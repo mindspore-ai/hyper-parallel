@@ -1,4 +1,4 @@
-# Copyright 2023-2025 Huawei Technologies Co., Ltd
+# Copyright 2025 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""shard"""
+"""layout"""
 
 import copy
 from typing import Tuple
@@ -20,7 +20,7 @@ import functools
 import numpy as np
 
 import torch
-from .group_manager import _get_comm_group
+from ._group_manager import _get_comm_group
 
 _group_map = {}
 
