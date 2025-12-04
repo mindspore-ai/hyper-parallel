@@ -1,0 +1,169 @@
+# Copyright 2025 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""HSDP gradient hook"""
+from mindspore import ops
+from mindspore.common.parameter import Parameter
+from mindspore.common.tensor import Tensor
+from dist_parallel.spmd.hsdp.hsdp_utils import OptimizerLevel
+import mindspore.parallel.spmd.hsdp.hsdp_comm as comm
+
+
+class HSDPGradHook:
+    """HSDP gradient hook"""
+
+    def __init__(self, reduce_dtype, grad_scale, shard_level, requires_acc_grad, use_pynative_hook):
+        """init"""
+        self.reduce_dtype = reduce_dtype
+        self.grad_scale = grad_scale
+        self.shard_level = shard_level
+        self.requires_acc_grad = requires_acc_grad
+        self.use_pynative_hook = use_pynative_hook
+        if self.use_pynative_hook:
+            self.requires_grad_sync = False
+        else:
+            self.requires_grad_sync = Parameter(Tensor(False), name="hsdp_requires_grad_sync", requires_grad=False)
+
+    def _cast_hook(self, hook, grad):
+        """add cast before and after reduce hook"""
+        if self.reduce_dtype is None:
+            return hook(grad)
+        origin_dtype = ops.dtype(grad)
+        grad_cast = ops.cast(grad, self.reduce_dtype)
+        output = hook(grad_cast)
+        output = ops.cast(output, origin_dtype)
+        return output
+
+    def _get_grad_scale_hook(self, param, grad_hook):
+        """add cast and scale grad"""
+        def scale_hook(grad):
+            output = self._cast_hook(grad_hook, grad)
+            if self.grad_scale != 1.0:
+                scale_output = output * self.grad_scale
+                param.grad = scale_output
+            else:
+                param.grad = output
+            return param.grad
+        return scale_hook
+
+    def _get_hsdp_param_single_node_hook(self, hsdp_param):
+        """get hook for unsharded param with single node."""
+        def grad_dummy_hook(grad):
+            output = grad * self.grad_scale
+            hsdp_param.param.grad = output
+            return output
+
+        def grad_hook(grad):
+            hsdp_param.acc_grad.add_(grad)
+            return hsdp_param.acc_grad
+
+        if not self.requires_acc_grad:
+            return grad_dummy_hook
+        return self._get_grad_scale_hook(hsdp_param.param, grad_hook)
+
+    def _get_hsdp_param_unsharded_hook(self, hsdp_param):
+        """get hook for unsharded param."""
+        def grad_all_reduce_hook(grad):
+            output, _ = comm.all_reduce(grad, group=hsdp_param.unsharded_group_name)
+            return output
+
+        def grad_acc_all_reduce_hook(grad):
+            hsdp_param.acc_grad.add_(grad)
+            if self.requires_grad_sync:
+                output, _ = comm.all_reduce(hsdp_param.acc_grad, group=hsdp_param.unsharded_group_name)
+                return output
+            return hsdp_param.acc_grad
+
+        if not self.requires_acc_grad:
+            grad_hook = grad_all_reduce_hook
+        else:
+            grad_hook = grad_acc_all_reduce_hook
+        return self._get_grad_scale_hook(hsdp_param.param, grad_hook)
+
+    def _get_hsdp_param_fully_sharded_hook(self, hsdp_param):
+        """get hook for fully sharded param."""
+        def grad_reduce_scatter_hook(grad):
+            output, _ = comm.reduce_scatter_tensor(grad, group=hsdp_param.sharded_group_name)
+            return output
+
+        def grad_acc_reduce_scatter_hook(grad):
+            hsdp_param.acc_grad.add_(grad)
+            if self.requires_grad_sync:
+                output, _ = comm.reduce_scatter_tensor(hsdp_param.acc_grad, group=hsdp_param.sharded_group_name)
+                return output
+            return hsdp_param.acc_grad
+
+        def grad_reduce_scatter_acc_hook(grad):
+            output, _ = comm.reduce_scatter_tensor(grad, group=hsdp_param.sharded_group_name)
+            hsdp_param.acc_grad.add_(output)
+            return hsdp_param.acc_grad
+
+        if not self.requires_acc_grad:
+            grad_hook = grad_reduce_scatter_hook
+        elif self.shard_level == OptimizerLevel.SHARD_OPT:
+            grad_hook = grad_acc_reduce_scatter_hook
+        else:
+            grad_hook = grad_reduce_scatter_acc_hook
+        return self._get_grad_scale_hook(hsdp_param.param, grad_hook)
+
+    def _get_hsdp_param_partial_sharded_hook(self, hsdp_param):
+        """get hook for partial sharded param."""
+        def grad_reduce_scatter_hook(grad):
+            output, _ = comm.reduce_scatter_tensor(grad, group=hsdp_param.sharded_group_name)
+            sliced_grad, _ = comm.all_reduce(output, group=hsdp_param.unsharded_group_name)
+            return sliced_grad
+
+        def grad_acc_reduce_scatter_hook(grad):
+            hsdp_param.acc_grad.add_(grad)
+            if self.requires_grad_sync:
+                output, _ = comm.reduce_scatter_tensor(hsdp_param.acc_grad, group=hsdp_param.sharded_group_name)
+                sliced_grad, _ = comm.all_reduce(output, group=hsdp_param.unsharded_group_name)
+                return sliced_grad
+            return hsdp_param.acc_grad
+
+        def grad_reduce_scatter_acc_hook(grad):
+            output, _ = comm.reduce_scatter_tensor(grad, group=hsdp_param.sharded_group_name)
+            hsdp_param.acc_grad.add_(output)
+            if self.requires_grad_sync:
+                output, _ = comm.all_reduce(hsdp_param.acc_grad, group=hsdp_param.unsharded_group_name)
+                return output
+            return hsdp_param.acc_grad
+
+        if not self.requires_acc_grad:
+            grad_hook = grad_reduce_scatter_hook
+        elif self.shard_level == OptimizerLevel.SHARD_OPT:
+            grad_hook = grad_acc_reduce_scatter_hook
+        else:
+            grad_hook = grad_reduce_scatter_acc_hook
+        return self._get_grad_scale_hook(hsdp_param.param, grad_hook)
+
+    def get_hook(self, hsdp_param):
+        """get hook for param gradient process."""
+        if not hsdp_param.sharded:
+            if hsdp_param.dp_size == 1:
+                return self._get_hsdp_param_single_node_hook(hsdp_param)
+            return self._get_hsdp_param_unsharded_hook(hsdp_param)
+
+        if hsdp_param.fully_sharded:
+            return self._get_hsdp_param_fully_sharded_hook(hsdp_param)
+
+        return self._get_hsdp_param_partial_sharded_hook(hsdp_param)
+
+    def set_requires_grad_sync(self, requires_grad_sync):
+        """set requires grad sync flag to control gradient sync."""
+        if self.use_pynative_hook:
+            self.requires_grad_sync = requires_grad_sync
+        else:
+            ops.assign(self.requires_grad_sync, Tensor(requires_grad_sync))
+    

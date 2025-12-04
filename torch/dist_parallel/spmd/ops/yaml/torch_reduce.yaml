@@ -1,0 +1,11 @@
+sum:
+  dist_op_name: _torch_sum_dist_op
+  distributed_op_class: SumExtDistributedOp
+  distributed_op_file: parallel_reduce
+
+mean:
+  dist_op_name: _torch_mean_dist_op
+  distributed_op_class: MeanExtDistributedOp
+  distributed_op_file: parallel_reduce
+
+

@@ -1,0 +1,4 @@
+SliceExt:
+  dist_op_name: _slice_ext_dist_op
+  distributed_op_class: SliceExtDistributedOp
+  distributed_op_file: parallel_slice_ext

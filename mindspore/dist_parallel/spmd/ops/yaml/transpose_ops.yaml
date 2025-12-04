@@ -1,0 +1,4 @@
+Transpose:
+  dist_op_name: _transpose_dist_op
+  distributed_op_class: TransposeDistributedOp
+  distributed_op_file: parallel_transpose

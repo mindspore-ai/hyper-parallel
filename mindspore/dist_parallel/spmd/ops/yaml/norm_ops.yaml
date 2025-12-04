@@ -1,0 +1,4 @@
+RmsNorm:
+  dist_op_name: _rms_norm_dist_op
+  distributed_op_class: NormDistributedOp
+  distributed_op_file: parallel_norm
