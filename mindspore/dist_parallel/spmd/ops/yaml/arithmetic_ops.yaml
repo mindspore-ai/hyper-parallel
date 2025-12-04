@@ -1,0 +1,29 @@
+AddExt:
+  dist_op_name: _add_ext_dist_op
+  distributed_op_class: ArithmeticDistributedOp
+  distributed_op_file: parallel_arithmetic
+
+Add:
+  dist_op_name: _add_dist_op
+  distributed_op_class: ArithmeticDistributedOp
+  distributed_op_file: parallel_arithmetic
+
+Sub:
+  dist_op_name: _sub_dist_op
+  distributed_op_class: ArithmeticDistributedOp
+  distributed_op_file: parallel_arithmetic
+
+Mul:
+  dist_op_name: _mul_dist_op
+  distributed_op_class: ArithmeticDistributedOp
+  distributed_op_file: parallel_arithmetic
+
+Div:
+  dist_op_name: _div_dist_op
+  distributed_op_class: ArithmeticDistributedOp
+  distributed_op_file: parallel_arithmetic
+
+SubExt:
+  dist_op_name: _sub_ext_dist_op
+  distributed_op_class: ArithmeticDistributedOp
+  distributed_op_file: parallel_arithmetic

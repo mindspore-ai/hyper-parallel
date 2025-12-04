@@ -1,0 +1,6 @@
+Reshape:
+  dist_op_name: _reshape_dist_op
+  distributed_op_class: ReshapeDistributedOp
+  distributed_op_file: parallel_reshape
+  template_name: without_parse
+  infer_layout_suffix: Reshape

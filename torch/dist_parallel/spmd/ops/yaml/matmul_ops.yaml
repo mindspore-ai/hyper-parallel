@@ -1,0 +1,19 @@
+MatMulExt:
+  dist_op_name: _matmul_ext_dist_op
+  distributed_op_class: MatMulExtDistributedOp
+  distributed_op_file: parallel_matmul
+
+MatMul:
+  dist_op_name: _matmul_dist_op
+  distributed_op_class: MatMulDistributedOp
+  distributed_op_file: parallel_matmul
+
+BatchMatMulExt:
+  dist_op_name: _batch_matmul_ext_dist_op
+  distributed_op_class: BatchMatMulExtDistributedOp
+  distributed_op_file: parallel_matmul
+
+BatchMatMul:
+  dist_op_name: _batch_matmul_dist_op
+  distributed_op_class: BatchMatMulDistributedOp
+  distributed_op_file: parallel_matmul

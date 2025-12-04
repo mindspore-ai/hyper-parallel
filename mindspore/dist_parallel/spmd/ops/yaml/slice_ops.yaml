@@ -1,0 +1,6 @@
+Slice:
+  dist_op_name: _slice_dist_op
+  distributed_op_class: SliceDistributedOp
+  distributed_op_file: parallel_slice
+  template_name: without_parse
+  infer_layout_suffix: Slice
