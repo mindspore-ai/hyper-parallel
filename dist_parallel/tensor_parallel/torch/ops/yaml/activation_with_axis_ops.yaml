@@ -1,9 +1,0 @@
-Softmax:
-  dist_op_name: _softmax_dist_op
-  distributed_op_class: ActivationWithAxisDistributedOp
-  distributed_op_file: parallel_activation_with_axis
-
-Swiglu:
-  dist_op_name: _swiglu_dist_op
-  distributed_op_class: ActivationWithAxisDistributedOp
-  distributed_op_file: parallel_activation_with_axis

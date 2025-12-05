@@ -1,4 +1,0 @@
-ArgMaxWithValue:
-  dist_op_name: _argmax_with_value_dist_op
-  distributed_op_class: ArgMaxWithValueDistributedOp
-  distributed_op_file: parallel_argmax_with_value_ops

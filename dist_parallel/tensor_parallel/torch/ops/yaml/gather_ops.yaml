@@ -1,9 +1,0 @@
-IndexSelect:
-  dist_op_name: _index_select_dist_op
-  distributed_op_class: IndexSelectDistributedOp
-  distributed_op_file: parallel_gather
-
-GatherD:
-  dist_op_name: _gather_dist_op
-  distributed_op_class: GatherDistributedOp
-  distributed_op_file: parallel_gather
