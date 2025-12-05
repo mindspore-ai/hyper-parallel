@@ -16,7 +16,7 @@
 import torch
 from torch import nn
 import torch.distributed as dist
-from dist_parallel.hsdp.platform.platform import Platform
+from dist_parallel.platform.platform import Platform
 
 
 class TorchPlatform(Platform):

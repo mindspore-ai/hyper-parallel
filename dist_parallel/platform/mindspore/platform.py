@@ -21,7 +21,7 @@ from mindspore.common.initializer import initializer
 from mindspore.communication import create_group as new_group
 import mindspore.communication.comm_func as comm_func
 from mindspore.parallel import DTensor
-from dist_parallel.hsdp.platform.platform import Platform
+from dist_parallel.platform.platform import Platform
 
 
 class MindSporePlatform(Platform):

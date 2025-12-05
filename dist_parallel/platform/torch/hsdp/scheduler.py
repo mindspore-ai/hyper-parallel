@@ -14,8 +14,8 @@
 # ============================================================================
 """HSDP scheduler"""
 from dist_parallel.hsdp.hsdp_scheduler import HSDPScheduler
-from dist_parallel.hsdp.platform.torch.platform import TorchPlatform
-from dist_parallel.hsdp.platform.torch.state import TorchHSDPState
+from dist_parallel.platform.torch.platform import TorchPlatform
+from dist_parallel.platform.torch.hsdp.state import TorchHSDPState
 
 
 class TorchHSDPScheduler(HSDPScheduler):

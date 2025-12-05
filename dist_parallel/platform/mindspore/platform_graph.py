@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore platform api for grap mode"""
-from dist_parallel.hsdp.platform.mindspore.platform import MindSporePlatform
+from dist_parallel.platform.mindspore.platform import MindSporePlatform
 
 
 class MindSporeGraphPlatform(MindSporePlatform):

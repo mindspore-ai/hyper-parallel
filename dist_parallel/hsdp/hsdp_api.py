@@ -38,15 +38,16 @@ class HSDPCell:
         self.platform_type = platform_type
         global current_platform
         if self.platform_type == PlatformType.MINDSPORE:
-            from dist_parallel.hsdp.platform.mindspore.scheduler import MindSporeHSDPScheduler
-            from dist_parallel.hsdp.platform.mindspore.platform import MindSporePlatform
-            scheduler_class = MindSporeHSDPScheduler
+            from dist_parallel.platform.mindspore.platform import MindSporePlatform
+            from dist_parallel.platform.mindspore.hsdp.scheduler import MindSporeHSDPScheduler
             current_platform = MindSporePlatform()
+            scheduler_class = MindSporeHSDPScheduler
         else:
-            from dist_parallel.hsdp.platform.torch.scheduler import TorchHSDPScheduler
-            from dist_parallel.hsdp.platform.torch.platform import TorchPlatform
-            scheduler_class = TorchHSDPScheduler
+            from dist_parallel.platform.torch.platform import TorchPlatform
+            from dist_parallel.platform.torch.hsdp.scheduler import TorchHSDPScheduler
             current_platform = TorchPlatform()
+            scheduler_class = TorchHSDPScheduler
+            
 
         self.hsdp_scheduler = scheduler_class(cell,
                                               shard_size,

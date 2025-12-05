@@ -14,8 +14,8 @@
 # ============================================================================
 """Torch HSDP cell state"""
 from dist_parallel.hsdp.hsdp_state import HSDPState
-from dist_parallel.hsdp.platform.torch.param import TorchHSDPParam
-from dist_parallel.hsdp.platform.torch.platform import TorchPlatform
+from dist_parallel.platform.torch.hsdp.param import TorchHSDPParam
+from dist_parallel.platform.torch.platform import TorchPlatform
 
 class TorchHSDPState(HSDPState):
     """Torch HSDP cell state"""

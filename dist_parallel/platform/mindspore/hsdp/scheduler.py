@@ -18,11 +18,12 @@ from mindspore import ops
 from mindspore.common.tensor import Tensor
 from dist_parallel.hsdp.hsdp_utils import OptimizerLevel
 from dist_parallel.hsdp.hsdp_scheduler import HSDPScheduler
-from dist_parallel.hsdp.platform.mindspore.state import MindSporeHSDPState
-from dist_parallel.hsdp.platform.mindspore.platform import MindSporePlatform
-from dist_parallel.hsdp.platform.mindspore.platform_graph import MindSporeGraphPlatform
-from dist_parallel.hsdp.platform.mindspore.grad_hook import MindSporeHSDPGradHook
-from dist_parallel.hsdp.platform.mindspore.async_grad_hook import MindSporeHSDPAsyncGradHook
+from dist_parallel.platform.mindspore.platform import MindSporePlatform
+from dist_parallel.platform.mindspore.platform_graph import MindSporeGraphPlatform
+from dist_parallel.platform.mindspore.hsdp.state import MindSporeHSDPState
+from dist_parallel.platform.mindspore.hsdp.grad_hook import MindSporeHSDPGradHook
+from dist_parallel.platform.mindspore.hsdp.async_grad_hook import MindSporeHSDPAsyncGradHook
+
 
 class MindSporeHSDPScheduler(HSDPScheduler):
     """MindSporeHSDPScheduler is used to implement optimizer level."""
