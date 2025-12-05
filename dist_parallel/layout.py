@@ -18,9 +18,8 @@ import copy
 from typing import Tuple
 import functools
 import numpy as np
-
-import mindspore as ms
-from ._group_manager import _get_comm_group
+from dist_parallel.platform import get_platform
+platform = get_platform()
 
 _group_map = {}
 
@@ -132,7 +131,8 @@ class _DeviceMatrix:
         self._alias_name = alias_name
         self._dev_num = np.prod(np.array(self._device_shape))
         self._global_shape_map = {}
-        self._rank = ms.communication.management.get_rank()
+        global platform
+        self._rank = platform.get_rank()
         self._dev_rank = len(self._device_shape)
         self._dev_name_to_dev_id = {name: self._dev_rank - i - 1 for i, name in enumerate(self.alias_name)}
         self._dev_name_to_index = {name: i for i, name in enumerate(self.alias_name)}
@@ -281,7 +281,7 @@ class _DeviceMatrix:
         if (axis, rank) in _group_map:
             return _group_map[(axis, rank)]
         rank_list = self.get_rank_list_along_axis(axis=axis)
-        group = _get_comm_group(rank_list)
+        group = platform.create_group(rank_list)
         _group_map[(axis, rank)] = group
         return group
 
@@ -583,11 +583,8 @@ class Layout:
                              f" alias_name is {self._mesh.alias_name}")
 
         # if it is not the last stage, return -1
-        if enable_ms:
-            from mindspore.communication.management import get_group_size
-            group_size = get_group_size()
-        else:
-            group_size = torch.distributed.get_world_size()
+        global platform
+        group_size = platform.get_world_size()
         if self._rank_list[-1] != (group_size - 1):
             return -1
 

@@ -13,12 +13,23 @@
 # limitations under the License.
 # ============================================================================
 """framework platform api"""
-from mindspore.parallel import DTensor
-from mindspore.common.dtype import type_size_in_bytes
-from mindspore.common.parameter import Parameter
-from mindspore.common.initializer import initializer
-from mindspore.communication import create_group
-import mindspore.communication.comm_func as comm_func
+platform = None
+
+def set_platform(input_platform):
+    global platform
+    platform = input_platform
+
+def get_platform():
+    global platform
+    if platform is not None:
+        return platform
+    try:
+        from dist_parallel.platform.torch.platform import TorchPlatform
+        platform = TorchPlatform()
+    except ImportError:
+        from dist_parallel.platform.mindspore.platform import MindSporePlatform
+        platform = MindSporePlatform()
+
 
 EXISTING_COMM_GROUPS = dict()
 
@@ -28,6 +39,14 @@ class Platform:
     current_grad_handle = None
     post_grad_handle_process = None
     grad_sync_stream = None
+
+    @staticmethod
+    def get_rank():
+        pass
+
+    @staticmethod
+    def get_world_size():
+        pass
 
     @staticmethod
     def register_forward_pre_hook(cell, hook):
@@ -84,7 +103,7 @@ class Platform:
     def reduce_scatter_tensor(data, group_info, async_op=False):
         pass
 
-    def _create_group(self, group_name, rank_list):
+    def _create_group(self, rank_list, group_name=None):
         pass
 
     def new_stream(self):
@@ -93,12 +112,16 @@ class Platform:
     def get_stream_context(self):
         pass
 
-    def create_group(self, group_name, rank_list):
-        if group_name in EXISTING_COMM_GROUPS:
-            return EXISTING_COMM_GROUPS[group_name]
+    def create_group(self, rank_list, group_name=None):
+        if group_name is None:
+            group_key = hash(tuple(rank_list))
+        else:
+            group_key = group_name
+        if group_key in EXISTING_COMM_GROUPS:
+            return EXISTING_COMM_GROUPS[group_key]
 
-        group = _create_group(group_name, rank_list)
-        EXISTING_COMM_GROUPS[group_name] = group
+        group = _create_group(rank_list, group_name)
+        EXISTING_COMM_GROUPS[group_key] = group
         return group
 
     def _process_current_handle(self):

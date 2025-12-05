@@ -16,11 +16,12 @@
 import inspect
 from typing import Union, Callable, Dict
 from functools import wraps
-from mindspore import nn
 from ..layout import Layout
-import mindspore as ms
-from mindspore import Tensor, Parameter
-
+from dist_parallel.platform import get_platform
+platform = get_platform()
+Parameter = platform.Parameter
+Tensor = platform.Tensor
+Module = platform.Module
 
 def _has_kwargs(func):
     """_has_kwargs"""
@@ -110,7 +111,7 @@ def _forward_with_kwargs_hook(cell, inputs, kwargs, outputs):
     """_forward_with_kwargs_hook"""
     return _forward_hook(cell, inputs, outputs)
 
-def _register_hook(model: nn.Cell, sharding_plan: Dict):
+def _register_hook(model: Module, sharding_plan: Dict):
     """_register_hook"""
     def _register_cell_hook(model, has_inputs_layout, has_outputs_layout):
         """_register_cell_hook"""
@@ -176,34 +177,34 @@ def _shard_callable(func: Callable, sharding_plan:Dict):
 
 def _search_parameter_by_name(cell, param_name: str):
     """
-    Find the parent Cell of the parameter, the parameter's name in the parent Cell, and the parameter object itself
-    Return value: (parent Cell instance, parameter's name in parent Cell, parameter object).
+    Find the parent Module of the parameter, the parameter's name in the parent Module, and the parameter object itself
+    Return value: (parent Module instance, parameter's name in parent Module, parameter object).
     Returns None if not found.
     """
     # Remove the "self." prefix from param_name (to maintain compatibility with original logic)
     param_name = param_name.replace("self.", "")
-    # Case 1: The parameter is a direct parameter of the current Cell (not in any sub-Cell)
+    # Case 1: The parameter is a direct parameter of the current Module (not in any sub-Module)
     if param_name in cell._params:
         return (cell, param_name, cell._params[param_name])
 
-    # Case 2: The parameter is in a sub-Cell (supports multi-level nesting, e.g., "net_b.dense1.weight")
+    # Case 2: The parameter is in a sub-Module (supports multi-level nesting, e.g., "net_b.dense1.weight")
     if "." in param_name:
-        # Split into: sub-Cell path + parameter name (e.g., "net_b.dense1" + "weight")
+        # Split into: sub-Module path + parameter name (e.g., "net_b.dense1" + "weight")
         cell_path, param_key = param_name.rsplit(".", 1)
         try:
-            # Locate the sub-Cell where the parameter resides (supports multi-level paths)
+            # Locate the sub-Module where the parameter resides (supports multi-level paths)
             target_cell = cell.get_sub_cell(cell_path)
-            # Check if the sub-Cell directly contains this parameter
+            # Check if the sub-Module directly contains this parameter
             if param_key in target_cell._params:
                 return (target_cell, param_key, target_cell._params[param_key])
         except AttributeError:
-            # Sub-Cell path does not exist or the parameter is not in that sub-Cell
+            # Sub-Module path does not exist or the parameter is not in that sub-Module
             pass
 
-    # Traverse all sub-Cells (recursively) to search for the parameter
+    # Traverse all sub-Modules (recursively) to search for the parameter
     for _, child_cell in cell._cells.items():
-        if isinstance(child_cell, nn.Cell):
-            # Recursively search within the sub-Cell
+        if isinstance(child_cell, Module):
+            # Recursively search within the sub-Module
             result = _search_parameter_by_name(child_cell, param_name)
             if result is not None:
                 return result
@@ -212,14 +213,14 @@ def _search_parameter_by_name(cell, param_name: str):
 
 def _update_parameter_by_name(cell, result: tuple, new_param: Parameter) -> bool:
     """
-    Modify the original parameter in a Cell or sub-Cell using the search result
+    Modify the original parameter in a Module or sub-Module using the search result
     Args:
         cell: The cell which parameter is to update
-        result: The tuple returned by _search_parameter_by_name (contains parent Cell, parameter key, old parameter)
+        result: The tuple returned by _search_parameter_by_name (contains parent Module, parameter key, old parameter)
         new_param: New Parameter object (used to replace the original parameter)
     """
     parent_cell, param_key, _ = result
-    # Key operation: directly modify the _params dictionary of the parent Cell (original storage location)
+    # Key operation: directly modify the _params dictionary of the parent Module (original storage location)
     parent_cell._params[param_key] = new_param
 
     if param_key in parent_cell.__dict__:
@@ -229,7 +230,7 @@ def _update_parameter_by_name(cell, result: tuple, new_param: Parameter) -> bool
 
 def _set_layout_into_parameter(param, layout):
     """Set layout in to parameter"""
-    if isinstance(param, dist_parallel.DTensor):
+    if isinstance(param, DTensor):
         raise ValueError(f"Parameter {param.name} has been configured layout, cannot be set repeatedly.")
     param_info = param.param_info
     requires_grad = param.requires_grad
@@ -238,18 +239,19 @@ def _set_layout_into_parameter(param, layout):
 
     if not param.has_init:
         # has been init, get slice data
-        param_dtensor = dist_parallel.DTensor.from_local(_get_slice_tensor_by_layout(param, layout).value(), layout)
-        param = ms.Parameter(param_dtensor, name=name, requires_grad=requires_grad)
+        param_dtensor = DTensor.from_local(_get_slice_tensor_by_layout(param, layout).value(), layout)
+        param = Parameter(param_dtensor, name=name, requires_grad=requires_grad)
         param.param_info = param_info
     else:
         # has not been init, need to modify init shape
         param.init_mode.shape = slice_shape
-        param_dtensor = dist_parallel.DTensor.from_local(param.init_mode, layout)
-        param = ms.Parameter(param_dtensor, name=name, requires_grad=requires_grad)
+        param_dtensor = DTensor.from_local(param.init_mode, layout)
+        param = Parameter(param_dtensor, name=name, requires_grad=requires_grad)
         param.param_info = param_info
     return param
 
-def shard(model: Union[nn.Cell, Callable], sharding_plan: Dict):
+
+def shard(model: Union[Module, Callable], sharding_plan: Dict):
     """
         Defining the input, output and parameters layouts of this cell or Callable.
 
@@ -260,45 +262,13 @@ def shard(model: Union[nn.Cell, Callable], sharding_plan: Dict):
             The method is currently not supported in Graph mode.
 
         Args:
-            model (Cell or Callable): The model to be sharded.
+            model (Module or Callable): The model to be sharded.
             sharding_plan (Dict): Define the layout for the specified parameters, inputs or outputs.
 
-        Examples:
-            >>> import numpy as np
-            >>> import mindspore as ms
-            >>> import mindspore.nn as nn
-            >>> from dist_parallel import Layout
-            >>> from dist_parallel.spmd.shard import shard
-            >>> import mindspore.communication.management as D
-            >>> ms.context.set_context(mode=ms.context.PYNATIVE_MODE, device_target="Ascend")
-            >>>
-            >>> class SimpleNet(nn.Cell):
-            ...     def __init__(self, strategy_list):
-            ...         super().__init__()
-            ...         relu_net = ms.mint.nn.ReLU()
-            ...         shard(relu_net, sharding_plan = strategy_list)
-            ...
-            ...     def construct(self, x):
-            ...         x = x.contiguous()
-            ...         x = cell(x)
-            ...     return x
-            >>>
-            >>> np_x = np.random.randn(16, 256).astype(np.float32)
-            >>> 
-            >>> base_device_matrix = (2, 4)  # dp=2, mp=4
-            >>> base_alias_name = ("dp", "mp")
-            >>> base_rank_list = list(range(8))
-            >>> layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
-            >>> in_strategy_1 = (layout("dp", "mp"),)
-            >>> out_strategy_1 = None
-            >>> strategy_list = { "forward": { "input": in_strategy_1, "output": out_strategy_1}}
-            >>> net = SimpleNet(strategy_list=strategy_list)
-            >>> x = Tensor(np, dtype=ms.float16)
-            >>> output = net(x)
     """
-    if ms.communication.management.get_group_size() == 1:
+    if platform.get_world_size() == 1:
         return None
-    if not isinstance(model, nn.Cell):
+    if not isinstance(model, Module):
         return _shard_callable(model, sharding_plan)
 
     param_sharding_plan = sharding_plan.get("parameter")
@@ -314,7 +284,7 @@ def shard(model: Union[nn.Cell, Callable], sharding_plan: Dict):
                 raise ValueError(f"{param_name} is configured with a layout, but no instance was found.")
             _, _, param = result
 
-            if isinstance(param, dist_parallel.DTensor):
+            if isinstance(param, DTensor):
                 raise ValueError(f"Parameter {param.name} has been configured layout, "
                                  f"cannot be set repeatedly.")
             param = _set_layout_into_parameter(param, layout)

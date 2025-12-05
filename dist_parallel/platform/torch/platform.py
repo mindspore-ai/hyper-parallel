@@ -15,12 +15,17 @@
 """Torch platform api"""
 import torch
 from torch import nn
+from torch import Tensor, Parameter, Module
 import torch.distributed as dist
 from dist_parallel.platform.platform import Platform
+from dist_parallel.platform.torch._group_manager import create_sub_groups
 
 
 class TorchPlatform(Platform):
     """Torch platform api"""
+    Tensor = Tensor
+    Parameter = Parameter
+    Module = Module
 
     @staticmethod
     def get_device_handle(device_type="cuda"):
@@ -46,8 +51,8 @@ class TorchPlatform(Platform):
     def new_tensor(tensor_shape, tensor_type):
         return torch.empty(tensor_shape, tensor_type)
 
-    def create_group(self, group_name, rank_list):
-        return dist.new_group(ranks=rank_list)
+    def _create_group(self, rank_list, group_name):
+        return create_sub_groups(rank_list)
 
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):

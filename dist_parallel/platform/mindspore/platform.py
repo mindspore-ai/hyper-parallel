@@ -14,6 +14,7 @@
 # ============================================================================
 """MindSpore platform api"""
 import mindspore as ms
+from mindspore.nn import Cell
 from mindspore.common.dtype import type_size_in_bytes
 from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
@@ -26,6 +27,9 @@ from dist_parallel.platform.platform import Platform
 
 class MindSporePlatform(Platform):
     """MindSpore platform api"""
+    Tensor = Tensor
+    Parameter = Parameter
+    Module = Cell
 
     #pylint: disable=W0212
     @staticmethod
@@ -63,8 +67,8 @@ class MindSporePlatform(Platform):
     def new_tensor(tensor_shape, tensor_type):
         return Tensor(shape=tensor_shape, dtype=tensor_type)
 
-    def create_group(self, group_name, rank_list):
-        new_group(group_name, rank_list)
+    def _create_group(self, rank_list, group_name):
+        new_group(rank_list, group_name)
         return None
 
     @staticmethod
