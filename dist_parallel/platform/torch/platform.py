@@ -16,9 +16,12 @@
 import torch
 from torch import nn
 from torch import Tensor, Parameter, Module
+from torch._ops import OpOverload, OpOverloadPacket
+import torch.distributed.nn.functional as dist_func
 import torch.distributed as dist
 from dist_parallel.platform.platform import Platform
-from dist_parallel.platform.torch._group_manager import create_sub_groups
+from dist_parallel.platform.torch.dtensor import DTensorBase
+from dist_parallel.platform.torch.group_utils import create_sub_groups
 
 
 class TorchPlatform(Platform):
@@ -26,6 +29,65 @@ class TorchPlatform(Platform):
     Tensor = Tensor
     Parameter = Parameter
     Module = Module
+    DTensorBase = DTensorBase
+
+    @staticmethod
+    def get_rank():
+        return dist.get_rank()
+
+    @staticmethod
+    def get_world_size():
+        return dist.get_world_size()
+
+    @staticmethod
+    def get_op_name(func):
+        if hasattr(func, "__name__"):
+            return func.__name__
+        elif isinstance(func, OpOverload):
+            full_name = func.name
+            core_name = full_name.split("::")[-1].split(".")[0]
+            return core_name
+        elif isinstance(func, OpOverloadPacket):
+            return func.name.split("::")[-1]
+        else:
+            func_str = str(func)
+            if "built-in function" in func_str:
+                return func_str.split()[-1].strip(">")
+            elif "function" in func_str:
+                return func_str.split()[1]
+            return "unknown_op"
+
+    @staticmethod
+    def differentiable_all_gather_concat(data, group, concat_size, concat_dim):
+        output, _ = dist_func.all_gather(data, group=group)
+        return torch.cat(output, dim=concat_dim)
+
+    @staticmethod
+    def chunk(data, split_dim, split_size, index):
+        return torch.chunk(data, split_size, dim=split_dim)[index]
+
+    @staticmethod
+    def differentiable_all_to_all(input_data, output_shape, group):
+        output_tensor = torch.empty(output_shape, device=input_data.device, dtype=input_data.dtype)
+        output_tensor = dist_func.all_to_all_single(
+            output_tensor,
+            input_data,
+            group=group
+        )
+        return output_tensor
+
+    @staticmethod
+    def differentiable_all_reduce(data, op, group):
+        return dist_func.all_reduce(data, group=group)
+
+    @staticmethod
+    def differentiable_reduce_scatter(data, dev_num, axis, op, group):
+        input_tuple = torch.chunk(data, dev_num, dim=axis)
+        output_tensor = torch.empty(input_tuple[0].shape, device=data.device, dtype=data.dtype)
+        output_tensor = dist_func.reduce_scatter(output_tensor, input_tuple, group=group)
+        if op == 'avg':
+            output_tensor = output_tensor / dev_num
+        return output_tensor
 
     @staticmethod
     def get_device_handle(device_type="cuda"):

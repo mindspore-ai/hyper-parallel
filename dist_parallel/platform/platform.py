@@ -49,6 +49,30 @@ class Platform:
         pass
 
     @staticmethod
+    def get_op_name(func):
+        pass
+
+    @staticmethod
+    def differentiable_all_gather_concat(x, group, concat_size, concat_dim):
+        pass
+
+    @staticmethod
+    def chunk(data, split_dim, split_size, index):
+        pass
+
+    @staticmethod
+    def differentiable_all_to_all(input_data, output_shape, group):
+        pass
+
+    @staticmethod
+    def differentiable_all_reduce(data, op, group, async_op=False):
+        pass
+
+    @staticmethod
+    def differentiable_reduce_scatter(x, dev_num, axis, op, group):
+        pass
+
+    @staticmethod
     def register_forward_pre_hook(cell, hook):
         return cell.register_forward_pre_hook(hook)
 

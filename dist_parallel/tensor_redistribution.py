@@ -14,16 +14,11 @@
 # ============================================================================
 """tensor_redistribution"""
 
-import mindspore as ms
-import mindspore.communication as comm
-from mindspore._c_expression import TensorTransform
-from mindspore import log as logger
-from mindspore.communication import get_rank, create_group
-from mindspore.parallel.redistribute_infer import RedistributionOperatorInfer
-import dist_parallel
-from ._group_manager import _get_comm_group
+from dist_parallel.dtensor import DTensor
+from dist_parallel.redistribute_infer import RedistributionOperatorInfer
+from dist_parallel.platform import get_platform
+platform = get_platform()
 
-_tensor_redistribution = TensorTransform.get_instance()
 
 def _construct_layout_tuple_for_transform_operator_list(from_layout, to_layout, from_full_shape):
     """_construct_layout_tuple_for_transform_operator_list"""
@@ -32,13 +27,6 @@ def _construct_layout_tuple_for_transform_operator_list(from_layout, to_layout, 
     from_layout_tuple = (from_layout_dict["device_matrix"], from_layout_dict["tensor_map"], list(from_full_shape))
     to_layout_tuple = (to_layout_dict["device_matrix"], to_layout_dict["tensor_map"], list(from_full_shape))  # TODO: 考虑reshape的场景
     return from_layout_tuple, to_layout_tuple
-
-
-def print_transform_operator(transform_operator_list):
-    """print_transform_operator"""
-    logger.warning(f"Transform operator list size: {len(transform_operator_list)}")
-    for i, transform_operator in enumerate(transform_operator_list):
-        logger.warning(f"[{i}] {transform_operator[0]}: {transform_operator[1]}")
 
 
 class TensorRedistribution:
@@ -67,12 +55,9 @@ class TensorRedistribution:
         """args: (*rank_list, concat_dim)"""
         rank_list = args[0:-1]
         concat_dim = args[-1]
-        group = _get_comm_group(rank_list)
-        output, _ = comm.comm_func.all_gather_into_tensor(x, group=group)
-        if concat_dim == 0:
-            return output
-        output_tensors = ms.ops.Split(output_num=len(rank_list))(output)
-        return ms.mint.concat(output_tensors, concat_dim)
+        group = platform.create_group(rank_list)
+        concat_size = len(rank_list)
+        return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim)
 
 
     def _construct_strided_slice(self, x, *args):
@@ -85,12 +70,8 @@ class TensorRedistribution:
         rank_list = args[2]
         concat_dim = args[0]
         concat_size = args[1]
-        group = _get_comm_group(rank_list)
-        output, _ = comm.comm_func.all_gather_into_tensor(x, group=group)
-        if concat_dim == 0:
-            return output
-        output_tensors = ms.ops.Split(output_num=concat_size)(output)
-        return ms.mint.concat(output_tensors, concat_dim)
+        group = platform.create_group(rank_list)
+        return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim)
 
     def _construct_all_split(self, x, *args):
         """args: (split_dim, split_size, group)"""
@@ -98,12 +79,12 @@ class TensorRedistribution:
         split_dim = args[0]
         split_size = args[1]
         idx = rank_list.index(self.rank_id)
-        return ms.ops.Split(axis=split_dim, output_num=split_size)(x)[idx]
+        return platform.chunk(x, split_dim, split_size, idx)
 
     def _construct_all_to_all(self, x, *args):
         """args: (split_dim, concat_dim, permute_size, group)"""
         split_dim, concat_dim, split_count, rank_list = args
-        group = _get_comm_group(rank_list)
+        group = platform.create_group(rank_list)
         original_shape = x.shape
 
         dim_size = original_shape[split_dim]
@@ -139,7 +120,8 @@ class TensorRedistribution:
             reshape_shape = tuple(reshape_shape)
             x_reshaped = x_reshaped.reshape(reshape_shape)
 
-        output_tensor, _ = comm.comm_func.all_to_all_single_with_output_shape(
+        output_tensor, _ = platform.differentiable_all_to_all(
+            output_shape=reshape_shape,
             output_shape=reshape_shape,
             tensor=x_reshaped,
             group=group,
@@ -209,7 +191,7 @@ class TensorRedistribution:
 
         from_layout = x.layout
         if not self.is_init:
-            self.rank_id = get_rank()
+            self.rank_id = platform.get_rank()
             self.rank_list = from_layout.rank_list
             self.is_init = True
         if self.rank_list != to_layout.rank_list:
@@ -221,7 +203,7 @@ class TensorRedistribution:
             transform_operator_list = self._transform_cache[key]
             for transform_operator in transform_operator_list:
                 x = self._construct_op_operator[transform_operator[0]](x, *transform_operator[1])
-            return dist_parallel.DTensor.from_local(x, to_layout)
+            return DTensor.from_local(x, to_layout)
 
         full_shape = x.shape
         key_and_shape = key + str(full_shape)
@@ -230,7 +212,7 @@ class TensorRedistribution:
             transform_operator_list = self._transform_cache[key_and_shape]
             for transform_operator in transform_operator_list:
                 x = self._construct_op_operator[transform_operator[0]](x, *transform_operator[1])
-            return dist_parallel.DTensor.from_local(x, to_layout)
+            return DTensor.from_local(x, to_layout)
 
         if self._apply_eazy_redistribute(from_layout, to_layout):
             if from_layout.is_partial:
@@ -241,7 +223,7 @@ class TensorRedistribution:
                                                                           full_shape, key_and_shape)
             for transform_operator in transform_operator_list:
                 x = self._construct_op_operator[transform_operator[0]](x, *transform_operator[1])
-        return dist_parallel.DTensor.from_local(x, to_layout)
+        return DTensor.from_local(x, to_layout)
 
     def _infer_transform_operator_list(self, from_layout, to_layout, from_full_shape, key):
         """infer transform operator list"""
@@ -254,12 +236,17 @@ class TensorRedistribution:
 
     def _allreduce_along_dev_dim(self, x, op, layout, dev_dim):
         group = layout.get_comm_group_by_axis(dev_dim, self.rank_id)
+        zero_dim = x.dim() == 0
+        if zero_dim:
+            x = x.unsqueeze(0)
         if op == 'avg':
             dev_num = layout.device_matrix[layout.alias_name.index(dev_dim)]
-            x, _ = comm.comm_func.all_reduce(x, 'sum', group)
+            x, _ = platform.differentiable_all_reduce(x, 'sum', group)
             x = x / dev_num
         else:
-            x, _ = comm.comm_func.all_reduce(x, op, group)
+            x, _ = platform.differentiable_all_reduce(x, op, group)
+        if zero_dim:
+            x = x.squeeze(0)
         logger.warning(f"Do AllReduce-{op} along {dev_dim}. group: {group}")
         return x
 
@@ -267,13 +254,7 @@ class TensorRedistribution:
         """Do reduce_scatter at specified axis along dev_dim."""
         dev_num = layout.device_matrix[layout.alias_name.index(dev_dim)]
         group = layout.get_comm_group_by_axis(dev_dim, self.rank_id)
-        if axis > 0:
-            x = ms.mint.concat(ms.ops.Split(axis=axis, output_num=dev_num)(x), dim=0)
-        if op == 'avg':
-            output_tensor, _ = comm.comm_func.reduce_scatter_tensor(x, 'sum', group)
-            output_tensor = output_tensor / dev_num
-        else:
-            output_tensor, _ = comm.comm_func.reduce_scatter_tensor(x, 'sum', group)
+        output_tensor = self.platform.reduce_scatter(x, dev_num, axis, op, group)
         logger.warning(f"Do ReduceScatter-{op} along dev {dev_dim} at axis {axis}. group: {group}")
         return output_tensor
 
@@ -338,7 +319,7 @@ class TensorRedistribution:
 
         output_layout = from_layout(*output_alias_tensor_map)
         output_layout.reset_partial()
-        return dist_parallel.DTensor.from_local(x, output_layout)
+        return DTensor.from_local(x, output_layout)
 
 
 _tensor_redistribution = TensorRedistribution()

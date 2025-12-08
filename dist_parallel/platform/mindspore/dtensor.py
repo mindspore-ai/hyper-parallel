@@ -12,31 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""dtensor"""
+"""mindspore dtensor base"""
 import copy as cp
 from mindspore.common.tensor import Tensor
 from mindspore.common.initializer import initializer
 from mindspore._c_expression import NoFallbackGuard
-from .layout import Layout
-from .spmd._op_dispatch import OpDispatcher
-from .tensor_redistribution import _tensor_redistribution
 
-_OP_DISPATCHER = OpDispatcher()
 
-class DTensor(Tensor):
+class DTensorBase(Tensor):
     """
-    DTensor
+    DTensorBase
     """
-    _local_tensor: Tensor
-    _layout: Layout
 
-    def __new__(cls, local_tensor: Tensor, layout: Layout = None, device="Ascend") -> "DTensor":
-        if isinstance(local_tensor, DTensor):
+    def __new__(cls, local_tensor, layout, device="Ascend") -> "DTensor":
+        if isinstance(local_tensor, DTensorBase):
             device_local_tensor = local_tensor.to_local() if local_tensor.to_local().has_init else\
                 local_tensor.to_local().to(device)
             t = Tensor._make_subclass(cls, device_local_tensor)
-            t._local_tensor = device_local_tensor
-            t._layout = local_tensor.layout
+            t.__init__(local_tensor, layout)
             t._device = device
             return t
         if not layout:
@@ -45,14 +38,9 @@ class DTensor(Tensor):
         if local_tensor.has_init:
             local_tensor.init_device = device
         t = Tensor._make_subclass(cls, device_local_tensor)
-        t._local_tensor = device_local_tensor
-        t._layout = layout
+        t.__init__(local_tensor, layout)
         t._device = device
         return t
-
-    # pylint: disable=W0231
-    def __init__(self, local_tensor, requires_grad, layout=None):
-        pass
 
     def asnumpy(self):
         """
@@ -65,10 +53,10 @@ class DTensor(Tensor):
 
     def __copy__(self):
         if self._local_tensor.has_init:
-            obj = DTensor.__new__(type(self), initializer(self._local_tensor.init, self._local_tensor.shape,
+            obj = DTensorBase.__new__(type(self), initializer(self._local_tensor.init, self._local_tensor.shape,
                                                           self._local_tensor.dtype), self._layout)
         else:
-            obj = DTensor.__new__(type(self), self._local_tensor.clone(), self._layout)
+            obj = DTensorBase.__new__(type(self), self._local_tensor.clone(), self._layout)
         filtered_dict = {k: v for k, v in self.__dict__.items() if k != '_local_tensor'}
         obj.__dict__.update(filtered_dict)
         return obj
@@ -78,6 +66,7 @@ class DTensor(Tensor):
     def __fallback__(self, func, args={}, kwargs=None):
         if kwargs is None:
             kwargs = {}
+        from dist_parallel.tensor_parallel._op_dispatch import _OP_DISPATCHER
         with NoFallbackGuard():
             out = _OP_DISPATCHER.dispatch(func, args, kwargs)
         return out
@@ -91,75 +80,6 @@ class DTensor(Tensor):
     def device(self):
         """Device info for dtensor"""
         return self._device
-
-    @property
-    def layout(self):
-        """Sharding state for dtensor"""
-        if not hasattr(self, '_layout'):
-            return None
-        return self._layout
-
-    @staticmethod
-    def from_local(local_tensor: Tensor, layout: Layout):
-        d_tensor =  DTensor(local_tensor, layout)
-        return d_tensor
-
-    def to_local(self):
-        """covert global_tensor to local_tensor"""
-        return self._local_tensor
-
-    @property
-    def shape(self):
-        """
-        For details, please refer to :func:`mindspore.ops.shape`.
-
-        Examples:
-            >>> from mindspore import Tensor
-            >>> from dist_parallel import DTensor, Layout
-            >>> import numpy as np
-            >>> x = Tensor(np.array([[1, 2], [3, 4]]))
-            >>> layout = Layout((2, 2), ("dp", "tp"))
-            >>> d_x = DTensor.from_local(x, layout("dp", "tp"))
-            >>> print(d_x.shape)
-            (4, 4)
-        """
-        return self._layout.get_global_shape(self._local_tensor.shape)
-
-    @property
-    def local_shape(self):
-        """
-        For details, please refer to :func:`mindspore.ops.shape`.
-
-        Examples:
-            >>> from mindspore import Tensor
-            >>> from dist_parallel import DTensor, Layout
-            >>> import numpy as np
-            >>> x = Tensor(np.array([[1, 2], [3, 4]]))
-            >>> layout = Layout((2, 2), ("dp", "tp"))
-            >>> d_x = DTensor.from_local(x, layout("dp", "tp"))
-            >>> print(d_x.local_shape)
-            (4, 4)
-        """
-        return self._local_tensor.shape
-
-    def redistribute(self, dst_layout):
-        """
-        Redistribute dtensor to destination layout.
-        """
-        out = _tensor_redistribution.redistribution(self, dst_layout)
-        return out
-
-    def reduce_partial(self):
-        """
-        Reduce partial sharding state for dtensor.
-
-        """
-        if not self.layout:
-            return self
-        to_layout = cp.deepcopy(self.layout)
-        to_layout.reset_partial()
-        out = _tensor_redistribution.reduce_partial(self, to_layout)
-        return out
 
     # pylint: disable=W0212
     def set_data(self, data):
