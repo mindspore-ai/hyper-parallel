@@ -191,15 +191,3 @@ def create_sub_groups(
         print(f"Rank {my_rank}: Created {len(group_dict)} groups I belong to")
     
     return group_dict
-
-_REDISTRIBUTION_GROUP_CACHE = {}
-
-def _get_comm_group(rank_list):
-    """_get_comm_group"""
-    map_key = hash(tuple(rank_list))
-    if map_key not in _REDISTRIBUTION_GROUP_CACHE:
-        group_dict = create_sub_groups(rank_list)
-        group = group_dict[tuple(rank_list)]
-        _REDISTRIBUTION_GROUP_CACHE[map_key] = group
-    return _REDISTRIBUTION_GROUP_CACHE[map_key]
-

@@ -19,9 +19,11 @@ import glob
 import importlib
 from typing import Any, List, Dict
 import yaml
-import mindspore
-from mindspore.common.tensor import Tensor
-from dist_parallel.spmd.ops.parallel_ops_register import get_distributed_op
+from dist_parallel.tensor_parallel.ops.parallel_ops_register import get_distributed_op
+from dist_parallel.dtensor import DTensor
+from dist_parallel.platform import get_platform
+platform = get_platform()
+Tensor = platform.Tensor
 
 
 class LayoutCacheKey:
@@ -75,16 +77,16 @@ class OpDispatcher:
     OpDispatcher
     """
     def __init__(self):
-        self.yaml_dir = "spmd/ops/yaml"
+        self.yaml_dir = "ops/yaml"
         self.work_dir = os.path.normpath(os.path.join(
             os.path.dirname(os.path.realpath(__file__)), '../'))
         self.layout_infer_ops = self.safe_load_yaml_from_dir()
         self.whitelist = ["InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv", "typeof", "DistCommIsend",
                           "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather",
-                          "DistCommReduceScatter"]
+                          "DistCommReduceScatter", "requires_grad_", "item", "__get__"]
         for op_name, config in self.layout_infer_ops.items():
             class_name = config['distributed_op_class']
-            module_name = "mindspore.parallel.spmd.ops." + config['distributed_op_file']
+            module_name = "dist_parallel.tensor_parallel.ops." + config['distributed_op_file']
             module = importlib.import_module(module_name)
             op_class = getattr(module, class_name)
             _ = op_class(op_name)
@@ -105,7 +107,7 @@ class OpDispatcher:
 
             if not hasattr(arg, "_layout"):
                 id_str = "scalar"
-                if not isinstance(arg, mindspore.Tensor):
+                if not isinstance(arg, Tensor):
                     id_str = str(arg)
                 cache_key.layout_ids.append(id_str)
                 extra_args.append(arg)
@@ -116,23 +118,23 @@ class OpDispatcher:
                 layout_id = layout.compact_str
                 cache_key.layout_ids.append(str(layout_id))
                 input_layouts.append(layout)
-                if isinstance(arg, mindspore.parallel.DTensor):
+                if isinstance(arg, DTensor):
                     input_args.append(arg.to_local())
                 else:
                     input_args.append(arg)
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
+        func_name = platform.get_op_name(func)
+        if func_name not in layout_cache:
+            layout_cache[func_name] = {}
 
-        if func.name not in layout_cache:
-            layout_cache[func.name] = {}
-
-        op_layout_cache = layout_cache[func.name]
+        op_layout_cache = layout_cache[func_name]
 
         if cache_key in op_layout_cache:
             output_layout = op_layout_cache[cache_key]
         else:
-            distribute_op = cache_manager.distributed_op(func.name)
+            distribute_op = cache_manager.distributed_op(func_name)
             all_args = (input_layouts, extra_args)
             output_layout = distribute_op.infer_layout(*all_args)
             op_layout_cache[cache_key] = output_layout
@@ -144,7 +146,7 @@ class OpDispatcher:
             if isinstance(output_layout, (tuple, list)):
                 if len(py_output) == len(output_layout):
                     for i, output_item in enumerate(py_output):
-                        output += (mindspore.parallel.DTensor.from_local(output_item, output_layout[i]),)
+                        output += (DTensor.from_local(output_item, output_layout[i]),)
                 else:
                     raise RuntimeError(f"Output tuple size ({len(py_output)}) "
                                        f"does not match layout tuple size ({len(output_layout)})")
@@ -152,7 +154,7 @@ class OpDispatcher:
                 raise RuntimeError("Output is a tuple but layout is not")
             return output
 
-        return mindspore.parallel.DTensor.from_local(py_output, output_layout)
+        return DTensor.from_local(py_output, output_layout)
 
     def _with_layout_infer_with_tuple_expand(self, func: callable, *args, **kwargs) -> Tensor:
         """_with_layout_infer_with_tuple_expand"""
@@ -165,7 +167,7 @@ class OpDispatcher:
                 input_args.append(tuple(item.to_local() if hasattr(item, "_layout") else item for item in arg))
             else:
                 expanded_args.append(arg)
-                input_args.append(arg.to_local() if isinstance(arg, mindspore.parallel.DTensor) else arg)
+                input_args.append(arg.to_local() if isinstance(arg, DTensor) else arg)
 
         cache_key = LayoutCacheKey([])
         input_layouts = []
@@ -178,7 +180,7 @@ class OpDispatcher:
 
             if not hasattr(arg, "_layout"):
                 id_str = "scalar"
-                if not isinstance(arg, mindspore.Tensor):
+                if not isinstance(arg, Tensor):
                     id_str = str(arg)
                 cache_key.layout_ids.append(id_str)
                 extra_args.append(arg)
@@ -191,16 +193,16 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
+        func_name = platform.get_op_name(func)
+        if func_name not in layout_cache:
+            layout_cache[func_name] = {}
 
-        if func.name not in layout_cache:
-            layout_cache[func.name] = {}
-
-        op_layout_cache = layout_cache[func.name]
+        op_layout_cache = layout_cache[func_name]
 
         if cache_key in op_layout_cache:
             output_layout = op_layout_cache[cache_key]
         else:
-            distribute_op = cache_manager.distributed_op(func.name)
+            distribute_op = cache_manager.distributed_op(func_name)
             all_args = (input_layouts, extra_args)
             output_layout = distribute_op.infer_layout(*all_args)
             op_layout_cache[cache_key] = output_layout
@@ -212,7 +214,7 @@ class OpDispatcher:
             if isinstance(output_layout, (tuple, list)):
                 if len(py_output) == len(output_layout):
                     for i, output_item in enumerate(py_output):
-                        output += (mindspore.parallel.DTensor.from_local(output_item, output_layout[i]),)
+                        output += (DTensor.from_local(output_item, output_layout[i]),)
                 else:
                     raise RuntimeError(f"Output tuple size ({len(py_output)}) "
                                        f"does not match layout tuple size ({len(output_layout)})")
@@ -221,7 +223,7 @@ class OpDispatcher:
             return output
 
 
-        return mindspore.parallel.DTensor.from_local(py_output, output_layout)
+        return DTensor.from_local(py_output, output_layout)
 
     def _with_layout_infer_reshape(self, func: callable, *args, **kwargs) -> Tensor:
         """_with_layout_infer_reshape"""
@@ -245,16 +247,16 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
+        func_name = platform.get_op_name(func)
+        if func_name not in layout_cache:
+            layout_cache[func_name] = {}
 
-        if func.name not in layout_cache:
-            layout_cache[func.name] = {}
-
-        op_layout_cache = layout_cache[func.name]
+        op_layout_cache = layout_cache[func_name]
 
         if cache_key in op_layout_cache:
             infer_output = op_layout_cache[cache_key]
         else:
-            distribute_op = cache_manager.distributed_op(func.name)
+            distribute_op = cache_manager.distributed_op(func_name)
             all_args = (input_layouts, extra_args)
             infer_output = distribute_op.infer_layout(*all_args)
             op_layout_cache[cache_key] = infer_output
@@ -263,7 +265,7 @@ class OpDispatcher:
         local_shape = infer_output_tuple[1]
 
         py_output = func(input_tensor.to_local(), local_shape)
-        return mindspore.parallel.DTensor.from_local(py_output, infer_output_tuple[0])
+        return DTensor.from_local(py_output, infer_output_tuple[0])
 
     def _with_layout_infer_with_shape(self, func: callable, *args, **kwargs) -> Tensor:
         """_with_layout_infer_with_shape"""
@@ -281,7 +283,7 @@ class OpDispatcher:
 
             if not hasattr(arg, "_layout"):
                 id_str = "scalar"
-                if not isinstance(arg, mindspore.Tensor):
+                if not isinstance(arg, Tensor):
                     id_str = str(arg)
                 cache_key.layout_ids.append(id_str)
                 extra_args.append(arg)
@@ -292,7 +294,7 @@ class OpDispatcher:
                 layout_id = layout.compact_str
                 cache_key.layout_ids.append(str(layout_id))
                 input_layouts.append(layout)
-                if isinstance(arg, mindspore.parallel.DTensor):
+                if isinstance(arg, DTensor):
                     input_args.append(arg.to_local())
                 else:
                     input_args.append(arg)
@@ -306,17 +308,17 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
+        func_name = platform.get_op_name(func)
+        if func_name not in layout_cache:
+            layout_cache[func_name] = {}
 
-        if func.name not in layout_cache:
-            layout_cache[func.name] = {}
-
-        op_layout_cache = layout_cache[func.name]
+        op_layout_cache = layout_cache[func_name]
 
         if cache_key in op_layout_cache:
             output_layout = op_layout_cache[cache_key]
         else:
             extra_args.append(input_shapes)
-            distribute_op = cache_manager.distributed_op(func.name)
+            distribute_op = cache_manager.distributed_op(func_name)
             all_args = (input_layouts, extra_args)
             output_layout = distribute_op.infer_layout(*all_args)
             op_layout_cache[cache_key] = output_layout
@@ -329,7 +331,7 @@ class OpDispatcher:
             if isinstance(output_layout, (tuple, list)):
                 if len(py_output) == len(output_layout):
                     for i, output_item in enumerate(py_output):
-                        output += (mindspore.parallel.DTensor.from_local(output_item, output_layout[i]),)
+                        output += (DTensor.from_local(output_item, output_layout[i]),)
                 else:
                     raise RuntimeError(f"Output tuple size ({len(py_output)}) "
                                        f"does not match layout tuple size ({len(output_layout)})")
@@ -337,7 +339,7 @@ class OpDispatcher:
                 raise RuntimeError("Output is a tuple but layout is not")
             return output
 
-        return mindspore.parallel.DTensor.from_local(py_output, output_layout)
+        return DTensor.from_local(py_output, output_layout)
 
     def _with_layout_infer_slice(self, func: callable, *args, **kwargs) -> Tensor:
         """_with_layout_infer_slice"""
@@ -365,16 +367,16 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
+        func_name = platform.get_op_name(func)
+        if func_name not in layout_cache:
+            layout_cache[func_name] = {}
 
-        if func.name not in layout_cache:
-            layout_cache[func.name] = {}
-
-        op_layout_cache = layout_cache[func.name]
+        op_layout_cache = layout_cache[func_name]
 
         if cache_key in op_layout_cache:
             infer_output = op_layout_cache[cache_key]
         else:
-            distribute_op = cache_manager.distributed_op(func.name)
+            distribute_op = cache_manager.distributed_op(func_name)
             all_args = (input_layouts, extra_args)
             infer_output = distribute_op.infer_layout(*all_args)
             op_layout_cache[cache_key] = infer_output
@@ -384,7 +386,7 @@ class OpDispatcher:
         new_end = infer_output_tuple[2]
 
         py_output = func(input_tensor.to_local(), new_begin, new_end)
-        return mindspore.parallel.DTensor.from_local(py_output, infer_output_tuple[0])
+        return DTensor.from_local(py_output, infer_output_tuple[0])
 
     def safe_load_yaml_from_dir(self):
         """
@@ -413,9 +415,9 @@ class OpDispatcher:
         :param kwargs:
         :return:
         """
-        op_name = op_call.name
+        op_name = platform.get_op_name(op_call)
         if op_name in self.whitelist:
-            input_args = [arg.to_local() if isinstance(arg, mindspore.parallel.DTensor) else arg for arg in args]
+            input_args = [arg.to_local() if isinstance(arg, DTensor) else arg for arg in args]
             return op_call(*input_args, **kwargs)
         if op_name not in self.layout_infer_ops:
             raise RuntimeError(f"Operator {op_name} dose not contain parallel layout infer func.")
@@ -434,3 +436,5 @@ class OpDispatcher:
         if suffix == "Slice":
             return self._with_layout_infer_slice(op_call, *args, **kwargs)
         raise RuntimeError(f"Operator {op_name} specified wrong suffix in parallel yaml.")
+
+_OP_DISPATCHER = OpDispatcher()

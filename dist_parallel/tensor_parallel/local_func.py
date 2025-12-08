@@ -16,10 +16,11 @@
 
 import queue
 from typing import Callable, Tuple, Optional
-import mindspore as ms
-
-import dist_parallel
-from .layout import Layout
+from ..layout import Layout
+from dist_parallel.dtensor import DTensor
+from dist_parallel.platform import get_platform
+platform = get_platform()
+Tensor = platform.Tensor
 
 def custom_shard(
         func: Callable,
@@ -52,7 +53,7 @@ def custom_shard(
 
         args_layout = queue.Queue(len(args))
         for i, arg in enumerate(args):
-            if isinstance(arg, dist_parallel.DTensor):
+            if isinstance(arg, DTensor):
                 if in_layouts is None:
                     raise RuntimeError("Found Tensor input but in_layouts is None")
 
@@ -94,12 +95,12 @@ def custom_shard(
 
         dist_output = []
         for item, out_layout in zip(out_tuple, out_layouts):
-            if isinstance(item, ms.Tensor):
+            if isinstance(item, Tensor):
                 if out_layout is None:
                     raise TypeError(
                         "Tensor output requires non-None out_layout!"
                     )
-                dist_output.append(dist_parallel.DTensor.from_local(item, out_layout))
+                dist_output.append(DTensor.from_local(item, out_layout))
             else:
                 if out_layout is not None:
                     raise TypeError(

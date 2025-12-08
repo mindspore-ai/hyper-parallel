@@ -27,13 +27,13 @@ def init_parameters(cell, stage_index=0):
     import mindspore as ms
     from mindspore.nn.cell import Cell
     from mindspore.parallel._tensor import _get_slice_index
-    import dist_parallel
+    from dist_parallel.dtensor import DTensor
     if not isinstance(cell, Cell):
         raise ValueError("cell's type must be Cell but got {}.".format(type(cell)))
     if not isinstance(stage_index, int):
         raise ValueError("stage_index's type must be int but got {}.".format(type(stage_index)))
     for param in cell.get_parameters(expand=True):
-        param_is_dtensor = isinstance(param, dist_parallel.DTensor)
+        param_is_dtensor = isinstance(param, DTensor)
         if not param.has_init:
             continue
         data_slice_index = None
