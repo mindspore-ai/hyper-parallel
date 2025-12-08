@@ -16,7 +16,7 @@
 Arithmetic ops with axis distributed operator implementation.
 """
 
-from ... import Layout
+from dist_parallel.layout import Layout
 from .parallel_ops import DistributedOp
 
 class ArithmeticDistributedOp(DistributedOp):

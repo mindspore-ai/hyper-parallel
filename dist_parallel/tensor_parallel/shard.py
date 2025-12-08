@@ -16,7 +16,8 @@
 import inspect
 from typing import Union, Callable, Dict
 from functools import wraps
-from ..layout import Layout
+from dist_parallel.layout import Layout
+from dist_parallel.dtensor import DTensor
 from dist_parallel.platform import get_platform
 platform = get_platform()
 Parameter = platform.Parameter
@@ -293,3 +294,94 @@ def shard(model: Union[Module, Callable], sharding_plan: Dict):
     if forward_sharding_plan is not None:
         _register_hook(model, forward_sharding_plan)
     return model
+
+def parallelize_value_and_grad(fn, weights, sens=None):
+    """
+    A wrapper function to generate the function to calculate forward output and gradient for the parallel scenario.
+
+    Args:
+        fn (Union[Cell, Function]): Function to do grad operation.
+        weights (Union[ParameterTuple, Parameter, list[Parameter]]):
+            The parameters of the training network that need to
+            calculate the gradient. `weights` can be got through `weights = net.trainable_params()` .
+        sens (Union[list(float), tuple(float)], optional): The sensitivity for grad operation. Default: "None".
+            - If the fn only have one output, the sens must be None, and it will be attached automatically.
+            - If the fn have multiple outputs:
+                1) If the sens is None, only handle the first sensitivity, and set the remaining sensitivity to 0.
+                2) If the sens is not None, the lengths of sens and outputs of fn must be equal.
+
+    Returns:
+        Function, the derivative function used to compute the gradient of a given function.
+        For example, as for `out1, out2 = fn(*args)` , gradient function will return outputs like
+        `((out1, out2), gradient)` .
+
+    Raises:
+        TypeError: If type of Args does not belong to required ones.
+
+    Supported Platforms:
+        ``Ascend``
+    """
+    from mindspore import ops
+    grad_fn = ops.GradOperation(get_by_list=True, sens_param=True)
+
+    def wrapped(*inputs):
+        loss_value = fn(*inputs)
+        p_sens = None
+
+        if isinstance(loss_value, (list, tuple)):
+            # There are multiple outputs, requiring multiple sens
+            p_sens = []
+
+            if sens is None:
+                # if sens is None, only handle the first sens, and set the remaining sens to 0
+                loss_0 = loss_value[0]
+                if isinstance(loss_0, DTensor):
+                    repeat_num = loss_0.layout.repeat_num()
+                    sens_0 = ops.fill(ops.DType()(loss_0), loss_0.local_shape, 1.0 / repeat_num)
+                else:
+                    sens_0 = ops.fill(ops.DType()(loss_0), loss_0.shape, 1.0)
+                p_sens.append(sens_0)
+
+                for i in range(1, len(loss_value)):
+                    loss_i = loss_value[i]
+                    if isinstance(loss_i, DTensor):
+                        sens_i = ops.fill(ops.DType()(loss_i), loss_i.local_shape, 0.0)
+                    else:
+                        sens_i = ops.fill(ops.DType()(loss_i), loss_i.shape, 0.0)
+                    p_sens.append(sens_i)
+
+            else:
+                # sens is not None
+                if not isinstance(sens, list) and not isinstance(sens, tuple):
+                    raise TypeError("if the loss is list or tuple, the sens must be None or list or tuple")
+
+                all_float = all(isinstance(item, float) for item in sens)
+                if not all_float:
+                    raise TypeError("if sens is not None, it should be list of float or tuple of float")
+
+                if len(sens) != len(loss_value):
+                    raise TypeError(f"the len of loss is {len(loss_value)}, but the len of sens is {len(sens)}")
+
+                for _, loss_i in enumerate(loss_value):
+                    if isinstance(loss_i, DTensor):
+                        repeat_num = loss_i.layout.repeat_num()
+                        sens_i = ops.fill(ops.DType()(loss_i), loss_i.local_shape, 1.0 / repeat_num)
+                    else:
+                        sens_i = ops.fill(ops.DType()(loss_i), loss_i.shape, 1.0)
+                    p_sens.append(sens_i)
+
+        else:
+            # loss is tensor
+            if sens is not None:
+                raise TypeError(f"the fn only have one output, the sens must be None, but it is {sens}")
+            if isinstance(loss_value, DTensor):
+                repeat_num = loss_value.layout.repeat_num()
+                p_sens = ops.fill(ops.DType()(loss_value), loss_value.local_shape, 1.0 / repeat_num)
+
+            else:
+                p_sens = ops.fill(ops.DType()(loss_value), loss_value.shape, 1.0)
+
+        grads = grad_fn(fn, weights)(*inputs, p_sens)
+        return loss_value, grads
+
+    return wrapped

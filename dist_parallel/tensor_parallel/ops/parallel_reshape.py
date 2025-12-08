@@ -16,8 +16,10 @@
 Distributed implementation for Reshape operator.
 """
 
-from ... import Layout
-from mindspore.common.tensor import Tensor
+from dist_parallel.layout import Layout
+from dist_parallel.platform import get_platform
+platform = get_platform()
+Tensor = platform.Tensor
 from .parallel_ops import DistributedOp
 
 

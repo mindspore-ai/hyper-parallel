@@ -26,10 +26,11 @@ def get_platform():
     try:
         from dist_parallel.platform.torch.platform import TorchPlatform
         platform = TorchPlatform()
+        return platform
     except ImportError:
         from dist_parallel.platform.mindspore.platform import MindSporePlatform
         platform = MindSporePlatform()
-
+        return platform
 
 EXISTING_COMM_GROUPS = dict()
 

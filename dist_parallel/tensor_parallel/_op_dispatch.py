@@ -77,7 +77,7 @@ class OpDispatcher:
     OpDispatcher
     """
     def __init__(self):
-        self.yaml_dir = "ops/yaml"
+        self.yaml_dir = "tensor_parallel/ops/yaml"
         self.work_dir = os.path.normpath(os.path.join(
             os.path.dirname(os.path.realpath(__file__)), '../'))
         self.layout_infer_ops = self.safe_load_yaml_from_dir()

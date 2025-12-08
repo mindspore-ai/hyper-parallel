@@ -24,12 +24,12 @@ class DTensorBase(Tensor):
     DTensorBase
     """
 
-    def __new__(cls, local_tensor, layout, device="Ascend") -> "DTensor":
+    def __new__(cls, local_tensor, layout=None, device="Ascend"):
         if isinstance(local_tensor, DTensorBase):
             device_local_tensor = local_tensor.to_local() if local_tensor.to_local().has_init else\
                 local_tensor.to_local().to(device)
             t = Tensor._make_subclass(cls, device_local_tensor)
-            t.__init__(local_tensor, layout)
+            t.__init_data__(device_local_tensor, local_tensor.layout)
             t._device = device
             return t
         if not layout:
@@ -38,7 +38,7 @@ class DTensorBase(Tensor):
         if local_tensor.has_init:
             local_tensor.init_device = device
         t = Tensor._make_subclass(cls, device_local_tensor)
-        t.__init__(local_tensor, layout)
+        t.__init_data__(local_tensor, layout)
         t._device = device
         return t
 
@@ -91,7 +91,7 @@ class DTensorBase(Tensor):
         if data.has_init:
             data.init_data()
             data = data.to(self._device)
-        if isinstance(data, DTensor):
+        if isinstance(data, DTensorBase):
             self._local_tensor._update_data(data.to_local())
             self._layout = data.layout
             self._update_data(self._local_tensor)

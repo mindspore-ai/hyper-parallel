@@ -17,10 +17,12 @@ Distributed implementation for Reduce operator.
 """
 
 from typing import Sequence, Union, Tuple, List
-
-import mindspore as ms
-from ... import Layout
 from .parallel_ops import DistributedOp
+from dist_parallel.layout import Layout
+from dist_parallel.platform import get_platform
+platform = get_platform()
+Tensor = platform.Tensor
+
 
 StrOrTuple = Union[str, Tuple["StrOrTuple", ...], List["StrOrTuple"]]
 
@@ -69,7 +71,7 @@ class ReduceExtDistributedOpBase(DistributedOp):
         else:
             dim, keepdim = extra_args
 
-        if isinstance(dim, ms.Tensor):
+        if isinstance(dim, platform.Tensor):
             raise TypeError(
                 "The `dim` argument should not be a `Tensor`. Instead, use one of the following types: "
                 "`None`, `int`, `tuple[int]`, or `list[int]`."

@@ -28,7 +28,7 @@ class DTensor(DTensorBase):
     _local_tensor: Tensor
     _layout: Layout
 
-    def __init__(self, local_tensor, layout):
+    def __init_data__(self, local_tensor, layout):
         self._local_tensor = local_tensor
         self._layout = layout
 

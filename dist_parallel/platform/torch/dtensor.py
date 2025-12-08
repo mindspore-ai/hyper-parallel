@@ -41,7 +41,7 @@ def get_ascend_device() -> torch.device:
 
 
 # ====================== 3. 完整的 DTensor 实现（同步存储 + 修复所有问题） ======================
-class DTensor(Tensor):
+class DTensorBase(Tensor):
 
     def __new__(cls, local_tensor, layout=None):
         if not layout:
@@ -49,7 +49,7 @@ class DTensor(Tensor):
 
         # 创建 Tensor 子类实例，共享 local_tensor 的底层存储
         t = Tensor._make_subclass(cls, local_tensor, local_tensor.requires_grad)
-        t.__init__(local_tensor, layout)
+        t.__init_data__(local_tensor, layout)
         return t
 
     @classmethod

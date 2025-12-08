@@ -122,7 +122,7 @@ class MindSporePlatform(Platform):
         if group_name is None:
             hash_str_rank_list = '-'.join([str(rank) for rank in rank_list])
             group_name = f"{len(rank_list)}-{hash_str_rank_list}"
-        new_group(group_name, rank_list)
+        new_group(rank_ids=rank_list, group=group_name)
         return group_name
 
     @staticmethod

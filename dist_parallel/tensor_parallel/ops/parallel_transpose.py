@@ -16,7 +16,7 @@
 Distributed implementation for MatMul operator.
 """
 
-from ... import Layout
+from dist_parallel.layout import Layout
 from .parallel_ops import DistributedOp
 
 

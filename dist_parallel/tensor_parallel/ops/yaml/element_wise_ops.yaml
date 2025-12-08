@@ -1,38 +1,3 @@
-AddExt:
-  dist_op_name: _add_ext_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
-
-Add:
-  dist_op_name: _add_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
-
-ReLU:
-  dist_op_name: _relu_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
-
-SubExt:
-  dist_op_name: _sub_ext_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
-
-Sub:
-  dist_op_name: _sub_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
-
-Mul:
-  dist_op_name: _mul_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
-
-Div:
-  dist_op_name: _div_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
-
 ReLU:
   dist_op_name: _relu_dist_op
   distributed_op_class: ElementWiseDistributedOp
