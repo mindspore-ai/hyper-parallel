@@ -144,7 +144,7 @@ class Platform:
         if group_key in EXISTING_COMM_GROUPS:
             return EXISTING_COMM_GROUPS[group_key]
 
-        group = _create_group(rank_list, group_name)
+        group = self._create_group(rank_list, group_name)
         EXISTING_COMM_GROUPS[group_key] = group
         return group
 

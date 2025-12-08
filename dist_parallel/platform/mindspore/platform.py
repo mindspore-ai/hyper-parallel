@@ -120,7 +120,9 @@ class MindSporePlatform(Platform):
 
     def _create_group(self, rank_list, group_name=None):
         if group_name is None:
-        new_group(rank_list, group_name)
+            hash_str_rank_list = '-'.join([str(rank) for rank in rank_list])
+            group_name = f"{len(rank_list)}-{hash_str_rank_list}"
+        new_group(group_name, rank_list)
         return group_name
 
     @staticmethod
