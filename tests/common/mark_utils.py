@@ -14,7 +14,7 @@
 # ============================================================================
 """ define marks """
 import pytest
-from random_generator import set_numpy_global_seed
+from tests.common.random_generator import set_numpy_global_seed
 
 
 def arg_mark(plat_marks, level_mark, card_mark, essential_mark):
