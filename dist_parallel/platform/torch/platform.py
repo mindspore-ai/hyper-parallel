@@ -15,7 +15,8 @@
 """Torch platform api"""
 import torch
 from torch import nn
-from torch import Tensor, Parameter, Module
+from torch import Tensor
+from torch.nn import Parameter, Module
 from torch._ops import OpOverload, OpOverloadPacket
 import torch.distributed.nn.functional as dist_func
 import torch.distributed as dist
@@ -114,7 +115,8 @@ class TorchPlatform(Platform):
         return torch.empty(tensor_shape, tensor_type)
 
     def _create_group(self, rank_list, group_name):
-        return create_sub_groups(rank_list)
+        group_dict = create_sub_groups(rank_list)
+        return group_dict[tuple(rank_list)]
 
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):

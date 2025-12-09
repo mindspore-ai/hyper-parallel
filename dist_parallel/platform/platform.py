@@ -59,7 +59,7 @@ class Platform:
         pass
 
     @staticmethod
-    def differentiable_all_gather_concat(x, group, concat_size, concat_dim):
+    def differentiable_all_gather_concat(data, group, concat_size, concat_dim):
         pass
 
     @staticmethod
@@ -75,7 +75,7 @@ class Platform:
         pass
 
     @staticmethod
-    def differentiable_reduce_scatter(x, dev_num, axis, op, group):
+    def differentiable_reduce_scatter(data, dev_num, axis, op, group):
         pass
 
     @staticmethod
