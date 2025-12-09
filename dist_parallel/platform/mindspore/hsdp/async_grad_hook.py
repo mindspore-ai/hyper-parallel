@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """HSDP async gradient hook"""
-from dist_parallel.hsdp.hsdp_async_grad_hook import HSDPAsyncGradHook
+from dist_parallel.core.hsdp.hsdp_async_grad_hook import HSDPAsyncGradHook
 
 
 class MindSporeHSDPAsyncGradHook(HSDPAsyncGradHook):

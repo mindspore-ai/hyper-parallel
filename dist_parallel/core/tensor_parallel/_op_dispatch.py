@@ -19,8 +19,8 @@ import glob
 import importlib
 from typing import Any, List, Dict
 import yaml
-from dist_parallel.tensor_parallel.ops.parallel_ops_register import get_distributed_op
-from dist_parallel.dtensor import DTensor
+from dist_parallel.core.tensor_parallel.ops.parallel_ops_register import get_distributed_op
+from dist_parallel.core.dtensor import DTensor
 from dist_parallel.platform import get_platform
 platform = get_platform()
 Tensor = platform.Tensor
@@ -86,7 +86,7 @@ class OpDispatcher:
                           "DistCommReduceScatter", "requires_grad_", "item", "__get__"]
         for op_name, config in self.layout_infer_ops.items():
             class_name = config['distributed_op_class']
-            module_name = "dist_parallel.tensor_parallel.ops." + config['distributed_op_file']
+            module_name = "dist_parallel.core.tensor_parallel.ops." + config['distributed_op_file']
             module = importlib.import_module(module_name)
             op_class = getattr(module, class_name)
             _ = op_class(op_name)

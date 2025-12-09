@@ -16,7 +16,7 @@
 Distributed implementation for Embedding operator.
 """
 
-from dist_parallel.layout import Layout
+from dist_parallel.core.layout import Layout
 from .parallel_ops import DistributedOp
 
 

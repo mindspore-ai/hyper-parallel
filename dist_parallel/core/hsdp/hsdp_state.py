@@ -13,8 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """HSDP cell state"""
-from dist_parallel.hsdp.hsdp_param_buffer import HSDPParamBuffer
-from dist_parallel.hsdp.hsdp_grad_buffer import HSDPGradBuffer
+from dist_parallel.core.hsdp.hsdp_param_buffer import HSDPParamBuffer
+from dist_parallel.core.hsdp.hsdp_grad_buffer import HSDPGradBuffer
 
 
 class HSDPState:

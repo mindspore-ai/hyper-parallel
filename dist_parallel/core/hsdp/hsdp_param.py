@@ -14,7 +14,7 @@
 # ============================================================================
 """HSDP parameter"""
 import functools
-from dist_parallel.hsdp.hsdp_utils import OptimizerLevel, GroupInfo
+from dist_parallel.core.hsdp.hsdp_utils import OptimizerLevel, GroupInfo
 
 
 class HSDPParam:

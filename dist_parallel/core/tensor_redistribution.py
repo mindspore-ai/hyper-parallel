@@ -14,8 +14,8 @@
 # ============================================================================
 """tensor_redistribution"""
 
-from dist_parallel.dtensor import DTensor
-from dist_parallel.redistribute_infer import RedistributionOperatorInfer
+from dist_parallel.core.dtensor import DTensor
+from dist_parallel.core.redistribute_infer import RedistributionOperatorInfer
 from dist_parallel.platform import get_platform
 platform = get_platform()
 

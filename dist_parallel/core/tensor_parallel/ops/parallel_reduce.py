@@ -18,7 +18,7 @@ Distributed implementation for Reduce operator.
 
 from typing import Sequence, Union, Tuple, List
 from .parallel_ops import DistributedOp
-from dist_parallel.layout import Layout
+from dist_parallel.core.layout import Layout
 from dist_parallel.platform import get_platform
 platform = get_platform()
 Tensor = platform.Tensor

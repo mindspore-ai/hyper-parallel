@@ -18,8 +18,8 @@ from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
 from mindspore.communication import get_rank, get_group_size
 from mindspore.common.initializer import initializer
-from dist_parallel.dtensor import DTensor
-from dist_parallel.hsdp.hsdp_param import HSDPParam
+from dist_parallel.core.dtensor import DTensor
+from dist_parallel.core.hsdp.hsdp_param import HSDPParam
 
 
 class MindSporeHSDPParam(HSDPParam):

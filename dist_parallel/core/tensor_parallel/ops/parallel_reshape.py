@@ -16,7 +16,7 @@
 Distributed implementation for Reshape operator.
 """
 
-from dist_parallel.layout import Layout
+from dist_parallel.core.layout import Layout
 from dist_parallel.platform import get_platform
 platform = get_platform()
 Tensor = platform.Tensor

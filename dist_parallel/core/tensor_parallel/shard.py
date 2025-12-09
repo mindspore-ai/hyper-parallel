@@ -16,8 +16,8 @@
 import inspect
 from typing import Union, Callable, Dict
 from functools import wraps
-from dist_parallel.layout import Layout
-from dist_parallel.dtensor import DTensor
+from dist_parallel.core.layout import Layout
+from dist_parallel.core.dtensor import DTensor
 from dist_parallel.platform import get_platform
 platform = get_platform()
 Parameter = platform.Parameter

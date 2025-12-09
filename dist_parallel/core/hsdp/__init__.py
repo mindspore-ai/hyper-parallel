@@ -13,5 +13,5 @@
 # limitations under the License.
 # ============================================================================
 """Interfaces for hybrid sharded data parallel"""
-from dist_parallel.hsdp.hsdp_api import hsdp, hsdp_wait_grad_handle, HSDPCell
+from dist_parallel.core.hsdp.hsdp_api import hsdp, hsdp_wait_grad_handle, HSDPCell
 __all__ = ["hsdp", "hsdp_wait_grad_handle", "HSDPCell"]

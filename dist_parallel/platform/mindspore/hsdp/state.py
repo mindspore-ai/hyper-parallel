@@ -14,7 +14,7 @@
 # ============================================================================
 """MindSpore HSDP cell state"""
 from mindspore.common.api import _no_grad
-from dist_parallel.hsdp.hsdp_state import HSDPState
+from dist_parallel.core.hsdp.hsdp_state import HSDPState
 from dist_parallel.platform.mindspore.hsdp.param import MindSporeHSDPParam
 
 

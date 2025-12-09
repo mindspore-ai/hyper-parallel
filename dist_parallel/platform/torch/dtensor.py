@@ -61,7 +61,7 @@ class DTensorBase(Tensor):
         kwargs: Optional[Dict[str, Any]] = None
     ) -> Any:
         kwargs = kwargs or {}
-        from dist_parallel.tensor_parallel._op_dispatch import _OP_DISPATCHER
+        from dist_parallel.core.tensor_parallel._op_dispatch import _OP_DISPATCHER
         out = _OP_DISPATCHER.dispatch(func, args, kwargs)
         return out
 

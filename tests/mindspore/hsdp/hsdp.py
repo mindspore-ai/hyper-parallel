@@ -21,8 +21,8 @@ import mindspore.dataset as ds
 from mindspore.communication import get_rank, get_group_size
 from mindspore import nn, ops
 from mindspore.communication import init
-from dist_parallel.hsdp import hsdp, hsdp_wait_grad_handle
-from dist_parallel.tensor_parallel.shard import parallelize_value_and_grad
+from dist_parallel import hsdp, hsdp_wait_grad_handle
+from dist_parallel import parallelize_value_and_grad
 from tests.common.mark_utils import arg_mark
 from tests.mindspore.common_net import SlimLeNet
 from tests.mindspore.hsdp.hsdp_test_common import hsdp_network_ckpt_path

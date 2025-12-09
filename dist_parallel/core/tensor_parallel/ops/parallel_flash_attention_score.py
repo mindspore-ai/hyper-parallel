@@ -19,8 +19,8 @@ Distributed implementation for MatMul operator.
 from mindspore import nn
 from mindspore import Tensor
 from mindspore.ops import flash_attention_score
-from dist_parallel.layout import Layout
-from dist_parallel.local_func import custom_shard
+from dist_parallel.core.layout import Layout
+from dist_parallel.core.local_func import custom_shard
 
 
 class ParallelFlashAttention(nn.Cell):

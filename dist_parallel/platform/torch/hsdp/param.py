@@ -15,7 +15,7 @@
 """HSDP parameter"""
 import torch
 import torch.distributed as dist
-from dist_parallel.hsdp.hsdp_param import HSDPParam
+from dist_parallel.core.hsdp.hsdp_param import HSDPParam
 
 
 class TorchHSDPParam(HSDPParam):

@@ -16,8 +16,8 @@
 
 import queue
 from typing import Callable, Tuple, Optional
-from ..layout import Layout
-from dist_parallel.dtensor import DTensor
+from dist_parallel.core.layout import Layout
+from dist_parallel.core.dtensor import DTensor
 from dist_parallel.platform import get_platform
 platform = get_platform()
 Tensor = platform.Tensor

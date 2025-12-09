@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """HSDP scheduler"""
-from dist_parallel.hsdp.hsdp_scheduler import HSDPScheduler
+from dist_parallel.core.hsdp.hsdp_scheduler import HSDPScheduler
 from dist_parallel.platform.torch.platform import TorchPlatform
 from dist_parallel.platform.torch.hsdp.state import TorchHSDPState
 

@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Torch HSDP cell state"""
-from dist_parallel.hsdp.hsdp_state import HSDPState
+from dist_parallel.core.hsdp.hsdp_state import HSDPState
 from dist_parallel.platform.torch.hsdp.param import TorchHSDPParam
 from dist_parallel.platform.torch.platform import TorchPlatform
 
