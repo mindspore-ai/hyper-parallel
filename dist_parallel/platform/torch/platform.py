@@ -96,11 +96,11 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def register_backward_pre_hook(cell, hook):
-        return cell.register_fully_backward_pre_hook(hook)
+        return cell.register_full_backward_pre_hook(hook)
 
     @staticmethod
     def register_backward_hook(cell, hook):
-        return cell.register_fully_backward_hook(hook)
+        return cell.register_full_backward_hook(hook)
 
     @staticmethod
     def get_param_type_size(param):

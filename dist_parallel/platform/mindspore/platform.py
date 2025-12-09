@@ -25,6 +25,7 @@ from mindspore.communication import get_rank as get_rank_id
 import mindspore.communication.comm_func as comm_func
 from dist_parallel.platform.platform import Platform
 from dist_parallel.platform.mindspore.dtensor import DTensorBase
+from dist_parallel.platform.mindspore.parameter_init import init_parameters as _init_parameters
 
 
 class MindSporePlatform(Platform):
@@ -70,7 +71,7 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def differentiable_all_reduce(data, op, group):
-        output, _ = comm.comm_func.all_reduce(data, op, group)
+        output, _ = comm_func.all_reduce(data, op, group)
         return output
 
     @staticmethod
@@ -81,6 +82,10 @@ class MindSporePlatform(Platform):
         if op == 'avg':
             output_tensor = output_tensor / dev_num
         return output_tensor
+
+    @staticmethod
+    def init_parameters(module, stage_index):
+        return _init_parameters(module, stage_index)
 
     #pylint: disable=W0212
     @staticmethod
