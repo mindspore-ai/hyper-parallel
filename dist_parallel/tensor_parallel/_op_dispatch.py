@@ -125,6 +125,7 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
+        global platform
         func_name = platform.get_op_name(func)
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
@@ -193,6 +194,7 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
+        global platform
         func_name = platform.get_op_name(func)
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
@@ -247,6 +249,7 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
+        global platform
         func_name = platform.get_op_name(func)
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
@@ -308,6 +311,7 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
+        global platform
         func_name = platform.get_op_name(func)
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
@@ -367,6 +371,7 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
+        global platform
         func_name = platform.get_op_name(func)
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
@@ -415,6 +420,7 @@ class OpDispatcher:
         :param kwargs:
         :return:
         """
+        global platform
         op_name = platform.get_op_name(op_call)
         if op_name in self.whitelist:
             input_args = [arg.to_local() if isinstance(arg, DTensor) else arg for arg in args]

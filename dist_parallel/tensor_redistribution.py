@@ -55,6 +55,7 @@ class TensorRedistribution:
         """args: (*rank_list, concat_dim)"""
         rank_list = args[0:-1]
         concat_dim = args[-1]
+        global platform
         group = platform.create_group(rank_list)
         concat_size = len(rank_list)
         return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim)
@@ -70,6 +71,7 @@ class TensorRedistribution:
         rank_list = args[2]
         concat_dim = args[0]
         concat_size = args[1]
+        global platform
         group = platform.create_group(rank_list)
         return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim)
 
@@ -79,11 +81,13 @@ class TensorRedistribution:
         split_dim = args[0]
         split_size = args[1]
         idx = rank_list.index(self.rank_id)
+        global platform
         return platform.chunk(x, split_dim, split_size, idx)
 
     def _construct_all_to_all(self, x, *args):
         """args: (split_dim, concat_dim, permute_size, group)"""
         split_dim, concat_dim, split_count, rank_list = args
+        global platform
         group = platform.create_group(rank_list)
         original_shape = x.shape
 
@@ -191,6 +195,7 @@ class TensorRedistribution:
 
         from_layout = x.layout
         if not self.is_init:
+            global platform
             self.rank_id = platform.get_rank()
             self.rank_list = from_layout.rank_list
             self.is_init = True
@@ -235,6 +240,7 @@ class TensorRedistribution:
         return self._transform_cache[key]
 
     def _allreduce_along_dev_dim(self, x, op, layout, dev_dim):
+        global platform
         group = layout.get_comm_group_by_axis(dev_dim, self.rank_id)
         zero_dim = x.dim() == 0
         if zero_dim:
@@ -254,6 +260,7 @@ class TensorRedistribution:
         """Do reduce_scatter at specified axis along dev_dim."""
         dev_num = layout.device_matrix[layout.alias_name.index(dev_dim)]
         group = layout.get_comm_group_by_axis(dev_dim, self.rank_id)
+        global platform
         output_tensor = self.platform.reduce_scatter(x, dev_num, axis, op, group)
         logger.warning(f"Do ReduceScatter-{op} along dev {dev_dim} at axis {axis}. group: {group}")
         return output_tensor

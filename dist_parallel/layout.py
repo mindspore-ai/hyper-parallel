@@ -281,6 +281,7 @@ class _DeviceMatrix:
         if (axis, rank) in _group_map:
             return _group_map[(axis, rank)]
         rank_list = self.get_rank_list_along_axis(axis=axis)
+        global platform
         group = platform.create_group(rank_list)
         _group_map[(axis, rank)] = group
         return group

@@ -267,6 +267,7 @@ def shard(model: Union[Module, Callable], sharding_plan: Dict):
             sharding_plan (Dict): Define the layout for the specified parameters, inputs or outputs.
 
     """
+    global platform
     if platform.get_world_size() == 1:
         return None
     if not isinstance(model, Module):

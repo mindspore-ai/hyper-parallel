@@ -71,7 +71,7 @@ class ReduceExtDistributedOpBase(DistributedOp):
         else:
             dim, keepdim = extra_args
 
-        if isinstance(dim, platform.Tensor):
+        if isinstance(dim, Tensor):
             raise TypeError(
                 "The `dim` argument should not be a `Tensor`. Instead, use one of the following types: "
                 "`None`, `int`, `tuple[int]`, or `list[int]`."
