@@ -15,21 +15,26 @@
 """framework platform api"""
 platform = None
 
-def set_platform(input_platform):
+def set_platform(platform_type):
     global platform
-    platform = input_platform
+    if "torch" in platform_type:
+        from dist_parallel.platform.torch.platform import TorchPlatform
+        platform = TorchPlatform()
+    else:
+        from dist_parallel.platform.mindspore.platform import MindSporePlatform
+        platform = MindSporePlatform()
 
 def get_platform():
     global platform
     if platform is not None:
         return platform
     try:
-        from dist_parallel.platform.torch.platform import TorchPlatform
-        platform = TorchPlatform()
-        return platform
-    except ImportError:
         from dist_parallel.platform.mindspore.platform import MindSporePlatform
         platform = MindSporePlatform()
+        return platform
+    except ImportError:
+        from dist_parallel.platform.torch.platform import TorchPlatform
+        platform = TorchPlatform()
         return platform
 
 EXISTING_COMM_GROUPS = dict()

@@ -14,7 +14,7 @@
 # ============================================================================
 """hybrid shard data parallel interface"""
 from typing import Optional, Any
-from dist_parallel.hsdp.hsdp_utils import PlatformType, OptimizerLevel
+from dist_parallel.core.hsdp.hsdp_utils import PlatformType, OptimizerLevel
 
 origin_class_to_extend_class = {}
 optimizer_level_map = {

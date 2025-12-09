@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """HSDP gradient buffer"""
-from dist_parallel.hsdp.hsdp_utils import OptimizerLevel
+from dist_parallel.core.hsdp.hsdp_utils import OptimizerLevel
 
 
 class HSDPGradBuffer:

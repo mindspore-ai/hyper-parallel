@@ -16,7 +16,7 @@
 from mindspore import ops
 from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
-from dist_parallel.hsdp.hsdp_grad_hook import HSDPGradHook
+from dist_parallel.core.hsdp.hsdp_grad_hook import HSDPGradHook
 
 
 class MindSporeHSDPGradHook(HSDPGradHook):

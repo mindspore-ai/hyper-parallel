@@ -14,7 +14,7 @@
 # ============================================================================
 """dtensor"""
 import copy as cp
-from dist_parallel.layout import Layout
+from dist_parallel.core.layout import Layout
 from dist_parallel.platform import get_platform
 platform = get_platform()
 DTensorBase = platform.DTensorBase
@@ -65,7 +65,7 @@ class DTensor(DTensorBase):
         """
         Redistribute dtensor to destination layout.
         """
-        from dist_parallel.tensor_redistribution import _tensor_redistribution
+        from dist_parallel.core.tensor_redistribution import _tensor_redistribution
         out = _tensor_redistribution.redistribution(self, dst_layout)
         return out
 
@@ -78,6 +78,6 @@ class DTensor(DTensorBase):
             return self
         to_layout = cp.deepcopy(self.layout)
         to_layout.reset_partial()
-        from dist_parallel.tensor_redistribution import _tensor_redistribution
+        from dist_parallel.core.tensor_redistribution import _tensor_redistribution
         out = _tensor_redistribution.reduce_partial(self, to_layout)
         return out

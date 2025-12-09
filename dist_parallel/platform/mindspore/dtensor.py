@@ -66,7 +66,7 @@ class DTensorBase(Tensor):
     def __fallback__(self, func, args={}, kwargs=None):
         if kwargs is None:
             kwargs = {}
-        from dist_parallel.tensor_parallel._op_dispatch import _OP_DISPATCHER
+        from dist_parallel.core.tensor_parallel._op_dispatch import _OP_DISPATCHER
         with NoFallbackGuard():
             out = _OP_DISPATCHER.dispatch(func, args, kwargs)
         return out
