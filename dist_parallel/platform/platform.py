@@ -79,6 +79,10 @@ class Platform:
         pass
 
     @staticmethod
+    def init_parameters(module, stage_index):
+        pass
+
+    @staticmethod
     def register_forward_pre_hook(cell, hook):
         return cell.register_forward_pre_hook(hook)
 
