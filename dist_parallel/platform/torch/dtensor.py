@@ -65,8 +65,7 @@ class DTensorBase(Tensor):
         out = _OP_DISPATCHER.dispatch(func, args, kwargs)
         return out
 
-    def to(self, device: str | torch.device):
-        """兼容 Meta → 实际设备，返回新 DTensor（自动同步存储）"""
+    def to(self, device):
         target_device = torch.device(device) if isinstance(device, str) else device
         src_local = self._local_tensor
 
@@ -79,8 +78,7 @@ class DTensorBase(Tensor):
         else:
             new_local = src_local.to(target_device)
 
-        # 重新创建 DTensor，保证新实例与 new_local 共享存储
-        return DTensor(new_local, layout=self._layout)
+        return self.__class__(new_local, layout=self._layout)
 
     # ====================== 梯度相关重写 ======================
     @property
@@ -117,7 +115,7 @@ class DTensorBase(Tensor):
 
     def detach(self):
         detached_local = self._local_tensor.detach()
-        return DTensor(detached_local, layout=self._layout)
+        return self.__class__(detached_local, layout=self._layout)
 
     def detach_(self):
         self._local_tensor.detach_()
@@ -153,7 +151,7 @@ class DTensorBase(Tensor):
     def shape(self) -> torch.Size:
         return self._local_tensor.shape
 
-    def size(self, dim: Optional[int] = None) -> torch.Size | int:
+    def size(self, dim: Optional[int] = None):
         return self._local_tensor.size(dim)
 
     @property
@@ -169,7 +167,6 @@ class DTensorBase(Tensor):
 
     # ====================== 数据操作重写（同步存储 + 修复原地操作） ======================
     def zero_(self):
-        """原地置零：同步 DTensor 外壳与 local_tensor 存储"""
         if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
             # 方案1：创建新张量 + 重新绑定 DTensor（保证存储共享）
             new_local = torch.zeros_like(self._local_tensor, requires_grad=True)
@@ -182,7 +179,6 @@ class DTensorBase(Tensor):
         return self
 
     def copy_(self, src: Tensor, non_blocking: bool = False):
-        """原地复制：同步外壳与 local_tensor"""
         if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
             new_local = src.to(self._local_tensor.device, non_blocking=non_blocking).detach().clone()
             new_local.requires_grad = self._local_tensor.requires_grad
@@ -193,8 +189,7 @@ class DTensorBase(Tensor):
             super().copy_(src, non_blocking=non_blocking)
         return self
 
-    def fill_(self, value: float | int):
-        """原地填充：核心修复 + 同步存储"""
+    def fill_(self, value):
         if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
             # 步骤1：创建新张量（非原地）
             new_local = torch.full_like(

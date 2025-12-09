@@ -124,10 +124,9 @@ class TensorRedistribution:
             reshape_shape = tuple(reshape_shape)
             x_reshaped = x_reshaped.reshape(reshape_shape)
 
-        output_tensor, _ = platform.differentiable_all_to_all(
+        output_tensor = platform.differentiable_all_to_all(
+            input_data=x_reshaped,
             output_shape=reshape_shape,
-            output_shape=reshape_shape,
-            tensor=x_reshaped,
             group=group,
             async_op=False
         )
@@ -189,8 +188,6 @@ class TensorRedistribution:
             if input_x.layout.device_matrix == to_layout.device_matrix:
                 x = self.reduce_partial(input_x, to_layout)
             else:
-                logger.info("The dev_matrix is change between from_layout and to_layout, and thers is partial status "
-                            "in from_layout, will be apply AllReduce op to resolve partial before redistribute.")
                 x = self.reduce_partial(input_x, x_layout)
 
         from_layout = x.layout
@@ -247,13 +244,12 @@ class TensorRedistribution:
             x = x.unsqueeze(0)
         if op == 'avg':
             dev_num = layout.device_matrix[layout.alias_name.index(dev_dim)]
-            x, _ = platform.differentiable_all_reduce(x, 'sum', group)
+            x = platform.differentiable_all_reduce(x, 'sum', group)
             x = x / dev_num
         else:
-            x, _ = platform.differentiable_all_reduce(x, op, group)
+            x = platform.differentiable_all_reduce(x, op, group)
         if zero_dim:
             x = x.squeeze(0)
-        logger.warning(f"Do AllReduce-{op} along {dev_dim}. group: {group}")
         return x
 
     def _reduce_scatter_along_dev_dim_with_axis(self, x, axis, op, layout, dev_dim):
@@ -262,7 +258,6 @@ class TensorRedistribution:
         group = layout.get_comm_group_by_axis(dev_dim, self.rank_id)
         global platform
         output_tensor = self.platform.reduce_scatter(x, dev_num, axis, op, group)
-        logger.warning(f"Do ReduceScatter-{op} along dev {dev_dim} at axis {axis}. group: {group}")
         return output_tensor
 
     def reduce_partial(self, input_x, to_layout):
