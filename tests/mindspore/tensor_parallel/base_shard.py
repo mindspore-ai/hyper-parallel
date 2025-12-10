@@ -22,7 +22,7 @@ import mindspore.communication.management as D
 from mindspore import nn, Tensor
 from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
-from dist_parallel import Layout, hsdp, init_parameters, shard, parallelize_value_and_grad
+from hyper_parallel import Layout, hsdp, init_parameters, shard, parallelize_value_and_grad
 from tests.mindspore.tensor_parallel.utils import create_dtensor
 
 learning_rate = 0.01

@@ -19,10 +19,10 @@ import numpy as np
 import mindspore as ms
 from mindspore import nn, Tensor
 from mindspore.communication.management import init
-from dist_parallel import hsdp
-from dist_parallel import Layout
-from dist_parallel import DTensor
-from dist_parallel import parallelize_value_and_grad
+from hyper_parallel import hsdp
+from hyper_parallel import Layout
+from hyper_parallel import DTensor
+from hyper_parallel import parallelize_value_and_grad
 from tests.common.mark_utils import arg_mark
 from tests.mindspore.common_net import DenseNet
 
