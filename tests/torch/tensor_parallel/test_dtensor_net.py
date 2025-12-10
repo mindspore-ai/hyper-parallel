@@ -4,7 +4,7 @@ import torch_npu  # 昇腾NPU核心适配
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
-from dist_parallel import DTensor, Layout
+from hyper_parallel import DTensor, Layout
 
 # ===================== 1. 昇腾分布式初始化（仅保留核心） =====================
 def init_dist():

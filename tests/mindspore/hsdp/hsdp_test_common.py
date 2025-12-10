@@ -14,7 +14,7 @@ import os
 import time
 import mindspore as ms
 from mindspore import nn
-from dist_parallel import hsdp_wait_grad_handle
+from hyper_parallel import hsdp_wait_grad_handle
 
 hsdp_network_ckpt_path: str = "hsdp_network.ckpt"
 
