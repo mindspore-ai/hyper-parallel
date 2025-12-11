@@ -56,11 +56,6 @@ class DTensor(DTensorBase):
     def local_shape(self):
         return self._local_tensor.shape
 
-    @staticmethod
-    def dispatch_func(func, args, kwargs):
-        output = _OP_DISPATCHER.dispatch(func, args, kwargs)
-        return output
-
     def redistribute(self, dst_layout):
         """
         Redistribute dtensor to destination layout.
