@@ -123,12 +123,11 @@ class TensorRedistribution:
             reshape_shape.pop(1)
             reshape_shape = tuple(reshape_shape)
             x_reshaped = x_reshaped.reshape(reshape_shape)
-
+        x_reshaped = x_reshaped.contiguous()
         output_tensor = platform.differentiable_all_to_all(
             input_data=x_reshaped,
             output_shape=reshape_shape,
-            group=group,
-            async_op=False
+            group=group
         )
 
         post_special_handle = all(final_shape[i] == 1 for i in range(concat_dim))

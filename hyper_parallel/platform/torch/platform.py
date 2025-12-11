@@ -60,7 +60,7 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def differentiable_all_gather_concat(data, group, concat_size, concat_dim):
-        output, _ = dist_func.all_gather(data, group=group)
+        output = dist_func.all_gather(data, group=group)
         return torch.cat(output, dim=concat_dim)
 
     @staticmethod

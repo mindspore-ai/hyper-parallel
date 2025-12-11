@@ -20,6 +20,15 @@ platform = get_platform()
 DTensorBase = platform.DTensorBase
 Tensor = platform.Tensor
 
+class SkipDTensorDispatch():
+    def __enter__(self):
+        from hyper_parallel.core.tensor_parallel._op_dispatch import disable_dtensor_dispatch
+        disable_dtensor_dispatch()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        from hyper_parallel.core.tensor_parallel._op_dispatch import enable_dtensor_dispatch
+        enable_dtensor_dispatch()
+
 
 class DTensor(DTensorBase):
     """
