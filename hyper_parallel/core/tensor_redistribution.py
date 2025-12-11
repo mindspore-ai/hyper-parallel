@@ -127,8 +127,7 @@ class TensorRedistribution:
         output_tensor = platform.differentiable_all_to_all(
             input_data=x_reshaped,
             output_shape=reshape_shape,
-            group=group,
-            async_op=False
+            group=group
         )
 
         post_special_handle = all(final_shape[i] == 1 for i in range(concat_dim))

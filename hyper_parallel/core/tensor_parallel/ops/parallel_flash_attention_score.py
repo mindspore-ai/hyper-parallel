@@ -20,7 +20,7 @@ from mindspore import nn
 from mindspore import Tensor
 from mindspore.ops import flash_attention_score
 from hyper_parallel.core.layout import Layout
-from hyper_parallel.core.local_func import custom_shard
+from hyper_parallel.core.tensor_parallel.local_func import custom_shard
 
 
 class ParallelFlashAttention(nn.Cell):
