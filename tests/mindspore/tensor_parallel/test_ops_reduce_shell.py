@@ -31,27 +31,27 @@ def run_case(file_name, case_name, master_port):
     assert ret == 0
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
-def test_bmm_ext_cell_shard_1():
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_sum_ext_cell_shard_1():
     '''
-    Feature: bmm operator.
+    Feature: sum operator.
     Description: Test cell shard in python.
     Expectation: Run success.
     '''
-    file_name = "bmm_shard_in_python.py"
-    case_name = "test_bmm_ext_partial_model_parallel"
+    file_name = "reduce_shard_in_python.py"
+    case_name = "test_sum_ext_dim_partial_model_parallel_1"
     master_port = 11290
     run_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
-def test_bmm_cell_shard_2():
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_mean_ext_cell_shard_2():
     '''
-    Feature: BatchMatMul operator.
+    Feature: mean operator.
     Description: Test cell shard in python.
     Expectation: Run success.
     '''
-    file_name = "bmm_shard_in_python.py"
-    case_name = "test_bmm_partial_transpose_model_parallel"
-    master_port = 11292
+    file_name = "reduce_shard_in_python.py"
+    case_name = "test_mean_ext_partial_model_parallel_2"
+    master_port = 11291
     run_case(file_name, case_name, master_port)

@@ -24,7 +24,7 @@ from mindspore import nn, Tensor
 from hyper_parallel import Layout, hsdp, init_parameters, custom_shard, shard, parallelize_value_and_grad, DTensor
 from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
-from tests.mindspore.shard.utils import create_dtensor
+from tests.mindspore.tensor_parallel.utils import create_dtensor
 
 learning_rate = 0.01
 epochs = 2
@@ -149,28 +149,38 @@ def base_case(dp, mp, hsdp_shard_size):
     custom_in_layouts = (x_layout, w_layout, None)
     custom_out_layouts = (layout("dp", "None"),)
     relu_strategy = ((layout("dp", "None"),), (layout("dp", "None"),))
+
     # step 1: define network with no init parameters
     with no_init_parameters():
         model = ParallelModel(input_size, output_size, custom_out_layouts, custom_in_layouts)
+
     # step 2: shard
     model_strategy = {"forward": {"input": (x_layout,), "output": (out_layout,)}, "parameter": {"weight": w_layout}}
     shard(model, model_strategy)
+
     mlp_strategy = {"forward": {"input": {"x": mlp_x_layout, "activation": mlp_activation_layout,
                                           "extra_loss": layout()}}, "parameter": {"weight": mlp_w_layout}}
     shard(model.mlp, mlp_strategy)
+
     relu_strategy = {"forward": {"input": relu_strategy[0], "output": relu_strategy[1]}}
     shard(model.relu, relu_strategy)
+
     # step 3: hsdp
     model = hsdp(model, shard_size=hsdp_shard_size, threshold=0)
+
     # step 4: init parameters
     model = init_parameters(model)
+
     x = create_dtensor(local_x, x_layout)
     parallel_loss, parallel_grads = run_model(x, model, parallel=True)
+
     # compare loss
     assert np.allclose(standalone_loss.asnumpy(), parallel_loss.asnumpy(), 0.001, 0.001)
+
     # compare grad
     if hsdp_shard_size < 0:
         hsdp_shard_size = dp
+
     standalone_grad = standalone_grads[0].asnumpy()
     # note: this way of obtaining grad slice is a simplified way, not a strict way
     standalone_grad_slice = standalone_grad[:local_input_size // hsdp_shard_size, :local_output_size]

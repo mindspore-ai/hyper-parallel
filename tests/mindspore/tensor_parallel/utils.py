@@ -13,7 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """utils"""
-
+import os
+import shutil
 from typing import List, Optional
 from mindspore import Tensor, mint
 from mindspore.communication import get_rank, create_group
@@ -27,8 +28,10 @@ def create_dtensor(data, layout, dtype=None):
         return DTensor.from_local(Tensor(data, dtype=dtype), layout)
     return DTensor.from_local(Tensor(data), layout)
 
-def _infer_slice_area_by_rank(dev_matrix, tensor_map, rank_id: int, full_shape: tuple): # -> tuple[tuple[int]]:
+
+def _infer_slice_area_by_rank(dev_matrix, tensor_map, rank_id: int, full_shape: tuple):  # -> tuple[tuple[int]]:
     """Return the range of each axis from full tensor for slice in current rank."""
+
     def _get_dev_num_alone_dim(matrix, dim):
         return matrix[-dim - 1] if dim != -1 else 1
 
@@ -85,10 +88,12 @@ def global_to_local(global_tensor, layout):
 def local_to_global(local_tensor):
     """Transfer local tensor to global tensor, preserving layout structure."""
     layout = local_tensor.layout
+
     def update_layout(dim):
         if isinstance(dim, tuple):
             return tuple("None" for _ in dim)
         return "None"
+
     tensor_map = layout.tensor_map
     none_structure = tuple(update_layout(dim) for dim in tensor_map)
     to_layout = layout(*none_structure)
@@ -158,3 +163,16 @@ def distribute_tensor(tensor: Tensor,
             continue
         local_tensor = mesh_broadcast(local_tensor, dev_matrix, dev_mat_dim_alias, src_data_rank)
     return DTensor.from_local(local_tensor, layout)
+
+
+def run_case(file_name, case_name, master_port, dev_num=8):
+    file_base = os.path.splitext(file_name)[0]
+    dir_to_remove = f"./{file_base}/{case_name}"
+    if os.path.exists(dir_to_remove):
+        shutil.rmtree(dir_to_remove)
+    cmd = f"export GLOG_v=2 && msrun --worker_num={dev_num} --local_worker_num={dev_num} " \
+          f"--master_addr=127.0.0.1 --master_port={master_port} " \
+          f"--join=True --log_dir=./{dir_to_remove}/msrun_log pytest -s -v " \
+          f"{file_name}::{case_name}"
+    ret = os.system(cmd)
+    assert ret == 0

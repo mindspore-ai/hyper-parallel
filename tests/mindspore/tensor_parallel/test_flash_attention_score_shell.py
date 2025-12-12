@@ -13,26 +13,18 @@
 # limitations under the License.
 # ============================================================================
 
-import os
+from tests.mindspore.tensor_parallel.utils import run_case
 from tests.common.mark_utils import arg_mark
 
 
-def run_case(case_name, master_port):
-    cmd = f"export GLOG_v=3 && msrun --worker_num=8 --local_worker_num=8 " \
-          f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"--join=True --log_dir=./{case_name} pytest -s -v " \
-          f"base_shard.py::{case_name}"
-    ret = os.system(cmd)
-    assert ret == 0
-
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_base_shard():
+def test_flash_attention_score_model_parallel():
     '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial.
-    Description: Test base shard.
+    Feature: sum operator.
+    Description: Test cell shard in python.
     Expectation: Run success.
     '''
-    case_name = "test_base_shard"
-    master_port = 11333
-    run_case(case_name, master_port)
+    file_name = "flash_attention_score_shard_in_python.py"
+    case_name = "test_flash_attention_score_model_parallel"
+    master_port = 11298
+    run_case(file_name, case_name, master_port)

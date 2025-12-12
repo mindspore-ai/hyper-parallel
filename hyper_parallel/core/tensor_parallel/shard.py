@@ -325,8 +325,23 @@ def parallelize_value_and_grad(fn, weights, sens=None):
     from mindspore import ops
     grad_fn = ops.GradOperation(get_by_list=True, sens_param=True)
 
-    def wrapped(*inputs):
-        loss_value = fn(*inputs)
+    # use CellWrapper to solve two problems:
+    # 1. avoid running the forward fn or cell twice
+    # 2. if the input of parallize_value_and_grad is cell and it is directly used as the input for grad,
+    #    the operations before and after its __call__ function will not enter the auto-diff process.
+    class CellWrapper(Module):
+        def __init__(self, net):
+            super().__init__(auto_prefix=False)
+            self.network = net
+
+        def construct(self, *args, **kwargs):
+            return self.network(*args, **kwargs)
+
+    fn = CellWrapper(fn)
+    fn.set_grad()  # avoid running the forward fn or cell twice
+
+    def wrapper(*args, **kwargs):
+        loss_value = fn(*args, **kwargs)
         p_sens = None
 
         if isinstance(loss_value, (list, tuple)):
@@ -382,7 +397,7 @@ def parallelize_value_and_grad(fn, weights, sens=None):
             else:
                 p_sens = ops.fill(ops.DType()(loss_value), loss_value.shape, 1.0)
 
-        grads = grad_fn(fn, weights)(*inputs, p_sens)
+        grads = grad_fn(fn, weights)(*args, **kwargs, sens=p_sens)
         return loss_value, grads
 
-    return wrapped
+    return wrapper
