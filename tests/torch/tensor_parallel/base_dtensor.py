@@ -14,7 +14,7 @@
 # ============================================================================
 import os
 import torch
-#import torch_npu  # 昇腾NPU核心适配
+import torch_npu  # 昇腾NPU核心适配
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
@@ -26,9 +26,9 @@ def init_dist():
     """init dist"""
     dist.init_process_group()
     rank = dist.get_rank()
-    torch.cuda.set_device(rank)
+    torch.npu.set_device(rank)
     device_id = rank % 8  # 8卡对应device_id 0-7
-    torch.cuda.set_device(device_id)
+    torch.npu.set_device(device_id)
     return rank, device_id
 
 
@@ -36,7 +36,7 @@ class SimpleModel(nn.Module):
     """simple model"""
     def __init__(self, dist=False):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(8, 8).cuda())
+        self.weight = nn.Parameter(torch.ones(8, 8).npu())
         self.dist = dist
         if self.dist is True:
             layout = Layout((1, 8), ("dp", "tp"))
@@ -63,9 +63,9 @@ def base_dtensor():
     world_size = dist.get_world_size()
 
     # -----------------------------------standalone----------------------------------
-    standalone_model = SimpleModel().cuda()
+    standalone_model = SimpleModel().npu()
     standalone_optimizer = optim.SGD(standalone_model.parameters(), lr=0.01)
-    standalone_x = torch.ones(8, 8).cuda()
+    standalone_x = torch.ones(8, 8).npu()
     for i in range (step):
         standalone_loss = standalone_model(standalone_x)
         standalone_loss.backward()
@@ -74,13 +74,13 @@ def base_dtensor():
         standalone_optimizer.zero_grad()
 
     # --------------------------------------dist-------------------------------------
-    dist_model = SimpleModel(dist=True).cuda()
+    dist_model = SimpleModel(dist=True).npu()
 
     layout = Layout((1, 8), ("dp", "tp"))
     x_layout = layout("None", "None")
     w_layout = layout("None", "tp")
-    dist_x = DTensor.from_local(torch.ones(8, 8).cuda(), x_layout)
-    local_w = torch.ones(8, 1).cuda()
+    dist_x = DTensor.from_local(torch.ones(8, 8).npu(), x_layout)
+    local_w = torch.ones(8, 1).npu()
     for key, param in dist_model._parameters.items():
         if param is not None and not isinstance(param, DTensor):
             dist_model.register_parameter(
