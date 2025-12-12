@@ -25,6 +25,20 @@ from hyper_parallel.platform import get_platform
 platform = get_platform()
 Tensor = platform.Tensor
 
+_dtensor_dispatch = True
+
+def enable_dtensor_dispatch():
+    global _dtensor_dispatch
+    _dtensor_dispatch = True
+
+def disable_dtensor_dispatch():
+    global _dtensor_dispatch
+    _dtensor_dispatch = False
+
+def get_dtensor_dispatch():
+    global _dtensor_dispatch
+    return _dtensor_dispatch
+
 
 class LayoutCacheKey:
     """
@@ -422,7 +436,7 @@ class OpDispatcher:
         """
         global platform
         op_name = platform.get_op_name(op_call)
-        if op_name in self.whitelist:
+        if op_name in self.whitelist or get_dtensor_dispatch() is False:
             input_args = [arg.to_local() if isinstance(arg, DTensor) else arg for arg in args]
             return op_call(*input_args, **kwargs)
         if op_name not in self.layout_infer_ops:

@@ -51,6 +51,9 @@ def generate_groups_from_template(
     
     if verbose:
         print(f"Rank {my_rank}: Original Template = {template}, World size = {world_size}")
+
+    if len(template) == 1:
+        return [[i] for i in range (world_size)]
     
     # 基础校验
     if len(template) < 2:
