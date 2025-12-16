@@ -10,6 +10,7 @@
 import io
 import pickle
 import mindspore as ms
+import hyper_parallel
 from hyper_parallel.core.dtensor import DTensor
 from mindspore import nn, Tensor, mint, ops
 from mindspore.common import dtype as mstype
@@ -101,7 +102,7 @@ class _MicroBatch(nn.Cell):
 
     def split_inputs_with_custom_shard(self, input, cur_arg_batch_dim, micro_idx):
         # if not isinstance(input, ms.parallel.DTensor):
-        if not isinstance(input, mindspore-parallel.hyper_parallel.core.dtensor.DTensor):
+        if not isinstance(input, hyper_parallel.DTensor):
             raise TypeError(f"Input type {type(input)} is not DTensor.")
         input_layout = input.layout
         func_wrap = custom_shard(self.split_inputs, out_layouts=(input_layout,), in_layouts=(input_layout, None, None))
