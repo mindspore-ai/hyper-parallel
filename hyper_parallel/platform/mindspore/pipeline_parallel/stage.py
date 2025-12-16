@@ -19,8 +19,7 @@ from mindspore import ops, mint, Parameter
 from mindspore.mint.distributed import isend, irecv, get_global_rank, broadcast, all_reduce
 from mindspore.communication.management import create_group, get_group_size, get_rank
 from hyper_parallel.core.hsdp import HSDPCell
-from _utils import _RecvInfo, send_object, recv_object  # pylint: disable = E0402
-
+from ._utils import _RecvInfo, send_object, recv_object  # pylint: disable = E0402
 
 class SharedParameterInfo:
     """

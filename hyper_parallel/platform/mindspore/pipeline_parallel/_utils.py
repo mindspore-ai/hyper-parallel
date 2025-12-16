@@ -1,9 +1,3 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
@@ -16,11 +10,13 @@
 import io
 import pickle
 import mindspore as ms
+from hyper_parallel.core.dtensor import DTensor
 from mindspore import nn, Tensor, mint, ops
 from mindspore.common import dtype as mstype
 from mindspore.mint.distributed.distributed import _object_to_tensor, send, recv
-from mindspore.parallel import custom_shard
+from hyper_parallel.core.tensor_parallel.local_func import custom_shard
 from mindspore.communication import GlobalComm
+
 
 class BatchDimSpec:
     """
@@ -102,8 +98,10 @@ class _MicroBatch(nn.Cell):
                 micro_kwargs[key] = micro_kwarg
             kwargs_after_split.append(micro_kwargs)
         return args_after_split, kwargs_after_split
+
     def split_inputs_with_custom_shard(self, input, cur_arg_batch_dim, micro_idx):
-        if not isinstance(input, ms.parallel.DTensor):
+        # if not isinstance(input, ms.parallel.DTensor):
+        if not isinstance(input, mindspore-parallel.hyper_parallel.core.dtensor.DTensor):
             raise TypeError(f"Input type {type(input)} is not DTensor.")
         input_layout = input.layout
         func_wrap = custom_shard(self.split_inputs, out_layouts=(input_layout,), in_layouts=(input_layout, None, None))
@@ -126,7 +124,6 @@ class _MicroBatch(nn.Cell):
         micro_input = ops.strided_slice(input, strided_slice_begin, strided_slice_end, strided_slice_strides)
         return micro_input
 
-
 class _RecvInfo:
     """
     Used for construct forward Receive operation and backward Send operation.
@@ -147,6 +144,7 @@ class _RecvInfo:
     @buffer.setter
     def buffer(self, val):
         self._buffer = val
+
 
 def send_object(obj, dst=0, group=None):
     """
@@ -181,7 +179,6 @@ def send_object(obj, dst=0, group=None):
     obj_size = Tensor([tensor_size], dtype=mstype.int32)
     send(obj_size, dst, group)
     send(obj_tensor, dst, group)
-
 
 def recv_object(src=0, group=None):
     """

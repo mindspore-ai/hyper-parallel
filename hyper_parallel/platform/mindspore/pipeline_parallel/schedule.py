@@ -18,8 +18,9 @@ from enum import Enum, auto
 from collections import defaultdict
 import itertools
 import bisect
-from stage import PipelineStage
-from _utils import _MicroBatch
+from .stage import PipelineStage
+from ._utils import _MicroBatch
+
 
 
 class MetaStepType(Enum):
