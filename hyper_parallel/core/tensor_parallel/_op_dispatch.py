@@ -97,7 +97,7 @@ class OpDispatcher:
         self.layout_infer_ops = self.safe_load_yaml_from_dir()
         self.whitelist = ["InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv", "typeof", "DistCommIsend",
                           "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather",
-                          "DistCommReduceScatter", "requires_grad_", "item", "__get__"]
+                          "DistCommReduceScatter", "requires_grad_", "item", "__get__", "register_hook"]
         for op_name, config in self.layout_infer_ops.items():
             class_name = config['distributed_op_class']
             module_name = "hyper_parallel.core.tensor_parallel.ops." + config['distributed_op_file']

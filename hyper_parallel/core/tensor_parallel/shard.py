@@ -16,7 +16,7 @@
 import inspect
 from typing import Union, Callable, Dict
 from functools import wraps
-from hyper_parallel.core.layout import Layout, _infer_slice_shape_by_layout
+from hyper_parallel.core.layout import Layout, _infer_slice_shape_by_layout, _get_slice_tensor_by_layout
 from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.platform import get_platform
 platform = get_platform()

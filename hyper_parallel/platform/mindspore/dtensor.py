@@ -38,7 +38,7 @@ class DTensorBase(Tensor):
         if local_tensor.has_init:
             local_tensor.init_device = device
         t = Tensor._make_subclass(cls, device_local_tensor)
-        t.__init_data__(local_tensor, layout)
+        t.__init_data__(device_local_tensor, layout)
         t._device = device
         return t
 
