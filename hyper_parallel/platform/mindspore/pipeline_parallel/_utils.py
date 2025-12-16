@@ -101,7 +101,6 @@ class _MicroBatch(nn.Cell):
         return args_after_split, kwargs_after_split
 
     def split_inputs_with_custom_shard(self, input, cur_arg_batch_dim, micro_idx):
-        # if not isinstance(input, ms.parallel.DTensor):
         if not isinstance(input, hyper_parallel.DTensor):
             raise TypeError(f"Input type {type(input)} is not DTensor.")
         input_layout = input.layout
