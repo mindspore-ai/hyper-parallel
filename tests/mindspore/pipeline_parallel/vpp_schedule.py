@@ -1,17 +1,18 @@
-import time
-import numpy as np
-import mindspore as ms
-from collections import defaultdict
-from mindspore import nn, Tensor, mint
-from mindspore.communication.management import init, get_rank, get_group_size
-from hyper_parallel.platform.mindspore.pipeline_parallel.stage import PipelineStage
-from hyper_parallel.platform.mindspore.pipeline_parallel.schedule import Schedule1F1B, ScheduleGPipe, ScheduleInterleaved1F1B
-from hyper_parallel import Layout, DTensor
-from hyper_parallel.core.hsdp import hsdp
-from hyper_parallel import shard
-from mindspore.common.initializer import initializer
+# Copyright 2025 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 
-import time
 import numpy as np
 import mindspore as ms
 from collections import defaultdict
@@ -129,8 +130,8 @@ def run_parallel(micro_batch_num):
     model0_split_manual(model0, stage_index, 4)
     model1_split_manual(model1, stage_index, 4)
     # shard config
-    dp = 1
-    mp = 2
+    dp = 2
+    mp = 1
     rank_list = [device_num_per_stage * stage_index + i for i in range(device_num_per_stage)]
     layout = Layout((dp, mp), ("dp", "mp"), rank_list)
     if stage_index == 0:
