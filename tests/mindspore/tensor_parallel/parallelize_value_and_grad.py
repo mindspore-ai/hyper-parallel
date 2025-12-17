@@ -12,18 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""base shard"""
+"""parallelize value and grad"""
 
 import time
 import numpy as np
 import mindspore as ms
-from mindspore._c_expression import NoFallbackGuard
 import mindspore.communication.management as D
-from mindspore import nn, Tensor
+from mindspore import nn
 from hyper_parallel import Layout, hsdp, init_parameters, shard, parallelize_value_and_grad
 from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
-from tests.mindspore.shard.utils import create_dtensor
+from tests.mindspore.tensor_parallel.utils import create_dtensor
 
 learning_rate = 0.01
 epochs = 2
@@ -36,38 +35,42 @@ class SimpleModel(nn.Cell):
         super().__init__()
         self.weight = ms.Parameter(initializer("ones", [input_size, output_size], ms.float32), name='weight')
         self.relu = ms.mint.nn.ReLU()
+        self.num = 0
 
     def construct(self, x):
         x = ms.mint.matmul(x, self.weight)
         x = self.relu(x)
+        self.num = self.num + 1
         x = ms.mint.sum(x)
         return x
 
 
-def run_model(x, model, parallel=False):
+def run_model(x, model, use_cell=False):
     """rum model"""
+    optimizer = nn.Adam(model.trainable_params(), learning_rate=learning_rate)
 
     def forward_fn(data):
+        """forward fn"""
         logits = model(data)
         return logits
 
-    optimizer = nn.Adam(model.trainable_params(), learning_rate=learning_rate)
-    if parallel is False:
-        grad_fn = ms.value_and_grad(forward_fn, None, optimizer.parameters, has_aux=False)
+    if use_cell is True:
+        fn = model
     else:
-        grad_fn = parallelize_value_and_grad(forward_fn, optimizer.parameters)
+        fn = forward_fn
+
+    grad_fn = parallelize_value_and_grad(fn, optimizer.parameters)
 
     ret_loss = None
     ret_grads = None
     for epoch in range(epochs):
         start = time.time()
         (loss_value, grads) = grad_fn(x)
-        with NoFallbackGuard():
-            optimizer(grads)
+        optimizer(grads)
         end = time.time()
         ret_loss = loss_value
         ret_grads = grads
-        print(f"[standalone] Epoch: {epoch + 1}/{epochs}, Loss: {loss_value}, Time: {end - start}")
+        print(f"use_cell: {use_cell}, Epoch: {epoch + 1}/{epochs}, Loss: {loss_value}, Time: {end - start}")
 
     return ret_loss, ret_grads
 
@@ -76,19 +79,13 @@ def base_case(dp, mp, hsdp_shard_size):
     """base case"""
     D.init()
 
-    # standalone
     input_size = 32
     output_size = 2
     batch_size = 4
 
-    standalone_x = Tensor(np.ones([batch_size, input_size]).astype(np.float32), dtype=ms.float32)
-    standalone_model = SimpleModel(input_size, output_size)
-    standalone_loss, standalone_grads = run_model(standalone_x, standalone_model)
-
     # parallel
     local_batch_size = batch_size // dp
     local_input_size = input_size // mp
-    local_output_size = output_size
     local_x = np.ones([local_batch_size, local_input_size]).astype(np.float32)
     layout = Layout((dp, mp), ("dp", "mp"))
     x_layout = layout("dp", "mp")
@@ -96,37 +93,49 @@ def base_case(dp, mp, hsdp_shard_size):
     out_layout = layout()
     relu_strategy = ((layout("dp", "None"),), (layout("dp", "None"),))
 
-    # step 1: define network with no init parameters
+    # input is fn
     with no_init_parameters():
         model = SimpleModel(input_size, output_size)
-    # step 2: shard
-    model_stra = {"forward": {"input": (x_layout,), "output": (out_layout,)},
-                  "parameter": {"weight": w_layout}}
-    shard(model, model_stra)
-    model_relu_stra = {"forward": {"input": relu_strategy[0], "output": relu_strategy[1]}}
-    shard(model.relu, model_relu_stra)
-    # step 3: hsdp
+
+    stra = {"forward": {"input": (x_layout,), "output": (out_layout,)}, "parameter": {"weight": w_layout}}
+    shard(model, stra)
+
+    relu_stra = {"forward": {"input": relu_strategy[0], "output": relu_strategy[1]}}
+    shard(model.relu, relu_stra)
+
     model = hsdp(model, shard_size=hsdp_shard_size, threshold=0)
-    # step 4: init parameters
+
     model = init_parameters(model)
+
     x = create_dtensor(local_x, x_layout)
-    parallel_loss, parallel_grads = run_model(x, model, parallel=True)
-    # compare loss
-    assert np.allclose(standalone_loss.asnumpy(), parallel_loss.asnumpy(), 0.001, 0.001)
-    # compare grad
-    if hsdp_shard_size < 0:
-        hsdp_shard_size = dp
-    standalone_grad = standalone_grads[0].asnumpy()
-    # note: this way of obtaining grad slice is a simplified way, not a strict way
-    standalone_grad_slice = standalone_grad[:local_input_size // hsdp_shard_size, :local_output_size]
-    parallel_grad = parallel_grads[0].asnumpy()
-    assert np.allclose(standalone_grad_slice, parallel_grad, 0.001, 0.001)
+    parallel_loss, parallel_grads = run_model(x, model, use_cell=False)
+
+    # input is cell
+    with no_init_parameters():
+        model_1 = SimpleModel(input_size, output_size)
+
+    shard(model_1, stra)
+    shard(model_1.relu, relu_stra)
+
+    model_1 = hsdp(model_1, shard_size=hsdp_shard_size, threshold=0)
+
+    model_1 = init_parameters(model_1)
+
+    parallel_loss_1, parallel_grads_1 = run_model(x, model_1, use_cell=True)
+
+    # validate
+    assert np.allclose(parallel_loss_1.asnumpy(), parallel_loss.asnumpy(), 0.001, 0.001)
+    grad = parallel_grads[0].asnumpy()
+    grad_1 = parallel_grads_1[0].asnumpy()
+    assert np.allclose(grad, grad_1, 0.001, 0.001)
+    assert model.num == epochs
+    assert model_1.num == epochs
 
 
-def test_base_shard():
+def test_parallelize_value_and_grad():
     '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial.
-    Description: Test base shard.
+    Feature: the input is fn or cell, it only run once in one step
+    Description: Test base case.
     Expectation: Run success.
     '''
     base_case(dp=4, mp=2, hsdp_shard_size=4)

@@ -13,3 +13,14 @@ SplitWithSize:
   dist_op_name: _split_dist_op
   distributed_op_class: SplitWithSizeDistributedOp
   distributed_op_file: parallel_split
+
+SplitTensorView:
+  dist_op_name: _split_dist_op
+  distributed_op_class: SplitTensorViewDistributedOp
+  distributed_op_file: parallel_split
+  infer_layout_suffix: WithShape
+
+SplitWithSizeView:
+  dist_op_name: _split_dist_op
+  distributed_op_class: SplitWithSizeViewDistributedOp
+  distributed_op_file: parallel_split

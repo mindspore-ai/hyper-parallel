@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test reduce shard in python"""
+"""bmm shard in python"""
 
 import numpy as np
-
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
 from hyper_parallel import Layout, shard
-from tests.mindspore.shard.utils import global_to_local, local_to_global
+from tests.mindspore.tensor_parallel.utils import global_to_local, local_to_global
 
 
 def setup_module():
@@ -28,37 +27,37 @@ def setup_module():
     D.init()
 
 
-class SumExtNet(nn.Cell):
-    """SumExt composed of bmm and ReLUs"""
+class BmmExtNet(nn.Cell):
+    """BmmExtNet composed of bmm and ReLUs"""
 
     def __init__(self, relu_strategy=None):
         super().__init__()
-        self.sum_ext = ms.mint.sum
+        self.bmm = ms.mint.bmm
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None:
             stra = {"forward": {"input": relu_strategy}}
             shard(self.relu, stra)
 
-    def construct(self, x, dim=None, keepdim=False, dtype=None):
-        out = self.sum_ext(input=x, dim=dim, keepdim=keepdim, dtype=dtype)
+    def construct(self, x, w):
+        out = self.bmm(x, w)
         out = self.relu(out)
         out = out + 1
         return out
 
 
-class MeanExtNet(nn.Cell):
-    """MeanExt composed of bmm and ReLUs"""
+class BmmNet(nn.Cell):
+    """BmmNet composed of BatchMatMul and ReLUs"""
 
-    def __init__(self, relu_strategy=None):
+    def __init__(self, transpose_a=False, transpose_b=False, relu_strategy=None):
         super().__init__()
-        self.sum_ext = ms.mint.mean
+        self.bmm = ms.ops.BatchMatMul(transpose_a=transpose_a, transpose_b=transpose_b)
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None:
             stra = {"forward": {"input": relu_strategy}}
             shard(self.relu, stra)
 
-    def construct(self, x, dim=None, keepdim=False, dtype=None):
-        out = self.sum_ext(input=x, dim=dim, keepdim=keepdim, dtype=dtype)
+    def construct(self, x, w):
+        out = self.bmm(x, w)
         out = self.relu(out)
         out = out + 1
         return out
@@ -69,49 +68,61 @@ base_alias_name = ("dp", "cp", "mp")
 base_rank_list = list(range(8))
 
 
-def test_sum_ext_dim_partial_model_parallel_1():
+def test_bmm_ext_partial_model_parallel():
     '''
-    Feature: SumExt in python shard.
-    Description: Test SumExt model parallel in python shard.
+    Feature: BatchMatMulExt in python shard.
+    Description: Test BatchMatMulExt model parallel in python shard.
     Expectation: Run success.
     '''
     ms.set_seed(1)
-    d, m, k = 16, 256, 128
+    d, m, k, n = 16, 256, 128, 64
     x = Tensor(np.random.randn(d, m, k).astype(np.float32))
+    w = Tensor(np.random.randn(d, k, n).astype(np.float32))
 
     # Standalone
-    standalone_net = SumExtNet()
-    standalone_output = standalone_net(x, dim=[0, 1], keepdim=True)
+    standalone_net = BmmExtNet()
+    standalone_output = standalone_net(x, w)
+
     # Parallel
     layout = Layout(base_device_matrix, base_alias_name)
-    x_layout = layout("None", ("dp", "cp"), "mp")
+    x_layout = layout("dp", "cp", "mp")
+    w_layout = layout("dp", "mp", "None")
     x_local = global_to_local(x, x_layout)
-    parallel_net = SumExtNet(relu_strategy=(layout("None", "None", "mp"),))
-    parallel_output = parallel_net(x_local, dim=[0, 1], keepdim=True)
+    w_local = global_to_local(w, w_layout)
+
+    parallel_net = BmmExtNet(relu_strategy=(layout("dp", "None", "None"),))
+    parallel_output = parallel_net(x_local, w_local)
+
     # Validate
     parallel_output = local_to_global(parallel_output)
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
-def test_mean_ext_partial_model_parallel_2():
+def test_bmm_partial_transpose_model_parallel():
     '''
-    Feature: MeanExt in python shard.
-    Description: Test MeanExt model parallel in python shard.
+    Feature: BatchMatMul in python shard.
+    Description: Test BatchMatMul model parallel in python shard with transpose.
     Expectation: Run success.
     '''
     ms.set_seed(1)
-    d, m, k = 16, 256, 128
-    x = Tensor(np.random.randn(d, m, k).astype(np.float32))
+    d, m, k, n = 16, 256, 128, 64
+    x = Tensor(np.random.randn(d, k, m).astype(np.float32))
+    w = Tensor(np.random.randn(d, k, n).astype(np.float32))
 
     # Standalone
-    standalone_net = MeanExtNet()
-    standalone_output = standalone_net(x, dim=[0, 1], keepdim=False)
+    standalone_net = BmmNet(transpose_a=True, transpose_b=False)
+    standalone_output = standalone_net(x, w)
+
     # Parallel
     layout = Layout(base_device_matrix, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
+    x_layout = layout("dp", "mp", "cp")
+    w_layout = layout("dp", "mp", "None")
     x_local = global_to_local(x, x_layout)
-    parallel_net = MeanExtNet(relu_strategy=(layout("mp", ),))
-    parallel_output = parallel_net(x_local, dim=[0, 1], keepdim=False)
+    w_local = global_to_local(w, w_layout)
+
+    parallel_net = BmmNet(transpose_a=True, transpose_b=False, relu_strategy=(layout("dp", "None", "None"),))
+    parallel_output = parallel_net(x_local, w_local)
+
     # Validate
     parallel_output = local_to_global(parallel_output)
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)

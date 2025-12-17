@@ -21,18 +21,18 @@ def run_case(case_name, master_port):
     cmd = f"export GLOG_v=3 && msrun --worker_num=8 --local_worker_num=8 " \
           f"--master_addr=127.0.0.1 --master_port={master_port} " \
           f"--join=True --log_dir=./{case_name} pytest -s -v " \
-          f"base_shard.py::{case_name}"
+          f"base_custom_shard.py::{case_name}"
     ret = os.system(cmd)
     assert ret == 0
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_base_shard():
+def test_base_custom_shard():
     '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial.
+    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial + custom shard.
     Description: Test base shard.
     Expectation: Run success.
     '''
-    case_name = "test_base_shard"
+    case_name = "test_base_custom_shard"
     master_port = 11333
     run_case(case_name, master_port)

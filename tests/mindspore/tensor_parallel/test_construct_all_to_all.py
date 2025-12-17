@@ -35,7 +35,7 @@ def run_case_8p(case_name, master_port):
     assert ret == 0
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_construct_all_to_all():
     '''
     Feature: loss repeat mean.
@@ -47,7 +47,7 @@ def test_construct_all_to_all():
     run_case(case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_construct_all_to_all_8p():
     '''
     Feature: loss repeat mean.

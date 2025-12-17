@@ -129,8 +129,8 @@ class ParallelFlashAttention(nn.Cell):
                  sparse_mode=0
                  ):
         super().__init__()
-        self._in_layouts = None
-        self._out_layouts = None
+        self.in_layout = None
+        self.out_layout = None
         if input_layout.find('T') != -1:
             raise ValueError("Do not support FlashAttentionVarLen currently.")
 
@@ -156,19 +156,19 @@ class ParallelFlashAttention(nn.Cell):
 
     def construct(self, query, key, value, attn_mask):
         # TODO: actual_seq_qlen/kv_len is tuple type, cannot be described by dtensor
-        if self._in_layouts is None or self._out_layouts is None:
+        if self.in_layout is None or self.out_layout is None:
             raise ValueError("Please call the shard function first.")
         _, head_num_split_num, _ = self._infer_split_dim_by_in_strategy()
         input_args = (query, key, value, self._head_num // head_num_split_num, self._real_shift, self._drop_mask,
                       self._padding_mask, attn_mask, self._prefix, self._actual_seq_qlen, self._actual_seq_kvlen,
                       self._keep_prob, self._scalar_value, self._pre_tokens, self._next_tokens, self._inner_precise,
                       self._input_layout, self._sparse_mode)
-        in_layout_with_non_tensor = self._insert_none_for_non_tensor_arg(self._in_layouts, input_args)
-        self._wrap_func = custom_shard(flash_attention_score, self._out_layouts, in_layout_with_non_tensor)
+        in_layout_with_non_tensor = self._insert_none_for_non_tensor_arg(self.in_layout, input_args)
+        self._wrap_func = custom_shard(flash_attention_score, self.out_layout, in_layout_with_non_tensor)
         return self._wrap_func(*input_args)
 
     def shard(self, in_strategy, out_strategy):
-        if self._in_layouts is not None or self._out_layouts is not None:
+        if self.in_layout is not None or self.out_layout is not None:
             raise ValueError(f"For {self.__class__.__name__}, the shard method cannot be called repeatedly to set the "
                              f"sharding strategy.")
 
@@ -176,8 +176,8 @@ class ParallelFlashAttention(nn.Cell):
             raise ValueError("The type of in_startegy must be Tuple[Layout].")
         if not isinstance(out_strategy, tuple) or any(not isinstance(ele, Layout) for ele in out_strategy):
             raise ValueError("The type of out_strategy must be Tuple[Layout].")
-        self._in_layouts = in_strategy
-        self._out_layouts = out_strategy
+        self.in_layout = in_strategy
+        self.out_layout = out_strategy
         super().shard(in_strategy, out_strategy)
 
     @staticmethod
@@ -208,7 +208,7 @@ class ParallelFlashAttention(nn.Cell):
         return batch_dim, seq_dim, head_num_dim
 
     def _infer_split_dim_by_in_strategy(self):
-        query_layout = self._in_layouts[0]
+        query_layout = self.in_layout[0]
         batch_split_num = self._get_split_num(query_layout, self._batch_dim)
         head_num_split_num = self._get_split_num(query_layout, self._head_num_dim)
         seq_split_num = self._get_split_num(query_layout, self._seq_dim)

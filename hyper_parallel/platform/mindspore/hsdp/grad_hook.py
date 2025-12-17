@@ -38,9 +38,9 @@ class MindSporeHSDPGradHook(HSDPGradHook):
         output = ops.cast(output, origin_dtype)
         return output
 
-    def _get_final_grad_hook(self, param, grad_hook):
+    def _get_final_grad_hook(self, param, grad_hook, no_cast=False):
         """add cast and scale grad"""
-        final_hook = super()._get_final_grad_hook(param, grad_hook)
+        final_hook = super()._get_final_grad_hook(param, grad_hook, no_cast)
         def set_grad_hook(grad):
             grad = final_hook(grad)
             param.grad = grad
