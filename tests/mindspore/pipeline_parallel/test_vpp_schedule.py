@@ -12,11 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-
-
+"""vpp test"""
 import os
-
-from tests.common.mark_utils import arg_mark
 
 
 def run_case(case_name, master_port):
@@ -28,7 +25,6 @@ def run_case(case_name, master_port):
     assert ret == 0
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
 def test_simple_mlp():
     """
     Feature: schedule 1f1b + hsdp + shard + shared_param.
