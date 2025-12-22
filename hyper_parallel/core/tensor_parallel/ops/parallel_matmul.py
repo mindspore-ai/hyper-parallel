@@ -339,3 +339,62 @@ class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
         merged_batch = self._merge_batches(x_map, w_map)
 
         return self._build_output_layout(x_layout, merged_batch, x_n, w_p, x_contract)
+
+class LinearDistributedOp(DistributedOp):
+    """Distributed implementation for Linear operator."""
+    def infer_layout(self, layouts, extra_args):
+        """
+        Infer output layout for MatMul operator.
+
+        Linear: output = x @ w
+
+        Rules:
+        1. Batch dimensions should have same layout
+        2. Contracting dimensions should have same layout
+        3. Output dimensions inherit layouts from non-contracting dimensions
+
+        Args:
+            x_layout (Layout): Layout of input x
+            w_layout (Layout): Layout of input w
+
+        Returns:
+            tuple: Layout for output tensor
+        """
+        if len(layouts) != 3:
+            raise ValueError(f"Linear layout length is not 3, but {len(layouts)}")
+        x_layout = layouts[0]
+        w_layout = layouts[1]
+        bias_layout = layouts[2]
+        if not x_layout or not w_layout:
+            raise ValueError(f"x_layout : {x_layout}, w_layout : {w_layout}")
+        x_device_matrix = x_layout.device_matrix
+        w_device_matrix = w_layout.device_matrix
+        if x_device_matrix != w_device_matrix:
+            raise ValueError("Linear inputs must have same device_matrix")
+        if bias_layout and bias_layout.device_matrix != x_device_matrix:
+            raise ValueError("Linear bias and x must have same device_matrix")
+        x_map = x_layout.alias_tensor_map
+        w_map = w_layout.alias_tensor_map
+        contract_dim = len(x_map) - 1
+        w_contract_dim = len(w_map) - 1
+        if x_map[contract_dim] != w_map[w_contract_dim]:
+            raise ValueError(f"Contracting dimensions must have same layout. "
+                             f"Got {x_map[contract_dim]} and {w_map[w_contract_dim]}")
+
+        output_dim = 0
+        output_map = x_map[:-1] + (w_map[output_dim],)
+        if bias_layout and bias_layout.alias_tensor_map[0] != w_map[output_dim]:
+            raise ValueError(f"Output dimensions must have same sharding. "
+                             f"Got weight output dim sharding size: {w_map[output_dim]}"
+                             f" and bias output dim sharding size : {bias_layout.alias_tensor_map[0]}")
+        output_layout = Layout(
+            device_matrix=x_layout.device_matrix,
+            alias_name=x_layout.alias_name,
+            rank_list=x_layout.rank_list
+        )
+        out_layout = output_layout(*output_map)
+
+        if x_map[contract_dim] != "None" and bias_layout:
+            raise ValueError("Linear/Dense ops cannot shard reduce_dim with bias.")
+
+        return out_layout

@@ -2,3 +2,8 @@ matmul:
   dist_op_name: _torch_matmul_dist_op
   distributed_op_class: MatMulExtDistributedOp
   distributed_op_file: parallel_matmul
+
+linear:
+  dist_op_name: _torch_linear_dist_op
+  distributed_op_class: LinearDistributedOp
+  distributed_op_file: parallel_matmul

@@ -17,3 +17,8 @@ BatchMatMul:
   dist_op_name: _batch_matmul_dist_op
   distributed_op_class: BatchMatMulDistributedOp
   distributed_op_file: parallel_matmul
+
+Dense:
+  dist_op_name: _dense_ext_dist_op
+  distributed_op_class: LinearDistributedOp
+  distributed_op_file: parallel_matmul
