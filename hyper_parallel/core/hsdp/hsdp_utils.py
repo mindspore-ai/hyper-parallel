@@ -15,12 +15,6 @@
 """HSDP optimizer shared level"""
 from enum import auto, Enum
 
-class PlatformType(Enum):
-    """
-    PlatformType
-    """
-    MINDSPORE = auto()
-    PYTORCH = auto()
 
 class OptimizerLevel(Enum):
     """
@@ -41,9 +35,9 @@ class GroupInfo:
     GroupInfo
     """
     def __init__(self, group_name, group, rank_size):
-      self.group_name = group_name
-      self.group = group
-      self.rank_size = rank_size
+        self.group_name = group_name
+        self.group = group
+        self.rank_size = rank_size
 
 class HSDPConfig:
     """HSDP config"""
@@ -71,7 +65,7 @@ class HSDPConfig:
         self.shard_level = shard_level
         self.use_eager_hook = use_eager_hook
         self.reduce_dtype = reduce_dtype
-        self.comm_async = comm_fusion
+        self.comm_async = comm_async
         self.comm_fusion = comm_fusion
         self.bucket_size = bucket_size
         self.grad_fusion = comm_fusion and bucket_size != 0

@@ -12,5 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"platform api"
-from hyper_parallel.platform.platform import get_platform
+"""test utils"""
+import os
+import torch
+import torch.distributed as dist
+
+
+def init_dist():
+    """init dist"""
+    dist.init_process_group()
+    rank = dist.get_rank()
+    torch.npu.set_device(rank)
+    device_id = rank % 8
+    torch.npu.set_device(device_id)
+    return rank, device_id
+
+
+def torchrun_case(master_port, case_name):
+    cmd = f"torchrun --nproc-per-node=8 " \
+          f"--master_addr=127.0.0.1 --master_port={master_port} " \
+          f"-m pytest -s {case_name}"
+    ret = os.system(cmd)
+    assert ret == 0

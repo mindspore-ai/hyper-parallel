@@ -14,6 +14,7 @@
 # ============================================================================
 """HSDP parameter"""
 import functools
+from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.core.hsdp.hsdp_utils import OptimizerLevel, GroupInfo
 
 
@@ -51,15 +52,128 @@ class HSDPParam:
 
     def _init_rank_info(self):
         """init parameter rank info"""
-        pass
+        self.rank_id = self.platform.get_rank()
+        self.hsdp_rank = self.rank_id
+        self.local_rank = self.rank_id
+        self.tp_rank = 0
+        if not isinstance(self.param, DTensor) or self.param.layout is None:
+            self.rank_size = self.platform.get_world_size()
+            return
+
+        if len(self.param.layout.rank_list) == 1:
+            self.rank_size = 1
+            return
+
+        try:
+            self.local_rank = self.param.layout.rank_list.index(self.rank_id)
+        except ValueError as e:
+            raise ValueError(f"HSDP invalid rank {self.rank_id} with rank list {self.param.layout.rank_list}.") from e
+
+        tensor_map = self.param.layout.tensor_map
+        sharded_axis_set = set()
+        for axis in tensor_map:
+            if isinstance(axis, int) and axis != -1:
+                sharded_axis_set.add(axis)
+                continue
+            if isinstance(axis, tuple):
+                for item in axis:
+                    sharded_axis_set.add(item)
+        self.sharded_axis_set = sharded_axis_set
+        self.rank_size = 1
+        self.unsharded_reverse_axis_list = []
+        self.global_rank_stride_list = []
+        self.hsdp_rank_stride_list = []
+        self.tp_rank_stride_list = []
+        device_dims = len(self.param.layout.device_matrix)
+        stride = 1
+        hsdp_stride = 1
+        tp_stride = 1
+        for axis in range(device_dims):
+            r_axis = device_dims - 1 - axis
+            self.global_rank_stride_list.append(stride)
+            self.hsdp_rank_stride_list.append(hsdp_stride)
+            self.tp_rank_stride_list.append(tp_stride)
+            stride = stride * self.param.layout.device_matrix[r_axis]
+            if axis in self.sharded_axis_set:
+                tp_stride = tp_stride * self.param.layout.device_matrix[r_axis]
+                continue
+
+            hsdp_stride = hsdp_stride * self.param.layout.device_matrix[r_axis]
+            self.unsharded_reverse_axis_list.append(r_axis)
+            self.rank_size = self.rank_size * self.param.layout.device_matrix[r_axis]
+        self.global_rank_stride_list.reverse()
+        self.hsdp_rank_stride_list.reverse()
+        self.tp_rank_stride_list.reverse()
+        self.unsharded_reverse_axis_list.reverse()
+
+        rank_indices = []
+        index = self.local_rank
+        for stride in self.global_rank_stride_list:
+            rank_indices.append(index // stride)
+            index = index % stride
+        self.rank_indices = rank_indices
+        hsdp_rank = 0
+        for axis in self.unsharded_reverse_axis_list:
+            hsdp_rank = hsdp_rank + rank_indices[axis] * self.hsdp_rank_stride_list[axis]
+        self.hsdp_rank = hsdp_rank
+        tp_rank = 0
+        for axis in range(device_dims):
+            if axis in self.sharded_axis_set:
+                r_axis = device_dims - 1 - axis
+                tp_rank = tp_rank + rank_indices[r_axis] * self.tp_rank_stride_list[r_axis]
+        self.tp_rank = tp_rank
+
+    def _hsdp_rank_to_global_rank(self, hsdp_rank_list):
+        """transform from hsdp rank to global rank"""
+        rank_list = []
+        for hsdp_rank in hsdp_rank_list:
+            local_index = hsdp_rank
+            local_indices_dict = {}
+            for axis in self.unsharded_reverse_axis_list:
+                stride = self.hsdp_rank_stride_list[axis]
+                local_indices_dict[axis] = local_index // stride
+                local_index = local_index % stride
+            global_rank = 0
+            for axis, index in enumerate(self.rank_indices):
+                index = local_indices_dict.get(axis, index)
+                global_rank = global_rank + index * self.global_rank_stride_list[axis]
+            if self.param.layout is not None:
+                if global_rank >= len(self.param.layout.rank_list):
+                    raise ValueError(f"HSDP invalid index {global_rank} with"
+                                     f"rank list len {len(self.param.layout.rank_list)}.")
+                global_rank = self.param.layout.rank_list[global_rank]
+            rank_list.append(global_rank)
+        return rank_list
+
+    def _get_op_rank_list(self):
+        """get data parallel rank list"""
+        if isinstance(self.param, DTensor):
+            rank_base = self.hsdp_rank // self.shard_size * self.shard_size
+            hsdp_rank_list = [i + rank_base for i in range(self.shard_size)]
+            return self._hsdp_rank_to_global_rank(hsdp_rank_list)
+        rank_base = self.local_rank // self.shard_size * self.shard_size
+        rank_list = [i + rank_base for i in range(self.shard_size)]
+        return rank_list
+
+    def _get_dp_rank_list(self):
+        """get optimizer parallel rank list"""
+        if isinstance(self.param, DTensor):
+            rank_stride = self.shard_size
+            rank_base = self.hsdp_rank % rank_stride
+            hsdp_rank_list = [i * rank_stride + rank_base for i in range(self.dp_size)]
+            return self._hsdp_rank_to_global_rank(hsdp_rank_list)
+        rank_stride = self.shard_size
+        rank_base = self.local_rank % rank_stride
+        rank_list = [i * rank_stride + rank_base for i in range(self.dp_size)]
+        return rank_list
 
     def _init_sharded_param(self):
         """add and init sharded param"""
-        pass
+        raise NotImplementedError("HSDP param subclasses must implement _init_sharded_param")
 
     def _init_unsharded_param(self):
         """add and init unshared param"""
-        pass
+        raise NotImplementedError("HSDP param subclasses must implement _init_unsharded_param")
 
     def _get_unsharded_param_data(self, async_op):
         """get unsharded param data with async comm"""
@@ -103,19 +217,6 @@ class HSDPParam:
         if rank_gcd % self.shard_size != 0:
             self.shard_size = 1
         self.param.hsdp_effective_shard_size = self.shard_size
-    
-    def _get_op_rank_list(self):
-        """get data parallel rank list"""
-        rank_base = self.local_rank // self.shard_size * self.shard_size
-        rank_list = [i + rank_base for i in range(self.shard_size)]
-        return rank_list
-
-    def _get_dp_rank_list(self):
-        """get optimizer parallel rank list"""
-        rank_stride = self.shard_size
-        rank_base = self.local_rank % rank_stride
-        rank_list = [i * rank_stride + rank_base for i in range(self.dp_size)]
-        return rank_list
 
     def _create_sharded_dp_group(self):
         """create communication group for sharded parameter"""
