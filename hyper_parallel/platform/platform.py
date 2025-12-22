@@ -13,18 +13,23 @@
 # limitations under the License.
 # ============================================================================
 """framework platform api"""
+from enum import auto, Enum
+
+
+class PlatformType(Enum):
+    """
+    PlatformType
+    """
+    MINDSPORE = auto()
+    PYTORCH = auto()
+
+
 platform = None
 
-def set_platform(platform_type):
-    global platform
-    if "torch" in platform_type:
-        from hyper_parallel.platform.torch.platform import TorchPlatform
-        platform = TorchPlatform()
-    else:
-        from hyper_parallel.platform.mindspore.platform import MindSporePlatform
-        platform = MindSporePlatform()
 
+# pylint: disable=C0415
 def get_platform():
+    """get framework platform"""
     global platform
     if platform is not None:
         return platform
@@ -37,7 +42,7 @@ def get_platform():
         platform = TorchPlatform()
         return platform
 
-EXISTING_COMM_GROUPS = dict()
+EXISTING_COMM_GROUPS = {}
 
 
 class Platform:
@@ -48,39 +53,43 @@ class Platform:
 
     @staticmethod
     def get_rank():
-        pass
+        raise NotImplementedError("Platform subclasses must implement get_rank")
 
     @staticmethod
     def get_world_size():
-        pass
+        raise NotImplementedError("Platform subclasses must implement get_world_size")
 
     @staticmethod
     def get_op_name(func):
-        pass
+        raise NotImplementedError("Platform subclasses must implement get_op_name")
 
     @staticmethod
     def differentiable_all_gather_concat(data, group, concat_size, concat_dim):
-        pass
+        raise NotImplementedError("Platform subclasses must implement differentiable_all_gather_concat")
 
     @staticmethod
     def chunk(data, split_dim, split_size, index):
-        pass
+        raise NotImplementedError("Platform subclasses must implement chunk")
 
     @staticmethod
     def differentiable_all_to_all(input_data, output_shape, group):
-        pass
+        raise NotImplementedError("Platform subclasses must implement differentiable_all_to_all")
 
     @staticmethod
-    def differentiable_all_reduce(data, op, group, async_op=False):
-        pass
+    def differentiable_all_reduce(data, op, group):
+        raise NotImplementedError("Platform subclasses must implement differentiable_all_reduce")
 
     @staticmethod
     def differentiable_reduce_scatter(data, dev_num, axis, op, group):
-        pass
+        raise NotImplementedError("Platform subclasses must implement differentiable_reduce_scatter")
 
     @staticmethod
     def init_parameters(module, stage_index):
-        pass
+        """platform ms need init parameter interface"""
+        if module is None:
+            raise ValueError("input module must not be none.")
+        if stage_index < 0:
+            raise ValueError("input stage_index must be positive.")
 
     @staticmethod
     def register_forward_pre_hook(cell, hook):
@@ -100,13 +109,11 @@ class Platform:
 
     @staticmethod
     def get_param_local_shape(param):
-        """get param local shape"""
-        return param.shape
+        raise NotImplementedError("Platform subclasses must implement get_param_local_shape")
 
     @staticmethod
     def get_param_local_data(param):
-        """get param local shape"""
-        return param
+        raise NotImplementedError("Platform subclasses must implement get_param_local_data")
 
     @staticmethod
     def update_param_data(param, data):
@@ -115,38 +122,39 @@ class Platform:
 
     @staticmethod
     def get_param_type_size(param):
-        pass
+        raise NotImplementedError("Platform subclasses must implement get_param_type_size")
 
     @staticmethod
     def new_zero_parameter(param_shape, param_type, requires_grad):
-        pass
+        raise NotImplementedError("Platform subclasses must implement new_zero_parameter")
 
     @staticmethod
     def new_tensor(tensor_shape, tensor_type):
-        pass
+        raise NotImplementedError("Platform subclasses must implement new_tensor")
 
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):
-        pass
+        raise NotImplementedError("Platform subclasses must implement all_gather_into_tensor")
 
     @staticmethod
     def all_reduce(data, group_info, async_op=False):
-        pass
+        raise NotImplementedError("Platform subclasses must implement all_reduce")
 
     @staticmethod
     def reduce_scatter_tensor(data, group_info, async_op=False):
-        pass
+        raise NotImplementedError("Platform subclasses must implement reduce_scatter_tensor")
 
     def _create_group(self, rank_list, group_name=None):
-        pass
+        raise NotImplementedError("Platform subclasses must implement _create_group")
 
     def new_stream(self):
-        pass
+        raise NotImplementedError("Platform subclasses must implement new_stream")
 
     def get_stream_context(self):
-        pass
+        raise NotImplementedError("Platform subclasses must implement get_stream_context")
 
     def create_group(self, rank_list, group_name=None):
+        """create comm group with rank list"""
         if group_name is None:
             group_key = hash(tuple(rank_list))
         else:
@@ -166,6 +174,7 @@ class Platform:
         Platform.current_grad_handle.wait()
         if Platform.post_grad_handle_process is None:
             return
+        # pylint: disable=E1102
         Platform.post_grad_handle_process()
 
     def set_grad_reduce_handle(self, handle, post_process=None):
@@ -179,6 +188,7 @@ class Platform:
         Platform.post_grad_handle_process = post_process
 
     def wait_grad_handle(self):
+        """wait grad handle"""
         if Platform.current_grad_handle is None:
             return
         if Platform.grad_sync_stream is None:

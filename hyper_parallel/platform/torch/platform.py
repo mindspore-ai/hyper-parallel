@@ -20,17 +20,21 @@ from torch.nn import Parameter, Module
 from torch._ops import OpOverload, OpOverloadPacket
 import torch.distributed.nn.functional as dist_func
 import torch.distributed as dist
-from hyper_parallel.platform.platform import Platform
 from hyper_parallel.platform.torch.dtensor import DTensorBase
 from hyper_parallel.platform.torch.group_utils import create_sub_groups
+from hyper_parallel.platform.platform import Platform, PlatformType
+from hyper_parallel.platform.torch.function_override import override_functions
+override_functions()
 
 
+# pylint: disable=C0103
 class TorchPlatform(Platform):
     """Torch platform api"""
     Tensor = Tensor
     Parameter = Parameter
     Module = Module
     DTensorBase = DTensorBase
+    platform_type = PlatformType.PYTORCH
 
     @staticmethod
     def get_rank():
@@ -41,22 +45,35 @@ class TorchPlatform(Platform):
         return dist.get_world_size()
 
     @staticmethod
+    def get_param_local_shape(param):
+        """get param local shape"""
+        if isinstance(param, DTensorBase):
+            return param.local_shape
+        return param.shape
+
+    @staticmethod
+    def get_param_local_data(param):
+        """get param local shape"""
+        if isinstance(param, DTensorBase):
+            return param.to_local()
+        return param
+
+    @staticmethod
     def get_op_name(func):
         if hasattr(func, "__name__"):
             return func.__name__
-        elif isinstance(func, OpOverload):
+        if isinstance(func, OpOverload):
             full_name = func.name
             core_name = full_name.split("::")[-1].split(".")[0]
             return core_name
-        elif isinstance(func, OpOverloadPacket):
+        if isinstance(func, OpOverloadPacket):
             return func.name.split("::")[-1]
-        else:
-            func_str = str(func)
-            if "built-in function" in func_str:
-                return func_str.split()[-1].strip(">")
-            elif "function" in func_str:
-                return func_str.split()[1]
-            return "unknown_op"
+        func_str = str(func)
+        if "built-in function" in func_str:
+            return func_str.split()[-1].strip(">")
+        if "function" in func_str:
+            return func_str.split()[1]
+        return "unknown_op"
 
     @staticmethod
     def differentiable_all_gather_concat(data, group, concat_size, concat_dim):
@@ -104,6 +121,7 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def get_param_type_size(param):
+        # pylint: disable=W0212
         return torch._utils._element_size(param.dtype)
 
     @staticmethod
@@ -114,7 +132,7 @@ class TorchPlatform(Platform):
     def new_tensor(tensor_shape, tensor_type):
         return torch.empty(tensor_shape, tensor_type)
 
-    def _create_group(self, rank_list, group_name):
+    def _create_group(self, rank_list, group_name=None):
         group_dict = create_sub_groups(rank_list)
         return group_dict[tuple(rank_list)]
 
@@ -122,20 +140,20 @@ class TorchPlatform(Platform):
     def all_gather_into_tensor(data, group_info, async_op=False):
         output_shape = list(data.shape)
         output_shape[0] = output_shape[0] * group_info.rank_size
-        output = torch.empty(output_shape, dtype=data.dtype)
+        output = torch.empty(output_shape, dtype=data.dtype, device=data.device)
         handle = dist.all_gather_into_tensor(output, data, group=group_info.group, async_op=async_op)
         return output, handle
 
     @staticmethod
     def all_reduce(data, group_info, async_op=False):
-        handle = dist.all_reduce(data.data, group=group_info.group, async_op=async_op)
+        handle = dist.all_reduce(data, group=group_info.group, async_op=async_op)
         return data, handle
 
     @staticmethod
     def reduce_scatter_tensor(data, group_info, async_op=False):
         output_shape = list(data.shape)
         output_shape[0] = output_shape[0] // group_info.rank_size
-        output = torch.empty(output_shape, dtype=data.dtype)
+        output = torch.empty(output_shape, dtype=data.dtype, device=data.device)
         handle = dist.reduce_scatter_tensor(output, data, group=group_info.group, async_op=async_op)
         return output, handle
 

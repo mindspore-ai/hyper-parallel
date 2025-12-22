@@ -22,18 +22,20 @@ from mindspore.common.initializer import initializer
 from mindspore.communication import get_group_size
 from mindspore.communication import create_group as new_group
 from mindspore.communication import get_rank as get_rank_id
-import mindspore.communication.comm_func as comm_func
-from hyper_parallel.platform.platform import Platform
+from mindspore.communication import comm_func
+from hyper_parallel.platform.platform import Platform, PlatformType
 from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 from hyper_parallel.platform.mindspore.parameter_init import init_parameters as _init_parameters
 
 
+# pylint: disable=C0103
 class MindSporePlatform(Platform):
     """MindSpore platform api"""
     Tensor = Tensor
     Parameter = Parameter
     Module = Cell
     DTensorBase = DTensorBase
+    platform_type = PlatformType.MINDSPORE
 
     @staticmethod
     def get_rank():

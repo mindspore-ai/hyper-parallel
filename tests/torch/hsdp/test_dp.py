@@ -12,5 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"platform api"
-from hyper_parallel.platform.platform import get_platform
+"""test data parallel"""
+from tests.torch.utils import torchrun_case
+from tests.common.mark_utils import arg_mark
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_data_parallel():
+    '''
+    Feature: data parallel
+    Description: 
+    Expectation: Run success.
+    '''
+    master_port = 12345
+    case_name = "dp.py::test_data_parallel"
+    torchrun_case(master_port, case_name)

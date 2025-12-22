@@ -12,5 +12,3 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"platform api"
-from hyper_parallel.platform.platform import get_platform

@@ -36,7 +36,6 @@ def disable_dtensor_dispatch():
     _dtensor_dispatch = False
 
 def get_dtensor_dispatch():
-    global _dtensor_dispatch
     return _dtensor_dispatch
 
 
@@ -97,7 +96,8 @@ class OpDispatcher:
         self.layout_infer_ops = self.safe_load_yaml_from_dir()
         self.whitelist = ["InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv", "typeof", "DistCommIsend",
                           "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather",
-                          "DistCommReduceScatter", "requires_grad_", "item", "__get__", "register_hook"]
+                          "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__", "register_hook",
+                          "is_complex", "chunk"]
         for op_name, config in self.layout_infer_ops.items():
             class_name = config['distributed_op_class']
             module_name = "hyper_parallel.core.tensor_parallel.ops." + config['distributed_op_file']
@@ -139,7 +139,6 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
-        global platform
         func_name = platform.get_op_name(func)
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
@@ -208,7 +207,6 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
-        global platform
         func_name = platform.get_op_name(func)
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
@@ -241,7 +239,7 @@ class OpDispatcher:
 
         return DTensor.from_local(py_output, output_layout)
 
-    def _with_layout_infer_reshape(self, func: callable, *args, **kwargs) -> Tensor:
+    def _with_layout_infer_reshape(self, func: callable, *args) -> Tensor:
         """_with_layout_infer_reshape"""
         input_tensor = args[0]
         shape = args[1]
@@ -263,7 +261,6 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
-        global platform
         func_name = platform.get_op_name(func)
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
@@ -325,7 +322,6 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
-        global platform
         func_name = platform.get_op_name(func)
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
@@ -359,7 +355,7 @@ class OpDispatcher:
 
         return DTensor.from_local(py_output, output_layout)
 
-    def _with_layout_infer_slice(self, func: callable, *args, **kwargs) -> Tensor:
+    def _with_layout_infer_slice(self, func: callable, *args) -> Tensor:
         """_with_layout_infer_slice"""
         input_tensor = args[0]
         begin = args[1]
@@ -385,7 +381,6 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
-        global platform
         func_name = platform.get_op_name(func)
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
@@ -434,7 +429,6 @@ class OpDispatcher:
         :param kwargs:
         :return:
         """
-        global platform
         op_name = platform.get_op_name(op_call)
         if op_name in self.whitelist or get_dtensor_dispatch() is False:
             input_args = [arg.to_local() if isinstance(arg, DTensor) else arg for arg in args]
@@ -450,11 +444,11 @@ class OpDispatcher:
         if suffix == "WithShape":
             return self._with_layout_infer_with_shape(op_call, *args, **kwargs)
         if suffix == "Reshape":
-            return self._with_layout_infer_reshape(op_call, *args, **kwargs)
+            return self._with_layout_infer_reshape(op_call, *args)
         if suffix == "WithTupleExpand":
             return self._with_layout_infer_with_tuple_expand(op_call, *args, **kwargs)
         if suffix == "Slice":
-            return self._with_layout_infer_slice(op_call, *args, **kwargs)
+            return self._with_layout_infer_slice(op_call, *args)
         raise RuntimeError(f"Operator {op_name} specified wrong suffix in parallel yaml.")
 
 _OP_DISPATCHER = OpDispatcher()

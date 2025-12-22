@@ -13,17 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """test base dtensor"""
-import os
+from tests.torch.utils import torchrun_case
+from tests.common.mark_utils import arg_mark
 
 
-def run_case(master_port):
-    cmd = f"torchrun --nproc-per-node=8 " \
-          f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"base_dtensor.py"
-    ret = os.system(cmd)
-    assert ret == 0
-
-
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_base_dtensor():
     '''
     Feature: dtensor dispatch/infer_layout/redistribute.
@@ -31,8 +25,5 @@ def test_base_dtensor():
     Expectation: Run success.
     '''
     master_port = 11333
-    run_case(master_port)
-
-
-if __name__ == "__main__":
-    test_base_dtensor()
+    case_name = "base_dtensor.py::test_base_dtensor"
+    torchrun_case(master_port, case_name)

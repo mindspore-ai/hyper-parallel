@@ -14,7 +14,10 @@
 # ============================================================================
 """hybrid shard data parallel interface"""
 from typing import Optional, Any
-from hyper_parallel.core.hsdp.hsdp_utils import PlatformType, OptimizerLevel
+from hyper_parallel.core.hsdp.hsdp_utils import OptimizerLevel
+from hyper_parallel.platform.platform import PlatformType
+from hyper_parallel.platform import get_platform
+platform = get_platform()
 
 origin_class_to_extend_class = {}
 optimizer_level_map = {
@@ -22,7 +25,7 @@ optimizer_level_map = {
     "level2": OptimizerLevel.SHARD_OPT_GRAD,
     "level3": OptimizerLevel.SHARD_OPT_GRAD_PARAM,
 }
-current_platform = None
+
 
 class HSDPCell:
     """
@@ -31,23 +34,17 @@ class HSDPCell:
     Supported Platforms:
         ``MindSpore`` ``torch``
     """
+    # pylint: disable=C0415
     def hsdp_init(self, platform_type, cell, shard_size, threshold, optimizer_level, enable_grad_accumulation,
                   grad_scale, reduce_dtype, comm_async, comm_fusion, bucket_size):
         """init hsdp scheduler."""
         scheduler_class = None
-        self.platform_type = platform_type
-        global current_platform
-        if self.platform_type == PlatformType.MINDSPORE:
-            from hyper_parallel.platform.mindspore.platform import MindSporePlatform
+        if platform_type == PlatformType.MINDSPORE:
             from hyper_parallel.platform.mindspore.hsdp.scheduler import MindSporeHSDPScheduler
-            current_platform = MindSporePlatform()
             scheduler_class = MindSporeHSDPScheduler
         else:
-            from hyper_parallel.platform.torch.platform import TorchPlatform
             from hyper_parallel.platform.torch.hsdp.scheduler import TorchHSDPScheduler
-            current_platform = TorchPlatform()
             scheduler_class = TorchHSDPScheduler
-            
 
         self.hsdp_scheduler = scheduler_class(cell,
                                               shard_size,
@@ -117,9 +114,23 @@ def _extend_cell_with_hsdp_interface(cell):
         origin_class_to_extend_class[origin_class] = extend_class
     cell.__class__ = extend_class
 
-def _check_hsdp_input_valid(platform_type, shard_size, threshold, optimizer_level, enable_grad_accumulation, grad_scale,
-                            reduce_dtype, comm_async, comm_fusion, bucket_size):
+# pylint: disable=C0415
+def _check_cell_valid(platform_type, cell):
+    """check cell valid"""
+    if platform_type == PlatformType.MINDSPORE:
+        from mindspore.nn.cell import Cell
+        if not isinstance(cell, Cell):
+            raise ValueError(f"cell's type must be nn.cell but got {type(cell)}.")
+    else:
+        from torch.nn import Module
+        if not isinstance(cell, Module):
+            raise ValueError(f"cell's type must be nn.Module but got {type(cell)}.")
+
+# pylint: disable=C0415
+def _check_hsdp_input_valid(platform_type, cell, shard_size, threshold, optimizer_level, enable_grad_accumulation,
+                            grad_scale, reduce_dtype, comm_async, comm_fusion, bucket_size):
     """check hsdp input valid"""
+    _check_cell_valid(platform_type, cell)
     if not isinstance(shard_size, int) or (shard_size <= 0 and shard_size != -1):
         raise ValueError(f"shard_size must be a positive integer, but got {shard_size}.")
     if not isinstance(threshold, int) or threshold < 0:
@@ -212,19 +223,11 @@ def hsdp(
             ValueError: If `comm_fusion` is not bool.
             ValueError: If the `bucket_size` is not a positive integer or -1.
         """
-    platform_type = PlatformType.MINDSPORE
-    try:
-        from mindspore.nn.cell import Cell
-        if not isinstance(cell, Cell):
-            raise ValueError(f"cell's type must be nn.Module but got {type(cell)}.")
-    except ImportError:
-        from torch.nn import Module as Cell
-        platform_type = PlatformType.PYTORCH
-        if not isinstance(cell, Cell):
-            raise ValueError(f"cell's type must be nn.Module but got {type(cell)}.")
+    platform_type = platform.platform_type
 
     _check_hsdp_input_valid(
         platform_type,
+        cell,
         shard_size,
         threshold,
         optimizer_level,
@@ -254,7 +257,6 @@ def hsdp(
 
 def hsdp_wait_grad_handle():
     """wait for hsdp gradient handle to be completed"""
-    global current_platform
-    if current_platform is None:
+    if platform is None:
         return
-    current_platform.wait_grad_handle()
+    platform.wait_grad_handle()

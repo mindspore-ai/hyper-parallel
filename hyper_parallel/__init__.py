@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 "hyper parallel interface"
-from hyper_parallel.platform import set_platform, get_platform
+from hyper_parallel.platform import get_platform
 from hyper_parallel.core.hsdp.hsdp_api import hsdp, hsdp_wait_grad_handle, HSDPCell
 from hyper_parallel.core.layout import Layout
 from hyper_parallel.core.dtensor import DTensor, SkipDTensorDispatch
@@ -23,5 +23,5 @@ from hyper_parallel.core.tensor_parallel.shard import parallelize_value_and_grad
 from hyper_parallel.core.tensor_parallel.local_func import custom_shard
 
 
-__all__ = ["set_platform", "get_platform", "hsdp", "hsdp_wait_grad_handle", "HSDPCell", "Layout", "DTensor",
+__all__ = ["get_platform", "hsdp", "hsdp_wait_grad_handle", "HSDPCell", "Layout", "DTensor",
            "init_parameters", "shard", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch"]

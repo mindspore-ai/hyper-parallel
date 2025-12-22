@@ -18,7 +18,7 @@ from mindspore import ops
 from mindspore.common.tensor import Tensor
 from hyper_parallel.core.hsdp.hsdp_utils import OptimizerLevel
 from hyper_parallel.core.hsdp.hsdp_scheduler import HSDPScheduler
-from hyper_parallel.platform.mindspore.platform import MindSporePlatform
+from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.mindspore.platform_graph import MindSporeGraphPlatform
 from hyper_parallel.platform.mindspore.hsdp.state import MindSporeHSDPState
 from hyper_parallel.platform.mindspore.hsdp.grad_hook import MindSporeHSDPGradHook
@@ -31,7 +31,7 @@ class MindSporeHSDPScheduler(HSDPScheduler):
     def _init_platform(self):
         """init platform"""
         if self.config.use_eager_hook:
-            self.platform = MindSporePlatform()
+            self.platform = get_platform()
         else:
             self.platform = MindSporeGraphPlatform()
 
@@ -57,14 +57,14 @@ class MindSporeHSDPScheduler(HSDPScheduler):
         """get param forward hook."""
 
         def stateless_param_forward_hook(origin_param):
-            output, _ = self.platform.all_gather_into_tensor(origin_param, group=hsdp_param.sharded_group_info)
+            output, _ = self.platform.all_gather_into_tensor(origin_param, hsdp_param.sharded_group_info)
             return output
 
         def stateful_param_forward_hook(origin_param):
             if hsdp_param.unsharded_param_available:
                 return hsdp_param.unsharded_param
 
-            unshared_data, _ = self.platform.all_gather_into_tensor(origin_param, group=hsdp_param.sharded_group_info)
+            unshared_data, _ = self.platform.all_gather_into_tensor(origin_param, hsdp_param.sharded_group_info)
             ops.assign(hsdp_param.unsharded_param, unshared_data)
             ops.assign(hsdp_param.unsharded_param_available, Tensor(True))
             return hsdp_param.unsharded_param

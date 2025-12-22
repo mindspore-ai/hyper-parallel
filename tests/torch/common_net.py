@@ -12,19 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""HSDP scheduler"""
-from hyper_parallel.core.hsdp.hsdp_scheduler import HSDPScheduler
-from hyper_parallel.platform.torch.hsdp.state import TorchHSDPState
-from hyper_parallel.platform import get_platform
+"""common net"""
+import torch
+from torch import nn
 
 
-class TorchHSDPScheduler(HSDPScheduler):
-    """TorchHSDPScheduler is used to implement optimizer level."""
+class SimpleModel(nn.Module):
+    """simple model"""
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(8, 8).npu())
 
-    def _init_platform(self):
-        """init platform"""
-        self.platform = get_platform()
-
-    def _new_cell_state(self):
-        """new cell state"""
-        self.hsdp_state = TorchHSDPState(self.cell, self.config, self.platform)
+    def forward(self, x):
+        x = torch.matmul(x, self.weight)
+        x = torch.relu(x)
+        x = torch.sum(x)
+        return x

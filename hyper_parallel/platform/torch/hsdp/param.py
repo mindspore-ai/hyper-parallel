@@ -22,31 +22,21 @@ class TorchHSDPParam(HSDPParam):
     """
     Torch HSDP parameter.
     """
-    def _init_rank_info(self):
-        """init parameter rank info"""
-        self.rank_id = dist.get_rank()
-        self.rank_size = dist.get_world_size()
-        self.hsdp_rank = self.rank_id
-        self.local_rank = self.rank_id
-        self.tp_rank = 0
-
     def _init_sharded_param(self):
         """add and init sharded param"""
         slice_index = self.hsdp_rank % self.shard_size
-        param_slice = torch.trunk(self.param, self.shard_size, 0)[slice_index]
-        self.param.data = param_slice
+        local_param = self.platform.get_param_local_data(self.param)
+        param_slice = torch.chunk(local_param, self.shard_size, 0)[slice_index]
+        self.platform.update_param_data(self.param, param_slice)
         self.sharded_param = param_slice
 
     def _init_unsharded_param(self):
         """add and init unshared param"""
-        self.unsharded_param = torch.empty(self.param_shape, dtype=self.param.dtype)
+        self.unsharded_param = torch.empty(self.param_shape, dtype=self.param.dtype, device=self.param.device)
 
-    def _update_param_data(self, param, data):
-        """update param data"""
-        param.data = data
-
-    def _get_unsharded_param_data(self, comm_async):
+    def _get_unsharded_param_data(self, async_op):
         """get unsharded param data with async comm"""
-        handle = dist.all_gather_into_tensor(self.unsharded_param, self.param, group=self.sharded_group,
-                                             async_op=comm_async)
+        local_param = self.platform.get_param_local_data(self.param)
+        handle = dist.all_gather_into_tensor(self.unsharded_param, local_param, group=self.sharded_group_info.group,
+                                             async_op=async_op)
         return self.unsharded_param, handle
