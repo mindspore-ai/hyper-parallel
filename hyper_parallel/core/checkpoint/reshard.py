@@ -177,6 +177,8 @@ def infer_slice_area_by_rank(
             coef *= _get_dev_num_along_dim(dim)
 
         # Calculate start/end indices for this slice
+        if full_shape[axis] % split_num != 0:
+            raise ValueError(f"Shape can not divided along dimension {axis} by {split_num} dev.")
         slice_size = full_shape[axis] // split_num
         start = slice_id * slice_size
         end = start + slice_size
@@ -246,6 +248,8 @@ class ReshardHandler:
             self.to_tensor_map = to_layout_dict["tensor_map"]
             self.to_rank_list = to_layout_dict["rank_list"]
             self.to_rank_id = to_rank_id
+            if self.to_rank_id not in self.to_rank_list:
+                raise ValueError("Input to_rank_id is not in to_rank_list.")
 
         # Calculate device counts and internal rank mappings
         self.from_dev_num = len(self.from_rank_list)
@@ -267,10 +271,10 @@ class ReshardHandler:
             List of ranks with unique data slices
         """
         inner_deredundancy_rank_list: List[int] = []
-        from_dev_map = set()
         dev_dim = len(self.from_dev_matrix)
 
         # Collect relevant device dimensions from tensor map
+        from_dev_map = set()
         for map_dev in self.from_tensor_map:
             if isinstance(map_dev, (list, tuple)):
                 for map_dev_inner in map_dev:
@@ -279,14 +283,21 @@ class ReshardHandler:
                 from_dev_map.add(dev_dim - map_dev - 1)
 
         # Filter ranks with non-redundant data
+        unused_dims = [dim for dim in range(dev_dim) if dim not in from_dev_map]
+        if not unused_dims:
+            return list(self.inner_from_rank_list)
         for rank_id in self.inner_from_rank_list:
             dev_id_list = rank_id_to_dev_id_list(self.from_dev_matrix, rank_id)
-            if any([
-                    dim not in from_dev_map and dev_id_list[dim] > 0
-                    for dim in range(dev_dim)
-            ]):
-                continue
-            inner_deredundancy_rank_list.append(rank_id)
+            # check redundant
+            found_redundant = False
+            for dim in unused_dims:
+                if dev_id_list[dim] > 0:
+                    found_redundant = True
+                    break
+
+            # save not redundant rank
+            if not found_redundant:
+                inner_deredundancy_rank_list.append(rank_id)
 
         return inner_deredundancy_rank_list
 
