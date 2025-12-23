@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Test ReshardingTensor"""
+"""Test Resharding"""
 import operator
 from functools import reduce
 import pytest
 import numpy as np
 
-from mindspore import Tensor
 from mindspore.parallel import Layout
 
 from hyper_parallel.core.checkpoint.reshard import ReshardHandler
@@ -43,15 +42,14 @@ def reshard_tensor_func(param_name, full_shape, from_layout, to_layout, to_rank_
     full_data = np.array(range(ele_num), np.int32).reshape(full_shape)
     from_tensor_map = {}
     for rank, offset in all_offset.items():
-        from_tensor_map[rank] = Tensor(get_slice_data(full_data, offset))
+        from_tensor_map[rank] = get_slice_data(full_data, offset)
 
     # Transfer and verify
     actual_result = reshard.get_real_tensor(from_tensor_map)
-    to_layout_dict = to_layout.to_dict()
     to_offset = infer_slice_area_by_rank(
-        to_layout_dict['device_matrix'],
-        to_layout_dict['tensor_map'],
-        to_layout_dict['rank_list'].index(to_rank_id),
+        reshard.to_dev_matrix,
+        reshard.to_tensor_map,
+        reshard.to_rank_list.index(reshard.to_rank_id),
         full_shape
     )
     expect_result = get_slice_data(full_data, to_offset)
@@ -61,9 +59,90 @@ def reshard_tensor_func(param_name, full_shape, from_layout, to_layout, to_rank_
 @pytest.mark.level0
 @pytest.mark.platform_x86_cpu
 @pytest.mark.env_onecard
+def test_reshard_between_layout_and_none_layout():
+    """
+    Feature: Resharding between a normal layout and a none layout.
+    Description: Test reshard between a normal layout and a none layout.
+    Expectation: The reshard_tensor_func executes successfully without throwing exceptions,
+                 completing bidirectional tensor resharding between a normal layout and a none layout.
+    """
+    param_name = "weight"
+    full_shape = (64, 64)
+
+    layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)))
+    layout = layout(('rep', 'cp'), 'tp')
+
+    rank_id = 19
+    reshard_tensor_func(param_name, full_shape, layout, None, 0)
+    reshard_tensor_func(param_name, full_shape, None, layout, rank_id)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_wrong_to_rank_id_while_to_layout_not_none():
+    """
+    Feature: Resharding when to_layout is normal, but to_rank_id is not in to_rank_list.
+    Description: Test reshard when to_rank_id is wrong and layout not none.
+    Expectation: A ValueError exception is raised when calling ReshardHandler()
+                 with to_layout is normal, but to_rank_id is not in to_rank_list.
+    """
+    param_name = "weight"
+    full_shape = (64, 64)
+
+    layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)))
+    layout = layout(('rep', 'cp'), 'tp')
+
+    rank_id = 32
+    with pytest.raises(ValueError, match=r'to_rank_id is not in to_rank_list.'):
+        ReshardHandler(param_name, full_shape, None, layout, rank_id)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_wrong_to_rank_id_while_to_layout_is_none():
+    """
+    Feature: Resharding between a normal layout and a none layout, to_layout is none and to_rank_id is not 0.
+    Description: Test reshard when to_rank_id is wrong and layout is none.
+    Expectation: The reshard_tensor_func executes successfully without throwing exceptions,
+                 completing bidirectional tensor resharding between the fully sharded layout and none layout.
+    """
+    param_name = "weight"
+    full_shape = (64, 64)
+
+    layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)))
+    layout = layout(('rep', 'cp'), 'tp')
+
+    reshard_tensor_func(param_name, full_shape, layout, None, 2)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
+def test_shape_not_even_divided_by_dev_matrix():
+    """
+    Feature: Resharding when dev can not divide tensor shape.
+    Description: Test reshard shape when dev can not divide tensor shape.
+    Expectation: A ValueError exception is raised when calling reshard_tensor_func()
+                 with message Shape can not divide.
+    """
+    param_name = "weight"
+    full_shape = (64, 65)
+
+    layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)))
+    layout = layout(('rep', 'cp'), 'tp')
+
+    with pytest.raises(ValueError, match=r'Shape can not divided'):
+        reshard_tensor_func(param_name, full_shape, layout, None, 0)
+
+
+@pytest.mark.level0
+@pytest.mark.platform_x86_cpu
+@pytest.mark.env_onecard
 def test_reshard_between_fully_shard():
     """
-    Feature: Tensor resharding between fully sharded modes.
+    Feature: Resharding between fully sharded modes.
     Description: Test bidirectional tensor resharding between two different fully sharded layouts.
     Expectation: The reshard_tensor_func executes successfully without throwing exceptions,
                  completing bidirectional tensor resharding between the two fully sharded layouts.
@@ -88,7 +167,7 @@ def test_reshard_between_fully_shard():
 @pytest.mark.env_onecard
 def test_reshard_between_fully_shard_and_not_shard():
     """
-    Feature: Tensor resharding between fully sharded and non-sharded modes.
+    Feature: Resharding between fully sharded and non-sharded modes.
     Description: Test bidirectional tensor resharding between a fully sharded layout and a non-sharded layout.
     Expectation: The reshard_tensor_func executes successfully without throwing exceptions,
                  completing bidirectional tensor resharding between the fully sharded and non-sharded layouts.
@@ -113,7 +192,7 @@ def test_reshard_between_fully_shard_and_not_shard():
 @pytest.mark.env_onecard
 def test_reshard_between_not_fully_shard():
     """
-    Feature: Tensor resharding between non-fully sharded modes.
+    Feature: Resharding between non-fully sharded modes.
     Description: Test bidirectional tensor resharding between two different non-fully sharded layouts.
     Expectation: The reshard_tensor_func executes successfully without throwing exceptions,
                  completing bidirectional tensor resharding between the two non-fully sharded layouts.
@@ -164,7 +243,7 @@ def test_from_tensor_map_missing_rank():
     pop_rank = 0
     for rank, offset in all_offset.items():
         pop_rank = rank
-        from_tensor_map[rank] = Tensor(get_slice_data(full_data, offset))
+        from_tensor_map[rank] = get_slice_data(full_data, offset)
     from_tensor_map.pop(pop_rank)
     with pytest.raises(ValueError):
         reshard.get_real_tensor(from_tensor_map)
@@ -201,9 +280,9 @@ def test_from_tensor_map_has_unexpected_data():
     modify_rank = 0
     for rank, offset in all_offset.items():
         modify_rank = rank
-        from_tensor_map[rank] = Tensor(get_slice_data(full_data, offset))
+        from_tensor_map[rank] = get_slice_data(full_data, offset)
     modify_shape = from_tensor_map[modify_rank].shape
     modify_shape = modify_shape[:-1] + (modify_shape[-1] + 2,)
-    from_tensor_map[modify_rank] = Tensor(np.zeros(modify_shape, full_data.dtype))
+    from_tensor_map[modify_rank] = np.zeros(modify_shape, full_data.dtype)
     with pytest.raises(ValueError):
         reshard.get_real_tensor(from_tensor_map)
