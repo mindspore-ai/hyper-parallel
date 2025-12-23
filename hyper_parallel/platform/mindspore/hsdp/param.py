@@ -17,6 +17,7 @@ from mindspore import ops
 from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
 from mindspore.common.initializer import initializer
+from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.core.hsdp.hsdp_param import HSDPParam
 
 
