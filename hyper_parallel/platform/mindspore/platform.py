@@ -89,7 +89,7 @@ class MindSporePlatform(Platform):
     def init_parameters(module, stage_index):
         return _init_parameters(module, stage_index)
 
-    #pylint: disable=W0212
+    # pylint: disable=W0212
     @staticmethod
     def update_param_data(param, data):
         """update param data"""
@@ -97,6 +97,95 @@ class MindSporePlatform(Platform):
             param.set_data(data)
         else:
             param._update_data(data)
+
+    @staticmethod
+    def get_cell_construct(cell):
+        return cell.construct
+
+    @staticmethod
+    def get_cells_and_names(cell):
+        return cell.cells_and_names()
+
+    @staticmethod
+    def search_parameter_by_name(cell, param_name: str):
+        """
+        Find the parent Module of the parameter, the parameter's name in the parent Module, and the parameter.
+        Return value: (parent Module instance, parameter's name in parent Module, parameter object).
+        Returns None if not found.
+        """
+        # Remove the "self." prefix from param_name (to maintain compatibility with original logic)
+        param_name = param_name.replace("self.", "")
+        # Case 1: The parameter is a direct parameter of the current Module (not in any sub-Module)
+        if param_name in cell._params:
+            return (cell, param_name, cell._params[param_name])
+
+        # Case 2: The parameter is in a sub-Module (supports multi-level nesting, e.g., "net_b.dense1.weight")
+        if "." in param_name:
+            # Split into: sub-Module path + parameter name (e.g., "net_b.dense1" + "weight")
+            cell_path, param_key = param_name.rsplit(".", 1)
+            try:
+                # Locate the sub-Module where the parameter resides (supports multi-level paths)
+                target_cell = cell.get_sub_cell(cell_path)
+                # Check if the sub-Module directly contains this parameter
+                if param_key in target_cell._params:
+                    return target_cell, param_key, target_cell._params[param_key]
+            except AttributeError:
+                # Sub-Module path does not exist or the parameter is not in that sub-Module
+                pass
+
+        # Traverse all sub-Modules (recursively) to search for the parameter
+        for _, child_cell in cell._cells.items():
+            if isinstance(child_cell, Cell):
+                # Recursively search within the sub-Module
+                result = MindSporePlatform.search_parameter_by_name(child_cell, param_name)
+                if result is not None:
+                    return result
+
+        return None
+
+    @staticmethod
+    def update_parameter_by_name(cell, result: tuple, new_param) -> bool:
+        """
+        Modify the original parameter in a Module or sub-Module using the search result
+        Args:
+            cell: The cell which parameter is to update
+            result: A tuple contains parent Module, parameter key and old parameter.
+            new_param: New Parameter object (used to replace the original parameter)
+        """
+        parent_cell, param_key, _ = result
+        # Key operation: directly modify the _params dictionary of the parent Module (original storage location)
+        parent_cell._params[param_key] = new_param
+
+        if param_key in parent_cell.__dict__:
+            parent_cell.__dict__[param_key] = new_param
+        parent_cell._params_list[param_key] = new_param
+        return True
+
+    @staticmethod
+    def set_layout_into_parameter(param, layout):
+        """Set layout in to parameter"""
+        from hyper_parallel.core.dtensor import DTensor  # pylint: disable=import-outside-toplevel
+        from hyper_parallel.core.layout import _infer_slice_shape_by_layout, \
+            _get_slice_tensor_by_layout  # pylint: disable=import-outside-toplevel
+        if isinstance(param, DTensor):
+            raise ValueError(f"Parameter {param.name} has been configured layout, cannot be set repeatedly.")
+        param_info = param.param_info
+        requires_grad = param.requires_grad
+        name = param.name
+        slice_shape = _infer_slice_shape_by_layout(param.shape, layout)
+
+        if not param.has_init:
+            # has been init, get slice data
+            param_dtensor = DTensor.from_local(_get_slice_tensor_by_layout(param, layout).value(), layout)
+            param = Parameter(param_dtensor, name=name, requires_grad=requires_grad)
+            param.param_info = param_info
+        else:
+            # has not been init, need to modify init shape
+            param.init_mode.shape = slice_shape
+            param_dtensor = DTensor.from_local(param.init_mode, layout)
+            param = Parameter(param_dtensor, name=name, requires_grad=requires_grad)
+            param.param_info = param_info
+        return param
 
     @staticmethod
     def get_param_local_shape(param):
