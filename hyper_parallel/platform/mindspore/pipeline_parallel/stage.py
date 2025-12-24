@@ -19,6 +19,7 @@ from mindspore import ops, mint, Parameter
 from mindspore.mint.distributed import isend, irecv, get_global_rank, broadcast, all_reduce
 from mindspore.communication.management import create_group, get_group_size, get_rank
 from hyper_parallel.core.hsdp import HSDPCell
+from hyper_parallel.core.dtensor import DTensor
 from ._utils import _RecvInfo, send_object, recv_object  # pylint: disable = E0402
 
 
@@ -391,7 +392,7 @@ class PipelineStage(ABC):
         """construct forward recv info."""
         shape = self._communicate_shape(global_rank, idx)
         layout, dtype = self._communicate_layout(global_rank, idx)
-        dtensor = ms.parallel.DTensor.from_local(mint.empty(shape, dtype=dtype), layout)
+        dtensor = DTensor.from_local(mint.empty(shape, dtype=dtype), layout)
         if micro_index in self.args_recv_info:
             recv_info = self.args_recv_info[micro_index][idx]
             recv_info.buffer = dtensor
