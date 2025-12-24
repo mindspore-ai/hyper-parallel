@@ -42,6 +42,7 @@ def get_platform():
         platform = TorchPlatform()
         return platform
 
+
 EXISTING_COMM_GROUPS = {}
 
 
@@ -98,6 +99,26 @@ class Platform:
     @staticmethod
     def register_forward_hook(cell, hook):
         return cell.register_forward_hook(hook)
+
+    @staticmethod
+    def get_cell_construct(cell):
+        raise NotImplementedError("Platform subclasses must implement get_cell_construct")
+
+    @staticmethod
+    def get_cells_and_names(cell):
+        raise NotImplementedError("Platform subclasses must implement get_cells_and_names")
+
+    @staticmethod
+    def search_parameter_by_name(cell, param_name: str):
+        raise NotImplementedError("Platform subclasses must implement search_parameter_by_name")
+
+    @staticmethod
+    def update_parameter_by_name(cell, result: tuple, new_param) -> bool:
+        raise NotImplementedError("Platform subclasses must implement update_parameter_by_name")
+
+    @staticmethod
+    def set_layout_into_parameter(param, layout):
+        raise NotImplementedError("Platform subclasses must implement set_layout_into_parameter")
 
     @staticmethod
     def register_backward_pre_hook(cell, hook):

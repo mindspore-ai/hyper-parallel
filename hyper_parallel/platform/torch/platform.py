@@ -24,6 +24,7 @@ from hyper_parallel.platform.torch.dtensor import DTensorBase
 from hyper_parallel.platform.torch.group_utils import create_sub_groups
 from hyper_parallel.platform.platform import Platform, PlatformType
 from hyper_parallel.platform.torch.function_override import override_functions
+
 override_functions()
 
 
@@ -97,6 +98,73 @@ class TorchPlatform(Platform):
     @staticmethod
     def differentiable_all_reduce(data, op, group):
         return dist_func.all_reduce(data, group=group)
+
+    @staticmethod
+    def get_cell_construct(cell):
+        return cell.forward
+
+    @staticmethod
+    def get_cells_and_names(cell):
+        return cell.named_modules()
+
+    @staticmethod
+    def search_parameter_by_name(cell, param_name: str):
+        """
+        Find the parent Module of the parameter, the parameter's name in the parent Module, and the parameter.
+        Return value: (parent Module instance, parameter's name in parent Module, parameter object).
+        Returns None if not found.
+        """
+        # Remove the "self." prefix from param_name
+        param_name = param_name.replace("self.", "")
+        # Case 1: The parameter is a direct parameter of the current Module
+        if param_name in cell._parameters:  # pylint:disable=protected-access
+            return (cell, param_name, cell._parameters[param_name])  # pylint:disable=protected-access
+
+        # Case 2: The parameter is in a sub-Module
+        if "." in param_name:
+            cell_path, param_key = param_name.rsplit(".", 1)
+            try:
+                # Locate the sub-Module where the parameter resides (supports multi-level paths)
+                target_cell = cell.get_submodule(cell_path)
+                # Check if the sub-Module directly contains this parameter
+                if param_key in target_cell._parameters:  # pylint:disable=protected-access
+                    return target_cell, param_key, target_cell._parameters[param_key]  # pylint:disable=protected-access
+            except AttributeError:
+                pass
+
+        # Traverse all sub-Modules (recursively) to search for the parameter
+        for _, child_cell in cell.named_children():
+            if isinstance(child_cell, Module):
+                result = TorchPlatform.search_parameter_by_name(child_cell, param_name)
+                if result is not None:
+                    return result
+
+        return None
+
+    @staticmethod
+    def update_parameter_by_name(cell, result: tuple, new_param) -> bool:
+        """
+        Modify the original parameter in a Module or sub-Module using the search result
+        """
+        parent_cell, param_key, _ = result
+        # Key operation: directly modify the _parameters dictionary.
+        if param_key in parent_cell._parameters:  # pylint:disable=protected-access
+            parent_cell._parameters[param_key] = new_param  # pylint:disable=protected-access
+        else:
+            parent_cell.register_parameter(param_key, new_param)
+        return True
+
+    @staticmethod
+    def set_layout_into_parameter(param, layout):
+        """Set layout in to parameter"""
+        from hyper_parallel.core.dtensor import DTensor  # pylint: disable=import-outside-toplevel
+        from hyper_parallel.core.layout import _get_slice_tensor_by_layout  # pylint: disable=import-outside-toplevel
+        if isinstance(param, DTensor):
+            raise ValueError(f"Parameter {param} has been configured layout, cannot be set repeatedly.")
+        requires_grad = param.requires_grad
+        param_dtensor = DTensor.from_local(_get_slice_tensor_by_layout(param, layout), layout)
+        new_param = Parameter(param_dtensor, requires_grad=requires_grad)
+        return new_param
 
     @staticmethod
     def differentiable_reduce_scatter(data, dev_num, axis, op, group):
