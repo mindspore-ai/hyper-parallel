@@ -22,7 +22,7 @@ from .parallel_ops import DistributedOp
 class SplitWithSizeDistributedOp(DistributedOp):
     """Distributed implementation for TopK operator."""
 
-    def infer_layout(self, input_layouts, extra_args):
+    def infer_layout(self, layouts, extra_args):
         """
         Infer output layouts for Split operator.
 
@@ -30,14 +30,14 @@ class SplitWithSizeDistributedOp(DistributedOp):
         1. Shared axis can not be split.
 
         Args:
-            input_layouts (Layout): Layout of input tensor
+            layouts (Layout): Layout of input tensor
             extra_args (list): split size or sections, axis, input shape
 
         Returns:
             tuple: Layouts for output tensors
         """
 
-        input_layout = input_layouts[0]
+        input_layout = layouts[0]
         axis = extra_args[1]
         # Check shared axis can not be split.
         tensor_map = input_layout.tensor_map
@@ -53,7 +53,7 @@ class SplitWithSizeDistributedOp(DistributedOp):
 class SplitWithSizeViewDistributedOp(DistributedOp):
     """Distributed implementation for TopK operator."""
 
-    def infer_layout(self, input_layouts, extra_args):
+    def infer_layout(self, layouts, extra_args):
         """
         Infer output layouts for SplitWithSizeView operator.
 
@@ -61,14 +61,14 @@ class SplitWithSizeViewDistributedOp(DistributedOp):
         1. Shared axis can not be split.
 
         Args:
-            input_layouts (Layout): Layout of input tensor
+            layouts (Layout): Layout of input tensor
             extra_args (list): split size or sections, axis, input shape
 
         Returns:
             tuple: Layouts for output tensors
         """
 
-        input_layout = input_layouts[0]
+        input_layout = layouts[0]
         axis = extra_args[1]
         # Check shared axis can not be split.
         tensor_map = input_layout.tensor_map
@@ -84,7 +84,7 @@ class SplitWithSizeViewDistributedOp(DistributedOp):
 class SplitDistributedOp(DistributedOp):
     """Distributed implementation for TopK operator."""
 
-    def infer_layout(self, input_layouts, extra_args):
+    def infer_layout(self, layouts, extra_args):
         """
         Infer output layouts for Split operator.
 
@@ -92,14 +92,14 @@ class SplitDistributedOp(DistributedOp):
         1. Shared axis can not be split.
 
         Args:
-            input_layouts (Layout): Layout of input tensor
+            layouts (Layout): Layout of input tensor
             extra_args (list): split size or sections, axis, input shape
 
         Returns:
             tuple: Layouts for output tensors
         """
 
-        input_layout = input_layouts[0]
+        input_layout = layouts[0]
         axis = extra_args[0]
         # Check shared axis can not be split.
         tensor_map = input_layout.tensor_map
@@ -114,7 +114,7 @@ class SplitDistributedOp(DistributedOp):
 class SplitTensorDistributedOp(DistributedOp):
     """Distributed implementation for TopK operator."""
 
-    def infer_layout(self, input_layouts, extra_args):
+    def infer_layout(self, layouts, extra_args):
         """
         Infer output layouts for Split operator.
 
@@ -122,14 +122,14 @@ class SplitTensorDistributedOp(DistributedOp):
         1. Shared axis can not be split.
 
         Args:
-            input_layouts (Layout): Layout of input tensor
+            layouts (Layout): Layout of input tensor
             extra_args (list): split size or sections, axis, input shape
 
         Returns:
             tuple: Layouts for output tensors
         """
 
-        input_layout = input_layouts[0]
+        input_layout = layouts[0]
         axis = extra_args[1]
         # Check shared axis can not be split.
         tensor_map = input_layout.tensor_map
@@ -149,7 +149,7 @@ class SplitTensorDistributedOp(DistributedOp):
 class SplitTensorViewDistributedOp(DistributedOp):
     """Distributed implementation for SplitTensorView operator."""
 
-    def infer_layout(self, input_layouts, extra_args):
+    def infer_layout(self, layouts, extra_args):
         """
         Infer output layouts for SplitTensorView operator.
 
@@ -157,14 +157,14 @@ class SplitTensorViewDistributedOp(DistributedOp):
         1. Shared axis can not be split.
 
         Args:
-            input_layouts (Layout): Layout of input tensor
+            layouts (Layout): Layout of input tensor
             extra_args (list): split size or sections, axis, input shape
 
         Returns:
             tuple: Layouts for output tensors
         """
 
-        input_layout = input_layouts[0]
+        input_layout = layouts[0]
         axis = extra_args[1]
         # Check shared axis can not be split.
         tensor_map = input_layout.tensor_map

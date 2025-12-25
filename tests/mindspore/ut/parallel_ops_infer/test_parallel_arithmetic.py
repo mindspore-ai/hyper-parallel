@@ -23,15 +23,15 @@ def test_add_layout_hybrid_parallel():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
     op = ArithmeticDistributedOp("Add")
 
     # Data Parallel (DP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "mp")
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout("dp", "mp")
 
     output_layout = op.infer_layout((x_layout, w_layout), ())
@@ -48,15 +48,15 @@ def test_add_layout_broadcast():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
     op = ArithmeticDistributedOp("Add")
 
     # Data Parallel (DP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "mp")
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout("dp", "None")
     output_layout = op.infer_layout((x_layout, w_layout), ())
     print(output_layout.alias_tensor_map)
@@ -72,15 +72,15 @@ def test_mul_layout_broadcast():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
     op = ArithmeticDistributedOp("Mul")
 
     # Data Parallel (DP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "mp")
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout("dp", "None")
     output_layout = op.infer_layout((x_layout, w_layout), ())
     print(output_layout.alias_tensor_map)
@@ -96,15 +96,15 @@ def test_sub_layout_broadcast():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
     op = ArithmeticDistributedOp("Sub")
 
     # Data Parallel (DP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "mp")
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout("dp", "None")
     output_layout = op.infer_layout((x_layout, w_layout), ())
     print(output_layout.alias_tensor_map)
@@ -120,15 +120,15 @@ def test_div_layout_broadcast():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
     op = ArithmeticDistributedOp("Div")
 
     # Data Parallel (DP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "mp")
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout("dp", "None")
     output_layout = op.infer_layout((x_layout, w_layout), ())
     print(output_layout.alias_tensor_map)
@@ -144,15 +144,15 @@ def test_tuple_layout_broadcast():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 2, 2)
+    base_mesh_shape = (2, 2, 2)
     base_alias_name = ("dp", "mp", "cp")
     base_rank_list = list(range(8))
     op = ArithmeticDistributedOp("Add")
 
     # Data Parallel (DP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout(("dp", "mp"), "cp")
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout(("dp", "mp"), "None")
     output_layout = op.infer_layout((x_layout, w_layout), ())
     print(output_layout.alias_tensor_map)
@@ -168,16 +168,16 @@ def test_multislice_layout_broadcast():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 1, 4)
+    base_mesh_shape = (2, 1, 4)
     base_alias_name = ("dp", "cp", "tp")
     base_rank_list = list(range(8))
     op = ArithmeticDistributedOp("Add")
 
     # Data Parallel (DP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("cp", "dp", "None")
     print("x_layout", x_layout)
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout(('cp', 'tp'), "dp", "None")
     print("w_layout", w_layout)
     with pytest.raises(ValueError):

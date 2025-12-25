@@ -71,7 +71,7 @@ class IndexSelectDistributedOp(DistributedOp):
         )
         output_layout = i_layout
         output_layout = Layout(
-            device_matrix=output_layout.device_matrix,
+            mesh_shape=output_layout.mesh_shape,
             alias_name=output_layout.alias_name,
             rank_list=output_layout.rank_list,
         )
@@ -128,7 +128,7 @@ class GatherDistributedOp(DistributedOp):
         output_tensor_map = i_tensor_map
         output_layout = i_layout
         output_layout = Layout(
-            device_matrix=output_layout.device_matrix,
+            mesh_shape=output_layout.mesh_shape,
             alias_name=output_layout.alias_name,
             rank_list=output_layout.rank_list,
         )

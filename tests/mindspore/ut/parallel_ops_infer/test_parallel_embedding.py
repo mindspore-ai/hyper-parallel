@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ============================================================================
+"""parallel_embedding test"""
 
 import pytest
 from hyper_parallel import Layout
@@ -25,14 +27,14 @@ def test_embedding_layout_parallel_1():
     Description: Parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("a", "b")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("None", "None")
 
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout("a", "b")
 
     with pytest.raises(ValueError):
@@ -62,14 +64,14 @@ def test_embedding_layout_parallel_2():
     Description: Parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (1, 8)
+    base_mesh_shape = (1, 8)
     base_alias_name = ("a", "b")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("None", "None")
 
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout("None", "b")
 
     output_layout = op.infer_layout(

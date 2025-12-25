@@ -25,12 +25,12 @@ def test_slice_layout_1():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
     # Data Parallel (DP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None")
 
     output_info = op.infer_layout((x_layout,), ((0, 0), (8, 4), (8, 8)))
@@ -45,12 +45,12 @@ def test_slice_layout_2():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
     # Data Parallel (DP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None")
 
     with pytest.raises(ValueError):

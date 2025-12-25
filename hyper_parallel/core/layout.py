@@ -23,22 +23,22 @@ platform = get_platform()
 
 _group_map = {}
 
-def _infer_slice_area_by_rank(dev_matrix, tensor_map, rank_id: int, full_shape: tuple): # -> tuple[tuple[int]]:
+def _infer_slice_area_by_rank(mesh_shape, tensor_map, rank_id: int, full_shape: tuple): # -> tuple[tuple[int]]:
     """Return the range of each axis from full tensor for slice in current rank."""
-    def _get_dev_num_alone_dim(dev_matrix, dim):
+    def _get_dev_num_alone_dim(mesh_shape, dim):
         """_get_dev_num_alone_dim."""
-        return dev_matrix[-dim - 1] if dim != -1 else 1
+        return mesh_shape[-dim - 1] if dim != -1 else 1
 
-    def _rank_id_to_dev_id_list(dev_matrix, rank_id):
-        """Infer dev id list by rank_id and dev_matrix"""
-        dims = len(dev_matrix)
+    def _rank_id_to_dev_id_list(mesh_shape, rank_id):
+        """Infer dev id list by rank_id and mesh_shape"""
+        dims = len(mesh_shape)
         dev_id_list = [0] * dims
         for i in range(dims - 1, -1, -1):
-            dev_id_list[i] = rank_id % dev_matrix[i]
-            rank_id = rank_id // dev_matrix[i]
+            dev_id_list[i] = rank_id % mesh_shape[i]
+            rank_id = rank_id // mesh_shape[i]
         return dev_id_list
 
-    dev_id_list = _rank_id_to_dev_id_list(dev_matrix, rank_id)
+    dev_id_list = _rank_id_to_dev_id_list(mesh_shape, rank_id)
 
     dims = len(full_shape)
     area = []
@@ -48,7 +48,7 @@ def _infer_slice_area_by_rank(dev_matrix, tensor_map, rank_id: int, full_shape: 
             mapping = (mapping,)
         split_num = 1
         for dim in mapping:
-            split_num *= _get_dev_num_alone_dim(dev_matrix, dim)
+            split_num *= _get_dev_num_alone_dim(mesh_shape, dim)
 
         slice_id = 0
         coef = 1
@@ -56,7 +56,7 @@ def _infer_slice_area_by_rank(dev_matrix, tensor_map, rank_id: int, full_shape: 
             if dim == -1:
                 continue
             slice_id += dev_id_list[-dim - 1] * coef
-            coef *= _get_dev_num_alone_dim(dev_matrix, dim)
+            coef *= _get_dev_num_alone_dim(mesh_shape, dim)
         slice_size = full_shape[axis] // split_num
         start = slice_id * slice_size
         end = start + slice_size
@@ -67,7 +67,7 @@ def _infer_slice_area_by_rank(dev_matrix, tensor_map, rank_id: int, full_shape: 
 def _get_slice_tensor_by_layout(global_tensor, layout):
     """Transfer global tensor to local tensor by layout"""
     inner_rank_id = layout.rank_list.index(layout.mesh.rank)
-    slice_area = _infer_slice_area_by_rank(layout.device_matrix, layout.tensor_map, inner_rank_id, global_tensor.shape)
+    slice_area = _infer_slice_area_by_rank(layout.mesh_shape, layout.tensor_map, inner_rank_id, global_tensor.shape)
 
     def get_slice_data(full_data, offset):
         area = ()
@@ -93,27 +93,27 @@ def _infer_slice_shape_by_layout(global_shape, layout):
     return slice_shape
 
 
-class _DeviceMatrix:
+class _DeviceMesh:
     """
     Topological abstraction describing cluster devices.
     Args:
-        device_matrix:
+        mesh_shape:
         alias_name:
         rank_list:
     """
     def __init__(self,
-                 device_matrix: Tuple[int],
+                 mesh_shape: Tuple[int],
                  alias_name: Tuple[str],
                  rank_list: Tuple[int]):
-        if not isinstance(device_matrix, tuple):
-            raise TypeError(f'device_matrix must be tuple type, but got:{type(device_matrix)}')
+        if not isinstance(mesh_shape, tuple):
+            raise TypeError(f'mesh_shape must be tuple type, but got:{type(mesh_shape)}')
         if not isinstance(alias_name, tuple):
             raise TypeError(f'alias_name must be tuple type, but got:{type(alias_name)}')
-        if len(device_matrix) != len(alias_name):
-            raise ValueError('device_matrix length should be equal to alias_name length')
-        for in_ele in device_matrix:
+        if len(mesh_shape) != len(alias_name):
+            raise ValueError('mesh_shape length should be equal to alias_name length')
+        for in_ele in mesh_shape:
             if not isinstance(in_ele, int):
-                raise TypeError(f'The element of device_matrix must be int type, but got:{type(in_ele)}')
+                raise TypeError(f'The element of mesh_shape must be int type, but got:{type(in_ele)}')
         for in_ele in alias_name:
             if not isinstance(in_ele, str):
                 raise TypeError(f'The element of alias_name must be str type, but got:{type(in_ele)}')
@@ -127,13 +127,12 @@ class _DeviceMatrix:
         if inter_key in alias_name and alias_name.index(inter_key) != len(alias_name) - 1:
             raise ValueError(f"When alias_name {alias_name} contains keyword 'interleaved_parallel',"
                              f" it should be at the last dim of alias_name, which means the virtual sharding.")
-        self._device_shape = device_matrix
+        self._mesh_shape = mesh_shape
         self._alias_name = alias_name
-        self._dev_num = np.prod(np.array(self._device_shape))
+        self._dev_num = np.prod(np.array(self._mesh_shape))
         self._global_shape_map = {}
-        global platform
         self._rank = platform.get_rank()
-        self._dev_rank = len(self._device_shape)
+        self._dev_rank = len(self._mesh_shape)
         self._dev_name_to_dev_id = {name: self._dev_rank - i - 1 for i, name in enumerate(self.alias_name)}
         self._dev_name_to_index = {name: i for i, name in enumerate(self.alias_name)}
         self._cache_rank_list_along_axis = {}
@@ -151,17 +150,17 @@ class _DeviceMatrix:
         if len(np.array(self._rank_list).shape) != 1:
             raise ValueError(
                 f"The rank_list should be a 1-D list, but got {len(np.array(self._rank_list).shape)}-D list.")
-        if len(self._rank_list) != np.prod(np.array(self._device_shape)):
-            raise ValueError(f"The length of rank_list should be equal to the product of device_matrix, "
-                             f"but got {len(self._rank_list)} and {np.prod(np.array(self._device_shape))}.")
+        if len(self._rank_list) != np.prod(np.array(self._mesh_shape)):
+            raise ValueError(f"The length of rank_list should be equal to the product of mesh_shape, "
+                             f"but got {len(self._rank_list)} and {np.prod(np.array(self._mesh_shape))}.")
 
     @property
     def rank(self):
         return self._rank
 
     @property
-    def device_matrix(self):
-        return self._device_shape
+    def mesh_shape(self):
+        return self._mesh_shape
 
     @property
     def alias_name(self):
@@ -175,13 +174,13 @@ class _DeviceMatrix:
         if axis == "None":
             return -1
         if axis not in self.alias_name:
-            raise ValueError(f"The axis name must be one of device matrix alias name {self.alias_name}), "
+            raise ValueError(f"The axis name must be one of mesh shape alias name {self.alias_name}), "
                              f"but got {axis}")
         return self._dev_name_to_dev_id[axis]
 
     def axis_index(self, axis):
         if axis not in self.alias_name:
-            raise ValueError(f"The axis name must be one of device matrix alias name {self.alias_name}), "
+            raise ValueError(f"The axis name must be one of mesh shape alias name {self.alias_name}), "
                              f"but got {axis}")
         return self._dev_name_to_index[axis]
 
@@ -189,7 +188,7 @@ class _DeviceMatrix:
         """Return device num along specify device axis"""
         if axis not in self.alias_name:
             raise ValueError(f"The axis must be one of device alias name: {self.alias_name}, but got {axis}")
-        return self.device_matrix[self.alias_name.index(axis)]
+        return self.mesh_shape[self.alias_name.index(axis)]
 
     def get_rank_list_along_axis(self, axis):
         """
@@ -207,7 +206,7 @@ class _DeviceMatrix:
             # short cut, get rank list from cache
             return self._cache_rank_list_along_axis[axis]
 
-        device_matrix = self.device_matrix
+        mesh_shape = self.mesh_shape
         alias_name = self.alias_name
         rank_list = self.rank_list
         rank = self.rank
@@ -219,23 +218,23 @@ class _DeviceMatrix:
             raise ValueError(f"Rank {rank} not found in rank_list")
 
         idx = rank_list.index(rank)
-        coord = [0] * len(device_matrix)
+        coord = [0] * len(mesh_shape)
         temp = idx
-        for i in range(len(device_matrix)-1, -1, -1):
-            coord[i] = temp % device_matrix[i]
-            temp //= device_matrix[i]
+        for i in range(len(mesh_shape)-1, -1, -1):
+            coord[i] = temp % mesh_shape[i]
+            temp //= mesh_shape[i]
 
         dim_index = alias_name.index(axis)
-        strides = [1] * len(device_matrix)
-        for i in range(len(device_matrix)-2, -1, -1):
-            strides[i] = strides[i+1] * device_matrix[i+1]
+        strides = [1] * len(mesh_shape)
+        for i in range(len(mesh_shape)-2, -1, -1):
+            strides[i] = strides[i+1] * mesh_shape[i+1]
 
         result_ranks = []
-        for v in range(device_matrix[dim_index]):
+        for v in range(mesh_shape[dim_index]):
             new_coord = coord.copy()
             new_coord[dim_index] = v
             new_idx = 0
-            for i in range(len(device_matrix)):
+            for i in range(len(mesh_shape)):
                 new_idx += new_coord[i] * strides[i]
 
             result_ranks.append(rank_list[new_idx])
@@ -254,10 +253,10 @@ class _DeviceMatrix:
             raise ValueError(f"Length of slice_shape ({len(slice_shape)}) must match "
                              f"the length of tensor_map ({len(tensor_map)}).")
 
-        n_dims = len(self._device_shape)
+        n_dims = len(self._mesh_shape)
         factors = [1] * len(slice_shape)
 
-        for dev_idx, size in enumerate(self._device_shape):
+        for dev_idx, size in enumerate(self._mesh_shape):
             reverse_idx = n_dims - 1 - dev_idx
             for axis_idx, mapping in enumerate(tensor_map):
                 if isinstance(mapping, int):
@@ -281,7 +280,6 @@ class _DeviceMatrix:
         if (axis, rank) in _group_map:
             return _group_map[(axis, rank)]
         rank_list = self.get_rank_list_along_axis(axis=axis)
-        global platform
         group = platform.create_group(rank_list)
         _group_map[(axis, rank)] = group
         return group
@@ -298,7 +296,7 @@ class _DeviceMatrix:
         Returns:
             list: reduce rank list
         """
-        device_matrix = self._device_shape
+        mesh_shape = self._mesh_shape
         alias_name = self._alias_name
         rank_list = self._rank_list
 
@@ -312,23 +310,23 @@ class _DeviceMatrix:
             raise ValueError(f"Rank {rank} not found in rank_list")
 
         idx = rank_list.index(rank)
-        coord = [0] * len(device_matrix)
+        coord = [0] * len(mesh_shape)
         temp = idx
-        for i in range(len(device_matrix)-1, -1, -1):
-            coord[i] = temp % device_matrix[i]
-            temp //= device_matrix[i]
+        for i in range(len(mesh_shape)-1, -1, -1):
+            coord[i] = temp % mesh_shape[i]
+            temp //= mesh_shape[i]
 
         dim_index = alias_name.index(axis)
-        strides = [1] * len(device_matrix)
-        for i in range(len(device_matrix)-2, -1, -1):
-            strides[i] = strides[i+1] * device_matrix[i+1]
+        strides = [1] * len(mesh_shape)
+        for i in range(len(mesh_shape)-2, -1, -1):
+            strides[i] = strides[i+1] * mesh_shape[i+1]
 
         result_ranks = []
-        for v in range(device_matrix[dim_index]):
+        for v in range(mesh_shape[dim_index]):
             new_coord = coord.copy()
             new_coord[dim_index] = v
             new_idx = 0
-            for i in range(len(device_matrix)):
+            for i in range(len(mesh_shape)):
                 new_idx += new_coord[i] * strides[i]
 
             result_ranks.append(rank_list[new_idx])
@@ -337,21 +335,21 @@ class _DeviceMatrix:
 
     def to_hash(self):
         rank_ids = (self.rank_list[0], self.rank_list[-1])
-        map_key = (self.device_matrix, self.alias_name, rank_ids)
+        map_key = (self.mesh_shape, self.alias_name, rank_ids)
         return map_key
 
 
 _DEVICE_MESH_MAP = {}
 
 
-def _create_device_mesh(device_matrix: Tuple[int], alias_name: Tuple[str], rank_list: Tuple[int]):
+def _create_device_mesh(mesh_shape: Tuple[int], alias_name: Tuple[str], rank_list: Tuple[int]):
     """
     create_device_mesh
     """
     rank_ids = (rank_list[0], rank_list[-1])
-    map_key = hash((device_matrix, alias_name, rank_ids))
+    map_key = hash((mesh_shape, alias_name, rank_ids))
     if map_key not in _DEVICE_MESH_MAP:
-        _DEVICE_MESH_MAP[map_key] = _DeviceMatrix(device_matrix, alias_name, rank_list)
+        _DEVICE_MESH_MAP[map_key] = _DeviceMesh(mesh_shape, alias_name, rank_list)
     return _DEVICE_MESH_MAP.get(map_key, None)
 
 
@@ -361,23 +359,23 @@ class Layout:
 
     Note:
         - It is valid only in semi auto parallel or auto parallel mode.
-        - The multiplication result of the `device_matrix` must be equal to the device count in a pipeline stage.
+        - The multiplication result of the `mesh_shape` must be equal to the device count in a pipeline stage.
         - When the layout function is invoked to constructs a sharding strategy, each alias name is only allowed to be
           used once to shard a tensor.
 
     Args:
-        device_matrix (tuple): Describe the shape of devices arrangement, its element type is int.
-        alias_name (tuple): The alias name for each axis of device_matrix, its length shoits element type is string.
+        mesh_shape (tuple): Describe the shape of devices arrangement, its element type is int.
+        alias_name (tuple): The alias name for each axis of mesh_shape, its length shoits element type is string.
                             When using "interleaved_parallel" as an alias name, the tensor would be split into multiple
                             copies on the corresponding partition dimension on a single card.
         rank_list (tuple, optional): Data is allocated to the device according to rank_list. Default: ``None``.
 
     Raises:
-        TypeError: `device_matrix` is not a tuple type.
+        TypeError: `mesh_shape` is not a tuple type.
         TypeError: `alias_name` is not a tuple type.
         TypeError: 'rank_list' is not a list type.
-        ValueError: `device_matrix` length is not equal to `alias_name` length.
-        TypeError: The element of `device_matrix` is not int type.
+        ValueError: `mesh_shape` length is not equal to `alias_name` length.
+        TypeError: The element of `mesh_shape` is not int type.
         TypeError: The element of `alias_name` is not a str type.
         TypeError: The element of `rank_list` is not int type.
         ValueError: The element of `alias_name` is an empty str.
@@ -392,23 +390,23 @@ class Layout:
         >>> layout = Layout((2, 2, 2), ("dp", "sp", "mp"))
         >>> layout0 = layout("dp", "mp")
         >>> print(layout0.to_dict())
-        {"device_matrix": (2, 2, 2), "tensor_map": (2, 0), "interleaved_parallel": False,
+        {"mesh_shape": (2, 2, 2), "tensor_map": (2, 0), "interleaved_parallel": False,
         'alias_name': {'dp', 'sp', 'mp'}, "rank_list": [0, 1, 2, 3, 4, 5, 6, 7]}
         >>> layout = Layout((2, 2, 2), ("dp", "sp", "interleaved_parallel"))
         >>> layout1 = layout(("dp", "interleaved_parallel"), "sp")
     """
 
-    def __init__(self, device_matrix, alias_name, rank_list=None):
+    def __init__(self, mesh_shape, alias_name, rank_list=None):
         self._alias_name = alias_name
         self._tensor_map = None
         if not rank_list:
-            self._rank_list = tuple(range(np.prod(np.array(device_matrix))))
+            self._rank_list = tuple(range(np.prod(np.array(mesh_shape))))
         else:
             self._rank_list = tuple(rank_list)
-        self._partial = [None] * len(device_matrix) # partial status for each dev dim
+        self._partial = [None] * len(mesh_shape) # partial status for each dev dim
         self._support_partial_op = ['sum', 'max', 'min', 'avg', None]
         self._alias_tensor_map = None
-        self._mesh = _create_device_mesh(device_matrix, alias_name, self._rank_list)
+        self._mesh = _create_device_mesh(mesh_shape, alias_name, self._rank_list)
         self._compact_str = self._to_compact_string()
 
     def __call__(self, *alias_tensor_map):
@@ -448,12 +446,12 @@ class Layout:
         """
         Transform layout to a dictionary.
         """
-        if self._mesh.device_matrix is None:
+        if self._mesh.mesh_shape is None:
             raise ValueError("The device_shape of layout is None")
         if self._tensor_map is None:
             raise ValueError("The tensor_map of layout is None")
         interleaved_parallel = "interleaved_parallel" in self._mesh.alias_name
-        return {"device_matrix": self._mesh.device_matrix, "tensor_map": self._tensor_map,
+        return {"mesh_shape": self._mesh.mesh_shape, "tensor_map": self._tensor_map,
                 "interleaved_parallel": interleaved_parallel, "alias_name": self._mesh.alias_name,
                 "rank_list": self._rank_list}
 
@@ -466,7 +464,7 @@ class Layout:
         return self._mesh
 
     def update_mesh(self):
-        self._mesh = _create_device_mesh(self.device_matrix, self.alias_name, self.rank_list)
+        self._mesh = _create_device_mesh(self.mesh_shape, self.alias_name, self.rank_list)
 
     @property
     def rank_list(self):
@@ -478,9 +476,9 @@ class Layout:
         self._rank_list = val
 
     @property
-    def device_matrix(self):
-        """device matrix"""
-        return self._mesh.device_matrix
+    def mesh_shape(self):
+        """mesh shape"""
+        return self._mesh.mesh_shape
 
     @property
     def alias_name(self):
@@ -543,10 +541,10 @@ class Layout:
         return None
 
     def reset_partial(self):
-        self._partial = [None] * len(self.device_matrix)
+        self._partial = [None] * len(self.mesh_shape)
 
     def is_partial(self):
-        """Return true if any dim in dev_matrix is partial"""
+        """Return true if any dim in mesh_shape is partial"""
         return any(self.partial)
 
     def get_global_shape(self, slice_shape):
@@ -580,25 +578,24 @@ class Layout:
         The repeat_num is equal to all device num 8 divided by device num corresponding to used axis 2, that is 4.
         """
         if self._tensor_map is None:
-            raise ValueError(f"The tensor_map is None, the device_matrix is {self._mesh.device_matrix},"
+            raise ValueError(f"The tensor_map is None, the mesh_shape is {self._mesh.mesh_shape},"
                              f" alias_name is {self._mesh.alias_name}")
 
         # if it is not the last stage, return -1
-        global platform
         group_size = platform.get_world_size()
         if self._rank_list[-1] != (group_size - 1):
             return -1
 
-        all_device_num = functools.reduce(lambda x, y: x * y, self._mesh.device_matrix)
+        all_device_num = functools.reduce(lambda x, y: x * y, self._mesh.mesh_shape)
         used_dev_num = 1
         for ele in self._tensor_map:
             if isinstance(ele, tuple):
                 for item in ele:
                     if item >= 0:
-                        used_dev_num *= self._mesh.device_matrix[len(self._mesh.device_matrix) - item - 1]
+                        used_dev_num *= self._mesh.mesh_shape[len(self._mesh.mesh_shape) - item - 1]
                 continue
             if ele >= 0:
-                used_dev_num *= self._mesh.device_matrix[len(self._mesh.device_matrix) - ele -1]
+                used_dev_num *= self._mesh.mesh_shape[len(self._mesh.mesh_shape) - ele -1]
 
         return all_device_num // used_dev_num
 
@@ -628,7 +625,7 @@ class Layout:
         Returns:
             str: layout string
         """
-        device_info = f"Device Matrix: {self._mesh.device_matrix}"
+        device_info = f"Mesh shape: {self._mesh.mesh_shape}"
         alias_info = f"Alias Names: {self._mesh.alias_name}"
         rank_info = f"Rank List: {self._rank_list}"
         partial_info = f"Partial: {self.partial}"
@@ -680,7 +677,7 @@ class Layout:
         if not isinstance(other, Layout):
             return False
 
-        if (self.device_matrix != other.device_matrix or
+        if (self.mesh_shape != other.mesh_shape or
                 self.alias_name != other.alias_name or
                 self.partial != other.partial or
                 self.rank_list != other.rank_list):
@@ -689,5 +686,3 @@ class Layout:
         if self._tensor_map is None or other.tensor_map is None:
             return self._tensor_map is other.tensor_map
         return self._tensor_map == other.tensor_map
-
-

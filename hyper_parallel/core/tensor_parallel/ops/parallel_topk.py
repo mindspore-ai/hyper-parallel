@@ -21,7 +21,7 @@ from .parallel_ops import DistributedOp
 class TopKDistributedOp(DistributedOp):
     """Distributed implementation for TopK operator."""
 
-    def infer_layout(self, input_layouts, extra_args=None):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for TopK operator.
 
@@ -32,14 +32,14 @@ class TopKDistributedOp(DistributedOp):
         2. Both values and indices have same layout as input
 
         Args:
-            input_layout (Layout): Layout of input tensor
+            layouts (Layout): Layout of input tensor
             k (int, optional): The k in topk, not affecting layout
 
         Returns:
             tuple: Layouts for values and indices tensors
         """
 
-        if not input_layouts[0]:
-            raise ValueError(f"input_layouts is empty: {input_layouts[0]}")
+        if not layouts[0]:
+            raise ValueError(f"layouts is empty: {layouts[0]}")
 
-        return input_layouts[0], input_layouts[0]
+        return layouts[0], layouts[0]

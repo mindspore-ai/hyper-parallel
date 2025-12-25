@@ -35,7 +35,7 @@ OPERATORS = [
     (MinimumDistributedOp, "Minimum"),
 ]
 
-base_device_matrix = (2, 2, 2)
+base_mesh_shape = (2, 2, 2)
 base_alias_name = ("dp", "cp", "mp")
 base_rank_list = list(range(8))
 
@@ -63,7 +63,7 @@ def test_same_layout_dp_cp_mp_1(operator_class, op_name):
     Description: Two inputs share the same layout (dp, cp, mp).
     Expectation: Output keeps the same tensor_map.
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "cp", "mp")
     y_layout = layout("dp", "cp", "mp")
 
@@ -83,7 +83,7 @@ def test_same_layout_dp_only_2(operator_class, op_name):
     Description: Two inputs share layout (dp, None, None).
     Expectation: Output keeps dp sharding.
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "None", "None")
     y_layout = layout("dp", "None", "None")
 
@@ -103,7 +103,7 @@ def test_same_layout_mp_only_3(operator_class, op_name):
     Description: Two inputs share layout (None, None, mp).
     Expectation: Output keeps mp sharding.
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("None", "None", "mp")
     y_layout = layout("None", "None", "mp")
 
@@ -123,7 +123,7 @@ def test_with_constant_rhs_4(operator_class, op_name):
     Description: RHS is a scalar/constant (layout=None).
     Expectation: Output keeps LHS tensor layout.
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "cp", "mp")
     y_layout = None
 
@@ -143,7 +143,7 @@ def test_mismatch_layout_should_raise_5(operator_class, op_name):
     Description: Mismatched layouts without shape info are not allowed.
     Expectation: Raise ValueError.
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "cp", "mp")
     y_layout = layout("dp", "cp", "None")
 
@@ -159,7 +159,7 @@ def test_broadcast_dimension_expansion_6(operator_class, op_name):
     Description: x: (4, 8, 16) sharded on dp, y: (1, 8, 16) not sharded.
     Expectation: Output keeps x's layout (dp, None, None).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "None", "None")
     y_layout = layout("None", "None", "None")
 
@@ -179,7 +179,7 @@ def test_broadcast_different_dims_7(operator_class, op_name):
     Description: x: (8, 16) sharded on (dp, mp), y: (16,) not sharded.
     Expectation: Output keeps x's layout (dp, mp).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "mp")
     y_layout = layout("None")
 
@@ -199,7 +199,7 @@ def test_broadcast_merge_sharding_8(operator_class, op_name):
     Description: x: (4, 1, 16) sharded on (dp, None, None), y: (1, 8, 16) sharded on (None, cp, None).
     Expectation: Output merges both sharding strategies: (dp, cp, None).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "None", "None")
     y_layout = layout("None", "cp", "None")
 
@@ -219,7 +219,7 @@ def test_broadcast_3_inputs_9(operator_class, op_name):
     Description: Three inputs with different sharding on different dimensions.
     Expectation: Output merges all three: (dp, cp, mp).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "None", "None")
     y_layout = layout("None", "cp", "None")
     z_layout = layout("None", "None", "mp")
@@ -243,7 +243,7 @@ def test_broadcast_sharded_dim_error_10(operator_class, op_name):
     Description: x: (1, 8, 16) with dimension 0 sharded on dp but size is 1.
     Expectation: Raise ValueError (broadcasting dimension cannot be sharded).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "None", "None")
     y_layout = layout("None", "None", "None")
 
@@ -261,7 +261,7 @@ def test_broadcast_conflicting_sharding_11(operator_class, op_name):
     Description: x: (4, 8, 16) sharded on (dp, None, None), y: (4, 8, 16) sharded on (cp, None, None).
     Expectation: Raise ValueError (conflicting sharding).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "None", "None")
     y_layout = layout("cp", "None", "None")
 
@@ -279,7 +279,7 @@ def test_broadcast_incompatible_shapes_12(operator_class, op_name):
     Description: x: (4, 8, 16), y: (4, 7, 16) - dimension 1 has different non-unit sizes.
     Expectation: Raise ValueError (shapes cannot be broadcast).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "None", "None")
     y_layout = layout("dp", "None", "None")
 
@@ -297,7 +297,7 @@ def test_broadcast_tuple_tensor_map_13(operator_class, op_name):
     Description: x: (4, 8, 16) sharded on ((dp, cp), None, None), y: (1, 8, 16) not sharded.
     Expectation: Output keeps x's tuple sharding (sorted as (1, 2)).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout(("dp", "cp"), "None", "None")
     y_layout = layout("None", "None", "None")
 
@@ -317,7 +317,7 @@ def test_broadcast_tuple_merge_14(operator_class, op_name):
     Description: x: (4, 1, 16) sharded on ((dp, cp), None, None), y: (1, 8, 16) sharded on (None, mp, None).
     Expectation: Output has merged sharding ((1, 2), 0, -1).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout(("dp", "cp"), "None", "None")
     y_layout = layout("None", "mp", "None")
 
@@ -337,7 +337,7 @@ def test_broadcast_tuple_sharded_dim_error_15(operator_class, op_name):
     Description: x: (1, 8, 16) with dimension 0 sharded on (dp, cp) but size is 1.
     Expectation: Raise ValueError (broadcasting dimension cannot be sharded).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout(("dp", "cp"), "None", "None")
     y_layout = layout("None", "None", "None")
 
@@ -355,7 +355,7 @@ def test_broadcast_tuple_conflict_16(operator_class, op_name):
     Description: x: (4, 8, 16) sharded on ((dp, cp), None, None), y: (4, 8, 16) sharded on ((dp, mp), None, None).
     Expectation: Raise ValueError (conflicting sharding).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout(("dp", "cp"), "None", "None")
     y_layout = layout(("dp", "mp"), "None", "None")
 
@@ -373,7 +373,7 @@ def test_broadcast_all_ones_17(operator_class, op_name):
     Description: x: (1, 1, 1) not sharded, y: (4, 8, 16) sharded on (dp, cp, mp).
     Expectation: Output keeps y's layout (dp, cp, mp).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("None", "None", "None")
     y_layout = layout("dp", "cp", "mp")
 
@@ -393,7 +393,7 @@ def test_broadcast_scalar_18(operator_class, op_name):
     Description: x: (4, 8, 16) sharded on (dp, cp, mp), y is scalar (shape ()).
     Expectation: Output keeps x's layout (dp, cp, mp).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "cp", "mp")
     y_layout = None
 
@@ -413,7 +413,7 @@ def test_broadcast_both_need_expansion_19(operator_class, op_name):
     Description: x: (4, 1, 16) sharded on (dp, None, mp), y: (1, 8, 1) sharded on (None, cp, None).
     Expectation: Output merges to (dp, cp, mp).
     """
-    layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = layout("dp", "None", "mp")
     y_layout = layout("None", "cp", "None")
 

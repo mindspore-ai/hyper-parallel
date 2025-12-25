@@ -25,7 +25,7 @@ class SliceDistributedOp(DistributedOp):
     def _is_shard_dim(self, layout):
         """return the shard num in each dim"""
         shard_dim = []
-        dev_mat = layout.device_matrix
+        dev_mat = layout.mesh_shape
         tensor_map = layout.tensor_map
         for dev_idx in tensor_map:
             if isinstance(dev_idx, (tuple, list)):
@@ -54,12 +54,12 @@ class SliceDistributedOp(DistributedOp):
                     f"the begin is {begin}, the end is {end}, the shape is {shape}, layout is {layout.to_dict()}")
         return shard_dim
 
-    def infer_layout(self, input_layouts, extra_args):
+    def infer_layout(self, layouts, extra_args):
         """
         Infer output layout for slice operator. The shard dim must be fully fetched.
 
         Args:
-            input_layouts (Layout): Layout of input x
+            layouts (Layout): Layout of input x
             extra_args: (begin, end, global shape)
 
         Returns:
@@ -70,7 +70,7 @@ class SliceDistributedOp(DistributedOp):
         begin = extra_args[0]
         end = extra_args[1]
         global_shape = extra_args[2]
-        shard_dim = self._check_layout(input_layouts, begin, end, global_shape)
+        shard_dim = self._check_layout(layouts, begin, end, global_shape)
         new_begin = tuple(begin[i] // shard_dim[i] for i in range(len(begin)))
         new_end = tuple(end[i] // shard_dim[i] for i in range(len(end)))
-        return input_layouts[0], new_begin, new_end
+        return layouts[0], new_begin, new_end

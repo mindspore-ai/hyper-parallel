@@ -67,7 +67,7 @@ class ArithmeticDistributedOp(DistributedOp):
             output_tensormap[i + len_diff] = tensormap_small[i] if abs(tensormap_big[i + len_diff]) == 1 else \
                 tensormap_big[i + len_diff]
         new_output_layout = Layout(
-            device_matrix=output_layout.device_matrix,
+            mesh_shape=output_layout.mesh_shape,
             alias_name=output_layout.alias_name,
             rank_list=output_layout.rank_list
         )

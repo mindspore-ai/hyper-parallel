@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+"""parallel_sum_mean_ext test"""
 
 import pytest
 
@@ -32,7 +33,7 @@ def run_scenario(op_name, scenario_name, x_layout, expected_map, extra_args):
         f"Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
 
 
-base_device_matrix = (2, 2, 2)
+base_mesh_shape = (2, 2, 2)
 base_alias_name = ("dp", "cp", "mp")
 base_rank_list = list(range(8))
 
@@ -44,7 +45,7 @@ def test_sum_ext_data_parallel_1(op_name):
     Description: reduce dp axis, keepdim=False.
     Expectation: dp axis reduced.
     """
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None", "None")
 
     run_scenario(
@@ -63,7 +64,7 @@ def test_sum_ext_model_parallel_2(op_name):
     Description: reduce mp axis, keepdim=True.
     Expectation: mp axis -> None.
     """
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("None", "None", "mp")
 
     run_scenario(
@@ -82,7 +83,7 @@ def test_sum_ext_hybrid_parallel_3(op_name):
     Description: reduce cp axis, keepdim=False.
     Expectation: cp reduced, dp/mp kept.
     """
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "cp", "mp")
 
     run_scenario(
@@ -101,7 +102,7 @@ def test_sum_ext_reduce_multiple_dims_4(op_name):
     Description: reduce (0, 2), keepdim=True.
     Expectation: dp/mp -> None, cp kept.
     """
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "cp", "mp")
 
     run_scenario(
@@ -120,7 +121,7 @@ def test_sum_ext_reduce_all_dims_5(op_name):
     Description: dim=None, keepdim=False.
     Expectation: all reduced.
     """
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "cp", "mp")
 
     run_scenario(
@@ -139,11 +140,11 @@ def test_sum_ext_tuple_alias_dim_6(op_name):
     Description: reduce dim=None with alias ('dp','cp'), keepdim=True.
     Expectation: tuple replaced by None.
     """
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "cp", "mp")
     rank_list = list(range(8))
 
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout("None", ("dp", "cp"), "mp")
 
     run_scenario(
@@ -162,11 +163,11 @@ def test_sum_ext_tuple_alias_dim_7(op_name):
     Description: reduce dim=None with alias ('dp','cp'), keepdim=False.
     Expectation: tuple replaced by None.
     """
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "cp", "mp")
     rank_list = list(range(8))
 
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout("None", ("dp", "cp"), "mp")
 
     run_scenario(
@@ -185,11 +186,11 @@ def test_sum_ext_tuple_alias_dim_8(op_name):
     Description: reduce dim=(0, 2) with alias ('dp','cp'), keepdim=True.
     Expectation: tuple replaced by None.
     """
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "cp", "mp")
     rank_list = list(range(8))
 
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout("None", ("dp", "cp"), "mp")
 
     run_scenario(
@@ -208,11 +209,11 @@ def test_sum_ext_tuple_alias_dim_9(op_name):
     Description: reduce dim=(0, 2) with alias ('dp','cp'), keepdim=False.
     Expectation: tuple replaced by None.
     """
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "cp", "mp")
     rank_list = list(range(8))
 
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout("None", ("dp", "cp"), "mp")
 
     run_scenario(
@@ -231,11 +232,11 @@ def test_sum_ext_tuple_alias_dim_10(op_name):
     Description: reduce dim=(0, 1) with alias ('dp','cp'), keepdim=False.
     Expectation: tuple replaced by None.
     """
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "cp", "mp")
     rank_list = list(range(8))
 
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout("None", ("dp", "cp"), "mp")
 
     run_scenario(
@@ -254,11 +255,11 @@ def test_sum_ext_tuple_alias_dim_11(op_name):
     Description: reduce dim=(0, 1) with alias ('dp','cp'), keepdim=True.
     Expectation: tuple replaced by None.
     """
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "cp", "mp")
     rank_list = list(range(8))
 
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout("None", ("dp", "cp"), "None")
 
     run_scenario(
@@ -277,11 +278,11 @@ def test_sum_ext_tuple_alias_dim_12(op_name):
     Description: reduce dim=(0, 1) with alias ('dp','cp'), keepdim=False.
     Expectation: tuple replaced by None.
     """
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "cp", "mp")
     rank_list = list(range(8))
 
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout("None", ("dp", "cp"), "None")
 
     run_scenario(
@@ -300,11 +301,11 @@ def test_sum_ext_tuple_alias_dim_13(op_name):
     Description: reduce dim=(0, 1) with alias ('dp','cp'), keepdim=True.
     Expectation: tuple replaced by None.
     """
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "cp", "mp")
     rank_list = list(range(8))
 
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout("None", ("dp", "cp"), "None")
 
     run_scenario(
@@ -323,11 +324,11 @@ def test_sum_ext_tuple_alias_dim_14(op_name):
     Description: reduce dim=(0, 1) with alias ('dp','cp'), keepdim=False.
     Expectation: tuple replaced by None.
     """
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "cp", "mp")
     rank_list = list(range(8))
 
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout("None", ("dp", "cp"), "None")
 
     run_scenario(
@@ -346,11 +347,11 @@ def test_sum_ext_tuple_alias_dim_15(op_name):
     Description: reduce dim=(0, 1) with alias ('dp','cp'), keepdim=False.
     Expectation: raise ValueError.
     """
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "cp", "mp")
     rank_list = list(range(8))
 
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout("None", ("dp", "cp"), "None")
 
     with pytest.raises(ValueError):

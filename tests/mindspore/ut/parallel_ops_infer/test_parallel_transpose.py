@@ -30,14 +30,14 @@ class TestTransposeDistributedOp:
         dev_mat = (2, 2)
         aliases = ("dp", "tp")
         rank_list = list(range(math.prod(dev_mat)))
-        input_layout = Layout(device_matrix=dev_mat, alias_name=aliases, rank_list=rank_list)
+        input_layout = Layout(mesh_shape=dev_mat, alias_name=aliases, rank_list=rank_list)
         layout_with_tensor_map = input_layout("tp", "dp")
 
         op = TransposeDistributedOp('Transpose')
         result_layout = op.infer_layout([layout_with_tensor_map], ((1, 0),))
 
         assert result_layout.tensor_map == (1, 0)
-        assert result_layout.device_matrix == input_layout.device_matrix
+        assert result_layout.mesh_shape == input_layout.mesh_shape
         assert result_layout.alias_name == input_layout.alias_name
 
     def test_3d_transpose_operation(self):
@@ -49,14 +49,14 @@ class TestTransposeDistributedOp:
         dev_mat = (2, 2, 2)
         aliases = ("dp", "cp", "tp")
         rank_list = list(range(math.prod(dev_mat)))
-        input_layout = Layout(device_matrix=dev_mat, alias_name=aliases, rank_list=rank_list)
+        input_layout = Layout(mesh_shape=dev_mat, alias_name=aliases, rank_list=rank_list)
         layout_with_tensor_map = input_layout("tp", "cp", "dp")
 
         op = TransposeDistributedOp('Transpose')
         result_layout = op.infer_layout([layout_with_tensor_map], ((2, 0, 1),))
 
         assert result_layout.tensor_map == (2, 0, 1)
-        assert result_layout.device_matrix == input_layout.device_matrix
+        assert result_layout.mesh_shape == input_layout.mesh_shape
         assert result_layout.alias_name == input_layout.alias_name
 
     def test_dimension_mismatch_error(self):
@@ -68,7 +68,7 @@ class TestTransposeDistributedOp:
         dev_mat = (2, 2)
         aliases = ("dp", "tp")
         rank_list = list(range(math.prod(dev_mat)))
-        input_layout = Layout(device_matrix=dev_mat, alias_name=aliases, rank_list=rank_list)
+        input_layout = Layout(mesh_shape=dev_mat, alias_name=aliases, rank_list=rank_list)
         layout_with_tensor_map = input_layout("tp", "dp")
 
         op = TransposeDistributedOp('Transpose')
@@ -85,7 +85,7 @@ class TestTransposeDistributedOp:
         dev_mat = (2, 2, 2)
         aliases = ("dp", "cp", "tp")
         rank_list = list(range(math.prod(dev_mat)))
-        input_layout = Layout(device_matrix=dev_mat, alias_name=aliases, rank_list=rank_list)
+        input_layout = Layout(mesh_shape=dev_mat, alias_name=aliases, rank_list=rank_list)
         layout_with_tensor_map = input_layout("tp", "cp", "dp")
 
         op = TransposeDistributedOp('Transpose')
@@ -102,7 +102,7 @@ class TestTransposeDistributedOp:
         dev_mat = (2, 2)
         aliases = ("dp", "tp")
         rank_list = list(range(math.prod(dev_mat)))
-        input_layout = Layout(device_matrix=dev_mat, alias_name=aliases, rank_list=rank_list)
+        input_layout = Layout(mesh_shape=dev_mat, alias_name=aliases, rank_list=rank_list)
         layout_with_tensor_map = input_layout("tp", "dp")
 
         op = TransposeDistributedOp('Transpose')
@@ -119,7 +119,7 @@ class TestTransposeDistributedOp:
         dev_mat = (2, 2, 2)
         aliases = ("dp", "cp", "tp")
         rank_list = list(range(math.prod(dev_mat)))
-        input_layout = Layout(device_matrix=dev_mat, alias_name=aliases, rank_list=rank_list)
+        input_layout = Layout(mesh_shape=dev_mat, alias_name=aliases, rank_list=rank_list)
         layout_with_tensor_map = input_layout("tp", "cp", "dp")
 
         op = TransposeDistributedOp('Transpose')
@@ -136,12 +136,12 @@ class TestTransposeDistributedOp:
         dev_mat = (2, 2, 2)
         aliases = ("dp", "cp", "tp")
         rank_list = list(range(math.prod(dev_mat)))
-        input_layout = Layout(device_matrix=dev_mat, alias_name=aliases, rank_list=rank_list)
+        input_layout = Layout(mesh_shape=dev_mat, alias_name=aliases, rank_list=rank_list)
         layout_with_tensor_map = input_layout("cp", "tp", "dp")
 
         op = TransposeDistributedOp('Transpose')
         result_layout = op.infer_layout([layout_with_tensor_map], ((0, 1, 2),))
 
         assert result_layout.tensor_map == (1, 0, 2)
-        assert result_layout.device_matrix == input_layout.device_matrix
+        assert result_layout.mesh_shape == input_layout.mesh_shape
         assert result_layout.alias_name == input_layout.alias_name

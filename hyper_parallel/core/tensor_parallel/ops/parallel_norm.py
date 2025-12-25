@@ -22,7 +22,7 @@ from .parallel_ops import DistributedOp
 class NormDistributedOp(DistributedOp):
     """Distributed implementation for Norm operator."""
 
-    def infer_layout(self, input_layouts, extra_args=None):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for normalization operator (e.g., RmsNorm).
 
@@ -31,7 +31,7 @@ class NormDistributedOp(DistributedOp):
         compatible with the distributed training setup.
 
         Args:
-            input_layouts (tuple): A tuple of Layout objects representing the input tensor layouts.
+            layouts (tuple): A tuple of Layout objects representing the input tensor layouts.
                 Expected to contain at least three layouts: input tensor, gamma parameter, and beta parameter.
             extra_args (dict, optional): Additional arguments that might be needed for layout inference.
                 Defaults to None.
@@ -48,18 +48,18 @@ class NormDistributedOp(DistributedOp):
             ValueError: If normalization axis is sharded, which is not supported.
             ValueError: If gamma parameter layout doesn't match the input layout in normalization dimensions.
         """
-        if len(input_layouts) < 3:
-            raise ValueError(f"RmsNorm input layouts size {len(input_layouts)} is less than 3.")
-        x_layout = input_layouts[0]
-        gamma_layout = input_layouts[-2]
-        x_device_matrix = x_layout.device_matrix
-        for i, layout in enumerate(input_layouts[:-2]):
+        if len(layouts) < 3:
+            raise ValueError(f"RmsNorm input layouts size {len(layouts)} is less than 3.")
+        x_layout = layouts[0]
+        gamma_layout = layouts[-2]
+        x_mesh_shape = x_layout.mesh_shape
+        for i, layout in enumerate(layouts[:-2]):
             if layout != x_layout:
                 raise ValueError(f"RmsNorm inputs must have same layout, but input 0 layout is: {x_layout},"
                                  f"input {i} layout is: {layout}.")
-        gamma_device_matrix = gamma_layout.device_matrix
-        if x_device_matrix != gamma_device_matrix:
-            raise ValueError("RmsNorm inputs must have same device_matrix")
+        gamma_mesh_shape = gamma_layout.mesh_shape
+        if x_mesh_shape != gamma_mesh_shape:
+            raise ValueError("RmsNorm inputs must have same mesh_shape")
         x_tensor_map = x_layout.tensor_map
         gamma_tensor_map = gamma_layout.tensor_map
         begin_norm_axis = len(x_tensor_map) - len(gamma_tensor_map)
@@ -70,10 +70,10 @@ class NormDistributedOp(DistributedOp):
                 for iaxis in axis:
                     if iaxis == -1:
                         continue
-                    if x_device_matrix[len(x_device_matrix) - 1 - iaxis] > 1:
+                    if x_mesh_shape[len(x_mesh_shape) - 1 - iaxis] > 1:
                         raise ValueError(f"RmsNorm is disabled to support the splitting after "
                                          f"begin_norm_axis {begin_norm_axis} for input 0.")
-            if x_device_matrix[len(x_device_matrix) - 1 - axis] > 1:
+            if x_mesh_shape[len(x_mesh_shape) - 1 - axis] > 1:
                 raise ValueError(f"RmsNorm is disabled to support the splitting after "
                                  f"begin_norm_axis {begin_norm_axis} for input 0.")
         if x_tensor_map[begin_norm_axis:] != gamma_tensor_map:
@@ -81,7 +81,7 @@ class NormDistributedOp(DistributedOp):
                              f"{x_layout.alias_tensor_map[begin_norm_axis:]} should equal to"
                              f" the gamma sharding {gamma_layout.alias_tensor_map}")
         output_layout = Layout(
-            device_matrix=x_layout.device_matrix,
+            mesh_shape=x_layout.mesh_shape,
             alias_name=x_layout.alias_name,
             rank_list=x_layout.rank_list
         )

@@ -43,17 +43,19 @@ class EmbeddingDistributedOp(DistributedOp):
         w_dict = w_layout.to_dict()
         w_tensor_map, w_aliases = w_dict["tensor_map"], w_dict["alias_name"]
 
-        device_matrix = w_dict["device_matrix"]
+        mesh_shape = w_dict["mesh_shape"]
         rank_list = w_dict["rank_list"]
 
         # Create output layout
-        idx_to_alias = lambda idx, aliases: (
-            aliases[len(aliases) - idx - 1] if idx != -1 else "None"
-        )
+        def idx_to_alias(idx, aliases):
+            if idx == -1:
+                return "None"
+            return aliases[len(aliases) - idx - 1]
+
         output_map = ()
 
         out_aliases = w_aliases
-        if not (w_tensor_map[0] == -1 or device_matrix[len(device_matrix) - 1 - w_tensor_map[0]] == 1):
+        if not (w_tensor_map[0] == -1 or mesh_shape[len(mesh_shape) - 1 - w_tensor_map[0]] == 1):
             raise ValueError(
                 f"Operation {self.op_name}: Cannot perform sharding on params along the axis"
             )
@@ -63,7 +65,7 @@ class EmbeddingDistributedOp(DistributedOp):
 
         output_map = tuple(idx_to_alias(idx, out_aliases) for idx in output_map)
         output_layout = Layout(
-            device_matrix=device_matrix,
+            mesh_shape=mesh_shape,
             alias_name=out_aliases,
             rank_list=rank_list,
         )

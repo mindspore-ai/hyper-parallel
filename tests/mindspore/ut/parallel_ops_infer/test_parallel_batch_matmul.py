@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+"""parallel_batch_matmul test"""
 
 from hyper_parallel import Layout
 from hyper_parallel.core.tensor_parallel.ops.parallel_matmul import BatchMatMulDistributedOp
@@ -30,7 +31,7 @@ def run_scenario(scenario_name, x_layout, w_layout, expected_map, transpose_a=Fa
         f" got {output_layout.to_dict()['tensor_map']}"
 
 
-base_device_matrix = (2, 2, 2)
+base_mesh_shape = (2, 2, 2)
 base_alias_name = ("dp", "cp", "mp")
 base_rank_list = list(range(8))
 
@@ -41,10 +42,10 @@ def test_bmm_tensor_parallel():
     Description: Test tensor parallel in python shard.
     Expectation: Run success.
     '''
-    x_layout4 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout4 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout4 = x_layout4("dp", "None", "mp")
 
-    w_layout4 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout4 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout4 = w_layout4("None", "mp", "None")
 
     run_scenario(
@@ -61,10 +62,10 @@ def test_bmm_transpose_tensor_parallel():
     Description: Test tensor parallel in python shard, transpose=True.
     Expectation: Run success.
     '''
-    x_layout4 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout4 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout4 = x_layout4("dp", "mp", "None")
 
-    w_layout4 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout4 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout4 = w_layout4("None", "mp", "None")
 
     run_scenario(
