@@ -76,6 +76,22 @@ x = DTensor.from_local(local_x, x_layout)
 run_model(x, model)
 ```
 
+3.  使用PipelineStage和PipelineSchedule进行流水线并行
+```
+from hyper_parallel.platform.mindspore.pipeline_parallel.stage import PipelineStage
+from hyper_parallel.platform.mindspore.pipeline_parallel.schedule import Schedule1F1B
+
+# 将切分后的module封装成PipelineStage
+stage = PipelineStage(splited_model, stage_index, stage_num=4)
+
+# 选择流水线并行的调度
+schedule = Schedule1F1B（stage, micro_batch_num=8）
+
+# 执行
+x = DTensor.from_local(local_x, x_layout)
+schedule.run(x)
+```
+
 #### 参与贡献
 
 1.  Fork 本仓库
