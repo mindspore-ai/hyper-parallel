@@ -45,8 +45,36 @@ model = hsdp(model, shard_size=1)
 model = hsdp(model, shard_size=dp_size, optimizer_level="level1")
 ```
 
-2.  xxxx
-3.  xxxx
+2.  使用shard进行张量并行
+```
+from mindspore.nn.utils import no_init_parameters
+from hyper_parallel import DTensor, Layout, hsdp, init_parameters, shard
+
+# 定义张量排布
+layout = Layout((dp, mp), ("dp", "mp"))
+x_layout = layout("dp", "mp")
+w_layout = layout("mp", "None")
+out_layout = layout()
+
+# 网络权重延后初始化
+with no_init_parameters():
+    model = SimpleModel()
+
+# 对网络输入/输出/权重做切分配置
+sharding_plan = { "forward": { "input": (x_layout,), "output": (out_layout,)},
+                "parameter": {"weight": w_layout}}
+model = shard(model, sharding_plan)
+
+# 可以进一步配置hsdp
+model = hsdp(model, shard_size=hsdp_shard_size, threshold=0)
+
+# 权重分片初始化
+model = init_parameters(model)
+
+# 执行
+x = DTensor.from_local(local_x, x_layout)
+run_model(x, model)
+```
 
 #### 参与贡献
 
