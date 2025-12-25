@@ -93,3 +93,23 @@ Tile:
   dist_op_name: _tile_dist_op
   distributed_op_class: ElementWiseDistributedOp
   distributed_op_file: parallel_elementwise
+
+LessEqual: 
+  dist_op_name: _less_equal_dist_op
+  distributed_op_class: ElementWiseDistributedOp
+  distributed_op_file: parallel_elementwise
+
+GreaterEqual: 
+  dist_op_name: _greater_equal_dist_op
+  distributed_op_class: ElementWiseDistributedOp
+  distributed_op_file: parallel_elementwise
+
+LogicalOr: 
+  dist_op_name: _logical_or_dist_op
+  distributed_op_class: ElementWiseDistributedOp
+  distributed_op_file: parallel_elementwise
+
+Minimum: 
+  dist_op_name: _minimum_dist_op
+  distributed_op_class: ElementWiseDistributedOp 
+  distributed_op_file: parallel_elementwise
