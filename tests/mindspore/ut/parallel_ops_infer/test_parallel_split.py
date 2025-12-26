@@ -1,3 +1,19 @@
+# Copyright 2025 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""parallel_split test"""
+
 import pytest
 from hyper_parallel.core.tensor_parallel.ops.parallel_split import (SplitDistributedOp, SplitWithSizeDistributedOp,
                                                                     SplitTensorDistributedOp)
@@ -9,10 +25,10 @@ split_op = SplitDistributedOp("split")
 
 # 定义一个辅助函数来创建Layout对象
 def create_layout(tensor_map):
-    base_device_matrix = (2, 2, 2)
+    base_mesh_shape = (2, 2, 2)
     base_alias_name = ("dp", "mp", "cp")
     base_rank_list = list(range(8))
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     alias_names = [(base_alias_name[-idx - 1] if idx >= 0 else "None") for idx in tensor_map]
     x_layout = x_layout(*alias_names)
     return x_layout

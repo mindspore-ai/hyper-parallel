@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+"""parallel_gather test"""
 
 import pytest
 from hyper_parallel import Layout
@@ -37,14 +38,14 @@ def test_index_select_parallel_1():
     Description: Test parallel in python shard.
     Expectation: Run success.
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("a", "b")
     base_rank_list = list(range(8))
 
-    p_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    p_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     p_layout = p_layout("None", "a")
 
-    i_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    i_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     i_layout = i_layout("b")
 
     run_scenario(
@@ -63,14 +64,14 @@ def test_index_select_parallel_2():
     Description: Test parallel in python shard.
     Expectation: Run success.
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("a", "b")
     base_rank_list = list(range(8))
 
-    p_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    p_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     p_layout = p_layout("b", "a")
 
-    i_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    i_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     i_layout = i_layout("b")
 
     with pytest.raises(ValueError):
@@ -89,14 +90,14 @@ def test_gather_parallel_1():
     Description: Test parallel in python shard.
     Expectation: Run success.
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("a", "b")
     base_rank_list = list(range(8))
 
-    p_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    p_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     p_layout = p_layout("None", "a")
 
-    i_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    i_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     i_layout = i_layout("b", "a")
 
     run_scenario(

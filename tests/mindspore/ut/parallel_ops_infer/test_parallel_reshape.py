@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ============================================================================
+"""parallel_reshape test"""
 
 import pytest
 from hyper_parallel import Layout
@@ -25,11 +27,11 @@ def test_reshape_layout_not_change_sharded_axis():
     Description: Reshape do not change sharded axis
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None", "None")
     src_shape = (1024, 512, 512)
     dst_shape = (1024, 2, 256, 512)
@@ -50,11 +52,11 @@ def test_reshape_layout_merge_sharded_axis():
     Description: Reshape merge shared axis with not shared axis
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None", "None")
     src_shape = (4, 4, 8)
     dst_shape = (16, 8)
@@ -75,11 +77,11 @@ def test_reshape_layout_split_sharded_axis():
     Description: Reshape do not change sharded axis
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None", "None")
     src_shape = (32, 128)
     dst_shape = (4, 8, 128)
@@ -100,11 +102,11 @@ def test_reshape_layout_multi_axes_shared():
     Description: Reshape split, merge, resize axes
     Expectation: Success
     """
-    base_device_matrix = (2, 2, 2)
+    base_mesh_shape = (2, 2, 2)
     base_alias_name = ("dp", "mp", "cp")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("cp", "dp", "None", "mp", "None")
     src_shape = (32, 6, 128, 28, 10)
     dst_shape = (4, 8, 2, 384, 280)
@@ -125,11 +127,11 @@ def test_reshape_layout_can_not_reshape1():
     Description: Can not be reshaped
     Expectation: Fail
     """
-    base_device_matrix = (2, 2, 2)
+    base_mesh_shape = (2, 2, 2)
     base_alias_name = ("dp", "mp", "cp")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("None", "None", "None", "mp")
     src_shape = (4, 8, 4, 12)
     dst_shape = (4, 8, 12, 4)
@@ -144,11 +146,11 @@ def test_reshape_layout_can_not_reshape2():
     Description: Can not be reshaped
     Expectation: Fail
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("None", "None", "mp", "None")
     src_shape = (4, 8, 12, 7)
     dst_shape = (4, 8, 2, 42)
@@ -163,11 +165,11 @@ def test_reshape_layout_dynamic_shape1():
     Description: Reshape parallel op with dynamic shape
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None", "None", "None")
     src_shape = (1024, -1, 256, 512)
     dst_shape = (1024, -1, 512)
@@ -188,11 +190,11 @@ def test_reshape_layout_dynamic_shape2():
     Description: Reshape parallel op with dynamic shape
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None", "None")
     src_shape = (1024, -1, 512)
     dst_shape = (1024, -1, 256, 512)
@@ -213,11 +215,11 @@ def test_reshape_layout_dynamic_shape3():
     Description: Reshape parallel op with dynamic shape
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None", "None")
     src_shape = (-1, 256, 512)
     dst_shape = (-1, 512)
@@ -238,11 +240,11 @@ def test_reshape_layout_dynamic_shape4():
     Description: Reshape parallel op with dynamic shape
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None", "None")
     src_shape = (-1, 512)
     dst_shape = (-1, 256, 512)
@@ -257,11 +259,11 @@ def test_reshape_layout_axis_shard_twice():
     Description: Reshape split, merge, resize axes
     Expectation: Success
     """
-    base_device_matrix = (2, 2, 2)
+    base_mesh_shape = (2, 2, 2)
     base_alias_name = ("dp", "mp", "cp")
     base_rank_list = list(range(8))
 
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout(("cp", "dp"), "None", "None", "mp", "None")
     src_shape = (32, 6, 128, 28, 10)
     dst_shape = (4, 8, 2, 384, 280)

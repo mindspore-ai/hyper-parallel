@@ -31,7 +31,7 @@ class TransposeDistributedOp(DistributedOp):
           1. Output layout is determined by input layout and permutation
 
         Args:
-            input_layouts: Layouts of input tensor
+            layouts : Layouts of input tensor
             extra_args (tuple): permutation of transpose
 
         Returns:
@@ -57,7 +57,7 @@ class TransposeDistributedOp(DistributedOp):
         out_tensor_map = type(in_tensor_map)(in_tensor_map[i] for i in axis)
 
         output_layout = Layout(
-            device_matrix=layout.device_matrix,
+            mesh_shape=layout.mesh_shape,
             alias_name=layout.alias_name,
             rank_list=layout.rank_list
         )

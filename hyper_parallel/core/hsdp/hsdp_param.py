@@ -84,7 +84,7 @@ class HSDPParam:
         self.global_rank_stride_list = []
         self.hsdp_rank_stride_list = []
         self.tp_rank_stride_list = []
-        device_dims = len(self.param.layout.device_matrix)
+        device_dims = len(self.param.layout.mesh_shape)
         stride = 1
         hsdp_stride = 1
         tp_stride = 1
@@ -93,14 +93,14 @@ class HSDPParam:
             self.global_rank_stride_list.append(stride)
             self.hsdp_rank_stride_list.append(hsdp_stride)
             self.tp_rank_stride_list.append(tp_stride)
-            stride = stride * self.param.layout.device_matrix[r_axis]
+            stride = stride * self.param.layout.mesh_shape[r_axis]
             if axis in self.sharded_axis_set:
-                tp_stride = tp_stride * self.param.layout.device_matrix[r_axis]
+                tp_stride = tp_stride * self.param.layout.mesh_shape[r_axis]
                 continue
 
-            hsdp_stride = hsdp_stride * self.param.layout.device_matrix[r_axis]
+            hsdp_stride = hsdp_stride * self.param.layout.mesh_shape[r_axis]
             self.unsharded_reverse_axis_list.append(r_axis)
-            self.rank_size = self.rank_size * self.param.layout.device_matrix[r_axis]
+            self.rank_size = self.rank_size * self.param.layout.mesh_shape[r_axis]
         self.global_rank_stride_list.reverse()
         self.hsdp_rank_stride_list.reverse()
         self.tp_rank_stride_list.reverse()

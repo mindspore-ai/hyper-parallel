@@ -17,9 +17,9 @@ Distributed implementation for Reduce operator.
 """
 
 from typing import Sequence, Union, Tuple, List
-from .parallel_ops import DistributedOp
 from hyper_parallel.core.layout import Layout
 from hyper_parallel.platform import get_platform
+from .parallel_ops import DistributedOp
 platform = get_platform()
 Tensor = platform.Tensor
 
@@ -42,23 +42,23 @@ class ReduceExtDistributedOpBase(DistributedOp):
             partial_type = ["sum"]
         self.partial_type = partial_type
 
-    def infer_layout(self, input_layouts, extra_args):
+    def infer_layout(self, layouts, extra_args):
         """
         Infer output layout for reduce operator.
 
         Args:
-            input_layouts (tuple): Layouts of input tensor.
+            layouts (tuple): Layouts of input tensor.
             extra_args (dict): Additional arguments (dim, keepdim).
 
         Returns:
             tuple: Layout for output tensor.
         """
-        if not input_layouts:
+        if not layouts:
             raise ValueError(f"{self.__class__.__name__} requires at least one input layout")
 
-        x_layout = input_layouts[0]
+        x_layout = layouts[0]
 
-        if x_layout.device_matrix is None:
+        if x_layout.mesh_shape is None:
             raise ValueError("Input layouts cannot be None.")
 
         # [dim, keepdim]
@@ -90,7 +90,7 @@ class ReduceExtDistributedOpBase(DistributedOp):
 
         # Case 2: Handle dim as int, tuple, or list, with keepdim True or False
         output_layout = Layout(
-            device_matrix=x_layout.device_matrix,
+            mesh_shape=x_layout.mesh_shape,
             alias_name=x_layout.alias_name,
             rank_list=x_layout.rank_list
         )
@@ -103,7 +103,7 @@ class ReduceExtDistributedOpBase(DistributedOp):
     def _handle_all_axis_reduce(self, x_layout, keepdim):
         """Handle the case where dim is empty, meaning reduce all dimensions."""
         layout = Layout(
-            device_matrix=x_layout.device_matrix,
+            mesh_shape=x_layout.mesh_shape,
             alias_name=x_layout.alias_name,
             rank_list=x_layout.rank_list
         )

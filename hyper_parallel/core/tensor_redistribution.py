@@ -24,8 +24,8 @@ def _construct_layout_tuple_for_transform_operator_list(from_layout, to_layout, 
     """_construct_layout_tuple_for_transform_operator_list"""
     from_layout_dict = from_layout.to_dict()
     to_layout_dict = to_layout.to_dict()
-    from_layout_tuple = (from_layout_dict["device_matrix"], from_layout_dict["tensor_map"], list(from_full_shape))
-    to_layout_tuple = (to_layout_dict["device_matrix"], to_layout_dict["tensor_map"], list(from_full_shape))  # TODO: 考虑reshape的场景
+    from_layout_tuple = (from_layout_dict["mesh_shape"], from_layout_dict["tensor_map"], list(from_full_shape))
+    to_layout_tuple = (to_layout_dict["mesh_shape"], to_layout_dict["tensor_map"], list(from_full_shape))  # TODO: 考虑reshape的场景
     return from_layout_tuple, to_layout_tuple
 
 
@@ -55,7 +55,6 @@ class TensorRedistribution:
         """args: (*rank_list, concat_dim)"""
         rank_list = args[0:-1]
         concat_dim = args[-1]
-        global platform
         group = platform.create_group(rank_list)
         concat_size = len(rank_list)
         return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim)
@@ -71,7 +70,6 @@ class TensorRedistribution:
         rank_list = args[2]
         concat_dim = args[0]
         concat_size = args[1]
-        global platform
         group = platform.create_group(rank_list)
         return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim)
 
@@ -81,13 +79,11 @@ class TensorRedistribution:
         split_dim = args[0]
         split_size = args[1]
         idx = rank_list.index(self.rank_id)
-        global platform
         return platform.chunk(x, split_dim, split_size, idx)
 
     def _construct_all_to_all(self, x, *args):
         """args: (split_dim, concat_dim, permute_size, group)"""
         split_dim, concat_dim, split_count, rank_list = args
-        global platform
         group = platform.create_group(rank_list)
         original_shape = x.shape
 
@@ -156,7 +152,7 @@ class TensorRedistribution:
 
     def _apply_eazy_redistribute(self, src_layout, dst_layout):
         """_apply_eazy_redistribute"""
-        if (src_layout.device_matrix != dst_layout.device_matrix or
+        if (src_layout.mesh_shape != dst_layout.mesh_shape or
                 src_layout.rank_list != dst_layout.rank_list):
             return False
 
@@ -168,7 +164,7 @@ class TensorRedistribution:
     def _redistribution_without_shape(self, local_x, src_layout, dst_layout, key):
         """_redistribution_without_shape"""
         inferrer = RedistributionOperatorInfer(
-            dev_mat=src_layout.device_matrix,
+            dev_mat=src_layout.mesh_shape,
             in_tensor_map=list(src_layout.tensor_map),
             out_tensor_map=list(dst_layout.tensor_map)
         )
@@ -184,14 +180,13 @@ class TensorRedistribution:
         x = input_x
         if input_x.layout.is_partial():
             # Solve partial status first
-            if input_x.layout.device_matrix == to_layout.device_matrix:
+            if input_x.layout.mesh_shape == to_layout.mesh_shape:
                 x = self.reduce_partial(input_x, to_layout)
             else:
                 x = self.reduce_partial(input_x, x_layout)
 
         from_layout = x.layout
         if not self.is_init:
-            global platform
             self.rank_id = platform.get_rank()
             self.rank_list = from_layout.rank_list
             self.is_init = True
@@ -236,13 +231,13 @@ class TensorRedistribution:
         return self._transform_cache[key]
 
     def _allreduce_along_dev_dim(self, x, op, layout, dev_dim):
-        global platform
+        """Do allreduce at specified axis along dev_dim."""
         group = layout.get_comm_group_by_axis(dev_dim, self.rank_id)
         zero_dim = x.dim() == 0
         if zero_dim:
             x = x.unsqueeze(0)
         if op == 'avg':
-            dev_num = layout.device_matrix[layout.alias_name.index(dev_dim)]
+            dev_num = layout.mesh_shape[layout.alias_name.index(dev_dim)]
             x = platform.differentiable_all_reduce(x, 'sum', group)
             x = x / dev_num
         else:
@@ -253,9 +248,8 @@ class TensorRedistribution:
 
     def _reduce_scatter_along_dev_dim_with_axis(self, x, axis, op, layout, dev_dim):
         """Do reduce_scatter at specified axis along dev_dim."""
-        dev_num = layout.device_matrix[layout.alias_name.index(dev_dim)]
+        dev_num = layout.mesh_shape[layout.alias_name.index(dev_dim)]
         group = layout.get_comm_group_by_axis(dev_dim, self.rank_id)
-        global platform
         output_tensor = self.platform.reduce_scatter(x, dev_num, axis, op, group)
         return output_tensor
 
@@ -267,9 +261,9 @@ class TensorRedistribution:
             return x
 
         x = x.to_local()
-        if from_layout.device_matrix != to_layout.device_matrix:
-            raise ValueError(f"For reduce partial, device_matrix between from_layout and to_layout must be the same, "
-                             f"but got {from_layout.device_matrix} and {to_layout.device_matrix}")
+        if from_layout.mesh_shape != to_layout.mesh_shape:
+            raise ValueError(f"For reduce partial, mesh_shape between from_layout and to_layout must be the same, "
+                             f"but got {from_layout.mesh_shape} and {to_layout.mesh_shape}")
         if to_layout.is_partial():
             raise ValueError(f"For reduce partial, to_layout must be non-partial status, but got to_layout.partial: "
                              f"{to_layout.partial}")

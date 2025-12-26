@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+"""parallel_concat test"""
 
 from hyper_parallel import Layout
 from hyper_parallel.core.tensor_parallel.ops.parallel_concat import ConcatDistributedOp
@@ -36,14 +37,14 @@ def test_concat_parallel_1():
     Description: Test parallel in python shard.
     Expectation: Run success.
     """
-    base_device_matrix = (2, 4, 1)
+    base_mesh_shape = (2, 4, 1)
     base_alias_name = ("a", "b", "c")
     base_rank_list = list(range(8))
 
-    t1_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)(
+    t1_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)(
         "a", "b", "c"
     )
-    t2_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)(
+    t2_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)(
         "None", "b", "c"
     )
 
@@ -62,14 +63,14 @@ def test_concat_parallel_2():
     Description: Test parallel in python shard.
     Expectation: Run success.
     """
-    base_device_matrix = (2, 4, 1)
+    base_mesh_shape = (2, 4, 1)
     base_alias_name = ("a", "b", "c")
     base_rank_list = list(range(8))
 
-    t1_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)(
+    t1_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)(
         "a", "b", "c"
     )
-    t2_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)(
+    t2_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)(
         "a", "None", "c"
     )
 
@@ -88,14 +89,14 @@ def test_concat_parallel_3():
     Description: Test parallel in python shard.
     Expectation: Run success.
     """
-    base_device_matrix = (2, 4, 1)
+    base_mesh_shape = (2, 4, 1)
     base_alias_name = ("a", "b", "c")
     base_rank_list = list(range(8))
 
-    t1_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)(
+    t1_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)(
         "a", "b", "None"
     )
-    t2_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)(
+    t2_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)(
         "a", "b", "None"
     )
 

@@ -35,7 +35,7 @@ def check_layout(layout: Optional[Any], name: str) -> None:
         return
 
     # Check for required attributes
-    required_attrs = ['_device_shape', '_tensor_map', '_rank_list']
+    required_attrs = ['mesh_shape', '_tensor_map', '_rank_list']
     for attr in required_attrs:
         if not hasattr(layout, attr):
             raise ValueError(
@@ -51,12 +51,12 @@ def check_layout(layout: Optional[Any], name: str) -> None:
             )
 
     layout_dict = layout.to_dict()
-    check_type_is_sequence(layout_dict['device_matrix'], 'device_matrix')
+    check_type_is_sequence(layout_dict['mesh_shape'], 'mesh_shape')
     check_type_is_sequence(layout_dict['tensor_map'], 'tensor_map')
     check_type_is_sequence(layout_dict['rank_list'], 'rank_list')
 
     # Validate rank list size matches device count
-    dev_num = reduce(operator.mul, layout_dict['device_matrix'])
+    dev_num = reduce(operator.mul, layout_dict['mesh_shape'])
     if len(layout_dict['rank_list']) != dev_num:
         raise ValueError(
             f"Layout {name} rank_list size ({len(layout_dict['rank_list'])}) "
@@ -64,23 +64,23 @@ def check_layout(layout: Optional[Any], name: str) -> None:
         )
 
 
-def rank_id_to_dev_id_list(dev_matrix: Tuple[int, ...], rank_id: int) -> List[int]:
+def rank_id_to_dev_id_list(mesh_shape: Tuple[int, ...], rank_id: int) -> List[int]:
     """
-    Converts a rank ID to a list of device IDs based on the device matrix.
+    Converts a rank ID to a list of device IDs based on the mesh shape.
 
     Args:
-        dev_matrix: Shape of the device matrix
+        mesh_shape: Shape of the mesh shape
         rank_id: Global rank ID to convert
 
     Returns:
         List of device IDs corresponding to the rank
     """
-    dims = len(dev_matrix)
+    dims = len(mesh_shape)
     dev_id_list = [0] * dims
 
     for i in range(dims - 1, -1, -1):
-        dev_id_list[i] = rank_id % dev_matrix[i]
-        rank_id = rank_id // dev_matrix[i]
+        dev_id_list[i] = rank_id % mesh_shape[i]
+        rank_id = rank_id // mesh_shape[i]
 
     return dev_id_list
 
@@ -132,7 +132,7 @@ def infer_intersection(
 
 
 def infer_slice_area_by_rank(
-        dev_matrix: Tuple[int, ...],
+        mesh_shape: Tuple[int, ...],
         tensor_map: Union[List[int], Tuple[int, ...]],
         rank_id: int,
         full_shape: Tuple[int, ...]
@@ -141,7 +141,7 @@ def infer_slice_area_by_rank(
     Calculates the tensor slice boundaries for a specific rank.
 
     Args:
-        dev_matrix: Shape of the device matrix
+        mesh_shape: Shape of the mesh shape
         tensor_map: Mapping of tensor dimensions to device dimensions
         rank_id: Rank ID to calculate slice for
         full_shape: Complete shape of the original tensor
@@ -151,10 +151,10 @@ def infer_slice_area_by_rank(
     """
     # Helper to get device count along a dimension
     def _get_dev_num_along_dim(dim: int) -> int:
-        return dev_matrix[-dim - 1] if dim != -1 else 1
+        return mesh_shape[-dim - 1] if dim != -1 else 1
 
     dims = len(full_shape)
-    dev_id_list = rank_id_to_dev_id_list(dev_matrix, rank_id)
+    dev_id_list = rank_id_to_dev_id_list(mesh_shape, rank_id)
     area: List[Tuple[int, int]] = []
 
     for axis in range(dims):
@@ -198,8 +198,8 @@ class ReshardHandler:
     Args:
         param_name: Name of the parameter (without pipeline stage prefix)
         full_shape: Complete shape of the tensor before sharding
-        from_layout: Source layout containing device matrix, tensor map, and rank list
-        to_layout: Target layout containing device matrix, tensor map, and rank list
+        from_layout: Source layout containing mesh shape, tensor map, and rank list
+        to_layout: Target layout containing mesh shape, tensor map, and rank list
         to_rank_id: Target rank ID to receive the resharded tensor
 
     Raises:
@@ -227,24 +227,24 @@ class ReshardHandler:
 
         # Process source layout configuration
         if from_layout is None:
-            self.from_dev_matrix = (1,)
+            self.from_mesh_shape = (1,)
             self.from_tensor_map = tuple(0 for _ in full_shape)
             self.from_rank_list = [0]
         else:
             from_layout_dict = from_layout.to_dict()
-            self.from_dev_matrix = from_layout_dict["device_matrix"]
+            self.from_mesh_shape = from_layout_dict["mesh_shape"]
             self.from_tensor_map = from_layout_dict["tensor_map"]
             self.from_rank_list = from_layout_dict["rank_list"]
 
         # Process target layout configuration
         if to_layout is None:
-            self.to_dev_matrix = (1,)
+            self.to_mesh_shape = (1,)
             self.to_tensor_map = tuple(0 for _ in full_shape)
             self.to_rank_list = [0]
             self.to_rank_id = 0
         else:
             to_layout_dict = to_layout.to_dict()
-            self.to_dev_matrix = to_layout_dict["device_matrix"]
+            self.to_mesh_shape = to_layout_dict["mesh_shape"]
             self.to_tensor_map = to_layout_dict["tensor_map"]
             self.to_rank_list = to_layout_dict["rank_list"]
             self.to_rank_id = to_rank_id
@@ -271,7 +271,7 @@ class ReshardHandler:
             List of ranks with unique data slices
         """
         inner_deredundancy_rank_list: List[int] = []
-        dev_dim = len(self.from_dev_matrix)
+        dev_dim = len(self.from_mesh_shape)
 
         # Collect relevant device dimensions from tensor map
         from_dev_map = set()
@@ -287,7 +287,7 @@ class ReshardHandler:
         if not unused_dims:
             return list(self.inner_from_rank_list)
         for rank_id in self.inner_from_rank_list:
-            dev_id_list = rank_id_to_dev_id_list(self.from_dev_matrix, rank_id)
+            dev_id_list = rank_id_to_dev_id_list(self.from_mesh_shape, rank_id)
             # check redundant
             found_redundant = False
             for dim in unused_dims:
@@ -313,7 +313,7 @@ class ReshardHandler:
         """
         # Calculate target area for current rank
         self.to_area = infer_slice_area_by_rank(
-            self.to_dev_matrix,
+            self.to_mesh_shape,
             self.to_tensor_map,
             self.inner_to_rank_id,
             self.full_shape
@@ -326,7 +326,7 @@ class ReshardHandler:
         for inner_rank_id in self.inner_deredundancy_from_rank_list:
             # Get source area for this rank
             from_area = infer_slice_area_by_rank(
-                self.from_dev_matrix,
+                self.from_mesh_shape,
                 self.from_tensor_map,
                 inner_rank_id,
                 self.full_shape

@@ -22,7 +22,7 @@ from .parallel_ops import DistributedOp
 class SliceExtDistributedOp(DistributedOp):
     """Distributed implementation for SliceExt operator."""
 
-    def infer_layout(self, input_layouts, extra_args):
+    def infer_layout(self, layouts, extra_args):
         """
         Infer output layouts for Split operator.
 
@@ -30,14 +30,14 @@ class SliceExtDistributedOp(DistributedOp):
         1. Shared axis can not be split.
 
         Args:
-            input_layouts (Layout): Layout of input tensor
+            layouts (Layout): Layout of input tensor
             extra_args (list): split size or sections, axis, input shape
 
         Returns:
             tuple: Layouts for output tensors
         """
 
-        input_layout = input_layouts[0]
+        input_layout = layouts[0]
         axis = extra_args[0]
         # Check shared axis can not be split.
         tensor_map = input_layout.tensor_map

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""parallel_topk test"""
 
 from hyper_parallel import Layout
 from hyper_parallel.core.tensor_parallel.ops.parallel_topk import TopKDistributedOp
@@ -24,12 +25,12 @@ def test_topk_layout_data_parallel():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
     # Data Parallel
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None")
 
     values_layout, indices_layout = op.infer_layout((x_layout,), True)
@@ -45,12 +46,12 @@ def test_topk_layout_tensor_parallel():
     Description: Tensor parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
     # Tensor Parallel
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("mp", "None")
 
     values_layout, indices_layout = op.infer_layout((x_layout,), True)
@@ -66,12 +67,12 @@ def test_topk_layout_tensor_and_data_parallel():
     Description: Tensor parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
     # Data and Tensor Parallel
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "mp")
 
     values_layout, indices_layout = op.infer_layout((x_layout,), True)

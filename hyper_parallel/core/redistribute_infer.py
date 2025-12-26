@@ -55,13 +55,13 @@ class DevMat:
     Supports operations to retrieve device groups along single or combined dimensions.
 
     Attributes:
-        dims (List[int]): Sizes of each dimension in the device matrix.
+        dims (List[int]): Sizes of each dimension in the mesh shape.
         _combined_dims (Dict[Tuple[int, ...], int]): Cache for precomputed combined dimension sizes.
     """
 
     def __init__(self, dims: List[int]):
         """
-        Initialize device matrix dimensions.
+        Initialize mesh shape dimensions.
 
         Args:
             dims: List of integers representing the size of each dimension.
@@ -109,7 +109,7 @@ class DevMat:
         """
         Get devices sharing the same coordinates.
 
-        Devices are grouped such that only the specified dimension varies. The device matrix
+        Devices are grouped such that only the specified dimension varies. The mesh shape
         is assumed to be in row-major order (last dimension changes fastest).
 
         Args:
@@ -137,7 +137,7 @@ class DevMat:
         # Validate rank_list length
         if len(rank_list) != total_devices:
             raise ValueError(f"rank_list length ({len(rank_list)}) doesn't match "
-                             f"device matrix product ({total_devices})")
+                             f"mesh shape product ({total_devices})")
 
         # Compute stride for the dimension
         stride = 1
@@ -147,8 +147,8 @@ class DevMat:
         # Find local index of rank in rank_list
         try:
             local_index = rank_list.index(rank)
-        except ValueError:
-            raise ValueError(f"Rank {rank} not in rank_list")
+        except ValueError as e:
+            raise ValueError(f"Rank {rank} not in rank_list") from e
 
         # Calculate base index and generate group
         index_in_dim = (local_index // stride) % self.dims[dim]
@@ -201,7 +201,7 @@ class RedistributionOperatorInfer:
     required to transform a tensor from an input device mapping to an output device mapping.
 
     Args:
-        dev_mat: Device matrix dimensions representing the device grid
+        dev_mat: Mesh shape dimensions representing the device grid
         in_tensor_map: Input tensor's device mapping for each tensor dimension
         out_tensor_map: Output tensor's device mapping for each tensor dimension
         use_permute: Whether to use permute operator (all-to-all) when possible (default: True)

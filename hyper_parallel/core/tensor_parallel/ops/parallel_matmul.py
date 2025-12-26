@@ -46,10 +46,10 @@ class MatMulExtDistributedOp(DistributedOp):
         w_layout = layouts[1]
         if not x_layout or not w_layout:
             raise ValueError(f"x_layout : {x_layout}, w_layout : {w_layout}")
-        x_device_matrix = x_layout.device_matrix
-        w_device_matrix = w_layout.device_matrix
-        if x_device_matrix != w_device_matrix:
-            raise ValueError("MatMul inputs must have same device_matrix")
+        x_mesh_shape = x_layout.mesh_shape
+        w_mesh_shape = w_layout.mesh_shape
+        if x_mesh_shape != w_mesh_shape:
+            raise ValueError("MatMul inputs must have same mesh_shape")
 
         x_map = x_layout.alias_tensor_map
         w_map = w_layout.alias_tensor_map
@@ -63,7 +63,7 @@ class MatMulExtDistributedOp(DistributedOp):
         output_map = x_map[:-1] + (w_map[output_dim],)
 
         output_layout = Layout(
-            device_matrix=x_layout.device_matrix,
+            mesh_shape=x_layout.mesh_shape,
             alias_name=x_layout.alias_name,
             rank_list=x_layout.rank_list
         )
@@ -82,23 +82,23 @@ class MatMulExtDistributedOp(DistributedOp):
 
 class MatMulDistributedOp(DistributedOp):
     """Distributed implementation for MatMul operator."""
-    def infer_layout(self, input_layouts, extra_args):
+    def infer_layout(self, layouts, extra_args):
         """
         Infer output layout for MatMul operator.
 
         MatMul: output = x @ w, with possible transpose
 
         Args:
-            input_layouts (tuple): Layouts of input tensors (x_layout, w_layout)
+            layouts (tuple): Layouts of input tensors (x_layout, w_layout)
             extra_args (tuple): Additional arguments (transpose_a, transpose_b)
 
         Returns:
             Layout: Layout for output tensor
         """
-        if len(input_layouts) < 2:
+        if len(layouts) < 2:
             raise ValueError("MatMul requires at least two input layouts")
 
-        x_layout, w_layout = input_layouts[:2]
+        x_layout, w_layout = layouts[:2]
 
         if len(extra_args) != 2:
             raise ValueError("MatMul requires two transpose input")
@@ -107,8 +107,8 @@ class MatMulDistributedOp(DistributedOp):
         x_dict = x_layout.to_dict()
         w_dict = w_layout.to_dict()
 
-        if x_dict["device_matrix"] != w_dict["device_matrix"]:
-            raise ValueError("MatMul inputs must have same device_matrix")
+        if x_dict["mesh_shape"] != w_dict["mesh_shape"]:
+            raise ValueError("MatMul inputs must have same mesh_shape")
 
         x_map = x_layout.alias_tensor_map
         w_map = w_layout.alias_tensor_map
@@ -135,7 +135,7 @@ class MatMulDistributedOp(DistributedOp):
 
         # Create output layout
         output_layout = Layout(
-            device_matrix=x_layout.device_matrix,
+            mesh_shape=x_layout.mesh_shape,
             alias_name=x_layout.alias_name,
             rank_list=x_layout.rank_list
         )
@@ -197,7 +197,7 @@ class BaseBatchMatMulDistributedOp(DistributedOp):
         output_map = tuple(merged_batch) + (x_n, w_p)
 
         output_layout = Layout(
-            device_matrix=x_layout.device_matrix,
+            mesh_shape=x_layout.mesh_shape,
             alias_name=x_layout.alias_name,
             rank_list=x_layout.rank_list
         )
@@ -217,14 +217,14 @@ class BaseBatchMatMulDistributedOp(DistributedOp):
 class BatchMatMulExtDistributedOp(BaseBatchMatMulDistributedOp):
     """Distributed implementation for BatchMatMulExt operator."""
 
-    def infer_layout(self, input_layouts, extra_args=None):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for BatchMatMulExt operator. Inputs shape are x=[b, n, m] and w=[b, m, p].
 
         BatchMatMulExt: output = x @ w.
 
         Rules:
-        - Device matrix must match.
+        - Mesh shape must match.
         - Contracting K dims must have identical layout: x[-1] == w[-2].
         - Batch dims are right-aligned broadcast:
             none vs shard -> shard
@@ -247,12 +247,12 @@ class BatchMatMulExtDistributedOp(BaseBatchMatMulDistributedOp):
             out_layout = layout("dp", "cp", "None")
         """
 
-        if len(input_layouts) < 2:
+        if len(layouts) < 2:
             raise ValueError("BatchMatMul requires at least two input layouts")
-        x_layout, w_layout = input_layouts[:2]
+        x_layout, w_layout = layouts[:2]
 
-        if x_layout.device_matrix != w_layout.device_matrix:
-            raise ValueError("BatchMatMul inputs must have same device_matrix")
+        if x_layout.mesh_shape != w_layout.mesh_shape:
+            raise ValueError("BatchMatMul inputs must have same mesh_shape")
 
         x_map = x_layout.alias_tensor_map
         w_map = w_layout.alias_tensor_map
@@ -273,14 +273,14 @@ class BatchMatMulExtDistributedOp(BaseBatchMatMulDistributedOp):
 class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
     """Distributed implementation for BatchMatMul operator."""
 
-    def infer_layout(self, input_layouts, extra_args):
+    def infer_layout(self, layouts, extra_args):
         """
         Infer output layout for BatchMatMul operator. Inputs shape are x=[b, n, m] and w=[b, m, p].
 
         BatchMatMul: output = x @ w, with possible transpose.
 
         Rules:
-        - Device matrix must match.
+        - Mesh shape must match.
         - Contracting K dims must have identical layout: x[-1] == w[-2].
         - Batch dims are right-aligned broadcast:
             none vs shard -> shard
@@ -290,7 +290,7 @@ class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
         - Output N inherits x[-2], Output P inherits w[-1]
 
         Args:
-            input_layouts (tuple): Layouts of input tensors (x_layout, w_layout)
+            layouts (tuple): Layouts of input tensors (x_layout, w_layout)
             extra_args (tuple): Additional arguments (transpose_a, transpose_b)
 
         Returns:
@@ -304,16 +304,16 @@ class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
             out_layout = layout("dp", "cp", "None")
         """
 
-        if len(input_layouts) < 2:
+        if len(layouts) < 2:
             raise ValueError("BatchMatMul requires at least two input layouts")
         if len(extra_args) != 2:
             raise ValueError("BatchMatMul requires two transpose input")
 
-        x_layout, w_layout = input_layouts[:2]
+        x_layout, w_layout = layouts[:2]
         transpose_a, transpose_b = extra_args
 
-        if x_layout.device_matrix != w_layout.device_matrix:
-            raise ValueError("BatchMatMul inputs must have same device_matrix")
+        if x_layout.mesh_shape != w_layout.mesh_shape:
+            raise ValueError("BatchMatMul inputs must have same mesh_shape")
 
         x_map = x_layout.alias_tensor_map
         w_map = w_layout.alias_tensor_map
@@ -367,12 +367,12 @@ class LinearDistributedOp(DistributedOp):
         bias_layout = layouts[2]
         if not x_layout or not w_layout:
             raise ValueError(f"x_layout : {x_layout}, w_layout : {w_layout}")
-        x_device_matrix = x_layout.device_matrix
-        w_device_matrix = w_layout.device_matrix
-        if x_device_matrix != w_device_matrix:
-            raise ValueError("Linear inputs must have same device_matrix")
-        if bias_layout and bias_layout.device_matrix != x_device_matrix:
-            raise ValueError("Linear bias and x must have same device_matrix")
+        x_mesh_shape = x_layout.mesh_shape
+        w_mesh_shape = w_layout.mesh_shape
+        if x_mesh_shape != w_mesh_shape:
+            raise ValueError("Linear inputs must have same mesh_shape")
+        if bias_layout and bias_layout.mesh_shape != x_mesh_shape:
+            raise ValueError("Linear bias and x must have same mesh_shape")
         x_map = x_layout.alias_tensor_map
         w_map = w_layout.alias_tensor_map
         contract_dim = len(x_map) - 1
@@ -388,7 +388,7 @@ class LinearDistributedOp(DistributedOp):
                              f"Got weight output dim sharding size: {w_map[output_dim]}"
                              f" and bias output dim sharding size : {bias_layout.alias_tensor_map[0]}")
         output_layout = Layout(
-            device_matrix=x_layout.device_matrix,
+            mesh_shape=x_layout.mesh_shape,
             alias_name=x_layout.alias_name,
             rank_list=x_layout.rank_list
         )

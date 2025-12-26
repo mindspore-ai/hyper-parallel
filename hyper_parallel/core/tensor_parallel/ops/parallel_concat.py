@@ -43,7 +43,7 @@ class ConcatDistributedOp(DistributedOp):
         base_layout = layouts[0]
         rank = len(base_layout.tensor_map)
         base_map = base_layout.tensor_map
-        base_device_matrix = base_layout.device_matrix
+        base_mesh_shape = base_layout.mesh_shape
 
         if dim < -rank or dim >= rank:
             raise ValueError(
@@ -54,9 +54,9 @@ class ConcatDistributedOp(DistributedOp):
             if not layout:
                 continue
 
-            if layout.device_matrix != base_device_matrix:
+            if layout.mesh_shape != base_mesh_shape:
                 raise ValueError(
-                    f"Operation {self.op_name}: Concat inputs must have same device_matrix"
+                    f"Operation {self.op_name}: Concat inputs must have same mesh_shape"
                 )
 
             if layout.tensor_map[:dim] + layout.tensor_map[dim + 1 :] != base_map[:dim] + base_map[dim + 1 :]:
@@ -66,7 +66,7 @@ class ConcatDistributedOp(DistributedOp):
 
         # Create output layout
         output_layout = Layout(
-            device_matrix=base_layout.device_matrix,
+            mesh_shape=base_layout.mesh_shape,
             alias_name=base_layout.alias_name,
             rank_list=base_layout.rank_list,
         )

@@ -24,14 +24,14 @@ def init_parameters(cell, stage_index=0):
         Raises:
             ValueError: If the `cell` is not a cell.
     """
-    import mindspore as ms
-    from mindspore.nn.cell import Cell
-    from mindspore.parallel._tensor import _get_slice_index
-    from hyper_parallel import DTensor
+    import mindspore as ms  # pylint: disable=import-outside-toplevel
+    from mindspore.nn.cell import Cell  # pylint: disable=import-outside-toplevel
+    from mindspore.parallel._tensor import _get_slice_index  # pylint: disable=import-outside-toplevel
+    from hyper_parallel import DTensor  # pylint: disable=import-outside-toplevel
     if not isinstance(cell, Cell):
-        raise ValueError("cell's type must be Cell but got {}.".format(type(cell)))
+        raise ValueError(f"cell's type must be Cell but got {type(cell)}.")
     if not isinstance(stage_index, int):
-        raise ValueError("stage_index's type must be int but got {}.".format(type(stage_index)))
+        raise ValueError(f"stage_index's type must be int but got {type(stage_index)}.")
     for param in cell.get_parameters(expand=True):
         param_is_dtensor = isinstance(param, DTensor)
         if not param.has_init:
@@ -40,7 +40,7 @@ def init_parameters(cell, stage_index=0):
         if hasattr(param, "hsdp_init_index"):
             data_slice_index = param.hsdp_init_index
         elif param_is_dtensor and param.layout is not None:
-            data_slice_index = _get_slice_index(param.layout.device_matrix, param.layout.tensor_map, None)
+            data_slice_index = _get_slice_index(param.layout.mesh_shape, param.layout.tensor_map, None)
         local_shape = param.shape
         init_tensor = param.init_mode
         if param_is_dtensor:

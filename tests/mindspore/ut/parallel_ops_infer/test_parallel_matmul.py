@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ============================================================================
+"""parallel_matmul test"""
 
 from hyper_parallel import Layout
 from hyper_parallel.core.tensor_parallel.ops.parallel_matmul import MatMulDistributedOp
@@ -24,14 +26,14 @@ def test_matmul_layout_data_parallel():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
     # Data Parallel (DP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None")
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout("None", "None")
 
     output_layout = op.infer_layout((x_layout, w_layout), (False, True))
@@ -47,14 +49,14 @@ def test_matmul_layout_hybrid_parallel():
     Description: Hybrid parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
     # Hybrid Parallel (DP + MP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None")
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout("mp", "None")
 
     output_layout = op.infer_layout((x_layout, w_layout), (False, True))
@@ -69,14 +71,14 @@ def test_matmul_layout_tensor_parallel():
     Description: Tensor parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
     # Tensor Parallel (TMP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("mp", "None")
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout("mp", "None")
 
     output_layout = op.infer_layout((x_layout, w_layout), (True, False))
@@ -91,14 +93,14 @@ def test_matmul_layout_hybrid_tensor_parallel():
     Description: Hybrid tensor parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (2, 4)
+    base_mesh_shape = (2, 4)
     base_alias_name = ("dp", "mp")
     base_rank_list = list(range(8))
 
     # Hybrid Tensor Parallel
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("mp", "dp")
-    w_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout = w_layout("None", "mp")
 
     # Test without transpose
@@ -114,14 +116,14 @@ def test_matmul_layout_multi_shard_tensor_parallel():
     Description: Multi shard tensor tensor parallel scenario
     Expectation: Success
     """
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "tp", "mp")
     rank_list = list(range(8))
 
     # Multi-Shard Tensor Parallel
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout("dp", "mp")
-    w_layout = Layout(device_matrix, alias_name, rank_list)
+    w_layout = Layout(mesh_shape, alias_name, rank_list)
     w_layout = w_layout("tp", "mp")
 
     # Test without transpose
@@ -137,14 +139,14 @@ def test_matmul_layout_multi_shard_one_dim_tensor_parallel():
     Description: Multi shard one dim tensor tensor parallel scenario
     Expectation: Success
     """
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "tp", "mp")
     rank_list = list(range(8))
 
     # Multi-Shard One Dimension Tensor Parallel
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout(("dp", "tp"), "None")
-    w_layout = Layout(device_matrix, alias_name, rank_list)
+    w_layout = Layout(mesh_shape, alias_name, rank_list)
     w_layout = w_layout("None", "mp")
 
     # Test without transpose
@@ -155,9 +157,9 @@ def test_matmul_layout_multi_shard_one_dim_tensor_parallel():
         f" got {output_layout.to_dict()['tensor_map']}"
 
     # Multi-Shard One Dimension Tensor Parallel
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout(("dp", "tp"), "mp")
-    w_layout = Layout(device_matrix, alias_name, rank_list)
+    w_layout = Layout(mesh_shape, alias_name, rank_list)
     w_layout = w_layout("None", "mp")
 
     # Test without transpose
@@ -168,9 +170,9 @@ def test_matmul_layout_multi_shard_one_dim_tensor_parallel():
         f" got {output_layout.to_dict()['tensor_map']}"
 
     # Multi-Shard One Dimension Tensor Parallel
-    x_layout = Layout(device_matrix, alias_name, rank_list)
+    x_layout = Layout(mesh_shape, alias_name, rank_list)
     x_layout = x_layout(("dp", "tp"), "mp")
-    w_layout = Layout(device_matrix, alias_name, rank_list)
+    w_layout = Layout(mesh_shape, alias_name, rank_list)
     w_layout = w_layout(("dp", "tp"), "None")
 
     # Test without transpose

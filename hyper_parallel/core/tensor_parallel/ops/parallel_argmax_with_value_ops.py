@@ -37,7 +37,7 @@ class ArgMaxWithValueDistributedOp(DistributedOp):
             raise ValueError(f"ArgMaxWithValue requires 2 extra args, but {len(extra_args)}")
 
         input_layout = layouts[0]
-        input_device_matrix = input_layout.device_matrix
+        input_mesh_shape = input_layout.mesh_shape
         input_tensor_map = input_layout.tensor_map
         input_alias_tensor_map = input_layout.alias_tensor_map
         axis, keep_dims = extra_args[0], extra_args[1]
@@ -47,11 +47,11 @@ class ArgMaxWithValueDistributedOp(DistributedOp):
             if isinstance(mapping, tuple):
                 shard_flag = False
                 for elem in mapping:
-                    if elem != -1 and input_device_matrix[len(input_device_matrix) - 1 - elem] != 1:
+                    if elem != -1 and input_mesh_shape[len(input_mesh_shape) - 1 - elem] != 1:
                         shard_flag = True
                 return shard_flag
 
-            if mapping == -1 or input_device_matrix[len(input_device_matrix) - 1 - mapping] == 1:
+            if mapping == -1 or input_mesh_shape[len(input_mesh_shape) - 1 - mapping] == 1:
                 return False
             return True
 

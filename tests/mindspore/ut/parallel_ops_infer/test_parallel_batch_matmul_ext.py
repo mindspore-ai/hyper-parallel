@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+"""parallel_batch_matmul_ext test"""
 
 from hyper_parallel import Layout
 from hyper_parallel.core.tensor_parallel.ops.parallel_matmul import BatchMatMulExtDistributedOp
@@ -30,7 +31,7 @@ def run_scenario(scenario_name, x_layout, w_layout, expected_map):
         f" got {output_layout.to_dict()['tensor_map']}"
 
 
-base_device_matrix = (2, 2, 2)
+base_mesh_shape = (2, 2, 2)
 base_alias_name = ("dp", "cp", "mp")
 base_rank_list = list(range(8))
 
@@ -41,10 +42,10 @@ def test_bmm_ext_data_parallel():
     Description: Test data parallel in python shard.
     Expectation: Run success.
     '''
-    x_layout1 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout1 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout1 = x_layout1("dp", "None", "None")
 
-    w_layout1 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout1 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout1 = w_layout1("dp", "None", "None")
 
     run_scenario(
@@ -61,10 +62,10 @@ def test_bmm_ext_model_parallel():
     Description: Test model parallel in python shard.
     Expectation: Run success.
     '''
-    x_layout2 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout2 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout2 = x_layout2("None", "None", "None")
 
-    w_layout2 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout2 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout2 = w_layout2("None", "None", "mp")
 
     run_scenario(
@@ -81,10 +82,10 @@ def test_bmm_ext_hybrid_parallel():
     Description: Test hybrid parallel in python shard.
     Expectation: Run success.
     '''
-    x_layout3 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout3 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout3 = x_layout3("dp", "cp", "None")
 
-    w_layout3 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout3 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout3 = w_layout3("dp", "None", "mp")
 
     run_scenario(
@@ -101,10 +102,10 @@ def test_bmm_ext_tensor_parallel():
     Description: Test tensor parallel in python shard.
     Expectation: Run success.
     '''
-    x_layout4 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout4 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout4 = x_layout4("dp", "None", "mp")
 
-    w_layout4 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout4 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout4 = w_layout4("None", "mp", "None")
 
     run_scenario(
@@ -121,10 +122,10 @@ def test_bmm_ext_hybrid_tensor_parallel():
     Description: Test tensor parallel in python shard.
     Expectation: Run success.
     '''
-    x_layout5 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout5 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout5 = x_layout5("dp", "cp", "mp")
 
-    w_layout5 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout5 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout5 = w_layout5("None", "mp", "None")
 
     run_scenario(
@@ -141,10 +142,10 @@ def test_bmm_ext_multi_shard_tensor_parallel():
     Description: Test multi shard tensor parallel in python shard.
     Expectation: Run success.
     '''
-    x_layout6 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout6 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout6 = x_layout6("dp", "None", "mp")
 
-    w_layout6 = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    w_layout6 = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     w_layout6 = w_layout6("dp", "mp", "cp")
 
     run_scenario(
@@ -161,13 +162,13 @@ def test_bmm_ext_multi_shard_one_dim_tensor_parallel():
     Description: Test Multi shard one dim tensor parallel in python shard.
     Expectation: Run success.
     '''
-    device_matrix = (2, 2, 2)
+    mesh_shape = (2, 2, 2)
     alias_name = ("dp", "tp", "mp")
     rank_list = list(range(8))
-    x_layout7 = Layout(device_matrix, alias_name, rank_list)
+    x_layout7 = Layout(mesh_shape, alias_name, rank_list)
     x_layout7 = x_layout7("None", ("dp", "tp"), "None")
 
-    w_layout7 = Layout(device_matrix, alias_name, rank_list)
+    w_layout7 = Layout(mesh_shape, alias_name, rank_list)
     w_layout7 = w_layout7("None", "None", "mp")
 
     run_scenario(

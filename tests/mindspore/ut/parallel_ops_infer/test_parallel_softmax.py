@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ============================================================================
+"""parallel_softmax test"""
 
 import pytest
 from hyper_parallel import Layout
@@ -25,12 +27,12 @@ def test_softmax_layout_data_parallel():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (8,)
+    base_mesh_shape = (8,)
     base_alias_name = ("dp",)
     base_rank_list = list(range(8))
 
     # Data Parallel (DP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None")
 
     output_layout = op.infer_layout((x_layout,), (-1,))
@@ -47,12 +49,12 @@ def test_softmax_layout_data_parallel_value_failed():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_device_matrix = (8,)
+    base_mesh_shape = (8,)
     base_alias_name = ("dp",)
     base_rank_list = list(range(8))
 
     # Data Parallel (DP)
-    x_layout = Layout(base_device_matrix, base_alias_name, base_rank_list)
+    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None")
 
     with pytest.raises(ValueError):

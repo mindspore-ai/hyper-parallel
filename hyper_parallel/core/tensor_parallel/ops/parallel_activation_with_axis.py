@@ -73,7 +73,7 @@ class ActivationWithAxisDistributedOp(DistributedOp):
             tensor_map = x_dev[axis_index]
             if tensor_map == -1:
                 continue
-            axis_strategy = x_dict["device_matrix"][len(x_dict["device_matrix"]) - tensor_map - 1]
+            axis_strategy = x_dict["mesh_shape"][len(x_dict["mesh_shape"]) - tensor_map - 1]
             if axis_strategy != min_slice_num:
                 raise ValueError(
                     f"Operation {self.op_name}: The strategy corresponding to axis dimension (in dim {axis_index}, "
