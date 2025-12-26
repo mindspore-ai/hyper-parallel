@@ -165,6 +165,10 @@ class Platform:
     def reduce_scatter_tensor(data, group_info, async_op=False):
         raise NotImplementedError("Platform subclasses must implement reduce_scatter_tensor")
 
+    @staticmethod
+    def parameters_dict(cell):
+        raise NotImplementedError("Platform subclasses must implement parameters_dict")
+
     def _create_group(self, rank_list, group_name=None):
         raise NotImplementedError("Platform subclasses must implement _create_group")
 

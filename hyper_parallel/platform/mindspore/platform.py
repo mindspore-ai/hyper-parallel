@@ -233,6 +233,10 @@ class MindSporePlatform(Platform):
     def reduce_scatter_tensor(data, group_info, async_op=False):
         return comm_func.reduce_scatter_tensor(data, group=group_info.group_name, async_op=async_op)
 
+    @staticmethod
+    def parameters_dict(cell: Cell):
+        return cell._params
+
     def new_stream(self):
         return ms.runtime.Stream()
 
