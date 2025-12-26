@@ -206,13 +206,18 @@ class MindSporePlatform(Platform):
         return type_size_in_bytes(param.dtype)
 
     @staticmethod
-    def new_zero_parameter(param_shape, param_type, requires_grad):
+    def new_zero_parameter(param_shape, param_type, requires_grad, device):
         param = Parameter(initializer("zeros", param_shape, param_type), requires_grad=requires_grad)
+        if device not in ("CPU", None):
+            return param.to(device)
         return param
 
     @staticmethod
-    def new_tensor(tensor_shape, tensor_type):
-        return Tensor(shape=tensor_shape, dtype=tensor_type)
+    def new_tensor(tensor_shape, tensor_type, device):
+        tensor = Tensor(shape=tensor_shape, dtype=tensor_type)
+        if device not in ("CPU", None):
+            return tensor.to(device)
+        return tensor
 
     def _create_group(self, rank_list, group_name=None):
         if group_name is None:

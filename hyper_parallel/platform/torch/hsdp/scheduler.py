@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""HSDP scheduler"""
+"""Torch HSDP scheduler"""
 from hyper_parallel.core.hsdp.hsdp_scheduler import HSDPScheduler
 from hyper_parallel.platform.torch.hsdp.state import TorchHSDPState
+from hyper_parallel.platform.torch.hsdp.grad_hook import TorchHSDPGradHook
 from hyper_parallel.platform import get_platform
 
 
@@ -28,3 +29,12 @@ class TorchHSDPScheduler(HSDPScheduler):
     def _new_cell_state(self):
         """new cell state"""
         self.hsdp_state = TorchHSDPState(self.cell, self.config, self.platform)
+
+    def _new_grad_hook(self):
+        """
+        Create and initialize a new TorchHSDPGradHook instance.
+        
+        This method instantiates the gradient hook component used for handling
+        gradient operations in the HSDP scheduler.
+        """
+        self.grad_hook = TorchHSDPGradHook(self.config, self.platform)

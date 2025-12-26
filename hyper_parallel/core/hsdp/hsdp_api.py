@@ -69,19 +69,19 @@ class HSDPCell:
             raise ValueError(f"requires_grad_sync must be bool but got {requires_grad_sync}.")
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call hsdp interface first.")
-        self.hsdp_scheduler.set_requires_grad_sync(requires_grad_sync)
-        for sub_cell in self.cells():
-            if isinstance(sub_cell, HSDPCell):
-                sub_cell.set_requires_grad_sync(requires_grad_sync)
+
+        for _, cell in platform.get_cells_and_names(self):
+            if isinstance(cell, HSDPCell):
+                cell.hsdp_scheduler.set_requires_grad_sync(requires_grad_sync)
 
     def zero_grads(self):
         """zero accumunication grads"""
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call hsdp interface first.")
-        self.hsdp_scheduler.zero_grads()
-        for sub_cell in self.cells():
-            if isinstance(sub_cell, HSDPCell):
-                sub_cell.zero_grads()
+
+        for _, cell in platform.get_cells_and_names(self):
+            if isinstance(cell, HSDPCell):
+                cell.hsdp_scheduler.zero_grads()
 
     def set_forward_prefetch_cells(self, hsdp_cell_list):
         """set forward prefetch cell list to prefetch all gather for unsharded parameters"""

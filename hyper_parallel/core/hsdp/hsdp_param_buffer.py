@@ -26,6 +26,7 @@ class HSDPParamBuffer:
         self.local_rank = init_hsdp_param.hsdp_rank % init_hsdp_param.shard_size
         self.dtype = init_hsdp_param.param.dtype
         self.sharded_group_info = init_hsdp_param.sharded_group_info
+        self.device = init_hsdp_param.device
         self.hsdp_params = []
         self.numel = 0
         self.sharded_param_buffer = None
@@ -46,7 +47,7 @@ class HSDPParamBuffer:
 
     def _init_param_buffer(self):
         """init params buffer"""
-        self.sharded_param_buffer = self.platform.new_tensor((self.numel), self.dtype)
+        self.sharded_param_buffer = self.platform.new_tensor((self.numel), self.dtype, self.device)
         for hsdp_param in self.hsdp_params:
             start_index = hsdp_param.param_buffer_start_index
             end_index = hsdp_param.param_buffer_end_index

@@ -146,11 +146,11 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement get_param_type_size")
 
     @staticmethod
-    def new_zero_parameter(param_shape, param_type, requires_grad):
+    def new_zero_parameter(param_shape, param_type, requires_grad, device):
         raise NotImplementedError("Platform subclasses must implement new_zero_parameter")
 
     @staticmethod
-    def new_tensor(tensor_shape, tensor_type):
+    def new_tensor(tensor_shape, tensor_type, device):
         raise NotImplementedError("Platform subclasses must implement new_tensor")
 
     @staticmethod

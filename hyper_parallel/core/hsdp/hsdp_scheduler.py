@@ -14,7 +14,6 @@
 # ============================================================================
 """HSDP scheduler"""
 from hyper_parallel.core.hsdp.hsdp_utils import OptimizerLevel, HSDPConfig
-from hyper_parallel.core.hsdp.hsdp_state import HSDPState
 from hyper_parallel.core.hsdp.hsdp_grad_hook import HSDPGradHook
 from hyper_parallel.core.hsdp.hsdp_async_grad_hook import HSDPAsyncGradHook
 
@@ -52,12 +51,12 @@ class HSDPScheduler:
 
     def _init_platform(self):
         """init platform"""
-        pass
+        raise NotImplementedError("HSDPScheduler subclasses must implement _init_platform")
 
     def _new_cell_state(self):
         """new cell state"""
-        pass
-    
+        raise NotImplementedError("HSDPScheduler subclasses must implement _new_cell_state")
+
     def _new_grad_hook(self):
         """new grad hook"""
         if self.config.comm_async:
@@ -99,26 +98,31 @@ class HSDPScheduler:
         if self.requires_acc_grad:
             self.hsdp_state.zero_grads()
 
+    # pylint: disable=W0613
     def _hsdp_forward_pre_hook(self, cell, inputs):
         """forward pre hook to unsharded parameter for forward process."""
         self.hsdp_state.unshard()
         for prefetch_cell in self.forward_prefetch_cells:
             prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()
 
+    # pylint: disable=W0613
     def _hsdp_forward_hook(self, cell, inputs, outputs):
         """forward hook to shard parameter for saving memory."""
         self.hsdp_state.shard()
 
+    # pylint: disable=W0613
     def _hsdp_backward_pre_hook(self, cell, grad_outputs):
         """backward pre hook to unsharded parameter for backward process."""
         self.hsdp_state.unshard()
         for prefetch_cell in self.backward_prefetch_cells:
             prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()
 
+    # pylint: disable=W0613
     def _hsdp_backward_hook(self, cell, grad_inputs, grad_outputs):
         """backward hook to shard parameter for optimizer process or saving memory."""
         self.hsdp_state.shard()
 
+    # pylint: disable=W0613
     def _hsdp_acc_backward_hook(self, cell, grad_inputs, grad_outputs):
         """backward hook to shard parameter for grad accumulation when requires_grad_sync is True."""
         if self.requires_grad_sync:
