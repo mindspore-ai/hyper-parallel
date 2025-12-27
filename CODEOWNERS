@@ -10,7 +10,6 @@
 * @kisnwang
 
 # The maintainers of hyper_parallel/core.
-/hyper_parallel/core/ @kisnwang
 /hyper_parallel/core/tensor_parallel @yangzhenzhang
 /hyper_parallel/core/hsdp @kisnwang
 
@@ -20,7 +19,7 @@
 /hyper_parallel/platform/hsdp @kisnwang
 
 # The maintainers of tests.
-/tests/ @kisnwang
+/tests/common @kisnwang
 /tests/mindspore/st/hsdp/ @kisnwang
 /tests/mindspore/st/pipeline_parallel/ @yangzhenzhang
 /tests/mindspore/st/tensor_parallel/ @yangzhenzhang
