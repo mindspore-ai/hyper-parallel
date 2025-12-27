@@ -1,0 +1,37 @@
+# The CODEOWNERS file is used to define the maintainer of a specific file or directory in the code repository.
+# Its main purpose is to automatically request designated maintainer to conduct code review in Pull Request (PR),
+# in order to clarify code ownership, improve code quality, and accelerate the review process.
+
+# The lines starting with # are comments.
+# Each line corresponds to a specified file or directory and maintainer by @ splitting.
+# The rules are applied from top to bottom, and the last matching rule will take effect.
+
+# If the file in PR does not match rule, the default maintainer kisnwang will be designated to conduct code review.
+* @kisnwang
+
+# The maintainers of hyper_parallel/core.
+/hyper_parallel/core/ @kisnwang
+/hyper_parallel/core/tensor_parallel @yangzhenzhang
+/hyper_parallel/core/hsdp @kisnwang
+
+# The maintainers of hyper_parallel/platform.
+/hyper_parallel/platform/ @kisnwang
+/hyper_parallel/platform/pipeline_parallel @yangzhenzhang
+/hyper_parallel/platform/hsdp @kisnwang
+
+# The maintainers of tests.
+/tests/ @kisnwang
+/tests/mindspore/st/hsdp/ @kisnwang
+/tests/mindspore/st/pipeline_parallel/ @yangzhenzhang
+/tests/mindspore/st/tensor_parallel/ @yangzhenzhang
+/tests/mindspore/st/ut/parallel_ops_infer/ @yangzhenzhang
+/tests/torch/hsdp/ @kisnwang
+/tests/torch/pipeline_parallel/ @yangzhenzhang
+/tests/torch/tensor_parallel/ @yangzhenzhang
+
+# The maintainers of other code directories.
+/.jenkins/ @kisnwang
+/docs/ @yangzhenzhang
+/.gitmodules  @kisnwang
+/requirements.txt  @kisnwang
+/setup.py  @kisnwang
