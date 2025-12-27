@@ -200,6 +200,10 @@ class TorchPlatform(Platform):
     def new_tensor(tensor_shape, tensor_type):
         return torch.empty(tensor_shape, tensor_type)
 
+    @staticmethod
+    def parameters_dict(cell: Module):
+        return cell.named_parameter()
+
     def _create_group(self, rank_list, group_name=None):
         group_dict = create_sub_groups(rank_list)
         return group_dict[tuple(rank_list)]
