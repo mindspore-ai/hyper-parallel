@@ -10,16 +10,15 @@
 * @kisnwang
 
 # The maintainers of hyper_parallel/core.
-/hyper_parallel/core/tensor_parallel @yangzhenzhang
-/hyper_parallel/core/hsdp @kisnwang
+/hyper_parallel/core/tensor_parallel/ @yangzhenzhang
+/hyper_parallel/core/hsdp/ @kisnwang
 
 # The maintainers of hyper_parallel/platform.
-/hyper_parallel/platform/ @kisnwang
-/hyper_parallel/platform/pipeline_parallel @yangzhenzhang
-/hyper_parallel/platform/hsdp @kisnwang
+/hyper_parallel/platform/pipeline_parallel/ @yangzhenzhang
+/hyper_parallel/platform/hsdp/ @kisnwang
 
 # The maintainers of tests.
-/tests/common @kisnwang
+/tests/ @kisnwang
 /tests/mindspore/st/hsdp/ @kisnwang
 /tests/mindspore/st/pipeline_parallel/ @yangzhenzhang
 /tests/mindspore/st/tensor_parallel/ @yangzhenzhang
@@ -30,7 +29,7 @@
 
 # The maintainers of other code directories.
 /.jenkins/ @kisnwang
-/docs/ @yangzhenzhang
+/docs/ @kisnwang
 /.gitmodules  @kisnwang
 /requirements.txt  @kisnwang
 /setup.py  @kisnwang
