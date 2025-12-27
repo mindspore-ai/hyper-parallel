@@ -17,6 +17,9 @@
 /hyper_parallel/platform/pipeline_parallel/ @yangzhenzhang
 /hyper_parallel/platform/hsdp/ @kisnwang
 
+# The maintainers of hyper_parallel/auto_parallel.
+/hyper_parallel/auto_parallel @bj-wang
+
 # The maintainers of tests.
 /tests/ @kisnwang
 /tests/mindspore/st/hsdp/ @kisnwang
