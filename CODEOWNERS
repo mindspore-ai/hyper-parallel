@@ -22,7 +22,7 @@
 /tests/mindspore/st/hsdp/ @kisnwang
 /tests/mindspore/st/pipeline_parallel/ @yangzhenzhang
 /tests/mindspore/st/tensor_parallel/ @yangzhenzhang
-/tests/mindspore/st/ut/parallel_ops_infer/ @yangzhenzhang
+/tests/mindspore/ut/parallel_ops_infer/ @yangzhenzhang
 /tests/torch/hsdp/ @kisnwang
 /tests/torch/pipeline_parallel/ @yangzhenzhang
 /tests/torch/tensor_parallel/ @yangzhenzhang
