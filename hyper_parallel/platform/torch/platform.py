@@ -193,16 +193,16 @@ class TorchPlatform(Platform):
         return torch._utils._element_size(param.dtype)
 
     @staticmethod
-    def new_zero_parameter(param_shape, param_type, requires_grad):
-        return nn.Parameter(torch.zeros(param_shape, dtype=param_type), requires_grad=requires_grad)
-
-    @staticmethod
-    def new_tensor(tensor_shape, tensor_type):
-        return torch.empty(tensor_shape, tensor_type)
-
-    @staticmethod
     def parameters_dict(cell: Module):
         return cell.named_parameter()
+
+    @staticmethod
+    def new_zero_parameter(param_shape, param_type, requires_grad, device):
+        return nn.Parameter(torch.zeros(param_shape, dtype=param_type, device=device), requires_grad=requires_grad)
+
+    @staticmethod
+    def new_tensor(tensor_shape, tensor_type, device):
+        return torch.empty(tensor_shape, tensor_type, device=device)
 
     def _create_group(self, rank_list, group_name=None):
         group_dict = create_sub_groups(rank_list)

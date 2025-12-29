@@ -31,6 +31,7 @@ class HSDPGradBuffer:
         self.unsharded_group_info = init_hsdp_param.unsharded_group_info
         self.sharded = init_hsdp_param.sharded
         self.fully_sharded = init_hsdp_param.fully_sharded
+        self.device = init_hsdp_param.device
         self.hsdp_params = []
         self.numel = 0
         self.requires_grad_sync = False
@@ -89,11 +90,12 @@ class HSDPGradBuffer:
         if self.config.shard_level != OptimizerLevel.SHARD_OPT:
             acc_grad_shape = (1, self.numel)
             self.acc_grad_buffer_dim0 = 1
-        self.acc_grad_buffer = self.platform.new_zero_parameter(acc_grad_shape, self.reduce_type, False)
+        self.acc_grad_buffer = self.platform.new_zero_parameter(acc_grad_shape, self.reduce_type, False, self.device)
 
     def _copy_grad_to_unsharded_buffer(self):
         """copy grad to buffer"""
-        self.unsharded_grad_buffer = self.platform.new_tensor((self.shard_size, self.numel), self.reduce_type)
+        self.unsharded_grad_buffer = self.platform.new_tensor((self.shard_size, self.numel), self.reduce_type,
+                                                               self.device)
         for hsdp_param in self.hsdp_params:
             if hsdp_param.grad is None:
                 raise ValueError("HSDP param grad can't be None with comm fusion.")
@@ -226,7 +228,7 @@ class HSDPGradBuffer:
             return
         self.acc_grad_buffer.zero_()
 
-    def set_grad_ready(self, hsdp_param):
+    def set_grad_ready(self):
         """set grad ready"""
         self.num_ready_grad = self.num_ready_grad + 1
         if self.num_ready_grad == self.num_grad:

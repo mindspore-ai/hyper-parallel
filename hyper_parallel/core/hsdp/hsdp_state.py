@@ -34,7 +34,7 @@ class HSDPState:
 
     def _init_hsdp_params(self):
         """init hsdp parameters for cell"""
-        pass
+        raise NotImplementedError("HSDPState subclasses must implement _init_hsdp_params")
 
     def _init_param_buffers(self):
         """init param buffers"""
@@ -149,7 +149,7 @@ class HSDPState:
             return
         buffer = self.param_to_buffer.get(hsdp_param, None)
         if buffer is not None:
-            buffer.set_grad_ready(hsdp_param)
+            buffer.set_grad_ready()
         else:
             raise ValueError(f"param {hsdp_param.param} is not register to buffer.")
 

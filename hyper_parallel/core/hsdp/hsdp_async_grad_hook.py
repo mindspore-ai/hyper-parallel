@@ -37,7 +37,8 @@ class HSDPAsyncGradHook(HSDPGradHook):
             return grad * self.grad_scale
         return grad
 
-    def _get_final_grad_hook(self, param, async_hook, post_hook=None):
+    # pylint: disable=W0613
+    def _get_final_async_grad_hook(self, param, async_hook, post_hook=None):
         """get async process hook"""
         def async_hook_handler(grad):
             origin_dtype, pre_grad = self._pre_process(grad)
@@ -73,7 +74,7 @@ class HSDPAsyncGradHook(HSDPGradHook):
             grad_hook = grad_all_reduce_hook
         else:
             grad_hook = grad_acc_all_reduce_hook
-        return self._get_final_grad_hook(hsdp_param.param, grad_hook)
+        return self._get_final_async_grad_hook(hsdp_param.param, grad_hook)
 
     def _get_async_param_fully_sharded_hook(self, hsdp_param):
         """get hook for fully sharded param."""
@@ -84,19 +85,20 @@ class HSDPAsyncGradHook(HSDPGradHook):
             hsdp_param.acc_grad.add_(grad)
             if not self.requires_grad_sync:
                 return grad, None
-            return self.platform.reduce_scatter_tensor(hsdp_param.acc_grad, hsdp_param.sharded_group_info, async_op=True)
+            return self.platform.reduce_scatter_tensor(hsdp_param.acc_grad, hsdp_param.sharded_group_info,
+                                                       async_op=True)
 
         def grad_reduce_scatter_acc_post_hook(output):
             hsdp_param.acc_grad.add_(output)
             return hsdp_param.acc_grad
 
         if not self.requires_acc_grad:
-            return self._get_final_grad_hook(hsdp_param.param, grad_reduce_scatter_hook)
+            return self._get_final_async_grad_hook(hsdp_param.param, grad_reduce_scatter_hook)
 
         if self.shard_level == OptimizerLevel.SHARD_OPT:
-            return self._get_final_grad_hook(hsdp_param.param, grad_acc_reduce_scatter_hook)
-        return self._get_final_grad_hook(hsdp_param.param, grad_reduce_scatter_hook,
-                                         grad_reduce_scatter_acc_post_hook)
+            return self._get_final_async_grad_hook(hsdp_param.param, grad_acc_reduce_scatter_hook)
+        return self._get_final_async_grad_hook(hsdp_param.param, grad_reduce_scatter_hook,
+                                               grad_reduce_scatter_acc_post_hook)
 
     def _get_async_param_partial_sharded_hook(self, hsdp_param):
         """get hook for partial sharded param."""
@@ -125,7 +127,7 @@ class HSDPAsyncGradHook(HSDPGradHook):
             grad_hook = grad_acc_reduce_scatter_hook
         else:
             grad_hook = grad_reduce_scatter_acc_hook
-        return self._get_final_grad_hook(hsdp_param.param, grad_hook)
+        return self._get_final_async_grad_hook(hsdp_param.param, grad_hook)
 
     def get_hook(self, hsdp_param):
         """get hook for param gradient process."""

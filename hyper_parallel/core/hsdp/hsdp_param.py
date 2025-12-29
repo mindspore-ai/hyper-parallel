@@ -252,7 +252,8 @@ class HSDPParam:
                 acc_grad_type = self.param.dtype
                 if self.config.reduce_dtype is not None:
                     acc_grad_type = self.config.reduce_dtype
-                self.acc_grad = self.platform.new_zero_parameter(self.param_shape, acc_grad_type, False)
+                self.acc_grad = self.platform.new_zero_parameter(self.param_shape, acc_grad_type, False,
+                                                                 self.param.device)
             self.param.acc_grad = self.acc_grad
             return
 
@@ -266,7 +267,7 @@ class HSDPParam:
             acc_grad_type = self.param.dtype
             if self.config.reduce_dtype is not None:
                 acc_grad_type = self.config.reduce_dtype
-            self.acc_grad = self.platform.new_zero_parameter(acc_grad_shape, acc_grad_type, False)
+            self.acc_grad = self.platform.new_zero_parameter(acc_grad_shape, acc_grad_type, False, self.param.device)
         self.param.acc_grad = self.acc_grad
         self.sharded = True
         if self.shard_size == self.rank_size:
