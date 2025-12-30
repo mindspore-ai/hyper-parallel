@@ -1,0 +1,4 @@
+StackExt:
+  dist_op_name: _stack_ext_dist_op
+  distributed_op_class: StackExtDistributedOp
+  distributed_op_file: parallel_stack_ext

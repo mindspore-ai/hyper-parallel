@@ -14,14 +14,17 @@
 # ============================================================================
 """_op_dispatch"""
 import os
+import sys
 import atexit
 import glob
 import importlib
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Optional
 import yaml
+
 from hyper_parallel.core.tensor_parallel.ops.parallel_ops_register import get_distributed_op
 from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.platform import get_platform
+
 platform = get_platform()
 Tensor = platform.Tensor
 
@@ -90,21 +93,94 @@ class OpDispatcher:
     OpDispatcher
     """
     def __init__(self):
-        self.yaml_dir = "tensor_parallel/ops/yaml"
-        self.work_dir = os.path.normpath(os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), '../'))
+        self._env_yaml_dir: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_YAML_DIR")
+        self._env_python_path: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_PYTHON_PATH")
+
+        self._setup_paths_from_env()
+
         self.layout_infer_ops = self.safe_load_yaml_from_dir()
         self.whitelist = ["InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv", "typeof", "DistCommIsend",
                           "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather",
                           "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__", "register_hook",
                           "is_complex", "chunk"]
+
+        self._register_distributed_ops()
+
+    def _setup_paths_from_env(self):
+        self._setup_yaml_dir(self._env_yaml_dir)
+        self._extend_sys_path(self._env_python_path)
+
+    def _setup_yaml_dir(self, env_yaml_dir: Optional[str]):
+        """
+        Feature: Configure yaml_dir/work_dir for OpDispatcher
+        Description: Resolve the YAML directory used to load distributed op definitions.
+                     If env_yaml_dir is an absolute path, use it directly; otherwise treat it
+                     as a path relative to the project work_dir. If env_yaml_dir is not set,
+                     fall back to the default 'tensor_parallel/ops/yaml' under work_dir.
+        Expectation: self.yaml_dir and self.work_dir are set to valid values used later by
+                     safe_load_yaml_from_dir(); no functional behavior is changed.
+        """
+        if env_yaml_dir:
+            if os.path.isabs(env_yaml_dir):
+                self.yaml_dir = env_yaml_dir
+                self.work_dir = ""
+            else:
+                self.work_dir = os.path.normpath(
+                    os.path.join(os.path.dirname(os.path.realpath(__file__)), "../")
+                )
+                self.yaml_dir = env_yaml_dir
+        else:
+            self.yaml_dir = "tensor_parallel/ops/yaml"
+            self.work_dir = os.path.normpath(
+                os.path.join(os.path.dirname(os.path.realpath(__file__)), "../")
+            )
+
+    def _extend_sys_path(self, env_python_path: Optional[str]):
+        if not env_python_path:
+            return
+        python_paths = env_python_path.split(":")
+        for path in python_paths:
+            if path and os.path.isdir(path) and path not in sys.path:
+                sys.path.insert(0, path)
+
+    def _register_distributed_ops(self):
         for op_name, config in self.layout_infer_ops.items():
-            class_name = config['distributed_op_class']
-            module_name = "hyper_parallel.core.tensor_parallel.ops." + config['distributed_op_file']
+            self._register_single_distributed_op(op_name, config)
+
+    def _register_single_distributed_op(self, op_name: str, config: dict):
+        """
+        Feature: Register a single distributed op implementation
+        Description: Import the distributed op class specified by config and instantiate it
+                     with op_name to trigger registration in the distributed op registry.
+                     Prefer 'distributed_op_module' when provided; otherwise import from
+                     built-in module prefix 'hyper_parallel.core.tensor_parallel.ops.' plus
+                     'distributed_op_file'. If import fails and an external python path is
+                     provided via env, fall back to importing 'distributed_op_file' directly.
+        Expectation: The distributed op class is imported and instantiated successfully,
+                     or the original import error is raised; no functional behavior is changed.
+        """
+        class_name = config["distributed_op_class"]
+
+        if "distributed_op_module" in config:
+            module_name = config["distributed_op_module"]
             module = importlib.import_module(module_name)
             op_class = getattr(module, class_name)
             _ = op_class(op_name)
+            return
 
+        module_file = config["distributed_op_file"]
+        try:
+            module_name = "hyper_parallel.core.tensor_parallel.ops." + module_file
+            module = importlib.import_module(module_name)
+            op_class = getattr(module, class_name)
+            _ = op_class(op_name)
+        except (ModuleNotFoundError, ImportError):
+            if self._env_python_path:
+                module = importlib.import_module(module_file)
+                op_class = getattr(module, class_name)
+                _ = op_class(op_name)
+            else:
+                raise
 
     def _with_layout_infer(self, func: callable, *args, **kwargs) -> Tensor:
         """_with_layout_infer"""
@@ -235,7 +311,6 @@ class OpDispatcher:
             else:
                 raise RuntimeError("Output is a tuple but layout is not")
             return output
-
 
         return DTensor.from_local(py_output, output_layout)
 
@@ -407,7 +482,7 @@ class OpDispatcher:
         Load yaml dictionary from directory.
         """
         yaml_dict = {}
-        yaml_path = os.path.join(self.work_dir, self.yaml_dir)
+        yaml_path = os.path.join(self.work_dir, self.yaml_dir) if self.work_dir else self.yaml_dir
         if not os.path.isdir(yaml_path):
             raise ValueError(f"Invalid yaml directory path: {yaml_path}")
 
