@@ -57,3 +57,31 @@ def test_mean_ext_cell_shard_2():
     case_name = "test_mean_ext_partial_model_parallel_2"
     master_port = 11291
     run_case(file_name, case_name, master_port)
+
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_reduce_max_cell_shard_3():
+    '''
+    Feature: ReduceMax operator.
+    Description: Test cell shard in python.
+    Expectation: Run success.
+    '''
+    file_name = "reduce_shard_in_python.py"
+    case_name = "test_reduce_max_partial_model_parallel_3"
+    master_port = 11292
+    run_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_reduce_max_backward_gradient_4():
+    '''
+    Feature: ReduceMax operator backward gradient.
+    Description: Test ReduceMax backward gradient in distributed training.
+    Expectation: Run success.
+    '''
+    file_name = "reduce_shard_in_python.py"
+    case_name = "test_reduce_max_backward_gradient_4"
+    master_port = 11293
+    run_case(file_name, case_name, master_port)
+    

@@ -7,3 +7,8 @@ MeanExt:
   dist_op_name: _mean_ext_dist_op
   distributed_op_class: MeanExtDistributedOp
   distributed_op_file: parallel_reduce
+
+ReduceMax:
+  dist_op_name: _reduce_max_dist_op
+  distributed_op_class: ReduceMaxDistributedOp
+  distributed_op_file: parallel_reduce
