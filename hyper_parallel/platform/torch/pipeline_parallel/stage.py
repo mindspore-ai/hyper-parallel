@@ -115,7 +115,6 @@ class PipelineStage(ABC):
             device_num_per_stage = device_num // real_stage_num
             index = self.stage_index % real_stage_num
             rank_ids = [rank_id + device_num_per_stage * (i - index) for i in range(real_stage_num)]
-            # if the names are the same, an error will be reported
             self.pp_group = dist.new_group(rank_ids, use_local_synchronization=True)
 
     def clear_cache(self):
@@ -200,7 +199,7 @@ class PipelineStage(ABC):
         if isinstance(src_stage, int):
             return src_stage
 
-        raise TypeError(f"Argument src_stage must be of type None, int, but got {type(each_stage)}.")
+        raise TypeError(f"Argument src_stage must be of type None, int, but got {type(src_stage)}.")
 
     def _check_dst_stage(self, dst_stage):
         """check type for dst_stage."""
@@ -293,13 +292,20 @@ class PipelineStage(ABC):
             recv_args = [recv_info.buffer for recv_info in self.grad_recv_info[micro_index]]
 
         fwd_output = self.fwd_cache.pop(micro_index)
+        local_output = []
+        # need local_tensor to get gradient.
+        for each_out in fwd_output:
+            if isinstance(each_out, DTensor):
+                local_output.append(each_out.to_local())
+            else:
+                local_output.append(each_out)
         if self.is_first_stage:
-            torch.autograd.backward(fwd_output, grad_tensors=recv_args)
+            torch.autograd.backward(local_output, grad_tensors=recv_args)
         elif self.is_last_stage:
             sens = self.get_last_stage_sens(self.last_stage_outputs)
-            torch.autograd.backward(fwd_output, grad_tensors=sens)
+            torch.autograd.backward(local_output, grad_tensors=sens)
         else:
-            torch.autograd.backward(fwd_output, grad_tensors=recv_args)
+            torch.autograd.backward(local_output, grad_tensors=recv_args)
         if not self.is_first_stage:
             input_grads = [recv_info.buffer.grad for recv_info in self.args_recv_info[micro_index]]
             self.bwd_cache[micro_index] = input_grads
@@ -308,11 +314,13 @@ class PipelineStage(ABC):
 
     def _construct_forward_recv_info(self, micro_index, idx, global_rank, meta):
         """construct forward recv info."""
-        if isinstance(meta, DTensor):
-            buffer = DTensor.from_local(torch.empty(meta.local_shape, dtype=meta.dtype,
-                                        device=self.device), meta.layout)
+        # shape, type, layout
+        if len(meta) == 3:
+            self._update_layout(meta[2])
+            buffer = DTensor.from_local(torch.empty(meta[0], dtype=meta[1],
+                                        device=self.device), meta[2])
         else:
-            buffer = torch.empty(meta.shape, dtype=meta.dtype, device=self.device)
+            buffer = torch.empty(meta[0], dtype=meta[1], device=self.device)
         buffer.requires_grad = True
         if micro_index in self.args_recv_info:
             recv_info = self.args_recv_info[micro_index][idx]
@@ -346,6 +354,20 @@ class PipelineStage(ABC):
         recv_info.buffer = torch.empty(shape, dtype=tensor_send.dtype, device=self.device)
         return None
 
+    def _extract_meta_from_tensor(self, tensor):
+        """
+        Extract meta info from tensor for communication.
+
+        Args:
+            tensor: Input tensor, can be DTensor or regular tensor
+
+        Returns:
+            list: Metadata containing shape, dtype and layout
+        """
+        if isinstance(tensor, DTensor):
+            return [tensor.local_shape, tensor.dtype, tensor.layout]
+        return [tensor.shape, tensor.dtype]
+
     def _communicate_meta(self, global_rank, meta_send=None):
         """communicate meta."""
         if meta_send is not None:
@@ -371,7 +393,7 @@ class PipelineStage(ABC):
             return comm_handle
         out = self.fwd_outputs_cache.pop(micro_index)
         bwd_recv_infos = []
-        output_meta = [each_out.to('meta') for each_out in out]
+        output_meta = [self._extract_meta_from_tensor(each_out) for each_out in out]
         global_rank = self._global_rank(self.dst_stage)
         self._communicate_meta(global_rank, output_meta)
         for idx, cur_out in enumerate(out):
