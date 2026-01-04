@@ -101,13 +101,12 @@ def base_case(dp, mp):
 
     # step 3: save layout
     layout_dict = get_current_layout(model)
-    if get_rank() == 0:
-        file_name = "test.layout"
-        save_layout(layout_dict, file_name)
-        assert os.path.isfile(file_name)
-        layout_dict = load_layout(file_name)
-        assert isinstance(layout_dict, dict)
-        os.remove(file_name)
+    rank_id = get_rank()
+    file_name = f"test_{rank_id}.layout"
+    save_layout(layout_dict, file_name)
+    assert os.path.isfile(file_name)
+    layout_dict = load_layout(file_name)
+    assert isinstance(layout_dict, dict)
 
 
 def test_base_layout():

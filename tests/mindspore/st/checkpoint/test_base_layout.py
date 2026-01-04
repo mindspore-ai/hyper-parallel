@@ -15,6 +15,8 @@
 """layout save load test"""
 
 import os
+
+from hyper_parallel.core.checkpoint.layout import combine_layout
 from tests.common.mark_utils import arg_mark
 
 
@@ -30,10 +32,12 @@ def run_case(case_name, master_port):
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_base_layout():
     """
-    Feature: layout save and load.
-    Description: save layout, load layout.
+    Feature: layout save, load and combine.
+    Description: save layout, load layout, and combine layout.
     Expectation: Run success.
     """
     case_name = "test_base_layout"
     master_port = 11222
     run_case(case_name, master_port)
+    layout_dict = combine_layout(".")
+    assert isinstance(layout_dict, dict)
