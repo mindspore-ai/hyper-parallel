@@ -1,0 +1,9 @@
+{
+    "yaml_path" : "./config/pretrain_deepseek3_671b.yaml",
+    "mindformers_dir" : "./config/pretrain_gpt.py",
+    "rank_num" : 64,
+    "dataset" : "./config/dataset/wiki103-4k.mindrecord",
+    "output_path": "./output/nd_output/",
+    "env_json" : "./config/env_config.json",
+    "gbs": 1024
+}

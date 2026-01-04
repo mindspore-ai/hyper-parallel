@@ -1,0 +1,10 @@
+{
+    "MS_SIMULATION_LEVEL": "1",
+    "GLOG_v": "3",
+    "MS_DEV_RUNTIME_CONF": "memory_statistics:True",
+    "MS_MEMORY_STATISTIC": "1",
+    "ENABLE_LAZY_INLINE_NO_PIPELINE": "1",
+    "MS_DEV_DUMP_IR_PASSES": "validate,graph_build,pipeline_split,recompute",
+    "MS_ALLOC_CONF": "memory_tracker:True",
+    "ENABLE_LESS_MEM_VPP": "0"
+}

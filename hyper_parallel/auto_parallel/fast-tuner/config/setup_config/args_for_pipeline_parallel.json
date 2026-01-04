@@ -1,0 +1,16 @@
+{
+    "llm_class": "0",
+    "train_yaml": "",
+    "mindformers_dir": "",
+    "layer_ratio": 0.33,
+    "backward_ratio": 2.0,
+    "head_loss": 1.5,
+    "recompute_ratio": 1,
+    "time_limit": 9999999999,
+    "dryrun": true,
+    "check": true,
+    "fit_level": 0,
+    "extract": false,
+    "env_json": "./config/boss_env_config.json",
+    "dryrun_lim": 16
+}

@@ -1,0 +1,16 @@
+{
+    "toml_path" : "./config/example/torchtitan/debug_model.toml",
+    "torchtitan_path": "./torchtitan/run_train.sh",
+    "rank_num" : 8,
+    "output_path": "./output/",
+    "npus_per_node": 8,
+    "nnodes": 1,
+    "strategy": {
+        "DP": true,
+        "TP": true,
+        "EP": true,
+        "FSDP": true,
+        "PP": false,
+        "CP": false
+    }
+}

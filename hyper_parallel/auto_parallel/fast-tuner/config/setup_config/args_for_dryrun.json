@@ -1,0 +1,12 @@
+{
+    "train_yaml": "",
+    "mindformers_dir": "",
+    "output_path": "dryrun_output",
+    "offset": [0,1,1,1,1,1,1,0],
+    "is_recompute": true,
+    "recompute_layers": [1,1,1,1,1,1,1,1],
+    "is_select_recompute": false,
+    "select_recompute_layers": null,
+    "env_json": "./config/boss_env_config.json",
+    "dryrun_lim": 16
+}
