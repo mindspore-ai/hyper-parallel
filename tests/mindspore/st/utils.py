@@ -15,6 +15,10 @@
 """test utils"""
 import os
 import shutil
+import pytest
+import mindspore as ms
+from packaging import version
+from hyper_parallel.platform.mindspore.hsdp.scheduler import MindSporeHSDPScheduler
 
 
 def msrun_case(glog_v, file_name, case_name, master_port, worker_num=8, local_worker_num=8):
@@ -29,3 +33,23 @@ def msrun_case(glog_v, file_name, case_name, master_port, worker_num=8, local_wo
           f"{file_name}::{case_name}"
     ret = os.system(cmd)
     assert ret == 0
+
+
+def skip_if_ms_version_lt(min_ms_version):
+    """
+    Skip if mindspore version less then `min_ms_version`.
+    """
+    return pytest.mark.skipif(
+        version.parse(ms.__version__) < version.parse(min_ms_version),
+        reason=f"Requires MindSpore >= {min_ms_version}, but got {ms.__version__}"
+    )
+
+
+def skip_if_ms_plugin_not_exist():
+    """
+    Skip if mindspore plugin does not exist.
+    """
+    return pytest.mark.skipif(
+        not MindSporeHSDPScheduler.get_pass_library_pass(),
+        reason="Mindspore plugin does not exist."
+    )

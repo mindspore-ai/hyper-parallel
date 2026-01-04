@@ -14,6 +14,7 @@
 # ============================================================================
 """test hsdp with slim lenet"""
 from typing import Optional
+import pytest
 import mindspore as ms
 from mindspore._c_expression import NoFallbackGuard
 import mindspore.runtime as rt
@@ -26,9 +27,11 @@ from hyper_parallel import parallelize_value_and_grad
 from tests.common.mark_utils import arg_mark
 from tests.mindspore.st.common_net import SlimLeNet
 from tests.mindspore.st.hsdp.hsdp_test_common import hsdp_network_ckpt_path
+from tests.mindspore.st.utils import skip_if_ms_version_lt, skip_if_ms_plugin_not_exist
 rt.launch_blocking()
 ms.set_seed(1)
 ms.set_deterministic(True)
+
 
 def create_dataset(local_batch_size: int, num_shards: Optional[int] = None, shard_id: Optional[int] = None):
     """create mnist dataset"""
@@ -36,7 +39,8 @@ def create_dataset(local_batch_size: int, num_shards: Optional[int] = None, shar
     if (num_shards is None) or (shard_id is None):
         dataset = ds.MnistDataset(dataset_path, shuffle=False)
     else:
-        dataset = ds.MnistDataset(dataset_path, num_shards=rank_size, shard_id=rank_id, shuffle=False)
+        dataset = ds.MnistDataset(
+            dataset_path, num_shards=rank_size, shard_id=rank_id, shuffle=False)
     image_transforms = [
         ds.vision.Rescale(1.0 / 255.0, 0),
         ds.vision.Normalize(mean=(0.1307,), std=(0.3081,)),
@@ -50,12 +54,15 @@ def create_dataset(local_batch_size: int, num_shards: Optional[int] = None, shar
 
 
 loss_fn = nn.CrossEntropyLoss()
+
+
 def get_forward_fn(net):
     def forward_fn(data, label):
         logits = net(data)
         loss = loss_fn(logits, label)
         return loss, logits
     return forward_fn
+
 
 # Global hyper parameters:
 local_bs = 32
@@ -65,6 +72,7 @@ rank_size = get_group_size()
 learning_rate = 1e-3
 max_step = 10
 
+
 def make_baseline_by_standalone_run():
     """single card result"""
     data_set = create_dataset(local_batch_size=local_bs * dp_size)
@@ -73,7 +81,8 @@ def make_baseline_by_standalone_run():
     param_not_load, _ = ms.load_param_into_net(net, param_dict)
     assert not param_not_load, f"For hsdp test case, not completely load ckpt from {hsdp_network_ckpt_path}"
     optimizer = nn.Adam(net.trainable_params(), learning_rate)
-    grad_fn = ms.value_and_grad(get_forward_fn(net), None, net.trainable_params(), has_aux=True)
+    grad_fn = ms.value_and_grad(get_forward_fn(
+        net), None, net.trainable_params(), has_aux=True)
 
     i = 0
     for data, label in data_set:
@@ -85,13 +94,24 @@ def make_baseline_by_standalone_run():
         if i >= max_step:
             break
 
-def hsdp_without_accumulate_grad(shard_size, threshold=64, optimizer_level="level1", comm_async=True):
+
+def hsdp_without_accumulate_grad(shard_size, threshold=64, optimizer_level="level1", mode="eager", comm_async=True):
     """test hsdp without acc grad"""
-    data_set = create_dataset(local_batch_size=local_bs, num_shards=dp_size, shard_id=rank_id)
+    data_set = create_dataset(
+        local_batch_size=local_bs, num_shards=dp_size, shard_id=rank_id)
     net = SlimLeNet()
-    hsdp(net, shard_size, threshold, optimizer_level, comm_async=comm_async)
+    hsdp(net, shard_size, threshold, optimizer_level, comm_async=comm_async,
+         use_eager_hook=mode == "eager")
     optimizer = nn.Adam(net.trainable_params(), learning_rate)
-    grad_fn = parallelize_value_and_grad(get_forward_fn(net), net.trainable_params())
+    if mode == "eager":
+        grad_fn = parallelize_value_and_grad(
+            get_forward_fn(net), net.trainable_params())
+    elif mode == "jit_ast":
+        grad_fn = ms.jit(ms.value_and_grad(get_forward_fn(
+            net), None, net.trainable_params(), has_aux=True))
+    else:
+        assert False, f"Unsupported mode: {mode}. Expected 'eager' or 'jit_ast'."
+
     loss_sync_allreduce = ops.AllReduce(ops.ReduceOp.SUM)
     i = 0
     final_loss = 10
@@ -110,15 +130,26 @@ def hsdp_without_accumulate_grad(shard_size, threshold=64, optimizer_level="leve
             break
     assert final_loss < 0.95
 
-def hsdp_with_accumulate_grad(shard_size, threshold=64, optimizer_level="level1", micro_step=1, comm_async=False,
-                              comm_fusion=False, bucket_size=-1):
+
+def hsdp_with_accumulate_grad(shard_size, threshold=64, optimizer_level="level1", mode="eager", micro_step=1,
+                              comm_async=False, comm_fusion=False, bucket_size=-1):
     """test hsdp with acc grad"""
-    data_set = create_dataset(local_batch_size=local_bs, num_shards=dp_size, shard_id=rank_id)
+    data_set = create_dataset(
+        local_batch_size=local_bs, num_shards=dp_size, shard_id=rank_id)
     net = SlimLeNet()
     hsdp(net, shard_size, threshold, optimizer_level, enable_grad_accumulation=True, comm_async=comm_async,
-         comm_fusion=comm_fusion, bucket_size=bucket_size)
+         comm_fusion=comm_fusion, bucket_size=bucket_size, use_eager_hook=mode == "eager")
     optimizer = nn.Adam(net.trainable_params(), learning_rate)
-    grad_fn = parallelize_value_and_grad(get_forward_fn(net), net.trainable_params())
+
+    if mode == "eager":
+        grad_fn = parallelize_value_and_grad(
+            get_forward_fn(net), net.trainable_params())
+    elif mode == "jit_ast":
+        grad_fn = ms.jit(ms.value_and_grad(get_forward_fn(
+            net), None, net.trainable_params(), has_aux=True))
+    else:
+        assert False, f"Unsupported mode: {mode}. Expected 'eager' or 'jit_ast'."
+
     loss_sync_allreduce = ops.AllReduce(ops.ReduceOp.SUM)
     i = 0
     micro_size = local_bs // micro_step
@@ -149,6 +180,7 @@ def hsdp_with_accumulate_grad(shard_size, threshold=64, optimizer_level="level1"
             break
     assert final_loss < 1.0
 
+
 @arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_standalone_run():
     '''
@@ -158,81 +190,155 @@ def test_standalone_run():
     '''
     make_baseline_by_standalone_run()
 
-def test_pure_dp():
-    init()
-    hsdp_without_accumulate_grad(shard_size=1)
 
-def test_zero1_fully_shard():
+@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+def test_pure_dp(mode):
     init()
-    hsdp_without_accumulate_grad(shard_size=8, optimizer_level="level1")
+    hsdp_without_accumulate_grad(shard_size=1, mode=mode)
 
-def test_zero1_partial_shard():
+
+@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+def test_zero1_fully_shard(mode):
     init()
-    hsdp_without_accumulate_grad(shard_size=4, optimizer_level="level1")
+    hsdp_without_accumulate_grad(
+        shard_size=8, optimizer_level="level1", mode=mode)
 
-def test_zero2_fully_shard():
+
+@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+def test_zero1_partial_shard(mode):
     init()
-    hsdp_without_accumulate_grad(shard_size=8, optimizer_level="level2")
+    hsdp_without_accumulate_grad(
+        shard_size=4, optimizer_level="level1", mode=mode)
 
-def test_zero2_partial_shard():
+
+@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+def test_zero2_fully_shard(mode):
     init()
-    hsdp_without_accumulate_grad(shard_size=4, optimizer_level="level2")
+    hsdp_without_accumulate_grad(
+        shard_size=8, optimizer_level="level2", mode=mode)
 
-def test_zero3_fully_shard():
+
+@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+def test_zero2_partial_shard(mode):
     init()
-    hsdp_without_accumulate_grad(shard_size=8, optimizer_level="level3")
+    hsdp_without_accumulate_grad(
+        shard_size=4, optimizer_level="level2", mode=mode)
 
-def test_zero3_partial_shard():
+
+@pytest.mark.parametrize("mode", [
+    "eager",
+    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
+])
+def test_zero3_fully_shard(mode):
     init()
-    hsdp_without_accumulate_grad(shard_size=4, optimizer_level="level3")
+    hsdp_without_accumulate_grad(
+        shard_size=8, optimizer_level="level3", mode=mode)
 
-def test_pure_dp_with_acc_grad():
+
+@pytest.mark.parametrize("mode", [
+    "eager",
+    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
+])
+def test_zero3_partial_shard(mode):
     init()
-    hsdp_with_accumulate_grad(shard_size=1, micro_step=8)
+    hsdp_without_accumulate_grad(
+        shard_size=4, optimizer_level="level3", mode=mode)
 
-def test_zero1_fully_shard_with_acc_grad():
+
+@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+def test_pure_dp_with_acc_grad(mode):
     init()
-    hsdp_with_accumulate_grad(shard_size=8, optimizer_level="level1", micro_step=8)
+    hsdp_with_accumulate_grad(shard_size=1, micro_step=8, mode=mode)
 
-def test_zero1_partial_shard_with_acc_grad():
+
+@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+def test_zero1_fully_shard_with_acc_grad(mode):
     init()
-    hsdp_with_accumulate_grad(shard_size=4, optimizer_level="level1", micro_step=8)
+    hsdp_with_accumulate_grad(
+        shard_size=8, optimizer_level="level1", micro_step=8, mode=mode)
 
-def test_zero2_fully_shard_with_acc_grad():
+
+@pytest.mark.parametrize("mode", [
+    "eager",
+    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
+])
+def test_zero1_partial_shard_with_acc_grad(mode):
     init()
-    hsdp_with_accumulate_grad(shard_size=8, optimizer_level="level2", micro_step=8)
+    hsdp_with_accumulate_grad(
+        shard_size=4, optimizer_level="level1", micro_step=8, mode=mode)
 
-def test_zero2_partial_shard_with_acc_grad():
+
+@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+def test_zero2_fully_shard_with_acc_grad(mode):
     init()
-    hsdp_with_accumulate_grad(shard_size=4, optimizer_level="level2", micro_step=8)
+    hsdp_with_accumulate_grad(
+        shard_size=8, optimizer_level="level2", micro_step=8, mode=mode)
 
-def test_zero3_fully_shard_with_acc_grad():
+
+@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+def test_zero2_partial_shard_with_acc_grad(mode):
     init()
-    hsdp_with_accumulate_grad(shard_size=8, optimizer_level="level3", micro_step=8)
+    hsdp_with_accumulate_grad(
+        shard_size=4, optimizer_level="level2", micro_step=8, mode=mode)
 
-def test_zero3_partial_shard_with_acc_grad():
+
+@pytest.mark.parametrize("mode", [
+    "eager",
+    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
+])
+def test_zero3_fully_shard_with_acc_grad(mode):
     init()
-    hsdp_with_accumulate_grad(shard_size=4, optimizer_level="level3", micro_step=8)
+    hsdp_with_accumulate_grad(
+        shard_size=8, optimizer_level="level3", micro_step=8, mode=mode)
 
-def test_zero3_partial_shard_with_async_acc_grad():
+
+@pytest.mark.parametrize("mode", [
+    "eager",
+    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
+])
+def test_zero3_partial_shard_with_acc_grad(mode):
+    init()
+    hsdp_with_accumulate_grad(
+        shard_size=4, optimizer_level="level3", micro_step=8, mode=mode)
+
+
+@pytest.mark.parametrize("mode", [
+    "eager",
+    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
+])
+def test_zero3_partial_shard_with_async_acc_grad(mode):
     '''
     Feature: zero3 partial shard data parallel with async grad accumulation.
     Description: zero3 data parallel.
     Expectation: Run success
     '''
     init()
-    hsdp_with_accumulate_grad(shard_size=4, optimizer_level="level3", micro_step=8, comm_async=True)
+    hsdp_with_accumulate_grad(
+        shard_size=4, optimizer_level="level3", micro_step=8, comm_async=True, mode=mode)
 
-def test_zero3_with_comm_fusion():
+
+@pytest.mark.parametrize("mode", [
+    "eager",
+    pytest.param("jit_ast", marks=pytest.mark.skip(
+        reason="comm_fusion is not supported in jit_ast mode now"))  # TODO: support this
+])
+def test_zero3_with_comm_fusion(mode):
     '''
     Feature: zero3 with comm fusion, gradient will be fused to only one buffer.
     Description: zero3 data parallel.
     Expectation: Run success
     '''
     init()
-    hsdp_with_accumulate_grad(shard_size=4, optimizer_level="level3", micro_step=8, comm_async=True, comm_fusion=True)
+    hsdp_with_accumulate_grad(shard_size=4, optimizer_level="level3",
+                              micro_step=8, comm_async=True, comm_fusion=True, mode=mode)
 
-def test_zero3_with_comm_fusion_bucket_size():
+
+@pytest.mark.parametrize("mode", [
+    "eager",
+    pytest.param("jit_ast", marks=pytest.mark.skip(
+        reason="comm_fusion is not supported in jit_ast mode now"))  # TODO: support this
+])
+def test_zero3_with_comm_fusion_bucket_size(mode):
     '''
     Feature: zero3 with comm fusion bucket size, gradient will be fused to buffer whose size is limited by bucket size.
     Description: zero3 gradient fusion bucket size.
@@ -240,9 +346,14 @@ def test_zero3_with_comm_fusion_bucket_size():
     '''
     init()
     hsdp_with_accumulate_grad(shard_size=4, optimizer_level="level3", micro_step=8, comm_async=True,
-                              comm_fusion=True, bucket_size=2000)
+                              comm_fusion=True, bucket_size=2000, mode=mode)
 
-def test_zero3_with_comm_fusion_bucket_size0():
+
+@pytest.mark.parametrize("mode", [
+    "eager",
+    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
+])
+def test_zero3_with_comm_fusion_bucket_size0(mode):
     '''
     Feature: zero3 with comm fusion bucket size 0 which mean gradient will not be fused into buffer.
     Description: zero3 data parallel.
@@ -250,22 +361,26 @@ def test_zero3_with_comm_fusion_bucket_size0():
     '''
     init()
     hsdp_with_accumulate_grad(shard_size=4, optimizer_level="level3", micro_step=8, comm_async=True,
-                              comm_fusion=True, bucket_size=0)
+                              comm_fusion=True, bucket_size=0, mode=mode)
+
 
 @arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="onecard", essential_mark="essential")
-def test_no_dp():
+@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+def test_no_dp(mode):
     '''
     Feature: apply hsdp with single node.
     Description: apply hsdp with single node.
     Expectation: Run success
     '''
-    hsdp_without_accumulate_grad(shard_size=1)
+    hsdp_without_accumulate_grad(shard_size=1, mode=mode)
+
 
 @arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="onecard", essential_mark="essential")
-def test_no_dp_with_acc_grad():
+@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+def test_no_dp_with_acc_grad(mode):
     '''
     Feature: apply hsdp with single node gradient accumulation.
     Description: apply hsdp with single node gradient accumulation.
     Expectation: Run success
     '''
-    hsdp_with_accumulate_grad(shard_size=1, micro_step=8)
+    hsdp_with_accumulate_grad(shard_size=1, micro_step=8, mode=mode)

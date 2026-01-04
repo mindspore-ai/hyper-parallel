@@ -40,7 +40,7 @@ class FSDPSchedulerState(Enum):
 class HSDPScheduler:
     """HSDPScheduler is used to implement optimizer level."""
 
-    def __init__(self, cell, shard_size, threshold, shard_level, requires_acc_grad, grad_scale,
+    def __init__(self, cell, shard_size, threshold, shard_level, requires_acc_grad, grad_scale, use_eager_hook,
                  reduce_dtype, comm_async, comm_fusion, bucket_size):
         """init hsdp scheduler."""
         self.cell = cell
@@ -58,7 +58,7 @@ class HSDPScheduler:
             requires_acc_grad,
             grad_scale,
             shard_level,
-            True,
+            use_eager_hook,
             reduce_dtype,
             comm_async,
             comm_fusion,

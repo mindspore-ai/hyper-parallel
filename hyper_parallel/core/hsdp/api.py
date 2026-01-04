@@ -36,7 +36,7 @@ class HSDPCell:
     """
     # pylint: disable=C0415
     def hsdp_init(self, platform_type, cell, shard_size, threshold, optimizer_level, enable_grad_accumulation,
-                  grad_scale, reduce_dtype, comm_async, comm_fusion, bucket_size):
+                  use_eager_hook, grad_scale, reduce_dtype, comm_async, comm_fusion, bucket_size):
         """init hsdp scheduler."""
         scheduler_class = None
         if platform_type == PlatformType.MINDSPORE:
@@ -52,6 +52,7 @@ class HSDPCell:
                                               optimizer_level,
                                               enable_grad_accumulation,
                                               grad_scale,
+                                              use_eager_hook,
                                               reduce_dtype,
                                               comm_async,
                                               comm_fusion,
@@ -128,7 +129,7 @@ def _check_cell_valid(platform_type, cell):
 
 # pylint: disable=C0415
 def _check_hsdp_input_valid(platform_type, cell, shard_size, threshold, optimizer_level, enable_grad_accumulation,
-                            grad_scale, reduce_dtype, comm_async, comm_fusion, bucket_size):
+                            use_eager_hook, grad_scale, reduce_dtype, comm_async, comm_fusion, bucket_size):
     """check hsdp input valid"""
     _check_cell_valid(platform_type, cell)
     if not isinstance(shard_size, int) or (shard_size <= 0 and shard_size != -1):
@@ -141,6 +142,8 @@ def _check_hsdp_input_valid(platform_type, cell, shard_size, threshold, optimize
         raise ValueError(f"enable_grad_accumulation must be bool but got {enable_grad_accumulation}.")
     if not isinstance(grad_scale, float):
         raise ValueError(f"grad_scale must be float but got {grad_scale}.")
+    if not isinstance(use_eager_hook, bool):
+        raise ValueError(f"use_eager_hook must be bool but got {use_eager_hook}.")
     if platform_type == PlatformType.MINDSPORE:
         from mindspore._c_expression.typing import Type
         if reduce_dtype is not None and not isinstance(reduce_dtype, Type):
@@ -162,6 +165,7 @@ def hsdp(
         threshold: Optional[int] = 64,
         optimizer_level: Optional[str] = "level1",
         enable_grad_accumulation: Optional[bool] = False,
+        use_eager_hook: Optional[bool] = True,
         grad_scale: Optional[float] = 1.0,
         reduce_dtype: Optional[Any] = None,
         comm_async: Optional[bool] = False,
@@ -197,6 +201,10 @@ def hsdp(
                   allgather communication to release the memory used by the forward pass allgather.
             enable_grad_accumulation (bool, optional): enable gradient accumulation. When gradient accumulation is
                 enable, gradient synchronization should be explicitly called by `set_requires_grad_sync` interface.
+            use_eager_hook (bool, optional): Controls whether to enable eager hook behavior. Default: ``True``.
+
+                - Set to `True` for **eager mode** (both MindSpore and PyTorch).
+                - Set to `False` for **MindSpore Graph mode** (static graph).
             grad_scale (float, optional): gradient will scale with grad_scale.
             reduce_dtype (float, optional): gradient reduce dtype. Default value is None, which means gradient
                 will be reduced with its origin dtype.
@@ -232,6 +240,7 @@ def hsdp(
         threshold,
         optimizer_level,
         enable_grad_accumulation,
+        use_eager_hook,
         grad_scale,
         reduce_dtype,
         comm_async,
@@ -247,6 +256,7 @@ def hsdp(
         threshold * 1024,
         optimizer_level,
         enable_grad_accumulation,
+        use_eager_hook,
         grad_scale,
         reduce_dtype,
         comm_async,
