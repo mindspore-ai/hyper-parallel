@@ -50,13 +50,13 @@ class HSDPAsyncGradHook(HSDPGradHook):
                 else:
                     post_output = output
                 post_grad = self._post_process(post_output, origin_dtype)
-                grad.data = post_grad
+                output.data = post_grad
 
             if handle is None:
                 post_process()
             else:
                 self.platform.set_grad_reduce_handle(handle, post_process)
-            return grad
+            return output
         return async_hook_handler
 
     def _get_async_param_unsharded_hook(self, hsdp_param):

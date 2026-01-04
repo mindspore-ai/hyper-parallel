@@ -51,7 +51,10 @@ class DTensorBackwardHookFunction(BackwardHookFunction):
         if isinstance(origin_output, (tuple, list)):
             output = ()
             for i, output_item in enumerate(origin_output):
-                output += (DTensor.from_local(output_item, input_layouts[i]),)
+                if input_layouts[i] is None:
+                    output += (output_item,)
+                else:
+                    output += (DTensor.from_local(output_item, input_layouts[i]),)
             return output
         return origin_output
 

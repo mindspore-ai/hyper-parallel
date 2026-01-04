@@ -101,6 +101,8 @@ class HSDPScheduler:
     # pylint: disable=W0613
     def _hsdp_forward_pre_hook(self, cell, inputs):
         """forward pre hook to unsharded parameter for forward process."""
+        if len(inputs) > 0:
+            self.platform.set_tensor_requires_grad(inputs[0])
         self.hsdp_state.unshard()
         for prefetch_cell in self.forward_prefetch_cells:
             prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()

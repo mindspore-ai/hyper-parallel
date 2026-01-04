@@ -16,6 +16,7 @@
 import torch
 import torch.distributed as dist
 from hyper_parallel.core.hsdp.hsdp_param import HSDPParam
+from hyper_parallel.core.hsdp.hsdp_utils import OptimizerLevel
 
 
 class TorchHSDPParam(HSDPParam):
@@ -26,17 +27,26 @@ class TorchHSDPParam(HSDPParam):
         """add and init sharded param"""
         slice_index = self.hsdp_rank % self.shard_size
         local_param = self.platform.get_param_local_data(self.param)
-        param_slice = torch.chunk(local_param, self.shard_size, 0)[slice_index]
+        param_slice = torch.chunk(local_param, self.shard_size, 0)[slice_index] + 0  # avoid error when handle view tensor
         self.platform.update_param_data(self.param, param_slice)
         self.sharded_param = param_slice
 
     def _init_unsharded_param(self):
-        """add and init unshared param"""
-        self.unsharded_param = torch.empty(self.param_shape, dtype=self.param.dtype, device=self.param.device)
+        """
+        Init unsharded param only at non-parameter shard level
+        """
+        if self.config.shard_level != OptimizerLevel.SHARD_OPT_GRAD_PARAM:
+            self.unsharded_param = torch.empty(self.param_shape, dtype=self.param.dtype, device=self.param.device)
+        else:
+            self.unsharded_param = None
 
     def _get_unsharded_param_data(self, async_op):
         """get unsharded param data with async comm"""
         local_param = self.platform.get_param_local_data(self.param)
-        handle = dist.all_gather_into_tensor(self.unsharded_param, local_param, group=self.sharded_group_info.group,
+        if self.unsharded_param is not None:
+            unsharded_param = self.unsharded_param
+        else:
+            unsharded_param = torch.empty(self.param_shape, dtype=self.param.dtype, device=self.param.device)
+        handle = dist.all_gather_into_tensor(unsharded_param, local_param, group=self.sharded_group_info.group,
                                              async_op=async_op)
-        return self.unsharded_param, handle
+        return unsharded_param, handle

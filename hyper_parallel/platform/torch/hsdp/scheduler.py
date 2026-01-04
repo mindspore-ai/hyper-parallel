@@ -16,6 +16,7 @@
 from hyper_parallel.core.hsdp.hsdp_scheduler import HSDPScheduler
 from hyper_parallel.platform.torch.hsdp.state import TorchHSDPState
 from hyper_parallel.platform.torch.hsdp.grad_hook import TorchHSDPGradHook
+from hyper_parallel.platform.torch.hsdp.async_grad_hook import TorchHSDPAsyncGradHook
 from hyper_parallel.platform import get_platform
 
 
@@ -37,4 +38,7 @@ class TorchHSDPScheduler(HSDPScheduler):
         This method instantiates the gradient hook component used for handling
         gradient operations in the HSDP scheduler.
         """
-        self.grad_hook = TorchHSDPGradHook(self.config, self.platform)
+        if self.config.comm_async:
+            self.grad_hook = TorchHSDPAsyncGradHook(self.config, self.platform)
+        else:
+            self.grad_hook = TorchHSDPGradHook(self.config, self.platform)

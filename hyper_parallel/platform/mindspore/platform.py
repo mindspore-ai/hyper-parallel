@@ -219,6 +219,13 @@ class MindSporePlatform(Platform):
             return tensor.to(device)
         return tensor
 
+    @staticmethod
+    def set_tensor_requires_grad(input_tensor):
+        """
+        set requires grad flag for input tensor
+        """
+        input_tensor.requires_grad_()
+
     def _create_group(self, rank_list, group_name=None):
         if group_name is None:
             hash_str_rank_list = '-'.join([str(rank) for rank in rank_list])
