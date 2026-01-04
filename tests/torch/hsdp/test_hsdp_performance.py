@@ -17,7 +17,7 @@ from tests.common.mark_utils import arg_mark
 from tests.torch.utils import torchrun_case
 
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_forward_prefetch():
     """
     Feature: hsdp prefetch
@@ -29,7 +29,7 @@ def test_hsdp_forward_prefetch():
     torchrun_case(master_port, case_name)
 
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_backward_prefetch():
     """
     Feature: hsdp prefetch
@@ -41,7 +41,7 @@ def test_hsdp_backward_prefetch():
     torchrun_case(master_port, case_name)
 
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_comm_async():
     """
     Feature: hsdp enable async comm

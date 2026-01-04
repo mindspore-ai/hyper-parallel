@@ -13,9 +13,28 @@
 # limitations under the License.
 # ============================================================================
 """HSDP scheduler"""
+from enum import auto, Enum
 from hyper_parallel.core.hsdp.hsdp_utils import OptimizerLevel, HSDPConfig
 from hyper_parallel.core.hsdp.hsdp_grad_hook import HSDPGradHook
 from hyper_parallel.core.hsdp.hsdp_async_grad_hook import HSDPAsyncGradHook
+
+
+class FSDPSchedulerState(Enum):
+    """
+        Scheduler state:
+                - PRE_FORWARD:
+                  already run hook before forward.
+                - FORWARD:
+                  already run hook after forward.
+                - PRE_BACKWARD:
+                  already run hook before backward.
+                - PRE_BACKWARD:
+                  already run hook after backward.
+    """
+    PRE_FORWARD = auto()
+    FORWARD = auto()
+    PRE_BACKWARD = auto()
+    BACKWARD = auto()
 
 
 class HSDPScheduler:
@@ -29,6 +48,7 @@ class HSDPScheduler:
         self.shard_level = shard_level
         self.requires_acc_grad = requires_acc_grad
         self.requires_grad_sync = False
+        self.scheduler_state = None
 
         self.forward_prefetch_cells = []
         self.backward_prefetch_cells = []
@@ -101,6 +121,9 @@ class HSDPScheduler:
     # pylint: disable=W0613
     def _hsdp_forward_pre_hook(self, cell, inputs):
         """forward pre hook to unsharded parameter for forward process."""
+        if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
+            return
+        self.scheduler_state = FSDPSchedulerState.PRE_FORWARD
         if len(inputs) > 0:
             self.platform.set_tensor_requires_grad(inputs[0])
         self.hsdp_state.unshard()
@@ -110,11 +133,15 @@ class HSDPScheduler:
     # pylint: disable=W0613
     def _hsdp_forward_hook(self, cell, inputs, outputs):
         """forward hook to shard parameter for saving memory."""
+        if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
+            return
+        self.scheduler_state = FSDPSchedulerState.FORWARD
         self.hsdp_state.shard()
 
     # pylint: disable=W0613
     def _hsdp_backward_pre_hook(self, cell, grad_outputs):
         """backward pre hook to unsharded parameter for backward process."""
+        self.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
         self.hsdp_state.unshard()
         for prefetch_cell in self.backward_prefetch_cells:
             prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()
@@ -122,11 +149,13 @@ class HSDPScheduler:
     # pylint: disable=W0613
     def _hsdp_backward_hook(self, cell, grad_inputs, grad_outputs):
         """backward hook to shard parameter for optimizer process or saving memory."""
+        self.scheduler_state = FSDPSchedulerState.BACKWARD
         self.hsdp_state.shard()
 
     # pylint: disable=W0613
     def _hsdp_acc_backward_hook(self, cell, grad_inputs, grad_outputs):
         """backward hook to shard parameter for grad accumulation when requires_grad_sync is True."""
+        self.scheduler_state = FSDPSchedulerState.BACKWARD
         if self.requires_grad_sync:
             self.hsdp_state.shard()
 

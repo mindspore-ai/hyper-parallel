@@ -30,7 +30,7 @@ def _run_hsdp_case_by_name(case_name: str):
     assert ret == 0
 
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_pure_dp():
     '''
     Feature: pure data parallel with hsdp api.
@@ -41,7 +41,7 @@ def test_pure_dp():
     _run_hsdp_case_by_name(case_name)
 
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero1_fully_shard():
     '''
     Feature: zero1 fully shard data parallel with hsdp api.
@@ -51,7 +51,7 @@ def test_zero1_fully_shard():
     case_name = "test_zero1_fully_shard"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero1_partial_shard():
     '''
     Feature: zero1 partial shard data parallel with hsdp api.
@@ -61,7 +61,7 @@ def test_zero1_partial_shard():
     case_name = "test_zero1_partial_shard"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero2_fully_shard():
     '''
     Feature: zero2 fully shard data parallel with hsdp api.
@@ -71,7 +71,7 @@ def test_zero2_fully_shard():
     case_name = "test_zero2_fully_shard"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero2_partial_shard():
     '''
     Feature: zero2 partial shard data parallel with hsdp api.
@@ -81,7 +81,7 @@ def test_zero2_partial_shard():
     case_name = "test_zero2_partial_shard"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_fully_shard():
     '''
     Feature: zero3 fully shard data parallel with hsdp api.
@@ -91,7 +91,7 @@ def test_zero3_fully_shard():
     case_name = "test_zero3_fully_shard"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_partial_shard():
     '''
     Feature: zero3 partial shard data parallel with hsdp api.
@@ -101,7 +101,7 @@ def test_zero3_partial_shard():
     case_name = "test_zero3_partial_shard"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_pure_dp_with_acc_grad():
     '''
     Feature: pure data parallel with grad accumulation.
@@ -111,7 +111,7 @@ def test_pure_dp_with_acc_grad():
     case_name = "test_pure_dp_with_acc_grad"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero1_fully_shard_with_acc_grad():
     '''
     Feature: zero1 fully shard data parallel with grad accumulation.
@@ -121,7 +121,7 @@ def test_zero1_fully_shard_with_acc_grad():
     case_name = "test_zero1_fully_shard_with_acc_grad"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero1_partial_shard_with_acc_grad():
     '''
     Feature: zero1 partial shard data parallel with grad accumulation.
@@ -131,7 +131,7 @@ def test_zero1_partial_shard_with_acc_grad():
     case_name = "test_zero1_partial_shard_with_acc_grad"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero2_fully_shard_with_acc_grad():
     '''
     Feature: zero2 fully shard data parallel with grad accumulation.
@@ -141,7 +141,7 @@ def test_zero2_fully_shard_with_acc_grad():
     case_name = "test_zero2_fully_shard_with_acc_grad"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero2_partial_shard_with_acc_grad():
     '''
     Feature: zero2 partial shard data parallel with grad accumulation.
@@ -151,7 +151,7 @@ def test_zero2_partial_shard_with_acc_grad():
     case_name = "test_zero2_partial_shard_with_acc_grad"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_fully_shard_with_acc_grad():
     '''
     Feature: zero3 fully shard data parallel with grad accumulation.
@@ -161,7 +161,7 @@ def test_zero3_fully_shard_with_acc_grad():
     case_name = "test_zero3_fully_shard_with_acc_grad"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_partial_shard_with_acc_grad():
     '''
     Feature: zero3 partial shard data parallel with grad accumulation.
@@ -171,7 +171,7 @@ def test_zero3_partial_shard_with_acc_grad():
     case_name = "test_zero3_partial_shard_with_acc_grad"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_partial_shard_with_async_acc_grad():
     '''
     Feature: zero3 partial shard data parallel with async grad accumulation.
@@ -181,7 +181,7 @@ def test_zero3_partial_shard_with_async_acc_grad():
     case_name = "test_zero3_partial_shard_with_async_acc_grad"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_with_comm_fusion():
     '''
     Feature: zero3 partial shard data parallel with comm fusion.
@@ -191,7 +191,7 @@ def test_zero3_with_comm_fusion():
     case_name = "test_zero3_with_comm_fusion"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_with_comm_fusion_bucket_size():
     '''
     Feature: zero3 with comm fusion bucket size, gradient will be fused to buffer whose size is limited by bucket size.
@@ -201,7 +201,7 @@ def test_zero3_with_comm_fusion_bucket_size():
     case_name = "test_zero3_with_comm_fusion_bucket_size"
     _run_hsdp_case_by_name(case_name)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_with_comm_fusion_bucket_size0():
     '''
     Feature: zero3 with comm fusion bucket size 0 which mean gradient will not be fused into buffer.

@@ -24,7 +24,6 @@ def run_case(case_name, master_port):
     ret = os.system(cmd)
     assert ret == 0
 
-
 def test_simple_mlp():
     """
     Feature: schedule 1f1b + hsdp + shard + shared_param.

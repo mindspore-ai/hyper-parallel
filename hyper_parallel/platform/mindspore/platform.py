@@ -208,14 +208,14 @@ class MindSporePlatform(Platform):
     @staticmethod
     def new_zero_parameter(param_shape, param_type, requires_grad, device):
         param = Parameter(initializer("zeros", param_shape, param_type), requires_grad=requires_grad)
-        if device not in ("CPU", None):
+        if device in ("GPU", "Ascend"):
             return param.to(device)
         return param
 
     @staticmethod
     def new_tensor(tensor_shape, tensor_type, device):
         tensor = Tensor(shape=tensor_shape, dtype=tensor_type)
-        if device not in ("CPU", None):
+        if device in ("GPU", "Ascend"):
             return tensor.to(device)
         return tensor
 
