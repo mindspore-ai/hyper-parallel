@@ -60,6 +60,11 @@ class TorchPlatform(Platform):
         return param
 
     @staticmethod
+    def update_param_data(param, data):
+        """update param data"""
+        param.data = data
+
+    @staticmethod
     def get_op_name(func):
         if hasattr(func, "__name__"):
             return func.__name__
@@ -176,8 +181,10 @@ class TorchPlatform(Platform):
         return output_tensor
 
     @staticmethod
-    def get_device_handle(device_type="cuda"):
-        return getattr(torch, device_type, None)
+    def get_device_handle():
+        if hasattr(torch, "npu"):
+            return torch.npu
+        return torch.cuda
 
     @staticmethod
     def register_backward_pre_hook(cell, hook):
@@ -203,6 +210,14 @@ class TorchPlatform(Platform):
     @staticmethod
     def new_tensor(tensor_shape, tensor_type, device):
         return torch.empty(tensor_shape, tensor_type, device=device)
+
+    @staticmethod
+    def set_tensor_requires_grad(input_tensor):
+        """
+        set requires grad flag for input tensor, only effective for leaf node
+        """
+        if input_tensor.is_leaf:
+            input_tensor.requires_grad = True
 
     def _create_group(self, rank_list, group_name=None):
         group_dict = create_sub_groups(rank_list)
@@ -230,9 +245,9 @@ class TorchPlatform(Platform):
         return output, handle
 
     def new_stream(self):
-        device = get_device_handle()
+        device = self.get_device_handle()
         return device.Stream()
 
     def get_stream_context(self):
-        device = get_device_handle()
+        device = self.get_device_handle()
         return device.stream

@@ -138,8 +138,7 @@ class Platform:
 
     @staticmethod
     def update_param_data(param, data):
-        """update param data"""
-        param.data = data
+        raise NotImplementedError("Platform subclasses must implement update_param_data")
 
     @staticmethod
     def get_param_type_size(param):
@@ -152,6 +151,10 @@ class Platform:
     @staticmethod
     def new_tensor(tensor_shape, tensor_type, device):
         raise NotImplementedError("Platform subclasses must implement new_tensor")
+
+    @staticmethod
+    def set_tensor_requires_grad(input_tensor):
+        raise NotImplementedError("Platform subclasses must implement set_tensor_requires_grad")
 
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):

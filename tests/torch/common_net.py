@@ -28,3 +28,36 @@ class SimpleModel(nn.Module):
         x = torch.relu(x)
         x = torch.sum(x)
         return x
+
+
+class DenseNet(nn.Module):
+    """Dense model"""
+    def __init__(self, in_channels, hidden_size, has_bias=True):
+        super().__init__()
+        self.has_bias = has_bias
+        self.weight = nn.Parameter(torch.ones(in_channels, hidden_size).npu())
+        if self.has_bias:
+            self.bias = nn.Parameter(torch.zeros(hidden_size).npu())
+
+    def forward(self, x):
+        x = torch.matmul(x, self.weight)
+        if self.has_bias:
+            x = torch.add(x, self.bias)
+        return x
+
+
+class DenseMutiLayerNet(nn.Module):
+    """dense net with configurable layer number"""
+    def __init__(self, hidden_size, layer_num, has_bias=True):
+        super().__init__()
+        self.layer_num = layer_num
+        self.layers = nn.Sequential()
+        for i in range(self.layer_num):
+            layer = DenseNet(hidden_size, hidden_size, has_bias)
+            self.layers.add_module(f"layer{i}", layer)
+
+    def forward(self, x):
+        for i in range(self.layer_num):
+            x = self.layers[i](x)
+        x = torch.sum(x)
+        return x
