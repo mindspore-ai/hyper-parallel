@@ -1,4 +1,4 @@
-# 大模型训练自动并行策略搜索工具(DEMO FEATURE)
+# 大模型训练并行策略自动搜索工具(DEMO FEATURE)
 
 ## 1 介绍
 
@@ -52,9 +52,8 @@
 支持通过源代码安装工具，安装步骤如下：
 
 ```bash
-git clone https://gitcode.com/taylor_cps/FAST-A.git （待替换为开源到mindspore社区的仓库路径）
-git checkout feature_training_parallel
-cd training_parallel/core/fast_tuner
+git clone https://gitee.com/mindspore/hyper-parallel.git
+cd hyper-parallel/hyper_parallel/auto_parallel/fast-tuner
 pip install -e .
 ```
 

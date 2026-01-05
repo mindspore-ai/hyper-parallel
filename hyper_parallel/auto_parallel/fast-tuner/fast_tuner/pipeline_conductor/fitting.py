@@ -291,7 +291,7 @@ class FitMem:
                     pp_util.write_config_to_shell(self.cur_solution.offset.tolist(), self.init_config.
                                                  config_file)
                 else:
-                    raise TypeError(dryrun.dryrun_config_error)
+                    raise TypeError(dryrun.DRYRUN_CONFIG_ERROR)
                 logger.info('The result is available for training, config has write to %s!',
                             self.init_config.config_file)
             return over_mem, False

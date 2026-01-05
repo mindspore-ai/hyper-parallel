@@ -20,7 +20,7 @@ from typing import List
 from pathlib import Path
 from fast_tuner.utils.common import GENERAL_TOML
 from fast_tuner.utils.profiling.profile_info import ProfileInfo
-from fast_tuner.pipeline_conductor.dryrun import DryRun, dryrun_config_error
+from fast_tuner.pipeline_conductor.dryrun import DryRun, DRYRUN_CONFIG_ERROR
 from fast_tuner.ndsearch.para_for_nd_search import ParaForNd
 
 class ParallelConfig:
@@ -60,7 +60,7 @@ class ParallelInput:
         elif DryRun.config_file_type == 2:
             self.ms_adapter_file = args.torchtitan_path
         else:
-            raise TypeError(dryrun_config_error)
+            raise TypeError(DRYRUN_CONFIG_ERROR)
 
     @staticmethod
     def parse_results_by_csv(csv_file):

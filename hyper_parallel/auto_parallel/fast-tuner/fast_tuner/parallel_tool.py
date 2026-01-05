@@ -146,9 +146,6 @@ def main():
                         help="Which parallel strategies are enabled")
 
     args = parser.parse_args()
-    # for test
-    args.config = './config/setup_config/args_for_parallel_tool_titan.json'
-    # for test
     if args.config:
         parse_args_from_json(args)
     args.strategy = types.SimpleNamespace(**args.strategy)

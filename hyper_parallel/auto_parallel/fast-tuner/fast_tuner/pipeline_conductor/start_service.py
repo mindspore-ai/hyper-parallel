@@ -242,7 +242,7 @@ class InitConfig:
         elif dryrun.DryRun.config_file_type == 2:
             self.get_toml_config()
         else:
-            raise TypeError(dryrun.dryrun_config_error)
+            raise TypeError(dryrun.DRYRUN_CONFIG_ERROR)
         self.rank_size = self.pipeline_stage * self.model_parallel * self.data_parallel
         self.parts = self.micro_batch_num // self.pipeline_stage
         if self.parts == 0:
@@ -540,4 +540,3 @@ if __name__ == '__main__':
     expert_input.is_dryrun = False
     model_input = InitConfig(expert_input)
     print(model_input)
-    
