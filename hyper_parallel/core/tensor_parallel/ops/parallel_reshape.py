@@ -23,8 +23,38 @@ platform = get_platform()
 Tensor = platform.Tensor
 
 
+def _filter_none_split_tensor_map(tensor_map, mesh_shape):
+    """
+    Filter out the elements in tensor_map where the size of the corresponding dimension in device_matrix is 1.
+
+    Args:
+        tensor_map (list): A list of tensor mappings, which may contain integers or tuples.
+        device_matrix (list): A device matrix representing the device distribution across each dimension.
+
+    Returns:
+        list: The filtered list of tensor mappings, where invalid mappings are replaced with -1 or valid mappings are
+        retained.
+    """
+    filtered_tensor_map = []
+    for item in tensor_map:
+        if isinstance(item, tuple):
+            filtered = []
+            for i in item:
+                if mesh_shape[-1 - i] != 1:
+                    filtered.append(i)
+            if len(filtered) == 0:
+                filtered_tensor_map.append(-1)
+            elif len(filtered) == 1:
+                filtered_tensor_map.append(filtered[0])
+            else:
+                filtered_tensor_map.append(filtered)
+        else:
+            filtered_tensor_map.append(item if mesh_shape[-1 - item] != 1 else -1)
+    return filtered_tensor_map
+
+
 class ReshapeDistributedOp(DistributedOp):
-    """Distributed implementation for MatMul operator."""
+    """Distributed implementation for Reshape operator."""
 
     def _get_dynamic_shape_info(self, shape):
         total_size = 1
@@ -141,7 +171,7 @@ class ReshapeDistributedOp(DistributedOp):
 
         input_shape = extra_args[1]
 
-        x_map = x_dict["tensor_map"]
+        x_map = _filter_none_split_tensor_map(x_dict["tensor_map"], x_dict["mesh_shape"])
         x_mesh_shape = x_dict["mesh_shape"]
 
         input_shape, dst_shape, dynamic_can_shard = self._handle_dynamic_shape(input_shape, dst_shape)
