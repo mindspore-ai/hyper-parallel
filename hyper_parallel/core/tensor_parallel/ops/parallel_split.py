@@ -20,7 +20,7 @@ from .parallel_ops import DistributedOp
 
 
 class SplitWithSizeDistributedOp(DistributedOp):
-    """Distributed implementation for TopK operator."""
+    """Distributed implementation for SplitWithSize operator."""
 
     def infer_layout(self, layouts, extra_args):
         """
@@ -51,7 +51,7 @@ class SplitWithSizeDistributedOp(DistributedOp):
 
 
 class SplitWithSizeViewDistributedOp(DistributedOp):
-    """Distributed implementation for TopK operator."""
+    """Distributed implementation for SplitWithSizeView operator."""
 
     def infer_layout(self, layouts, extra_args):
         """
@@ -82,7 +82,7 @@ class SplitWithSizeViewDistributedOp(DistributedOp):
 
 
 class SplitDistributedOp(DistributedOp):
-    """Distributed implementation for TopK operator."""
+    """Distributed implementation for Split operator."""
 
     def infer_layout(self, layouts, extra_args):
         """
@@ -112,7 +112,7 @@ class SplitDistributedOp(DistributedOp):
 
 
 class SplitTensorDistributedOp(DistributedOp):
-    """Distributed implementation for TopK operator."""
+    """Distributed implementation for SplitTensor operator."""
 
     def infer_layout(self, layouts, extra_args):
         """
