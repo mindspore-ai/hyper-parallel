@@ -26,7 +26,7 @@ class HSDPParamBuffer:
         self.local_rank = init_hsdp_param.hsdp_rank % init_hsdp_param.shard_size
         self.dtype = init_hsdp_param.param.dtype
         self.sharded_group_info = init_hsdp_param.sharded_group_info
-        self.device = init_hsdp_param.device
+        self.device = init_hsdp_param.param.device
         self.hsdp_params = []
         self.numel = 0
         self.sharded_param_buffer = None

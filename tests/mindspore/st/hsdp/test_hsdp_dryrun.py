@@ -67,7 +67,7 @@ def construct_net_and_data():
     label = Tensor(np.random.randn(batch_size, out_channels).astype(np.float32))
     return net, data, label
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_hsdp_level1():
     """
     Feature: hsdp
@@ -77,7 +77,7 @@ def test_hsdp_level1():
     net, data, label = construct_net_and_data()
     run_hsdp(net, data, label, "level1")
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_hsdp_level2():
     """
     Feature: hsdp
@@ -87,7 +87,7 @@ def test_hsdp_level2():
     net, data, label = construct_net_and_data()
     run_hsdp(net, data, label, "level2")
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_hsdp_level3():
     """
     Feature: hsdp
@@ -97,7 +97,7 @@ def test_hsdp_level3():
     net, data, label = construct_net_and_data()
     run_hsdp(net, data, label, "level3")
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_hsdp_level1_acc_grad():
     """
     Feature: hsdp
@@ -107,7 +107,7 @@ def test_hsdp_level1_acc_grad():
     net, data, label = construct_net_and_data()
     run_hsdp(net, data, label, "level1", True)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_hsdp_level2_acc_grad():
     """
     Feature: hsdp
@@ -117,7 +117,7 @@ def test_hsdp_level2_acc_grad():
     net, data, label = construct_net_and_data()
     run_hsdp(net, data, label, "level2", True)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_hsdp_level3_acc_grad():
     """
     Feature: hsdp
@@ -147,7 +147,7 @@ def get_device_layout():
     layout = Layout(mesh_shape, alias_name, rank_list)
     return layout
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_hsdp_with_dp_layout():
     """
     Feature: hsdp
@@ -160,7 +160,7 @@ def test_hsdp_with_dp_layout():
     label_layout = layout("dp", "None")
     run_hsdp_with_layout(w_layout, w_layout, data_layout, label_layout)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_hsdp_with_mp_layout():
     """
     Feature: hsdp
@@ -174,7 +174,7 @@ def test_hsdp_with_mp_layout():
     label_layout = layout("dp", "None")
     run_hsdp_with_layout(w1_layout, w2_layout, data_layout, label_layout)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_hsdp_with_exception():
     """
     Feature: hsdp
@@ -194,7 +194,7 @@ def test_hsdp_with_exception():
     assert "invalid rank" in result
     os.environ["RANK_ID"] = "32"
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_hsdp_custom_shard_size():
     """
     Feature: hsdp
@@ -208,7 +208,7 @@ def test_hsdp_custom_shard_size():
     assert net.dense1.weight.shape == (64, 256)
     assert net.dense2.weight.shape == (8, 128)
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_hsdp_freeze_param():
     """
     Feature: hsdp

@@ -17,7 +17,7 @@ import os
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_param_init_with_tp_dp():
     '''
     Feature: parameter init.

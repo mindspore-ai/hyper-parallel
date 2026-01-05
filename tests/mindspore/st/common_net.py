@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """common net"""
-import mindspore as ms
 from mindspore import nn, mint
 from mindspore.common.parameter import Parameter
 from mindspore.common.initializer import initializer
@@ -73,8 +72,6 @@ class DenseNet(nn.Cell):
     def construct(self, x):
         x = self.dense1(x)
         x = self.dense2(x)
-        if isinstance(x, ms.parallel.DTensor):
-            x = x.reduce_partial()
         return x
 
 class DenseMutiLayerNet(nn.Cell):

@@ -31,7 +31,7 @@ class HSDPGradBuffer:
         self.unsharded_group_info = init_hsdp_param.unsharded_group_info
         self.sharded = init_hsdp_param.sharded
         self.fully_sharded = init_hsdp_param.fully_sharded
-        self.device = init_hsdp_param.device
+        self.device = init_hsdp_param.param.device
         self.hsdp_params = []
         self.numel = 0
         self.requires_grad_sync = False

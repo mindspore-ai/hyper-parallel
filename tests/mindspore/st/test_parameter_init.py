@@ -29,7 +29,7 @@ from tests.common.mark_utils import arg_mark
 from tests.mindspore.st.common_net import DenseL3
 from tests.mindspore.st.common_net import DenseMutiLayerNet
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize('use_hsdp', [True, False])
 def test_init_parameters(use_hsdp):
     '''
