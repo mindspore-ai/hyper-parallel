@@ -59,7 +59,7 @@ def get_description():
     os_info = get_platform()
     cpu_info = platform.machine().strip()
 
-    return 'hyper_parallel platform: %s, cpu: %s' % (os_info, cpu_info)
+    return f'hyper_parallel platform: {os_info}, cpu: {cpu_info}'
 
 
 def get_install_requires():
@@ -69,7 +69,7 @@ def get_install_requires():
     Returns:
         list, list of dependent packages.
     """
-    with open('requirements.txt') as file:
+    with open('requirements.txt', encoding='utf-8') as file:
         return file.read().strip().splitlines()
 
 
@@ -151,7 +151,9 @@ if __name__ == '__main__':
         long_description=get_readme_content(),
         long_description_content_type="text/markdown",
         test_suite="tests",
-        packages=find_packages(exclude=["*tests*"]),
+        packages=find_packages(exclude=["*tests*",
+                                        "hyper_parallel.auto_parallel.fast-tuner",
+                                        "hyper_parallel.auto_parallel.fast-tuner.*"]),
         platforms=[get_platform()],
         include_package_data=True,
         package_data=package_data,

@@ -1,0 +1,10 @@
+{
+    "yaml_dir": "./output/dryrun_yaml/",
+    "mindformers_dir": "./mindformers/run_mindformer.py",
+    "profile_data_dir": "./profile_data/",
+    "parser_result": null,
+    "env_json": "./config/boss_env_config.json",
+    "dryrun_lim": 16,
+    "topn": 0,
+    "max_vpp": 3
+}

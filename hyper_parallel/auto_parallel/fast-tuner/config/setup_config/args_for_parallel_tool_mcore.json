@@ -1,0 +1,10 @@
+{
+    "shell_path" : "./config/example/mcore/pretrain_deepseek3_671b_4k_A3_ptd.sh",
+    "mindspeed_path": "./config/pretrain_gpt.py",
+    "rank_num" : 512,
+    "dataset" : "./config/dataset/wiki103-4k.mindrecord",
+    "max_expert_parallel": 64,
+    "output_path": "./output/nd_output/",
+    "env_json" : "./config/env_config.json",
+    "gbs": 3840
+}
