@@ -27,7 +27,8 @@ from mindspore.communication import get_rank
 
 from hyper_parallel import Layout, shard, parallelize_value_and_grad
 from hyper_parallel.core.checkpoint.layout import get_current_layout, save_layout, load_layout
-
+from hyper_parallel.core.checkpoint.loader import load_checkpoint
+from hyper_parallel.core.checkpoint.saver import save_checkpoint
 
 learning_rate = 0.01
 epochs = 2
@@ -109,6 +110,39 @@ def base_case(dp, mp):
     assert isinstance(layout_dict, dict)
 
 
+def save_load_checkpoint(dp, mp):
+    """Test case for saving and loading checkpoint functionality."""
+    D.init()
+
+    # standalone
+    input_size = 32
+    output_size = 2
+    layout = Layout((dp, mp), ("dp", "mp"))
+    x_layout = layout("dp", "mp")
+    w_layout = layout("mp", "None")
+    out_layout = layout()
+    relu_strategy = ((layout("dp", "None"),), (layout("dp", "None"),))
+
+    # step 1: define network with no init parameters
+    with no_init_parameters():
+        model = SimpleModel(input_size, output_size)
+
+    # step 2: shard
+    model_stra = {"forward": {"input": (x_layout,), "output": (out_layout,)},
+                  "parameter": {"weight": w_layout}}
+    shard(model, model_stra)
+
+    model_relu_stra = {"forward": {"input": relu_strategy[0], "output": relu_strategy[1]}}
+    shard(model.relu, model_relu_stra)
+
+    # step 3: save checkpoint
+    save_checkpoint(model, "ckpt.safetensors")
+
+    # step 4: load checkpoint
+    param_dict = load_checkpoint("ckpt.safetensors")
+    assert isinstance(param_dict, dict)
+
+
 def test_base_layout():
     """
     Feature: test layout save and load.
@@ -116,3 +150,10 @@ def test_base_layout():
     Expectation: Run success.
     """
     base_case(dp=4, mp=2)
+
+
+def test_saver_loader():
+    """
+    Feature: test save and load.
+    """
+    save_load_checkpoint(dp=4, mp=2)
