@@ -23,10 +23,12 @@ from mindspore.communication import get_group_size
 from mindspore.communication import create_group as new_group
 from mindspore.communication import get_rank as get_rank_id
 from mindspore.communication import comm_func
+from mindspore._c_expression import TensorTransform
 from hyper_parallel.platform.platform import Platform, PlatformType
 from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 from hyper_parallel.platform.mindspore.parameter_init import init_parameters as _init_parameters
 
+_tensor_transform = TensorTransform.get_instance()
 
 # pylint: disable=C0103
 class MindSporePlatform(Platform):
@@ -248,6 +250,14 @@ class MindSporePlatform(Platform):
     @staticmethod
     def parameters_dict(cell: Cell):
         return cell._params
+
+    @staticmethod
+    def get_tensor_transform():
+        return _tensor_transform
+
+    @staticmethod
+    def construct_strided_slice(x, begin, end, stride):
+        return ms.ops.strided_slice(x, begin, end, stride)
 
     def new_stream(self):
         return ms.runtime.Stream()
