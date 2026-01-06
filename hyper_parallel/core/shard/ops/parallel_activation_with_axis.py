@@ -40,10 +40,14 @@ class ActivationWithAxisDistributedOp(DistributedOp):
             tuple: Layout for output tensor.
 
         Raises:
-            ValueError: If input layouts are not compatible.
+            ValueError: If input layouts are not compatible or have partial status.
         """
         if not layouts:
             return None
+
+        # Check partial inputs
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs(layouts)
 
         self.check_layout(layouts, extra_args)
         # Verify all layouts are the same

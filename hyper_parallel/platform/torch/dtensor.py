@@ -132,6 +132,12 @@ class DTensorBase(Tensor):
     def shape(self) -> torch.Size:
         return self._local_tensor.shape
 
+    def type(self, dtype=None, non_blocking=False):
+        if dtype is None:
+            return self._local_tensor.type()
+        new_local = self._local_tensor.to(dtype=dtype, non_blocking=non_blocking)
+        return self.__class__(new_local, layout=self._layout)
+
     def size(self, dim: Optional[int] = None):
         return self._local_tensor.size(dim)
 

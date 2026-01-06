@@ -16,6 +16,7 @@
 from mindspore import nn, mint
 from mindspore.common.parameter import Parameter
 from mindspore.common.initializer import initializer
+from hyper_parallel import DTensor
 
 class DenseL2(nn.Cell):
     """dense cell with level 2 depth"""
@@ -30,6 +31,8 @@ class DenseL2(nn.Cell):
         x = self.dense1(x)
         if self.has_bias:
             x = mint.add(x, self.bias)
+        if isinstance(x, DTensor):
+            x = x.reduce_partial()
         return x
 
 class DenseL3(nn.Cell):
@@ -41,7 +44,11 @@ class DenseL3(nn.Cell):
 
     def construct(self, x):
         x = self.block(x)
+        if isinstance(x, DTensor):
+            x = x.reduce_partial()
         x = self.dense2(x)
+        if isinstance(x, DTensor):
+            x = x.reduce_partial()
         return x
 
 class SlimLeNet(nn.Cell):
@@ -60,6 +67,8 @@ class SlimLeNet(nn.Cell):
     def construct(self, x):
         x = self.flatten(x)
         logits = self.dense_relu_sequential(x)
+        if isinstance(logits, DTensor):
+            logits = logits.reduce_partial()
         return logits
 
 class DenseNet(nn.Cell):
@@ -71,7 +80,11 @@ class DenseNet(nn.Cell):
 
     def construct(self, x):
         x = self.dense1(x)
+        if isinstance(x, DTensor):
+            x = x.reduce_partial()
         x = self.dense2(x)
+        if isinstance(x, DTensor):
+            x = x.reduce_partial()
         return x
 
 class DenseMutiLayerNet(nn.Cell):
@@ -87,6 +100,8 @@ class DenseMutiLayerNet(nn.Cell):
     def construct(self, x):
         for i in range(self.layer_num):
             x = self.layers[i](x)
+            if isinstance(x, DTensor):
+                x = x.reduce_partial()
         return x
 
 class NetWithScaler(nn.Cell):
@@ -100,4 +115,6 @@ class NetWithScaler(nn.Cell):
     def construct(self, x):
         x = self.dense(x)
         x = mint.add(x, self.scaler)
+        if isinstance(x, DTensor):
+            x = x.reduce_partial()
         return x

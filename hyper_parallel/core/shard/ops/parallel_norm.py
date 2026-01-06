@@ -47,9 +47,13 @@ class NormDistributedOp(DistributedOp):
             ValueError: If device matrices of input layouts don't match.
             ValueError: If normalization axis is sharded, which is not supported.
             ValueError: If gamma parameter layout doesn't match the input layout in normalization dimensions.
+            ValueError: If input layouts have partial status.
         """
         if len(layouts) < 3:
             raise ValueError(f"RmsNorm input layouts size {len(layouts)} is less than 3.")
+        # Check partial inputs
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs(layouts)
         x_layout = layouts[0]
         gamma_layout = layouts[-2]
         x_mesh_shape = x_layout.mesh_shape

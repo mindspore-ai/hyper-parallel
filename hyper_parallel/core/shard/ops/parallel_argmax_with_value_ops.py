@@ -29,7 +29,13 @@ class ArgMaxWithValueDistributedOp(DistributedOp):
             x_layout (Layout): Layout of input x
         Returns:
             tuple: Layout for output tensor
+        Raises:
+            ValueError: If input layouts have partial status.
         """
+        # Check partial inputs
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs(layouts)
+
         # Parse input layout
         if len(layouts) != 3:
             raise ValueError(f"ArgMaxWithValue requires 3 layouts, but {len(layouts)}")

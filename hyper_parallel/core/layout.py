@@ -650,6 +650,7 @@ class Layout:
         if self.is_dev_axis_apply_shard(axis):
             raise ValueError("Partial dim must be replicate.")
         self._partial[self._mesh.axis_index(axis)] = op
+        self.update_compact_str()
 
     def get_partial_by_dev_id(self, axis):
         """Get the partial status for the specified dev id"""
@@ -680,6 +681,7 @@ class Layout:
 
     def reset_partial(self):
         self._partial = [None] * len(self.mesh_shape)
+        self.update_compact_str()
 
     def is_partial(self):
         """Return true if any dim in mesh_shape is partial"""
@@ -745,7 +747,7 @@ class Layout:
             str: string for compact
         """
         mesh_key = self._mesh.to_hash()
-        hash_key = (self._tensor_map,)
+        hash_key = (self._tensor_map, self.partial)
         hash_key += mesh_key
         return str(hash_key)
 

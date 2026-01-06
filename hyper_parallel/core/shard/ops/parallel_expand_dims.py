@@ -22,9 +22,6 @@ from .parallel_ops import DistributedOp
 class ExpandDimsDistributedOp(DistributedOp):
     """Distributed implementation for ExpandDims operator."""
 
-    def __init__(self, op_name="ExpandDims"):
-        super().__init__(op_name)
-
     def infer_layout(self, layouts, extra_args):
         """
         Infer output layout for ExpandDims.
@@ -45,7 +42,7 @@ class ExpandDimsDistributedOp(DistributedOp):
             raise ValueError("Input layout cannot be None.")
 
         if not extra_args:
-            raise ValueError("ExpandDims: axis parameter is required")
+            raise ValueError(f"{self.op_name}: axis parameter is required")
 
         axis = extra_args[0] if isinstance(extra_args, (tuple, list)) else extra_args
 
@@ -55,7 +52,7 @@ class ExpandDimsDistributedOp(DistributedOp):
 
         if axis < 0 or axis > in_rank:
             raise ValueError(
-                f"ExpandDims: axis {axis} out of range for input rank {in_rank}. "
+                f"{self.op_name}: axis {axis} out of range for input rank {in_rank}. "
                 f"Valid range is [{-in_rank-1}, {in_rank}]"
             )
 

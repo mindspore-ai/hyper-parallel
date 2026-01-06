@@ -1,0 +1,67 @@
+__default__:
+  distributed_op_class: ElementWiseDistributedOp
+  distributed_op_file: parallel_elementwise
+  infer_layout_suffix: WithShape
+
+add:
+  dist_op_name: _torch_add_dist_op
+  distributed_op_class: AddDistributedOp
+
+add_:
+  dist_op_name: _torch_add__dist_op
+  distributed_op_class: AddDistributedOp
+
+sub:
+  dist_op_name: _torch_sub_dist_op
+
+sub_:
+  dist_op_name: _torch_sub__dist_op
+
+__and__:
+  dist_op_name: _torch___and___dist_op
+
+__eq__:
+  dist_op_name: _torch___eq___dist_op
+
+__floordiv__:
+  dist_op_name: _torch___floordiv___dist_op
+
+__or__:
+  dist_op_name: _torch___or___dist_op
+
+ge:
+  dist_op_name: _torch_ge_dist_op
+
+gt:
+  dist_op_name: _torch_gt_dist_op
+
+le:
+  dist_op_name: _torch_le_dist_op
+
+lt:
+  dist_op_name: _torch_lt_dist_op
+
+pow:
+  dist_op_name: _torch_pow_dist_op
+
+masked_fill:
+  dist_op_name: _torch_masked_fill_dist_op
+
+masked_fill_:
+  dist_op_name: _torch_masked_fill__dist_op
+
+mul:
+  dist_op_name: _torch_mul_dist_op
+  distributed_op_class: ElementWiseWithPartialDistributedOp
+
+div:
+  dist_op_name: _torch_div_dist_op
+
+floor_div:
+  dist_op_name: _torch_floor_div_dist_op
+
+real_div:
+  dist_op_name: _torch_real_div_dist_op
+
+not_equal:
+  dist_op_name: _torch_not_equal_dist_op
