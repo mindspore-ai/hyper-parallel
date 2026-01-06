@@ -23,8 +23,6 @@ from fast_tuner.pipeline_conductor.pp_util import parse_shell
 from fast_tuner.utils.logger import logger
 from fast_tuner.ndsearch.para_for_nd_search import ParaForNd
 from fast_tuner.ndsearch.memory_model import compute_weight_and_optimizer_memory
-import torchtitan.protocols.train_spec as train_spec_module
-
 
 encoding = 'utf-8'
 
@@ -369,6 +367,8 @@ class ProfileParser:
         atts, grad_atts = self.extract_atts_for_titan()
         layer_num = 10  # 与titan的__init__.py中的
         try:
+            # pylint: disable=C0415
+            import torchtitan.protocols.train_spec as train_spec_module
             model_flavor = 'tune'
             train_spec = train_spec_module.get_train_spec(self.model_name)
             model_args = train_spec.model_args[model_flavor]

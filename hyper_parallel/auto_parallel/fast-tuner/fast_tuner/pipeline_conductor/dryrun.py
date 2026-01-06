@@ -29,7 +29,6 @@ from multiprocessing import Pool
 
 from fast_tuner.utils.logger import logger
 from fast_tuner.pipeline_conductor.pp_util import (
-    pp_util,
     pipeline_output_file,
     str2bool,
     str2int,

@@ -21,7 +21,7 @@ import yaml
 
 from fast_tuner.utils.logger import logger
 from fast_tuner.pipeline_conductor import pp_util
-from fast_tuner.pipeline_conductor.dryrun import DryRun, dryrun_config_error
+from fast_tuner.pipeline_conductor.dryrun import DryRun, DRYRUN_CONFIG_ERROR
 
 class ResultCsv:
     """
@@ -68,7 +68,7 @@ class ResultCsv:
         elif DryRun.config_file_type == 2:
             self.toml_to_row(candidate, new_row)
         else:
-            raise TypeError(dryrun_config_error)
+            raise TypeError(DRYRUN_CONFIG_ERROR)
         with open(self.path, 'a', newline='', encoding='utf-8-sig') as file:
             writer = csv.writer(file)
             writer.writerows([new_row])

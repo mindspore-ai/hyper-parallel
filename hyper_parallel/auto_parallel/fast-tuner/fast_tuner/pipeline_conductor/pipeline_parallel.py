@@ -23,7 +23,7 @@ from fast_tuner.pipeline_conductor import solution
 from fast_tuner.pipeline_conductor import fitting
 from fast_tuner.utils.ppc_input import ParallelInput
 from fast_tuner.pipeline_conductor.result_csv import ResultCsv
-from fast_tuner.pipeline_conductor.dryrun import DryRun, dryrun_config_error
+from fast_tuner.pipeline_conductor.dryrun import DryRun, DRYRUN_CONFIG_ERROR
 
 from fast_tuner.utils.common import check_dryrun_parallel_number
 
@@ -216,7 +216,7 @@ if __name__ == '__main__':
         DryRun.config_file_type = 1
         ExpertInput.is_full_recomp = False
     else:
-        raise TypeError(dryrun_config_error)
+        raise TypeError(DRYRUN_CONFIG_ERROR)
 
     if args.extract:
         solution.extract_solution_file(args.train_yaml, args.solution)
