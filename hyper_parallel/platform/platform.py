@@ -13,34 +13,77 @@
 # limitations under the License.
 # ============================================================================
 """framework platform api"""
+import os
 from enum import auto, Enum
+# Environment variable name used to specify the AI framework platform to use
+HYPER_PARALLEL_PLATFORM = "HYPER_PARALLEL_PLATFORM"
+
+# Identifier for the MindSpore framework
+HYPER_PARALLEL_PLATFORM_MINDSPORE = "mindspore"
+
+# Identifier for the PyTorch framework
+HYPER_PARALLEL_PLATFORM_TORCH = "torch"
 
 
 class PlatformType(Enum):
-    """
-    PlatformType
+    """Enumeration class for AI framework platform types.
+
+    Used to identify different deep learning framework platform types.
     """
     MINDSPORE = auto()
     PYTORCH = auto()
 
 
+# Global platform instance, used to cache the created platform object
 platform = None
 
 
-# pylint: disable=C0415
-def get_platform():
-    """get framework platform"""
+def get_mindspore_platform():
+    """Create mindspore platform"""
+    # pylint: disable=C0415
+    from hyper_parallel.platform.mindspore.platform import MindSporePlatform
     global platform
+    platform = MindSporePlatform()
+    return platform
+
+
+def get_torch_platform():
+    """Create torch platform"""
+    # pylint: disable=C0415
+    from hyper_parallel.platform.torch.platform import TorchPlatform
+    global platform
+    platform = TorchPlatform()
+    return platform
+
+
+def get_platform():
+    """Obtain a framework platform instance.
+
+    Returns the appropriate AI framework platform instance based on environment variables or a default priority order.
+    The lookup priority is as follows:
+    1. Platform specified by environment variable
+    2. MindSpore platform (default preferred choice)
+    3. PyTorch platform (fallback option)
+
+    Returns:
+        Platform: An instance of the framework platform
+
+    Raises:
+        ImportError: Raised when none of the supported frameworks are available
+    """
     if platform is not None:
         return platform
+    platform_type = os.environ.get(HYPER_PARALLEL_PLATFORM)
+    if platform_type is not None and isinstance(platform_type, str):
+        platform_type = platform_type.lower()
+        if platform_type == HYPER_PARALLEL_PLATFORM_MINDSPORE:
+            return get_mindspore_platform()
+        if platform_type == HYPER_PARALLEL_PLATFORM_TORCH:
+            return get_torch_platform()
     try:
-        from hyper_parallel.platform.mindspore.platform import MindSporePlatform
-        platform = MindSporePlatform()
-        return platform
+        return get_mindspore_platform()
     except ImportError:
-        from hyper_parallel.platform.torch.platform import TorchPlatform
-        platform = TorchPlatform()
-        return platform
+        return get_torch_platform()
 
 
 EXISTING_COMM_GROUPS = {}
