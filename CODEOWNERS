@@ -20,6 +20,7 @@
 
 # The maintainers of hyper_parallel/auto_parallel.
 /hyper_parallel/auto_parallel/ @bj-wang
+/hyper_parallel/auto_parallel/fast-tuner/ @ChaoRanCaaat
 
 # The maintainers of tests.
 /tests/ @kisnwang
