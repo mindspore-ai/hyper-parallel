@@ -59,13 +59,13 @@ def _parallel_in(func, args, kwargs, layouts):
 
     is_list = isinstance(layouts, (list, tuple))
     for i, arg in enumerate(args):
-        if not isinstance(arg, Tensor) or arg is None:
+        if not isinstance(arg, DTensor):
             continue
 
         to_layout = _get_layout(i, is_list)
         processed_args[i] = arg.redistribute(to_layout)
     for k, v in kwargs.items():
-        if not isinstance(v, Tensor) or v.layout is None or layouts.get(k) is None:
+        if not isinstance(v, DTensor) or layouts.get(k) is None:
             processed_kwargs[k] = v
             continue
         to_layout = layouts[k]
@@ -84,7 +84,7 @@ def _parallel_out(outputs, layouts):
                              f"{len(layouts)}")
         new_outputs = []
         for i, arg in enumerate(outputs):
-            if not isinstance(arg, Tensor) or arg is None:
+            if not isinstance(arg, DTensor) or arg is None:
                 new_outputs.append(arg)
                 continue
             to_layout = layouts[i]
@@ -93,7 +93,7 @@ def _parallel_out(outputs, layouts):
     if len(layouts) != 1:
         raise ValueError(f"The size of outputs and out_layout must be equal, but got 1 and "
                          f"{len(layouts)}")
-    return outputs.redistribute(layouts[0])
+    return outputs.redistribute(layouts[0]) if isinstance(outputs, DTensor) else outputs
 
 
 def _forward_pre_hook(cell, args):
