@@ -14,7 +14,7 @@
 """test ut for parallel arithmetic"""
 import pytest
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_arithmetic import ArithmeticDistributedOp
+from hyper_parallel.core.shard.ops.parallel_arithmetic import ArithmeticDistributedOp
 
 
 def test_add_layout_hybrid_parallel():

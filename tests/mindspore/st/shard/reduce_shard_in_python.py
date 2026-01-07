@@ -20,7 +20,7 @@ import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor, ops
 from hyper_parallel import Layout, shard, DTensor, parallelize_value_and_grad
-from tests.mindspore.st.tensor_parallel.utils import global_to_local, local_to_global, distribute_tensor
+from tests.mindspore.st.shard.utils import global_to_local, local_to_global, distribute_tensor
 
 
 def setup_module():

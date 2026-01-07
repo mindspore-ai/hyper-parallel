@@ -12,20 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""parallel_flash_attention_score_shell test"""
+"""
+Parallel layout decorator
+"""
+_DISTRIBUTED_OPS = {}
 
-from tests.mindspore.st.tensor_parallel.utils import run_case
-from tests.common.mark_utils import arg_mark
+def register_distributed_op(op_name, op_class):
+    """
+    Register a distributed operator implementation.
 
+    Args:
+        op_name (str): Name of the operator
+        op_class (class): Distributed operator implementation class
+    """
+    _DISTRIBUTED_OPS[op_name] = op_class
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_flash_attention_score_model_parallel():
-    '''
-    Feature: sum operator.
-    Description: Test cell shard in python.
-    Expectation: Run success.
-    '''
-    file_name = "flash_attention_score_shard_in_python.py"
-    case_name = "test_flash_attention_score_model_parallel"
-    master_port = 11298
-    run_case(file_name, case_name, master_port)
+def get_distributed_op(op_name):
+    """
+    Get distributed operator implementation by operator name.
+
+    Args:
+        op_name (str): Name of the operator
+
+    Returns:
+        object: Distributed operator instance or None if not found
+    """
+    return _DISTRIBUTED_OPS.get(op_name, None)

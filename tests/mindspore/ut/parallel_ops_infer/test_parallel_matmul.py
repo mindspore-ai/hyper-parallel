@@ -15,7 +15,7 @@
 """parallel_matmul test"""
 
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_matmul import MatMulDistributedOp
+from hyper_parallel.core.shard.ops.parallel_matmul import MatMulDistributedOp
 
 op = MatMulDistributedOp("MatMul")
 

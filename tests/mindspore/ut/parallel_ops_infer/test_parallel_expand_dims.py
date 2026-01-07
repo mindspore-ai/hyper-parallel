@@ -17,7 +17,7 @@
 import pytest
 
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_expand_dims import ExpandDimsDistributedOp
+from hyper_parallel.core.shard.ops.parallel_expand_dims import ExpandDimsDistributedOp
 
 
 def run_scenario(scenario_name, x_layout, expected_map, extra_args):

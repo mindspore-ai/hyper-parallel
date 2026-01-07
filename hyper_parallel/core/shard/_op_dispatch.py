@@ -21,7 +21,7 @@ import importlib
 from typing import Any, List, Dict, Optional
 import yaml
 
-from hyper_parallel.core.tensor_parallel.ops.parallel_ops_register import get_distributed_op
+from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
 from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.platform import get_platform
 
@@ -116,7 +116,7 @@ class OpDispatcher:
         Description: Resolve the YAML directory used to load distributed op definitions.
                      If env_yaml_dir is an absolute path, use it directly; otherwise treat it
                      as a path relative to the project work_dir. If env_yaml_dir is not set,
-                     fall back to the default 'tensor_parallel/ops/yaml' under work_dir.
+                     fall back to the default 'shard/ops/yaml' under work_dir.
         Expectation: self.yaml_dir and self.work_dir are set to valid values used later by
                      safe_load_yaml_from_dir(); no functional behavior is changed.
         """
@@ -130,7 +130,7 @@ class OpDispatcher:
                 )
                 self.yaml_dir = env_yaml_dir
         else:
-            self.yaml_dir = "tensor_parallel/ops/yaml"
+            self.yaml_dir = "shard/ops/yaml"
             self.work_dir = os.path.normpath(
                 os.path.join(os.path.dirname(os.path.realpath(__file__)), "../")
             )
@@ -153,7 +153,7 @@ class OpDispatcher:
         Description: Import the distributed op class specified by config and instantiate it
                      with op_name to trigger registration in the distributed op registry.
                      Prefer 'distributed_op_module' when provided; otherwise import from
-                     built-in module prefix 'hyper_parallel.core.tensor_parallel.ops.' plus
+                     built-in module prefix 'hyper_parallel.core.shard.ops.' plus
                      'distributed_op_file'. If import fails and an external python path is
                      provided via env, fall back to importing 'distributed_op_file' directly.
         Expectation: The distributed op class is imported and instantiated successfully,
@@ -170,7 +170,7 @@ class OpDispatcher:
 
         module_file = config["distributed_op_file"]
         try:
-            module_name = "hyper_parallel.core.tensor_parallel.ops." + module_file
+            module_name = "hyper_parallel.core.shard.ops." + module_file
             module = importlib.import_module(module_name)
             op_class = getattr(module, class_name)
             _ = op_class(op_name)

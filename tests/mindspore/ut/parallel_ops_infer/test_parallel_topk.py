@@ -14,7 +14,7 @@
 """parallel_topk test"""
 
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_topk import TopKDistributedOp
+from hyper_parallel.core.shard.ops.parallel_topk import TopKDistributedOp
 
 op = TopKDistributedOp("TopK")
 

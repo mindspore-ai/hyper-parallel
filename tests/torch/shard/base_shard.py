@@ -20,7 +20,7 @@ from torch import optim
 # pylint: disable=W0611
 import torch_npu  # 昇腾NPU核心适配
 from hyper_parallel import DTensor, Layout, SkipDTensorDispatch
-from hyper_parallel.core.tensor_parallel.shard import shard
+from hyper_parallel.core.shard.api import shard
 from tests.torch.utils import init_dist
 
 

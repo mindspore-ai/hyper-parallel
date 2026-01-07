@@ -17,7 +17,7 @@
 import pytest
 
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_reduce import SumExtDistributedOp, MeanExtDistributedOp
+from hyper_parallel.core.shard.ops.parallel_reduce import SumExtDistributedOp, MeanExtDistributedOp
 
 
 def run_scenario(op_name, scenario_name, x_layout, expected_map, extra_args):

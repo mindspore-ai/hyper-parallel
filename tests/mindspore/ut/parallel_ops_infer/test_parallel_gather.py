@@ -16,7 +16,7 @@
 
 import pytest
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_gather import GatherDistributedOp, IndexSelectDistributedOp
+from hyper_parallel.core.shard.ops.parallel_gather import GatherDistributedOp, IndexSelectDistributedOp
 
 
 def run_scenario(scenario_name, op_name, params_layout, indices_layout, axis, expected_map=None):

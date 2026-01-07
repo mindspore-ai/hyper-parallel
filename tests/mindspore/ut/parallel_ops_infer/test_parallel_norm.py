@@ -15,7 +15,7 @@
 """parallel_norm test"""
 
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_norm import NormDistributedOp
+from hyper_parallel.core.shard.ops.parallel_norm import NormDistributedOp
 
 op = NormDistributedOp("RmsNorm")
 

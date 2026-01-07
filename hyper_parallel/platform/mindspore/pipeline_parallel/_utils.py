@@ -9,14 +9,12 @@
 """pipeline parallel utils"""
 import io
 import pickle
-import mindspore as ms
-import hyper_parallel
-from hyper_parallel.core.dtensor import DTensor
 from mindspore import nn, Tensor, mint, ops
 from mindspore.common import dtype as mstype
-from mindspore.mint.distributed.distributed import _object_to_tensor, send, recv
-from hyper_parallel.core.tensor_parallel.local_func import custom_shard
 from mindspore.communication import GlobalComm
+from mindspore.mint.distributed.distributed import _object_to_tensor, send, recv
+import hyper_parallel
+from hyper_parallel.core.shard.local_func import custom_shard
 
 
 class BatchDimSpec:
@@ -100,28 +98,28 @@ class _MicroBatch(nn.Cell):
             kwargs_after_split.append(micro_kwargs)
         return args_after_split, kwargs_after_split
 
-    def split_inputs_with_custom_shard(self, input, cur_arg_batch_dim, micro_idx):
-        if not isinstance(input, hyper_parallel.DTensor):
-            raise TypeError(f"Input type {type(input)} is not DTensor.")
-        input_layout = input.layout
+    def split_inputs_with_custom_shard(self, input_tensor, cur_arg_batch_dim, micro_idx):
+        if not isinstance(input_tensor, hyper_parallel.DTensor):
+            raise TypeError(f"Input type {type(input_tensor)} is not DTensor.")
+        input_layout = input_tensor.layout
         func_wrap = custom_shard(self.split_inputs, out_layouts=(input_layout,), in_layouts=(input_layout, None, None))
-        return func_wrap(input, cur_arg_batch_dim, micro_idx)
+        return func_wrap(input_tensor, cur_arg_batch_dim, micro_idx)
 
-    def split_inputs(self, input, cur_arg_batch_dim, micro_idx):
+    def split_inputs(self, input_tensor, cur_arg_batch_dim, micro_idx):
         """
         Split the input along the specified batch_dim and micro_idx
         """
         if cur_arg_batch_dim == -1:
-            return input
-        batch_dim_shape = input.shape[cur_arg_batch_dim]
+            return input_tensor
+        batch_dim_shape = input_tensor.shape[cur_arg_batch_dim]
         micro_batch_begin = (batch_dim_shape // self.micro_batch_num) * micro_idx
         micro_batch_end = (batch_dim_shape // self.micro_batch_num) * (micro_idx + 1)
-        strided_slice_begin = [0] * input.ndim
-        strided_slice_strides = [1] * input.ndim
-        strided_slice_end = list(input.shape)
+        strided_slice_begin = [0] * input_tensor.ndim
+        strided_slice_strides = [1] * input_tensor.ndim
+        strided_slice_end = list(input_tensor.shape)
         strided_slice_begin[cur_arg_batch_dim] = micro_batch_begin
         strided_slice_end[cur_arg_batch_dim] = micro_batch_end
-        micro_input = ops.strided_slice(input, strided_slice_begin, strided_slice_end, strided_slice_strides)
+        micro_input = ops.strided_slice(input_tensor, strided_slice_begin, strided_slice_end, strided_slice_strides)
         return micro_input
 
 class _RecvInfo:

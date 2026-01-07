@@ -14,7 +14,7 @@
 """test ut for parallel slice infer_layout"""
 import pytest
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_slice import SliceDistributedOp
+from hyper_parallel.core.shard.ops.parallel_slice import SliceDistributedOp
 
 op = SliceDistributedOp("Slice")
 

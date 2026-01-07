@@ -15,7 +15,7 @@
 """parallel_split test"""
 
 import pytest
-from hyper_parallel.core.tensor_parallel.ops.parallel_split import (SplitDistributedOp, SplitWithSizeDistributedOp,
+from hyper_parallel.core.shard.ops.parallel_split import (SplitDistributedOp, SplitWithSizeDistributedOp,
                                                                     SplitTensorDistributedOp)
 from hyper_parallel import Layout
 

@@ -15,7 +15,7 @@
 """parallel_batch_matmul test"""
 
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_matmul import BatchMatMulDistributedOp
+from hyper_parallel.core.shard.ops.parallel_matmul import BatchMatMulDistributedOp
 
 
 def run_scenario(scenario_name, x_layout, w_layout, expected_map, transpose_a=False, transpose_b=False):
