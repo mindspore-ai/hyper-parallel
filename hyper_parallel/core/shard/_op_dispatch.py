@@ -105,7 +105,7 @@ class OpDispatcher:
                           "is_complex", "chunk", "__bool__", "__len__", "__format__"]
 
         # Ops requiring args unpacking for layout inference (packed as prim, name, real_args).
-        self.unpack_ops = ["ScatterUpdate", "Mod"]
+        self.unpack_ops = ["ScatterUpdate", "Mod", "GatherNd"]
 
         self._register_distributed_ops()
 
