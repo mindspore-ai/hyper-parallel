@@ -259,6 +259,15 @@ class MindSporePlatform(Platform):
     def construct_strided_slice(x, begin, end, stride):
         return ms.ops.strided_slice(x, begin, end, stride)
 
+    @staticmethod
+    def save_checkpoint(cell: Cell, file_path: str) -> None:
+        save_dict = cell._params
+        ms.save_checkpoint(save_obj=save_dict, ckpt_file_name=file_path, format="safetensors")
+
+    @staticmethod
+    def load_checkpoint(file_path: str) -> dict:
+        return ms.load_checkpoint(ckpt_file_name=file_path, format="safetensors")
+
     def new_stream(self):
         return ms.runtime.Stream()
 

@@ -13,18 +13,28 @@
 # limitations under the License.
 # ============================================================================
 """Load model parameters from checkpoint file."""
-import mindspore as ms
+from pathlib import Path
+from typing import Union
+
+from hyper_parallel.core.checkpoint.util import has_valid_filename
+from hyper_parallel.platform import get_platform
+
+platform = get_platform()
 
 
-def load_checkpoint(file_path: str):
+def load_checkpoint(file_path: Union[Path, str]) -> dict:
     """
     Load model parameters from checkpoint file.
 
     Args:
-        file_path (str): Path to the checkpoint file.
+        file_path (str): Path to the checkpoint file. Path must contain file name with extension.
 
     Returns:
         dict: A dictionary containing the loaded parameters.
-"""
-    param_dict = ms.load_checkpoint(ckpt_file_name=file_path, format="safetensors")
+    """
+    file_path_obj = Path(file_path) if isinstance(file_path, str) else file_path
+    if not has_valid_filename(file_path_obj):
+        raise ValueError(f"Loader file_path should contains valid filename but get: {file_path}")
+
+    param_dict = platform.load_checkpoint(str(file_path_obj))
     return param_dict
