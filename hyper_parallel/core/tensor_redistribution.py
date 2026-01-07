@@ -63,7 +63,7 @@ class TensorRedistribution:
     def _construct_strided_slice(self, x, *args):
         """args: (begin, end, strides)"""
         dims = len(args) // 3
-        return ms.ops.strided_slice(x, args[0: dims], args[dims: 2*dims], args[2*dims:])
+        return platform.construct_strided_slice(x, args[0: dims], args[dims: 2 * dims], args[2 * dims:])
 
     def _construct_all_concat_new(self, x, *args):
         """args: (concat_dim, concat_size, group)"""
@@ -226,8 +226,8 @@ class TensorRedistribution:
         from_layout_tuple, to_layout_tuple = \
             _construct_layout_tuple_for_transform_operator_list(from_layout, to_layout, from_full_shape)
         self._transform_cache[key] = \
-            _tensor_transform.transform_tensor_sharding(from_layout_tuple, to_layout_tuple, self.rank_list,
-                                                        False, self.rank_id)
+            platform.get_tensor_transform().transform_tensor_sharding(from_layout_tuple, to_layout_tuple,
+                                                                      self.rank_list, False, self.rank_id)
         return self._transform_cache[key]
 
     def _allreduce_along_dev_dim(self, x, op, layout, dev_dim):

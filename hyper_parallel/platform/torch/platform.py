@@ -244,6 +244,14 @@ class TorchPlatform(Platform):
         handle = dist.reduce_scatter_tensor(output, data, group=group_info.group, async_op=async_op)
         return output, handle
 
+    @staticmethod
+    def get_tensor_transform():
+        raise NotImplementedError("Unsupported get_tensor_transform for torch platform")
+
+    @staticmethod
+    def construct_strided_slice(x, begin, end, stride):
+        raise NotImplementedError("Unsupported construct_strided_slice for torch platform")
+
     def new_stream(self):
         device = self.get_device_handle()
         return device.Stream()

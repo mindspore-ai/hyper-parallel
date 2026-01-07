@@ -224,6 +224,14 @@ class Platform:
     def get_stream_context(self):
         raise NotImplementedError("Platform subclasses must implement get_stream_context")
 
+    @staticmethod
+    def get_tensor_transform():
+        raise NotImplementedError("Platform subclasses must implement get_tensor_transform")
+
+    @staticmethod
+    def construct_strided_slice(x, begin, end, stride):
+        raise NotImplementedError("Platform subclasses must implement construct_strided_slice")
+
     def create_group(self, rank_list, group_name=None):
         """create comm group with rank list"""
         if group_name is None:
