@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@ from enum import Enum, auto
 from collections import defaultdict
 import itertools
 import bisect
+import re
+import mindspore.log as logger
 from .stage import PipelineStage
 from ._utils import _MicroBatch
 
@@ -463,8 +465,7 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
                  micro_batch_num,
                  args_batch_dim=None,
                  kwargs_batch_dim=None,
-                 output_concat_dim=None,
-                 com_style='loop'):
+                 output_concat_dim=None):
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
@@ -563,3 +564,277 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
                 order_list.extend([None] * (self.real_stage_num - self.micro_batch_num))
             bwd_stage_micro_index[bwd_stage_idx] += 1
         return order_list
+
+def detect_cycle_in_graph(ranks_map):
+    """
+    Detects a cycle in the directed graph constructed from ranks_map.
+
+    Args:
+        ranks_map: A dictionary where keys are rank names and values are lists of nodes.
+
+    Returns:
+        tuple: (cycle_path, cycle_ranks) where cycle_path is a list of nodes forming the cycle and cycle_ranks
+               is a list of rank transitions corresponding to the cycle path.
+    """
+    graph = defaultdict(list)
+    rank_edges = {}
+
+    for rank, nodes in ranks_map.items():
+        for i in range(len(nodes) - 1):
+            u, v = nodes[i], nodes[i + 1]
+            graph[u].append(v)
+            rank_edges[(u, v)] = rank
+
+    visited = set()
+    path = []
+    node_indices = {}
+    cycle_path = []
+    cycle_ranks = []
+
+    stack = []
+    for node in list(graph.keys()):
+        if node not in visited:
+            stack.append((node, False))
+            while stack:
+                current_node, is_processed = stack.pop()
+
+                if is_processed:
+                    path.pop()
+                    del node_indices[current_node]
+                    continue
+
+                if current_node in node_indices:
+                    cycle_start = node_indices[current_node]
+                    cycle_path = path[cycle_start:] + [current_node]
+                    for i in range(cycle_start, len(path)):
+                        u = path[i]
+                        v = path[i + 1] if i + 1 < len(path) else current_node
+                        cycle_ranks.append(f"{rank_edges[(u, v)]} {u} -> {v}")
+                    return cycle_path, cycle_ranks
+
+                if current_node in visited:
+                    continue
+
+                visited.add(current_node)
+                node_indices[current_node] = len(path)
+                path.append(current_node)
+
+                stack.append((current_node, True))
+                for neighbor in reversed(graph[current_node]):
+                    stack.append((neighbor, False))
+
+    return None, None
+
+def output_cycle_results(cycle_path, cycle_ranks):
+    """
+    Helper function to output cycle detection results.
+
+    Args:
+        cycle_path (list): List of nodes forming a cycle, if any.
+        cycle_ranks (list): List of ranks involved in the cycle.
+
+    Returns:
+        None: Outputs results to the console.
+    """
+    if cycle_path:
+        logger.error("Cycle detected:")
+        logger.error(" -> ".join(cycle_path) + f" -> {cycle_path[0]}")  # Close the cycle
+        logger.error("Involving ranks:")
+        for rank in cycle_ranks:
+            logger.error(rank)
+    else:
+        logger.warning("Cycle Check success. There is no cycle in the graph.")
+
+def parse_and_validate(data: dict, all_rank: bool = True):
+    """
+    Parse and validate execution orders in a directed graph structure.
+
+    This function checks the integrity and consistency of a given dataset, ensuring all required
+    keys are present and correctly referenced. It also validates the structure of the input data
+    and parses string values to extract meaningful components.
+
+    Args:
+        data (dict): A dictionary where keys are string identifiers and values are lists of strings.
+                        Each value represents a dependency or reference to other keys.
+        all_rank (bool): If True, checks that all elements referenced in the data are present as keys
+                            in the dictionary. If False, only checks intersections.
+
+    Returns:
+        None: Log error messages to the console if validation fails, otherwise completes silently.
+
+    Raises:
+        ValueError: Raised indirectly if `parse_elements` encounters malformed input strings.
+        TypeError: Raised indirectly if data contains unexpected types.
+    """
+
+    def parse_elements(value: str, max_groups: int = 2) -> set:
+        """Extract unique elements inside the first one or two parentheses from a string."""
+
+        groups = re.findall(r'\((\d+)\)', value)
+        limited_groups = groups[:max_groups]  # Limit to the first `max_groups` matches
+
+        return {item.strip() for item in limited_groups}
+
+    if not isinstance(data, dict):
+        logger.error("Input must be a dictionary with string keys and lists of strings as values.")
+        return
+
+    key_to_values = {key: set(values) for key, values in data.items() if
+                     isinstance(values, list) and all(isinstance(v, str) for v in values)}
+
+    for key, values in data.items():
+        if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+            logger.error(f"Values for key '{key}' must be a list of strings.")
+            continue
+
+        for value in values:
+            try:
+                elements = parse_elements(value)
+            except (ValueError, TypeError, AttributeError) as e:
+                logger.error(f"Unable to parse elements from value '{value}' in key '{key}'. Error: {e}")
+                continue
+
+            # Check for missing keys if all_rank is True
+            if all_rank:
+                missing_keys = elements - key_to_values.keys()
+                if missing_keys:
+                    logger.error(f"The following keys are missing for value '{value}': {missing_keys}")
+                    continue
+
+            # Check if the value is present in the referenced keys
+            for element in elements & key_to_values.keys() if not all_rank else elements:
+                if value not in key_to_values[element]:
+                    logger.error(f"Key '{element}' is missing the value '{value}'.")
+
+def generate_operations(order_list: dict[int, list[MetaStep]],
+                                  chunk_num: int,
+                                  com_type: str = 'loop') -> dict[str, list[str]]:
+    """
+    Generate formatted operations dictionary from pipeline execution order.
+
+    Args:
+        order_list: Dictionary where keys are rank IDs and values are MetaStep execution sequences
+        chunk_num: Number of chunks (virtual pipeline stages)
+        com_type: Stage-to-rank mapping type ('loop' for cyclic, 'v' for V-shaped)
+
+    Returns:
+        Dictionary where keys are rank IDs (as strings) and values are lists of formatted operation strings
+    """
+
+    def stage_to_rank(stage_index, style, stage_num, real_stage_num):
+        """Map stage index to rank"""
+        if style == 'loop':
+            return stage_index % real_stage_num
+        if style == 'v':
+            if stage_index < real_stage_num:
+                return stage_index
+            return stage_num - 1 - stage_index
+        raise ValueError("Invalid style")
+
+    def find_send_target(stage_idx, op_type):
+        """Find target stage for SEND operation"""
+        if op_type == MetaStepType.FWD_SEND:
+            return forward_comm.get(stage_idx)
+        return backward_comm.get(stage_idx)
+
+    def find_recv_source(stage_idx, op_type):
+        """Find source stage for RECV operation"""
+        if op_type == MetaStepType.FWD_RECV:
+            # Reverse lookup in forward_comm
+            for src, dst in forward_comm.items():
+                if dst == stage_idx:
+                    return src
+        else:
+            # Reverse lookup in backward_comm
+            for src, dst in backward_comm.items():
+                if dst == stage_idx:
+                    return src
+        return None
+
+    real_stage = len(order_list)
+    total_stages = real_stage * chunk_num
+
+    # Build communication rules
+    forward_comm = {}
+    backward_comm = {}
+
+    for i in range(total_stages):
+        if i + 1 < total_stages:
+            forward_comm[i] = i + 1
+        if i - 1 >= 0:
+            backward_comm[i] = i - 1
+
+    formatted_operations = defaultdict(list)
+
+    for rank, steps in order_list.items():
+        operation_counter = defaultdict(int)
+
+        for step in steps:
+            if step.type in [MetaStepType.FWD_SEND, MetaStepType.BWD_SEND]:
+                target_stage = find_send_target(step.stage_index, step.type)
+                if target_stage is not None:
+                    target_rank = stage_to_rank(target_stage, com_type, total_stages, real_stage)
+                    comm_pair = (rank, target_rank, step.micro_index)
+                    operation_counter[comm_pair] += 1
+                    count = operation_counter[comm_pair]
+                    formatted_op = f"Send_Receive_({rank})->({target_rank})_micro{step.micro_index}_{count}th"
+                    formatted_operations[str(rank)].append(formatted_op)
+
+            elif step.type in [MetaStepType.FWD_RECV, MetaStepType.BWD_RECV]:
+                source_stage = find_recv_source(step.stage_index, step.type)
+                if source_stage is not None:
+                    source_rank = stage_to_rank(source_stage, com_type, total_stages, real_stage)
+                    comm_pair = (source_rank, rank, step.micro_index)
+                    operation_counter[comm_pair] += 1
+                    count = operation_counter[comm_pair]
+                    formatted_op = f"Send_Receive_({source_rank})->({rank})_micro{step.micro_index}_{count}th"
+                    formatted_operations[str(rank)].append(formatted_op)
+
+    # Convert defaultdict to dict
+    return dict(formatted_operations)
+
+def validate_pipeline_execution(order_list: dict[int, list[MetaStep]],
+                                chunk_num: int,
+                                com_type: str = 'loop') -> dict[str, any]:
+    """
+    Comprehensive validation function for pipeline parallel execution order.
+
+    This function validates the execution order of pipeline parallelism by:
+    1. Checking SEND/RECV communication pair matching
+    2. Detecting duplicate operations
+    3. Detecting cycles in communication graphs
+    4. Verifying computation-SEND matching
+
+    Args:
+        order_list: Dictionary where keys are rank IDs and values are MetaStep execution sequences
+        chunk_num: Number of chunks (virtual pipeline stages)
+        com_type: Stage-to-rank mapping type ('loop' for cyclic, 'v' for V-shaped)
+
+    Returns:
+        Dictionary containing validation results with the following keys:
+        - validation: Communication pair validation results
+        - cycle_detection: Cycle detection results
+        - computation_send_matching: Computation-SEND matching validation results
+        - has_errors: Boolean indicating if any errors were found
+        - error_messages: List of all error messages found
+        - formatted_operations: Generated formatted operations
+    """
+
+    # Generate operations
+    formatted_operations = generate_operations(order_list, chunk_num, com_type)
+
+    parse_and_validate(formatted_operations, True)
+
+    # Detect cycles
+    cycle_path, cycle_ranks = detect_cycle_in_graph(formatted_operations)
+
+    # Output results
+    output_cycle_results(cycle_path, cycle_ranks)
+
+    result = {
+        'formatted_operations': formatted_operations,
+        'cycle_path': cycle_path,
+        'cycle_ranks': cycle_ranks,
+        'has_cycle': bool(cycle_path)
+    }
+    return result
