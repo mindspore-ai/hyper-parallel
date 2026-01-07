@@ -15,7 +15,7 @@
 """parallel_argmax_with_value_ops test"""
 
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_argmax_with_value_ops import ArgMaxWithValueDistributedOp
+from hyper_parallel.core.shard.ops.parallel_argmax_with_value_ops import ArgMaxWithValueDistributedOp
 
 
 def run_scenario(scenario_name, tensor_layout, axis, keep_dims, expected_map):

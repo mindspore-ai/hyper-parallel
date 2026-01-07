@@ -22,11 +22,13 @@ Tensor = platform.Tensor
 
 class SkipDTensorDispatch():
     def __enter__(self):
-        from hyper_parallel.core.tensor_parallel._op_dispatch import disable_dtensor_dispatch
+        # pylint: disable=C0415
+        from hyper_parallel.core.shard._op_dispatch import disable_dtensor_dispatch
         disable_dtensor_dispatch()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        from hyper_parallel.core.tensor_parallel._op_dispatch import enable_dtensor_dispatch
+        # pylint: disable=C0415
+        from hyper_parallel.core.shard._op_dispatch import enable_dtensor_dispatch
         enable_dtensor_dispatch()
 
 
@@ -69,6 +71,7 @@ class DTensor(DTensorBase):
         """
         Redistribute dtensor to destination layout.
         """
+        # pylint: disable=C0415
         from hyper_parallel.core.tensor_redistribution import _tensor_redistribution
         out = _tensor_redistribution.redistribution(self, dst_layout)
         return out
@@ -82,6 +85,7 @@ class DTensor(DTensorBase):
             return self
         to_layout = cp.deepcopy(self.layout)
         to_layout.reset_partial()
+        # pylint: disable=C0415
         from hyper_parallel.core.tensor_redistribution import _tensor_redistribution
         out = _tensor_redistribution.reduce_partial(self, to_layout)
         return out

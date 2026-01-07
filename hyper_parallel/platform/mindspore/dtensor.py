@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """mindspore dtensor base"""
-import copy as cp
 from mindspore.common.tensor import Tensor
 from mindspore.common.initializer import initializer
 from mindspore._c_expression import NoFallbackGuard
@@ -63,10 +62,11 @@ class DTensorBase(Tensor):
 
     # pylint: disable=W0211
     # pylint: disable=W0102
+    # pylint: disable=C0415
     def __fallback__(self, func, args={}, kwargs=None):
         if kwargs is None:
             kwargs = {}
-        from hyper_parallel.core.tensor_parallel._op_dispatch import _OP_DISPATCHER
+        from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
         with NoFallbackGuard():
             out = _OP_DISPATCHER.dispatch(func, args, kwargs)
         return out

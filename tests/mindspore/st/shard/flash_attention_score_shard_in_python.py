@@ -22,8 +22,8 @@ import mindspore.common.dtype as mstype
 from mindspore import Tensor
 from mindspore.ops import flash_attention_score
 from hyper_parallel import Layout, shard
-from hyper_parallel.core.tensor_parallel.ops.parallel_flash_attention_score import ParallelFlashAttention
-from tests.mindspore.st.tensor_parallel.utils import global_to_local, local_to_global
+from hyper_parallel.core.shard.ops.parallel_flash_attention_score import ParallelFlashAttention
+from tests.mindspore.st.shard.utils import global_to_local, local_to_global
 
 
 def setup_module():

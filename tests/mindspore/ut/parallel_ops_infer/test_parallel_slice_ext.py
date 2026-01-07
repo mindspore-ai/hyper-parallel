@@ -15,7 +15,7 @@
 """parallel_slice_ext test"""
 
 import pytest
-from hyper_parallel.core.tensor_parallel.ops.parallel_slice_ext import SliceExtDistributedOp
+from hyper_parallel.core.shard.ops.parallel_slice_ext import SliceExtDistributedOp
 from hyper_parallel import Layout
 
 slice_op = SliceExtDistributedOp("SliceExt")

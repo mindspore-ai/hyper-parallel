@@ -16,7 +16,7 @@
 
 import pytest
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_embedding import EmbeddingDistributedOp
+from hyper_parallel.core.shard.ops.parallel_embedding import EmbeddingDistributedOp
 
 op = EmbeddingDistributedOp("Embedding")
 

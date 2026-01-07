@@ -13,35 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """torch dtensor base"""
-import copy as cp
+from typing import Tuple, Dict, Any, Optional
 import torch
 from torch import Tensor
-from typing import Tuple, Dict, Any, Optional, Callable
-
-# ====================== 1. 适配 Ascend 设备的辅助判断 ======================
-def is_ascend_available() -> bool:
-    """判断 Ascend 设备是否可用（PyTorch Ascend 版以 npu 标识）"""
-    try:
-        #return False
-        return torch.npu.is_available()
-    except AttributeError:
-        try:
-            return torch.device("ascend").type == "ascend"
-        except:
-            return False
-
-def get_ascend_device() -> torch.device:
-    """获取 Ascend 设备对象（优先 npu:0，兼容 ascend）"""
-    if is_ascend_available():
-        try:
-            return torch.device("npu:0")
-        except:
-            return torch.device("ascend")
-    raise RuntimeError("Ascend device is not available!")
 
 
-# ====================== 3. 完整的 DTensor 实现（同步存储 + 修复所有问题） ======================
 class DTensorBase(Tensor):
+    """torch dtensor base"""
 
     def __new__(cls, local_tensor, layout=None):
         if not layout:
@@ -52,6 +30,7 @@ class DTensorBase(Tensor):
         t.__init_data__(local_tensor, layout)
         return t
 
+    # pylint: disable=W0613
     @classmethod
     def __torch_function__(
         cls,
@@ -61,11 +40,13 @@ class DTensorBase(Tensor):
         kwargs: Optional[Dict[str, Any]] = None
     ) -> Any:
         kwargs = kwargs or {}
-        from hyper_parallel.core.tensor_parallel._op_dispatch import _OP_DISPATCHER
+        # pylint: disable=C0415
+        from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
         out = _OP_DISPATCHER.dispatch(func, args, kwargs)
         return out
 
     def to(self, device):
+        """set tensor to device"""
         target_device = torch.device(device) if isinstance(device, str) else device
         src_local = self._local_tensor
 
@@ -167,6 +148,7 @@ class DTensorBase(Tensor):
 
     # ====================== 数据操作重写（同步存储 + 修复原地操作） ======================
     def zero_(self):
+        """Set tensor zeros"""
         if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
             # 方案1：创建新张量 + 重新绑定 DTensor（保证存储共享）
             new_local = torch.zeros_like(self._local_tensor, requires_grad=True)
@@ -179,6 +161,7 @@ class DTensorBase(Tensor):
         return self
 
     def copy_(self, src: Tensor, non_blocking: bool = False):
+        """Copy data from src tensor"""
         if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
             new_local = src.to(self._local_tensor.device, non_blocking=non_blocking).detach().clone()
             new_local.requires_grad = self._local_tensor.requires_grad
@@ -190,6 +173,7 @@ class DTensorBase(Tensor):
         return self
 
     def fill_(self, value):
+        """Fill tensor with value"""
         if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
             # 步骤1：创建新张量（非原地）
             new_local = torch.full_like(

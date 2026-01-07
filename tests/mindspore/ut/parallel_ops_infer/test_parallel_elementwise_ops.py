@@ -19,7 +19,7 @@ Unit tests for element-wise distributed operators
 import pytest
 
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_elementwise import (
+from hyper_parallel.core.shard.ops.parallel_elementwise import (
     LessEqualDistributedOp,
     GreaterEqualDistributedOp,
     LogicalOrDistributedOp,

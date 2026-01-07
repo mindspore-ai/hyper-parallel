@@ -15,7 +15,7 @@
 """parallel_concat test"""
 
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_concat import ConcatDistributedOp
+from hyper_parallel.core.shard.ops.parallel_concat import ConcatDistributedOp
 
 
 def run_scenario(scenario_name, tensor_1_layout, tensor_2_layout, dim, expected_map):

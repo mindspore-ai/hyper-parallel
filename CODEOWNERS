@@ -10,7 +10,7 @@
 * @kisnwang
 
 # The maintainers of hyper_parallel/core.
-/hyper_parallel/core/tensor_parallel/ @yangzhenzhang
+/hyper_parallel/core/shard/ @yangzhenzhang
 /hyper_parallel/core/hsdp/ @kisnwang
 /hyper_parallel/core/checkpoint/ @changzherui
 
@@ -26,13 +26,13 @@
 /tests/ @kisnwang
 /tests/mindspore/st/hsdp/ @kisnwang
 /tests/mindspore/st/pipeline_parallel/ @yangzhenzhang
-/tests/mindspore/st/tensor_parallel/ @yangzhenzhang
+/tests/mindspore/st/shard/ @yangzhenzhang
 /tests/mindspore/st/checkpoint/ @changzherui
 /tests/mindspore/ut/parallel_ops_infer/ @yangzhenzhang
 /tests/mindspore/ut/checkpoint/ @changzherui
 /tests/torch/hsdp/ @kisnwang
 /tests/torch/pipeline_parallel/ @yangzhenzhang
-/tests/torch/tensor_parallel/ @yangzhenzhang
+/tests/torch/shard/ @yangzhenzhang
 
 # The maintainers of other code directories.
 /.jenkins/ @kisnwang

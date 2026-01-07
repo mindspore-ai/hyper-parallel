@@ -120,7 +120,7 @@ def _reload_op_dispatch_with_env(
     monkeypatch.setenv("HYPER_PARALLEL_OPS_YAML_DIR", yaml_dir)
     monkeypatch.setenv("HYPER_PARALLEL_OPS_PYTHON_PATH", python_path)
 
-    target_mod = "hyper_parallel.core.tensor_parallel._op_dispatch"
+    target_mod = "hyper_parallel.core.shard._op_dispatch"
     if target_mod in sys.modules:
         del sys.modules[target_mod]
 

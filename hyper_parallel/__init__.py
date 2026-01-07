@@ -18,9 +18,9 @@ from hyper_parallel.core.hsdp.hsdp_api import hsdp, hsdp_wait_grad_handle, HSDPC
 from hyper_parallel.core.layout import Layout
 from hyper_parallel.core.dtensor import DTensor, SkipDTensorDispatch
 from hyper_parallel.core.parameter_init import init_parameters
-from hyper_parallel.core.tensor_parallel.shard import shard
-from hyper_parallel.core.tensor_parallel.shard import parallelize_value_and_grad
-from hyper_parallel.core.tensor_parallel.local_func import custom_shard
+from hyper_parallel.core.shard.api import shard
+from hyper_parallel.core.shard.api import parallelize_value_and_grad
+from hyper_parallel.core.shard.local_func import custom_shard
 
 __all__ = ["get_platform", "hsdp", "hsdp_wait_grad_handle", "HSDPCell", "Layout", "DTensor",
            "init_parameters", "shard", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch"]

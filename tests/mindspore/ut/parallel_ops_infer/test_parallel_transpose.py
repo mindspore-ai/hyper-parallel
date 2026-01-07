@@ -15,7 +15,7 @@
 import math
 import pytest
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_transpose import TransposeDistributedOp
+from hyper_parallel.core.shard.ops.parallel_transpose import TransposeDistributedOp
 
 
 class TestTransposeDistributedOp:

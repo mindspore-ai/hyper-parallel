@@ -32,6 +32,7 @@ class DistributedOp:
         self.op_name = op_name
         register_distributed_op(op_name, self)
 
+    # pylint: disable=W0613
     def infer_layout(self, layouts, extra_args):
         """
         Infer output layouts based on input layouts.
@@ -39,9 +40,8 @@ class DistributedOp:
         Default implementation returns the first input layout for element-wise operations.
 
         Args:
-            primitive: Primitive instance
-            layouts: Layouts of input tensors
-            kwargs: Additional keyword arguments
+            layouts (tuple): Layouts of input tensor.
+            extra_args (dict): Additional arguments (dim, keepdim).
 
         Returns:
             tuple: Layouts for output tensors.

@@ -22,7 +22,7 @@ from mindspore import nn
 from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
 from hyper_parallel import Layout, hsdp, init_parameters, shard, parallelize_value_and_grad
-from tests.mindspore.st.tensor_parallel.utils import create_dtensor
+from tests.mindspore.st.shard.utils import create_dtensor
 
 learning_rate = 0.01
 epochs = 2

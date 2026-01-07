@@ -16,7 +16,7 @@
 
 import pytest
 from hyper_parallel import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_reshape import ReshapeDistributedOp
+from hyper_parallel.core.shard.ops.parallel_reshape import ReshapeDistributedOp
 
 op = ReshapeDistributedOp("Reshape")
 

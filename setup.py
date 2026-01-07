@@ -29,7 +29,7 @@ from setuptools.command.install import install
 
 package_data = {
     'hyper_parallel': ['.commit_id'],
-    'hyper_parallel.core.tensor_parallel.ops': ['yaml/*.yaml']
+    'hyper_parallel.core.shard.ops': ['yaml/*.yaml']
 }
 
 

@@ -17,7 +17,7 @@ Distributed implementation for StackExt operator.
 """
 
 from hyper_parallel.core.layout import Layout
-from hyper_parallel.core.tensor_parallel.ops.parallel_ops import DistributedOp
+from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
 
 
 class StackExtDistributedOp(DistributedOp):

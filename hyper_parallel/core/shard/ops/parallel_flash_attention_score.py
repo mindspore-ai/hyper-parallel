@@ -20,7 +20,7 @@ from mindspore import nn
 from mindspore import Tensor
 from mindspore.ops import flash_attention_score
 from hyper_parallel.core.layout import Layout
-from hyper_parallel.core.tensor_parallel.local_func import custom_shard
+from hyper_parallel.core.shard.local_func import custom_shard
 
 
 class ParallelFlashAttention(nn.Cell):
@@ -155,6 +155,7 @@ class ParallelFlashAttention(nn.Cell):
         self._wrap_func = None
 
     def construct(self, query, key, value, attn_mask):
+        """Use custom shard for flash attention"""
         # TODO: actual_seq_qlen/kv_len is tuple type, cannot be described by dtensor
         if self.in_layout is None or self.out_layout is None:
             raise ValueError("Please call the shard function first.")
@@ -168,6 +169,7 @@ class ParallelFlashAttention(nn.Cell):
         return self._wrap_func(*input_args)
 
     def shard(self, in_strategy, out_strategy):
+        """Set shard strategy"""
         if self.in_layout is not None or self.out_layout is not None:
             raise ValueError(f"For {self.__class__.__name__}, the shard method cannot be called repeatedly to set the "
                              f"sharding strategy.")
