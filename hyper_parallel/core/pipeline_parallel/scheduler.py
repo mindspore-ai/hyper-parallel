@@ -18,11 +18,12 @@ from enum import Enum, auto
 from collections import defaultdict
 import itertools
 import bisect
+import logging
 import re
-import mindspore.log as logger
-from .stage import PipelineStage
-from ._utils import _MicroBatch
-
+import hyper_parallel
+from hyper_parallel.platform import get_platform
+platform = get_platform()
+logger = logging.getLogger(__name__)
 
 
 class MetaStepType(Enum):
@@ -44,7 +45,7 @@ class MetaStep:
     Args:
         micro_index (int): The index of micro-batch.
         type (MetaStepType): Specify the type of current step.
-        stage_index(int): Specify the stage index of current step.
+        stage_index (int): Specify the stage index of current step.
     """
     def __init__(self, micro_index, meta_type, stage_index):
         self._type = meta_type
@@ -102,7 +103,7 @@ class PipelineScheduleRuntime(ABC):
         micro_batch_num (int): The number of micro-batch.
         args_batch_dim (list, optional): Specify the batch dim of the args.
             Default ``None``.
-        kwargs_batch_dim(dict, optional): Specify the batch dim of the kwargs.
+        kwargs_batch_dim (dict, optional): Specify the batch dim of the kwargs.
             Default ``None``.
     """
     def __init__(self,
@@ -117,7 +118,8 @@ class PipelineScheduleRuntime(ABC):
         self._args_batch_dim = args_batch_dim
         self._kwargs_batch_dim = kwargs_batch_dim
         self._output_concat_dim = output_concat_dim
-        self.split_micro_batch = _MicroBatch(self.micro_batch_num, self._args_batch_dim, self._kwargs_batch_dim)
+        self.split_micro_batch = platform.micro_batch(self.micro_batch_num,
+                                                      self._args_batch_dim, self._kwargs_batch_dim)
         self.n_local_stages = len(self.stages)
         self._stage_dict = self.convert_stages_dict()
         self.real_stage_num = self.stages[0].stage_num // self.n_local_stages
@@ -144,11 +146,11 @@ class PipelineScheduleRuntime(ABC):
 
     def _check_stages(self, stages):
         """check stages type."""
-        if isinstance(stages, PipelineStage):
+        if isinstance(stages, hyper_parallel.PipelineStage):
             return [stages]
         if isinstance(stages, (list, tuple)):
             for stage in stages:
-                if not isinstance(stage, PipelineStage):
+                if not isinstance(stage, hyper_parallel.PipelineStage):
                     raise TypeError(f"Argument 'stages' must be type of PipelineStage, \
                                      list or tuple of PipelineStage, but got list or tuple of {type(stage)}.")
             return stages
@@ -164,9 +166,8 @@ class PipelineScheduleRuntime(ABC):
         """schedule run."""
         split_args, split_kwargs = self.split_microbatches(args, kwargs)
         losses = []
-        grads = []
-        self.run_microbatches(split_args, split_kwargs, losses, grads)
-        return losses, tuple(grads)
+        self.run_microbatches(split_args, split_kwargs, losses)
+        return losses
 
     def sync_shared_parameters_grad(self):
         """sync_shared_parameters_grad."""
@@ -183,7 +184,7 @@ class PipelineScheduleRuntime(ABC):
             if handle is not None:
                 handle.wait()
 
-    def run_microbatches(self, arg_mbs, kwarg_mbs, losses, grads):
+    def run_microbatches(self, arg_mbs, kwarg_mbs, losses):
         """run_microbatches."""
         real_stage_index = self.stages[0].stage_index % self.real_stage_num
         send_handle = []
@@ -226,19 +227,19 @@ class PipelineScheduleRuntime(ABC):
                     comm_handle = self.bwd_handle_cache.pop(key)
                     self._wait_p2p(comm_handle)
                 if micro_index == self.micro_batch_num - 1:
-                    grad_out = stage.backward_one_chunk(micro_index, True)
-                    grads += grad_out
+                    stage.backward_one_chunk(micro_index, True)
                 else:
-                    _ = stage.backward_one_chunk(micro_index)
-                if cur_step.type == MetaStepType.BWD_SEND:
-                    comm_handle = stage.exec_bwd_send_ops(micro_index)
-                    if not self._overlap_p2p:
-                        self._wait_p2p(comm_handle)
-                    else:
-                        send_handle.append(comm_handle)
-                self.sync_shared_parameters_grad()
-                while send_handle:
-                    self._wait_p2p(send_handle.pop())
+                    stage.backward_one_chunk(micro_index)
+            if cur_step.type == MetaStepType.BWD_SEND:
+                comm_handle = stage.exec_bwd_send_ops(micro_index)
+                if not self._overlap_p2p:
+                    self._wait_p2p(comm_handle)
+                else:
+                    send_handle.append(comm_handle)
+        self.sync_shared_parameters_grad()
+        while send_handle:
+            self._wait_p2p(send_handle.pop())
+
 
 def add_send_recv(scheduler, stage_num, real_stage_num, style='loop'):
     """
@@ -253,6 +254,7 @@ def add_send_recv(scheduler, stage_num, real_stage_num, style='loop'):
     Returns:
         Complete schedule table for each rank (including communication operations)
     """
+
     def _need_com(action, style, stage_num):
         """Determine if communication is needed"""
         if action.type == MetaStepType.FWD:
@@ -340,6 +342,7 @@ def add_send_recv(scheduler, stage_num, real_stage_num, style='loop'):
 
     return new_schedule
 
+
 class ScheduleGPipe(PipelineScheduleRuntime):
     """
     The Gpipe schedule.
@@ -375,6 +378,7 @@ class ScheduleGPipe(PipelineScheduleRuntime):
                 if stage_index != 0:
                     order_list.append(MetaStep(mb_index, MetaStepType.BWD_SEND, stage_index))
             self.exec_order[stage_index] = order_list
+
 
 class Schedule1F1B(PipelineScheduleRuntime):
     """
@@ -419,7 +423,6 @@ class Schedule1F1B(PipelineScheduleRuntime):
             if self.real_stage_num - stage_index > self.micro_batch_num:
                 order_list.append(MetaStep(fwd_index - 1, MetaStepType.FWD_SEND, stage_index))
                 fwd_index += 1
-
             # steady phase
             steady_micro_batches = self.micro_batch_num - warmup_micro_batches
             for _ in range(steady_micro_batches):
@@ -448,7 +451,6 @@ class Schedule1F1B(PipelineScheduleRuntime):
                     order_list.append(MetaStep(bwd_index, MetaStepType.BWD_SEND, stage_index))
                 bwd_index += 1
             self.exec_order[stage_index] = order_list
-
 
 
 class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
@@ -487,7 +489,7 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
         self.n_microbatch_per_round_accu.insert(0, 0)
         for stage_index in range(self.real_stage_num):
             self.exec_order[stage_index] = self.construct_stage_exec_order(stage_index)
-        self.exec_order = add_send_recv(self.exec_order,self._stage_num,self.real_stage_num,style = 'loop')
+        self.exec_order = add_send_recv(self.exec_order, self._stage_num, self.real_stage_num, style = 'loop')
 
     def warmup_ops(self, stage_index):
         """warmup phase."""
@@ -499,14 +501,14 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
         """obtain forward stage_index based on op_index."""
         accu_index = bisect.bisect_right(self.n_microbatch_per_round_accu, op_index) - 1
         local_index = (op_index - self.n_microbatch_per_round_accu[accu_index]) // \
-            self.n_microbatch_per_round[accu_index]
+                      self.n_microbatch_per_round[accu_index]
         return (local_index * self.real_stage_num) + stage_index
 
     def backward_stage_index(self, op_index, stage_index):
         """obtain backward stage_index based on op_index."""
         accu_index = bisect.bisect_right(self.n_microbatch_per_round_accu, op_index) - 1
         local_index = (op_index - self.n_microbatch_per_round_accu[accu_index]) // \
-            self.n_microbatch_per_round[accu_index]
+                      self.n_microbatch_per_round[accu_index]
         local_index = self.n_local_stages - 1 - local_index
         return (local_index * self.real_stage_num) + stage_index
 
@@ -536,6 +538,7 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
             order_list.extend([None] * (2 * (self.real_stage_num - stage_index - 1) - self.micro_batch_num))
         # Bubble from the end of warmup to the start of backward.
         order_list.extend([None] * (self.real_stage_num - 1 - stage_index))
+
         # 1f1b phase
         for op_idx in range(warmup_ops, warmup_ops+fwd_bwd_ops):
             fwd_stage_idx = self.forward_stage_index(op_idx, stage_index)
@@ -551,7 +554,6 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
                 if stage_index == self.real_stage_num - 1:
                     order_list.extend([None] * (self.real_stage_num - self.micro_batch_num))
             bwd_stage_micro_index[bwd_stage_idx] += 1
-
         # cooldown phase
         for op_idx in range(warmup_ops+fwd_bwd_ops, total_ops):
             order_list.append(None)
@@ -564,6 +566,7 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
                 order_list.extend([None] * (self.real_stage_num - self.micro_batch_num))
             bwd_stage_micro_index[bwd_stage_idx] += 1
         return order_list
+
 
 def detect_cycle_in_graph(ranks_map):
     """
@@ -625,6 +628,7 @@ def detect_cycle_in_graph(ranks_map):
 
     return None, None
 
+
 def output_cycle_results(cycle_path, cycle_ranks):
     """
     Helper function to output cycle detection results.
@@ -638,12 +642,14 @@ def output_cycle_results(cycle_path, cycle_ranks):
     """
     if cycle_path:
         logger.error("Cycle detected:")
-        logger.error(" -> ".join(cycle_path) + f" -> {cycle_path[0]}")  # Close the cycle
+        path_str = " -> ".join(str(node) for node in cycle_path)
+        logger.error("%s -> %s", path_str, cycle_path[0])  # Close the cycle
         logger.error("Involving ranks:")
         for rank in cycle_ranks:
             logger.error(rank)
     else:
-        logger.warning("Cycle Check success. There is no cycle in the graph.")
+        logger.warning("Cycle Check succeeded. There is no cycle in the graph.")
+
 
 def parse_and_validate(data: dict, all_rank: bool = True):
     """
@@ -684,38 +690,39 @@ def parse_and_validate(data: dict, all_rank: bool = True):
 
     for key, values in data.items():
         if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
-            logger.error(f"Values for key '{key}' must be a list of strings.")
+            logger.error("Values for key '%s' must be a list of strings.", key)
             continue
 
         for value in values:
             try:
                 elements = parse_elements(value)
             except (ValueError, TypeError, AttributeError) as e:
-                logger.error(f"Unable to parse elements from value '{value}' in key '{key}'. Error: {e}")
+                logger.error("Unable to parse elements from value '%s' in key '%s'. Error: %s", value, key, e)
                 continue
 
             # Check for missing keys if all_rank is True
             if all_rank:
                 missing_keys = elements - key_to_values.keys()
                 if missing_keys:
-                    logger.error(f"The following keys are missing for value '{value}': {missing_keys}")
+                    logger.error("The following keys are missing for value '%s': %s", value, missing_keys)
                     continue
 
             # Check if the value is present in the referenced keys
             for element in elements & key_to_values.keys() if not all_rank else elements:
                 if value not in key_to_values[element]:
-                    logger.error(f"Key '{element}' is missing the value '{value}'.")
+                    logger.error("Key '%s' is missing the value '%s'.", element, value)
+
 
 def generate_operations(order_list: dict[int, list[MetaStep]],
-                                  chunk_num: int,
-                                  com_type: str = 'loop') -> dict[str, list[str]]:
+                        chunk_num: int,
+                        com_type: str = 'loop') -> dict[str, list[str]]:
     """
     Generate formatted operations dictionary from pipeline execution order.
 
     Args:
-        order_list: Dictionary where keys are rank IDs and values are MetaStep execution sequences
-        chunk_num: Number of chunks (virtual pipeline stages)
-        com_type: Stage-to-rank mapping type ('loop' for cyclic, 'v' for V-shaped)
+        order_list (dict): Dictionary where keys are rank IDs and values are MetaStep execution sequences
+        chunk_num (int): Number of chunks (virtual pipeline stages)
+        com_type (str): Stage-to-rank mapping type ('loop' for cyclic, 'v' for V-shaped)
 
     Returns:
         Dictionary where keys are rank IDs (as strings) and values are lists of formatted operation strings
@@ -792,6 +799,7 @@ def generate_operations(order_list: dict[int, list[MetaStep]],
 
     # Convert defaultdict to dict
     return dict(formatted_operations)
+
 
 def validate_pipeline_execution(order_list: dict[int, list[MetaStep]],
                                 chunk_num: int,

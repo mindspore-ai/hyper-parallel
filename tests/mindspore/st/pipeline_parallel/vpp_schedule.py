@@ -19,8 +19,7 @@ import mindspore as ms
 from mindspore import nn, Tensor, mint
 from mindspore.communication.management import init, get_rank, get_group_size
 from mindspore.common.initializer import initializer
-from hyper_parallel.platform.mindspore.pipeline_parallel.stage import PipelineStage
-from hyper_parallel.platform.mindspore.pipeline_parallel.schedule import ScheduleInterleaved1F1B
+from hyper_parallel import PipelineStage, ScheduleInterleaved1F1B
 from hyper_parallel import Layout, DTensor
 from hyper_parallel.core.hsdp import hsdp
 from hyper_parallel import shard
@@ -152,10 +151,11 @@ def run_parallel(micro_batch_num):
         model0.zero_grads()
         model1.zero_grads()
         if stage_index == 0:
-            loss, grads = schedule.run(x)
+            loss = schedule.run(x)
         else:
-            loss, grads = schedule.run()
-    return loss, grads
+            loss = schedule.run()
+    return loss, model0
+
 
 def vpp(micro):
     """
@@ -164,7 +164,7 @@ def vpp(micro):
     Expectation: Run success.
     """
     standalone_loss, standalone_grads = run_standalone(micro*2)
-    pp_loss, pp_grads = run_parallel(micro)
+    pp_loss, model0 = run_parallel(micro)
     num_stages = 4
     rank_id = get_rank()
     device_num = get_group_size()
@@ -177,7 +177,8 @@ def vpp(micro):
         expect_grad = standalone_grads[stage_index].asnumpy()
     else:
         expect_grad = standalone_grads[0].asnumpy()
-    assert np.allclose(expect_grad[:8, :], pp_grads[0].asnumpy())
+    assert np.allclose(expect_grad[:8, :], model0.trainable_params()[0].grad.asnumpy())
+
 
 def test():
     micro = 8

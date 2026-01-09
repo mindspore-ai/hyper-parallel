@@ -9,45 +9,13 @@
 """pipeline parallel utils"""
 import io
 import pickle
+import hyper_parallel
 from mindspore import nn, Tensor, mint, ops
 from mindspore.common import dtype as mstype
 from mindspore.communication import GlobalComm
 from mindspore.mint.distributed.distributed import _object_to_tensor, send, recv
-import hyper_parallel
 from hyper_parallel.core.shard.local_func import custom_shard
 
-
-class BatchDimSpec:
-    """
-    Specify the batch dimension of a Tensor.
-
-    Args:
-        batch_dim(int): batch dimension。
-    """
-    __slots__ = ("batch_dim",)
-
-    def __init__(self, batch_dim):
-        if not isinstance(batch_dim, int):
-            raise TypeError(f"batch_dim must be int, but got type {type(batch_dim)}.")
-        self.batch_dim = batch_dim
-
-    def __repr__(self):
-        return f"BatchDimSpec({self.batch_dim})"
-
-    def __str__(self):
-        return f"BatchDim(dim={self.batch_dim})"
-
-    @staticmethod
-    def from_tuple(batch_dims):
-        if not isinstance(batch_dims, tuple):
-            raise TypeError(f"batch_dims must be tuple, but got type {type(batch_dims)}.")
-        return tuple(BatchDimSpec(dim) for dim in batch_dims)
-
-    @staticmethod
-    def from_dict(batch_dims):
-        if not isinstance(batch_dims, dict):
-            raise TypeError(f"batch_dims must be dict, but got type {type(batch_dims)}.")
-        return {k: BatchDimSpec(v) for k, v in batch_dims.items()}
 
 class _MicroBatch(nn.Cell):
     """
@@ -122,49 +90,16 @@ class _MicroBatch(nn.Cell):
         micro_input = ops.strided_slice(input_tensor, strided_slice_begin, strided_slice_end, strided_slice_strides)
         return micro_input
 
-class _RecvInfo:
+
+def send_object_list(obj, dst=0, group=None):
     """
-    Used for construct forward Receive operation and backward Send operation.
-    """
-
-    def __init__(self, global_rank, buffer=None):
-        self._global_rank = global_rank
-        self._buffer = buffer
-
-    @property
-    def global_rank(self):
-        return self._global_rank
-
-    @property
-    def buffer(self):
-        return self._buffer
-
-    @buffer.setter
-    def buffer(self, val):
-        self._buffer = val
-
-
-def send_object(obj, dst=0, group=None):
-    """
-    send the input Python object to dst rank.
-
-    Note:
-        - Similar to :func:`mindspore.mint.distributed.send`, but Python objects can be passed in.
-        - Only support PyNative mode, Graph mode is not currently supported.
+    Send the input Python object to dst rank.
 
     Args:
-        object (Any): The input to be send.
-        dst (int, optional): Specifies the rank(global rank) of the process that send the Python object to.
-            Default: ``0`` .
-        group (str, optional): The communication group to work on. If ``None``, which means ``"hccl_world_group"`` in
-            Ascend. Default: ``None``.
-
-    Raises:
-        TypeError: If `dst` is not an integer or `group` is not a string.
-        RuntimeError: If device target is invalid, or backend is invalid, or distributed initialization fails.
-
-    Supported Platforms:
-        ``Ascend``
+        obj (Any): The input tensor to be send.
+        dst (int, optional): Specifies the global rank that send the Python object to.
+            Default: ``0``.
+        group (str, optional): Communication group. Default: ``None``.
     """
     if group is None:
         group = GlobalComm.WORLD_COMM_GROUP
@@ -178,26 +113,16 @@ def send_object(obj, dst=0, group=None):
     send(obj_size, dst, group)
     send(obj_tensor, dst, group)
 
-def recv_object(src=0, group=None):
+
+def recv_object_list(recv_obj, src=0, group=None):
     """
     receive Python object from src rank.
 
-    Note:
-        - Similar to :func:`mindspore.mint.distributed.recv`, but Python objects can be received.
-        - Only support PyNative mode, Graph mode is not currently supported.
-
     Args:
-        src (int, optional): Specifies the rank(global rank) of the process that receive the Python object.
+        recv_obj (list): list to recv python objects.
+        src (int, optional): Specifies the global rank that receive the Python object.
             Default: ``0`` .
-        group (str, optional): The communication group to work on. If ``None``, which means ``"hccl_world_group"`` in
-            Ascend. Default: ``None``.
-
-    Raises:
-        TypeError: If `src` is not an integer or `group` is not a string.
-        RuntimeError: If device target is invalid, or backend is invalid, or distributed initialization fails.
-
-    Supported Platforms:
-        ``Ascend``
+        group (str, optional): Communication group. Default: ``None``.
     """
     if group is None:
         group = GlobalComm.WORLD_COMM_GROUP
@@ -212,4 +137,5 @@ def recv_object(src=0, group=None):
     obj_tensor = mint.empty([size_val], dtype=mstype.int8)
     recv(obj_tensor, src, group)
     buf = obj_tensor.asnumpy().tobytes()[:size_val]
-    return pickle.Unpickler(io.BytesIO(buf)).load()
+    recv_obj.clear()
+    recv_obj.append(pickle.Unpickler(io.BytesIO(buf)).load()[0])

@@ -20,6 +20,7 @@ platform = get_platform()
 DTensorBase = platform.DTensorBase
 Tensor = platform.Tensor
 
+
 class SkipDTensorDispatch():
     def __enter__(self):
         # pylint: disable=C0415

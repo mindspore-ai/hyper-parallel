@@ -22,6 +22,9 @@ from hyper_parallel.core.parameter_init import init_parameters
 from hyper_parallel.core.shard.api import shard
 from hyper_parallel.core.shard.api import parallelize_value_and_grad
 from hyper_parallel.core.shard.local_func import custom_shard
+from hyper_parallel.core.pipeline_parallel import PipelineStage, ScheduleInterleaved1F1B, MetaStep, MetaStepType, BatchDimSpec
 
-__all__ = ["get_platform", "hsdp", "hsdp_sync_stream", "HSDPCell", "Layout", "DeviceMesh", "init_device_mesh",
-           "DTensor", "init_parameters", "shard", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch"]
+__all__ = ["get_platform", "hsdp", "hsdp_sync_stream", "HSDPCell", "Layout", "DTensor",
+           "Layout", "DeviceMesh", "init_device_mesh",
+           "init_parameters", "shard", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch",
+           "MetaStep", "MetaStepType", "BatchDimSpec", "PipelineStage", "ScheduleInterleaved1F1B"]

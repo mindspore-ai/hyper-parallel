@@ -13,41 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """pipeline parallel utils"""
+import hyper_parallel
 from torch import nn
-from hyper_parallel import custom_shard, DTensor
-
-
-class BatchDimSpec:
-    """
-    Specify the batch dimension of a Tensor.
-
-    Args:
-        batch_dim (int): batch dimension.
-    """
-    __slots__ = ("batch_dim",)
-
-    def __init__(self, batch_dim):
-        if not isinstance(batch_dim, int):
-            raise TypeError(f"batch_dim must be int, but got type {type(batch_dim)}.")
-        self.batch_dim = batch_dim
-
-    def __repr__(self):
-        return f"BatchDimSpec({self.batch_dim})"
-
-    def __str__(self):
-        return f"BatchDim(dim={self.batch_dim})"
-
-    @staticmethod
-    def from_tuple(batch_dims):
-        if not isinstance(batch_dims, tuple):
-            raise TypeError(f"batch_dims must be tuple, but got type {type(batch_dims)}.")
-        return tuple(BatchDimSpec(dim) for dim in batch_dims)
-
-    @staticmethod
-    def from_dict(batch_dims):
-        if not isinstance(batch_dims, dict):
-            raise TypeError(f"batch_dims must be dict, but got type {type(batch_dims)}.")
-        return {k: BatchDimSpec(v) for k, v in batch_dims.items()}
 
 
 class _MicroBatch(nn.Module):
@@ -86,7 +53,7 @@ class _MicroBatch(nn.Module):
                 cur_arg_batch_dim = 0
                 if self.args_batch_dim and self.args_batch_dim[arg_idx] is not None:
                     cur_arg_batch_dim = self.args_batch_dim[arg_idx].batch_dim
-                if isinstance(cur_arg, DTensor):
+                if isinstance(cur_arg, hyper_parallel.DTensor):
                     micro_arg = self.split_inputs_with_custom_shard(cur_arg, cur_arg_batch_dim, micro_idx)
                 else:
                     micro_arg = self.split_inputs(cur_arg, cur_arg_batch_dim, micro_idx)
@@ -97,7 +64,7 @@ class _MicroBatch(nn.Module):
                 cur_kwarg_batch_dim = 0
                 if self.kwargs_batch_dim is not None:
                     cur_kwarg_batch_dim = self.kwargs_batch_dim[key].batch_dim
-                if isinstance(cur_kwarg, DTensor):
+                if isinstance(cur_kwarg, hyper_parallel.DTensor):
                     micro_kwarg = self.split_inputs_with_custom_shard(cur_kwarg, cur_kwarg_batch_dim, micro_idx)
                 else:
                     micro_kwarg = self.split_inputs(cur_kwarg, cur_kwarg_batch_dim, micro_idx)
@@ -107,7 +74,8 @@ class _MicroBatch(nn.Module):
 
     def split_inputs_with_custom_shard(self, input_tensor, cur_arg_batch_dim, micro_idx):
         input_layout = input_tensor.layout
-        func_wrap = custom_shard(self.split_inputs, out_layouts=(input_layout,), in_layouts=(input_layout, None, None))
+        func_wrap = hyper_parallel.custom_shard(self.split_inputs, out_layouts=(input_layout,),
+                                                in_layouts=(input_layout, None, None))
         return func_wrap(input_tensor, cur_arg_batch_dim, micro_idx)
 
     def split_inputs(self, input_tensor, cur_arg_batch_dim, micro_idx):
@@ -130,25 +98,3 @@ class _MicroBatch(nn.Module):
         slices = [slice(None)] * input_tensor.ndim
         slices[cur_arg_batch_dim] = slice(start, end)
         return input_tensor[slices]
-
-
-class _RecvInfo:
-    """
-    Used for construct forward Receive operation and backward Send operation.
-    """
-
-    def __init__(self, global_rank, buffer=None):
-        self._global_rank = global_rank
-        self._buffer = buffer
-
-    @property
-    def global_rank(self):
-        return self._global_rank
-
-    @property
-    def buffer(self):
-        return self._buffer
-
-    @buffer.setter
-    def buffer(self, val):
-        self._buffer = val
