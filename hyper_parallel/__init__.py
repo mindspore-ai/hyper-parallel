@@ -16,11 +16,12 @@
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.hsdp.api import hsdp, hsdp_sync_stream, HSDPCell
 from hyper_parallel.core.layout import Layout
+from hyper_parallel.core.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.core.dtensor import DTensor, SkipDTensorDispatch
 from hyper_parallel.core.parameter_init import init_parameters
 from hyper_parallel.core.shard.api import shard
 from hyper_parallel.core.shard.api import parallelize_value_and_grad
 from hyper_parallel.core.shard.local_func import custom_shard
 
-__all__ = ["get_platform", "hsdp", "hsdp_sync_stream", "HSDPCell", "Layout", "DTensor",
-           "init_parameters", "shard", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch"]
+__all__ = ["get_platform", "hsdp", "hsdp_sync_stream", "HSDPCell", "Layout", "DeviceMesh", "init_device_mesh",
+           "DTensor", "init_parameters", "shard", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch"]

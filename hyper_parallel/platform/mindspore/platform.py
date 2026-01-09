@@ -14,6 +14,7 @@
 # ============================================================================
 """MindSpore platform api"""
 import mindspore as ms
+import mindspore.common.dtype as mstype
 from mindspore.nn import Cell
 from mindspore.common.dtype import type_size_in_bytes
 from mindspore.common.parameter import Parameter
@@ -38,6 +39,7 @@ class MindSporePlatform(Platform):
     Module = Cell
     DTensorBase = DTensorBase
     platform_type = PlatformType.MINDSPORE
+    tensor_dtype = mstype
 
     @staticmethod
     def get_rank():
