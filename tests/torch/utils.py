@@ -28,9 +28,9 @@ def init_dist():
     return rank, device_id
 
 
-def torchrun_case(master_port, case_name):
-    cmd = f"torchrun --nproc-per-node=8 " \
+def torchrun_case(file_name, case_name, master_port, num_proc=8):
+    cmd = f"torchrun --nproc-per-node={num_proc} " \
           f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"-m pytest -s {case_name}"
+          f"-m pytest -s {file_name}::{case_name}"
     ret = os.system(cmd)
     assert ret == 0

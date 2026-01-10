@@ -13,16 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """vpp test"""
-import os
 
+from tests.mindspore.st.utils import msrun_case
 
-def run_case(case_name, master_port):
-    cmd = f"export GLOG_v=3 && msrun --worker_num=8 --local_worker_num=8 " \
-          f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"--join=True --log_dir=./{case_name} pytest -s -v " \
-          f"vpp_schedule.py::{case_name}"
-    ret = os.system(cmd)
-    assert ret == 0
 
 def test_simple_mlp():
     """
@@ -30,6 +23,8 @@ def test_simple_mlp():
     Description: Test pp with shared parameter.
     Expectation: Run success.
     """
+    glog_v = 3
+    file_name = "vpp_schedule.py"
     case_name = "test"
     master_port = 12346
-    run_case(case_name, master_port)
+    msrun_case(glog_v, file_name, case_name, master_port)

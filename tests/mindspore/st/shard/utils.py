@@ -13,8 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """utils"""
-import os
-import shutil
+
 from typing import List, Optional
 from mindspore import Tensor, mint
 from mindspore.communication import get_rank, create_group
@@ -163,17 +162,3 @@ def distribute_tensor(tensor: Tensor,
             continue
         local_tensor = mesh_broadcast(local_tensor, mesh_shape, dev_mat_dim_alias, src_data_rank)
     return DTensor.from_local(local_tensor, layout)
-
-
-def run_case(file_name, case_name, master_port, dev_num=8):
-    """Run test case."""
-    file_base = os.path.splitext(file_name)[0]
-    dir_to_remove = f"./{file_base}/{case_name}"
-    if os.path.exists(dir_to_remove):
-        shutil.rmtree(dir_to_remove)
-    cmd = f"export GLOG_v=2 && msrun --worker_num={dev_num} --local_worker_num={dev_num} " \
-          f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"--join=True --log_dir=./{dir_to_remove}/msrun_log pytest -s -v " \
-          f"{file_name}::{case_name}"
-    ret = os.system(cmd)
-    assert ret == 0

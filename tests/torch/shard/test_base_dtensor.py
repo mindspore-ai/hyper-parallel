@@ -24,6 +24,7 @@ def test_base_dtensor():
     Description: 
     Expectation: Run success.
     '''
-    master_port = 11333
-    case_name = "base_dtensor.py::test_base_dtensor"
-    torchrun_case(master_port, case_name)
+    master_port = 11335
+    file_name = "base_dtensor.py"
+    case_name = "test_base_dtensor"
+    torchrun_case(file_name, case_name, master_port)

@@ -14,7 +14,7 @@
 # ============================================================================
 """parallel_flash_attention_score_shell test"""
 
-from tests.mindspore.st.shard.utils import run_case
+from tests.mindspore.st.utils import msrun_case
 from tests.common.mark_utils import arg_mark
 
 
@@ -25,7 +25,8 @@ def test_flash_attention_score_model_parallel():
     Description: Test cell shard in python.
     Expectation: Run success.
     '''
+    glog_v = 2
     file_name = "flash_attention_score_shard_in_python.py"
     case_name = "test_flash_attention_score_model_parallel"
     master_port = 11298
-    run_case(file_name, case_name, master_port)
+    msrun_case(glog_v, file_name, case_name, master_port)

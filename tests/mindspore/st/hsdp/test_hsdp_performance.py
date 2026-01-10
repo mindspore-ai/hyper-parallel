@@ -14,7 +14,7 @@
 # ============================================================================
 """test hsdp performancee feature with msrun 8 card"""
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.hsdp.hsdp_test_common import run_hsdp_case_by_name
+from tests.mindspore.st.utils import msrun_case
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -24,9 +24,11 @@ def test_hsdp_forward_prefetch():
     Description: test hsdp forward prefetch
     Expectation: run success
     """
+    glog_v = 2
     file_name = "hsdp_prefetch.py"
     case_name = "test_hsdp_forward_prefetch"
-    run_hsdp_case_by_name(file_name, case_name)
+    master_port = 18182
+    msrun_case(glog_v, file_name, case_name, master_port)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -36,9 +38,11 @@ def test_hsdp_backward_prefetch():
     Description: test hsdp backward prefetch
     Expectation: run success
     """
+    glog_v = 2
     file_name = "hsdp_prefetch.py"
     case_name = "test_hsdp_backward_prefetch"
-    run_hsdp_case_by_name(file_name, case_name)
+    master_port = 18182
+    msrun_case(glog_v, file_name, case_name, master_port)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -48,9 +52,11 @@ def test_hsdp_comm_async():
     Description: test hsdp async comm performance
     Expectation: run success
     """
+    glog_v = 2
     file_name = "hsdp_comm_async.py"
     case_name = "test_hsdp_comm_async"
-    run_hsdp_case_by_name(file_name, case_name)
+    master_port = 18182
+    msrun_case(glog_v, file_name, case_name, master_port)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -60,6 +66,8 @@ def test_hsdp_comm_fusion():
     Description: test hsdp comm fusion performance
     Expectation: run success
     """
+    glog_v = 2
     file_name = "hsdp_comm_fusion.py"
     case_name = "test_hsdp_comm_fusion"
-    run_hsdp_case_by_name(file_name, case_name)
+    master_port = 18182
+    msrun_case(glog_v, file_name, case_name, master_port)

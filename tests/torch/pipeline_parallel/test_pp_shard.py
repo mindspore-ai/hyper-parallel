@@ -13,16 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """test vpp"""
-import os
 from tests.common.mark_utils import arg_mark
-
-
-def run_case(case_name, master_port):
-    cmd = f"torchrun --nproc-per-node=8 " \
-          f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"-m pytest -s pipeline_shard.py::{case_name}"
-    ret = os.system(cmd)
-    assert ret == 0
+from tests.torch.utils import torchrun_case
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
@@ -32,6 +24,7 @@ def test_simple_mlp():
     Description: Test pp.
     Expectation: Run success.
     """
+    file_name = "pipeline_shard.py"
     case_name = "test_vpp_shard"
     master_port = 12346
-    run_case(case_name, master_port)
+    torchrun_case(file_name, case_name, master_port)

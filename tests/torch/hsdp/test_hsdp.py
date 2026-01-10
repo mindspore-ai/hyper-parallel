@@ -25,8 +25,9 @@ def test_pure_data_parallel():
     Expectation: Run successfully.
     '''
     master_port = 12341
-    case_name = "hsdp.py::test_pure_data_parallel"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_pure_data_parallel"
+    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero1_fully_shard():
@@ -36,8 +37,9 @@ def test_zero1_fully_shard():
     Expectation: Run successfully.
     '''
     master_port = 12342
-    case_name = "hsdp.py::test_zero1_fully_shard"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_zero1_fully_shard"
+    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero1_partial_shard():
@@ -47,8 +49,9 @@ def test_zero1_partial_shard():
     Expectation: Run successfully.
     '''
     master_port = 12343
-    case_name = "hsdp.py::test_zero1_partial_shard"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_zero1_partial_shard"
+    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero2_fully_shard():
@@ -58,8 +61,9 @@ def test_zero2_fully_shard():
     Expectation: Run successfully.
     '''
     master_port = 12344
-    case_name = "hsdp.py::test_zero2_fully_shard"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_zero2_fully_shard"
+    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero2_partial_shard():
@@ -69,8 +73,9 @@ def test_zero2_partial_shard():
     Expectation: Run successfully.
     '''
     master_port = 12345
-    case_name = "hsdp.py::test_zero2_partial_shard"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_zero2_partial_shard"
+    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_fully_shard():
@@ -80,8 +85,9 @@ def test_zero3_fully_shard():
     Expectation: Run successfully.
     '''
     master_port = 12346
-    case_name = "hsdp.py::test_zero3_fully_shard"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_zero3_fully_shard"
+    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_partial_shard():
@@ -91,8 +97,9 @@ def test_zero3_partial_shard():
     Expectation: Run successfully.
     '''
     master_port = 12347
-    case_name = "hsdp.py::test_zero3_partial_shard"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_zero3_partial_shard"
+    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero1_fully_shard_with_acc_grad():
@@ -102,8 +109,9 @@ def test_zero1_fully_shard_with_acc_grad():
     Expectation: Run successfully.
     '''
     master_port = 12342
-    case_name = "hsdp.py::test_zero1_fully_shard_with_acc_grad"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_zero1_fully_shard_with_acc_grad"
+    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero1_partial_shard_with_acc_grad():
@@ -113,8 +121,9 @@ def test_zero1_partial_shard_with_acc_grad():
     Expectation: Run successfully.
     '''
     master_port = 12343
-    case_name = "hsdp.py::test_zero1_partial_shard_with_acc_grad"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_zero1_partial_shard_with_acc_grad"
+    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero2_fully_shard_with_acc_grad():
@@ -124,8 +133,9 @@ def test_zero2_fully_shard_with_acc_grad():
     Expectation: Run successfully.
     '''
     master_port = 12344
-    case_name = "hsdp.py::test_zero2_fully_shard_with_acc_grad"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_zero2_fully_shard_with_acc_grad"
+    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero2_partial_shard_with_acc_grad():
@@ -135,8 +145,9 @@ def test_zero2_partial_shard_with_acc_grad():
     Expectation: Run successfully.
     '''
     master_port = 12345
-    case_name = "hsdp.py::test_zero2_partial_shard_with_acc_grad"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_zero2_partial_shard_with_acc_grad"
+    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_fully_shard_with_acc_grad():
@@ -146,8 +157,9 @@ def test_zero3_fully_shard_with_acc_grad():
     Expectation: Run successfully.
     '''
     master_port = 12346
-    case_name = "hsdp.py::test_zero3_fully_shard_with_acc_grad"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_zero3_fully_shard_with_acc_grad"
+    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_partial_shard_with_acc_grad():
@@ -157,5 +169,6 @@ def test_zero3_partial_shard_with_acc_grad():
     Expectation: Run successfully.
     '''
     master_port = 12347
-    case_name = "hsdp.py::test_zero3_partial_shard_with_acc_grad"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp.py"
+    case_name = "test_zero3_partial_shard_with_acc_grad"
+    torchrun_case(file_name, case_name, master_port)

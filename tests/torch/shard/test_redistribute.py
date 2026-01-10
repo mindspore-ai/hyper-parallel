@@ -16,7 +16,6 @@
 from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_shard_to_replicate():
     '''
@@ -25,8 +24,9 @@ def test_shard_to_replicate():
     Expectation: Run success.
     '''
     master_port = 11333
-    case_name = "redistribute.py::test_shard_to_replicate"
-    torchrun_case(master_port, case_name)
+    file_name = "redistribute.py"
+    case_name = "test_shard_to_replicate"
+    torchrun_case(file_name, case_name, master_port)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -37,8 +37,9 @@ def test_replicate_to_shard():
     Expectation: Run success.
     '''
     master_port = 11334
-    case_name = "redistribute.py::test_replicate_to_shard"
-    torchrun_case(master_port, case_name)
+    file_name = "redistribute.py"
+    case_name = "test_replicate_to_shard"
+    torchrun_case(file_name, case_name, master_port)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -49,5 +50,6 @@ def test_different_mesh():
     Expectation: Run success.
     '''
     master_port = 11335
-    case_name = "redistribute.py::test_different_mesh"
-    torchrun_case(master_port, case_name)
+    file_name = "redistribute.py"
+    case_name = "test_different_mesh"
+    torchrun_case(file_name, case_name, master_port)

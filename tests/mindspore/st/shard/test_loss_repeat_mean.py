@@ -14,17 +14,8 @@
 # ============================================================================
 """loss_repeat_mean test"""
 
-import os
 from tests.common.mark_utils import arg_mark
-
-
-def run_case(case_name, master_port):
-    cmd = f"export GLOG_v=3 && msrun --worker_num=8 --local_worker_num=8 " \
-          f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"--join=True --log_dir=./{case_name} pytest -s -v " \
-          f"loss_repeat_mean.py::{case_name}"
-    ret = os.system(cmd)
-    assert ret == 0
+from tests.mindspore.st.utils import msrun_case
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -34,9 +25,11 @@ def test_loss_repeat_mean_0():
     Description: Test loss repeat mean.
     Expectation: Run success.
     '''
+    glog_v = 3
+    file_name = "loss_repeat_mean.py"
     case_name = "test_loss_repeat_mean_0"
     master_port = 11296
-    run_case(case_name, master_port)
+    msrun_case(glog_v, file_name, case_name, master_port)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -46,9 +39,11 @@ def test_loss_repeat_mean_1():
     Description: Test loss repeat mean.
     Expectation: Run success.
     '''
+    glog_v = 3
+    file_name = "loss_repeat_mean.py"
     case_name = "test_loss_repeat_mean_1"
     master_port = 11297
-    run_case(case_name, master_port)
+    msrun_case(glog_v, file_name, case_name, master_port)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -58,9 +53,11 @@ def test_loss_repeat_mean_2():
     Description: Test loss repeat mean.
     Expectation: Run success.
     '''
+    glog_v = 3
+    file_name = "loss_repeat_mean.py"
     case_name = "test_loss_repeat_mean_2"
     master_port = 11298
-    run_case(case_name, master_port)
+    msrun_case(glog_v, file_name, case_name, master_port)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -70,6 +67,8 @@ def test_loss_repeat_mean_3():
     Description: Test loss repeat mean.
     Expectation: Run success.
     '''
+    glog_v = 3
+    file_name = "loss_repeat_mean.py"
     case_name = "test_loss_repeat_mean_3"
     master_port = 11299
-    run_case(case_name, master_port)
+    msrun_case(glog_v, file_name, case_name, master_port)
