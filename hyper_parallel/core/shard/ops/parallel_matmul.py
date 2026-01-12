@@ -19,7 +19,6 @@ Distributed implementation for MatMul operator.
 from hyper_parallel.core.layout import Layout
 from .parallel_ops import DistributedOp
 
-
 class MatMulExtDistributedOp(DistributedOp):
     """Distributed implementation for MatMul operator."""
     def infer_layout(self, layouts, extra_args):
@@ -375,11 +374,11 @@ class LinearDistributedOp(DistributedOp):
             raise ValueError("Linear bias and x must have same mesh_shape")
         x_map = x_layout.alias_tensor_map
         w_map = w_layout.alias_tensor_map
-        contract_dim = len(x_map) - 1
+        x_contract_dim = len(x_map) - 1
         w_contract_dim = len(w_map) - 1
-        if x_map[contract_dim] != w_map[w_contract_dim]:
+        if x_map[x_contract_dim] != w_map[w_contract_dim]:
             raise ValueError(f"Contracting dimensions must have same layout. "
-                             f"Got {x_map[contract_dim]} and {w_map[w_contract_dim]}")
+                             f"Got {x_map[x_contract_dim]} and {w_map[w_contract_dim]}")
 
         output_dim = 0
         output_map = x_map[:-1] + (w_map[output_dim],)
@@ -394,7 +393,37 @@ class LinearDistributedOp(DistributedOp):
         )
         out_layout = output_layout(*output_map)
 
-        if x_map[contract_dim] != "None" and bias_layout:
-            raise ValueError("Linear/Dense ops cannot shard reduce_dim with bias.")
+        # Set partial status
+        if x_map[x_contract_dim] != "None":
+            if isinstance(x_map[x_contract_dim], tuple):
+                for axis in x_map[x_contract_dim]:
+                    out_layout.set_partial_by_dev_axis(axis, 'sum')
+            else:
+                out_layout.set_partial_by_dev_axis(x_map[x_contract_dim], 'sum')
 
         return out_layout
+
+    def get_expand_impl(self, func, output_layout, layouts, extra_args):
+        """
+        Get expand implementation for the operator
+        """
+        x_layout = layouts[0]
+        bias_layout = layouts[2]
+        x_map = x_layout.alias_tensor_map
+        x_contract_dim = len(x_map) - 1
+        scaling_factor = 1
+
+        if x_map[x_contract_dim] != "None":
+            if isinstance(x_map[x_contract_dim], tuple):
+                for axis in x_map[x_contract_dim]:
+                    scaling_factor *= output_layout.mesh.get_device_num_along_axis(axis)
+            else:
+                scaling_factor *= output_layout.mesh.get_device_num_along_axis(x_map[x_contract_dim])
+
+        def expand_impl(x, w, bias):
+            linear_out = func(x, w, bias / scaling_factor)
+            return linear_out
+
+        if x_map[x_contract_dim] != "None" and bias_layout:
+            return expand_impl
+        return None
