@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 '''test initialize parameter'''
+from typing import Dict
 import os
 import pytest
 import psutil
@@ -29,12 +30,26 @@ from tests.common.mark_utils import arg_mark
 from tests.mindspore.st.common_net import DenseL3
 from tests.mindspore.st.common_net import DenseMutiLayerNet
 
+def _check_param_init_shape_using_hsdp(
+    param_names,
+    before_hsdp_shape_dict: Dict,
+    after_hsdp_shape_dict: Dict,
+    expect_shard_size: int,
+):
+    """check param shape between before_shard_shape and after_shard_shape"""
+    for name in param_names:
+        expect_shape = list(before_hsdp_shape_dict[name])
+        expect_shape[0] = expect_shape[0] // expect_shard_size
+        after_shard_shape = list(after_hsdp_shape_dict[name])
+        assert expect_shape == after_shard_shape, \
+            f"Checking {name}, expect_shape: {expect_shape}, actual shape: {after_shard_shape}"
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize('use_hsdp', [True, False])
-def test_init_parameters(use_hsdp):
+def test_init_parameters_with_hsdp(use_hsdp):
     '''
     Feature: init parameters.
-    Description: test init parameter interface.
+    Description: test init parameter interface, using hyper_parallel.hsdp.
     Expectation: Run success
     '''
     os.environ["MS_SIMULATION_LEVEL"] = "0"
@@ -47,13 +62,59 @@ def test_init_parameters(use_hsdp):
     hidden_size = 512
     with no_init_parameters():
         net = DenseL3(in_channels, out_channels, hidden_size)
+    before_shard = {name : param.shape for name, param in net.parameters_and_names()}
     if use_hsdp:
         shard_size = 4
-        threshold = 4
+        threshold = 0
         optimizer_level = "level1"
         hsdp(net, shard_size, threshold, optimizer_level)
 
     init_parameters(net)
+    after_shard = {name : param.shape for name, param in net.parameters_and_names()}
+    expect_shard_size = shard_size if use_hsdp else 1
+    param_names = (name for name, _ in net.parameters_and_names())
+    _check_param_init_shape_using_hsdp(param_names, before_shard, after_shard, expect_shard_size)
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@pytest.mark.parametrize('use_hsdp', [True, False])
+def test_init_parameters_with_dtensor_and_hsdp(use_hsdp):
+    '''
+    Feature: init parameters.
+    Description: test init parameter interface, using hyper_parallel.hsdp + DTensor.
+    Expectation: Run success
+    '''
+    world_size = 8
+    os.environ["MS_SIMULATION_LEVEL"] = "0"
+    os.environ["RANK_SIZE"] = str(world_size)
+    os.environ["RANK_ID"] = "0"
+    init()
+    set_seed(1)
+    num_layer = 1
+    hidden_size = 1024
+    with no_init_parameters():
+        net = DenseMutiLayerNet(hidden_size, num_layer, has_bias=False)
+
+    mesh_shape = (2, 4)
+    alias_name = ("dp", "mp")
+    rank_list = list(range(world_size))
+    layout = Layout(mesh_shape, alias_name, rank_list)
+    w_layout = layout("mp", "None")
+    for i in range(num_layer):
+        net.layers[i].dense1.weight = Parameter(DTensor.from_local(net.layers[i].dense1.weight, w_layout))
+    before_shard_local_shapes = {name : param.local_shape for name, param in net.parameters_and_names()}
+    if use_hsdp:
+        shard_size = 2
+        hsdp(net, shard_size, threshold=0, optimizer_level="level1")
+    init_parameters(net)
+    after_shard_local_shapes = {name : param.local_shape for name, param in net.parameters_and_names()}
+    param_names = (name for name, _ in net.parameters_and_names())
+    expect_shard_size = shard_size if use_hsdp else 1
+    _check_param_init_shape_using_hsdp(
+        param_names,
+        before_shard_local_shapes,
+        after_shard_local_shapes,
+        expect_shard_size
+    )
 
 
 @arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="onecard", essential_mark="essential")

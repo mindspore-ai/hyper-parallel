@@ -45,9 +45,12 @@ class MindSporeHSDPParam(HSDPParam):
             init_shape = list(init_mode_local_shape)
             init_shape[0] = init_shape[0] // self.shard_size
             if isinstance(self.param.init_mode, DTensor):
+                # 'self.param.to_local()' and 'self.param.init_mode.to_local()' is same object.
                 self.param.init_mode.to_local().shape = init_shape
             else:
+                # 'self.param' and 'self.param.init_mode' is not same object. set 'self.param.shape' manually.
                 self.param.init_mode.shape = init_shape
+                self.param.shape = init_shape
             self.param.hsdp_init_index = data_slice_index
             self.sharded_param = Parameter(initializer("zeros", init_shape, self.param.dtype),
                                            name="sharded_"+self.param.name,
