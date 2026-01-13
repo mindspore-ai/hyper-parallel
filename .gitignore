@@ -1,0 +1,61 @@
+# --- Build & Install ---
+build/
+output/
+dist/
+*.egg-info/
+*.ir
+st_tests
+kernel_meta/
+somas_meta/
+trace_code_graph_*
+ms_kernels_internal/
+ms_kernels_symmetric_memory/
+
+
+# Protocol buffers
+*_pb2.py
+*.pb.h
+*.pb.cc
+*.pb
+*_grpc.py
+
+# --- Python ---
+*__pycache__*
+.pytest_cache
+*.py[cod]
+*.whl
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Test results
+*.dot
+*.dat
+*.svg
+*.perf
+*.info
+*.ckpt
+*.shp
+*.pkl
+*.pb
+.clangd
+
+# Dynamic libraries
+*.so
+*.so.*
+*.dylib
+
+# Static libraries
+*.la
+*.lai
+*.a
+*.lib
+
+# --- IDE & System ---
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# tools
+.cursorignore
