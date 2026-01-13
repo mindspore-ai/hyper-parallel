@@ -21,7 +21,7 @@ import mindspore.dataset as ds
 from mindspore.communication import get_rank, get_group_size
 from mindspore import nn, ops
 from mindspore.communication import init
-from hyper_parallel import hsdp, hsdp_wait_grad_handle
+from hyper_parallel import hsdp, hsdp_sync_stream
 from hyper_parallel import parallelize_value_and_grad
 from tests.common.mark_utils import arg_mark
 from tests.mindspore.st.common_net import SlimLeNet
@@ -98,7 +98,7 @@ def hsdp_without_accumulate_grad(shard_size, threshold=64, optimizer_level="leve
     for data, label in data_set:
         (loss, _), grads = grad_fn(data, label)
         if comm_async:
-            hsdp_wait_grad_handle()
+            hsdp_sync_stream()
         with NoFallbackGuard():
             optimizer(grads)
         reduced_loss = loss_sync_allreduce(loss)
@@ -136,7 +136,7 @@ def hsdp_with_accumulate_grad(shard_size, threshold=64, optimizer_level="level1"
                 net.set_requires_grad_sync(True)
             (loss, _), grads = grad_fn(data_list[j], label_list[j])
             if comm_async:
-                hsdp_wait_grad_handle()
+                hsdp_sync_stream()
             total_loss = total_loss + loss
         reduced_loss = loss_sync_allreduce(total_loss)
         with NoFallbackGuard():

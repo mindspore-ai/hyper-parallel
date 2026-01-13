@@ -18,7 +18,7 @@ import re
 import time
 import mindspore as ms
 from mindspore import nn
-from hyper_parallel import hsdp_wait_grad_handle
+from hyper_parallel import hsdp_sync_stream
 
 hsdp_network_ckpt_path: str = "hsdp_network.ckpt"
 
@@ -104,7 +104,7 @@ def train_with_data_label(net, data, label, comm_async=True, train_steps=10):
             start_time = time.time()
         _, grads = grad_fn(data, label)
         if comm_async:
-            hsdp_wait_grad_handle()
+            hsdp_sync_stream()
         if i != 0:
             end_time = time.time()
             cost_time = end_time - start_time + cost_time

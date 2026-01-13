@@ -217,7 +217,7 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def new_tensor(tensor_shape, tensor_type, device):
-        return torch.empty(tensor_shape, tensor_type, device=device)
+        return torch.empty(tensor_shape, dtype=tensor_type, device=device)
 
     @staticmethod
     def set_tensor_requires_grad(input_tensor):
