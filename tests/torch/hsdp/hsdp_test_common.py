@@ -1,3 +1,8 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -10,7 +15,7 @@
 """hsdp test common"""
 import time
 from torch import optim
-from hyper_parallel import hsdp_wait_grad_handle
+from hyper_parallel import hsdp_sync_stream
 
 
 def train(model, data, comm_async=True, train_steps=10):
@@ -27,7 +32,7 @@ def train(model, data, comm_async=True, train_steps=10):
         loss = model(data)
         loss.backward()
         if comm_async:
-            hsdp_wait_grad_handle()
+            hsdp_sync_stream()
         if i != 0:
             end_time = time.time()
             cost_time = end_time - start_time + cost_time

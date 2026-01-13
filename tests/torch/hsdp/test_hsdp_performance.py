@@ -54,3 +54,16 @@ def test_hsdp_comm_async():
     file_name = "hsdp_comm_async.py"
     case_name = "test_hsdp_comm_async"
     torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_hsdp_comm_fusion():
+    """
+    Feature: hsdp enable comm fusion
+    Description: test hsdp comm fusion performance
+    Expectation: run success
+    """
+    file_name = "hsdp_comm_fusion.py"
+    case_name = "test_hsdp_comm_fusion"
+    master_port = 12344
+    torchrun_case(file_name, case_name, master_port)

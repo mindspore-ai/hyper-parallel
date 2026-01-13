@@ -201,7 +201,7 @@ def hsdp(
             reduce_dtype (float, optional): gradient reduce dtype. Default value is None, which means gradient
                 will be reduced with its origin dtype.
             comm_async (bool, optional): reduce gradient with async communication op for communication overlap.
-                When comm_async is enable, ``hsdp_wait_grad_handle`` should be called before using generated
+                When comm_async is enable, ``hsdp_sync_stream`` should be called before using generated
                 gradient. Default value is False, which means gradient will be reduced with sync communication op.
             comm_fusion (bool, optional): fuse forward parameter allgathers and backward gradient reducescatters or
                 allreduces into buffers communication to reduce the number of communication op. ``bucket_size` will
@@ -255,7 +255,7 @@ def hsdp(
     )
     return cell
 
-def hsdp_wait_grad_handle():
+def hsdp_sync_stream():
     """wait for hsdp gradient handle to be completed"""
     if platform is None:
         return

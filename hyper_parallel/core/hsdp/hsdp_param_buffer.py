@@ -47,7 +47,7 @@ class HSDPParamBuffer:
 
     def _init_param_buffer(self):
         """init params buffer"""
-        self.sharded_param_buffer = self.platform.new_tensor((self.numel), self.dtype, self.device)
+        self.sharded_param_buffer = self.platform.new_tensor((self.numel,), self.dtype, self.device)
         for hsdp_param in self.hsdp_params:
             start_index = hsdp_param.param_buffer_start_index
             end_index = hsdp_param.param_buffer_end_index
