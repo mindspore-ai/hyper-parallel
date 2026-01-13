@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-
 """
 Distributed implementation for Element-wise operator.
 """
@@ -32,6 +31,36 @@ class ElementWiseDistributedOp(DistributedOp):
         op_name (str): Name of the operator to register.
     """
 
+    def infer_layout_with_shape(self, layouts, input_shapes):
+        """
+        Infer output layouts for element-wise operations with shape information.
+
+        Note:
+            The framework's WithShape dispatch path still calls `infer_layout(layouts, extra_args)`
+            where extra_args is a list and the last element is `input_shapes`. This helper is kept
+            for compatibility but may not be invoked by the dispatcher.
+        """
+        extra_args = {"input_shapes": input_shapes}
+        return self.infer_layout(layouts, extra_args)
+
+    def _extract_input_shapes(self, extra_args):
+        """
+        Extract input_shapes from extra_args.
+
+        Compatible with:
+          - dict: {"input_shapes": [...]}
+          - list/tuple (WithShape dispatcher): extra_args = [..., input_shapes]
+        """
+        if isinstance(extra_args, dict):
+            return extra_args.get("input_shapes", None)
+
+        if isinstance(extra_args, (list, tuple)) and extra_args:
+            maybe_shapes = extra_args[-1]
+            if isinstance(maybe_shapes, (list, tuple)):
+                return maybe_shapes
+
+        return None
+
     def infer_layout(self, layouts, extra_args):
         """
         Infer output layouts for element-wise operations with broadcasting support.
@@ -44,8 +73,9 @@ class ElementWiseDistributedOp(DistributedOp):
 
         Args:
             layouts (tuple): Tuple of layouts for input tensors
-            extra_args (dict): Extra arguments for the operation, should contain:
-                             - 'input_shapes': List of global shapes for all inputs (optional)
+            extra_args: Extra arguments for the operation. It can be:
+                        - dict containing 'input_shapes'
+                        - list/tuple where the last element is input_shapes (WithShape path)
 
         Returns:
             Layout: Layout for output tensor with merged sharding strategy.
@@ -65,49 +95,116 @@ class ElementWiseDistributedOp(DistributedOp):
             return valid_layouts[0]
 
         try:
-            if "input_shapes" not in extra_args:
+            input_shapes = self._extract_input_shapes(extra_args)
+
+            if not input_shapes:
+                # If any real tensor layouts exist, they must match exactly.
+                # Otherwise we cannot safely infer broadcasting behavior.
                 first_layout = valid_layouts[0]
                 for layout in valid_layouts[1:]:
-                    if layout != first_layout:
+                    if layout.tensor_map != first_layout.tensor_map:
                         raise ValueError(
-                            f"Element-wise operation {self.op_name} requires all tensor inputs "
-                            f"to have the same layout when shape information is not provided."
+                            f"Element-wise operation {self.op_name} cannot infer layout without shapes: "
+                            f"mismatched tensor_map {first_layout.tensor_map} vs {layout.tensor_map}."
                         )
                 return first_layout
 
-            input_shapes = extra_args["input_shapes"]
+            # Align shapes with layouts by position (layouts may include None for scalars / non-dtensor args)
+            aligned_layouts = []
+            aligned_shapes = []
+            for layout, shape in zip(layouts, input_shapes):
+                if layout is None:
+                    continue
+                aligned_layouts.append(layout)
+                aligned_shapes.append(shape)
 
-            output_shape = input_shapes[0]
-            for shape in input_shapes[1:]:
+            # Defensive fallback: if alignment is unexpected, use legacy path
+            if len(aligned_layouts) <= 1 or len(aligned_layouts) != len(aligned_shapes):
+                return valid_layouts[0]
+
+            # Compute broadcasted output shape
+            output_shape = aligned_shapes[0]
+            for shape in aligned_shapes[1:]:
                 output_shape = self._broadcast_shapes(output_shape, shape)
 
-            base_layout = valid_layouts[0]
+            base_layout = aligned_layouts[0]
             merged_tensor_map = self._merge_tensor_maps_for_broadcast(
-                valid_layouts[0],
-                valid_layouts[1],
-                input_shapes[0],
-                input_shapes[1],
+                aligned_layouts[0],
+                aligned_layouts[1],
+                aligned_shapes[0],
+                aligned_shapes[1],
                 output_shape,
             )
 
-            for i in range(2, len(valid_layouts)):
+            for i in range(2, len(aligned_layouts)):
                 temp_layout = self._create_output_layout(base_layout, merged_tensor_map)
                 merged_tensor_map = self._merge_tensor_maps_for_broadcast(
                     temp_layout,
-                    valid_layouts[i],
+                    aligned_layouts[i],
                     output_shape,
-                    input_shapes[i],
+                    aligned_shapes[i],
                     output_shape,
                 )
 
-            output_layout = self._create_output_layout(base_layout, merged_tensor_map)
-
-            return output_layout
+            return self._create_output_layout(base_layout, merged_tensor_map)
 
         except ValueError as e:
             raise ValueError(
                 f"Element-wise operation {self.op_name} failed to infer layout: {str(e)}"
             ) from e
+
+    def _merge_tensor_maps_without_shape(self, layout1, layout2):
+        """
+        Merge tensor_maps without shape information (for broadcasting scenarios).
+
+        Merging rules without shape:
+        - If both dimensions are not sharded: use -1
+        - If one is sharded and one is not: use the sharded one (assume broadcasting)
+        - If both are sharded: they must be identical, otherwise raise error
+
+        Args:
+            layout1: Layout of the first input
+            layout2: Layout of the second input
+
+        Returns:
+            tuple: Merged tensor_map
+
+        Raises:
+            ValueError: If sharding strategies conflict
+        """
+        map1 = layout1.tensor_map if layout1.tensor_map else tuple()
+        map2 = layout2.tensor_map if layout2.tensor_map else tuple()
+
+        # Align ranks by padding with -1
+        max_len = max(len(map1), len(map2))
+        padded_map1 = (-1,) * (max_len - len(map1)) + map1
+        padded_map2 = (-1,) * (max_len - len(map2)) + map2
+
+        merged_map = []
+        for i, (m1, m2) in enumerate(zip(padded_map1, padded_map2)):
+            m1_axes = self._normalize_tensor_map_element(m1)
+            m2_axes = self._normalize_tensor_map_element(m2)
+
+            m1_is_sharded = bool(m1_axes)
+            m2_is_sharded = bool(m2_axes)
+
+            if not m1_is_sharded and not m2_is_sharded:
+                merged_map.append(-1)
+            elif not m1_is_sharded:
+                merged_map.append(self._denormalize_tensor_map_element(m2_axes))
+            elif not m2_is_sharded:
+                merged_map.append(self._denormalize_tensor_map_element(m1_axes))
+            else:
+                # Both sharded, must be identical
+                if m1_axes != m2_axes:
+                    raise ValueError(
+                        f"Conflicting sharding at dimension {i}: "
+                        f"layout1 sharded on device axes {m1_axes}, "
+                        f"layout2 sharded on device axes {m2_axes}"
+                    )
+                merged_map.append(self._denormalize_tensor_map_element(m1_axes))
+
+        return tuple(merged_map)
 
     def _broadcast_shapes(self, shape1, shape2):
         """
@@ -182,7 +279,6 @@ class ElementWiseDistributedOp(DistributedOp):
         map1 = layout1.tensor_map if layout1.tensor_map else tuple([-1] * len1)
         map2 = layout2.tensor_map if layout2.tensor_map else tuple([-1] * len2)
 
-        # Pad with -1 on the left to make dimensions equal
         aligned_map1 = (-1,) * (max_len - len1) + map1
         aligned_map2 = (-1,) * (max_len - len2) + map2
 
@@ -224,9 +320,7 @@ class ElementWiseDistributedOp(DistributedOp):
             return next(iter(device_axes_set))
         return tuple(sorted(device_axes_set))
 
-    def _merge_tensor_maps_for_broadcast(
-        self, layout1, layout2, shape1, shape2, output_shape
-    ):
+    def _merge_tensor_maps_for_broadcast(self, layout1, layout2, shape1, shape2, output_shape):
         """
         Merge tensor_maps of two inputs to generate output tensor_map.
 
@@ -246,9 +340,7 @@ class ElementWiseDistributedOp(DistributedOp):
         Raises:
             ValueError: If sharding strategies conflict or broadcasting dimension is sharded
         """
-        map1, map2 = self._align_tensor_maps_for_broadcast(
-            layout1, layout2, shape1, shape2
-        )
+        map1, map2 = self._align_tensor_maps_for_broadcast(layout1, layout2, shape1, shape2)
 
         len1, len2 = len(shape1), len(shape2)
         max_len = len(output_shape)
@@ -256,9 +348,7 @@ class ElementWiseDistributedOp(DistributedOp):
         padded_shape2 = (1,) * (max_len - len2) + tuple(shape2)
 
         merged_map = []
-        for i, (dim1, dim2, out_dim) in enumerate(
-            zip(padded_shape1, padded_shape2, output_shape)
-        ):
+        for i, (dim1, dim2, out_dim) in enumerate(zip(padded_shape1, padded_shape2, output_shape)):
             m1, m2 = map1[i], map2[i]
 
             m1_axes = self._normalize_tensor_map_element(m1)
