@@ -14,26 +14,8 @@
 # ============================================================================
 """parallel_construct_all_to_all test"""
 
-import os
 from tests.common.mark_utils import arg_mark
-
-
-def run_case(case_name, master_port):
-    cmd = f"export GLOG_v=3 && msrun --worker_num=2 --local_worker_num=2 " \
-          f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"--join=True --log_dir=./{case_name} pytest -s -v " \
-          f"construct_all_to_all.py::{case_name}"
-    ret = os.system(cmd)
-    assert ret == 0
-
-
-def run_case_8p(case_name, master_port):
-    cmd = f"export GLOG_v=3 && msrun --worker_num=8 --local_worker_num=8 " \
-          f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"--join=True --log_dir=./{case_name} pytest -s -v " \
-          f"construct_all_to_all.py::{case_name}"
-    ret = os.system(cmd)
-    assert ret == 0
+from tests.mindspore.st.utils import msrun_case
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -43,9 +25,13 @@ def test_construct_all_to_all():
     Description: Test loss repeat mean.
     Expectation: Run success.
     '''
+    glog_v = 3
+    file_name = "construct_all_to_all.py"
     case_name = "test_construct_all_to_all"
     master_port = 13296
-    run_case(case_name, master_port)
+    worker_num = 2
+    local_worker_num = 2
+    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -55,6 +41,8 @@ def test_construct_all_to_all_8p():
     Description: Test loss repeat mean.
     Expectation: Run success.
     '''
+    glog_v = 3
+    file_name = "construct_all_to_all.py"
     case_name = "test_construct_all_to_all_8p"
     master_port = 13297
-    run_case_8p(case_name, master_port)
+    msrun_case(glog_v, file_name, case_name, master_port)

@@ -25,8 +25,9 @@ def test_hsdp_forward_prefetch():
     Expectation: run success
     """
     master_port = 12341
-    case_name = "hsdp_prefetch.py::test_hsdp_forward_prefetch"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp_prefetch.py"
+    case_name = "test_hsdp_forward_prefetch"
+    torchrun_case(file_name, case_name, master_port)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -37,8 +38,9 @@ def test_hsdp_backward_prefetch():
     Expectation: run success
     """
     master_port = 12342
-    case_name = "hsdp_prefetch.py::test_hsdp_backward_prefetch"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp_prefetch.py"
+    case_name = "test_hsdp_backward_prefetch"
+    torchrun_case(file_name, case_name, master_port)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -49,5 +51,6 @@ def test_hsdp_comm_async():
     Expectation: run success
     """
     master_port = 12343
-    case_name = "hsdp_comm_async.py::test_hsdp_comm_async"
-    torchrun_case(master_port, case_name)
+    file_name = "hsdp_comm_async.py"
+    case_name = "test_hsdp_comm_async"
+    torchrun_case(file_name, case_name, master_port)

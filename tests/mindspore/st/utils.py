@@ -12,21 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test parallelize value and grad"""
+"""test utils"""
+import os
+import shutil
 
-from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
 
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_parallelize_value_and_grad():
-    '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial.
-    Description: Test base shard.
-    Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "parallelize_value_and_grad.py"
-    case_name = "test_parallelize_value_and_grad"
-    master_port = 11333
-    msrun_case(glog_v, file_name, case_name, master_port)
+def msrun_case(glog_v, file_name, case_name, master_port, worker_num=8, local_worker_num=8):
+    """Run test case."""
+    filename = file_name.split(".py")[0]
+    log_path = f"./log_{filename}/{case_name}"
+    if os.path.exists(log_path):
+        shutil.rmtree(log_path)
+    cmd = f"export GLOG_v={glog_v} && msrun --worker_num={worker_num} --local_worker_num={local_worker_num} " \
+          f"--master_addr=127.0.0.1 --master_port={master_port} " \
+          f"--join=True --log_dir={log_path} pytest -s -v " \
+          f"{file_name}::{case_name}"
+    ret = os.system(cmd)
+    assert ret == 0

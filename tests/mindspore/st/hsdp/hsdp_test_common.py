@@ -1,3 +1,8 @@
+# Copyright 2025 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -10,7 +15,6 @@
 """hsdp common utils"""
 from typing import List, Tuple
 import re
-import os
 import time
 import mindspore as ms
 from mindspore import nn
@@ -106,12 +110,3 @@ def train_with_data_label(net, data, label, comm_async=True, train_steps=10):
             cost_time = end_time - start_time + cost_time
         optimizer(grads)
     return cost_time
-
-def run_hsdp_case_by_name(file_name: str, case_name: str):
-    """msrun hsdp test case with 8 workers"""
-    log = f"log_{case_name}"
-    ret = os.system(
-        f"msrun --worker_num=8 --local_worker_num=8 --log_dir={log} --join=True --master_port=18182\
-            pytest -s {file_name}::{case_name}"
-    )
-    assert ret == 0

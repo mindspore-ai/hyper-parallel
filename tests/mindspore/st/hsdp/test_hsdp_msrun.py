@@ -13,21 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """test hsdp with msrun multi card"""
-import os
+
 from tests.common.mark_utils import arg_mark
+from tests.mindspore.st.utils import msrun_case
 
 
 LOSS_REL_ABSOLUTE_TOL: float = 1e-2
 FIRST_STEP_LOSS_REL_ABSOLUTE_TOL: float = 5e-3
-
-
-def _run_hsdp_case_by_name(case_name: str):
-    log = f"log_{case_name}"
-    ret = os.system(
-        f"msrun --worker_num=8 --local_worker_num=8 --log_dir={log} --join=True --master_port=18181\
-            pytest -s hsdp.py::{case_name}"
-    )
-    assert ret == 0
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -37,8 +29,11 @@ def test_pure_dp():
     Description: pure data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_pure_dp"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -48,8 +43,11 @@ def test_zero1_fully_shard():
     Description: zero1 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero1_fully_shard"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero1_partial_shard():
@@ -58,8 +56,11 @@ def test_zero1_partial_shard():
     Description: zero1 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero1_partial_shard"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero2_fully_shard():
@@ -68,8 +69,11 @@ def test_zero2_fully_shard():
     Description: zero2 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero2_fully_shard"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero2_partial_shard():
@@ -78,8 +82,11 @@ def test_zero2_partial_shard():
     Description: zero2 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero2_partial_shard"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_fully_shard():
@@ -88,8 +95,11 @@ def test_zero3_fully_shard():
     Description: zero3 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero3_fully_shard"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_partial_shard():
@@ -98,8 +108,11 @@ def test_zero3_partial_shard():
     Description: zero3 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero3_partial_shard"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_pure_dp_with_acc_grad():
@@ -108,8 +121,11 @@ def test_pure_dp_with_acc_grad():
     Description: pure data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_pure_dp_with_acc_grad"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero1_fully_shard_with_acc_grad():
@@ -118,8 +134,11 @@ def test_zero1_fully_shard_with_acc_grad():
     Description: zero1 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero1_fully_shard_with_acc_grad"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero1_partial_shard_with_acc_grad():
@@ -128,8 +147,11 @@ def test_zero1_partial_shard_with_acc_grad():
     Description: zero1 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero1_partial_shard_with_acc_grad"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero2_fully_shard_with_acc_grad():
@@ -138,8 +160,11 @@ def test_zero2_fully_shard_with_acc_grad():
     Description: zero2 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero2_fully_shard_with_acc_grad"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero2_partial_shard_with_acc_grad():
@@ -148,8 +173,11 @@ def test_zero2_partial_shard_with_acc_grad():
     Description: zero2 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero2_partial_shard_with_acc_grad"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_fully_shard_with_acc_grad():
@@ -158,8 +186,11 @@ def test_zero3_fully_shard_with_acc_grad():
     Description: zero3 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero3_fully_shard_with_acc_grad"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_partial_shard_with_acc_grad():
@@ -168,8 +199,11 @@ def test_zero3_partial_shard_with_acc_grad():
     Description: zero3 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero3_partial_shard_with_acc_grad"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_partial_shard_with_async_acc_grad():
@@ -178,8 +212,11 @@ def test_zero3_partial_shard_with_async_acc_grad():
     Description: zero3 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero3_partial_shard_with_async_acc_grad"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_with_comm_fusion():
@@ -188,8 +225,11 @@ def test_zero3_with_comm_fusion():
     Description: zero3 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero3_with_comm_fusion"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_with_comm_fusion_bucket_size():
@@ -198,8 +238,11 @@ def test_zero3_with_comm_fusion_bucket_size():
     Description: zero3 gradient fusion bucket size.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero3_with_comm_fusion_bucket_size"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_with_comm_fusion_bucket_size0():
@@ -208,5 +251,8 @@ def test_zero3_with_comm_fusion_bucket_size0():
     Description: zero3 data parallel.
     Expectation: Run success
     '''
+    glob_v = 2
+    file_name = "hsdp.py"
+    master_port = 18181
     case_name = "test_zero3_with_comm_fusion_bucket_size0"
-    _run_hsdp_case_by_name(case_name)
+    msrun_case(glob_v, file_name, case_name, master_port)

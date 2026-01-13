@@ -14,17 +14,8 @@
 # ============================================================================
 """parallel_base_custom_shard test"""
 
-import os
 from tests.common.mark_utils import arg_mark
-
-
-def run_case(case_name, master_port):
-    cmd = f"export GLOG_v=3 && msrun --worker_num=8 --local_worker_num=8 " \
-          f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"--join=True --log_dir=./{case_name} pytest -s -v " \
-          f"base_custom_shard.py::{case_name}"
-    ret = os.system(cmd)
-    assert ret == 0
+from tests.mindspore.st.utils import msrun_case
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -34,6 +25,8 @@ def test_base_custom_shard():
     Description: Test base shard.
     Expectation: Run success.
     '''
+    glog_v = 3
+    file_name = "base_custom_shard.py"
     case_name = "test_base_custom_shard"
     master_port = 11333
-    run_case(case_name, master_port)
+    msrun_case(glog_v, file_name, case_name, master_port)

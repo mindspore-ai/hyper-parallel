@@ -14,19 +14,9 @@
 # ============================================================================
 """layout save load test"""
 
-import os
-
 from hyper_parallel.core.checkpoint.layout import combine_layout
 from tests.common.mark_utils import arg_mark
-
-
-def run_case(case_name, master_port):
-    cmd = f"export GLOG_v=3 && msrun --worker_num=8 --local_worker_num=8 " \
-          f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"--join=True --log_dir=./{case_name} pytest -s -v " \
-          f"base_shard.py::{case_name}"
-    ret = os.system(cmd)
-    assert ret == 0
+from tests.mindspore.st.utils import msrun_case
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -36,8 +26,10 @@ def test_base_layout():
     Description: save layout, load layout, and combine layout.
     Expectation: Run success.
     """
+    glog_v = 3
+    file_name = "base_shard.py"
     case_name = "test_base_layout"
     master_port = 11222
-    run_case(case_name, master_port)
+    msrun_case(glog_v, file_name, case_name, master_port)
     layout_dict = combine_layout(".")
     assert isinstance(layout_dict, dict)

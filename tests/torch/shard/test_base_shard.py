@@ -25,5 +25,6 @@ def test_base_shard():
     Expectation: Run success.
     '''
     master_port = 10999
-    case_name = "base_shard.py::test_base_shard"
-    torchrun_case(master_port, case_name)
+    file_name = "base_shard.py"
+    case_name = "test_base_shard"
+    torchrun_case(file_name, case_name, master_port)
