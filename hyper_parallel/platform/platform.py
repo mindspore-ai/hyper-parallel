@@ -215,6 +215,14 @@ class Platform:
     def parameters_dict(cell):
         raise NotImplementedError("Platform subclasses must implement parameters_dict")
 
+    @staticmethod
+    def save_checkpoint(cell, file_path: str) -> None:
+        raise NotImplementedError("Platform subclasses must implement save_checkpoint")
+
+    @staticmethod
+    def load_checkpoint(file_path: str) -> dict:
+        raise NotImplementedError("Platform subclasses must implement load_checkpoint")
+
     def _create_group(self, rank_list, group_name=None):
         raise NotImplementedError("Platform subclasses must implement _create_group")
 

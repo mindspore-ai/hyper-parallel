@@ -204,6 +204,14 @@ class TorchPlatform(Platform):
         return cell.named_parameter()
 
     @staticmethod
+    def save_checkpoint(cell: Module, file_path: str) -> None:
+        torch.save(obj=cell, f=file_path)
+
+    @staticmethod
+    def load_checkpoint(file_path: str) -> dict:
+        return torch.load(f=file_path)
+
+    @staticmethod
     def new_zero_parameter(param_shape, param_type, requires_grad, device):
         return nn.Parameter(torch.zeros(param_shape, dtype=param_type, device=device), requires_grad=requires_grad)
 

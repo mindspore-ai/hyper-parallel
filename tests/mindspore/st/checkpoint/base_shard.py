@@ -110,8 +110,14 @@ def base_case(dp, mp):
     assert isinstance(layout_dict, dict)
 
 
-def save_load_checkpoint(dp, mp):
-    """Test case for saving and loading checkpoint functionality."""
+def save_load_checkpoint(dp: int, mp: int) -> None:
+    """
+    Test using saver to save checkpoint to safetensors file, and then using loader to load checkpoint from this
+    safetensors file.
+
+    Args:
+        dp, mp: Mesh shape coordinate.
+    """
     D.init()
 
     # standalone
@@ -136,10 +142,12 @@ def save_load_checkpoint(dp, mp):
     shard(model.relu, model_relu_stra)
 
     # step 3: save checkpoint
-    save_checkpoint(model, "ckpt.safetensors")
+    file_path = "tmp1.safetensors"
+    save_checkpoint(model, file_path)
 
     # step 4: load checkpoint
-    param_dict = load_checkpoint("ckpt.safetensors")
+    param_dict = load_checkpoint(file_path)
+    os.remove(file_path)
     assert isinstance(param_dict, dict)
 
 
@@ -154,6 +162,9 @@ def test_base_layout():
 
 def test_saver_loader():
     """
-    Feature: test save and load.
+    Feature: Test checkpoint saver and loader.
+    Description: Test when a simple model sharded by dp and mp, use saver and loader to save checkpoint to safetensors
+    file, and use loader to load checkpoint from this safetensors file.
+    Expectation: Run success.
     """
     save_load_checkpoint(dp=4, mp=2)
