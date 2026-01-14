@@ -13,8 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """Torch function override"""
+from torch import Tensor
+from torch.nn.modules import module
 from torch.nn.modules import _functions
 from torch.nn.modules._functions import BackwardHookFunction
+from torch.utils.hooks import BackwardHook
+from torch.utils._pytree import tree_flatten, tree_unflatten
 
 
 class DTensorBackwardHookFunction(BackwardHookFunction):
@@ -22,7 +26,7 @@ class DTensorBackwardHookFunction(BackwardHookFunction):
 
     @classmethod
     def apply(cls, *args, **kwargs):
-        """override apply function"""
+        """Override apply function for dtensor."""
         # pylint: disable=C0415
         from hyper_parallel import DTensor
 
@@ -59,5 +63,17 @@ class DTensorBackwardHookFunction(BackwardHookFunction):
         return origin_output
 
 
+class ExtendBackwardHook(BackwardHook):
+    """Override BackwardHook for none tuple inputs."""
+
+    def setup_output_hook(self, args):
+        if not isinstance(args, tuple) and not isinstance(args, Tensor):
+            arg_list, args_spec = tree_flatten(args)
+            arg_list = super().setup_output_hook(tuple(arg_list))
+            return tree_unflatten(arg_list, args_spec)
+        return super().setup_output_hook(args)
+
+
 def override_functions():
     _functions.BackwardHookFunction = DTensorBackwardHookFunction
+    module.BackwardHook = ExtendBackwardHook
