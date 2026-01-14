@@ -18,13 +18,17 @@ import copy
 from typing import Tuple
 import functools
 import numpy as np
+from hyper_parallel.core.placement_types import Placement, Shard, Replicate, Partial
 from hyper_parallel.platform import get_platform
+
 platform = get_platform()
 
 _group_map = {}
 
-def _infer_slice_area_by_rank(mesh_shape, tensor_map, rank_id: int, full_shape: tuple): # -> tuple[tuple[int]]:
+
+def _infer_slice_area_by_rank(mesh_shape, tensor_map, rank_id: int, full_shape: tuple):  # -> tuple[tuple[int]]:
     """Return the range of each axis from full tensor for slice in current rank."""
+
     def _get_dev_num_alone_dim(mesh_shape, dim):
         """_get_dev_num_alone_dim."""
         return mesh_shape[-dim - 1] if dim != -1 else 1
@@ -101,6 +105,7 @@ class _DeviceMesh:
         alias_name:
         rank_list:
     """
+
     def __init__(self,
                  mesh_shape: Tuple[int],
                  alias_name: Tuple[str],
@@ -220,14 +225,14 @@ class _DeviceMesh:
         idx = rank_list.index(rank)
         coord = [0] * len(mesh_shape)
         temp = idx
-        for i in range(len(mesh_shape)-1, -1, -1):
+        for i in range(len(mesh_shape) - 1, -1, -1):
             coord[i] = temp % mesh_shape[i]
             temp //= mesh_shape[i]
 
         dim_index = alias_name.index(axis)
         strides = [1] * len(mesh_shape)
-        for i in range(len(mesh_shape)-2, -1, -1):
-            strides[i] = strides[i+1] * mesh_shape[i+1]
+        for i in range(len(mesh_shape) - 2, -1, -1):
+            strides[i] = strides[i + 1] * mesh_shape[i + 1]
 
         result_ranks = []
         for v in range(mesh_shape[dim_index]):
@@ -312,14 +317,14 @@ class _DeviceMesh:
         idx = rank_list.index(rank)
         coord = [0] * len(mesh_shape)
         temp = idx
-        for i in range(len(mesh_shape)-1, -1, -1):
+        for i in range(len(mesh_shape) - 1, -1, -1):
             coord[i] = temp % mesh_shape[i]
             temp //= mesh_shape[i]
 
         dim_index = alias_name.index(axis)
         strides = [1] * len(mesh_shape)
-        for i in range(len(mesh_shape)-2, -1, -1):
-            strides[i] = strides[i+1] * mesh_shape[i+1]
+        for i in range(len(mesh_shape) - 2, -1, -1):
+            strides[i] = strides[i + 1] * mesh_shape[i + 1]
 
         result_ranks = []
         for v in range(mesh_shape[dim_index]):
@@ -403,14 +408,61 @@ class Layout:
             self._rank_list = tuple(range(np.prod(np.array(mesh_shape))))
         else:
             self._rank_list = tuple(rank_list)
-        self._partial = [None] * len(mesh_shape) # partial status for each dev dim
+        self._partial = [None] * len(mesh_shape)  # partial status for each dev dim
         self._support_partial_op = ['sum', 'max', 'min', 'avg', None]
         self._alias_tensor_map = None
         self._mesh = _create_device_mesh(mesh_shape, alias_name, self._rank_list)
         self._compact_str = self._to_compact_string()
+        self._placements = None
+
+    @classmethod
+    def from_device_mesh(cls, device_mesh):
+        """
+        Create a Layout object from a device mesh.
+
+        Args:
+            device_mesh (_DeviceMesh): The device mesh object containing topological information about the
+            cluster devices.
+
+        Returns:
+            Layout: A new Layout instance initialized with the properties of the provided device mesh.
+
+        Examples:
+            >>> from hyper_parallel.core.layout import Layout, _DeviceMesh
+            >>> device_mesh = _DeviceMesh((2, 2), ("dp", "mp"), tuple(range(4)))
+            >>> layout = Layout.from_device_mesh(device_mesh)
+        """
+        obj = cls.__new__(cls)
+        obj._mesh = device_mesh
+        obj._alias_name = device_mesh.alias_name
+        obj._rank_list = device_mesh.rank_list
+        obj._tensor_map = None
+        obj._partial = [None] * len(device_mesh.mesh_shape)
+        obj._support_partial_op = ['sum', 'max', 'min', 'avg', None]
+        obj._alias_tensor_map = None
+        obj._placements = None
+        obj._compact_str = obj._to_compact_string()
+        return obj
 
     def __call__(self, *alias_tensor_map):
         obj = copy.deepcopy(self)
+
+        if len(alias_tensor_map) == 1 and isinstance(alias_tensor_map[0], (list, tuple)):
+            if len(alias_tensor_map[0]) > 0 and isinstance(alias_tensor_map[0][0], Placement):
+                return self._process_placement_layout(obj, alias_tensor_map[0])
+
+        if len(alias_tensor_map) > 0 and isinstance(alias_tensor_map[0], Placement):
+            return self._process_placement_layout(obj, alias_tensor_map)
+
+        return self._process_alias_layout(obj, alias_tensor_map)
+
+    def _process_placement_layout(self, obj, placements):
+        """Process layout defined by Placement types."""
+        obj.set_placements(placements)
+        return copy.deepcopy(obj)
+
+    def _process_alias_layout(self, obj, alias_tensor_map):
+        """Process layout defined by alias strings."""
         obj.set_alias_tensor_map(alias_tensor_map)
         tensor_map = ()
         writed_map = ()
@@ -455,6 +507,81 @@ class Layout:
                 "interleaved_parallel": interleaved_parallel, "alias_name": self._mesh.alias_name,
                 "rank_list": self._rank_list}
 
+    def placement_to_tensor_map(self, dim):
+        """
+        Transform placement to tensor map.
+
+        This method converts the `placements` configuration (consisting of Shard, Replicate, Partial)
+        into a `tensor_map` representation used for distributed tensor operations.
+
+        Args:
+            dim (int): The dimension of the tensor. Must be a positive integer.
+
+        Returns:
+            tuple: A tuple representing the tensor map, where each element corresponds to a tensor dimension.
+                   A value of -1 indicates the dimension is not sharded, while other values indicate
+                   the mesh dimension index along which the tensor dimension is sharded.
+
+        Raises:
+            ValueError: If `dim` is negative.
+            ValueError: If a shard dimension in `placements` is out of bounds for the given tensor dimension.
+            ValueError: If a tensor dimension is sharded by multiple mesh axes.
+        """
+        if dim < 0:
+            raise ValueError(f"Tensor dimension must be positive, but got {dim}")
+        if dim == 0:
+            self.set_tensor_map(())
+        dim_map = [-1] * dim
+        self.partial_ops = {}
+        for mesh_idx, placement in enumerate(self.placements):
+            if isinstance(placement, Shard):
+                shard_dim = placement.dim
+                if shard_dim < 0 or shard_dim >= dim:
+                    raise ValueError(f"Shard dimension {shard_dim} is out of bounds for tensor of dimension {dim}")
+                if dim_map[shard_dim] != -1:
+                    raise ValueError(f"Dimension {shard_dim} has been sharded by Mesh axis {dim_map[shard_dim]}")
+                dim_map[shard_dim] = mesh_idx
+            elif isinstance(placement, Partial):
+                op_name = getattr(placement, "reduce_op", "sum").lower()
+                self.partial[mesh_idx] = op_name
+        device_dim_count = len(self.mesh_shape)
+        tensor_map = [
+            device_dim_count - 1 - mesh_idx if mesh_idx != -1 else -1
+            for mesh_idx in dim_map
+        ]
+        self.set_tensor_map(tuple(tensor_map))
+        return tensor_map
+
+    def tensor_map_to_placement(self):
+        """
+        Transform tensor map to placement.
+
+        This method converts the existing `tensor_map` and `partial` status into a list of `Placement` objects
+        (Shard, Replicate, Partial). This is the inverse operation of `placement_to_tensor_map`.
+
+        Returns:
+            list[Placement]: A list of Placement objects describing the distribution strategy for each
+                             dimension of the device mesh.
+
+        Raises:
+            ValueError: If `tensor_map` is not configured (None).
+        """
+        if self._tensor_map is None:
+            raise ValueError("The tensor_map is None, cannot transform to placements.")
+        mesh_ndim = len(self.mesh_shape)
+        placements = [Replicate()] * mesh_ndim
+        for tensor_dim, mapping in enumerate(self._tensor_map):
+            mapping_list = mapping if isinstance(mapping, tuple) else (mapping,)
+            for map_val in mapping_list:
+                if map_val != -1:
+                    root_mesh_idx = mesh_ndim - 1 - map_val
+                    placements[root_mesh_idx] = Shard(dim=tensor_dim)
+        for mesh_idx, op in enumerate(self.partial):
+            if op is not None:
+                placements[mesh_idx] = Partial(reduce_op=op)
+        self.set_placements(placements)
+        return placements
+
     def __setstate__(self, state):
         self.__dict__.update(state)
         self.update_mesh()
@@ -494,6 +621,15 @@ class Layout:
         self._alias_tensor_map = alias_tensor_map
 
     @property
+    def placements(self):
+        """placements"""
+        return self._placements
+
+    def set_placements(self, placements):
+        """Set placements."""
+        self._placements = placements
+
+    @property
     def tensor_map(self):
         """tensor map"""
         return self._tensor_map
@@ -522,6 +658,7 @@ class Layout:
     def is_dev_axis_apply_shard(self, axis):
         """Return true if device axis is applying shard"""
         axis_id = self._mesh.axis_id(axis)
+
         def flatten(input_x):
             flatten_res = []
             for item in input_x:
@@ -530,6 +667,7 @@ class Layout:
                 else:
                     flatten_res.append(item)
             return flatten_res
+
         flatten_tensor_map = flatten(self.tensor_map)
         return axis_id in flatten_tensor_map
 
@@ -595,7 +733,7 @@ class Layout:
                         used_dev_num *= self._mesh.mesh_shape[len(self._mesh.mesh_shape) - item - 1]
                 continue
             if ele >= 0:
-                used_dev_num *= self._mesh.mesh_shape[len(self._mesh.mesh_shape) - ele -1]
+                used_dev_num *= self._mesh.mesh_shape[len(self._mesh.mesh_shape) - ele - 1]
 
         return all_device_num // used_dev_num
 
@@ -638,13 +776,13 @@ class Layout:
                 if isinstance(item, tuple):
                     # 处理嵌套元组
                     mapped_tuple = tuple(
-                        self._mesh.alias_name[len(self._mesh.alias_name)-1-dim] if dim != -1 else "None"
+                        self._mesh.alias_name[len(self._mesh.alias_name) - 1 - dim] if dim != -1 else "None"
                         for dim in item
                     )
                     readable_map.append(mapped_tuple)
                 else:
                     readable_map.append(
-                        self._mesh.alias_name[len(self._mesh.alias_name)-1-item] if item != -1 else "None"
+                        self._mesh.alias_name[len(self._mesh.alias_name) - 1 - item] if item != -1 else "None"
                     )
 
             tensor_info = f"Tensor Map: {tuple(readable_map)}"
