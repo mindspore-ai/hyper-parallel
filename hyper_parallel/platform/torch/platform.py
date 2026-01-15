@@ -36,6 +36,7 @@ class TorchPlatform(Platform):
     Module = Module
     DTensorBase = DTensorBase
     platform_type = PlatformType.PYTORCH
+    tensor_dtype = torch
 
     @staticmethod
     def get_rank():
