@@ -59,7 +59,19 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def get_op_name(func):
-        return func.name
+        if hasattr(func, "name"):
+            return func.name
+        module = getattr(func, "__module__", "")
+        if module and not module.startswith("mindspore"):
+            if hasattr(func, "__name__"):
+                return f"{module}.{func.__name__}"
+            if hasattr(func, "__class__"):
+                return f"{module}.{func.__class__.__name__}"
+        if hasattr(func, "__name__"):
+            return func.__name__
+        if hasattr(func, "__class__"):
+            return func.__class__.__name__
+        return str(func)
 
     @staticmethod
     def differentiable_all_gather_concat(data, group, concat_size, concat_dim):

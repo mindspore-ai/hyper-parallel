@@ -1,0 +1,29 @@
+PagedAttention:
+  dist_op_name: _paged_attention_dist_op
+  distributed_op_class: PagedAttentionDistributedOp
+  distributed_op_file: parallel_paged_attention
+
+paged_attention:
+  dist_op_name: _paged_attention_dist_op
+  distributed_op_class: PagedAttentionDistributedOp
+  distributed_op_file: parallel_paged_attention
+
+ms_custom_ops.PagedAttention:
+  dist_op_name: _paged_attention_dist_op
+  distributed_op_class: PagedAttentionDistributedOp
+  distributed_op_file: parallel_paged_attention
+
+ms_custom_ops.paged_attention:
+  dist_op_name: _paged_attention_dist_op
+  distributed_op_class: PagedAttentionDistributedOp
+  distributed_op_file: parallel_paged_attention
+
+ms_custom_ops.gen_ops_def.paged_attention:
+  dist_op_name: _paged_attention_dist_op
+  distributed_op_class: PagedAttentionDistributedOp
+  distributed_op_file: parallel_paged_attention
+
+ms_custom_ops.gen_ops_def.PagedAttention:
+  dist_op_name: _paged_attention_dist_op
+  distributed_op_class: PagedAttentionDistributedOp
+  distributed_op_file: parallel_paged_attention

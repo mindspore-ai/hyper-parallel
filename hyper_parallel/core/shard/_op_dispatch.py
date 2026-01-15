@@ -102,7 +102,7 @@ class OpDispatcher:
         self.whitelist = ["InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv", "typeof", "DistCommIsend",
                           "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather",
                           "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__", "register_hook",
-                          "is_complex", "chunk"]
+                          "is_complex", "chunk", "CellBackwardHook", "CellBackwardPreHook"]
 
         self._register_distributed_ops()
 
@@ -189,6 +189,8 @@ class OpDispatcher:
         extra_args = []
         input_args = []
 
+        print(f"[_with_layout_infer] func={func}, args_count={len(args)}")
+
         for arg in args:
             if arg is None:
                 input_layouts.append(None)
@@ -216,17 +218,27 @@ class OpDispatcher:
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
         func_name = platform.get_op_name(func)
+        print(f"[_with_layout_infer] func_name={func_name}, input_layouts_count={len(input_layouts)}")
+        print(f"[_with_layout_infer] input_layouts={[l.compact_str if l else None for l in input_layouts]}")
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
 
         op_layout_cache = layout_cache[func_name]
 
         if cache_key in op_layout_cache:
+            print(f"[_with_layout_infer] cache hit for {func_name}")
             output_layout = op_layout_cache[cache_key]
         else:
+            print(f"[_with_layout_infer] cache miss, calling distributed_op for {func_name}")
+            print(f"[_with_layout_infer] registered ops: {list(self.layout_infer_ops.keys())}")
             distribute_op = cache_manager.distributed_op(func_name)
+            print(f"[_with_layout_infer] distribute_op={distribute_op}")
+            if distribute_op is None:
+                raise RuntimeError(f"Operator '{func_name}' not registered. "
+                                   f"Available ops: {list(self.layout_infer_ops.keys())}")
             all_args = (input_layouts, extra_args)
             output_layout = distribute_op.infer_layout(*all_args)
+            print(f"[_with_layout_infer] infer_layout returned, output_layout={output_layout}")
             op_layout_cache[cache_key] = output_layout
 
         py_output = func(*input_args, **kwargs)

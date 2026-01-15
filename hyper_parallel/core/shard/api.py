@@ -14,16 +14,126 @@
 # ============================================================================
 """shard"""
 import inspect
-from typing import Union, Callable, Dict
+from typing import Union, Callable, Dict, Optional
 from functools import wraps
 from hyper_parallel.core.layout import Layout
 from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.platform import get_platform
+from hyper_parallel.core.shard import _op_dispatch as op_dispatch
 
 platform = get_platform()
 Parameter = platform.Parameter
 Tensor = platform.Tensor
 Module = platform.Module
+
+
+class DistributedCustomOp:
+    """
+    Wrapper for custom operators to enable automatic DTensor dispatch and infer_layout.
+
+    Unlike MindSpore built-in operators that automatically trigger DTensor.__fallback__,
+    custom operators (e.g., ms_custom_ops.paged_attention) do not go through the C++ _run_op
+    path and thus won't trigger fallback. This wrapper bridges that gap by:
+    1. Detecting DTensor inputs automatically
+    2. Calling _op_dispatch._with_layout_infer to trigger infer_layout
+    3. Returning properly wrapped DTensor outputs
+
+    Note: MindSpore's Cell.__call__ converts DTensor to plain Tensor before calling construct.
+    To work around this, use input_layouts parameter or cell._current_input_layouts.
+
+    Usage:
+        # Create a distributed version of the custom op
+        distributed_paged_attention = DistributedCustomOp(ms_custom_ops.paged_attention)
+
+        # Use it in your Cell's construct - it will automatically handle DTensor
+        output = distributed_paged_attention(query, key_cache, value_cache, ...)
+
+    Args:
+        op: The custom operator callable (e.g., ms_custom_ops.paged_attention)
+        infer_layout_suffix: Optional suffix for layout inference method.
+            Valid values: None, "WithShape", "Reshape", "WithTupleExpand", "Slice"
+        cell: Optional Cell instance to read _current_input_layouts from (set by shard hook)
+        cpu_arg_indices: Optional tuple of arg indices that should stay on CPU when wrapped
+        cpu_kwarg_names: Optional tuple of kwarg names that should stay on CPU when wrapped
+    """
+
+    def __init__(self, op: Callable, infer_layout_suffix: Optional[str] = None, cell=None,
+                 cpu_arg_indices: Optional[tuple] = None, cpu_kwarg_names: Optional[tuple] = None):
+        self._op = op
+        self._infer_layout_suffix = infer_layout_suffix
+        self._cell = cell
+        self._cpu_arg_indices = cpu_arg_indices or ()
+        self._cpu_kwarg_names = cpu_kwarg_names or ()
+        # Copy op's attributes for compatibility
+        if hasattr(op, 'name'):
+            self.name = op.name
+        if hasattr(op, '__name__'):
+            self.__name__ = op.__name__
+        if hasattr(op, '__module__'):
+            self.__module__ = op.__module__
+
+    def __call__(self, *args, **kwargs):
+        """
+        Call the wrapped operator. Automatically detects DTensor inputs and
+        routes through infer_layout when needed.
+        """
+        # Check if any input is a DTensor
+        has_dtensor = any(isinstance(arg, DTensor) for arg in args)
+        print(f"[DistributedCustomOp] op={self._op}, args_count={len(args)}, "
+              f"has_dtensor_in_args={has_dtensor}")
+        for i, arg in enumerate(args):
+            print(f"  arg[{i}] type={type(arg).__name__}, is_dtensor={isinstance(arg, DTensor)}")
+
+        if not has_dtensor:
+            has_dtensor = any(isinstance(v, DTensor) for v in kwargs.values())
+            print(f"[DistributedCustomOp] checked kwargs, has_dtensor={has_dtensor}")
+
+        # Check if cell has saved layouts from shard hook
+        input_layouts = None
+        if not has_dtensor and self._cell is not None:
+            input_layouts = getattr(self._cell, '_current_input_layouts', None)
+            if input_layouts:
+                print(f"[DistributedCustomOp] found _current_input_layouts from cell")
+                has_dtensor = any(layout is not None for layout in input_layouts)
+
+        if not has_dtensor:
+            # No DTensor inputs and no saved layouts, call operator directly
+            print(f"[DistributedCustomOp] no DTensor, calling op directly")
+            return self._op(*args, **kwargs)
+
+        # Has DTensor inputs or saved layouts, route through dispatch
+        print(f"[DistributedCustomOp] has DTensor/layouts, routing through _with_layout_infer")
+        dispatcher = op_dispatch._OP_DISPATCHER
+        suffix = self._infer_layout_suffix
+
+        # If inputs are plain Tensor but we have layouts, wrap them temporarily
+        if input_layouts and not any(isinstance(arg, DTensor) for arg in args):
+            wrapped_args = []
+            for i, arg in enumerate(args):
+                layout = input_layouts[i] if i < len(input_layouts) else None
+                if layout is not None and isinstance(arg, Tensor) and not isinstance(arg, DTensor):
+                    device = "CPU" if i in self._cpu_arg_indices else None
+                    wrapped_args.append(DTensor.from_local(arg, layout, device=device))
+                else:
+                    wrapped_args.append(arg)
+            args = tuple(wrapped_args)
+            print(f"[DistributedCustomOp] wrapped args with layouts")
+
+        if not suffix:
+            return dispatcher._with_layout_infer(self._op, *args, **kwargs)
+        if suffix == "WithShape":
+            return dispatcher._with_layout_infer_with_shape(self._op, *args, **kwargs)
+        if suffix == "Reshape":
+            return dispatcher._with_layout_infer_reshape(self._op, *args)
+        if suffix == "WithTupleExpand":
+            return dispatcher._with_layout_infer_with_tuple_expand(self._op, *args, **kwargs)
+        if suffix == "Slice":
+            return dispatcher._with_layout_infer_slice(self._op, *args)
+
+        raise ValueError(f"Unknown infer_layout_suffix: {suffix}")
+
+    def __repr__(self):
+        return f"DistributedCustomOp({self._op})"
 
 
 def _has_kwargs(func):
@@ -98,9 +208,26 @@ def _parallel_out(outputs, layouts):
 
 def _forward_pre_hook(cell, args):
     """_forward_pre_hook"""
+    print(f"[shard._forward_pre_hook] cell={cell.__class__.__name__}, in_layout={cell.in_layout}")
+    print(f"[shard._forward_pre_hook] args types: {[type(a).__name__ for a in args]}")
     if cell.in_layout is None:
         return args
+
+    # Save DTensor layouts before MindSpore converts them to plain Tensor
+    # This allows DistributedCustomOp to access layout info even when construct receives Tensor
+    input_layouts = []
+    for i, arg in enumerate(args):
+        if isinstance(arg, DTensor):
+            input_layouts.append(arg.layout)
+        elif cell.in_layout and i < len(cell.in_layout):
+            input_layouts.append(cell.in_layout[i])
+        else:
+            input_layouts.append(None)
+    cell._current_input_layouts = tuple(input_layouts)
+    print(f"[shard._forward_pre_hook] saved _current_input_layouts to cell")
+
     processed_args, _ = _parallel_in(platform.get_cell_construct(cell), args, {}, cell.in_layout)
+    print(f"[shard._forward_pre_hook] processed_args types: {[type(a).__name__ for a in processed_args]}")
     return processed_args
 
 
@@ -229,6 +356,37 @@ def shard(model: Union[Module, Callable], sharding_plan: Dict):
     if forward_sharding_plan is not None:
         _register_hook(model, forward_sharding_plan)
     return model
+
+
+def distributed_op_call(op_call: Callable, *args, **kwargs):
+    """
+    Call a custom op with layout inference when DTensor inputs exist.
+
+    This API is intended for ms_custom_ops-style operators that are not built-in
+    MindSpore primitives and need explicit layout inference.
+    """
+    dispatcher = op_dispatch._OP_DISPATCHER
+    op_name = platform.get_op_name(op_call)
+    has_dtensor = any(isinstance(arg, DTensor) for arg in args) or any(
+        isinstance(value, DTensor) for value in kwargs.values()
+    )
+    if not has_dtensor:
+        return op_call(*args, **kwargs)
+    if op_name not in dispatcher.layout_infer_ops:
+        raise RuntimeError(f"Operator {op_name} does not contain parallel layout infer config.")
+
+    suffix = dispatcher.layout_infer_ops[op_name].get("infer_layout_suffix", "")
+    if not suffix:
+        return dispatcher._with_layout_infer(op_call, *args, **kwargs)
+    if suffix == "WithShape":
+        return dispatcher._with_layout_infer_with_shape(op_call, *args, **kwargs)
+    if suffix == "Reshape":
+        return dispatcher._with_layout_infer_reshape(op_call, *args)
+    if suffix == "WithTupleExpand":
+        return dispatcher._with_layout_infer_with_tuple_expand(op_call, *args, **kwargs)
+    if suffix == "Slice":
+        return dispatcher._with_layout_infer_slice(op_call, *args)
+    raise RuntimeError(f"Operator {op_name} specified wrong suffix in parallel yaml.")
 
 
 def parallelize_value_and_grad(fn, weights, sens=None):

@@ -16,6 +16,7 @@
 import copy as cp
 from hyper_parallel.core.layout import Layout
 from hyper_parallel.platform import get_platform
+from hyper_parallel.platform.platform import PlatformType
 platform = get_platform()
 DTensorBase = platform.DTensorBase
 Tensor = platform.Tensor
@@ -52,9 +53,28 @@ class DTensor(DTensorBase):
         return self._layout
 
     @staticmethod
-    def from_local(local_tensor: Tensor, layout: Layout):
-        d_tensor =  DTensor(local_tensor, layout)
-        return d_tensor
+    def _infer_cpu_device(local_tensor: Tensor):
+        try:
+            device_obj = local_tensor.device
+        except Exception:
+            return None
+        try:
+            device_str = str(device_obj)
+        except Exception:
+            return None
+        if "cpu" in device_str.lower():
+            return "CPU"
+        return None
+
+    @staticmethod
+    def from_local(local_tensor: Tensor, layout: Layout, device: str = None):
+        if device is None and getattr(platform, "platform_type", None) == PlatformType.MINDSPORE:
+            device = DTensor._infer_cpu_device(local_tensor)
+        if device is None:
+            return DTensor(local_tensor, layout)
+        if getattr(platform, "platform_type", None) == PlatformType.MINDSPORE:
+            return DTensor(local_tensor, layout, device=device)
+        return DTensor(local_tensor, layout)
 
     def to_local(self):
         """covert global_tensor to local_tensor"""

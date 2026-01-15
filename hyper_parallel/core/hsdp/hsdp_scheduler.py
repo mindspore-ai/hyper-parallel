@@ -119,6 +119,8 @@ class HSDPScheduler:
     # pylint: disable=W0613
     def _hsdp_forward_pre_hook(self, cell, inputs):
         """Forward pre hook to unsharded parameter for forward process."""
+        print(f"[hsdp._forward_pre_hook] cell={cell.__class__.__name__}")
+        print(f"[hsdp._forward_pre_hook] inputs types: {[type(i).__name__ for i in inputs]}")
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return
         self.scheduler_state = FSDPSchedulerState.PRE_FORWARD
