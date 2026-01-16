@@ -188,14 +188,6 @@ class TorchPlatform(Platform):
         return torch.cuda
 
     @staticmethod
-    def register_backward_pre_hook(cell, hook):
-        return cell.register_full_backward_pre_hook(hook)
-
-    @staticmethod
-    def register_backward_hook(cell, hook):
-        return cell.register_full_backward_hook(hook)
-
-    @staticmethod
     def get_param_type_size(param):
         # pylint: disable=W0212
         return torch._utils._element_size(param.dtype)

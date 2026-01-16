@@ -29,32 +29,45 @@ class MindSporeHSDPScheduler(HSDPScheduler):
     """MindSporeHSDPScheduler is used to implement optimizer level."""
 
     def _init_platform(self):
-        """init platform"""
+        """Initialize the platform."""
         if self.config.use_eager_hook:
             self.platform = get_platform()
         else:
             self.platform = MindSporeGraphPlatform()
 
     def _new_cell_state(self):
-        """new cell state"""
+        """Create a new cell state."""
         self.config.use_eager_hook = ms.get_context("mode") != ms.GRAPH_MODE
         self.hsdp_state = MindSporeHSDPState(self.cell, self.config, self.platform)
 
     def _new_grad_hook(self):
+        """Create a new grad hook."""
         if self.config.use_eager_hook and self.config.comm_async:
             self.grad_hook = MindSporeHSDPAsyncGradHook(self.config, self.platform)
         else:
             self.grad_hook = MindSporeHSDPGradHook(self.config, self.platform)
 
+    def _register_forward_backward_hooks(self):
+        """Register module forward and backward hook."""
+        self.cell.register_forward_pre_hook(self._hsdp_forward_pre_hook)
+        self.cell.register_backward_pre_hook(self._hsdp_backward_pre_hook)
+        if self.shard_level == OptimizerLevel.SHARD_OPT_GRAD_PARAM:
+            self.cell.register_forward_hook(self._hsdp_forward_hook)
+            self.cell.register_backward_hook(self._hsdp_backward_hook)
+        elif self.requires_acc_grad:
+            self.cell.register_backward_hook(self._hsdp_acc_backward_hook)
+        else:
+            self.cell.register_backward_hook(self._hsdp_backward_hook)
+
     def _register_hooks(self):
-        """register hooks"""
+        """Register hooks."""
         if self.config.use_eager_hook:
             super()._register_hooks()
         else:
             self._register_graph_hook()
 
     def _get_param_forward_hook(self, hsdp_param):
-        """get param forward hook."""
+        """Get param forward hook."""
 
         def stateless_param_forward_hook(origin_param):
             output, _ = self.platform.all_gather_into_tensor(origin_param, hsdp_param.sharded_group_info)
@@ -74,7 +87,7 @@ class MindSporeHSDPScheduler(HSDPScheduler):
         return stateful_param_forward_hook
 
     def _get_param_backward_hook(self, hsdp_param):
-        """get hook for param backward process."""
+        """Get hook for param backward process."""
         grad_hook = self.grad_hook.get_hook(hsdp_param)
         def backward_hook(grad):
             ops.assign(hsdp_param.unsharded_param_available, Tensor(False))
@@ -90,7 +103,7 @@ class MindSporeHSDPScheduler(HSDPScheduler):
         return backward_hook
 
     def _register_graph_hook(self):
-        """register param forward and grad hook."""
+        """Register param forward and grad hook."""
         for hsdp_param in self.hsdp_state.hsdp_params:
             if not hsdp_param.sharded:
                 hsdp_param.param.register_hook(self.grad_hook.get_hook(hsdp_param))
@@ -99,7 +112,7 @@ class MindSporeHSDPScheduler(HSDPScheduler):
                                                     self._get_param_backward_hook(hsdp_param))
 
     def _get_grad_buffer_hook(self, hsdp_param):
-        """set grad for hsdp parameter."""
+        """Set grad for hsdp parameter."""
         origin_hook = super()._get_grad_buffer_hook(hsdp_param)
         def set_grad_hook(grad):
             grad = origin_hook(grad)

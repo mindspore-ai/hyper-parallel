@@ -136,14 +136,6 @@ class Platform:
             raise ValueError("input stage_index must be positive.")
 
     @staticmethod
-    def register_forward_pre_hook(cell, hook):
-        return cell.register_forward_pre_hook(hook)
-
-    @staticmethod
-    def register_forward_hook(cell, hook):
-        return cell.register_forward_hook(hook)
-
-    @staticmethod
     def get_cell_construct(cell):
         raise NotImplementedError("Platform subclasses must implement get_cell_construct")
 
@@ -162,14 +154,6 @@ class Platform:
     @staticmethod
     def set_layout_into_parameter(param, layout):
         raise NotImplementedError("Platform subclasses must implement set_layout_into_parameter")
-
-    @staticmethod
-    def register_backward_pre_hook(cell, hook):
-        return cell.register_backward_pre_hook(hook)
-
-    @staticmethod
-    def register_backward_hook(cell, hook):
-        return cell.register_backward_hook(hook)
 
     @staticmethod
     def get_param_local_shape(param):
