@@ -179,8 +179,7 @@ run_model(x, model)
 
 3.  使用PipelineStage和PipelineSchedule进行流水线并行
 ```
-from hyper_parallel.platform.mindspore.pipeline_parallel.stage import PipelineStage
-from hyper_parallel.platform.mindspore.pipeline_parallel.schedule import Schedule1F1B
+from hyper_parallel import PipelineStage, Schedule1F1B
 
 # 将切分后的module封装成PipelineStage
 stage = PipelineStage(splited_model, stage_index, stage_num=4)
