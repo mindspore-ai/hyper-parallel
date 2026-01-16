@@ -19,7 +19,7 @@ This module contains test classes for validating various functions in the schedu
 
 import unittest
 import sys
-from hyper_parallel.platform.mindspore.pipeline_parallel.schedule import MetaStep, MetaStepType, validate_pipeline_execution, detect_cycle_in_graph, parse_and_validate, generate_operations
+from hyper_parallel.core.pipeline_parallel.scheduler import MetaStep, MetaStepType, validate_pipeline_execution, detect_cycle_in_graph, parse_and_validate, generate_operations
 
 sys.setrecursionlimit(10000)
 

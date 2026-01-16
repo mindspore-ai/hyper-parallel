@@ -16,6 +16,7 @@
 import mindspore as ms
 import mindspore.common.dtype as mstype
 from mindspore.nn import Cell
+from mindspore import mint
 from mindspore.common.dtype import type_size_in_bytes
 from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
@@ -25,8 +26,10 @@ from mindspore.communication import create_group as new_group
 from mindspore.communication import get_rank as get_rank_id
 from mindspore.communication import comm_func
 from mindspore._c_expression import TensorTransform
+import mindspore.mint.distributed as dist
 from hyper_parallel.platform.platform import Platform, PlatformType
 from hyper_parallel.platform.mindspore.dtensor import DTensorBase
+from hyper_parallel.platform.mindspore.pipeline_parallel.stage import PipelineStageBase
 from hyper_parallel.platform.mindspore.parameter_init import init_parameters as _init_parameters
 
 _tensor_transform = TensorTransform.get_instance()
@@ -38,12 +41,17 @@ class MindSporePlatform(Platform):
     Parameter = Parameter
     Module = Cell
     DTensorBase = DTensorBase
+    PipelineStageBase = PipelineStageBase
     platform_type = PlatformType.MINDSPORE
     tensor_dtype = mstype
 
     @staticmethod
     def get_rank():
         return get_rank_id()
+
+    @staticmethod
+    def get_global_rank(group, group_rank):
+        return dist.get_global_rank(group, group_rank)
 
     @staticmethod
     def get_world_size():
@@ -224,6 +232,30 @@ class MindSporePlatform(Platform):
         return tensor
 
     @staticmethod
+    def full_like(tensor, fill_value, dtype=None):
+        return mint.full_like(tensor, fill_value, dtype=dtype)
+
+    @staticmethod
+    def isend(tensor, dst=None, group=None, tag=0):
+        return dist.isend(tensor, dst, group, tag)
+
+    @staticmethod
+    def irecv(tensor, src=None, group=None, tag=0):
+        return dist.irecv(tensor, src, group, tag)
+
+    @staticmethod
+    def send_object_list(obj_list, dst=None, group=None):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.mindspore.pipeline_parallel._utils import send_object_list
+        send_object_list(obj_list, dst, group)
+
+    @staticmethod
+    def recv_object_list(obj_list, src=None, group=None):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.mindspore.pipeline_parallel._utils import recv_object_list
+        recv_object_list(obj_list, src, group)
+
+    @staticmethod
     def set_tensor_requires_grad(input_tensor):
         """
         set requires grad flag for input tensor
@@ -243,7 +275,18 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def all_reduce(data, group_info, async_op=False):
-        return comm_func.all_reduce(data, group=group_info.group_name, async_op=async_op)
+        if isinstance(group_info, str):
+            handle = dist.all_reduce(data, group=group_info, async_op=async_op)
+        else:
+            handle = dist.all_reduce(data, group=group_info.group_name, async_op=async_op)
+        return data, handle
+
+    @staticmethod
+    def broadcast(data, src, group, async_op=False):
+        handle = dist.broadcast(data, src, group, async_op)
+        if async_op:
+            handle.wait()
+        return data
 
     @staticmethod
     def reduce_scatter_tensor(data, group_info, async_op=False):
@@ -260,6 +303,12 @@ class MindSporePlatform(Platform):
     @staticmethod
     def construct_strided_slice(x, begin, end, stride):
         return ms.ops.strided_slice(x, begin, end, stride)
+
+    @staticmethod
+    def micro_batch(micro_batch_num, args_batch_dim=None, kwargs_batch_dim=None):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.mindspore.pipeline_parallel._utils import _MicroBatch
+        return _MicroBatch(micro_batch_num, args_batch_dim, kwargs_batch_dim)
 
     @staticmethod
     def save_checkpoint(cell: Cell, file_path: str) -> None:

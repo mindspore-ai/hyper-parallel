@@ -21,6 +21,7 @@ from torch._ops import OpOverload, OpOverloadPacket
 import torch.distributed.nn.functional as dist_func
 import torch.distributed as dist
 from hyper_parallel.platform.torch.dtensor import DTensorBase
+from hyper_parallel.platform.torch.pipeline_parallel.stage import PipelineStageBase
 from hyper_parallel.platform.torch.group_utils import create_sub_groups
 from hyper_parallel.platform.platform import Platform, PlatformType
 from hyper_parallel.platform.torch.function_override import override_functions
@@ -35,12 +36,17 @@ class TorchPlatform(Platform):
     Parameter = Parameter
     Module = Module
     DTensorBase = DTensorBase
+    PipelineStageBase = PipelineStageBase
     platform_type = PlatformType.PYTORCH
     tensor_dtype = torch
 
     @staticmethod
     def get_rank():
         return dist.get_rank()
+
+    @staticmethod
+    def get_global_rank(group, group_rank):
+        return dist.get_global_rank(group, group_rank)
 
     @staticmethod
     def get_world_size():
@@ -210,7 +216,11 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def new_tensor(tensor_shape, tensor_type, device):
-        return torch.empty(tensor_shape, dtype=tensor_type, device=device)
+        return torch.empty(size=tensor_shape, dtype=tensor_type, device=device)
+
+    @staticmethod
+    def full_like(tensor, fill_value, dtype=None):
+        return torch.full_like(tensor, fill_value, dtype=dtype)
 
     @staticmethod
     def set_tensor_requires_grad(input_tensor):
@@ -238,6 +248,28 @@ class TorchPlatform(Platform):
         return data, handle
 
     @staticmethod
+    def broadcast(data, src, group, async_op=False):
+        handle = dist.broadcast(data, src, group, async_op)
+        if async_op:
+            handle.wait()
+
+    @staticmethod
+    def isend(tensor, dst=None, group=None, tag=0):
+        return dist.isend(tensor, dst, group, tag)
+
+    @staticmethod
+    def irecv(tensor, src=None, group=None, tag=0):
+        return dist.irecv(tensor, src, group, tag)
+
+    @staticmethod
+    def send_object_list(obj_list, dst=None, group=None):
+        dist.send_object_list(obj_list, dst, group)
+
+    @staticmethod
+    def recv_object_list(obj_list, src=None, group=None):
+        dist.recv_object_list(obj_list, src, group)
+
+    @staticmethod
     def reduce_scatter_tensor(data, group_info, async_op=False):
         output_shape = list(data.shape)
         output_shape[0] = output_shape[0] // group_info.rank_size
@@ -252,6 +284,12 @@ class TorchPlatform(Platform):
     @staticmethod
     def construct_strided_slice(x, begin, end, stride):
         raise NotImplementedError("Unsupported construct_strided_slice for torch platform")
+
+    @staticmethod
+    def micro_batch(micro_batch_num, args_batch_dim=None, kwargs_batch_dim=None):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.pipeline_parallel._utils import _MicroBatch
+        return _MicroBatch(micro_batch_num, args_batch_dim, kwargs_batch_dim)
 
     def new_stream(self):
         device = self.get_device_handle()

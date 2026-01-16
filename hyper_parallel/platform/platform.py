@@ -100,6 +100,10 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement get_rank")
 
     @staticmethod
+    def get_global_rank(group, group_rank):
+        raise NotImplementedError("Platform subclasses must implement get_global_rank")
+
+    @staticmethod
     def get_world_size():
         raise NotImplementedError("Platform subclasses must implement get_world_size")
 
@@ -180,6 +184,10 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement new_tensor")
 
     @staticmethod
+    def full_like(tensor, fill_value, dtype=None):
+        raise NotImplementedError("Platform subclasses must implement full_like")
+
+    @staticmethod
     def set_tensor_requires_grad(input_tensor):
         raise NotImplementedError("Platform subclasses must implement set_tensor_requires_grad")
 
@@ -190,6 +198,26 @@ class Platform:
     @staticmethod
     def all_reduce(data, group_info, async_op=False):
         raise NotImplementedError("Platform subclasses must implement all_reduce")
+
+    @staticmethod
+    def broadcast(data, src, group, async_op=False):
+        raise NotImplementedError("Platform subclasses must implement broadcast")
+
+    @staticmethod
+    def isend(tensor, dst=None, group=None, tag=0):
+        raise NotImplementedError("Platform subclasses must implement isend")
+
+    @staticmethod
+    def irecv(tensor, src=None, group=None, tag=0):
+        raise NotImplementedError("Platform subclasses must implement irecv")
+
+    @staticmethod
+    def send_object_list(obj_list, dst=None, group=None):
+        raise NotImplementedError("Platform subclasses must implement send_object_list")
+
+    @staticmethod
+    def recv_object_list(obj_list, src=None, group=None):
+        raise NotImplementedError("Platform subclasses must implement send_object_list")
 
     @staticmethod
     def reduce_scatter_tensor(data, group_info, async_op=False):
@@ -223,6 +251,10 @@ class Platform:
     @staticmethod
     def construct_strided_slice(x, begin, end, stride):
         raise NotImplementedError("Platform subclasses must implement construct_strided_slice")
+
+    @staticmethod
+    def micro_batch(micro_batch_num, args_batch_dim=None, kwargs_batch_dim=None):
+        raise NotImplementedError("Platform subclasses must implement micro_batch")
 
     def create_group(self, rank_list, group_name=None):
         """create comm group with rank list"""

@@ -18,8 +18,8 @@ import torch
 # pylint: disable=W0611
 import torch_npu  # 昇腾NPU核心适配
 from hyper_parallel import DTensor, Layout, shard
-from hyper_parallel.platform.torch.pipeline_parallel.stage import PipelineStage
-from hyper_parallel.platform.torch.pipeline_parallel.schedule import ScheduleInterleaved1F1B
+from hyper_parallel import PipelineStage
+from hyper_parallel import ScheduleInterleaved1F1B
 from .simple_mlp import SimpleMLP, model_split_manual, run_standalone, init_hccl, get_stage_index, get_rank_list
 
 
