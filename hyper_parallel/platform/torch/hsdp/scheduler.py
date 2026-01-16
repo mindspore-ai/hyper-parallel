@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Torch HSDP scheduler"""
+import torch
 from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from hyper_parallel.core.hsdp.hsdp_utils import OptimizerLevel
@@ -47,9 +48,8 @@ class TorchHSDPScheduler(HSDPScheduler):
         else:
             self.grad_hook = TorchHSDPGradHook(self.config, self.platform)
 
-    def _forward_pre_hook(self, cell, args, kwargs):
-        """Execute forward pre hook and set up backward hook."""
-        self._hsdp_forward_pre_hook(cell, args)
+    def _register_backward_hook(self, args, kwargs):
+        """Register backward hook using backward function."""
         args_list, args_spec = tree_flatten(args)
         kwargs_list, kwargs_spec = tree_flatten(kwargs)
         args_kwargs_list = list(args_list) + list(kwargs_list)
@@ -60,11 +60,36 @@ class TorchHSDPScheduler(HSDPScheduler):
         kwargs = tree_unflatten(kwargs_list, kwargs_spec)
         return args, kwargs
 
+    def _forward_pre_hook(self, cell, args, kwargs):
+        """Execute forward pre hook and set up backward hook."""
+        self._hsdp_forward_pre_hook(cell, args)
+        return self._register_backward_hook(args, kwargs)
+
+    def _register_backward_pre_hook(self, outputs):
+        """Register output hook to trigger backward pre hook."""
+        flat_outputs, _ = tree_flatten(outputs)
+        for output in flat_outputs:
+            if isinstance(output, torch.Tensor) and output.requires_grad:
+                output.register_hook(self._backward_pre_hook)
+        return outputs
+
+    def _forward_hook(self, cell, inputs, outputs):
+        """Execute forward hook."""
+        self._register_backward_pre_hook(outputs)
+        if self.shard_level != OptimizerLevel.SHARD_OPT_GRAD_PARAM:
+            return
+        if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
+            return
+        self._hsdp_forward_hook(cell, inputs, outputs)
+
     # pylint: disable=W0212
-    def _backward_pre_hook(self, cell, grad_outputs):
+    def _backward_pre_hook(self, grad):
         """Execute backward pre hook."""
-        self._hsdp_backward_pre_hook(cell, grad_outputs)
+        if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
+            return grad
+        self._hsdp_backward_pre_hook(self.cell, None)
         Variable._execution_engine.queue_callback(self._backward_hook)
+        return grad
 
     def _backward_hook(self):
         """Execute backward hook."""
@@ -78,6 +103,4 @@ class TorchHSDPScheduler(HSDPScheduler):
     def _register_forward_backward_hooks(self):
         """Register module forward and backward hook."""
         self.cell.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
-        self.cell.register_full_backward_pre_hook(self._backward_pre_hook)
-        if self.shard_level == OptimizerLevel.SHARD_OPT_GRAD_PARAM:
-            self.cell.register_forward_hook(self._hsdp_forward_hook)
+        self.cell.register_forward_hook(self._forward_hook)
