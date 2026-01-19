@@ -15,3 +15,4 @@
 
 from .activation_checkpoint import CheckpointPolicy, checkpoint_wrapper
 from .swap import SwapManager
+from .activation_swap import swap_wrapper, ActivationPolicy
