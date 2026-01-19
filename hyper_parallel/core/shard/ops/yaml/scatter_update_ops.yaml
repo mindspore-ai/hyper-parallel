@@ -1,0 +1,4 @@
+ScatterUpdate:
+  dist_op_name: _scatter_update_dist_op
+  distributed_op_class: ScatterUpdateDistributedOp
+  distributed_op_file: parallel_scatter_update

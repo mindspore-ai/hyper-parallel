@@ -103,6 +103,8 @@ class OpDispatcher:
                           "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather",
                           "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__", "register_hook",
                           "is_complex", "chunk"]
+        # Ops requiring args unpacking for layout inference (packed as prim, name, real_args).
+        self.unpack_ops = ["ScatterUpdate"]
 
         self._register_distributed_ops()
 
@@ -184,11 +186,20 @@ class OpDispatcher:
 
     def _with_layout_infer(self, func: callable, *args, **kwargs) -> Tensor:
         """_with_layout_infer"""
+        func_name = platform.get_op_name(func)
+        packed_call = None
+        # Ops in unpack_ops use packed fallback args (e.g. ScatterUpdate: (prim_obj, op_name: str, (input_x, indices, updates))).
+        if(func_name in self.unpack_ops and len(args) == 3 and
+            isinstance(args[1], str) and isinstance(args[2],(tuple,list))):
+            packed_call = (args[0], args[1])
+            args = tuple(args[2])
+
         cache_key = LayoutCacheKey([])
         input_layouts = []
         extra_args = []
         input_args = []
 
+        # Normal ops pass real inputs directly (e.g. SumExt: args = (dtensor, axis: list, keep_dims: bool, dtype: None)).
         for arg in args:
             if arg is None:
                 input_layouts.append(None)
@@ -215,7 +226,6 @@ class OpDispatcher:
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
-        func_name = platform.get_op_name(func)
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
 
@@ -229,7 +239,10 @@ class OpDispatcher:
             output_layout = distribute_op.infer_layout(*all_args)
             op_layout_cache[cache_key] = output_layout
 
-        py_output = func(*input_args, **kwargs)
+        if packed_call is not None:
+            py_output = func(packed_call[0], packed_call[1], tuple(input_args), **kwargs)
+        else:
+            py_output = func(*input_args, **kwargs)
 
         if isinstance(py_output, (tuple, list)):
             output = ()
