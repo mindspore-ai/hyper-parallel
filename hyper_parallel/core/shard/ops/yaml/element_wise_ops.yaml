@@ -117,3 +117,9 @@ Minimum:
   distributed_op_class: ElementWiseDistributedOp 
   distributed_op_file: parallel_elementwise
   infer_layout_suffix: WithShape
+
+Mod:
+  dist_op_name: _mod_dist_op
+  distributed_op_class: ElementWiseDistributedOp
+  distributed_op_file: parallel_elementwise
+  infer_layout_suffix: WithShape

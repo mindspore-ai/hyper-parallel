@@ -261,3 +261,150 @@ class TestMinimumPartialShard(ElementWiseShellBase):
         Expectation: Run success.
         """
         self._run()
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+class TestModSameShape(ElementWiseShellBase):
+    """Shell launcher for Mod same-shape elementwise ST case."""
+
+    case_name = "test_mod_same_shape_parallel_12"
+    master_port = 11311
+
+    def test_mod_same_shape_parallel_12(self):
+        """
+        Feature: Mod operator.
+        Description: Test same-shape inputs with full parallel in python shard.
+        Expectation: Run success.
+        """
+        self._run()
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+class TestModBroadcastDim0(ElementWiseShellBase):
+    """Shell launcher for Mod broadcasting on dimension 0."""
+
+    case_name = "test_mod_broadcast_dim0_parallel_13"
+    master_port = 11312
+
+    def test_mod_broadcast_dim0_parallel_13(self):
+        """
+        Feature: Mod operator with broadcasting.
+        Description: Test broadcasting on dimension 0 (y: [1, 256, 128]) in python shard.
+        Expectation: Run success.
+        """
+        self._run()
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+class TestModBroadcastDim1(ElementWiseShellBase):
+    """Shell launcher for Mod broadcasting on dimension 1."""
+
+    case_name = "test_mod_broadcast_dim1_parallel_14"
+    master_port = 11313
+
+    def test_mod_broadcast_dim1_parallel_14(self):
+        """
+        Feature: Mod operator with broadcasting.
+        Description: Test broadcasting on dimension 1 (y: [16, 1, 128]) in python shard.
+        Expectation: Run success.
+        """
+        self._run()
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+class TestModBroadcastDim2(ElementWiseShellBase):
+    """Shell launcher for Mod broadcasting on dimension 2."""
+
+    case_name = "test_mod_broadcast_dim2_parallel_15"
+    master_port = 11314
+
+    def test_mod_broadcast_dim2_parallel_15(self):
+        """
+        Feature: Mod operator with broadcasting.
+        Description: Test broadcasting on dimension 2 (y: [16, 256, 1]) in python shard.
+        Expectation: Run success.
+        """
+        self._run()
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+class TestModBroadcastRankMismatch(ElementWiseShellBase):
+    """Shell launcher for Mod broadcasting with rank mismatch."""
+
+    case_name = "test_mod_broadcast_rank_mismatch_parallel_16"
+    master_port = 11315
+
+    def test_mod_broadcast_rank_mismatch_parallel_16(self):
+        """
+        Feature: Mod operator with broadcasting.
+        Description: Test rank mismatch broadcasting (y: [256, 128] -> [16, 256, 128]) in python shard.
+        Expectation: Run success.
+        """
+        self._run()
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+class TestModTensorScalar(ElementWiseShellBase):
+    """Shell launcher for Mod tensor-scalar."""
+
+    case_name = "test_mod_tensor_scalar_parallel_17"
+    master_port = 11316
+
+    def test_mod_tensor_scalar_parallel_17(self):
+        """
+        Feature: Mod operator with scalar.
+        Description: Test tensor-scalar mod (scalar must be constant) in python shard.
+        Expectation: Run success.
+        """
+        self._run()
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+class TestModPartialShard(ElementWiseShellBase):
+    """Shell launcher for Mod with partial sharding."""
+
+    case_name = "test_mod_partial_shard_parallel_18"
+    master_port = 11317
+
+    def test_mod_partial_shard_parallel_18(self):
+        """
+        Feature: Mod operator with partial sharding.
+        Description: Test partial sharding (only one dimension sharded) in python shard.
+        Expectation: Run success.
+        """
+        self._run()

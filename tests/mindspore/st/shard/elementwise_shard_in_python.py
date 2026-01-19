@@ -108,6 +108,25 @@ class LogicalOrNet(nn.Cell):
         return out
 
 
+class ModNet(nn.Cell):
+    """Mod network composed of mod operation and ReLU"""
+
+    def __init__(self, relu_strategy=None):
+        super().__init__()
+        self.mod = ops.Mod()
+        self.relu = ms.nn.ReLU()
+        if relu_strategy is not None:
+            stra = {"forward": {"input": relu_strategy}}
+            shard(self.relu, stra)
+
+    def construct(self, x, y):
+        out = self.mod(x, y)
+        out = ops.cast(out, ms.float32)
+        out = self.relu(out)
+        out = out + 1
+        return out
+
+
 def test_minimum_same_shape_parallel_1():
     """
     Feature: Minimum elementwise operation in python shard.
@@ -457,6 +476,229 @@ def test_minimum_partial_shard_parallel_11():
     y_local = global_to_local(y, y_layout)
 
     parallel_net = MinimumNet(relu_strategy=(layout("None", "None", "mp"),))
+    parallel_output = parallel_net(x_local, y_local)
+
+    # Validate
+    parallel_output = local_to_global(parallel_output)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+
+
+def test_mod_same_shape_parallel_12():
+    """
+    Feature: Mod elementwise operation in python shard.
+    Description: Test Mod with same-shape inputs in full parallel.
+    Expectation: Run success.
+    """
+    ms.set_seed(1)
+    np.random.seed(1)
+
+    d, m, k = 16, 256, 128
+    x = Tensor(np.random.randn(d, m, k).astype(np.float32))
+    # Avoid dividing by zero: shift distribution away from 0
+    y = Tensor((np.random.randn(d, m, k).astype(np.float32) + 0.5))
+
+    # Standalone
+    standalone_net = ModNet()
+    standalone_output = standalone_net(x, y)
+
+    # Parallel
+    layout = Layout(base_mesh_shape, base_alias_name)
+    x_layout = layout("dp", "cp", "mp")
+    y_layout = layout("dp", "cp", "mp")
+    x_local = global_to_local(x, x_layout)
+    y_local = global_to_local(y, y_layout)
+
+    parallel_net = ModNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    parallel_output = parallel_net(x_local, y_local)
+
+    # Validate
+    parallel_output = local_to_global(parallel_output)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+
+
+def test_mod_broadcast_dim0_parallel_13():
+    """
+    Feature: Mod elementwise operation with broadcasting in python shard.
+    Description: Test Mod with broadcasting on dimension 0 (y: [1, 256, 128]).
+    Expectation: Run success.
+    """
+    ms.set_seed(1)
+    np.random.seed(1)
+
+    d, m, k = 16, 256, 128
+    x = Tensor(np.random.randn(d, m, k).astype(np.float32))
+    y = Tensor((np.random.randn(1, m, k).astype(np.float32) + 0.5))  # Broadcast on dim 0
+
+    # Standalone
+    standalone_net = ModNet()
+    standalone_output = standalone_net(x, y)
+
+    # Parallel
+    layout = Layout(base_mesh_shape, base_alias_name)
+    x_layout = layout("dp", "cp", "mp")
+    y_layout = layout("None", "cp", "mp")  # Dimension 0 cannot be sharded
+    x_local = global_to_local(x, x_layout)
+    y_local = global_to_local(y, y_layout)
+
+    parallel_net = ModNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    parallel_output = parallel_net(x_local, y_local)
+
+    # Validate
+    parallel_output = local_to_global(parallel_output)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+
+
+def test_mod_broadcast_dim1_parallel_14():
+    """
+    Feature: Mod elementwise operation with broadcasting in python shard.
+    Description: Test Mod with broadcasting on dimension 1 (y: [16, 1, 128]).
+    Expectation: Run success.
+    """
+    ms.set_seed(1)
+    np.random.seed(1)
+
+    d, m, k = 16, 256, 128
+    x = Tensor(np.random.randn(d, m, k).astype(np.float32))
+    y = Tensor((np.random.randn(d, 1, k).astype(np.float32) + 0.5))  # Broadcast on dim 1
+
+    # Standalone
+    standalone_net = ModNet()
+    standalone_output = standalone_net(x, y)
+
+    # Parallel
+    layout = Layout(base_mesh_shape, base_alias_name)
+    x_layout = layout("dp", "cp", "mp")
+    y_layout = layout("dp", "None", "mp")  # Dimension 1 cannot be sharded
+    x_local = global_to_local(x, x_layout)
+    y_local = global_to_local(y, y_layout)
+
+    parallel_net = ModNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    parallel_output = parallel_net(x_local, y_local)
+
+    # Validate
+    parallel_output = local_to_global(parallel_output)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+
+
+def test_mod_broadcast_dim2_parallel_15():
+    """
+    Feature: Mod elementwise operation with broadcasting in python shard.
+    Description: Test Mod with broadcasting on dimension 2 (y: [16, 256, 1]).
+    Expectation: Run success.
+    """
+    ms.set_seed(1)
+    np.random.seed(1)
+
+    d, m, k = 16, 256, 128
+    x = Tensor(np.random.randn(d, m, k).astype(np.float32))
+    y = Tensor((np.random.randn(d, m, 1).astype(np.float32) + 0.5))  # Broadcast on dim 2
+
+    # Standalone
+    standalone_net = ModNet()
+    standalone_output = standalone_net(x, y)
+
+    # Parallel
+    layout = Layout(base_mesh_shape, base_alias_name)
+    x_layout = layout("dp", "cp", "mp")
+    y_layout = layout("dp", "cp", "None")  # Dimension 2 cannot be sharded
+    x_local = global_to_local(x, x_layout)
+    y_local = global_to_local(y, y_layout)
+
+    parallel_net = ModNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    parallel_output = parallel_net(x_local, y_local)
+
+    # Validate
+    parallel_output = local_to_global(parallel_output)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+
+
+def test_mod_broadcast_rank_mismatch_parallel_16():
+    """
+    Feature: Mod elementwise operation with broadcasting in python shard.
+    Description: Test Mod with rank mismatch (y: [256, 128] -> [16, 256, 128]).
+    Expectation: Run success.
+    """
+    ms.set_seed(1)
+    np.random.seed(1)
+
+    d, m, k = 16, 256, 128
+    x = Tensor(np.random.randn(d, m, k).astype(np.float32))
+    y = Tensor((np.random.randn(m, k).astype(np.float32) + 0.5))  # 2D -> 3D broadcasting
+
+    # Standalone
+    standalone_net = ModNet()
+    standalone_output = standalone_net(x, y)
+
+    # Parallel
+    layout = Layout(base_mesh_shape, base_alias_name)
+    x_layout = layout("dp", "cp", "mp")
+    y_layout = layout("cp", "mp")  # 2D layout
+    x_local = global_to_local(x, x_layout)
+    y_local = global_to_local(y, y_layout)
+
+    parallel_net = ModNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    parallel_output = parallel_net(x_local, y_local)
+
+    # Validate
+    parallel_output = local_to_global(parallel_output)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+
+
+def test_mod_tensor_scalar_parallel_17():
+    """
+    Feature: Mod elementwise operation with scalar in python shard.
+    Description: Test Mod with tensor-scalar input (scalar must be constant).
+    Expectation: Run success.
+    """
+    ms.set_seed(1)
+    np.random.seed(1)
+
+    d, m, k = 16, 256, 128
+    x = Tensor(np.random.randn(d, m, k).astype(np.float32))
+    y = 3.0  # constant scalar
+
+    # Standalone
+    standalone_net = ModNet()
+    standalone_output = standalone_net(x, y)
+
+    # Parallel
+    layout = Layout(base_mesh_shape, base_alias_name)
+    x_layout = layout("dp", "cp", "mp")
+    x_local = global_to_local(x, x_layout)
+
+    parallel_net = ModNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    parallel_output = parallel_net(x_local, y)
+
+    # Validate
+    parallel_output = local_to_global(parallel_output)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+
+
+def test_mod_partial_shard_parallel_18():
+    """
+    Feature: Mod elementwise operation in python shard.
+    Description: Test Mod with partial sharding (only one dimension sharded).
+    Expectation: Run success.
+    """
+    ms.set_seed(1)
+    np.random.seed(1)
+
+    d, m, k = 16, 256, 128
+    x = Tensor(np.random.randn(d, m, k).astype(np.float32))
+    y = Tensor((np.random.randn(d, m, k).astype(np.float32) + 0.5))
+
+    # Standalone
+    standalone_net = ModNet()
+    standalone_output = standalone_net(x, y)
+
+    # Parallel
+    layout = Layout(base_mesh_shape, base_alias_name)
+    x_layout = layout("None", "None", "mp")  # Only last dimension sharded
+    y_layout = layout("None", "None", "mp")
+    x_local = global_to_local(x, x_layout)
+    y_local = global_to_local(y, y_layout)
+
+    parallel_net = ModNet(relu_strategy=(layout("None", "None", "mp"),))
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate

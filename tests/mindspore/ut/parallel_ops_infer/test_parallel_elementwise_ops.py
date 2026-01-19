@@ -24,6 +24,7 @@ from hyper_parallel.core.shard.ops.parallel_elementwise import (
     GreaterEqualDistributedOp,
     LogicalOrDistributedOp,
     MinimumDistributedOp,
+    ModDistributedOp
 )
 
 
@@ -33,6 +34,7 @@ OPERATORS = [
     (GreaterEqualDistributedOp, "GreaterEqual"),
     (LogicalOrDistributedOp, "LogicalOr"),
     (MinimumDistributedOp, "Minimum"),
+    (ModDistributedOp, "Mod"),
 ]
 
 base_mesh_shape = (2, 2, 2)
