@@ -456,3 +456,10 @@ class MinimumDistributedOp(ElementWiseDistributedOp):
 
     def __init__(self, op_name="Minimum"):
         super().__init__(op_name)
+
+
+class ModDistributedOp(ElementWiseDistributedOp):
+    """Distributed implementation for Mod operator."""
+
+    def __init__(self, op_name="Mod"):
+        super().__init__(op_name)
