@@ -26,33 +26,29 @@ class EmbeddingDistributedOp(DistributedOp):
     def infer_layout(self, layouts, extra_args):
         """
         Infer output layout for Embedding operator.
+
         Args:
-            x_layout (Layout): Layout of input x
+            layouts (tuple): Layouts of input tensors.
+            extra_args (dict): Additional arguments.
+
         Returns:
-            tuple: Layout for output tensor
-        Raises:
-            ValueError: If input layouts have partial status.
+            Layout: Layout for output tensor
         """
-        # Check partial inputs
-        if not self._allow_partial_inputs:
-            self._check_partial_inputs(layouts)
+        # Step 1: Validate input length  FIRST
+        if len(layouts) < 2:
+            raise ValueError(f"Embedding requires at least 2 layouts (input, weight), but got {len(layouts)}")
 
-        # Check
-        if len(layouts) != 6:
-            raise ValueError(f"Embedding requires 6 layouts, but {len(layouts)}")
-        if len(extra_args) != 2:
-            raise ValueError(f"Embedding requires 2 extra args, but {len(extra_args)}")
 
-        # Parse input layout info
+        # Step 2: Now it is safe to extract common weight layout info
+        # MS: layouts[1] is weight
+        # Torch: embedding(input, weight), so layouts[1] is weight
         w_layout = layouts[1]
-
         w_dict = w_layout.to_dict()
-        w_tensor_map, w_aliases = w_dict["tensor_map"], w_dict["alias_name"]
-
+        w_tensor_map = w_dict["tensor_map"]
+        w_aliases = w_dict["alias_name"]
         mesh_shape = w_dict["mesh_shape"]
         rank_list = w_dict["rank_list"]
 
-        # Create output layout
         def idx_to_alias(idx, aliases):
             if idx == -1:
                 return "None"
@@ -60,20 +56,27 @@ class EmbeddingDistributedOp(DistributedOp):
 
         output_map = ()
 
-        out_aliases = w_aliases
-        if not (w_tensor_map[0] == -1 or mesh_shape[len(mesh_shape) - 1 - w_tensor_map[0]] == 1):
-            raise ValueError(
-                f"Operation {self.op_name}: Cannot perform sharding on params along the axis"
-            )
-        output_map += (-1, -1,)
-        for i in range(1, len(w_tensor_map)):
-            output_map += (len(w_tensor_map) - 1 - i,)
+        # Step 3: Specific Logic Calculation
+        # Inputs: input (indices), weight (table), [padding_idx, max_norm, ...]
+        input_layout = layouts[0]
+        inp_tensor_map = input_layout.tensor_map
 
-        output_map = tuple(idx_to_alias(idx, out_aliases) for idx in output_map)
+        # Output Layout Logic:
+        # 1. Inherit the distribution of the input indices (Batch/Seq dimensions)
+        output_map += inp_tensor_map
+
+        # 2. Inherit the distribution of the embedding dimension from the weight table.
+        if len(w_tensor_map) > 0:
+            embed_dim_map = w_tensor_map[-1]
+            output_map += (embed_dim_map,)
+
+        # Reconstruct final Layout object
+        output_aliases_tuple = tuple(idx_to_alias(idx, w_aliases) for idx in output_map)
+
         output_layout = Layout(
             mesh_shape=mesh_shape,
-            alias_name=out_aliases,
+            alias_name=w_aliases,
             rank_list=rank_list,
         )
-        output_layout = output_layout(*output_map)
-        return output_layout
+
+        return output_layout(*output_aliases_tuple)

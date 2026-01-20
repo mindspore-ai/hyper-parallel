@@ -47,7 +47,7 @@ def _filter_none_split_tensor_map(tensor_map, mesh_shape):
             elif len(filtered) == 1:
                 filtered_tensor_map.append(filtered[0])
             else:
-                filtered_tensor_map.append(filtered)
+                filtered_tensor_map.append(tuple(filtered))
         else:
             filtered_tensor_map.append(item if mesh_shape[-1 - item] != 1 else -1)
     return filtered_tensor_map
@@ -152,7 +152,9 @@ class ReshapeDistributedOp(DistributedOp):
 
         Args:
             layouts (Layout): Layout of input x
-            extra_args: (destination shape, original shape)
+            extra_args:
+                For MindSpore Reshape: (destination shape, original shape)
+                For PyTorch reshape/view: (shape_arg1, shape_arg2, ..., original shape) or (shape_tuple, original shape)
 
         Returns:
             tuple: Layout for output tensor
@@ -160,16 +162,41 @@ class ReshapeDistributedOp(DistributedOp):
         x_layout = layouts[0]
         x_dict = x_layout.to_dict()
 
-        if len(extra_args) != 2:
-            raise ValueError("Reshape requires output shape and input shape.")
-        # Check output shape.
-        dst_shape = extra_args[0]
+        dst_shape = None
+        input_shape = None
+
+        if self.op_name in ["reshape", "view"]:
+            # PyTorch style: extra_args contains shape args + input_shape (appended by system)
+            if len(extra_args) < 2:
+                raise ValueError(f"{self.op_name} requires output shape and input shape.")
+
+            input_shape = extra_args[-1]
+            shape_args = extra_args[:-1]
+
+            # Handle variable arguments vs tuple/list argument
+            if len(shape_args) == 1:
+                if isinstance(shape_args[0], (list, tuple)):
+                    dst_shape = shape_args[0]
+                elif isinstance(shape_args[0], Tensor):
+                    dst_shape = shape_args[0].tolist()
+                else:
+                    # Single int arg (e.g. flatten to 1D)
+                    dst_shape = shape_args
+            else:
+                dst_shape = shape_args
+        else:
+            # MindSpore Reshape style
+            if len(extra_args) != 2:
+                raise ValueError("Reshape requires output shape and input shape.")
+
+            dst_shape = extra_args[0]
+            input_shape = extra_args[1]
+
+        # Common processing
         if isinstance(dst_shape, Tensor):
             dst_shape = dst_shape.tolist()
         if not isinstance(dst_shape, list) and not isinstance(dst_shape, tuple):
             raise ValueError("Shape should be a tensor or a tuple or a list.")
-
-        input_shape = extra_args[1]
 
         x_map = _filter_none_split_tensor_map(x_dict["tensor_map"], x_dict["mesh_shape"])
         x_mesh_shape = x_dict["mesh_shape"]
