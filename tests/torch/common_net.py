@@ -61,3 +61,45 @@ class DenseMutiLayerNet(nn.Module):
             x = self.layers[i](x)
         x = torch.sum(x)
         return x
+
+
+class TransformerBlock(nn.Module):
+    """A simple Transformer block for testing purposes."""
+
+    def __init__(self, dim=256, num_heads=4):
+        super().__init__()
+        self.dim = dim
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.ReLU(),
+            nn.Linear(dim * 4, dim)
+        )
+
+    def forward(self, x):
+        attn_out, _ = self.attn(x, x, x)
+        x = x + attn_out
+        x = self.norm1(x)
+        x = x + self.ffn(x)
+        x = self.norm2(x)
+        return x
+
+
+class SimpleTransformer(nn.Module):
+    """A simple Transformer model for testing purposes."""
+
+    def __init__(self, vocab_size=1000, dim=2048, depth=6):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.layers = nn.ModuleList([TransformerBlock(dim) for _ in range(depth)])
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, vocab_size)
+
+    def forward(self, x):
+        x = self.embed(x)
+        for block in self.layers:
+            x = block(x)
+        x = self.norm(x)
+        return self.head(x)
