@@ -49,3 +49,9 @@ class DistributedOp:
         if layouts:
             return (layouts[0],)
         return None
+
+    def get_expand_impl(self, func, output_layout, layouts, extra_args):
+        """
+        Get expand implementation for the operator
+        """
+        return None

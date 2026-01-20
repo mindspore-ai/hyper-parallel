@@ -20,6 +20,10 @@ from hyper_parallel.core.shard.ops.parallel_matmul import LinearDistributedOp
 
 op = LinearDistributedOp("Linear")
 
+base_mesh_shape = (2, 4)
+base_alias_name = ("dp", "mp")
+base_rank_list = list(range(8))
+layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
 
 def test_linear_layout_data_parallel():
     """
@@ -27,15 +31,9 @@ def test_linear_layout_data_parallel():
     Description: Data parallel scenario
     Expectation: Success
     """
-    base_mesh_shape = (2, 4)
-    base_alias_name = ("dp", "mp")
-    base_rank_list = list(range(8))
-
     # Data Parallel (DP)
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("dp", "None")
-    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    w_layout = w_layout("None", "None")
+    x_layout = layout("dp", "None")
+    w_layout = layout("None", "None")
     output_layout = op.infer_layout((x_layout, w_layout, None), ())
     expected_map = (1, -1)  # Expected output tensor map
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
@@ -49,17 +47,10 @@ def test_linear_layout_hybrid_parallel():
     Description: Hybrid parallel scenario
     Expectation: Success
     """
-    base_mesh_shape = (2, 4)
-    base_alias_name = ("dp", "mp")
-    base_rank_list = list(range(8))
-
     # Hybrid Parallel (DP + MP)
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("dp", "None")
-    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    w_layout = w_layout("mp", "None")
-    bias_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    bias_layout = bias_layout("mp")
+    x_layout = layout("dp", "None")
+    w_layout = layout("mp", "None")
+    bias_layout = layout("mp")
     output_layout = op.infer_layout((x_layout, w_layout, bias_layout), ())
     expected_map = (1, 0)  # Expected output tensor map
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
@@ -72,15 +63,9 @@ def test_linear_layout_hybrid_tensor_parallel():
     Description: Hybrid tensor parallel scenario
     Expectation: Success
     """
-    base_mesh_shape = (2, 4)
-    base_alias_name = ("dp", "mp")
-    base_rank_list = list(range(8))
-
     # Hybrid Tensor Parallel
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("dp", "mp")
-    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    w_layout = w_layout("None", "mp")
+    x_layout = layout("dp", "mp")
+    w_layout = layout("None", "mp")
 
     # Test without transpose
     output_layout = op.infer_layout((x_layout, w_layout, None), ())
@@ -94,16 +79,44 @@ def test_linear_layout_hybrid_tensor_parallel_with_bias():
     Description: Hybrid tensor parallel scenario
     Expectation: raise error
     """
-    base_mesh_shape = (2, 4)
-    base_alias_name = ("dp", "mp")
-    base_rank_list = list(range(8))
-
     # Hybrid Tensor Parallel
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("dp", "mp")
-    w_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    w_layout = w_layout("None", "mp")
-    bias_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    bias_layout = bias_layout("None")
+    x_layout = layout("dp", "mp")
+    w_layout = layout("None", "mp")
+    bias_layout = layout("None")
     with pytest.raises(ValueError):
         _ = op.infer_layout((x_layout, w_layout, bias_layout), ())
+
+
+def test_linear_layout_partial_with_sharded_contract_dim():
+    """
+    Feature: Linear partial status with sharded contract dimension
+    Description: Test that partial status is set when contract dimension is sharded
+    Expectation: Success
+    """
+
+    # Contract dimension is sharded
+    x_layout = layout("dp", "mp")
+    w_layout = layout("None", "mp")
+    output_layout = op.infer_layout((x_layout, w_layout, None), ())
+
+    # Check that partial status is set for mp axis
+    expected_partial = [None, 'sum']
+    assert output_layout.partial == expected_partial, \
+        f"Partial status test failed. Expected {expected_partial}, got {output_layout.partial}"
+
+
+def test_linear_layout_partial_without_sharded_contract_dim():
+    """
+    Feature: Linear partial status without sharded contract dimension
+    Description: Test that partial status is None when contract dimension is not sharded
+    Expectation: Success
+    """
+    # Contract dimension is not sharded
+    x_layout = layout("dp", "None")
+    w_layout = layout("None", "mp")
+    output_layout = op.infer_layout((x_layout, w_layout, None), ())
+
+    # Check that partial status is None
+    expected_partial = [None, None]
+    assert output_layout.partial == expected_partial, \
+        f"Partial status test failed. Expected {expected_partial}, got {output_layout.partial}"

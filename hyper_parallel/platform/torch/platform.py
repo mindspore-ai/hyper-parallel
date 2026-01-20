@@ -244,6 +244,8 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def all_reduce(data, group_info, async_op=False):
+        if not data.is_contiguous():
+            data = data.contiguous()
         handle = dist.all_reduce(data, group=group_info.group, async_op=async_op)
         return data, handle
 

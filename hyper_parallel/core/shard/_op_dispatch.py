@@ -102,7 +102,8 @@ class OpDispatcher:
         self.whitelist = ["InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv", "typeof", "DistCommIsend",
                           "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather",
                           "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__", "register_hook",
-                          "is_complex", "chunk"]
+                          "is_complex", "chunk", "__bool__", "__len__", "__format__"]
+
         # Ops requiring args unpacking for layout inference (packed as prim, name, real_args).
         self.unpack_ops = ["ScatterUpdate", "Mod"]
 
@@ -231,18 +232,22 @@ class OpDispatcher:
 
         op_layout_cache = layout_cache[func_name]
 
+        distribute_op = cache_manager.distributed_op(func_name)
         if cache_key in op_layout_cache:
-            output_layout = op_layout_cache[cache_key]
+            output_layout, op_impl = op_layout_cache[cache_key]
         else:
-            distribute_op = cache_manager.distributed_op(func_name)
             all_args = (input_layouts, extra_args)
             output_layout = distribute_op.infer_layout(*all_args)
-            op_layout_cache[cache_key] = output_layout
+            op_impl = distribute_op.get_expand_impl(func, output_layout, input_layouts, extra_args)
+            op_layout_cache[cache_key] = (output_layout, op_impl)
+
+        if op_impl is None:
+            op_impl = func
 
         if packed_call is not None:
-            py_output = func(packed_call[0], packed_call[1], tuple(input_args), **kwargs)
+            py_output = op_impl(packed_call[0], packed_call[1], tuple(input_args), **kwargs)
         else:
-            py_output = func(*input_args, **kwargs)
+            py_output = op_impl(*input_args, **kwargs)
 
         if isinstance(py_output, (tuple, list)):
             output = ()
@@ -302,15 +307,19 @@ class OpDispatcher:
 
         op_layout_cache = layout_cache[func_name]
 
+        distribute_op = cache_manager.distributed_op(func_name)
         if cache_key in op_layout_cache:
-            output_layout = op_layout_cache[cache_key]
+            output_layout, op_impl = op_layout_cache[cache_key]
         else:
-            distribute_op = cache_manager.distributed_op(func_name)
             all_args = (input_layouts, extra_args)
             output_layout = distribute_op.infer_layout(*all_args)
-            op_layout_cache[cache_key] = output_layout
+            op_impl = distribute_op.get_expand_impl(func, output_layout, input_layouts, extra_args)
+            op_layout_cache[cache_key] = (output_layout, op_impl)
 
-        py_output = func(*input_args, **kwargs)
+        if op_impl is None:
+            op_impl = func
+
+        py_output = op_impl(*input_args, **kwargs)
 
         if isinstance(py_output, (tuple, list)):
             output = ()
@@ -355,18 +364,23 @@ class OpDispatcher:
 
         op_layout_cache = layout_cache[func_name]
 
+        distribute_op = cache_manager.distributed_op(func_name)
         if cache_key in op_layout_cache:
-            infer_output = op_layout_cache[cache_key]
+            infer_output, op_impl = op_layout_cache[cache_key]
         else:
-            distribute_op = cache_manager.distributed_op(func_name)
             all_args = (input_layouts, extra_args)
             infer_output = distribute_op.infer_layout(*all_args)
-            op_layout_cache[cache_key] = infer_output
+            op_impl = distribute_op.get_expand_impl(func, infer_output, input_layouts, extra_args)
+            op_layout_cache[cache_key] = (infer_output, op_impl)
 
         infer_output_tuple = infer_output
         local_shape = infer_output_tuple[1]
 
-        py_output = func(input_tensor.to_local(), local_shape)
+        if op_impl is None:
+            op_impl = func
+
+        py_output = op_impl(input_tensor.to_local(), local_shape)
+
         return DTensor.from_local(py_output, infer_output_tuple[0])
 
     def _with_layout_infer_with_shape(self, func: callable, *args, **kwargs) -> Tensor:
@@ -425,19 +439,23 @@ class OpDispatcher:
 
         op_layout_cache = layout_cache[func_name]
 
+        distribute_op = cache_manager.distributed_op(func_name)
         if cache_key in op_layout_cache:
-            output_layout = op_layout_cache[cache_key]
+            output_layout, op_impl = op_layout_cache[cache_key]
         else:
             extra_args.append(input_shapes)
-            distribute_op = cache_manager.distributed_op(func_name)
             all_args = (input_layouts, extra_args)
             output_layout = distribute_op.infer_layout(*all_args)
-            op_layout_cache[cache_key] = output_layout
+            op_impl = distribute_op.get_expand_impl(func, output_layout, input_layouts, extra_args)
+            op_layout_cache[cache_key] = (output_layout, op_impl)
+
+        if op_impl is None:
+            op_impl = func
 
         if packed_call is not None:
-            py_output = func(packed_call[0], packed_call[1], tuple(input_args), **kwargs)
+            py_output = op_impl(packed_call[0], packed_call[1], tuple(input_args), **kwargs)
         else:
-            py_output = func(*input_args, **kwargs)
+            py_output = op_impl(*input_args, **kwargs)
 
         # 设置输出布局
         if isinstance(py_output, (tuple, list)):
@@ -487,19 +505,24 @@ class OpDispatcher:
 
         op_layout_cache = layout_cache[func_name]
 
+        distribute_op = cache_manager.distributed_op(func_name)
         if cache_key in op_layout_cache:
-            infer_output = op_layout_cache[cache_key]
+            infer_output, op_impl = op_layout_cache[cache_key]
         else:
-            distribute_op = cache_manager.distributed_op(func_name)
             all_args = (input_layouts, extra_args)
             infer_output = distribute_op.infer_layout(*all_args)
-            op_layout_cache[cache_key] = infer_output
+            op_impl = distribute_op.get_expand_impl(func, infer_output, input_layouts, extra_args)
+            op_layout_cache[cache_key] = (infer_output, op_impl)
 
         infer_output_tuple = infer_output
         new_begin = infer_output_tuple[1]
         new_end = infer_output_tuple[2]
 
-        py_output = func(input_tensor.to_local(), new_begin, new_end)
+        if op_impl is None:
+            op_impl = func
+
+        py_output = op_impl(input_tensor.to_local(), new_begin, new_end)
+
         return DTensor.from_local(py_output, infer_output_tuple[0])
 
     def safe_load_yaml_from_dir(self):
