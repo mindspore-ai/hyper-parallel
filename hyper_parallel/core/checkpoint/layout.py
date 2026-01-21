@@ -27,25 +27,24 @@ def get_current_layout(cell):
     """
     Get current layout from cell
     Args:
-        cell: instance of Cell in MindSpore or Module in PyTorch
+        cell: instance of Cell
 
     Returns:
         dict: A dictionary where keys are rank IDs and values are dictionaries
             mapping parameter names to their layout information, including
             data type and full shape.
     """
-    layout_dict = {}
-    rank_id = str(platform.get_rank())
-    layout_dict[rank_id] = {}
+    current_rank = str(platform.get_rank())
+    layout_dict = {current_rank: {}}
 
     param_dict = platform.parameters_dict(cell)
-    for name, param in param_dict.items():
+    for name, param in param_dict:
         if name in layout_dict:
             raise RuntimeError("param in cell can not have same name")
         if param.layout:
-            layout_dict[rank_id][param.name] = param.layout.to_dict()
-            layout_dict[rank_id][param.name]["type"] = str(param.dtype)
-            layout_dict[rank_id][param.name]["full_shape"] = param.shape
+            layout_dict[current_rank][param.name] = param.layout.to_dict()
+            layout_dict[current_rank][param.name]["type"] = str(param.dtype)
+            layout_dict[current_rank][param.name]["full_shape"] = param.shape
 
     return layout_dict
 
@@ -98,3 +97,35 @@ def combine_layout(directory: Union[Path, str]) -> dict:
                 layout_dict[rank_id] = param_dict
 
     return layout_dict
+
+
+def get_global_layout(cell) -> dict:
+    """
+    Get global layout information from all ranks, and gather them into a dict.
+
+    Args:
+        cell: instance of Cell
+
+    Return:
+        dict: A dictionary containing the global layout information keyed by rank ID.
+    """
+    # global layout
+    global_layout_dict = {}
+
+    # prepare empty global_layout_list
+    global_layout_list = []
+    world_size = platform.get_world_size()
+    for _ in range(world_size):
+        global_layout_list.append(None)
+
+    # local layout
+    local_layout = get_current_layout(cell)
+
+    # all gather object
+    platform.all_gather_object(global_layout_list, local_layout)
+
+    # cast list to dict
+    for layout_dict in global_layout_list:
+        global_layout_dict.update(layout_dict)
+
+    return global_layout_dict
