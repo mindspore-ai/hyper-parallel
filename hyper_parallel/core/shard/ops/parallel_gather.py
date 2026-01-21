@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -134,3 +134,177 @@ class GatherDistributedOp(DistributedOp):
         )
         output_layout = output_layout(*output_tensor_map)
         return output_layout
+
+
+class GatherNdDistributedOp(DistributedOp):
+    """Distributed implementation for GatherNd operator."""
+
+    def infer_layout(self, layouts, extra_args):
+        """
+        Infer output layout for GatherNd.
+
+        For GatherNd: out.shape = indices.shape[:-1] + input_x.shape[K:], where K = indices.shape[-1].
+        This implementation:
+            - Inherits sharding only from indices[:-1].
+            - Forces all trailing dims from input_x[K:] to be replicated ("None").
+
+        Sharding Constraints:
+        - input_x (layouts[0]):
+            * Supported: fully replicated only (all dims must be "None").
+            * Unsupported: any sharding on input_x (would require cross-rank communication).
+        - indices (layouts[1]):
+            * Supported: indices[:-1] may be sharded.
+            * Unsupported: indices[-1] (K dim) cannot be sharded; it must be "None".
+
+        Output Layout:
+        output_tensor_map = indices_tensor_map[:-1] + ("None",) * (input_rank - K)
+
+        Args:
+            layouts: (input_x_layout, indices_layout, ...)
+            extra_args: must carry input_shapes from dispatcher.
+
+        Returns:
+           Layout for output tensor.
+        """
+        input_layout, indices_layout = self._parse_input_layouts(layouts)
+        indices_tensor_map = self._validate_tensor_maps(input_layout, indices_layout)
+
+        input_shape, indices_shape = self._get_input_shapes(extra_args)
+        trail_rank = self._get_trailing_rank(input_shape, indices_shape)
+
+        # Output shape: indices_shape[:-1] + input_shape[k:]
+        # Output sharding: inherit indices[:-1], trailing dims must be replicated.
+        output_tensor_map = tuple(indices_tensor_map[:-1]) + ("None",) * trail_rank
+
+        output_layout = Layout(
+            mesh_shape=indices_layout.mesh_shape,
+            alias_name=indices_layout.alias_name,
+            rank_list=indices_layout.rank_list,
+        )
+
+        if output_tensor_map:
+            output_layout = output_layout(*output_tensor_map)
+        else:
+            output_layout = output_layout("None")
+
+        return output_layout
+
+    def _parse_input_layouts(self, layouts):
+        """Parse and validate input layouts."""
+        if len(layouts) < 2:
+            raise ValueError(
+                f"Operation {self.op_name} requires at least 2 input layouts, but got {len(layouts)}"
+            )
+
+        input_layout, indices_layout = layouts[0], layouts[1]
+
+        # Extra inputs are allowed only when they are non-tensor args (layout is None).
+        for extra_layout in layouts[2:]:
+            if extra_layout is not None:
+                raise ValueError(
+                    f"Operation {self.op_name} only supports 2 tensor inputs, but got extra tensor layout: "
+                    f"{extra_layout}"
+                )
+
+        # For GatherNd: input_layout can be None (params fully replicated), but indices_layout must exist.
+        if indices_layout is None or not hasattr(indices_layout, "alias_tensor_map"):
+            raise ValueError(f"Operation {self.op_name}: Indices layout cannot be None")
+
+        return input_layout, indices_layout
+
+    def _validate_tensor_maps(self, input_layout, indices_layout):
+        """Validate tensor maps constraints for GatherNd."""
+        indices_tensor_map = indices_layout.alias_tensor_map
+
+        # Validate input only when layout is provided.
+        if input_layout is not None:
+            input_tensor_map = input_layout.alias_tensor_map
+            for axis_name in input_tensor_map:
+                if not self._is_none_axis(axis_name):
+                    raise ValueError(
+                        f"Operation {self.op_name}: input_x cannot be split on any dimension. "
+                        f"All dimensions must be 'None', but got tensor_map: {input_tensor_map}"
+                    )
+
+        # Validate: last dimension of indices cannot be split.
+        if not indices_tensor_map:
+            raise ValueError(f"Operation {self.op_name}: indices tensor_map cannot be empty")
+
+        last_axis = indices_tensor_map[-1]
+        if not self._is_none_axis(last_axis):
+            raise ValueError(
+                f"Operation {self.op_name}: The last dimension of indices cannot be split. "
+                f"Got indices[-1] = {last_axis}"
+            )
+
+        return indices_tensor_map
+
+    def _get_input_shapes(self, extra_args):
+        """Get input and indices shapes from extra_args (WithShape suffix required)."""
+        input_shapes = None
+        if extra_args and hasattr(extra_args[-1], "__len__") and len(extra_args[-1]) >= 2:
+            input_shapes = extra_args[-1]
+
+        if input_shapes is None:
+            raise ValueError(
+                f"Operation {self.op_name}: missing input_shapes in extra_args. "
+                f"Please configure yaml with infer_layout_suffix: WithShape."
+            )
+
+        input_shape = input_shapes[0]
+        indices_shape = input_shapes[1]
+        if input_shape is None or indices_shape is None:
+            raise ValueError(f"Operation {self.op_name}: input_shapes contains None: {input_shapes}")
+
+        input_shape = self._normalize_shape(input_shape, "input")
+        indices_shape = self._normalize_shape(indices_shape, "indices")
+
+        if len(indices_shape) < 1:
+            raise ValueError(f"Operation {self.op_name}: indices shape invalid: {indices_shape}")
+
+        return input_shape, indices_shape
+
+    def _normalize_shape(self, shape, name):
+        """Normalize shape-like object to tuple of int."""
+        try:
+            norm = tuple(shape)
+        except TypeError as err:
+            raise ValueError(f"Operation {self.op_name}: {name} shape is not iterable: {shape}") from err
+
+        try:
+            norm = tuple(int(dim) for dim in norm)
+        except (TypeError, ValueError) as err:
+            raise ValueError(f"Operation {self.op_name}: {name} shape contains non-integer dims: {norm}") from err
+
+        return norm
+
+    def _get_trailing_rank(self, input_shape, indices_shape):
+        """Compute trailing rank = len(input_shape) - K, where K is indices_shape[-1]."""
+        k = indices_shape[-1]
+        try:
+            k = int(k)
+        except (TypeError, ValueError) as err:
+            raise ValueError(f"Operation {self.op_name}: indices last dim (K) is invalid: {k}") from err
+
+        if k <= 0:
+            raise ValueError(f"Operation {self.op_name}: indices last dim (K) must be positive, but got {k}")
+
+        trail_rank = len(input_shape) - k
+        if trail_rank < 0:
+            raise ValueError(
+                f"Operation {self.op_name}: indices last dim (K={k}) is larger than input rank ({len(input_shape)})"
+            )
+
+        return trail_rank
+
+    def _is_none_axis(self, axis_name):
+        """
+        Check if an axis name represents no sharding.
+        """
+        if axis_name == "None":
+            return True
+
+        if isinstance(axis_name, tuple):
+            return all(name == "None" for name in axis_name)
+
+        return False
