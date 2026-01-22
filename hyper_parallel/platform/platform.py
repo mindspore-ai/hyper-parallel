@@ -303,3 +303,10 @@ class Platform:
         sync_event.wait()
         Platform.current_grad_handle = None
         Platform.post_grad_handle_process = None
+
+    @staticmethod
+    def all_gather_object(object_list, obj, group=None) -> None:
+        """
+        Aggregates all Python objects objs in a specified communication group into object_list.
+        """
+        raise NotImplementedError("Platform subclasses must implement all_gather_object")

@@ -200,7 +200,7 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def parameters_dict(cell: Module):
-        return cell.named_parameter()
+        return cell.named_parameters()
 
     @staticmethod
     def save_checkpoint(cell: Module, file_path: str) -> None:
@@ -300,3 +300,23 @@ class TorchPlatform(Platform):
     def get_stream_context(self):
         device = self.get_device_handle()
         return device.stream
+
+    @staticmethod
+    def all_gather_object(object_list, obj, group=None) -> None:
+        """
+        Gathers picklable objects from the whole group into a list.
+
+        Args:
+            object_list (list[Any]): Output list. It should be correctly sized as the
+                size of the group for this collective and will contain the output.
+            obj (Any): Pickable Python object to be broadcast from current process.
+            group (ProcessGroup, optional): The process group to work on. If None,
+                the default process group will be used. Default is ``None``.
+
+        Returns:
+            None. If the calling rank is part of this group, the output of the
+            collective will be populated into the input ``object_list``. If the
+            calling rank is not part of the group, the passed in ``object_list`` will
+            be unmodified.
+        """
+        dist.all_gather_object(object_list, obj, group)

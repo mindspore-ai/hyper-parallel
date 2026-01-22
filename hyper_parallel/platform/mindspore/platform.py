@@ -34,6 +34,7 @@ from hyper_parallel.platform.mindspore.parameter_init import init_parameters as 
 
 _tensor_transform = TensorTransform.get_instance()
 
+
 # pylint: disable=C0103
 class MindSporePlatform(Platform):
     """MindSpore platform api"""
@@ -294,7 +295,7 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def parameters_dict(cell: Cell):
-        return cell._params
+        return cell.parameters_and_names()
 
     @staticmethod
     def get_tensor_transform():
@@ -324,3 +325,16 @@ class MindSporePlatform(Platform):
 
     def get_stream_context(self):
         return ms.runtime.StreamCtx
+
+    @staticmethod
+    def all_gather_object(object_list, obj, group=None) -> None:
+        """
+        Aggregates Python objects in a specified communication group.
+
+        Args:
+            object_list (list[Any]): Output Python object list.
+            obj (Any): Python object to be broadcast from current process.
+            group (str, optional): The communication group to work on. If ``None``, which means ``"hccl_world_group"``
+                in Ascend. Default: ``None``.
+        """
+        dist.all_gather_object(object_list, obj, group)
