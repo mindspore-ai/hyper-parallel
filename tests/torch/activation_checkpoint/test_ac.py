@@ -13,100 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """Test Activation checkpoint memory comparison: None vs Recompute vs Save vs Swap"""
-import random
-import time
-from contextlib import contextmanager
-
-import numpy as np
 import torch
-from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
-
-from hyper_parallel.platform.torch.activation_checkpoint import (
-    CheckpointPolicy, SwapManager, checkpoint_wrapper)
 from tests.common.mark_utils import arg_mark
-
-
-def set_seed(seed=42):
-    """Set random seed for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.npu.is_available():
-        torch.npu.manual_seed(seed)
-        torch.npu.manual_seed_all(seed)
-
-
-@contextmanager
-def seed_memory_time_context(seed=42):
-    """Context manager to set seed, track peak memory and execution time."""
-    set_seed(seed)
-    torch.npu.reset_peak_memory_stats()
-    torch.npu.empty_cache()
-    start_time = time.time()
-
-    stats = {}
-
-    try:
-        yield stats
-    finally:
-        exec_time = time.time() - start_time
-        peak_mem_gb = torch.npu.max_memory_allocated() / (1024 ** 3)
-        torch.npu.empty_cache()
-        stats["peak_mem"] = peak_mem_gb
-        stats["exec_time"] = exec_time
-
-
-class TransformerBlock(nn.Module):
-    """A simple Transformer block for testing purposes."""
-
-    def __init__(self, dim=256, num_heads=4):
-        super().__init__()
-        self.dim = dim
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.ReLU(),
-            nn.Linear(dim * 4, dim)
-        )
-
-    def forward(self, x):
-        attn_out, _ = self.attn(x, x, x)
-        x = x + attn_out
-        x = self.norm1(x)
-        x = x + self.ffn(x)
-        x = self.norm2(x)
-        return x
-
-
-class SimpleTransformer(nn.Module):
-    """A simple Transformer model for testing purposes."""
-
-    def __init__(self, vocab_size=1000, dim=2048, depth=6):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, dim)
-        self.layers = nn.ModuleList([TransformerBlock(dim) for _ in range(depth)])
-        self.norm = nn.LayerNorm(dim)
-        self.head = nn.Linear(dim, vocab_size)
-
-    def forward(self, x):
-        x = self.embed(x)
-        for block in self.layers:
-            x = block(x)
-        x = self.norm(x)
-        return self.head(x)
-
-
-def prepare_data(batch_size=8, seq_len=512, num_samples=64):
-    dataset = TensorDataset(
-        torch.randint(0, 10000, (num_samples, seq_len)),
-        torch.randint(0, 10000, (num_samples, seq_len))
-    )
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    return dataloader
-
+from tests.torch.common_net import SimpleTransformer
+from hyper_parallel.platform.torch.activation_checkpoint import (
+    SwapManager, CheckpointPolicy, checkpoint_wrapper)
+from .utils import prepare_data, train_one_mode, seed_memory_time_context
 
 def apply_recompute(model, mode):
     """Apply activation checkpointing based on the specified mode."""
@@ -145,28 +57,6 @@ def apply_recompute(model, mode):
     return model
 
 
-def train_one_mode(mode, dataloader, train_steps=5):
-    """Run training for one mode and return metrics."""
-    with seed_memory_time_context() as stats:
-        model = SimpleTransformer(vocab_size=32000, dim=2048, depth=16).npu()
-        model = apply_recompute(model, mode)
-
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-        losses = []
-        for step, (x, y) in enumerate(dataloader):
-            if step >= train_steps:
-                break
-            x, y = x.npu(), y.npu()
-            optimizer.zero_grad()
-            logits = model(x)
-            loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-            loss.backward()
-            optimizer.step()
-            losses.append(loss.item())
-
-    return losses, stats.get("peak_mem"), stats.get("exec_time")
-
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_ac_memory_comparison():
     """
@@ -189,7 +79,11 @@ def test_ac_memory_comparison():
 
     for mode in modes:
         print(f"\n--- Running mode: {mode.upper()} ---")
-        losses, peak_mem, duration = train_one_mode(mode, dataloader, train_steps)
+        with seed_memory_time_context() as stats:
+            base_model = SimpleTransformer(vocab_size=32000, dim=2048, depth=16).npu()
+            model = apply_recompute(base_model, mode)
+            losses = train_one_mode(model, dataloader, train_steps)
+        peak_mem, duration = stats.get("peak_mem"), stats.get("exec_time")
         results[mode] = {
             "losses": losses,
             "peak_mem_gb": peak_mem,

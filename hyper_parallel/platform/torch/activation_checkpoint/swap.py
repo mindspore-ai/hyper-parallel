@@ -39,11 +39,11 @@ class SwapTensor:
 
         if isinstance(val, torch.Tensor) and not val.is_cpu:
             self._state = self.STATE_DEVICE
-            self.is_slice_tensor = val.untyped_storage().size() != val.numel()
+            self.is_slice_tensor = val.storage().size() != val.numel()
             self.val_cpu: Optional[torch.Tensor] = torch.empty_like(
                 val, device="cpu", pin_memory=True
             )
-            self.storage_size = val.untyped_storage().size()
+            self.storage_size = val.storage().size()
         else:
             self._state = self.STATE_NON_TENSOR
             self.val_cpu = None
@@ -71,11 +71,11 @@ class SwapTensor:
             return
 
         assert self.val_cpu is not None
-        self.val.untyped_storage().resize_(self.storage_size)
+        self.val.storage().resize_(self.storage_size)
         if self.is_slice_tensor:
             self.val.copy_(self.val_cpu, non_blocking=True)
         else:
-            self.val.untyped_storage().copy_(self.val_cpu.untyped_storage(), non_blocking=True)
+            self.val.storage().copy_(self.val_cpu.storage(), non_blocking=True)
         self._state = self.STATE_H2D
 
     def wait_load(self):
@@ -108,7 +108,7 @@ class SwapTensor:
         if self.is_slice_tensor:
             self.val_cpu.copy_(self.val, non_blocking=True)
         else:
-            self.val_cpu.untyped_storage().copy_(self.val.untyped_storage(), non_blocking=True)
+            self.val_cpu.storage().copy_(self.val.storage(), non_blocking=True)
         self._state = self.STATE_D2H
 
     def wait_offload(self):
@@ -124,7 +124,7 @@ class SwapTensor:
                 f"Expected 'd2h'. Skipped."
             )
             return
-        self.val.untyped_storage().resize_(0)
+        self.val.storage().resize_(0)
         self._state = self.STATE_HOST
 
     @property
