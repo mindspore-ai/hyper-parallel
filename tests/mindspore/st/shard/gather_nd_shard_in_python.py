@@ -132,48 +132,6 @@ def test_gathernd_partial_data_parallel_2():
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
-def test_gathernd_partial_model_parallel_with_trailing_dims_3():
-    """
-    Feature: GatherNd in python shard.
-    Description: Test GatherNd where K < input_rank, output contains trailing dims.
-                 Params is replicated; indices sharded by mp and last dim not sharded.
-    Expectation: Run success and match standalone.
-    """
-    ms.set_seed(1)
-    np.random.seed(1)
-
-    n, m, k = 16, 8, 32
-    x = Tensor(np.random.randn(n, m, k).astype(np.float32))
-    idx_np = np.stack([np.arange(n, dtype=np.int32), np.zeros([n], dtype=np.int32)], axis=1)  # [n, 2]
-    indices = Tensor(idx_np)
-
-    # Standalone
-    standalone_net = GatherNdNet()
-    standalone_output = standalone_net(x, indices)
-
-    # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-
-    x_layout = layout("None", "None", "None")
-    indices_layout = layout("mp", "None")
-
-    x_local = global_to_local(x, x_layout)
-    indices_local = global_to_local(indices, indices_layout)
-
-    # Output shape: [n, k] -> layout: ("mp", "None")
-    parallel_net = GatherNdNet(relu_strategy=(layout("mp", "None"),))
-
-    out_layout = layout("mp", "None")
-    net_stra = {"input": (x_layout, indices_layout), "output": (out_layout,)}
-    shard(parallel_net, net_stra)
-
-    parallel_output = parallel_net(x_local, indices_local)
-
-    # Validate
-    parallel_output = local_to_global(parallel_output)
-    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
-
-
 def test_gathernd_params_plain_tensor():
     """
     Feature: GatherNd in python shard.
@@ -211,5 +169,118 @@ def test_gathernd_params_plain_tensor():
     parallel_output = parallel_net(x, indices_local)  # x is plain Tensor
 
     # Validate
+    parallel_output = local_to_global(parallel_output)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+
+
+def test_gathernd_k1_trailing_dims_shard_3():
+    """
+    Feature: GatherNd in python shard.
+    Description: Test GatherNd with K=1, params sharded on trailing dims, indices sharded on indices[:-1].
+    Expectation: Run success and match standalone.
+    """
+    ms.set_seed(1)
+    np.random.seed(1)
+
+    n, m, k = 16, 8, 32
+    x = Tensor(np.random.randn(n, m, k).astype(np.float32))
+    indices = Tensor(np.arange(n, dtype=np.int32).reshape(n, 1))
+
+    standalone_net = GatherNdNet()
+    standalone_output = standalone_net(x, indices)
+
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
+
+    x_layout = layout("None", "cp", "mp")
+    indices_layout = layout("dp", "None")
+
+    x_local = global_to_local(x, x_layout)
+    indices_local = global_to_local(indices, indices_layout)
+
+    parallel_net = GatherNdNet(relu_strategy=(layout("dp", "cp", "mp"),))
+
+    out_layout = layout("dp", "cp", "mp")
+    net_stra = {"input": (x_layout, indices_layout), "output": (out_layout,)}
+    shard(parallel_net, net_stra)
+
+    parallel_output = parallel_net(x_local, indices_local)
+
+    parallel_output = local_to_global(parallel_output)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+
+
+def test_gathernd_k2_trailing_dim_shard_4():
+    """
+    Feature: GatherNd in python shard.
+    Description: Test GatherNd with K=2, params sharded on trailing dims, indices sharded on indices[:-1].
+    Expectation: Run success and match standalone.
+    """
+    ms.set_seed(1)
+    np.random.seed(1)
+
+    n, m, k = 16, 8, 32
+    x = Tensor(np.random.randn(n, m, k).astype(np.float32))
+    idx_np = np.stack([np.arange(n, dtype=np.int32), np.zeros([n], dtype=np.int32)], axis=1)
+    indices = Tensor(idx_np)
+
+    standalone_net = GatherNdNet()
+    standalone_output = standalone_net(x, indices)
+
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
+
+    x_layout = layout("None", "None", "cp")
+    indices_layout = layout("mp", "None")
+
+    x_local = global_to_local(x, x_layout)
+    indices_local = global_to_local(indices, indices_layout)
+
+    parallel_net = GatherNdNet(relu_strategy=(layout("mp", "cp"),))
+
+    out_layout = layout("mp", "cp")
+    net_stra = {"input": (x_layout, indices_layout), "output": (out_layout,)}
+    shard(parallel_net, net_stra)
+
+    parallel_output = parallel_net(x_local, indices_local)
+
+    parallel_output = local_to_global(parallel_output)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+
+
+def test_gathernd_k3_no_trailing_dims_5():
+    """
+    Feature: GatherNd in python shard.
+    Description: Test GatherNd with K=3 and input_rank=3, params replicated, indices sharded on indices[:-1].
+    Expectation: Run success and match standalone.
+    """
+    ms.set_seed(1)
+    np.random.seed(1)
+
+    n, m, k = 16, 8, 32
+    x = Tensor(np.random.randn(n, m, k).astype(np.float32))
+
+    idx0 = np.arange(n, dtype=np.int32)
+    idx1 = np.zeros([n], dtype=np.int32)
+    idx2 = np.zeros([n], dtype=np.int32)
+    indices = Tensor(np.stack([idx0, idx1, idx2], axis=1))
+
+    standalone_net = GatherNdNet()
+    standalone_output = standalone_net(x, indices)
+
+    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
+
+    x_layout = layout("None", "None", "None")
+    indices_layout = layout("mp", "None")
+
+    x_local = global_to_local(x, x_layout)
+    indices_local = global_to_local(indices, indices_layout)
+
+    parallel_net = GatherNdNet(relu_strategy=(layout("mp",),))
+
+    out_layout = layout("mp",)
+    net_stra = {"input": (x_layout, indices_layout), "output": (out_layout,)}
+    shard(parallel_net, net_stra)
+
+    parallel_output = parallel_net(x_local, indices_local)
+
     parallel_output = local_to_global(parallel_output)
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
