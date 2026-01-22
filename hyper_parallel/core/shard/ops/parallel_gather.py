@@ -144,37 +144,31 @@ class GatherNdDistributedOp(DistributedOp):
         Infer output layout for GatherNd.
 
         For GatherNd: out.shape = indices.shape[:-1] + input_x.shape[K:], where K = indices.shape[-1].
-        This implementation:
-            - Inherits sharding only from indices[:-1].
-            - Forces all trailing dims from input_x[K:] to be replicated ("None").
 
-        Sharding Constraints:
-        - input_x (layouts[0]):
-            * Supported: fully replicated only (all dims must be "None").
-            * Unsupported: any sharding on input_x (would require cross-rank communication).
-        - indices (layouts[1]):
-            * Supported: indices[:-1] may be sharded.
-            * Unsupported: indices[-1] (K dim) cannot be sharded; it must be "None".
+        This implementation:
+            - Inherits sharding from indices[:-1].
+            - Allows sharding on input_x trailing dims input_x[K:].
+            - Requires input_x[:K] to be replicated ("None") if input_layout is provided.
+            - Requires indices[-1] (K dim) to be replicated ("None").
 
         Output Layout:
-        output_tensor_map = indices_tensor_map[:-1] + ("None",) * (input_rank - K)
-
-        Args:
-            layouts: (input_x_layout, indices_layout, ...)
-            extra_args: must carry input_shapes from dispatcher.
-
-        Returns:
-           Layout for output tensor.
+        output_tensor_map = indices_tensor_map[:-1] + input_tensor_map[K:]
+        If input_layout is None, input trailing dims are treated as replicated ("None").
         """
         input_layout, indices_layout = self._parse_input_layouts(layouts)
-        indices_tensor_map = self._validate_tensor_maps(input_layout, indices_layout)
 
         input_shape, indices_shape = self._get_input_shapes(extra_args)
-        trail_rank = self._get_trailing_rank(input_shape, indices_shape)
+        k, trail_rank = self._get_k_and_trailing_rank(input_shape, indices_shape)
 
-        # Output shape: indices_shape[:-1] + input_shape[k:]
-        # Output sharding: inherit indices[:-1], trailing dims must be replicated.
-        output_tensor_map = tuple(indices_tensor_map[:-1]) + ("None",) * trail_rank
+        input_tensor_map, indices_tensor_map = self._validate_tensor_maps(
+            input_layout, indices_layout, k
+        )
+
+        # Output sharding: inherit indices[:-1] + input_x[K:].
+        if input_tensor_map is None:
+            output_tensor_map = tuple(indices_tensor_map[:-1]) + ("None",) * trail_rank
+        else:
+            output_tensor_map = tuple(indices_tensor_map[:-1]) + tuple(input_tensor_map[k:])
 
         output_layout = Layout(
             mesh_shape=indices_layout.mesh_shape,
@@ -206,27 +200,17 @@ class GatherNdDistributedOp(DistributedOp):
                     f"{extra_layout}"
                 )
 
-        # For GatherNd: input_layout can be None (params fully replicated), but indices_layout must exist.
+        # For GatherNd: input_layout can be None (treated as fully replicated), but indices_layout must exist.
         if indices_layout is None or not hasattr(indices_layout, "alias_tensor_map"):
             raise ValueError(f"Operation {self.op_name}: Indices layout cannot be None")
 
         return input_layout, indices_layout
 
-    def _validate_tensor_maps(self, input_layout, indices_layout):
+    def _validate_tensor_maps(self, input_layout, indices_layout, k):
         """Validate tensor maps constraints for GatherNd."""
         indices_tensor_map = indices_layout.alias_tensor_map
 
-        # Validate input only when layout is provided.
-        if input_layout is not None:
-            input_tensor_map = input_layout.alias_tensor_map
-            for axis_name in input_tensor_map:
-                if not self._is_none_axis(axis_name):
-                    raise ValueError(
-                        f"Operation {self.op_name}: input_x cannot be split on any dimension. "
-                        f"All dimensions must be 'None', but got tensor_map: {input_tensor_map}"
-                    )
-
-        # Validate: last dimension of indices cannot be split.
+        # Validate: indices tensor_map must exist and last dimension cannot be split.
         if not indices_tensor_map:
             raise ValueError(f"Operation {self.op_name}: indices tensor_map cannot be empty")
 
@@ -237,7 +221,26 @@ class GatherNdDistributedOp(DistributedOp):
                 f"Got indices[-1] = {last_axis}"
             )
 
-        return indices_tensor_map
+        # Validate input only when layout is provided.
+        input_tensor_map = None
+        if input_layout is not None:
+            input_tensor_map = input_layout.alias_tensor_map
+
+            if k > len(input_tensor_map):
+                raise ValueError(
+                    f"Operation {self.op_name}: indices last dim (K={k}) is larger than input rank "
+                    f"({len(input_tensor_map)})"
+                )
+
+            # Indexed dims [0:K) must be replicated.
+            for axis_name in input_tensor_map[:k]:
+                if not self._is_none_axis(axis_name):
+                    raise ValueError(
+                        f"Operation {self.op_name}: input_x cannot be split on indexed dims [0:{k}). "
+                        f"These dims must be 'None', but got tensor_map: {input_tensor_map}"
+                    )
+
+        return input_tensor_map, indices_tensor_map
 
     def _get_input_shapes(self, extra_args):
         """Get input and indices shapes from extra_args (WithShape suffix required)."""
@@ -278,8 +281,8 @@ class GatherNdDistributedOp(DistributedOp):
 
         return norm
 
-    def _get_trailing_rank(self, input_shape, indices_shape):
-        """Compute trailing rank = len(input_shape) - K, where K is indices_shape[-1]."""
+    def _get_k_and_trailing_rank(self, input_shape, indices_shape):
+        """Compute K and trailing rank = len(input_shape) - K, where K is indices_shape[-1]."""
         k = indices_shape[-1]
         try:
             k = int(k)
@@ -295,7 +298,7 @@ class GatherNdDistributedOp(DistributedOp):
                 f"Operation {self.op_name}: indices last dim (K={k}) is larger than input rank ({len(input_shape)})"
             )
 
-        return trail_rank
+        return k, trail_rank
 
     def _is_none_axis(self, axis_name):
         """

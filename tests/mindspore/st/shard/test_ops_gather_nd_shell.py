@@ -47,21 +47,7 @@ def test_gathernd_partial_data_parallel_2():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gathernd_partial_model_parallel_with_trailing_dims_3():
-    '''
-    Feature: GatherNd operator.
-    Description: Test GatherNd model parallel in python shard where output contains trailing dims.
-    Expectation: Run success.
-    '''
-    glog_v = 2
-    file_name = "gather_nd_shard_in_python.py"
-    case_name = "test_gathernd_partial_model_parallel_with_trailing_dims_3"
-    master_port = 11302
-    msrun_case(glog_v, file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gathernd_params_plain_tensor_4():
+def test_gathernd_params_plain_tensor_3():
     '''
     Feature: GatherNd operator.
     Description: Test GatherNd where params is plain Tensor in python shard.
@@ -71,4 +57,46 @@ def test_gathernd_params_plain_tensor_4():
     file_name = "gather_nd_shard_in_python.py"
     case_name = "test_gathernd_params_plain_tensor"
     master_port = 11303
+    msrun_case(glog_v, file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gathernd_k1_trailing_dims_shard_4():
+    '''
+    Feature: GatherNd operator.
+    Description: Test GatherNd with K=1 and shard params trailing dims in python shard.
+    Expectation: Run success.
+    '''
+    glog_v = 2
+    file_name = "gather_nd_shard_in_python.py"
+    case_name = "test_gathernd_k1_trailing_dims_shard_3"
+    master_port = 11303
+    msrun_case(glog_v, file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gathernd_k2_trailing_dim_shard_5():
+    '''
+    Feature: GatherNd operator.
+    Description: Test GatherNd with K=2 and shard params trailing dims in python shard.
+    Expectation: Run success.
+    '''
+    glog_v = 2
+    file_name = "gather_nd_shard_in_python.py"
+    case_name = "test_gathernd_k2_trailing_dim_shard_4"
+    master_port = 11304
+    msrun_case(glog_v, file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gathernd_k3_no_trailing_dims_6():
+    '''
+    Feature: GatherNd operator.
+    Description: Test GatherNd with K=3 and no params trailing dims in python shard.
+    Expectation: Run success.
+    '''
+    glog_v = 2
+    file_name = "gather_nd_shard_in_python.py"
+    case_name = "test_gathernd_k3_no_trailing_dims_5"
+    master_port = 11305
     msrun_case(glog_v, file_name, case_name, master_port)
