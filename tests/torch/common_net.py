@@ -103,3 +103,16 @@ class SimpleTransformer(nn.Module):
             x = block(x)
         x = self.norm(x)
         return self.head(x)
+
+class FullyShardTestNet(nn.Module):
+    """net for fully_shard test"""
+    def __init__(self, dense_hidden, dense_layer_num, has_bias=True):
+        super().__init__()
+        self.w1 = nn.Parameter(torch.rand(dense_hidden, dense_hidden).npu())
+        self.dense_layers = DenseMutiLayerNet(dense_hidden, dense_layer_num, has_bias)
+
+    def forward(self, x):
+        w1_out = torch.matmul(x, self.w1)
+        layers_out = self.dense_layers(w1_out)
+        out = torch.sum(layers_out)
+        return out
