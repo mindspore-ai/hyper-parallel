@@ -54,3 +54,15 @@ def test_distributed_linear_with_bias_shard():
     file_name = "parallel_op_linear.py"
     case_name = "test_distributed_linear_with_bias_shard"
     torchrun_case(file_name, case_name, master_port)
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_distributed_linear_with_elementwise_ops():
+    '''
+    Feature: test parallel op linear with elementwise ops.
+    Description: test parallel op linear with elementwise ops.
+    Expectation: Run success.
+    '''
+    master_port = 11002
+    file_name = "parallel_op_elementwise.py"
+    case_name = "test_distributed_linear_with_elementwise_ops"
+    torchrun_case(file_name, case_name, master_port)

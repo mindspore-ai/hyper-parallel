@@ -1,90 +1,64 @@
-add:
-  dist_op_name: _torch_add_dist_op
+__default__:
   distributed_op_class: ElementWiseDistributedOp
   distributed_op_file: parallel_elementwise
 
 relu:
   dist_op_name: _torch_relu_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
 
-sub:
-  dist_op_name: _torch_sub_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
+__rsub__:
+  dist_op_name: _torch___sub___dist_op
 
-mul:
-  dist_op_name: _torch_mul_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
+clone:
+  dist_op_name: _torch_clone_dist_op
+  distributed_op_class: ElementWiseWithPartialDistributedOp
 
-div:
-  dist_op_name: _torch_div_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
+__invert__:
+  dist_op_name: _torch___invert___dist_op
 
-floor_div:
-  dist_op_name: _torch_floor_div_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
+gelu:
+  dist_op_name: _torch_gelu_dist_op
 
-real_div:
-  dist_op_name: _torch_real_div_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
+abs:
+  dist_op_name: _torch_abs_dist_op
+
+long:
+  dist_op_name: _torch_long_dist_op
+
+int:
+  dist_op_name: _torch_int_dist_op
+
+float:
+  dist_op_name: _torch_float_dist_op
+
+rsqrt:
+  dist_op_name: _torch_rsqrt_dist_op
 
 sigmoid:
   dist_op_name: _torch_sigmoid_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
 
 silu:
   dist_op_name: _torch_silu_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
 
 cos:
   dist_op_name: _torch_cos_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
 
 sin:
   dist_op_name: _torch_sin_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
 
 log:
   dist_op_name: _torch_log_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
 
 neg:
   dist_op_name: _torch_neg_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
 
 exp:
   dist_op_name: _torch_exp_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
-
-not_equal:
-  dist_op_name: _torch_not_equal_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
 
 cast:
   dist_op_name: _torch_cast_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
 
 contiguous:
   dist_op_name: _torch_contiguous_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
 
 square:
   dist_op_name: _torch_square_dist_op
-  distributed_op_class: ElementWiseDistributedOp
-  distributed_op_file: parallel_elementwise
-

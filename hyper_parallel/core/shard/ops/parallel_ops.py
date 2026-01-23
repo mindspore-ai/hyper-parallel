@@ -31,6 +31,28 @@ class DistributedOp:
     def __init__(self, op_name):
         self.op_name = op_name
         register_distributed_op(op_name, self)
+        self._allow_partial_inputs = False
+
+    def _check_partial_inputs(self, layouts):
+        """
+        Check if any input layout has partial status and raise an error if not allowed.
+
+        This method can be called by subclasses to enforce that partial inputs
+        are not supported for a particular operator. Subclasses that support
+        partial inputs should not call this method.
+
+        Args:
+            layouts (tuple): Layouts of input tensor.
+
+        Raises:
+            ValueError: If any input layout has partial status.
+        """
+        for i, layout in enumerate(layouts):
+            if layout is not None and layout.is_partial():
+                raise ValueError(
+                    f"For {self.op_name}, input {i} with {layout} has Partial status which is not allowed. "
+                    f"Should be without Partial status for this operation."
+                )
 
     # pylint: disable=W0613
     def infer_layout(self, layouts, extra_args):
@@ -38,6 +60,7 @@ class DistributedOp:
         Infer output layouts based on input layouts.
 
         Default implementation returns the first input layout for element-wise operations.
+        Subclasses can override this method to provide custom layout inference logic.
 
         Args:
             layouts (tuple): Layouts of input tensor.
@@ -46,6 +69,10 @@ class DistributedOp:
         Returns:
             tuple: Layouts for output tensors.
         """
+        # Check partial inputs
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs(layouts)
+
         if layouts:
             return (layouts[0],)
         return None

@@ -30,7 +30,13 @@ class EmbeddingDistributedOp(DistributedOp):
             x_layout (Layout): Layout of input x
         Returns:
             tuple: Layout for output tensor
+        Raises:
+            ValueError: If input layouts have partial status.
         """
+        # Check partial inputs
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs(layouts)
+
         # Check
         if len(layouts) != 6:
             raise ValueError(f"Embedding requires 6 layouts, but {len(layouts)}")

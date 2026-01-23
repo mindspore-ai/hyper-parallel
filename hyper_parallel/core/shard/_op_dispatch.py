@@ -525,6 +525,24 @@ class OpDispatcher:
 
         return DTensor.from_local(py_output, infer_output_tuple[0])
 
+    def _merge_default(self, config: dict):
+        """Apply __default__ values to all ops in this YAML file."""
+        if "__default__" not in config:
+            return config
+
+        default_cfg = config["__default__"]
+        merged = {}
+
+        for op_name, op_cfg in config.items():
+            if op_name == "__default__":
+                continue
+
+            new_cfg = default_cfg.copy()
+            new_cfg.update(op_cfg)
+            merged[op_name] = new_cfg
+
+        return merged
+
     def safe_load_yaml_from_dir(self):
         """
         Load yaml dictionary from directory.
@@ -537,6 +555,8 @@ class OpDispatcher:
         for yaml_file_path in glob.glob(os.path.join(yaml_path, '*.yaml')):
             with open(yaml_file_path, 'r', encoding="utf-8") as f:
                 yaml_data = yaml.safe_load(f)
+
+            yaml_data = self._merge_default(yaml_data)
             for name, data in yaml_data.items():
                 if name in yaml_dict:
                     raise ValueError(f"Duplicate yaml object with name '{name}'.")

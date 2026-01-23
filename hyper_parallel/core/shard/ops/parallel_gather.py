@@ -35,8 +35,12 @@ class IndexSelectDistributedOp(DistributedOp):
             tuple: Layout for output tensor.
 
         Raises:
-            ValueError: If input layouts are not compatible.
+            ValueError: If input layouts are not compatible or have partial status.
         """
+        # Check partial inputs
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs(layouts)
+
         # Check
         if len(layouts) != 3:
             raise ValueError(f"Gather ops requires 3 layouts, but {len(layouts)}")
@@ -94,8 +98,12 @@ class GatherDistributedOp(DistributedOp):
             tuple: Layout for output tensor.
 
         Raises:
-            ValueError: If input layouts are not compatible.
+            ValueError: If input layouts are not compatible or have partial status.
         """
+        # Check partial inputs
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs(layouts)
+
         # Check
         if len(layouts) != 3:
             raise ValueError(f"Gather ops requires 3 layouts, but {len(layouts)}")
