@@ -25,7 +25,7 @@ from typing import Optional, Callable, Any
 import torch
 from torch import nn
 from torch.distributed.utils import _replace_by_prefix
-from .swap import Storage, SwapManager, SwapTensor
+from hyper_parallel.core.activation_checkpoint.swap import SwapManager, SwapTensor, Storage
 
 
 _SWAP_WRAPPED_MODULE = "_swap_wrapped_module"

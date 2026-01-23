@@ -14,11 +14,13 @@
 # ============================================================================
 """Test Activation checkpoint memory comparison: None vs Recompute vs Save vs Swap"""
 import torch
+
+from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, checkpoint_wrapper
 from tests.common.mark_utils import arg_mark
 from tests.torch.common_net import SimpleTransformer
-from hyper_parallel.platform.torch.activation_checkpoint import (
-    SwapManager, CheckpointPolicy, checkpoint_wrapper)
-from .utils import prepare_data, train_one_mode, seed_memory_time_context
+
+from .utils import prepare_data, seed_memory_time_context, train_one_mode
+
 
 def apply_recompute(model, mode):
     """Apply activation checkpointing based on the specified mode."""
@@ -40,7 +42,7 @@ def apply_recompute(model, mode):
             return CheckpointPolicy.MUST_RECOMPUTE
 
         for i, layer in enumerate(model.layers):
-            model.layers[i] = checkpoint_wrapper(layer, policy_fn=policy_fn)
+            model.layers[i] = checkpoint_wrapper(layer, policy_fn=policy_fn, swap_inputs=True)
 
         for i in range(len(model.layers) - 1):
             SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])

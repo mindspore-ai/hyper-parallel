@@ -15,8 +15,10 @@
 """MindSpore platform api"""
 import mindspore as ms
 import mindspore.common.dtype as mstype
+
 from mindspore.nn import Cell
 from mindspore import mint
+from mindspore.common.api import _no_grad
 from mindspore.common.dtype import type_size_in_bytes
 from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
@@ -36,6 +38,8 @@ _tensor_transform = TensorTransform.get_instance()
 
 
 # pylint: disable=C0103
+
+
 class MindSporePlatform(Platform):
     """MindSpore platform api"""
     Tensor = Tensor
@@ -338,3 +342,68 @@ class MindSporePlatform(Platform):
                 in Ascend. Default: ``None``.
         """
         dist.all_gather_object(object_list, obj, group)
+
+    @staticmethod
+    def no_grad():
+        return _no_grad()
+
+    @staticmethod
+    def empty_like(tensor, *, dtype=None, device=None, pin_memory=False):
+        return mint.empty_like(tensor, dtype=dtype, device=device, pin_memory=pin_memory)
+
+    def get_current_stream(self):
+        return ms.runtime.current_stream()
+
+    def new_event(self):
+        return ms.runtime.Event()
+
+    def tree_map(self, fn, tree):
+        """
+        Apply fn to each leaf in a nested structure (list / tuple / dict),
+        preserving the original structure.
+        """
+        if isinstance(tree, dict):
+            return type(tree)(
+                (k, self.tree_map(fn, v)) for k, v in tree.items()
+            )
+
+        if isinstance(tree, tuple):
+            return tuple(self.tree_map(fn, v) for v in tree)
+
+        if isinstance(tree, list):
+            return [self.tree_map(fn, v) for v in tree]
+
+        # leaf
+        return fn(tree)
+
+    @staticmethod
+    def register_forward_pre_hook(module, hook, prepend=False, with_kwargs=False):
+        return module.register_forward_pre_hook(hook, with_kwargs)
+
+    @staticmethod
+    def register_full_backward_hook(module, hook, prepend=False):
+        return module.register_backward_hook(hook)
+
+    @staticmethod
+    def register_full_backward_pre_hook(module, hook, prepend=False):
+        return module.register_backward_pre_hook(hook)
+
+    @property
+    def checkpoint(self):
+        return ms.recompute
+
+    @staticmethod
+    def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
+        raise NotImplementedError("ckpt_wrapper is not supported on MindSpore platform")
+
+    @property
+    def noop_context_fn(self):
+        raise NotImplementedError("noop_context_fn is not supported on MindSpore platform")
+
+    @staticmethod
+    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
+        raise NotImplementedError("create_selective_checkpoint_contexts is not supported on MindSpore platform")
+
+    @staticmethod
+    def async_save_on_cpu(policy_fn=None):
+        raise NotImplementedError("async_save_on_cpu is not supported on MindSpore platform")
