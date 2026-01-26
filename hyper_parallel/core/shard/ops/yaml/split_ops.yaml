@@ -2,6 +2,7 @@ Split:
   dist_op_name: _split_dist_op
   distributed_op_class: SplitDistributedOp
   distributed_op_file: parallel_split
+  infer_layout_suffix: WithShape
 
 SplitTensor:
   dist_op_name: _split_dist_op
@@ -24,3 +25,9 @@ SplitWithSizeView:
   dist_op_name: _split_dist_op
   distributed_op_class: SplitWithSizeViewDistributedOp
   distributed_op_file: parallel_split
+
+split:
+  dist_op_name: _torch_split_dist_op
+  distributed_op_class: SplitDistributedOp
+  distributed_op_file: parallel_split
+  infer_layout_suffix: WithShape
