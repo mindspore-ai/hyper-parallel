@@ -171,8 +171,8 @@ def _make_dtensors_ms():
     x1 = ms.Tensor(np.arange(6, 12).reshape(2, 3), ms.int32)
 
     x_layout = _make_layout_2d_replicated()
-    d0 = DTensor.from_local(x0, x_layout)
-    d1 = DTensor.from_local(x1, x_layout)
+    d0 = DTensor.from_local(x0, x_layout.mesh, x_layout.placements)
+    d1 = DTensor.from_local(x1, x_layout.mesh, x_layout.placements)
     return d0, d1
 
 

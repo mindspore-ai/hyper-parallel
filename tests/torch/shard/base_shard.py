@@ -19,7 +19,8 @@ from torch import nn
 from torch import optim
 # pylint: disable=W0611
 import torch_npu  # 昇腾NPU核心适配
-from hyper_parallel import DTensor, Layout, SkipDTensorDispatch
+from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
+from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.api import shard
 from tests.torch.utils import init_dist
 
@@ -81,35 +82,44 @@ def test_base_shard():
     torch.manual_seed(1)
     dist_model = SimpleModel().npu()
 
-    # Define sharding plan
-    layout = Layout((1, 8), ("dp", "tp"))
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=(1, 8),
+        alias_name=("dp", "tp")
+    )
+
+    # Define placements using Placement format
+    x_placements = (Replicate(), Replicate())
+    w_placements = (Replicate(), Shard(1))
+
+    # Define sharding plan using Placement format
     sharding_plan = {
         "parameter": {
-            "weight": layout("None", "tp")
+            "weight": w_placements
         },
         "forward": {
-            "input": [layout("None", "None")],
-            "output": [layout("None", "tp")]
+            "input": x_placements,
+            "output": w_placements
         }
     }
 
-    # Apply shard
-    dist_model = shard(dist_model, sharding_plan)
+    # Apply shard with device_mesh
+    dist_model = shard(dist_model, device_mesh=mesh, sharding_plan=sharding_plan)
 
     dist_optimizer = optim.SGD(dist_model.parameters(), lr=0.01)
 
     torch.manual_seed(2)
     dist_x_local = torch.randn(32, 8).npu()
-    dist_x = DTensor.from_local(dist_x_local, layout("None", "None"))
+    dist_x = DTensor.from_local(dist_x_local, mesh, x_placements)
 
     torch.manual_seed(3)
     dist_y_local = torch.randn(32, 8).npu()
-    dist_y = DTensor.from_local(dist_y_local, layout("None", "None"))
+    dist_y = DTensor.from_local(dist_y_local, mesh, x_placements)
 
     for _ in range(step):
         y_pred = dist_model(dist_x)
 
-        y_shard = dist_y.redistribute(y_pred.layout)
+        y_shard = dist_y.redistribute(mesh, y_pred.placements)
 
         dist_loss = mse_loss_sum(y_pred, y_shard)
         dist_loss = dist_loss.reduce_partial()

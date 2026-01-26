@@ -17,7 +17,9 @@
 import numpy as np
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
-from hyper_parallel import Layout, shard, DTensor
+from hyper_parallel import init_device_mesh, shard, DTensor
+from hyper_parallel.core.placement_types import Shard, Replicate
+
 
 class NetTestInput(nn.Cell):
     """
@@ -38,12 +40,32 @@ def test_shard_with_args_and_kwargs_non_dtensor_input():
     Expectation: Run success
     '''
     D.init()
-    mesh = Layout(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=(2, 4),
+        alias_name=("dp", "tp")
+    )
+
     model = NetTestInput()
-    input_layouts = (mesh("dp", "tp"), mesh("dp", "tp"), mesh("dp", "tp"), mesh(), mesh())
-    output_layouts = (mesh("dp", "tp"), mesh())
-    sharding_plan = {"forward": {"input": input_layouts, "output": output_layouts}}
-    shard(model, sharding_plan)
+
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1))
+    y_placements = (Shard(0), Shard(1))
+    z_placements = (Shard(0), Shard(1))
+    use_residual_add_placements = (Replicate(), Replicate())
+    return_residual_sign_placements = (Replicate(), Replicate())
+    # output placements
+    output_0_placements = (Shard(0), Shard(1))
+    output_1_placements = (Replicate(), Replicate())
+
+    input_placements = (x_placements, y_placements, z_placements,
+                        use_residual_add_placements, return_residual_sign_placements)
+    output_placements = (output_0_placements, output_1_placements)
+
+    sharding_plan = {"forward": {"input": input_placements, "output": output_placements}}
+    shard(model, device_mesh=mesh, sharding_plan=sharding_plan)
+
     x = Tensor(np.ones((4, 8)))
     y = Tensor(np.zeros((4, 8)))
     z = Tensor(np.arange(32).reshape(4, 8))

@@ -19,8 +19,8 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor, ops
-from hyper_parallel import Layout, shard
-from tests.mindspore.st.shard.utils import global_to_local, local_to_global
+from hyper_parallel import init_device_mesh, shard, DTensor
+from hyper_parallel.core.placement_types import Shard, Replicate
 
 
 def setup_module():
@@ -31,13 +31,13 @@ def setup_module():
 class ScatterUpdateNet(nn.Cell):
     """ScatterUpdate composed of scatter_update and ReLU"""
 
-    def __init__(self, relu_strategy=None):
+    def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.scatter_update = ops.ScatterUpdate()
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = {"forward": {"input": relu_strategy}}
+            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, input_x, indices, updates):
         out = self.scatter_update(input_x, indices, updates)
@@ -48,7 +48,6 @@ class ScatterUpdateNet(nn.Cell):
 
 base_mesh_shape = (2, 2, 2)
 base_alias_name = ("dp", "cp", "mp")
-base_rank_list = list(range(8))
 
 
 def test_scatter_update_data_parallel_1():
@@ -70,20 +69,27 @@ def test_scatter_update_data_parallel_1():
     standalone_output = standalone_net(input_x, indices, updates)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    input_layout = layout("None", "dp", "None")
-    indices_layout = layout("None",)
-    updates_layout = layout("None", "dp", "None")
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    input_local = global_to_local(input_x, input_layout)
-    indices_local = global_to_local(indices, indices_layout)
-    updates_local = global_to_local(updates, updates_layout)
+    # Define placements using Placement format
+    input_placements = (Shard(1), Replicate(), Replicate())
+    indices_placements = (Replicate(), Replicate(), Replicate())
+    updates_placements = (Shard(1), Replicate(), Replicate())
+    relu_input_placements = (Shard(1), Replicate(), Replicate())
 
-    parallel_net = ScatterUpdateNet(relu_strategy=(input_layout,))
+    input_local = DTensor.distribute_tensor(input_x, mesh, input_placements)
+    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
+    updates_local = DTensor.distribute_tensor(updates, mesh, updates_placements)
+
+    parallel_net = ScatterUpdateNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(input_local, indices_local, updates_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -106,20 +112,27 @@ def test_scatter_update_model_parallel_2():
     standalone_output = standalone_net(input_x, indices, updates)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    input_layout = layout("None", "None", "mp")
-    indices_layout = layout("None",)
-    updates_layout = layout("None", "None", "mp")
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    input_local = global_to_local(input_x, input_layout)
-    indices_local = global_to_local(indices, indices_layout)
-    updates_local = global_to_local(updates, updates_layout)
+    # Define placements using Placement format
+    input_placements = (Replicate(), Replicate(), Shard(2))
+    indices_placements = (Replicate(), Replicate(), Replicate())
+    updates_placements = (Replicate(), Replicate(), Shard(2))
+    relu_input_placements = (Replicate(), Replicate(), Shard(2))
 
-    parallel_net = ScatterUpdateNet(relu_strategy=(input_layout,))
+    input_local = DTensor.distribute_tensor(input_x, mesh, input_placements)
+    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
+    updates_local = DTensor.distribute_tensor(updates, mesh, updates_placements)
+
+    parallel_net = ScatterUpdateNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(input_local, indices_local, updates_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -142,20 +155,27 @@ def test_scatter_update_hybrid_parallel_3():
     standalone_output = standalone_net(input_x, indices, updates)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    input_layout = layout("None", "dp", "mp")
-    indices_layout = layout("None",)
-    updates_layout = layout("None", "dp", "mp")
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    input_local = global_to_local(input_x, input_layout)
-    indices_local = global_to_local(indices, indices_layout)
-    updates_local = global_to_local(updates, updates_layout)
+    # Define placements using Placement format
+    input_placements = (Shard(1), Replicate(), Shard(2))
+    indices_placements = (Replicate(), Replicate(), Replicate())
+    updates_placements = (Shard(1), Replicate(), Shard(2))
+    relu_input_placements = (Shard(1), Replicate(), Shard(2))
 
-    parallel_net = ScatterUpdateNet(relu_strategy=(input_layout,))
+    input_local = DTensor.distribute_tensor(input_x, mesh, input_placements)
+    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
+    updates_local = DTensor.distribute_tensor(updates, mesh, updates_placements)
+
+    parallel_net = ScatterUpdateNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(input_local, indices_local, updates_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -178,20 +198,27 @@ def test_scatter_update_multi_dim_indices_4():
     standalone_output = standalone_net(input_x, indices, updates)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    input_layout = layout("None", "dp", "mp")
-    indices_layout = layout("None", "None")
-    updates_layout = layout("None", "None", "dp", "mp")
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    input_local = global_to_local(input_x, input_layout)
-    indices_local = global_to_local(indices, indices_layout)
-    updates_local = global_to_local(updates, updates_layout)
+    # Define placements using Placement format
+    input_placements = (Shard(1), Replicate(), Shard(2))
+    indices_placements = (Replicate(), Replicate(), Replicate())
+    updates_placements = (Shard(2), Replicate(), Shard(3))
+    relu_input_placements = (Shard(1), Replicate(), Shard(2))
 
-    parallel_net = ScatterUpdateNet(relu_strategy=(input_layout,))
+    input_local = DTensor.distribute_tensor(input_x, mesh, input_placements)
+    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
+    updates_local = DTensor.distribute_tensor(updates, mesh, updates_placements)
+
+    parallel_net = ScatterUpdateNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(input_local, indices_local, updates_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -214,18 +241,25 @@ def test_scatter_update_replicate_all_5():
     standalone_output = standalone_net(input_x, indices, updates)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    input_layout = layout("None", "None", "None")
-    indices_layout = layout("None",)
-    updates_layout = layout("None", "None", "None")
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    input_local = global_to_local(input_x, input_layout)
-    indices_local = global_to_local(indices, indices_layout)
-    updates_local = global_to_local(updates, updates_layout)
+    # Define placements using Placement format
+    input_placements = (Replicate(), Replicate(), Replicate())
+    indices_placements = (Replicate(), Replicate(), Replicate())
+    updates_placements = (Replicate(), Replicate(), Replicate())
+    relu_input_placements = (Replicate(), Replicate(), Replicate())
 
-    parallel_net = ScatterUpdateNet(relu_strategy=(input_layout,))
+    input_local = DTensor.distribute_tensor(input_x, mesh, input_placements)
+    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
+    updates_local = DTensor.distribute_tensor(updates, mesh, updates_placements)
+
+    parallel_net = ScatterUpdateNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(input_local, indices_local, updates_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)

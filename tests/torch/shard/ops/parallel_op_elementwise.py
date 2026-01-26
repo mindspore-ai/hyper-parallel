@@ -460,11 +460,11 @@ def test_distributed_linear_with_elementwise_ops():
 
     dist_model.register_parameter(
         "weight",
-        nn.Parameter(DTensor.from_local(local_w, w_layout)),
+        nn.Parameter(DTensor.from_local(local_w, w_layout.mesh, w_layout.placements)),
     )
     dist_model.register_parameter(
         "bias",
-        nn.Parameter(DTensor.from_local(local_b, b_layout)),
+        nn.Parameter(DTensor.from_local(local_b, b_layout.mesh, b_layout.placements)),
     )
 
     dist_x = global_to_local(standalone_x, x_layout)

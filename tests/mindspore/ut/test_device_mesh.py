@@ -18,7 +18,9 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 
-from hyper_parallel.core.device_mesh import init_device_mesh, DeviceMesh, _group_map, Tensor
+from hyper_parallel.core.device_mesh import (
+    init_device_mesh, DeviceMesh, _group_map, Tensor, _DEVICE_MESH_MAP
+)
 
 
 @pytest.fixture(name="mock_platform")
@@ -31,6 +33,13 @@ def fixture_mock_platform():
         # Mock communication group creation (return Mock object)
         mock_group = Mock()
         platform_mock.create_group.return_value = mock_group
+        # Mock tensor_to_numpy to return actual numpy array from Tensor.asnumpy()
+        def mock_tensor_to_numpy(tensor):
+            """Convert Tensor to numpy array using asnumpy() method"""
+            if hasattr(tensor, 'asnumpy'):
+                return tensor.asnumpy()
+            return tensor
+        platform_mock.tensor_to_numpy.side_effect = mock_tensor_to_numpy
         yield platform_mock
 
 
@@ -38,8 +47,10 @@ def fixture_mock_platform():
 def fixture_clear_group_map():
     """Auto clear global group cache to avoid test case pollution, effective for all test cases"""
     _group_map.clear()
+    _DEVICE_MESH_MAP.clear()
     yield
     _group_map.clear()
+    _DEVICE_MESH_MAP.clear()
 
 
 @pytest.fixture(name="basic_2d_mesh")

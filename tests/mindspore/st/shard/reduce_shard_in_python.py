@@ -19,8 +19,8 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor, ops
-from hyper_parallel import Layout, shard, DTensor, parallelize_value_and_grad
-from tests.mindspore.st.shard.utils import global_to_local, local_to_global, distribute_tensor
+from hyper_parallel import init_device_mesh, shard, DTensor, parallelize_value_and_grad
+from hyper_parallel.core.placement_types import Shard, Replicate
 
 
 def setup_module():
@@ -31,13 +31,13 @@ def setup_module():
 class SumExtNet(nn.Cell):
     """SumExt composed of bmm and ReLUs"""
 
-    def __init__(self, relu_strategy=None):
+    def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.sum_ext = ms.mint.sum
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = {"forward": {"input": relu_strategy}}
+            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, dim=None, keepdim=False, dtype=None):
         out = self.sum_ext(input=x, dim=dim, keepdim=keepdim, dtype=dtype)
@@ -49,13 +49,13 @@ class SumExtNet(nn.Cell):
 class MeanExtNet(nn.Cell):
     """MeanExt composed of bmm and ReLUs"""
 
-    def __init__(self, relu_strategy=None):
+    def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.sum_ext = ms.mint.mean
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = {"forward": {"input": relu_strategy}}
+            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, dim=None, keepdim=False, dtype=None):
         out = self.sum_ext(input=x, dim=dim, keepdim=keepdim, dtype=dtype)
@@ -67,13 +67,13 @@ class MeanExtNet(nn.Cell):
 class ReduceMaxNet(nn.Cell):
     """ReduceMax composed of ReduceMax and ReLUs"""
 
-    def __init__(self, relu_strategy=None, keep_dims=False):
+    def __init__(self, device_mesh=None, relu_strategy=None, keep_dims=False):
         super().__init__()
         self.reduce_max = ops.ReduceMax(keep_dims=keep_dims)
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = {"forward": {"input": relu_strategy}}
+            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, axis=()):
         out = self.reduce_max(x, axis)
@@ -102,15 +102,23 @@ def test_sum_ext_dim_partial_model_parallel_1():
     standalone_output = standalone_net(x, dim=[0, 1], keepdim=True)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("None", ("dp", "cp"), "mp")
-    x_local = global_to_local(x, x_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = SumExtNet(relu_strategy=(layout("None", "None", "mp"),))
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    relu_input_placements = (Replicate(), Replicate(), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+
+    parallel_net = SumExtNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(x_local, dim=[0, 1], keepdim=True)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -129,15 +137,23 @@ def test_mean_ext_partial_model_parallel_2():
     standalone_output = standalone_net(x, dim=[0, 1], keepdim=False)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = MeanExtNet(relu_strategy=(layout("mp", ),))
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    relu_input_placements = (Replicate(), Replicate(), Shard(0))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+
+    parallel_net = MeanExtNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(x_local, dim=[0, 1], keepdim=False)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -156,15 +172,23 @@ def test_reduce_max_partial_model_parallel_3():
     standalone_output = standalone_net(x, axis=(0, 1))
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ReduceMaxNet(relu_strategy=(layout("mp",),), keep_dims=False)
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    relu_input_placements = (Replicate(), Replicate(), Shard(0))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+
+    parallel_net = ReduceMaxNet(device_mesh=mesh, relu_strategy=(relu_input_placements,), keep_dims=False)
     parallel_output = parallel_net(x_local, axis=(0, 1))
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -206,21 +230,27 @@ def test_reduce_max_backward_gradient_4():
     _, standalone_grads = grad_fn(x)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
+
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
 
     _, _, mp = base_mesh_shape
     local_k = k // mp
 
     class ParallelNet(nn.Cell):
         """Parallel network for ReduceMax testing with distributed parameters"""
-        def __init__(self, k, layout):
+        def __init__(self, k, mesh):
             super().__init__()
             self.reduce_max = ops.ReduceMax(keep_dims=False)
             self.relu = ms.nn.ReLU()
 
-            weight_layout = layout("mp",)
+            weight_placements = (Replicate(), Replicate(), Shard(0))
             rank = D.get_rank()
 
             if rank == 0:
@@ -228,17 +258,19 @@ def test_reduce_max_backward_gradient_4():
             else:
                 full_weight = Tensor(np.zeros([k]).astype(np.float32))
 
-            weight_dtensor = distribute_tensor(full_weight, weight_layout, src_data_rank=0)
+            weight_dtensor = DTensor.distribute_tensor(full_weight, mesh, weight_placements)
             self.weight = ms.Parameter(weight_dtensor.to_local(), name="weight")
 
             # Shard relu operator
-            relu_stra = {
+            relu_input_placements = (Replicate(), Replicate(), Shard(0))
+            relu_output_placements = (Replicate(), Replicate(), Shard(0))
+            relu_sharding_plan = {
                 "forward": {
-                    "input": (layout("mp",),),
-                    "output": (layout("mp",),)
+                    "input": (relu_input_placements,),
+                    "output": (relu_output_placements,)
                 }
             }
-            shard(self.relu, relu_stra)
+            shard(self.relu, device_mesh=mesh, sharding_plan=relu_sharding_plan)
 
         def construct(self, x):
             out = self.reduce_max(x, (0, 1))
@@ -251,11 +283,11 @@ def test_reduce_max_backward_gradient_4():
 
             return loss
 
-    parallel_net = ParallelNet(k, layout)
+    parallel_net = ParallelNet(k, mesh)
 
-    out_layout = layout()
-    net_stra = {"input": (x_layout,), "output": (out_layout,)}
-    shard(parallel_net, net_stra)
+    out_placements = (Replicate(), Replicate(), Replicate())
+    net_sharding_plan = {"input": (x_placements,), "output": (out_placements,)}
+    shard(parallel_net, device_mesh=mesh, sharding_plan=net_sharding_plan)
 
     parallel_optimizer = nn.SGD(parallel_net.trainable_params(), learning_rate=0.01)
 

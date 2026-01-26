@@ -16,8 +16,9 @@
 import inspect
 from typing import Union, Callable, Dict
 from functools import wraps
-from hyper_parallel.core.layout import Layout
+from hyper_parallel.core.layout import Layout, DeviceMesh
 from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.placement_types import Placement
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -39,6 +40,153 @@ def _get_param_name(func):
     """_get_param_name"""
     sig = inspect.signature(func)
     return list(sig.parameters.keys())
+
+
+def _convert_sharding_plan(sharding_plan: Dict, device_mesh: DeviceMesh) -> Dict:
+    """
+    Convert sharding_plan values to Layout objects.
+
+    This function recursively traverses the sharding_plan and converts
+    placement tuples (e.g., (Shard(0), Replicate())) to Layout objects.
+
+    Args:
+        sharding_plan: The original sharding plan with tuple specifications
+        device_mesh: The DeviceMesh to use for conversion
+
+    Returns:
+        Dict: Converted sharding plan with Layout objects
+    """
+
+    def _is_placement_tuple(value):
+        """Check if value is a placement specification tuple.
+
+        A placement tuple contains Placement instances (Shard, Replicate) or
+        alias strings ("dp", "None"). It should NOT be a tuple of placement tuples.
+
+        Examples of placement tuples:
+            (Shard(0), Replicate(), Shard(1))  -> True
+            ("dp", "tp", "None")               -> True
+            (("dp", "tp"), "None")             -> True (multi-axis sharding)
+
+        Examples of NON-placement tuples:
+            ((Shard(0),), (Shard(1),))         -> False (tuple of placement tuples)
+        """
+        if not isinstance(value, tuple) or len(value) == 0:
+            return False
+
+        for item in value:
+            # Placement instance is valid
+            if isinstance(item, Placement):
+                continue
+            # String (alias name) is valid
+            if isinstance(item, str):
+                continue
+            # Nested tuple needs special handling
+            if isinstance(item, tuple):
+                # Nested tuple of strings is valid (multi-axis sharding)
+                if len(item) > 0 and all(isinstance(x, str) for x in item):
+                    continue
+                # Nested tuple containing Placement means this is a tuple of placement tuples
+                if len(item) > 0 and any(isinstance(x, Placement) for x in item):
+                    return False
+                # Empty tuple or other cases - not valid
+                return False
+            # Any other type is not valid in a placement tuple
+            return False
+
+        return True
+
+    def _to_layout(value):
+        """Convert a single sharding specification to Layout."""
+        layout = Layout.from_device_mesh(device_mesh)
+        result = layout(value)
+        return result
+
+    def _convert_value(value, wrap_single_as_list=False):
+        """Recursively convert value based on its structure."""
+        if value is None:
+            return None
+
+        # Case 1: It's a placement tuple - convert to Layout
+        if _is_placement_tuple(value):
+            layout = _to_layout(value)
+            # Wrap single layout in list if required (for input/output in forward)
+            return [layout] if wrap_single_as_list else layout
+
+        # Case 2: It's a dict - recursively process each value
+        if isinstance(value, dict):
+            converted_dict = {}
+            for k, v in value.items():
+                converted_dict[k] = _convert_value(v, wrap_single_as_list=False)
+            return converted_dict
+
+        # Case 3: It's a list - recursively process each element
+        if isinstance(value, list):
+            return [_convert_value(v, wrap_single_as_list=False) for v in value]
+
+        # Case 4: It's a tuple but not a placement tuple - treat as list
+        if isinstance(value, tuple):
+            return [_convert_value(v, wrap_single_as_list=False) for v in value]
+
+        # Case 5: Other types (e.g., primitives) - return as is
+        return value
+
+    def _convert_forward_plan(forward_plan):
+        """Convert forward plan with special handling for input/output."""
+        if forward_plan is None:
+            return None
+
+        converted = {}
+        for key, value in forward_plan.items():
+            if key in ("input", "output"):
+                # input/output need special handling:
+                # - dict format: convert each value, keep as dict
+                # - list/tuple format: convert each element, keep as list
+                # - single placement tuple: convert and wrap in list
+                if value is None:
+                    converted[key] = None
+                elif isinstance(value, dict):
+                    # Dict format for kwargs: {"x": placements, "activation": placements}
+                    converted[key] = {k: _convert_value(v) for k, v in value.items()}
+                elif isinstance(value, (list, tuple)):
+                    # Check if it's a single placement tuple or a list/tuple of placement tuples
+                    if _is_placement_tuple(value):
+                        # Single placement tuple - wrap in list
+                        converted[key] = [_to_layout(value)]
+                    else:
+                        # List/tuple of placements for multiple positional args
+                        converted[key] = [_convert_value(v) for v in value]
+                else:
+                    converted[key] = _convert_value(value, wrap_single_as_list=True)
+            else:
+                # Other keys in forward plan
+                converted[key] = _convert_value(value)
+        return converted
+
+    # Main conversion logic
+    converted_plan = {}
+
+    for key, value in sharding_plan.items():
+        if key == "forward":
+            converted_plan[key] = _convert_forward_plan(value)
+        elif key in ("input", "output"):
+            # Top-level input/output (for callable sharding)
+            if value is None:
+                converted_plan[key] = None
+            elif isinstance(value, dict):
+                converted_plan[key] = {k: _convert_value(v) for k, v in value.items()}
+            elif isinstance(value, (list, tuple)):
+                if _is_placement_tuple(value):
+                    converted_plan[key] = [_to_layout(value)]
+                else:
+                    converted_plan[key] = [_convert_value(v) for v in value]
+            else:
+                converted_plan[key] = _convert_value(value, wrap_single_as_list=True)
+        else:
+            # parameter and other keys - use standard recursive conversion
+            converted_plan[key] = _convert_value(value)
+
+    return converted_plan
 
 
 def _parallel_in(func, args, kwargs, layouts):
@@ -63,13 +211,13 @@ def _parallel_in(func, args, kwargs, layouts):
             continue
 
         to_layout = _get_layout(i, is_list)
-        processed_args[i] = arg.redistribute(to_layout)
+        processed_args[i] = arg.redistribute(to_layout.mesh, to_layout.placements)
     for k, v in kwargs.items():
         if not isinstance(v, DTensor) or layouts.get(k) is None:
             processed_kwargs[k] = v
             continue
         to_layout = layouts[k]
-        processed_kwargs[k] = v.redistribute(to_layout)
+        processed_kwargs[k] = v.redistribute(to_layout.mesh, to_layout.placements)
 
     return tuple(processed_args), processed_kwargs
 
@@ -88,12 +236,13 @@ def _parallel_out(outputs, layouts):
                 new_outputs.append(arg)
                 continue
             to_layout = layouts[i]
-            new_outputs.append(arg.redistribute(to_layout))
+            new_outputs.append(arg.redistribute(to_layout.mesh, to_layout.placements))
         return tuple(new_outputs)
     if len(layouts) != 1:
         raise ValueError(f"The size of outputs and out_layout must be equal, but got 1 and "
                          f"{len(layouts)}")
-    return outputs.redistribute(layouts[0]) if isinstance(outputs, DTensor) else outputs
+
+    return outputs.redistribute(layouts[0].mesh, layouts[0].placements) if isinstance(outputs, DTensor) else outputs
 
 
 def _forward_pre_hook(cell, args):
@@ -190,28 +339,58 @@ def _shard_callable(func: Callable, sharding_plan: Dict):
     return _shard_wrapper
 
 
-def shard(model: Union[Module, Callable], sharding_plan: Dict):
+def shard(model: Union[Module, Callable], device_mesh: DeviceMesh, sharding_plan: Dict):
     """
-        Defining the input, output and parameters layouts of this cell or Callable.
+    Defining the input, output and parameters layouts of this cell or Callable.
 
-        Note:
-            - It is valid only in pynative mode.
+    Note:
+        - It is valid only in pynative mode.
 
-        .. warning::
-            The method is currently not supported in Graph mode.
+    .. warning::
+        The method is currently not supported in Graph mode.
 
-        Args:
-            model (Module or Callable): The model to be sharded.
-            sharding_plan (Dict): Define the layout for the specified parameters, inputs or outputs.
+    Args:
+        model (Module or Callable): The model to be sharded.
+        device_mesh (DeviceMesh): The device mesh for sharding.
+        sharding_plan (Dict): Define the layout for the specified parameters, inputs or outputs.
+            The sharding specification can be:
+            - tuple of strings for alias format, e.g., ("dp", "None")
+            - tuple of Placements, e.g., (Shard(0), Replicate())
+
+    Returns:
+        Module or Callable: The sharded model.
+
+    Examples:
+        >>> # Usage with device_mesh and alias format
+        >>> mesh = DeviceMesh((2, 2), ("dp", "tp"))
+        >>> sharding_plan = {
+        ...     "parameter": {"mlp.weight": ("None", "tp")},
+        ...     "forward": {"input": ("dp", "None"),
+        ...                 "output": ("dp", "tp")}
+        ... }
+        >>> model = shard(model, mesh, sharding_plan)
+
+        >>> # Usage with device_mesh and Placement format
+        >>> mesh = DeviceMesh((2, 2), ("dp", "tp"))
+        >>> sharding_plan = {
+        ...     "parameter": {"mlp.weight": (Replicate(), Shard(1))},
+        ...     "forward": {"input": (Shard(0), Replicate()),
+        ...                 "output": (Shard(0), Shard(1))}
+        ... }
+        >>> model = shard(model, mesh, sharding_plan)
 
     """
     if platform.get_world_size() == 1:
         return None
-    if not isinstance(model, Module):
-        return _shard_callable(model, sharding_plan)
 
-    param_sharding_plan = sharding_plan.get("parameter")
-    forward_sharding_plan = sharding_plan.get("forward")
+    # Convert sharding_plan to Layout objects
+    converted_plan = _convert_sharding_plan(sharding_plan, device_mesh)
+
+    if not isinstance(model, Module):
+        return _shard_callable(model, converted_plan)
+
+    param_sharding_plan = converted_plan.get("parameter")
+    forward_sharding_plan = converted_plan.get("forward")
 
     if param_sharding_plan is not None:
         for param_name, layout in param_sharding_plan.items():
@@ -222,7 +401,7 @@ def shard(model: Union[Module, Callable], sharding_plan: Dict):
             if not result:
                 raise ValueError(f"{param_name} is configured with a layout, but no instance was found.")
             _, _, param = result
-
+            layout.placement_to_tensor_map(param.dim())
             param = platform.set_layout_into_parameter(param, layout)
             platform.update_parameter_by_name(model, result, param)
 

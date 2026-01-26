@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore platform api"""
+import numpy as np
 import mindspore as ms
 import mindspore.common.dtype as mstype
 
@@ -193,13 +194,15 @@ class MindSporePlatform(Platform):
 
         if not param.has_init:
             # has been init, get slice data
-            param_dtensor = DTensor.from_local(_get_slice_tensor_by_layout(param, layout).value(), layout)
+            param_dtensor = DTensor.from_local(
+                _get_slice_tensor_by_layout(param, layout).value(), layout.mesh, layout.placements
+                )
             param = Parameter(param_dtensor, name=name, requires_grad=requires_grad)
             param.param_info = param_info
         else:
             # has not been init, need to modify init shape
             param.init_mode.shape = slice_shape
-            param_dtensor = DTensor.from_local(param.init_mode, layout)
+            param_dtensor = DTensor.from_local(param.init_mode, layout.mesh, layout.placements)
             param = Parameter(param_dtensor, name=name, requires_grad=requires_grad)
             param.param_info = param_info
         return param
@@ -407,3 +410,8 @@ class MindSporePlatform(Platform):
     @staticmethod
     def async_save_on_cpu(policy_fn=None):
         raise NotImplementedError("async_save_on_cpu is not supported on MindSpore platform")
+
+    @staticmethod
+    def tensor_to_numpy(tensor) -> np.ndarray:
+        """Convert MindSpore tensor to numpy array."""
+        return tensor.asnumpy()

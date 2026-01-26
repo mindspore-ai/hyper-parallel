@@ -21,13 +21,29 @@ from torch import Tensor
 class DTensorBase(Tensor):
     """torch dtensor base"""
 
-    def __new__(cls, local_tensor, layout=None):
-        if not layout:
-            raise ValueError("Layout is None, must provide a Layout instance")
+    def __new__(cls, local_tensor, device_mesh=None, placements=None):
+        """
+        Create a new DTensorBase instance.
 
-        # 创建 Tensor 子类实例，共享 local_tensor 的底层存储
+        Args:
+            local_tensor: The local tensor shard or another DTensorBase instance.
+            device_mesh: The device mesh describing the device topology.
+            placements: The placement strategy for each mesh dimension.
+        """
+        if isinstance(local_tensor, DTensorBase):
+            # Copy from existing DTensorBase
+            t = Tensor._make_subclass(cls, local_tensor._local_tensor, local_tensor._local_tensor.requires_grad)
+            t.__init_data__(local_tensor._local_tensor, local_tensor.device_mesh, local_tensor.placements)
+            return t
+
+        if device_mesh is None:
+            raise ValueError("device_mesh is None, must provide a DeviceMesh instance")
+        if placements is None:
+            raise ValueError("placements is None, must provide placements")
+
+        # Create Tensor subclass instance, sharing local_tensor's underlying storage
         t = Tensor._make_subclass(cls, local_tensor, local_tensor.requires_grad)
-        t.__init_data__(local_tensor, layout)
+        t.__init_data__(local_tensor, device_mesh, placements)
         return t
 
     # pylint: disable=W0613
@@ -59,9 +75,8 @@ class DTensorBase(Tensor):
         else:
             new_local = src_local.to(target_device)
 
-        return self.__class__(new_local, layout=self._layout)
+        return self.__class__(new_local, device_mesh=self._device_mesh, placements=self._placements)
 
-    # ====================== 梯度相关重写 ======================
     @property
     def grad(self) -> Optional[Tensor]:
         return self._local_tensor.grad
@@ -77,7 +92,7 @@ class DTensorBase(Tensor):
     @requires_grad.setter
     def requires_grad(self, value: bool) -> None:
         self._local_tensor.requires_grad_(value)
-        # 同步 DTensor 外壳的 requires_grad
+        # Sync DTensor wrapper's requires_grad
         super().requires_grad_(value)
 
     def requires_grad_(self, requires_grad: bool = True):
@@ -96,14 +111,14 @@ class DTensorBase(Tensor):
 
     def detach(self):
         detached_local = self._local_tensor.detach()
-        return self.__class__(detached_local, layout=self._layout)
+        return self.__class__(detached_local, device_mesh=self._device_mesh, placements=self._placements)
 
     def detach_(self):
         self._local_tensor.detach_()
         super().detach_()
         return self
 
-    # ====================== 计算图相关重写 ======================
+    # ====================== Computation graph related overrides ======================
     @property
     def is_leaf(self) -> bool:
         return self._local_tensor.is_leaf
@@ -119,7 +134,7 @@ class DTensorBase(Tensor):
     def backward(self, gradient=None, retain_graph=None, create_graph=False) -> None:
         self._local_tensor.backward(gradient, retain_graph, create_graph)
 
-    # ====================== 元数据相关重写（保证与 local_tensor 同步） ======================
+    # ====================== Metadata related overrides (sync with local_tensor) ======================
     @property
     def device(self) -> torch.device:
         return self._local_tensor.device
@@ -136,7 +151,7 @@ class DTensorBase(Tensor):
         if dtype is None:
             return self._local_tensor.type()
         new_local = self._local_tensor.to(dtype=dtype, non_blocking=non_blocking)
-        return self.__class__(new_local, layout=self._layout)
+        return self.__class__(new_local, device_mesh=self._device_mesh, placements=self._placements)
 
     def size(self, dim: Optional[int] = None):
         return self._local_tensor.size(dim)
@@ -146,24 +161,24 @@ class DTensorBase(Tensor):
         return self._local_tensor.ndim
 
     def data_ptr(self) -> int:
-        # 强制返回 local_tensor 的数据指针（保证地址一致）
+        # Force return local_tensor's data pointer (ensure address consistency)
         return self._local_tensor.data_ptr()
 
     def numel(self) -> int:
         return self._local_tensor.numel()
 
-    # ====================== 数据操作重写（同步存储 + 修复原地操作） ======================
+    # ====================== Data operation overrides (sync storage + fix in-place ops) ======================
     def zero_(self):
         """Set tensor zeros"""
         if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
-            # 方案1：创建新张量 + 重新绑定 DTensor（保证存储共享）
+            # Create new tensor + rebind DTensor (ensure storage sharing)
             new_local = torch.zeros_like(self._local_tensor, requires_grad=True)
-            # 关键：将 DTensor 外壳的存储同步到新 local_tensor
-            super().copy_(new_local)  # 同步底层数据
-            self._local_tensor = new_local  # 替换内部属性
+            # Key: sync DTensor wrapper's storage to new local_tensor
+            super().copy_(new_local)  # sync underlying data
+            self._local_tensor = new_local  # replace internal attribute
         else:
             self._local_tensor.zero_()
-            super().zero_()  # 同步外壳的原地置零
+            super().zero_()  # sync wrapper's in-place zero
         return self
 
     def copy_(self, src: Tensor, non_blocking: bool = False):
@@ -181,34 +196,36 @@ class DTensorBase(Tensor):
     def fill_(self, value):
         """Fill tensor with value"""
         if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
-            # 步骤1：创建新张量（非原地）
+            # Step 1: Create new tensor (non-in-place)
             new_local = torch.full_like(
                 self._local_tensor,
                 fill_value=value,
                 requires_grad=True,
                 device=self._local_tensor.device
             )
-            # 步骤2：同步 DTensor 外壳的底层存储到新 local_tensor
-            super().copy_(new_local)  # 关键：让 DTensor 外壳指向新地址
-            # 步骤3：替换内部的 local_tensor（保证属性一致）
+            # Step 2: Sync DTensor wrapper's underlying storage to new local_tensor
+            super().copy_(new_local)  # Key: make DTensor wrapper point to new address
+            # Step 3: Replace internal local_tensor (ensure attribute consistency)
             self._local_tensor = new_local
         else:
-            # 非叶子张量：直接原地填充 + 同步外壳
+            # Non-leaf tensor: direct in-place fill + sync wrapper
             self._local_tensor.fill_(value)
-            super().fill_(value)  # 同步 DTensor 外壳的填充
+            super().fill_(value)  # sync DTensor wrapper's fill
         return self
 
-    # ====================== 辅助打印 ======================
+    # ====================== Auxiliary print ======================
     def __repr__(self) -> str:
         return (
             f"DTensor(\n"
             f"  local_tensor={self._local_tensor},\n"
-            f"  layout={self._layout},\n"
+            f"  device_mesh={self._device_mesh},\n"
+            f"  placements={self._placements},\n"
+            f"  layout={getattr(self, '_layout', None)},\n"
             f"  device={self.device},\n"
             f"  dtype={self.dtype},\n"
             f"  requires_grad={self.requires_grad},\n"
             f"  grad={self.grad},\n"
             f"  is_leaf={self.is_leaf},\n"
-            f"  data_ptr={self.data_ptr()}\n"  # 打印数据指针，验证地址一致
+            f"  data_ptr={self.data_ptr()}\n"
             f")"
         )

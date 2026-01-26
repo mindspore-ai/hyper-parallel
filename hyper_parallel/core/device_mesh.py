@@ -20,7 +20,6 @@ from hyper_parallel.platform import get_platform
 
 platform = get_platform()
 Tensor = platform.Tensor
-dtype = platform.tensor_dtype
 
 _group_map = {}
 
@@ -70,13 +69,13 @@ class DeviceMesh:
     Topological abstraction describing cluster devices.
 
     Args:
-        mesh (Union[Tensor, list, np.ndarray]): A multi-dimensional array, list, or integer
+        mesh (Union[Tensor, list, tuple, np.ndarray]): A multi-dimensional array, list, or integer
             tensor describing the device layout. The IDs in the mesh are global IDs of the
             default process group, representing the multi-dimensional networking structure
             of devices in distributed training (e.g., [[0,1],[2,3]] represents a 2x2 device mesh).
             If a list or non-int32 tensor is provided, it will be automatically converted
             to an int32 tensor.
-        alias_name (Tuple[str]): A tuple of alias names for each dimension of mesh.
+        alias_name (tuple[str]): A tuple[str] of alias names for each dimension of mesh.
 
     Attributes:
         ndim (int): Number of dimensions in the mesh.
@@ -94,12 +93,12 @@ class DeviceMesh:
         >>> # Get sub mesh
         >>> dp_mesh = device_mesh["dp"]
         >>> # Access ndim
-        >>> >>> print(device_mesh.ndim)  # Output: 2.
+        >>> print(device_mesh.ndim)  # Output: 2
         >>> print(device_mesh.mesh_shape)  # Output: (2, 2)
         >>> print(device_mesh.rank_list)  # Output: (0, 1, 2, 3)
     """
     def __init__(self,
-                 mesh: Union[Tensor, list, np.ndarray],
+                 mesh: Union[Tensor, list, tuple, np.ndarray],
                  alias_name: Tuple[str]):
         # Convert mesh to Tensor with int32 dtype
         mesh = self._convert_mesh_to_tensor(mesh)
@@ -110,7 +109,7 @@ class DeviceMesh:
 
         # Extract mesh_shape and rank_list from mesh
         self._mesh_shape = tuple(mesh.shape)
-        self._rank_list = tuple(mesh.flatten().tolist())
+        self._rank_list = tuple(platform.tensor_to_numpy(mesh).flatten().tolist())
         self._mesh = mesh
 
         # Validate alias_name
@@ -159,18 +158,19 @@ class DeviceMesh:
         self._sub_mesh: List['DeviceMesh'] = []
 
     @staticmethod
-    def _convert_mesh_to_tensor(mesh: Union[Tensor, list, np.ndarray]) -> Tensor:
+    def _convert_mesh_to_tensor(mesh: Union[Tensor, list, tuple, np.ndarray]) -> Tensor:
         """Convert mesh to Tensor with int32 dtype."""
-        if isinstance(mesh, (list, np.ndarray)):
-            mesh = Tensor(mesh)
-        elif not isinstance(mesh, Tensor):
+        if isinstance(mesh, Tensor):
+            mesh = platform.tensor_to_numpy(mesh)
+        elif isinstance(mesh, (list, tuple)):
+            mesh = np.array(mesh)
+        elif not isinstance(mesh, np.ndarray):
             raise TypeError(
-                f"mesh must be Tensor, list, or numpy array, but got {type(mesh)}"
+                f"mesh must be Tensor, list, tuple or numpy array, but got {type(mesh)}"
             )
-        # Convert to int32 if needed
-        if mesh.dtype != dtype.int32:
-            mesh = mesh.to(dtype.int32)
-        return mesh
+
+        mesh = mesh.astype(np.int32)
+        return Tensor(mesh)
 
     @property
     def mesh(self) -> Tensor:
@@ -222,16 +222,21 @@ class DeviceMesh:
         """
         Get a sub DeviceMesh based on the specified dimension names.
 
+        This method supports both original dimension names and flattened dimension names.
+        For example, if a mesh has dimensions ("dp", "cp", "tp") and a flattened mesh
+        "dp_cp" was created via flatten(), both mesh["dp"] and mesh["dp_cp"] are valid.
+
         Args:
             sub_alias_name: A string or tuple of strings specifying the dimension names
-                           for the sub mesh.
+                           for the sub mesh. Can be original dimension names or flattened
+                           dimension names registered in the root mesh's flatten_mapping.
 
         Returns:
-            DeviceMesh A new DeviceMesh representing the sub mesh.
+            DeviceMesh: A new DeviceMesh representing the sub mesh.
 
         Raises:
             ValueError: If sub_alias_name is invalid or not a contiguous prefix.
-            KeyError: If sub_alias_name contains names not in alias_name.
+            KeyError: If sub_alias_name contains names not in alias_name or flatten_mapping.
 
         Examples:
             >>> mesh = platform.tensor([[0, 1], [2, 3]])
@@ -239,8 +244,27 @@ class DeviceMesh:
             >>> dp_mesh = device_mesh["dp"]
             >>> print(dp_mesh.mesh_shape)  # Output: (2,)
             >>> print(dp_mesh.alias_name)  # Output: ("dp",)
+            >>> # After creating a flattened mesh:
+            >>> flat_mesh = device_mesh.flatten()
+            >>> # Can also access via flattened name:
+            >>> same_flat_mesh = device_mesh["dp_tp"]
         """
-        # Convert string to tuple for uniform handling
+        sub_alias_name = self._normalize_sub_alias_name(sub_alias_name)
+        flatten_mapping = self._get_root_mesh().get_flatten_mapping()
+
+        # Try to get from flatten_mapping first
+        flattened_result = self._try_get_from_flatten_mapping(sub_alias_name, flatten_mapping)
+        if flattened_result is not None:
+            return flattened_result
+
+        # Validate dimension names
+        self._validate_getitem_dimensions(sub_alias_name, flatten_mapping)
+
+        # Get or create sub mesh for original dimensions
+        return self._get_or_create_original_sub_mesh(sub_alias_name)
+
+    def _normalize_sub_alias_name(self, sub_alias_name: Union[str, Tuple[str, ...]]) -> Tuple[str, ...]:
+        """Convert sub_alias_name to tuple format and validate basic type."""
         if isinstance(sub_alias_name, str):
             sub_alias_name = (sub_alias_name,)
 
@@ -252,36 +276,69 @@ class DeviceMesh:
         if len(sub_alias_name) == 0:
             raise ValueError("sub_alias_name cannot be empty")
 
-        # Validate all names exist in alias_name
+        return sub_alias_name
+
+    def _try_get_from_flatten_mapping(self, sub_alias_name: Tuple[str, ...],
+                                       flatten_mapping: dict) -> Optional['DeviceMesh']:
+        """Try to get mesh from flatten_mapping. Returns None if not applicable."""
+        if len(sub_alias_name) == 1 and sub_alias_name[0] in flatten_mapping:
+            return flatten_mapping[sub_alias_name[0]]
+        return None
+
+    def _validate_getitem_dimensions(self, sub_alias_name: Tuple[str, ...], flatten_mapping: dict):
+        """Validate dimension names for __getitem__ operation."""
+        valid_dim_names = list(self._alias_name) + list(flatten_mapping.keys())
+
+        # Validate all names exist
         for name in sub_alias_name:
-            if name not in self._alias_name:
+            if name not in valid_dim_names:
                 raise KeyError(
-                    f"Dimension name '{name}' not found in alias_name {self._alias_name}"
+                    f"Dimension name '{name}' not found in alias_name {self._alias_name} "
+                    f"or flatten_mapping keys {list(flatten_mapping.keys())}"
                 )
 
-        # Check if sub_alias_name is a contiguous prefix of alias_name
-        # Get the indices of sub_alias_name in alias_name
+        # Check for mixed or multiple flattened dimensions
+        original_dims = [name for name in sub_alias_name if name in self._alias_name]
+        flattened_dims = [name for name in sub_alias_name if name in flatten_mapping]
+
+        if len(flattened_dims) == len(sub_alias_name) and len(flattened_dims) > 1:
+            raise ValueError(
+                f"Slicing multiple flattened dimensions {flattened_dims} simultaneously "
+                f"is not supported. Please slice them separately."
+            )
+
+        if flattened_dims and original_dims:
+            raise ValueError(
+                f"Cannot mix original dimensions {original_dims} with flattened dimensions "
+                f"{flattened_dims} in a single slice operation."
+            )
+
+    def _get_or_create_original_sub_mesh(self, sub_alias_name: Tuple[str, ...]) -> 'DeviceMesh':
+        """Get or create sub mesh for original (non-flattened) dimensions."""
+        # Validate dimension order
         indices = [self._alias_name.index(name) for name in sub_alias_name]
-        # Ensure the sub_alias_name follows the same order as the original alias_name
         if indices != sorted(indices):
             raise ValueError(
                 f"sub_alias_name {sub_alias_name} must follow the order of "
                 f"original alias_name {self._alias_name}"
             )
 
-        # Check cache first
-        cache_key = sub_alias_name
-        if cache_key in self._sub_mesh_cache:
-            return self._sub_mesh_cache[cache_key]
+        # Check cache
+        if sub_alias_name in self._sub_mesh_cache:
+            return self._sub_mesh_cache[sub_alias_name]
 
-        # If requesting all dimensions, return self
+        # Return self if requesting all dimensions
         if len(sub_alias_name) == len(self._alias_name):
             return self
 
-        # Calculate sub mesh shape
+        # Create new sub mesh
+        return self._create_and_cache_sub_mesh(sub_alias_name, indices)
+
+    def _create_and_cache_sub_mesh(self, sub_alias_name: Tuple[str, ...],
+                                    indices: List[int]) -> 'DeviceMesh':
+        """Create a new sub mesh and cache it."""
         sub_mesh_shape = tuple(self._mesh_shape[i] for i in indices)
 
-        # Calculate sub rank list using the provided algorithm
         sub_rank_list = _get_sub_rank_list(
             self._mesh_shape,
             self._alias_name,
@@ -300,10 +357,10 @@ class DeviceMesh:
             alias_name=sub_alias_name
         )
         # Set root mesh reference
-        sub_mesh.root_mesh = self
+        sub_mesh.root_mesh = self._get_root_mesh()
 
-        # Cache the sub mesh
-        self._sub_mesh_cache[cache_key] = sub_mesh
+        # Cache and track
+        self._sub_mesh_cache[sub_alias_name] = sub_mesh
         # Add to sub_mesh list
         self.sub_mesh.append(sub_mesh)
 
@@ -314,9 +371,9 @@ class DeviceMesh:
         Get the communication group for a specific mesh dimension.
 
         Args:
-            mesh_dim (Optional[Union[int, str]], optional): The dimension index or name. If None and mesh is 1D,
+            mesh_dim: The dimension index or name. If None and mesh is 1D,
                      returns the only group. If None and mesh is multi-dimensional,
-                     raises an error. Default: None.
+                     raises an error.
 
         Returns:
             The process group for the specified dimension.
@@ -376,7 +433,7 @@ class DeviceMesh:
                      raises an error.
 
         Returns:
-            int The local rank within the specified dimension.
+            int: The local rank within the specified dimension.
 
         Raises:
             RuntimeError: If mesh_dim is None and mesh has more than 1 dimension.
@@ -428,24 +485,33 @@ class DeviceMesh:
 
         return coord[dim_index]
 
-    def flatten(self) -> 'DeviceMesh':
+    def flatten(self, mesh_dim_name: Optional[str] = None) -> 'DeviceMesh':
         """
         Returns a 1D DeviceMesh by flattening the current DeviceMesh.
+
+        Args:
+            mesh_dim_name (str, optional): The name for the flattened dimension.
+                If not provided, the name will be generated by joining the original
+                alias names with underscore (e.g., "dp_tp" for ("dp", "tp")).
+                This name will be used as the key in the root mesh's flatten_mapping.
 
         Returns:
             DeviceMesh: A 1D DeviceMesh with flattened dimensions.
 
         Raises:
-            ValueError: If generated mesh_dim_name conflicts with existing alias names.
+            ValueError: If mesh_dim_name conflicts with existing alias names.
 
         Examples:
             >>> mesh = Tensor([[0, 1], [2, 3]])
             >>> device_mesh = DeviceMesh(mesh, ("dp", "tp"))
+            >>> # Using default name
             >>> flat_mesh = device_mesh.flatten()
-            >>> print(flat_mesh.mesh_shape)  # Output: (4,)
             >>> print(flat_mesh.alias_name)  # Output: ("dp_tp",)
+            >>> # Using custom name
+            >>> flat_mesh = device_mesh.flatten(mesh_dim_name="custom_name")
+            >>> print(flat_mesh.alias_name)  # Output: ("custom_name",)
         """
-        return self._create_flatten_mesh()
+        return self._create_flatten_mesh(mesh_dim_name)
 
     def _get_root_mesh(self) -> 'DeviceMesh':
         """Get the root mesh of this DeviceMesh."""
@@ -454,12 +520,18 @@ class DeviceMesh:
         # pylint: disable=protected-access
         return self._root_mesh._get_root_mesh()
 
-    def _create_flatten_mesh(self) -> 'DeviceMesh':
-        """Create a flattened 1D mesh from the current mesh."""
+    def _create_flatten_mesh(self, mesh_dim_name: Optional[str] = None) -> 'DeviceMesh':
+        """Create a flattened 1D mesh from the current mesh.
+
+        Args:
+            mesh_dim_name (str, optional): The name for the flattened dimension.
+                If not provided, defaults to joining alias names with underscore.
+        """
         root_mesh = self._get_root_mesh()
 
-        # Generate mesh_dim_name by joining alias names
-        mesh_dim_name = "_".join(self._alias_name)
+        # Generate mesh_dim_name by joining alias names if not provided
+        if mesh_dim_name is None:
+            mesh_dim_name = "_".join(self._alias_name)
 
         # Flatten a 1D device mesh into its original alias_name will return itself
         if self.ndim == 1 and mesh_dim_name in self._alias_name:
@@ -694,7 +766,7 @@ class DeviceMesh:
 _DEVICE_MESH_MAP = {}
 
 
-def _create_device_mesh(mesh: Tensor, alias_name: Tuple[str]):
+def _create_device_mesh(mesh_shape: Tuple[int], alias_name: Tuple[str], rank_list: Tuple[int]):
     """
     Create or retrieve a cached DeviceMesh.
 
@@ -705,8 +777,7 @@ def _create_device_mesh(mesh: Tensor, alias_name: Tuple[str]):
     Returns:
         DeviceMesh: A DeviceMesh object.
     """
-    mesh_shape = tuple(mesh.shape)
-    rank_list = tuple(mesh.flatten().tolist())
+    mesh = np.array(rank_list).reshape(mesh_shape)
     rank_ids = (rank_list[0], rank_list[-1])
     map_key = hash((mesh_shape, alias_name, rank_ids))
     if map_key not in _DEVICE_MESH_MAP:
@@ -716,14 +787,16 @@ def _create_device_mesh(mesh: Tensor, alias_name: Tuple[str]):
 
 def init_device_mesh(
     mesh_shape: Tuple[int, ...],
-    alias_name: Tuple[str, ...]
+    alias_name: Tuple[str, ...],
+    rank_list: Optional[Tuple[int, ...]] = None
 ) -> DeviceMesh:
     """
     Initialize a DeviceMesh based on mesh_shape and alias_name parameters.
 
     This function creates a DeviceMesh with an n-dimensional array layout, where n is the
     length of mesh_shape. Each dimension is labeled with the corresponding alias_name.
-    The rank_list is automatically generated as sequential ranks (0, 1, 2, ..., n-1).
+    When rank_list is not provided, it is generated so that the current rank is included
+    (e.g. for onecard/simulation: base, base+1, ..., base+n-1 where base aligns to mesh size).
 
     Compared to directly constructing DeviceMesh, init_device_mesh provides:
     - Automatic mesh array generation from mesh_shape
@@ -731,11 +804,13 @@ def init_device_mesh(
     - Validation of parameters
 
     Args:
-        mesh_shape (Tuple[int, ...]): A tuple describing the dimensions of the multi-dimensional
+        mesh_shape (tuple[int]): A tuple describing the dimensions of the multi-dimensional
             array that describes the layout of devices. For example, (2, 4) creates
             a 2D mesh with 2 rows and 4 columns.
-        alias_name (Tuple[str, ...]): A tuple of names to assign to each dimension of the mesh.
+        alias_name (tuple[str]): A tuple of names to assign to each dimension of the mesh.
             Its length must match the length of mesh_shape. Each string must be unique.
+    rank_list (tuple[int], optional): Flattened list of ranks for the mesh. When None,
+            generated so that the current process rank is included (for onecard/simulation).
 
     Returns:
         DeviceMesh: A DeviceMesh object representing the device layout.
@@ -777,10 +852,18 @@ def init_device_mesh(
             f"alias_name length ({len(alias_name)})"
         )
 
-    # Generate mesh tensor from mesh_shape with sequential ranks using Tensor()
+    # Generate rank_list: use provided or build one that includes current rank
     total_devices = int(np.prod(np.array(mesh_shape)))
-    rank_list = list(range(total_devices))
-    mesh = Tensor(rank_list).reshape(mesh_shape)
+    if rank_list is not None:
+        if len(rank_list) != total_devices:
+            raise ValueError(
+                f"rank_list length ({len(rank_list)}) must equal mesh size ({total_devices})"
+            )
+        rank_list = tuple(rank_list)
+    else:
+        current_rank = platform.get_rank()
+        base = current_rank - (current_rank % total_devices)
+        rank_list = tuple(base + i for i in range(total_devices))
 
     # Use the caching mechanism
-    return _create_device_mesh(mesh, alias_name)
+    return _create_device_mesh(mesh_shape, alias_name, rank_list)

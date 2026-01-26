@@ -15,6 +15,7 @@
 """framework platform api"""
 import os
 from enum import auto, Enum
+import numpy as np
 # Environment variable name used to specify the AI framework platform to use
 HYPER_PARALLEL_PLATFORM = "HYPER_PARALLEL_PLATFORM"
 
@@ -359,3 +360,7 @@ class Platform:
     @staticmethod
     def async_save_on_cpu(policy_fn=None):
         raise NotImplementedError("Platform subclasses must implement async_save_on_cpu")
+
+    @staticmethod
+    def tensor_to_numpy(tensor) -> np.ndarray:
+        raise NotImplementedError("Platform subclasses must implement tensor_to_numpy")

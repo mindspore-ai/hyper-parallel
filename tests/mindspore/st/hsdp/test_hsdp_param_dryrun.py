@@ -111,7 +111,7 @@ def test_hsdp_param_with_layout():
     layout = Layout(mesh_shape, alias_name, rank_list)
     w_layout = layout("mp", "None")
     net.weight = ms.Parameter(DTensor.from_local(initializer(
-        "ones", [out_channels, in_channels], dtype=ms.float32), w_layout), name="weight")
+        "ones", [out_channels, in_channels], dtype=ms.float32), w_layout.mesh, w_layout.placements), name="weight")
     hsdp_param = get_hsdp_param(net)
     hsdp_param.to_sharded()
     assert net.weight.local_shape == (32, 256)
@@ -136,7 +136,7 @@ def test_hsdp_no_init_param_with_layout():
     layout = Layout(mesh_shape, alias_name, rank_list)
     w_layout = layout("mp", "None")
     net.weight = ms.Parameter(DTensor.from_local(initializer(
-        "ones", [out_channels, in_channels], dtype=ms.float32), w_layout), name="weight")
+        "ones", [out_channels, in_channels], dtype=ms.float32), w_layout.mesh, w_layout.placements), name="weight")
     hsdp_param = get_hsdp_param(net)
     hsdp_param.to_sharded()
     assert net.weight.local_shape == (32, 256)
@@ -160,7 +160,7 @@ def test_hsdp_param_with_two_axis_unshard():
     layout = Layout(mesh_shape, alias_name, rank_list)
     w_layout = layout("mp", "None")
     net.weight = ms.Parameter(DTensor.from_local(initializer(
-        "ones", [out_channels, in_channels], dtype=ms.float32), w_layout), name="weight")
+        "ones", [out_channels, in_channels], dtype=ms.float32), w_layout.mesh, w_layout.placements), name="weight")
     hsdp_param = get_hsdp_param(net)
     hsdp_param.to_sharded()
     assert net.weight.local_shape == (32, 256)

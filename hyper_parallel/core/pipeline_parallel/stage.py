@@ -230,7 +230,7 @@ class PipelineStage(PipelineStageBase):
         if len(meta) == 3:
             self._update_layout(meta[2])
             buffer = DTensor.from_local(platform.new_tensor(meta[0], meta[1],
-                                                            device=self.device), meta[2])
+                                                            device=self.device), meta[2].mesh, meta[2].placements)
         else:
             buffer = platform.new_tensor(meta[0], meta[1], device=self.device)
         buffer.requires_grad = True

@@ -70,7 +70,11 @@ class _MicroBatch(nn.Cell):
         if not isinstance(input_tensor, hyper_parallel.DTensor):
             raise TypeError(f"Input type {type(input_tensor)} is not DTensor.")
         input_layout = input_tensor.layout
-        func_wrap = custom_shard(self.split_inputs, out_layouts=(input_layout,), in_layouts=(input_layout, None, None))
+        func_wrap = custom_shard(self.split_inputs,
+                                 device_mesh=input_layout.mesh,
+                                 out_placements=(input_layout.placements,),
+                                 in_placements=(input_layout.placements, None, None)
+                                 )
         return func_wrap(input_tensor, cur_arg_batch_dim, micro_idx)
 
     def split_inputs(self, input_tensor, cur_arg_batch_dim, micro_idx):

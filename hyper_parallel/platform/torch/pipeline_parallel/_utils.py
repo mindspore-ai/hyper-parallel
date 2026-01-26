@@ -74,8 +74,11 @@ class _MicroBatch(nn.Module):
 
     def split_inputs_with_custom_shard(self, input_tensor, cur_arg_batch_dim, micro_idx):
         input_layout = input_tensor.layout
-        func_wrap = hyper_parallel.custom_shard(self.split_inputs, out_layouts=(input_layout,),
-                                                in_layouts=(input_layout, None, None))
+        func_wrap = hyper_parallel.custom_shard(self.split_inputs,
+                                 device_mesh=input_layout.mesh,
+                                 out_placements=(input_layout.placements,),
+                                 in_placements=(input_layout.placements, None, None)
+                                 )
         return func_wrap(input_tensor, cur_arg_batch_dim, micro_idx)
 
     def split_inputs(self, input_tensor, cur_arg_batch_dim, micro_idx):

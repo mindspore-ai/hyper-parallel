@@ -18,7 +18,8 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
-from hyper_parallel import Layout, hsdp, shard, DTensor
+from hyper_parallel import hsdp, shard, DTensor, init_device_mesh
+from hyper_parallel.core.placement_types import Shard
 
 learning_rate = 0.01
 epochs = 2
@@ -34,9 +35,9 @@ class SimpleModel(nn.Cell):
         return x
 
 
-def create_dtensor(data, layout):
+def create_dtensor(data, device_mesh, placements):
     """create_dtensor"""
-    return DTensor.from_local(Tensor(data), layout)
+    return DTensor.from_local(Tensor(data), device_mesh, placements)
 
 
 def create_tensor(data):
@@ -64,16 +65,16 @@ def run_standalone(x):
     return ret_output
 
 
-def run_parallel(local_x, x_layout):
+def run_parallel(local_x, device_mesh, x_placements):
     """run SimpleModel with input x in parallel mode."""
     model = SimpleModel()
 
     transpose_stra = {
         "forward": {
-            "input": (x_layout,)
+            "input": x_placements
         }
     }
-    shard(model.transpose, transpose_stra)
+    shard(model.transpose, device_mesh=device_mesh, sharding_plan=transpose_stra)
 
     model = hsdp(model, shard_size=1, threshold=0)
 
@@ -81,7 +82,7 @@ def run_parallel(local_x, x_layout):
         logits = model(data)
         return logits
 
-    x = create_dtensor(local_x, x_layout)
+    x = create_dtensor(local_x, device_mesh, x_placements)
 
     ret_output = None
     for epoch in range(epochs):
@@ -110,9 +111,13 @@ def base_case(dp, mp):
     local_batch_size = batch_size // dp
     local_seq_length = seq_length // mp
     local_x = np.ones([local_batch_size, local_seq_length, hidden_size]).astype(np.float32)
-    layout = Layout((dp, mp), ("dp", "mp"))
-    x_layout = layout("dp", "mp", "None")
-    parallel_output = run_parallel(local_x, x_layout)
+
+    # Create DeviceMesh
+    mesh = init_device_mesh(mesh_shape=(dp, mp), alias_name=("dp", "mp"))
+
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1))
+    parallel_output = run_parallel(local_x, mesh, x_placements)
 
     # compare output
     assert np.allclose(standalone_output.asnumpy()[::dp, ::mp, :],

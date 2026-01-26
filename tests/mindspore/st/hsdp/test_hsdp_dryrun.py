@@ -133,10 +133,16 @@ def run_hsdp_with_layout(w1_layout, w2_layout, data_layout, label_layout):
     """
     net, data, label = construct_net_and_data()
 
-    global_data = DTensor.from_local(data, data_layout)
-    global_label = DTensor.from_local(label, label_layout)
-    net.dense1.weight = ms.Parameter(DTensor.from_local(Tensor(net.dense1.weight.asnumpy()), w1_layout))
-    net.dense2.weight = ms.Parameter(DTensor.from_local(Tensor(net.dense2.weight.asnumpy()), w2_layout))
+    global_data = DTensor.from_local(data, data_layout.mesh, data_layout.placements)
+    global_label = DTensor.from_local(label, label_layout.mesh, label_layout.placements)
+    net.dense1.weight = ms.Parameter(DTensor.from_local(Tensor(net.dense1.weight.asnumpy()),
+                                                        w1_layout.mesh,
+                                                        w1_layout.placements)
+                                                        )
+    net.dense2.weight = ms.Parameter(DTensor.from_local(Tensor(net.dense2.weight.asnumpy()),
+                                                        w2_layout.mesh,
+                                                        w2_layout.placements)
+                                                        )
 
     run_hsdp(net, global_data, global_label)
 

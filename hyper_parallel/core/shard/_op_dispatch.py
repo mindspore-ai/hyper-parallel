@@ -285,7 +285,7 @@ class OpDispatcher:
             if isinstance(output_layout, (tuple, list)):
                 if len(py_output) == len(output_layout):
                     for i, output_item in enumerate(py_output):
-                        output += (DTensor.from_local(output_item, output_layout[i]),)
+                        output += (DTensor.from_local(output_item, output_layout[i].mesh, output_layout[i].placements),)
                 else:
                     raise RuntimeError(f"Output tuple size ({len(py_output)}) "
                                        f"does not match layout tuple size ({len(output_layout)})")
@@ -293,7 +293,7 @@ class OpDispatcher:
                 raise RuntimeError("Output is a tuple but layout is not")
             return output
 
-        return DTensor.from_local(py_output, output_layout)
+        return DTensor.from_local(py_output, output_layout.mesh, output_layout.placements)
 
     def _with_layout_infer_with_tuple_expand(self, func: callable, *args, **kwargs) -> Tensor:
         """_with_layout_infer_with_tuple_expand"""
@@ -357,7 +357,7 @@ class OpDispatcher:
             if isinstance(output_layout, (tuple, list)):
                 if len(py_output) == len(output_layout):
                     for i, output_item in enumerate(py_output):
-                        output += (DTensor.from_local(output_item, output_layout[i]),)
+                        output += (DTensor.from_local(output_item, output_layout[i].mesh, output_layout[i].placements),)
                 else:
                     raise RuntimeError(f"Output tuple size ({len(py_output)}) "
                                        f"does not match layout tuple size ({len(output_layout)})")
@@ -365,7 +365,7 @@ class OpDispatcher:
                 raise RuntimeError("Output is a tuple but layout is not")
             return output
 
-        return DTensor.from_local(py_output, output_layout)
+        return DTensor.from_local(py_output, output_layout.mesh, output_layout.placements)
 
     def _with_layout_infer_reshape(self, func: callable, *args) -> Tensor:
         """_with_layout_infer_reshape"""
@@ -412,7 +412,7 @@ class OpDispatcher:
 
         py_output = op_impl(input_tensor.to_local(), local_shape)
 
-        return DTensor.from_local(py_output, infer_output_tuple[0])
+        return DTensor.from_local(py_output, infer_output_tuple[0].mesh, infer_output_tuple[0].placements)
 
     def _process_args_and_kwargs_with_shape(
         self, args, kwargs, cache_key: "LayoutCacheKey"
@@ -528,7 +528,7 @@ class OpDispatcher:
             if isinstance(output_layout, (tuple, list)):
                 if len(py_output) == len(output_layout):
                     for i, output_item in enumerate(py_output):
-                        output += (DTensor.from_local(output_item, output_layout[i]),)
+                        output += (DTensor.from_local(output_item, output_layout[i].mesh, output_layout[i].placements),)
                 else:
                     raise RuntimeError(f"Output tuple size ({len(py_output)}) "
                                        f"does not match layout tuple size ({len(output_layout)})")
@@ -536,7 +536,7 @@ class OpDispatcher:
                 raise RuntimeError("Output is a tuple but layout is not")
             return output
 
-        return DTensor.from_local(py_output, output_layout)
+        return DTensor.from_local(py_output, output_layout.mesh, output_layout.placements)
 
     def _with_layout_infer_slice(self, func: callable, *args) -> Tensor:
         """_with_layout_infer_slice"""
@@ -588,7 +588,7 @@ class OpDispatcher:
 
         py_output = op_impl(input_tensor.to_local(), new_begin, new_end)
 
-        return DTensor.from_local(py_output, infer_output_tuple[0])
+        return DTensor.from_local(py_output, infer_output_tuple[0].mesh, infer_output_tuple[0].placements)
 
     def _merge_default(self, config: dict):
         """Apply __default__ values to all ops in this YAML file."""
