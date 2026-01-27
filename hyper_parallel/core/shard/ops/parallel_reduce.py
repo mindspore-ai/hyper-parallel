@@ -228,3 +228,12 @@ class ReduceMaxDistributedOp(ReduceExtDistributedOpBase):
 
     def __init__(self, op_name="ReduceMax"):
         super().__init__(op_name, partial_type=["max"])
+
+class ProdExtDistributedOp(ReduceExtDistributedOpBase):
+    """
+    Distributed implementation for ProdExt operator (product of all elements or along a dim).
+    Compatible with torch.prod arguments.
+    """
+
+    def __init__(self, op_name="prod"):
+        super().__init__(op_name, partial_type=["prod"])
