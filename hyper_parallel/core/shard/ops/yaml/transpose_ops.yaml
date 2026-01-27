@@ -3,11 +3,15 @@ Transpose:
   distributed_op_class: TransposeDistributedOp
   distributed_op_file: parallel_transpose
 
+TransposeExtView:
+  dist_op_name: _transpose_ext_view_dist_op
+  distributed_op_class: TransposeDistributedOp
+  distributed_op_file: parallel_transpose
+
 permute:
   dist_op_name: _torch_permute_dist_op
   distributed_op_class: TransposeDistributedOp
   distributed_op_file: parallel_transpose
-
 
 transpose:
   dist_op_name: _torch_transpose_dist_op

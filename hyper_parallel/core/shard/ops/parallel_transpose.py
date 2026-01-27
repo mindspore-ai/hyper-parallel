@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """
-Distributed implementation for MatMul operator.
+Distributed implementation for Transpose operator.
 """
 
 from hyper_parallel.core.layout import Layout
@@ -68,7 +68,7 @@ class TransposeDistributedOp(DistributedOp):
 
             out_tensor_map = tuple(in_tensor_map[i] for i in axis)
 
-        elif self.op_name == "transpose":
+        elif self.op_name in ("transpose", "TransposeExtView"):
             # PyTorch style: transpose(input, dim0, dim1)
             # extra_args should contain two elements: dim0 and dim1
             if len(extra_args) != 2:
