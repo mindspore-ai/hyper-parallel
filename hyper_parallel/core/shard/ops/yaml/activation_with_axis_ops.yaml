@@ -7,3 +7,8 @@ Swiglu:
   dist_op_name: _swiglu_dist_op
   distributed_op_class: ActivationWithAxisDistributedOp
   distributed_op_file: parallel_activation_with_axis
+
+softmax:
+  dist_op_name: _torch_softmax_dist_op
+  distributed_op_class: ActivationWithAxisDistributedOp
+  distributed_op_file: parallel_activation_with_axis

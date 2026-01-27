@@ -28,8 +28,10 @@ class ConcatDistributedOp(DistributedOp):
         Infer output layouts for Concat operations.
 
         Args:
-            layouts: Layouts of input tensors
-            extra_args: extra_args of input tensors
+            layouts (tuple): Layouts of input tensors.
+            extra_args (tuple): Extra arguments.
+                For MindSpore Concat: (axis, )
+                For PyTorch cat: (dim, ) or () - dim defaults to 0.
 
         Returns:
             tuple: Layout for output tensor.
@@ -42,17 +44,35 @@ class ConcatDistributedOp(DistributedOp):
             self._check_partial_inputs(layouts)
 
         # Parse input layout
-        dim = extra_args[0]
-
         base_layout = layouts[0]
         rank = len(base_layout.tensor_map)
-        base_map = base_layout.tensor_map
-        base_mesh_shape = base_layout.mesh_shape
 
-        if dim < -rank or dim >= rank:
+        # Determine concatenation dimension based on op_name and arguments
+        dim = 0
+        if self.op_name == "cat":
+            # PyTorch 'cat': dim is optional and defaults to 0
+            if extra_args:
+                dim = extra_args[0]
+        elif self.op_name == "Concat":
+            # MindSpore 'Concat': axis is usually required and provided
+            if not extra_args:
+                # Fallback to 0 if not provided, though typically required for Concat
+                # Or raise error if strict validation is needed
+                pass
+            else:
+                dim = extra_args[0]
+
+        # Handle negative dimension
+        if dim < 0:
+            dim += rank
+
+        if dim < 0 or dim >= rank:
             raise ValueError(
                 f"Operation {self.op_name}: dim value is out of valid range"
             )
+
+        base_map = base_layout.tensor_map
+        base_mesh_shape = base_layout.mesh_shape
 
         for layout in layouts[1:]:
             if not layout:
@@ -63,6 +83,8 @@ class ConcatDistributedOp(DistributedOp):
                     f"Operation {self.op_name}: Concat inputs must have same mesh_shape"
                 )
 
+            # Check consistency of tensor map on non-concatenation dimensions
+            # The sharding strategy must be identical for all dimensions except the concat dimension
             if layout.tensor_map[:dim] + layout.tensor_map[dim + 1 :] != base_map[:dim] + base_map[dim + 1 :]:
                 raise ValueError(
                     f"Operation {self.op_name}: Except for dim, the tensor map of inputs must be equal"
@@ -74,5 +96,10 @@ class ConcatDistributedOp(DistributedOp):
             alias_name=base_layout.alias_name,
             rank_list=base_layout.rank_list,
         )
+
+        # Apply the alias strategy from the first input layout
+
         output_layout = output_layout(*base_layout.alias_tensor_map)
-        return output_layout
+
+
+        return (output_layout,)

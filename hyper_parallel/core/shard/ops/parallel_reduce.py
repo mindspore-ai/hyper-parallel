@@ -228,4 +228,3 @@ class ReduceMaxDistributedOp(ReduceExtDistributedOpBase):
 
     def __init__(self, op_name="ReduceMax"):
         super().__init__(op_name, partial_type=["max"])
-        

@@ -80,5 +80,5 @@ class ActivationWithAxisDistributedOp(DistributedOp):
             axis_strategy = x_dict["mesh_shape"][len(x_dict["mesh_shape"]) - tensor_map - 1]
             if axis_strategy != min_slice_num:
                 raise ValueError(
-                    f"Operation {self.op_name}: The strategy corresponding to axis dimension (in dim {axis_index}, "
-                    f"now set to {axis_strategy}) is not 1")
+                    f"Operation {self.op_name}: The axis dimension (in dim {axis_index}) is sharded "
+                    f"(strategy is {axis_strategy}). This operation requires the reduction axis to be un-sharded.")
