@@ -25,7 +25,7 @@ def test_distributed_permute():
     Expectation: Run success.
     '''
     master_port = 10889  # Ensure distinct port if run in parallel
-    file_name = "perallel_op_transpose_permute.py"
+    file_name = "parallel_op_transpose_permute.py"
     case_name = "test_distributed_permute_layout_inference"
     torchrun_case(file_name, case_name, master_port)
 
@@ -38,7 +38,7 @@ def test_distributed_transpose():
     Expectation: Run success.
     '''
     master_port = 10890
-    file_name = "perallel_op_transpose_permute.py"
+    file_name = "parallel_op_transpose_permute.py"
     case_name = "test_distributed_transpose_layout_inference"
     torchrun_case(file_name, case_name, master_port)
 
@@ -51,6 +51,6 @@ def test_distributed_transpose_neg():
     Expectation: Run success.
     '''
     master_port = 10891
-    file_name = "perallel_op_transpose_permute.py"
+    file_name = "parallel_op_transpose_permute.py"
     case_name = "test_distributed_transpose_negative_dim"
     torchrun_case(file_name, case_name, master_port)
