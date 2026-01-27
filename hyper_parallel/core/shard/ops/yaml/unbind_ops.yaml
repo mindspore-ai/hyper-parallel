@@ -1,0 +1,5 @@
+unbind:
+  dist_op_name: _unbind_dist_op
+  distributed_op_class: UnbindDistributedOp
+  distributed_op_file: parallel_unbind
+  infer_layout_suffix: WithShape
