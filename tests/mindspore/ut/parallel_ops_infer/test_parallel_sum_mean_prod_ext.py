@@ -38,7 +38,7 @@ base_alias_name = ("dp", "cp", "mp")
 base_rank_list = list(range(8))
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_data_parallel_1(op_name):
     """
     Feature: Data parallel.
@@ -57,7 +57,7 @@ def test_sum_ext_data_parallel_1(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_model_parallel_2(op_name):
     """
     Feature: Model parallel.
@@ -76,7 +76,7 @@ def test_sum_ext_model_parallel_2(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_hybrid_parallel_3(op_name):
     """
     Feature: Hybrid parallel.
@@ -95,7 +95,7 @@ def test_sum_ext_hybrid_parallel_3(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_reduce_multiple_dims_4(op_name):
     """
     Feature: Reduce over multiple dims.
@@ -114,7 +114,7 @@ def test_sum_ext_reduce_multiple_dims_4(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_reduce_all_dims_5(op_name):
     """
     Feature: Reduce over all dims.
@@ -133,7 +133,7 @@ def test_sum_ext_reduce_all_dims_5(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_tuple_alias_dim_6(op_name):
     """
     Feature: Tuple alias in one dim.
@@ -156,7 +156,7 @@ def test_sum_ext_tuple_alias_dim_6(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_tuple_alias_dim_7(op_name):
     """
     Feature: Tuple alias in one dim.
@@ -179,7 +179,7 @@ def test_sum_ext_tuple_alias_dim_7(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_tuple_alias_dim_8(op_name):
     """
     Feature: Tuple alias in one dim.
@@ -202,7 +202,7 @@ def test_sum_ext_tuple_alias_dim_8(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_tuple_alias_dim_9(op_name):
     """
     Feature: Tuple alias in one dim.
@@ -225,7 +225,7 @@ def test_sum_ext_tuple_alias_dim_9(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_tuple_alias_dim_10(op_name):
     """
     Feature: Tuple alias in one dim.
@@ -248,7 +248,7 @@ def test_sum_ext_tuple_alias_dim_10(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_tuple_alias_dim_11(op_name):
     """
     Feature: Tuple alias in one dim, keep dim 'none'.
@@ -271,7 +271,7 @@ def test_sum_ext_tuple_alias_dim_11(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_tuple_alias_dim_12(op_name):
     """
     Feature: Tuple alias in one dim, keep other dim 'none'.
@@ -294,7 +294,7 @@ def test_sum_ext_tuple_alias_dim_12(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_tuple_alias_dim_13(op_name):
     """
     Feature: Tuple alias in one dim, reduce with negative dim.
@@ -317,7 +317,7 @@ def test_sum_ext_tuple_alias_dim_13(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_tuple_alias_dim_14(op_name):
     """
     Feature: Tuple alias in one dim, reduce with negative dim.
@@ -340,7 +340,7 @@ def test_sum_ext_tuple_alias_dim_14(op_name):
     )
 
 
-@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt"])
+@pytest.mark.parametrize("op_name", ["SumExt", "MeanExt", "prod"])
 def test_sum_ext_tuple_alias_dim_15(op_name):
     """
     Feature: Tuple alias in one dim.

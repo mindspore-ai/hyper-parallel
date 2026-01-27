@@ -8,5 +8,7 @@ mean:
   distributed_op_class: MeanExtDistributedOp
   distributed_op_file: parallel_reduce
 
-
-
+prod:
+  dist_op_name: _torch_prod_dist_op
+  distributed_op_class: ProdExtDistributedOp
+  distributed_op_file: parallel_reduce

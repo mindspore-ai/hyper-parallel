@@ -28,6 +28,24 @@ from hyper_parallel.platform.torch.function_override import override_functions
 
 override_functions()
 
+# Mapping from string op names to torch.distributed.ReduceOp
+_OP_MAP = {
+    'sum': dist.ReduceOp.SUM,
+    'prod': dist.ReduceOp.PRODUCT,
+    'max': dist.ReduceOp.MAX,
+    'min': dist.ReduceOp.MIN,
+    # 'avg' is typically handled by SUM followed by division in current implementation logic
+    'avg': dist.ReduceOp.SUM,
+}
+
+# Try to add AVG for 'mean' if supported by current torch version
+if hasattr(dist.ReduceOp, "AVG"):
+    _OP_MAP['mean'] = dist.ReduceOp.AVG
+else:
+    # Fallback for older torch versions if necessary, though this might require manual division upstream
+    # Assuming standard behavior where 'mean' implies native AVG support or upstream handling
+    _OP_MAP['mean'] = dist.ReduceOp.SUM
+
 
 # pylint: disable=C0103
 class TorchPlatform(Platform):
@@ -109,7 +127,9 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def differentiable_all_reduce(data, op, group):
-        return dist_func.all_reduce(data, group=group)
+        # Resolve the op from string to ReduceOp enum if necessary
+        reduce_op = _OP_MAP.get(op, dist.ReduceOp.SUM) if isinstance(op, str) else op
+        return dist_func.all_reduce(data, op=reduce_op, group=group)
 
     @staticmethod
     def get_cell_construct(cell):
@@ -182,7 +202,13 @@ class TorchPlatform(Platform):
     def differentiable_reduce_scatter(data, dev_num, axis, op, group):
         input_tuple = torch.chunk(data, dev_num, dim=axis)
         output_tensor = torch.empty(input_tuple[0].shape, device=data.device, dtype=data.dtype)
-        output_tensor = dist_func.reduce_scatter(output_tensor, input_tuple, group=group)
+
+        # Resolve the op from string to ReduceOp enum
+        reduce_op = _OP_MAP.get(op, dist.ReduceOp.SUM) if isinstance(op, str) else op
+
+        output_tensor = dist_func.reduce_scatter(output_tensor, input_tuple, op=reduce_op, group=group)
+
+        # Keep manual handling for 'avg' string as it maps to SUM in _OP_MAP
         if op == 'avg':
             output_tensor = output_tensor / dev_num
         return output_tensor
