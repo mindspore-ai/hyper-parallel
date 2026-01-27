@@ -2,3 +2,8 @@ TopkExt:
   dist_op_name: _topk_ext_dist_op
   distributed_op_class: TopKDistributedOp
   distributed_op_file: parallel_topk
+
+topk:
+  dist_op_name: _torch_topk_ext_dist_op
+  distributed_op_class: TopKDistributedOp
+  distributed_op_file: parallel_topk

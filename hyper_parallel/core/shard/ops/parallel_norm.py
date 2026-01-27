@@ -92,3 +92,78 @@ class NormDistributedOp(DistributedOp):
         output_map = x_layout.alias_tensor_map[:begin_norm_axis] + ("None",) * len(gamma_tensor_map)
         out_layout = output_layout(*output_map)
         return x_layout, out_layout
+
+class LayerNormDistributedOp(DistributedOp):
+    """Distributed implementation for torch.nn.functional.layer_norm."""
+
+    def infer_layout(self, layouts, extra_args=None):
+        """
+        Infer output layout for layer_norm.
+
+        PyTorch rules:
+          - normalized_shape specifies the last N dimensions to normalize over.
+          - All dimensions in normalized_shape MUST be unsharded for correctness.
+          - Output layout is identical to input layout (shape unchanged).
+
+        Args:
+        layouts (tuple): Layouts of inputs. Expected:
+            layouts[0] (Layout): Input tensor layout (required).
+        extra_args (tuple): Should contain 'normalized_shape'. Expected:
+            extra_args[0] (int | list | tuple): Normalized shape to be unsharded.
+
+        Returns:
+            Layout object representing output tensor layout (same as input if valid).
+        """
+        if not layouts or layouts[0] is None:
+            raise ValueError("layer_norm requires a valid input tensor layout.")
+        input_layout = layouts[0]
+        in_tensor_map = input_layout.tensor_map  # e.g., (-1, 0, -1) for 3D tensor
+
+        if not extra_args or extra_args[0] is None:
+            raise ValueError("layer_norm requires normalized_shape in extra_args.")
+        normalized_shape = extra_args[0]
+
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+        elif isinstance(normalized_shape, (list, tuple)):
+            normalized_shape = tuple(normalized_shape)
+        else:
+            raise ValueError(f"normalized_shape must be int, list, or tuple, got {type(normalized_shape)}")
+
+        input_ndim = len(in_tensor_map)
+        norm_ndim = len(normalized_shape)
+
+        if norm_ndim > input_ndim:
+            raise ValueError(
+                f"normalized_shape {normalized_shape} (dims={norm_ndim}) is larger than input ndim={input_ndim}."
+            )
+
+        # The last `norm_ndim` dimensions are going to be normalized
+        dims_to_normalize = list(range(input_ndim - norm_ndim, input_ndim))
+
+        # All normalized dims must be unsharded
+        for dim in dims_to_normalize:
+            if in_tensor_map[dim] != -1:
+                raise ValueError(
+                    f"Operation {self.op_name}: Cannot perform sharding on normalized dimension {dim}, "
+                    f"but found sharding assignment: {in_tensor_map[dim]}"
+                )
+
+        mesh_shape = input_layout.mesh_shape
+        alias_name = input_layout.alias_name
+        rank_list = input_layout.rank_list
+
+        # Create output layout
+        def idx_to_alias(idx, aliases):
+            if idx == -1:
+                return "None"
+            return aliases[len(aliases) - idx - 1]
+        output_map = tuple(idx_to_alias(idx, alias_name) for idx in in_tensor_map)
+
+        output_layout = Layout(
+            mesh_shape=mesh_shape,
+            alias_name=alias_name,
+            rank_list=rank_list
+        )
+        output_layout = output_layout(*output_map)
+        return output_layout

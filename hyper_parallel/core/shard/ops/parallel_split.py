@@ -16,6 +16,7 @@
 Distributed implementation for TopK operator.
 """
 
+import math
 from .parallel_ops import DistributedOp
 
 
@@ -90,23 +91,51 @@ class SplitDistributedOp(DistributedOp):
 
         Rules:
         1. Shared axis can not be split.
+        2. Default: dim = 0 if not specified.
 
         Args:
             layouts (Layout): Layout of input tensor
-            extra_args (list): split size or sections, axis, input shape
+            extra_args (list): split size or sections, axis, input shape. Expected:
+                extra_args[0]: split_size (required)
+                extra_args[1]: axis (optional)
+                extra_args[2][0]: input_shape
 
         Returns:
             tuple: Layouts for output tensors
         """
 
+        if not layouts or layouts[0] is None:
+            raise ValueError("split requires a valid input tensor layout.")
         input_layout = layouts[0]
-        axis = extra_args[0]
-        # Check shared axis can not be split.
+
+        if len(extra_args) == 2:
+            split_size = extra_args[0]
+            axis = 0 # default
+            input_shape = extra_args[1][0]
+        elif len(extra_args) == 3:
+            split_size = extra_args[0]
+            axis = extra_args[1]
+            input_shape = extra_args[2][0]
+        else:
+            raise ValueError("Split ops extra_args requires 'axis' and contains 'output_num' optionally.")
+
         tensor_map = input_layout.tensor_map
+        input_dim = len(tensor_map)
+        if axis < 0:
+            axis = input_dim + axis
+        if not 0 <= axis < input_dim:
+            raise ValueError(f"Dimension out of range (expected [0, {input_dim}), got {axis}).")
+
+        # Check shared axis can not be split.
         if tensor_map[axis] != -1:
             raise ValueError(f"Can not split tensor at sharded axis[{axis}], layout: {input_layout}")
 
-        output_num = extra_args[1]
+        output_num = 1
+        if isinstance(split_size, int):
+            output_num = math.ceil(input_shape[axis] / split_size)
+        elif isinstance(split_size, (list, tuple)):
+            output_num = len(split_size)
+
         output_layouts = (input_layout,) * output_num
         return output_layouts
 

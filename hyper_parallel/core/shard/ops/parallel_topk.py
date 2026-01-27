@@ -25,21 +25,42 @@ class TopKDistributedOp(DistributedOp):
         """
         Infer output layouts for TopK operator.
 
-        TopK: values, indices = topk(input, k)
+        TopK: values, indices = topk(input, k, dim)
 
         Rules:
-        1. Output layouts must match input layout exactly
-        2. Both values and indices have same layout as input
+        1. dim = -1 if not specified.
+        2. The dimension `dim` MUST be unsharded to ensure global top-k correctness.
+        3. Both values and indices have same layout as input
 
         Args:
-            layouts (Layout): Layout of input tensor
-            k (int, optional): The k in topk, not affecting layout
+            layouts (tuple): Layouts of inputs. Expected:
+                layouts[0] (Layout): Input tensor layout (required).
+            extra_args (tuple, optional): Requires k and optionally contains dim. Expected:
+                extra_args[0] (int, required): K value.
+                extra_args[1] (int, optional): Dimension to compute topk. Defaults to -1.
 
         Returns:
             tuple: Layouts for values and indices tensors
         """
+        if not layouts or layouts[0] is None:
+            raise ValueError("topk requires a valid input tensor layout.")
 
-        if not layouts[0]:
-            raise ValueError(f"layouts is empty: {layouts[0]}")
+        input_layout = layouts[0]
+        in_tensor_map = input_layout.tensor_map
 
-        return layouts[0], layouts[0]
+        dim = -1 # If dim is not given, the last dimension of the input is chosen.
+        if len(extra_args) >= 2 and extra_args[1] is not None:
+            dim = extra_args[1]
+        input_dim = len(in_tensor_map)
+        if dim < 0:
+            dim = input_dim + dim # -1 represents the last dimension
+        if not 0 <= dim < input_dim:
+            raise ValueError(f"Dimension out of range (expected to be in [0, {input_dim}), but got {dim}).")
+
+        # The chosen dim must NOT be sharded
+        if in_tensor_map[dim] != -1:
+            raise ValueError(
+                f"Operation {self.op_name}: Cannot perform sharding on params along the chosen dim"
+            )
+
+        return input_layout, input_layout

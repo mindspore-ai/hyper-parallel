@@ -185,20 +185,16 @@ class OpDispatcher:
             else:
                 raise
 
-    def _with_layout_infer(self, func: callable, *args, **kwargs) -> Tensor:
-        """_with_layout_infer"""
-        func_name = platform.get_op_name(func)
-        packed_call = None
-        # Ops in unpack_ops use packed fallback args (e.g. ScatterUpdate: (prim_obj, op_name: str, (input_x, indices, updates))).
-        if(func_name in self.unpack_ops and len(args) == 3 and
-            isinstance(args[1], str) and isinstance(args[2],(tuple,list))):
-            packed_call = (args[0], args[1])
-            args = tuple(args[2])
-
-        cache_key = LayoutCacheKey([])
+    def _process_args_and_kwargs(
+        self, args, kwargs, cache_key: "LayoutCacheKey"
+    ) -> tuple[list, list, list, dict]:
+        """_process_args_and_kwargs"""
+        # input_layouts contain prarmeters which have layout, extra_args contain other parameters
         input_layouts = []
         extra_args = []
+        # input_args are position prarmeters, input_kwargs are keyword parameters
         input_args = []
+        input_kwargs = kwargs.copy()
 
         # Normal ops pass real inputs directly (e.g. SumExt: args = (dtensor, axis: list, keep_dims: bool, dtype: None)).
         for arg in args:
@@ -225,6 +221,41 @@ class OpDispatcher:
                 else:
                     input_args.append(arg)
 
+        for k, val in kwargs.items():
+            if val is None:
+                input_layouts.append(None)
+                continue
+            if not hasattr(val, "layout"):
+                id_str = "scalar"
+                if not isinstance(val, Tensor):
+                    id_str = str(val)
+                cache_key.layout_ids.append(id_str)
+                extra_args.append(val)
+                input_layouts.append(None)
+            else:
+                layout = val.layout
+                layout_id = layout.compact_str
+                cache_key.layout_ids.append(str(layout_id))
+                input_layouts.append(layout)
+                if isinstance(val, DTensor):
+                    input_kwargs[k] = val.to_local()
+
+        return input_layouts, extra_args, input_args, input_kwargs
+
+    def _with_layout_infer(self, func: callable, *args, **kwargs) -> Tensor:
+        """_with_layout_infer"""
+        func_name = platform.get_op_name(func)
+        packed_call = None
+        # Ops in unpack_ops use packed fallback args (e.g. ScatterUpdate: (prim_obj, op_name: str, (input_x, indices, updates))).
+        if(func_name in self.unpack_ops and len(args) == 3 and
+            isinstance(args[1], str) and isinstance(args[2],(tuple,list))):
+            packed_call = (args[0], args[1])
+            args = tuple(args[2])
+
+        cache_key = LayoutCacheKey([])
+        input_layouts, extra_args, input_args, input_kwargs = self._process_args_and_kwargs(
+            args, kwargs, cache_key
+        )
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
         if func_name not in layout_cache:
@@ -245,9 +276,9 @@ class OpDispatcher:
             op_impl = func
 
         if packed_call is not None:
-            py_output = op_impl(packed_call[0], packed_call[1], tuple(input_args), **kwargs)
+            py_output = op_impl(packed_call[0], packed_call[1], tuple(input_args), **input_kwargs)
         else:
-            py_output = op_impl(*input_args, **kwargs)
+            py_output = op_impl(*input_args, **input_kwargs)
 
         if isinstance(py_output, (tuple, list)):
             output = ()
@@ -383,23 +414,15 @@ class OpDispatcher:
 
         return DTensor.from_local(py_output, infer_output_tuple[0])
 
-    def _with_layout_infer_with_shape(self, func: callable, *args, **kwargs) -> Tensor:
-        """_with_layout_infer_with_shape"""
-        func_name = platform.get_op_name(func)
-        packed_call = None
-        # Packed fallback args for some ops (e.g. Mod: (prim_obj, "Mod", (x, y))).
-        if (func_name in self.unpack_ops and len(args) == 3 and
-            isinstance(args[1], str) and isinstance(args[2], (tuple, list))):
-            packed_call = (args[0], args[1])
-            args = tuple(args[2])
-
-        cache_key = LayoutCacheKey([])
+    def _process_args_and_kwargs_with_shape(
+        self, args, kwargs, cache_key: "LayoutCacheKey"
+    ) -> tuple[list, list, list, list, dict]:
+        """_process_args_and_kwargs_with_shape"""
         input_layouts = []
         extra_args = []
         input_shapes = []
         input_args = []
-
-        # Normal ops pass real inputs directly (e.g. GreaterEqual: (dtensor_x, dtensor_y)).
+        input_kwargs = kwargs.copy()
         for arg in args:
             if arg is None:
                 input_layouts.append(None)
@@ -432,6 +455,48 @@ class OpDispatcher:
                 input_shapes.append(input_shape)
                 cache_key.layout_ids.append(str(input_shape))
 
+        for k, val in kwargs.items():
+            if val is None:
+                input_layouts.append(None)
+                continue
+            if not hasattr(val, "layout"):
+                id_str = "scalar"
+                if not isinstance(val, Tensor):
+                    id_str = str(val)
+                cache_key.layout_ids.append(id_str)
+                extra_args.append(val)
+                input_layouts.append(None)
+            else:
+                layout = val.layout
+                layout_id = layout.compact_str
+                cache_key.layout_ids.append(str(layout_id))
+                input_layouts.append(layout)
+                if isinstance(val, DTensor):
+                    input_kwargs[k] = val.to_local()
+
+            if not hasattr(val, "shape"):
+                input_shapes.append(None)
+            else:
+                input_shape = val.shape
+                input_shapes.append(input_shape)
+                cache_key.layout_ids.append(str(input_shape))
+
+        return input_layouts, input_shapes, extra_args, input_args, input_kwargs
+
+    def _with_layout_infer_with_shape(self, func: callable, *args, **kwargs) -> Tensor:
+        """_with_layout_infer_with_shape"""
+        func_name = platform.get_op_name(func)
+        packed_call = None
+        # Packed fallback args for some ops (e.g. Mod: (prim_obj, "Mod", (x, y))).
+        if (func_name in self.unpack_ops and len(args) == 3 and
+            isinstance(args[1], str) and isinstance(args[2], (tuple, list))):
+            packed_call = (args[0], args[1])
+            args = tuple(args[2])
+
+        cache_key = LayoutCacheKey([])
+        input_layouts, input_shapes, extra_args, input_args, input_kwargs = \
+            self._process_args_and_kwargs_with_shape(args, kwargs, cache_key)
+
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
         if func_name not in layout_cache:
@@ -453,9 +518,9 @@ class OpDispatcher:
             op_impl = func
 
         if packed_call is not None:
-            py_output = op_impl(packed_call[0], packed_call[1], tuple(input_args), **kwargs)
+            py_output = op_impl(packed_call[0], packed_call[1], tuple(input_args), **input_kwargs)
         else:
-            py_output = op_impl(*input_args, **kwargs)
+            py_output = op_impl(*input_args, **input_kwargs)
 
         # 设置输出布局
         if isinstance(py_output, (tuple, list)):

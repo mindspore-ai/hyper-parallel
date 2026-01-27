@@ -21,6 +21,7 @@ from hyper_parallel import Layout
 
 # 初始化一个SplitDistributedOp实例
 split_op = SplitDistributedOp("split")
+torch_split_op = SplitDistributedOp("split")
 
 
 # 定义一个辅助函数来创建Layout对象
@@ -42,11 +43,12 @@ def test_infer_layout_normal():
     """
     input_layout = create_layout([1, -1, 0])
     axis = 1
-    output_num = 2
-    extra_args = [axis, output_num]
+    split_size = 2
+    input_shape = ((12, 16, 20), None)
+    extra_args = [split_size, axis, input_shape]
 
     output_layouts = split_op.infer_layout([input_layout], extra_args)
-    assert len(output_layouts) == output_num
+    assert len(output_layouts) == 8
     assert all(layout.tensor_map == input_layout.tensor_map for layout in output_layouts)
 
 
@@ -58,10 +60,40 @@ def test_infer_layout_invalid_axis():
     """
     input_layout = create_layout([1, 0, -1])
     axis = 0
-    output_num = 2
-    extra_args = [axis, output_num]
+    split_size = 2
+    input_shape = ((12, 16, 20), None)
+    extra_args = [split_size, axis, input_shape]
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Can not split tensor at sharded axis"):
+        split_op.infer_layout([input_layout], extra_args)
+
+
+def test_infer_layout_axis_out_of_range():
+    """
+    Feature: Test axis out of range
+    Description: Test axis out of range
+    Expectation: Success
+    """
+    input_layout = create_layout([-1, -1])
+    axis = 5  # invalid for 2D tensor
+    split_size = 2
+    input_shape = ((12, 16, 20), None)
+    extra_args = [split_size, axis, input_shape]
+
+    with pytest.raises(ValueError, match="Dimension out of range"):
+        split_op.infer_layout([input_layout], extra_args)
+
+
+def test_infer_layout_insufficient_extra_args():
+    """
+    Feature: Test missing extra_arg
+    Description: Test missing extra_arg
+    Expectation: Success
+    """
+    input_layout = create_layout([-1, -1])
+    extra_args = [0]  # missing output_num
+
+    with pytest.raises(ValueError, match="Split ops extra_args requires 'axis' and contains 'output_num' optionally."):
         split_op.infer_layout([input_layout], extra_args)
 
 
