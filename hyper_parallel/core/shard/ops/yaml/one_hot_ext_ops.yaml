@@ -1,0 +1,4 @@
+OneHotExt:
+  dist_op_name: _one_hot_ext_dist_op
+  distributed_op_class: OneHotExtDistributedOp
+  distributed_op_file: parallel_one_hot_ext
