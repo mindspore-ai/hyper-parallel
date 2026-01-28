@@ -409,7 +409,7 @@ class Layout:
         else:
             self._rank_list = tuple(rank_list)
         self._partial = [None] * len(mesh_shape)  # partial status for each dev dim
-        self._support_partial_op = ['sum', 'max', 'min', 'avg', 'prod', None]
+        self._support_partial_op = ['sum', 'max', 'min', 'avg', 'prod', 'all', None]
         self._alias_tensor_map = None
         self._mesh = _create_device_mesh(mesh_shape, alias_name, self._rank_list)
         self._compact_str = self._to_compact_string()
@@ -438,7 +438,7 @@ class Layout:
         obj._rank_list = device_mesh.rank_list
         obj._tensor_map = None
         obj._partial = [None] * len(device_mesh.mesh_shape)
-        obj._support_partial_op = ['sum', 'max', 'min', 'avg', 'prod', None]
+        obj._support_partial_op = ['sum', 'max', 'min', 'avg', 'prod', 'all', None]
         obj._alias_tensor_map = None
         obj._placements = None
         obj._compact_str = obj._to_compact_string()

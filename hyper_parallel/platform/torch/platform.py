@@ -34,6 +34,8 @@ _OP_MAP = {
     'prod': dist.ReduceOp.PRODUCT,
     'max': dist.ReduceOp.MAX,
     'min': dist.ReduceOp.MIN,
+    # convert tensor elements to int32 and use MIN
+    'all': dist.ReduceOp.MIN,
     # 'avg' is typically handled by SUM followed by division in current implementation logic
     'avg': dist.ReduceOp.SUM,
 }

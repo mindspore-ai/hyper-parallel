@@ -14,6 +14,7 @@
 # ============================================================================
 """tensor_redistribution"""
 
+import torch
 from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.core.redistribute_infer import RedistributionOperatorInfer
 from hyper_parallel.platform import get_platform
@@ -240,6 +241,10 @@ class TensorRedistribution:
             dev_num = layout.mesh_shape[layout.alias_name.index(dev_dim)]
             x = platform.differentiable_all_reduce(x, 'sum', group)
             x = x / dev_num
+        elif op == 'all':
+            x_int32 = x.bool().to(torch.int32)  # True→1, False→0
+            x = platform.differentiable_all_reduce(x_int32, 'all', group)
+            x = x.bool()
         else:
             x = platform.differentiable_all_reduce(x, op, group)
         if zero_dim:

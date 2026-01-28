@@ -1,0 +1,4 @@
+cumsum:
+  dist_op_name: _torch_cumsum_dist_op
+  distributed_op_class: CumsumDistributedOp
+  distributed_op_file: parallel_cumsum

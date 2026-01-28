@@ -12,3 +12,9 @@ prod:
   dist_op_name: _torch_prod_dist_op
   distributed_op_class: ProdExtDistributedOp
   distributed_op_file: parallel_reduce
+
+all:
+  dist_op_name: _torch_all_dist_op
+  distributed_op_class: AllExtDistributedOp
+  distributed_op_file: parallel_reduce
+
