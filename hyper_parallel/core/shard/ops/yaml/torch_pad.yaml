@@ -1,0 +1,4 @@
+pad:
+  dist_op_name: _torch_pad_dist_op
+  distributed_op_class: PadDistributedOp
+  distributed_op_file: parallel_pad
