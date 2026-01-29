@@ -19,6 +19,7 @@ class HSDPParamBuffer:
     """
     HSDP parameter buffer.
     """
+
     def __init__(self, config, init_hsdp_param, platform):
         self.config = config
         self.platform = platform
@@ -83,7 +84,7 @@ class HSDPParamBuffer:
         self.prefetch_data = unshared_param_buffer
         self.prefetch_handle = handle
 
-    def to_unsharded(self):
+    def to_unsharded(self, async_op=False):
         """change parameter to unsharded state"""
         if self.prefetch_handle is not None:
             self.prefetch_handle.wait()
@@ -92,9 +93,13 @@ class HSDPParamBuffer:
             self.prefetch_data = None
         else:
             self._update_data_view()
-            unshared_param_buffer, _ = self.platform.all_gather_into_tensor(self.sharded_param_buffer,
-                                                                            self.sharded_group_info,
-                                                                            async_op=True)
+            unshared_param_buffer, handle = self.platform.all_gather_into_tensor(self.sharded_param_buffer,
+                                                                                 self.sharded_group_info,
+                                                                                 async_op=async_op)
+            if async_op:
+                self.prefetch_handle = handle
+                self.prefetch_data = unshared_param_buffer
+                return
         unshared_param_buffer = unshared_param_buffer.view((self.shard_size, -1))
         for hsdp_param in self.hsdp_params:
             start_index = hsdp_param.param_buffer_start_index
@@ -103,3 +108,19 @@ class HSDPParamBuffer:
             unshared_param_data = unshared_param_data.view(hsdp_param.param_shape)
             self.platform.update_param_data(hsdp_param.param, unshared_param_data)
         self.unshared_param_buffer = unshared_param_buffer
+
+    def wait_for_unsharded(self):
+        """wait for unsharded buffer"""
+        if self.prefetch_handle is not None:
+            self.prefetch_handle.wait()
+            unshared_param_buffer = self.prefetch_data
+            self.prefetch_handle = None
+            self.prefetch_data = None
+            unshared_param_buffer = unshared_param_buffer.view((self.shard_size, -1))
+            for hsdp_param in self.hsdp_params:
+                start_index = hsdp_param.param_buffer_start_index
+                end_index = hsdp_param.param_buffer_end_index
+                unshared_param_data = unshared_param_buffer[:, start_index:end_index]
+                unshared_param_data = unshared_param_data.view(hsdp_param.param_shape)
+                self.platform.update_param_data(hsdp_param.param, unshared_param_data)
+            self.unshared_param_buffer = unshared_param_buffer

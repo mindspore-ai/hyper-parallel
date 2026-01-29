@@ -18,9 +18,20 @@ from typing import Optional, Any
 from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel import DeviceMesh
 from hyper_parallel.platform import get_platform
+
 platform = get_platform()
 
 origin_class_to_extend_class = {}
+
+
+class _UnshardHandle:
+    def __init__(self, hsdp_state=None):
+        self._hsdp_state = hsdp_state
+
+    def wait(self):
+        if self._hsdp_state is not None:
+            self._hsdp_state.wait_for_unshard()
+            self._hsdp_state = None
 
 
 class HSDPCell:
@@ -30,9 +41,10 @@ class HSDPCell:
     Supported Platforms:
         ``MindSpore`` ``torch``
     """
+
     # pylint: disable=C0415
     def hsdp_init(self, platform_type, cell, mesh, reshard_after_forward,
-                   shard_placement_fn, mp_policy, offload_policy, ignored_params):
+                  shard_placement_fn, mp_policy, offload_policy, ignored_params):
         """init hsdp2 scheduler."""
         scheduler_class = None
         if platform_type == PlatformType.MINDSPORE:
@@ -49,7 +61,7 @@ class HSDPCell:
                                               mp_policy,
                                               offload_policy,
                                               ignored_params,
-                                            )
+                                              )
 
     def set_requires_gradient_sync(self, requires_grad_sync):
         r"""
@@ -100,44 +112,36 @@ class HSDPCell:
         self.hsdp_scheduler.set_backward_prefetch_cells(hsdp_cell_list)
 
     def reshard(self) -> None:
-        # TODO
+        """reshard all sharded parameters"""
         if not self.hsdp_scheduler:
             raise ValueError("hsdphsdp_scheduler_state is None")
-        self.hsdp_scheduler.reshard()
-
+        scheduler_state = self.hsdp_scheduler.scheduler_state
+        if scheduler_state:
+            scheduler_state.shard()
 
     def unshard(self, async_op: bool = False):
-        if hsdp_state := self.hsdp_scheduler.hsdp_state:
-            # TODO: support async unshard
-            hsdp_state.unshard(async_op=False)
-        if async_op:
-            raise ValueError(f"async_op unshard need impl")
+        """unshard all sharded parameters"""
+        if not isinstance(async_op, bool):
+            raise ValueError(f"async_op should be a bool, got {type(async_op)}")
+        if not self.hsdp_scheduler:
+            raise ValueError("hsdphsdp_scheduler_state is None")
+        scheduler_state = self.hsdp_scheduler.scheduler_state
+        if scheduler_state:
+            scheduler_state.unshard(async_op=async_op)
+            if async_op:
+                return _UnshardHandle(hsdp_state=scheduler_state)
         return None
 
     def set_is_last_backward(self, is_last_backward: bool):
-        # TODO
+        """set is_last_backward flag"""
         self.hsdp_scheduler.scheduler_ctx.is_last_backward = is_last_backward
 
     def set_requires_all_reduce(self, requires_all_reduce: bool, *, recurse: bool = True) -> None:
-        # TODO
-        pass
-
-    def set_reshard_after_forward(self, reshard_after_forward: bool, recurse: bool = True) -> None:
-        # TODO
-        if not isinstance(reshard_after_forward, bool):
+        """set requires_all_reduce flag"""
+        if not isinstance(requires_all_reduce, bool):
             raise ValueError(
-                f"reshard_after_forward should be a bool, got {type(reshard_after_forward)}"
+                f"requires_all_reduce should be a bool, got {type(requires_all_reduce)}"
             )
-        if not recurse:
-            raise NotImplementedError(f"Currently impl is equal to recurse=True,\
-                                      need support module_param mapping.")
-        # self_module = cast(Cell, self)
-        if isinstance(self.cell, HSDPCell):
-            self.hsdp_scheduler.reshard_after_forward = reshard_after_forward
-
-
-    def set_reshard_after_backward(self, reshard_after_backward: bool, recurse: bool = True) -> None:
-        # TODO
         if not recurse:
             raise NotImplementedError(f"Currently impl is equal to recurse=True,\
                                       need support module_param mapping.")
@@ -145,7 +149,37 @@ class HSDPCell:
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
             if isinstance(module, HSDPCell):
-                self.hsdp_scheduler.reshard_after_forward = reshard_after_backward
+                module.hsdp_scheduler.set_requires_all_reduce(requires_all_reduce)
+
+    def set_reshard_after_forward(self, reshard_after_forward: bool, recurse: bool = True) -> None:
+        """set reshard_after_forward flag"""
+        if not isinstance(reshard_after_forward, bool):
+            raise ValueError(
+                f"reshard_after_forward should be a bool, got {type(reshard_after_forward)}"
+            )
+        if not recurse:
+            raise NotImplementedError(f"Currently impl is equal to recurse=True,\
+                                      need support module_param mapping.")
+        self_module = cast(nn.Module, self)
+        modules = list(self_module.modules()) if recurse else [self_module]
+        for module in modules:
+            if isinstance(module, HSDPCell):
+                module.hsdp_scheduler.set_reshard_after_forward(reshard_after_forward)
+
+    def set_reshard_after_backward(self, reshard_after_backward: bool, recurse: bool = True) -> None:
+        """set reshard_after_backward flag"""
+        if not isinstance(reshard_after_backward, bool):
+            raise ValueError(
+                f"reshard_after_backward should be a bool, got {type(reshard_after_backward)}"
+            )
+        if not recurse:
+            raise NotImplementedError(f"Currently impl is equal to recurse=True,\
+                                      need support module_param mapping.")
+        self_module = cast(nn.Module, self)
+        modules = list(self_module.modules()) if recurse else [self_module]
+        for module in modules:
+            if isinstance(module, HSDPCell):
+                module.hsdp_scheduler.set_reshard_after_backward(reshard_after_backward)
 
 
 def _extend_cell_with_hsdp_interface(cell):
@@ -156,6 +190,7 @@ def _extend_cell_with_hsdp_interface(cell):
         extend_class = type(f"HSDP{origin_class.__name__}", (HSDPCell, origin_class), {})
         origin_class_to_extend_class[origin_class] = extend_class
     cell.__class__ = extend_class
+
 
 # pylint: disable=C0415
 def _check_cell_valid(platform_type, cell):
@@ -168,6 +203,7 @@ def _check_cell_valid(platform_type, cell):
         from torch.nn import Module
         if not isinstance(cell, Module):
             raise ValueError(f"cell's type must be nn.Module but got {type(cell)}.")
+
 
 # pylint: disable=C0415
 def _check_hsdp_input_valid(platform_type, cell, shard_size, threshold, optimizer_level, enable_grad_accumulation,
@@ -210,7 +246,6 @@ def fully_shard(
         offload_policy: None = None,
         ignored_params: set[nn.Parameter] | None = None
 ):
-
     platform_type = platform.platform_type
     _extend_cell_with_hsdp_interface(cell)
     cell.hsdp_init(
