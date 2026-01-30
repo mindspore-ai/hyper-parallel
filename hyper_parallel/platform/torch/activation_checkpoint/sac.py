@@ -17,7 +17,6 @@
 # ============================================================================
 """enhanced with selective checkpoint support swap"""
 # pylint: disable=W0212, W0613, C0115, C0116, C0103, R1705
-import enum
 from typing import Any, Optional, Union
 
 import torch
@@ -25,7 +24,8 @@ import torch.fx.traceback as fx_traceback
 from torch._functorch._aot_autograd.functional_utils import is_fun
 from torch.utils._pytree import tree_map
 from torch.utils._python_dispatch import TorchDispatchMode
-from .swap import SwapManager, SwapTensor, Storage  # patch code
+from hyper_parallel.core.activation_checkpoint import CheckpointPolicy  # patch code
+from hyper_parallel.core.activation_checkpoint.swap import SwapManager, SwapTensor, Storage  # patch code
 
 def _is_compiling(func, args, kwargs):
     # Check if we are under AOTAutograd tracing
@@ -96,36 +96,6 @@ class SelectiveCheckpointContext:
     """
     def __init__(self, *, is_recompute):
         self.is_recompute = is_recompute
-
-
-class CheckpointPolicy(enum.Enum):
-    """
-    Enum for specifying the policy for checkpointing during backpropagation.
-
-    The following policies are supported:
-
-    - ``{MUST,PREFER}_SAVE``: The operation's output will be saved during the forward
-      pass and will not be recomputed during the backward pass
-    - ``{MUST,PREFER}_RECOMPUTE``: The operation's output will not be saved during the
-      forward pass and will be recomputed during the backward pass
-
-    Use ``MUST_*`` over ``PREFER_*`` to indicate that the policy should not be overridden
-    by other subsystems like `torch.compile`.
-
-    .. note::
-        A policy function that always returns ``PREFER_RECOMPUTE`` is
-        equivalent to vanilla checkpointing.
-
-        A policy function that returns ``PREFER_SAVE`` every op is
-        NOT equivalent to not using checkpointing. Using such a policy would
-        save additional tensors not limited to ones that are actually needed for
-        gradient computation.
-    """
-    MUST_SAVE = 0
-    PREFER_SAVE = 1
-    MUST_RECOMPUTE = 2
-    PREFER_RECOMPUTE = 3
-    MUST_SWAP = 4  # patch code
 
 
 def _policy_from_bool(b):

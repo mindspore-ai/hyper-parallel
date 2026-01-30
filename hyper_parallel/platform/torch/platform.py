@@ -18,6 +18,8 @@ from torch import nn
 from torch import Tensor
 from torch.nn import Parameter, Module
 from torch._ops import OpOverload, OpOverloadPacket
+from torch.utils.checkpoint import noop_context_fn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 import torch.distributed.nn.functional as dist_func
 import torch.distributed as dist
 from hyper_parallel.platform.torch.dtensor import DTensorBase
@@ -346,3 +348,46 @@ class TorchPlatform(Platform):
             be unmodified.
         """
         dist.all_gather_object(object_list, obj, group)
+
+    @staticmethod
+    def no_grad():
+        return torch.no_grad()
+
+    @staticmethod
+    def empty_like(tensor, *, dtype=None, device=None, pin_memory=False):
+        return torch.empty_like(tensor, dtype=dtype, device=device, pin_memory=pin_memory)
+
+    def get_current_stream(self):
+        device = self.get_device_handle()
+        return device.current_stream()
+
+    def new_event(self):
+        device = self.get_device_handle()
+        return device.Event()
+
+    def tree_map(self, fn, tree):
+        return torch.utils._pytree.tree_map(fn, tree)  # pylint:disable=protected-access
+
+    @property
+    def checkpoint(self):
+        return torch.utils.checkpoint.checkpoint
+
+    @staticmethod
+    def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
+        return checkpoint_wrapper(module, checkpoint_fn=checkpoint_fn, **checkpoint_fn_kwargs)
+
+    @property
+    def noop_context_fn(self):
+        return noop_context_fn
+
+    @staticmethod
+    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.sac import create_selective_checkpoint_contexts
+        return create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation)
+
+    @staticmethod
+    def async_save_on_cpu(policy_fn=None):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import AsyncSaveOnCpu
+        return AsyncSaveOnCpu(policy_fn)

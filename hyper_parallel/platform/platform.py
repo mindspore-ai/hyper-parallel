@@ -310,3 +310,52 @@ class Platform:
         Aggregates all Python objects objs in a specified communication group into object_list.
         """
         raise NotImplementedError("Platform subclasses must implement all_gather_object")
+
+    @staticmethod
+    def no_grad():
+        raise NotImplementedError("Platform subclasses must implement no_grad")
+
+    @staticmethod
+    def empty_like(tensor, *, dtype=None, device=None, pin_memory=False):
+        raise NotImplementedError("Platform subclasses must implement empty_like")
+
+    def get_current_stream(self):
+        raise NotImplementedError("Platform subclasses must implement get_current_stream")
+
+    def new_event(self):
+        raise NotImplementedError("Platform subclasses must implement new_event")
+
+    def tree_map(self, fn, tree):
+        raise NotImplementedError("Platform subclasses must implement tree_map")
+
+    @staticmethod
+    def register_forward_pre_hook(module, hook, prepend=False, with_kwargs=False):
+        return module.register_forward_pre_hook(hook, prepend=prepend, with_kwargs=with_kwargs)
+
+    @staticmethod
+    def register_full_backward_hook(module, hook, prepend=False):
+        return module.register_full_backward_hook(hook, prepend)
+
+    @staticmethod
+    def register_full_backward_pre_hook(module, hook, prepend=False):
+        return module.register_full_backward_pre_hook(hook, prepend)
+
+    @property
+    def checkpoint(self):
+        raise NotImplementedError("Platform subclasses must implement checkpoint")
+
+    @staticmethod
+    def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
+        raise NotImplementedError("Platform subclasses must implement ckpt_wrapper")
+
+    @property
+    def noop_context_fn(self):
+        raise NotImplementedError("Platform subclasses must implement ckpt_wrapper")
+
+    @staticmethod
+    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
+        raise NotImplementedError("Platform subclasses must implement create_selective_checkpoint_contexts")
+
+    @staticmethod
+    def async_save_on_cpu(policy_fn=None):
+        raise NotImplementedError("Platform subclasses must implement async_save_on_cpu")
