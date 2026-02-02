@@ -293,8 +293,10 @@ class Layout:
         for mesh_idx, placement in enumerate(self.placements):
             if isinstance(placement, Shard):
                 shard_dim = placement.dim
-                if shard_dim < 0 or shard_dim >= dim:
+                if shard_dim < -dim or shard_dim >= dim:
                     raise ValueError(f"Shard dimension {shard_dim} is out of bounds for tensor of dimension {dim}")
+                if shard_dim < 0:
+                    shard_dim += dim
                 if dim_map[shard_dim] != -1:
                     raise ValueError(f"Dimension {shard_dim} has been sharded by Mesh axis {dim_map[shard_dim]}")
                 dim_map[shard_dim] = mesh_idx

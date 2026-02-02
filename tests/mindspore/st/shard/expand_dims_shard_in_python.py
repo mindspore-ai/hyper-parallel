@@ -19,36 +19,38 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor, ops
-from hyper_parallel import init_device_mesh, shard, DTensor
+from hyper_parallel import init_device_mesh, shard_module, DTensor
 from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 
 def setup_module():
-    ms.context.set_context(mode=ms.context.PYNATIVE_MODE, device_target="Ascend")
+    ms.set_device("Ascend")
     D.init()
 
 
+base_mesh_shape = (2, 2, 2)
+base_alias_name = ("dp", "cp", "tp")
+
+
 class ExpandDimsNet(nn.Cell):
-    """ExpandDims composed of ExpandDims and ReLUs"""
+    """ExpandDims network composed of ExpandDims operation and ReLU"""
 
     def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.expand_dims = ops.ExpandDims()
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None and device_mesh is not None:
-            sharding_plan = {"forward": {"input": relu_strategy}}
-            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, axis):
         out = self.expand_dims(x, axis)
         out = self.relu(out)
         out = out + 1
         return out
-
-
-base_mesh_shape = (2, 2, 2)
-base_alias_name = ("dp", "cp", "mp")
-base_rank_list = list(range(8))
 
 
 def test_expanddims_data_parallel_1():

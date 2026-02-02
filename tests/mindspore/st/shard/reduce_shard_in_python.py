@@ -19,8 +19,9 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor, ops
-from hyper_parallel import init_device_mesh, shard, DTensor, parallelize_value_and_grad
+from hyper_parallel import init_device_mesh, shard_module, DTensor, parallelize_value_and_grad
 from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 
 def setup_module():
@@ -36,8 +37,10 @@ class SumExtNet(nn.Cell):
         self.sum_ext = ms.mint.sum
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None and device_mesh is not None:
-            sharding_plan = {"forward": {"input": relu_strategy}}
-            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, dim=None, keepdim=False, dtype=None):
         out = self.sum_ext(input=x, dim=dim, keepdim=keepdim, dtype=dtype)
@@ -54,8 +57,10 @@ class MeanExtNet(nn.Cell):
         self.sum_ext = ms.mint.mean
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None and device_mesh is not None:
-            sharding_plan = {"forward": {"input": relu_strategy}}
-            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, dim=None, keepdim=False, dtype=None):
         out = self.sum_ext(input=x, dim=dim, keepdim=keepdim, dtype=dtype)
@@ -72,8 +77,10 @@ class ReduceMaxNet(nn.Cell):
         self.reduce_max = ops.ReduceMax(keep_dims=keep_dims)
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None and device_mesh is not None:
-            sharding_plan = {"forward": {"input": relu_strategy}}
-            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, axis=()):
         out = self.reduce_max(x, axis)
@@ -206,6 +213,7 @@ def test_reduce_max_backward_gradient_4():
     # Standalone
     class StandaloneNet(nn.Cell):
         """Standalone network for ReduceMax testing"""
+
         def __init__(self, k):
             super().__init__()
             self.reduce_max = ops.ReduceMax(keep_dims=False)
@@ -245,6 +253,7 @@ def test_reduce_max_backward_gradient_4():
 
     class ParallelNet(nn.Cell):
         """Parallel network for ReduceMax testing with distributed parameters"""
+
         def __init__(self, k, mesh):
             super().__init__()
             self.reduce_max = ops.ReduceMax(keep_dims=False)
@@ -264,13 +273,11 @@ def test_reduce_max_backward_gradient_4():
             # Shard relu operator
             relu_input_placements = (Replicate(), Replicate(), Shard(0))
             relu_output_placements = (Replicate(), Replicate(), Shard(0))
-            relu_sharding_plan = {
-                "forward": {
-                    "input": (relu_input_placements,),
-                    "output": (relu_output_placements,)
-                }
-            }
-            shard(self.relu, device_mesh=mesh, sharding_plan=relu_sharding_plan)
+            relu_sharding_plan = ShardingPlan(
+                input_plan={"input": (relu_input_placements,)},
+                output_plan={"output": (relu_output_placements,)},
+            )
+            shard_module(self.relu, device_mesh=mesh, sharding_plan=relu_sharding_plan)
 
         def construct(self, x):
             out = self.reduce_max(x, (0, 1))
@@ -286,8 +293,11 @@ def test_reduce_max_backward_gradient_4():
     parallel_net = ParallelNet(k, mesh)
 
     out_placements = (Replicate(), Replicate(), Replicate())
-    net_sharding_plan = {"input": (x_placements,), "output": (out_placements,)}
-    shard(parallel_net, device_mesh=mesh, sharding_plan=net_sharding_plan)
+    net_sharding_plan = ShardingPlan(
+        input_plan={"input": (x_placements,)},
+        output_plan={"output": (out_placements,)},
+    )
+    shard_module(parallel_net, device_mesh=mesh, sharding_plan=net_sharding_plan)
 
     parallel_optimizer = nn.SGD(parallel_net.trainable_params(), learning_rate=0.01)
 

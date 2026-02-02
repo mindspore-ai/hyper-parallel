@@ -19,7 +19,7 @@ from hyper_parallel.core.layout import Layout
 from hyper_parallel.core.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.core.dtensor import DTensor, SkipDTensorDispatch
 from hyper_parallel.core.parameter_init import init_parameters
-from hyper_parallel.core.shard.api import shard
+from hyper_parallel.core.shard.api import shard_module
 from hyper_parallel.core.shard.api import parallelize_value_and_grad
 from hyper_parallel.core.shard.local_func import custom_shard
 from hyper_parallel.core.pipeline_parallel import (PipelineStage, ScheduleInterleaved1F1B, MetaStep, MetaStepType,
@@ -29,6 +29,6 @@ from hyper_parallel.distributed.distributed import (init_process_group, destroy_
 
 __all__ = ["get_platform", "hsdp", "hsdp_sync_stream", "HSDPCell", "Layout", "DTensor",
            "Layout", "DeviceMesh", "init_device_mesh",
-           "init_parameters", "shard", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch",
+           "init_parameters", "shard_module", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch",
            "MetaStep", "MetaStepType", "BatchDimSpec", "PipelineStage", "ScheduleInterleaved1F1B",
            "init_process_group", "destroy_process_group", "get_process_group_ranks", "get_backend", "split_group"]

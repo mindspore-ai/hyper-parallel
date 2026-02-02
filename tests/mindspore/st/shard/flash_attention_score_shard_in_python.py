@@ -21,8 +21,9 @@ import mindspore.communication.management as D
 import mindspore.common.dtype as mstype
 from mindspore import Tensor
 from mindspore.ops import flash_attention_score
-from hyper_parallel import init_device_mesh, shard, DTensor
+from hyper_parallel import init_device_mesh, shard_module, DTensor
 from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.core.shard.ops.parallel_flash_attention_score import ParallelFlashAttention
 
 
@@ -124,13 +125,15 @@ def test_flash_attention_score_model_parallel():
                                           scalar_value=scalar_value,
                                           input_layout=input_layout,
                                           sparse_mode=sparse_mode)
-    sharding_plan = {
-        "forward": {
+    sharding_plan = ShardingPlan(
+        input_plan={
             "input": (query_placements, key_placements, value_placements, attn_mask_placements),
-            "output": (output_placements,)
-        }
-    }
-    shard(parallel_net, device_mesh=mesh, sharding_plan=sharding_plan)
+        },
+        output_plan={
+            "output": (output_placements,),
+        },
+    )
+    shard_module(parallel_net, device_mesh=mesh, sharding_plan=sharding_plan)
     parallel_output = parallel_net(query_local, key_local, value_local, attn_mask_local)
 
     # Validate

@@ -23,8 +23,11 @@ import mindspore.communication.management as D
 from mindspore import nn, Tensor
 from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
-from hyper_parallel import init_device_mesh, hsdp, init_parameters, custom_shard, shard, parallelize_value_and_grad, DTensor
+
+from hyper_parallel import init_device_mesh, hsdp, init_parameters, custom_shard, shard_module, \
+    parallelize_value_and_grad, DTensor
 from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from tests.mindspore.st.shard.utils import create_dtensor
 
 learning_rate = 0.01
@@ -83,7 +86,7 @@ class ParallelModel(nn.Cell):
         self.relu = ms.mint.nn.ReLU()
         self.wrap = custom_shard(
             func=local_func, device_mesh=mesh, out_placements=out_placements, in_placements=in_placements
-            )
+        )
         self.group = mesh.get_group("tp")
         self.mlp = MLP(output_size, output_size)
 
@@ -170,38 +173,27 @@ def base_case(dp, tp, hsdp_shard_size):
         model = ParallelModel(input_size, output_size, mesh, custom_out_placements, custom_in_placements)
 
     # step 2: shard
-    model_sharding_plan = {
-        "forward": {
-            "input": x_placements,
-            "output": out_placements
-        },
-        "parameter": {
-            "weight": w_placements
-        }
-    }
-    shard(model, device_mesh=mesh, sharding_plan=model_sharding_plan)
+    model_stra = ShardingPlan(
+        plan={"weight": w_placements},
+        input_plan={"input": x_placements},
+        output_plan={"output": out_placements},
+    )
+    shard_module(model, device_mesh=mesh, sharding_plan=model_stra)
 
-    mlp_sharding_plan = {
-        "forward": {
-            "input": {
-                "x": mlp_x_placements,
-                "activation": mlp_activation_placements,
-                "extra_loss": (Replicate(), Replicate())
-            }
-        },
-        "parameter": {
-            "weight": mlp_w_placements
-        }
-    }
-    shard(model.mlp, device_mesh=mesh, sharding_plan=mlp_sharding_plan)
+    mlp_sharding_plan = ShardingPlan(
+        plan={"weight": mlp_w_placements},
+        input_plan={"input": {
+            "x": mlp_x_placements,
+            "activation": mlp_activation_placements,
+            "extra_loss": (Replicate(), Replicate())}
+        })
+    shard_module(model.mlp, device_mesh=mesh, sharding_plan=mlp_sharding_plan)
 
-    relu_sharding_plan = {
-        "forward": {
-            "input": relu_input_placements,
-            "output": relu_output_placements
-        }
-    }
-    shard(model.relu, device_mesh=mesh, sharding_plan=relu_sharding_plan)
+    relu_sharding_plan = ShardingPlan(
+        input_plan={"input": relu_input_placements},
+        output_plan={"output": relu_output_placements},
+    )
+    shard_module(model.relu, device_mesh=mesh, sharding_plan=relu_sharding_plan)
 
     # step 3: hsdp
     model = hsdp(model, shard_size=hsdp_shard_size, threshold=0)

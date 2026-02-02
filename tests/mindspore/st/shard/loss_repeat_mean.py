@@ -19,8 +19,9 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
-from hyper_parallel import init_device_mesh, hsdp, shard, DTensor, parallelize_value_and_grad
+from hyper_parallel import init_device_mesh, hsdp, shard_module, DTensor, parallelize_value_and_grad
 from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from tests.mindspore.st.shard.utils import create_dtensor
 
 learning_rate = 0.01
@@ -91,11 +92,16 @@ def run_parallel(local_x, local_input_size, local_output_size, device_mesh, x_pl
     """run parallel"""
     model = SimpleModel(local_input_size, local_output_size, device_mesh, w_placements)
 
-    model_sharding_plan = {"forward": {"input": (x_placements,)}}
-    shard(model, device_mesh=device_mesh, sharding_plan=model_sharding_plan)
+    model_sharding_plan = ShardingPlan(
+        input_plan={"input": (x_placements,)},
+    )
+    shard_module(model, device_mesh=device_mesh, sharding_plan=model_sharding_plan)
 
-    model_relu_sharding_plan = {"forward": {"input": (relu_input_placements,), "output": (relu_output_placements,)}}
-    shard(model.relu, device_mesh=device_mesh, sharding_plan=model_relu_sharding_plan)
+    model_relu_sharding_plan = ShardingPlan(
+        input_plan={"input": (relu_input_placements,)},
+        output_plan={"output": (relu_output_placements,)},
+    )
+    shard_module(model.relu, device_mesh=device_mesh, sharding_plan=model_relu_sharding_plan)
 
     model = hsdp(model, shard_size=hsdp_shard_size, threshold=0)
 

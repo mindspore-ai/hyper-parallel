@@ -14,11 +14,12 @@
 # ============================================================================
 """shard"""
 import inspect
-from typing import Union, Callable, Dict
+from typing import Union, Callable, Dict, List
 from functools import wraps
 from hyper_parallel.core.layout import Layout, DeviceMesh
 from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.core.placement_types import Placement
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -138,7 +139,7 @@ def _convert_sharding_plan(sharding_plan: Dict, device_mesh: DeviceMesh) -> Dict
 
         converted = {}
         for key, value in forward_plan.items():
-            if key in ("input", "output"):
+            if key.endswith("input") or key.endswith("output"):
                 # input/output need special handling:
                 # - dict format: convert each value, keep as dict
                 # - list/tuple format: convert each element, keep as list
@@ -169,7 +170,7 @@ def _convert_sharding_plan(sharding_plan: Dict, device_mesh: DeviceMesh) -> Dict
     for key, value in sharding_plan.items():
         if key == "forward":
             converted_plan[key] = _convert_forward_plan(value)
-        elif key in ("input", "output"):
+        elif key.endswith("input") or key.endswith("output"):
             # Top-level input/output (for callable sharding)
             if value is None:
                 converted_plan[key] = None
@@ -307,7 +308,7 @@ def _register_hook(model: Module, sharding_plan: Dict):
         prefix = split_key[0] if has_dot else ""
         suffix = split_key[1] if has_dot else key
         if suffix not in valid_suffix:
-            raise ValueError(f"In python shard, sharding_plan's forward key must end with input or output, "
+            raise ValueError(f"In python shard_module, sharding_plan's forward key must end with input or output, "
                              f"but got type {suffix}")
 
         set_inputs_layout = suffix == "input"
@@ -316,6 +317,31 @@ def _register_hook(model: Module, sharding_plan: Dict):
 
         _set_layouts(register_cell, value, set_inputs_layout, set_outputs_layout)
         _register_cell_hook(register_cell, set_inputs_layout, set_outputs_layout)
+
+
+def _register_local_tensor_hook(cell: Module, return_local_tensor_list: List[str]):
+    """_register_local_tensor_hook"""
+
+    def hook_func(cell, inputs, outputs):  # pylint: disable=unused-argument
+        def _recursive_to_local(out):
+            if isinstance(out, (tuple, list)):
+                new_out = []
+                for item in out:
+                    new_out.append(_recursive_to_local(item))
+                return tuple(new_out) if isinstance(out, tuple) else new_out
+            if isinstance(out, DTensor):
+                return out.to_local()
+            return out
+
+        return _recursive_to_local(outputs)
+
+    cell_dict = {}
+    for name, sub_cell in platform.get_cells_and_names(cell):
+        cell_dict[name] = sub_cell
+
+    for cell_name in return_local_tensor_list:
+        register_cell = cell_dict[cell_name]
+        register_cell.register_forward_hook(hook_func)
 
 
 def _shard_callable(func: Callable, sharding_plan: Dict):
@@ -327,8 +353,8 @@ def _shard_callable(func: Callable, sharding_plan: Dict):
     @wraps(func)
     def _shard_wrapper(*args, **kwargs):
         """_shard_wrapper"""
-        input_layout = sharding_plan.get("input")
-        output_layout = sharding_plan.get("output")
+        input_layout = forward_sharding_plan.get("input")
+        output_layout = forward_sharding_plan.get("output")
         if input_layout is not None:
             args, kwargs = _parallel_in(func, args, kwargs, input_layout)
         outputs = func(*args, **kwargs)
@@ -339,7 +365,7 @@ def _shard_callable(func: Callable, sharding_plan: Dict):
     return _shard_wrapper
 
 
-def shard(model: Union[Module, Callable], device_mesh: DeviceMesh, sharding_plan: Dict):
+def shard_module(model: Union[Module, Callable], device_mesh: DeviceMesh, sharding_plan: ShardingPlan):
     """
     Defining the input, output and parameters layouts of this cell or Callable.
 
@@ -352,7 +378,7 @@ def shard(model: Union[Module, Callable], device_mesh: DeviceMesh, sharding_plan
     Args:
         model (Module or Callable): The model to be sharded.
         device_mesh (DeviceMesh): The device mesh for sharding.
-        sharding_plan (Dict): Define the layout for the specified parameters, inputs or outputs.
+        sharding_plan (ShardingPlan): Define the layout for the specified parameters, inputs or outputs.
             The sharding specification can be:
             - tuple of strings for alias format, e.g., ("dp", "None")
             - tuple of Placements, e.g., (Shard(0), Replicate())
@@ -363,28 +389,55 @@ def shard(model: Union[Module, Callable], device_mesh: DeviceMesh, sharding_plan
     Examples:
         >>> # Usage with device_mesh and alias format
         >>> mesh = DeviceMesh((2, 2), ("dp", "tp"))
-        >>> sharding_plan = {
-        ...     "parameter": {"mlp.weight": ("None", "tp")},
-        ...     "forward": {"input": ("dp", "None"),
-        ...                 "output": ("dp", "tp")}
-        ... }
-        >>> model = shard(model, mesh, sharding_plan)
+        >>> sharding_plan = ShardingPlan(
+        ...     plan={"mlp.weight": ("None", "tp")},
+        ...     input_plan={"input": ("dp", "None")},
+        ...     output_plan={"output": ("dp", "tp")}
+        ... )
+        >>> model = shard_module(model, mesh, sharding_plan)
 
         >>> # Usage with device_mesh and Placement format
         >>> mesh = DeviceMesh((2, 2), ("dp", "tp"))
-        >>> sharding_plan = {
-        ...     "parameter": {"mlp.weight": (Replicate(), Shard(1))},
-        ...     "forward": {"input": (Shard(0), Replicate()),
-        ...                 "output": (Shard(0), Shard(1))}
-        ... }
-        >>> model = shard(model, mesh, sharding_plan)
-
+        >>> sharding_plan = ShardingPlan(
+        ...     plan={"mlp.weight": (Replicate(), Shard(1))},
+        ...     input_plan={"input": (Shard(0), Replicate())},
+        ...     output_plan={"output": (Shard(0), Shard(1))}
+        ... )
+        >>> model = shard_module(model, mesh, sharding_plan)
     """
     if platform.get_world_size() == 1:
         return None
 
+    if not isinstance(sharding_plan, ShardingPlan):
+        raise TypeError(f"The 'sharding_plan' must be an instance of ShardingPlan, "
+                        f"but got {type(sharding_plan)}. Direct dict input is not supported.")
+
+    normalized_plan = {}
+    return_local_tensor_list = None
+
+    if sharding_plan.plan:
+        normalized_plan["parameter"] = sharding_plan.plan
+
+    forward_part = {}
+
+    if sharding_plan.input_plan:
+        if not isinstance(sharding_plan.input_plan, dict):
+            raise TypeError(f"input_plan must be a dict, but got {type(sharding_plan.input_plan)}")
+        forward_part.update(sharding_plan.input_plan)
+
+    if sharding_plan.output_plan:
+        if not isinstance(sharding_plan.output_plan, dict):
+            raise TypeError(f"output_plan must be a dict, but got {type(sharding_plan.output_plan)}")
+        forward_part.update(sharding_plan.output_plan)
+
+    if forward_part:
+        normalized_plan["forward"] = forward_part
+
+    if sharding_plan.return_local_tensor:
+        return_local_tensor_list = sharding_plan.return_local_tensor
+
     # Convert sharding_plan to Layout objects
-    converted_plan = _convert_sharding_plan(sharding_plan, device_mesh)
+    converted_plan = _convert_sharding_plan(normalized_plan, device_mesh)
 
     if not isinstance(model, Module):
         return _shard_callable(model, converted_plan)
@@ -395,7 +448,7 @@ def shard(model: Union[Module, Callable], device_mesh: DeviceMesh, sharding_plan
     if param_sharding_plan is not None:
         for param_name, layout in param_sharding_plan.items():
             if not isinstance(layout, Layout):
-                raise ValueError(f"In python shard, the type of setting in parameter_plan must be Layout, "
+                raise ValueError(f"In python shard_module, the type of setting in parameter_plan must be Layout, "
                                  f"but got type {type(layout)}")
             result = platform.search_parameter_by_name(model, param_name)
             if not result:
@@ -407,6 +460,10 @@ def shard(model: Union[Module, Callable], device_mesh: DeviceMesh, sharding_plan
 
     if forward_sharding_plan is not None:
         _register_hook(model, forward_sharding_plan)
+
+    if return_local_tensor_list is not None:
+        _register_local_tensor_hook(model, return_local_tensor_list)
+
     return model
 
 

@@ -17,14 +17,16 @@
 import numpy as np
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
-from hyper_parallel import init_device_mesh, shard, DTensor
+from hyper_parallel import init_device_mesh, shard_module, DTensor
 from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 
 class NetTestInput(nn.Cell):
     """
         Net for testing hyper_parallel.shard processing args and kwargs inputs
     """
+
     def construct(self, x, y, z, use_residual_add=False, return_residual_sign=True):
         temp = x + y
         result = temp * z
@@ -63,8 +65,11 @@ def test_shard_with_args_and_kwargs_non_dtensor_input():
                         use_residual_add_placements, return_residual_sign_placements)
     output_placements = (output_0_placements, output_1_placements)
 
-    sharding_plan = {"forward": {"input": input_placements, "output": output_placements}}
-    shard(model, device_mesh=mesh, sharding_plan=sharding_plan)
+    sharding_plan = ShardingPlan(
+        input_plan={"input": input_placements},
+        output_plan={"output": output_placements},
+    )
+    shard_module(model, device_mesh=mesh, sharding_plan=sharding_plan)
 
     x = Tensor(np.ones((4, 8)))
     y = Tensor(np.zeros((4, 8)))

@@ -25,8 +25,9 @@ from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
 from mindspore.communication import get_rank
 
-from hyper_parallel import shard, parallelize_value_and_grad, init_device_mesh
+from hyper_parallel import shard_module, parallelize_value_and_grad, init_device_mesh
 from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.core.checkpoint.layout import get_current_layout, save_layout, load_layout, get_global_layout
 from hyper_parallel.core.checkpoint.loader import load_checkpoint
 from hyper_parallel.core.checkpoint.saver import save_checkpoint
@@ -99,12 +100,18 @@ def base_case(dp, mp):
         model = SimpleModel(input_size, output_size)
 
     # step 2: shard
-    model_stra = {"forward": {"input": x_placements, "output": out_placements},
-                  "parameter": {"weight": w_placements}}
-    shard(model, device_mesh=mesh, sharding_plan=model_stra)
+    model_stra = ShardingPlan(
+        plan = {"weight": w_placements},
+        input_plan={"input": x_placements},
+        output_plan={"output": out_placements},
+    )
+    shard_module(model, device_mesh=mesh, sharding_plan=model_stra)
 
-    model_relu_stra = {"forward": {"input": relu_input_placements, "output": relu_output_placements}}
-    shard(model.relu, device_mesh=mesh, sharding_plan=model_relu_stra)
+    model_relu_stra = ShardingPlan(
+        input_plan={"input": relu_input_placements},
+        output_plan={"output": relu_output_placements},
+    )
+    shard_module(model.relu, device_mesh=mesh, sharding_plan=model_relu_stra)
 
     # step 3: save layout
     layout_dict = get_current_layout(model)
@@ -145,12 +152,18 @@ def save_load_checkpoint(dp: int, mp: int) -> None:
         model = SimpleModel(input_size, output_size)
 
     # step 2: shard
-    model_stra = {"forward": {"input": x_placements, "output": out_placements},
-                  "parameter": {"weight": w_placements}}
-    shard(model, device_mesh=mesh, sharding_plan=model_stra)
+    model_stra = ShardingPlan(
+        plan = {"weight": w_placements},
+        input_plan={"input": x_placements},
+        output_plan={"output": out_placements},
+    )
+    shard_module(model, device_mesh=mesh, sharding_plan=model_stra)
 
-    model_relu_stra = {"forward": {"input": relu_input_placements, "output": relu_output_placements}}
-    shard(model.relu, device_mesh=mesh, sharding_plan=model_relu_stra)
+    model_relu_stra = ShardingPlan(
+        input_plan={"input": relu_input_placements},
+        output_plan={"output": relu_output_placements},
+    )
+    shard_module(model.relu, device_mesh=mesh, sharding_plan=model_relu_stra)
 
     # step 3: save checkpoint
     file_path = "tmp1.safetensors"
@@ -204,12 +217,18 @@ def base_global_layout(dp: int, mp: int):
         model = SimpleModel(input_size, output_size)
 
     # step 2: shard
-    model_stra = {"forward": {"input": x_placements, "output": out_placements},
-                  "parameter": {"weight": w_placements}}
-    shard(model, device_mesh=mesh, sharding_plan=model_stra)
+    model_stra = ShardingPlan(
+        plan = {"weight": w_placements},
+        input_plan={"input": x_placements},
+        output_plan={"output": out_placements},
+    )
+    shard_module(model, device_mesh=mesh, sharding_plan=model_stra)
 
-    model_relu_stra = {"forward": {"input": relu_input_placements, "output": relu_output_placements}}
-    shard(model.relu, device_mesh=mesh, sharding_plan=model_relu_stra)
+    model_relu_stra = ShardingPlan(
+        input_plan={"input": relu_input_placements},
+        output_plan={"output": relu_output_placements},
+    )
+    shard_module(model.relu, device_mesh=mesh, sharding_plan=model_relu_stra)
 
     # step 3: get global layout
     global_layout = get_global_layout(model)

@@ -18,8 +18,9 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
-from hyper_parallel import DTensor, init_device_mesh, shard
+from hyper_parallel import DTensor, init_device_mesh, shard_module
 from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 
 def setup_module():
@@ -35,8 +36,10 @@ class BmmExtNet(nn.Cell):
         self.bmm = ms.mint.bmm
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None and device_mesh is not None:
-            sharding_plan = {"forward": {"input": relu_strategy}}
-            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, w):
         out = self.bmm(x, w)
@@ -53,8 +56,10 @@ class BmmNet(nn.Cell):
         self.bmm = ms.ops.BatchMatMul(transpose_a=transpose_a, transpose_b=transpose_b)
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None and device_mesh is not None:
-            sharding_plan = {"forward": {"input": relu_strategy}}
-            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, w):
         out = self.bmm(x, w)

@@ -19,8 +19,9 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor, ops
-from hyper_parallel import init_device_mesh, shard, DTensor
+from hyper_parallel import init_device_mesh, shard_module, DTensor
 from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 
 def setup_module():
@@ -40,8 +41,10 @@ class MinimumNet(nn.Cell):
         self.minimum = ms.mint.minimum
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None and device_mesh is not None:
-            sharding_plan = {"forward": {"input": relu_strategy}}
-            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, y):
         out = self.minimum(x, y)
@@ -58,8 +61,10 @@ class LessEqualNet(nn.Cell):
         self.less_equal = ops.LessEqual()
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None and device_mesh is not None:
-            sharding_plan = {"forward": {"input": relu_strategy}}
-            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, y):
         out = self.less_equal(x, y)
@@ -77,8 +82,10 @@ class GreaterEqualNet(nn.Cell):
         self.greater_equal = ops.GreaterEqual()
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None and device_mesh is not None:
-            sharding_plan = {"forward": {"input": relu_strategy}}
-            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, y):
         out = self.greater_equal(x, y)
@@ -96,8 +103,10 @@ class LogicalOrNet(nn.Cell):
         self.logical_or = ops.LogicalOr()
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None and device_mesh is not None:
-            sharding_plan = {"forward": {"input": relu_strategy}}
-            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, y):
         out = self.logical_or(x, y)
@@ -115,8 +124,10 @@ class ModNet(nn.Cell):
         self.mod = ops.Mod()
         self.relu = ms.nn.ReLU()
         if relu_strategy is not None and device_mesh is not None:
-            sharding_plan = {"forward": {"input": relu_strategy}}
-            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, y):
         out = self.mod(x, y)
