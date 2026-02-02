@@ -20,24 +20,38 @@ from mindspore._c_expression import NoFallbackGuard
 
 class DTensorBase(Tensor):
     """
-    DTensorBase
+    DTensorBase - Base class for distributed tensors in MindSpore.
+
+    This class extends Tensor to support distributed tensor operations with
+    device mesh and placement specifications.
     """
 
-    def __new__(cls, local_tensor, layout=None, device="Ascend"):
+    def __new__(cls, local_tensor, device_mesh=None, placements=None, device="Ascend"):
+        """
+        Create a new DTensorBase instance.
+
+        Args:
+            local_tensor: The local tensor shard or another DTensorBase instance.
+            device_mesh: The device mesh describing the device topology.
+            placements: The placement strategy for each mesh dimension.
+            device: The device type (default: "Ascend").
+        """
         if isinstance(local_tensor, DTensorBase):
-            device_local_tensor = local_tensor.to_local() if local_tensor.to_local().has_init else\
+            device_local_tensor = local_tensor.to_local() if local_tensor.to_local().has_init else \
                 local_tensor.to_local().to(device)
             t = Tensor._make_subclass(cls, device_local_tensor)
-            t.__init_data__(device_local_tensor, local_tensor.layout)
+            t.__init_data__(device_local_tensor, local_tensor.device_mesh, local_tensor.placements)
             t._device = device
             return t
-        if not layout:
-            raise ValueError("Layout is None")
+        if device_mesh is None:
+            raise ValueError("device_mesh is None")
+        if placements is None:
+            raise ValueError("placements is None")
         device_local_tensor = local_tensor if local_tensor.has_init else local_tensor.to(device)
         if local_tensor.has_init:
             local_tensor.init_device = device
         t = Tensor._make_subclass(cls, device_local_tensor)
-        t.__init_data__(device_local_tensor, layout)
+        t.__init_data__(device_local_tensor, device_mesh, placements)
         t._device = device
         return t
 
@@ -51,11 +65,39 @@ class DTensorBase(Tensor):
         return str(self._local_tensor)
 
     def __copy__(self):
+        """
+        Create a shallow copy of the DTensorBase instance.
+
+        This method ensures that device_mesh and placements are correctly
+        propagated when creating a copy (e.g., for optimizer states).
+        """
+        # Get device_mesh and placements from either direct attributes or from layout
+        device_mesh = getattr(self, '_device_mesh', None)
+        placements = getattr(self, '_placements', None)
+
+        # If not found directly, try to get from layout
+        if device_mesh is None and hasattr(self, '_layout') and self._layout is not None:
+            device_mesh = self._layout.mesh
+        if placements is None and hasattr(self, '_layout') and self._layout is not None:
+            placements = self._layout.placements
+
+        if device_mesh is None or placements is None:
+            raise ValueError("Cannot copy DTensorBase: device_mesh or placements is None")
+
         if self._local_tensor.has_init:
-            obj = DTensorBase.__new__(type(self), initializer(self._local_tensor.init, self._local_tensor.shape,
-                                                          self._local_tensor.dtype), self._layout)
+            obj = DTensorBase.__new__(
+                type(self),
+                initializer(self._local_tensor.init, self._local_tensor.shape, self._local_tensor.dtype),
+                device_mesh,
+                placements
+            )
         else:
-            obj = DTensorBase.__new__(type(self), self._local_tensor.clone(), self._layout)
+            obj = DTensorBase.__new__(
+                type(self),
+                self._local_tensor.clone(),
+                device_mesh,
+                placements
+            )
         filtered_dict = {k: v for k, v in self.__dict__.items() if k != '_local_tensor'}
         obj.__dict__.update(filtered_dict)
         return obj
@@ -93,6 +135,8 @@ class DTensorBase(Tensor):
             data = data.to(self._device)
         if isinstance(data, DTensorBase):
             self._local_tensor._update_data(data.to_local())
+            self._device_mesh = data.device_mesh
+            self._placements = data.placements
             self._layout = data.layout
             self._update_data(self._local_tensor)
             return
@@ -125,7 +169,6 @@ class DTensorBase(Tensor):
             return None
         return self._local_tensor.init
 
-
     @init.setter
     def init(self, init_value):
         """
@@ -148,7 +191,6 @@ class DTensorBase(Tensor):
         if not hasattr(self._local_tensor, "param_info"):
             return None
         return self._local_tensor.param_info
-
 
     @local_param_info.setter
     def local_param_info(self, local_param_info_value):

@@ -18,7 +18,8 @@ import torch
 import pytest
 # pylint: disable=W0611
 import torch_npu
-from hyper_parallel import DTensor, Layout
+from hyper_parallel import DTensor, init_device_mesh
+from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 
 
@@ -30,11 +31,18 @@ def test_shard_to_replicate():
     '''
     init_dist()
 
-    layout = Layout((1, 8), ("dp", "tp"))
-    x_layout = layout("None", "tp")
-    dst_layout = layout("None", "None")
-    dist_x = DTensor.from_local(torch.ones(8, 1).npu(), x_layout)
-    out = dist_x.redistribute(dst_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=(1, 8),
+        alias_name=("dp", "tp")
+    )
+
+    # Define placements using Placement format
+    x_placements = (Replicate(), Shard(1))
+    dst_placements = (Replicate(), Replicate())
+
+    dist_x = DTensor.from_local(torch.ones(8, 1).npu(), mesh, x_placements)
+    out = dist_x.redistribute(mesh, dst_placements)
 
     expect_out = torch.ones(8, 8)
 
@@ -51,11 +59,18 @@ def test_replicate_to_shard():
     '''
     init_dist()
 
-    layout = Layout((1, 8), ("dp", "tp"))
-    dst_layout = layout("None", "tp")
-    x_layout = layout("None", "None")
-    dist_x = DTensor.from_local(torch.ones(8, 8).npu(), x_layout)
-    out = dist_x.redistribute(dst_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=(1, 8),
+        alias_name=("dp", "tp")
+    )
+
+    # Define placements using Placement format
+    dst_placements = (Replicate(), Shard(1))
+    x_placements = (Replicate(), Replicate())
+
+    dist_x = DTensor.from_local(torch.ones(8, 8).npu(), mesh, x_placements)
+    out = dist_x.redistribute(mesh, dst_placements)
 
     expect_out = torch.ones(8, 1)
 
@@ -72,11 +87,25 @@ def test_different_mesh():
     '''
     init_dist()
 
-    layout = Layout((1, 8, 1), ("dp", "tp", "sp"))
-    dst_layout = layout("None", "tp")
+    # Create DeviceMesh with 3 dimensions
+    mesh_3d = init_device_mesh(
+        mesh_shape=(1, 8, 1),
+        alias_name=("dp", "tp", "sp")
+    )
 
-    layout_1 = Layout((1, 8), ("dp", "tp"))
-    x_layout = layout_1("None", "None")
-    dist_x = DTensor.from_local(torch.ones(8, 8).npu(), x_layout)
+    # Note: For 3D mesh, "tp" maps to dim 1
+    dst_placements = (Replicate(), Shard(1), Replicate())
+
+    # Create DeviceMesh with 2 dimensions
+    mesh_2d = init_device_mesh(
+        mesh_shape=(1, 8),
+        alias_name=("dp", "tp")
+    )
+
+    x_placements = (Replicate(), Replicate())
+
+    dist_x = DTensor.from_local(torch.ones(8, 8).npu(), mesh_2d, x_placements)
+
+    # Redistributing between different meshes should raise RuntimeError
     with pytest.raises(RuntimeError):
-        dist_x.redistribute(dst_layout)
+        dist_x.redistribute(mesh_3d, dst_placements)

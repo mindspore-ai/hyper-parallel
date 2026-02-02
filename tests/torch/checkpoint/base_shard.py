@@ -16,8 +16,9 @@
 import numpy as np
 import torch
 from torch import optim
-from hyper_parallel import Layout, shard
+from hyper_parallel import shard, init_device_mesh
 from hyper_parallel.core.checkpoint.layout import get_global_layout
+from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.common_net import SimpleModel
 from tests.torch.shard.base_shard import mse_loss_sum
 
@@ -54,20 +55,26 @@ def base_global_layout():
     torch.manual_seed(1)
     dist_model = SimpleModel().npu()
 
-    # Define sharding plan
-    layout = Layout((1, 8), ("dp", "tp"))
+    # Create DeviceMesh
+    mesh = init_device_mesh(mesh_shape=(1, 8), alias_name=("dp", "tp"))
+
+    # Define placements using Placement format
+    w_placements = (Replicate(), Shard(1))  # tp shard on dim 1
+    in_placements = (Replicate(), Replicate())
+    out_placements = (Replicate(), Shard(1))  # tp shard on dim 1
+
     sharding_plan = {
         "parameter": {
-            "weight": layout("None", "tp")
+            "weight": w_placements
         },
         "forward": {
-            "input": [layout("None", "None")],
-            "output": [layout("None", "tp")]
+            "input": in_placements,
+            "output": out_placements
         }
     }
 
     # Apply shard
-    dist_model = shard(dist_model, sharding_plan)
+    dist_model = shard(dist_model, device_mesh=mesh, sharding_plan=sharding_plan)
 
     # step 3: get global layout
     global_layout = get_global_layout(dist_model)

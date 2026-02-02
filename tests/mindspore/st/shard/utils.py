@@ -18,14 +18,14 @@ from typing import List, Optional
 from mindspore import Tensor, mint
 from mindspore.communication import get_rank, create_group
 from hyper_parallel import Layout, DTensor
-from hyper_parallel.core.layout import _DeviceMesh
+from hyper_parallel.core.device_mesh import DeviceMesh
 
 
-def create_dtensor(data, layout, dtype=None):
+def create_dtensor(data, device_mesh, placements, dtype=None):
     """create_dtensor"""
     if dtype:
-        return DTensor.from_local(Tensor(data, dtype=dtype), layout)
-    return DTensor.from_local(Tensor(data), layout)
+        return DTensor.from_local(Tensor(data, dtype=dtype), device_mesh, placements)
+    return DTensor.from_local(Tensor(data), device_mesh, placements)
 
 
 def _infer_slice_area_by_rank(mesh_shape, tensor_map, rank_id: int, full_shape: tuple):  # -> tuple[tuple[int]]:
@@ -81,7 +81,7 @@ def global_to_local(global_tensor, layout):
         return full_data[area]
 
     local_tensor = get_slice_data(global_tensor, slice_area)
-    return DTensor.from_local(local_tensor, layout)
+    return DTensor.from_local(local_tensor, layout.mesh, layout.placements)
 
 
 def local_to_global(local_tensor):
@@ -99,7 +99,7 @@ def local_to_global(local_tensor):
     return local_tensor.redistribute(to_layout).to_local()
 
 
-def mesh_scatter(output: Tensor, scatter_list: List[Tensor], dev_mesh: _DeviceMesh,
+def mesh_scatter(output: Tensor, scatter_list: List[Tensor], dev_mesh: DeviceMesh,
                  mesh_alias: str, group_src_rank: Optional[int] = 0):
     """mesh_scatter"""
     rank_id = get_rank()
@@ -114,7 +114,7 @@ def mesh_scatter(output: Tensor, scatter_list: List[Tensor], dev_mesh: _DeviceMe
     return output
 
 
-def mesh_broadcast(tensor: Tensor, dev_mesh: _DeviceMesh,
+def mesh_broadcast(tensor: Tensor, dev_mesh: DeviceMesh,
                    mesh_alias: str, group_src_rank: Optional[int] = 0):
     """mesh_broadcast"""
     rank_id = get_rank()
@@ -161,4 +161,4 @@ def distribute_tensor(tensor: Tensor,
         if dev_mat_dim_alias in sharded_dim_set:
             continue
         local_tensor = mesh_broadcast(local_tensor, mesh_shape, dev_mat_dim_alias, src_data_rank)
-    return DTensor.from_local(local_tensor, layout)
+    return DTensor.from_local(local_tensor, layout.mesh, layout.placements)

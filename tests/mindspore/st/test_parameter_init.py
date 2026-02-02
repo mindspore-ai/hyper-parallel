@@ -100,7 +100,9 @@ def test_init_parameters_with_dtensor_and_hsdp(use_hsdp):
     layout = Layout(mesh_shape, alias_name, rank_list)
     w_layout = layout("mp", "None")
     for i in range(num_layer):
-        net.layers[i].dense1.weight = Parameter(DTensor.from_local(net.layers[i].dense1.weight, w_layout))
+        net.layers[i].dense1.weight = Parameter(DTensor.from_local(net.layers[i].dense1.weight,
+                                                                   w_layout.mesh,
+                                                                   w_layout.placements))
     before_shard_local_shapes = {name : param.local_shape for name, param in net.parameters_and_names()}
     if use_hsdp:
         shard_size = 2
@@ -163,7 +165,10 @@ def test_param_init_with_tp_dp():
     w_layout = layout("mp", "None")
     x_layout = layout("dp", "None")
     for i in range(num_layer):
-        net.layers[i].dense1.weight = Parameter(DTensor.from_local(net.layers[i].dense1.weight, w_layout))
+        net.layers[i].dense1.weight = Parameter(DTensor.from_local(net.layers[i].dense1.weight,
+                                                                   w_layout.mesh,
+                                                                   w_layout.placements)
+                                                                   )
 
     hsdp(net, shard_size=1)
     init_parameters(net)
@@ -211,7 +216,7 @@ def test_param_init_with_tp_dp():
     grad_fn = ms.value_and_grad(forward_fn, None, net.trainable_params(), has_aux=False)
 
     data = Tensor(np.random.randn(1, hidden_size).astype(np.float32))
-    global_data = DTensor.from_local(data, x_layout)
+    global_data = DTensor.from_local(data, x_layout.mesh, x_layout.placements)
 
     _, grads = grad_fn(global_data)
     optimizer(grads)

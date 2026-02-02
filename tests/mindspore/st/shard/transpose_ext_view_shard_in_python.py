@@ -21,8 +21,8 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
-from hyper_parallel import Layout, shard
-from tests.mindspore.st.shard.utils import global_to_local, local_to_global
+from hyper_parallel import init_device_mesh, shard, DTensor
+from hyper_parallel.core.placement_types import Shard, Replicate
 
 
 def setup_module():
@@ -37,13 +37,13 @@ base_alias_name = ("dp", "cp", "mp")
 class TransposeExtViewNet(nn.Cell):
     """TransposeExtView composed of transpose and ReLUs"""
 
-    def __init__(self, relu_strategy=None):
+    def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.transpose = ms.mint.transpose
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = {"forward": {"input": relu_strategy}}
+            shard(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, dim0, dim1):
         out = self.transpose(x, dim0, dim1)
@@ -52,18 +52,18 @@ class TransposeExtViewNet(nn.Cell):
         return out
 
 
-def _standalone_and_parallel_run(x, x_layout, dim0, dim1, relu_in_layout):
+def _standalone_and_parallel_run(x, mesh, x_placements, dim0, dim1, relu_placements):
     """Run standalone and parallel graph and return outputs."""
     # Standalone
     standalone_net = TransposeExtViewNet()
     standalone_output = standalone_net(x, dim0, dim1)
 
     # Parallel
-    x_local = global_to_local(x, x_layout)
-    parallel_net = TransposeExtViewNet(relu_strategy=(relu_in_layout,))
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    parallel_net = TransposeExtViewNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, dim0, dim1)
 
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     return standalone_output, parallel_output
 
 
@@ -79,17 +79,22 @@ def test_transpose_ext_view_basic_3d_1():
     d0, d1, d2 = 16, 64, 32
     x = Tensor(np.random.randn(d0, d1, d2).astype(np.float32))
 
-    layout = Layout(base_mesh_shape, base_alias_name)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
     # Shard input to ensure dtensor path is exercised
-    x_layout = layout("dp", "cp", "mp")
+    # x_layout = layout("dp", "cp", "mp") -> (Shard(0), Shard(1), Shard(2))
+    x_placements = (Shard(0), Shard(1), Shard(2))
 
     # After transpose(0, 2): shape becomes (d2, d1, d0).
     # Keep ReLU sharding simple: shard last dim by mp.
-    relu_in_layout = layout("None", "None", "mp")
+    # relu_in_layout = layout("None", "None", "mp") -> (Replicate(), Replicate(), Shard(2))
+    relu_placements = (Replicate(), Replicate(), Shard(2))
 
     standalone_output, parallel_output = _standalone_and_parallel_run(
-        x, x_layout, dim0=0, dim1=2, relu_in_layout=relu_in_layout
+        x, mesh, x_placements, dim0=0, dim1=2, relu_placements=relu_placements
     )
 
     assert np.allclose(
@@ -109,17 +114,22 @@ def test_transpose_ext_view_negative_dims_2():
     d0, d1, d2, d3 = 8, 16, 32, 64
     x = Tensor(np.random.randn(d0, d1, d2, d3).astype(np.float32))
 
-    layout = Layout(base_mesh_shape, base_alias_name)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
     # Shard input: shard dim2 by mp; others replicated
-    x_layout = layout("None", "None", "mp", "None")
+    # x_layout = layout("None", "None", "mp", "None") -> (Replicate(), Replicate(), Shard(2), Replicate())
+    x_placements = (Replicate(), Replicate(), Shard(2), Replicate())
 
     # swap(-1, -3) => swap dim3 and dim1
     # output shape becomes (d0, d3, d2, d1)
-    relu_in_layout = layout("None", "mp", "None", "None")
+    # relu_in_layout = layout("None", "mp", "None", "None") -> (Replicate(), Replicate(), Shard(1), Replicate())
+    relu_placements = (Replicate(), Replicate(), Shard(1), Replicate())
 
     standalone_output, parallel_output = _standalone_and_parallel_run(
-        x, x_layout, dim0=-1, dim1=-3, relu_in_layout=relu_in_layout
+        x, mesh, x_placements, dim0=-1, dim1=-3, relu_placements=relu_placements
     )
 
     assert np.allclose(
@@ -139,13 +149,18 @@ def test_transpose_ext_view_same_dims_noop_3():
     d0, d1, d2 = 4, 32, 128
     x = Tensor(np.random.randn(d0, d1, d2).astype(np.float32))
 
-    layout = Layout(base_mesh_shape, base_alias_name)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    x_layout = layout("dp", "cp", "mp")
-    relu_in_layout = layout("dp", "cp", "mp")
+    # x_layout = layout("dp", "cp", "mp") -> (Shard(0), Shard(1), Shard(2))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    # relu_in_layout = layout("dp", "cp", "mp") -> (Shard(0), Shard(1), Shard(2))
+    relu_placements = (Shard(0), Shard(1), Shard(2))
 
     standalone_output, parallel_output = _standalone_and_parallel_run(
-        x, x_layout, dim0=1, dim1=1, relu_in_layout=relu_in_layout
+        x, mesh, x_placements, dim0=1, dim1=1, relu_placements=relu_placements
     )
 
     assert np.allclose(

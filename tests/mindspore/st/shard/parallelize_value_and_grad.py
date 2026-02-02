@@ -18,11 +18,11 @@ import time
 import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
-from mindspore import nn
+from mindspore import nn, Tensor
 from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
-from hyper_parallel import Layout, hsdp, init_parameters, shard, parallelize_value_and_grad
-from tests.mindspore.st.shard.utils import create_dtensor
+from hyper_parallel import hsdp, init_parameters, shard, parallelize_value_and_grad, init_device_mesh, DTensor
+from hyper_parallel.core.placement_types import Shard, Replicate
 
 learning_rate = 0.01
 epochs = 2
@@ -86,36 +86,50 @@ def base_case(dp, mp, hsdp_shard_size):
     # parallel
     local_batch_size = batch_size // dp
     local_input_size = input_size // mp
-    local_x = np.ones([local_batch_size, local_input_size]).astype(np.float32)
-    layout = Layout((dp, mp), ("dp", "mp"))
-    x_layout = layout("dp", "mp")
-    w_layout = layout("mp", "None")
-    out_layout = layout()
-    relu_strategy = ((layout("dp", "None"),), (layout("dp", "None"),))
+    local_x = Tensor(np.ones([local_batch_size, local_input_size]).astype(np.float32))
+
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=(dp, mp),
+        alias_name=("dp", "mp")
+    )
+
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1))
+    w_placements = (Replicate(), Shard(0))
+    out_placements = (Replicate(), Replicate())
+    relu_input_placements = (Shard(0), Replicate())
+    relu_output_placements = (Shard(0), Replicate())
 
     # input is fn
     with no_init_parameters():
         model = SimpleModel(input_size, output_size)
 
-    stra = {"forward": {"input": (x_layout,), "output": (out_layout,)}, "parameter": {"weight": w_layout}}
-    shard(model, stra)
+    sharding_plan = {
+        "forward": {"input": (x_placements,), "output": (out_placements,)},
+        "parameter": {"weight": w_placements}
+    }
+    shard(model, device_mesh=mesh, sharding_plan=sharding_plan)
 
-    relu_stra = {"forward": {"input": relu_strategy[0], "output": relu_strategy[1]}}
-    shard(model.relu, relu_stra)
+    relu_sharding_plan = {
+        "forward": {"input": (relu_input_placements,), "output": (relu_output_placements,)}
+    }
+    shard(model.relu, device_mesh=mesh, sharding_plan=relu_sharding_plan)
 
     model = hsdp(model, shard_size=hsdp_shard_size, threshold=0)
 
     model = init_parameters(model)
 
-    x = create_dtensor(local_x, x_layout)
+    x = DTensor.from_local(local_x, mesh, x_placements)
+
     parallel_loss, parallel_grads = run_model(x, model, use_cell=False)
 
     # input is cell
     with no_init_parameters():
         model_1 = SimpleModel(input_size, output_size)
 
-    shard(model_1, stra)
-    shard(model_1.relu, relu_stra)
+    shard(model_1, device_mesh=mesh, sharding_plan=sharding_plan)
+    shard(model_1.relu, device_mesh=mesh, sharding_plan=relu_sharding_plan)
 
     model_1 = hsdp(model_1, shard_size=hsdp_shard_size, threshold=0)
 

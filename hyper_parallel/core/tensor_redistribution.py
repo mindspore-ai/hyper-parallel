@@ -199,7 +199,7 @@ class TensorRedistribution:
             transform_operator_list = self._transform_cache[key]
             for transform_operator in transform_operator_list:
                 x = self._construct_op_operator[transform_operator[0]](x, *transform_operator[1])
-            return DTensor.from_local(x, to_layout)
+            return DTensor.from_local(x, to_layout.mesh, to_layout.placements)
 
         full_shape = x.shape
         key_and_shape = key + str(full_shape)
@@ -208,7 +208,7 @@ class TensorRedistribution:
             transform_operator_list = self._transform_cache[key_and_shape]
             for transform_operator in transform_operator_list:
                 x = self._construct_op_operator[transform_operator[0]](x, *transform_operator[1])
-            return DTensor.from_local(x, to_layout)
+            return DTensor.from_local(x, to_layout.mesh, to_layout.placements)
 
         if self._apply_eazy_redistribute(from_layout, to_layout):
             if from_layout.is_partial:
@@ -219,7 +219,7 @@ class TensorRedistribution:
                                                                           full_shape, key_and_shape)
             for transform_operator in transform_operator_list:
                 x = self._construct_op_operator[transform_operator[0]](x, *transform_operator[1])
-        return DTensor.from_local(x, to_layout)
+        return DTensor.from_local(x, to_layout.mesh, to_layout.placements)
 
     def _infer_transform_operator_list(self, from_layout, to_layout, from_full_shape, key):
         """infer transform operator list"""
@@ -314,7 +314,7 @@ class TensorRedistribution:
 
         output_layout = from_layout(*output_alias_tensor_map)
         output_layout.reset_partial()
-        return DTensor.from_local(x, output_layout)
+        return DTensor.from_local(x, output_layout.mesh, output_layout.placements)
 
 
 _tensor_redistribution = TensorRedistribution()

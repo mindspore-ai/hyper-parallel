@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Torch platform api"""
+import numpy as np
 import torch
 from torch import nn
 from torch import Tensor
@@ -196,7 +197,7 @@ class TorchPlatform(Platform):
         if isinstance(param, DTensor):
             raise ValueError(f"Parameter {param} has been configured layout, cannot be set repeatedly.")
         requires_grad = param.requires_grad
-        param_dtensor = DTensor.from_local(_get_slice_tensor_by_layout(param, layout), layout)
+        param_dtensor = DTensor.from_local(_get_slice_tensor_by_layout(param, layout), layout.mesh, layout.placements)
         new_param = Parameter(param_dtensor, requires_grad=requires_grad)
         return new_param
 
@@ -391,3 +392,8 @@ class TorchPlatform(Platform):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import AsyncSaveOnCpu
         return AsyncSaveOnCpu(policy_fn)
+
+    @staticmethod
+    def tensor_to_numpy(tensor) -> np.ndarray:
+        """Convert PyTorch tensor to numpy array."""
+        return tensor.cpu().numpy()
