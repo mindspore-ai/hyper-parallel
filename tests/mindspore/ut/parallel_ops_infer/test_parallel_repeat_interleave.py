@@ -35,7 +35,6 @@ def test_torch_repeat_interleave_layout_data_parallel():
 
     x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None")  # tensor_map = (1, -1)  len(alias_name)-1-i
-    
     repeats = 2
     dim = 1
     output_layout = op.infer_layout(x_layout, (repeats, dim))
@@ -62,7 +61,6 @@ def test_torch_repeat_interleave_layout_tensor_parallel():
     repeats = 2
     dim = 1
     output_layout = op.infer_layout((x_layout,), (repeats, dim))
-    
     expected_map = (0, -1)
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Tensor Parallel with torch repeat_interleave test failed. Expected {expected_map}," \
@@ -81,13 +79,11 @@ def test_torch_repeat_interleave_with_tensor_layout_data_parallel():
 
     x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None")  # tensor_map = (1, -1)  len(alias_name)-1-i
-    
     repeats_tensor_np = np.random.randint(1, 4, size=(4,)).astype(np.int64)
     repeats_tensor = Tensor(repeats_tensor_np, ms.int64)
 
     dim = 1
     output_layout = op.infer_layout((x_layout,), (repeats_tensor, dim))
-    
     expected_map = (1, -1)
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Data Parallel with torch repeat_interleave test failed. Expected {expected_map}," \
@@ -112,13 +108,12 @@ def test_torch_repeat_interleave_with_tensor_layout_tensor_parallel():
 
     dim = 1
     output_layout = op.infer_layout((x_layout,), (repeats_tensor, dim))
-    
     expected_map = (0, -1)
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Tensor Parallel with torch repeat_interleave test failed. Expected {expected_map}," \
         f" got {output_layout.to_dict()['tensor_map']}"
     
-def test_torch_repeat_interleave_dim_None_layout_data_parallel():
+def test_torch_repeat_interleave_dim_none_layout_data_parallel():
     """
     Feature: RepeatInterleave data parallel
     Description: Data parallel scenario (shard on first dim, repeat on last unsharded dim)
@@ -132,16 +127,14 @@ def test_torch_repeat_interleave_dim_None_layout_data_parallel():
     x_layout = x_layout("dp", "None")
     
     repeats = 2
-
     output_layout = op.infer_layout((x_layout,), (repeats,))
-    
     expected_map = (1,)
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Data Parallel with dim None repeat_interleave test failed. Expected {expected_map}," \
         f" got {output_layout.to_dict()['tensor_map']}"
 
 
-def test_torch_repeat_interleave_dim_None_layout_tensor_parallel():
+def test_torch_repeat_interleave_dim_none_layout_tensor_parallel():
     """
     Feature: RepeatInterleave tensor parallel
     Description: Tensor parallel scenario (shard on first dim with 'tp', repeat on last unsharded dim)
@@ -155,9 +148,7 @@ def test_torch_repeat_interleave_dim_None_layout_tensor_parallel():
     x_layout = x_layout("tp", "None")
 
     repeats = 2
-    
     output_layout = op.infer_layout((x_layout,), (repeats,))
-    
     expected_map = (0,)
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Tensor Parallel dim None repeat_interleave test failed. Expected {expected_map}," \

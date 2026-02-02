@@ -48,12 +48,9 @@ class RepeatInterleaveDistributedOp(DistributedOp):
 
         input_layout = layouts[0]
         in_tensor_map = input_layout.tensor_map
-        
-        
         dim = None # The dimension along which to repeat values. By default, use the flattened input array, and return a flat output array.
         if len(extra_args) >= 2 and extra_args[1] is not None:
             dim = extra_args[1]
-        
         if dim is None:
             sharded_dims = [i for i, shard in enumerate(in_tensor_map) if shard != -1]
             if not sharded_dims: # not shard
@@ -79,15 +76,12 @@ class RepeatInterleaveDistributedOp(DistributedOp):
             )
 
             return output_layout(*output_map)
-        
         input_dim = len(in_tensor_map)
         if dim < 0:
             dim = input_dim + dim
-        
         # Check if dimension is within valid range
         if not 0 <= dim < input_dim:
             raise ValueError(f"Dimension out of range (expected to be in [0, {input_dim}), but got {dim}).")
-        
         # The chosen dim must NOT be sharded
         if in_tensor_map[dim] != -1:
             raise ValueError(

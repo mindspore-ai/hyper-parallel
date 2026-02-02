@@ -42,7 +42,7 @@ def test_distributed_repeat_interleave_with_tensor():
     torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_interleave_dim_None():
+def test_distributed_repeat_interleave_dim_none():
     '''
     Feature: test parallel op repeat_interleave.
     Description: test parallel op repeat_interleave.
@@ -64,4 +64,3 @@ def test_distributed_repeat_interleave_sharded_dim_error():
     file_name = "/home/f50056840/hyper-parallel/tests/torch/shard/ops/parallel_op_repeat_interleave.py"
     case_name = "test_distributed_repeat_interleave_sharded_dim_error"
     torchrun_case(file_name, case_name, master_port)
-

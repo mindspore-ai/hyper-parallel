@@ -19,11 +19,9 @@ import torch
 from hyper_parallel import Layout
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global, global_to_local
-
 # Generate input data using numpy at file header
 np.random.seed(42)
 standalone_input_np = np.random.randn(8, 16).astype(np.float32)
-
 def test_distributed_repeat_interleave_layout_inference():
     """
     Feature: dtensor + torch.repeat_interleave layout inference
@@ -35,15 +33,12 @@ def test_distributed_repeat_interleave_layout_inference():
     Expectation: Success.
     """
     init_dist()
-    
     # Simple repeat with integer repeats
     repeats = 3
     dim = -1  # last dimension
-    
     # Standalone (single-device)
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     standalone_output = torch.repeat_interleave(standalone_input, repeats, dim=dim)
-    
     # Distributed setup
     layout = Layout((2, 4), ("dp", "tp"))
     x_layout = layout("dp", "None")  # shard on dim=0 (dp), keep dim=1 unsharded
@@ -97,7 +92,7 @@ def test_distributed_repeat_interleave_with_tensor():
         standalone_output, gathered_output, atol=1e-5
     ), "repeat_interleave_with_tensor output mismatch between standalone and distributed"
 
-def test_distributed_repeat_interleave_dim_None():
+def test_distributed_repeat_interleave_dim_none():
     """
     Feature: dtensor + torch.repeat_interleave dim None
     Description:
