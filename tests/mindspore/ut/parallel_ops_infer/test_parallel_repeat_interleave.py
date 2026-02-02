@@ -112,8 +112,6 @@ def test_torch_repeat_interleave_with_tensor_layout_tensor_parallel():
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Tensor Parallel with torch repeat_interleave test failed. Expected {expected_map}," \
         f" got {output_layout.to_dict()['tensor_map']}"
-    
-    
 def test_torch_repeat_interleave_dim_none_layout_data_parallel():
     """
     Feature: RepeatInterleave data parallel

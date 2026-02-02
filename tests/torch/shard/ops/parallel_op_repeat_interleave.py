@@ -116,7 +116,7 @@ def test_distributed_repeat_interleave_sharded_dim_error():
     """
     init_dist()
     repeats = 2
-    dim = 1  
+    dim = 1
     layout = Layout((2, 4), ("dp", "tp"))
     x_layout = layout("dp", "tp")  # shard on both dimensions
     standalone_input = torch.from_numpy(standalone_input_np).npu()
