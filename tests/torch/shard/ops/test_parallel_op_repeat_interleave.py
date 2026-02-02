@@ -24,7 +24,7 @@ def test_distributed_repeat_interleave_layout_inference():
     Description: test parallel op repeat_interleave.
     Expectation: Run success.
     """
-    master_port = 10892
+    master_port = 10890
     file_name = "parallel_op_repeat_interleave.py"
     case_name = "test_distributed_repeat_interleave_layout_inference"
     torchrun_case(file_name, case_name, master_port)
@@ -36,7 +36,7 @@ def test_distributed_repeat_interleave_with_tensor():
     Description: test parallel op repeat_interleave.
     Expectation: Run success.
     """
-    master_port = 10892
+    master_port = 10890
     file_name = "parallel_op_repeat_interleave.py"
     case_name = "test_distributed_repeat_interleave_with_tensor"
     torchrun_case(file_name, case_name, master_port)
@@ -48,7 +48,7 @@ def test_distributed_repeat_interleave_dim_none():
     Description: test parallel op repeat_interleave.
     Expectation: Run success.
     """
-    master_port = 10892
+    master_port = 10890
     file_name = "parallel_op_repeat_interleave.py"
     case_name = "test_distributed_repeat_interleave_dim_None"
     torchrun_case(file_name, case_name, master_port)
@@ -60,7 +60,7 @@ def test_distributed_repeat_interleave_sharded_dim_error():
     Description: test parallel op repeat_interleave.
     Expectation: Run success.
     """
-    master_port = 10892
+    master_port = 10890
     file_name = "parallel_op_repeat_interleave.py"
     case_name = "test_distributed_repeat_interleave_sharded_dim_error"
     torchrun_case(file_name, case_name, master_port)
