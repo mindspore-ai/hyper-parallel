@@ -23,7 +23,7 @@
 /hyper_parallel/auto_parallel/fast-tuner/ @ChaoRanCaaat
 
 # The maintainers of tests.
-/tests/ @kisnwang
+/tests/ @yangzhenzhang
 /tests/mindspore/st/hsdp/ @kisnwang
 /tests/mindspore/st/pipeline_parallel/ @yangzhenzhang
 /tests/mindspore/st/shard/ @yangzhenzhang
