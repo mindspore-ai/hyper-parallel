@@ -48,7 +48,6 @@ def test_distributed_repeat_interleave_layout_inference():
     assert dist_output.layout == x_layout, "Torch repeat_interleave: output layout mismatch input"
     # Gather distributed results back to global view
     gathered_output = local_to_global(dist_output)
-    
     assert torch.allclose(
         standalone_output, gathered_output, atol=1e-5
     ), "repeat_interleave output mismatch between standalone and distributed"
@@ -74,12 +73,10 @@ def test_distributed_repeat_interleave_with_tensor():
     # Distributed setup
     layout = Layout((2, 4), ("dp", "tp"))
     x_layout = layout("dp", "None")  # shard on dim=0 (dp), keep dim=1 unsharded
-    
     dist_input = global_to_local(standalone_input, x_layout)
     dist_output = torch.repeat_interleave(dist_input, repeats_tensor, dim=dim)
     # Gather distributed results back to global view
     gathered_output = local_to_global(dist_output)
-    
     assert torch.allclose(
         standalone_output, gathered_output, atol=1e-5
     ), "repeat_interleave_with_tensor output mismatch between standalone and distributed"
@@ -101,12 +98,10 @@ def test_distributed_repeat_interleave_dim_none():
     # Distributed setup
     layout = Layout((2, 4), ("dp", "tp"))
     x_layout = layout("dp", "None")  # shard on dim=0 (dp), keep dim=1 unsharded
-    
     dist_input = global_to_local(standalone_input, x_layout)
     dist_output = torch.repeat_interleave(dist_input, repeats)
     # Gather distributed results back to global view
-    gathered_output = local_to_global(dist_output) 
-    
+    gathered_output = local_to_global(dist_output)
     assert torch.allclose(
         standalone_output, gathered_output, atol=1e-5
     ), "repeat_interleave_dim_None output mismatch between standalone and distributed"
@@ -122,13 +117,10 @@ def test_distributed_repeat_interleave_sharded_dim_error():
     init_dist()
     repeats = 2
     dim = 1  
-    
     layout = Layout((2, 4), ("dp", "tp"))
     x_layout = layout("dp", "tp")  # shard on both dimensions
-    
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     dist_input = global_to_local(standalone_input, x_layout)
-    
     try:
         torch.repeat_interleave(dist_input, repeats, dim=dim)
         assert False, "Expected ValueError when repeat_interleave along sharded dimension"

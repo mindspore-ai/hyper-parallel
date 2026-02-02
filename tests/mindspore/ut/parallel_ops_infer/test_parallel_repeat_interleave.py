@@ -113,6 +113,7 @@ def test_torch_repeat_interleave_with_tensor_layout_tensor_parallel():
         f"Tensor Parallel with torch repeat_interleave test failed. Expected {expected_map}," \
         f" got {output_layout.to_dict()['tensor_map']}"
     
+    
 def test_torch_repeat_interleave_dim_none_layout_data_parallel():
     """
     Feature: RepeatInterleave data parallel
@@ -125,7 +126,6 @@ def test_torch_repeat_interleave_dim_none_layout_data_parallel():
 
     x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None")
-    
     repeats = 2
     output_layout = op.infer_layout((x_layout,), (repeats,))
     expected_map = (1,)
