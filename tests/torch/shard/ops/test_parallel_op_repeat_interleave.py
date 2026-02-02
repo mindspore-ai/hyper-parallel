@@ -19,11 +19,11 @@ from tests.common.mark_utils import arg_mark
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_distributed_repeat_interleave_layout_inference():
-    '''
+    """
     Feature: test parallel op repeat_interleave.
     Description: test parallel op repeat_interleave.
     Expectation: Run success.
-    '''
+    """
     master_port = 10892
     file_name = "/home/f50056840/hyper-parallel/tests/torch/shard/ops/parallel_op_repeat_interleave.py"
     case_name = "test_distributed_repeat_interleave_layout_inference"
@@ -31,11 +31,11 @@ def test_distributed_repeat_interleave_layout_inference():
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_distributed_repeat_interleave_with_tensor():
-    '''
+    """
     Feature: test parallel op repeat_interleave.
     Description: test parallel op repeat_interleave.
     Expectation: Run success.
-    '''
+    """
     master_port = 10892
     file_name = "/home/f50056840/hyper-parallel/tests/torch/shard/ops/parallel_op_repeat_interleave.py"
     case_name = "test_distributed_repeat_interleave_with_tensor"
@@ -43,11 +43,11 @@ def test_distributed_repeat_interleave_with_tensor():
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_distributed_repeat_interleave_dim_none():
-    '''
+    """
     Feature: test parallel op repeat_interleave.
     Description: test parallel op repeat_interleave.
     Expectation: Run success.
-    '''
+    """
     master_port = 10892
     file_name = "/home/f50056840/hyper-parallel/tests/torch/shard/ops/parallel_op_repeat_interleave.py"
     case_name = "test_distributed_repeat_interleave_dim_None"
@@ -55,11 +55,11 @@ def test_distributed_repeat_interleave_dim_none():
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_distributed_repeat_interleave_sharded_dim_error():
-    '''
+    """
     Feature: test parallel op repeat_interleave.
     Description: test parallel op repeat_interleave.
     Expectation: Run success.
-    '''
+    """
     master_port = 10892
     file_name = "/home/f50056840/hyper-parallel/tests/torch/shard/ops/parallel_op_repeat_interleave.py"
     case_name = "test_distributed_repeat_interleave_sharded_dim_error"

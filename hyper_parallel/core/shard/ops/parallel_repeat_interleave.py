@@ -56,7 +56,7 @@ class RepeatInterleaveDistributedOp(DistributedOp):
             if not sharded_dims: # not shard
                 output_tensor_map = [-1]
             # Only can shard on the first dimension.
-            elif sharded_dims == [0] and in_tensor_map[0] != -1: 
+            elif sharded_dims == [0] and in_tensor_map[0] != -1:
                 output_tensor_map = [in_tensor_map[0]]
             else:
                 # Other dims must NOT be sharded.
@@ -87,6 +87,5 @@ class RepeatInterleaveDistributedOp(DistributedOp):
             raise ValueError(
                 f"Operation {self.op_name}: Cannot perform sharding on params along the chosen dim"
             )
-        
         # Output layout same as input layout (shape change does not affect sharding pattern)
         return input_layout

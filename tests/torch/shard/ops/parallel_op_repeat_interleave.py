@@ -42,15 +42,12 @@ def test_distributed_repeat_interleave_layout_inference():
     # Distributed setup
     layout = Layout((2, 4), ("dp", "tp"))
     x_layout = layout("dp", "None")  # shard on dim=0 (dp), keep dim=1 unsharded
-    
     dist_input = global_to_local(standalone_input, x_layout)
     dist_output = torch.repeat_interleave(dist_input, repeats, dim=dim)
-    
     # Layout correctness check
     assert dist_output.layout == x_layout, "Torch repeat_interleave: output layout mismatch input"
-    
     # Gather distributed results back to global view
-    gathered_output = local_to_global(dist_output) 
+    gathered_output = local_to_global(dist_output)
     
     assert torch.allclose(
         standalone_output, gathered_output, atol=1e-5
@@ -67,24 +64,19 @@ def test_distributed_repeat_interleave_with_tensor():
     Expectation: Success.
     """
     init_dist()
-    
     # Create repeats tensor
     repeats_tensor_np = np.random.randint(1, 4, size=(16,)).astype(np.int64)
     repeats_tensor = torch.from_numpy(repeats_tensor_np).npu()
-    
     dim = 1  # second dimension
-    
     # Standalone (single-device)
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     standalone_output = torch.repeat_interleave(standalone_input, repeats_tensor, dim=dim)
-    
     # Distributed setup
     layout = Layout((2, 4), ("dp", "tp"))
     x_layout = layout("dp", "None")  # shard on dim=0 (dp), keep dim=1 unsharded
     
     dist_input = global_to_local(standalone_input, x_layout)
     dist_output = torch.repeat_interleave(dist_input, repeats_tensor, dim=dim)
-    
     # Gather distributed results back to global view
     gathered_output = local_to_global(dist_output)
     
@@ -102,23 +94,16 @@ def test_distributed_repeat_interleave_dim_none():
     Expectation: Success.
     """
     init_dist()
-
     repeats = 3
-    
     # Standalone (single-device)
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     standalone_output = torch.repeat_interleave(standalone_input, repeats)
-    
     # Distributed setup
     layout = Layout((2, 4), ("dp", "tp"))
     x_layout = layout("dp", "None")  # shard on dim=0 (dp), keep dim=1 unsharded
     
     dist_input = global_to_local(standalone_input, x_layout)
     dist_output = torch.repeat_interleave(dist_input, repeats)
-    
-    # # Layout correctness check
-    # assert dist_output.layout == x_layout, "Torch repeat_interleave: output layout mismatch input"
-    
     # Gather distributed results back to global view
     gathered_output = local_to_global(dist_output) 
     
