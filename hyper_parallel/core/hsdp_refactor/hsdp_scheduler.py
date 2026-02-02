@@ -96,8 +96,31 @@ class HSDPSchedulerV2:
         """Register module forward and backward hook."""
         raise NotImplementedError("HSDPScheduler subclasses must implement _register_forward_backward_hooks.")
 
-    def set_requires_grad_sync(self, requires_grad_sync):
+    def set_reshard_after_forward(self, reshard_after_forward: bool):
+        """set reshard_after_forward flag"""
+        if not isinstance(reshard_after_forward, bool):
+            raise ValueError(f"reshard_after_forward should be a bool, got {type(reshard_after_forward)}")
+        self.reshard_after_forward = reshard_after_forward
+        self.config.reshard_after_forward = reshard_after_forward
+
+    def set_reshard_after_backward(self, reshard_after_backward: bool):
+        """set reshard_after_backward flag"""
+        if not isinstance(reshard_after_backward, bool):
+            raise ValueError(f"reshard_after_backward should be a bool, got {type(reshard_after_backward)}")
+        if self.hsdp_state is not None:
+            self.hsdp_state.reshard_after_backward = reshard_after_backward
+
+    def set_requires_all_reduce(self, requires_all_reduce: bool):
+        """set requires_all_reduce flag"""
+        if not isinstance(requires_all_reduce, bool):
+            raise ValueError(f"requires_all_reduce should be a bool, got {type(requires_all_reduce)}")
+        if self.hsdp_state is not None:
+            self.hsdp_state.all_reduce_grads = requires_all_reduce
+
+    def set_requires_grad_sync(self, requires_grad_sync: bool):
         """Set requires grad sync flag to control gradient sync."""
+        if not isinstance(requires_grad_sync, bool):
+            raise ValueError(f"requires_grad_sync should be a bool, got {type(requires_grad_sync)}")
         self.requires_grad_sync = requires_grad_sync
         self.grad_hook.set_requires_grad_sync(requires_grad_sync)
         self.hsdp_state.set_requires_grad_sync(requires_grad_sync)
@@ -116,8 +139,8 @@ class HSDPSchedulerV2:
         if len(inputs) > 0:
             self.platform.set_tensor_requires_grad(inputs[0])
         if self.mp_policy.cast_forward_inputs and self.mp_policy.param_dtype:
-                # TODO(lichen): impl cast_forward_inputs
-                raise NotImplementedError(f"mp_policy.cast_forward_inputs not implemented yet.")
+            # TODO(lichen): impl cast_forward_inputs
+            raise NotImplementedError(f"mp_policy.cast_forward_inputs not implemented yet.")
         self.hsdp_state.unshard()
         for prefetch_cell in self.forward_prefetch_cells:
             prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()
@@ -128,7 +151,8 @@ class HSDPSchedulerV2:
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return
         self.scheduler_state = FSDPSchedulerState.FORWARD
-        self.hsdp_state.shard()
+        if self.reshard_after_forward:
+            self.hsdp_state.shard()
         if self.mp_policy.output_dtype is not None:
             # TODO(lichen): impl output_dtype mp
             outputs = _apply_to_tensors(
@@ -160,10 +184,12 @@ class HSDPSchedulerV2:
 
     def _get_grad_buffer_hook(self, hsdp_param):
         """Set grad ready."""
+
         def hook(grad):
             hsdp_param.grad = grad
             self.hsdp_state.set_grad_ready(hsdp_param)
             return grad
+
         return hook
 
     def set_forward_prefetch_cells(self, hsdp_cell_list):
@@ -174,8 +200,6 @@ class HSDPSchedulerV2:
         """Set backward prefetch cells."""
         self.backward_prefetch_cells = hsdp_cell_list
 
-
-    def reshard(self,):
+    def reshard(self, ):
         """Reshard parameters after forward or backward."""
         self.hsdp_state.reshard()
-

@@ -19,6 +19,7 @@ from hyper_parallel.core.hsdp_refactor.hsdp_grad_buffer import HSDPGradBuffer
 
 class HSDPState:
     """HSDP state for cell"""
+
     def __init__(self, cell, config, platform):
         self.cell = cell
         self.config = config
@@ -61,6 +62,7 @@ class HSDPState:
             return
 
         bucket_infos = {}
+
         def get_bucket_key(buffer_key, hsdp_param):
             if self.config.bucket_size < 0:
                 return buffer_key
@@ -108,17 +110,17 @@ class HSDPState:
                 param.to_sharded()
         self.is_shard = True
 
-    def unshard(self):
+    def unshard(self, async_op=False):
         """change parameters to unsharded state"""
         if not self.is_shard:
             return
 
         if self.config.comm_fusion:
             for buffer in self.param_buffers:
-                buffer.to_unsharded()
+                buffer.to_unsharded(async_op=async_op)
         else:
             for param in self.sharded_hsdp_params:
-                param.to_unsharded()
+                param.to_unsharded(async_op=async_op)
         self.is_shard = False
 
     def prefetch(self):
@@ -131,6 +133,19 @@ class HSDPState:
         else:
             for param in self.sharded_hsdp_params:
                 param.prefetch_unsharded()
+
+    def wait_for_unsharded(self):
+        """wait for all unsharded parameters"""
+        if not self.is_shard:
+            return
+        if self.config.comm_fusion:
+            for buffer in self.param_buffers:
+                if buffer.prefetch_handle is not None:
+                    buffer.wait_for_unsharded()
+        else:
+            for param in self.sharded_hsdp_params:
+                if param.prefetch_handle is not None:
+                    param.wait_for_unsharded()
 
     def zero_grads(self):
         """zero grad or grad buffer"""

@@ -23,13 +23,14 @@ class HSDPParamV2:
     """
     HSDP parameter.
     """
+
     def __init__(
-        self,
-        cell, 
-        param_name,
-        param,
-        config: HSDPConfigV2,
-        platform
+            self,
+            cell,
+            param_name,
+            param,
+            config: HSDPConfigV2,
+            platform
     ):
         self.cell = cell
         self.param_name = param_name
@@ -66,7 +67,6 @@ class HSDPParamV2:
         group_name, group = self._create_unsharded_dp_group()
         self.unsharded_group_info = GroupInfo(group_name, group, self.dp_size)
 
-
     def _init_sharded_param(self):
         """add and init sharded param"""
         raise NotImplementedError("HSDP param subclasses must implement _init_sharded_param")
@@ -82,8 +82,6 @@ class HSDPParamV2:
         """get unsharded param data with async comm"""
         local_data = self.platform.get_param_local_data(self.param)
         return self.platform.all_gather_into_tensor(local_data, self.sharded_group_info, async_op=async_op)
-
-
 
     def _create_sharded_dp_group(self, mesh: DeviceMesh | None = None):
         """create communication group for sharded parameter"""
@@ -160,7 +158,7 @@ class HSDPParamV2:
         self.prefetch_data = unshared_param_data
         self.prefetch_handle = handle
 
-    #pylint: disable=W0212
+    # pylint: disable=W0212
     def to_unsharded(self, async_op=False):
         """change parameter to unsharded state"""
         if self.prefetch_handle is not None:
@@ -172,11 +170,21 @@ class HSDPParamV2:
             return
 
         unshared_param_data, handle = self._get_unsharded_param_data(async_op=async_op)
-        if handle or async_op:
-            # TODO: support async unshard
-            raise NotImplementedError(f"support async allgather.")
+        if async_op:
+            self.prefetch_data = unshared_param_data
+            self.prefetch_handle = handle
+            return
         self.platform.update_param_data(self.sharded_param, self.platform.get_param_local_data(self.param))
         self.platform.update_param_data(self.param, unshared_param_data)
+
+    def wait_for_unsharded(self):
+        """wait for unsharded param"""
+        if self.prefetch_handle is not None:
+            self.prefetch_handle.wait()
+            self.platform.update_param_data(self.sharded_param, self.platform.get_param_local_data(self.param))
+            self.platform.update_param_data(self.param, self.prefetch_data)
+            self.prefetch_handle = None
+            self.prefetch_data = None
 
     def zero_acc_grad(self):
         """zero accumunication grad"""

@@ -26,6 +26,7 @@ class TorchHSDPStateV2(HSDPState):
         self._init_mp_dtypes()
         self.reduce_grads = True
         self.reshard_after_backward = True
+        self.all_reduce_grads = True
 
     def _init_hsdp_params(self):
         """init hsdp parameters for cell"""
