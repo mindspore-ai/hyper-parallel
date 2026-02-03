@@ -37,7 +37,7 @@ class RepeatInterleaveDistributedOp(DistributedOp):
             layouts (tuple): Layouts of inputs. Expected:
                 layouts[0] (Layout): Input tensor layout (required).
             extra_args (tuple, optional): Contains repeats and dim. Expected:
-                extra_args[0] (int or Tensor): Number of repeats or Tensor
+                extra_args[0] (int or Tensor): Number of repeats or Tensor shape
                 extra_args[1] (int, optional): Dimension to repeat. Defaults to -1.
 
         Returns:
