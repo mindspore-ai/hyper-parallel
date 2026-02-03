@@ -18,8 +18,9 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
-from hyper_parallel import hsdp, shard, DTensor, init_device_mesh
+from hyper_parallel import hsdp, shard_module, DTensor, init_device_mesh
 from hyper_parallel.core.placement_types import Shard
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 learning_rate = 0.01
 epochs = 2
@@ -69,12 +70,10 @@ def run_parallel(local_x, device_mesh, x_placements):
     """run SimpleModel with input x in parallel mode."""
     model = SimpleModel()
 
-    transpose_stra = {
-        "forward": {
-            "input": x_placements
-        }
-    }
-    shard(model.transpose, device_mesh=device_mesh, sharding_plan=transpose_stra)
+    transpose_stra = ShardingPlan(
+        input_plan={"input": x_placements},
+    )
+    shard_module(model.transpose, device_mesh=device_mesh, sharding_plan=transpose_stra)
 
     model = hsdp(model, shard_size=1, threshold=0)
 

@@ -21,8 +21,9 @@ import mindspore.communication.management as D
 from mindspore import nn, Tensor
 from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
-from hyper_parallel import hsdp, init_parameters, shard, parallelize_value_and_grad, init_device_mesh, DTensor
+from hyper_parallel import hsdp, init_parameters, shard_module, parallelize_value_and_grad, init_device_mesh, DTensor
 from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 learning_rate = 0.01
 epochs = 2
@@ -105,16 +106,18 @@ def base_case(dp, mp, hsdp_shard_size):
     with no_init_parameters():
         model = SimpleModel(input_size, output_size)
 
-    sharding_plan = {
-        "forward": {"input": (x_placements,), "output": (out_placements,)},
-        "parameter": {"weight": w_placements}
-    }
-    shard(model, device_mesh=mesh, sharding_plan=sharding_plan)
+    sharding_plan = ShardingPlan(
+        plan={"weight": w_placements},
+        input_plan={"input": (x_placements,)},
+        output_plan={"output": (out_placements,)},
+    )
+    shard_module(model, device_mesh=mesh, sharding_plan=sharding_plan)
 
-    relu_sharding_plan = {
-        "forward": {"input": (relu_input_placements,), "output": (relu_output_placements,)}
-    }
-    shard(model.relu, device_mesh=mesh, sharding_plan=relu_sharding_plan)
+    relu_sharding_plan = ShardingPlan(
+        input_plan={"input": (relu_input_placements,)},
+        output_plan={"output": (relu_output_placements,)},
+    )
+    shard_module(model.relu, device_mesh=mesh, sharding_plan=relu_sharding_plan)
 
     model = hsdp(model, shard_size=hsdp_shard_size, threshold=0)
 
@@ -128,8 +131,8 @@ def base_case(dp, mp, hsdp_shard_size):
     with no_init_parameters():
         model_1 = SimpleModel(input_size, output_size)
 
-    shard(model_1, device_mesh=mesh, sharding_plan=sharding_plan)
-    shard(model_1.relu, device_mesh=mesh, sharding_plan=relu_sharding_plan)
+    shard_module(model_1, device_mesh=mesh, sharding_plan=sharding_plan)
+    shard_module(model_1.relu, device_mesh=mesh, sharding_plan=relu_sharding_plan)
 
     model_1 = hsdp(model_1, shard_size=hsdp_shard_size, threshold=0)
 

@@ -21,7 +21,8 @@ from torch import optim
 import torch_npu  # 昇腾NPU核心适配
 from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.placement_types import Shard, Replicate
-from hyper_parallel.core.shard.api import shard
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
+from hyper_parallel.core.shard.api import shard_module
 from tests.torch.utils import init_dist
 
 
@@ -93,18 +94,14 @@ def test_base_shard():
     w_placements = (Replicate(), Shard(1))
 
     # Define sharding plan using Placement format
-    sharding_plan = {
-        "parameter": {
-            "weight": w_placements
-        },
-        "forward": {
-            "input": x_placements,
-            "output": w_placements
-        }
-    }
+    sharding_plan = ShardingPlan(
+        plan={"weight": w_placements},
+        input_plan={"input": x_placements},
+        output_plan={"output": w_placements}
+    )
 
     # Apply shard with device_mesh
-    dist_model = shard(dist_model, device_mesh=mesh, sharding_plan=sharding_plan)
+    dist_model = shard_module(dist_model, device_mesh=mesh, sharding_plan=sharding_plan)
 
     dist_optimizer = optim.SGD(dist_model.parameters(), lr=0.01)
 

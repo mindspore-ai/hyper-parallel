@@ -22,8 +22,10 @@ from mindspore.common.initializer import initializer
 from hyper_parallel import PipelineStage, ScheduleInterleaved1F1B
 from hyper_parallel import DTensor, init_device_mesh
 from hyper_parallel.core.hsdp import hsdp
-from hyper_parallel import shard
+from hyper_parallel import shard_module
 from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
+
 
 class MLP(nn.Cell):
     """MLP net."""
@@ -123,10 +125,13 @@ def run_parallel(micro_batch_num):
     w_placements = (Replicate(), Replicate())
     out_placements = (Shard(0), Replicate())
 
-    model_stra = {"forward": {"input": in_placements, "output": out_placements},
-                  "parameter": {"weight": w_placements}}
-    shard(model0, device_mesh=mesh, sharding_plan=model_stra)
-    shard(model1, device_mesh=mesh, sharding_plan=model_stra)
+    model_stra = ShardingPlan(
+        plan = {"weight": w_placements},
+        input_plan={"input": in_placements},
+        output_plan={"output": out_placements},
+    )
+    shard_module(model0, device_mesh=mesh, sharding_plan=model_stra)
+    shard_module(model1, device_mesh=mesh, sharding_plan=model_stra)
 
     model0 = hsdp(model0, 2, 0, "level1", True)
     model1 = hsdp(model1, 2, 0, "level1", True)

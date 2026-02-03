@@ -17,10 +17,11 @@ import numpy as np
 import torch
 # pylint: disable=W0611
 import torch_npu  # 昇腾NPU核心适配
-from hyper_parallel import DTensor, shard, init_device_mesh
+from hyper_parallel import DTensor, shard_module, init_device_mesh
 from hyper_parallel import PipelineStage
 from hyper_parallel import ScheduleInterleaved1F1B
 from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from .simple_mlp import SimpleMLP, model_split_manual, run_standalone, init_hccl, get_stage_index, get_rank_list
 
 
@@ -45,20 +46,21 @@ def run_parallel(micro_batch_num):
     w_tp_none = (Replicate(), Shard(0))  # tp shard on dim 0
     w_none_tp = (Replicate(), Shard(1))  # tp shard on dim 1
 
-    sharding_plan = {"parameter": {"mlp_layers.0.weight": w_none_tp,
-                                    "mlp_layers.1.weight": w_tp_none,
-                                    "mlp_layers.2.weight": w_none_tp,
-                                    "mlp_layers.3.weight": w_tp_none,
-                                    "mlp_layers.4.weight": w_none_tp,
-                                    "mlp_layers.5.weight": w_tp_none,
-                                    "mlp_layers.6.weight": w_none_tp,
-                                    "mlp_layers.7.weight": w_tp_none}}
+    sharding_plan = ShardingPlan(
+        plan={"mlp_layers.0.weight": w_none_tp,
+              "mlp_layers.1.weight": w_tp_none,
+              "mlp_layers.2.weight": w_none_tp,
+              "mlp_layers.3.weight": w_tp_none,
+              "mlp_layers.4.weight": w_none_tp,
+              "mlp_layers.5.weight": w_tp_none,
+              "mlp_layers.6.weight": w_none_tp,
+              "mlp_layers.7.weight": w_tp_none})
     local_hidden_size = 16
 
     model0 = SimpleMLP(8, local_hidden_size, local_hidden_size)
-    model0 = shard(model0, device_mesh=mesh, sharding_plan=sharding_plan)
+    model0 = shard_module(model0, device_mesh=mesh, sharding_plan=sharding_plan)
     model1 = SimpleMLP(8, local_hidden_size, local_hidden_size)
-    model1 = shard(model1, device_mesh=mesh, sharding_plan=sharding_plan)
+    model1 = shard_module(model1, device_mesh=mesh, sharding_plan=sharding_plan)
     model_split_manual(model0, stage_index, 8)
     model_split_manual(model1, stage_index + 4, 8)
 
@@ -100,8 +102,8 @@ def test_vpp_shard():
         assert np.allclose(standalone_loss.cpu().detach().numpy(), pp_loss[0].to_local().cpu().detach().numpy())
     assert np.allclose(standalone_model.mlp_layers[str(stage_index)].weight.grad.cpu().detach().numpy()[:8, :8],
                        pp_model[0].mlp_layers[str(stage_index)].weight.grad.cpu().detach().numpy()[:8, :8])
-    assert np.allclose(standalone_model.mlp_layers[str(stage_index+4)].weight.grad.cpu().detach().numpy()[:8, :8],
-                       pp_model[1].mlp_layers[str(stage_index+4)].weight.grad.cpu().detach().numpy()[:8, :8])
+    assert np.allclose(standalone_model.mlp_layers[str(stage_index + 4)].weight.grad.cpu().detach().numpy()[:8, :8],
+                       pp_model[1].mlp_layers[str(stage_index + 4)].weight.grad.cpu().detach().numpy()[:8, :8])
 
 
 if __name__ == "__main__":

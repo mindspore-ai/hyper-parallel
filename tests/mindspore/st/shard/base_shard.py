@@ -22,7 +22,8 @@ import mindspore.communication.management as D
 from mindspore import nn, Tensor
 from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
-from hyper_parallel import init_device_mesh, hsdp, init_parameters, shard, parallelize_value_and_grad
+from hyper_parallel import init_device_mesh, hsdp, init_parameters, shard_module, parallelize_value_and_grad
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.mindspore.st.shard.utils import create_dtensor
 
@@ -106,24 +107,18 @@ def base_case(dp, mp, hsdp_shard_size):
         model = SimpleModel(input_size, output_size)
 
     # step 2: shard
-    model_sharding_plan = {
-        "forward": {
-            "input": x_placements,
-            "output": out_placements
-        },
-        "parameter": {
-            "weight": w_placements
-        }
-    }
-    shard(model, device_mesh=mesh, sharding_plan=model_sharding_plan)
+    model_sharding_plan = ShardingPlan(
+        plan={"weight": w_placements},
+        input_plan={"input": x_placements},
+        output_plan={"output": out_placements},
+    )
+    shard_module(model, device_mesh=mesh, sharding_plan=model_sharding_plan)
 
-    model_relu_sharding_plan = {
-        "forward": {
-            "input": relu_input_placements,
-            "output": relu_output_placements,
-        }
-    }
-    shard(model.relu, device_mesh=mesh, sharding_plan=model_relu_sharding_plan)
+    model_relu_sharding_plan = ShardingPlan(
+        input_plan={"input": relu_input_placements},
+        output_plan={"output": relu_output_placements}
+    )
+    shard_module(model.relu, device_mesh=mesh, sharding_plan=model_relu_sharding_plan)
 
     # step 3: hsdp
     model = hsdp(model, shard_size=hsdp_shard_size, threshold=0)
