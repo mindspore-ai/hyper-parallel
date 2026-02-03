@@ -42,7 +42,7 @@ def test_distributed_repeat_interleave_layout_inference():
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     standalone_output = torch.repeat_interleave(standalone_input, repeats, dim=dim)
     # Distributed setup
-    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
     dist_input = global_to_local(standalone_input, x_layout)
@@ -74,7 +74,7 @@ def test_distributed_repeat_interleave_with_tensor():
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     standalone_output = torch.repeat_interleave(standalone_input, repeats_tensor, dim=dim)
     # Distributed setup
-    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
     dist_input = global_to_local(standalone_input, x_layout)
@@ -100,7 +100,7 @@ def test_distributed_repeat_interleave_dim_none():
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     standalone_output = torch.repeat_interleave(standalone_input, repeats)
     # Distributed setup
-    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
     dist_input = global_to_local(standalone_input, x_layout)
@@ -122,7 +122,7 @@ def test_distributed_repeat_interleave_sharded_dim_error():
     init_dist()
     repeats = 2
     dim = 1
-    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(1))
     x_layout = _build_layout(mesh, x_placements, 2)
     standalone_input = torch.from_numpy(standalone_input_np).npu()

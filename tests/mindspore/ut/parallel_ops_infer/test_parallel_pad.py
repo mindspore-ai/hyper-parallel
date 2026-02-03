@@ -21,6 +21,7 @@ from hyper_parallel.core.shard.ops.parallel_pad import PadDistributedOp
 
 op = PadDistributedOp("pad")
 
+
 def test_pad_infer_layout_success_unsharded():
     """
     Feature: Pad unsharded dimension
@@ -28,8 +29,9 @@ def test_pad_infer_layout_success_unsharded():
     Expectation: Output layout is identical to input layout.
     """
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
+        mesh_dim_names=("dp", "mp")
     )
     # Input: Shard(0) on dim0, Replicate on dim1
     x_placements = (Shard(0), Replicate())
@@ -52,8 +54,9 @@ def test_pad_infer_layout_fail_sharded():
     Expectation: Raises ValueError.
     """
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
+        mesh_dim_names=("dp", "mp")
     )
     # Input: Shard(0) on dim0, Replicate on dim1
     x_placements = (Shard(0), Replicate())
@@ -74,8 +77,9 @@ def test_pad_infer_layout_mixed_dims():
     Expectation: Success for unsharded pad, Failure for sharded pad.
     """
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 2, 2),
-        alias_name=("dp", "tp", "mp")
+        mesh_dim_names=("dp", "tp", "mp")
     )
     # 3D Tensor: dim0=Shard(0), dim1=Shard(1), dim2=Replicate
     x_placements = (Shard(0), Shard(1), Replicate())
@@ -99,8 +103,9 @@ def test_pad_infer_layout_zero_padding_on_sharded():
     Expectation: Success.
     """
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
+        mesh_dim_names=("dp", "mp")
     )
     # dim0 sharded
     x_placements = (Shard(0), Replicate())
@@ -121,8 +126,9 @@ def test_pad_infer_layout_invalid_args():
     Expectation: Raises ValueError.
     """
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
+        mesh_dim_names=("dp", "mp")
     )
     x_placements = (Replicate(),)
     x_layout = _build_layout(mesh, x_placements, 1)

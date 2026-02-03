@@ -22,6 +22,7 @@ from hyper_parallel.core.shard.ops.parallel_new_ones import NewOnesDistributedOp
 
 op = NewOnesDistributedOp("new_ones")
 
+
 def test_new_ones_infer_layout_tuple_size():
     """
     Feature: Infer layout for new_ones with tuple size
@@ -29,8 +30,9 @@ def test_new_ones_infer_layout_tuple_size():
     Expectation: Output layout should be fully replicated (all dimensions -1) on the same device mesh.
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 4),
-    alias_name=("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: sharded on dim0 ("dp"), unsharded on dim1
     x_placements = (Shard(0), Replicate())
@@ -46,6 +48,7 @@ def test_new_ones_infer_layout_tuple_size():
         f"Tuple size inference failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
     assert output_layout.mesh_shape == mesh.mesh_shape
 
+
 def test_new_ones_infer_layout_list_size():
     """
     Feature: Infer layout for new_ones with list size
@@ -53,8 +56,9 @@ def test_new_ones_infer_layout_list_size():
     Expectation: Output layout should be fully replicated.
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 2),
-    alias_name=("dp", "tp")
+        device_type="npu",
+        mesh_shape=(2, 2),
+        mesh_dim_names=("dp", "tp")
     )
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -65,6 +69,7 @@ def test_new_ones_infer_layout_list_size():
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"List size inference failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
 
+
 def test_new_ones_infer_layout_int_size():
     """
     Feature: Infer layout for new_ones with int size
@@ -72,8 +77,9 @@ def test_new_ones_infer_layout_int_size():
     Expectation: Output layout should be a 1D Replicated layout.
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 4),
-    alias_name=("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     x_placements = (Shard(1), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -84,6 +90,7 @@ def test_new_ones_infer_layout_int_size():
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Int size inference failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
 
+
 def test_new_ones_ignores_input_sharding():
     """
     Feature: Ignore input sharding
@@ -91,8 +98,9 @@ def test_new_ones_ignores_input_sharding():
     Expectation: Output layout is strictly Replicated (-1, ...).
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 2),
-    alias_name=("dp", "tp")
+        device_type="npu",
+        mesh_shape=(2, 2),
+        mesh_dim_names=("dp", "tp")
     )
     # Input is sharded on both dimensions
     x_placements = (Shard(0), Shard(1))
@@ -104,6 +112,7 @@ def test_new_ones_ignores_input_sharding():
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Should ignore input sharding. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
 
+
 def test_new_ones_scalar_shape():
     """
     Feature: Infer layout for scalar new_ones
@@ -111,8 +120,9 @@ def test_new_ones_scalar_shape():
     Expectation: Output layout tensor_map should be empty tuple.
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 2),
-    alias_name=("dp", "tp")
+        device_type="npu",
+        mesh_shape=(2, 2),
+        mesh_dim_names=("dp", "tp")
     )
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -123,6 +133,7 @@ def test_new_ones_scalar_shape():
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Scalar inference failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
 
+
 def test_new_ones_missing_args():
     """
     Feature: Error handling for missing args
@@ -130,12 +141,14 @@ def test_new_ones_missing_args():
     Expectation: ValueError raised.
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 4),
-    alias_name=("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     with pytest.raises(ValueError, match="expected 'size' in extra_args"):
         op.infer_layout((x_layout,), extra_args=())
+
 
 def test_new_ones_invalid_size_type():
     """
@@ -144,8 +157,9 @@ def test_new_ones_invalid_size_type():
     Expectation: TypeError raised.
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 4),
-    alias_name=("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     with pytest.raises(TypeError, match="must be int, tuple or list"):

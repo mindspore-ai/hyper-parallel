@@ -22,18 +22,18 @@ platform = get_platform()
 
 def test_process_group():
     """
-    Init process group with backend is ``gloo``, then try to get rank list and backend in this
+    Init process group with backend is ``hccl``, then try to get rank list and backend in this
     process group. After that, create a sub process group and get rank list and backend in sub process group.
     Finally, destroy the sub process group and process group.
     """
     # init process group
-    init_process_group(backend='gloo')
+    init_process_group()
     world_size = platform.get_world_size()
     # pylint: disable=C0415
     rank_list = get_process_group_ranks()
     assert rank_list == list(range(world_size))
     backend = get_backend()
-    assert backend == "gloo"
+    assert backend == "hccl"
 
     # create process group
     group = platform.create_group(rank_list=list(range(world_size)))
@@ -41,7 +41,7 @@ def test_process_group():
     rank_list = get_process_group_ranks(group)
     assert rank_list == list(range(world_size))
     backend = get_backend(group)
-    assert backend == "gloo"
+    assert backend == "hccl"
 
     # split group
     split_ranks = []
@@ -64,7 +64,7 @@ def test_process_group():
         rank_list = get_process_group_ranks(split_group_from_group)
         assert rank_list == split_rank
         backend = get_backend(split_group_from_group)
-        assert backend == "gloo"
+        assert backend == "hccl"
 
         destroy_process_group(split_group_from_group)
 

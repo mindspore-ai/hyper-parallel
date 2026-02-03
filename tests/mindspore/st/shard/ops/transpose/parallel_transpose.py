@@ -112,7 +112,7 @@ def base_case(dp, mp):
     local_x = np.ones([local_batch_size, local_seq_length, hidden_size]).astype(np.float32)
 
     # Create DeviceMesh
-    mesh = init_device_mesh(mesh_shape=(dp, mp), alias_name=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(dp, mp), mesh_dim_names=("dp", "mp"))
 
     # Define placements using Placement format
     x_placements = (Shard(0), Shard(1))

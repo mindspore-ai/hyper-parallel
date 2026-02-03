@@ -33,8 +33,9 @@ def test_shard_to_replicate():
 
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(1, 8),
-        alias_name=("dp", "tp")
+        mesh_dim_names=("dp", "tp")
     )
 
     # Define placements using Placement format
@@ -61,8 +62,9 @@ def test_replicate_to_shard():
 
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(1, 8),
-        alias_name=("dp", "tp")
+        mesh_dim_names=("dp", "tp")
     )
 
     # Define placements using Placement format
@@ -89,8 +91,9 @@ def test_different_mesh():
 
     # Create DeviceMesh with 3 dimensions
     mesh_3d = init_device_mesh(
+        device_type="npu",
         mesh_shape=(1, 8, 1),
-        alias_name=("dp", "tp", "sp")
+        mesh_dim_names=("dp", "tp", "sp")
     )
 
     # Note: For 3D mesh, "tp" maps to dim 1
@@ -98,8 +101,9 @@ def test_different_mesh():
 
     # Create DeviceMesh with 2 dimensions
     mesh_2d = init_device_mesh(
+        device_type="npu",
         mesh_shape=(1, 8),
-        alias_name=("dp", "tp")
+        mesh_dim_names=("dp", "tp")
     )
 
     x_placements = (Replicate(), Replicate())

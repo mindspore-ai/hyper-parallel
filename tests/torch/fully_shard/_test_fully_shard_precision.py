@@ -33,7 +33,7 @@ standalone_x = torch.rand(8, 8)
 
 def _get_standard_fully_shard_kwargs(mp_policy):
     """get standard fully shard kwargs"""
-    default_mesh = init_device_mesh(mesh_shape=(8,), alias_name=("dp",))
+    default_mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     fsdp_kwargs = {
         'mesh': default_mesh,
         'reshard_after_forward': True,
@@ -158,7 +158,7 @@ def test_zero3_partial_shard():
     """test zero3 partial shard parallel"""
     init_dist()
     op_size = 2
-    hsdp_mesh = init_device_mesh(mesh_shape=(4, op_size), alias_name=("dp", "op"))
+    hsdp_mesh = init_device_mesh(device_type="npu", mesh_shape=(4, op_size), mesh_dim_names=("dp", "op"))
     mp_policy = MixedPrecisionPolicy()
     fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
     fsdp_kwargs['mesh'] = hsdp_mesh

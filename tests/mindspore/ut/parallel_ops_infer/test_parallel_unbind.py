@@ -22,6 +22,7 @@ from hyper_parallel.core.shard.ops.parallel_unbind import UnbindDistributedOp
 
 op = UnbindDistributedOp("unbind")
 
+
 def test_unbind_layout_inference_dim0():
     """
     Feature: Unbind on unsharded dimension 0
@@ -29,8 +30,9 @@ def test_unbind_layout_inference_dim0():
     Expectation: Return tuple of layouts, size equals dim 0 size. Remaining dimension preserves sharding.
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: (3, 8). dim0=Replicate (-1), dim1=Shard(1) ("mp" -> tensor_map 0)
     # tensor_map: (-1, 0)
@@ -60,8 +62,9 @@ def test_unbind_layout_inference_dim1():
     Expectation: Return tuple of layouts. Dim 0 preserves sharding.
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: (4, 4). dim0=Shard(0) ("dp" -> tensor_map 1), dim1=Replicate (-1)
     # tensor_map: (1, -1)
@@ -88,8 +91,9 @@ def test_unbind_layout_inference_negative_dim():
     Expectation: Correctly resolves negative index and infers layout.
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 2, 2),
-        alias_name = ("dp", "tp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 2, 2),
+        mesh_dim_names=("dp", "tp", "mp")
     )
     # Input: (2, 4, 8). dim0=Shard(0) ("dp"->2), dim1=Shard(1) ("tp"->1), dim2=Replicate
     # tensor_map: (2, 1, -1)
@@ -116,8 +120,9 @@ def test_unbind_layout_sharded_dim_error():
     Expectation: ValueError raised.
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: dim0=Shard(0), dim1=Replicate
     x_placements = (Shard(0), Replicate())
@@ -136,8 +141,9 @@ def test_unbind_layout_dim_out_of_range():
     Expectation: ValueError raised.
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)

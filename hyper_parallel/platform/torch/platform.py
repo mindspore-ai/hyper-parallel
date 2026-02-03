@@ -439,8 +439,7 @@ class TorchPlatform(Platform):
         Initialize global process group.
 
         Args:
-            backend (str or Backend, optional): The backend to use for distributed communication. Valid values
-                are ``nccl``, ``gloo``, ``mpi``, ``ucc``, ``xccl``.
+            backend (str or Backend, optional): The backend to use for distributed communication.
             init_method (str, optional): URL specifying how to initialize the process group. Default is "env://",
                 can not be specified at the same time with ``store``.
             timeout (timedelta, optional): Timeout for process group. Default 10 minutes for NCCL and for other
@@ -456,6 +455,8 @@ class TorchPlatform(Platform):
         try:
             _get_default_group()
         except ValueError:
+            if backend is None:
+                backend = "hccl"
             dist.init_process_group(backend=backend, init_method=init_method, timeout=timeout, world_size=world_size,
                                     rank=rank, store=store, pg_options=pg_options, device_id=device_id)
 
@@ -528,7 +529,7 @@ class TorchPlatform(Platform):
 
         split_group = None
         for split_rank in split_ranks:
-            dist_group = dist.new_group(split_rank)
+            dist_group = dist.new_group(ranks=split_rank)
             if TorchPlatform.get_rank() in split_rank:
                 split_group = dist_group
 

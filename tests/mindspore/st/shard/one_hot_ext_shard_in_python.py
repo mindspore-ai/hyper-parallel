@@ -66,7 +66,7 @@ def test_one_hot_ext_data_parallel_1d_int64_1():
     standalone_net = OneHotExtNet()
     standalone_output = standalone_net(tensor, num_classes)
 
-    mesh = init_device_mesh(mesh_shape=base_mesh_shape, alias_name=base_alias_name)
+    mesh = init_device_mesh(device_type="npu", mesh_shape=base_mesh_shape, mesh_dim_names=base_alias_name)
     tensor_placements = (Shard(0), Replicate(), Replicate())
     onehot_out_placements = (Shard(0), Replicate(), Replicate())
 
@@ -94,7 +94,7 @@ def test_one_hot_ext_data_parallel_2d_int64_2():
     standalone_net = OneHotExtNet()
     standalone_output = standalone_net(tensor, num_classes)
 
-    mesh = init_device_mesh(mesh_shape=base_mesh_shape, alias_name=base_alias_name)
+    mesh = init_device_mesh(device_type="npu", mesh_shape=base_mesh_shape, mesh_dim_names=base_alias_name)
     tensor_placements = (Shard(0), Replicate(), Replicate())
     onehot_out_placements = (Shard(0), Replicate(), Replicate())
 
@@ -122,7 +122,7 @@ def test_one_hot_ext_replicate_all_int64_3():
     standalone_net = OneHotExtNet()
     standalone_output = standalone_net(tensor, num_classes)
 
-    mesh = init_device_mesh(mesh_shape=base_mesh_shape, alias_name=base_alias_name)
+    mesh = init_device_mesh(device_type="npu", mesh_shape=base_mesh_shape, mesh_dim_names=base_alias_name)
     tensor_placements = (Replicate(), Replicate(), Replicate())
     onehot_out_placements = (Replicate(), Replicate(), Replicate())
 
@@ -150,7 +150,7 @@ def test_one_hot_ext_3d_data_parallel_int64_4():
     standalone_net = OneHotExtNet()
     standalone_output = standalone_net(tensor, num_classes)
 
-    mesh = init_device_mesh(mesh_shape=base_mesh_shape, alias_name=base_alias_name)
+    mesh = init_device_mesh(device_type="npu", mesh_shape=base_mesh_shape, mesh_dim_names=base_alias_name)
     tensor_placements = (Shard(0), Replicate(), Replicate())
     onehot_out_placements = (Shard(0), Replicate(), Replicate())
 
@@ -173,7 +173,7 @@ def test_one_hot_ext_auto_depth_skewed_distribution_int64_5():
     np.random.seed(1)
     rank = D.get_rank()
 
-    mesh = init_device_mesh(mesh_shape=base_mesh_shape, alias_name=base_alias_name)
+    mesh = init_device_mesh(device_type="npu", mesh_shape=base_mesh_shape, mesh_dim_names=base_alias_name)
     tensor_placements = (Shard(0), Replicate(), Replicate())
     onehot_out_placements = (Shard(0), Replicate(), Replicate())
 
@@ -220,7 +220,7 @@ def test_one_hot_ext_auto_depth_all_same_local_max_int64_6():
     np.random.seed(2)
     rank = D.get_rank()
 
-    mesh = init_device_mesh(mesh_shape=base_mesh_shape, alias_name=base_alias_name)
+    mesh = init_device_mesh(device_type="npu", mesh_shape=base_mesh_shape, mesh_dim_names=base_alias_name)
     tensor_placements = (Shard(0), Replicate(), Replicate())
     onehot_out_placements = (Shard(0), Replicate(), Replicate())
 

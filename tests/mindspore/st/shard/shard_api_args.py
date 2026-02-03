@@ -45,8 +45,9 @@ def test_shard_with_args_and_kwargs_non_dtensor_input():
 
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 4),
-        alias_name=("dp", "tp")
+        mesh_dim_names=("dp", "tp")
     )
 
     model = NetTestInput()

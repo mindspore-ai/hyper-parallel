@@ -57,7 +57,7 @@ def base_global_layout():
     dist_model = SimpleModel().npu()
 
     # Create DeviceMesh
-    mesh = init_device_mesh(mesh_shape=(1, 8), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(1, 8), mesh_dim_names=("dp", "tp"))
 
     # Define placements using Placement format
     w_placements = (Replicate(), Shard(1))  # tp shard on dim 1

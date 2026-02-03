@@ -523,7 +523,8 @@ class MindSporePlatform(Platform):
                     pg_options = f"{len(split_rank)}-{hash_str_rank_list}"
                 new_group(rank_ids=split_rank, group=pg_options)
                 return pg_options
-        raise ValueError(f"The Split_ranks {split_ranks} does not contain current rank {rank_id}")
+        raise ValueError(f"Split group invalid rank, the Split_ranks {split_ranks} does not contain current rank"
+                         f" {rank_id}")
 
     @staticmethod
     def no_grad():

@@ -18,7 +18,7 @@ from tests.common.mark_utils import arg_mark
 from tests.mindspore.st.utils import msrun_case
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_saver_loader():
     """
     Feature: save checkpoint and load checkpoint.
@@ -29,6 +29,4 @@ def test_saver_loader():
     file_name = "base_shard.py"
     case_name = "test_saver_loader"
     master_port = 11318
-    worker_num = 1
-    local_worker_num = 1
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)
+    msrun_case(glog_v, file_name, case_name, master_port)

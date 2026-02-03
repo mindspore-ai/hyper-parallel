@@ -30,8 +30,9 @@ def test_cumsum_layout_data_parallel():
     Expectation: Output layout identical to input layout
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
 
     # Input: sharded on dim0 ("dp"), unsharded on dim1 (cumsum dimension)
@@ -53,8 +54,9 @@ def test_cumsum_layout_tensor_parallel():
     Expectation: Output layout identical to input layout
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
 
     # Input: unsharded on dim0 (cumsum dimension), sharded on dim1 ("mp")
@@ -76,8 +78,9 @@ def test_cumsum_layout_mixed_parallel():
     Expectation: Output layout identical to input layout
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 3, 4),
-        alias_name = ("dp", "tp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 3, 4),
+        mesh_dim_names=("dp", "tp", "mp")
     )
 
     # Input: sharded on dim0 ("dp"), unsharded on dim1 (cumsum dimension), sharded on dim2 ("mp")
@@ -99,8 +102,9 @@ def test_cumsum_layout_negative_dim():
     Expectation: Correctly normalized and validated
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
 
     # Input: unsharded on dim0 (cumsum dimension), sharded on dim1
@@ -122,8 +126,9 @@ def test_cumsum_layout_invalid_sharding_on_cumsum_dim():
     Expectation: ValueError raised with clear message
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
 
     # Input: sharded on BOTH dimensions including cumsum dimension
@@ -142,8 +147,9 @@ def test_cumsum_layout_dim_out_of_range_positive():
     Expectation: ValueError raised
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
 
     x_placements = (Replicate(), Replicate())
@@ -161,8 +167,9 @@ def test_cumsum_layout_missing_dim_parameter():
     Expectation: ValueError raised
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
 
     x_placements = (Replicate(), Replicate())
@@ -184,8 +191,9 @@ def test_cumsum_layout_invalid_dim_type():
     Expectation: ValueError raised
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
 
     x_placements = (Replicate(), Replicate())

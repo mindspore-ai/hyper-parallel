@@ -118,7 +118,7 @@ def run_parallel(micro_batch_num):
     # shard config
     dp = 2
     mp = 1
-    mesh = init_device_mesh(mesh_shape=(dp, mp), alias_name=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(dp, mp), mesh_dim_names=("dp", "mp"))
 
     # Define placements using Placement format
     in_placements = (Shard(0), Replicate())

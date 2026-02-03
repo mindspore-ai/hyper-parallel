@@ -83,8 +83,9 @@ def test_transpose_ext_view_basic_3d_1():
     x = Tensor(np.random.randn(d0, d1, d2).astype(np.float32))
 
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Shard input to ensure dtensor path is exercised
@@ -118,8 +119,9 @@ def test_transpose_ext_view_negative_dims_2():
     x = Tensor(np.random.randn(d0, d1, d2, d3).astype(np.float32))
 
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Shard input: shard dim2 by mp; others replicated
@@ -153,8 +155,9 @@ def test_transpose_ext_view_same_dims_noop_3():
     x = Tensor(np.random.randn(d0, d1, d2).astype(np.float32))
 
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # x_layout = layout("dp", "cp", "mp") -> (Shard(0), Shard(1), Shard(2))

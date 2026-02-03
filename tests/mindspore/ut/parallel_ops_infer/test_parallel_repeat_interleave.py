@@ -22,13 +22,14 @@ from hyper_parallel.core.shard.ops.parallel_repeat_interleave import RepeatInter
 
 op = RepeatInterleaveDistributedOp("repeat_interleave")
 
+
 def test_torch_repeat_interleave_layout_data_parallel():
     """
     Feature: RepeatInterleave data parallel
     Description: Data parallel scenario (shard on first dim, repeat on last unsharded dim)
     Expectation: Success
     """
-    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
     repeats = 2
@@ -47,7 +48,7 @@ def test_torch_repeat_interleave_layout_tensor_parallel():
     Description: Tensor parallel scenario (shard on first dim with 'tp', repeat on last unsharded dim)
     Expectation: Success
     """
-    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Shard(0))
     x_layout = _build_layout(mesh, x_placements, 2)
     repeats = 2
@@ -65,10 +66,10 @@ def test_torch_repeat_interleave_with_tensor_layout_data_parallel():
     Description: Data parallel scenario (shard on first dim, repeat on last unsharded dim)
     Expectation: Success
     """
-    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
-    repeats_tensor = [2,1,1,1]
+    repeats_tensor = [2, 1, 1, 1]
 
     dim = 1
     output_layout = op.infer_layout((x_layout,), (repeats_tensor, dim))
@@ -84,10 +85,10 @@ def test_torch_repeat_interleave_with_tensor_layout_tensor_parallel():
     Description: Tensor parallel scenario (shard on first dim with 'tp', repeat on last unsharded dim)
     Expectation: Success
     """
-    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Shard(0))
     x_layout = _build_layout(mesh, x_placements, 2)
-    repeats_tensor = [2,1,1,1]
+    repeats_tensor = [2, 1, 1, 1]
 
     dim = 1
     output_layout = op.infer_layout((x_layout,), (repeats_tensor, dim))
@@ -95,13 +96,15 @@ def test_torch_repeat_interleave_with_tensor_layout_tensor_parallel():
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Tensor Parallel with torch repeat_interleave test failed. Expected {expected_map}," \
         f" got {output_layout.to_dict()['tensor_map']}"
+
+
 def test_torch_repeat_interleave_dim_none_layout_data_parallel():
     """
     Feature: RepeatInterleave data parallel
     Description: Data parallel scenario (shard on first dim, repeat on last unsharded dim)
     Expectation: Success
     """
-    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
     repeats = 2
@@ -118,7 +121,7 @@ def test_torch_repeat_interleave_dim_none_layout_tensor_parallel():
     Description: Tensor parallel scenario (shard on first dim with 'tp', repeat on last unsharded dim)
     Expectation: Success
     """
-    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Shard(0))
     x_layout = _build_layout(mesh, x_placements, 2)
 
@@ -129,13 +132,14 @@ def test_torch_repeat_interleave_dim_none_layout_tensor_parallel():
         f"Tensor Parallel dim None repeat_interleave test failed. Expected {expected_map}," \
         f" got {output_layout.to_dict()['tensor_map']}"
 
+
 def test_torch_repeat_interleave_layout_sharded_dim_error():
     """
     Feature: RepeatInterleave on sharded dimension
     Description: Repeat on a sharded dimension should raise error
     Expectation: Success
     """
-    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(1))
     x_layout = _build_layout(mesh, x_placements, 2)
 
@@ -144,13 +148,14 @@ def test_torch_repeat_interleave_layout_sharded_dim_error():
     with pytest.raises(ValueError, match="Cannot perform sharding on params along the chosen dim"):
         op.infer_layout((x_layout,), (repeats, dim))
 
+
 def test_torch_repeat_interleave_layout_error_dim_out_of_range():
     """
     Feature: Test indicating a invalid dim
     Description: Test indicating a invalid dim.
     Expectation: Success
     """
-    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
 

@@ -21,6 +21,7 @@ from hyper_parallel.core.shard.ops.parallel_reduce import MaxDistributedOp
 
 op = MaxDistributedOp("max")
 
+
 def test_max_layout_inference_reduce_dim_sharded():
     """
     Feature: Max reduction on sharded dimension
@@ -30,8 +31,9 @@ def test_max_layout_inference_reduce_dim_sharded():
     Implicitly assumes PartialMax on the reduced axis (internal state).
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 4),
-    alias_name=("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: sharded on dim0 ("dp"->1), replicated on dim1 (-1)
     # Tensor Map: (1, -1)
@@ -53,6 +55,8 @@ def test_max_layout_inference_reduce_dim_sharded():
         f"Values layout incorrect. Expected {expected_map}, got {val_layout.to_dict()['tensor_map']}"
     assert idx_layout.to_dict()["tensor_map"] == expected_map, \
         f"Indices layout incorrect. Expected {expected_map}, got {idx_layout.to_dict()['tensor_map']}"
+
+
 def test_max_layout_inference_reduce_dim_replicated():
     """
     Feature: Max reduction on replicated dimension
@@ -60,8 +64,9 @@ def test_max_layout_inference_reduce_dim_replicated():
     Expectation: Returns tuple of layouts. Dimension 1 is removed.
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 4),
-    alias_name=("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: sharded on dim0 ("dp"->1), replicated on dim1 (-1)
     x_placements = (Shard(0), Replicate())
@@ -77,6 +82,8 @@ def test_max_layout_inference_reduce_dim_replicated():
 
     assert val_layout.to_dict()["tensor_map"] == expected_map, \
         f"Values layout incorrect. Expected {expected_map}, got {val_layout.to_dict()['tensor_map']}"
+
+
 def test_max_layout_inference_keepdim():
     """
     Feature: Max reduction with keepdim=True
@@ -84,8 +91,9 @@ def test_max_layout_inference_keepdim():
     Expectation: Dimension 0 becomes unsharded/None (-1) in the map.
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 4),
-    alias_name=("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: sharded on dim0 ("dp"->1), replicated on dim1 (-1)
     x_placements = (Shard(0), Replicate())
@@ -102,6 +110,8 @@ def test_max_layout_inference_keepdim():
 
     assert val_layout.to_dict()["tensor_map"] == expected_map, \
         f"Keepdim layout incorrect. Expected {expected_map}, got {val_layout.to_dict()['tensor_map']}"
+
+
 def test_max_layout_inference_global():
     """
     Feature: Global Max reduction (torch.max(input))
@@ -109,8 +119,9 @@ def test_max_layout_inference_global():
     Expectation: Returns a single layout (not tuple). Output should be scalar (empty map).
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 4),
-    alias_name=("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: sharded on dim0
     x_placements = (Shard(0), Replicate())
@@ -126,6 +137,8 @@ def test_max_layout_inference_global():
 
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Global reduce layout incorrect. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+
+
 def test_max_layout_inference_global_keepdim():
     """
     Feature: Global Max reduction with keepdim (hypothetical case via extra args logic)
@@ -133,8 +146,9 @@ def test_max_layout_inference_global_keepdim():
     Expectation: All dimensions become -1.
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 4),
-    alias_name=("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -144,6 +158,8 @@ def test_max_layout_inference_global_keepdim():
     expected_map = (-1, -1)
 
     assert output_layout.to_dict()["tensor_map"] == expected_map
+
+
 def test_max_layout_inference_elementwise():
     """
     Feature: Element-wise max (torch.max(a, b))
@@ -151,8 +167,9 @@ def test_max_layout_inference_elementwise():
     Expectation: Returns one layout (propagates first input layout).
     """
     mesh = init_device_mesh(
-    mesh_shape=(2, 4),
-    alias_name=("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -166,13 +183,14 @@ def test_max_layout_inference_elementwise():
 
     assert output_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_negative_dim():
     """
     Feature: Max reduction with negative dimension index
     Description: Reduce last dimension (dim=-1) of a 2D tensor
     Expectation: Last dimension is removed from layout.
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # Input: sharded on dim0 ("dp"->1), replicated on dim1 (-1)
     # Tensor Map: (1, -1)
     x_placements = (Shard(0), Replicate())
@@ -188,13 +206,14 @@ def test_max_layout_inference_negative_dim():
     assert val_layout.to_dict()["tensor_map"] == expected_map
     assert idx_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_3d_sharded():
     """
     Feature: Max reduction on 3D tensor
     Description: Reduce middle dimension (dim1) of a 3D tensor where dim0 and dim1 are sharded
     Expectation: Dim1 is removed, Dim0 and Dim2 sharding preserved.
     """
-    mesh = init_device_mesh((2, 2, 2), ("dp", "tp", "mp"))
+    mesh = init_device_mesh("npu", (2, 2, 2), mesh_dim_names=("dp", "tp", "mp"))
     # Map: dp->2, tp->1, mp->0
     # Input: Shard(0)->dp(2), Shard(1)->tp(1), Replicate()->-1
     # Tensor Map: (2, 1, -1)
@@ -209,13 +228,14 @@ def test_max_layout_inference_3d_sharded():
     expected_map = (2, -1)
     assert val_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_all_sharded_reduce_0():
     """
     Feature: Max reduction on fully sharded tensor
     Description: Reduce dim0 of a 2D tensor where both dims are sharded
     Expectation: Dim0 removed, Dim1 sharding preserved.
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # Input: Shard(0)->1, Shard(1)->0
     # Tensor Map: (1, 0)
     x_placements = (Shard(0), Shard(1))
@@ -228,13 +248,14 @@ def test_max_layout_inference_all_sharded_reduce_0():
     expected_map = (0,)
     assert val_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_keepdim_negative():
     """
     Feature: Max reduction with keepdim and negative dim
     Description: Reduce last dimension with keepdim=True
     Expectation: Last dimension becomes -1 (None).
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # Input: (1, -1)
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -247,13 +268,14 @@ def test_max_layout_inference_keepdim_negative():
     expected_map = (1, -1)
     assert val_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_global_fully_sharded():
     """
     Feature: Global Max reduction on fully sharded tensor
     Description: Reduce all dims of (Shard(0), Shard(1))
     Expectation: Output is a scalar (empty tuple map).
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # Input: (1, 0)
     x_placements = (Shard(0), Shard(1))
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -263,13 +285,14 @@ def test_max_layout_inference_global_fully_sharded():
     expected_map = ()
     assert output_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_replicated_input():
     """
     Feature: Max reduction on fully replicated tensor
     Description: Reduce dim0 of replicated tensor
     Expectation: Output remains replicated/unsharded.
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # Input: (-1, -1)
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -280,13 +303,14 @@ def test_max_layout_inference_replicated_input():
     expected_map = (-1,)
     assert val_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_elementwise_mismatched():
     """
     Feature: Element-wise max with mismatched sharding
     Description: Input A is sharded, Input B is replicated.
     Expectation: Output should adopt the sharding strategy (broadcasting sharding).
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # A: (1, -1)
     layout_a = _build_layout(mesh, (Shard(0), Replicate()), 2)
     # B: (-1, -1)
@@ -299,6 +323,7 @@ def test_max_layout_inference_elementwise_mismatched():
     expected_map = (1, -1)
     assert output_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_4d_complex():
     """
     Feature: Max reduction on 4D tensor
@@ -306,7 +331,7 @@ def test_max_layout_inference_4d_complex():
     Expectation: Correctly removes dim 2 and preserves others.
     """
 
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # Mesh IDs: dp->1, mp->0
 
     # Input: (Shard(0), Replicate, Shard(1), Replicate)
@@ -323,18 +348,20 @@ def test_max_layout_inference_4d_complex():
     expected_map = (1, -1, -1)
     assert val_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_dim_out_of_range():
     """
     Feature: Invalid dimension index
     Description: Provide dimension index larger than rank
     Expectation: Raises ValueError or IndexError (depending on impl, usually ValueError for validation)
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
     # Dim 5 is out of bounds for 2D tensor
-    with pytest.raises(Exception): # Catching general Exception as implementation specific
+    with pytest.raises(Exception):  # Catching general Exception as implementation specific
         op.infer_layout((x_layout,), extra_args=(5,))
+
 
 def test_max_layout_inference_scalar_input():
     """
@@ -342,7 +369,7 @@ def test_max_layout_inference_scalar_input():
     Description: Global reduce on 0-D tensor
     Expectation: Returns scalar layout.
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # Scalar layout (empty tuple placements)
     x_layout = _build_layout(mesh, (), 0)
 
@@ -352,13 +379,14 @@ def test_max_layout_inference_scalar_input():
     expected_map = ()
     assert output_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_1d_sharded_reduce():
     """
     Feature: Max reduction on 1D sharded tensor
     Description: Reduce the only dimension of a 1D sharded tensor.
     Expectation: Returns scalar tuple layout (values, indices) with empty tensor maps.
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # Input: 1D tensor sharded on dim0 ("dp"->1)
     # Tensor Map: (1,)
     x_placements = (Shard(0),)
@@ -374,13 +402,14 @@ def test_max_layout_inference_1d_sharded_reduce():
     assert val_layout.to_dict()["tensor_map"] == expected_map
     assert idx_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_binary_same_layout():
     """
     Feature: Element-wise max with identical sharded layouts
     Description: Input A and B have same sharding.
     Expectation: Output preserves the common sharding.
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # Both inputs: (Shard(0), Replicate) -> (1, -1)
     x_placements = (Shard(0), Replicate())
     layout = _build_layout(mesh, x_placements, 2)
@@ -391,13 +420,14 @@ def test_max_layout_inference_binary_same_layout():
     expected_map = (1, -1)
     assert output_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_binary_mixed_shard_replicate():
     """
     Feature: Element-wise max with mixed Shard/Replicate
     Description: Input A is Sharded, Input B is Replicated (on same mesh).
     Expectation: Output takes the Sharded layout (propagates sharding).
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # A: Sharded (1, -1)
     layout_a = _build_layout(mesh, (Shard(0), Replicate()), 2)
     # B: Replicated (-1, -1)
@@ -409,13 +439,14 @@ def test_max_layout_inference_binary_mixed_shard_replicate():
     expected_map = (1, -1)
     assert output_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_binary_broadcast_scalar():
     """
     Feature: Element-wise max with scalar broadcasting
     Description: Max of 2D Sharded Tensor and a Scalar.
     Expectation: Scalar broadcasts to tensor shape, output preserves tensor layout.
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # A: 2D Sharded (1, -1)
     layout_a = _build_layout(mesh, (Shard(0), Replicate()), 2)
     # B: Scalar ()
@@ -426,6 +457,7 @@ def test_max_layout_inference_binary_broadcast_scalar():
     expected_map = (1, -1)
     assert output_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_binary_orthogonal_sharding():
     """
     Feature: Element-wise max with orthogonal sharding
@@ -434,7 +466,7 @@ def test_max_layout_inference_binary_orthogonal_sharding():
                  Adjusted expectation to match current behavior: (1, -1).
     """
     # Use 2x2 mesh to allow distinct axes for Shard(0) and Shard(1)
-    mesh = init_device_mesh((2, 2), ("dp", "tp"))
+    mesh = init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "mp"))
 
     # A: Sharded on dim0 (using mesh 'dp' -> 1). Map: (1, -1)
     layout_a = _build_layout(mesh, (Shard(0), Replicate()), 2)
@@ -449,13 +481,14 @@ def test_max_layout_inference_binary_orthogonal_sharding():
     expected_map = (1, -1)
     assert output_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_reduce_keepdim_false_explicit():
     """
     Feature: Max reduction with explicit keepdim=False
     Description: Reduce dim0 of 2D tensor.
     Expectation: Rank reduced from 2 to 1.
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
     # keepdim=False
@@ -466,18 +499,20 @@ def test_max_layout_inference_reduce_keepdim_false_explicit():
     expected_map = (-1,)
     assert val_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_reduce_invalid_dim_type():
     """
     Feature: Max reduction with invalid dim type
     Description: Pass a float as dimension.
     Expectation: Raises ValueError (as per implementation).
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
     # Implementation raises ValueError for non-int dimensions
     with pytest.raises(ValueError, match="Invalid reduce axis"):
         op.infer_layout((x_layout,), extra_args=(1.5,))
+
 
 def test_max_layout_inference_3d_reduce_last_dim():
     """
@@ -485,7 +520,7 @@ def test_max_layout_inference_3d_reduce_last_dim():
     Description: Reduce dim 2.
     Expectation: Dim 2 removed, dim 0/1 preserved.
     """
-    mesh = init_device_mesh((2, 2, 2), ("dp", "tp", "mp"))
+    mesh = init_device_mesh("npu", (2, 2, 2), mesh_dim_names=("dp", "tp", "mp"))
     # Input: (Shard(0), Shard(1), Replicate) -> (2, 1, -1)
     x_placements = (Shard(0), Shard(1), Replicate())
     x_layout = _build_layout(mesh, x_placements, 3)
@@ -497,13 +532,14 @@ def test_max_layout_inference_3d_reduce_last_dim():
     expected_map = (2, 1)
     assert val_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_replicate_reduce_keepdim():
     """
     Feature: Max reduction on Replicated tensor with keepdim
     Description: Reduce dim0 of fully replicated tensor, keeping dimensions.
     Expectation: Layout remains fully replicated, but dimension preserved (as None/-1).
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # Input: (-1, -1)
     x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
@@ -514,13 +550,14 @@ def test_max_layout_inference_replicate_reduce_keepdim():
     expected_map = (-1, -1)
     assert val_layout.to_dict()["tensor_map"] == expected_map
 
+
 def test_max_layout_inference_global_scalar_input():
     """
     Feature: Global Max reduction on Scalar
     Description: Input is scalar, op is global max.
     Expectation: Output is scalar (empty map).
     """
-    mesh = init_device_mesh((2, 4), ("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"))
     # Scalar layout
     x_layout = _build_layout(mesh, (), 0)
 

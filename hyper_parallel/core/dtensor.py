@@ -74,7 +74,7 @@ class DTensor(DTensorBase):
 
     Example:
         >>> from hyper_parallel.core.placement_types import Shard, Replicate
-        >>> mesh = init_device_mesh(mesh_shape=(2, 2), alias_name=("dp", "tp"))
+        >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
         >>> local_tensor = Tensor(np.ones((4, 4)))
         >>> dtensor = DTensor.from_local(local_tensor, mesh, [Shard(0), Replicate()])
     """
@@ -133,7 +133,7 @@ class DTensor(DTensorBase):
 
         Example:
             >>> from hyper_parallel.core.placement_types import Shard, Replicate
-            >>> mesh = init_device_mesh(mesh_shape=(2, 2), alias_name=("dp", "tp"))
+            >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
             >>> local_tensor = Tensor(np.ones((4, 4)))
             >>> dtensor = DTensor.from_local(local_tensor, mesh, [Shard(0), Replicate()])
         """
@@ -279,7 +279,7 @@ class DTensor(DTensorBase):
 
         Example:
             >>> from hyper_parallel.core.placement_types import Shard, Replicate
-            >>> mesh = init_device_mesh(mesh_shape=(2, 2), alias_name=("dp", "tp"))
+            >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
             >>> global_tensor = Tensor(np.arange(16).reshape(4, 4))
             >>> dtensor = DTensor.distribute_tensor(global_tensor, mesh, [Shard(0), Replicate()])
             >>> # rank 0 and rank1 gets: [[0,1,2,3], [4,5,6,7]]

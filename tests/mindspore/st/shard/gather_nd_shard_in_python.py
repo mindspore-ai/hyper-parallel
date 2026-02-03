@@ -73,8 +73,9 @@ def test_gathernd_partial_model_parallel_1():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Replicate(), Replicate(), Replicate())
@@ -114,8 +115,9 @@ def test_gathernd_partial_data_parallel_2():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Replicate(), Replicate(), Replicate())
@@ -154,8 +156,9 @@ def test_gathernd_params_plain_tensor():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     indices_placements = (Replicate(), Replicate(), Shard(0))
@@ -188,8 +191,9 @@ def test_gathernd_k1_trailing_dims_shard_3():
     standalone_output = standalone_net(x, indices)
 
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Replicate(), Shard(1), Shard(2))
@@ -225,8 +229,9 @@ def test_gathernd_k2_trailing_dim_shard_4():
     standalone_output = standalone_net(x, indices)
 
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Replicate(), Shard(2), Replicate())
@@ -265,8 +270,9 @@ def test_gathernd_k3_no_trailing_dims_5():
     standalone_output = standalone_net(x, indices)
 
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Replicate(), Replicate(), Replicate())

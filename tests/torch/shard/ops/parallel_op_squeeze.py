@@ -40,7 +40,7 @@ def test_distributed_squeeze_basic():
     standalone_output = standalone_input.squeeze(1)
 
     # Distributed setup: shard dim=0 ("dp"), dim=1 is unsharded (Replicate)
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -72,7 +72,7 @@ def test_distributed_squeeze_no_args_all_dims():
     standalone_output = standalone_input.squeeze()
 
     # Mesh (2, 2). Map: Tensor dim 1 -> "dp" (Mesh 0), Tensor dim 3 -> "tp" (Mesh 1)
-    mesh = init_device_mesh(mesh_shape=(2, 2), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(1), Shard(3))
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -104,7 +104,7 @@ def test_distributed_squeeze_specific_axis_negative():
     standalone_output = standalone_input.squeeze(-2)
 
     # Mesh (2, 2). Map: Tensor dim 0 -> Mesh 0, Tensor dim 2 -> Mesh 1
-    mesh = init_device_mesh(mesh_shape=(2, 2), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(2))
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -133,7 +133,7 @@ def test_distributed_squeeze_error_non_singleton():
     input_np = np.random.randn(8, 2).astype(np.float32)
     standalone_input = torch.from_numpy(input_np).npu()
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -158,7 +158,7 @@ def test_distributed_squeeze_scalar_like():
     standalone_input = torch.from_numpy(input_np).npu()
     standalone_output = standalone_input.squeeze()
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)

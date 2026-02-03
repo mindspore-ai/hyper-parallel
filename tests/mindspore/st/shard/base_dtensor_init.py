@@ -12,7 +12,7 @@ D.init()
 
 def build_device_mesh():
     world_size = get_group_size()
-    return init_device_mesh((world_size,), ("dp",))
+    return init_device_mesh("npu", (world_size,), mesh_dim_names=("dp",))
 
 def assert_equal(x,y):
     assert (x == y).all()

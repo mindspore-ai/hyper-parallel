@@ -21,7 +21,7 @@ from tests.torch.utils import torchrun_case
 def test_process_group():
     """
     Feature: Init process group, get rank list and backend in group, then destroy the group.
-    Description: Test init process group with backend is ``gloo``, then try to get rank list and backend in this
+    Description: Test init process group with backend is ``hccl``, then try to get rank list and backend in this
         process group. After that, create a sub process group and get rank list and backend in sub process group.
         Finally, destroy the sub process group and process group.
     Expectation: Run success.

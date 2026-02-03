@@ -44,7 +44,7 @@ def test_distributed_all_unsharded_dim():
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     standalone_result = torch.all(standalone_input, dim=dim)
 
-    mesh = init_device_mesh(mesh_shape = (2, 4), alias_name = ("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
     dist_result = torch.all(dist_input, dim, keepdim=False)
@@ -81,7 +81,7 @@ def test_distributed_all_sharded_dim():
     standalone_result = torch.all(standalone_input, dim=dim)
 
     # Distributed setup
-    mesh = init_device_mesh(mesh_shape = (2, 4), alias_name = ("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(1))
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)

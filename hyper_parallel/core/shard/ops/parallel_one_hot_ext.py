@@ -88,7 +88,6 @@ class OneHotExtDistributedOp(DistributedOp):
             return None
 
         original_op = func
-        rank = platform.get_rank()
         reduce_max = ops.ReduceMax(keep_dims=False)
 
         def expanded_one_hot(indices, num_classes, on_value, off_value, axis):
@@ -116,7 +115,7 @@ class OneHotExtDistributedOp(DistributedOp):
 
             global_max_i32 = local_max_i32
             for axis_name in sharded_axes:
-                group = indices_layout.get_comm_group_by_axis(axis_name, rank)
+                group = indices_layout.get_comm_group_by_axis(axis_name)
                 global_max_i32 = platform.differentiable_all_reduce(
                     global_max_i32, "max", group
                 )

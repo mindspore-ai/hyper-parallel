@@ -45,7 +45,7 @@ def test_distributed_new_ones_tuple_size():
     standalone_output = standalone_input.new_ones(size)
 
     # Distributed setup: Input sharded on dim 0 and 1
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(1))
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -76,7 +76,7 @@ def test_distributed_new_ones_list_size():
     size = [2, 2, 2]
     standalone_output = standalone_input.new_ones(size)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -105,7 +105,7 @@ def test_distributed_new_ones_int_size():
     size = 8
     standalone_output = standalone_input.new_ones(size)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -134,7 +134,7 @@ def test_distributed_new_ones_scalar():
     size = ()
     standalone_output = standalone_input.new_ones(size)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -165,7 +165,7 @@ def test_distributed_new_ones_input_sharding_ignored():
     standalone_output = standalone_input.new_ones(size)
 
     # Heavily sharded input: dim0 on dp(2), dim1 on tp(4)
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(1))
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)

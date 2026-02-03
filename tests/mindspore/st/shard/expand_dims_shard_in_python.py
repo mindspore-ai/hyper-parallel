@@ -70,8 +70,9 @@ def test_expanddims_data_parallel_1():
     # Parallel
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Define placements using Placement format
@@ -105,8 +106,9 @@ def test_expanddims_model_parallel_2():
     # Parallel
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Define placements using Placement format
@@ -140,8 +142,9 @@ def test_expanddims_hybrid_parallel_3():
     # Parallel
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Define placements using Placement format
@@ -175,8 +178,9 @@ def test_expanddims_insert_middle_4():
     # Parallel
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Define placements using Placement format
@@ -210,8 +214,9 @@ def test_expanddims_negative_axis_5():
     # Parallel
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Define placements using Placement format

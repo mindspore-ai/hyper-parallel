@@ -45,7 +45,7 @@ def custom_shard(
         Callable: Wrapped function that handles distributed tensors.
 
     Examples:
-        >>> mesh = DeviceMesh((2, 2), ("dp", "tp"))
+        >>> mesh = DeviceMesh("npu", (2, 2), nesh_dim_names=("dp", "tp"))
         >>> @custom_shard(
         ...     device_mesh=mesh,
         ...     out_placements=((Shard(0), Replicate()),),
