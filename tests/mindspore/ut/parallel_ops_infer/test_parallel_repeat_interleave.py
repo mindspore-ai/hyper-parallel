@@ -76,10 +76,10 @@ def test_torch_repeat_interleave_with_tensor_layout_data_parallel():
 
     x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None")  # tensor_map = (1, -1)  len(alias_name)-1-i
-    repeats_tensor_shape = (4,)
+    repeats_tensor = [2,1,1,1]
 
     dim = 1
-    output_layout = op.infer_layout((x_layout,), (repeats_tensor_shape, dim))
+    output_layout = op.infer_layout((x_layout,), (repeats_tensor, dim))
     expected_map = (1, -1)
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Data Parallel with torch repeat_interleave test failed. Expected {expected_map}," \
@@ -98,10 +98,10 @@ def test_torch_repeat_interleave_with_tensor_layout_tensor_parallel():
 
     x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("tp", "None")  # tensor_map = (0, -1)
-    repeats_tensor_shape = (4,)
+    repeats_tensor = [2,1,1,1]
 
     dim = 1
-    output_layout = op.infer_layout((x_layout,), (repeats_tensor_shape, dim))
+    output_layout = op.infer_layout((x_layout,), (repeats_tensor, dim))
     expected_map = (0, -1)
     assert output_layout.to_dict()["tensor_map"] == expected_map, \
         f"Tensor Parallel with torch repeat_interleave test failed. Expected {expected_map}," \
