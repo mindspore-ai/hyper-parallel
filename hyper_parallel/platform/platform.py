@@ -14,7 +14,10 @@
 # ============================================================================
 """framework platform api"""
 import os
+from datetime import timedelta
 from enum import auto, Enum
+from typing import Optional, Any
+
 import numpy as np
 # Environment variable name used to specify the AI framework platform to use
 HYPER_PARALLEL_PLATFORM = "HYPER_PARALLEL_PLATFORM"
@@ -311,6 +314,92 @@ class Platform:
         Aggregates all Python objects objs in a specified communication group into object_list.
         """
         raise NotImplementedError("Platform subclasses must implement all_gather_object")
+
+    @staticmethod
+    def init_process_group(
+            backend: Optional[str] = None,
+            *,
+            init_method: Optional[str] = None,
+            timeout: Optional[timedelta] = None,
+            world_size: int = -1,
+            rank: int = -1,
+            store: Any = None,
+            pg_options: Any = None,
+            device_id: Any = None
+    ) -> None:
+        """
+        Initialize the default distributed process group.
+
+        Args:
+            backend: The backend to use for distributed communication
+            init_method: URL specifying how to initialize the process group
+            timeout: Timeout for operations executed against the process group
+            world_size: Number of processes participating in the job
+            rank: Rank of the current process
+            store: Key/value store for exchanging connection information
+            pg_options: Process group options for backend-specific configurations
+            device_id: Specific device this process will work on
+
+        Raises:
+            NotImplementedError: This method must be implemented by subclasses
+        """
+        raise NotImplementedError("Platform subclasses must implement init_process_group")
+
+    @staticmethod
+    def destroy_process_group(group=None) -> None:
+        """
+        Destroy a given process group.
+
+        Args:
+            group: The process group to be destroyed. If None, destroys the default group.
+
+        Raises:
+            NotImplementedError: This method must be implemented by subclasses
+        """
+        raise NotImplementedError("Platform subclasses must implement destroy_process_group")
+
+    @staticmethod
+    def get_process_group_ranks(group=None) -> list[int]:
+        """
+        Get rank list of the given process group.
+
+        Args:
+            group: The process group to get ranks from. If None, uses the default group.
+
+        Returns:
+            List of ranks in the specified process group.
+
+        Raises:
+            NotImplementedError: This method must be implemented by subclasses
+        """
+        raise NotImplementedError("Platform subclasses must implement get_process_group_ranks")
+
+    @staticmethod
+    def get_backend(group=None):
+        """
+        Get the backend of the given process group.
+        Args:
+            group: The process group to get backend from. If None, uses the default group.
+
+        Returns:
+            The backend name of the specified process group.
+
+        Raises:
+            NotImplementedError: This method must be implemented by subclasses
+        """
+        raise NotImplementedError("Platform subclasses must implement get_backend")
+
+    @staticmethod
+    def split_group(parent_pg: Any = None,
+                    split_ranks: Optional[list] = None,
+                    timeout: Optional[timedelta] = None,
+                    pg_options: Optional[Any] = None,
+                    group_desc: Optional[str] = None,
+                    ) -> Any:
+        """
+        Create split group relative to the parent process group.
+        """
+        raise NotImplementedError("Platform subclasses must implement split_group")
 
     @staticmethod
     def no_grad():

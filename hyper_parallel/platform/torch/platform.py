@@ -13,10 +13,16 @@
 # limitations under the License.
 # ============================================================================
 """Torch platform api"""
+from datetime import timedelta
+from typing import Optional, Any, Union
+
 import numpy as np
 import torch
 from torch import nn
 from torch import Tensor
+from torch._C._distributed_c10d import Store, ProcessGroup
+from torch.distributed import Backend
+from torch.distributed.distributed_c10d import _get_default_group
 from torch.nn import Parameter, Module
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.utils.checkpoint import noop_context_fn
@@ -333,22 +339,129 @@ class TorchPlatform(Platform):
     @staticmethod
     def all_gather_object(object_list, obj, group=None) -> None:
         """
-        Gathers picklable objects from the whole group into a list.
+        Gathers objects from the given group into object list.
 
         Args:
-            object_list (list[Any]): Output list. It should be correctly sized as the
-                size of the group for this collective and will contain the output.
-            obj (Any): Pickable Python object to be broadcast from current process.
-            group (ProcessGroup, optional): The process group to work on. If None,
-                the default process group will be used. Default is ``None``.
+            object_list (list[Any]): Define the output list, which size equal to the size of group.
+            obj (Any): The object on current rank and in given process group.
+            group (ProcessGroup, optional): The process group to gather obj. Default is ``None``, and ``None`` means
+                global group.
 
         Returns:
-            None. If the calling rank is part of this group, the output of the
-            collective will be populated into the input ``object_list``. If the
-            calling rank is not part of the group, the passed in ``object_list`` will
-            be unmodified.
+            None. Objs are gathered into ``object_list``.
         """
         dist.all_gather_object(object_list, obj, group)
+
+    @staticmethod
+    def init_process_group(
+            backend: Optional[str] = None,
+            *,
+            init_method: Optional[str] = None,
+            timeout: Optional[timedelta] = None,
+            world_size: int = -1,
+            rank: int = -1,
+            store: Optional[Store] = None,
+            pg_options: Optional[Any] = None,
+            device_id: Optional[Union[torch.device, int]] = None,
+    ) -> None:
+        """
+        Initialize global process group.
+
+        Args:
+            backend (str or Backend, optional): The backend to use for distributed communication. Valid values
+                are ``nccl``, ``gloo``, ``mpi``, ``ucc``, ``xccl``.
+            init_method (str, optional): URL specifying how to initialize the process group. Default is "env://",
+                can not be specified at the same time with ``store``.
+            timeout (timedelta, optional): Timeout for process group. Default 10 minutes for NCCL and for other
+                backends 30 minutes.
+            world_size (int, optional): Number of processes. If ``store`` is specified, world_size is required.
+            rank (int, optional): Rank of the current process, which value must between 0 and ``world_size``-1. If
+                ``store`` is specified, rank is required.
+            store (Store, optional): Key/value store accessible to all workers, used to exchange connection/address
+                information. Can not be specified at the same time with ``init_method``.
+            pg_options (ProcessGroupOptions, optional): Extra options to pass during constructing process groups.
+            device_id (torch.device | int, optional): Specific device this process will work on.
+        """
+        try:
+            _get_default_group()
+        except ValueError:
+            dist.init_process_group(backend=backend, init_method=init_method, timeout=timeout, world_size=world_size,
+                                    rank=rank, store=store, pg_options=pg_options, device_id=device_id)
+
+    @staticmethod
+    def destroy_process_group(group: Optional[ProcessGroup] = None) -> None:
+        """
+        Destroy given process group.
+
+        Args:
+            group (ProcessGroup, optional): Given process group will be destroyed, if not given, all process groups
+                will be destroyed.
+        """
+        group = group or _get_default_group()
+        dist.destroy_process_group(group)
+
+    @staticmethod
+    def get_process_group_ranks(group: Optional[ProcessGroup] = None) -> list[int]:
+        """
+        Get all ranks relative to given process group.
+
+        Args:
+            group (Optional[ProcessGroup]): Process group worked on. Default is ``None``, and ``None`` means global
+                group.
+
+        Returns:
+            Rank list.
+        """
+        group = group or _get_default_group()
+        return dist.get_process_group_ranks(group)
+
+    @staticmethod
+    def get_backend(group: Optional[ProcessGroup] = None) -> Backend:
+        """
+        Get the backend of the given process group.
+
+        Args:
+            group (ProcessGroup, optional): Process group worked on. Default is ``None``, and ``None`` means global
+                group.
+
+        Returns:
+            The backend object of the given process group.
+        """
+        group = group or _get_default_group()
+        return dist.get_backend(group)
+
+    @staticmethod
+    def split_group(parent_pg: Optional[ProcessGroup] = None,
+                    split_ranks: Optional[list] = None,
+                    timeout: Optional[timedelta] = None,
+                    pg_options: Optional[Any] = None,
+                    group_desc: Optional[str] = None,
+                    ) -> Optional[ProcessGroup]:
+        """
+        Create split groups for every group rank in split_ranks, and return the split process group which relative to
+            current rank id.
+
+        Args:
+            parent_pg (Optional[ProcessGroup]): A process group which the goal group split from.
+            split_ranks (Optional[list]): A list like ``list[list[int]]``.
+            timeout (Optional[timedelta]): Timeout for process group. Default 10 minutes for NCCL and for other
+                backend 30 minutes.
+            pg_options (Optional[Any]): Extra options to pass during constructing process groups.
+            group_desc (Optional[str]): Description of process group.
+
+        Return:
+            Optional[ProcessGroup]: One of split process group which relative to current rank id
+        """
+        if split_ranks is None or len(split_ranks) == 0:
+            raise ValueError("split_ranks cannot be None or empty")
+
+        split_group = None
+        for split_rank in split_ranks:
+            dist_group = dist.new_group(split_rank)
+            if TorchPlatform.get_rank() in split_rank:
+                split_group = dist_group
+
+        return split_group
 
     @staticmethod
     def no_grad():
