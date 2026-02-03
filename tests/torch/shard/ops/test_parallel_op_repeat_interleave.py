@@ -50,7 +50,7 @@ def test_distributed_repeat_interleave_dim_none():
     """
     master_port = 10890
     file_name = "parallel_op_repeat_interleave.py"
-    case_name = "test_distributed_repeat_interleave_dim_None"
+    case_name = "test_distributed_repeat_interleave_dim_none"
     torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
