@@ -17,7 +17,6 @@
 import pytest
 from hyper_parallel import Layout
 from hyper_parallel.core.shard.ops.parallel_repeat_interleave import RepeatInterleaveDistributedOp
-import numpy as np
 
 op = RepeatInterleaveDistributedOp("repeat_interleave")
 
