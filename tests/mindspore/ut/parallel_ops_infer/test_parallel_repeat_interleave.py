@@ -17,6 +17,7 @@
 import pytest
 from hyper_parallel import Layout
 from hyper_parallel.core.shard.ops.parallel_repeat_interleave import RepeatInterleaveDistributedOp
+import numpy as np
 
 op = RepeatInterleaveDistributedOp("repeat_interleave")
 
@@ -76,7 +77,7 @@ def test_torch_repeat_interleave_with_tensor_layout_data_parallel():
 
     x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("dp", "None")  # tensor_map = (1, -1)  len(alias_name)-1-i
-    repeats_tensor = [2,1,1,1]
+    repeats_tensor = np.random.randint(1, 4, size=(4,)).astype(np.int64)
 
     dim = 1
     output_layout = op.infer_layout((x_layout,), (repeats_tensor, dim))
@@ -98,7 +99,7 @@ def test_torch_repeat_interleave_with_tensor_layout_tensor_parallel():
 
     x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
     x_layout = x_layout("tp", "None")  # tensor_map = (0, -1)
-    repeats_tensor = [2,1,1,1]
+    repeats_tensor = np.random.randint(1, 4, size=(4,)).astype(np.int64)
 
     dim = 1
     output_layout = op.infer_layout((x_layout,), (repeats_tensor, dim))
