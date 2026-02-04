@@ -27,7 +27,7 @@ def save_checkpoint(save_obj, file_path: Union[Path, str]) -> None:
     Save model checkpoint parameters to a file using safetensors format.
 
     Args:
-        save_obj: Net instance containing parameters to save. Can be a Cell or a Module.
+        save_obj (Any): Net instance containing parameters to save. Can be a Cell or a Module.
         file_path (Union[Path, str]): The path or file to save checkpoint parameters. Path must contain the file name
         with extension.
     """
