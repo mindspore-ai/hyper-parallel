@@ -19,8 +19,9 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor, ops
-from hyper_parallel import Layout, shard
-from tests.mindspore.st.shard.utils import global_to_local, local_to_global
+from hyper_parallel import init_device_mesh, shard_module, DTensor
+from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 
 def setup_module():
@@ -29,20 +30,21 @@ def setup_module():
 
 
 base_mesh_shape = (2, 2, 2)
-base_alias_name = ("dp", "cp", "mp")
-base_rank_list = list(range(8))
+base_alias_name = ("dp", "cp", "tp")
 
 
 class MinimumNet(nn.Cell):
     """Minimum network composed of minimum operation and ReLU"""
 
-    def __init__(self, relu_strategy=None):
+    def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.minimum = ms.mint.minimum
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, y):
         out = self.minimum(x, y)
@@ -54,13 +56,15 @@ class MinimumNet(nn.Cell):
 class LessEqualNet(nn.Cell):
     """LessEqual network composed of comparison and ReLU"""
 
-    def __init__(self, relu_strategy=None):
+    def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.less_equal = ops.LessEqual()
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, y):
         out = self.less_equal(x, y)
@@ -73,13 +77,15 @@ class LessEqualNet(nn.Cell):
 class GreaterEqualNet(nn.Cell):
     """GreaterEqual network composed of comparison and ReLU"""
 
-    def __init__(self, relu_strategy=None):
+    def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.greater_equal = ops.GreaterEqual()
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, y):
         out = self.greater_equal(x, y)
@@ -92,13 +98,15 @@ class GreaterEqualNet(nn.Cell):
 class LogicalOrNet(nn.Cell):
     """LogicalOr network composed of logical operation and ReLU"""
 
-    def __init__(self, relu_strategy=None):
+    def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.logical_or = ops.LogicalOr()
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, y):
         out = self.logical_or(x, y)
@@ -111,13 +119,15 @@ class LogicalOrNet(nn.Cell):
 class ModNet(nn.Cell):
     """Mod network composed of mod operation and ReLU"""
 
-    def __init__(self, relu_strategy=None):
+    def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.mod = ops.Mod()
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, y):
         out = self.mod(x, y)
@@ -145,17 +155,24 @@ def test_minimum_same_shape_parallel_1():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = MinimumNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    # Placement元组: (dp轴行为, cp轴行为, tp轴行为)
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Shard(0), Shard(1), Shard(2))
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -177,17 +194,23 @@ def test_less_equal_same_shape_parallel_2():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = LessEqualNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Shard(0), Shard(1), Shard(2))
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = LessEqualNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -209,17 +232,23 @@ def test_greater_equal_same_shape_parallel_3():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = GreaterEqualNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Shard(0), Shard(1), Shard(2))
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = GreaterEqualNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -241,17 +270,23 @@ def test_logical_or_same_shape_parallel_4():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = LogicalOrNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Shard(0), Shard(1), Shard(2))
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = LogicalOrNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -273,17 +308,23 @@ def test_minimum_broadcast_dim0_parallel_5():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("None", "cp", "mp")  # Dimension 0 cannot be sharded
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = MinimumNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Replicate(), Shard(1), Shard(2))
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -305,17 +346,23 @@ def test_minimum_broadcast_dim1_parallel_6():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("dp", "None", "mp")  # Dimension 1 cannot be sharded
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = MinimumNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Shard(0), Replicate(), Shard(2))
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -337,17 +384,23 @@ def test_minimum_broadcast_dim2_parallel_7():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("dp", "cp", "None")  # Dimension 2 cannot be sharded
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = MinimumNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Shard(0), Shard(1), Replicate())
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -369,17 +422,23 @@ def test_minimum_broadcast_rank_mismatch_parallel_8():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("cp", "mp")  # 2D layout
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = MinimumNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Replicate(), Shard(0), Shard(1))
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -401,19 +460,23 @@ def test_minimum_broadcast_scalar_like_parallel_9():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout(
-        "mp",
-    )  # 1D layout
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = MinimumNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Replicate(), Replicate(), Shard(0))
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -437,17 +500,23 @@ def test_less_equal_broadcast_multi_dim_parallel_10():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("None", "cp", "None")  # Dimensions 0 and 2 cannot be sharded
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = LessEqualNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Replicate(), Shard(1), Replicate())
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = LessEqualNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -469,17 +538,23 @@ def test_minimum_partial_shard_parallel_11():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("None", "None", "mp")  # Only last dimension sharded
-    y_layout = layout("None", "None", "mp")
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = MinimumNet(relu_strategy=(layout("None", "None", "mp"),))
+    x_placements = (Replicate(), Replicate(), Shard(2))
+    y_placements = (Replicate(), Replicate(), Shard(2))
+    relu_placements = (Replicate(), Replicate(), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -502,17 +577,23 @@ def test_mod_same_shape_parallel_12():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ModNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Shard(0), Shard(1), Shard(2))
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -534,17 +615,23 @@ def test_mod_broadcast_dim0_parallel_13():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("None", "cp", "mp")  # Dimension 0 cannot be sharded
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ModNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Replicate(), Shard(1), Shard(2))  # Dimension 0 cannot be sharded
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -566,17 +653,23 @@ def test_mod_broadcast_dim1_parallel_14():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("dp", "None", "mp")  # Dimension 1 cannot be sharded
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ModNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Shard(0), Replicate(), Shard(2))  # Dimension 1 cannot be sharded
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -598,17 +691,23 @@ def test_mod_broadcast_dim2_parallel_15():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("dp", "cp", "None")  # Dimension 2 cannot be sharded
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ModNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Shard(0), Shard(1), Replicate())  # Dimension 2 cannot be sharded
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -630,17 +729,23 @@ def test_mod_broadcast_rank_mismatch_parallel_16():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    y_layout = layout("cp", "mp")  # 2D layout
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ModNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    y_placements = (Replicate(), Shard(0), Shard(1))  # 2D tensor placements
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -662,15 +767,21 @@ def test_mod_tensor_scalar_parallel_17():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ModNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    relu_placements = (Shard(0), Shard(1), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+
+    parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -692,15 +803,21 @@ def test_mod_partial_shard_parallel_18():
     standalone_output = standalone_net(x, y)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("None", "None", "mp")  # Only last dimension sharded
-    y_layout = layout("None", "None", "mp")
-    x_local = global_to_local(x, x_layout)
-    y_local = global_to_local(y, y_layout)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ModNet(relu_strategy=(layout("None", "None", "mp"),))
+    x_placements = (Replicate(), Replicate(), Shard(2))  # Only last dimension sharded
+    y_placements = (Replicate(), Replicate(), Shard(2))
+    relu_placements = (Replicate(), Replicate(), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+
+    parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)

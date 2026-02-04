@@ -15,7 +15,8 @@
 """test placement and tensor_map conversion"""
 import pytest
 from tests.common.mark_utils import arg_mark
-from hyper_parallel.core.layout import Layout, _DeviceMesh
+from hyper_parallel.core.layout import Layout
+from hyper_parallel.core.device_mesh import init_device_mesh
 from hyper_parallel.core.placement_types import Shard, Replicate, Partial
 
 
@@ -184,7 +185,7 @@ def test_from_device_mesh():
     mesh_shape = (4, 2)
     alias_name = ("dp", "mp")
     rank_list = tuple(range(8))
-    device_mesh = _DeviceMesh(mesh_shape, alias_name, rank_list)
+    device_mesh = init_device_mesh(mesh_shape, alias_name)
 
     layout = Layout.from_device_mesh(device_mesh)
 

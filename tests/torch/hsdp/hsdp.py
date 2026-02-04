@@ -73,14 +73,14 @@ def get_hsdp_result(step, shard_size=1, optimizer_level="level1", acc_grad=False
     layout = Layout((4, 2), ("dp", "tp"))
     x_layout = layout("None", "None")
     w_layout = layout("None", "tp")
-    dist_x = DTensor.from_local(standalone_x.npu(), x_layout)
+    dist_x = DTensor.from_local(standalone_x.npu(), x_layout.mesh, x_layout.placements)
     local_w = torch.ones(8, 4).npu()
     # pylint: disable=W0212
     for key, param in dist_model._parameters.items():
         if param is not None and not isinstance(param, DTensor):
             dist_model.register_parameter(
                 key,
-                nn.Parameter(DTensor.from_local(local_w, w_layout)),
+                nn.Parameter(DTensor.from_local(local_w, w_layout.mesh, w_layout.placements)),
             )
     dist_model = hsdp(dist_model, shard_size=shard_size, threshold=0, enable_grad_accumulation=acc_grad,
                       optimizer_level=optimizer_level)

@@ -69,7 +69,7 @@ def global_to_local(global_tensor, layout):
         return full_data[area]
 
     local_tensor = get_slice_data(global_tensor, slice_area)
-    return DTensor.from_local(local_tensor, layout)
+    return DTensor.from_local(local_tensor, layout.mesh, layout.placements)
 
 
 def local_to_global(local_tensor):
@@ -84,4 +84,4 @@ def local_to_global(local_tensor):
     tensor_map = layout.tensor_map
     none_structure = tuple(update_layout(dim) for dim in tensor_map)
     to_layout = layout(*none_structure)
-    return local_tensor.redistribute(to_layout).to_local()
+    return local_tensor.redistribute(to_layout.mesh, to_layout.placements).to_local()

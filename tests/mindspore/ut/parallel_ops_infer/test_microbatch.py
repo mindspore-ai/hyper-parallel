@@ -41,8 +41,8 @@ def test_microbatch_basic_args_only():
     local_tensor2 = Tensor(np.ones((batch_size, 5)), ms.float32)
     input_tensor1_layout = layout("dp", "mp", "cp")
     input_tensor2_layout = layout("dp", "mp")
-    input_tensor1 = DTensor.from_local(local_tensor1, input_tensor1_layout)
-    input_tensor2 = DTensor.from_local(local_tensor2, input_tensor2_layout)
+    input_tensor1 = DTensor.from_local(local_tensor1, input_tensor1_layout.mesh, input_tensor1_layout.placements)
+    input_tensor2 = DTensor.from_local(local_tensor2, input_tensor2_layout.mesh, input_tensor2_layout.placements)
     original_layout1 = input_tensor1.layout
     original_layout2 = input_tensor2.layout
     microbatch = _MicroBatch(
@@ -76,8 +76,11 @@ def test_microbatch_kwargs_only():
     local_tensor1 = Tensor(np.ones((batch_per_device, 32)), ms.float32)
     local_tensor2 = Tensor(np.ones((20, batch_per_device)), ms.float32)
 
-    input_tensor1 = DTensor.from_local(local_tensor1, layout("dp", "mp"))
-    input_tensor2 = DTensor.from_local(local_tensor2, layout("dp", "mp"))
+    input_tensor1_layout = layout("dp", "mp")
+    input_tensor2_layout = layout("dp", "mp")
+
+    input_tensor1 = DTensor.from_local(local_tensor1, input_tensor1_layout.mesh, input_tensor1_layout.placements)
+    input_tensor2 = DTensor.from_local(local_tensor2, input_tensor2_layout.mesh, input_tensor2_layout.placements)
 
     original_layout1 = input_tensor1.layout
     original_layout2 = input_tensor2.layout
@@ -131,9 +134,15 @@ def test_microbatch_mixed_args_kwargs():
     kwarg_tensor1_layout = layout("dp", "mp", "cp")
     kwarg_tensor2_layout = layout("dp")
 
-    input_arg_tensor = DTensor.from_local(local_arg_tensor,arg_tensor_layout)
-    input_kwarg_tensor1 = DTensor.from_local(local_kwarg_tensor1,kwarg_tensor1_layout)
-    input_kwarg_tensor2 = DTensor.from_local(local_kwarg_tensor2,kwarg_tensor2_layout)
+    input_arg_tensor = DTensor.from_local(local_arg_tensor, arg_tensor_layout.mesh, arg_tensor_layout.placements)
+    input_kwarg_tensor1 = DTensor.from_local(local_kwarg_tensor1,
+                                             kwarg_tensor1_layout.mesh,
+                                             kwarg_tensor1_layout.placements
+                                             )
+    input_kwarg_tensor2 = DTensor.from_local(local_kwarg_tensor2,
+                                             kwarg_tensor2_layout.mesh,
+                                             kwarg_tensor2_layout.placements
+                                             )
 
     microbatch = _MicroBatch(
         micro_batch_num=micro_batch_num,
@@ -175,7 +184,7 @@ def test_microbatch_default_batch_dim():
     mp = 1
     layout = Layout((dp, mp), ("dp", "mp"))
     tensor_layout = layout("dp", "mp")
-    input_tensor = DTensor.from_local(local_tensor,tensor_layout)
+    input_tensor = DTensor.from_local(local_tensor, tensor_layout.mesh, tensor_layout.placements)
 
     microbatch = _MicroBatch(micro_batch_num=micro_batch_num)
 
@@ -201,8 +210,8 @@ def test_microbatch_partial_batch_dim_spec():
     mp = 1
     layout = Layout((dp, mp), ("dp", "mp"))
     input_tensor_layout = layout("dp", "mp")
-    arg_tensor1 = DTensor.from_local(local_arg_tensor1, input_tensor_layout)
-    arg_tensor2 = DTensor.from_local(local_arg_tensor2, input_tensor_layout)
+    arg_tensor1 = DTensor.from_local(local_arg_tensor1, input_tensor_layout.mesh, input_tensor_layout.placements)
+    arg_tensor2 = DTensor.from_local(local_arg_tensor2, input_tensor_layout.mesh, input_tensor_layout.placements)
 
     microbatch = _MicroBatch(
         micro_batch_num=micro_batch_num,
@@ -229,7 +238,7 @@ def test_microbatch_edge_cases():
     mp = 1
     layout = Layout((dp, mp), ("dp", "mp"))
     input_tensor_layout = layout("dp", "mp")
-    input_tensor = DTensor.from_local(local_input_tensor, input_tensor_layout)
+    input_tensor = DTensor.from_local(local_input_tensor, input_tensor_layout.mesh, input_tensor_layout.placements)
 
     microbatch = _MicroBatch(micro_batch_num=1)
     args = [input_tensor]

@@ -17,7 +17,8 @@ import numpy as np
 import mindspore as ms
 from mindspore import Tensor
 import mindspore.communication.management as D
-from hyper_parallel import DTensor, Layout
+from hyper_parallel import DTensor, init_device_mesh
+from hyper_parallel.core.placement_types import Shard, Replicate
 
 
 def test_shard_to_replicate():
@@ -28,17 +29,24 @@ def test_shard_to_replicate():
     '''
     D.init()
 
-    layout = Layout((1, 8), ("dp", "tp"))
-    x_layout = layout("None", "tp")
-    dst_layout = layout("None", "None")
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=(1, 8),
+        alias_name=("dp", "tp")
+    )
+
+    # Define placements using Placement format
+    x_placements = (Replicate(), Shard(1))
+    dst_placements = (Replicate(), Replicate())
+
     x_slice = Tensor(np.ones([8, 1]), dtype=ms.float32)
-    dist_x = DTensor.from_local(x_slice, x_layout)
-    out = dist_x.redistribute(dst_layout)
+    dist_x = DTensor.from_local(x_slice, mesh, x_placements)
+    out = dist_x.redistribute(mesh, dst_placements)
 
     expect_out = Tensor(np.ones([8, 8]), dtype=ms.float32)
 
     assert np.allclose(expect_out.asnumpy(),
-                       out.to_local().asnumpy(),  # use to_local()
+                       out.to_local().asnumpy(),
                        0.001, 0.001)
 
 
@@ -50,17 +58,24 @@ def test_replicate_to_shard():
     '''
     D.init()
 
-    layout = Layout((1, 8), ("dp", "tp"))
-    x_layout = layout("None", "None")
-    dst_layout = layout("None", "tp")
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=(1, 8),
+        alias_name=("dp", "tp")
+    )
+
+    # Define placements using Placement format
+    x_placements = (Replicate(), Replicate())
+    dst_placements = (Replicate(), Shard(1))
+
     x_slice = Tensor(np.ones([8, 8]), dtype=ms.float32)
-    dist_x = DTensor.from_local(x_slice, x_layout)
-    out = dist_x.redistribute(dst_layout)
+    dist_x = DTensor.from_local(x_slice, mesh, x_placements)
+    out = dist_x.redistribute(mesh, dst_placements)
 
     expect_out = Tensor(np.ones([8, 1]), dtype=ms.float32)
 
     assert np.allclose(expect_out.asnumpy(),
-                       out.to_local().asnumpy(),  # use to_local()
+                       out.to_local().asnumpy(),
                        0.001, 0.001)
 
 
@@ -72,17 +87,26 @@ def test_different_mesh():
     '''
     D.init()
 
-    layout = Layout((1, 8, 1), ("dp", "tp", "sp"))
-    dst_layout = layout("None", "tp")
+    # Create destination DeviceMesh (3D mesh)
+    dst_mesh = init_device_mesh(
+        mesh_shape=(1, 8, 1),
+        alias_name=("dp", "tp", "sp")
+    )
+    dst_placements = (Replicate(), Shard(1), Replicate())
 
-    layout_1 = Layout((1, 8), ("dp", "tp"))
-    x_layout = layout_1("None", "None")
+    # Create source DeviceMesh (2D mesh)
+    src_mesh = init_device_mesh(
+        mesh_shape=(1, 8),
+        alias_name=("dp", "tp")
+    )
+    x_placements = (Replicate(), Replicate())
+
     x_slice = Tensor(np.ones([8, 8]), dtype=ms.float32)
-    dist_x = DTensor.from_local(x_slice, x_layout)
-    out = dist_x.redistribute(dst_layout)
+    dist_x = DTensor.from_local(x_slice, src_mesh, x_placements)
+    out = dist_x.redistribute(dst_mesh, dst_placements)
 
     expect_out = Tensor(np.ones([8, 1]), dtype=ms.float32)
 
     assert np.allclose(expect_out.asnumpy(),
-                       out.to_local().asnumpy(),  # use to_local()
+                       out.to_local().asnumpy(),
                        0.001, 0.001)

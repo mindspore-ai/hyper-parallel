@@ -23,7 +23,11 @@ import mindspore.communication.management as D
 from mindspore import nn, Tensor
 from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
-from hyper_parallel import Layout, hsdp, init_parameters, custom_shard, shard, parallelize_value_and_grad, DTensor
+
+from hyper_parallel import init_device_mesh, hsdp, init_parameters, custom_shard, shard_module, \
+    parallelize_value_and_grad, DTensor
+from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from tests.mindspore.st.shard.utils import create_dtensor
 
 learning_rate = 0.01
@@ -76,12 +80,14 @@ class MLP(nn.Cell):
 class ParallelModel(nn.Cell):
     """parallel model"""
 
-    def __init__(self, input_size, output_size, out_layouts, in_layouts):
+    def __init__(self, input_size, output_size, mesh, out_placements, in_placements):
         super().__init__()
         self.weight = ms.Parameter(initializer("ones", [input_size, output_size], ms.float32), name='weight')
         self.relu = ms.mint.nn.ReLU()
-        self.wrap = custom_shard(func=local_func, out_layouts=out_layouts, in_layouts=in_layouts)
-        self.group = in_layouts[0].get_comm_group_by_axis("mp", comm.get_rank())
+        self.wrap = custom_shard(
+            func=local_func, device_mesh=mesh, out_placements=out_placements, in_placements=in_placements
+        )
+        self.group = mesh.get_group("tp")
         self.mlp = MLP(output_size, output_size)
 
     def construct(self, x):
@@ -121,7 +127,7 @@ def run_model(x, model, parallel=False):
     return ret_loss, ret_grads
 
 
-def base_case(dp, mp, hsdp_shard_size):
+def base_case(dp, tp, hsdp_shard_size):
     """base case"""
     D.init()
 
@@ -136,34 +142,58 @@ def base_case(dp, mp, hsdp_shard_size):
 
     # parallel
     local_batch_size = batch_size // dp
-    local_input_size = input_size // mp
+    local_input_size = input_size // tp
     local_output_size = output_size
     local_x = np.ones([local_batch_size, local_input_size]).astype(np.float32)
-    layout = Layout((dp, mp), ("dp", "mp"))
-    x_layout = layout("dp", "mp")
-    w_layout = layout("mp", "None")
-    mlp_x_layout = layout("None", "None")
-    mlp_w_layout = layout("None", "mp")
-    mlp_activation_layout = layout("None", "mp")
-    out_layout = layout()
-    custom_in_layouts = (x_layout, w_layout, None)
-    custom_out_layouts = (layout("dp", "None"),)
-    relu_strategy = ((layout("dp", "None"),), (layout("dp", "None"),))
+
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=(dp, tp),
+        alias_name=("dp", "tp")
+    )
+
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1))
+    w_placements = (Replicate(), Shard(0))
+    out_placements = (Replicate(), Replicate())
+    relu_input_placements = (Shard(0), Replicate())
+    relu_output_placements = (Shard(0), Replicate())
+
+    # custom_shard placements
+    custom_in_placements = (x_placements, w_placements, None)
+    custom_out_placements = ((Shard(0), Replicate()),)
+
+    # mlp placements
+    mlp_x_placements = (Replicate(), Replicate())
+    mlp_w_placements = (Replicate(), Shard(1))
+    mlp_activation_placements = (Replicate(), Shard(1))
 
     # step 1: define network with no init parameters
     with no_init_parameters():
-        model = ParallelModel(input_size, output_size, custom_out_layouts, custom_in_layouts)
+        model = ParallelModel(input_size, output_size, mesh, custom_out_placements, custom_in_placements)
 
     # step 2: shard
-    model_strategy = {"forward": {"input": (x_layout,), "output": (out_layout,)}, "parameter": {"weight": w_layout}}
-    shard(model, model_strategy)
+    model_stra = ShardingPlan(
+        plan={"weight": w_placements},
+        input_plan={"input": x_placements},
+        output_plan={"output": out_placements},
+    )
+    shard_module(model, device_mesh=mesh, sharding_plan=model_stra)
 
-    mlp_strategy = {"forward": {"input": {"x": mlp_x_layout, "activation": mlp_activation_layout,
-                                          "extra_loss": layout()}}, "parameter": {"weight": mlp_w_layout}}
-    shard(model.mlp, mlp_strategy)
+    mlp_sharding_plan = ShardingPlan(
+        plan={"weight": mlp_w_placements},
+        input_plan={"input": {
+            "x": mlp_x_placements,
+            "activation": mlp_activation_placements,
+            "extra_loss": (Replicate(), Replicate())}
+        })
+    shard_module(model.mlp, device_mesh=mesh, sharding_plan=mlp_sharding_plan)
 
-    relu_strategy = {"forward": {"input": relu_strategy[0], "output": relu_strategy[1]}}
-    shard(model.relu, relu_strategy)
+    relu_sharding_plan = ShardingPlan(
+        input_plan={"input": relu_input_placements},
+        output_plan={"output": relu_output_placements},
+    )
+    shard_module(model.relu, device_mesh=mesh, sharding_plan=relu_sharding_plan)
 
     # step 3: hsdp
     model = hsdp(model, shard_size=hsdp_shard_size, threshold=0)
@@ -171,7 +201,7 @@ def base_case(dp, mp, hsdp_shard_size):
     # step 4: init parameters
     model = init_parameters(model)
 
-    x = create_dtensor(local_x, x_layout)
+    x = create_dtensor(local_x, mesh, x_placements)
     parallel_loss, parallel_grads = run_model(x, model, parallel=True)
 
     # compare loss
@@ -194,4 +224,4 @@ def test_base_custom_shard():
     Description: Test base shard.
     Expectation: Run success.
     '''
-    base_case(dp=4, mp=2, hsdp_shard_size=4)
+    base_case(dp=4, tp=2, hsdp_shard_size=4)

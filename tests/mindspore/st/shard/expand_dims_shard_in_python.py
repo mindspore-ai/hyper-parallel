@@ -19,36 +19,38 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor, ops
-from hyper_parallel import Layout, shard
-from tests.mindspore.st.shard.utils import global_to_local, local_to_global
+from hyper_parallel import init_device_mesh, shard_module, DTensor
+from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 
 def setup_module():
-    ms.context.set_context(mode=ms.context.PYNATIVE_MODE, device_target="Ascend")
+    ms.set_device("Ascend")
     D.init()
 
 
-class ExpandDimsNet(nn.Cell):
-    """ExpandDims composed of ExpandDims and ReLUs"""
+base_mesh_shape = (2, 2, 2)
+base_alias_name = ("dp", "cp", "tp")
 
-    def __init__(self, relu_strategy=None):
+
+class ExpandDimsNet(nn.Cell):
+    """ExpandDims network composed of ExpandDims operation and ReLU"""
+
+    def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.expand_dims = ops.ExpandDims()
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, axis):
         out = self.expand_dims(x, axis)
         out = self.relu(out)
         out = out + 1
         return out
-
-
-base_mesh_shape = (2, 2, 2)
-base_alias_name = ("dp", "cp", "mp")
-base_rank_list = list(range(8))
 
 
 def test_expanddims_data_parallel_1():
@@ -66,15 +68,23 @@ def test_expanddims_data_parallel_1():
     standalone_output = standalone_net(x, axis=0)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ExpandDimsNet(relu_strategy=(layout("None", "dp", "cp", "mp"),))
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    relu_input_placements = (Shard(1), Shard(2), Shard(3))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+
+    parallel_net = ExpandDimsNet(device_mesh=mesh, relu_strategy=relu_input_placements)
     parallel_output = parallel_net(x_local, axis=0)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -93,15 +103,23 @@ def test_expanddims_model_parallel_2():
     standalone_output = standalone_net(x, axis=1)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("None", "None", "mp")
-    x_local = global_to_local(x, x_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ExpandDimsNet(relu_strategy=(layout("None", "None", "None", "mp"),))
+    # Define placements using Placement format
+    x_placements = (Replicate(), Replicate(), Shard(2))
+    relu_input_placements = (Replicate(), Replicate(), Replicate(), Shard(2))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+
+    parallel_net = ExpandDimsNet(device_mesh=mesh, relu_strategy=relu_input_placements)
     parallel_output = parallel_net(x_local, axis=1)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -120,15 +138,23 @@ def test_expanddims_hybrid_parallel_3():
     standalone_output = standalone_net(x, axis=-1)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ExpandDimsNet(relu_strategy=(layout("dp", "cp", "mp", "None"),))
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    relu_input_placements = (Shard(0), Shard(1), Shard(2), Replicate())
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+
+    parallel_net = ExpandDimsNet(device_mesh=mesh, relu_strategy=relu_input_placements)
     parallel_output = parallel_net(x_local, axis=-1)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -147,15 +173,23 @@ def test_expanddims_insert_middle_4():
     standalone_output = standalone_net(x, axis=2)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ExpandDimsNet(relu_strategy=(layout("dp", "cp", "None", "mp"),))
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    relu_input_placements = (Shard(0), Shard(1), Shard(3))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+
+    parallel_net = ExpandDimsNet(device_mesh=mesh, relu_strategy=relu_input_placements)
     parallel_output = parallel_net(x_local, axis=2)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -174,13 +208,21 @@ def test_expanddims_negative_axis_5():
     standalone_output = standalone_net(x, axis=-2)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    x_local = global_to_local(x, x_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = ExpandDimsNet(relu_strategy=(layout("dp", "cp", "None", "mp"),))
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    relu_input_placements = (Shard(0), Shard(1), Shard(3))
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+
+    parallel_net = ExpandDimsNet(device_mesh=mesh, relu_strategy=relu_input_placements)
     parallel_output = parallel_net(x_local, axis=-2)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)

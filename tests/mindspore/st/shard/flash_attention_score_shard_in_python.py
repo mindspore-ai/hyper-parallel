@@ -21,9 +21,10 @@ import mindspore.communication.management as D
 import mindspore.common.dtype as mstype
 from mindspore import Tensor
 from mindspore.ops import flash_attention_score
-from hyper_parallel import Layout, shard
+from hyper_parallel import init_device_mesh, shard_module, DTensor
+from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.core.shard.ops.parallel_flash_attention_score import ParallelFlashAttention
-from tests.mindspore.st.shard.utils import global_to_local, local_to_global
 
 
 def setup_module():
@@ -92,29 +93,51 @@ def test_flash_attention_score_model_parallel():
                                               sparse_mode=sparse_mode)
     # Parallel
     mesh_shape = (2, 1, 4)
-    alias_name = ("dp", "cp", "mp")
-    rank_list = list(range(8))
-    layout = Layout(mesh_shape, alias_name, rank_list)
-    query_layout = layout("dp", "mp", "cp", "None")
-    key_layout = layout("dp", "mp", "None", "None")
-    value_layout = layout("dp", "mp", "None", "None")
-    attn_mask_layout = layout("dp", "None", "cp", "None")
-    query_local = global_to_local(query, query_layout)
-    key_local = global_to_local(key, key_layout)
-    value_local = global_to_local(value, value_layout)
-    attn_mask_local = global_to_local(attn_mask, attn_mask_layout)
+    alias_name = ("dp", "cp", "tp")
+
+    mesh = init_device_mesh(
+        mesh_shape=mesh_shape,
+        alias_name=alias_name
+    )
+
+    # Define placements using Placement format
+    # query shape: [b, n, s, d] (BNSD)
+    query_placements = (Shard(0), Shard(2), Shard(1))
+
+    # key shape: [b, n, s, d] (BNSD)
+    key_placements = (Shard(0), Replicate(), Shard(1))
+
+    # value shape: [b, n, s, d] (BNSD)
+    value_placements = (Shard(0), Replicate(), Shard(1))
+
+    # attn_mask shape: [b, 1, s1, s2]
+    attn_mask_placements = (Shard(0), Shard(2), Replicate())
+
+    # output placements (same as query)
+    output_placements = (Shard(0), Shard(2), Shard(1))
+
+    query_local = DTensor.distribute_tensor(query, mesh, query_placements)
+    key_local = DTensor.distribute_tensor(key, mesh, key_placements)
+    value_local = DTensor.distribute_tensor(value, mesh, value_placements)
+    attn_mask_local = DTensor.distribute_tensor(attn_mask, mesh, attn_mask_placements)
 
     parallel_net = ParallelFlashAttention(head_num=n,
                                           scalar_value=scalar_value,
                                           input_layout=input_layout,
                                           sparse_mode=sparse_mode)
-    stra = {"forward": {"input": (query_layout, key_layout, value_layout, attn_mask_layout),
-                        "output": (query_layout,)}}
-    shard(parallel_net, stra)
+    sharding_plan = ShardingPlan(
+        input_plan={
+            "input": (query_placements, key_placements, value_placements, attn_mask_placements),
+        },
+        output_plan={
+            "output": (output_placements,),
+        },
+    )
+    shard_module(parallel_net, device_mesh=mesh, sharding_plan=sharding_plan)
     parallel_output = parallel_net(query_local, key_local, value_local, attn_mask_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.astype(mstype.float32).asnumpy(),
                        parallel_output.astype(mstype.float32).asnumpy(),
                        1e-3, 1e-3)

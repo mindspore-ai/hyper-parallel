@@ -18,8 +18,9 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
-from hyper_parallel import Layout, shard
-from tests.mindspore.st.shard.utils import global_to_local, local_to_global
+from hyper_parallel import DTensor, init_device_mesh, shard_module
+from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 
 def setup_module():
@@ -30,13 +31,15 @@ def setup_module():
 class BmmExtNet(nn.Cell):
     """BmmExtNet composed of bmm and ReLUs"""
 
-    def __init__(self, relu_strategy=None):
+    def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.bmm = ms.mint.bmm
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, w):
         out = self.bmm(x, w)
@@ -48,13 +51,15 @@ class BmmExtNet(nn.Cell):
 class BmmNet(nn.Cell):
     """BmmNet composed of BatchMatMul and ReLUs"""
 
-    def __init__(self, transpose_a=False, transpose_b=False, relu_strategy=None):
+    def __init__(self, transpose_a=False, transpose_b=False, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.bmm = ms.ops.BatchMatMul(transpose_a=transpose_a, transpose_b=transpose_b)
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, w):
         out = self.bmm(x, w)
@@ -64,8 +69,7 @@ class BmmNet(nn.Cell):
 
 
 base_mesh_shape = (2, 2, 2)
-base_alias_name = ("dp", "cp", "mp")
-base_rank_list = list(range(8))
+base_alias_name = ("dp", "cp", "tp")
 
 
 def test_bmm_ext_partial_model_parallel():
@@ -84,17 +88,25 @@ def test_bmm_ext_partial_model_parallel():
     standalone_output = standalone_net(x, w)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "cp", "mp")
-    w_layout = layout("dp", "mp", "None")
-    x_local = global_to_local(x, x_layout)
-    w_local = global_to_local(w, w_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = BmmExtNet(relu_strategy=(layout("dp", "None", "None"),))
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    w_placements = (Shard(0), Replicate(), Shard(1))
+    relu_input_placements = (Shard(0), Replicate(), Replicate())
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    w_local = DTensor.distribute_tensor(w, mesh, w_placements)
+
+    parallel_net = BmmExtNet(device_mesh=mesh, relu_strategy=relu_input_placements)
     parallel_output = parallel_net(x_local, w_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -114,15 +126,28 @@ def test_bmm_partial_transpose_model_parallel():
     standalone_output = standalone_net(x, w)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name)
-    x_layout = layout("dp", "mp", "cp")
-    w_layout = layout("dp", "mp", "None")
-    x_local = global_to_local(x, x_layout)
-    w_local = global_to_local(w, w_layout)
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    parallel_net = BmmNet(transpose_a=True, transpose_b=False, relu_strategy=(layout("dp", "None", "None"),))
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(2), Shard(1))
+    w_placements = (Shard(0), Replicate(), Shard(1))
+    relu_input_placements = (Shard(0), Replicate(), Replicate())
+
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    w_local = DTensor.distribute_tensor(w, mesh, w_placements)
+
+    parallel_net = BmmNet(
+        transpose_a=True,
+        transpose_b=False,
+        device_mesh=mesh,
+        relu_strategy=relu_input_placements
+    )
     parallel_output = parallel_net(x_local, w_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)

@@ -22,8 +22,9 @@ import weakref
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
-import torch
-from torch.utils._pytree import tree_map
+from hyper_parallel.platform import get_platform
+
+platform = get_platform()
 
 
 class SwapTensor:
@@ -36,11 +37,10 @@ class SwapTensor:
 
     def __init__(self, val: Any) -> None:
         self.val = val
-
-        if isinstance(val, torch.Tensor) and not val.is_cpu:
+        if isinstance(val, platform.Tensor) and str(val.device).lower() != 'cpu':
             self._state = self.STATE_DEVICE
             self.is_slice_tensor = val.storage().size() != val.numel()
-            self.val_cpu: Optional[torch.Tensor] = torch.empty_like(
+            self.val_cpu = platform.empty_like(
                 val, device="cpu", pin_memory=True
             )
             self.storage_size = val.storage().size()
@@ -151,9 +151,9 @@ class Storage:
                 x.async_load()
             return x
 
-        for stroage_list in self.swap_storage.values():
-            for item in stroage_list:
-                tree_map(_async_load, item)
+        for storage_list in self.swap_storage.values():
+            for item in storage_list:
+                platform.tree_map(_async_load, item)
 
     def wait_load(self):
         """wait load for all tensors in swap storage"""
@@ -162,9 +162,9 @@ class Storage:
                 x.wait_load()
             return x
 
-        for stroage_list in self.swap_storage.values():
-            for item in stroage_list:
-                tree_map(_wait_load, item)
+        for storage_list in self.swap_storage.values():
+            for item in storage_list:
+                platform.tree_map(_wait_load, item)
 
     def wait_offload(self):
         """wait offload for all tensors in swap storage"""
@@ -173,9 +173,9 @@ class Storage:
                 x.wait_offload()
             return x
 
-        for stroage_list in self.swap_storage.values():
-            for item in stroage_list:
-                tree_map(_wait_offload, item)
+        for storage_list in self.swap_storage.values():
+            for item in storage_list:
+                platform.tree_map(_wait_offload, item)
 
     def launch_offload(self):
         """launch async offload for all tensors in swap storage"""
@@ -184,9 +184,9 @@ class Storage:
                 x.async_offload()
             return x
 
-        for stroage_list in self.swap_storage.values():
-            for item in stroage_list:
-                tree_map(_async_offload, item)
+        for storage_list in self.swap_storage.values():
+            for item in storage_list:
+                platform.tree_map(_async_offload, item)
 
 
 class SwapGroup:
@@ -204,10 +204,11 @@ class SwapGroup:
 
     def launch_offload(self, copy_stream):
         """Launch async offload for all storages in the group."""
-        compute_event = torch.npu.Event()
-        compute_event.record(torch.npu.current_stream())
-        self._offload_event = torch.npu.Event()
-        with torch.no_grad(), torch.npu.stream(copy_stream):
+        compute_event = platform.new_event()
+        compute_event.record(platform.get_current_stream())
+        self._offload_event = platform.new_event()
+        stream_context = platform.get_stream_context()
+        with platform.no_grad(), stream_context(copy_stream):
             compute_event.wait(copy_stream)
             for storage in self._storages:
                 storage.launch_offload()
@@ -215,8 +216,9 @@ class SwapGroup:
 
     def wait_offload(self):
         """Wait for offload to complete for all storages in the group."""
-        compute_stream = torch.npu.current_stream()
-        with torch.no_grad(), torch.npu.stream(compute_stream):
+        compute_stream = platform.get_current_stream()
+        stream_context = platform.get_stream_context()
+        with platform.no_grad(), stream_context(compute_stream):
             self._offload_event.wait(compute_stream)
             self._offload_event = None
             for storage in self._storages:
@@ -224,10 +226,11 @@ class SwapGroup:
 
     def launch_load(self, copy_stream):
         """Launch async load for all storages in the group."""
-        compute_event = torch.npu.Event()
-        compute_event.record(torch.npu.current_stream())
-        self._load_event = torch.npu.Event()
-        with torch.no_grad(), torch.npu.stream(copy_stream):
+        compute_event = platform.new_event()
+        compute_event.record(platform.get_current_stream())
+        self._load_event = platform.new_event()
+        stream_context = platform.get_stream_context()
+        with platform.no_grad(), stream_context(copy_stream):
             compute_event.wait(copy_stream)
             for storage in self._storages:
                 storage.launch_load()
@@ -235,8 +238,9 @@ class SwapGroup:
 
     def wait_load(self):
         """Wait for load to complete for all storages in the group."""
-        compute_stream = torch.npu.current_stream()
-        with torch.no_grad(), torch.npu.stream(compute_stream):
+        compute_stream = platform.get_current_stream()
+        stream_context = platform.get_stream_context()
+        with platform.no_grad(), stream_context(compute_stream):
             self._load_event.wait(compute_stream)
             self._load_event = None
             for storage in self._storages:
@@ -430,7 +434,7 @@ class SwapManager:
         def _register_hooks_once(module, group_name):
             hooks = [
                 ("_swap_forward_pre_hook_handle",
-                 lambda h: module.register_forward_pre_hook(h, prepend=True),
+                 lambda h: platform.register_forward_pre_hook(module, h, prepend=True),
                  functools.partial(_forward_pre_hook, group_name)),
 
                 ("_swap_forward_hook_handle",
@@ -438,11 +442,11 @@ class SwapManager:
                  functools.partial(_forward_hook, group_name)),
 
                 ("_swap_backward_pre_hook_handle",
-                 lambda h: module.register_full_backward_pre_hook(h, prepend=True),
+                 lambda h: platform.register_full_backward_pre_hook(module, h, prepend=True),
                  functools.partial(_backward_pre_hook, group_name)),
 
                 ("_swap_backward_hook_handle",
-                 module.register_full_backward_hook,
+                 lambda h: platform.register_full_backward_hook(module, h),
                  functools.partial(_backward_hook, group_name)),
             ]
 
@@ -455,7 +459,7 @@ class SwapManager:
         _register_hooks_once(second_layer, second_name)
 
     def _get_copy_stream(self):
-        """Return a singleton NPU copy stream, created on first access."""
+        """Return a singleton copy stream, created on first access."""
         if self._copy_stream is None:
-            self._copy_stream = torch.npu.Stream()
+            self._copy_stream = platform.new_stream()
         return self._copy_stream

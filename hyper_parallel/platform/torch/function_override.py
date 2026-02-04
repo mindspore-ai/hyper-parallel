@@ -58,7 +58,7 @@ class DTensorBackwardHookFunction(BackwardHookFunction):
                 if input_layouts[i] is None:
                     output += (output_item,)
                 else:
-                    output += (DTensor.from_local(output_item, input_layouts[i]),)
+                    output += (DTensor.from_local(output_item, input_layouts[i].mesh, input_layouts[i].placements),)
             return output
         return origin_output
 

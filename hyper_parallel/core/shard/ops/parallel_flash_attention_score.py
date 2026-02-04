@@ -159,14 +159,71 @@ class ParallelFlashAttention(nn.Cell):
         # TODO: actual_seq_qlen/kv_len is tuple type, cannot be described by dtensor
         if self.in_layout is None or self.out_layout is None:
             raise ValueError("Please call the shard function first.")
+
+        query_dim = len(query.shape)
+        self._setup_layout_tensor_maps(query, key, value, attn_mask, query_dim)
+
         _, head_num_split_num, _ = self._infer_split_dim_by_in_strategy()
+
         input_args = (query, key, value, self._head_num // head_num_split_num, self._real_shift, self._drop_mask,
                       self._padding_mask, attn_mask, self._prefix, self._actual_seq_qlen, self._actual_seq_kvlen,
                       self._keep_prob, self._scalar_value, self._pre_tokens, self._next_tokens, self._inner_precise,
                       self._input_layout, self._sparse_mode)
-        in_layout_with_non_tensor = self._insert_none_for_non_tensor_arg(self.in_layout, input_args)
-        self._wrap_func = custom_shard(flash_attention_score, self.out_layout, in_layout_with_non_tensor)
+
+        device_mesh = self._get_device_mesh_from_layouts()
+        self._wrap_func = self._build_custom_shard_func(device_mesh, input_args)
         return self._wrap_func(*input_args)
+
+    def _setup_layout_tensor_maps(self, query, key, value, attn_mask, query_dim):
+        """Setup tensor maps for input and output layouts."""
+        tensor_dims_in = [
+            len(query.shape),
+            len(key.shape),
+            len(value.shape),
+            len(attn_mask.shape) if attn_mask is not None else None
+        ]
+
+        # Process in_layout
+        for i, layout in enumerate(self.in_layout):
+            if layout is not None and i < len(tensor_dims_in) and tensor_dims_in[i] is not None:
+                layout.placement_to_tensor_map(tensor_dims_in[i])
+
+        # Process out_layout
+        for layout in self.out_layout:
+            if layout is not None:
+                layout.placement_to_tensor_map(query_dim)
+
+    def _get_device_mesh_from_layouts(self):
+        """Get device_mesh from the first non-None layout."""
+        for layout in self.in_layout:
+            if layout is not None:
+                return layout.mesh
+
+        for layout in self.out_layout:
+            if layout is not None:
+                return layout.mesh
+
+        raise ValueError("Cannot find device_mesh from layouts.")
+
+    def _build_custom_shard_func(self, device_mesh, input_args):
+        """Build the custom shard function."""
+        in_layout_with_non_tensor = self._insert_none_for_non_tensor_arg(self.in_layout, input_args)
+
+        out_placements = tuple(
+            layout.placements if layout is not None else None
+            for layout in self.out_layout
+        )
+        in_placements_with_non_tensor = tuple(
+            layout.placements if layout is not None else None
+            for layout in in_layout_with_non_tensor
+        )
+
+        return custom_shard(
+            flash_attention_score,
+            device_mesh,
+            out_placements,
+            in_placements_with_non_tensor
+        )
 
     def shard(self, in_strategy, out_strategy):
         """Set shard strategy"""

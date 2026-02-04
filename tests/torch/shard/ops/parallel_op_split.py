@@ -158,7 +158,7 @@ def test_distributed_split_on_sharded_dim_error():
     x_layout = layout("dp", "tp")
 
     local_tensor = torch.randn(4, 12).npu()
-    dist_input = DTensor.from_local(local_tensor, x_layout)
+    dist_input = DTensor.from_local(local_tensor, x_layout.mesh, x_layout.placements)
 
     try:
         torch.split(dist_input, split_size, dim=axis)

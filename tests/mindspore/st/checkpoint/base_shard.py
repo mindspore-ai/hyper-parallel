@@ -25,7 +25,9 @@ from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
 from mindspore.communication import get_rank
 
-from hyper_parallel import Layout, shard, parallelize_value_and_grad
+from hyper_parallel import shard_module, parallelize_value_and_grad, init_device_mesh
+from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.core.checkpoint.layout import get_current_layout, save_layout, load_layout, get_global_layout
 from hyper_parallel.core.checkpoint.loader import load_checkpoint
 from hyper_parallel.core.checkpoint.saver import save_checkpoint
@@ -82,23 +84,34 @@ def base_case(dp, mp):
     # standalone
     input_size = 32
     output_size = 2
-    layout = Layout((dp, mp), ("dp", "mp"))
-    x_layout = layout("dp", "mp")
-    w_layout = layout("mp", "None")
-    out_layout = layout()
-    relu_strategy = ((layout("dp", "None"),), (layout("dp", "None"),))
+
+    # Create DeviceMesh
+    mesh = init_device_mesh(mesh_shape=(dp, mp), alias_name=("dp", "mp"))
+
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1))
+    w_placements = (Replicate(), Shard(0))
+    out_placements = (Replicate(), Replicate())
+    relu_input_placements = (Shard(0), Replicate())
+    relu_output_placements = (Shard(0), Replicate())
 
     # step 1: define network with no init parameters
     with no_init_parameters():
         model = SimpleModel(input_size, output_size)
 
     # step 2: shard
-    model_stra = {"forward": {"input": (x_layout,), "output": (out_layout,)},
-                  "parameter": {"weight": w_layout}}
-    shard(model, model_stra)
+    model_stra = ShardingPlan(
+        plan = {"weight": w_placements},
+        input_plan={"input": x_placements},
+        output_plan={"output": out_placements},
+    )
+    shard_module(model, device_mesh=mesh, sharding_plan=model_stra)
 
-    model_relu_stra = {"forward": {"input": relu_strategy[0], "output": relu_strategy[1]}}
-    shard(model.relu, model_relu_stra)
+    model_relu_stra = ShardingPlan(
+        input_plan={"input": relu_input_placements},
+        output_plan={"output": relu_output_placements},
+    )
+    shard_module(model.relu, device_mesh=mesh, sharding_plan=model_relu_stra)
 
     # step 3: save layout
     layout_dict = get_current_layout(model)
@@ -123,23 +136,34 @@ def save_load_checkpoint(dp: int, mp: int) -> None:
     # standalone
     input_size = 32
     output_size = 2
-    layout = Layout((dp, mp), ("dp", "mp"))
-    x_layout = layout("dp", "mp")
-    w_layout = layout("mp", "None")
-    out_layout = layout()
-    relu_strategy = ((layout("dp", "None"),), (layout("dp", "None"),))
+
+    # Create DeviceMesh
+    mesh = init_device_mesh(mesh_shape=(dp, mp), alias_name=("dp", "mp"))
+
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1))
+    w_placements = (Replicate(), Shard(0))
+    out_placements = (Replicate(), Replicate())
+    relu_input_placements = (Shard(0), Replicate())
+    relu_output_placements = (Shard(0), Replicate())
 
     # step 1: define network with no init parameters
     with no_init_parameters():
         model = SimpleModel(input_size, output_size)
 
     # step 2: shard
-    model_stra = {"forward": {"input": (x_layout,), "output": (out_layout,)},
-                  "parameter": {"weight": w_layout}}
-    shard(model, model_stra)
+    model_stra = ShardingPlan(
+        plan = {"weight": w_placements},
+        input_plan={"input": x_placements},
+        output_plan={"output": out_placements},
+    )
+    shard_module(model, device_mesh=mesh, sharding_plan=model_stra)
 
-    model_relu_stra = {"forward": {"input": relu_strategy[0], "output": relu_strategy[1]}}
-    shard(model.relu, model_relu_stra)
+    model_relu_stra = ShardingPlan(
+        input_plan={"input": relu_input_placements},
+        output_plan={"output": relu_output_placements},
+    )
+    shard_module(model.relu, device_mesh=mesh, sharding_plan=model_relu_stra)
 
     # step 3: save checkpoint
     file_path = "tmp1.safetensors"
@@ -177,23 +201,34 @@ def base_global_layout(dp: int, mp: int):
     # standalone
     input_size = 32
     output_size = 4
-    layout = Layout((dp, mp), ("dp", "mp"))
-    x_layout = layout("dp", "mp")
-    w_layout = layout("mp", "None")
-    out_layout = layout()
-    relu_strategy = ((layout("dp", "None"),), (layout("dp", "None"),))
+
+    # Create DeviceMesh
+    mesh = init_device_mesh(mesh_shape=(dp, mp), alias_name=("dp", "mp"))
+
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1))
+    w_placements = (Replicate(), Shard(0))
+    out_placements = (Replicate(), Replicate())
+    relu_input_placements = (Shard(0), Replicate())
+    relu_output_placements = (Shard(0), Replicate())
 
     # step 1: define network with no init parameters
     with no_init_parameters():
         model = SimpleModel(input_size, output_size)
 
     # step 2: shard
-    model_stra = {"forward": {"input": (x_layout,), "output": (out_layout,)},
-                  "parameter": {"weight": w_layout}}
-    shard(model, model_stra)
+    model_stra = ShardingPlan(
+        plan = {"weight": w_placements},
+        input_plan={"input": x_placements},
+        output_plan={"output": out_placements},
+    )
+    shard_module(model, device_mesh=mesh, sharding_plan=model_stra)
 
-    model_relu_stra = {"forward": {"input": relu_strategy[0], "output": relu_strategy[1]}}
-    shard(model.relu, model_relu_stra)
+    model_relu_stra = ShardingPlan(
+        input_plan={"input": relu_input_placements},
+        output_plan={"output": relu_output_placements},
+    )
+    shard_module(model.relu, device_mesh=mesh, sharding_plan=model_relu_stra)
 
     # step 3: get global layout
     global_layout = get_global_layout(model)

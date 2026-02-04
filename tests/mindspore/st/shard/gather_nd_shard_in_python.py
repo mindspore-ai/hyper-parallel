@@ -19,8 +19,9 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import Tensor, ops
-from hyper_parallel import Layout, shard
-from tests.mindspore.st.shard.utils import global_to_local, local_to_global
+from hyper_parallel import init_device_mesh, shard_module, DTensor
+from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 
 def setup_module():
@@ -31,13 +32,15 @@ def setup_module():
 class GatherNdNet(ms.nn.Cell):
     """GatherNd composed of GatherNd and ReLUs"""
 
-    def __init__(self, relu_strategy=None):
+    def __init__(self, device_mesh=None, relu_strategy=None):
         super().__init__()
         self.gathernd = ops.GatherNd()
         self.relu = ms.nn.ReLU()
-        if relu_strategy is not None:
-            stra = {"forward": {"input": relu_strategy}}
-            shard(self.relu, stra)
+        if relu_strategy is not None and device_mesh is not None:
+            sharding_plan = ShardingPlan(
+                input_plan={"input": relu_strategy},
+            )
+            shard_module(self.relu, device_mesh=device_mesh, sharding_plan=sharding_plan)
 
     def construct(self, x, indices):
         out = self.gathernd(x, indices)
@@ -47,14 +50,13 @@ class GatherNdNet(ms.nn.Cell):
 
 
 base_mesh_shape = (2, 2, 2)
-base_alias_name = ("dp", "cp", "mp")
-base_rank_list = list(range(8))
+base_alias_name = ("dp", "cp", "tp")
 
 
 def test_gathernd_partial_model_parallel_1():
     """
     Feature: GatherNd in python shard.
-    Description: Test GatherNd with indices sharded by mp (last dim not sharded), params replicated.
+    Description: Test GatherNd with indices sharded by tp (last dim not sharded), params replicated.
     Expectation: Run success and match standalone.
     """
     ms.set_seed(1)
@@ -70,24 +72,24 @@ def test_gathernd_partial_model_parallel_1():
     standalone_output = standalone_net(x, indices)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    x_layout = layout("None", "None")
-    indices_layout = layout("mp", "None")
+    x_placements = (Replicate(), Replicate(), Replicate())
+    indices_placements = (Replicate(), Replicate(), Shard(0))
 
-    x_local = global_to_local(x, x_layout)
-    indices_local = global_to_local(indices, indices_layout)
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
 
-    parallel_net = GatherNdNet(relu_strategy=(layout("mp",),))
+    relu_placements = (Replicate(), Replicate(), Shard(0))
 
-    out_layout = layout("mp",)
-    net_stra = {"input": (x_layout, indices_layout), "output": (out_layout,)}
-    shard(parallel_net, net_stra)
-
+    parallel_net = GatherNdNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, indices_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -111,38 +113,37 @@ def test_gathernd_partial_data_parallel_2():
     standalone_output = standalone_net(x, indices)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    x_layout = layout("None", "None")
-    indices_layout = layout("dp", "None")
+    x_placements = (Replicate(), Replicate(), Replicate())
+    indices_placements = (Shard(0), Replicate(), Replicate())
 
-    x_local = global_to_local(x, x_layout)
-    indices_local = global_to_local(indices, indices_layout)
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
 
-    parallel_net = GatherNdNet(relu_strategy=(layout("dp",),))
+    relu_placements = (Shard(0), Replicate(), Replicate())
 
-    out_layout = layout("dp",)
-    net_stra = {"input": (x_layout, indices_layout), "output": (out_layout,)}
-    shard(parallel_net, net_stra)
-
+    parallel_net = GatherNdNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, indices_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
 def test_gathernd_params_plain_tensor():
     """
     Feature: GatherNd in python shard.
-    Description: Test GatherNd where params is plain Tensor (not DTensor), indices sharded by mp.
+    Description: Test GatherNd where params is plain Tensor (not DTensor), indices sharded by tp.
     Expectation: Run success and match standalone.
     """
     ms.set_seed(1)
     np.random.seed(1)
 
     n, m = 16, 64
-    # x is plain Tensor, not wrapped with layout
     x = Tensor(np.random.randn(n, m).astype(np.float32))
     idx_np = np.stack([np.arange(n, dtype=np.int32), np.ones([n], dtype=np.int32)], axis=1)
     indices = Tensor(idx_np)
@@ -152,24 +153,21 @@ def test_gathernd_params_plain_tensor():
     standalone_output = standalone_net(x, indices)
 
     # Parallel
-    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    # x is plain Tensor, no layout transformation
-    # indices_local is DTensor
-    indices_layout = layout("mp", "None")
-    indices_local = global_to_local(indices, indices_layout)
+    indices_placements = (Replicate(), Replicate(), Shard(0))
+    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
 
-    parallel_net = GatherNdNet(relu_strategy=(layout("mp",),))
+    relu_placements = (Replicate(), Replicate(), Shard(0))
 
-    # Only specify indices layout, x will be treated as replicated (layout=None)
-    out_layout = layout("mp",)
-    net_stra = {"input": (None, indices_layout), "output": (out_layout,)}
-    shard(parallel_net, net_stra)
-
-    parallel_output = parallel_net(x, indices_local)  # x is plain Tensor
+    parallel_net = GatherNdNet(device_mesh=mesh, relu_strategy=relu_placements)
+    parallel_output = parallel_net(x, indices_local)
 
     # Validate
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -189,23 +187,23 @@ def test_gathernd_k1_trailing_dims_shard_3():
     standalone_net = GatherNdNet()
     standalone_output = standalone_net(x, indices)
 
-    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    x_layout = layout("None", "cp", "mp")
-    indices_layout = layout("dp", "None")
+    x_placements = (Replicate(), Shard(1), Shard(2))
+    indices_placements = (Shard(0), Replicate(), Replicate())
 
-    x_local = global_to_local(x, x_layout)
-    indices_local = global_to_local(indices, indices_layout)
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
 
-    parallel_net = GatherNdNet(relu_strategy=(layout("dp", "cp", "mp"),))
+    relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    out_layout = layout("dp", "cp", "mp")
-    net_stra = {"input": (x_layout, indices_layout), "output": (out_layout,)}
-    shard(parallel_net, net_stra)
-
+    parallel_net = GatherNdNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, indices_local)
 
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -226,23 +224,23 @@ def test_gathernd_k2_trailing_dim_shard_4():
     standalone_net = GatherNdNet()
     standalone_output = standalone_net(x, indices)
 
-    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    x_layout = layout("None", "None", "cp")
-    indices_layout = layout("mp", "None")
+    x_placements = (Replicate(), Shard(2), Replicate())
+    indices_placements = (Replicate(), Replicate(), Shard(0))
 
-    x_local = global_to_local(x, x_layout)
-    indices_local = global_to_local(indices, indices_layout)
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
 
-    parallel_net = GatherNdNet(relu_strategy=(layout("mp", "cp"),))
+    relu_placements = (Replicate(), Shard(1), Shard(0))
 
-    out_layout = layout("mp", "cp")
-    net_stra = {"input": (x_layout, indices_layout), "output": (out_layout,)}
-    shard(parallel_net, net_stra)
-
+    parallel_net = GatherNdNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, indices_local)
 
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
 
 
@@ -266,21 +264,21 @@ def test_gathernd_k3_no_trailing_dims_5():
     standalone_net = GatherNdNet()
     standalone_output = standalone_net(x, indices)
 
-    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
+    mesh = init_device_mesh(
+        mesh_shape=base_mesh_shape,
+        alias_name=base_alias_name
+    )
 
-    x_layout = layout("None", "None", "None")
-    indices_layout = layout("mp", "None")
+    x_placements = (Replicate(), Replicate(), Replicate())
+    indices_placements = (Replicate(), Replicate(), Shard(0))
 
-    x_local = global_to_local(x, x_layout)
-    indices_local = global_to_local(indices, indices_layout)
+    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
 
-    parallel_net = GatherNdNet(relu_strategy=(layout("mp",),))
+    relu_placements = (Replicate(), Replicate(), Shard(0))
 
-    out_layout = layout("mp",)
-    net_stra = {"input": (x_layout, indices_layout), "output": (out_layout,)}
-    shard(parallel_net, net_stra)
-
+    parallel_net = GatherNdNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, indices_local)
 
-    parallel_output = local_to_global(parallel_output)
+    parallel_output = parallel_output.full_tensor()
     assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)

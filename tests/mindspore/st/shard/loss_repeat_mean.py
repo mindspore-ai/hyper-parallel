@@ -19,7 +19,9 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
-from hyper_parallel import Layout, hsdp, shard, DTensor, parallelize_value_and_grad
+from hyper_parallel import init_device_mesh, hsdp, shard_module, DTensor, parallelize_value_and_grad
+from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from tests.mindspore.st.shard.utils import create_dtensor
 
 learning_rate = 0.01
@@ -29,16 +31,20 @@ epochs = 2
 class SimpleModel(nn.Cell):
     """simple model"""
 
-    def __init__(self, input_size, output_size, w_layout=None):
+    def __init__(self, input_size, output_size, device_mesh=None, w_placements=None):
         super().__init__()
-        if not w_layout:
+        if device_mesh is None or w_placements is None:
             self.weight = ms.Parameter(
                 Tensor(np.ones([input_size, output_size]).astype(np.float32)),
                 name='weight'
             )
         else:
             self.weight = ms.Parameter(
-                DTensor.from_local(Tensor(np.ones([input_size, output_size]).astype(np.float32)), w_layout),
+                DTensor.from_local(
+                    Tensor(np.ones([input_size, output_size]).astype(np.float32)),
+                    device_mesh,
+                    w_placements
+                ),
                 name='weight'
             )
         self.relu = ms.mint.nn.ReLU()
@@ -81,15 +87,21 @@ def run_standalone(x, input_size, output_size):
     return ret_loss, ret_grads
 
 
-def run_parallel(local_x, local_input_size, local_output_size, x_layout, w_layout, relu_strategy, hsdp_shard_size):
+def run_parallel(local_x, local_input_size, local_output_size, device_mesh, x_placements, w_placements,
+                 relu_input_placements, relu_output_placements, hsdp_shard_size):
     """run parallel"""
-    model = SimpleModel(local_input_size, local_output_size, w_layout)
+    model = SimpleModel(local_input_size, local_output_size, device_mesh, w_placements)
 
-    model_stra = {"forward": {"input": (x_layout,)}}
-    shard(model, model_stra)
+    model_sharding_plan = ShardingPlan(
+        input_plan={"input": (x_placements,)},
+    )
+    shard_module(model, device_mesh=device_mesh, sharding_plan=model_sharding_plan)
 
-    model_relu_stra = {"forward": {"input": relu_strategy[0], "output": relu_strategy[1]}}
-    shard(model.relu, model_relu_stra)
+    model_relu_sharding_plan = ShardingPlan(
+        input_plan={"input": (relu_input_placements,)},
+        output_plan={"output": (relu_output_placements,)},
+    )
+    shard_module(model.relu, device_mesh=device_mesh, sharding_plan=model_relu_sharding_plan)
 
     model = hsdp(model, shard_size=hsdp_shard_size, threshold=0)
 
@@ -100,7 +112,7 @@ def run_parallel(local_x, local_input_size, local_output_size, x_layout, w_layou
     optimizer = nn.Adam(model.trainable_params(), learning_rate=learning_rate)
     grad_fn = parallelize_value_and_grad(forward_fn, optimizer.parameters)
 
-    x = create_dtensor(local_x, x_layout, ms.float32)
+    x = create_dtensor(local_x, device_mesh, x_placements, ms.float32)
 
     ret_loss = None
     ret_grads = None
@@ -133,12 +145,22 @@ def base_case(dp, mp, hsdp_shard_size):
     local_input_size = input_size // mp
     local_output_size = output_size
     local_x = np.ones([local_batch_size, local_input_size]).astype(np.float32)
-    layout = Layout((dp, mp), ("dp", "mp"))
-    x_layout = layout("dp", "mp")
-    w_layout = layout("mp", "None")
-    relu_strategy = ((layout("dp", "None"),), (layout("dp", "None"),))
-    parallel_loss, parallel_grads = run_parallel(local_x, local_input_size, local_output_size, x_layout, w_layout,
-                                                 relu_strategy, hsdp_shard_size)
+
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        mesh_shape=(dp, mp),
+        alias_name=("dp", "mp")
+    )
+
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1))
+    w_placements = (Replicate(), Shard(0))
+    relu_input_placements = (Shard(0), Replicate())
+    relu_output_placements = (Shard(0), Replicate())
+
+    parallel_loss, parallel_grads = run_parallel(local_x, local_input_size, local_output_size, mesh, x_placements,
+                                                 w_placements, relu_input_placements, relu_output_placements,
+                                                 hsdp_shard_size)
 
     # compare loss
     assert np.allclose(standalone_loss.asnumpy(), parallel_loss.asnumpy(), 0.001, 0.001)

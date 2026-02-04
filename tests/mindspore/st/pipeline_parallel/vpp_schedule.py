@@ -20,22 +20,25 @@ from mindspore import nn, Tensor, mint
 from mindspore.communication.management import init, get_rank, get_group_size
 from mindspore.common.initializer import initializer
 from hyper_parallel import PipelineStage, ScheduleInterleaved1F1B
-from hyper_parallel import Layout, DTensor
+from hyper_parallel import DTensor, init_device_mesh
 from hyper_parallel.core.hsdp import hsdp
-from hyper_parallel import shard
+from hyper_parallel import shard_module
+from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
+
 
 class MLP(nn.Cell):
     """MLP net."""
-    def __init__(self, in_size, out_size, w_layout=None):
+    def __init__(self, in_size, out_size, device_mesh=None, w_placements=None):
         super().__init__()
-        if not w_layout:
+        if device_mesh is None or w_placements is None:
             self.weight = ms.Parameter(
                 initializer("ones", [in_size, out_size],ms.float32),
                 name="weight")
         else:
             self.weight = ms.Parameter(
-                DTensor.from_local(initializer("ones", [in_size, out_size],ms.float32), w_layout),
-                name="weight")
+                DTensor.from_local(initializer("ones", [in_size, out_size],ms.float32),
+                                   device_mesh, w_placements), name="weight")
         self.relu = mint.nn.ReLU()
 
     def construct(self, x):
@@ -46,11 +49,11 @@ class MLP(nn.Cell):
 class SimpleMLP(nn.Cell):
     """Simple MLP net."""
 
-    def __init__(self, num_layers, in_size, out_size, w_layout=None):
+    def __init__(self, num_layers, in_size, out_size, device_mesh=None, w_placements=None):
         super().__init__()
         self.mlp_layers = nn.CellDict()
         for mlp_id in range(num_layers):
-            self.mlp_layers[str(mlp_id)] = MLP(in_size, out_size, w_layout=w_layout)
+            self.mlp_layers[str(mlp_id)] = MLP(in_size, out_size, device_mesh=device_mesh, w_placements=w_placements)
 
     def construct(self, x):
         for mlp in self.mlp_layers.values():
@@ -115,21 +118,20 @@ def run_parallel(micro_batch_num):
     # shard config
     dp = 2
     mp = 1
-    rank_list = [device_num_per_stage * stage_index + i for i in range(device_num_per_stage)]
-    layout = Layout((dp, mp), ("dp", "mp"), rank_list)
-    if stage_index == 0:
-        in_layout = layout("dp", "None")
-        w_layout = layout("None", "None")
-        out_layout = layout("dp", "None")
-    else:
-        in_layout = layout("dp", "None")
-        w_layout = layout("None", "None")
-        out_layout = layout("dp", "None")
+    mesh = init_device_mesh(mesh_shape=(dp, mp), alias_name=("dp", "mp"))
 
-    model_stra = {"forward": {"input": (in_layout,), "output": (out_layout,)},
-                  "parameter": {"weight": w_layout}}
-    shard(model0, model_stra)
-    shard(model1, model_stra)
+    # Define placements using Placement format
+    in_placements = (Shard(0), Replicate())
+    w_placements = (Replicate(), Replicate())
+    out_placements = (Shard(0), Replicate())
+
+    model_stra = ShardingPlan(
+        plan = {"weight": w_placements},
+        input_plan={"input": in_placements},
+        output_plan={"output": out_placements},
+    )
+    shard_module(model0, device_mesh=mesh, sharding_plan=model_stra)
+    shard_module(model1, device_mesh=mesh, sharding_plan=model_stra)
 
     model0 = hsdp(model0, 2, 0, "level1", True)
     model1 = hsdp(model1, 2, 0, "level1", True)
@@ -140,10 +142,11 @@ def run_parallel(micro_batch_num):
     schedule = ScheduleInterleaved1F1B([pipeline_stage0, pipeline_stage1], micro_batch_num)
 
     # input
-    x_layout = layout("dp", "mp")
+    x_placements = (Shard(0), Shard(1))
     local_batch_size = 8
     local_hidden_size = 16
-    x = DTensor.from_local(Tensor(np.ones((local_batch_size, local_hidden_size)), dtype=ms.float32), x_layout)
+    x = DTensor.from_local(Tensor(np.ones((local_batch_size, local_hidden_size)), dtype=ms.float32),
+                           mesh, x_placements)
 
     # train config
     epochs = 1

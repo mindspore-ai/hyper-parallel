@@ -13,11 +13,20 @@
 # limitations under the License.
 # ============================================================================
 """Torch platform api"""
+from datetime import timedelta
+from typing import Optional, Any, Union
+
+import numpy as np
 import torch
 from torch import nn
 from torch import Tensor
+from torch._C._distributed_c10d import Store, ProcessGroup
+from torch.distributed import Backend
+from torch.distributed.distributed_c10d import _get_default_group
 from torch.nn import Parameter, Module
 from torch._ops import OpOverload, OpOverloadPacket
+from torch.utils.checkpoint import noop_context_fn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 import torch.distributed.nn.functional as dist_func
 import torch.distributed as dist
 from hyper_parallel.platform.torch.dtensor import DTensorBase
@@ -34,6 +43,8 @@ _OP_MAP = {
     'prod': dist.ReduceOp.PRODUCT,
     'max': dist.ReduceOp.MAX,
     'min': dist.ReduceOp.MIN,
+    # convert tensor elements to int32 and use MIN
+    'all': dist.ReduceOp.MIN,
     # 'avg' is typically handled by SUM followed by division in current implementation logic
     'avg': dist.ReduceOp.SUM,
 }
@@ -194,7 +205,7 @@ class TorchPlatform(Platform):
         if isinstance(param, DTensor):
             raise ValueError(f"Parameter {param} has been configured layout, cannot be set repeatedly.")
         requires_grad = param.requires_grad
-        param_dtensor = DTensor.from_local(_get_slice_tensor_by_layout(param, layout), layout)
+        param_dtensor = DTensor.from_local(_get_slice_tensor_by_layout(param, layout), layout.mesh, layout.placements)
         new_param = Parameter(param_dtensor, requires_grad=requires_grad)
         return new_param
 
@@ -330,19 +341,174 @@ class TorchPlatform(Platform):
     @staticmethod
     def all_gather_object(object_list, obj, group=None) -> None:
         """
-        Gathers picklable objects from the whole group into a list.
+        Gathers objects from the given group into object list.
 
         Args:
-            object_list (list[Any]): Output list. It should be correctly sized as the
-                size of the group for this collective and will contain the output.
-            obj (Any): Pickable Python object to be broadcast from current process.
-            group (ProcessGroup, optional): The process group to work on. If None,
-                the default process group will be used. Default is ``None``.
+            object_list (list[Any]): Define the output list, which size equal to the size of group.
+            obj (Any): The object on current rank and in given process group.
+            group (ProcessGroup, optional): The process group to gather obj. Default is ``None``, and ``None`` means
+                global group.
 
         Returns:
-            None. If the calling rank is part of this group, the output of the
-            collective will be populated into the input ``object_list``. If the
-            calling rank is not part of the group, the passed in ``object_list`` will
-            be unmodified.
+            None. Objs are gathered into ``object_list``.
         """
         dist.all_gather_object(object_list, obj, group)
+
+    @staticmethod
+    def init_process_group(
+            backend: Optional[str] = None,
+            *,
+            init_method: Optional[str] = None,
+            timeout: Optional[timedelta] = None,
+            world_size: int = -1,
+            rank: int = -1,
+            store: Optional[Store] = None,
+            pg_options: Optional[Any] = None,
+            device_id: Optional[Union[torch.device, int]] = None,
+    ) -> None:
+        """
+        Initialize global process group.
+
+        Args:
+            backend (str or Backend, optional): The backend to use for distributed communication. Valid values
+                are ``nccl``, ``gloo``, ``mpi``, ``ucc``, ``xccl``.
+            init_method (str, optional): URL specifying how to initialize the process group. Default is "env://",
+                can not be specified at the same time with ``store``.
+            timeout (timedelta, optional): Timeout for process group. Default 10 minutes for NCCL and for other
+                backends 30 minutes.
+            world_size (int, optional): Number of processes. If ``store`` is specified, world_size is required.
+            rank (int, optional): Rank of the current process, which value must between 0 and ``world_size``-1. If
+                ``store`` is specified, rank is required.
+            store (Store, optional): Key/value store accessible to all workers, used to exchange connection/address
+                information. Can not be specified at the same time with ``init_method``.
+            pg_options (ProcessGroupOptions, optional): Extra options to pass during constructing process groups.
+            device_id (torch.device | int, optional): Specific device this process will work on.
+        """
+        try:
+            _get_default_group()
+        except ValueError:
+            dist.init_process_group(backend=backend, init_method=init_method, timeout=timeout, world_size=world_size,
+                                    rank=rank, store=store, pg_options=pg_options, device_id=device_id)
+
+    @staticmethod
+    def destroy_process_group(group: Optional[ProcessGroup] = None) -> None:
+        """
+        Destroy given process group.
+
+        Args:
+            group (ProcessGroup, optional): Given process group will be destroyed, if not given, all process groups
+                will be destroyed.
+        """
+        group = group or _get_default_group()
+        dist.destroy_process_group(group)
+
+    @staticmethod
+    def get_process_group_ranks(group: Optional[ProcessGroup] = None) -> list[int]:
+        """
+        Get all ranks relative to given process group.
+
+        Args:
+            group (Optional[ProcessGroup]): Process group worked on. Default is ``None``, and ``None`` means global
+                group.
+
+        Returns:
+            Rank list.
+        """
+        group = group or _get_default_group()
+        return dist.get_process_group_ranks(group)
+
+    @staticmethod
+    def get_backend(group: Optional[ProcessGroup] = None) -> Backend:
+        """
+        Get the backend of the given process group.
+
+        Args:
+            group (ProcessGroup, optional): Process group worked on. Default is ``None``, and ``None`` means global
+                group.
+
+        Returns:
+            The backend object of the given process group.
+        """
+        group = group or _get_default_group()
+        return dist.get_backend(group)
+
+    @staticmethod
+    def split_group(parent_pg: Optional[ProcessGroup] = None,
+                    split_ranks: Optional[list] = None,
+                    timeout: Optional[timedelta] = None,
+                    pg_options: Optional[Any] = None,
+                    group_desc: Optional[str] = None,
+                    ) -> Optional[ProcessGroup]:
+        """
+        Create split groups for every group rank in split_ranks, and return the split process group which relative to
+            current rank id.
+
+        Args:
+            parent_pg (Optional[ProcessGroup]): A process group which the goal group split from.
+            split_ranks (Optional[list]): A list like ``list[list[int]]``.
+            timeout (Optional[timedelta]): Timeout for process group. Default 10 minutes for NCCL and for other
+                backend 30 minutes.
+            pg_options (Optional[Any]): Extra options to pass during constructing process groups.
+            group_desc (Optional[str]): Description of process group.
+
+        Return:
+            Optional[ProcessGroup]: One of split process group which relative to current rank id
+        """
+        if split_ranks is None or len(split_ranks) == 0:
+            raise ValueError("split_ranks cannot be None or empty")
+
+        split_group = None
+        for split_rank in split_ranks:
+            dist_group = dist.new_group(split_rank)
+            if TorchPlatform.get_rank() in split_rank:
+                split_group = dist_group
+
+        return split_group
+
+    @staticmethod
+    def no_grad():
+        return torch.no_grad()
+
+    @staticmethod
+    def empty_like(tensor, *, dtype=None, device=None, pin_memory=False):
+        return torch.empty_like(tensor, dtype=dtype, device=device, pin_memory=pin_memory)
+
+    def get_current_stream(self):
+        device = self.get_device_handle()
+        return device.current_stream()
+
+    def new_event(self):
+        device = self.get_device_handle()
+        return device.Event()
+
+    def tree_map(self, fn, tree):
+        return torch.utils._pytree.tree_map(fn, tree)  # pylint:disable=protected-access
+
+    @property
+    def checkpoint(self):
+        return torch.utils.checkpoint.checkpoint
+
+    @staticmethod
+    def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
+        return checkpoint_wrapper(module, checkpoint_fn=checkpoint_fn, **checkpoint_fn_kwargs)
+
+    @property
+    def noop_context_fn(self):
+        return noop_context_fn
+
+    @staticmethod
+    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.sac import create_selective_checkpoint_contexts
+        return create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation)
+
+    @staticmethod
+    def async_save_on_cpu(policy_fn=None):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import AsyncSaveOnCpu
+        return AsyncSaveOnCpu(policy_fn)
+
+    @staticmethod
+    def tensor_to_numpy(tensor) -> np.ndarray:
+        """Convert PyTorch tensor to numpy array."""
+        return tensor.cpu().numpy()

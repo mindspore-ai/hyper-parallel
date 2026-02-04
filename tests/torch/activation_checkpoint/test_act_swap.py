@@ -15,8 +15,8 @@
 """Test Activation Swap memory comparison: None vs Swap"""
 from tests.common.mark_utils import arg_mark
 from tests.torch.common_net import SimpleTransformer
-from hyper_parallel.platform.torch.activation_checkpoint import (
-    SwapManager, ActivationPolicy, swap_wrapper)
+from hyper_parallel.core.activation_checkpoint import SwapManager
+from hyper_parallel.platform.torch.activation_checkpoint import ActivationPolicy, swap_wrapper
 from .utils import prepare_data, train_one_mode, seed_memory_time_context
 
 

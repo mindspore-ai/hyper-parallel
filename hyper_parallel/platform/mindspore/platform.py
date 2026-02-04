@@ -13,10 +13,17 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore platform api"""
+from datetime import timedelta
+from typing import Optional
+
+import numpy as np
 import mindspore as ms
 import mindspore.common.dtype as mstype
+from mindspore.mint.distributed import TCPStore
+
 from mindspore.nn import Cell
 from mindspore import mint
+from mindspore.common.api import _no_grad
 from mindspore.common.dtype import type_size_in_bytes
 from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
@@ -27,6 +34,7 @@ from mindspore.communication import get_rank as get_rank_id
 from mindspore.communication import comm_func
 from mindspore._c_expression import TensorTransform
 import mindspore.mint.distributed as dist
+
 from hyper_parallel.platform.platform import Platform, PlatformType
 from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 from hyper_parallel.platform.mindspore.pipeline_parallel.stage import PipelineStageBase
@@ -36,6 +44,8 @@ _tensor_transform = TensorTransform.get_instance()
 
 
 # pylint: disable=C0103
+
+
 class MindSporePlatform(Platform):
     """MindSpore platform api"""
     Tensor = Tensor
@@ -189,13 +199,15 @@ class MindSporePlatform(Platform):
 
         if not param.has_init:
             # has been init, get slice data
-            param_dtensor = DTensor.from_local(_get_slice_tensor_by_layout(param, layout).value(), layout)
+            param_dtensor = DTensor.from_local(
+                _get_slice_tensor_by_layout(param, layout).value(), layout.mesh, layout.placements
+                )
             param = Parameter(param_dtensor, name=name, requires_grad=requires_grad)
             param.param_info = param_info
         else:
             # has not been init, need to modify init shape
             param.init_mode.shape = slice_shape
-            param_dtensor = DTensor.from_local(param.init_mode, layout)
+            param_dtensor = DTensor.from_local(param.init_mode, layout.mesh, layout.placements)
             param = Parameter(param_dtensor, name=name, requires_grad=requires_grad)
             param.param_info = param_info
         return param
@@ -329,12 +341,188 @@ class MindSporePlatform(Platform):
     @staticmethod
     def all_gather_object(object_list, obj, group=None) -> None:
         """
-        Aggregates Python objects in a specified communication group.
+        Gathers objects from the given group into object list.
 
         Args:
-            object_list (list[Any]): Output Python object list.
-            obj (Any): Python object to be broadcast from current process.
-            group (str, optional): The communication group to work on. If ``None``, which means ``"hccl_world_group"``
-                in Ascend. Default: ``None``.
+            object_list (list[Any]): Define the output list, which size equal to the size of group.
+            obj (Any): The object on current rank and in given process group.
+            group (ProcessGroup, optional): The process group to gather obj. Default is ``None``, and ``None`` means
+                global group.
+
+        Returns:
+            None. Objs are gathered into ``object_list``.
         """
         dist.all_gather_object(object_list, obj, group)
+
+    @staticmethod
+    def init_process_group(
+            backend: str = None,
+            *,
+            init_method: Optional[str] = None,
+            timeout: Optional[timedelta] = None,
+            world_size: int = -1,
+            rank: int = -1,
+            store: TCPStore = None,
+            pg_options=None,
+            device_id=None
+    ) -> None:
+        """
+        Initialize global process group.
+
+        Args:
+            backend (str): The backend used to init process group. Default is ``"hccl"`` and now only support hccl.
+            init_method (str, optional): URL specifying how to initialize the process group. Default is ``None``.
+            timeout (timedelta, optional): Timeout for API executed. Default is ``None``.
+            world_size (int): Number of processes. Default is ``-1``.
+            rank (int, optional): Rank of the current process. Default is ``-1``.
+            store (Store, optional): An object that stores key/value data, facilitating the exchange of inter-process
+                communication addresses and connection information. Default is ``None``. Currently, only the
+                ``TCPStore`` type is supported.
+            pg_options (ProcessGroupOptions, optional): Reserved parameter. Current not take effect.
+            device_id (int, optional): Reserved parameter. Current not take effect.
+        """
+        if backend is None:
+            backend = "hccl"
+        dist.init_process_group(backend=backend, init_method=init_method, timeout=timeout, world_size=world_size,
+                                rank=rank, store=store, pg_options=pg_options, device_id=device_id)
+
+    @staticmethod
+    def destroy_process_group(group: Optional[str] = None) -> None:
+        """
+        Destroy given process group.
+
+        Args:
+            group (str, optional): Specify the group to destroy. Default: ``None`` means ``hccl_world_group``. If group
+                is None or "hccl_world_group", destroy global process group and all process groups relative to global
+                process group.
+        """
+        dist.destroy_process_group(group)
+
+    @staticmethod
+    def get_process_group_ranks(group: Optional[str] = None) -> list[int]:
+        """
+        Get all ranks in given process group.
+
+        Args:
+            group (str, optional): Specify the process group to work on. Default: ``None`` means ``hccl_world_group``.
+
+        Returns:
+            List[int]: List of ranks in given process group.
+        """
+        return dist.get_process_group_ranks(group)
+
+    @staticmethod
+    def get_backend(group: Optional[str] = None) -> str:
+        """
+        Get the backend of given process group.
+
+        Args:
+            group (str, optional): Specify the process group to work on. Default: ``None`` means ``hccl_world_group``.
+
+        Returns:
+            str: The backend of the group.
+        """
+        return dist.get_backend(group)
+
+    @staticmethod
+    def split_group(parent_pg: Optional[str] = None,
+                    split_ranks: Optional[list] = None,
+                    timeout: Optional[timedelta] = None,
+                    pg_options: Optional[str] = None,
+                    group_desc: Optional[str] = None,
+                    ) -> str:
+        """
+        Create split group for a specific group rank in split_ranks, which group contains current rank id.
+
+        Args:
+            parent_pg (str, Optional): A process group which the goal group split from.
+            split_ranks (Optional[list]): A list like ``list[list[int]]``.
+            timeout (Optional[timedelta]): Timeout for API executed. Default is ``None``.
+            pg_options (Optional[str]): Reserved parameter. Current not take effect.
+            group_desc (Optional[str]): Description of process group.
+
+        Returns:
+            str: The split group name.
+        """
+        if split_ranks is None or len(split_ranks) == 0:
+            raise ValueError("split_ranks cannot be None or empty")
+
+        rank_id = MindSporePlatform.get_rank()
+        for split_rank in split_ranks:
+            if rank_id in split_rank:
+                if pg_options is None:
+                    hash_str_rank_list = '-'.join([str(rank) for rank in split_rank])
+                    pg_options = f"{len(split_rank)}-{hash_str_rank_list}"
+                new_group(rank_ids=split_rank, group=pg_options)
+                return pg_options
+        raise ValueError(f"The Split_ranks {split_ranks} does not contain current rank {rank_id}")
+
+    @staticmethod
+    def no_grad():
+        return _no_grad()
+
+    @staticmethod
+    def empty_like(tensor, *, dtype=None, device=None, pin_memory=False):
+        return mint.empty_like(tensor, dtype=dtype, device=device, pin_memory=pin_memory)
+
+    def get_current_stream(self):
+        return ms.runtime.current_stream()
+
+    def new_event(self):
+        return ms.runtime.Event()
+
+    def tree_map(self, fn, tree):
+        """
+        Apply fn to each leaf in a nested structure (list / tuple / dict),
+        preserving the original structure.
+        """
+        if isinstance(tree, dict):
+            return type(tree)(
+                (k, self.tree_map(fn, v)) for k, v in tree.items()
+            )
+
+        if isinstance(tree, tuple):
+            return tuple(self.tree_map(fn, v) for v in tree)
+
+        if isinstance(tree, list):
+            return [self.tree_map(fn, v) for v in tree]
+
+        # leaf
+        return fn(tree)
+
+    @staticmethod
+    def register_forward_pre_hook(module, hook, prepend=False, with_kwargs=False):
+        return module.register_forward_pre_hook(hook, with_kwargs)
+
+    @staticmethod
+    def register_full_backward_hook(module, hook, prepend=False):
+        return module.register_backward_hook(hook)
+
+    @staticmethod
+    def register_full_backward_pre_hook(module, hook, prepend=False):
+        return module.register_backward_pre_hook(hook)
+
+    @property
+    def checkpoint(self):
+        return ms.recompute
+
+    @staticmethod
+    def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
+        raise NotImplementedError("ckpt_wrapper is not supported on MindSpore platform")
+
+    @property
+    def noop_context_fn(self):
+        raise NotImplementedError("noop_context_fn is not supported on MindSpore platform")
+
+    @staticmethod
+    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
+        raise NotImplementedError("create_selective_checkpoint_contexts is not supported on MindSpore platform")
+
+    @staticmethod
+    def async_save_on_cpu(policy_fn=None):
+        raise NotImplementedError("async_save_on_cpu is not supported on MindSpore platform")
+
+    @staticmethod
+    def tensor_to_numpy(tensor) -> np.ndarray:
+        """Convert MindSpore tensor to numpy array."""
+        return tensor.asnumpy()
