@@ -128,6 +128,10 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement differentiable_all_to_all")
 
     @staticmethod
+    def tensor_type_cast(input_data, cast_type):
+        raise NotImplementedError("Platform subclasses must implement tensor_type_cast")
+
+    @staticmethod
     def differentiable_all_reduce(data, op, group):
         raise NotImplementedError("Platform subclasses must implement differentiable_all_reduce")
 

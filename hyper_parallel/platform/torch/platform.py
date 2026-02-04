@@ -137,6 +137,19 @@ class TorchPlatform(Platform):
         return output_tensor
 
     @staticmethod
+    def tensor_type_cast(input_data, cast_type):
+        """Cast tensor to specified data type."""
+        type_mapping = {
+            'float32': torch.float32,
+            'float16': torch.float16,
+            'int64': torch.int64,
+            'int32': torch.int32
+        }
+        if cast_type not in type_mapping:
+            raise ValueError(f"Unknown cast type: {cast_type}. Supported types: {list(type_mapping.keys())}")
+        return input_data.to(type_mapping[cast_type])
+
+    @staticmethod
     def differentiable_all_reduce(data, op, group):
         # Resolve the op from string to ReduceOp enum if necessary
         reduce_op = _OP_MAP.get(op, dist.ReduceOp.SUM) if isinstance(op, str) else op
