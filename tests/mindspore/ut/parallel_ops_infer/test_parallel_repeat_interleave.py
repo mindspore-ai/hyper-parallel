@@ -15,7 +15,9 @@
 """parallel_repeat_interleave test"""
 
 import pytest
-from hyper_parallel import Layout
+from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_repeat_interleave import RepeatInterleaveDistributedOp
 
 op = RepeatInterleaveDistributedOp("repeat_interleave")
@@ -26,12 +28,9 @@ def test_torch_repeat_interleave_layout_data_parallel():
     Description: Data parallel scenario (shard on first dim, repeat on last unsharded dim)
     Expectation: Success
     """
-    base_mesh_shape = (2, 4)
-    base_alias_name = ("dp", "tp")
-    base_rank_list = list(range(8))
-
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("dp", "None")  # tensor_map = (1, -1)  len(alias_name)-1-i
+    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    x_placements = (Shard(0), Replicate())
+    x_layout = _build_layout(mesh, x_placements, 2)
     repeats = 2
     dim = 1
     output_layout = op.infer_layout(x_layout, (repeats, dim))
