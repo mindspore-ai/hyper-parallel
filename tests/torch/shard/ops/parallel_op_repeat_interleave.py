@@ -16,7 +16,9 @@
 
 import numpy as np
 import torch
-from hyper_parallel import Layout
+from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global, global_to_local
 # Generate input data using numpy at file header
@@ -40,8 +42,9 @@ def test_distributed_repeat_interleave_layout_inference():
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     standalone_output = torch.repeat_interleave(standalone_input, repeats, dim=dim)
     # Distributed setup
-    layout = Layout((2, 4), ("dp", "tp"))
-    x_layout = layout("dp", "None")  # shard on dim=0 (dp), keep dim=1 unsharded
+    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    x_placements = (Shard(0), Replicate())
+    x_layout = _build_layout(mesh, x_placements, 2)
     dist_input = global_to_local(standalone_input, x_layout)
     dist_output = torch.repeat_interleave(dist_input, repeats, dim=dim)
     # Layout correctness check
@@ -71,8 +74,9 @@ def test_distributed_repeat_interleave_with_tensor():
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     standalone_output = torch.repeat_interleave(standalone_input, repeats_tensor, dim=dim)
     # Distributed setup
-    layout = Layout((2, 4), ("dp", "tp"))
-    x_layout = layout("dp", "None")  # shard on dim=0 (dp), keep dim=1 unsharded
+    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    x_placements = (Shard(0), Replicate())
+    x_layout = _build_layout(mesh, x_placements, 2)
     dist_input = global_to_local(standalone_input, x_layout)
     dist_output = torch.repeat_interleave(dist_input, repeats_tensor, dim=dim)
     # Gather distributed results back to global view
@@ -96,8 +100,9 @@ def test_distributed_repeat_interleave_dim_none():
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     standalone_output = torch.repeat_interleave(standalone_input, repeats)
     # Distributed setup
-    layout = Layout((2, 4), ("dp", "tp"))
-    x_layout = layout("dp", "None")  # shard on dim=0 (dp), keep dim=1 unsharded
+    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    x_placements = (Shard(0), Replicate())
+    x_layout = _build_layout(mesh, x_placements, 2)
     dist_input = global_to_local(standalone_input, x_layout)
     dist_output = torch.repeat_interleave(dist_input, repeats)
     # Gather distributed results back to global view
@@ -117,8 +122,9 @@ def test_distributed_repeat_interleave_sharded_dim_error():
     init_dist()
     repeats = 2
     dim = 1
-    layout = Layout((2, 4), ("dp", "tp"))
-    x_layout = layout("dp", "tp")  # shard on both dimensions
+    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    x_placements = (Shard(0), Shard(1))
+    x_layout = _build_layout(mesh, x_placements, 2)
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     dist_input = global_to_local(standalone_input, x_layout)
     try:

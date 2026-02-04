@@ -47,13 +47,9 @@ def test_torch_repeat_interleave_layout_tensor_parallel():
     Description: Tensor parallel scenario (shard on first dim with 'tp', repeat on last unsharded dim)
     Expectation: Success
     """
-    base_mesh_shape = (2, 4)
-    base_alias_name = ("dp", "tp")
-    base_rank_list = list(range(8))
-
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("tp", "None")  # tensor_map = (0, -1)
-
+    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    x_placements = (Replicate(), Shard(0))
+    x_layout = _build_layout(mesh, x_placements, 2)
     repeats = 2
     dim = 1
     output_layout = op.infer_layout((x_layout,), (repeats, dim))
@@ -69,12 +65,9 @@ def test_torch_repeat_interleave_with_tensor_layout_data_parallel():
     Description: Data parallel scenario (shard on first dim, repeat on last unsharded dim)
     Expectation: Success
     """
-    base_mesh_shape = (2, 4)
-    base_alias_name = ("dp", "tp")
-    base_rank_list = list(range(8))
-
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("dp", "None")  # tensor_map = (1, -1)  len(alias_name)-1-i
+    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    x_placements = (Shard(0), Replicate())
+    x_layout = _build_layout(mesh, x_placements, 2)
     repeats_tensor = [2,1,1,1]
 
     dim = 1
@@ -91,12 +84,9 @@ def test_torch_repeat_interleave_with_tensor_layout_tensor_parallel():
     Description: Tensor parallel scenario (shard on first dim with 'tp', repeat on last unsharded dim)
     Expectation: Success
     """
-    base_mesh_shape = (2, 4)
-    base_alias_name = ("dp", "tp")
-    base_rank_list = list(range(8))
-
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("tp", "None")  # tensor_map = (0, -1)
+    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    x_placements = (Replicate(), Shard(0))
+    x_layout = _build_layout(mesh, x_placements, 2)
     repeats_tensor = [2,1,1,1]
 
     dim = 1
@@ -111,12 +101,9 @@ def test_torch_repeat_interleave_dim_none_layout_data_parallel():
     Description: Data parallel scenario (shard on first dim, repeat on last unsharded dim)
     Expectation: Success
     """
-    base_mesh_shape = (2, 4)
-    base_alias_name = ("dp", "tp")
-    base_rank_list = list(range(8))
-
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("dp", "None")
+    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    x_placements = (Shard(0), Replicate())
+    x_layout = _build_layout(mesh, x_placements, 2)
     repeats = 2
     output_layout = op.infer_layout((x_layout,), (repeats,))
     expected_map = (1,)
@@ -131,12 +118,9 @@ def test_torch_repeat_interleave_dim_none_layout_tensor_parallel():
     Description: Tensor parallel scenario (shard on first dim with 'tp', repeat on last unsharded dim)
     Expectation: Success
     """
-    base_mesh_shape = (2, 4)
-    base_alias_name = ("dp", "tp")
-    base_rank_list = list(range(8))
-
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("tp", "None")
+    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    x_placements = (Replicate(), Shard(0))
+    x_layout = _build_layout(mesh, x_placements, 2)
 
     repeats = 2
     output_layout = op.infer_layout((x_layout,), (repeats,))
@@ -151,12 +135,9 @@ def test_torch_repeat_interleave_layout_sharded_dim_error():
     Description: Repeat on a sharded dimension should raise error
     Expectation: Success
     """
-    base_mesh_shape = (2, 4)
-    base_alias_name = ("dp", "tp")
-    base_rank_list = list(range(8))
-
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("dp", "tp")  # tensor_map = (1, 0)
+    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    x_placements = (Shard(0), Shard(1))
+    x_layout = _build_layout(mesh, x_placements, 2)
 
     repeats = 2
     dim = 1
@@ -169,12 +150,9 @@ def test_torch_repeat_interleave_layout_error_dim_out_of_range():
     Description: Test indicating a invalid dim.
     Expectation: Success
     """
-    base_mesh_shape = (2, 4)
-    base_alias_name = ("dp", "tp")
-    base_rank_list = list(range(8))
-
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("None", "None")
+    mesh = init_device_mesh(mesh_shape=(2,4),alias_name=("dp","tp"))
+    x_placements = (Replicate(), Replicate())
+    x_layout = _build_layout(mesh, x_placements, 2)
 
     repeats = 2
     dim = 5
