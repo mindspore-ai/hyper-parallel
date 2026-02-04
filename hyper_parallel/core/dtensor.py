@@ -18,6 +18,7 @@ from typing import Sequence, Tuple
 from hyper_parallel.core.layout import Layout, DeviceMesh, _get_slice_tensor_by_layout
 from hyper_parallel.core.placement_types import Placement, Replicate
 from hyper_parallel.platform import get_platform
+from hyper_parallel.core.utils import compute_local_shape_and_global_offset
 
 platform = get_platform()
 DTensorBase = platform.DTensorBase
@@ -291,3 +292,158 @@ class DTensor(DTensorBase):
         local_tensor = _get_slice_tensor_by_layout(tensor, layout)
 
         return DTensor(local_tensor, device_mesh, placements)
+
+
+def _dtensor_init_helper(
+        init_op,
+        size,
+        device_mesh,
+        placements,
+        **kwargs,
+) -> DTensor:
+    """
+        Helper function to create and initialize a distributed tensor.
+
+        Args:
+            size: Shape of the tensor.
+            dtype: Data type of the tensor.
+            device: Target device for the tensor.
+            requires_grad: Whether the tensor requires gradient.
+
+        Returns:
+            DTensor: The initialized distributed tensor.
+    """
+    # get local tensor shape
+    local_shape = compute_local_shape_and_global_offset(
+        size, device_mesh, placements
+    )
+
+    # initialize the local tensor
+    if init_op is platform.full:
+        fill_value = kwargs.pop("fill_value", 0)
+        local_tensor = init_op(local_shape, fill_value, **kwargs)
+    else:
+        local_tensor = init_op(local_shape, **kwargs)
+
+    return DTensor.from_local(
+            local_tensor,
+            device_mesh,
+            placements,
+    )
+
+def ones(
+    size,
+    device_mesh,
+    placements,
+) -> DTensor:
+    """
+    Returns a :class:`DTensor` filled with the scalar value 1, with the shape defined
+    by the variable argument ``size``.
+
+    Args:
+        size (Union[tuple[int], list[int], int, Tensor]): The specified shape of output tensor. Only positive integer or
+            tuple or Tensor containing positive integers are allowed. If it is a Tensor,
+            it must be a 0-D or 1-D Tensor with int32 or int64 dtypes.
+
+    Keyword args:
+        device_mesh: :class:`DeviceMesh` type, contains the mesh info of ranks
+        placements: a sequence of :class:`Placement` type: ``Shard``, ``Replicate``
+
+    Returns:
+        A :class:`DTensor` object on each rank
+    """
+    ones_ = platform.ones
+    return _dtensor_init_helper(
+        ones_,
+        size,
+        device_mesh=device_mesh,
+        placements=placements,
+    )
+
+def empty(
+    size,
+    device_mesh,
+    placements,
+) -> DTensor:
+    """
+    Returns a :class:`DTensor` filled with uninitialized data. The shape of the :class:`DTensor`
+    is defined by the variable argument ``size``.
+
+    Args:
+        size (Union[tuple[int], list[int], int]): The specified shape of output tensor. Can be variable numbers of
+            positive integers or tuple or list containing positive integers.
+
+    Keyword args:
+        device_mesh: :class:`DeviceMesh` type, contains the mesh info of ranks
+        placements: a sequence of :class:`Placement` type: ``Shard``, ``Replicate``
+
+    Returns:
+        A :class:`DTensor` object on each rank
+    """
+    empty_ = platform.empty
+    return _dtensor_init_helper(
+        empty_,
+        size,
+        device_mesh=device_mesh,
+        placements=placements,
+    )
+
+
+def full(
+    size,
+    fill_value,
+    *,
+    device_mesh,
+    placements,
+) -> DTensor:
+    """
+    Returns a :class:`DTensor` filled with ``fill_value`` according to ``device_mesh`` and
+    ``placements``, with the shape defined by the argument ``size``.
+
+    Args:
+        size (Union[tuple[int], list[int]]): The specified shape of output tensor.
+        fill_value (Union[numbers.Number, Tensor]): Value to fill the returned tensor. It can be a scalar number, a 0-D
+            Tensor, or a 1-D Tensor with only one element.
+
+    Keyword args:
+        device_mesh: :class:`DeviceMesh` type, contains the mesh info of ranks.
+        placements: a sequence of :class:`Placement` type: ``Shard``, ``Replicate``
+
+    Returns:
+        A :class:`DTensor` object on each rank
+    """
+    full_ = platform.full
+    return _dtensor_init_helper(
+        full_,
+        size,
+        fill_value=fill_value,
+        device_mesh=device_mesh,
+        placements=placements,
+    )
+
+def zeros(
+    size,
+    device_mesh,
+    placements,
+) -> DTensor:
+    """
+    Returns a :class:`DTensor` filled with the scalar value 0.
+
+    Args:
+        size (Union[tuple[int], list[int], int, Tensor]): The specified shape of output tensor. Only positive integer or
+        tuple or Tensor containing positive integers are allowed. If it is a Tensor,
+            it must be a 0-D or 1-D Tensor with int32 or int64 dtypes.
+    Keyword args:
+        device_mesh: :class:`DeviceMesh` type, contains the mesh info of ranks
+        placements: a sequence of :class:`Placement` type: ``Shard``, ``Replicate``
+
+    Returns:
+        A :class:`DTensor` object on each rank
+    """
+    zeros_ = platform.zeros
+    return _dtensor_init_helper(
+        zeros_,
+        size,
+        device_mesh=device_mesh,
+        placements=placements,
+    )

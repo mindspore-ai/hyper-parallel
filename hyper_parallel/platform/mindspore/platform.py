@@ -57,6 +57,22 @@ class MindSporePlatform(Platform):
     tensor_dtype = mstype
 
     @staticmethod
+    def ones(size, dtype=None):
+        return mint.ones(size, dtype=dtype)
+
+    @staticmethod
+    def zeros(size, dtype=None):
+        return mint.zeros(size, dtype=dtype)
+
+    @staticmethod
+    def full(size, fill_value, dtype=None):
+        return mint.full(size, fill_value, dtype=dtype)
+
+    @staticmethod
+    def empty(size, dtype=None):
+        return mint.empty(size, dtype=dtype)
+
+    @staticmethod
     def get_rank():
         return get_rank_id()
 
