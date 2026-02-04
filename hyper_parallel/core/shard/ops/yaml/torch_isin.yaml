@@ -1,0 +1,4 @@
+isin:
+  dist_op_name: _torch_isin_dist_op
+  distributed_op_class: IsinDistributedOp
+  distributed_op_file: parallel_isin

@@ -237,3 +237,12 @@ class ProdExtDistributedOp(ReduceExtDistributedOpBase):
 
     def __init__(self, op_name="prod"):
         super().__init__(op_name, partial_type=["prod"])
+
+class AllExtDistributedOp(ReduceExtDistributedOpBase):
+    """
+    Distributed implementation for All operator
+    Returns the cumulative sum of elements of input in the dimension dim.
+    """
+
+    def __init__(self, op_name="all"):
+        super().__init__(op_name, partial_type=["all"])
