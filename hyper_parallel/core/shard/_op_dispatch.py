@@ -269,7 +269,9 @@ class OpDispatcher:
         else:
             all_args = (input_layouts, extra_args)
             output_layout = distribute_op.infer_layout(*all_args)
-            op_impl = distribute_op.get_expand_impl(func, output_layout, input_layouts, extra_args)
+            op_impl = getattr(
+                distribute_op, "get_expand_impl", lambda *args, **kwargs: None
+                )(func, output_layout, input_layouts, extra_args)
             op_layout_cache[cache_key] = (output_layout, op_impl)
 
         if op_impl is None:
