@@ -48,7 +48,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         else:
             # HSDP
             self.mesh_info = HSDPMeshInfo(mesh=self.mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
-        self.hsdp_state = TorchHSDPStateV2(self.cell, self.mesh_info, self.config, self.platform)
+        self.hsdp_state = TorchHSDPStateV2(self.cell, self.mesh_info, self.config, self.platform, self.device)
 
     def _new_grad_hook(self):
         """

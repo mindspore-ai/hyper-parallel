@@ -51,12 +51,14 @@ class TorchHSDPParamV2(HSDPParamV2):
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         offload_policy: Optional[OffloadPolicy] = None,
         threshold: int = 0,
+        device: Optional[torch.device] = None,
     ):
         self._module_info: ParamModuleInfo = module_info
         self.mesh_info = mesh_info
         self.post_forward_mesh_info = post_forward_mesh_info
         self.mp_policy = mp_policy
         self.threshold = threshold
+        self.device = device
         self.offload_to_cpu: bool = isinstance(offload_policy, CPUOffloadPolicy)
         self.pin_memory = (
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
@@ -83,6 +85,11 @@ class TorchHSDPParamV2(HSDPParamV2):
         param: nn.Parameter,
         shard_placement_fn: Optional[Callable],
     ) -> None:
+        if param.device != self.device and param.device.type != "meta":
+            raise AssertionError(
+                f"Expects the parameter to already be moved to device {self.device} but got {param.device}"
+            )
+
         hsdp_placement = shard_placement_fn(param) if shard_placement_fn else None
         if hsdp_placement is None:
             hsdp_placement = Shard(0)
@@ -358,7 +365,6 @@ class TorchHSDPParamV2(HSDPParamV2):
     def alloc_all_gather_outputs(self) -> None:
         for tensor in self.all_gather_outputs:
             expected_size = tensor.numel() * tensor.itemsize
-            # meta
             storage = tensor.untyped_storage()
             if storage.size() != expected_size:
                 storage.resize_(expected_size)
@@ -519,7 +525,7 @@ class TorchHSDPParamV2(HSDPParamV2):
                 all_gather_input_numels=[self._sharded_param_data.numel()],
                 all_gather_input_dtypes=[self._sharded_param_data.dtype],
                 world_size=1,
-                device=self._sharded_param_data.device,
+                device=self.device,
             )
             self.alloc_all_gather_outputs()
             self.all_gather_outputs[0].copy_(self._sharded_param_data)
@@ -533,7 +539,7 @@ class TorchHSDPParamV2(HSDPParamV2):
             all_gather_input_numels=[all_gather_input.numel()],
             all_gather_input_dtypes=[all_gather_input.dtype],
             world_size=self.shard_world_size,
-            device=self._sharded_param_data.device,
+            device=self.device,
         )
         self.alloc_all_gather_outputs()
 

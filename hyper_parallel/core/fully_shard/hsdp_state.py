@@ -21,17 +21,19 @@ from hyper_parallel.core.fully_shard.hsdp_utils import HSDPConfigV2
 
 class HSDPState:
     """HSDP state for cell"""
-    def __init__(self, cell, mesh_info, config: HSDPConfigV2, platform):
+    def __init__(self, cell, mesh_info, config: HSDPConfigV2, platform, device=None):
         self.cell = cell
         self.mesh_info = mesh_info
         self.config = config
         self.mp_policy = config.mp_policy
         self.offload_policy = config.offload_policy
         self.platform = platform
+        self.device = device
         self.hsdp_params: List[HSDPParamV2] = []
         self.sharded_hsdp_params: List[HSDPParamV2] = []
         self.param_buffers = []
         self.grad_buffers = []
+        self._move_states_to_device()
         self._init_hsdp_params()
         self._init_param_buffers()
         self._init_grad_buffers()
@@ -40,6 +42,10 @@ class HSDPState:
     def _init_hsdp_params(self):
         """init hsdp parameters for cell"""
         raise NotImplementedError("HSDPState subclasses must implement _init_hsdp_params")
+
+    def _move_states_to_device(self):
+        """move states to device"""
+        raise NotImplementedError("HSDPState subclasses must implement _move_states_to_device")
 
     def _init_param_buffers(self):
         """init param buffers"""

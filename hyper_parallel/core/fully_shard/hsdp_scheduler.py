@@ -34,7 +34,7 @@ class HSDPSchedulerContext:
 class HSDPSchedulerV2:
     """HSDPScheduler is used to scheduler hsdp"""
     def __init__(self, cell, mesh, reshard_after_forward, shard_placement_fn,
-                 mp_policy, offload_policy, ignored_params):
+                 mp_policy, offload_policy, ignored_params, device):
         """init hsdp scheduler."""
         self.cell = cell
         self.mesh: DeviceMesh = mesh
@@ -43,6 +43,7 @@ class HSDPSchedulerV2:
         self.mp_policy = mp_policy
         self.offload_policy = offload_policy
         self.ignored_params = ignored_params
+        self.device = device
         self.scheduler_state = None
         self.scheduler_ctx = HSDPSchedulerContext()
         self.forward_prefetch_cells = []

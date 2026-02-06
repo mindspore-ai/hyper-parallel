@@ -58,6 +58,7 @@ def test_hsdp_param_v2_fsdp_1d_mesh():
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
+        device=torch.device("npu"),
     )
 
     # Verify sharded state
@@ -114,6 +115,7 @@ def test_hsdp_param_v2_hsdp_2d_mesh():
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
+        device=torch.device("npu"),
     )
 
     # Verify sharded state
@@ -156,6 +158,7 @@ def test_hsdp_param_v2_sharded_state_transitions():
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
+        device=torch.device("npu"),
     )
 
     # Initial state should be SHARDED
@@ -221,6 +224,7 @@ def test_hsdp_param_v2_custom_shard_placement():
         module_info=module_info,
         mesh_info=mesh_info,
         shard_placement_fn=custom_shard_fn,
+        device=torch.device("npu"),
     )
 
     # Verify shard placement
@@ -267,6 +271,7 @@ def test_hsdp_param_v2_mixed_precision():
         module_info=module_info,
         mesh_info=mesh_info,
         mp_policy=mp_policy,
+        device=torch.device("npu"),
     )
 
     # Initialize dtype attributes
@@ -305,6 +310,7 @@ def test_hsdp_param_v2_all_gather_comm():
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
+        device=torch.device("npu"),
     )
 
     # Verify initial state
@@ -346,6 +352,7 @@ def test_hsdp_param_v2_prefetch_unshard():
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
+        device=torch.device("npu"),
     )
 
     # Test prefetch workflow
@@ -386,6 +393,7 @@ def test_hsdp_param_v2_unshard_shard_cycle():
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
+        device=torch.device("npu"),
     )
 
     # Initial state
@@ -427,6 +435,7 @@ def test_hsdp_param_v2_reduce_scatter_grad():
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
+        device=torch.device("npu"),
     )
 
     # Unshard first
@@ -492,6 +501,7 @@ def test_hsdp_param_v2_all_reduce_grad():
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
+        device=torch.device("npu"),
     )
 
     # Unshard first
@@ -547,6 +557,7 @@ def test_hsdp_param_v2_accumulate_grad():
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
+        device=torch.device("npu"),
     )
 
     # Unshard
