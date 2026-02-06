@@ -583,6 +583,7 @@ class TorchHSDPParamV2(HSDPParamV2):
     def reduce_scatter_grad(
         self,
         async_op: bool = False,
+        dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, Optional[dist.Work]]:
         """
         Perform reduce-scatter on gradient to reduce and shard the full gradient.
@@ -600,6 +601,8 @@ class TorchHSDPParamV2(HSDPParamV2):
             grad = self.unsharded_accumulated_grad_data
         else:
             grad = self.unsharded_grad_data
+        reduce_dtype = dtype or grad.dtype
+        grad = grad.to(reduce_dtype)
         grad_flat = grad.view(-1)
 
         # If parameter is not sharded (below threshold), no reduce-scatter needed
@@ -615,7 +618,7 @@ class TorchHSDPParamV2(HSDPParamV2):
 
         # Calculate output size
         output_numel = grad_flat.numel() // self.shard_world_size
-        output = torch.empty(output_numel, dtype=grad.dtype, device=grad.device)
+        output = torch.empty(output_numel, dtype=reduce_dtype, device=grad.device)
 
         # Execute reduce_scatter_tensor
         handle = dist.reduce_scatter_tensor(

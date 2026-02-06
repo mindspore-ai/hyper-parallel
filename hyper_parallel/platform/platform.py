@@ -457,3 +457,13 @@ class Platform:
     @staticmethod
     def tensor_to_numpy(tensor) -> np.ndarray:
         raise NotImplementedError("Platform subclasses must implement tensor_to_numpy")
+
+    def cast_fp_tensor(self, dtype, x):
+        """
+        Cast floating-point tensor to target dtype if applicable.
+        """
+        raise NotImplementedError("Platform subclasses must implement cast_fp_tensor")
+
+    def apply_to_tensors(self, fn, container):
+        """Recursively apply to all tensor in different kinds of container types."""
+        raise NotImplementedError("Platform subclasses must implement apply_to_tensors")
