@@ -111,6 +111,19 @@ class MindSporePlatform(Platform):
         return output_tensor
 
     @staticmethod
+    def tensor_type_cast(input_data, cast_type):
+        """Cast tensor to specified data type."""
+        type_mapping = {
+            'float32': ms.float32,
+            'float16': ms.float16,
+            'int64': ms.int64,
+            'int32': ms.int32
+        }
+        if cast_type not in type_mapping:
+            raise ValueError(f"Unknown cast type: {cast_type}. Supported types: {list(type_mapping.keys())}")
+        return input_data.to(type_mapping[cast_type])
+
+    @staticmethod
     def differentiable_all_reduce(data, op, group):
         output, _ = comm_func.all_reduce(data, op, group)
         return output
