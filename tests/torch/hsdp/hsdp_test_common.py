@@ -14,6 +14,7 @@
 # ============================================================================
 """hsdp test common"""
 import time
+import torch
 from torch import optim
 from hyper_parallel import hsdp_sync_stream
 
@@ -30,7 +31,7 @@ def train(model, data, comm_async=True, train_steps=10):
         if i != 0:
             start_time = time.time()
         loss = model(data)
-        loss.backward()
+        loss.backward(torch.ones_like(loss))
         if comm_async:
             hsdp_sync_stream()
         if i != 0:
