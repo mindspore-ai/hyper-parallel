@@ -70,6 +70,22 @@ class TorchPlatform(Platform):
     tensor_dtype = torch
 
     @staticmethod
+    def ones(size, dtype=None):
+        return torch.ones(size, dtype=dtype)
+
+    @staticmethod
+    def zeros(size, dtype=None):
+        return torch.zeros(size, dtype=dtype)
+
+    @staticmethod
+    def full(size, fill_value, dtype=None):
+        return torch.full(size, fill_value, dtype=dtype)
+
+    @staticmethod
+    def empty(size, dtype=None):
+        return torch.empty(size, dtype=dtype)
+
+    @staticmethod
     def get_rank():
         return dist.get_rank()
 
