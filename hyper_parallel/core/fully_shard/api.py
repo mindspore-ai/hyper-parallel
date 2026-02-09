@@ -14,7 +14,7 @@
 # ============================================================================
 """hybrid shard data parallel interface"""
 from torch import nn
-from typing import Optional, Any
+from typing import cast
 from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel import DeviceMesh
 from hyper_parallel.platform import get_platform
@@ -76,47 +76,46 @@ class HSDPModule:
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call hsdp interface first.")
 
-        for _, cell in platform.get_cells_and_names(self):
-            if isinstance(cell, HSDPModule):
-                # Currently,  make it bo be True.
-                cell.hsdp_scheduler.set_requires_grad_sync(True)
+        for _, module in platform.get_cells_and_names(self):
+            if isinstance(module, HSDPModule):
+                module.hsdp_scheduler.set_requires_grad_sync(requires_grad_sync)
 
     def zero_grads(self):
         """zero accumunication grads"""
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call hsdp interface first.")
         if platform == PlatformType.PYTORCH:
-            raise RuntimeError("zero_grads shouldn't called in torch platform, use optimizer.zero_grad() instead.")
-        for _, cell in platform.get_cells_and_names(self):
-            if isinstance(cell, HSDPModule):
-                cell.hsdp_scheduler.zero_grads()
+            raise RuntimeError("zero_grads shouldn't be called in torch platform, use optimizer.zero_grad() instead.")
+        for _, module in platform.get_cells_and_names(self):
+            if isinstance(module, HSDPModule):
+                module.hsdp_scheduler.zero_grads()
 
-    def set_forward_prefetch_modules(self, hsdp_module_list):
-        """set forward prefetch cell list to prefetch all gather for unsharded parameters"""
-        if not isinstance(hsdp_module_list, (tuple, list)):
-            raise ValueError("hsdp_module_list must be HSDPModule list")
-        for cell in hsdp_module_list:
-            if not isinstance(cell, HSDPModule):
-                raise ValueError(f"hsdp_module_list must be HSDPModule list but got {type(cell)} in list.")
+    def set_modules_to_forward_prefetch(self, modules):
+        """set forward prefetch module list to prefetch all gather for unsharded parameters"""
+        if not isinstance(modules, (tuple, list)):
+            raise ValueError("modules must be HSDPModule list")
+        for module in modules:
+            if not isinstance(module, HSDPModule):
+                raise ValueError(f"modules must be HSDPModule list but got {type(module)} in list.")
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call hsdp interface first.")
-        self.hsdp_scheduler.set_forward_prefetch_cells(hsdp_module_list)
+        self.hsdp_scheduler.set_forward_prefetch_cells(modules)
 
-    def set_backward_prefetch_modules(self, hsdp_module_list):
-        """set backward prefetch cell list to prefetch all gather for unsharded parameters"""
-        if not isinstance(hsdp_module_list, (tuple, list)):
-            raise ValueError("hsdp_module_list must be HSDPModule list")
-        for cell in hsdp_module_list:
-            if not isinstance(cell, HSDPModule):
-                raise ValueError(f"hsdp_module_list must be HSDPModule list but got {type(cell)} in list.")
+    def set_modules_to_backward_prefetch(self, modules):
+        """set backward prefetch module list to prefetch all gather for unsharded parameters"""
+        if not isinstance(modules, (tuple, list)):
+            raise ValueError("modules must be HSDPModule list")
+        for module in modules:
+            if not isinstance(module, HSDPModule):
+                raise ValueError(f"modules must be HSDPModule list but got {type(module)} in list.")
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call fully_shard interface first.")
-        self.hsdp_scheduler.set_backward_prefetch_cells(hsdp_module_list)
+        self.hsdp_scheduler.set_backward_prefetch_cells(modules)
 
     def reshard(self) -> None:
         """reshard all sharded parameters"""
         if not self.hsdp_scheduler:
-            raise ValueError("hsdphsdp_scheduler_state is None")
+            raise ValueError("hsdp_scheduler is None")
         scheduler_state = self.hsdp_scheduler.scheduler_state
         if scheduler_state:
             scheduler_state.shard()
@@ -126,7 +125,7 @@ class HSDPModule:
         if not isinstance(async_op, bool):
             raise ValueError(f"async_op should be a bool, got {type(async_op)}")
         if not self.hsdp_scheduler:
-            raise ValueError("hsdphsdp_scheduler_state is None")
+            raise ValueError("hsdp_scheduler is None")
         scheduler_state = self.hsdp_scheduler.scheduler_state
         if scheduler_state:
             scheduler_state.unshard(async_op=async_op)
@@ -184,34 +183,34 @@ class HSDPModule:
                 module.hsdp_scheduler.set_reshard_after_backward(reshard_after_backward)
 
 
-def _extend_cell_with_hsdp_interface(cell):
-    """extend Cell with HSDPCell interface"""
-    origin_class = cell.__class__
+def _extend_module_with_hsdp_interface(module):
+    """extend Module with HSDPModule interface"""
+    origin_class = module.__class__
     extend_class = origin_class_to_extend_class.get(origin_class, None)
     if extend_class is None:
         extend_class = type(f"HSDP{origin_class.__name__}", (HSDPModule, origin_class), {})
         origin_class_to_extend_class[origin_class] = extend_class
-    cell.__class__ = extend_class
+    module.__class__ = extend_class
 
 
 # pylint: disable=C0415
-def _check_cell_valid(platform_type, cell):
-    """check cell valid"""
+def _check_module_valid(platform_type, module):
+    """check module valid"""
     if platform_type == PlatformType.MINDSPORE:
         from mindspore.nn.cell import Cell
-        if not isinstance(cell, Cell):
-            raise ValueError(f"cell's type must be nn.cell but got {type(cell)}.")
+        if not isinstance(module, Cell):
+            raise ValueError(f"module's type must be nn.cell but got {type(module)}.")
     else:
         from torch.nn import Module
-        if not isinstance(cell, Module):
-            raise ValueError(f"cell's type must be nn.Module but got {type(cell)}.")
+        if not isinstance(module, Module):
+            raise ValueError(f"module's type must be nn.Module but got {type(module)}.")
 
 
 # pylint: disable=C0415
-def _check_hsdp_input_valid(platform_type, cell, shard_size, threshold, optimizer_level, enable_grad_accumulation,
+def _check_hsdp_input_valid(platform_type, module, shard_size, threshold, optimizer_level, enable_grad_accumulation,
                             grad_scale, reduce_dtype, comm_async, comm_fusion, bucket_size):
     """check hsdp input valid"""
-    _check_cell_valid(platform_type, cell)
+    _check_module_valid(platform_type, module)
     if not isinstance(shard_size, int) or (shard_size <= 0 and shard_size != -1):
         raise ValueError(f"shard_size must be a positive integer, but got {shard_size}.")
     if not isinstance(threshold, int) or threshold < 0:
@@ -249,7 +248,7 @@ def fully_shard(
         ignored_params: set[nn.Parameter] | None = None
 ):
     platform_type = platform.platform_type
-    _extend_cell_with_hsdp_interface(module)
+    _extend_module_with_hsdp_interface(module)
     module.hsdp_init(
         platform_type,
         module,
