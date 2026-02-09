@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """device mesh"""
-
+import os
 from typing import Optional, Tuple, Union, List
 import numpy as np
 from hyper_parallel.platform import get_platform
@@ -156,6 +156,54 @@ class DeviceMesh:
         self._ndim: int = len(self._mesh_shape)
         self._root_mesh: Optional['DeviceMesh'] = None
         self._sub_mesh: List['DeviceMesh'] = []
+        if os.getenv("MS_SIMULATION_LEVEL") is None:
+            self._coordinate_on_dim = self._compute_coordinate_on_dim()
+
+    def _compute_coordinate_on_dim(self):
+        # calculate the coordinates of the current global rank on the mesh
+        return self._compute_coordinates_from_mesh(self.mesh, self._rank)
+
+    @staticmethod
+    def _compute_coordinates_from_mesh(
+            mesh_tensor: Tensor,
+            rank: int,
+    ):
+        """
+        Compute the coordinates of a rank within a mesh tensor.
+
+        Args:
+            mesh_tensor (Tensor): The mesh tensor to search in
+            rank (int): The rank to find coordinates for
+
+        Returns:
+            A tuple of coordinates if the rank is found in the mesh, None otherwise
+
+        Raises:
+            AssertionError: If the rank appears more than once in the mesh
+        """
+        rank_coords = (mesh_tensor == rank).nonzero()
+        if rank_coords.shape[0] not in (0, 1):
+            raise AssertionError(
+                f"rank_coords.shape[0] must be 0 or 1, got {rank_coords.shape[0]}"
+            )
+
+        if rank_coords.shape[0] == 0:
+            return None
+
+        coords = rank_coords[0].tolist()
+        return tuple(coords)
+
+    def size(self, mesh_dim=None) -> int:
+        if mesh_dim is not None:
+            return self.mesh.shape[mesh_dim]
+        return self.mesh.numel()
+
+    def get_coordinate(self):
+        """
+        Return the relative indices of this rank relative to all
+        dimensions of the mesh. If this rank is not part of the mesh, return None.
+        """
+        return self._coordinate_on_dim if self._coordinate_on_dim else None
 
     @staticmethod
     def _convert_mesh_to_tensor(mesh: Union[Tensor, list, tuple, np.ndarray]) -> Tensor:

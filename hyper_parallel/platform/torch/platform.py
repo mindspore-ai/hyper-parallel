@@ -62,12 +62,49 @@ else:
 class TorchPlatform(Platform):
     """Torch platform api"""
     Tensor = Tensor
+    tensor = torch.tensor
     Parameter = Parameter
     Module = Module
     DTensorBase = DTensorBase
     PipelineStageBase = PipelineStageBase
     platform_type = PlatformType.PYTORCH
     tensor_dtype = torch
+
+    @staticmethod
+    def device_count(device_handle):
+        return device_handle.device_count()
+
+    def device_type(self):
+        device_handle = self.get_device_handle()
+        if device_handle == torch.npu:
+            return "npu"
+        return "cuda"
+
+    def device(self, device_idx=None):
+        device_type = self.device_type()
+        if device_idx is None:
+            return torch.device(device_type)
+        return torch.device(f"{device_type}:{device_idx:d}")
+
+    @staticmethod
+    def get_rng_state(device=None, device_handle=None):
+        if device_handle is None:
+            return torch.get_rng_state()
+        if device is None:
+            return device_handle.get_rng_state()
+        return device_handle.get_rng_state(device)
+
+    @staticmethod
+    def set_rng_state(state, device=None, device_handle=None):
+        if device_handle is None:
+            return torch.set_rng_state(state)
+        if device is None:
+            return device_handle.set_rng_state(state)
+        return device_handle.set_rng_state(state, device)
+
+    @staticmethod
+    def manual_seed(seed):
+        return torch.manual_seed(seed)
 
     @staticmethod
     def ones(size, dtype=None):
@@ -316,7 +353,7 @@ class TorchPlatform(Platform):
         return data, handle
 
     @staticmethod
-    def broadcast(data, src, group, async_op=False):
+    def broadcast(data, src, group=None, async_op=False):
         handle = dist.broadcast(data, src, group, async_op)
         if async_op:
             handle.wait()

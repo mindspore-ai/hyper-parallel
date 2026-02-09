@@ -49,12 +49,51 @@ _tensor_transform = TensorTransform.get_instance()
 class MindSporePlatform(Platform):
     """MindSpore platform api"""
     Tensor = Tensor
+    tensor = Tensor
     Parameter = Parameter
     Module = Cell
     DTensorBase = DTensorBase
     PipelineStageBase = PipelineStageBase
     platform_type = PlatformType.MINDSPORE
     tensor_dtype = mstype
+
+    def device_count(self, device_handle):
+        device_type = self.device_type()
+        if device_type == "cpu":
+            return device_handle.device_context.cpu.device_count()
+        if device_type == "gpu":
+            return device_handle.device_context.gpu.device_count()
+        return device_handle.device_context.ascend.device_count()
+
+    @staticmethod
+    def get_rng_state(device=None, device_handle=None):
+        """Get RNG state """
+        _ = device, device_handle
+        return ms.get_rng_state()
+
+    @staticmethod
+    def set_rng_state(state, device=None, device_handle=None):
+        _ = device, device_handle
+        return ms.set_rng_state(state)
+
+    def device_type(self):
+        device_type = ms.get_context("device_target")
+        if device_type == "Ascend":
+            return "npu"
+        return device_type.lower()
+
+    def device(self, device_idx=None):
+        _ = device_idx
+        device_type = self.device_type()
+        return device_type
+
+    @staticmethod
+    def get_device_handle():
+        return ms
+
+    @staticmethod
+    def manual_seed(seed):
+        return ms.manual_seed(seed)
 
     @staticmethod
     def ones(size, dtype=None):
@@ -324,7 +363,7 @@ class MindSporePlatform(Platform):
         return data, handle
 
     @staticmethod
-    def broadcast(data, src, group, async_op=False):
+    def broadcast(data, src, group=None, async_op=False):
         handle = dist.broadcast(data, src, group, async_op)
         if async_op:
             handle.wait()
