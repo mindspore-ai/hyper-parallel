@@ -1,0 +1,4 @@
+new_ones:
+  dist_op_name: _torch_new_ones_dist_op
+  distributed_op_class: NewOnesDistributedOp
+  distributed_op_file: parallel_new_ones
