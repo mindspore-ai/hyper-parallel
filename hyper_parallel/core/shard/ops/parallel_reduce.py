@@ -16,6 +16,7 @@
 Distributed implementation for Reduce operator.
 """
 
+from copy import deepcopy
 from typing import Sequence, Union, Tuple, List
 from hyper_parallel.core.layout import Layout
 from hyper_parallel.platform import get_platform
@@ -246,3 +247,65 @@ class AllExtDistributedOp(ReduceExtDistributedOpBase):
 
     def __init__(self, op_name="all"):
         super().__init__(op_name, partial_type=["all"])
+
+class MaxDistributedOp(ReduceExtDistributedOpBase):
+    """
+    Distributed implementation for Pytorch style Max operator.
+    
+    Supports three Pytorch behaviors:
+    1. torch.max(input) -> Global reduction (returns single Tensor)
+    2. torch.max(input, dim, keepdim=False) -> Dimension reduction (returns (values, indices))
+    3. torch.max(input, other) -> Element-wise max (returns single Tensor)
+    """
+
+    def __init__(self, op_name="max"):
+        super().__init__(op_name, partial_type=["max"])
+
+    def infer_layout(self, layouts, extra_args):
+        """
+        Infer output layouts for torch.max.
+        """
+        # Filter out None layouts (corresponding to non-tensor args like dim, keepdim)
+        valid_layouts = [l for l in layouts if l is not None]
+
+        if not valid_layouts:
+            raise ValueError("MaxDistributedOp requires at least one input layout")
+
+        # Case 1: Element-wise max (e.g., torch.max(a, b))
+        if len(valid_layouts) > 1:
+            # Element-wise max returns a single tensor, so return a single Layout object.
+            return valid_layouts[0]
+
+        # Case 2 & 3: Reduction max
+        x_layout = valid_layouts[0]
+        if x_layout.mesh_shape is None:
+            raise ValueError("Input layouts cannot be None.")
+
+        dim = None
+        keepdim = False
+
+        if extra_args:
+            dim = extra_args[0]
+            if len(extra_args) > 1:
+                keepdim = extra_args[1]
+
+        if isinstance(dim, Tensor):
+            raise TypeError(
+                "The `dim` argument should not be a `Tensor`. Instead, use one of the following types: "
+                "`None`, `int`, `tuple[int]`, or `list[int]`."
+            )
+
+        values_layout = self._infer_output_layout(x_layout, dim, keepdim)
+
+        if dim is None:
+            # torch.max(input) -> Single Tensor
+            # OpDispatcher logic:
+            # if isinstance(py_output, tuple): ...
+            # else: DTensor.from_local(py_output, output_layout.mesh, ...)
+            # So here output_layout MUST be a Layout object, not a tuple.
+            return values_layout
+
+        # torch.max(input, dim) -> (values, indices)
+        # OpDispatcher logic expects tuple of layouts.
+        indices_layout = deepcopy(values_layout)
+        return (values_layout, indices_layout)
