@@ -31,18 +31,15 @@ from hyper_parallel import SkipDTensorDispatch
 torch.manual_seed(0)
 standalone_x = torch.rand(8, 8)
 
-
-def _get_standard_fully_shard_kwargs():
+def _get_standard_fully_shard_kwargs(mp_policy):
     """get standard fully shard kwargs"""
-    default_mp_policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32,
-                                             output_dtype=torch.float32, cast_forward_inputs=True)
     default_mesh = init_device_mesh(mesh_shape=(8,), alias_name=("dp",))
     fsdp_kwargs = {
         'mesh': default_mesh,
         'reshard_after_forward': True,
         'shard_placement_fn': None,
-        'mp_policy': None,
-        'offload_policy': default_mp_policy,
+        'mp_policy': mp_policy,
+        'offload_policy': None,
         'ignored_params': None
     }
     return fsdp_kwargs
@@ -143,7 +140,17 @@ def shard_param_data_parallel(acc_grad=False, **fsdp_kwargs):
 def test_zero3_fully_shard():
     """test zero3 fully shard parallel"""
     init_dist()
-    fsdp_kwargs = _get_standard_fully_shard_kwargs()
+    mp_policy = MixedPrecisionPolicy()
+    fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
+    shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)
+
+
+def test_zero3_fully_shard_with_mp():
+    """test zero3 fully shard parallel with mixed precision"""
+    init_dist()
+    mp_policy = MixedPrecisionPolicy(param_dtype=torch.float16, reduce_dtype=torch.float32,
+                                     output_dtype=torch.float32, cast_forward_inputs=True)
+    fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
     shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)
 
 
@@ -152,6 +159,7 @@ def test_zero3_partial_shard():
     init_dist()
     op_size = 2
     hsdp_mesh = init_device_mesh(mesh_shape=(4, op_size), alias_name=("dp", "op"))
-    fsdp_kwargs = _get_standard_fully_shard_kwargs()
+    mp_policy = MixedPrecisionPolicy()
+    fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
     fsdp_kwargs['mesh'] = hsdp_mesh
     shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)

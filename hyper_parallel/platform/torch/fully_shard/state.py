@@ -30,12 +30,15 @@ class TorchHSDPStateV2(HSDPState):
         super().__init__(cell, mesh_info, config, platform)
         # self._init_mp_dtypes()
         # Do ReduceScatter/AllReduce for grad
+        self.mp_policy = config.mp_policy
+        self.offload_policy = config.offload_policy
         self.reduce_grads = True
         # Reshard parameter after backward
         self.reshard_after_backward = True
         # Requires AllReduce for grad When HSDP
         self.requires_all_reduce = True
         self._use_post_forward_mesh = False
+        self._init_mp_dtypes()
 
     def _init_hsdp_params(self):
         """init hsdp parameters for cell"""
@@ -52,7 +55,9 @@ class TorchHSDPStateV2(HSDPState):
         for param, module_info in zip(filtered_params, module_infos):
             hsdp_param = TorchHSDPParamV2(param, 
                                           module_info,
-                                          self.mesh_info
+                                          self.mesh_info,
+                                          mp_policy=self.mp_policy,
+                                          offload_policy=self.offload_policy
                                           )
             self.hsdp_params.append(hsdp_param)
             if hsdp_param.is_sharded:
@@ -61,16 +66,23 @@ class TorchHSDPStateV2(HSDPState):
 
     def _init_mp_dtypes(self,):
         """init mp dtypes for hsdp parameters"""
-        # TODO(fuchao): Get correct self._orig_dtypes, self._reduce_dtype
-        assert self.mp_policy is not None, "mp_policy should not be None when init mp dtypes."
         for hsdp_param in self.hsdp_params:
             hsdp_param.init_dtype_attrs(self.mp_policy)
-        # 下面的东西暂时没用
-        orig_dtypes =None
-        reduce_dtypes = None
-
-        self._orig_dtypes = None
-        self._reduce_dtype = None
+        trainable_params: list[TorchHSDPParamV2] = [
+            p for p in self.hsdp_params if p.sharded_param.requires_grad
+        ]
+        orig_dtypes = {p.orig_dtype for p in trainable_params}
+        reduce_dtypes = {p.reduce_dtype for p in trainable_params}
+        if len(trainable_params) > 0 and len(orig_dtypes) != 1:
+            raise AssertionError(
+                f"hsdp expects uniform original parameter dtype but got {orig_dtypes}"
+            )
+        self._orig_dtype = next(iter(orig_dtypes)) if trainable_params else None
+        if len(trainable_params) > 0 and len(reduce_dtypes) != 1:
+            raise AssertionError(
+                f"hsdp expects uniform reduce dtype but got {reduce_dtypes}"
+            )
+        self._reduce_dtype = next(iter(reduce_dtypes)) if trainable_params else None
 
 
     def lazy_init(self):
@@ -107,19 +119,25 @@ class TorchHSDPStateV2(HSDPState):
                 if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
                     continue
                 if hsdp_param.shard_world_size > 1:
-                    reduced_grad, handle = hsdp_param.reduce_scatter_grad()
+                    reduced_grad, handle = hsdp_param.reduce_scatter_grad(dtype=self._reduce_dtype)
                 if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
                     assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
                     reduced_grad, handle = hsdp_param.all_reduce_grad(grad=reduced_grad)
 
-                # grad is flattened, viewed into sharded_param.shape
-                sharded_param_local_shape = hsdp_param.sharded_param.local_shape if isinstance(hsdp_param.sharded_param, DTensor) \
-                    else hsdp_param.sharded_param.shape
                 sharded_grad = hsdp_param.sharded_param.grad
+                # grad is flattened, viewed into sharded_param.shape
+                sharded_param_local_shape = hsdp_param.sharded_param.local_shape if isinstance(hsdp_param.sharded_param, DTensor) else hsdp_param.sharded_param.shape
+                reduced_grad = reduced_grad.view(sharded_param_local_shape)
+                to_accumulate_grad = sharded_grad is not None
+                if hsdp_param.offload_to_cpu:
+                    non_blocking = hsdp_param.pin_memory and not to_accumulate_grad
+                    reduced_grad = reduced_grad.to(
+                        torch.device("cpu"), non_blocking=non_blocking
+                    )
                 if sharded_grad is None:
-                    hsdp_param.sharded_param.grad = reduced_grad.view(sharded_param_local_shape)
+                    hsdp_param.sharded_param.grad = reduced_grad
                 else:
-                    hsdp_param.sharded_param.grad += reduced_grad.view(sharded_param_local_shape)
+                    hsdp_param.sharded_param.grad += reduced_grad
                 if hsdp_param.unsharded_accumulated_grad_data is not None:
                     # hsdp_params_with_grad.append(hsdp_param)
                     # unsharded_grads.append(hsdp_param.unsharded_accumulated_grad_data)

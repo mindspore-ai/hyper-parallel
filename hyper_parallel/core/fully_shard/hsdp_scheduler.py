@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """HSDP scheduler"""
+import functools
 from hyper_parallel.core.device_mesh import DeviceMesh
 from hyper_parallel.core.fully_shard.hsdp_utils import HSDPConfigV2, FSDPSchedulerState
 from hyper_parallel.core.fully_shard.hsdp_grad_hook import HSDPGradHook
@@ -39,7 +40,7 @@ class HSDPSchedulerV2:
         self.mesh: DeviceMesh = mesh
         self.reshard_after_forward = reshard_after_forward
         self.shard_placement_fn = shard_placement_fn
-        # self.mp_policy = mp_policy
+        self.mp_policy = mp_policy
         self.offload_policy = offload_policy
         self.ignored_params = ignored_params
         self.scheduler_state = None
@@ -133,12 +134,13 @@ class HSDPSchedulerV2:
         self.scheduler_state = FSDPSchedulerState.PRE_FORWARD
         if len(inputs) > 0:
             self.platform.set_tensor_requires_grad(inputs[0])
-        # if self.mp_policy and self.mp_policy.cast_forward_inputs and self.mp_policy.param_dtype:
-        #         # TODO(fuchao): impl cast_forward_inputs
-        #         raise NotImplementedError(f"mp_policy.cast_forward_inputs not implemented yet.")
+        if self.mp_policy.cast_forward_inputs and self.mp_policy.param_dtype:
+            cast_fn = functools.partial(self.platform.cast_fp_tensor, self.mp_policy.param_dtype)
+            inputs = self.platform.apply_to_tensors(cast_fn, inputs)
         self.hsdp_state.unshard()
         for prefetch_cell in self.forward_prefetch_cells:
             prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()
+        return inputs
 
     # pylint: disable=W0613
     def _hsdp_forward_hook(self, cell, inputs, outputs):
@@ -148,9 +150,11 @@ class HSDPSchedulerV2:
         self.scheduler_state = FSDPSchedulerState.FORWARD
         if self.reshard_after_forward:
             self.hsdp_state.shard()
-        # if self.mp_policy.output_dtype is not None:
-        #     # TODO(fuchao): impl output_dtype mp
-        #     pass
+        if self.mp_policy.output_dtype is not None:
+            outputs = self.platform.apply_to_tensors(
+                functools.partial(self.platform.cast_fp_tensor, self.mp_policy.output_dtype),
+                outputs,
+            )
         return outputs
 
     # pylint: disable=W0613

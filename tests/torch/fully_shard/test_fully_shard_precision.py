@@ -26,6 +26,15 @@ def test_zero3_fully_shard():
     case_name = "test_zero3_fully_shard"
     torchrun_case(file_name, case_name, master_port)
 
+def test_zero3_fully_shard_with_mp():
+    """
+    Feature: Test_zero3_fully_shard_with_mp_policy.
+    Description: Test_zero3_fully_shard with 1D FSDP mesh and mixed precision.
+    Expectation: case run successfully.
+    """
+    master_port = 12343
+    case_name = "test_zero3_fully_shard_with_mp"
+    torchrun_case(file_name, case_name, master_port)
 
 def test_zero3_partial_shard():
     """
