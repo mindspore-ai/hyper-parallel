@@ -1,0 +1,4 @@
+multinomial:
+  dist_op_name: _torch_multinomial_dist_op
+  distributed_op_class: MultinomialDistributedOp
+  distributed_op_file: parallel_multinomial
