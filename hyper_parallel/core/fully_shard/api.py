@@ -34,7 +34,7 @@ class _UnshardHandle:
             self._hsdp_state = None
 
 
-class HSDPCell:
+class HSDPModule:
     """
     The hsdp block of neural networks with hsdp interface.
 
@@ -43,7 +43,7 @@ class HSDPCell:
     """
 
     # pylint: disable=C0415
-    def hsdp_init(self, platform_type, cell, mesh, reshard_after_forward,
+    def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
                   shard_placement_fn, mp_policy, offload_policy, ignored_params):
         """init hsdp2 scheduler."""
         scheduler_class = None
@@ -54,7 +54,7 @@ class HSDPCell:
             from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
             scheduler_class = TorchHSDPSchedulerV2
 
-        self.hsdp_scheduler = scheduler_class(cell,
+        self.hsdp_scheduler = scheduler_class(module,
                                               mesh,
                                               reshard_after_forward,
                                               shard_placement_fn,
@@ -77,7 +77,7 @@ class HSDPCell:
             raise ValueError("call hsdp interface first.")
 
         for _, cell in platform.get_cells_and_names(self):
-            if isinstance(cell, HSDPCell):
+            if isinstance(cell, HSDPModule):
                 # Currently,  make it bo be True.
                 cell.hsdp_scheduler.set_requires_grad_sync(True)
 
@@ -85,32 +85,33 @@ class HSDPCell:
         """zero accumunication grads"""
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call hsdp interface first.")
-
+        if platform == PlatformType.PYTORCH:
+            raise RuntimeError("zero_grads shouldn't called in torch platform, use optimizer.zero_grad() instead.")
         for _, cell in platform.get_cells_and_names(self):
-            if isinstance(cell, HSDPCell):
+            if isinstance(cell, HSDPModule):
                 cell.hsdp_scheduler.zero_grads()
 
-    def set_forward_prefetch_cells(self, hsdp_cell_list):
+    def set_forward_prefetch_modules(self, hsdp_module_list):
         """set forward prefetch cell list to prefetch all gather for unsharded parameters"""
-        if not isinstance(hsdp_cell_list, (tuple, list)):
-            raise ValueError("hsdp_cell_list must be HSDPCell list")
-        for cell in hsdp_cell_list:
-            if not isinstance(cell, HSDPCell):
-                raise ValueError(f"hsdp_cell_list must be HSDPCell list but got {type(cell)} in list.")
+        if not isinstance(hsdp_module_list, (tuple, list)):
+            raise ValueError("hsdp_module_list must be HSDPModule list")
+        for cell in hsdp_module_list:
+            if not isinstance(cell, HSDPModule):
+                raise ValueError(f"hsdp_module_list must be HSDPModule list but got {type(cell)} in list.")
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call hsdp interface first.")
-        self.hsdp_scheduler.set_forward_prefetch_cells(hsdp_cell_list)
+        self.hsdp_scheduler.set_forward_prefetch_cells(hsdp_module_list)
 
-    def set_backward_prefetch_cells(self, hsdp_cell_list):
+    def set_backward_prefetch_modules(self, hsdp_module_list):
         """set backward prefetch cell list to prefetch all gather for unsharded parameters"""
-        if not isinstance(hsdp_cell_list, (tuple, list)):
-            raise ValueError("hsdp_cell_list must be HSDPCell list")
-        for cell in hsdp_cell_list:
-            if not isinstance(cell, HSDPCell):
-                raise ValueError(f"hsdp_cell_list must be HSDPCell list but got {type(cell)} in list.")
+        if not isinstance(hsdp_module_list, (tuple, list)):
+            raise ValueError("hsdp_module_list must be HSDPModule list")
+        for cell in hsdp_module_list:
+            if not isinstance(cell, HSDPModule):
+                raise ValueError(f"hsdp_module_list must be HSDPModule list but got {type(cell)} in list.")
         if not hasattr(self, "hsdp_scheduler"):
-            raise ValueError("call hsdp interface first.")
-        self.hsdp_scheduler.set_backward_prefetch_cells(hsdp_cell_list)
+            raise ValueError("call fully_shard interface first.")
+        self.hsdp_scheduler.set_backward_prefetch_cells(hsdp_module_list)
 
     def reshard(self) -> None:
         """reshard all sharded parameters"""
@@ -149,7 +150,7 @@ class HSDPCell:
         self_module = cast(nn.Module, self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
-            if isinstance(module, HSDPCell):
+            if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_requires_all_reduce(requires_all_reduce)
 
     def set_reshard_after_forward(self, reshard_after_forward: bool, recurse: bool = True) -> None:
@@ -164,7 +165,7 @@ class HSDPCell:
         self_module = cast(nn.Module, self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
-            if isinstance(module, HSDPCell):
+            if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_forward(reshard_after_forward)
 
     def set_reshard_after_backward(self, reshard_after_backward: bool, recurse: bool = True) -> None:
@@ -179,7 +180,7 @@ class HSDPCell:
         self_module = cast(nn.Module, self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
-            if isinstance(module, HSDPCell):
+            if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_backward(reshard_after_backward)
 
 
@@ -188,7 +189,7 @@ def _extend_cell_with_hsdp_interface(cell):
     origin_class = cell.__class__
     extend_class = origin_class_to_extend_class.get(origin_class, None)
     if extend_class is None:
-        extend_class = type(f"HSDP{origin_class.__name__}", (HSDPCell, origin_class), {})
+        extend_class = type(f"HSDP{origin_class.__name__}", (HSDPModule, origin_class), {})
         origin_class_to_extend_class[origin_class] = extend_class
     cell.__class__ = extend_class
 
@@ -238,7 +239,7 @@ def _check_hsdp_input_valid(platform_type, cell, shard_size, threshold, optimize
 
 
 def fully_shard(
-        cell,
+        module: nn.Module,
         *,
         mesh: DeviceMesh | None = None,
         reshard_after_forward: bool | int | None = None,
@@ -248,10 +249,10 @@ def fully_shard(
         ignored_params: set[nn.Parameter] | None = None
 ):
     platform_type = platform.platform_type
-    _extend_cell_with_hsdp_interface(cell)
-    cell.hsdp_init(
+    _extend_cell_with_hsdp_interface(module)
+    module.hsdp_init(
         platform_type,
-        cell,
+        module,
         mesh,
         reshard_after_forward,
         shard_placement_fn,
@@ -259,7 +260,7 @@ def fully_shard(
         offload_policy,
         ignored_params
     )
-    return cell
+    return module
 
 
 def hsdp_sync_stream():
