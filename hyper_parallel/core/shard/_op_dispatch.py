@@ -225,7 +225,7 @@ class OpDispatcher:
             if val is None:
                 input_layouts.append(None)
                 continue
-            if not hasattr(val, "layout"):
+            if not hasattr(val, "_layout"):
                 id_str = "scalar"
                 if not isinstance(val, Tensor):
                     id_str = str(val)
@@ -461,7 +461,7 @@ class OpDispatcher:
             if val is None:
                 input_layouts.append(None)
                 continue
-            if not hasattr(val, "layout"):
+            if not hasattr(val, "_layout"):
                 id_str = "scalar"
                 if not isinstance(val, Tensor):
                     id_str = str(val)
