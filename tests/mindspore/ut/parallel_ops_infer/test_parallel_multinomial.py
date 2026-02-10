@@ -30,8 +30,9 @@ def test_multinomial_infer_layout_1d():
     Expectation: Output layout should be 1D and Replicated ("None").
     """
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
+        mesh_dim_names=("dp", "mp")
     )
     # Input: 1D Tensor, Replicated on all mesh dims
     x_placements = (Replicate(), Replicate())
@@ -54,8 +55,9 @@ def test_multinomial_infer_layout_2d_batch_sharded():
     Expectation: Output (N, num_samples) preserves sharding on dim 0, dim 1 is Replicated.
     """
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
+        mesh_dim_names=("dp", "mp")
     )
     # Input: 2D Tensor
     # Mesh dim 0 ("dp") shards Tensor dim 0 (Batch)
@@ -82,8 +84,9 @@ def test_multinomial_infer_layout_2d_fully_replicated():
     Expectation: Output (N, num_samples) is fully replicated.
     """
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
+        mesh_dim_names=("dp", "mp")
     )
     # Input: 2D Tensor, Replicated
     x_placements = (Replicate(), Replicate())
@@ -104,8 +107,9 @@ def test_multinomial_error_sharded_prob_dim():
     Expectation: ValueError raised requiring redistribution.
     """
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
+        mesh_dim_names=("dp", "mp")
     )
     # Input: 2D Tensor
     # Mesh dim 0 ("dp") is Replicate
@@ -127,8 +131,9 @@ def test_multinomial_error_invalid_ndim_3d():
     Expectation: ValueError raised.
     """
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
+        mesh_dim_names=("dp", "mp")
     )
     # Input: 3D Tensor
     x_placements = (Replicate(), Replicate())

@@ -388,7 +388,7 @@ def shard_module(model: Union[Module, Callable], device_mesh: DeviceMesh, shardi
 
     Examples:
         >>> # Usage with device_mesh and alias format
-        >>> mesh = DeviceMesh((2, 2), ("dp", "tp"))
+        >>> mesh = DeviceMesh("npu", (2, 2), nesh_dim_names=("dp", "tp"))
         >>> sharding_plan = ShardingPlan(
         ...     plan={"mlp.weight": ("None", "tp")},
         ...     input_plan={"input": ("dp", "None")},
@@ -397,7 +397,7 @@ def shard_module(model: Union[Module, Callable], device_mesh: DeviceMesh, shardi
         >>> model = shard_module(model, mesh, sharding_plan)
 
         >>> # Usage with device_mesh and Placement format
-        >>> mesh = DeviceMesh((2, 2), ("dp", "tp"))
+        >>> mesh = DeviceMesh("npu", (2, 2), nesh_dim_names=("dp", "tp"))
         >>> sharding_plan = ShardingPlan(
         ...     plan={"mlp.weight": (Replicate(), Shard(1))},
         ...     input_plan={"input": (Shard(0), Replicate())},

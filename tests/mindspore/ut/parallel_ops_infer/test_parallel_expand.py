@@ -31,8 +31,9 @@ def test_expand_layout_inference():
     Expectation: Output layout preserves sharding on preserved dimension, expanded dimension unsharded
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: sharded on dim0 ("dp"), unsharded on dim1 (singleton to expand)
     x_placements = (Shard(0), Replicate())
@@ -53,12 +54,13 @@ def test_expand_layout_inference_3d():
     Expectation: Preserved dimensions keep original sharding, expanded dimension becomes unsharded
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 2, 2),
-        alias_name = ("dp", "tp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 2, 2),
+        mesh_dim_names=("dp", "tp", "mp")
     )
     # Input: sharded on dim0 ("dp"→2), unsharded on dim1 (to expand), sharded on dim2 ("mp"→0)
     x_placements = (Shard(0), Replicate(), Shard(2))
-    x_layout = _build_layout(mesh, x_placements, 3) # tensor_map = (2, -1, 0)
+    x_layout = _build_layout(mesh, x_placements, 3)  # tensor_map = (2, -1, 0)
 
     # Expand dim1 from 1 to 10, preserve others with -1
     output_layout = op.infer_layout((x_layout,), extra_args=(-1, 10, -1))
@@ -75,8 +77,9 @@ def test_expand_layout_prepend_new_dimensions():
     Expectation: Both new dimensions unsharded, existing dimensions preserve sharding
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: unsharded on dim0, sharded on dim1 ("mp"→0)
     x_placements = (Replicate(), Shard(1))
@@ -97,8 +100,9 @@ def test_expand_layout_scalar_expansion():
     Expectation: Output layout fully unsharded (both dimensions unsharded)
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Scalar input layout (0 dimensions)
     x_placements = ()
@@ -119,8 +123,9 @@ def test_expand_layout_invalid_expand_sharded_dim():
     Expectation: ValueError raised with clear message
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: sharded on dim0 ("dp"→1), unsharded on dim1
     x_placements = (Shard(0), Replicate())
@@ -138,8 +143,9 @@ def test_expand_layout_invalid_minus_one_for_new_dim():
     Expectation: ValueError raised
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -156,8 +162,9 @@ def test_expand_layout_invalid_dimension_reduction():
     Expectation: ValueError raised
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -174,8 +181,9 @@ def test_expand_as_layout_basic_expansion():
     Expectation: Output layout preserves sharding on dim0, dim1 unsharded
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: sharded on dim0 ("dp"), unsharded on dim1 (singleton to expand)
     x_placements = (Shard(0), Replicate())
@@ -202,12 +210,13 @@ def test_expand_as_layout_3d_preservation():
     Expectation: Preserved dims keep sharding, expanded dim unsharded
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 2, 2),
-        alias_name = ("dp", "tp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 2, 2),
+        mesh_dim_names=("dp", "tp", "mp")
     )
     # Input: sharded on dim0 ("dp"→1), unsharded on dim1 (to expand), sharded on dim2 ("mp"→0)
     x_placements = (Shard(0), Replicate(), Shard(2))
-    x_layout = _build_layout(mesh, x_placements, 3) # tensor_map = (2, -1, 0)
+    x_layout = _build_layout(mesh, x_placements, 3)  # tensor_map = (2, -1, 0)
 
     # Global shapes: input (4,1,6) → target (4,10,6)
     input_global_shape = (4, 1, 6)
@@ -230,12 +239,13 @@ def test_expand_as_layout_prepend_dimensions():
     Expectation: New dims unsharded, dim2 preserved (sharded), dim3 expanded (unsharded)
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: sharded on dim0 ("dp"→1), unsharded on dim1
     x_placements = (Shard(0), Replicate())
-    x_layout = _build_layout(mesh, x_placements, 2) # tensor_map = (1, -1)
+    x_layout = _build_layout(mesh, x_placements, 2)  # tensor_map = (1, -1)
 
     # Global shapes: input (8,1) → target (2,3,8,16)
     input_global_shape = (8, 1)
@@ -258,12 +268,13 @@ def test_expand_as_layout_scalar_expansion():
     Expectation: Output layout fully unsharded (all dimensions unsharded)
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # Scalar input layout (0 dimensions)
     x_placements = ()
-    x_layout = _build_layout(mesh, x_placements, 0) # tensor_map = (1, -1)
+    x_layout = _build_layout(mesh, x_placements, 0)  # tensor_map = (1, -1)
 
     # Global shapes: input () → target (3,4,5)
     input_global_shape = ()
@@ -286,12 +297,13 @@ def test_expand_as_layout_invalid_sharded_singleton():
     Expectation: ValueError raised with clear message about sharded dimension
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     # INVALID: shard dim1 (singleton dimension)
     x_placements = (Replicate(), Shard(1))
-    x_layout = _build_layout(mesh, x_placements, 2) # tensor_map = (-1, 0) - sharded singleton
+    x_layout = _build_layout(mesh, x_placements, 2)  # tensor_map = (-1, 0) - sharded singleton
 
     # Global shapes: input (8,1) → target (8,16)
     input_global_shape = (8, 1)
@@ -311,11 +323,12 @@ def test_expand_as_layout_invalid_non_singleton_mismatch():
     Expectation: ValueError raised for incompatible dimension sizes
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     x_placements = (Shard(0), Replicate())
-    x_layout = _build_layout(mesh, x_placements, 2) # tensor_map = (1, -1)
+    x_layout = _build_layout(mesh, x_placements, 2)  # tensor_map = (1, -1)
 
     # Global shapes: input (8,3) → target (8,5) - invalid non-singleton mismatch
     input_global_shape = (8, 3)
@@ -335,11 +348,12 @@ def test_expand_as_layout_invalid_rank_reduction():
     Expectation: ValueError raised for rank reduction
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
     x_placements = (Replicate(), Replicate(), Replicate())
-    x_layout = _build_layout(mesh, x_placements, 3) # tensor_map = (-1, -1, -1)
+    x_layout = _build_layout(mesh, x_placements, 3)  # tensor_map = (-1, -1, -1)
 
     # Global shapes: input (4,5,6) → target (4,5) - invalid rank reduction
     input_global_shape = (4, 5, 6)
@@ -359,12 +373,13 @@ def test_expand_as_layout_right_aligned_broadcast():
     Expectation: Leading dimension unsharded (new), middle dimension unsharded (expanded), last preserved
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 2),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 2),
+        mesh_dim_names=("dp", "mp")
     )
     # Input: unsharded on dim1 (singleton), sharded on dim0 ("dp"→1)
     x_placements = (Shard(0), Replicate())
-    x_layout = _build_layout(mesh, x_placements, 2) # tensor_map = (1, -1)
+    x_layout = _build_layout(mesh, x_placements, 2)  # tensor_map = (1, -1)
 
     # Global shapes: input (4,1) → target (3,4,1)
     # PyTorch aligns from right: input treated as (1,4,1) before expansion

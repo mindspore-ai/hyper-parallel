@@ -111,8 +111,9 @@ def test_sum_ext_dim_partial_model_parallel_1():
     # Parallel
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Define placements using Placement format
@@ -146,8 +147,9 @@ def test_mean_ext_partial_model_parallel_2():
     # Parallel
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Define placements using Placement format
@@ -181,8 +183,9 @@ def test_reduce_max_partial_model_parallel_3():
     # Parallel
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Define placements using Placement format
@@ -240,8 +243,9 @@ def test_reduce_max_backward_gradient_4():
     # Parallel
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Define placements using Placement format

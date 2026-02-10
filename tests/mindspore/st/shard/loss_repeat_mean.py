@@ -148,8 +148,9 @@ def base_case(dp, mp, hsdp_shard_size):
 
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(dp, mp),
-        alias_name=("dp", "mp")
+        mesh_dim_names=("dp", "mp")
     )
 
     # Define placements using Placement format

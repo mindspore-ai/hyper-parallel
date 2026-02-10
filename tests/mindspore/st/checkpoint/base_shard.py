@@ -86,7 +86,7 @@ def base_case(dp, mp):
     output_size = 2
 
     # Create DeviceMesh
-    mesh = init_device_mesh(mesh_shape=(dp, mp), alias_name=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(dp, mp), mesh_dim_names=("dp", "mp"))
 
     # Define placements using Placement format
     x_placements = (Shard(0), Shard(1))
@@ -138,7 +138,7 @@ def save_load_checkpoint(dp: int, mp: int) -> None:
     output_size = 2
 
     # Create DeviceMesh
-    mesh = init_device_mesh(mesh_shape=(dp, mp), alias_name=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(dp, mp), mesh_dim_names=("dp", "mp"))
 
     # Define placements using Placement format
     x_placements = (Shard(0), Shard(1))
@@ -153,7 +153,7 @@ def save_load_checkpoint(dp: int, mp: int) -> None:
 
     # step 2: shard
     model_stra = ShardingPlan(
-        plan = {"weight": w_placements},
+        plan={"weight": w_placements},
         input_plan={"input": x_placements},
         output_plan={"output": out_placements},
     )
@@ -166,7 +166,8 @@ def save_load_checkpoint(dp: int, mp: int) -> None:
     shard_module(model.relu, device_mesh=mesh, sharding_plan=model_relu_stra)
 
     # step 3: save checkpoint
-    file_path = "tmp1.safetensors"
+    rank_id = get_rank()
+    file_path = f"tmp_{rank_id}.safetensors"
     save_checkpoint(model, file_path)
 
     # step 4: load checkpoint
@@ -203,7 +204,7 @@ def base_global_layout(dp: int, mp: int):
     output_size = 4
 
     # Create DeviceMesh
-    mesh = init_device_mesh(mesh_shape=(dp, mp), alias_name=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(dp, mp), mesh_dim_names=("dp", "mp"))
 
     # Define placements using Placement format
     x_placements = (Shard(0), Shard(1))

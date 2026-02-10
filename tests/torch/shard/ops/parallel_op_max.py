@@ -45,7 +45,7 @@ def test_distributed_max_element_wise():
     standalone_output = torch.max(standalone_a, standalone_b)
 
     # Distributed setup: Shard dim=0 ("dp"), Replicate dim=1
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_a = DTensor.distribute_tensor(standalone_a, mesh, x_placements)
@@ -83,7 +83,7 @@ def test_distributed_max_dim_reduce_sharded():
     # torch.max(dim) returns (values, indices)
     standalone_vals, _ = torch.max(standalone_input, dim=0)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     # Shard dim 0 ("dp"), Replicate dim 1
     x_placements = (Shard(0), Replicate())
 
@@ -123,7 +123,7 @@ def test_distributed_max_dim_reduce_replicated():
     standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
     standalone_vals, _ = torch.max(standalone_input, dim=1)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     # Shard dim 0 ("dp"), Replicate dim 1
     x_placements = (Shard(0), Replicate())
 
@@ -164,7 +164,7 @@ def test_distributed_max_global_reduce():
     standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
     standalone_output = torch.max(standalone_input)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     # Shard both dims
     x_placements = (Shard(0), Shard(1))
 
@@ -204,7 +204,7 @@ def test_distributed_max_keepdim():
     standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
     standalone_vals, _ = torch.max(standalone_input, dim=0, keepdim=True)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)

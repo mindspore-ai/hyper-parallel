@@ -85,8 +85,9 @@ def test_base_shard():
 
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(1, 8),
-        alias_name=("dp", "tp")
+        mesh_dim_names=("dp", "tp")
     )
 
     # Define placements using Placement format

@@ -52,7 +52,7 @@ def test_distributed_multinomial_1d_replicated():
 
     # 2. Distributed Execution
     _set_seed() # Reset seed to ensure same random sequence on all ranks
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(),) # 1D Replicated
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -93,7 +93,7 @@ def test_distributed_multinomial_2d_batch_sharded():
     standalone_input = torch.from_numpy(weights_np).npu()
 
     # Distributed Setup: Shard dim 0 ("dp"), Replicate dim 1
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -133,7 +133,7 @@ def test_distributed_multinomial_2d_fully_replicated():
     standalone_output = torch.multinomial(standalone_input, num_samples=3, replacement=True)
 
     _set_seed() # Reset seed
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -162,7 +162,7 @@ def test_distributed_multinomial_error_sharded_prob():
     weights_np = np.abs(np.random.randn(4, 8)).astype(np.float32)
     standalone_input = torch.from_numpy(weights_np).npu()
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
 
     # INVALID: Sharding the probability dimension (dim 1)
     x_placements = (Replicate(), Shard(1))

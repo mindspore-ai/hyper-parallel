@@ -139,7 +139,7 @@ class Layout:
         >>> layout1 = layout(("dp", "interleaved_parallel"), "sp")
     """
 
-    def __init__(self, mesh_shape, alias_name, rank_list=None):
+    def __init__(self, mesh_shape, alias_name, rank_list=None, init_backend=True):
         self._alias_name = alias_name
         self._tensor_map = None
         if not rank_list:
@@ -149,7 +149,8 @@ class Layout:
         self._partial = [None] * len(mesh_shape)  # partial status for each dev dim
         self._support_partial_op = ['sum', 'max', 'min', 'avg', 'prod', 'all', None]
         self._alias_tensor_map = None
-        self._mesh = _create_device_mesh(mesh_shape, alias_name, self._rank_list)
+        self._mesh = _create_device_mesh("npu", mesh_shape, mesh_dim_names=alias_name, rank_list=self._rank_list,
+                                         init_backend=init_backend)
         self._compact_str = self._to_compact_string()
         self._placements = None
 
@@ -165,13 +166,13 @@ class Layout:
             Layout: A new Layout instance initialized with the properties of the provided device mesh.
 
         Examples:
-            >>> from hyper_parallel.core.layout import Layout, _DeviceMesh
-            >>> device_mesh = _DeviceMesh((2, 2), ("dp", "mp"), tuple(range(4)))
+            >>> from hyper_parallel.core.layout import Layout, DeviceMesh
+            >>> device_mesh = DeviceMesh("npu", (2, 2), nesh_dim_names=("dp", "mp"))
             >>> layout = Layout.from_device_mesh(device_mesh)
         """
         obj = cls.__new__(cls)
         obj._mesh = device_mesh
-        obj._alias_name = device_mesh.alias_name
+        obj._alias_name = device_mesh.mesh_dim_names
         obj._rank_list = device_mesh.rank_list
         obj._tensor_map = None
         obj._partial = [None] * len(device_mesh.mesh_shape)
@@ -240,9 +241,9 @@ class Layout:
             raise ValueError("The device_shape of layout is None")
         if self._tensor_map is None:
             raise ValueError("The tensor_map of layout is None")
-        interleaved_parallel = "interleaved_parallel" in self._mesh.alias_name
+        interleaved_parallel = "interleaved_parallel" in self._mesh.mesh_dim_names
         return {"mesh_shape": self._mesh.mesh_shape, "tensor_map": self._tensor_map,
-                "interleaved_parallel": interleaved_parallel, "alias_name": self._mesh.alias_name,
+                "interleaved_parallel": interleaved_parallel, "alias_name": self._mesh.mesh_dim_names,
                 "rank_list": self._rank_list}
 
     def placement_to_tensor_map(self, dim):
@@ -325,13 +326,13 @@ class Layout:
         for item in self._tensor_map:
             if isinstance(item, tuple):
                 mapped_tuple = tuple(
-                    self._mesh.alias_name[len(self._mesh.alias_name) - 1 - dim] if dim != -1 else "None"
+                    self._mesh.mesh_dim_names[len(self._mesh.mesh_dim_names) - 1 - dim] if dim != -1 else "None"
                     for dim in item
                 )
                 readable_map.append(mapped_tuple)
             else:
                 readable_map.append(
-                    self._mesh.alias_name[len(self._mesh.alias_name) - 1 - item] if item != -1 else "None"
+                    self._mesh.mesh_dim_names[len(self._mesh.mesh_dim_names) - 1 - item] if item != -1 else "None"
                 )
         return tuple(readable_map)
 
@@ -374,7 +375,8 @@ class Layout:
         return self._mesh
 
     def update_mesh(self):
-        self._mesh = _create_device_mesh(self.mesh_shape, self.alias_name, self.rank_list)
+        self._mesh = _create_device_mesh("npu", self.mesh_shape, mesh_dim_names=self.alias_name,
+                                         rank_list=self.rank_list)
 
     @property
     def rank_list(self):
@@ -393,7 +395,7 @@ class Layout:
     @property
     def alias_name(self):
         """alias name"""
-        return self._mesh.alias_name
+        return self._mesh.mesh_dim_names
 
     @property
     def alias_tensor_map(self):
@@ -490,8 +492,8 @@ class Layout:
         """
         return self._mesh.get_devices_for_axis(axis, rank)
 
-    def get_comm_group_by_axis(self, axis, rank):
-        return self._mesh.get_comm_group_by_axis(axis, rank)
+    def get_comm_group_by_axis(self, axis):
+        return self._mesh.get_comm_group_by_axis(axis)
 
     def repeat_num(self):
         """
@@ -504,7 +506,7 @@ class Layout:
         """
         if self._tensor_map is None:
             raise ValueError(f"The tensor_map is None, the mesh_shape is {self._mesh.mesh_shape},"
-                             f" alias_name is {self._mesh.alias_name}")
+                             f" alias_name is {self._mesh.mesh_dim_names}")
 
         # if it is not the last stage, return -1
         group_size = platform.get_world_size()
@@ -551,7 +553,7 @@ class Layout:
             str: layout string
         """
         device_info = f"Mesh shape: {self._mesh.mesh_shape}"
-        alias_info = f"Alias Names: {self._mesh.alias_name}"
+        alias_info = f"Alias Names: {self._mesh.mesh_dim_names}"
         rank_info = f"Rank List: {self._rank_list}"
         partial_info = f"Partial: {self.partial}"
 
@@ -563,18 +565,18 @@ class Layout:
                 if isinstance(item, tuple):
                     # 处理嵌套元组
                     mapped_tuple = tuple(
-                        self._mesh.alias_name[len(self._mesh.alias_name) - 1 - dim] if dim != -1 else "None"
+                        self._mesh.mesh_dim_names[len(self._mesh.mesh_dim_names) - 1 - dim] if dim != -1 else "None"
                         for dim in item
                     )
                     readable_map.append(mapped_tuple)
                 else:
                     readable_map.append(
-                        self._mesh.alias_name[len(self._mesh.alias_name) - 1 - item] if item != -1 else "None"
+                        self._mesh.mesh_dim_names[len(self._mesh.mesh_dim_names) - 1 - item] if item != -1 else "None"
                     )
 
             tensor_info = f"Tensor Map: {tuple(readable_map)}"
 
-        interleaved = "Yes" if "interleaved_parallel" in self._mesh.alias_name else "No"
+        interleaved = "Yes" if "interleaved_parallel" in self._mesh.mesh_dim_names else "No"
         interleaved_info = f"Interleaved Parallel: {interleaved}"
 
         return (

@@ -64,7 +64,7 @@ def test_distribute_region_disabled():
     tracker.distribute_region_enabled = False
 
     world_size = get_group_size()
-    device_mesh = DeviceMesh(list(ms.mint.arange(world_size)), ("dp",))
+    device_mesh = DeviceMesh("npu", list(ms.mint.arange(world_size)), mesh_dim_names=("dp",))
     placements = [Replicate()]
     global_shape = (8,10)
 
@@ -101,8 +101,9 @@ def test_multi_dim_sharding_offset():
 
     # Create 2D mesh: 2x4
     mesh_2d = DeviceMesh(
+        "npu",
         ms.mint.arange(world_size).reshape(2, 4).tolist(),
-        ("dp", "tp")
+        mesh_dim_names=("dp", "tp")
     )
 
     tracker = OffsetBasedRNGTracker(run_state_sync=False)
@@ -142,7 +143,7 @@ def test_rng_tracker():
     ms.manual_seed(rank)
     world_size = get_group_size()
 
-    mesh = init_device_mesh((world_size,), ("dp",))
+    mesh = init_device_mesh("npu", (world_size,), mesh_dim_names=("dp",))
 
     ms.manual_seed(123)
 

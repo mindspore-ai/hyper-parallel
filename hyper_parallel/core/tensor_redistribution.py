@@ -232,7 +232,7 @@ class TensorRedistribution:
 
     def _allreduce_along_dev_dim(self, x, op, layout, dev_dim):
         """Do allreduce at specified axis along dev_dim."""
-        group = layout.get_comm_group_by_axis(dev_dim, self.rank_id)
+        group = layout.get_comm_group_by_axis(dev_dim)
         zero_dim = x.dim() == 0
         if zero_dim:
             x = x.unsqueeze(0)
@@ -253,7 +253,7 @@ class TensorRedistribution:
     def _reduce_scatter_along_dev_dim_with_axis(self, x, axis, op, layout, dev_dim):
         """Do reduce_scatter at specified axis along dev_dim."""
         dev_num = layout.mesh_shape[layout.alias_name.index(dev_dim)]
-        group = layout.get_comm_group_by_axis(dev_dim, self.rank_id)
+        group = layout.get_comm_group_by_axis(dev_dim)
         output_tensor = self.platform.reduce_scatter(x, dev_num, axis, op, group)
         return output_tensor
 

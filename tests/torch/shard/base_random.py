@@ -62,7 +62,7 @@ def test_distribute_region_disabled():
     tracker.distribute_region_enabled = False
 
     world_size = dist.get_world_size()
-    device_mesh = DeviceMesh(list(torch.arange(world_size)), ("dp",))
+    device_mesh = DeviceMesh("npu", list(torch.arange(world_size)), mesh_dim_names=("dp",))
     placements = [Replicate()]
 
     initial_state = torch.npu.get_rng_state()
@@ -90,7 +90,7 @@ def test_multi_dim_sharding_offset():
     '''
     # Create 2D mesh
     world_size = dist.get_world_size()
-    mesh_2d = DeviceMesh(torch.arange(world_size).reshape(2, 4), ("dp","tp"))
+    mesh_2d = DeviceMesh("npu", torch.arange(world_size).reshape(2, 4), mesh_dim_names=("dp","tp"))
 
     tracker = OffsetBasedRNGTracker(run_state_sync=False)
     tracker._manual_seed(42)
@@ -127,7 +127,7 @@ def test_rng_tracker():
     world_size = dist.get_world_size()
     device_type = "npu"
 
-    mesh = init_device_mesh((world_size,), ("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("dp",))
 
     torch.manual_seed(123)
 

@@ -67,8 +67,9 @@ def test_base_dtensor():
     # --------------------------------------dist-------------------------------------
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(1, 8),
-        alias_name=("dp", "tp")
+        mesh_dim_names=("dp", "tp")
     )
 
     dist_model = SimpleModel(dist=True, mesh=mesh).npu()

@@ -30,8 +30,9 @@ def test_isin_layout_data_parallel():
     Expectation: Output layout identical to elements layout
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
 
     # elements: sharded on dim0 ("dp"), unsharded on dim1
@@ -40,7 +41,7 @@ def test_isin_layout_data_parallel():
 
     # test_elements: fully replicated (critical constraint)
     test_elements_placements = (Replicate(), Replicate())
-    test_elements_layout = _build_layout(mesh, test_elements_placements, 2) # tensor_map = (-1, -1)
+    test_elements_layout = _build_layout(mesh, test_elements_placements, 2)  # tensor_map = (-1, -1)
 
     output_layout = op.infer_layout((elements_layout, test_elements_layout), extra_args=None)
 
@@ -56,8 +57,9 @@ def test_isin_layout_mixed_parallel():
     Expectation: Output layout identical to elements layout
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 3, 4),
-        alias_name = ("dp", "tp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 3, 4),
+        mesh_dim_names=("dp", "tp", "mp")
     )
 
     # elements: sharded on dim0 ("dp"), unsharded on dim1, sharded on dim2 ("mp")
@@ -82,8 +84,9 @@ def test_isin_layout_invalid_test_elements_sharded():
     Expectation: ValueError raised with clear message
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
 
     # elements: fully replicated (valid)
@@ -105,8 +108,9 @@ def test_isin_layout_missing_test_elements():
     Expectation: ValueError raised
     """
     mesh = init_device_mesh(
-        mesh_shape = (2, 4),
-        alias_name = ("dp", "mp")
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "mp")
     )
 
     elements_placements = (Replicate(), Replicate())

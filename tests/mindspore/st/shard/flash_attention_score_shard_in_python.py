@@ -96,8 +96,9 @@ def test_flash_attention_score_model_parallel():
     alias_name = ("dp", "cp", "tp")
 
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=mesh_shape,
-        alias_name=alias_name
+        mesh_dim_names=alias_name
     )
 
     # Define placements using Placement format

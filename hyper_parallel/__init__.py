@@ -24,7 +24,7 @@ from hyper_parallel.core.shard.api import parallelize_value_and_grad
 from hyper_parallel.core.shard.local_func import custom_shard
 from hyper_parallel.core.pipeline_parallel import (PipelineStage, ScheduleInterleaved1F1B, MetaStep, MetaStepType,
                                                    BatchDimSpec)
-from hyper_parallel.distributed.distributed import (init_process_group, destroy_process_group,
+from hyper_parallel.collectives.cc import (init_process_group, destroy_process_group,
                                                     get_process_group_ranks, get_backend, split_group)
 
 __all__ = ["get_platform", "hsdp", "hsdp_sync_stream", "HSDPCell", "Layout", "DTensor",

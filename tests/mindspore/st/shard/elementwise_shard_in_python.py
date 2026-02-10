@@ -156,8 +156,9 @@ def test_minimum_same_shape_parallel_1():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Placement元组: (dp轴行为, cp轴行为, tp轴行为)
@@ -195,8 +196,9 @@ def test_less_equal_same_shape_parallel_2():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -233,8 +235,9 @@ def test_greater_equal_same_shape_parallel_3():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -271,8 +274,9 @@ def test_logical_or_same_shape_parallel_4():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -309,8 +313,9 @@ def test_minimum_broadcast_dim0_parallel_5():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -347,8 +352,9 @@ def test_minimum_broadcast_dim1_parallel_6():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -385,8 +391,9 @@ def test_minimum_broadcast_dim2_parallel_7():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -423,8 +430,9 @@ def test_minimum_broadcast_rank_mismatch_parallel_8():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -461,8 +469,9 @@ def test_minimum_broadcast_scalar_like_parallel_9():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -501,8 +510,9 @@ def test_less_equal_broadcast_multi_dim_parallel_10():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -539,8 +549,9 @@ def test_minimum_partial_shard_parallel_11():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Replicate(), Replicate(), Shard(2))
@@ -578,8 +589,9 @@ def test_mod_same_shape_parallel_12():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -616,8 +628,9 @@ def test_mod_broadcast_dim0_parallel_13():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -654,8 +667,9 @@ def test_mod_broadcast_dim1_parallel_14():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -692,8 +706,9 @@ def test_mod_broadcast_dim2_parallel_15():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -730,8 +745,9 @@ def test_mod_broadcast_rank_mismatch_parallel_16():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -768,8 +784,9 @@ def test_mod_tensor_scalar_parallel_17():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Shard(0), Shard(1), Shard(2))
@@ -804,8 +821,9 @@ def test_mod_partial_shard_parallel_18():
 
     # Parallel
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     x_placements = (Replicate(), Replicate(), Shard(2))  # Only last dimension sharded

@@ -38,7 +38,7 @@ def test_fully_shard_01():
     hidden_size = 32
     hidden_out = 64
     init_dist()
-    mesh = init_device_mesh(mesh_shape=(8,), alias_name=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     dense_model = DenseNet(hidden_size, hidden_out, has_bias=False)
     dense_model = fully_shard(dense_model,
                              mesh=mesh,
@@ -61,7 +61,7 @@ def test_fully_shard_02():
     hidden_size = 32
     dense_layer_num = 2
     init_dist()
-    mesh = init_device_mesh(mesh_shape=(8,), alias_name=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     multi_layer_net = FullyShardTestNet(32, dense_layer_num, has_bias=False)
     for dense_layer in multi_layer_net.dense_layers.layers:
         # Wrap each layer with fully_shard

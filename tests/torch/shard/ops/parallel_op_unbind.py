@@ -49,7 +49,7 @@ def test_distributed_unbind_dim0():
     standalone_output = torch.unbind(standalone_input, dim=0)
 
     # Distributed setup: Shard dim1 ("tp"), keep dim0 unsharded (to unbind)
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Shard(1))
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -92,7 +92,7 @@ def test_distributed_unbind_dim1():
     standalone_output = torch.unbind(standalone_input, dim=1)
 
     # Distributed setup: Shard dim0 ("dp"), keep dim1 unsharded
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -129,7 +129,7 @@ def test_distributed_unbind_negative_dim():
     standalone_output = torch.unbind(standalone_input, dim=-1)
 
     # Distributed setup: Shard dim0 ("dp"), dim1 ("tp"), Replicate dim2
-    mesh = init_device_mesh(mesh_shape=(2, 2, 2), alias_name=("dp", "tp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "tp", "mp"))
     x_placements = (Shard(0), Shard(1), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -165,7 +165,7 @@ def test_distributed_unbind_sharded_dim_error():
     standalone_input = torch.from_numpy(input_2d_np).npu()
 
     # Setup: Shard dim0 ("dp"), Replicate dim1
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)

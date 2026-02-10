@@ -49,7 +49,7 @@ def test_distributed_sort_basic():
     s_values, s_indices = torch.sort(standalone_input, dim=1, descending=False)
 
     # Distributed setup: Shard dim 0 ("dp"), Replicate dim 1 (sort dim)
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -83,7 +83,7 @@ def test_distributed_sort_descending():
     standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
     s_values, s_indices = torch.sort(standalone_input, dim=1, descending=True)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -111,7 +111,7 @@ def test_distributed_sort_middle_dim():
     s_values, s_indices = torch.sort(standalone_input, dim=1)
 
     # Mesh: (dp=4, tp=2). Input layout: (Shard(0), Replicate(), Shard(1))
-    mesh = init_device_mesh(mesh_shape=(4, 2), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate(), Shard(1))
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -143,7 +143,7 @@ def test_distributed_sort_negative_dim():
     standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
     s_values, s_indices = torch.sort(standalone_input, dim=-1)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -169,7 +169,7 @@ def test_distributed_sort_sharded_dim_error():
     standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
 
     # Shard dim 0 and Replicate dim 1
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)

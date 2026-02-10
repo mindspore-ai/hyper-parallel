@@ -29,7 +29,7 @@ def test_basic_conversion():
     """
     mesh_shape = (2, 2)
     alias_name = ("dp", "tp")
-    layout = Layout(mesh_shape, alias_name)
+    layout = Layout(mesh_shape, alias_name, init_backend=False)
 
     # Test placement_to_tensor_map
     layout.set_placements([Shard(0), Shard(1)])
@@ -57,7 +57,7 @@ def test_shard_combinations():
     """
     mesh_shape = (4, 2)
     alias_name = ("dp", "mp")
-    layout = Layout(mesh_shape, alias_name)
+    layout = Layout(mesh_shape, alias_name, init_backend=False)
 
     # Case 1: Reverse sharding
     layout.set_placements([Shard(1), Shard(0)])
@@ -89,7 +89,7 @@ def test_full_replication():
     """
     mesh_shape = (2, 2, 2)
     alias_name = ("dp", "sp", "mp")
-    layout = Layout(mesh_shape, alias_name)
+    layout = Layout(mesh_shape, alias_name, init_backend=False)
 
     layout.set_placements([Replicate(), Replicate(), Replicate()])
     t_map = layout.placement_to_tensor_map(dim=4)
@@ -110,7 +110,7 @@ def test_partial_shard_mixed():
     """
     mesh_shape = (2, 2)
     alias_name = ("dp", "mp")
-    layout = Layout(mesh_shape, alias_name)
+    layout = Layout(mesh_shape, alias_name, init_backend=False)
 
     # Mesh 0 -> Partial(sum), Mesh 1 -> Shard(0)
     layout.set_placements([Partial("sum"), Shard(0)])
@@ -136,7 +136,7 @@ def test_partial_reduce_ops():
     """
     mesh_shape = (2,)
     alias_name = ("dp",)
-    layout = Layout(mesh_shape, alias_name)
+    layout = Layout(mesh_shape, alias_name, init_backend=False)
 
     for op in ["min", "max", "avg"]:
         layout.set_placements([Partial(op)])
@@ -158,7 +158,7 @@ def test_conversion_errors():
     """
     mesh_shape = (2, 2)
     alias_name = ("dp", "mp")
-    layout = Layout(mesh_shape, alias_name)
+    layout = Layout(mesh_shape, alias_name, init_backend=False)
 
     # 1. Shard dimension out of bounds
     layout.set_placements([Shard(5), Replicate()])
@@ -185,7 +185,7 @@ def test_from_device_mesh():
     mesh_shape = (4, 2)
     alias_name = ("dp", "mp")
     rank_list = tuple(range(8))
-    device_mesh = init_device_mesh(mesh_shape, alias_name)
+    device_mesh = init_device_mesh("npu", mesh_shape, mesh_dim_names=alias_name, init_backend=False)
 
     layout = Layout.from_device_mesh(device_mesh)
 

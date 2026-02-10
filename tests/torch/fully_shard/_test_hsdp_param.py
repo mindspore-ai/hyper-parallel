@@ -45,7 +45,7 @@ def test_hsdp_param_v2_fsdp_1d_mesh():
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP (shard only)
-    device_mesh = init_device_mesh(mesh_shape=(world_size,), alias_name=("fsdp",))
+    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model and get parameter
@@ -94,8 +94,9 @@ def test_hsdp_param_v2_hsdp_2d_mesh():
     replicate_size = 2
     shard_size = world_size // replicate_size
     device_mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(replicate_size, shard_size),
-        alias_name=("replicate", "shard")
+        mesh_dim_names=("replicate", "shard")
     )
     mesh_info = HSDPMeshInfo(
         mesh=device_mesh,
@@ -142,7 +143,7 @@ def test_hsdp_param_v2_sharded_state_transitions():
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP
-    device_mesh = init_device_mesh(mesh_shape=(world_size,), alias_name=("fsdp",))
+    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model and parameter
@@ -202,7 +203,7 @@ def test_hsdp_param_v2_custom_shard_placement():
     world_size = dist.get_world_size()
 
     # Create 1D mesh
-    device_mesh = init_device_mesh(mesh_shape=(world_size,), alias_name=("fsdp",))
+    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model with 2D weight
@@ -246,7 +247,7 @@ def test_hsdp_param_v2_mixed_precision():
     world_size = dist.get_world_size()
 
     # Create mesh
-    device_mesh = init_device_mesh(mesh_shape=(world_size,), alias_name=("fsdp",))
+    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model
@@ -290,7 +291,7 @@ def test_hsdp_param_v2_all_gather_comm():
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP
-    device_mesh = init_device_mesh(mesh_shape=(world_size,), alias_name=("fsdp",))
+    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model with known values
@@ -332,7 +333,7 @@ def test_hsdp_param_v2_prefetch_unshard():
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP
-    device_mesh = init_device_mesh(mesh_shape=(world_size,), alias_name=("fsdp",))
+    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model
@@ -372,7 +373,7 @@ def test_hsdp_param_v2_unshard_shard_cycle():
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP
-    device_mesh = init_device_mesh(mesh_shape=(world_size,), alias_name=("fsdp",))
+    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model
@@ -413,7 +414,7 @@ def test_hsdp_param_v2_reduce_scatter_grad():
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP
-    device_mesh = init_device_mesh(mesh_shape=(world_size,), alias_name=("fsdp",))
+    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model
@@ -471,8 +472,9 @@ def test_hsdp_param_v2_all_reduce_grad():
     replicate_size = 2
     shard_size = world_size // replicate_size
     device_mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(replicate_size, shard_size),
-        alias_name=("replicate", "shard")
+        mesh_dim_names=("replicate", "shard")
     )
     mesh_info = HSDPMeshInfo(
         mesh=device_mesh,
@@ -532,7 +534,7 @@ def test_hsdp_param_v2_accumulate_grad():
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP
-    device_mesh = init_device_mesh(mesh_shape=(world_size,), alias_name=("fsdp",))
+    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model

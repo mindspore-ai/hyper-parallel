@@ -47,7 +47,7 @@ def test_distributed_pad_basic_unsharded():
     standalone_output = F.pad(standalone_input, (1, 1, 2, 2), mode='constant', value=0.5)
 
     # Distributed setup
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     # Shard dim 0 (Batch), Replicate others
     x_placements = (Shard(0), Replicate(), Replicate(), Replicate())
 
@@ -82,7 +82,7 @@ def test_distributed_pad_zero_on_sharded_dim():
     pad_args = (1, 1, 0, 0, 0, 0, 0, 0)
     standalone_output = F.pad(standalone_input, pad_args, mode='constant', value=0)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate(), Replicate(), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -112,7 +112,7 @@ def test_distributed_pad_sharded_dim_error():
 
     standalone_input = torch.from_numpy(input_4d_np).npu()
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     # Shard dim 0
     x_placements = (Shard(0), Replicate(), Replicate(), Replicate())
 

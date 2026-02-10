@@ -90,8 +90,9 @@ def test_bmm_ext_partial_model_parallel():
     # Parallel
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Define placements using Placement format
@@ -128,8 +129,9 @@ def test_bmm_partial_transpose_model_parallel():
     # Parallel
     # Create DeviceMesh
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=base_mesh_shape,
-        alias_name=base_alias_name
+        mesh_dim_names=base_alias_name
     )
 
     # Define placements using Placement format

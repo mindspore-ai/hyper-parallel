@@ -44,7 +44,7 @@ def test_distributed_cumsum_layout_inference():
     standalone_output = torch.cumsum(standalone_input, dim=cumsum_dim)
 
     # Distributed setup: shard on dim=0 ("dp"), keep dim=1 unsharded for cumsum
-    mesh = init_device_mesh(mesh_shape = (2, 4), alias_name = ("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())  # dim=0 sharded, dim=1 unsharded → VALID for cumsum(dim=1)
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
@@ -71,7 +71,7 @@ def test_distributed_cumsum_sharded_dim_error():
     init_dist()
     cumsum_dim = 0  # Attempt cumsum along dimension 0 (which will be sharded)
 
-    mesh = init_device_mesh(mesh_shape = (2, 4), alias_name = ("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     standalone_input = torch.from_numpy(standalone_input_np).npu()
@@ -102,7 +102,7 @@ def test_distributed_cumsum_negative_dim_support():
     standalone_input = torch.from_numpy(standalone_input_np).npu()
     standalone_output = torch.cumsum(standalone_input, dim=cumsum_dim)
 
-    mesh = init_device_mesh(mesh_shape = (2, 4), alias_name = ("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())  # dim=0 sharded
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)

@@ -76,9 +76,9 @@ class CumsumDistributedOp(DistributedOp):
                     f"but found sharding assignment: {in_tensor_map[normalized_dim]}"
                 )
 
-        mesh_shape=input_layout.mesh_shape
-        alias_name=input_layout.alias_name
-        rank_list=input_layout.rank_list
+        mesh_shape = input_layout.mesh_shape
+        alias_name = input_layout.alias_name
+        rank_list = input_layout.rank_list
 
         # Create output layout
         def idx_to_alias(idx, aliases):

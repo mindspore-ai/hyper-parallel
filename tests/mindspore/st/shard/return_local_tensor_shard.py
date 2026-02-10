@@ -89,8 +89,9 @@ def base_case(dp, mp, hsdp_shard_size):
     local_x = np.ones([local_batch_size, local_input_size]).astype(np.float32)
 
     mesh = init_device_mesh(
+        device_type="npu",
         mesh_shape=(dp, mp),
-        alias_name=("dp", "tp")
+        mesh_dim_names=("dp", "tp")
     )
 
     x_placements = (Shard(0), Shard(1))

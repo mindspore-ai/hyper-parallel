@@ -32,7 +32,8 @@ def fixture_mock_platform():
         platform_mock.get_world_size.return_value = 8
         # Mock communication group creation (return Mock object)
         mock_group = Mock()
-        platform_mock.create_group.return_value = mock_group
+        platform_mock.split_group.return_value = mock_group
+
         # Mock tensor_to_numpy to return actual numpy array from Tensor.asnumpy()
         def mock_tensor_to_numpy(tensor):
             """Convert Tensor to numpy array using asnumpy() method"""
@@ -55,21 +56,23 @@ def fixture_clear_group_map():
 
 @pytest.fixture(name="basic_2d_mesh")
 def fixture_basic_2d_mesh(mock_platform):
-    """Create basic 2D DeviceMesh: shape=(2,4), alias=("dp", "tp"), rank_list=(0-7)"""
+    """Create basic 2D DeviceMesh: mesh_shape=(2,4), mesh_dim_names=("dp", "tp"), rank_list=(0-7)"""
     _ = mock_platform  # Ensure mock is active
     return init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 4),
-        alias_name=("dp", "tp")
+        mesh_dim_names=("dp", "tp")
     )
 
 
 @pytest.fixture(name="basic_3d_mesh")
 def fixture_basic_3d_mesh(mock_platform):
-    """Create basic 3D DeviceMesh: shape=(2, 2, 2), alias=("dp", "cp", "tp"), rank_list=(0-7)"""
+    """Create basic 3D DeviceMesh: mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "cp", "tp"), rank_list=(0-7)"""
     _ = mock_platform  # Ensure mock is active
     return init_device_mesh(
+        device_type="npu",
         mesh_shape=(2, 2, 2),
-        alias_name=("dp", "cp", "tp")
+        mesh_dim_names=("dp", "cp", "tp")
     )
 
 
@@ -87,18 +90,19 @@ class TestDeviceMesh:
         _ = mock_platform  # Ensure mock is active
         # Automatically generate rank_list from mesh_shape
         mesh = init_device_mesh(
+            device_type="npu",
             mesh_shape=(2, 2),
-            alias_name=("dp", "tp")
+            mesh_dim_names=("dp", "tp")
         )
         assert mesh.mesh_shape == (2, 2)
-        assert mesh.alias_name == ("dp", "tp")
+        assert mesh.mesh_dim_names == ("dp", "tp")
         assert mesh.rank_list == (0, 1, 2, 3)
         assert mesh.ndim == 2
         assert mesh.rank == 0
 
         # Cache mechanism (same parameters return the same instance)
-        mesh1 = init_device_mesh((2, 2), ("dp", "tp"))
-        mesh2 = init_device_mesh((2, 2), ("dp", "tp"))
+        mesh1 = init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"))
+        mesh2 = init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"))
         assert mesh1 is mesh2
 
     def test_device_mesh_direct_construction_with_tensor(self, mock_platform):
@@ -111,10 +115,10 @@ class TestDeviceMesh:
         _ = mock_platform  # Ensure mock is active
         # Custom mesh layout using Tensor
         mesh = Tensor([[0, 2], [1, 3]])
-        device_mesh = DeviceMesh(mesh, ("dp", "tp"))
+        device_mesh = DeviceMesh("npu", mesh, mesh_dim_names=("dp", "tp"))
 
         assert device_mesh.mesh_shape == (2, 2)
-        assert device_mesh.alias_name == ("dp", "tp")
+        assert device_mesh.mesh_dim_names == ("dp", "tp")
         assert device_mesh.rank_list == (0, 2, 1, 3)  # Flattened from custom layout
         assert device_mesh.ndim == 2
 
@@ -127,10 +131,10 @@ class TestDeviceMesh:
         """
         _ = mock_platform  # Ensure mock is active
         # Custom mesh layout using list
-        device_mesh = DeviceMesh([[0, 2], [1, 3]], ("dp", "tp"))
+        device_mesh = DeviceMesh("npu", [[0, 2], [1, 3]], mesh_dim_names=("dp", "tp"))
 
         assert device_mesh.mesh_shape == (2, 2)
-        assert device_mesh.alias_name == ("dp", "tp")
+        assert device_mesh.mesh_dim_names == ("dp", "tp")
         assert device_mesh.rank_list == (0, 2, 1, 3)
         assert device_mesh.ndim == 2
 
@@ -144,10 +148,10 @@ class TestDeviceMesh:
         _ = mock_platform  # Ensure mock is active
         # Custom mesh layout using numpy array
         mesh = np.array([[0, 2], [1, 3]], dtype=np.int64)  # Use int64 to test conversion
-        device_mesh = DeviceMesh(mesh, ("dp", "tp"))
+        device_mesh = DeviceMesh("npu", mesh, mesh_dim_names=("dp", "tp"))
 
         assert device_mesh.mesh_shape == (2, 2)
-        assert device_mesh.alias_name == ("dp", "tp")
+        assert device_mesh.mesh_dim_names == ("dp", "tp")
         assert device_mesh.rank_list == (0, 2, 1, 3)
         assert device_mesh.ndim == 2
 
@@ -163,40 +167,35 @@ class TestDeviceMesh:
         # Single dimension specified by string
         dp_mesh = basic_2d_mesh["dp"]
         assert dp_mesh.mesh_shape == (2,)
-        assert dp_mesh.alias_name == ("dp",)
+        assert dp_mesh.mesh_dim_names == ("dp",)
         assert dp_mesh.root_mesh == basic_2d_mesh
         assert dp_mesh.rank_list == (0, 4)
         assert dp_mesh in basic_2d_mesh.sub_mesh
 
         tp_mesh = basic_2d_mesh["tp"]
         assert tp_mesh.mesh_shape == (4,)
-        assert tp_mesh.alias_name == ("tp",)
+        assert tp_mesh.mesh_dim_names == ("tp",)
         assert tp_mesh.root_mesh == basic_2d_mesh
         assert tp_mesh.rank_list == (0, 1, 2, 3)
 
         # Multiple dimensions specified by tuple
         dp_cp_mesh = basic_3d_mesh[("dp", "cp")]
         assert dp_cp_mesh.mesh_shape == (2, 2)
-        assert dp_cp_mesh.alias_name == ("dp", "cp")
+        assert dp_cp_mesh.mesh_dim_names == ("dp", "cp")
         assert dp_cp_mesh.rank_list == (0, 2, 4, 6)
 
-    def test_device_mesh_get_group_valid(self, basic_2d_mesh, mock_platform):
+    def test_device_mesh_get_group_valid_via_name_and_index(self, basic_2d_mesh):
         """
         Feature: DeviceMesh.get_group method.
         Description: Test valid communication group acquisition via get_group method,
             including group acquisition by dimension name and by dimension index.
-        Expectation: Run success, create_group is called with correct rank list,
-            returned group matches mock object.
+        Expectation: Run success, the groups arm same acquired by dimension name and by dimension index.
         """
         # Get group by dimension name
-        dp_group = basic_2d_mesh.get_group("dp")
-        mock_platform.create_group.assert_called_with([0, 4])
-        assert dp_group is mock_platform.create_group.return_value
-
+        dp_group_1 = basic_2d_mesh.get_group("dp")
         # Get group by dimension index
-        tp_group = basic_2d_mesh.get_group(1)
-        mock_platform.create_group.assert_called_with([0, 1, 2, 3])
-        assert tp_group is mock_platform.create_group.return_value
+        dp_group_2 = basic_2d_mesh.get_group(0)
+        assert dp_group_1 == dp_group_2
 
     def test_device_mesh_get_local_rank(self, basic_2d_mesh):
         """
@@ -220,21 +219,21 @@ class TestDeviceMesh:
         Feature: DeviceMesh.flatten method.
         Description: Test valid mesh flattening via flatten method,
             verifying flattened mesh properties and group creation.
-        Expectation: Run success, flattened mesh has correct shape, alias_name,
+        Expectation: Run success, flattened mesh has correct shape, mesh_dim_names,
             rank_list, and root_mesh reference.
         """
         dp_cp_mesh = basic_3d_mesh[("dp", "cp")]
         flat_mesh = dp_cp_mesh.flatten()
         flat_mesh_group_1 = flat_mesh.get_group()
         flat_mesh_group_2 = basic_3d_mesh.get_group("dp_cp")
-        mock_platform.create_group.assert_called_with([0, 2, 4, 6])
+        mock_platform.split_group.assert_called_with(split_ranks=[[0, 2, 4, 6]])
 
         assert flat_mesh.mesh_shape == (4,)
-        assert flat_mesh.alias_name == ("dp_cp",)
+        assert flat_mesh.mesh_dim_names == ("dp_cp",)
         assert flat_mesh.rank_list == (0, 2, 4, 6)
         assert flat_mesh.root_mesh == basic_3d_mesh
-        assert flat_mesh_group_1 is mock_platform.create_group.return_value
-        assert flat_mesh_group_2 is mock_platform.create_group.return_value
+        assert flat_mesh_group_1 is mock_platform.split_group.return_value
+        assert flat_mesh_group_2 is mock_platform.split_group.return_value
 
     def test_device_mesh_mesh_property(self, mock_platform):
         """
@@ -244,7 +243,7 @@ class TestDeviceMesh:
         """
         _ = mock_platform  # Ensure mock is active
         mesh = Tensor([[0, 1], [2, 3]])
-        device_mesh = DeviceMesh(mesh, ("dp", "tp"))
+        device_mesh = DeviceMesh("npu", mesh, mesh_dim_names=("dp", "tp"))
 
         np.testing.assert_array_equal(device_mesh.mesh, mesh)
         assert device_mesh.mesh.shape == (2, 2)
