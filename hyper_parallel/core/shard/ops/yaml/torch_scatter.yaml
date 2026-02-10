@@ -1,0 +1,4 @@
+scatter:
+  dist_op_name: _torch_scatter_dist_op
+  distributed_op_class: ScatterDistributedOp
+  distributed_op_file: parallel_scatter
