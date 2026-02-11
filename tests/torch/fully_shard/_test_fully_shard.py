@@ -14,6 +14,7 @@
 # ============================================================================
 """test fully_shard api"""
 import os
+
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 # pylint: disable=W0611
@@ -41,11 +42,11 @@ def test_fully_shard_01():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     dense_model = DenseNet(hidden_size, hidden_out, has_bias=False)
     dense_model = fully_shard(dense_model,
-                             mesh=mesh,
-                             reshard_after_forward=True,
-                             mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32,
-                                                   output_dtype=torch.float32, cast_forward_inputs=True)
-                             )
+                              mesh=mesh,
+                              reshard_after_forward=True,
+                              mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32,
+                                                             output_dtype=torch.float32, cast_forward_inputs=True)
+                              )
     input_data = torch.rand(batch_size, hidden_size).npu()
     with SkipDTensorDispatch():
         train(dense_model, input_data, comm_async=True, train_steps=2)
@@ -109,3 +110,28 @@ def test_fully_shard_03():
     input_data = torch.rand(batch_size, hidden_size).npu()
     with SkipDTensorDispatch():
         train(net, input_data, comm_async=True, train_steps=2)
+
+
+def test_fully_shard_from_group_mesh():
+    """
+    Feature: When mesh created by from_group, test fully_shard with simple network, optimization level is default ZeRO-3
+    Description: The DenseNet only have one weight and no bias, verify the basic process of fully_shard
+    Expectation: run successfully
+    """
+    batch_size = 4
+    hidden_size = 32
+    hidden_out = 64
+    init_dist()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=["dp"])
+    dp_group = mesh.get_group()
+    device_mesh = DeviceMesh.from_group(dp_group, device_type="npu", mesh_dim_names=["shard"])
+    dense_model = DenseNet(hidden_size, hidden_out, has_bias=False)
+    dense_model = fully_shard(dense_model,
+                              mesh=device_mesh,
+                              reshard_after_forward=True,
+                              mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32,
+                                                             output_dtype=torch.float32, cast_forward_inputs=True)
+                              )
+    input_data = torch.rand(batch_size, hidden_size).npu()
+    with SkipDTensorDispatch():
+        train(dense_model, input_data, comm_async=True, train_steps=2)

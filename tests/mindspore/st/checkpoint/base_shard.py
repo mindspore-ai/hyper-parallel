@@ -120,6 +120,7 @@ def base_case(dp, mp):
     save_layout(layout_dict, file_name)
     assert os.path.isfile(file_name)
     layout_dict = load_layout(file_name)
+    os.remove(file_name)
     assert isinstance(layout_dict, dict)
 
 

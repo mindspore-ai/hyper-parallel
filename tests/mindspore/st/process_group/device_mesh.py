@@ -32,7 +32,7 @@ def test_device_mesh_from_1d_group_valid():
         mesh_dim_names=("dp",)
     )
     group = device_mesh_init.get_group()
-    device_mesh = DeviceMesh.from_group(group, mesh_dim_names=("tp",))
+    device_mesh = DeviceMesh.from_group(group, "npu", mesh_dim_names=("tp",))
     tp_mesh = device_mesh["tp"]
     assert tp_mesh.mesh_shape == (8,)
     assert tp_mesh.mesh_dim_names == ("tp",)
@@ -55,6 +55,7 @@ def test_device_mesh_from_2d_group_valid():
     mesh_init = device_mesh_init.mesh
     device_mesh = DeviceMesh.from_group(
         [dp_group, tp_group],
+        "npu",
         mesh=(mesh_init[0], mesh_init[1]),
         mesh_dim_names=("tp", "cp")
     )
@@ -94,6 +95,7 @@ def test_device_mesh_from_3d_group_valid():
     mesh_init = device_mesh_init.mesh
     device_mesh = DeviceMesh.from_group(
         [dp_group, tp_group],
+        "npu",
         mesh=mesh_init[:, :, device_mesh_init.get_local_rank("cp")],
         mesh_dim_names=("dp", "tp")
     )

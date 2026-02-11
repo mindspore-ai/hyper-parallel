@@ -21,6 +21,7 @@ import numpy as np
 from hyper_parallel import Layout
 from hyper_parallel.core.checkpoint.reshard import ReshardHandler
 from hyper_parallel.core.checkpoint.reshard import infer_slice_area_by_rank
+from tests.common.mark_utils import arg_mark
 
 
 def get_slice_data(full_data, offset):
@@ -55,9 +56,7 @@ def reshard_tensor_func(param_name, full_shape, from_layout, to_layout, to_rank_
     assert np.all(actual_result == expect_result)
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_reshard_between_layout_and_none_layout():
     """
     Feature: Resharding between a normal layout and a none layout.
@@ -68,7 +67,7 @@ def test_reshard_between_layout_and_none_layout():
     param_name = "weight"
     full_shape = (64, 64)
 
-    layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)))
+    layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)), init_backend=False)
     layout = layout(('rep', 'cp'), 'tp')
 
     rank_id = 19
@@ -76,9 +75,7 @@ def test_reshard_between_layout_and_none_layout():
     reshard_tensor_func(param_name, full_shape, None, layout, rank_id)
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_wrong_to_rank_id_while_to_layout_not_none():
     """
     Feature: Resharding when to_layout is normal, but to_rank_id is not in to_rank_list.
@@ -89,7 +86,7 @@ def test_wrong_to_rank_id_while_to_layout_not_none():
     param_name = "weight"
     full_shape = (64, 64)
 
-    layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)))
+    layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)), init_backend=False)
     layout = layout(('rep', 'cp'), 'tp')
 
     rank_id = 32
@@ -97,9 +94,7 @@ def test_wrong_to_rank_id_while_to_layout_not_none():
         ReshardHandler(param_name, full_shape, None, layout, rank_id)
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_wrong_to_rank_id_while_to_layout_is_none():
     """
     Feature: Resharding between a normal layout and a none layout, to_layout is none and to_rank_id is not 0.
@@ -110,15 +105,13 @@ def test_wrong_to_rank_id_while_to_layout_is_none():
     param_name = "weight"
     full_shape = (64, 64)
 
-    layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)))
+    layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)), init_backend=False)
     layout = layout(('rep', 'cp'), 'tp')
 
     reshard_tensor_func(param_name, full_shape, layout, None, 2)
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_shape_not_even_divided_by_mesh_shape():
     """
     Feature: Resharding when dev can not divide tensor shape.
@@ -129,16 +122,14 @@ def test_shape_not_even_divided_by_mesh_shape():
     param_name = "weight"
     full_shape = (64, 65)
 
-    layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)))
+    layout = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)), init_backend=False)
     layout = layout(('rep', 'cp'), 'tp')
 
     with pytest.raises(ValueError, match=r'Shape can not divided'):
         reshard_tensor_func(param_name, full_shape, layout, None, 0)
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_reshard_between_fully_shard():
     """
     Feature: Resharding between fully sharded modes.
@@ -149,10 +140,10 @@ def test_reshard_between_fully_shard():
     param_name = "weight"
     full_shape = (64, 64)
 
-    layout_0 = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)))
+    layout_0 = Layout((2, 2, 2, 2), ('dp', 'cp', 'rep', 'tp'), rank_list=list(range(16, 32)), init_backend=False)
     from_layout = layout_0(('rep', 'cp'), 'tp')
 
-    layout_1 = Layout((2, 4), ('dp', 'tp'), rank_list=list(range(8, 16)))
+    layout_1 = Layout((2, 4), ('dp', 'tp'), rank_list=list(range(8, 16)), init_backend=False)
     to_layout = layout_1('dp', 'tp')
 
     from_rank_id = 19
@@ -161,9 +152,7 @@ def test_reshard_between_fully_shard():
     reshard_tensor_func(param_name, full_shape, to_layout, from_layout, from_rank_id)
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_reshard_between_fully_shard_and_not_shard():
     """
     Feature: Resharding between fully sharded and non-sharded modes.
@@ -174,10 +163,10 @@ def test_reshard_between_fully_shard_and_not_shard():
     param_name = "weight"
     full_shape = (64, 64)
 
-    layout_0 = Layout((2, 4, 4), ('dp', 'cp', 'tp'), rank_list=list(range(32, 64)))
+    layout_0 = Layout((2, 4, 4), ('dp', 'cp', 'tp'), rank_list=list(range(32, 64)), init_backend=False)
     from_layout = layout_0(('cp', 'dp'), 'tp')
 
-    layout_1 = Layout((8,), ('dp',), rank_list=list(range(0, 8)))
+    layout_1 = Layout((8,), ('dp',), rank_list=list(range(0, 8)), init_backend=False)
     to_layout = layout_1('None', 'None')
 
     from_rank_id = 35
@@ -186,9 +175,7 @@ def test_reshard_between_fully_shard_and_not_shard():
     reshard_tensor_func(param_name, full_shape, to_layout, from_layout, from_rank_id)
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_reshard_between_not_fully_shard():
     """
     Feature: Resharding between non-fully sharded modes.
@@ -199,10 +186,10 @@ def test_reshard_between_not_fully_shard():
     param_name = "weight"
     full_shape = (64, 64)
 
-    layout_0 = Layout((2, 4, 4), ('dp', 'cp', 'tp'), rank_list=list(range(32, 64)))
+    layout_0 = Layout((2, 4, 4), ('dp', 'cp', 'tp'), rank_list=list(range(32, 64)), init_backend=False)
     from_layout = layout_0('cp', 'tp')
 
-    layout_1 = Layout((2, 4, 4), ('dp', 'cp', 'tp'), rank_list=list(range(0, 32)))
+    layout_1 = Layout((2, 4, 4), ('dp', 'cp', 'tp'), rank_list=list(range(0, 32)), init_backend=False)
     to_layout = layout_1('tp', 'dp')
 
     from_rank_id = 35
@@ -211,9 +198,7 @@ def test_reshard_between_not_fully_shard():
     reshard_tensor_func(param_name, full_shape, to_layout, from_layout, from_rank_id)
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_from_tensor_map_missing_rank():
     """
     Feature: Exception handling for incomplete from_tensor_map.
@@ -224,10 +209,10 @@ def test_from_tensor_map_missing_rank():
     param_name = "weight"
     full_shape = (64, 64)
 
-    layout_0 = Layout((2, 4, 4), ('dp', 'cp', 'tp'), rank_list=list(range(32, 64)))
+    layout_0 = Layout((2, 4, 4), ('dp', 'cp', 'tp'), rank_list=list(range(32, 64)), init_backend=False)
     from_layout = layout_0(('cp', 'dp'), 'tp')
 
-    layout_1 = Layout((8,), ('dp',), rank_list=list(range(0, 8)))
+    layout_1 = Layout((8,), ('dp',), rank_list=list(range(0, 8)), init_backend=False)
     to_layout = layout_1('None', 'None')
 
     to_rank_id = 7
@@ -248,9 +233,7 @@ def test_from_tensor_map_missing_rank():
         reshard.get_real_tensor(from_tensor_map)
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_cpu
-@pytest.mark.env_onecard
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_from_tensor_map_has_unexpected_data():
     """
     Feature: Exception handling for invalid data in from_tensor_map.
@@ -261,10 +244,10 @@ def test_from_tensor_map_has_unexpected_data():
     param_name = "weight"
     full_shape = (64, 64)
 
-    layout_0 = Layout((2, 4, 4), ('dp', 'cp', 'tp'), rank_list=list(range(32, 64)))
+    layout_0 = Layout((2, 4, 4), ('dp', 'cp', 'tp'), rank_list=list(range(32, 64)), init_backend=False)
     from_layout = layout_0(('cp', 'dp'), 'tp')
 
-    layout_1 = Layout((8,), ('dp',), rank_list=list(range(0, 8)))
+    layout_1 = Layout((8,), ('dp',), rank_list=list(range(0, 8)), init_backend=False)
     to_layout = layout_1('None', 'None')
 
     to_rank_id = 7

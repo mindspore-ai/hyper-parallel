@@ -454,7 +454,8 @@ class TorchPlatform(Platform):
         """
         try:
             _get_default_group()
-        except ValueError:
+        # except multi version error
+        except (ValueError, RuntimeError):
             if backend is None:
                 backend = "hccl"
             dist.init_process_group(backend=backend, init_method=init_method, timeout=timeout, world_size=world_size,
