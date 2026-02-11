@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""save load layout"""
+"""Layout I/O utilities for saving, loading and gathering layout information."""
 import json
 import os
 from pathlib import Path
@@ -27,7 +27,7 @@ def get_current_layout(cell):
     """
     Get current layout from cell
     Args:
-        cell: instance of Cell
+        cell (Any): Instance of Cell (model/network object).
 
     Returns:
         dict: A dictionary where keys are rank IDs and values are dictionaries
@@ -104,7 +104,7 @@ def get_global_layout(cell) -> dict:
     Get global layout information from all ranks, and gather them into a dict.
 
     Args:
-        cell: instance of Cell
+        cell (Any): Instance of Cell (model/network object).
 
     Return:
         dict: A dictionary containing the global layout information keyed by rank ID.

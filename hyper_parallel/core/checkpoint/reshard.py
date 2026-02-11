@@ -14,7 +14,7 @@
 # ============================================================================
 """resharding tensor"""
 import operator
-from typing import Dict, List, Tuple, Optional, Any, Union
+from typing import Any, Optional, Union
 from functools import reduce
 import numpy as np
 
@@ -24,8 +24,8 @@ def check_layout(layout: Optional[Any], name: str) -> None:
     Validates that a layout contains required attributes with correct types.
 
     Args:
-        layout: Layout object to validate
-        name: Name of the layout (for error messages)
+        layout (Optional[Any]): Layout object to validate.
+        name (str): Name of the layout (for error messages).
 
     Raises:
         ValueError: If layout missing required attributes or has size mismatches
@@ -64,16 +64,16 @@ def check_layout(layout: Optional[Any], name: str) -> None:
         )
 
 
-def rank_id_to_dev_id_list(mesh_shape: Tuple[int, ...], rank_id: int) -> List[int]:
+def rank_id_to_dev_id_list(mesh_shape: tuple[int, ...], rank_id: int) -> list[int]:
     """
     Converts a rank ID to a list of device IDs based on the mesh shape.
 
     Args:
-        mesh_shape: Shape of the mesh shape
-        rank_id: Global rank ID to convert
+        mesh_shape (tuple[int, ...]): Shape of the mesh shape.
+        rank_id (int): Global rank ID to convert.
 
     Returns:
-        List of device IDs corresponding to the rank
+        list[int]: List of device IDs corresponding to the rank.
     """
     dims = len(mesh_shape)
     dev_id_list = [0] * dims
@@ -86,18 +86,18 @@ def rank_id_to_dev_id_list(mesh_shape: Tuple[int, ...], rank_id: int) -> List[in
 
 
 def infer_intersection(
-        area_a: Tuple[Tuple[int, int], ...],
-        area_b: Tuple[Tuple[int, int], ...]
-) -> Optional[Tuple[Tuple[int, int], ...]]:
+        area_a: tuple[tuple[int, int], ...],
+        area_b: tuple[tuple[int, int], ...]
+) -> Optional[tuple[tuple[int, int], ...]]:
     """
     Calculates the intersection of two tensor slice areas.
 
     Args:
-        area_a: First area to intersect
-        area_b: Second area to intersect
+        area_a (tuple[tuple[int, int], ...]): First area to intersect.
+        area_b (tuple[tuple[int, int], ...]): Second area to intersect.
 
     Returns:
-        Tuple of intersection boundaries or None if no intersection
+        Optional[tuple[tuple[int, int], ...]]: Tuple of intersection boundaries or None if no intersection.
     """
     # Validate input formats
     def is_valid_axis_list(axis_list: Any) -> None:
@@ -118,7 +118,7 @@ def infer_intersection(
         )
 
     # Calculate intersection for each dimension
-    intersection: List[Tuple[int, int]] = []
+    intersection: list[tuple[int, int]] = []
     for axis_range_a, axis_range_b in zip(area_a, area_b):
         left = max(axis_range_a[0], axis_range_b[0])
         right = min(axis_range_a[1], axis_range_b[1])
@@ -132,22 +132,22 @@ def infer_intersection(
 
 
 def infer_slice_area_by_rank(
-        mesh_shape: Tuple[int, ...],
-        tensor_map: Union[List[int], Tuple[int, ...]],
+        mesh_shape: tuple[int, ...],
+        tensor_map: Union[list[int], tuple[int, ...]],
         rank_id: int,
-        full_shape: Tuple[int, ...]
-) -> Tuple[Tuple[int, int], ...]:
+        full_shape: tuple[int, ...]
+) -> tuple[tuple[int, int], ...]:
     """
     Calculates the tensor slice boundaries for a specific rank.
 
     Args:
-        mesh_shape: Shape of the mesh shape
-        tensor_map: Mapping of tensor dimensions to device dimensions
-        rank_id: Rank ID to calculate slice for
-        full_shape: Complete shape of the original tensor
+        mesh_shape (tuple[int, ...]): Shape of the mesh shape.
+        tensor_map (Union[list[int], tuple[int, ...]]): Mapping of tensor dimensions to device dimensions.
+        rank_id (int): Rank ID to calculate slice for.
+        full_shape (tuple[int, ...]): Complete shape of the original tensor.
 
     Returns:
-        Tuple of (start, end) boundaries for each tensor dimension
+        tuple[tuple[int, int], ...]: Tuple of (start, end) boundaries for each tensor dimension.
     """
     # Helper to get device count along a dimension
     def _get_dev_num_along_dim(dim: int) -> int:
@@ -155,7 +155,7 @@ def infer_slice_area_by_rank(
 
     dims = len(full_shape)
     dev_id_list = rank_id_to_dev_id_list(mesh_shape, rank_id)
-    area: List[Tuple[int, int]] = []
+    area: list[tuple[int, int]] = []
 
     for axis in range(dims):
         mapping = tensor_map[axis]
@@ -196,11 +196,11 @@ class ReshardHandler:
     input layouts, and assembles the final tensor for the target rank.
 
     Args:
-        param_name: Name of the parameter (without pipeline stage prefix)
-        full_shape: Complete shape of the tensor before sharding
-        from_layout: Source layout containing mesh shape, tensor map, and rank list
-        to_layout: Target layout containing mesh shape, tensor map, and rank list
-        to_rank_id: Target rank ID to receive the resharded tensor
+        param_name (str): Name of the parameter (without pipeline stage prefix).
+        full_shape (tuple[int, ...]): Complete shape of the tensor before sharding.
+        from_layout (Optional[Any]): Source layout containing mesh shape, tensor map, and rank list.
+        to_layout (Optional[Any]): Target layout containing mesh shape, tensor map, and rank list.
+        to_rank_id (int): Target rank ID to receive the resharded tensor.
 
     Raises:
         ValueError: If both layouts are None or layouts contain invalid attributes
@@ -209,7 +209,7 @@ class ReshardHandler:
     def __init__(
             self,
             param_name: str,
-            full_shape: Tuple[int, ...],
+            full_shape: tuple[int, ...],
             from_layout: Optional[Any],
             to_layout: Optional[Any],
             to_rank_id: int
@@ -261,16 +261,16 @@ class ReshardHandler:
             self._infer_inner_deredundancy_rank_list_by_from_layout()
             if from_layout else [0]
         )
-        self.global_union_area_map: Dict[int, Tuple[Tuple[int, int], ...]] = {}
+        self.global_union_area_map: dict[int, tuple[tuple[int, int], ...]] = {}
 
-    def _infer_inner_deredundancy_rank_list_by_from_layout(self) -> List[int]:
+    def _infer_inner_deredundancy_rank_list_by_from_layout(self) -> list[int]:
         """
         Infers ranks containing non-redundant data from the source layout.
 
         Returns:
             List of ranks with unique data slices
         """
-        inner_deredundancy_rank_list: List[int] = []
+        inner_deredundancy_rank_list: list[int] = []
         dev_dim = len(self.from_mesh_shape)
 
         # Collect relevant device dimensions from tensor map
@@ -301,7 +301,7 @@ class ReshardHandler:
 
         return inner_deredundancy_rank_list
 
-    def infer_all_tensor_offset(self) -> Dict[int, Tuple[Tuple[int, int], ...]]:
+    def infer_all_tensor_offset(self) -> dict[int, tuple[tuple[int, int], ...]]:
         """
         Calculates required tensor slices from each source rank.
 
@@ -320,7 +320,7 @@ class ReshardHandler:
         )
 
         # Calculate required slices from each source rank
-        local_union_areas_map: Dict[int, Tuple[Tuple[int, int], ...]] = {}
+        local_union_areas_map: dict[int, tuple[tuple[int, int], ...]] = {}
         self.global_union_area_map.clear()
 
         for inner_rank_id in self.inner_deredundancy_from_rank_list:
@@ -346,15 +346,15 @@ class ReshardHandler:
 
         return local_union_areas_map
 
-    def get_real_tensor(self, from_tensor_map: Dict[int, np.ndarray]) -> np.ndarray:
+    def get_real_tensor(self, from_tensor_map: dict[int, np.ndarray]) -> np.ndarray:
         """
         Assembles the final tensor for the target rank from collected slices.
 
         Args:
-            from_tensor_map: Dictionary mapping source ranks to their tensor slices
+            from_tensor_map (dict[int, np.ndarray]): Dictionary mapping source ranks to their tensor slices.
 
         Returns:
-            Assembled tensor for the target rank
+            np.ndarray: Assembled tensor for the target rank.
 
         Raises:
             ValueError: If input slices are missing or have incorrect shapes

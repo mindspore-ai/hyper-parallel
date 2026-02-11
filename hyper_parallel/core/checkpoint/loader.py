@@ -27,7 +27,7 @@ def load_checkpoint(file_path: Union[Path, str]) -> dict:
     Load model parameters from checkpoint file.
 
     Args:
-        file_path (str): Path to the checkpoint file. Path must contain file name with extension.
+        file_path (Union[Path, str]): Path to the checkpoint file. Path must contain file name with extension.
 
     Returns:
         dict: A dictionary containing the loaded parameters.
