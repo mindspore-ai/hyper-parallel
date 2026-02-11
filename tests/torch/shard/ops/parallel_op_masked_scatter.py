@@ -56,7 +56,7 @@ def test_masked_scatter_basic_replicated():
 
     # Distributed Setup
     # Mesh shape (2, 4)
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh("npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
 
     # All inputs must be Replicated on all mesh axes
     # placements tuple length must match mesh ndim
@@ -95,7 +95,7 @@ def test_masked_scatter_input_sharded_error():
     standalone_mask = torch.from_numpy(standalone_mask_np).npu()
     standalone_source = torch.from_numpy(standalone_source_np).npu()
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh("npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
 
     # Shard dim 0 of input on mesh axis 0 ("dp")
     input_placements = (Shard(0), Replicate())
@@ -127,7 +127,7 @@ def test_masked_scatter_mask_sharded_error():
     standalone_mask = torch.from_numpy(standalone_mask_np).npu()
     standalone_source = torch.from_numpy(standalone_source_np).npu()
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh("npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
 
     repl_placements = (Replicate(), Replicate())
     # Shard dim 1 of mask on mesh axis 1 ("tp")
@@ -158,7 +158,7 @@ def test_masked_scatter_source_sharded_error():
     standalone_mask = torch.from_numpy(standalone_mask_np).npu()
     standalone_source = torch.from_numpy(standalone_source_np).npu()
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh("npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
 
     repl_placements = (Replicate(), Replicate())
     # Shard source (1D tensor) on mesh axis 0 ("dp")
@@ -195,7 +195,7 @@ def test_masked_scatter_1d_replicated():
     standalone_output = standalone_input.masked_scatter(standalone_mask, standalone_source)
 
     # Distributed Setup
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh("npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     placements_1d = (Replicate(), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, placements_1d)
@@ -233,7 +233,7 @@ def test_masked_scatter_3d_broadcast():
     standalone_source = torch.from_numpy(source_np).npu()
     standalone_output = standalone_input.masked_scatter(standalone_mask, standalone_source)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh("npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     placements = (Replicate(), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, placements)
@@ -269,7 +269,7 @@ def test_masked_scatter_oversized_source():
     standalone_source = torch.from_numpy(source_np).npu()
     standalone_output = standalone_input.masked_scatter(standalone_mask, standalone_source)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh("npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     placements = (Replicate(), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, placements)
@@ -302,7 +302,7 @@ def test_masked_scatter_all_false_mask():
 
     standalone_output = standalone_input.masked_scatter(standalone_mask, standalone_source)
 
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "tp"))
+    mesh = init_device_mesh("npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     placements = (Replicate(), Replicate())
 
     dist_input = DTensor.distribute_tensor(standalone_input, mesh, placements)
