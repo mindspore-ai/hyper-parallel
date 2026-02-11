@@ -32,7 +32,8 @@ def test_new_ones_infer_layout_tuple_size():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: sharded on dim0 ("dp"), unsharded on dim1
     x_placements = (Shard(0), Replicate())
@@ -58,7 +59,8 @@ def test_new_ones_infer_layout_list_size():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 2),
-        mesh_dim_names=("dp", "tp")
+        mesh_dim_names=("dp", "tp"),
+        init_backend=False
     )
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -79,7 +81,8 @@ def test_new_ones_infer_layout_int_size():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     x_placements = (Shard(1), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -100,7 +103,8 @@ def test_new_ones_ignores_input_sharding():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 2),
-        mesh_dim_names=("dp", "tp")
+        mesh_dim_names=("dp", "tp"),
+        init_backend=False
     )
     # Input is sharded on both dimensions
     x_placements = (Shard(0), Shard(1))
@@ -122,7 +126,8 @@ def test_new_ones_scalar_shape():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 2),
-        mesh_dim_names=("dp", "tp")
+        mesh_dim_names=("dp", "tp"),
+        init_backend=False
     )
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -143,7 +148,8 @@ def test_new_ones_missing_args():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     with pytest.raises(ValueError, match="expected 'size' in extra_args"):
@@ -159,7 +165,8 @@ def test_new_ones_invalid_size_type():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     with pytest.raises(TypeError, match="must be int, tuple or list"):

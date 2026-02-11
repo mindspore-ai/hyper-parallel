@@ -32,7 +32,8 @@ def test_cumsum_layout_data_parallel():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
 
     # Input: sharded on dim0 ("dp"), unsharded on dim1 (cumsum dimension)
@@ -56,7 +57,8 @@ def test_cumsum_layout_tensor_parallel():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
 
     # Input: unsharded on dim0 (cumsum dimension), sharded on dim1 ("mp")
@@ -80,7 +82,8 @@ def test_cumsum_layout_mixed_parallel():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 3, 4),
-        mesh_dim_names=("dp", "tp", "mp")
+        mesh_dim_names=("dp", "tp", "mp"),
+        init_backend=False
     )
 
     # Input: sharded on dim0 ("dp"), unsharded on dim1 (cumsum dimension), sharded on dim2 ("mp")
@@ -104,7 +107,8 @@ def test_cumsum_layout_negative_dim():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
 
     # Input: unsharded on dim0 (cumsum dimension), sharded on dim1
@@ -128,7 +132,8 @@ def test_cumsum_layout_invalid_sharding_on_cumsum_dim():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
 
     # Input: sharded on BOTH dimensions including cumsum dimension
@@ -149,7 +154,8 @@ def test_cumsum_layout_dim_out_of_range_positive():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
 
     x_placements = (Replicate(), Replicate())
@@ -169,7 +175,8 @@ def test_cumsum_layout_missing_dim_parameter():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
 
     x_placements = (Replicate(), Replicate())
@@ -193,7 +200,8 @@ def test_cumsum_layout_invalid_dim_type():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
 
     x_placements = (Replicate(), Replicate())

@@ -33,7 +33,8 @@ def test_expand_layout_inference():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: sharded on dim0 ("dp"), unsharded on dim1 (singleton to expand)
     x_placements = (Shard(0), Replicate())
@@ -56,7 +57,8 @@ def test_expand_layout_inference_3d():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 2, 2),
-        mesh_dim_names=("dp", "tp", "mp")
+        mesh_dim_names=("dp", "tp", "mp"),
+        init_backend=False
     )
     # Input: sharded on dim0 ("dp"→2), unsharded on dim1 (to expand), sharded on dim2 ("mp"→0)
     x_placements = (Shard(0), Replicate(), Shard(2))
@@ -79,7 +81,8 @@ def test_expand_layout_prepend_new_dimensions():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: unsharded on dim0, sharded on dim1 ("mp"→0)
     x_placements = (Replicate(), Shard(1))
@@ -102,7 +105,8 @@ def test_expand_layout_scalar_expansion():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Scalar input layout (0 dimensions)
     x_placements = ()
@@ -125,7 +129,8 @@ def test_expand_layout_invalid_expand_sharded_dim():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: sharded on dim0 ("dp"→1), unsharded on dim1
     x_placements = (Shard(0), Replicate())
@@ -145,7 +150,8 @@ def test_expand_layout_invalid_minus_one_for_new_dim():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -164,7 +170,8 @@ def test_expand_layout_invalid_dimension_reduction():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
@@ -183,7 +190,8 @@ def test_expand_as_layout_basic_expansion():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: sharded on dim0 ("dp"), unsharded on dim1 (singleton to expand)
     x_placements = (Shard(0), Replicate())
@@ -212,7 +220,8 @@ def test_expand_as_layout_3d_preservation():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 2, 2),
-        mesh_dim_names=("dp", "tp", "mp")
+        mesh_dim_names=("dp", "tp", "mp"),
+        init_backend=False
     )
     # Input: sharded on dim0 ("dp"→1), unsharded on dim1 (to expand), sharded on dim2 ("mp"→0)
     x_placements = (Shard(0), Replicate(), Shard(2))
@@ -241,7 +250,8 @@ def test_expand_as_layout_prepend_dimensions():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: sharded on dim0 ("dp"→1), unsharded on dim1
     x_placements = (Shard(0), Replicate())
@@ -270,7 +280,8 @@ def test_expand_as_layout_scalar_expansion():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Scalar input layout (0 dimensions)
     x_placements = ()
@@ -299,7 +310,8 @@ def test_expand_as_layout_invalid_sharded_singleton():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # INVALID: shard dim1 (singleton dimension)
     x_placements = (Replicate(), Shard(1))
@@ -325,7 +337,8 @@ def test_expand_as_layout_invalid_non_singleton_mismatch():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)  # tensor_map = (1, -1)
@@ -350,7 +363,8 @@ def test_expand_as_layout_invalid_rank_reduction():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     x_placements = (Replicate(), Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 3)  # tensor_map = (-1, -1, -1)
@@ -375,7 +389,8 @@ def test_expand_as_layout_right_aligned_broadcast():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 2),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: unsharded on dim1 (singleton), sharded on dim0 ("dp"→1)
     x_placements = (Shard(0), Replicate())

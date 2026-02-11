@@ -31,7 +31,8 @@ def test_pad_infer_layout_success_unsharded():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: Shard(0) on dim0, Replicate on dim1
     x_placements = (Shard(0), Replicate())
@@ -56,7 +57,8 @@ def test_pad_infer_layout_fail_sharded():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: Shard(0) on dim0, Replicate on dim1
     x_placements = (Shard(0), Replicate())
@@ -79,7 +81,8 @@ def test_pad_infer_layout_mixed_dims():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 2, 2),
-        mesh_dim_names=("dp", "tp", "mp")
+        mesh_dim_names=("dp", "tp", "mp"),
+        init_backend=False
     )
     # 3D Tensor: dim0=Shard(0), dim1=Shard(1), dim2=Replicate
     x_placements = (Shard(0), Shard(1), Replicate())
@@ -105,7 +108,8 @@ def test_pad_infer_layout_zero_padding_on_sharded():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # dim0 sharded
     x_placements = (Shard(0), Replicate())
@@ -128,7 +132,8 @@ def test_pad_infer_layout_invalid_args():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     x_placements = (Replicate(),)
     x_layout = _build_layout(mesh, x_placements, 1)

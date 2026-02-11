@@ -32,7 +32,8 @@ def test_sort_layout_inference_basic():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: Sharded on dim0 ("dp"->1), Replicate on dim1
     # tensor_map: (1, -1)
@@ -65,7 +66,8 @@ def test_sort_layout_inference_sharded_dim_error():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: Sharded on dim0
     x_placements = (Shard(0), Replicate())
@@ -87,7 +89,8 @@ def test_sort_layout_inference_negative_dim():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 2),
-        mesh_dim_names=("dp", "tp")
+        mesh_dim_names=("dp", "tp"),
+        init_backend=False
     )
     # Input: Sharded on dim0, Replicate on dim1
     x_placements = (Shard(0), Replicate())
@@ -112,7 +115,8 @@ def test_sort_layout_inference_preserve_other_dims():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 2, 2),
-        mesh_dim_names=("dp", "tp", "mp")
+        mesh_dim_names=("dp", "tp", "mp"),
+        init_backend=False
     )
     # Input: Shard(0), Replicate, Shard(2)
     # tensor_map: (2, -1, 0)  -> (dp, None, mp)
@@ -138,7 +142,8 @@ def test_sort_layout_inference_all_replicate():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 2),
-        mesh_dim_names=("dp", "tp")
+        mesh_dim_names=("dp", "tp"),
+        init_backend=False
     )
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
