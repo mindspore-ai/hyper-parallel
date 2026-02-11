@@ -45,12 +45,14 @@ class WriteItem:
     Attributes:
         index: Metadata index identifying this item.
         type: Type of write item (TENSOR or BYTE_IO).
-        tensor_data: Dictionary containing tensor data (for TENSOR type).
-        bytes_io_data: Bytes data (for BYTE_IO type).
+        tensor_data: Dictionary containing tensor data (for TENSOR type). Default None.
+        bytes_io_data: Bytes data (for BYTE_IO type). Default None.
     """
     index: MetadataIndex
     type: WriteItemType
-    tensor_data: Optional[dict[str, Any]] = None  # Contains keys: 'chunk' (ChunkStorageMetadata), 'properties' (TensorProperties), 'size' (tuple). Note: The actual tensor data is stored in the planner's tensor cache, not here, to avoid transmitting tensor data during all_gather operations.
+    # Keys: 'chunk' (ChunkStorageMetadata), 'properties' (TensorProperties), 'size' (tuple).
+    # Actual tensor data is in planner's tensor cache, not here, to avoid all_gather of tensors.
+    tensor_data: Optional[dict[str, Any]] = None
     bytes_io_data: Optional[Union[bytes, Any]] = None  # Bytes or pickle-serializable object
 
     def tensor_storage_size(self) -> Optional[int]:
@@ -125,9 +127,9 @@ class SavePlan:
     Contains write items and optional storage/planner-specific data.
 
     Attributes:
-        items: List of WriteItems to be saved.
-        storage_data: Storage-specific data (optional).
-        planner_data: Planner-specific data (optional).
+        items: List of WriteItems to be saved. Default [].
+        storage_data: Storage-specific data (optional). Default None.
+        planner_data: Planner-specific data (optional). Default None.
     """
     items: list[WriteItem] = field(default_factory=list)
     storage_data: Optional[dict[MetadataIndex, Any]] = None  # Storage-specific data mapping
@@ -142,9 +144,9 @@ class LoadPlan:
     Contains read items and optional storage/planner-specific data.
 
     Attributes:
-        items: List of ReadItems to be loaded.
-        storage_data: Storage-specific data (optional).
-        planner_data: Planner-specific data (optional).
+        items: List of ReadItems to be loaded. Default [].
+        storage_data: Storage-specific data (optional). Default None.
+        planner_data: Planner-specific data (optional). Default None.
     """
     items: list[ReadItem] = field(default_factory=list)
     storage_data: Optional[dict[MetadataIndex, Any]] = None  # Storage-specific data mapping

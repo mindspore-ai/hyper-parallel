@@ -52,13 +52,14 @@ class FileSystemWriter(StorageWriter):
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.rank: int = 0
         self.is_coordinator: bool = False
+        self.use_collectives: bool = True
 
     def initialize_writer(self, checkpoint_id: Optional[Union[Path, str]] = None) -> None:
         """
         Initialize storage writer with new checkpoint directory.
 
         Args:
-            checkpoint_id (Optional[Union[Path, str]]): New checkpoint directory path.
+            checkpoint_id (Optional[Union[Path, str]]): New checkpoint directory path. Default None.
         """
         if checkpoint_id:
             self.checkpoint_dir = Path(checkpoint_id) if isinstance(checkpoint_id, str) else checkpoint_id
@@ -74,6 +75,7 @@ class FileSystemWriter(StorageWriter):
         """
         self.is_coordinator = is_coordinator
         self.rank = kwargs.get("rank", get_platform().get_rank())
+        self.use_collectives = kwargs.get("use_collectives", True)
 
     def optimize_local_plan(self, plan: SavePlan) -> SavePlan:
         """
@@ -226,13 +228,17 @@ class FileSystemWriter(StorageWriter):
         """
         Finish writing checkpoint and populate metadata.storage_data.
 
-        Build storage_data mapping and saves metadata file. Only coordinator rank performs this operation.
+        When use_collectives=True: only coordinator saves global metadata to .metadata.
+        When use_collectives=False: each rank saves its own metadata to .rank{rank}_metadata,
+        no cross-rank interaction.
 
         Args:
             metadata (Metadata): Checkpoint metadata to update.
-            results (list[list[WriteResult]]): Write results from all ranks.
+            results (list[list[WriteResult]]): Write results from all ranks (or single rank when use_collectives=False).
         """
-        if self.is_coordinator:
+        should_save = self.use_collectives and self.is_coordinator or not self.use_collectives
+
+        if should_save:
             # Build storage_data: map MetadataIndex -> StorageInfo
             storage_md: dict[MetadataIndex, StorageInfo] = {}
             for wr_list in results:
@@ -240,8 +246,11 @@ class FileSystemWriter(StorageWriter):
                     storage_md[wr.index] = wr.storage_data
             metadata.storage_data = storage_md
 
-            # Save metadata file (including storage_data) for load path
-            metadata_file = self.checkpoint_dir / _metadata_file_name
+            # Save metadata file
+            if self.use_collectives:
+                metadata_file = self.checkpoint_dir / _metadata_file_name
+            else:
+                metadata_file = self.checkpoint_dir / f".rank{self.rank}_metadata"
             with open(metadata_file, "wb") as f:
                 pickle.dump(metadata, f)
 
@@ -360,7 +369,7 @@ class FileSystemReader(StorageReader):
         Initialize storage reader with new checkpoint directory.
 
         Args:
-            checkpoint_id (Optional[Union[Path, str]]): New checkpoint directory path.
+            checkpoint_id (Optional[Union[Path, str]]): New checkpoint directory path. Default None.
         """
         if checkpoint_id:
             self.checkpoint_dir = Path(checkpoint_id) if isinstance(checkpoint_id, str) else checkpoint_id
@@ -369,13 +378,22 @@ class FileSystemReader(StorageReader):
         """
         Load checkpoint metadata from file.
 
+        When rank is provided in kwargs: load rank-local metadata from .rank{rank}_metadata
+        (for checkpoints saved with use_collectives=False).
+        Otherwise: load global metadata from .metadata.
+
         Args:
             **kwargs: Optional arguments (e.g., rank for rank-local metadata).
 
         Returns:
             Metadata: Metadata object loaded from file.
         """
-        metadata_file = self.checkpoint_dir / _metadata_file_name
+        rank = kwargs.get("rank")
+        if rank is not None:
+            metadata_file = self.checkpoint_dir / f".rank{rank}_metadata"
+        else:
+            metadata_file = self.checkpoint_dir / _metadata_file_name
+
         if not metadata_file.exists():
             raise FileNotFoundError(f"Metadata file not found: {metadata_file}")
         with open(metadata_file, "rb") as f:

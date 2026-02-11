@@ -24,8 +24,8 @@ class MetadataIndex:
 
     Attributes:
         fqn: Fully qualified name of the tensor/object.
-        offset: Offset in the tensor (for sharded tensors).
-        index: Index for sharded tensors (None for non-sharded).
+        offset: Offset in the tensor (for sharded tensors). Default ().
+        index: Index for sharded tensors (None for non-sharded). Default None.
     """
     fqn: str
     offset: tuple = field(default_factory=tuple)
@@ -54,8 +54,8 @@ class TensorProperties:
 
     Attributes:
         dtype: Data type of the tensor (as string).
-        requires_grad: Whether the tensor requires gradients.
-        memory_format: Memory format (optional).
+        requires_grad: Whether the tensor requires gradients. Default False.
+        memory_format: Memory format (optional). Default None.
     """
     dtype: str
     requires_grad: bool = False
@@ -76,7 +76,7 @@ class TensorStorageMetadata:
     Attributes:
         properties: Tensor properties (dtype, etc.).
         size: Global size of the tensor.
-        chunks: List of chunks stored in the checkpoint.
+        chunks: List of chunks stored in the checkpoint. Default [].
     """
     properties: TensorProperties
     size: tuple
@@ -92,9 +92,9 @@ class Metadata:
 
     Attributes:
         state_dict_metadata: Mapping from FQN to storage metadata.
-        planner_data: Planner-specific data (optional).
-        storage_data: Storage-specific data (optional).
-        version: Checkpoint format version.
+        planner_data: Planner-specific data (optional). Default None.
+        storage_data: Storage-specific data (optional). Default None.
+        version: Checkpoint format version. Default "1.0".
     """
     state_dict_metadata: dict[str, Union[TensorStorageMetadata, BytesStorageMetadata]]
     planner_data: Any = None  # Planner-specific data (can be any type)

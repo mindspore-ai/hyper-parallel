@@ -18,21 +18,8 @@ from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level3", card_mark="allcards", essential_mark="essential")
-def test_dcp_api_with_dtensor_and_scalar():
-    """
-    Feature: Test checkpoint save and load API with DTensor state_dict.
-    Description: Test save and load function with state_dict containing DTensors on 8-card setup.
-    Expectation: Run success.
-    """
-    master_port = 12252
-    file_name = "dcp_api.py"
-    case_name = "test_dcp_api_with_dtensor_and_scalar"
-    torchrun_case(file_name, case_name, master_port)
-
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_dcp_api_with_dtensor_and_scalar_with_more_params():
+def test_dcp_api_with_dtensor_and_tensor_and_scalar():
     """
     Feature: Test checkpoint save and load API with DTensor state_dict using different mesh_shape and layouts.
     Description: Test save and load function with state_dict containing DTensors on 8-card setup with mesh_shape (4, 2).
@@ -40,7 +27,20 @@ def test_dcp_api_with_dtensor_and_scalar_with_more_params():
     """
     master_port = 12253
     file_name = "dcp_api.py"
-    case_name = "test_dcp_api_with_dtensor_and_scalar_with_more_params"
+    case_name = "test_dcp_api_with_dtensor_and_tensor_and_scalar"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_dcp_api_with_full_tensor():
+    """
+    Feature: Test checkpoint save and load API with state_dict containing only torch Tensors.
+    Description: Test save and load function with state_dict containing purely torch Tensors.
+    Expectation: Run success.
+    """
+    master_port = 12255
+    file_name = "dcp_api.py"
+    case_name = "test_dcp_api_with_full_tensor"
     torchrun_case(file_name, case_name, master_port)
 
 

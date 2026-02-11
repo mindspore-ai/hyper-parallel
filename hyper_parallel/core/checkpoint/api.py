@@ -70,13 +70,17 @@ def save(
     Args:
         state_dict (dict[str, Any]): The state_dict to save.
         checkpoint_id (Optional[Union[Path, str]]): The ID/path of this checkpoint instance (can be Path or str).
+            Default None.
         storage_writer (Optional[StorageWriter]): Instance of StorageWriter. If None, FileSystemWriter
-            will be created based on checkpoint_id.
+            will be created based on checkpoint_id. Default None.
         planner (Optional[SavePlanner]): Instance of SavePlanner. If None, StandardSavePlanner will be used.
-        no_dist (bool): If True, save in single process mode.
+            Default None.
+        no_dist (bool): If True, save in single process mode. Default False.
         use_collectives (bool): If True, use collective communication for coordination.
-        remove_redundancy (bool): If True, deduplicate tensors across ranks.
-        save_to_minimum_rank (bool): If True, deduplicated items are saved on the minimum rank.
+            If False, each rank saves its own shard data and rank-local metadata (.metadata_rank{rank}),
+            with no cross-rank interaction. Default True.
+        remove_redundancy (bool): If True, deduplicate tensors across ranks. Default True.
+        save_to_minimum_rank (bool): If True, deduplicated items are saved on the minimum rank. Default False.
 
     Returns:
         Metadata: Metadata object for the saved checkpoint.
@@ -88,6 +92,10 @@ def save(
 
     # Determine if we're in distributed mode
     use_collectives = False if no_dist else use_collectives
+
+    # When use_collectives=False: each rank saves its own shard, no cross-rank interaction
+    if not use_collectives:
+        remove_redundancy = False
 
     # Set up storage writer
     if storage_writer is None:
@@ -106,7 +114,7 @@ def save(
     world_size = platform.get_world_size()
     is_coordinator = rank == 0
 
-    # Configure planner
+    # Configure planner (remove_redundancy=False when use_collectives=False)
     planner.configure_planner(
         state_dict=state_dict,
         is_coordinator=is_coordinator,
@@ -115,7 +123,7 @@ def save(
         save_to_minimum_rank=save_to_minimum_rank
     )
 
-    # Configure storage writer
+    # Configure storage writer (use_collectives for rank-local metadata when False)
     storage_writer.configure_writer(
         is_coordinator=is_coordinator,
         rank=rank,
@@ -147,8 +155,7 @@ def save(
 
     # Finalize checkpoint
     all_write_results = _gather_from_all_ranks(platform, write_results, world_size, use_collectives)
-    if is_coordinator or not use_collectives:
-        storage_writer.finalize_checkpoint(metadata, all_write_results)
+    storage_writer.finalize_checkpoint(metadata, all_write_results)
 
     return metadata
 
@@ -160,6 +167,7 @@ def load(
         storage_reader: Optional[StorageReader] = None,
         planner: Optional[LoadPlanner] = None,
         no_dist: bool = False,
+        use_collectives: bool = True,
 ) -> None:
     """
     Load a distributed checkpoint into state_dict in SPMD style.
@@ -171,10 +179,14 @@ def load(
     Args:
         state_dict (dict[str, Any]): The state_dict to load the checkpoint into (modified in-place).
         checkpoint_id (Optional[Union[Path, str]]): The ID/path of this checkpoint instance (can be Path or str).
+            Default None.
         storage_reader (Optional[StorageReader]): Instance of StorageReader. If None, FileSystemReader
-            will be created based on checkpoint_id.
+            will be created based on checkpoint_id. Default None.
         planner (Optional[LoadPlanner]): Instance of LoadPlanner. If None, StandardLoadPlanner will be used.
-        no_dist (bool): If True, load without cross-rank synchronization.
+            Default None.
+        no_dist (bool): If True, load without cross-rank synchronization. Default False.
+        use_collectives (bool): If False, load from rank-local metadata (.metadata_rank{rank}),
+            for checkpoints saved with save(use_collectives=False). No cross-rank interaction. Default True.
 
     Returns:
         None. The state_dict is modified in-place.
@@ -185,7 +197,7 @@ def load(
     checkpoint_id = Path(checkpoint_id) if isinstance(checkpoint_id, str) else checkpoint_id
 
     # Determine if we're in distributed mode
-    use_collectives = not no_dist
+    use_collectives = False if no_dist else use_collectives
 
     # Set up storage reader
     if storage_reader is None:
@@ -205,12 +217,16 @@ def load(
     is_coordinator = rank == 0
 
     # Load metadata
-    try:
-        metadata = storage_reader.load_metadata()
-    except Exception:
-        # Fallback to rank-local metadata
+    if use_collectives:
+        try:
+            metadata = storage_reader.load_metadata()
+        except FileNotFoundError:
+            # Fallback to rank-local metadata (e.g. checkpoint saved with use_collectives=False)
+            metadata = storage_reader.load_metadata(rank=rank)
+            use_collectives = False
+    else:
+        # Load rank-local metadata directly (no cross-rank interaction)
         metadata = storage_reader.load_metadata(rank=rank)
-        use_collectives = False
 
     # Configure planner
     planner.configure_planner(

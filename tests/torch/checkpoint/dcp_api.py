@@ -33,20 +33,26 @@ def _run_dcp_save_load_test(
     param_configs: list[dict[str, Any]],
     checkpoint_path: Path,
     seed: int = 1,
-    scalar_values: Optional[dict[str, Any]] = None
-):
+    scalar_values: Optional[dict[str, Any]] = None,
+    tensor_values: Optional[dict[str, tuple[int, ...]]] = None,
+    use_collectives: bool = True,
+) -> None:
     """
-    Common function to test checkpoint save and load API with DTensor state_dict and scalar values.
+    Common function to test checkpoint save and load API with DTensor state_dict, scalar and torch Tensor values.
 
     Args:
-        mesh_shape: Tuple of (dp_size, tp_size) for device mesh shape
-        param_configs: List of parameter configurations, each containing:
+        mesh_shape (tuple[int, int]): Tuple of (dp_size, tp_size) for device mesh shape.
+        param_configs (list[dict[str, Any]]): List of parameter configurations, each containing:
             - 'name': parameter name (str)
             - 'placements': list of Placement objects, e.g., [Replicate(), Shard(1)]
             - 'local_shape': tuple of local tensor shape
-        checkpoint_path: Path to checkpoint directory
-        seed: Random seed for reproducibility
-        scalar_values: Optional dict of scalar values to save/load (e.g., {'epoch': 10, 'lr': 0.001})
+        checkpoint_path (Path): Path to checkpoint directory.
+        seed (int): Random seed for reproducibility. Default 1.
+        scalar_values (Optional[dict[str, Any]]): Optional dict of scalar values to save/load
+            (e.g., {'epoch': 10, 'lr': 0.001}). Default None.
+        tensor_values (Optional[dict[str, tuple[int, ...]]]): Optional dict of torch Tensor configs,
+            key is name, value is shape tuple (e.g., {'buffer': (10, 8)}). Default None.
+        use_collectives (bool): If True, use collective communication for save/load coordination. Default True.
     """
     init_dist()
     torch.manual_seed(seed)
@@ -77,8 +83,17 @@ def _run_dcp_save_load_test(
             state_dict[scalar_name] = scalar_value
             original_scalars[scalar_name] = scalar_value
 
+    # Add torch Tensor values to state_dict
+    original_tensors: dict[str, Any] = {}
+    if tensor_values:
+        for tensor_name, tensor_shape in tensor_values.items():
+            tensor = torch.randn(*tensor_shape).npu()
+            state_dict[tensor_name] = tensor
+            original_tensors[tensor_name] = tensor.clone()
+
     # Call save API
-    metadata = save(state_dict, checkpoint_id=checkpoint_path)
+    metadata = save(state_dict, checkpoint_id=checkpoint_path, use_collectives=use_collectives)
+    print("metadata: ", metadata)
 
     # Verify save results
     assert metadata is not None
@@ -88,6 +103,9 @@ def _run_dcp_save_load_test(
     if scalar_values:
         for scalar_name in scalar_values.keys():
             assert scalar_name in metadata.state_dict_metadata
+    if tensor_values:
+        for tensor_name in tensor_values.keys():
+            assert tensor_name in metadata.state_dict_metadata
 
     # Verify checkpoint directory exists
     assert checkpoint_path.exists()
@@ -114,8 +132,13 @@ def _run_dcp_save_load_test(
             else:
                 load_state_dict[scalar_name] = None
 
+    # Initialize torch Tensor values in load_state_dict (will be overwritten by load)
+    if tensor_values:
+        for tensor_name, tensor_shape in tensor_values.items():
+            load_state_dict[tensor_name] = torch.zeros(*tensor_shape).npu()
+
     # Call load API
-    load(load_state_dict, checkpoint_id=checkpoint_path)
+    load(load_state_dict, checkpoint_id=checkpoint_path, use_collectives=use_collectives)
 
     # Verify load results - compare loaded tensors with original tensors
     for param_config in param_configs:
@@ -138,55 +161,25 @@ def _run_dcp_save_load_test(
             assert type(loaded_value) == type(original_value), \
                 f"{scalar_name} scalar type mismatch: expected {type(original_value)}, got {type(loaded_value)}"
 
+    # Verify load results - compare loaded torch Tensors with original tensors
+    if tensor_values:
+        for tensor_name, original_tensor in original_tensors.items():
+            loaded_tensor = load_state_dict[tensor_name]
+            assert np.allclose(
+                original_tensor.cpu().detach().numpy(),
+                loaded_tensor.cpu().detach().numpy(),
+                rtol=1e-5, atol=1e-5
+            ), f"{tensor_name} torch Tensor values do not match after load"
 
 
-def test_dcp_api_with_dtensor_and_scalar():
-    """
-    Feature: Test checkpoint save and load API with DTensor state_dict.
-    Description: Test save and load function with state_dict containing DTensors on 8-card setup.
-    Expectation: Run success, checkpoint saved correctly, and loaded values match original values.
-    """
-    checkpoint_path = Path("./test_checkpoint")
-    mesh_shape = (2, 4)
 
-    # Parameter configurations:
-    # param1: sharded along tp dimension (tensor dim 1 sharded on tp mesh dim)
-    #   Global shape: (8, 8), Local shape: (8, 2) per rank (tp dimension has 4 devices)
-    # param2: replicated (all dimensions replicated)
-    #   Global shape: (4, 4), Local shape: (4, 4) per rank
-    # param3: sharded along tp dimension (tensor dim 1 sharded on tp mesh dim)
-    #   Global shape: (16, 8), Local shape: (16, 2) per rank (tp dimension has 4 devices)
-    # Note: placements order is [dp_mesh_dim, tp_mesh_dim]
-    param_configs = [
-        {'name': 'param1', 'placements': [Replicate(), Shard(1)], 'local_shape': (8, 2)},
-        {'name': 'param2', 'placements': [Replicate(), Replicate()], 'local_shape': (4, 4)},
-        {'name': 'param3', 'placements': [Replicate(), Shard(1)], 'local_shape': (16, 2)},
-    ]
-
-    # Add scalar values (int and float) to test mixed DTensor and scalar save/load
-    scalar_values = {
-        'epoch': 10,
-        'learning_rate': 0.001,
-        'step': 1000,
-        'loss': 0.12345
-    }
-
-    _run_dcp_save_load_test(
-        mesh_shape=mesh_shape,
-        param_configs=param_configs,
-        checkpoint_path=checkpoint_path,
-        seed=1,
-        scalar_values=scalar_values
-    )
-
-
-def test_dcp_api_with_dtensor_and_scalar_with_more_params():
+def test_dcp_api_with_dtensor_and_tensor_and_scalar() -> None:
     """
     Feature: Test checkpoint save and load API with DTensor state_dict using different mesh_shape and layouts.
     Description: Test save and load function with state_dict containing DTensors on 8-card setup with mesh_shape (4, 2).
     Expectation: Run success, checkpoint saved correctly, and loaded values match original values.
     """
-    checkpoint_path = Path("./test_checkpoint_diff_layout")
+    checkpoint_path = Path("./test_dcp_api")
     mesh_shape = (4, 2)  # Different mesh_shape: 4 data parallel, 2 tensor parallel
 
     # Parameter configurations:
@@ -233,12 +226,60 @@ def test_dcp_api_with_dtensor_and_scalar_with_more_params():
         'warmup_steps': 100
     }
 
+    # Add torch Tensor values to test mixed DTensor, scalar and torch Tensor save/load
+    tensor_values = {
+        'buffer': (16, 8),
+        'position_ids': (1, 32),
+    }
+
     _run_dcp_save_load_test(
         mesh_shape=mesh_shape,
         param_configs=param_configs,
         checkpoint_path=checkpoint_path,
         seed=2,
-        scalar_values=scalar_values
+        scalar_values=scalar_values,
+        tensor_values=tensor_values,
+    )
+
+    # Scenario: save/load without collective communication
+    checkpoint_path_no_coll = Path("./test_dcp_api_no_collectives")
+    _run_dcp_save_load_test(
+        mesh_shape=mesh_shape,
+        param_configs=param_configs,
+        checkpoint_path=checkpoint_path_no_coll,
+        seed=3,
+        scalar_values=scalar_values,
+        tensor_values=tensor_values,
+        use_collectives=False,
+    )
+
+
+def test_dcp_api_with_full_tensor() -> None:
+    """
+    Feature: Test checkpoint save and load API with state_dict containing only torch Tensors.
+    Description: Test save and load function with state_dict containing purely torch Tensors
+                 (no DTensor, no scalars) on 8-card setup.
+    Expectation: Run success, checkpoint saved correctly, and loaded values match original values.
+    """
+    checkpoint_path = Path("./test_dcp_full_tensor")
+    mesh_shape = (2, 4)
+
+    # Only torch Tensors - no DTensor, no scalars
+    tensor_values = {
+        'tensor1': (8, 8),
+        'tensor2': (16, 4),
+        'tensor3': (1, 128),
+        'buffer': (32, 64),
+    }
+
+    _run_dcp_save_load_test(
+        mesh_shape=mesh_shape,
+        param_configs=[],
+        checkpoint_path=checkpoint_path,
+        seed=42,
+        scalar_values=None,
+        tensor_values=tensor_values,
+        use_collectives=False,
     )
 
 
@@ -249,25 +290,26 @@ def _run_dcp_save_load_with_different_mesh_test(
     load_param_configs: list[dict[str, Any]],
     checkpoint_path: Path,
     seed: int = 1,
-    scalar_values: Optional[dict[str, Any]] = None
-):
+    scalar_values: Optional[dict[str, Any]] = None,
+) -> None:
     """
     Test checkpoint save with one mesh_shape and load with different mesh_shape.
 
     Args:
-        save_mesh_shape: Tuple of (dp_size, tp_size) for device mesh shape during save
-        load_mesh_shape: Tuple of (dp_size, tp_size) for device mesh shape during load
-        save_param_configs: List of parameter configurations for save, each containing:
+        save_mesh_shape (tuple[int, int]): Tuple of (dp_size, tp_size) for device mesh shape during save.
+        load_mesh_shape (tuple[int, int]): Tuple of (dp_size, tp_size) for device mesh shape during load.
+        save_param_configs (list[dict[str, Any]]): List of parameter configurations for save, each containing:
             - 'name': parameter name (str)
             - 'placements': list of Placement objects, e.g., [Replicate(), Shard(1)]
             - 'local_shape': tuple of local tensor shape
-        load_param_configs: List of parameter configurations for load, each containing:
+        load_param_configs (list[dict[str, Any]]): List of parameter configurations for load, each containing:
             - 'name': parameter name (str)
             - 'placements': list of Placement objects, e.g., [Replicate(), Shard(1)]
             - 'local_shape': tuple of local tensor shape
-        checkpoint_path: Path to checkpoint directory
-        seed: Random seed for reproducibility
-        scalar_values: Optional dict of scalar values to save/load (e.g., {'epoch': 10, 'lr': 0.001})
+        checkpoint_path (Path): Path to checkpoint directory.
+        seed (int): Random seed for reproducibility. Default 1.
+        scalar_values (Optional[dict[str, Any]]): Optional dict of scalar values to save/load
+            (e.g., {'epoch': 10, 'lr': 0.001}). Default None.
     """
     init_dist()
     torch.manual_seed(seed)
@@ -392,7 +434,7 @@ def _run_dcp_save_load_with_different_mesh_test(
                     f"{scalar_name} scalar type mismatch: expected {type(original_value)}, got {type(loaded_value)}"
 
 
-def test_dcp_api_save_8card_load_4card():
+def test_dcp_api_save_8card_load_4card() -> None:
     """
     Feature: Test checkpoint save with 8-card cluster and load with 4-card cluster.
     Description: Test save function with state_dict containing DTensors and scalars on 8-card setup,
@@ -400,7 +442,7 @@ def test_dcp_api_save_8card_load_4card():
     Expectation: Run success, checkpoint saved correctly, and loaded values match original values
                  after resharding from 8-card to 4-card layout.
     """
-    checkpoint_path = Path("./test_checkpoint_8card_to_4card")
+    checkpoint_path = Path("./test_dcp_8card_reshard_to_4card")
 
     # Save phase: 8-card cluster (2 data parallel, 4 tensor parallel)
     save_mesh_shape = (2, 4)

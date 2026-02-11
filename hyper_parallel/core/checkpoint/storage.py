@@ -65,7 +65,7 @@ class StorageWriter(abc.ABC):
 
         Args:
             checkpoint_id (Optional[Union[Path, str]]): The ID/path of the checkpoint directory.
-                If None, uses the previously configured checkpoint directory.
+                If None, uses the previously configured checkpoint directory. Default None.
         """
 
     @abc.abstractmethod
@@ -141,7 +141,7 @@ class StorageReader(abc.ABC):
 
         Args:
             checkpoint_id (Optional[Union[Path, str]]): The ID/path of the checkpoint directory.
-                If None, uses the previously configured checkpoint directory.
+                If None, uses the previously configured checkpoint directory. Default None.
         """
 
     @abc.abstractmethod
