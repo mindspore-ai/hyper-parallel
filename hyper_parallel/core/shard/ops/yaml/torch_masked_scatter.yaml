@@ -1,0 +1,4 @@
+masked_scatter:
+  dist_op_name: _torch_masked_scatter_dist_op
+  distributed_op_class: MaskedScatterDistributedOp
+  distributed_op_file: parallel_masked_scatter
