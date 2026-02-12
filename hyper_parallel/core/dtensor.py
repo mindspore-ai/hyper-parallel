@@ -158,6 +158,17 @@ class DTensor(DTensorBase):
         """
         return self._layout.get_global_shape(self._local_tensor.shape)
 
+    def size(self, dim=None):
+        """Return the global shape, consistent with .shape.
+
+        Without ``dim`` returns a tuple matching ``self.shape``.
+        With ``dim`` returns the size of that dimension.
+        """
+        global_shape = self.shape
+        if dim is not None:
+            return global_shape[dim]
+        return global_shape
+
     @property
     def local_shape(self) -> Tuple[int, ...]:
         """

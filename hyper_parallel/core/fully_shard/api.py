@@ -13,8 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """hybrid shard data parallel interface"""
+from typing import Any, Mapping, cast
+
+import torch
 from torch import nn
-from typing import cast
+
 from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel import DeviceMesh
 from hyper_parallel.platform import get_platform
@@ -132,6 +135,94 @@ class HSDPModule:
             if async_op:
                 return _UnshardHandle(hsdp_state=scheduler_state)
         return None
+
+    def load_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+        strict: bool = True,
+        assign: bool = False,
+    ):
+        """Load state dict by copying directly into local tensors.
+
+        Bypasses ``super().load_state_dict()`` to avoid DTensor op-dispatch
+        issues (``copy_`` not registered in the parallel layout dispatcher).
+
+        Accepted value types per key:
+        * hyper DTensor          → copy local shard directly
+        * plain Tensor (local)   → copy as-is
+        * plain Tensor (global)  → distribute then copy local shard
+        """
+        from hyper_parallel.core.dtensor import DTensor as _DTensor  # pylint: disable=C0415
+
+        self_module = cast(nn.Module, self)
+
+        # Build FQN → target param/buffer lookup
+        target_map: dict[str, torch.Tensor] = {}
+        for name, p in self_module.named_parameters():
+            target_map[name] = p
+        for name, b in self_module.named_buffers():
+            target_map[name] = b
+
+        if strict:
+            # Use state_dict().keys() to match PyTorch behavior:
+            # only persistent params/buffers, excludes persistent=False buffers.
+            expected_keys = set(self_module.state_dict().keys())
+            missing = expected_keys - set(state_dict.keys())
+            unexpected = set(state_dict.keys()) - expected_keys
+            error_msgs: list[str] = []
+            if missing:
+                error_msgs.append(
+                    "Missing key(s): " + ", ".join(repr(k) for k in sorted(missing))
+                )
+            if unexpected:
+                error_msgs.append(
+                    "Unexpected key(s): " + ", ".join(repr(k) for k in sorted(unexpected))
+                )
+            if error_msgs:
+                raise RuntimeError(
+                    f"Error(s) in loading state_dict for "
+                    f"{self_module.__class__.__name__}:\n\t"
+                    + "\n\t".join(error_msgs)
+                )
+
+        with torch.no_grad():
+            for key, val in state_dict.items():
+                target = target_map.get(key)
+                if target is None:
+                    continue
+
+                if isinstance(target, _DTensor):
+                    if isinstance(val, _DTensor):
+                        local_val = val._local_tensor
+                    else:
+                        local_shape = tuple(target._local_tensor.shape)
+                        global_shape = tuple(target.shape)
+                        val_shape = tuple(val.shape)
+                        if val_shape == local_shape:
+                            local_val = val
+                        elif val_shape == global_shape:
+                            wrapped = _DTensor.distribute_tensor(
+                                val.detach(), target.device_mesh, target.placements,
+                            )
+                            local_val = wrapped._local_tensor
+                        else:
+                            raise ValueError(
+                                f"load '{key}': plain tensor shape {val_shape} "
+                                f"matches neither local shard {local_shape} "
+                                f"nor global {global_shape}."
+                            )
+                    if target._local_tensor.is_meta:
+                        target._local_tensor = local_val
+                    else:
+                        target._local_tensor.copy_(local_val)
+                else:
+                    target.copy_(val)
+
+        # Fire load_state_dict post hooks (e.g. reset_sharded_param) to
+        # sync internal HSDP bookkeeping (_sharded_param_data etc.).
+        for _, module in self_module.named_modules():
+            for hook in module._load_state_dict_post_hooks.values():
+                hook(module, None)
 
     def set_is_last_backward(self, is_last_backward: bool):
         """set is_last_backward flag"""

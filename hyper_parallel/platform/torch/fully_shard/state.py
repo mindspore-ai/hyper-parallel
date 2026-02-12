@@ -15,14 +15,12 @@
 """Torch HSDP cell state"""
 from typing import List
 import torch
-from torch import Tensor
 from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
-from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
-from hyper_parallel.platform.torch.platform import TorchPlatform
-from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState
-from hyper_parallel.platform.torch.fully_shard.utils import HSDPMeshInfo
 from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos
+from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
+from hyper_parallel.platform.torch.fully_shard.utils import HSDPMeshInfo
+
 
 class TorchHSDPStateV2(HSDPState):
     """Torch HSDP cell state"""
@@ -53,7 +51,7 @@ class TorchHSDPStateV2(HSDPState):
 
         module_infos = _get_param_module_infos(filtered_params, [self.cell,])
         for param, module_info in zip(filtered_params, module_infos):
-            hsdp_param = TorchHSDPParamV2(param, 
+            hsdp_param = TorchHSDPParamV2(param,
                                           module_info,
                                           self.mesh_info,
                                           mp_policy=self.mp_policy,
@@ -118,7 +116,15 @@ class TorchHSDPStateV2(HSDPState):
             for hsdp_param in self.hsdp_params:
                 if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
                     continue
+                # Frozen parameters (requires_grad=False) produce no
+                # gradient — skip all reduce-scatter / all-reduce work.
+                if not hsdp_param.sharded_param.requires_grad:
+                    continue
                 if hsdp_param.shard_world_size > 1:
+                    if hsdp_param.unsharded_param.grad is None:
+                        # Parameter requires grad but was not used in
+                        # forward — all ranks skip consistently.
+                        continue
                     reduced_grad, handle = hsdp_param.reduce_scatter_grad(dtype=self._reduce_dtype)
                 if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
                     assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
@@ -139,12 +145,8 @@ class TorchHSDPStateV2(HSDPState):
                 else:
                     hsdp_param.sharded_param.grad += reduced_grad
                 if hsdp_param.unsharded_accumulated_grad_data is not None:
-                    # hsdp_params_with_grad.append(hsdp_param)
-                    # unsharded_grads.append(hsdp_param.unsharded_accumulated_grad_data)
                     hsdp_param.unsharded_accumulated_grad_data = None
                 elif hsdp_param.unsharded_param.grad is not None:
-                    # hsdp_params_with_grad.append(hsdp_param)
-                    # unsharded_grads.append(hsdp_param.unsharded_param.grad)
                     hsdp_param.unsharded_param.grad = None
 
             if self.reshard_after_backward:
@@ -164,7 +166,7 @@ class TorchHSDPStateV2(HSDPState):
                 assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
                 reduced_grad = self.platform.all_reduce_tensor(
                     reduced_grad, hsdp_param.mesh_info.replicate_process_group, dtype=hsdp_param.reduce_dtype)
-                
+
             sharded_grad = hsdp_param.sharded_param.grad
             if sharded_grad is None:
                 sharded_grad = reduced_grad
