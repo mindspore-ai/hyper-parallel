@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,13 +13,21 @@
 # limitations under the License.
 # ============================================================================
 """Torch HSDP cell state"""
-from typing import List
+from typing import List, Optional
 import torch
 from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
 from hyper_parallel.platform.torch.fully_shard.utils import HSDPMeshInfo
+
+
+def _to_dtype_if_needed(
+    tensor: torch.Tensor, dtype: Optional[torch.dtype]
+) -> torch.Tensor:
+    if dtype is not None and tensor.dtype != dtype:
+        return tensor.to(dtype)
+    return tensor
 
 
 class TorchHSDPStateV2(HSDPState):
@@ -136,6 +144,7 @@ class TorchHSDPStateV2(HSDPState):
                 else hsdp_param.sharded_param.shape
             )
             reduced_grad = reduced_grad.view(sharded_param_local_shape)
+            reduced_grad = _to_dtype_if_needed(reduced_grad, self._orig_dtype)
             to_accumulate_grad = sharded_grad is not None
             if hsdp_param.offload_to_cpu:
                 non_blocking = hsdp_param.pin_memory and not to_accumulate_grad
