@@ -18,7 +18,7 @@ Run 2-card tests:
     pytest tests/torch/fully_shard/test_state_dict.py -k "2cards" -v -s
 
 Run 4-card test:
-    pytest tests/torch/fully_shard/test_state_dict.py::test_T4_roundtrip_4cards -v -s
+    pytest tests/torch/fully_shard/test_state_dict.py::test_t4_roundtrip_4cards -v -s
 
 Run all:
     pytest tests/torch/fully_shard/test_state_dict.py -v -s
@@ -32,35 +32,65 @@ _PORT_BASE = 12370
 
 # ---------- 2-card tests (T1–T3) ----------
 
-def test_T1_state_dict_2cards():
-    """T1: state_dict returns DTensor with correct global shape (2-card)."""
-    torchrun_case(_FILE, "test_T1_state_dict_2cards", _PORT_BASE, num_proc=2)
+def test_t1_state_dict_2cards():
+    """
+    Feature: Test state_dict returns DTensor after fully_shard.
+    Description: Create a 2-card fully_shard model and call state_dict(), verify each entry
+        is DTensor with correct global shape.
+    Expectation: Run success.
+    """
+    torchrun_case(_FILE, "test_t1_state_dict_2cards", _PORT_BASE, num_proc=2)
 
 
-def test_T2_load_dtensor_2cards():
-    """T2: load_state_dict with hyper DTensor — copy + assign (2-card)."""
-    torchrun_case(_FILE, "test_T2_load_dtensor_2cards", _PORT_BASE + 1, num_proc=2)
+def test_t2_load_dtensor_2cards():
+    """
+    Feature: Test load_state_dict with hyper DTensor.
+    Description: Train model_a, save state_dict as DTensor, load into model_b (copy) and
+        model_c (assign) on 2 cards, verify forward output matches.
+    Expectation: Run success.
+    """
+    torchrun_case(_FILE, "test_t2_load_dtensor_2cards", _PORT_BASE + 1, num_proc=2)
 
 
-def test_T3_load_tensor_2cards():
-    """T3: load_state_dict with torch Tensor — local + global (2-card)."""
-    torchrun_case(_FILE, "test_T3_load_tensor_2cards", _PORT_BASE + 2, num_proc=2)
+def test_t3_load_tensor_2cards():
+    """
+    Feature: Test load_state_dict with plain torch Tensor.
+    Description: Train model, extract local shard and global full tensors, load into new
+        models via copy and assign on 2 cards, verify forward output matches.
+    Expectation: Run success.
+    """
+    torchrun_case(_FILE, "test_t3_load_tensor_2cards", _PORT_BASE + 2, num_proc=2)
 
 
-def test_T3b_load_single_npu_checkpoint():
-    """T3b: single-NPU vanilla checkpoint → fully_shard model (2-card)."""
-    torchrun_case(_FILE, "test_T3b_load_single_npu_checkpoint", _PORT_BASE + 5, num_proc=2)
+def test_t3b_load_single_npu_checkpoint():
+    """
+    Feature: Test load single-NPU vanilla checkpoint into fully_shard model.
+    Description: Create vanilla non-sharded model, save state_dict as plain Tensor, load
+        into 2-card fully_shard model via copy and assign, then continue training.
+    Expectation: Run success.
+    """
+    torchrun_case(_FILE, "test_t3b_load_single_npu_checkpoint", _PORT_BASE + 5, num_proc=2)
 
 
 # ---------- 4-card test (T4) ----------
 
-def test_T4_roundtrip_4cards():
-    """T4: train -> save -> load(DTensor + Tensor) -> train (4-card)."""
-    torchrun_case(_FILE, "test_T4_roundtrip_4cards", _PORT_BASE + 3, num_proc=4)
+def test_t4_roundtrip_4cards():
+    """
+    Feature: Test full training round-trip on 4 cards.
+    Description: Train 3 steps, save state_dict, load with DTensor and Tensor on 4 cards,
+        verify forward output matches and continue training.
+    Expectation: Run success.
+    """
+    torchrun_case(_FILE, "test_t4_roundtrip_4cards", _PORT_BASE + 3, num_proc=4)
 
 
 # ---------- 8-card test (T5) ----------
 
-def test_T5_roundtrip_8cards():
-    """T5: full training round-trip — DTensor + local + global (8-card)."""
-    torchrun_case(_FILE, "test_T5_roundtrip_8cards", _PORT_BASE + 4, num_proc=8)
+def test_t5_roundtrip_8cards():
+    """
+    Feature: Test full training round-trip on 8 cards.
+    Description: Train 3 steps, save state_dict, load with DTensor, local shard and global
+        full tensor on 8 cards, verify forward output matches and continue training.
+    Expectation: Run success.
+    """
+    torchrun_case(_FILE, "test_t5_roundtrip_8cards", _PORT_BASE + 4, num_proc=8)

@@ -42,7 +42,7 @@ class TorchHSDPStateV2(HSDPState):
         """init hsdp parameters for cell"""
         # Cell 树内的全部parameters
         filtered_params = []
-        for param_name, param in self.cell.named_parameters():
+        for _, param in self.cell.named_parameters():
             if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
                 # 在HSDPParam._init_sharded_param中添加该属性，避免重复初始化
                 # 通过_setattr_重新给cell绑定了param后，named_parameters会重复遍历到该param
@@ -62,7 +62,7 @@ class TorchHSDPStateV2(HSDPState):
                 # TODO: 这个可能不需要了，后续根据mesh处理是否切分。
                 self.sharded_hsdp_params.append(hsdp_param)
 
-    def _init_mp_dtypes(self,):
+    def _init_mp_dtypes(self):
         """init mp dtypes for hsdp parameters"""
         for hsdp_param in self.hsdp_params:
             hsdp_param.init_dtype_attrs(self.mp_policy)
@@ -101,6 +101,41 @@ class TorchHSDPStateV2(HSDPState):
         #         return
         self.shard()
 
+    def _apply_reduced_grad(self, hsdp_param, reduced_grad):
+            """
+            Apply reduced gradient to the sharded parameter.
+
+            Reshapes ``reduced_grad`` to match the local shard, optionally
+            offloads to CPU, then accumulates or assigns onto
+            ``hsdp_param.sharded_param.grad``.
+
+            Args:
+                hsdp_param (TorchHSDPParamV2): The HSDP parameter wrapper.
+                reduced_grad (torch.Tensor): Gradient after reduce-scatter
+                    and/or all-reduce.
+            """
+            sharded_grad = hsdp_param.sharded_param.grad
+            sharded_param_local_shape = (
+                hsdp_param.sharded_param.local_shape
+                if isinstance(hsdp_param.sharded_param, DTensor)
+                else hsdp_param.sharded_param.shape
+            )
+            reduced_grad = reduced_grad.view(sharded_param_local_shape)
+            to_accumulate_grad = sharded_grad is not None
+            if hsdp_param.offload_to_cpu:
+                non_blocking = hsdp_param.pin_memory and not to_accumulate_grad
+                reduced_grad = reduced_grad.to(
+                    torch.device("cpu"), non_blocking=non_blocking
+                )
+            if sharded_grad is None:
+                hsdp_param.sharded_param.grad = reduced_grad
+            else:
+                hsdp_param.sharded_param.grad += reduced_grad
+            if hsdp_param.unsharded_accumulated_grad_data is not None:
+                hsdp_param.unsharded_accumulated_grad_data = None
+            elif hsdp_param.unsharded_param.grad is not None:
+                hsdp_param.unsharded_param.grad = None
+
     def post_backward(self, *unused):
             # TODO: reshard + 梯度处理
             for hsdp_param in self.hsdp_params:
@@ -125,29 +160,14 @@ class TorchHSDPStateV2(HSDPState):
                         # Parameter requires grad but was not used in
                         # forward — all ranks skip consistently.
                         continue
-                    reduced_grad, handle = hsdp_param.reduce_scatter_grad(dtype=self._reduce_dtype)
+                    reduced_grad, _ = hsdp_param.reduce_scatter_grad(
+                        dtype=self._reduce_dtype
+                    )
                 if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
                     assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
-                    reduced_grad, handle = hsdp_param.all_reduce_grad(grad=reduced_grad)
+                    reduced_grad, _ = hsdp_param.all_reduce_grad(grad=reduced_grad)
 
-                sharded_grad = hsdp_param.sharded_param.grad
-                # grad is flattened, viewed into sharded_param.shape
-                sharded_param_local_shape = hsdp_param.sharded_param.local_shape if isinstance(hsdp_param.sharded_param, DTensor) else hsdp_param.sharded_param.shape
-                reduced_grad = reduced_grad.view(sharded_param_local_shape)
-                to_accumulate_grad = sharded_grad is not None
-                if hsdp_param.offload_to_cpu:
-                    non_blocking = hsdp_param.pin_memory and not to_accumulate_grad
-                    reduced_grad = reduced_grad.to(
-                        torch.device("cpu"), non_blocking=non_blocking
-                    )
-                if sharded_grad is None:
-                    hsdp_param.sharded_param.grad = reduced_grad
-                else:
-                    hsdp_param.sharded_param.grad += reduced_grad
-                if hsdp_param.unsharded_accumulated_grad_data is not None:
-                    hsdp_param.unsharded_accumulated_grad_data = None
-                elif hsdp_param.unsharded_param.grad is not None:
-                    hsdp_param.unsharded_param.grad = None
+                self._apply_reduced_grad(hsdp_param, reduced_grad)
 
             if self.reshard_after_backward:
                 self.reshard()

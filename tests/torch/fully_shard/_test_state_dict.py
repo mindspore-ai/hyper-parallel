@@ -110,13 +110,15 @@ def _assert_all_dtensor(model, tag=""):
 def _assert_fwd_match(fwd_expected, fwd_actual, tag="", tol=1e-4):
     """Assert forward values match within tolerance."""
     diff = abs(fwd_expected - fwd_actual)
-    assert diff < tol, f"{tag}: expected {fwd_expected}, got {fwd_actual}, diff={diff}"
+    assert diff < tol, (
+        f"{tag}: expected {fwd_expected}, got {fwd_actual}, diff={diff}"
+    )
 
 
 # =====================================================================
 # T1 (2-card): state_dict returns DTensor with global shape
 # =====================================================================
-def test_T1_state_dict_2cards():
+def test_t1_state_dict_2cards():
     """After fully_shard, state_dict() returns DTensors with global shape."""
     init_dist()
     num_cards = 2
@@ -133,7 +135,8 @@ def test_T1_state_dict_2cards():
         local_dim0 = val._local_tensor.shape[0]
         global_dim0 = val.shape[0]
         assert global_dim0 == local_dim0 * num_cards, (
-            f"sd[{key}]: global[0]={global_dim0} != local[0]*{num_cards}={local_dim0 * num_cards}"
+            f"sd[{key}]: global[0]={global_dim0} != local[0]*{num_cards}="
+            f"{local_dim0 * num_cards}"
         )
 
     print(f"[rank{_rank()}] T1 PASS: state_dict has {len(sd)} DTensor entries")
@@ -142,7 +145,7 @@ def test_T1_state_dict_2cards():
 # =====================================================================
 # T2 (2-card): load_state_dict with hyper DTensor (copy + assign)
 # =====================================================================
-def test_T2_load_dtensor_2cards():
+def test_t2_load_dtensor_2cards():
     """load_state_dict with hyper DTensor: both copy and assign paths."""
     init_dist()
     torch.manual_seed(42 + _rank())
@@ -170,7 +173,7 @@ def test_T2_load_dtensor_2cards():
 # =====================================================================
 # T3 (2-card): load_state_dict with torch Tensor (local + global)
 # =====================================================================
-def test_T3_load_tensor_2cards():
+def test_t3_load_tensor_2cards():
     """load_state_dict with plain torch.Tensor: local shard and global."""
     init_dist()
     torch.manual_seed(42 + _rank())
@@ -210,7 +213,7 @@ def test_T3_load_tensor_2cards():
 # =====================================================================
 # T3b (2-card): load from single-NPU vanilla state_dict
 # =====================================================================
-def test_T3b_load_single_npu_checkpoint():
+def test_t3b_load_single_npu_checkpoint():
     """Simulate: single-NPU model saved with torch.save, loaded into fully_shard model.
 
     This is the real-world scenario:
@@ -257,7 +260,7 @@ def test_T3b_load_single_npu_checkpoint():
 # =====================================================================
 # T4 (4-card): full training round-trip
 # =====================================================================
-def test_T4_roundtrip_4cards():
+def test_t4_roundtrip_4cards():
     """Train -> save -> load(DTensor + Tensor) -> continue training."""
     init_dist()
     assert dist.get_world_size() >= 4, "T4 requires 4+ cards"
@@ -297,7 +300,7 @@ def test_T4_roundtrip_4cards():
 # =====================================================================
 # T5 (8-card): full training round-trip
 # =====================================================================
-def test_T5_roundtrip_8cards():
+def test_t5_roundtrip_8cards():
     """Full training round-trip on 8 cards: DTensor + local + global."""
     init_dist()
     assert dist.get_world_size() >= 8, "T5 requires 8 cards"
