@@ -13,11 +13,15 @@
 # limitations under the License.
 # ============================================================================
 """hybrid shard data parallel interface"""
+from typing import Any, Mapping, cast
+
+import torch
 from torch import nn
-from typing import cast
+
 from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel import DeviceMesh
 from hyper_parallel.platform import get_platform
+from hyper_parallel.core.dtensor import DTensor
 
 platform = get_platform()
 
@@ -133,6 +137,108 @@ class HSDPModule:
                 return _UnshardHandle(hsdp_state=scheduler_state)
         return None
 
+    def load_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+        strict: bool = True,
+        assign: bool = False,
+    ):
+        """
+        Load state dict by copying directly into local shards.
+
+        Bypasses ``super().load_state_dict()`` because the standard PyTorch
+        implementation triggers ``copy_`` through the DTensor dispatcher, which
+        is not registered in the hyper-parallel layout system.
+
+        Each value in ``state_dict`` is dispatched by type:
+          - hyper DTensor: extract local shard and copy directly.
+          - plain Tensor whose shape == local shard shape: copy as-is.
+          - plain Tensor whose shape == global shape: distribute via
+            ``DTensor.distribute_tensor``, then copy the local shard.
+
+        Args:
+            state_dict (Mapping[str, Any]): Fully-qualified parameter/buffer
+                names mapped to tensors (DTensor or plain Tensor).
+            strict (bool): If ``True`` (default), missing or unexpected keys
+                raise ``RuntimeError``, matching ``nn.Module.load_state_dict``
+                semantics.
+            assign (bool): Reserved for API compatibility with
+                ``nn.Module.load_state_dict(assign=True)``. Currently unused.
+
+        Raises:
+            RuntimeError: When ``strict`` is ``True`` and keys do not match.
+            ValueError: When a plain tensor shape matches neither the local
+                shard shape nor the global shape of the target DTensor.
+        """
+        self_module = cast(nn.Module, self)
+
+        target_map: dict[str, torch.Tensor] = {}
+        for name, p in self_module.named_parameters():
+            target_map[name] = p
+        for name, b in self_module.named_buffers():
+            target_map[name] = b
+
+        if strict:
+            expected_keys = set(self_module.state_dict().keys())
+            missing = expected_keys - set(state_dict.keys())
+            unexpected = set(state_dict.keys()) - expected_keys
+            error_msgs: list[str] = []
+            if missing:
+                error_msgs.append(
+                    "Missing key(s): " + ", ".join(repr(k) for k in sorted(missing))
+                )
+            if unexpected:
+                error_msgs.append(
+                    "Unexpected key(s): " + ", ".join(repr(k) for k in sorted(unexpected))
+                )
+            if error_msgs:
+                raise RuntimeError(
+                    f"Error(s) in loading state_dict for "
+                    f"{self_module.__class__.__name__}:\n\t"
+                    + "\n\t".join(error_msgs)
+                )
+
+        with torch.no_grad():
+            for key, val in state_dict.items():
+                target = target_map.get(key)
+                if target is None:
+                    continue
+
+                if isinstance(target, DTensor):
+                    if isinstance(val, DTensor):
+                        local_val = val.to_local()
+                    else:
+                        local_shape = tuple(target.local_shape)
+                        global_shape = tuple(target.shape)
+                        val_shape = tuple(val.shape)
+                        if val_shape == local_shape:
+                            local_val = val
+                        elif val_shape == global_shape:
+                            wrapped = DTensor.distribute_tensor(
+                                val.detach(), target.device_mesh, target.placements,
+                            )
+                            local_val = wrapped.to_local()
+                        else:
+                            raise ValueError(
+                                f"load '{key}': plain tensor shape {val_shape} "
+                                f"matches neither local shard {local_shape} "
+                                f"nor global {global_shape}."
+                            )
+                    if target.to_local().is_meta:
+                        # Meta tensor materialisation: replace the placeholder
+                        target._local_tensor = local_val  # pylint: disable=protected-access
+                    else:
+                        target.to_local().copy_(local_val)
+                else:
+                    target.copy_(val)
+
+        # Trigger load_state_dict post-hooks so that HSDP internal
+        # bookkeeping (e.g. _sharded_param_data) stays in sync.
+        for _, module in self_module.named_modules():
+            hooks = module._load_state_dict_post_hooks  # pylint: disable=protected-access
+            for hook in hooks.values():
+                hook(module, None)
+
     def set_is_last_backward(self, is_last_backward: bool):
         """set is_last_backward flag"""
         self.hsdp_scheduler.scheduler_ctx.is_last_backward = is_last_backward
@@ -226,7 +332,6 @@ def _check_hsdp_input_valid(platform_type, module, shard_size, threshold, optimi
         if reduce_dtype is not None and not isinstance(reduce_dtype, Type):
             raise ValueError(f"reduce_dtype must be mindspore.dtype but got {reduce_dtype}.")
     else:
-        import torch
         if reduce_dtype is not None and not isinstance(reduce_dtype, torch.dtype):
             raise ValueError(f"reduce_dtype must be torch.dtype but got {reduce_dtype}.")
     if not isinstance(comm_async, bool):
