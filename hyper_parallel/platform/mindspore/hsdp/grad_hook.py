@@ -13,12 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """HSDP gradient hook"""
-from mindspore import ops
+from mindspore import ops, jit_class
 from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
 from hyper_parallel.core.hsdp.hsdp_grad_hook import HSDPGradHook
 
 
+@jit_class
 class MindSporeHSDPGradHook(HSDPGradHook):
     """MindSpore HSDP gradient hook"""
 

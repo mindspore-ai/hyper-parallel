@@ -14,7 +14,7 @@
 # ============================================================================
 """MindSpore platform api for grap mode"""
 from hyper_parallel.platform.mindspore.platform import MindSporePlatform
-
+from mindspore import ops
 
 class MindSporeGraphPlatform(MindSporePlatform):
     """MindSpore platform api"""
@@ -33,3 +33,19 @@ class MindSporeGraphPlatform(MindSporePlatform):
     def reduce_scatter_tensor(data, group_info, async_op=False):
         output = ops.ReduceScatter(group=group_info.group_name)(data)
         return output, None
+
+    @staticmethod
+    def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
+        raise NotImplementedError("ckpt_wrapper is not supported on MindSpore Graph platform")
+
+    @property
+    def noop_context_fn(self):
+        raise NotImplementedError("noop_context_fn is not supported on MindSpore Graph platform")
+
+    @staticmethod
+    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
+        raise NotImplementedError("create_selective_checkpoint_contexts is not supported on MindSpore Graph platform")
+
+    @staticmethod
+    def async_save_on_cpu(policy_fn=None):
+        raise NotImplementedError("async_save_on_cpu is not supported on MindSpore Graph platform")

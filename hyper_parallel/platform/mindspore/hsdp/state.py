@@ -14,10 +14,12 @@
 # ============================================================================
 """MindSpore HSDP cell state"""
 from mindspore.common.api import _no_grad
+from mindspore import jit_class
 from hyper_parallel.core.hsdp.hsdp_state import HSDPState
 from hyper_parallel.platform.mindspore.hsdp.param import MindSporeHSDPParam
 
 
+@jit_class
 class MindSporeHSDPState(HSDPState):
     """MindSpore HSDP cell state"""
 
