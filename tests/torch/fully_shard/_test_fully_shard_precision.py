@@ -111,10 +111,10 @@ def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):
                     dist_grad = dist_model.weight.grad.data.clone()
                 if not acc_grad:
                     dist_optimizer.step()
-                    dist_optimizer.zero_grads()
+                    dist_optimizer.zero_grad()
             if acc_grad:
                 dist_optimizer.step()
-                dist_optimizer.zero_grads()
+                dist_optimizer.zero_grad()
     return dist_loss, dist_grad
 
 
@@ -158,8 +158,8 @@ def test_zero3_partial_shard():
     """test zero3 partial shard parallel"""
     init_dist()
     op_size = 2
-    hsdp_mesh = init_device_mesh(device_type="npu", mesh_shape=(4, op_size), mesh_dim_names=("dp", "op"))
     mp_policy = MixedPrecisionPolicy()
     fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
+    hsdp_mesh = init_device_mesh(device_type="npu", mesh_shape=(4, op_size), mesh_dim_names=("dp", "op"))
     fsdp_kwargs['mesh'] = hsdp_mesh
     shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)

@@ -38,3 +38,15 @@ def test_fully_shard_02():
     file_name = "_test_fully_shard.py"
     case_name = "test_fully_shard_02"
     torchrun_case(file_name, case_name, master_port)
+
+
+def test_fully_shard_03():
+    """
+    Feature: Test fully_shard with buffer network, CPU init
+    Description: NetWithBuffer has BatchNorm buffers, init on CPU, _move_states_to_device moves to NPU
+    Expectation: run successfully
+    """
+    master_port = 12345
+    file_name = "_test_fully_shard.py"
+    case_name = "test_fully_shard_03"
+    torchrun_case(file_name, case_name, master_port)

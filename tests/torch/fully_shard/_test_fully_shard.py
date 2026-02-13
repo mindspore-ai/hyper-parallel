@@ -20,7 +20,7 @@ import torch
 import torch_npu
 from hyper_parallel import DeviceMesh, init_device_mesh
 from hyper_parallel.platform.platform import get_torch_platform
-from tests.torch.common_net import FullyShardTestNet, DenseNet
+from tests.torch.common_net import FullyShardTestNet, DenseNet, BufferTestNet
 from tests.torch.utils import init_dist
 from tests.torch.hsdp.hsdp_test_common import train
 from hyper_parallel.core.fully_shard.api import fully_shard
@@ -81,3 +81,31 @@ def test_fully_shard_02():
     input_data = torch.rand(batch_size, hidden_size).npu()
     with SkipDTensorDispatch():
         train(multi_layer_net, input_data, comm_async=True, train_steps=2)
+
+
+def test_fully_shard_03():
+    """
+    Feature: Test fully_shard with network that has buffers, initialized on CPU
+    Description: BufferTestNet contains BatchNorm (running_mean, running_var buffers).
+    Model is on CPU at init, _move_states_to_device moves params and buffers to NPU.
+    Expectation: run successfully
+    """
+    batch_size = 4
+    hidden_size = 32
+    init_dist()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    net = BufferTestNet(hidden_size=hidden_size)
+    net = fully_shard(
+        net,
+        mesh=mesh,
+        reshard_after_forward=True,
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+            cast_forward_inputs=True,
+        ),
+    )
+    input_data = torch.rand(batch_size, hidden_size).npu()
+    with SkipDTensorDispatch():
+        train(net, input_data, comm_async=True, train_steps=2)

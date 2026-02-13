@@ -116,3 +116,24 @@ class FullyShardTestNet(nn.Module):
         layers_out = self.dense_layers(w1_out)
         out = torch.sum(layers_out)
         return out
+
+
+class BufferTestNet(nn.Module):
+    """
+    BufferTestNet is a helper network used for testing buffer device in hyper-parallel.
+    """
+    def __init__(self, hidden_size=32):
+        super().__init__()
+        self.linear = nn.Linear(hidden_size, hidden_size)
+        self.bn = nn.BatchNorm1d(hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+        inv_freq = torch.arange(1, hidden_size, 2).float()
+        inv_freq = 1.0 / (inv_freq ** (1.0 / 2.0))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = self.bn(x)
+        x = torch.relu(x)
+        x = self.linear2(x)
+        return torch.sum(x) + torch.sum(self.inv_freq)

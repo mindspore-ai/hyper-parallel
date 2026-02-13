@@ -24,8 +24,8 @@ from hyper_parallel.platform.torch.fully_shard.utils import HSDPMeshInfo
 
 class TorchHSDPStateV2(HSDPState):
     """Torch HSDP cell state"""
-    def __init__(self, cell, mesh_info, config, platform):
-        super().__init__(cell, mesh_info, config, platform)
+    def __init__(self, cell, mesh_info, config, platform, device=None):
+        super().__init__(cell, mesh_info, config, platform, device)
         # self._init_mp_dtypes()
         # Do ReduceScatter/AllReduce for grad
         self.mp_policy = config.mp_policy
@@ -37,6 +37,20 @@ class TorchHSDPStateV2(HSDPState):
         self.requires_all_reduce = True
         self._use_post_forward_mesh = False
         self._init_mp_dtypes()
+
+    def _move_states_to_device(self):
+        """move states to device"""
+        # TODO: @celia DTensor support
+        for param in self.cell.parameters():
+            if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
+                continue
+            if param.device == self.device or param.device.type == "meta":
+                continue
+            param.data = param.to(self.device)
+        for buffer in self.cell.buffers():
+            if buffer.device == self.device or buffer.device.type == "meta":
+                continue
+            buffer.data = buffer.to(self.device)
 
     def _init_hsdp_params(self):
         """init hsdp parameters for cell"""
@@ -55,7 +69,8 @@ class TorchHSDPStateV2(HSDPState):
                                           module_info,
                                           self.mesh_info,
                                           mp_policy=self.mp_policy,
-                                          offload_policy=self.offload_policy
+                                          offload_policy=self.offload_policy,
+                                          device=self.device,
                                           )
             self.hsdp_params.append(hsdp_param)
             if hsdp_param.is_sharded:

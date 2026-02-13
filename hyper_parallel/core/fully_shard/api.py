@@ -48,7 +48,7 @@ class HSDPModule:
 
     # pylint: disable=C0415
     def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
-                  shard_placement_fn, mp_policy, offload_policy, ignored_params):
+                  shard_placement_fn, mp_policy, offload_policy, ignored_params, device):
         """init hsdp2 scheduler."""
         scheduler_class = None
         if platform_type == PlatformType.MINDSPORE:
@@ -65,6 +65,7 @@ class HSDPModule:
                                               mp_policy,
                                               offload_policy,
                                               ignored_params,
+                                              device,
                                               )
 
     def set_requires_gradient_sync(self, requires_grad_sync):
@@ -350,10 +351,19 @@ def fully_shard(
         shard_placement_fn: None = None,
         mp_policy: None = None,
         offload_policy: None = None,
-        ignored_params: set[nn.Parameter] | None = None
+        ignored_params: set[nn.Parameter] | None = None,
+        device = None,
 ):
     platform_type = platform.platform_type
     _extend_module_with_hsdp_interface(module)
+    # TODO: mindspore does not support get_device_handle
+    if device is None:
+        import torch
+        device_handle = platform.get_device_handle()  # return torch.npu or torch.cuda
+        if device_handle.is_available():
+            device = torch.device(device_handle.current_device())
+        else:
+            device = torch.device("cpu")
     module.hsdp_init(
         platform_type,
         module,
@@ -362,7 +372,8 @@ def fully_shard(
         shard_placement_fn,
         mp_policy,
         offload_policy,
-        ignored_params
+        ignored_params,
+        device,
     )
     return module
 
