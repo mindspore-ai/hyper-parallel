@@ -20,18 +20,25 @@ Verified scenarios:
   T3 (2-card): load_state_dict with torch Tensor (local shard + global)
   T4 (4-card): train -> save -> load(DTensor + Tensor) -> continue training
   T5 (8-card): full training round-trip (DTensor + local + global)
+  T6 (8-card): get_model_state_dict sharded (default options)
+  T7 (8-card): get_model_state_dict full + cpu_offload
+  T8 (8-card): get_model_state_dict ignore_frozen_params
+  T9 (8-card): get_model_state_dict sharded + cpu_offload
+  T10 (1-card): _to_dtype_if_needed cast / no-op
 """
 import os
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import torch
-import torch_npu  # pylint: disable=W0611
 import torch.distributed as dist
+import torch_npu  # pylint: disable=W0611
+from torch.distributed.checkpoint.state_dict import StateDictOptions
 
 from hyper_parallel import init_device_mesh, SkipDTensorDispatch
 from hyper_parallel.core.dtensor import DTensor
-from hyper_parallel.core.fully_shard.api import fully_shard
+from hyper_parallel.core.fully_shard.api import fully_shard, get_model_state_dict
+from hyper_parallel.platform.torch.fully_shard.state import _to_dtype_if_needed
 from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.common_net import FullyShardTestNet
 from tests.torch.utils import init_dist
@@ -214,11 +221,12 @@ def test_t3_load_tensor_2cards():
 # T3b (2-card): load from single-NPU vanilla state_dict
 # =====================================================================
 def test_t3b_load_single_npu_checkpoint():
-    """Simulate: single-NPU model saved with torch.save, loaded into fully_shard model.
+    """Simulate: single-NPU model saved with save(), loaded into fully_shard model.
 
     This is the real-world scenario:
-        1. Train on 1 NPU, torch.save(model.state_dict(), "ckpt.pt")
-        2. Load on N NPUs: model = fully_shard(Model()); model.load_state_dict(torch.load("ckpt.pt"))
+        1. Train on 1 NPU, save(model.state_dict(), "ckpt.pt")
+        2. Load on N NPUs: model = fully_shard(Model());
+           model.load_state_dict(load("ckpt.pt"))
     """
     init_dist()
     num_cards = 2
@@ -339,3 +347,147 @@ def test_t5_roundtrip_8cards():
     _assert_all_dtensor(model4, "8-card round-trip")
 
     print(f"[rank{_rank()}] T5 PASS: 8-card round-trip (DTensor + local + global)")
+
+
+# =====================================================================
+# T6 (8-card): get_model_state_dict sharded (default options)
+# =====================================================================
+def test_t6_get_model_sd_sharded():
+    """get_model_state_dict with default options returns sharded DTensors."""
+    init_dist()
+    torch.manual_seed(42 + _rank())
+    model = _make_model(8)
+    x = torch.randn(BATCH, HIDDEN).npu()
+    _train_step(model, x)
+
+    sd = get_model_state_dict(model)
+    ref_sd = model.state_dict()
+
+    assert set(sd.keys()) == set(ref_sd.keys()), (
+        f"key mismatch: {set(sd.keys()) ^ set(ref_sd.keys())}"
+    )
+    for key, val in sd.items():
+        assert isinstance(val, DTensor), f"sd[{key}] should be DTensor"
+        ref_val = ref_sd[key]
+        assert tuple(val.shape) == tuple(ref_val.shape), (
+            f"sd[{key}]: shape mismatch {val.shape} vs {ref_val.shape}"
+        )
+
+    print(f"[rank{_rank()}] T6 PASS: get_model_state_dict sharded (default)")
+
+
+# =====================================================================
+# T7 (8-card): get_model_state_dict full + cpu_offload
+# =====================================================================
+def test_t7_get_model_sd_full_cpu():
+    """get_model_state_dict with full_state_dict=True, cpu_offload=True."""
+    init_dist()
+    torch.manual_seed(42 + _rank())
+    num_cards = 8
+    model = _make_model(num_cards)
+    x = torch.randn(BATCH, HIDDEN).npu()
+    _train_step(model, x)
+
+    opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    sd = get_model_state_dict(model, options=opts)
+
+    if _rank() == 0:
+        assert len(sd) > 0, "rank0 should get non-empty state_dict"
+        for key, val in sd.items():
+            assert isinstance(val, torch.Tensor), f"sd[{key}] should be Tensor"
+            assert not isinstance(val, DTensor), f"sd[{key}] should not be DTensor"
+            assert val.device == torch.device("cpu"), (
+                f"sd[{key}] should be on CPU, got {val.device}"
+            )
+            # Full tensor: dim0 should equal global shape
+            expected_dim0 = HIDDEN  # all params are (HIDDEN, HIDDEN)
+            assert val.shape[0] == expected_dim0, (
+                f"sd[{key}]: expected full dim0={expected_dim0}, got {val.shape[0]}"
+            )
+    else:
+        assert len(sd) == 0, f"non-rank0 should get empty dict, got {len(sd)} keys"
+
+    print(f"[rank{_rank()}] T7 PASS: get_model_state_dict full + cpu_offload")
+
+
+# =====================================================================
+# T8 (8-card): get_model_state_dict ignore_frozen_params
+# =====================================================================
+def test_t8_get_model_sd_ignore_frozen():
+    """get_model_state_dict with ignore_frozen_params=True excludes frozen params."""
+    init_dist()
+    torch.manual_seed(42 + _rank())
+    model = _make_model(8)
+
+    # Freeze the first dense layer's weight
+    all_params = list(model.named_parameters())
+    assert len(all_params) > 1, "model should have >1 param to freeze one"
+    frozen_name, frozen_param = all_params[0]
+    frozen_param.requires_grad = False
+
+    opts = StateDictOptions(ignore_frozen_params=True)
+    sd = get_model_state_dict(model, options=opts)
+
+    assert frozen_name not in sd, (
+        f"frozen param '{frozen_name}' should not be in state_dict"
+    )
+
+    # All non-frozen params should still be present
+    non_frozen_names = {name for name, p in all_params if p.requires_grad}
+    for name in non_frozen_names:
+        assert name in sd, f"non-frozen param '{name}' should be in state_dict"
+
+    print(f"[rank{_rank()}] T8 PASS: get_model_state_dict ignore_frozen_params")
+
+
+# =====================================================================
+# T9 (8-card): get_model_state_dict sharded + cpu_offload
+# =====================================================================
+def test_t9_get_model_sd_sharded_cpu():
+    """get_model_state_dict with full_state_dict=False, cpu_offload=True."""
+    init_dist()
+    torch.manual_seed(42 + _rank())
+    model = _make_model(8)
+    x = torch.randn(BATCH, HIDDEN).npu()
+    _train_step(model, x)
+
+    opts = StateDictOptions(cpu_offload=True)
+    sd = get_model_state_dict(model, options=opts)
+
+    assert len(sd) > 0, "state_dict should be non-empty"
+    for key, val in sd.items():
+        assert isinstance(val, DTensor), f"sd[{key}] should still be DTensor"
+        local_tensor = val.to_local()
+        assert local_tensor.device == torch.device("cpu"), (
+            f"sd[{key}] local shard should be on CPU, got {local_tensor.device}"
+        )
+
+    print(f"[rank{_rank()}] T9 PASS: get_model_state_dict sharded + cpu_offload")
+
+
+# =====================================================================
+# T10 (unit): _to_dtype_if_needed
+# =====================================================================
+def test_t10_to_dtype_if_needed():
+    """_to_dtype_if_needed: cast when dtype differs, no-op when same."""
+    # Same dtype → returns same object
+    t_fp32 = torch.randn(4, 4)
+    result = _to_dtype_if_needed(t_fp32, torch.float32)
+    assert result is t_fp32, "same dtype should return same object"
+
+    # None dtype → returns same object
+    result_none = _to_dtype_if_needed(t_fp32, None)
+    assert result_none is t_fp32, "None dtype should return same object"
+
+    # Different dtype → returns cast tensor
+    result_fp16 = _to_dtype_if_needed(t_fp32, torch.float16)
+    assert result_fp16 is not t_fp32, "different dtype should return new tensor"
+    assert result_fp16.dtype == torch.float16, (
+        f"expected float16, got {result_fp16.dtype}"
+    )
+    # Values should be approximately equal
+    assert torch.allclose(t_fp32, result_fp16.float(), atol=1e-3), (
+        "cast values should be approximately equal"
+    )
+
+    print("T10 PASS: _to_dtype_if_needed")
