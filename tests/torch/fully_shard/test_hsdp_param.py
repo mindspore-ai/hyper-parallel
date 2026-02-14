@@ -13,9 +13,10 @@
 # limitations under the License.
 # ============================================================================
 """test TorchHSDPParamV2"""
+from tests.common.mark_utils import arg_mark
 from tests.torch.utils import torchrun_case
 
-
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_fsdp_1d_mesh():
     """
     Feature: TorchHSDPParamV2.
@@ -28,6 +29,7 @@ def test_hsdp_param_v2_fsdp_1d_mesh():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_hsdp_2d_mesh():
     """
     Feature: TorchHSDPParamV2.
@@ -40,6 +42,7 @@ def test_hsdp_param_v2_hsdp_2d_mesh():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_sharded_state_transitions():
     """
     Feature: TorchHSDPParamV2.
@@ -52,6 +55,7 @@ def test_hsdp_param_v2_sharded_state_transitions():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_custom_shard_placement():
     """
     Feature: TorchHSDPParamV2.
@@ -64,6 +68,7 @@ def test_hsdp_param_v2_custom_shard_placement():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_mixed_precision():
     """
     Feature: TorchHSDPParamV2.
@@ -76,6 +81,7 @@ def test_hsdp_param_v2_mixed_precision():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_all_gather_comm():
     """
     Feature: TorchHSDPParamV2.
@@ -88,6 +94,7 @@ def test_hsdp_param_v2_all_gather_comm():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_prefetch_unshard():
     """
     Feature: TorchHSDPParamV2.
@@ -100,6 +107,7 @@ def test_hsdp_param_v2_prefetch_unshard():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_unshard_shard_cycle():
     """
     Feature: TorchHSDPParamV2.
@@ -112,6 +120,7 @@ def test_hsdp_param_v2_unshard_shard_cycle():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_reduce_scatter_grad():
     """
     Feature: TorchHSDPParamV2.
@@ -124,6 +133,7 @@ def test_hsdp_param_v2_reduce_scatter_grad():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_all_reduce_grad():
     """
     Feature: TorchHSDPParamV2.
@@ -136,6 +146,7 @@ def test_hsdp_param_v2_all_reduce_grad():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_accumulate_grad():
     """
     Feature: TorchHSDPParamV2.

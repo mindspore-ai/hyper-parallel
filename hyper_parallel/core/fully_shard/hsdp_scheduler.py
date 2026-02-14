@@ -21,11 +21,9 @@ from hyper_parallel.core.fully_shard.hsdp_async_grad_hook import HSDPAsyncGradHo
 
 
 class HSDPSchedulerContext:
-    """This has state shared across FSDP states."""
+    """HSDPSchedulerContext"""
 
     def __init__(self) -> None:
-        self.all_states = []
-        self.iter_forward_root = None
         self.post_backward_final_callback_queued: bool = False
         self.is_last_backward: bool = True
         self.post_optim_event = None
@@ -45,9 +43,9 @@ class HSDPSchedulerV2:
         self.ignored_params = ignored_params
         self.device = device
         self.scheduler_state = None
-        self.scheduler_ctx = HSDPSchedulerContext()
         self.forward_prefetch_cells = []
         self.backward_prefetch_cells = []
+        self.scheduler_ctx = HSDPSchedulerContext()
         self.config = HSDPConfigV2(
             mesh,
             reshard_after_forward,
@@ -133,8 +131,6 @@ class HSDPSchedulerV2:
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return
         self.scheduler_state = FSDPSchedulerState.PRE_FORWARD
-        if len(inputs) > 0:
-            self.platform.set_tensor_requires_grad(inputs[0])
         if self.mp_policy.cast_forward_inputs and self.mp_policy.param_dtype:
             cast_fn = functools.partial(self.platform.cast_fp_tensor, self.mp_policy.param_dtype)
             inputs = self.platform.apply_to_tensors(cast_fn, inputs)

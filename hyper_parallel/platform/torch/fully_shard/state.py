@@ -50,6 +50,8 @@ class TorchHSDPStateV2(HSDPState):
         # Requires AllReduce for grad When HSDP
         self.requires_all_reduce = True
         self._use_post_forward_mesh = False
+        # Reduce Op type for gradient reduction, default to AVG.
+        self.reduce_op_type = torch.distributed.ReduceOp.AVG
         self._init_mp_dtypes()
 
     def _move_states_to_device(self):
@@ -167,7 +169,6 @@ class TorchHSDPStateV2(HSDPState):
                 hsdp_param.unsharded_param.grad = None
 
     def post_backward(self, *unused):
-            # TODO: reshard + 梯度处理
             for hsdp_param in self.hsdp_params:
                 hsdp_param.accumulate_unsharded_grad_if_needed()
             if not self.reduce_grads:
@@ -191,38 +192,32 @@ class TorchHSDPStateV2(HSDPState):
                         # forward — all ranks skip consistently.
                         continue
                     reduced_grad, _ = hsdp_param.reduce_scatter_grad(
-                        dtype=self._reduce_dtype
+                        dtype=self._reduce_dtype,
+                        reduce_op=self.reduce_op_type
                     )
                 if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
                     assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
-                    reduced_grad, _ = hsdp_param.all_reduce_grad(grad=reduced_grad)
-
+                    reduced_grad, _ = hsdp_param.all_reduce_grad(
+                        grad=reduced_grad,
+                        reduce_op=self.reduce_op_type,
+                    )
+                # Bind the reduced gradient to hsdp_param.sharded_param
                 self._apply_reduced_grad(hsdp_param, reduced_grad)
 
             if self.reshard_after_backward:
                 self.reshard()
-            if not hsdp_params_with_grad:
-                # 没有要处理的梯度
-                return
-
-    def grad_comm_reduce(self, hsdp_params_with_grad: List[TorchHSDPParamV2], unsharded_grads: List[torch.Tensor]):
-        # TODO: 能够支持处理FSDP和HSDP的场景, 可以先不接入分组ReduceScatter能力，后续再做优化
-        for hsdp_param, unsharded_grad in zip(hsdp_params_with_grad, unsharded_grads):
-            assert not isinstance(unsharded_grad, DTensor), "unsharded_grad shouldn't be DTensor in hyper-parallel."
-            if hsdp_param.shard_world_size > 1:
-                reduced_grad = self.platform.reduce_scatter_tensor(
-                    unsharded_grad, hsdp_param.mesh_info.shard_process_group, dtype=hsdp_param.reduce_dtype)
-            if self.requires_all_reduce and hsdp_param.replicate_world_size > 1 and not hsdp_param.fully_shard:
-                assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
-                reduced_grad = self.platform.all_reduce_tensor(
-                    reduced_grad, hsdp_param.mesh_info.replicate_process_group, dtype=hsdp_param.reduce_dtype)
-
-            sharded_grad = hsdp_param.sharded_param.grad
-            if sharded_grad is None:
-                sharded_grad = reduced_grad
-            else:
-                hsdp_param.sharded_param.grad += reduced_grad
 
     def set_requires_grad_sync(self, requires_grad_sync):
         """set requires grad sync flag to control gradient sync."""
         self.reduce_grads = requires_grad_sync
+    
+    def set_reduce_op_type(self, reduce_op_type: str):
+        """set reduce op type for gradient reduction."""
+        fsdp_support_reduce_op = {
+            "sum": torch.distributed.ReduceOp.SUM,
+            "avg": torch.distributed.ReduceOp.AVG,
+        }
+        if reduce_op_type not in fsdp_support_reduce_op:
+            raise ValueError(f"Unsupported reduce op type {reduce_op_type}, supported types are {list(fsdp_support_reduce_op.keys())}")
+        reduce_op: str = reduce_op_type.lower().strip()
+        self.reduce_op_type = fsdp_support_reduce_op[reduce_op]

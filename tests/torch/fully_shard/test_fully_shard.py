@@ -14,8 +14,10 @@
 # ============================================================================
 """test fully_shard api"""
 
+from tests.common.mark_utils import arg_mark
 from tests.torch.utils import torchrun_case
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_fully_shard_01():
     """
     Feature: Test fully_shard with simple network, optimization level is default ZeRO-3
@@ -28,6 +30,7 @@ def test_fully_shard_01():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_fully_shard_02():
     """
     Feature: Test fully_shard with multi-layer network, optimization level is default ZeRO-3
@@ -40,6 +43,7 @@ def test_fully_shard_02():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_fully_shard_03():
     """
     Feature: Test fully_shard with buffer network, CPU init
@@ -52,6 +56,7 @@ def test_fully_shard_03():
     torchrun_case(file_name, case_name, master_port)
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_fully_shard_from_group_mesh():
     """
     Feature: When mesh created by from_group, test fully_shard with multi-layer network, optimization level is default ZeRO-3

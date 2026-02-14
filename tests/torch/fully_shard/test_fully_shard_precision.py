@@ -14,8 +14,12 @@
 # ============================================================================
 """launch _test_fully_shard_precison.py cases"""
 from tests.torch.utils import torchrun_case
+from tests.common.mark_utils import arg_mark
+
 
 file_name = "_test_fully_shard_precision.py"
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_fully_shard():
     """
     Feature: Test_zero3_fully_shard.
@@ -26,6 +30,7 @@ def test_zero3_fully_shard():
     case_name = "test_zero3_fully_shard"
     torchrun_case(file_name, case_name, master_port)
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_fully_shard_with_mp():
     """
     Feature: Test_zero3_fully_shard_with_mp_policy.
@@ -36,6 +41,7 @@ def test_zero3_fully_shard_with_mp():
     case_name = "test_zero3_fully_shard_with_mp"
     torchrun_case(file_name, case_name, master_port)
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_partial_shard():
     """
     Feature: Test_zero3_fully_shard.
