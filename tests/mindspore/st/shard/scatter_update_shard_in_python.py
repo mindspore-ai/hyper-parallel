@@ -19,7 +19,8 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor, ops
-from hyper_parallel import init_device_mesh, shard_module, DTensor
+from hyper_parallel import init_device_mesh, shard_module
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
@@ -85,9 +86,9 @@ def test_scatter_update_data_parallel_1():
     updates_placements = (Shard(1), Replicate(), Replicate())
     relu_input_placements = (Shard(1), Replicate(), Replicate())
 
-    input_local = DTensor.distribute_tensor(input_x, mesh, input_placements)
-    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
-    updates_local = DTensor.distribute_tensor(updates, mesh, updates_placements)
+    input_local = distribute_tensor(input_x, mesh, input_placements)
+    indices_local = distribute_tensor(indices, mesh, indices_placements)
+    updates_local = distribute_tensor(updates, mesh, updates_placements)
 
     parallel_net = ScatterUpdateNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(input_local, indices_local, updates_local)
@@ -129,9 +130,9 @@ def test_scatter_update_model_parallel_2():
     updates_placements = (Replicate(), Replicate(), Shard(2))
     relu_input_placements = (Replicate(), Replicate(), Shard(2))
 
-    input_local = DTensor.distribute_tensor(input_x, mesh, input_placements)
-    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
-    updates_local = DTensor.distribute_tensor(updates, mesh, updates_placements)
+    input_local = distribute_tensor(input_x, mesh, input_placements)
+    indices_local = distribute_tensor(indices, mesh, indices_placements)
+    updates_local = distribute_tensor(updates, mesh, updates_placements)
 
     parallel_net = ScatterUpdateNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(input_local, indices_local, updates_local)
@@ -173,9 +174,9 @@ def test_scatter_update_hybrid_parallel_3():
     updates_placements = (Shard(1), Replicate(), Shard(2))
     relu_input_placements = (Shard(1), Replicate(), Shard(2))
 
-    input_local = DTensor.distribute_tensor(input_x, mesh, input_placements)
-    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
-    updates_local = DTensor.distribute_tensor(updates, mesh, updates_placements)
+    input_local = distribute_tensor(input_x, mesh, input_placements)
+    indices_local = distribute_tensor(indices, mesh, indices_placements)
+    updates_local = distribute_tensor(updates, mesh, updates_placements)
 
     parallel_net = ScatterUpdateNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(input_local, indices_local, updates_local)
@@ -217,9 +218,9 @@ def test_scatter_update_multi_dim_indices_4():
     updates_placements = (Shard(2), Replicate(), Shard(3))
     relu_input_placements = (Shard(1), Replicate(), Shard(2))
 
-    input_local = DTensor.distribute_tensor(input_x, mesh, input_placements)
-    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
-    updates_local = DTensor.distribute_tensor(updates, mesh, updates_placements)
+    input_local = distribute_tensor(input_x, mesh, input_placements)
+    indices_local = distribute_tensor(indices, mesh, indices_placements)
+    updates_local = distribute_tensor(updates, mesh, updates_placements)
 
     parallel_net = ScatterUpdateNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(input_local, indices_local, updates_local)
@@ -261,9 +262,9 @@ def test_scatter_update_replicate_all_5():
     updates_placements = (Replicate(), Replicate(), Replicate())
     relu_input_placements = (Replicate(), Replicate(), Replicate())
 
-    input_local = DTensor.distribute_tensor(input_x, mesh, input_placements)
-    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
-    updates_local = DTensor.distribute_tensor(updates, mesh, updates_placements)
+    input_local = distribute_tensor(input_x, mesh, input_placements)
+    indices_local = distribute_tensor(indices, mesh, indices_placements)
+    updates_local = distribute_tensor(updates, mesh, updates_placements)
 
     parallel_net = ScatterUpdateNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(input_local, indices_local, updates_local)

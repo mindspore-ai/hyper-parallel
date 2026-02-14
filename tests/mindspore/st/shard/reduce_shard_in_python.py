@@ -20,6 +20,7 @@ import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor, ops
 from hyper_parallel import init_device_mesh, shard_module, DTensor, parallelize_value_and_grad
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
@@ -120,7 +121,7 @@ def test_sum_ext_dim_partial_model_parallel_1():
     x_placements = (Shard(0), Shard(1), Shard(2))
     relu_input_placements = (Replicate(), Replicate(), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
 
     parallel_net = SumExtNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(x_local, dim=[0, 1], keepdim=True)
@@ -156,7 +157,7 @@ def test_mean_ext_partial_model_parallel_2():
     x_placements = (Shard(0), Shard(1), Shard(2))
     relu_input_placements = (Replicate(), Replicate(), Shard(0))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
 
     parallel_net = MeanExtNet(device_mesh=mesh, relu_strategy=(relu_input_placements,))
     parallel_output = parallel_net(x_local, dim=[0, 1], keepdim=False)
@@ -192,7 +193,7 @@ def test_reduce_max_partial_model_parallel_3():
     x_placements = (Shard(0), Shard(1), Shard(2))
     relu_input_placements = (Replicate(), Replicate(), Shard(0))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
 
     parallel_net = ReduceMaxNet(device_mesh=mesh, relu_strategy=(relu_input_placements,), keep_dims=False)
     parallel_output = parallel_net(x_local, axis=(0, 1))
@@ -250,7 +251,7 @@ def test_reduce_max_backward_gradient_4():
 
     # Define placements using Placement format
     x_placements = (Shard(0), Shard(1), Shard(2))
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
 
     _, _, mp = base_mesh_shape
     local_k = k // mp
@@ -271,7 +272,7 @@ def test_reduce_max_backward_gradient_4():
             else:
                 full_weight = Tensor(np.zeros([k]).astype(np.float32))
 
-            weight_dtensor = DTensor.distribute_tensor(full_weight, mesh, weight_placements)
+            weight_dtensor = distribute_tensor(full_weight, mesh, weight_placements)
             self.weight = ms.Parameter(weight_dtensor.to_local(), name="weight")
 
             # Shard relu operator

@@ -16,7 +16,8 @@
 
 import numpy as np
 import torch
-from hyper_parallel import DTensor, init_device_mesh
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global
@@ -47,7 +48,7 @@ def test_distributed_cumsum_layout_inference():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())  # dim=0 sharded, dim=1 unsharded → VALID for cumsum(dim=1)
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = torch.cumsum(dist_input, dim=cumsum_dim)
 
     assert dist_output.layout == dist_input.layout, (
@@ -75,7 +76,7 @@ def test_distributed_cumsum_sharded_dim_error():
     x_placements = (Shard(0), Replicate())
 
     standalone_input = torch.from_numpy(standalone_input_np).npu()
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     try:
         torch.cumsum(dist_input, dim=cumsum_dim)
@@ -105,7 +106,7 @@ def test_distributed_cumsum_negative_dim_support():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())  # dim=0 sharded
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = torch.cumsum(dist_input, dim=cumsum_dim)
 
     assert dist_output.layout == dist_input.layout, "Cumsum with negative dim: layout mismatch"

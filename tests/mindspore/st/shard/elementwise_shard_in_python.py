@@ -19,7 +19,8 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor, ops
-from hyper_parallel import init_device_mesh, shard_module, DTensor
+from hyper_parallel import init_device_mesh, shard_module
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
@@ -166,8 +167,8 @@ def test_minimum_same_shape_parallel_1():
     y_placements = (Shard(0), Shard(1), Shard(2))
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -205,8 +206,8 @@ def test_less_equal_same_shape_parallel_2():
     y_placements = (Shard(0), Shard(1), Shard(2))
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = LessEqualNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -244,8 +245,8 @@ def test_greater_equal_same_shape_parallel_3():
     y_placements = (Shard(0), Shard(1), Shard(2))
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = GreaterEqualNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -283,8 +284,8 @@ def test_logical_or_same_shape_parallel_4():
     y_placements = (Shard(0), Shard(1), Shard(2))
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = LogicalOrNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -322,8 +323,8 @@ def test_minimum_broadcast_dim0_parallel_5():
     y_placements = (Replicate(), Shard(1), Shard(2))
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -361,8 +362,8 @@ def test_minimum_broadcast_dim1_parallel_6():
     y_placements = (Shard(0), Replicate(), Shard(2))
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -400,8 +401,8 @@ def test_minimum_broadcast_dim2_parallel_7():
     y_placements = (Shard(0), Shard(1), Replicate())
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -439,8 +440,8 @@ def test_minimum_broadcast_rank_mismatch_parallel_8():
     y_placements = (Replicate(), Shard(0), Shard(1))
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -478,8 +479,8 @@ def test_minimum_broadcast_scalar_like_parallel_9():
     y_placements = (Replicate(), Replicate(), Shard(0))
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -519,8 +520,8 @@ def test_less_equal_broadcast_multi_dim_parallel_10():
     y_placements = (Replicate(), Shard(1), Replicate())
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = LessEqualNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -558,8 +559,8 @@ def test_minimum_partial_shard_parallel_11():
     y_placements = (Replicate(), Replicate(), Shard(2))
     relu_placements = (Replicate(), Replicate(), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = MinimumNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -598,8 +599,8 @@ def test_mod_same_shape_parallel_12():
     y_placements = (Shard(0), Shard(1), Shard(2))
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -637,8 +638,8 @@ def test_mod_broadcast_dim0_parallel_13():
     y_placements = (Replicate(), Shard(1), Shard(2))  # Dimension 0 cannot be sharded
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -676,8 +677,8 @@ def test_mod_broadcast_dim1_parallel_14():
     y_placements = (Shard(0), Replicate(), Shard(2))  # Dimension 1 cannot be sharded
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -715,8 +716,8 @@ def test_mod_broadcast_dim2_parallel_15():
     y_placements = (Shard(0), Shard(1), Replicate())  # Dimension 2 cannot be sharded
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -754,8 +755,8 @@ def test_mod_broadcast_rank_mismatch_parallel_16():
     y_placements = (Replicate(), Shard(0), Shard(1))  # 2D tensor placements
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)
@@ -792,7 +793,7 @@ def test_mod_tensor_scalar_parallel_17():
     x_placements = (Shard(0), Shard(1), Shard(2))
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
 
     parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y)
@@ -830,8 +831,8 @@ def test_mod_partial_shard_parallel_18():
     y_placements = (Replicate(), Replicate(), Shard(2))
     relu_placements = (Replicate(), Replicate(), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    y_local = DTensor.distribute_tensor(y, mesh, y_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    y_local = distribute_tensor(y, mesh, y_placements)
 
     parallel_net = ModNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, y_local)

@@ -21,7 +21,8 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
-from hyper_parallel import init_device_mesh, shard_module, DTensor
+from hyper_parallel import init_device_mesh, shard_module
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
@@ -62,7 +63,7 @@ def _standalone_and_parallel_run(x, mesh, x_placements, dim0, dim1, relu_placeme
     standalone_output = standalone_net(x, dim0, dim1)
 
     # Parallel
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
     parallel_net = TransposeExtViewNet(device_mesh=mesh, relu_strategy=relu_placements)
     parallel_output = parallel_net(x_local, dim0, dim1)
 

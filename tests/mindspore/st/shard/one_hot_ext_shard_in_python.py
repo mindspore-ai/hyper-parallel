@@ -21,6 +21,7 @@ import mindspore.communication.management as D
 from mindspore import nn, Tensor
 from mindspore import mint
 from hyper_parallel import init_device_mesh, shard_module, DTensor
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
@@ -70,7 +71,7 @@ def test_one_hot_ext_data_parallel_1d_int64_1():
     tensor_placements = (Shard(0), Replicate(), Replicate())
     onehot_out_placements = (Shard(0), Replicate(), Replicate())
 
-    tensor_local = DTensor.distribute_tensor(tensor, mesh, tensor_placements)
+    tensor_local = distribute_tensor(tensor, mesh, tensor_placements)
 
     parallel_net = OneHotExtNet(device_mesh=mesh, relu_strategy=(onehot_out_placements,))
     parallel_output = parallel_net(tensor_local, num_classes)
@@ -98,7 +99,7 @@ def test_one_hot_ext_data_parallel_2d_int64_2():
     tensor_placements = (Shard(0), Replicate(), Replicate())
     onehot_out_placements = (Shard(0), Replicate(), Replicate())
 
-    tensor_local = DTensor.distribute_tensor(tensor, mesh, tensor_placements)
+    tensor_local = distribute_tensor(tensor, mesh, tensor_placements)
 
     parallel_net = OneHotExtNet(device_mesh=mesh, relu_strategy=(onehot_out_placements,))
     parallel_output = parallel_net(tensor_local, num_classes)
@@ -126,7 +127,7 @@ def test_one_hot_ext_replicate_all_int64_3():
     tensor_placements = (Replicate(), Replicate(), Replicate())
     onehot_out_placements = (Replicate(), Replicate(), Replicate())
 
-    tensor_local = DTensor.distribute_tensor(tensor, mesh, tensor_placements)
+    tensor_local = distribute_tensor(tensor, mesh, tensor_placements)
 
     parallel_net = OneHotExtNet(device_mesh=mesh, relu_strategy=(onehot_out_placements,))
     parallel_output = parallel_net(tensor_local, num_classes)
@@ -154,7 +155,7 @@ def test_one_hot_ext_3d_data_parallel_int64_4():
     tensor_placements = (Shard(0), Replicate(), Replicate())
     onehot_out_placements = (Shard(0), Replicate(), Replicate())
 
-    tensor_local = DTensor.distribute_tensor(tensor, mesh, tensor_placements)
+    tensor_local = distribute_tensor(tensor, mesh, tensor_placements)
 
     parallel_net = OneHotExtNet(device_mesh=mesh, relu_strategy=(onehot_out_placements,))
     parallel_output = parallel_net(tensor_local, num_classes)

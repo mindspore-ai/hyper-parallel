@@ -264,46 +264,45 @@ class DTensor(DTensorBase):
         out = _tensor_redistribution.redistribution(self, replicated_layout)
         return out.to_local()
 
-    @staticmethod
-    def distribute_tensor(
-        tensor: Tensor,
-        device_mesh: DeviceMesh,
-        placements: Sequence[Placement]
-    ) -> 'DTensor':
-        """
-        Distribute a global tensor to the device mesh according to the placements.
 
-        Args:
-            tensor (Tensor): The global tensor to be distributed. All ranks
-                should have the same tensor data.
-            device_mesh (DeviceMesh): The device mesh describing the device topology.
-            placements (Sequence[Placement]): The placement strategy for distribution.
-                Each element should be a Placement object (Shard, Replicate, etc.).
+def distribute_tensor(
+    tensor: Tensor,
+    device_mesh: DeviceMesh,
+    placements: Sequence[Placement]
+) -> DTensor:
+    """
+    Distribute a global tensor to the device mesh according to the placements.
 
-        Returns:
-            DTensor: A new DTensor with the local shard on each rank.
+    Args:
+        tensor (Tensor): The global tensor to be distributed. All ranks
+            should have the same tensor data.
+        device_mesh (DeviceMesh): The device mesh describing the device topology.
+        placements (Sequence[Placement]): The placement strategy for distribution.
+            Each element should be a Placement object (Shard, Replicate, etc.).
 
-        Note:
-            This method assumes all ranks have the same global tensor. It slices
-            the tensor locally without communication. If ranks have different
-            data, use `from_local` instead.
+    Returns:
+        DTensor: A new DTensor with the local shard on each rank.
 
-        Example:
-            >>> from hyper_parallel.core.placement_types import Shard, Replicate
-            >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-            >>> global_tensor = Tensor(np.arange(16).reshape(4, 4))
-            >>> dtensor = DTensor.distribute_tensor(global_tensor, mesh, [Shard(0), Replicate()])
-            >>> # rank 0 and rank1 gets: [[0,1,2,3], [4,5,6,7]]
-            >>> # rank 2 and rank3 gets: [[8,9,10,11], [12,13,14,15]]
-        """
-        # Build layout from device_mesh and placements
-        layout = _build_layout(device_mesh, placements, len(tensor.shape))
+    Note:
+        This method assumes all ranks have the same global tensor. It slices
+        the tensor locally without communication. If ranks have different
+        data, use `from_local` instead.
 
-        # Slice the global tensor to get local shard based on layout
-        local_tensor = _get_slice_tensor_by_layout(tensor, layout)
+    Example:
+        >>> from hyper_parallel.core.placement_types import Shard, Replicate
+        >>> mesh = init_device_mesh(mesh_shape=(2, 2), alias_name=("dp", "tp"))
+        >>> global_tensor = Tensor(np.arange(16).reshape(4, 4))
+        >>> dtensor = distribute_tensor(global_tensor, mesh, [Shard(0), Replicate()])
+        >>> # rank 0 and rank1 gets: [[0,1,2,3], [4,5,6,7]]
+        >>> # rank 2 and rank3 gets: [[8,9,10,11], [12,13,14,15]]
+    """
+    # Build layout from device_mesh and placements
+    layout = _build_layout(device_mesh, placements, len(tensor.shape))
 
-        return DTensor(local_tensor, device_mesh, placements)
+    # Slice the global tensor to get local shard based on layout
+    local_tensor = _get_slice_tensor_by_layout(tensor, layout)
 
+    return DTensor(local_tensor, device_mesh, placements)
 
 def _dtensor_init_helper(
         init_op,

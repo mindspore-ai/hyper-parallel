@@ -21,7 +21,7 @@ from torch import nn
 from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel import DeviceMesh
 from hyper_parallel.platform import get_platform
-from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.dtensor import DTensor, distribute_tensor
 
 platform = get_platform()
 
@@ -155,7 +155,7 @@ class HSDPModule:
           - hyper DTensor: extract local shard and copy directly.
           - plain Tensor whose shape == local shard shape: copy as-is.
           - plain Tensor whose shape == global shape: distribute via
-            ``DTensor.distribute_tensor``, then copy the local shard.
+            ``distribute_tensor``, then copy the local shard.
 
         Args:
             state_dict (Mapping[str, Any]): Fully-qualified parameter/buffer
@@ -215,7 +215,7 @@ class HSDPModule:
                         if val_shape == local_shape:
                             local_val = val
                         elif val_shape == global_shape:
-                            wrapped = DTensor.distribute_tensor(
+                            wrapped = distribute_tensor(
                                 val.detach(), target.device_mesh, target.placements,
                             )
                             local_val = wrapped.to_local()
@@ -358,7 +358,6 @@ def fully_shard(
     _extend_module_with_hsdp_interface(module)
     # TODO: mindspore does not support get_device_handle
     if device is None:
-        import torch
         device_handle = platform.get_device_handle()  # return torch.npu or torch.cuda
         if device_handle.is_available():
             device = torch.device(device_handle.current_device())

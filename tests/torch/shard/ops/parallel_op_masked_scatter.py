@@ -16,8 +16,8 @@
 
 import numpy as np
 import torch
-from hyper_parallel import DTensor, init_device_mesh
-from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global
@@ -62,9 +62,9 @@ def test_masked_scatter_basic_replicated():
     # placements tuple length must match mesh ndim
     placements = (Replicate(), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, placements)
-    dist_mask = DTensor.distribute_tensor(standalone_mask, mesh, placements)
-    dist_source = DTensor.distribute_tensor(standalone_source, mesh, placements)
+    dist_input = distribute_tensor(standalone_input, mesh, placements)
+    dist_mask = distribute_tensor(standalone_mask, mesh, placements)
+    dist_source = distribute_tensor(standalone_source, mesh, placements)
 
     dist_output = dist_input.masked_scatter(dist_mask, dist_source)
 
@@ -101,9 +101,9 @@ def test_masked_scatter_input_sharded_error():
     input_placements = (Shard(0), Replicate())
     repl_placements = (Replicate(), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, input_placements)
-    dist_mask = DTensor.distribute_tensor(standalone_mask, mesh, repl_placements)
-    dist_source = DTensor.distribute_tensor(standalone_source, mesh, repl_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, input_placements)
+    dist_mask = distribute_tensor(standalone_mask, mesh, repl_placements)
+    dist_source = distribute_tensor(standalone_source, mesh, repl_placements)
 
     try:
         dist_input.masked_scatter(dist_mask, dist_source)
@@ -133,9 +133,9 @@ def test_masked_scatter_mask_sharded_error():
     # Shard dim 1 of mask on mesh axis 1 ("tp")
     mask_placements = (Replicate(), Shard(1))
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, repl_placements)
-    dist_mask = DTensor.distribute_tensor(standalone_mask, mesh, mask_placements)
-    dist_source = DTensor.distribute_tensor(standalone_source, mesh, repl_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, repl_placements)
+    dist_mask = distribute_tensor(standalone_mask, mesh, mask_placements)
+    dist_source = distribute_tensor(standalone_source, mesh, repl_placements)
 
     try:
         dist_input.masked_scatter(dist_mask, dist_source)
@@ -165,9 +165,9 @@ def test_masked_scatter_source_sharded_error():
     # This is valid placement syntax, but invalid for this op
     source_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, repl_placements)
-    dist_mask = DTensor.distribute_tensor(standalone_mask, mesh, repl_placements)
-    dist_source = DTensor.distribute_tensor(standalone_source, mesh, source_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, repl_placements)
+    dist_mask = distribute_tensor(standalone_mask, mesh, repl_placements)
+    dist_source = distribute_tensor(standalone_source, mesh, source_placements)
 
     try:
         dist_input.masked_scatter(dist_mask, dist_source)
@@ -198,9 +198,9 @@ def test_masked_scatter_1d_replicated():
     mesh = init_device_mesh("npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     placements_1d = (Replicate(), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, placements_1d)
-    dist_mask = DTensor.distribute_tensor(standalone_mask, mesh, placements_1d)
-    dist_source = DTensor.distribute_tensor(standalone_source, mesh, placements_1d)
+    dist_input = distribute_tensor(standalone_input, mesh, placements_1d)
+    dist_mask = distribute_tensor(standalone_mask, mesh, placements_1d)
+    dist_source = distribute_tensor(standalone_source, mesh, placements_1d)
 
     dist_output = dist_input.masked_scatter(dist_mask, dist_source)
 
@@ -236,9 +236,9 @@ def test_masked_scatter_3d_broadcast():
     mesh = init_device_mesh("npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     placements = (Replicate(), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, placements)
-    dist_mask = DTensor.distribute_tensor(standalone_mask, mesh, placements)
-    dist_source = DTensor.distribute_tensor(standalone_source, mesh, placements)
+    dist_input = distribute_tensor(standalone_input, mesh, placements)
+    dist_mask = distribute_tensor(standalone_mask, mesh, placements)
+    dist_source = distribute_tensor(standalone_source, mesh, placements)
 
     dist_output = dist_input.masked_scatter(dist_mask, dist_source)
 
@@ -272,9 +272,9 @@ def test_masked_scatter_oversized_source():
     mesh = init_device_mesh("npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     placements = (Replicate(), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, placements)
-    dist_mask = DTensor.distribute_tensor(standalone_mask, mesh, placements)
-    dist_source = DTensor.distribute_tensor(standalone_source, mesh, placements)
+    dist_input = distribute_tensor(standalone_input, mesh, placements)
+    dist_mask = distribute_tensor(standalone_mask, mesh, placements)
+    dist_source = distribute_tensor(standalone_source, mesh, placements)
 
     dist_output = dist_input.masked_scatter(dist_mask, dist_source)
 
@@ -305,9 +305,9 @@ def test_masked_scatter_all_false_mask():
     mesh = init_device_mesh("npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     placements = (Replicate(), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, placements)
-    dist_mask = DTensor.distribute_tensor(standalone_mask, mesh, placements)
-    dist_source = DTensor.distribute_tensor(standalone_source, mesh, placements)
+    dist_input = distribute_tensor(standalone_input, mesh, placements)
+    dist_mask = distribute_tensor(standalone_mask, mesh, placements)
+    dist_source = distribute_tensor(standalone_source, mesh, placements)
 
     dist_output = dist_input.masked_scatter(dist_mask, dist_source)
 
