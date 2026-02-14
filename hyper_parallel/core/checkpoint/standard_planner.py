@@ -29,11 +29,14 @@ from hyper_parallel.core.checkpoint.reshard import infer_slice_area_by_rank, inf
 from hyper_parallel.core.checkpoint.util import (
     narrow_tensor_by_index,
     chunk_to_area,
-    create_chunk_list_for_load,
+    create_chunk_list_for_tensor,
     remove_redundant_plans,
 )
 from hyper_parallel.core.dtensor import DTensor, Layout
 from hyper_parallel.platform import get_platform
+
+platform = get_platform()
+Tensor = platform.Tensor
 
 
 class StandardSavePlanner(SavePlanner):
@@ -148,6 +151,29 @@ class StandardSavePlanner(SavePlanner):
                     }
                 )
                 items.append(write_item)
+            elif isinstance(obj, Tensor):
+                # Create write item for platform.Tensor: build single chunk with tensor's own size
+                dtype_str = str(obj.dtype) if hasattr(obj, 'dtype') else 'unknown'
+                properties = TensorProperties(dtype=dtype_str)
+
+                # Single chunk covering the whole tensor (offsets=0, sizes=shape)
+                chunk = ChunkStorageMetadata(
+                    offsets=(0,) * len(obj.shape),
+                    sizes=obj.shape,
+                )
+
+                index = MetadataIndex(fqn=fqn, offset=(0,) * len(obj.shape), index=None)
+                self._tensor_cache[index] = obj
+                write_item = WriteItem(
+                    index=index,
+                    type=WriteItemType.TENSOR,
+                    tensor_data={
+                        'chunk': chunk,
+                        'properties': properties,
+                        'size': obj.shape,
+                    }
+                )
+                items.append(write_item)
             else:
                 # Handle non-tensor types (bytes, etc.)
                 index = MetadataIndex(fqn=fqn)
@@ -202,7 +228,7 @@ class StandardSavePlanner(SavePlanner):
                         fqn_to_size[fqn] = size
                         fqn_to_chunks[fqn] = []
 
-                    # Update index and add chunk
+                    # Append chunk and set index (platform.Tensor has exactly one chunk)
                     new_index = dataclasses.replace(item.index, index=len(fqn_to_chunks[fqn]))
                     with_index_item = dataclasses.replace(item, index=new_index)
                     with_index_items.append(with_index_item)
@@ -352,6 +378,11 @@ class StandardLoadPlanner(LoadPlanner):
     """
 
     def __init__(self, allow_partial_load: bool = False):
+        """
+        Args:
+            allow_partial_load (bool): If True, allow loading when checkpoint has fewer keys than state_dict.
+                Default False.
+        """
         self.state_dict: Optional[dict[str, Any]] = None
         self.metadata: Optional[Metadata] = None
         self.is_coordinator: bool = False
@@ -406,13 +437,8 @@ class StandardLoadPlanner(LoadPlanner):
                     if layout is not None and rank_list is not None:
                         if get_platform().get_rank() not in rank_list:
                             continue
-                try:
-                    local_chunks = create_chunk_list_for_load(obj)
-                except ValueError as e:
-                    raise ValueError(
-                        f"Invalid checkpoint metadata for {fqn}, "
-                        f"expected BytesStorageMetadata but found {type(md)}",
-                    ) from e
+                # Both DTensor and platform.Tensor: create local chunks and read items
+                local_chunks = create_chunk_list_for_tensor(obj)
                 requests += create_read_items_for_chunk_list(fqn, md, local_chunks)
             else:
                 requests.append(

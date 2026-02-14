@@ -24,6 +24,9 @@ from hyper_parallel.core.checkpoint.reshard import infer_slice_area_by_rank
 from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.platform import get_platform
 
+platform = get_platform()
+Tensor = platform.Tensor
+
 
 def check_path(path: Union[Path, str]) -> None:
     """
@@ -107,14 +110,14 @@ def chunk_to_area(chunk: ChunkStorageMetadata) -> tuple[tuple[int, int], ...]:
     )
 
 
-def create_chunk_list_for_load(obj: Any) -> list[ChunkStorageMetadata]:
+def create_chunk_list_for_tensor(obj: Union[Tensor, DTensor]) -> list[ChunkStorageMetadata]:
     """
     Create list of local chunks for the given object (DTensor or plain tensor).
 
     Used to determine what this rank needs to load (resharding).
 
     Args:
-        obj (Any): DTensor or plain tensor object (tensor-like with shape attribute).
+        obj (Union[Tensor, DTensor]): hyper DTensor or platform Tensor.
 
     Returns:
         list[ChunkStorageMetadata]: List of ChunkStorageMetadata representing
@@ -124,7 +127,7 @@ def create_chunk_list_for_load(obj: Any) -> list[ChunkStorageMetadata]:
         layout = obj.layout
         if layout is None:
             shape = obj.shape if hasattr(obj, "shape") else obj.to_local().shape
-            return [ChunkStorageMetadata(offsets=tuple(0 for _ in shape), sizes=tuple(shape))]
+            return [ChunkStorageMetadata(offsets=(0,) * len(shape), sizes=tuple(shape))]
 
         mesh_shape = getattr(layout, "mesh_shape", None) or getattr(layout, "_mesh", None)
         tensor_map = getattr(layout, "tensor_map", None) or getattr(layout, "_tensor_map", None)
@@ -132,9 +135,8 @@ def create_chunk_list_for_load(obj: Any) -> list[ChunkStorageMetadata]:
 
         if mesh_shape is None or tensor_map is None or rank_list is None:
             shape = obj.shape if hasattr(obj, "shape") else obj.to_local().shape
-            return [ChunkStorageMetadata(offsets=tuple(0 for _ in shape), sizes=tuple(shape))]
+            return [ChunkStorageMetadata(offsets=(0,) * len(shape), sizes=tuple(shape))]
 
-        platform = get_platform()
         current_rank = platform.get_rank()
         if current_rank not in rank_list:
             return []
@@ -151,11 +153,12 @@ def create_chunk_list_for_load(obj: Any) -> list[ChunkStorageMetadata]:
         sizes = tuple(e - s for s, e in slice_area)
         return [ChunkStorageMetadata(offsets=offsets, sizes=sizes)]
 
-    if hasattr(obj, "shape"):
+    if isinstance(obj, Tensor):
+        # platform.Tensor has exactly one chunk in metadata (full tensor)
         shape = tuple(obj.shape)
-        return [ChunkStorageMetadata(offsets=tuple(0 for _ in shape), sizes=shape)]
+        return [ChunkStorageMetadata(offsets=(0,) * len(shape), sizes=shape)]
 
-    return []
+    raise ValueError(f"Not support type {type(obj)} for creating chunk list ")
 
 
 def remove_redundant_plans(
@@ -166,6 +169,11 @@ def remove_redundant_plans(
     Remove duplicate entries across SavePlans. For each duplicate, only one plan
     keeps the entry. The selection prefers the smallest planned storage size
     (or the minimum rank when save_to_minimum_rank is True).
+
+    Args:
+        all_plans (list[SavePlan]): List of save plans to deduplicate.
+        save_to_minimum_rank (bool): If True, assign duplicates to the minimum rank; else to plan with minimal storage.
+            Default False.
     """
     # Build mapping from item index to set of plan indices containing it
     duplicate_map: dict[MetadataIndex, set[int]] = defaultdict(set)
