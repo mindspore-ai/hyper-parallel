@@ -25,6 +25,12 @@ from hyper_parallel.platform.torch.fully_shard.utils import HSDPMeshInfo
 def _to_dtype_if_needed(
     tensor: torch.Tensor, dtype: Optional[torch.dtype]
 ) -> torch.Tensor:
+    """Cast tensor to the given dtype if it differs from current dtype.
+
+    Args:
+        tensor: The input tensor to potentially cast.
+        dtype: Target dtype. If None or same as tensor dtype, no-op.
+    """
     if dtype is not None and tensor.dtype != dtype:
         return tensor.to(dtype)
     return tensor

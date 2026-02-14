@@ -384,8 +384,10 @@ def _gather_full_state_dict(
 ) -> dict[str, Any]:
     """All-gather every DTensor shard into a full tensor.
 
-    When *cpu_offload* is ``True``, only rank-0 keeps the result (on CPU);
-    other ranks return an empty dict to save memory.
+    Args:
+        state_dict: Model state dict with DTensor or plain tensor values.
+        cpu_offload: If True, only rank-0 keeps the result on CPU;
+            other ranks return an empty dict to save memory.
     """
     is_rank0 = (not dist.is_initialized()) or (dist.get_rank() == 0)
 
@@ -409,7 +411,11 @@ def _gather_full_state_dict(
 def _offload_sharded_state_dict(
     state_dict: dict[str, Any],
 ) -> dict[str, Any]:
-    """Move each shard to CPU without all-gathering."""
+    """Move each shard to CPU without all-gathering.
+
+    Args:
+        state_dict: Model state dict with DTensor or plain tensor values.
+    """
     offloaded: dict[str, Any] = {}
     for key, val in state_dict.items():
         if isinstance(val, DTensor):
@@ -427,10 +433,9 @@ def get_model_state_dict(
     *,
     options: StateDictOptions | None = None,
 ) -> dict[str, Any]:
-    """Return model state_dict, consistent with
-    :pyfunc:`torch.distributed.checkpoint.state_dict.get_model_state_dict`.
+    """Return the model state dict with configurable gathering and offloading.
 
-    Behaviour matrix (mirrors torch upstream):
+    Behaviour matrix:
 
     +-----------------+-------------+--------------------------------------+
     | full_state_dict | cpu_offload | result                               |
@@ -444,13 +449,10 @@ def get_model_state_dict(
     | True            | True        | full Tensor on CPU, **rank 0 only**  |
     +-----------------+-------------+--------------------------------------+
 
-    Additional flags:
-
-    * ``ignore_frozen_params`` – drop parameters with
-      ``requires_grad is False``.
-    * ``broadcast_from_rank0`` – validated (must pair with
-      ``full_state_dict=True``), but only takes effect in
-      ``set_model_state_dict`` (the load path).
+    Args:
+        model: The model whose state dict to retrieve.
+        options: Controls full_state_dict, cpu_offload,
+            ignore_frozen_params, and broadcast_from_rank0 flags.
     """
     options = options or StateDictOptions()
 
