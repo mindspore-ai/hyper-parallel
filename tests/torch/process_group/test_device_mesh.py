@@ -46,6 +46,20 @@ def test_device_mesh_from_2d_group_valid():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_device_mesh_from_2d_group_use_list_valid():
+    """
+    Feature: Test case test_device_mesh_from_2d_group_valid in device_mesh.py.
+    Description: Initial environments for torch, and execute case test_device_mesh_from_2d_group_valid in
+        device_mesh.py.
+    Expectation: Run success.
+    """
+    file_name = "device_mesh.py"
+    case_name = "test_device_mesh_from_2d_group_use_list_valid"
+    master_port = 10127
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_device_mesh_from_3d_group_valid():
     """
     Feature: Test case test_device_mesh_from_3d_group_valid in device_mesh.py.

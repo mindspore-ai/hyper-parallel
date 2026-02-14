@@ -50,3 +50,15 @@ def test_fully_shard_03():
     file_name = "_test_fully_shard.py"
     case_name = "test_fully_shard_03"
     torchrun_case(file_name, case_name, master_port)
+
+
+def test_fully_shard_from_group_mesh():
+    """
+    Feature: When mesh created by from_group, test fully_shard with multi-layer network, optimization level is default ZeRO-3
+    Description: The FullyShardTestNet is a multi-layer module, verify the basic process of fully_shard
+    Expectation: run successfully
+    """
+    master_port = 12343
+    file_name = "_test_fully_shard.py"
+    case_name = "test_fully_shard_from_group_mesh"
+    torchrun_case(file_name, case_name, master_port)

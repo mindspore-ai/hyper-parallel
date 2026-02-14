@@ -226,7 +226,7 @@ class TestDeviceMesh:
         flat_mesh = dp_cp_mesh.flatten()
         flat_mesh_group_1 = flat_mesh.get_group()
         flat_mesh_group_2 = basic_3d_mesh.get_group("dp_cp")
-        mock_platform.split_group.assert_called_with(split_ranks=[[0, 2, 4, 6]])
+        mock_platform.split_group.assert_called_with(split_ranks=[[0, 2, 4, 6]], group_desc="mesh_dp_cp")
 
         assert flat_mesh.mesh_shape == (4,)
         assert flat_mesh.mesh_dim_names == ("dp_cp",)

@@ -15,7 +15,7 @@
 """test_process_group.py"""
 
 from hyper_parallel.core.device_mesh import init_device_mesh, DeviceMesh
-from hyper_parallel import get_platform, init_process_group
+from hyper_parallel import get_platform, init_process_group, get_process_group_ranks
 
 platform = get_platform()
 
@@ -33,7 +33,7 @@ def test_device_mesh_from_1d_group_valid():
         mesh_dim_names=("dp",)
     )
     group = device_mesh_init.get_group()
-    device_mesh = DeviceMesh.from_group(group, mesh_dim_names=("tp",))
+    device_mesh = DeviceMesh.from_group(group, "npu", mesh_dim_names=("tp",))
     tp_mesh = device_mesh["tp"]
     assert tp_mesh.mesh_shape == (8,)
     assert tp_mesh.mesh_dim_names == ("tp",)
@@ -57,6 +57,7 @@ def test_device_mesh_from_2d_group_valid():
     mesh_init = device_mesh_init.mesh
     device_mesh = DeviceMesh.from_group(
         [dp_group, tp_group],
+        "npu",
         mesh=(mesh_init[0], mesh_init[1]),
         mesh_dim_names=("tp", "cp")
     )
@@ -80,6 +81,37 @@ def test_device_mesh_from_2d_group_valid():
     assert cp_mesh.rank_list == cp_rank_list
 
 
+def test_device_mesh_from_2d_group_use_list_valid():
+    """
+    Feature: DeviceMesh.from_group method with 2d group.
+    Description: Create 2d group via from_group method, using two group and 2d mesh.
+    Expectation: Run success, values of created 2d group are in expected.
+    """
+    init_process_group()
+    device_mesh_init = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(2, 4),
+        mesh_dim_names=("dp", "tp")
+    )
+    dp_group = device_mesh_init.get_group("dp")
+    tp_group = device_mesh_init.get_group("tp")
+    mesh_init = device_mesh_init.mesh
+    device_mesh = DeviceMesh.from_group(
+        [dp_group, tp_group],
+        "npu",
+        mesh=(mesh_init[0], mesh_init[1]),
+        mesh_dim_names=["mp", "cp"]
+    )
+    mp_group = device_mesh.get_group("mp")
+    cp_group = device_mesh.get_group("cp")
+    mp_rank_list = get_process_group_ranks(mp_group)
+    cp_rank_list = get_process_group_ranks(cp_group)
+    dp_rank_list = get_process_group_ranks(dp_group)
+    tp_rank_list = get_process_group_ranks(tp_group)
+    assert mp_rank_list == dp_rank_list
+    assert cp_rank_list == tp_rank_list
+
+
 def test_device_mesh_from_3d_group_valid():
     """
     Feature: DeviceMesh.from_group method with 3d group.
@@ -97,6 +129,7 @@ def test_device_mesh_from_3d_group_valid():
     mesh_init = device_mesh_init.mesh
     device_mesh = DeviceMesh.from_group(
         [dp_group, tp_group],
+        "npu",
         mesh=mesh_init[:, :, device_mesh_init.get_local_rank("cp")],
         mesh_dim_names=("dp", "tp")
     )
