@@ -21,7 +21,7 @@ from torch import nn
 from torch.distributed.checkpoint.state_dict import StateDictOptions
 
 from hyper_parallel.platform.platform import PlatformType
-from hyper_parallel import DeviceMesh
+from hyper_parallel import DeviceMesh, init_device_mesh
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor import DTensor, distribute_tensor
 
@@ -373,6 +373,9 @@ def fully_shard(
             device = torch.device(device_handle.current_device())
         else:
             device = torch.device("cpu")
+
+    mesh = mesh or init_device_mesh(device_type=device, mesh_shape=(platform.get_world_size(),))
+
     module.hsdp_init(
         platform_type,
         module,

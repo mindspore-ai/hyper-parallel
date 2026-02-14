@@ -109,3 +109,66 @@ def test_device_mesh_from_3d_group_valid():
     assert tp_mesh.mesh_shape == tp_init_mesh.mesh_shape
     assert tp_mesh.mesh_dim_names == tp_init_mesh.mesh_dim_names
     assert tp_mesh.rank_list == tp_init_mesh.rank_list
+
+
+def test_device_mesh_slice_invalid_without_mesh_dim_names():
+    """
+    Feature: DeviceMesh __getitem__ method without mesh_dim_names.
+    Description: Init device mesh without mesh_dim_names, use __getitem__ method slice sub device mesh.
+    Expectation: Raise RuntimeError.
+    """
+    result = ""
+    device_mesh_init = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(2, 2, 2)
+    )
+    try:
+        device_mesh_init["dp"]
+    except RuntimeError as e:
+        result = str(e)
+    assert "without mesh_dim_names" in result
+
+
+def test_device_mesh_get_group_invalid_without_init_backend():
+    """
+    Feature: DeviceMesh get_group method with init_backend is False.
+    Description: Init device mesh with init_backend is False, and get_group from this device mesh.
+    Expectation: Raise RuntimeError.
+    """
+    result = ""
+    device_mesh_init = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(2, 2, 2),
+        init_backend=False
+    )
+    try:
+        device_mesh_init.get_group(2)
+    except RuntimeError as e:
+        result = str(e)
+    assert "process groups not initialized" in result
+
+
+def test_device_mesh_invalid_different_mesh_dim_names():
+    """
+    Feature: DeviceMesh __init__ method with different mesh_dim_names.
+    Description: Init device mesh with different not None and invalid mesh_dim_names.
+    Expectation: Raise expected ValueError.
+    """
+    result = ""
+    try:
+        init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp", "tp"))
+    except ValueError as e:
+        result = str(e)
+    assert "mesh_dim_names length" in result
+
+    try:
+        init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "dp"))
+    except ValueError as e:
+        result = str(e)
+    assert "element of mesh_dim_names" in result
+
+    try:
+        init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("interleaved_parallel", "dp"))
+    except ValueError as e:
+        result = str(e)
+    assert "'interleaved_parallel' should be at the last dim of mesh_dim_names" in result

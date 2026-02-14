@@ -60,3 +60,48 @@ def test_device_mesh_from_3d_group_valid():
     case_name = "test_device_mesh_from_3d_group_valid"
     master_port = 10116
     msrun_case(glog_v, file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_device_mesh_slice_invalid_without_mesh_dim_names():
+    """
+    Feature: Test case test_device_mesh_slice_invalid_without_mesh_dim_names in device_mesh.py.
+    Description: Initial environments for mindspore, and execute case
+        test_device_mesh_slice_invalid_without_mesh_dim_names in device_mesh.py.
+    Expectation: Run success.
+    """
+    glog_v = 3
+    file_name = "device_mesh.py"
+    case_name = "test_device_mesh_slice_invalid_without_mesh_dim_names"
+    master_port = 10117
+    msrun_case(glog_v, file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_device_mesh_get_group_invalid_without_init_backend():
+    """
+    Feature: Test case test_device_mesh_get_group_invalid_without_init_backend in device_mesh.py.
+    Description: Initial environments for mindspore, and execute case
+        test_device_mesh_get_group_invalid_without_init_backend in device_mesh.py.
+    Expectation: Run success.
+    """
+    glog_v = 3
+    file_name = "device_mesh.py"
+    case_name = "test_device_mesh_get_group_invalid_without_init_backend"
+    master_port = 10118
+    msrun_case(glog_v, file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_device_mesh_invalid_different_mesh_dim_names():
+    """
+    Feature: Test case test_device_mesh_invalid_different_mesh_dim_names in device_mesh.py.
+    Description: Initial environments for mindspore, and execute case
+        test_device_mesh_invalid_different_mesh_dim_names in device_mesh.py.
+    Expectation: Run success.
+    """
+    glog_v = 3
+    file_name = "device_mesh.py"
+    case_name = "test_device_mesh_invalid_different_mesh_dim_names"
+    master_port = 10119
+    msrun_case(glog_v, file_name, case_name, master_port)

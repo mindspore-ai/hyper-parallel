@@ -17,6 +17,7 @@
 from tests.common.mark_utils import arg_mark
 from tests.torch.utils import torchrun_case
 
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_fully_shard_01():
     """
@@ -66,4 +67,17 @@ def test_fully_shard_from_group_mesh():
     master_port = 12343
     file_name = "_test_fully_shard.py"
     case_name = "test_fully_shard_from_group_mesh"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_fully_shard_none_mesh():
+    """
+    Feature: When pass none mesh, test fully_shard with simple network, optimization level is default ZeRO-3
+    Description: The DenseNet only have one weight and no bias, verify the basic process of fully_shard
+    Expectation: run successfully
+    """
+    master_port = 12344
+    file_name = "_test_fully_shard.py"
+    case_name = "test_fully_shard_none_mesh"
     torchrun_case(file_name, case_name, master_port)

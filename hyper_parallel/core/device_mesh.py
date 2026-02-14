@@ -105,7 +105,7 @@ class DeviceMesh:
                  device_type: str,
                  mesh: Union[Tensor, list, tuple, np.ndarray],
                  *,
-                 mesh_dim_names: Union[tuple[str, ...], list[str]],
+                 mesh_dim_names: Union[tuple[str, ...], list[str], None] = None,
                  _init_backend: bool = True,
                  ):
         self._device_type = device_type
@@ -120,42 +120,30 @@ class DeviceMesh:
         self._mesh_shape = tuple(mesh.shape)
         self._rank_list = tuple(platform.tensor_to_numpy(mesh).flatten().tolist())
         self._mesh = mesh
-
-        # Validate mesh_dim_names
-        if len(self._mesh_shape) != len(mesh_dim_names):
-            raise ValueError(
-                f'mesh dimensions ({len(self._mesh_shape)}) should be equal to '
-                f'mesh_dim_names length ({len(mesh_dim_names)})'
-            )
-        for in_ele in mesh_dim_names:
-            if not isinstance(in_ele, str):
-                raise TypeError(
-                    f'The element of mesh_dim_names must be str type, but got:{type(in_ele)}'
-                )
-            if not in_ele:
-                raise ValueError("The element of mesh_dim_names can not be empty.")
-            if in_ele == "None":
-                raise ValueError(
-                    "The element of mesh_dim_names can not set 'None', "
-                    "because 'None' means no sharding."
-                )
-        if len(set(mesh_dim_names)) != len(mesh_dim_names):
-            raise ValueError(f'Each element of mesh_dim_names {mesh_dim_names} should be different')
-        inter_key = "interleaved_parallel"
-        if inter_key in mesh_dim_names and mesh_dim_names.index(inter_key) != len(mesh_dim_names) - 1:
-            raise ValueError(
-                f"When mesh_dim_names {mesh_dim_names} contains keyword 'interleaved_parallel', "
-                f"it should be at the last dim of mesh_dim_names, which means the virtual sharding."
-            )
-
-        self._mesh_dim_names = tuple(mesh_dim_names)
         self._dev_num = np.prod(np.array(self._mesh_shape))
-        self._rank = platform.get_rank()
         self._dev_rank = len(self._mesh_shape)
-        self._dev_name_to_dev_id = {
-            name: self._dev_rank - i - 1 for i, name in enumerate(self._mesh_dim_names)
-        }
-        self._dev_name_to_index = {name: i for i, name in enumerate(self._mesh_dim_names)}
+        # mesh_dim_names
+        self._mesh_dim_names = tuple(mesh_dim_names) if mesh_dim_names else None
+        if self._mesh_dim_names is not None:
+            # Validate mesh_dim_names
+            if len(self._mesh_shape) != len(mesh_dim_names):
+                raise ValueError(
+                    f'mesh dimensions ({len(self._mesh_shape)}) should be equal to '
+                    f'mesh_dim_names length ({len(mesh_dim_names)})'
+                )
+            if len(set(mesh_dim_names)) != len(mesh_dim_names):
+                raise ValueError(f'Each element of mesh_dim_names {mesh_dim_names} should be different')
+            inter_key = "interleaved_parallel"
+            if inter_key in mesh_dim_names and mesh_dim_names.index(inter_key) != len(mesh_dim_names) - 1:
+                raise ValueError(
+                    "'interleaved_parallel' should be at the last dim of mesh_dim_names, means virtual sharding."
+                )
+            self._dev_name_to_dev_id = {
+                name: self._dev_rank - i - 1 for i, name in enumerate(self._mesh_dim_names)
+            }
+            self._dev_name_to_index = {name: i for i, name in enumerate(self._mesh_dim_names)}
+
+        self._rank = platform.get_rank()
         self._cache_rank_list_along_axis = {}
         self._global_shape_map = {}
         self._sub_mesh_cache = {}
@@ -231,8 +219,8 @@ class DeviceMesh:
         return Tensor(mesh).int()
 
     @staticmethod
-    def _init_one_process_group(mesh_shape: tuple[int, ...], mesh_dim_names: tuple[str, ...], dim_name: str,
-                                rank_list: tuple[int, ...]) -> str:
+    def _init_one_process_group(mesh_shape: tuple[int, ...], mesh_dim_names: tuple[str, ...],
+                                dim_name: str, rank_list: tuple[int, ...]) -> str:
         """
         init one process group
         """
@@ -255,7 +243,7 @@ class DeviceMesh:
         return group_name
 
     @staticmethod
-    def _init_process_groups(mesh_shape: tuple[int, ...], mesh_dim_names: tuple[str, ...],
+    def _init_process_groups(mesh_shape: tuple[int, ...], mesh_dim_names: Union[tuple[str, ...], None],
                              rank_list: tuple[int, ...]) -> list:
         """
         Init process groups. For every dim in mesh_shape, create split group for current rank.
@@ -265,9 +253,15 @@ class DeviceMesh:
             mesh_dim_names (tuple[str, ...]): Names of every dimension of mesh.
             rank_list (tuple[int, ...]): Rank list of current process group worked on.
         """
+        if mesh_dim_names is None:
+            mesh_dim_names = []
+            for dim in range(len(mesh_shape)):
+                mesh_dim_names.append(f"dim_{dim}")
+            mesh_dim_names = tuple(mesh_dim_names)
+
         dim_group_names = []
         for dim in range(len(mesh_shape)):
-            dim_name = mesh_dim_names[dim] if mesh_dim_names else f"dim_{dim}"
+            dim_name = mesh_dim_names[dim]
             dim_group_name = DeviceMesh._init_one_process_group(mesh_shape, mesh_dim_names, dim_name, rank_list)
             dim_group_names.append(dim_group_name)
 
@@ -275,7 +269,6 @@ class DeviceMesh:
         dim_non_none_group_names = [n for n in dim_group_names if n is not None]
         assert not dim_non_none_group_names or len(dim_non_none_group_names) == len(dim_group_names)
         return dim_non_none_group_names
-
 
     @property
     def mesh(self) -> Tensor:
@@ -358,6 +351,9 @@ class DeviceMesh:
             >>> # Can also access via flattened name:
             >>> same_flat_mesh = device_mesh["dp_tp"]
         """
+        if not self._mesh_dim_names:
+            raise RuntimeError("Cannot slice a DeviceMesh without mesh_dim_names!")
+
         sub_mesh_dim_names = self._normalize_sub_mesh_dim_names(sub_mesh_dim_names)
         flatten_mapping = self._get_root_mesh().get_flatten_mapping()
 
@@ -407,7 +403,7 @@ class DeviceMesh:
                 )
 
         # Check for mixed or multiple flattened dimensions
-        original_dims = [name for name in sub_mesh_dim_names if name in self._mesh_dim_names]
+        original_dims = [name for name in sub_mesh_dim_names if name in self._mesh_dim_names]  # pylint: disable=E1135
         flattened_dims = [name for name in sub_mesh_dim_names if name in flatten_mapping]
 
         if len(flattened_dims) == len(sub_mesh_dim_names) and len(flattened_dims) > 1:
@@ -472,11 +468,12 @@ class DeviceMesh:
 
         slice_dim_group_name = []
         for name in sub_mesh_dim_names:
+            # pylint: disable=E1135
             if name in self._mesh_dim_names:
                 slice_dim_group_name.append(
                     self._dim_group_names[self._mesh_dim_names.index(name)]
                 )
-        sub_mesh._dim_group_names = slice_dim_group_name # pylint: disable=W0212
+        sub_mesh._dim_group_names = slice_dim_group_name  # pylint: disable=W0212
 
         # Cache and track
         self._sub_mesh_cache[sub_mesh_dim_names] = sub_mesh
@@ -508,6 +505,9 @@ class DeviceMesh:
             >>> # or by index
             >>> dp_group = device_mesh.get_group(0)
         """
+        if not hasattr(self, "_dim_group_names"):
+            raise RuntimeError("DeviceMesh process groups not initialized!")
+
         if self.ndim > 1 and mesh_dim is None:
             raise RuntimeError(
                 f"Found the DeviceMesh have {self.ndim} dimensions. "
@@ -557,8 +557,10 @@ class DeviceMesh:
             if isinstance(group, str):
                 # pylint: disable=W0212
                 device_mesh._dim_group_names = [group]
+                _group_map[group] = group
             else:
-                device_mesh._dim_group_names = [group.group_name] # pylint: disable=W0212
+                device_mesh._dim_group_names = [group.group_name]  # pylint: disable=W0212
+                _group_map[group.group_name] = group
             return device_mesh
 
         groups = list(group)
@@ -576,9 +578,11 @@ class DeviceMesh:
             if isinstance(dim_group, str):
                 # pylint: disable=W0212
                 device_mesh._dim_group_names.append(dim_group)
+                _group_map[dim_group] = dim_group
             else:
                 # pylint: disable=W0212
                 device_mesh._dim_group_names.append(dim_group.group_name)
+                _group_map[dim_group.group_name] = dim_group
         return device_mesh
 
     def get_local_rank(self, mesh_dim: Optional[Union[int, str]] = None) -> int:
@@ -615,6 +619,7 @@ class DeviceMesh:
 
         # Convert string to index
         if isinstance(mesh_dim, str):
+            # pylint: disable=E1135
             if mesh_dim not in self._mesh_dim_names:
                 raise ValueError(
                     f"mesh_dim '{mesh_dim}' not found in mesh_dim_names {self._mesh_dim_names}"
@@ -692,7 +697,7 @@ class DeviceMesh:
             mesh_dim_name = "_".join(self._mesh_dim_names)
 
         # Flatten a 1D device mesh into its original mesh_dim_names will return itself
-        if self.ndim == 1 and mesh_dim_name in self._mesh_dim_names:
+        if self.ndim == 1 and mesh_dim_name in self._mesh_dim_names:  # pylint: disable=E1135
             return self
 
         # Check whether the mesh_dim_name for flattened mesh is valid
@@ -741,6 +746,7 @@ class DeviceMesh:
     def axis_id(self, axis):
         if axis == "None":
             return -1
+        # pylint: disable=E1135
         if axis not in self.mesh_dim_names:
             raise ValueError(
                 f"The axis name must be one of mesh shape mesh dim name {self.mesh_dim_names}), "
@@ -749,6 +755,7 @@ class DeviceMesh:
         return self._dev_name_to_dev_id[axis]
 
     def axis_index(self, axis):
+        # pylint: disable=E1135
         if axis not in self.mesh_dim_names:
             raise ValueError(
                 f"The axis name must be one of mesh shape mesh dim name {self.mesh_dim_names}), "
@@ -758,33 +765,35 @@ class DeviceMesh:
 
     def get_device_num_along_axis(self, axis):
         """Return device num along specify device axis"""
+        # pylint: disable=E1135
         if axis not in self.mesh_dim_names:
             raise ValueError(
                 f"The axis must be one of device mesh dim name: {self.mesh_dim_names}, but got {axis}"
             )
         return self.mesh_shape[self.mesh_dim_names.index(axis)]
 
-    def get_rank_list_along_axis(self, axis):
+    def get_rank_list_along_axis(self, mesh_dim):
         """
         Get the repeat rank list when the axis is not shard.
 
         Args:
-            axis (str): Axis name.
+            mesh_dim (str): mesh_dim name.
 
         Returns:
             list: reduce rank list
         """
-        if axis in self._cache_rank_list_along_axis:
-            # short cut, get rank list from cache
-            return self._cache_rank_list_along_axis[axis]
+        if mesh_dim in self._cache_rank_list_along_axis:
+            # shortcut, get rank list from cache
+            return self._cache_rank_list_along_axis[mesh_dim]
 
         mesh_shape = self.mesh_shape
         mesh_dim_names = self.mesh_dim_names
         rank_list = self.rank_list
         rank = self.rank
 
-        if axis not in mesh_dim_names:
-            raise ValueError(f"Axis '{axis}' not found in mesh_dim_names {mesh_dim_names}")
+        # pylint: disable=E1135
+        if mesh_dim not in mesh_dim_names:
+            raise ValueError(f"Axis '{mesh_dim}' not found in mesh_dim_names {mesh_dim_names}")
 
         if rank not in rank_list:
             raise ValueError(f"Rank {rank} not found in rank_list")
@@ -796,7 +805,7 @@ class DeviceMesh:
             coord[i] = temp % mesh_shape[i]
             temp //= mesh_shape[i]
 
-        dim_index = mesh_dim_names.index(axis)
+        dim_index = mesh_dim_names.index(mesh_dim)
         strides = [1] * len(mesh_shape)
         for i in range(len(mesh_shape) - 2, -1, -1):
             strides[i] = strides[i + 1] * mesh_shape[i + 1]
@@ -811,7 +820,7 @@ class DeviceMesh:
 
             result_ranks.append(rank_list[new_idx])
 
-        self._cache_rank_list_along_axis[axis] = result_ranks
+        self._cache_rank_list_along_axis[mesh_dim] = result_ranks
         return result_ranks
 
     def get_global_shape(self, slice_shape, tensor_map):
@@ -868,6 +877,9 @@ class DeviceMesh:
 
         # Convert string to axis name
         if isinstance(mesh_dim, str):
+            if self._mesh_dim_names is None or len(self._mesh_dim_names) == 0:
+                raise ValueError(f"DeviceMesh mesh_dim_names is not set, string mesh_dim {mesh_dim}, is not support.")
+            # pylint: disable=E1135
             if mesh_dim not in self._mesh_dim_names:
                 raise ValueError(
                     f"mesh_dim can pass a string or integer, but string mesh_dim '{mesh_dim}' not found in "
@@ -885,24 +897,30 @@ class DeviceMesh:
         assert group_name in _group_map, f"{group_name} not in _group_map keys {_group_map.keys()}"
         return _group_map[group_name]
 
-    def get_devices_for_axis(self, axis, rank):
+    def get_devices_for_axis(self, mesh_dim: Union[str, int], rank: int):
         """
         Get the repeat rank list when the axis is not shard.
 
         Args:
-            axis (str): Axis name.
+            mesh_dim (Union[str, int]): Mesh dim or dim name.
             rank (int): Global rank
 
         Returns:
             list: reduce rank list
         """
+        if isinstance(mesh_dim, str):
+            if not self._mesh_dim_names:
+                raise ValueError("_mesh_dim_names is not set, string mesh_dim is not supported, please pass a integer.")
+            mesh_dim_names = self._mesh_dim_names
+            # pylint: disable=E1135
+            if mesh_dim not in mesh_dim_names:
+                raise ValueError(f"mesh_dim '{mesh_dim}' not found in mesh_dim_names {mesh_dim_names}")
+            mesh_dim = mesh_dim_names.index(mesh_dim)
+
         mesh_shape = self._mesh_shape
-        mesh_dim_names = self._mesh_dim_names
+        if mesh_dim < 0 or mesh_dim >= self.ndim:
+            raise ValueError(f"mesh_dim {mesh_dim} can not out of range [0, {self.ndim})")
         rank_list = self._rank_list
-
-        if axis not in mesh_dim_names:
-            raise ValueError(f"Axis '{axis}' not found in mesh_dim_names {mesh_dim_names}")
-
         if rank not in rank_list:
             raise ValueError(f"Rank {rank} not found in rank_list")
 
@@ -913,15 +931,14 @@ class DeviceMesh:
             coord[i] = temp % mesh_shape[i]
             temp //= mesh_shape[i]
 
-        dim_index = mesh_dim_names.index(axis)
         strides = [1] * len(mesh_shape)
         for i in range(len(mesh_shape) - 2, -1, -1):
             strides[i] = strides[i + 1] * mesh_shape[i + 1]
 
         result_ranks = []
-        for v in range(mesh_shape[dim_index]):
+        for v in range(mesh_shape[mesh_dim]):
             new_coord = coord.copy()
-            new_coord[dim_index] = v
+            new_coord[mesh_dim] = v
             new_idx = 0
             for i in range(len(mesh_shape)):
                 new_idx += new_coord[i] * strides[i]
@@ -953,7 +970,7 @@ _DEVICE_MESH_MAP = {}
 def _create_device_mesh(device_type: str,
                         mesh_shape: tuple[int, ...],
                         *,
-                        mesh_dim_names: Union[tuple[str, ...], list[str]],
+                        mesh_dim_names: Union[tuple[str, ...], list[str], None] = None,
                         rank_list: tuple[int, ...],
                         init_backend: bool = True, ):
     """
@@ -962,7 +979,7 @@ def _create_device_mesh(device_type: str,
     Args:
         device_type (str): Device type.
         mesh_shape (Tensor): A multi dimension tensor describing the device layout.
-        mesh_dim_names (tuple[str]): A tuple of mesh dim names for each dimension.
+        mesh_dim_names (Union[tuple[str, ...], list[str], None]): A tuple of mesh dim names for each dimension.
         rank_list (tuple[int]): A tuple of rank.
         init_backend (bool): Whether to initialize the device mesh.
 
@@ -971,7 +988,7 @@ def _create_device_mesh(device_type: str,
     """
     mesh = np.array(rank_list).reshape(mesh_shape)
     rank_ids = (rank_list[0], rank_list[-1])
-    mesh_dim_names = tuple(mesh_dim_names)
+    mesh_dim_names = tuple(mesh_dim_names) if mesh_dim_names else None
     map_key = hash((mesh_shape, mesh_dim_names, rank_ids))
     if map_key not in _DEVICE_MESH_MAP:
         _DEVICE_MESH_MAP[map_key] = DeviceMesh(device_type, mesh,
@@ -984,7 +1001,7 @@ def init_device_mesh(
         device_type: str,
         mesh_shape: tuple[int, ...],
         *,
-        mesh_dim_names: Union[tuple[str, ...], list[str]],
+        mesh_dim_names: Union[tuple[str, ...], list[str], None] = None,
         rank_list: Optional[tuple[int, ...]] = None,
         init_backend: bool = True,
 ) -> DeviceMesh:
@@ -1005,8 +1022,8 @@ def init_device_mesh(
         mesh_shape (tuple[int]): A tuple describing the dimensions of the multi-dimensional
             array that describes the layout of devices. For example, (2, 4) creates
             a 2D mesh with 2 rows and 4 columns.
-        mesh_dim_names (tuple[str, ...]): A tuple of names to assign to each dimension of the mesh.
-            Its length must match the length of mesh_shape. Each string must be unique.
+        mesh_dim_names (Union[tuple[str, ...], list[str], None]): A tuple or list string of names to assign to each
+            dimension of the mesh. Its length must match the length of mesh_shape. Each string must be unique.
         rank_list (tuple[int], optional): Flattened list of ranks for the mesh. When None,
             generated so that the current process rank is included (for onecard/simulation).
         device_type (str): The type of device to create.
@@ -1039,16 +1056,6 @@ def init_device_mesh(
         >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
         >>> print(mesh.rank_list)  # Output: (0, 1, 2, 3, 4, 5, 6, 7)
     """
-    # Validate mesh_shape
-    if not isinstance(mesh_shape, tuple):
-        raise TypeError(f"mesh_shape must be tuple type, but got: {type(mesh_shape)}")
-
-    if len(mesh_shape) != len(mesh_dim_names):
-        raise ValueError(
-            f"mesh_shape length ({len(mesh_shape)}) should be equal to "
-            f"mesh_dim_names length ({len(mesh_dim_names)})"
-        )
-
     # Generate rank_list: use provided or build one that includes current rank
     total_devices = int(np.prod(np.array(mesh_shape)))
     if rank_list is not None:

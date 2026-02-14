@@ -324,7 +324,9 @@ class Layout:
         """Build human-readable alias tensor map from tensor_map."""
         readable_map = []
         for item in self._tensor_map:
-            if isinstance(item, tuple):
+            if self._mesh.mesh_dim_names is None:
+                readable_map.append("None")
+            elif isinstance(item, tuple):
                 mapped_tuple = tuple(
                     self._mesh.mesh_dim_names[len(self._mesh.mesh_dim_names) - 1 - dim] if dim != -1 else "None"
                     for dim in item
