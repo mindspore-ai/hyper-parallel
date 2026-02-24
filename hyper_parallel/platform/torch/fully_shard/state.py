@@ -19,7 +19,7 @@ from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
-from hyper_parallel.platform.torch.fully_shard.utils import HSDPMeshInfo
+from hyper_parallel.platform.torch.fully_shard.utils import HSDPMeshInfo, CPUOffloadPolicy
 
 
 def _to_dtype_if_needed(
@@ -38,10 +38,10 @@ def _to_dtype_if_needed(
 
 class TorchHSDPStateV2(HSDPState):
     """Torch HSDP cell state"""
-    def __init__(self, cell, mesh_info, config, platform, device=None):
+    def __init__(self, cell, mesh_info, config, platform, device):
         super().__init__(cell, mesh_info, config, platform, device)
-        # self._init_mp_dtypes()
         # Do ReduceScatter/AllReduce for grad
+        self.device = device
         self.mp_policy = config.mp_policy
         self.offload_policy = config.offload_policy
         self.reduce_grads = True
@@ -52,6 +52,7 @@ class TorchHSDPStateV2(HSDPState):
         self._use_post_forward_mesh = False
         # Reduce Op type for gradient reduction, default to AVG.
         self.reduce_op_type = torch.distributed.ReduceOp.AVG
+        self._validate_cpu_offload_params()
         self._init_mp_dtypes()
 
     def _move_states_to_device(self):
@@ -113,6 +114,21 @@ class TorchHSDPStateV2(HSDPState):
             )
         self._reduce_dtype = next(iter(reduce_dtypes)) if trainable_params else None
 
+    def _validate_cpu_offload_params(self):
+        if not isinstance(self.offload_policy, CPUOffloadPolicy):
+            return
+        hsdp_params_not_on_cpu = [
+            hsdp_param
+            for hsdp_param in self.hsdp_params
+            if hsdp_param.sharded_param.device.type != "cpu"
+        ]
+        if hsdp_params_not_on_cpu:
+            raise RuntimeError(
+                "HSDP parameters should be materialized on CPU when enabling CPU offloading. "
+                'For example, load a CPU state dict or call module.to_empty(device="cpu"). '
+                "Found following parameters on non-CPU device: "
+                f"{[(hsdp_param._param_fqn, hsdp_param.sharded_param.device) for hsdp_param in hsdp_params_not_on_cpu]}\n"
+            )
 
     def lazy_init(self):
         raise NotImplementedError("lazy_init not implemented in TorchHSDPStateV2")
@@ -154,11 +170,13 @@ class TorchHSDPStateV2(HSDPState):
             reduced_grad = reduced_grad.view(sharded_param_local_shape)
             reduced_grad = _to_dtype_if_needed(reduced_grad, self._orig_dtype)
             to_accumulate_grad = sharded_grad is not None
+            need_synchronize = False
             if hsdp_param.offload_to_cpu:
                 non_blocking = hsdp_param.pin_memory and not to_accumulate_grad
                 reduced_grad = reduced_grad.to(
                     torch.device("cpu"), non_blocking=non_blocking
                 )
+                need_synchronize = True
             if sharded_grad is None:
                 hsdp_param.sharded_param.grad = reduced_grad
             else:
@@ -167,6 +185,7 @@ class TorchHSDPStateV2(HSDPState):
                 hsdp_param.unsharded_accumulated_grad_data = None
             elif hsdp_param.unsharded_param.grad is not None:
                 hsdp_param.unsharded_param.grad = None
+            return need_synchronize
 
     def post_backward(self, *unused):
             for hsdp_param in self.hsdp_params:
@@ -202,7 +221,14 @@ class TorchHSDPStateV2(HSDPState):
                         reduce_op=self.reduce_op_type,
                     )
                 # Bind the reduced gradient to hsdp_param.sharded_param
-                self._apply_reduced_grad(hsdp_param, reduced_grad)
+                need_synchronize = self._apply_reduced_grad(hsdp_param, reduced_grad)
+            if need_synchronize:
+                if self.device.type == "npu":
+                    torch.npu.current_stream().synchronize()
+                elif self.device.type == "cuda":
+                    torch.cuda.current_stream().synchronize()
+                else:
+                    raise NotImplementedError(f"Unsupported device type {self.device.type} for synchronization after CPU offload.")
 
             if self.reshard_after_backward:
                 self.reshard()

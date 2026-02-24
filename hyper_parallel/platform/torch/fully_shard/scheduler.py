@@ -78,7 +78,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _forward_pre_hook(self, cell, args, kwargs):
         """Execute forward pre hook and set up backward hook."""
-        self._hsdp_forward_pre_hook(cell, args)
+        args, kwargs = self._hsdp_forward_pre_hook(cell, args, kwargs)
         return self._register_post_backward_hook(args, kwargs)
 
     def _register_backward_pre_hook(self, outputs):
@@ -94,7 +94,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         self._register_backward_pre_hook(outputs)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return
-        self._hsdp_forward_hook(cell, inputs, outputs)
+        outputs = self._hsdp_forward_hook(cell, inputs, outputs)
         return outputs
 
     # pylint: disable=W0212

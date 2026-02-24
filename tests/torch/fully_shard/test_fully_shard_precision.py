@@ -42,6 +42,17 @@ def test_zero3_fully_shard_with_mp():
     torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_zero3_fully_shard_with_offload():
+    """
+    Feature: Test_zero3_fully_shard_with_offload.
+    Description: Test_zero3_fully_shard with 1D FSDP mesh and offload.
+    Expectation: case run successfully.
+    """
+    master_port = 12345
+    case_name = "test_zero3_fully_shard_with_offload"
+    torchrun_case(file_name, case_name, master_port)
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_zero3_partial_shard():
     """
     Feature: Test_zero3_fully_shard.

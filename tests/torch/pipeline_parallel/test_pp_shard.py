@@ -26,5 +26,5 @@ def test_simple_mlp():
     """
     file_name = "pipeline_shard.py"
     case_name = "test_vpp_shard"
-    master_port = 12346
+    master_port = 12300
     torchrun_case(file_name, case_name, master_port)

@@ -21,7 +21,7 @@ import torch
 import torch_npu
 from torch import optim
 from tests.torch.utils import init_dist
-from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy
+from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy, CPUOffloadPolicy, OffloadPolicy
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel import init_device_mesh, DeviceMesh
 from tests.torch.common_net import SimpleModel
@@ -31,7 +31,7 @@ from hyper_parallel import SkipDTensorDispatch
 torch.manual_seed(0)
 standalone_x = torch.rand(8, 8)
 
-def _get_standard_fully_shard_kwargs(mp_policy):
+def _get_standard_fully_shard_kwargs(mp_policy, offload_policy=None):
     """get standard fully shard kwargs"""
     default_mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     fsdp_kwargs = {
@@ -39,7 +39,7 @@ def _get_standard_fully_shard_kwargs(mp_policy):
         'reshard_after_forward': True,
         'shard_placement_fn': None,
         'mp_policy': mp_policy,
-        'offload_policy': None,
+        'offload_policy': offload_policy,
         'ignored_params': None
     }
     return fsdp_kwargs
@@ -153,6 +153,15 @@ def test_zero3_fully_shard_with_mp():
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.float16, reduce_dtype=torch.float32,
                                      output_dtype=torch.float32, cast_forward_inputs=True)
     fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
+    shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)
+
+
+def test_zero3_fully_shard_with_offload():
+    """test zero3 fully shard parallel with offload"""
+    init_dist()
+    mp_policy = MixedPrecisionPolicy()
+    offload_policy = CPUOffloadPolicy(pin_memory=True)
+    fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy, offload_policy)
     shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)
 
 
