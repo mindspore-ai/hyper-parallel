@@ -102,7 +102,7 @@ class OpDispatcher:
         self.whitelist = ["InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv", "typeof", "DistCommIsend",
                           "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather",
                           "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__", "register_hook",
-                          "is_complex", "chunk", "__bool__", "__len__", "__format__"]
+                          "is_complex", "chunk", "__bool__", "__len__", "__format__", "dim", "empty_like", "zeros_like"]
 
         # Ops requiring args unpacking for layout inference (packed as prim, name, real_args).
         self.unpack_ops = ["ScatterUpdate", "Mod", "GatherNd"]
@@ -641,7 +641,18 @@ class OpDispatcher:
         """
         op_name = platform.get_op_name(op_call)
         if op_name in self.whitelist or get_dtensor_dispatch() is False:
-            input_args = [arg.to_local() if isinstance(arg, DTensor) else arg for arg in args]
+            input_args = []
+            for arg in args:
+                if isinstance(arg, DTensor):
+                    input_args.append(arg.to_local())
+                elif isinstance(arg, tuple):
+                    input_arg = tuple(e.to_local() if isinstance(e, DTensor) else e for e in arg)
+                    input_args.append(input_arg)
+                elif isinstance(arg, list):
+                    input_arg = [e.to_local() if isinstance(e, DTensor) else e for e in arg]
+                    input_args.append(input_arg)
+                else:
+                    input_args.append(arg)
             return op_call(*input_args, **kwargs)
         if op_name not in self.layout_infer_ops:
             raise RuntimeError(f"Operator {op_name} dose not contain parallel layout infer func.")

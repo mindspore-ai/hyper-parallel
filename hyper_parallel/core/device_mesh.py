@@ -231,7 +231,12 @@ class DeviceMesh:
             dim_name = (dim_name,)
         for rank in rank_list:
             split_rank = _get_sub_rank_list(mesh_shape, mesh_dim_names, rank_list, dim_name, rank)
-            split_ranks.add(tuple(sorted(split_rank)))
+            sorted_rank = tuple(sorted(split_rank))
+            split_ranks.add(sorted_rank)
+            if rank == platform.get_rank():
+                for gname, g in _group_map.items():
+                    if tuple(platform.get_process_group_ranks(g)) == sorted_rank:
+                        return gname
         split_ranks = sorted([list(item) for item in split_ranks])
         group = platform.split_group(split_ranks=split_ranks, group_desc=group_desc)
         if group:

@@ -38,13 +38,21 @@ class SkipDTensorDispatch():
         enable_dtensor_dispatch()
 
 
+# Cache for _build_layout to avoid redundant Layout computations
+# Key: (device_mesh.to_hash(), tuple(placements), tensor_dim)
+# Value: Layout
+_LAYOUT_CACHE = {}
+
 def _build_layout(
-    device_mesh: DeviceMesh,
-    placements: Sequence[Placement],
-    tensor_dim: int
+        device_mesh: DeviceMesh,
+        placements: Sequence[Placement],
+        tensor_dim: int
 ) -> Layout:
     """
     Build Layout from device_mesh and placements.
+
+    This function uses a cache to avoid redundant Layout computations
+    for the same (device_mesh, placements, tensor_dim) combination.
 
     Args:
         device_mesh: The device mesh describing the device topology.
@@ -54,9 +62,23 @@ def _build_layout(
     Returns:
         Layout: The built layout object.
     """
+    # Create cache key using device_mesh hash, placements tuple, and tensor_dim
+    mesh_key = device_mesh.to_hash()
+    placements_key = tuple(placements)  # Convert to tuple for hashability
+    cache_key = (mesh_key, placements_key, tensor_dim)
+
+    # Check cache
+    if cache_key in _LAYOUT_CACHE:
+        return _LAYOUT_CACHE[cache_key]
+
+    # Build layout if not in cache
     layout = Layout.from_device_mesh(device_mesh)
     result = layout(placements)
     result.placement_to_tensor_map(tensor_dim)
+
+    # Store in cache
+    _LAYOUT_CACHE[cache_key] = result
+
     return result
 
 

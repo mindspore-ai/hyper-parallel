@@ -81,6 +81,82 @@ class TorchHSDPParamV2(HSDPParamV2):
                 lambda *args, **kwargs: self.reset_sharded_param()
             )
         )
+        self._reduce_scatter_output = None
+        self.reduce_scatter_handle = None
+        self._all_reduce_output = None
+        self.all_reduce_handle = None
+
+    def reduce_scatter_output(self):
+        """
+        Get the reduce-scatter output tensor and wait for asynchronous operation to complete.
+
+        Returns:
+            torch.Tensor: The sharded gradient tensor after reduce-scatter operation.
+        """
+        if self.reduce_scatter_handle is not None:
+            self.reduce_scatter_handle.wait()
+            self.reduce_scatter_handle = None
+        return self._reduce_scatter_output
+
+    def clear_reduce_scatter_output(self):
+        """Clear the reduce-scatter output tensor to free memory."""
+        self._reduce_scatter_output = None
+
+    def all_reduce_output(self):
+        """
+        Get the all-reduce output tensor and wait for asynchronous operation to complete.
+
+        Returns:
+            torch.Tensor: The reduced gradient tensor after all-reduce operation.
+        """
+        if self.all_reduce_handle is not None:
+            self.all_reduce_handle.wait()
+            self.all_reduce_handle = None
+        return self._all_reduce_output
+
+    def clear_all_reduce_output(self):
+        """Clear the all-reduce output tensor to free memory."""
+        self._all_reduce_output = None
+
+    def apply_reduced_grad(self, reduced_grad, param_type):
+        """
+        Apply reduced gradient to the sharded parameter.
+
+        Reshapes ``reduced_grad`` to match the local shard, optionally
+        offloads to CPU, then accumulates or assigns onto
+        ``hsdp_param.sharded_param.grad``.
+
+        Args:
+            reduced_grad (torch.Tensor): Gradient after reduce-scatter
+                and/or all-reduce.
+            param_type (Optional[torch.dtype]): Target dtype for the gradient (if conversion is needed).
+        """
+        sharded_grad = self.sharded_param.grad
+        sharded_param_local_shape = (
+            self.sharded_param.local_shape
+            if isinstance(self.sharded_param, DTensor)
+            else self.sharded_param.shape
+        )
+        reduced_grad = reduced_grad.view(sharded_param_local_shape)
+        if param_type is not None and reduced_grad.dtype != param_type:
+            reduced_grad = reduced_grad.to(param_type)
+        to_accumulate_grad = sharded_grad is not None
+        need_synchronize = False
+        if self.offload_to_cpu:
+            non_blocking = self.pin_memory and not to_accumulate_grad
+            reduced_grad = reduced_grad.to(
+                torch.device("cpu"), non_blocking=non_blocking
+            )
+            need_synchronize = True
+        if sharded_grad is None:
+            self.sharded_param.grad = self.to_sharded_dtensor(reduced_grad)
+        else:
+            self.sharded_param.grad._local_tensor += reduced_grad
+        if self.unsharded_accumulated_grad_data is not None:
+            self.unsharded_accumulated_grad_data = None
+        elif self.unsharded_param.grad is not None:
+            self.unsharded_param.grad = None
+        return need_synchronize
 
     @torch.no_grad()
     def _init_sharded_param(
@@ -595,7 +671,7 @@ class TorchHSDPParamV2(HSDPParamV2):
 
     def reduce_scatter_grad(
         self,
-        async_op: bool = False,
+        async_op: bool = True,
         dtype: Optional[torch.dtype] = None,
         reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG
     ) -> Tuple[torch.Tensor, Optional[dist.Work]]:
@@ -634,24 +710,23 @@ class TorchHSDPParamV2(HSDPParamV2):
 
         # Calculate output size
         output_numel = grad_flat.numel() // self.shard_world_size
-        output = torch.empty(output_numel, dtype=reduce_dtype, device=grad.device)
+        self._reduce_scatter_output = torch.empty(output_numel, dtype=reduce_dtype, device=grad.device)
 
         # Execute reduce_scatter_tensor
-        handle = dist.reduce_scatter_tensor(
-            output,
+        self.reduce_scatter_handle = dist.reduce_scatter_tensor(
+            self._reduce_scatter_output,
             grad_flat,
             op=reduce_op,
             group=shard_group,
             async_op=async_op,
         )
 
-        return output, handle
 
     def all_reduce_grad(
         self,
         grad: Optional[torch.Tensor] = None,
         dtype: Optional[torch.dtype] = None,
-        async_op: bool = False,
+        async_op: bool = True,
         reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG
     ) -> Tuple[torch.Tensor, Optional[dist.Work]]:
         """
@@ -684,13 +759,9 @@ class TorchHSDPParamV2(HSDPParamV2):
         if replicate_group is None or self.replicate_world_size <= 1:
             return grad, None
 
-        handle = dist.all_reduce(
-            grad,
-            op=reduce_op,
-            group=replicate_group,
-            async_op=async_op
-        )
-        return grad, handle
+        self.all_reduce_handle = dist.all_reduce(grad, op=reduce_op,
+                                                 group=replicate_group, async_op=async_op)
+        self._all_reduce_output = grad
 
 
 def set_requires_grad_if_needed(
