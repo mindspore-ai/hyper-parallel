@@ -90,6 +90,8 @@ def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):
     dist_model = SimpleModel().npu()
     dist_x = standalone_x.npu()
     dist_model = fully_shard(dist_model, **fsdp_kwargs)
+    # 当loss类型为sum，且没有使用DTensor时，和单卡比较精度需要设置梯度通信类型为sum
+    dist_model.set_reduce_op_type("sum")
     dist_optimizer = optim.SGD(dist_model.parameters(), lr=0.01)
     mesh: DeviceMesh = fsdp_kwargs['mesh']
     acc_epoch = 2

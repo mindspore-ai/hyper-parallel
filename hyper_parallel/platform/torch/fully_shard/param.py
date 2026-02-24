@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Adapted from https://github.com/pytorch/pytorch/blob/release/2.6/torch/distributed/fsdp/_fully_shard/_fsdp_param.py
+# enhanced with fully_shard parameter management
 # ============================================================================
 """HSDP parameter"""
 from typing import List, Callable, Optional, cast, Sequence, Tuple, Any
@@ -590,12 +593,15 @@ class TorchHSDPParamV2(HSDPParamV2):
         self,
         async_op: bool = False,
         dtype: Optional[torch.dtype] = None,
+        reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG
     ) -> Tuple[torch.Tensor, Optional[dist.Work]]:
         """
         Perform reduce-scatter on gradient to reduce and shard the full gradient.
 
         Args:
             async_op: Whether to execute asynchronously.
+            dtype: reduce dtype.
+            reduce_op: do reduce-scatter avg or sum.
 
         Returns:
             (sharded_grad, handle): Sharded gradient and communication handle.
@@ -630,6 +636,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         handle = dist.reduce_scatter_tensor(
             output,
             grad_flat,
+            op=reduce_op,
             group=shard_group,
             async_op=async_op,
         )
@@ -640,6 +647,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         self,
         grad: Optional[torch.Tensor] = None,
         async_op: bool = False,
+        reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG
     ) -> Tuple[torch.Tensor, Optional[dist.Work]]:
         """
         Perform all-reduce on gradient (across replicate dimension in HSDP mode).
@@ -648,6 +656,7 @@ class TorchHSDPParamV2(HSDPParamV2):
             grad: Gradient tensor to reduce. If None, will use unsharded_param.grad
                 or unsharded_accumulated_grad based on use_accumulated_grad flag.
             async_op: Whether to execute asynchronously.
+            reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG.
 
         Returns:
             (reduced_grad, handle): Reduced gradient and communication handle.
@@ -667,7 +676,12 @@ class TorchHSDPParamV2(HSDPParamV2):
         if replicate_group is None or self.replicate_world_size <= 1:
             return grad, None
 
-        handle = dist.all_reduce(grad, group=replicate_group, async_op=async_op)
+        handle = dist.all_reduce(
+            grad,
+            op=reduce_op,
+            group=replicate_group,
+            async_op=async_op
+        )
         return grad, handle
 
 

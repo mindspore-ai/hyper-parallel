@@ -21,6 +21,7 @@ import torch_npu
 import torch
 from tests.torch.utils import init_dist
 from tests.torch.common_net import DenseNet
+from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.torch.fully_shard.utils import (
     FSDPMeshInfo,
     HSDPMeshInfo,
@@ -34,6 +35,7 @@ from hyper_parallel.core.placement_types import Shard
 from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
 from hyper_parallel import init_device_mesh
 
+platform = get_platform()
 
 def test_hsdp_param_v2_fsdp_1d_mesh():
     """
@@ -52,13 +54,13 @@ def test_hsdp_param_v2_fsdp_1d_mesh():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-
+    device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
     hsdp_param = TorchHSDPParamV2(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
-        device=torch.device("npu"),
+        device=torch.device(device_handle.current_device()),
     )
 
     # Verify sharded state
@@ -109,13 +111,13 @@ def test_hsdp_param_v2_hsdp_2d_mesh():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-
+    device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
     hsdp_param = TorchHSDPParamV2(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
-        device=torch.device("npu"),
+        device=torch.device(device_handle.current_device()),
     )
 
     # Verify sharded state
@@ -152,13 +154,13 @@ def test_hsdp_param_v2_sharded_state_transitions():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-
+    device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
     hsdp_param = TorchHSDPParamV2(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
-        device=torch.device("npu"),
+        device=torch.device(device_handle.current_device()),
     )
 
     # Initial state should be SHARDED
@@ -217,14 +219,14 @@ def test_hsdp_param_v2_custom_shard_placement():
     # Custom shard placement function - shard along dim 1 instead of default dim 0
     def custom_shard_fn(param):
         return Shard(1)
-
+    device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2 with custom placement
     hsdp_param = TorchHSDPParamV2(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
         shard_placement_fn=custom_shard_fn,
-        device=torch.device("npu"),
+        device=torch.device(device_handle.current_device()),
     )
 
     # Verify shard placement
@@ -264,14 +266,14 @@ def test_hsdp_param_v2_mixed_precision():
         param_dtype=torch.float16,
         reduce_dtype=torch.float32,
     )
-
+    device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2 with mixed precision
     hsdp_param = TorchHSDPParamV2(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
         mp_policy=mp_policy,
-        device=torch.device("npu"),
+        device=torch.device(device_handle.current_device()),
     )
 
     # Initialize dtype attributes
@@ -304,13 +306,13 @@ def test_hsdp_param_v2_all_gather_comm():
     net = DenseNet(in_channels, hidden_size)
     # Initialize weight with rank-based values for verification
     module_info = ParamModuleInfo(module=net, param_name="weight")
-
+    device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
     hsdp_param = TorchHSDPParamV2(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
-        device=torch.device("npu"),
+        device=torch.device(device_handle.current_device()),
     )
 
     # Verify initial state
@@ -346,13 +348,13 @@ def test_hsdp_param_v2_prefetch_unshard():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-
+    device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
     hsdp_param = TorchHSDPParamV2(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
-        device=torch.device("npu"),
+        device=torch.device(device_handle.current_device()),
     )
 
     # Test prefetch workflow
@@ -387,13 +389,13 @@ def test_hsdp_param_v2_unshard_shard_cycle():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-
+    device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
     hsdp_param = TorchHSDPParamV2(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
-        device=torch.device("npu"),
+        device=torch.device(device_handle.current_device()),
     )
 
     # Initial state
@@ -429,13 +431,13 @@ def test_hsdp_param_v2_reduce_scatter_grad():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-
+    device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
     hsdp_param = TorchHSDPParamV2(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
-        device=torch.device("npu"),
+        device=torch.device(device_handle.current_device()),
     )
 
     # Unshard first
@@ -452,7 +454,7 @@ def test_hsdp_param_v2_reduce_scatter_grad():
     )
 
     # Execute reduce-scatter
-    sharded_grad, handle = hsdp_param.reduce_scatter_grad(async_op=False)
+    sharded_grad, handle = hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
 
     # Verify output size
     expected_numel = in_channels * hidden_size // world_size
@@ -495,13 +497,13 @@ def test_hsdp_param_v2_all_reduce_grad():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-
+    device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
     hsdp_param = TorchHSDPParamV2(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
-        device=torch.device("npu"),
+        device=torch.device(device_handle.current_device()),
     )
 
     # Unshard first
@@ -520,7 +522,7 @@ def test_hsdp_param_v2_all_reduce_grad():
 
     # Execute all-reduce on gradient
     grad = hsdp_param._unsharded_param.grad.clone()
-    reduced_grad, handle = hsdp_param.all_reduce_grad(grad=grad, async_op=False)
+    reduced_grad, handle = hsdp_param.all_reduce_grad(grad=grad, async_op=False, reduce_op=dist.ReduceOp.SUM)
 
     # Calculate sum of ranks in the same replicate group
     # Ranks in same replicate group share the same shard_idx
@@ -551,13 +553,13 @@ def test_hsdp_param_v2_accumulate_grad():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-
+    device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
     hsdp_param = TorchHSDPParamV2(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
-        device=torch.device("npu"),
+        device=torch.device(device_handle.current_device()),
     )
 
     # Unshard
@@ -593,7 +595,7 @@ def test_hsdp_param_v2_accumulate_grad():
 
     assert hsdp_param._unsharded_param.grad is None, "Gradient should be cleared after accumulation"
 
-    sharded_grad, handle = hsdp_param.reduce_scatter_grad(async_op=False)
+    sharded_grad, handle = hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
 
     # Calculate expected reduced value:
     # Each rank's accumulated grad = rank + (rank + 1) = 2 * rank + 1

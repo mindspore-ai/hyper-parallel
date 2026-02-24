@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """hybrid shard data parallel interface"""
-from typing import Any, Mapping, cast
+from typing import Any, Mapping, cast, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -291,6 +291,14 @@ class HSDPModule:
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_backward(reshard_after_backward)
 
+    def set_reduce_op_type(self, reduce_op_type) -> None:
+        """
+        set reduce_op_type for all reduce operations in HSDP
+        support reduce_op_type "avg" and "sum", default is "avg"
+        """
+        if hsdp_state := self.hsdp_scheduler.hsdp_state:
+            hsdp_state.set_reduce_op_type(reduce_op_type)
+
 
 def _extend_module_with_hsdp_interface(module):
     """extend Module with HSDPModule interface"""
@@ -348,12 +356,12 @@ def _check_hsdp_input_valid(platform_type, module, shard_size, threshold, optimi
 def fully_shard(
         module: nn.Module,
         *,
-        mesh: DeviceMesh | None = None,
-        reshard_after_forward: bool | int | None = None,
+        mesh: Optional[DeviceMesh] = None,
+        reshard_after_forward: Optional[Union[bool, int]] = None,
         shard_placement_fn: None = None,
         mp_policy: None = None,
         offload_policy: None = None,
-        ignored_params: set[nn.Parameter] | None = None,
+        ignored_params: Optional[set[nn.Parameter]] = None,
         device = None,
 ):
     platform_type = platform.platform_type
