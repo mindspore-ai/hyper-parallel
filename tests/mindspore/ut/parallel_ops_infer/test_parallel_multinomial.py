@@ -32,7 +32,8 @@ def test_multinomial_infer_layout_1d():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: 1D Tensor, Replicated on all mesh dims
     x_placements = (Replicate(), Replicate())
@@ -57,7 +58,8 @@ def test_multinomial_infer_layout_2d_batch_sharded():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: 2D Tensor
     # Mesh dim 0 ("dp") shards Tensor dim 0 (Batch)
@@ -86,7 +88,8 @@ def test_multinomial_infer_layout_2d_fully_replicated():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: 2D Tensor, Replicated
     x_placements = (Replicate(), Replicate())
@@ -109,7 +112,8 @@ def test_multinomial_error_sharded_prob_dim():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: 2D Tensor
     # Mesh dim 0 ("dp") is Replicate
@@ -133,7 +137,8 @@ def test_multinomial_error_invalid_ndim_3d():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: 3D Tensor
     x_placements = (Replicate(), Replicate())

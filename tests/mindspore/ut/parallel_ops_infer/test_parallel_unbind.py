@@ -32,7 +32,8 @@ def test_unbind_layout_inference_dim0():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: (3, 8). dim0=Replicate (-1), dim1=Shard(1) ("mp" -> tensor_map 0)
     # tensor_map: (-1, 0)
@@ -64,7 +65,8 @@ def test_unbind_layout_inference_dim1():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: (4, 4). dim0=Shard(0) ("dp" -> tensor_map 1), dim1=Replicate (-1)
     # tensor_map: (1, -1)
@@ -93,7 +95,8 @@ def test_unbind_layout_inference_negative_dim():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 2, 2),
-        mesh_dim_names=("dp", "tp", "mp")
+        mesh_dim_names=("dp", "tp", "mp"),
+        init_backend=False
     )
     # Input: (2, 4, 8). dim0=Shard(0) ("dp"->2), dim1=Shard(1) ("tp"->1), dim2=Replicate
     # tensor_map: (2, 1, -1)
@@ -122,7 +125,8 @@ def test_unbind_layout_sharded_dim_error():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     # Input: dim0=Shard(0), dim1=Replicate
     x_placements = (Shard(0), Replicate())
@@ -143,7 +147,8 @@ def test_unbind_layout_dim_out_of_range():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)

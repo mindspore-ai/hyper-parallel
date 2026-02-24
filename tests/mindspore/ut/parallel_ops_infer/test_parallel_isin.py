@@ -32,7 +32,8 @@ def test_isin_layout_data_parallel():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
 
     # elements: sharded on dim0 ("dp"), unsharded on dim1
@@ -59,7 +60,8 @@ def test_isin_layout_mixed_parallel():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 3, 4),
-        mesh_dim_names=("dp", "tp", "mp")
+        mesh_dim_names=("dp", "tp", "mp"),
+        init_backend=False
     )
 
     # elements: sharded on dim0 ("dp"), unsharded on dim1, sharded on dim2 ("mp")
@@ -86,7 +88,8 @@ def test_isin_layout_invalid_test_elements_sharded():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
 
     # elements: fully replicated (valid)
@@ -110,7 +113,8 @@ def test_isin_layout_missing_test_elements():
     mesh = init_device_mesh(
         device_type="npu",
         mesh_shape=(2, 4),
-        mesh_dim_names=("dp", "mp")
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
     )
 
     elements_placements = (Replicate(), Replicate())

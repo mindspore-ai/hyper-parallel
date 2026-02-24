@@ -29,7 +29,8 @@ def test_torch_repeat_interleave_layout_data_parallel():
     Description: Data parallel scenario (shard on first dim, repeat on last unsharded dim)
     Expectation: Success
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"),
+        init_backend=False)
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
     repeats = 2
@@ -48,7 +49,8 @@ def test_torch_repeat_interleave_layout_tensor_parallel():
     Description: Tensor parallel scenario (shard on first dim with 'tp', repeat on last unsharded dim)
     Expectation: Success
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"),
+        init_backend=False)
     x_placements = (Replicate(), Shard(0))
     x_layout = _build_layout(mesh, x_placements, 2)
     repeats = 2
@@ -66,7 +68,8 @@ def test_torch_repeat_interleave_with_tensor_layout_data_parallel():
     Description: Data parallel scenario (shard on first dim, repeat on last unsharded dim)
     Expectation: Success
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"),
+        init_backend=False)
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
     repeats_tensor = [2, 1, 1, 1]
@@ -85,7 +88,8 @@ def test_torch_repeat_interleave_with_tensor_layout_tensor_parallel():
     Description: Tensor parallel scenario (shard on first dim with 'tp', repeat on last unsharded dim)
     Expectation: Success
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"),
+        init_backend=False)
     x_placements = (Replicate(), Shard(0))
     x_layout = _build_layout(mesh, x_placements, 2)
     repeats_tensor = [2, 1, 1, 1]
@@ -104,7 +108,8 @@ def test_torch_repeat_interleave_dim_none_layout_data_parallel():
     Description: Data parallel scenario (shard on first dim, repeat on last unsharded dim)
     Expectation: Success
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"),
+        init_backend=False)
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
     repeats = 2
@@ -121,7 +126,8 @@ def test_torch_repeat_interleave_dim_none_layout_tensor_parallel():
     Description: Tensor parallel scenario (shard on first dim with 'tp', repeat on last unsharded dim)
     Expectation: Success
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"),
+        init_backend=False)
     x_placements = (Replicate(), Shard(0))
     x_layout = _build_layout(mesh, x_placements, 2)
 
@@ -139,7 +145,8 @@ def test_torch_repeat_interleave_layout_sharded_dim_error():
     Description: Repeat on a sharded dimension should raise error
     Expectation: Success
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"),
+        init_backend=False)
     x_placements = (Shard(0), Shard(1))
     x_layout = _build_layout(mesh, x_placements, 2)
 
@@ -155,7 +162,8 @@ def test_torch_repeat_interleave_layout_error_dim_out_of_range():
     Description: Test indicating a invalid dim.
     Expectation: Success
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"),
+        init_backend=False)
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
 
