@@ -19,6 +19,7 @@ import pytest
 import torch
 import torch_npu
 from hyper_parallel import DTensor, init_device_mesh
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 
@@ -171,9 +172,9 @@ def test_bsh_dp():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     q, k, v = bsh_tensors()
     placements = (Shard(0),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
@@ -198,9 +199,9 @@ def test_bsh_mp():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("mp",))
     q, k, v = bsh_tensors()
     placements = (Shard(2),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
@@ -224,7 +225,7 @@ def test_bsh_sp():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
     q, k, v = bsh_tensors()
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(1),))
+    dq = distribute_tensor(q, mesh, (Shard(1),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
 
@@ -252,9 +253,9 @@ def test_bsh_dp_mp_2d():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bsh_tensors()
     placements = (Shard(0), Shard(2))
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
@@ -279,9 +280,9 @@ def test_bsh_sp_mp_2d():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("sp", "mp"))
     q, k, v = bsh_tensors()
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(1), Shard(2)))
-    dk = DTensor.distribute_tensor(k, mesh, (Replicate(), Shard(2)))
-    dv = DTensor.distribute_tensor(v, mesh, (Replicate(), Shard(2)))
+    dq = distribute_tensor(q, mesh, (Shard(1), Shard(2)))
+    dk = distribute_tensor(k, mesh, (Replicate(), Shard(2)))
+    dv = distribute_tensor(v, mesh, (Replicate(), Shard(2)))
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
@@ -306,9 +307,9 @@ def test_bsh_dp_sp_mp_3d():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "sp", "mp"))
     q, k, v = bsh_tensors()
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(0), Shard(1), Shard(2)))
-    dk = DTensor.distribute_tensor(k, mesh, (Shard(0), Replicate(), Shard(2)))
-    dv = DTensor.distribute_tensor(v, mesh, (Shard(0), Replicate(), Shard(2)))
+    dq = distribute_tensor(q, mesh, (Shard(0), Shard(1), Shard(2)))
+    dk = distribute_tensor(k, mesh, (Shard(0), Replicate(), Shard(2)))
+    dv = distribute_tensor(v, mesh, (Shard(0), Replicate(), Shard(2)))
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
@@ -334,9 +335,9 @@ def test_bnsd_dp_mp():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bnsd_tensors()
     placements = (Shard(0), Shard(1))
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BNSD',
@@ -359,9 +360,9 @@ def test_bnsd_sp():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "sp"))
     q, k, v = bnsd_tensors()
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(0), Shard(2)))
-    dk = DTensor.distribute_tensor(k, mesh, (Shard(0), Replicate()))
-    dv = DTensor.distribute_tensor(v, mesh, (Shard(0), Replicate()))
+    dq = distribute_tensor(q, mesh, (Shard(0), Shard(2)))
+    dk = distribute_tensor(k, mesh, (Shard(0), Replicate()))
+    dv = distribute_tensor(v, mesh, (Shard(0), Replicate()))
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BNSD',
@@ -384,9 +385,9 @@ def test_sbh_dp():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     q, k, v = sbh_tensors()
     placements = (Shard(1),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='SBH',
@@ -410,9 +411,9 @@ def test_bsnd_dp_mp():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bsnd_tensors()
     placements = (Shard(0), Shard(2))
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSND',
@@ -438,9 +439,9 @@ def test_tnd_dp():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     placements = (Shard(0),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='TND',
@@ -468,9 +469,9 @@ def test_tnd_mp():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("mp",))
     placements = (Shard(1),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='TND',
@@ -497,9 +498,9 @@ def test_tnd_dp_mp():
     q, k, v, actual_seq_qlen, actual_seq_kvlen = tnd_tensors()
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(0), Shard(1)))
-    dk = DTensor.distribute_tensor(k, mesh, (Shard(0), Shard(1)))
-    dv = DTensor.distribute_tensor(v, mesh, (Shard(0), Shard(1)))
+    dq = distribute_tensor(q, mesh, (Shard(0), Shard(1)))
+    dk = distribute_tensor(k, mesh, (Shard(0), Shard(1)))
+    dv = distribute_tensor(v, mesh, (Shard(0), Shard(1)))
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='TND',
@@ -527,7 +528,7 @@ def test_sp_sparse_mode_0():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
     q, k, v = bsh_tensors()
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(1),))
+    dq = distribute_tensor(q, mesh, (Shard(1),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
 
@@ -555,7 +556,7 @@ def test_sp_sparse_mode_2():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
     q, k, v = bsh_tensors()
     mask = create_attention_mask(2)
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(1),))
+    dq = distribute_tensor(q, mesh, (Shard(1),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
 
@@ -583,7 +584,7 @@ def test_sp_sparse_mode_3():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
     q, k, v = bsh_tensors()
     mask = create_attention_mask(3)
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(1),))
+    dq = distribute_tensor(q, mesh, (Shard(1),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
 
@@ -612,7 +613,7 @@ def test_sp_sparse_mode_4():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
     q, k, v = bsh_tensors()
     mask = create_attention_mask(4)
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(1),))
+    dq = distribute_tensor(q, mesh, (Shard(1),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
 
@@ -642,9 +643,9 @@ def test_dp_sparse_mode_1():
     q, k, v = bsh_tensors()
     mask = create_attention_mask(1)
     placements = (Shard(0),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
@@ -671,9 +672,9 @@ def test_dp_sparse_mode_4():
     q, k, v = bsh_tensors()
     mask = create_attention_mask(4)
     placements = (Shard(0),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
@@ -696,9 +697,9 @@ def test_error_kv_strategy_mismatch():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bsh_tensors()
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(0), Shard(2)))
-    dk = DTensor.distribute_tensor(k, mesh, (Shard(0), Shard(2)))
-    dv = DTensor.distribute_tensor(v, mesh, (Shard(0), Replicate()))
+    dq = distribute_tensor(q, mesh, (Shard(0), Shard(2)))
+    dk = distribute_tensor(k, mesh, (Shard(0), Shard(2)))
+    dv = distribute_tensor(v, mesh, (Shard(0), Replicate()))
 
     with pytest.raises(ValueError, match="Key and Value must have identical"):
         torch_npu.npu_fusion_attention(
@@ -726,9 +727,9 @@ def test_error_head_num_not_divisible():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("mp",))
     placements = (Shard(2),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     with pytest.raises(ValueError, match="not divisible"):
         torch_npu.npu_fusion_attention(
@@ -750,9 +751,9 @@ def test_error_kv_seq_sharding_blocked():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
     q, k, v = bsh_tensors()
     placements = (Shard(1),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     with pytest.raises(NotImplementedError, match="KV sequence sharding is not supported"):
         torch_npu.npu_fusion_attention(
@@ -774,9 +775,9 @@ def test_error_sparse_mode_1_no_mask():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     q, k, v = bsh_tensors()
     placements = (Shard(0),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     with pytest.raises(ValueError, match="sparse_mode=1.*requires atten_mask"):
         torch_npu.npu_fusion_attention(
@@ -798,9 +799,9 @@ def test_error_tnd_sp_without_actual_seq_len():
     q, k, v, _, _ = tnd_tensors()
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "sp"))
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(0), Shard(1)))
-    dk = DTensor.distribute_tensor(k, mesh, (Shard(0), Shard(1)))
-    dv = DTensor.distribute_tensor(v, mesh, (Shard(0), Shard(1)))
+    dq = distribute_tensor(q, mesh, (Shard(0), Shard(1)))
+    dk = distribute_tensor(k, mesh, (Shard(0), Shard(1)))
+    dv = distribute_tensor(v, mesh, (Shard(0), Shard(1)))
 
     with pytest.raises(ValueError, match="actual_seq_qlen and actual_seq_kvlen must be provided"):
         torch_npu.npu_fusion_attention(
@@ -823,9 +824,9 @@ def test_error_bnsd_kv_seq_sharding_blocked():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "sp"))
     q, k, v = bnsd_tensors()
     placements = (Shard(0), Shard(2))
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     with pytest.raises(NotImplementedError, match="KV sequence sharding is not supported"):
         torch_npu.npu_fusion_attention(
@@ -850,9 +851,9 @@ def test_bsh_custom_scale():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     q, k, v = bsh_tensors()
     placements = (Shard(0),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
@@ -875,9 +876,9 @@ def test_bsh_dropout():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     q, k, v = bsh_tensors()
     placements = (Shard(0),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
@@ -907,7 +908,7 @@ def test_bsh_long_sequence_sp():
     v = torch.from_numpy(v_np).npu()
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(1),))
+    dq = distribute_tensor(q, mesh, (Shard(1),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
 
@@ -937,9 +938,9 @@ def test_bsh_large_batch_dp():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     placements = (Shard(0),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
@@ -994,9 +995,9 @@ def test_sp_sparse_mode_2_with_2way_split():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("sp", "dp"))
     q, k, v = bsh_tensors()
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(1), Shard(0)))
-    dk = DTensor.distribute_tensor(k, mesh, (Replicate(), Shard(0)))
-    dv = DTensor.distribute_tensor(v, mesh, (Replicate(), Shard(0)))
+    dq = distribute_tensor(q, mesh, (Shard(1), Shard(0)))
+    dk = distribute_tensor(k, mesh, (Replicate(), Shard(0)))
+    dv = distribute_tensor(v, mesh, (Replicate(), Shard(0)))
     mask = create_attention_mask(2)
 
     result = torch_npu.npu_fusion_attention(
@@ -1022,9 +1023,9 @@ def test_sp_sparse_mode_3_with_2way_split():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("sp", "dp"))
     q, k, v = bsh_tensors()
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(1), Shard(0)))
-    dk = DTensor.distribute_tensor(k, mesh, (Replicate(), Shard(0)))
-    dv = DTensor.distribute_tensor(v, mesh, (Replicate(), Shard(0)))
+    dq = distribute_tensor(q, mesh, (Shard(1), Shard(0)))
+    dk = distribute_tensor(k, mesh, (Replicate(), Shard(0)))
+    dv = distribute_tensor(v, mesh, (Replicate(), Shard(0)))
     mask = create_attention_mask(3)
 
     result = torch_npu.npu_fusion_attention(
@@ -1054,7 +1055,7 @@ def test_bnsd_sp_correctness():
     )[0]
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
-    dq = DTensor.distribute_tensor(q_bnsd, mesh, (Shard(2),))
+    dq = distribute_tensor(q_bnsd, mesh, (Shard(2),))
     dk = DTensor.from_local(k_bnsd, mesh, (Replicate(),))
     dv = DTensor.from_local(v_bnsd, mesh, (Replicate(),))
 
@@ -1084,9 +1085,9 @@ def test_tnd_dp_correctness():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     placements = (Shard(0),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     # Run standalone for comparison
     q_full = torch.from_numpy(
@@ -1147,7 +1148,7 @@ def test_tnd_cp():
     )[0]
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("cp",))
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(0),))
+    dq = distribute_tensor(q, mesh, (Shard(0),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
 
@@ -1201,9 +1202,9 @@ def test_fa_vs_sdpa_distributed_cross_validation():
     full_replicate = (Replicate(), Replicate())
 
     # FA path: BSH, Q=Shard(1)+Shard(2), KV=Replicate+Shard(2)
-    dq_fa = DTensor.distribute_tensor(q, mesh, (Shard(1), Shard(2)))
-    dk_fa = DTensor.distribute_tensor(k, mesh, (Replicate(), Shard(2)))
-    dv_fa = DTensor.distribute_tensor(v, mesh, (Replicate(), Shard(2)))
+    dq_fa = distribute_tensor(q, mesh, (Shard(1), Shard(2)))
+    dk_fa = distribute_tensor(k, mesh, (Replicate(), Shard(2)))
+    dv_fa = distribute_tensor(v, mesh, (Replicate(), Shard(2)))
 
     fa_result = torch_npu.npu_fusion_attention(
         dq_fa, dk_fa, dv_fa, head_num=HEAD_NUM, input_layout='BSH',
@@ -1213,9 +1214,9 @@ def test_fa_vs_sdpa_distributed_cross_validation():
 
     # SDPA path: BNSD [B,N,S,D], Q=Shard(2)+Shard(1), KV=Replicate+Shard(1)
     # BSH Shard(1)=seq -> BNSD Shard(2)=seq; BSH Shard(2)=hidden -> BNSD Shard(1)=head
-    dq_sdpa = DTensor.distribute_tensor(q_bnsd, mesh, (Shard(2), Shard(1)))
-    dk_sdpa = DTensor.distribute_tensor(k_bnsd, mesh, (Replicate(), Shard(1)))
-    dv_sdpa = DTensor.distribute_tensor(v_bnsd, mesh, (Replicate(), Shard(1)))
+    dq_sdpa = distribute_tensor(q_bnsd, mesh, (Shard(2), Shard(1)))
+    dk_sdpa = distribute_tensor(k_bnsd, mesh, (Replicate(), Shard(1)))
+    dv_sdpa = distribute_tensor(v_bnsd, mesh, (Replicate(), Shard(1)))
 
     sdpa_result = torch.nn.functional.scaled_dot_product_attention(
         dq_sdpa.to_local().float(),
@@ -1246,9 +1247,9 @@ def test_error_batch_sharding_mismatch():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bsh_tensors()
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(0), Shard(2)))
-    dk = DTensor.distribute_tensor(k, mesh, (Replicate(), Shard(2)))
-    dv = DTensor.distribute_tensor(v, mesh, (Replicate(), Shard(2)))
+    dq = distribute_tensor(q, mesh, (Shard(0), Shard(2)))
+    dk = distribute_tensor(k, mesh, (Replicate(), Shard(2)))
+    dv = distribute_tensor(v, mesh, (Replicate(), Shard(2)))
 
     with pytest.raises(ValueError, match="batch sharding strategy"):
         torch_npu.npu_fusion_attention(
@@ -1269,9 +1270,9 @@ def test_error_hidden_sharding_mismatch():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bsh_tensors()
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(0), Shard(2)))
-    dk = DTensor.distribute_tensor(k, mesh, (Shard(0), Replicate()))
-    dv = DTensor.distribute_tensor(v, mesh, (Shard(0), Replicate()))
+    dq = distribute_tensor(q, mesh, (Shard(0), Shard(2)))
+    dk = distribute_tensor(k, mesh, (Shard(0), Replicate()))
+    dv = distribute_tensor(v, mesh, (Shard(0), Replicate()))
 
     with pytest.raises(ValueError, match="hidden sharding strategy"):
         torch_npu.npu_fusion_attention(
@@ -1292,9 +1293,9 @@ def test_error_dim_sharding_mismatch():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bnsd_tensors()
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(0), Shard(3)))
-    dk = DTensor.distribute_tensor(k, mesh, (Shard(0), Replicate()))
-    dv = DTensor.distribute_tensor(v, mesh, (Shard(0), Replicate()))
+    dq = distribute_tensor(q, mesh, (Shard(0), Shard(3)))
+    dk = distribute_tensor(k, mesh, (Shard(0), Replicate()))
+    dv = distribute_tensor(v, mesh, (Shard(0), Replicate()))
 
     with pytest.raises(ValueError, match="dim sharding strategy"):
         torch_npu.npu_fusion_attention(
@@ -1317,7 +1318,7 @@ def test_error_tnd_cp_wrong_sparse_mode():
     q, k, v, actual_seq_qlen, actual_seq_kvlen = tnd_tensors()
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("cp",))
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(0),))
+    dq = distribute_tensor(q, mesh, (Shard(0),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
 
@@ -1348,7 +1349,7 @@ def test_error_tnd_cp_qk_global_t_mismatch():
     v_short = v[:half_total]
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("cp", "mp"))
-    dq = DTensor.distribute_tensor(q, mesh, (Shard(0), Shard(1)))
+    dq = distribute_tensor(q, mesh, (Shard(0), Shard(1)))
     dk = DTensor.from_local(k_short, mesh, (Replicate(), Shard(1)))
     dv = DTensor.from_local(v_short, mesh, (Replicate(), Shard(1)))
     mask = create_attention_mask(3)
@@ -1387,9 +1388,9 @@ def test_tnd_dp_kv_sharded():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     placements = (Shard(0),)
-    dq = DTensor.distribute_tensor(q, mesh, placements)
-    dk = DTensor.distribute_tensor(k, mesh, placements)
-    dv = DTensor.distribute_tensor(v, mesh, placements)
+    dq = distribute_tensor(q, mesh, placements)
+    dk = distribute_tensor(k, mesh, placements)
+    dv = distribute_tensor(v, mesh, placements)
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='TND',
