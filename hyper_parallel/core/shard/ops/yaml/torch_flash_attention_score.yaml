@@ -1,0 +1,4 @@
+npu_fusion_attention:
+  dist_op_name: _torch_npu_fusion_attention_dist_op
+  distributed_op_class: FlashAttentionScoreDistributedOp
+  distributed_op_file: parallel_npu_flash_attention_score
