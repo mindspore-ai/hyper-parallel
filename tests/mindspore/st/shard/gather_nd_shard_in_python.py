@@ -19,7 +19,8 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import Tensor, ops
-from hyper_parallel import init_device_mesh, shard_module, DTensor
+from hyper_parallel import init_device_mesh, shard_module
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
@@ -81,8 +82,8 @@ def test_gathernd_partial_model_parallel_1():
     x_placements = (Replicate(), Replicate(), Replicate())
     indices_placements = (Replicate(), Replicate(), Shard(0))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    indices_local = distribute_tensor(indices, mesh, indices_placements)
 
     relu_placements = (Replicate(), Replicate(), Shard(0))
 
@@ -123,8 +124,8 @@ def test_gathernd_partial_data_parallel_2():
     x_placements = (Replicate(), Replicate(), Replicate())
     indices_placements = (Shard(0), Replicate(), Replicate())
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    indices_local = distribute_tensor(indices, mesh, indices_placements)
 
     relu_placements = (Shard(0), Replicate(), Replicate())
 
@@ -162,7 +163,7 @@ def test_gathernd_params_plain_tensor():
     )
 
     indices_placements = (Replicate(), Replicate(), Shard(0))
-    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
+    indices_local = distribute_tensor(indices, mesh, indices_placements)
 
     relu_placements = (Replicate(), Replicate(), Shard(0))
 
@@ -199,8 +200,8 @@ def test_gathernd_k1_trailing_dims_shard_3():
     x_placements = (Replicate(), Shard(1), Shard(2))
     indices_placements = (Shard(0), Replicate(), Replicate())
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    indices_local = distribute_tensor(indices, mesh, indices_placements)
 
     relu_placements = (Shard(0), Shard(1), Shard(2))
 
@@ -237,8 +238,8 @@ def test_gathernd_k2_trailing_dim_shard_4():
     x_placements = (Replicate(), Shard(2), Replicate())
     indices_placements = (Replicate(), Replicate(), Shard(0))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    indices_local = distribute_tensor(indices, mesh, indices_placements)
 
     relu_placements = (Replicate(), Shard(1), Shard(0))
 
@@ -278,8 +279,8 @@ def test_gathernd_k3_no_trailing_dims_5():
     x_placements = (Replicate(), Replicate(), Replicate())
     indices_placements = (Replicate(), Replicate(), Shard(0))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    indices_local = DTensor.distribute_tensor(indices, mesh, indices_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    indices_local = distribute_tensor(indices, mesh, indices_placements)
 
     relu_placements = (Replicate(), Replicate(), Shard(0))
 

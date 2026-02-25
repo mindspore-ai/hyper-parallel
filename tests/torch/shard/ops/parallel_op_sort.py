@@ -16,8 +16,8 @@
 
 import numpy as np
 import torch
-from hyper_parallel import DTensor, init_device_mesh
-from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global
@@ -52,7 +52,7 @@ def test_distributed_sort_basic():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     d_values, d_indices = dist_input.sort(dim=1, descending=False)
 
     # Layout validation
@@ -86,7 +86,7 @@ def test_distributed_sort_descending():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     d_values, d_indices = dist_input.sort(dim=1, descending=True)
 
     g_values = local_to_global(d_values)
@@ -114,7 +114,7 @@ def test_distributed_sort_middle_dim():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate(), Shard(1))
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     d_values, d_indices = dist_input.sort(dim=1)
 
     # Layout validation
@@ -146,7 +146,7 @@ def test_distributed_sort_negative_dim():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     d_values, d_indices = dist_input.sort(dim=-1)
 
     g_values = local_to_global(d_values)
@@ -172,7 +172,7 @@ def test_distributed_sort_sharded_dim_error():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     # Try to sort dim 0 (which is sharded)
     try:

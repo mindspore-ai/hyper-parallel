@@ -18,7 +18,8 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
-from hyper_parallel import DTensor, init_device_mesh, shard_module
+from hyper_parallel import init_device_mesh, shard_module
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
@@ -100,8 +101,8 @@ def test_bmm_ext_partial_model_parallel():
     w_placements = (Shard(0), Replicate(), Shard(1))
     relu_input_placements = (Shard(0), Replicate(), Replicate())
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    w_local = DTensor.distribute_tensor(w, mesh, w_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    w_local = distribute_tensor(w, mesh, w_placements)
 
     parallel_net = BmmExtNet(device_mesh=mesh, relu_strategy=relu_input_placements)
     parallel_output = parallel_net(x_local, w_local)
@@ -139,8 +140,8 @@ def test_bmm_partial_transpose_model_parallel():
     w_placements = (Shard(0), Replicate(), Shard(1))
     relu_input_placements = (Shard(0), Replicate(), Replicate())
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
-    w_local = DTensor.distribute_tensor(w, mesh, w_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
+    w_local = distribute_tensor(w, mesh, w_placements)
 
     parallel_net = BmmNet(
         transpose_a=True,

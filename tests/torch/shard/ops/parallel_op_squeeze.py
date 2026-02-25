@@ -16,8 +16,8 @@
 
 import numpy as np
 import torch
-from hyper_parallel import DTensor, init_device_mesh
-from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global
@@ -43,7 +43,7 @@ def test_distributed_squeeze_basic():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.squeeze(1)
 
     # Layout validation: dim0 preserved (sharded on dp), dim1 removed
@@ -75,7 +75,7 @@ def test_distributed_squeeze_no_args_all_dims():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(1), Shard(3))
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.squeeze()
 
     # Layout validation:
@@ -107,7 +107,7 @@ def test_distributed_squeeze_specific_axis_negative():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(2))
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.squeeze(-2)
 
     # Layout validation:
@@ -136,7 +136,7 @@ def test_distributed_squeeze_error_non_singleton():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     try:
         # Try to squeeze dim 1 which has size 2
@@ -161,7 +161,7 @@ def test_distributed_squeeze_scalar_like():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.squeeze()
 
     # Layout validation: 0-dim tensor, fully replicated

@@ -21,7 +21,8 @@ import mindspore.communication.management as D
 import mindspore.common.dtype as mstype
 from mindspore import Tensor
 from mindspore.ops import flash_attention_score
-from hyper_parallel import init_device_mesh, shard_module, DTensor
+from hyper_parallel import init_device_mesh, shard_module
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.core.shard.ops.parallel_flash_attention_score import ParallelFlashAttention
@@ -117,10 +118,10 @@ def test_flash_attention_score_model_parallel():
     # output placements (same as query)
     output_placements = (Shard(0), Shard(2), Shard(1))
 
-    query_local = DTensor.distribute_tensor(query, mesh, query_placements)
-    key_local = DTensor.distribute_tensor(key, mesh, key_placements)
-    value_local = DTensor.distribute_tensor(value, mesh, value_placements)
-    attn_mask_local = DTensor.distribute_tensor(attn_mask, mesh, attn_mask_placements)
+    query_local = distribute_tensor(query, mesh, query_placements)
+    key_local = distribute_tensor(key, mesh, key_placements)
+    value_local = distribute_tensor(value, mesh, value_placements)
+    attn_mask_local = distribute_tensor(attn_mask, mesh, attn_mask_placements)
 
     parallel_net = ParallelFlashAttention(head_num=n,
                                           scalar_value=scalar_value,

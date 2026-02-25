@@ -16,8 +16,8 @@
 
 import numpy as np
 import torch
-from hyper_parallel import DTensor, init_device_mesh
-from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global, global_to_local
@@ -47,7 +47,7 @@ def test_distributed_expand_basic_unsharded():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.expand(-1, 16)
 
     # Layout validation: dim0 preserved (sharded), dim1 expanded (unsharded)
@@ -80,7 +80,7 @@ def test_distributed_expand_3d():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate(), Shard(1))
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.expand(-1, 10, -1)  # preserve dim0/dim2 with -1
 
     # Layout validation: preserved dims keep sharding, expanded dim unsharded
@@ -112,7 +112,7 @@ def test_distributed_expand_prepend_new_dimensions():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate()) # tensor_map = (1, -1)
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.expand(2, 3, -1, 16)  # prepend (2,3), preserve dim0, expand dim1
 
     # Layout validation: new dims unsharded, dim2 preserved (sharded), dim3 expanded (unsharded)
@@ -143,7 +143,7 @@ def test_distributed_expand_sharded_dim_error():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Shard(1)) # tensor_map = (-1, 0)
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     try:
         # Attempt to expand sharded dim=1 from 1→16 (should fail)
         dist_input.expand(8, 16)
@@ -171,7 +171,7 @@ def test_distributed_expand_scalar_tensor():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.expand(3, 4, 5)
 
     # Layout validation: all new dimensions must be unsharded (fully replicated)
@@ -203,7 +203,7 @@ def test_distributed_expand_as_basic():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     # Target tensor MUST be fully replicated (shape metadata only; no computation on values)
     target_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
@@ -241,7 +241,7 @@ def test_distributed_expand_as_3d_preservation():
     # Shard dim=0 ("dp") and dim=2 ("tp"), keep dim=1 unsharded (to expand)
     mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate(), Shard(1))
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     # Target tensor fully replicated (shape metadata only)
     target_layout = _build_layout(mesh, (Shard(0), Replicate(), Shard(1)), 3)
@@ -278,7 +278,7 @@ def test_distributed_expand_as_prepend_dimensions():
     # Shard only dim=0 ("dp") in input
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     # Target tensor fully replicated (shape metadata only)
     target_layout = _build_layout(mesh, (Shard(2), Replicate(), Shard(1)), 4)
@@ -315,7 +315,7 @@ def test_distributed_expand_as_scalar_to_tensor():
     # Scalar-like input must be fully replicated
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     # Target tensor fully replicated (shape metadata only)
     target_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)

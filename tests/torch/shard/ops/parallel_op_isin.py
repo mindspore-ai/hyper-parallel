@@ -16,7 +16,8 @@
 
 import numpy as np
 import torch
-from hyper_parallel import DTensor, init_device_mesh
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global
@@ -52,8 +53,8 @@ def test_distributed_isin_layout_inference():
     test_elements_placements = (Replicate(), Replicate()) # tensor_map = (-1,) - fully replicated 1D tensor
 
     # Convert to distributed tensors
-    dist_elements = DTensor.distribute_tensor(standalone_elements, mesh, elements_placements)
-    dist_test_elements = DTensor.distribute_tensor(standalone_test_elements, mesh, test_elements_placements)
+    dist_elements = distribute_tensor(standalone_elements, mesh, elements_placements)
+    dist_test_elements = distribute_tensor(standalone_test_elements, mesh, test_elements_placements)
 
     # Distributed execution
     dist_output = torch.isin(dist_elements, dist_test_elements)
@@ -88,8 +89,8 @@ def test_distributed_isin_sharded_test_elements_error():
     test_elements_placements = (Shard(0), Replicate())
 
     # Convert to distributed tensors (test_elements will be partial on each device)
-    dist_elements = DTensor.distribute_tensor(standalone_elements, mesh, elements_placements)
-    dist_test_elements = DTensor.distribute_tensor(standalone_test_elements, mesh, test_elements_placements)
+    dist_elements = distribute_tensor(standalone_elements, mesh, elements_placements)
+    dist_test_elements = distribute_tensor(standalone_test_elements, mesh, test_elements_placements)
 
     # Attempt distributed execution → should fail at layout inference stage
     try:
@@ -136,8 +137,8 @@ def test_distributed_isin_invert_and_assume_unique():
     elements_placements = (Shard(0), Replicate()) # tensor_map = (1, -1)
     test_elements_placements = (Replicate(), Replicate())
 
-    dist_elements = DTensor.distribute_tensor(standalone_elements, mesh, elements_placements)
-    dist_test_elements = DTensor.distribute_tensor(standalone_test_elements, mesh, test_elements_placements)
+    dist_elements = distribute_tensor(standalone_elements, mesh, elements_placements)
+    dist_test_elements = distribute_tensor(standalone_test_elements, mesh, test_elements_placements)
 
     # Distributed execution with parameters
     dist_invert = torch.isin(dist_elements, dist_test_elements, invert=True)
@@ -181,8 +182,8 @@ def test_distributed_isin_mixed_parallel_3d():
     test_elements_placements = (Replicate(), Replicate(), Replicate())
 
     # Convert and execute
-    dist_elements = DTensor.distribute_tensor(standalone_elements_3d, mesh, elements_placements)
-    dist_test_elements = DTensor.distribute_tensor(standalone_test_elements, mesh, test_elements_placements)
+    dist_elements = distribute_tensor(standalone_elements_3d, mesh, elements_placements)
+    dist_test_elements = distribute_tensor(standalone_test_elements, mesh, test_elements_placements)
     dist_output = torch.isin(dist_elements, dist_test_elements)
 
     # Verify layout correctness

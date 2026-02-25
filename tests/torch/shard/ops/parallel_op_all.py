@@ -15,8 +15,8 @@
 """test torch dtensor with distributed all"""
 import numpy as np
 import torch
-from hyper_parallel import DTensor, init_device_mesh
-from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global
@@ -46,7 +46,7 @@ def test_distributed_all_unsharded_dim():
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_result = torch.all(dist_input, dim, keepdim=False)
 
     expected_layout = _build_layout(mesh, (Shard(0),), 1)
@@ -84,7 +84,7 @@ def test_distributed_all_sharded_dim():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(1))
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     # FIX: Use positional arguments to ensure correct layout inference
     dist_result = torch.all(dist_input, dim, keepdim=False)

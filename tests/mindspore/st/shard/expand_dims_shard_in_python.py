@@ -19,7 +19,8 @@ import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor, ops
-from hyper_parallel import init_device_mesh, shard_module, DTensor
+from hyper_parallel import init_device_mesh, shard_module
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
@@ -79,7 +80,7 @@ def test_expanddims_data_parallel_1():
     x_placements = (Shard(0), Shard(1), Shard(2))
     relu_input_placements = (Shard(1), Shard(2), Shard(3))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
 
     parallel_net = ExpandDimsNet(device_mesh=mesh, relu_strategy=relu_input_placements)
     parallel_output = parallel_net(x_local, axis=0)
@@ -115,7 +116,7 @@ def test_expanddims_model_parallel_2():
     x_placements = (Replicate(), Replicate(), Shard(2))
     relu_input_placements = (Replicate(), Replicate(), Replicate(), Shard(2))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
 
     parallel_net = ExpandDimsNet(device_mesh=mesh, relu_strategy=relu_input_placements)
     parallel_output = parallel_net(x_local, axis=1)
@@ -151,7 +152,7 @@ def test_expanddims_hybrid_parallel_3():
     x_placements = (Shard(0), Shard(1), Shard(2))
     relu_input_placements = (Shard(0), Shard(1), Shard(2), Replicate())
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
 
     parallel_net = ExpandDimsNet(device_mesh=mesh, relu_strategy=relu_input_placements)
     parallel_output = parallel_net(x_local, axis=-1)
@@ -187,7 +188,7 @@ def test_expanddims_insert_middle_4():
     x_placements = (Shard(0), Shard(1), Shard(2))
     relu_input_placements = (Shard(0), Shard(1), Shard(3))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
 
     parallel_net = ExpandDimsNet(device_mesh=mesh, relu_strategy=relu_input_placements)
     parallel_output = parallel_net(x_local, axis=2)
@@ -223,7 +224,7 @@ def test_expanddims_negative_axis_5():
     x_placements = (Shard(0), Shard(1), Shard(2))
     relu_input_placements = (Shard(0), Shard(1), Shard(3))
 
-    x_local = DTensor.distribute_tensor(x, mesh, x_placements)
+    x_local = distribute_tensor(x, mesh, x_placements)
 
     parallel_net = ExpandDimsNet(device_mesh=mesh, relu_strategy=relu_input_placements)
     parallel_output = parallel_net(x_local, axis=-2)

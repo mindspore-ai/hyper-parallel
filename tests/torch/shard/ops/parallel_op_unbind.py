@@ -16,8 +16,8 @@
 
 import numpy as np
 import torch
-from hyper_parallel import DTensor, init_device_mesh
-from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global
@@ -52,7 +52,7 @@ def test_distributed_unbind_dim0():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Shard(1))
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = torch.unbind(dist_input, dim=0)
 
     # Validation: Output should be a tuple
@@ -95,7 +95,7 @@ def test_distributed_unbind_dim1():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = torch.unbind(dist_input, dim=1)
 
     assert len(dist_output) == input_2d_shape[1]
@@ -132,7 +132,7 @@ def test_distributed_unbind_negative_dim():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "tp", "mp"))
     x_placements = (Shard(0), Shard(1), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = torch.unbind(dist_input, dim=-1)
 
     assert len(dist_output) == input_3d_shape[2]
@@ -168,7 +168,7 @@ def test_distributed_unbind_sharded_dim_error():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     # Attempt to unbind dim0 which is sharded
     try:

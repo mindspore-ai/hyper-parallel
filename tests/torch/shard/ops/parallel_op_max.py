@@ -16,8 +16,8 @@
 
 import numpy as np
 import torch
-from hyper_parallel import DTensor, init_device_mesh
-from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate, Partial
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global
@@ -48,8 +48,8 @@ def test_distributed_max_element_wise():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
-    dist_a = DTensor.distribute_tensor(standalone_a, mesh, x_placements)
-    dist_b = DTensor.distribute_tensor(standalone_b, mesh, x_placements)
+    dist_a = distribute_tensor(standalone_a, mesh, x_placements)
+    dist_b = distribute_tensor(standalone_b, mesh, x_placements)
 
     dist_output = torch.max(dist_a, dist_b)
 
@@ -87,7 +87,7 @@ def test_distributed_max_dim_reduce_sharded():
     # Shard dim 0 ("dp"), Replicate dim 1
     x_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     # Reduce dim 0 -> This is the sharded dimension ("dp")
     # Output will be a tuple (values, indices). We verify 'values'.
@@ -127,7 +127,7 @@ def test_distributed_max_dim_reduce_replicated():
     # Shard dim 0 ("dp"), Replicate dim 1
     x_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     # Reduce dim 1 -> This is Replicated. No communication needed.
     dist_vals, _ = torch.max(dist_input, dim=1)
@@ -168,7 +168,7 @@ def test_distributed_max_global_reduce():
     # Shard both dims
     x_placements = (Shard(0), Shard(1))
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     dist_output = torch.max(dist_input)
 
@@ -207,7 +207,7 @@ def test_distributed_max_keepdim():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     dist_vals, _ = torch.max(dist_input, dim=0, keepdim=True)
 

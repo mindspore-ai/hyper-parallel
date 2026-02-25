@@ -17,7 +17,8 @@ import numpy as np
 import mindspore as ms
 from mindspore import nn, Tensor, ops
 from mindspore.communication.management import get_rank, init
-from hyper_parallel import DTensor, init_device_mesh
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor import distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.platform import get_platform
 
@@ -62,9 +63,9 @@ def test_full_mesh_shard_forward_1():
     b_p = (Replicate(), Shard(0))
 
     # 创建分布式张量
-    dist_x = DTensor.distribute_tensor(x_input, mesh, x_p)
-    dist_w = DTensor.distribute_tensor(w_input, mesh, w_p)
-    dist_b = DTensor.distribute_tensor(b_input, mesh, b_p)
+    dist_x = distribute_tensor(x_input, mesh, x_p)
+    dist_w = distribute_tensor(w_input, mesh, w_p)
+    dist_b = distribute_tensor(b_input, mesh, b_p)
 
     rank = get_rank()
     if rank in (0, 1):
@@ -150,9 +151,9 @@ def test_sub_mesh_column_parallel_forward():
     w_p = (Shard(1),)
     b_p = (Shard(0),)
 
-    dist_x = DTensor.distribute_tensor(x_input, tp_mesh, x_p)
-    dist_w = DTensor.distribute_tensor(w_input, tp_mesh, w_p)
-    dist_b = DTensor.distribute_tensor(b_input, tp_mesh, b_p)
+    dist_x = distribute_tensor(x_input, tp_mesh, x_p)
+    dist_w = distribute_tensor(w_input, tp_mesh, w_p)
+    dist_b = distribute_tensor(b_input, tp_mesh, b_p)
 
     if rank in (0, 1):
         expected = Tensor(np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.float32), ms.float32)
@@ -200,9 +201,9 @@ def test_full_mesh_shard_forward_2():
     w_p = (Replicate(), Shard(0))
     b_p = (Replicate(), Replicate())
 
-    dist_x = DTensor.distribute_tensor(x_input, mesh, x_p)
-    dist_w = DTensor.distribute_tensor(w_input, mesh, w_p)
-    dist_b = DTensor.distribute_tensor(b_input, mesh, b_p)
+    dist_x = distribute_tensor(x_input, mesh, x_p)
+    dist_w = distribute_tensor(w_input, mesh, w_p)
+    dist_b = distribute_tensor(b_input, mesh, b_p)
     rank = get_rank()
     if rank == 0:
         expected = Tensor(np.array([[0, 1], [4, 5]], dtype=np.float32), ms.float32)
@@ -265,9 +266,9 @@ def test_sub_mesh_row_parallel_forward():
     w_p = (Shard(0),)
     b_p = (Replicate(),)
 
-    dist_x = DTensor.distribute_tensor(x_input, tp_mesh, x_p)
-    dist_w = DTensor.distribute_tensor(w_input, tp_mesh, w_p)
-    dist_b = DTensor.distribute_tensor(b_input, tp_mesh, b_p)
+    dist_x = distribute_tensor(x_input, tp_mesh, x_p)
+    dist_w = distribute_tensor(w_input, tp_mesh, w_p)
+    dist_b = distribute_tensor(b_input, tp_mesh, b_p)
 
     if rank == 0:
         expected = Tensor(np.array([[0, 1], [4, 5]], dtype=np.float32), ms.float32)
@@ -338,9 +339,9 @@ def test_sub_mesh_row_parallel_redistribute_forward():
     w_p = (Shard(0),)
     b_p = (Replicate(),)
 
-    dist_x = DTensor.distribute_tensor(x_input, tp_mesh, x_p)
-    dist_w = DTensor.distribute_tensor(w_input, tp_mesh, w_p)
-    dist_b = DTensor.distribute_tensor(b_input, tp_mesh, b_p)
+    dist_x = distribute_tensor(x_input, tp_mesh, x_p)
+    dist_w = distribute_tensor(w_input, tp_mesh, w_p)
+    dist_b = distribute_tensor(b_input, tp_mesh, b_p)
 
     if rank == 0:
         expected = Tensor(np.array([[0, 1], [0, 1]], dtype=np.float32), ms.float32)
@@ -398,7 +399,7 @@ def test_sub_mesh_redistribute_1():
     # (Shard(1),) redistribute to (Shard(0),)
     tp_mesh = mesh["tp"]
     x_p = (Shard(1),)
-    dist_x = DTensor.distribute_tensor(x_input, tp_mesh, x_p)
+    dist_x = distribute_tensor(x_input, tp_mesh, x_p)
     if rank in (0, 2, 4, 6):
         expected = Tensor(np.array([[0, 1], [4, 5], [8, 9], [12, 13]], dtype=np.float32), ms.float32)
         assert ops.equal(dist_x.to_local(), expected).all()
@@ -421,7 +422,7 @@ def test_sub_mesh_redistribute_1():
 
     # (Shard(0),) redistribute to (Replicate(),)
     x_p = (Shard(0),)
-    dist_x = DTensor.distribute_tensor(x_input, tp_mesh, x_p)
+    dist_x = distribute_tensor(x_input, tp_mesh, x_p)
     if rank in (0, 2, 4, 6):
         expected = Tensor(np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.float32), ms.float32)
         assert ops.equal(dist_x.to_local(), expected).all()
@@ -455,7 +456,7 @@ def test_sub_mesh_redistribute_2():
     dp_mesh = mesh["dp"]
     # (Shard(0),) redistribute to (Shard(1),)
     x_p = (Shard(0),)
-    dist_x = DTensor.distribute_tensor(x_input, dp_mesh, x_p)
+    dist_x = distribute_tensor(x_input, dp_mesh, x_p)
     if rank in (0, 1):
         arr = np.array([
             [0, 1, 2, 3]
@@ -541,7 +542,7 @@ def test_sub_mesh_redistribute_2():
 
     # (Replicate(),) redistribute to (Shard(0),)
     x_p = (Replicate(),)
-    dist_x = DTensor.distribute_tensor(x_input, dp_mesh, x_p)
+    dist_x = distribute_tensor(x_input, dp_mesh, x_p)
     new_x_p = (Shard(0),)
     new_dist_x = dist_x.redistribute(dp_mesh, new_x_p)
     if rank in (0, 1):
@@ -599,7 +600,7 @@ def test_sub_mesh_redistribute_3():
     tp_mesh = mesh["tp"]
     # (Shard(1),) redistribute to (Shard(0),)
     x_p = (Shard(1),)
-    dist_x = DTensor.distribute_tensor(x_input, tp_mesh, x_p)
+    dist_x = distribute_tensor(x_input, tp_mesh, x_p)
     if rank == 0:
         arr = np.array([
             [0],
@@ -648,7 +649,7 @@ def test_sub_mesh_redistribute_4():
     tp_mesh = mesh["dp"]
     # (Shard(1),) redistribute to (Shard(0),)
     x_p = (Shard(1),)
-    dist_x = DTensor.distribute_tensor(x_input, tp_mesh, x_p)
+    dist_x = distribute_tensor(x_input, tp_mesh, x_p)
     assert ops.equal(dist_x.to_local(), x_input).all(), (
             f"Expected dist_x tensor {x_input}, but got {dist_x.to_local()}"
         )
@@ -677,7 +678,7 @@ def test_sub_mesh_redistribute_5():
     dp_mesh = mesh["dp"]
     # (Shard(0),) redistribute to (Shard(1),) redistribute to (Shard(2),)
     x_p = (Shard(0),)
-    dist_x = DTensor.distribute_tensor(x_input, dp_mesh, x_p)
+    dist_x = distribute_tensor(x_input, dp_mesh, x_p)
     if rank in (0, 1, 2, 3):
         arr = np.array([
             [[0, 1],
@@ -763,7 +764,7 @@ def test_sub_mesh_redistribute_6():
     tp_mesh = mesh["tp"]
     # (Shard(0),) redistribute to (Shard(1),) redistribute to (Shard(2),)
     x_p = (Shard(0),)
-    dist_x = DTensor.distribute_tensor(x_input, tp_mesh, x_p)
+    dist_x = distribute_tensor(x_input, tp_mesh, x_p)
     if rank in (0, 1, 4, 5):
         arr = np.array([
             [[0, 1],
@@ -849,7 +850,7 @@ def test_sub_mesh_redistribute_7():
     mp_mesh = mesh["mp"]
     # (Shard(0),) redistribute to (Shard(1),) redistribute to (Shard(2),)
     x_p = (Shard(0),)
-    dist_x = DTensor.distribute_tensor(x_input, mp_mesh, x_p)
+    dist_x = distribute_tensor(x_input, mp_mesh, x_p)
     if rank in (0, 2, 4, 6):
         arr = np.array([
             [[0, 1],
@@ -935,7 +936,7 @@ def test_sub_mesh_redistribute_8():
     dtp_mesh = mesh["dp", "tp"]
     # (Shard(0), Shard(1),) redistribute to (Shard(0), Shard(2),) redistribute to (Shard(1), Shard(2),)
     x_p = (Shard(0), Shard(1),)
-    dist_x = DTensor.distribute_tensor(x_input, dtp_mesh, x_p)
+    dist_x = distribute_tensor(x_input, dtp_mesh, x_p)
     if rank in (0, 1):
         arr = np.array([
             [[0, 1]]
@@ -1067,7 +1068,7 @@ def test_sub_mesh_redistribute_9():
     dtp_mesh = mesh["dp", "mp"]
     # (Shard(0), Shard(1),) redistribute to (Shard(0), Shard(2),) redistribute to (Shard(1), Shard(2),)
     x_p = (Shard(0), Shard(1),)
-    dist_x = DTensor.distribute_tensor(x_input, dtp_mesh, x_p)
+    dist_x = distribute_tensor(x_input, dtp_mesh, x_p)
     if rank in (0, 2):
         arr = np.array([
             [[0, 1]]
@@ -1199,7 +1200,7 @@ def test_sub_mesh_redistribute_10():
     dtp_mesh = mesh["tp", "mp"]
     # (Shard(0), Shard(1),) redistribute to (Shard(0), Shard(2),) redistribute to (Shard(1), Shard(2),)
     x_p = (Shard(0), Shard(1),)
-    dist_x = DTensor.distribute_tensor(x_input, dtp_mesh, x_p)
+    dist_x = distribute_tensor(x_input, dtp_mesh, x_p)
     if rank in (0, 4):
         arr = np.array([
             [[0, 1]]

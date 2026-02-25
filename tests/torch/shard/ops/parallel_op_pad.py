@@ -17,8 +17,8 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-from hyper_parallel import DTensor, init_device_mesh
-from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global
@@ -51,7 +51,7 @@ def test_distributed_pad_basic_unsharded():
     # Shard dim 0 (Batch), Replicate others
     x_placements = (Shard(0), Replicate(), Replicate(), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = F.pad(dist_input, (1, 1, 2, 2), mode='constant', value=0.5)
 
     # Layout validation: Output layout should match input layout (preserves sharding)
@@ -85,7 +85,7 @@ def test_distributed_pad_zero_on_sharded_dim():
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate(), Replicate(), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = F.pad(dist_input, pad_args, mode='constant', value=0)
 
     # Layout validation
@@ -116,7 +116,7 @@ def test_distributed_pad_sharded_dim_error():
     # Shard dim 0
     x_placements = (Shard(0), Replicate(), Replicate(), Replicate())
 
-    dist_input = DTensor.distribute_tensor(standalone_input, mesh, x_placements)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
     # Attempt to pad dim 0 (N) which is sharded
     pad_args = (0, 0, 0, 0, 0, 0, 1, 1)
