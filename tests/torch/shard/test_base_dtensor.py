@@ -28,3 +28,15 @@ def test_base_dtensor():
     file_name = "base_dtensor.py"
     case_name = "test_base_dtensor"
     torchrun_case(file_name, case_name, master_port)
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_dtensor_float():
+    '''
+    Feature: DTensor.float() method.
+    Description: Test converting DTensor to float dtype
+    Expectation: Run success and DTensor is converted to float dtype.
+    '''
+    master_port = 11336
+    file_name = "base_dtensor.py"
+    case_name = "test_dtensor_float"
+    torchrun_case(file_name, case_name, master_port)

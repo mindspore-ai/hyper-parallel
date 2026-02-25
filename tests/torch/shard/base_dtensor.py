@@ -113,3 +113,23 @@ def test_base_dtensor():
     assert np.allclose(standalone_grad.cpu().detach().numpy(),
                        dist_grad.cpu().detach().numpy(),
                        0.001, 0.001)
+
+
+def test_dtensor_float():
+    '''
+    Feature: DTensor.float() method.
+    Description: Test converting DTensor to float dtype
+    Expectation: Run success and DTensor is converted to float dtype.
+    '''
+    init_dist()
+    mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(1, 8),
+        mesh_dim_names=("dp", "tp")
+    )
+    local_tensor = torch.ones(8, 8).npu().half()
+    local_float_tensor = local_tensor.clone().detach().float()
+    dtensor = DTensor.from_local(local_tensor, mesh, (Replicate(), Shard(0)))
+    float_dtensor = dtensor.float()
+    assert float_dtensor._local_tensor.dtype == torch.float32 #pylint: disable=W0212
+    assert (float_dtensor._local_tensor.cpu().detach().numpy() == local_float_tensor.cpu().detach().numpy()).all() #pylint: disable=W0212
