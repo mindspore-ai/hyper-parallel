@@ -61,20 +61,10 @@ class DTensorBase(Tensor):
         out = _OP_DISPATCHER.dispatch(func, args, kwargs)
         return out
 
-    def to(self, device):
-        """set tensor to device"""
-        target_device = torch.device(device) if isinstance(device, str) else device
+    def to(self, *args, **kwargs):
+        """Move the DTensor to a different device or dtype."""
         src_local = self._local_tensor
-
-        if src_local.device.type == "meta":
-            new_local = torch.empty_like(
-                src_local,
-                device=target_device,
-                requires_grad=src_local.requires_grad
-            )
-        else:
-            new_local = src_local.to(target_device)
-
+        new_local = src_local.to(*args, **kwargs)
         return self.__class__(new_local, device_mesh=self._device_mesh, placements=self._placements)
 
     @property
