@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,7 +28,8 @@ class TransposeDistributedOp(DistributedOp):
         Infer output layout for Transpose operator.
 
         Based on the op_name initialized in the base class, this method switches behavior:
-        1. op_name == 'Transpose' or 'permute': Implements MindSpore Transpose behavior or PyTorch permute behavior.
+        1. op_name == 'Transpose', 'permute' or "TransposeView": Implements MindSpore Transpose behavior
+        or PyTorch permute behavior.
            - extra_args expected: (perm,) where perm is a tuple of indices.
            - Rules: Output layout is determined by input layout and permutation.
         2. op_name == 'transpose': Implements PyTorch transpose behavior.
@@ -47,7 +48,7 @@ class TransposeDistributedOp(DistributedOp):
         ndim = len(in_tensor_map)
         out_tensor_map = None
 
-        if self.op_name in ("Transpose", "permute"):
+        if self.op_name in ("Transpose", "permute", "TransposeView"):
             # MindSpore style: Transpose(input, input_perm)
             # extra_args should contain a single element: the permutation tuple
             if not extra_args or not isinstance(extra_args[0], (list, tuple)):
