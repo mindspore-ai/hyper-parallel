@@ -22,7 +22,8 @@ from torch import nn
 class HSDPConfigV2:
     """HSDPConfigV2 inspect by torch fully_shard"""
 
-    def __init__(self, mesh, reshard_after_forward, shard_placement_fn, mp_policy, offload_policy, ignored_params=None):
+    def __init__(self, mesh, reshard_after_forward, shard_placement_fn, mp_policy,
+                 offload_policy, ignored_params=None, comm_fusion=False):
         self.mesh = mesh
         self.reshard_after_forward = reshard_after_forward
         self.shard_placement_fn = shard_placement_fn
@@ -30,6 +31,7 @@ class HSDPConfigV2:
         self.offload_policy = offload_policy
         self.ignored_params = ignored_params
         self.reduce_dtype = self.mp_policy.reduce_dtype if self.mp_policy else None
+        self.comm_fusion = comm_fusion
 
 class ShardedState(Enum):
     """

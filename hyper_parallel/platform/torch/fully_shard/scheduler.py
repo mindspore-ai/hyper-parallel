@@ -20,6 +20,7 @@ from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2, FSDP
 from hyper_parallel.platform.torch.fully_shard.hook_function import PostBackwardFunction
 from hyper_parallel.platform.torch.fully_shard.state import TorchHSDPStateV2
 from hyper_parallel.platform.torch.fully_shard.utils import FSDPMeshInfo, HSDPMeshInfo
+from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx
 from hyper_parallel.platform import get_platform
 
 class TorchHSDPSchedulerV2(HSDPSchedulerV2):
@@ -54,7 +55,6 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             self.mesh_info = HSDPMeshInfo(mesh=self.mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
         self.hsdp_state = TorchHSDPStateV2(self.cell, self.mesh_info, self.config, self.platform, self.device)
 
-
     def _register_post_backward_hook(self, args, kwargs):
         """Wrap forward args/kwargs through PostBackwardFunction to register backward hook."""
         args_list, args_spec = tree_flatten(args)
@@ -87,14 +87,13 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         """Execute forward hook."""
         self._register_backward_pre_hook(outputs)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
-            return
+            return None
         if TorchHSDPSchedulerV2.root_bp_state:
             if self._backup_forward_fetch:
                 self.forward_prefetch_cells = self._backup_forward_fetch
                 self._backup_forward_fetch = []
-            return
-        outputs = self._hsdp_forward_hook(cell, inputs, outputs)
-        return outputs
+            return None
+        return self._hsdp_forward_hook(cell, inputs, outputs)
 
     # pylint: disable=W0212
     def _backward_pre_hook(self, grad):
@@ -107,11 +106,25 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         return grad
 
     def _root_backward_hook(self):
-        """Final backward callback: run backward hook and apply remaining gradient reductions."""
+        """Root backward hook: finalize gradient reduction for the outermost HSDP module.
+
+        For the root module (the last to finish backward), this hook drains any
+        pending fused reduction from ``CommContext`` and then calls ``reduce_params()``
+        to apply the final per-parameter gradient reduction.
+        """
         apply_final_reduce = self.scheduler_state != FSDPSchedulerState.BACKWARD
         self._backward_hook()
         if apply_final_reduce:
             TorchHSDPSchedulerV2.root_bp_state = False
+            # Drain any pending async fused reduction from the last module's backward
+            comm_ctx = get_comm_ctx()
+            # Drain any pending pipelined HSDP reductions
+            if comm_ctx.all_reduce_param_group is not None:
+                comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
+                comm_ctx.all_reduce_param_group = None
+            if comm_ctx.pre_param_group is not None:
+                comm_ctx.pre_param_group.apply_fusion_reduced_grad()
+                comm_ctx.pre_param_group = None
             self.hsdp_state.reduce_params()
 
     def _backward_hook(self):

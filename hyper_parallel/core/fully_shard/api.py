@@ -325,7 +325,7 @@ class HSDPModule:
 
     # pylint: disable=C0415
     def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
-                  shard_placement_fn, mp_policy, offload_policy, ignored_params, device):
+                  shard_placement_fn, mp_policy, offload_policy, ignored_params, device, comm_fusion):
         """init hsdp2 scheduler."""
         scheduler_class = None
         if platform_type == PlatformType.MINDSPORE:
@@ -343,6 +343,7 @@ class HSDPModule:
                                               offload_policy,
                                               ignored_params,
                                               device,
+                                              comm_fusion
                                               )
 
     def set_requires_gradient_sync(self, requires_grad_sync):
@@ -632,6 +633,7 @@ def fully_shard(
         mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
         offload_policy: OffloadPolicy = OffloadPolicy(),
         ignored_params: Optional[set[nn.Parameter]] = None,
+        comm_fusion: bool = False
 ):
     """
     Apply fully_shard to a module for distributed training with parameter sharding.
@@ -679,13 +681,14 @@ def fully_shard(
             fully replicated across all devices. Useful for small parameters where
             sharding overhead outweighs memory benefits, or parameters that must
             remain unsharded for correctness.
+        comm_fusion  (bool, default=False):
+            Whether enable all_gather fusion and reduce_scatter fusion.
 
     Returns:
         nn.Module: The input module with HSDP capabilities added. The module's
             class is dynamically extended to inherit from HSDPModule, providing
             additional methods for distributed training control.
     """
-
     platform_type = platform.platform_type
     _extend_module_with_hsdp_interface(module)
     # if mesh is None, Using Default npu mesh
@@ -701,6 +704,7 @@ def fully_shard(
         offload_policy,
         ignored_params,
         device,
+        comm_fusion
     )
     return module
 
