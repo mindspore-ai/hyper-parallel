@@ -1,0 +1,4 @@
+scaled_dot_product_attention:
+  dist_op_name: _torch_scaled_dot_product_attention_dist_op
+  distributed_op_class: ScaledDotProductAttentionDistributedOp
+  distributed_op_file: parallel_scaled_dot_product_attention
