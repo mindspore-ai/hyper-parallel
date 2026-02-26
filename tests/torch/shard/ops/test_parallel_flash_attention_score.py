@@ -96,7 +96,7 @@ def test_bsh_sp_mp_2d():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bsh_dp_sp_mp_3d():
     """
     Feature: test npu_fusion_attention with BSH layout, DP + SP + MP on 3D mesh.
@@ -109,7 +109,7 @@ def test_bsh_dp_sp_mp_3d():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bnsd_dp_mp():
     """
     Feature: test npu_fusion_attention with BNSD layout, DP + MP.
@@ -122,7 +122,7 @@ def test_bnsd_dp_mp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bnsd_sp():
     """
     Feature: test npu_fusion_attention with BNSD layout, DP + SP.
@@ -135,7 +135,7 @@ def test_bnsd_sp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_sbh_dp():
     """
     Feature: test npu_fusion_attention with SBH layout, data parallelism.
@@ -148,7 +148,7 @@ def test_sbh_dp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bsnd_dp_mp():
     """
     Feature: test npu_fusion_attention with BSND layout, DP + MP.
@@ -161,7 +161,7 @@ def test_bsnd_dp_mp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_tnd_dp():
     """
     Feature: test npu_fusion_attention with TND layout, data parallelism.
@@ -174,7 +174,7 @@ def test_tnd_dp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_tnd_mp():
     """
     Feature: test npu_fusion_attention with TND layout, head parallelism.
@@ -187,7 +187,7 @@ def test_tnd_mp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_tnd_dp_mp():
     """
     Feature: test npu_fusion_attention with TND layout, DP + MP on 2D mesh.
@@ -200,7 +200,7 @@ def test_tnd_dp_mp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sp_sparse_mode_0():
     """
     Feature: test npu_fusion_attention SP with sparse_mode=0.
@@ -265,7 +265,7 @@ def test_dp_sparse_mode_1():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dp_sparse_mode_4():
     """
     Feature: test npu_fusion_attention DP with sparse_mode=4.
@@ -369,7 +369,7 @@ def test_bsh_custom_scale():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bsh_dropout():
     """
     Feature: test npu_fusion_attention with dropout.
@@ -382,7 +382,7 @@ def test_bsh_dropout():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bsh_long_sequence_sp():
     """
     Feature: test npu_fusion_attention SP with long sequence.
@@ -395,7 +395,7 @@ def test_bsh_long_sequence_sp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bsh_large_batch_dp():
     """
     Feature: test npu_fusion_attention DP with large batch.
@@ -408,7 +408,7 @@ def test_bsh_large_batch_dp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bsh_redistribute_then_attention():
     """
     Feature: test npu_fusion_attention after redistribute.
@@ -434,7 +434,7 @@ def test_sp_sparse_mode_2_with_2way_split():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_sp_sparse_mode_3_with_2way_split():
     """
     Feature: test npu_fusion_attention SP sparse_mode=3 with 2-way split.
