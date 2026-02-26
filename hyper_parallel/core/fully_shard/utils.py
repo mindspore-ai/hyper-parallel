@@ -37,7 +37,6 @@ class OffloadPolicy:
     This represents no offloading and serves as the default policy.
     Subclass this to implement custom offload strategies.
     """
-    pass
 
 
 @dataclass
@@ -94,6 +93,7 @@ class DDPMeshInfo(DataParallelMeshInfo):
 
 @dataclass
 class HSDPMeshInfo(FSDPMeshInfo, DDPMeshInfo):
+    # pylint: disable=W0246
     def __post_init__(self):
         # Calls `FSDPMeshInfo` -> `DDPMeshInfo` -> `DataParallelMeshInfo`
         super().__post_init__()

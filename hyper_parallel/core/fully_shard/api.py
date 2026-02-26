@@ -103,12 +103,13 @@ class HSDPModule:
 
     # pylint: disable=C0415
     def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
-                  shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device):
+                  shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device, comm_fusion):
         """init hsdp2 scheduler."""
         scheduler_class = None
         if platform_type == PlatformType.MINDSPORE:
             from hyper_parallel.platform.mindspore.fully_shard.scheduler import MindSporeHSDPSchedulerV2
             scheduler_class = MindSporeHSDPSchedulerV2
+            comm_fusion = False
         else:
             from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
             scheduler_class = TorchHSDPSchedulerV2
@@ -122,6 +123,7 @@ class HSDPModule:
                                               ignored_params,
                                               replicate_params,
                                               device,
+                                              comm_fusion
                                               )
 
     def set_requires_gradient_sync(self, requires_grad_sync):
@@ -499,6 +501,7 @@ def fully_shard(
         offload_policy: OffloadPolicy = OffloadPolicy(),
         ignored_params: Optional[set[platform.Parameter]] = None,
         replicate_params: Optional[set[platform.Parameter]] = None,
+        comm_fusion: bool = False
 ) -> Union[platform.Module, List[platform.Module]]:
     """
     Apply fully_shard to a module (or list of modules) for distributed training with parameter sharding.
@@ -544,6 +547,8 @@ def fully_shard(
             fully replicated across all devices. Useful for small parameters where
             sharding overhead outweighs memory benefits, or parameters that must
             remain unsharded for correctness.
+        comm_fusion  (bool, default=False):
+            Whether enable all_gather fusion and reduce_scatter fusion.
 
         replicate_params (Optional[set[nn.Parameter]], default=None):
             Set of parameters to exclude from sharding. These parameters remain
@@ -580,6 +585,7 @@ def fully_shard(
         ignored_params,
         replicate_params,
         device,
+        comm_fusion
     )
     # Share the same scheduler handle with other roots so mods[i].unshard()/prefetch work
     if len(modules) > 1:

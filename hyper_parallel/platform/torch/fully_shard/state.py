@@ -16,10 +16,12 @@
 # pylint: disable=protected-access
 from typing import Optional
 import torch
+import torch.distributed as dist
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos
 from hyper_parallel.core.fully_shard.utils import HSDPMeshInfo, DDPMeshInfo, CPUOffloadPolicy
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
+from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx, HSDPParamGroup
 
 
 def _to_dtype_if_needed(
@@ -55,6 +57,7 @@ class TorchHSDPStateV2(HSDPState):
             device (torch.device): Target device.
         """
         super().__init__(cell, mesh_info, config, platform, device)
+        self.comm_fusion = config.comm_fusion
         # Do ReduceScatter/AllReduce for grad
         self.device = device
         self.mp_policy = config.mp_policy
@@ -69,6 +72,18 @@ class TorchHSDPStateV2(HSDPState):
         self._ignored_allreduce_works = []
         self._validate_cpu_offload_params()
         self._reset_sharded_params = False
+        self._init_param_group()
+
+    def _init_param_group(self):
+        """Initialize fused parameter group for communication fusion.
+
+        When ``comm_fusion`` is enabled, creates an ``HSDPParamGroup`` that packs all
+        parameters into a single buffer for fused all-gather and reduce-scatter,
+        replacing the per-parameter communication pattern.
+        """
+        if self.config.comm_fusion:
+            # pylint: disable=E1128
+            self.param_group = HSDPParamGroup(self.hsdp_params, self.mesh_info, self.device, self.mp_policy)
 
     def _move_states_to_device(self):
         """move states to device"""
@@ -248,6 +263,24 @@ class TorchHSDPStateV2(HSDPState):
 
         self._ignored_allreduce_works.clear()
 
+    def post_backward_for_comm_fusion(self):
+        """post_backward_for_comm_fusion."""
+        # Fused gradient reduction path: first apply any pending async reduction
+        # from the previous module's backward (pipelined overlap), then issue
+        # this module's fused reduce-scatter (+ all-reduce for HSDP).
+        comm_ctx = get_comm_ctx()
+        # Phase 2: apply grads for the param group whose all_reduce is done
+        if comm_ctx.all_reduce_param_group is not None:
+            comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
+            comm_ctx.all_reduce_param_group = None
+        # Phase 1: wait reduce_scatter, issue async all_reduce for previous layer
+        if comm_ctx.pre_param_group is not None:
+            comm_ctx.pre_param_group.wait_reduce_scatter_and_issue_all_reduce()
+            comm_ctx.pre_param_group = None
+        self.param_group.foreach_reduce(
+            reduce_scatter_reduce_op=self.reduce_op_type
+        )
+
     def post_backward(self, *unused):  # pylint: disable=unused-argument
         """Reduce gradients and reshard parameters after backward."""
         for hsdp_param in self.hsdp_params:
@@ -263,29 +296,32 @@ class TorchHSDPStateV2(HSDPState):
                 replicate_param.to_accumulated_grad_if_needed()
             return
         self._allreduce_replicate_params()
-        self.reduce_params()
-        for hsdp_param in self.hsdp_params:
-            if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
-                continue
-            # Frozen parameters (requires_grad=False) produce no
-            # gradient — skip all reduce-scatter / all-reduce work.
-            if not hsdp_param.sharded_param.requires_grad:
-                continue
-            if hsdp_param.shard_world_size > 1:
-                hsdp_param.reduce_scatter_grad(
-                    dtype=self._reduce_dtype,
-                    reduce_op=self.reduce_op_type
-                )
-                TorchHSDPStateV2.pre_reduce_scatter_params.append([hsdp_param, self._orig_dtype])
+        if not self.comm_fusion:
+            self.reduce_params()
+            for hsdp_param in self.hsdp_params:
+                if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
+                    continue
+                # Frozen parameters (requires_grad=False) produce no
+                # gradient — skip all reduce-scatter / all-reduce work.
+                if not hsdp_param.sharded_param.requires_grad:
+                    continue
+                if hsdp_param.shard_world_size > 1:
+                    hsdp_param.reduce_scatter_grad(
+                        dtype=self._reduce_dtype,
+                        reduce_op=self.reduce_op_type
+                    )
+                    TorchHSDPStateV2.pre_reduce_scatter_params.append([hsdp_param, self._orig_dtype])
 
-            if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
-                assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
-                reduced_grad = hsdp_param.reduce_scatter_output()
-                hsdp_param.all_reduce_grad(grad=reduced_grad, dtype=self._reduce_dtype, reduce_op=self.reduce_op_type)
-                if TorchHSDPStateV2.pre_reduce_scatter_params and \
-                        TorchHSDPStateV2.pre_reduce_scatter_params[-1][0] == hsdp_param:
-                    TorchHSDPStateV2.pre_reduce_scatter_params.pop()
-                TorchHSDPStateV2.pre_all_reduce_params.append([hsdp_param, self._orig_dtype])
+                if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
+                    assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
+                    reduced_grad = hsdp_param.reduce_scatter_output()
+                    hsdp_param.all_reduce_grad(grad=reduced_grad, dtype=self._reduce_dtype, reduce_op=self.reduce_op_type)
+                    if TorchHSDPStateV2.pre_reduce_scatter_params and \
+                            TorchHSDPStateV2.pre_reduce_scatter_params[-1][0] == hsdp_param:
+                        TorchHSDPStateV2.pre_reduce_scatter_params.pop()
+                    TorchHSDPStateV2.pre_all_reduce_params.append([hsdp_param, self._orig_dtype])
+        else:
+            self.post_backward_for_comm_fusion()
         self._finish_ignored_allreduce()
         if self.reshard_after_backward:
             self.shard()

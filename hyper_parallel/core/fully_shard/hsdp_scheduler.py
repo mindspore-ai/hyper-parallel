@@ -35,7 +35,7 @@ class HSDPSchedulerV2:
     """HSDPScheduler is used to scheduler hsdp"""
     def __init__(self, cell: Union[platform.Module, Tuple[platform.Module, ...]], mesh,
                  reshard_after_forward, shard_placement_fn,
-                 mp_policy, offload_policy, ignored_params, replicate_params, device):
+                 mp_policy, offload_policy, ignored_params, replicate_params, device, comm_fusion):
         """init hsdp scheduler.
 
         Args:
@@ -62,6 +62,7 @@ class HSDPSchedulerV2:
             offload_policy,
             ignored_params,
             replicate_params,
+            comm_fusion=comm_fusion
         )
         self._init_platform()
         self._new_cell_state()
