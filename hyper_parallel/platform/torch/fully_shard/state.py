@@ -53,7 +53,7 @@ class TorchHSDPStateV2(HSDPState):
         # Reduce Op type for gradient reduction, default to AVG.
         self.reduce_op_type = torch.distributed.ReduceOp.AVG
         self._validate_cpu_offload_params()
-        self._init_mp_dtypes()
+        self._reset_sharded_params = False
 
     def _move_states_to_device(self):
         """move states to device"""
@@ -131,7 +131,29 @@ class TorchHSDPStateV2(HSDPState):
             )
 
     def lazy_init(self):
-        raise NotImplementedError("lazy_init not implemented in TorchHSDPStateV2")
+        if not self._reset_sharded_params:
+            for hsdp_param in self.hsdp_params:
+                if hsdp_param.is_sharded:
+                    hsdp_param.reset_sharded_param()
+                    hsdp_param._init_extensions()
+            self._reset_sharded_params = True
+        self._validate_no_meta_params()
+        self._validate_cpu_offload_params()
+        self._init_mp_dtypes()
+
+    def _validate_no_meta_params(self):
+        param_names_on_meta = [
+            hsdp_param._param_fqn
+            for hsdp_param in self.hsdp_params
+            if hsdp_param.sharded_param.device.type == "meta"
+        ]
+        if param_names_on_meta:
+            raise RuntimeError(
+                "HSDP parameters should be materialized from meta device before training, "
+                f"but the following were still on meta device: {param_names_on_meta}\n"
+                "For example, call module.to_empty(device) to materialize to device and "
+                "call module.reset_parameters() on each module to initialize values."
+            )
 
     def reshard(self,):
         # TODO：补齐reshard接口，当前我们不考虑reshard_after_forward配置是int的情况，只考虑True/False

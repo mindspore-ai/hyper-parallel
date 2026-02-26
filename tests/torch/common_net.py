@@ -118,6 +118,20 @@ class FullyShardTestNet(nn.Module):
         return out
 
 
+class MetaInitNet(nn.Module):
+    """Simple network that supports meta device initialization via torch.device context."""
+    def __init__(self, hidden_size=32):
+        super().__init__()
+        self.linear1 = nn.Linear(hidden_size, hidden_size)
+        self.linear2 = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = torch.relu(x)
+        x = self.linear2(x)
+        return torch.sum(x)
+
+
 class BufferTestNet(nn.Module):
     """
     BufferTestNet is a helper network used for testing buffer device in hyper-parallel.

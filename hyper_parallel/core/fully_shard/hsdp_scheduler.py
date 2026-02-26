@@ -135,6 +135,7 @@ class HSDPSchedulerV2:
             cast_fn = functools.partial(self.platform.cast_fp_tensor, self.mp_policy.param_dtype)
             args = self.platform.apply_to_tensors(cast_fn, args)
             kwargs = self.platform.apply_to_tensors(cast_fn, kwargs)
+        self.hsdp_state.lazy_init()
         self.hsdp_state.unshard()
         for prefetch_cell in self.forward_prefetch_cells:
             prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()

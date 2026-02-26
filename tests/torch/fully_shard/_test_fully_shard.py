@@ -21,7 +21,7 @@ import torch
 import torch_npu
 from hyper_parallel import DeviceMesh, init_device_mesh
 from hyper_parallel.platform.platform import get_torch_platform
-from tests.torch.common_net import FullyShardTestNet, DenseNet, BufferTestNet
+from tests.torch.common_net import FullyShardTestNet, DenseNet, BufferTestNet, MetaInitNet
 from tests.torch.utils import init_dist
 from tests.torch.hsdp.hsdp_test_common import train
 from hyper_parallel.core.fully_shard.api import fully_shard
@@ -110,6 +110,42 @@ def test_fully_shard_03():
     input_data = torch.rand(batch_size, hidden_size).npu()
     with SkipDTensorDispatch():
         train(net, input_data, comm_async=True, train_steps=2)
+
+
+def test_fully_shard_meta_init():
+    """
+    Feature: Test fully_shard with meta device initialization
+    Description: Model is created on meta device, then materialized to NPU before training.
+    This validates the lazy_init path: reset_sharded_param and _validate_no_meta_params.
+    Expectation: run successfully
+    """
+    batch_size = 4
+    hidden_size = 32
+    init_dist()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+ 
+    with torch.device("meta"):
+        model = MetaInitNet(hidden_size)
+
+    model = fully_shard(
+        model,
+        mesh=mesh,
+        reshard_after_forward=True,
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+            cast_forward_inputs=True,
+        ),
+    )
+    model.to_empty(device="npu")
+    for module in model.modules():
+        if hasattr(module, "reset_parameters"):
+            module.reset_parameters()
+
+    input_data = torch.rand(batch_size, hidden_size).npu()
+    with SkipDTensorDispatch():
+        train(model, input_data, comm_async=True, train_steps=2)
 
 
 def test_fully_shard_from_group_mesh():

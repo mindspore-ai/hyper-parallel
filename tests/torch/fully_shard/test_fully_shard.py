@@ -56,6 +56,19 @@ def test_fully_shard_03():
     torchrun_case(file_name, case_name, master_port)
 
 
+# @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_fully_shard_meta_init():
+    """
+    Feature: Test fully_shard with meta device initialization
+    Description: Model is created on meta device, then materialized to NPU before training
+    Expectation: run successfully
+    """
+    master_port = 12346
+    file_name = "_test_fully_shard.py"
+    case_name = "test_fully_shard_meta_init"
+    torchrun_case(file_name, case_name, master_port)
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_fully_shard_from_group_mesh():
     """
