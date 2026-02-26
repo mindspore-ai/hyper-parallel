@@ -19,10 +19,13 @@ import atexit
 import glob
 import importlib
 from typing import Any, List, Dict, Optional
+from itertools import chain
+
 import yaml
 
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
 from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.random import OffsetBasedRNGTracker, is_rng_supported_mesh
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -106,6 +109,13 @@ class OpDispatcher:
 
         # Ops requiring args unpacking for layout inference (packed as prim, name, real_args).
         self.unpack_ops = ["ScatterUpdate", "Mod", "GatherNd"]
+
+        self._random_ops = {
+            "normal_", "uniform_", "bernoulli", "bernoulli_",
+            "native_dropout", "rand", "rand_like", "randn",
+            "randn_like", "randint_like", "kaiming_uniform_",
+        }
+        self._rng_tracker: Optional[OffsetBasedRNGTracker] = None
 
         self._register_distributed_ops()
 
@@ -631,6 +641,56 @@ class OpDispatcher:
 
         return yaml_dict
 
+    def _dispatch_random_op(self, op_name: str, op_call: callable, args, kwargs):
+        """Handle dispatch for random ops that operate on DTensors."""
+        first_arg = next(
+            (x for x in chain(args, kwargs.values()) if isinstance(x, DTensor)),
+            None,
+        )
+        # Fall back to the default op if no DTensor is found.
+        if first_arg is None:
+            return op_call(*args, **kwargs)
+
+        local_args = [arg.to_local() if isinstance(arg, DTensor) else arg for arg in args]
+        local_kwargs = {k: v.to_local() if isinstance(v, DTensor) else v for k, v in kwargs.items()}
+        first_local_arg = first_arg.to_local()
+
+        if self._rng_tracker is None and is_rng_supported_mesh():
+            self._rng_tracker = OffsetBasedRNGTracker()
+
+        maybe_user_generator = local_kwargs.pop("generator", None)
+        if (
+            self._rng_tracker is not None
+            and not first_local_arg.is_meta
+            and self._rng_tracker.distribute_region_enabled
+        ):
+            # pylint: disable=W0212
+            with self._rng_tracker._distribute_region(
+                device_mesh=first_arg.device_mesh,
+                placements=first_arg.placements,
+                global_shape=first_arg.shape,
+                generator=maybe_user_generator,
+            ):
+                local_results = op_call(*local_args, **local_kwargs)
+        else:
+            local_results = op_call(*local_args, **local_kwargs)
+
+        # in-place ops
+        if op_name.endswith('_'):
+            return first_arg
+        # non-in-place ops
+        # Some ops return tuple/list, e.g. native_dropout returns (output, mask).
+        if isinstance(local_results, (tuple, list)):
+            return tuple(
+                DTensor.from_local(r, first_arg.device_mesh, first_arg.placements)
+                if isinstance(r, Tensor) else r
+                for r in local_results
+            )
+        if isinstance(local_results, Tensor):
+            return DTensor.from_local(local_results, first_arg.device_mesh, first_arg.placements)
+        # Fallback: return as-is for non-Tensor results (currently unreachable with existing _random_ops).
+        return local_results
+
     def dispatch(self, op_call: callable, args: tuple[object, ...], kwargs: dict[str, object]):
         """
         dispatch
@@ -654,6 +714,10 @@ class OpDispatcher:
                 else:
                     input_args.append(arg)
             return op_call(*input_args, **kwargs)
+
+        if op_name in self._random_ops:
+            return self._dispatch_random_op(op_name, op_call, args, kwargs)
+
         if op_name not in self.layout_infer_ops:
             raise RuntimeError(f"Operator {op_name} dose not contain parallel layout infer func.")
 
