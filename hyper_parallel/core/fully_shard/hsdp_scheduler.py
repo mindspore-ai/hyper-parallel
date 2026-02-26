@@ -126,18 +126,19 @@ class HSDPSchedulerV2:
             self.hsdp_state.zero_grads()
 
     # pylint: disable=W0613
-    def _hsdp_forward_pre_hook(self, cell, inputs):
+    def _hsdp_forward_pre_hook(self, cell, args, kwargs):
         """Forward pre hook to unsharded parameter for forward process."""
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
-            return
+            return args, kwargs
         self.scheduler_state = FSDPSchedulerState.PRE_FORWARD
         if self.mp_policy.cast_forward_inputs and self.mp_policy.param_dtype:
             cast_fn = functools.partial(self.platform.cast_fp_tensor, self.mp_policy.param_dtype)
-            inputs = self.platform.apply_to_tensors(cast_fn, inputs)
+            args = self.platform.apply_to_tensors(cast_fn, args)
+            kwargs = self.platform.apply_to_tensors(cast_fn, kwargs)
         self.hsdp_state.unshard()
         for prefetch_cell in self.forward_prefetch_cells:
             prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()
-        return inputs
+        return args, kwargs
 
     # pylint: disable=W0613
     def _hsdp_forward_hook(self, cell, inputs, outputs):

@@ -165,6 +165,10 @@ class TorchHSDPParamV2(HSDPParamV2):
         sharded_param = chunks[shard_rank].clone().contiguous()
         self.sharded_size = sharded_param.size()
         self.contiguous_sharded_stride = make_contiguous_strides_for(self.sharded_size)
+        if self.offload_to_cpu and not sharded_param.is_meta:
+            sharded_param = sharded_param.cpu()
+            if self.pin_memory:
+                sharded_param = sharded_param.pin_memory()
         self._sharded_param_data = sharded_param.view(-1)
 
         self._sharding_spec = Layout.from_device_mesh(self._spmd_mesh)
