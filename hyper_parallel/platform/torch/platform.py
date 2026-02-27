@@ -309,6 +309,14 @@ class TorchPlatform(Platform):
         return cell.named_parameters()
 
     @staticmethod
+    def get_model_state_dict(model, *, options=None):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (
+            get_model_state_dict as _get_model_state_dict,
+        )
+        return _get_model_state_dict(model, options=options)
+
+    @staticmethod
     def save_checkpoint(cell: Module, file_path: str) -> None:
         torch.save(obj=cell, f=file_path)
 
