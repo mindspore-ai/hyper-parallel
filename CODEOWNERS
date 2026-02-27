@@ -9,34 +9,63 @@
 # If the file in PR does not match rule, the default maintainers will be designated to conduct code review.
 * @yangzhenzhang @suteng @yao_yf
 
-# The maintainers of hyper_parallel/core.
-/hyper_parallel/core/shard/ @yangzhenzhang
-/hyper_parallel/core/hsdp/ @kisnwang
-/hyper_parallel/core/checkpoint/ @changzherui
-
-# The maintainers of hyper_parallel/platform.
-/hyper_parallel/platform/pipeline_parallel/ @yangzhenzhang
-/hyper_parallel/platform/hsdp/ @kisnwang
-
 # The maintainers of hyper_parallel/auto_parallel.
 /hyper_parallel/auto_parallel/ @bj-wang
 /hyper_parallel/auto_parallel/fast-tuner/ @ChaoRanCaaat
 
+
+# The maintainers of hyper_parallel/collectives.
+/hyper_parallel/collectives/ @changzherui1
+
+
+# The maintainers of hyper_parallel/core.
+/hyper_parallel/core/ @yangzhenzhang
+/hyper_parallel/core/activation_checkpoint/ @DavidFFFan
+/hyper_parallel/core/checkpoint/ @zhangbuxue
+/hyper_parallel/core/fully_shard/ @Meng107
+/hyper_parallel/core/hsdp/ @kisnwang
+/hyper_parallel/core/pipeline_parallel/ @lichen666
+/hyper_parallel/core/shard/ @yangzhenzhang
+/hyper_parallel/core/shard/ops/ @david-he91
+
+
+# The maintainers of hyper_parallel/platform.
+/hyper_parallel/platform/ @yangzhenzhang
+/hyper_parallel/platform/mindspore/ @yangzhenzhang
+/hyper_parallel/platform/mindspore/custom_pass/ @yuanqi1104
+/hyper_parallel/platform/mindspore/hsdp/ @kisnwang
+/hyper_parallel/platform/mindspore/pipeline_parallel/ @lichen666
+
+/hyper_parallel/platform/torch/ @yangzhenzhang
+/hyper_parallel/platform/torch/activation_checkpoint/ @DavidFFFan
+/hyper_parallel/platform/torch/fully_shard/ @Meng107
+/hyper_parallel/platform/torch/hsdp/ @kisnwang
+/hyper_parallel/platform/torch/pipeline_parallel/ @lichen666
+
+
 # The maintainers of tests.
-/tests/ @yangzhenzhang
+/tests/ @fengyixing
+/tests/mindspore/ @yangzhenzhang
 /tests/mindspore/st/hsdp/ @kisnwang
 /tests/mindspore/st/pipeline_parallel/ @yangzhenzhang
 /tests/mindspore/st/shard/ @yangzhenzhang
-/tests/mindspore/st/checkpoint/ @changzherui
+/tests/mindspore/st/checkpoint/ @zhangbuxue
 /tests/mindspore/ut/parallel_ops_infer/ @yangzhenzhang
-/tests/mindspore/ut/checkpoint/ @changzherui
+/tests/mindspore/ut/checkpoint/ @zhangbuxue
+
+/tests/torch/ @yangzhenzhang
+/tests/torch/activation_checkpoint/ @DavidFFFan
+/tests/torch/checkpoint/ @zhangbuxue
+/tests/torch/fully_shard/ @Meng107
 /tests/torch/hsdp/ @kisnwang
-/tests/torch/pipeline_parallel/ @yangzhenzhang
+/tests/torch/pipeline_parallel/ @lichen666
+/tests/torch/process_group/ @changzherui1
 /tests/torch/shard/ @yangzhenzhang
 
+
 # The maintainers of other code directories.
-/.jenkins/ @kisnwang
-/docs/ @kisnwang
-/.gitmodules  @kisnwang
-/requirements.txt  @kisnwang
-/setup.py  @kisnwang
+/.jenkins/ @yangzhenzhang
+/docs/ @yangzhenzhang
+/.gitmodules  @yangzhenzhang
+/requirements.txt  @yangzhenzhang
+/setup.py  @yangzhenzhang
