@@ -15,7 +15,7 @@
 """hybrid shard data parallel interface"""
 import warnings
 from collections import namedtuple
-from typing import Any, Mapping, cast, Optional
+from typing import Any, List, Mapping, cast, Optional, Union
 
 from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy
@@ -464,3 +464,10 @@ def get_model_state_dict(model, *, options=None):
     Users import from here instead of platform internals.
     """
     return platform.get_model_state_dict(model, options=options)
+
+
+def hsdp_sync_stream():
+    """wait for hsdp gradient handle to be completed"""
+    if platform is None:
+        return
+    platform.wait_grad_handle()
