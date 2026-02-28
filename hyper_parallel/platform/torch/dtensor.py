@@ -62,7 +62,12 @@ class DTensorBase(Tensor):
         return out
 
     def to(self, *args, **kwargs):
-        """Move the DTensor to a different device or dtype."""
+        """Move the DTensor to a different device or dtype.
+
+        Args:
+            *args (tuple): Arguments passed to the underlying tensor's ``to`` method (e.g., device or dtype).
+            **kwargs (dict): Keyword arguments for the tensor conversion (e.g., dtype, device, non_blocking).
+        """
         src_local = self._local_tensor
         new_local = src_local.to(*args, **kwargs)
         return self.__class__(new_local, device_mesh=self._device_mesh, placements=self._placements)

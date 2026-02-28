@@ -126,39 +126,27 @@ class HSDPState:
             return
 
         if self.config.comm_fusion:
-            raise ValueError(f"comm_fusion is deprecated, check config.comm_fusion.")
-            for buffer in self.param_buffers:
-                buffer.to_unsharded(async_op=async_op)
-        else:
-            for param in self.sharded_hsdp_params:
-                param.unshard()
-                param.wait_for_unshard()
-        self.is_shard = False
+            raise ValueError("comm_fusion is deprecated, check config.comm_fusion.")
+        for param in self.sharded_hsdp_params:
+            param.unshard(async_op)
+        if not async_op:
+            self.wait_for_unshard()
 
     def prefetch(self):
         """prefetch unsharded parameters"""
-        if not self.is_shard:
-            return
-        if self.config.comm_fusion:
-            for buffer in self.param_buffers:
-                buffer.prefetch_unsharded()
-        else:
-            for param in self.sharded_hsdp_params:
-                param.unshard(async_op=True)
-                
+        self.unshard(async_op=True)
 
-    def wait_for_unsharded(self):
-        """wait for all unsharded parameters"""
+    def wait_for_unshard(self):
+        """wait for all unshard parameters"""
         if not self.is_shard:
             return
         if self.config.comm_fusion:
             for buffer in self.param_buffers:
-                if buffer.prefetch_handle is not None:
-                    buffer.wait_for_unsharded()
+                buffer.wait_for_unshard()
         else:
             for param in self.sharded_hsdp_params:
-                if param.prefetch_handle is not None:
-                    param.wait_for_unsharded()
+                param.wait_for_unshard()
+        self.is_shard = False
 
     def zero_grads(self):
         """zero grad or grad buffer"""

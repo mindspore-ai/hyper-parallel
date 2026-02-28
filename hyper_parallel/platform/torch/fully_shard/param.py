@@ -16,8 +16,7 @@
 # enhanced with fully_shard parameter management
 # ============================================================================
 """HSDP parameter"""
-from typing import List, Callable, Optional, cast, Sequence, Tuple, Any
-from dataclasses import dataclass, field
+from typing import List, Callable, Optional, cast, Tuple
 import itertools
 import torch
 import torch.nn as nn

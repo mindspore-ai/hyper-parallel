@@ -111,7 +111,7 @@ class HSDPSchedulerV2:
         if not isinstance(requires_all_reduce, bool):
             raise ValueError(f"requires_all_reduce should be a bool, got {type(requires_all_reduce)}")
         if self.hsdp_state is not None:
-            self.hsdp_state.all_reduce_grads = requires_all_reduce
+            self.hsdp_state.requires_all_reduce = requires_all_reduce
 
     def set_requires_grad_sync(self, requires_grad_sync: bool):
         """Set requires grad sync flag to control gradient sync."""
@@ -140,7 +140,7 @@ class HSDPSchedulerV2:
             prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()
         return args, kwargs
 
-    # pylint: disable=W0613
+    # pylint: disable=W0613, R1710
     def _hsdp_forward_hook(self, cell, inputs, outputs):
         """Forward hook to shard parameter for saving memory."""
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
@@ -189,10 +189,6 @@ class HSDPSchedulerV2:
         """Set backward prefetch cells."""
         self.backward_prefetch_cells = hsdp_cell_list
 
-    def set_requires_allreuce(self, requires_all_reduce):
-        """set_require_allreuce for HSDP"""
-        self.hsdp_state.requires_all_reduce = requires_all_reduce
-
-    def reshard(self,):
+    def reshard(self):
         """Reshard parameters after forward or backward."""
         self.hsdp_state.reshard()
