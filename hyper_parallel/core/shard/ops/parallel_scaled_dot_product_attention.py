@@ -209,58 +209,71 @@ class ScaledDotProductAttentionDistributedOp:
     def _build_causal_mask_for_chunk(
         self,
         local_q_len: int,
-        global_kv_len: int,
+        kv_len: int,
         split_id: int,
         device,
     ) -> Tensor:
-        """Build causal attention mask for a local Q chunk against full KV.
+        """Build causal attention mask for a local Q chunk.
 
-        For global Q position (split_id * local_q_len + j), causal mask allows
-        attending to KV positions [0, split_id * local_q_len + j].
+        For global Q position (split_id * local_q_len + i), causal mask allows
+        attending to KV positions [0, split_id * local_q_len + i].
         Returns a bool mask where True means allow attention.
         """
         import torch   # pylint: disable=import-outside-toplevel
 
         offset = split_id * local_q_len
         q_positions = torch.arange(local_q_len, device=device).unsqueeze(1) + offset
-        kv_positions = torch.arange(global_kv_len, device=device).unsqueeze(0)
+        kv_positions = torch.arange(kv_len, device=device).unsqueeze(0)
         return kv_positions <= q_positions
 
     def _adjust_attn_mask_for_sp(
         self,
         attn_mask: Optional[Tensor],
         is_causal: bool,
+        key: Tensor,
+        value: Tensor,
         split_id: int,
         local_q_len: int,
         seq_split_num: int,
         global_kv_len: int,
+        seq_dim: int,
         device,
-    ) -> Tuple[Optional[Tensor], bool]:
-        """Adjust attn_mask and is_causal for sequence parallelism.
+    ) -> Tuple[Optional[Tensor], bool, Tensor, Tensor]:
+        """Adjust attn_mask, is_causal, and KV tensors for sequence parallelism.
 
-        For is_causal=True: constructs explicit causal mask for the local Q chunk,
-        since the standard lower-triangular pattern no longer applies after splitting.
+        For is_causal=True: truncates KV to the causally relevant range via
+        narrow(). For split_id=0 the truncated KV length equals Q length, so
+        is_causal=True is preserved and the kernel uses its built-in fast path.
+        For split_id>0, an explicit mask over the truncated KV range is built,
+        which is smaller than the original full-length mask.
 
         For explicit attn_mask with global Q dimension: slices to local Q range.
 
-        Returns (adjusted_attn_mask, adjusted_is_causal).
+        Returns (adjusted_attn_mask, adjusted_is_causal, adjusted_key, adjusted_value).
         """
         if is_causal:
+            kv_end = min((split_id + 1) * local_q_len, global_kv_len)
+            key = key.narrow(seq_dim, 0, kv_end)
+            value = value.narrow(seq_dim, 0, kv_end)
+
+            if split_id == 0:
+                return None, True, key, value
+
             causal_mask = self._build_causal_mask_for_chunk(
-                local_q_len, global_kv_len, split_id, device,
+                local_q_len, kv_end, split_id, device,
             )
-            return causal_mask, False
+            return causal_mask, False, key, value
 
         if attn_mask is not None:
             global_q_len = local_q_len * seq_split_num
             if attn_mask.shape[-2] == global_q_len:
                 offset = split_id * local_q_len
                 if attn_mask.dim() == 2:
-                    return attn_mask[offset:offset + local_q_len, :], False
-                if attn_mask.dim() == 4:
-                    return attn_mask[:, :, offset:offset + local_q_len, :], False
+                    attn_mask = attn_mask[offset:offset + local_q_len, :]
+                elif attn_mask.dim() == 4:
+                    attn_mask = attn_mask[:, :, offset:offset + local_q_len, :]
 
-        return attn_mask, is_causal
+        return attn_mask, is_causal, key, value
 
     def infer_layout(
         self, input_layouts: List[Optional[Layout]], extra_args: List[Any]
@@ -343,10 +356,12 @@ class ScaledDotProductAttentionDistributedOp:
                 local_q_len = query.shape[dims["seq"]]
                 global_kv_len = key.shape[dims["seq"]]
 
-                adjusted_attn_mask, adjusted_is_causal = self._adjust_attn_mask_for_sp(
-                    attn_mask, is_causal,
-                    split_id, local_q_len, seq_split_num,
-                    global_kv_len, query.device,
+                adjusted_attn_mask, adjusted_is_causal, key, value = (
+                    self._adjust_attn_mask_for_sp(
+                        attn_mask, is_causal, key, value,
+                        split_id, local_q_len, seq_split_num,
+                        global_kv_len, dims["seq"], query.device,
+                    )
                 )
 
             return func(
