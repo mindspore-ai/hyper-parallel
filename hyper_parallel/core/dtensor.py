@@ -15,6 +15,7 @@
 """dtensor"""
 import copy as cp
 from typing import Sequence, Tuple
+import numpy as np
 from hyper_parallel.core.layout import Layout, DeviceMesh, _get_slice_tensor_by_layout
 from hyper_parallel.core.placement_types import Placement, Replicate
 from hyper_parallel.platform import get_platform
@@ -168,6 +169,10 @@ class DTensor(DTensorBase):
         if dim is not None:
             return global_shape[dim]
         return global_shape
+
+    def numel(self) -> int:
+        """Return the number of elements in this DTensor."""
+        return int(np.prod(self.shape))
 
     @property
     def local_shape(self) -> Tuple[int, ...]:
