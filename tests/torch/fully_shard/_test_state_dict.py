@@ -25,6 +25,7 @@ Verified scenarios:
   T8 (8-card): get_model_state_dict ignore_frozen_params
   T9 (8-card): get_model_state_dict sharded + cpu_offload
   T10 (1-card): _to_dtype_if_needed cast / no-op
+  T11 (8-card): meta init -> load_state_dict -> backward (requires_grad regression)
 """
 import os
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
@@ -491,3 +492,59 @@ def test_t10_to_dtype_if_needed():
     )
 
     print("T10 PASS: _to_dtype_if_needed")
+
+
+# =====================================================================
+# T11 (8-card): meta init -> load_state_dict -> backward
+# =====================================================================
+def test_t11_meta_load_backward():
+    """Regression: load_state_dict into meta-init model must preserve
+    requires_grad so that backward does not crash with
+    'element 0 of tensors does not require grad'.
+    """
+    init_dist()
+    assert dist.get_world_size() >= 8, "T11 requires 8 cards"
+    torch.manual_seed(42 + _rank())
+    num_cards = 8
+
+    # Phase 1: reference model — train and extract a global checkpoint
+    model_ref = _make_model(num_cards)
+    x = torch.randn(BATCH, HIDDEN).npu()
+    _train_step(model_ref, x)
+    fwd_ref = _forward_val(model_ref, x)
+    checkpoint = _to_full_sd(model_ref.state_dict())
+
+    # Phase 2: target model — convert DTensor params to meta (simulate
+    # lazy / meta init, e.g. HuggingFace init_empty_weights)
+    model = _make_model(num_cards)
+    grad_flags: dict[str, bool] = {}
+    for name, p in model.named_parameters():
+        grad_flags[name] = p.requires_grad
+        if isinstance(p, DTensor):
+            meta_local = torch.empty_like(p.to_local(), device="meta")
+            meta_local.requires_grad_(p.requires_grad)
+            p._local_tensor = meta_local  # pylint: disable=protected-access
+
+    # Sanity: params are now meta
+    for name, p in model.named_parameters():
+        if isinstance(p, DTensor):
+            assert p.to_local().is_meta, f"'{name}' should be meta"
+
+    # Phase 3: load checkpoint (hits meta materialisation path)
+    model.load_state_dict(checkpoint)
+
+    # Phase 4: requires_grad must be preserved
+    for name, p in model.named_parameters():
+        assert p.requires_grad == grad_flags[name], (
+            f"'{name}': requires_grad changed from {grad_flags[name]} "
+            f"to {p.requires_grad} after load_state_dict"
+        )
+        assert not p.to_local().is_meta, f"'{name}' should be materialised"
+
+    # Phase 5: forward values should match reference
+    _assert_fwd_match(fwd_ref, _forward_val(model, x), "meta load fwd")
+
+    # Phase 6: backward must succeed (the actual reported crash)
+    _train_step(model, x)
+
+    print(f"[rank{_rank()}] T11 PASS: 8-card meta init -> load -> backward")

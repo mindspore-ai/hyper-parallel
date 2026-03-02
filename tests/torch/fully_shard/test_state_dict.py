@@ -80,6 +80,21 @@ def test_t9_get_model_sd_sharded_cpu():
     torchrun_case(_FILE, "test_t9_get_model_sd_sharded_cpu", _PORT_BASE + 9, num_proc=8)
 
 
+# ---------- 8-card test (T11): meta init -> load -> backward ----------
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_t11_meta_load_backward():
+    """
+    Feature: Test load_state_dict into meta-init model preserves requires_grad.
+    Description: Convert fully_shard model params to meta tensors (simulating
+        lazy init), load a global checkpoint, verify requires_grad is preserved
+        and forward/backward succeed without 'does not require grad' error.
+    Expectation: Run success.
+    """
+    torchrun_case(_FILE, "test_t11_meta_load_backward", _PORT_BASE + 11, num_proc=8)
+
+
 # ---------- 0-card dryrun test (T10): _to_dtype_if_needed ----------
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
