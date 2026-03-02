@@ -178,9 +178,9 @@ class TorchHSDPStateV2(HSDPState):
                 )
                 need_synchronize = True
             if sharded_grad is None:
-                hsdp_param.sharded_param.grad = reduced_grad
+                hsdp_param.sharded_param.grad = hsdp_param.to_sharded_dtensor(reduced_grad)
             else:
-                hsdp_param.sharded_param.grad += reduced_grad
+                hsdp_param.sharded_param.grad._local_tensor += reduced_grad
             if hsdp_param.unsharded_accumulated_grad_data is not None:
                 hsdp_param.unsharded_accumulated_grad_data = None
             elif hsdp_param.unsharded_param.grad is not None:

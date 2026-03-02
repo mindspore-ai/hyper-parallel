@@ -67,6 +67,12 @@ class DTensorBase(Tensor):
         new_local = src_local.to(*args, **kwargs)
         return self.__class__(new_local, device_mesh=self._device_mesh, placements=self._placements)
 
+    def float(self):
+        """convert tensor to float dtype"""
+        local_tensor = self._local_tensor
+        new_local = local_tensor.float()
+        return self.__class__(new_local, device_mesh=self._device_mesh, placements=self._placements)
+
     @property
     def grad(self) -> Optional[Tensor]:
         return self._local_tensor.grad

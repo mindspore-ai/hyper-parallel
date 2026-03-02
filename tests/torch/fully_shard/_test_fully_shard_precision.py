@@ -22,6 +22,7 @@ import torch_npu
 from torch import optim
 from tests.torch.utils import init_dist
 from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy, CPUOffloadPolicy, OffloadPolicy
+from hyper_parallel import DTensor
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel import init_device_mesh, DeviceMesh
 from tests.torch.common_net import SimpleModel
@@ -110,6 +111,8 @@ def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):
                 backward_input = torch.tensor(1.0 / repeat_num)
                 dist_loss.backward(backward_input)
                 if dist_model.weight.grad is not None:
+                    assert isinstance(dist_model.weight.grad, DTensor),\
+                        f"Expected dist_model.weight.grad to be a DTensor, but got {type(dist_model.weight.grad)}"
                     dist_grad = dist_model.weight.grad.data.clone()
                 if not acc_grad:
                     dist_optimizer.step()
