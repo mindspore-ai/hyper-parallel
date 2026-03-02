@@ -650,6 +650,7 @@ class TorchHSDPParamV2(HSDPParamV2):
     def all_reduce_grad(
         self,
         grad: Optional[torch.Tensor] = None,
+        dtype: Optional[torch.dtype] = None,
         async_op: bool = False,
         reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG
     ) -> Tuple[torch.Tensor, Optional[dist.Work]]:
@@ -671,6 +672,9 @@ class TorchHSDPParamV2(HSDPParamV2):
                 grad = self.unsharded_accumulated_grad_data
             else:
                 grad = self.unsharded_grad_data
+
+        if dtype is not None and dtype != grad.dtype:
+            grad = grad.to(dtype)
 
         if not isinstance(self.mesh_info, HSDPMeshInfo):
             # Not HSDP mode, no all-reduce needed

@@ -205,6 +205,7 @@ class TorchHSDPStateV2(HSDPState):
                 # gradient — skip all reduce-scatter / all-reduce work.
                 if not hsdp_param.sharded_param.requires_grad:
                     continue
+                reduced_grad = None
                 if hsdp_param.shard_world_size > 1:
                     if hsdp_param.unsharded_param.grad is None:
                         # Parameter requires grad but was not used in
@@ -218,6 +219,7 @@ class TorchHSDPStateV2(HSDPState):
                     assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
                     reduced_grad, _ = hsdp_param.all_reduce_grad(
                         grad=reduced_grad,
+                        dtype=self._reduce_dtype,
                         reduce_op=self.reduce_op_type,
                     )
                 # Bind the reduced gradient to hsdp_param.sharded_param
