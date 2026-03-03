@@ -22,10 +22,14 @@ from hyper_parallel.platform.torch.fully_shard.state import TorchHSDPStateV2
 from hyper_parallel.platform.torch.fully_shard.utils import FSDPMeshInfo, HSDPMeshInfo
 from hyper_parallel.platform import get_platform
 
-
-
 class TorchHSDPSchedulerV2(HSDPSchedulerV2):
     """TorchHSDPScheduler is used to implement optimizer level."""
+    root_bp_state = False
+
+    def __init__(self, *args, **kwargs):
+        """init"""
+        super().__init__(*args, **kwargs)
+        self._backup_forward_fetch = None
 
     def _register_hooks(self):
         """Register hooks."""
@@ -51,18 +55,9 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         self.hsdp_state = TorchHSDPStateV2(self.cell, self.mesh_info, self.config, self.platform, self.device)
 
     def _new_grad_hook(self):
-        """
-        Create and initialize a new TorchHSDPGradHook instance.
-        
-        This method instantiates the gradient hook component used for handling
-        gradient operations in the HSDP scheduler.
-        """
+        """Create and initialize a new TorchHSDPGradHook instance."""
         # TorchHSDPScheduler don't need param hook, using param.grad
         pass
-        # if self.config.comm_async:
-        #     self.grad_hook = TorchHSDPAsyncGradHook(self.config, self.platform)
-        # else:
-        #     self.grad_hook = TorchHSDPGradHook(self.config, self.platform)
 
     def _register_post_backward_hook(self, args, kwargs):
         """Register backward hook using backward function."""
@@ -78,6 +73,9 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _forward_pre_hook(self, cell, args, kwargs):
         """Execute forward pre hook and set up backward hook."""
+        if TorchHSDPSchedulerV2.root_bp_state:
+            self._backup_forward_fetch = self.forward_prefetch_cells
+            self.forward_prefetch_cells = []
         args, kwargs = self._hsdp_forward_pre_hook(cell, args, kwargs)
         return self._register_post_backward_hook(args, kwargs)
 
@@ -94,17 +92,30 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         self._register_backward_pre_hook(outputs)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return
+        if TorchHSDPSchedulerV2.root_bp_state:
+            if self._backup_forward_fetch:
+                self.forward_prefetch_cells = self._backup_forward_fetch
+                self._backup_forward_fetch = []
+            return
         outputs = self._hsdp_forward_hook(cell, inputs, outputs)
         return outputs
 
     # pylint: disable=W0212
     def _backward_pre_hook(self, grad):
         """Execute backward pre hook."""
+        Variable._execution_engine.queue_callback(self._root_backward_hook)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return grad
+        TorchHSDPSchedulerV2.root_bp_state = True
         self._hsdp_backward_pre_hook(self.cell, None)
-        Variable._execution_engine.queue_callback(self._backward_hook)
         return grad
+
+    def _root_backward_hook(self):
+        apply_final_reduce = self.scheduler_state != FSDPSchedulerState.BACKWARD
+        self._backward_hook()
+        if apply_final_reduce:
+            TorchHSDPSchedulerV2.root_bp_state = False
+            self.hsdp_state.reduce_params()
 
     def _backward_hook(self):
         """Execute backward hook."""

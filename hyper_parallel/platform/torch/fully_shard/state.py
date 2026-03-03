@@ -23,7 +23,7 @@ from hyper_parallel.platform.torch.fully_shard.utils import HSDPMeshInfo, CPUOff
 
 
 def _to_dtype_if_needed(
-    tensor: torch.Tensor, dtype: Optional[torch.dtype]
+        tensor: torch.Tensor, dtype: Optional[torch.dtype]
 ) -> torch.Tensor:
     """Cast tensor to the given dtype if it differs from current dtype.
 
@@ -35,9 +35,11 @@ def _to_dtype_if_needed(
         return tensor.to(dtype)
     return tensor
 
-
 class TorchHSDPStateV2(HSDPState):
     """Torch HSDP cell state"""
+    pre_reduce_scatter_params = []
+    pre_all_reduce_params = []
+
     def __init__(self, cell, mesh_info, config, platform, device):
         super().__init__(cell, mesh_info, config, platform, device)
         # Do ReduceScatter/AllReduce for grad
@@ -148,97 +150,91 @@ class TorchHSDPStateV2(HSDPState):
         #         return
         self.shard()
 
-    def _apply_reduced_grad(self, hsdp_param, reduced_grad):
-            """
-            Apply reduced gradient to the sharded parameter.
-
-            Reshapes ``reduced_grad`` to match the local shard, optionally
-            offloads to CPU, then accumulates or assigns onto
-            ``hsdp_param.sharded_param.grad``.
-
-            Args:
-                hsdp_param (TorchHSDPParamV2): The HSDP parameter wrapper.
-                reduced_grad (torch.Tensor): Gradient after reduce-scatter
-                    and/or all-reduce.
-            """
-            sharded_grad = hsdp_param.sharded_param.grad
-            sharded_param_local_shape = (
-                hsdp_param.sharded_param.local_shape
-                if isinstance(hsdp_param.sharded_param, DTensor)
-                else hsdp_param.sharded_param.shape
-            )
-            reduced_grad = reduced_grad.view(sharded_param_local_shape)
-            reduced_grad = _to_dtype_if_needed(reduced_grad, self._orig_dtype)
-            to_accumulate_grad = sharded_grad is not None
-            need_synchronize = False
-            if hsdp_param.offload_to_cpu:
-                non_blocking = hsdp_param.pin_memory and not to_accumulate_grad
-                reduced_grad = reduced_grad.to(
-                    torch.device("cpu"), non_blocking=non_blocking
-                )
-                need_synchronize = True
-            if sharded_grad is None:
-                hsdp_param.sharded_param.grad = hsdp_param.to_sharded_dtensor(reduced_grad)
-            else:
-                hsdp_param.sharded_param.grad._local_tensor += reduced_grad
-            if hsdp_param.unsharded_accumulated_grad_data is not None:
-                hsdp_param.unsharded_accumulated_grad_data = None
-            elif hsdp_param.unsharded_param.grad is not None:
-                hsdp_param.unsharded_param.grad = None
-            return need_synchronize
-
     def post_backward(self, *unused):
-            for hsdp_param in self.hsdp_params:
-                hsdp_param.accumulate_unsharded_grad_if_needed()
-            if not self.reduce_grads:
-                if self.reshard_after_backward:
-                    self.reshard()
-                for hsdp_param in self.hsdp_params:
-                    hsdp_param.to_accumulated_grad_if_needed()
-                return
-            hsdp_params_with_grad: List[TorchHSDPParamV2] = []
-            unsharded_grads: List[torch.Tensor] = []
-            for hsdp_param in self.hsdp_params:
-                if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
-                    continue
-                # Frozen parameters (requires_grad=False) produce no
-                # gradient — skip all reduce-scatter / all-reduce work.
-                if not hsdp_param.sharded_param.requires_grad:
-                    continue
-                reduced_grad = None
-                if hsdp_param.shard_world_size > 1:
-                    if hsdp_param.unsharded_param.grad is None:
-                        # Parameter requires grad but was not used in
-                        # forward — all ranks skip consistently.
-                        continue
-                    reduced_grad, _ = hsdp_param.reduce_scatter_grad(
-                        dtype=self._reduce_dtype,
-                        reduce_op=self.reduce_op_type
-                    )
-                if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
-                    assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
-                    reduced_grad, _ = hsdp_param.all_reduce_grad(
-                        grad=reduced_grad,
-                        dtype=self._reduce_dtype,
-                        reduce_op=self.reduce_op_type,
-                    )
-                # Bind the reduced gradient to hsdp_param.sharded_param
-                need_synchronize = self._apply_reduced_grad(hsdp_param, reduced_grad)
-            if need_synchronize:
-                if self.device.type == "npu":
-                    torch.npu.current_stream().synchronize()
-                elif self.device.type == "cuda":
-                    torch.cuda.current_stream().synchronize()
-                else:
-                    raise NotImplementedError(f"Unsupported device type {self.device.type} for synchronization after CPU offload.")
-
+        for hsdp_param in self.hsdp_params:
+            hsdp_param.accumulate_unsharded_grad_if_needed()
+        if not self.reduce_grads:
             if self.reshard_after_backward:
                 self.reshard()
+            for hsdp_param in self.hsdp_params:
+                hsdp_param.to_accumulated_grad_if_needed()
+            return
+        # reduce pre post_backward parameters, overlap with computing
+        self.reduce_params()
+        for hsdp_param in self.hsdp_params:
+            if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
+                continue
+            # Frozen parameters (requires_grad=False) produce no
+            # gradient — skip all reduce-scatter / all-reduce work.
+            if not hsdp_param.sharded_param.requires_grad:
+                continue
+            if hsdp_param.shard_world_size > 1:
+                if hsdp_param.unsharded_param.grad is None:
+                    # Parameter requires grad but was not used in
+                    # forward — all ranks skip consistently.
+                    continue
+                hsdp_param.reduce_scatter_grad(
+                    dtype=self._reduce_dtype,
+                    reduce_op=self.reduce_op_type
+                )
+                TorchHSDPStateV2.pre_reduce_scatter_params.append(hsdp_param)
+
+            if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
+                assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
+                reduced_grad = hsdp_param.reduce_scatter_output()
+                hsdp_param.all_reduce_grad(grad=reduced_grad, dtype=self._reduce_dtype, reduce_op=self.reduce_op_type)
+                if TorchHSDPStateV2.pre_reduce_scatter_params and \
+                        TorchHSDPStateV2.pre_reduce_scatter_params[-1] == hsdp_param:
+                    TorchHSDPStateV2.pre_reduce_scatter_params.pop()
+                TorchHSDPStateV2.pre_all_reduce_params.append(hsdp_param)
+
+        if self.reshard_after_backward:
+            self.reshard()
+
+    def reduce_params(self):
+        """Apply reduced gradients from pre-staged HSDP parameters to sharded parameters.
+
+        This function processes two lists of pre-queued HSDP parameters (`pre_reduce_scatter_params`
+        and `pre_all_reduce_params`), retrieves the reduced gradients from asynchronous
+        reduce-scatter/all-reduce operations, clears cached communication outputs, and applies
+        the reduced gradients to the corresponding sharded parameters (including reshaping,
+        dtype conversion, optional CPU offloading, and gradient accumulation/assignment).
+
+        Note:
+            - Parameters are processed in **FIFO (First-In-First-Out)** order (via `pop(0)`), ensuring
+              gradient application order matches the order of gradient reduction operations.
+            - After retrieving the reduced gradient, the cached communication output (reduce_scatter_output
+              or all_reduce_output) is cleared to free memory and avoid stale data.
+            - Gradient application logic (in `apply_reduced_grad`) includes:
+              1. Reshaping the flat reduced gradient to match the local shard shape
+              2. Optional dtype conversion to `param_type`
+              3. Optional CPU offloading (per the HSDP parameter's offload policy)
+              4. Assigning or accumulating the gradient to `sharded_param.grad`
+        """
+        need_synchronize = False
+        while TorchHSDPStateV2.pre_reduce_scatter_params:
+            pre_hsdp_param = TorchHSDPStateV2.pre_reduce_scatter_params.pop(0)
+            reduced_grad = pre_hsdp_param.reduce_scatter_output()
+            pre_hsdp_param.clear_reduce_scatter_output()
+            need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, self._orig_dtype) or need_synchronize
+
+        while TorchHSDPStateV2.pre_all_reduce_params:
+            pre_hsdp_param = TorchHSDPStateV2.pre_all_reduce_params.pop(0)
+            reduced_grad = pre_hsdp_param.all_reduce_output()
+            pre_hsdp_param.clear_all_reduce_output()
+            need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, self._orig_dtype) or need_synchronize
+        if need_synchronize:
+            if self.device.type == "npu":
+                torch.npu.current_stream().synchronize()
+            elif self.device.type == "cuda":
+                torch.cuda.current_stream().synchronize()
+            else:
+                raise NotImplementedError(f"Unsupported device type {self.device.type} for synchronization after CPU offload.")
 
     def set_requires_grad_sync(self, requires_grad_sync):
         """set requires grad sync flag to control gradient sync."""
         self.reduce_grads = requires_grad_sync
-    
+
     def set_reduce_op_type(self, reduce_op_type: str):
         """set reduce op type for gradient reduction."""
         fsdp_support_reduce_op = {

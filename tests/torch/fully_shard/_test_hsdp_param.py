@@ -454,8 +454,9 @@ def test_hsdp_param_v2_reduce_scatter_grad():
     )
 
     # Execute reduce-scatter
-    sharded_grad, handle = hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
-
+    hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
+    sharded_grad = hsdp_param.reduce_scatter_output()
+    hsdp_param.clear_reduce_scatter_output()
     # Verify output size
     expected_numel = in_channels * hidden_size // world_size
     assert sharded_grad.numel() == expected_numel, \
@@ -522,8 +523,9 @@ def test_hsdp_param_v2_all_reduce_grad():
 
     # Execute all-reduce on gradient
     grad = hsdp_param._unsharded_param.grad.clone()
-    reduced_grad, handle = hsdp_param.all_reduce_grad(grad=grad, async_op=False, reduce_op=dist.ReduceOp.SUM)
-
+    hsdp_param.all_reduce_grad(grad=grad, async_op=False, reduce_op=dist.ReduceOp.SUM)
+    reduced_grad = hsdp_param.all_reduce_output()
+    hsdp_param.clear_all_reduce_output()
     # Calculate sum of ranks in the same replicate group
     # Ranks in same replicate group share the same shard_idx
     expected_sum = 0.0
@@ -595,8 +597,9 @@ def test_hsdp_param_v2_accumulate_grad():
 
     assert hsdp_param._unsharded_param.grad is None, "Gradient should be cleared after accumulation"
 
-    sharded_grad, handle = hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
-
+    hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
+    sharded_grad = hsdp_param.reduce_scatter_output()
+    hsdp_param.clear_reduce_scatter_output()
     # Calculate expected reduced value:
     # Each rank's accumulated grad = rank + (rank + 1) = 2 * rank + 1
     expected_reduced_value = sum(2 * i + 1 for i in range(world_size))
