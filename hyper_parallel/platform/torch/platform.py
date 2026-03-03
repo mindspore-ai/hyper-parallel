@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -583,6 +583,20 @@ class TorchPlatform(Platform):
     def tensor_to_numpy(tensor) -> np.ndarray:
         """Convert PyTorch tensor to numpy array."""
         return tensor.cpu().numpy()
+
+    @staticmethod
+    def clip_grad_norm_(
+        parameters, max_norm, norm_type=2.0,
+        error_if_nonfinite=False, foreach=None,
+    ):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.clip_grad import (
+            clip_grad_norm_ as _clip_grad_norm,
+        )
+        return _clip_grad_norm(
+            parameters, max_norm, norm_type,
+            error_if_nonfinite=error_if_nonfinite, foreach=foreach,
+        )
 
     def cast_fp_tensor(self,dtype, x):
         """
