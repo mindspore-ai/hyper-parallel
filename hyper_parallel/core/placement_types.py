@@ -94,7 +94,7 @@ class Replicate(Placement):
         return type(self) is type(other)
 
     def __hash__(self) -> int:
-        return 0
+        return -1
 
     def __str__(self) -> str:
         return "R"

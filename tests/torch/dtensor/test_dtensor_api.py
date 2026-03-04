@@ -19,11 +19,11 @@ from tests.common.mark_utils import arg_mark
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_dtensor_api():
-    '''
+    """
     Feature: DTensor numel and to API.
     Description: Test numel and to API of DTensor.
     Expectation: Run success.
-    '''
+    """
     master_port = 12781
     file_name = "dtensor_api.py"
     case_name = "test_dtensor_api"

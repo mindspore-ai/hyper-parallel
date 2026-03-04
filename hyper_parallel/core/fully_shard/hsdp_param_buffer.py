@@ -109,7 +109,7 @@ class HSDPParamBuffer:
             self.platform.update_param_data(hsdp_param.param, unshared_param_data)
         self.unshared_param_buffer = unshared_param_buffer
 
-    def wait_for_unsharded(self):
+    def wait_for_unshard(self):
         """wait for unsharded buffer"""
         if self.prefetch_handle is not None:
             self.prefetch_handle.wait()

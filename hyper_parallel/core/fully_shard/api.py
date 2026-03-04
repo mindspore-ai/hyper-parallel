@@ -123,9 +123,9 @@ class HSDPModule:
         """reshard all sharded parameters"""
         if not self.hsdp_scheduler:
             raise ValueError("hsdp_scheduler is None")
-        scheduler_state = self.hsdp_scheduler.scheduler_state
-        if scheduler_state:
-            scheduler_state.shard()
+        hsdp_state = self.hsdp_scheduler.hsdp_state
+        if hsdp_state:
+            hsdp_state.shard()
 
     def unshard(self, async_op: bool = False):
         """unshard all sharded parameters"""
@@ -133,11 +133,11 @@ class HSDPModule:
             raise ValueError(f"async_op should be a bool, got {type(async_op)}")
         if not self.hsdp_scheduler:
             raise ValueError("hsdp_scheduler is None")
-        scheduler_state = self.hsdp_scheduler.scheduler_state
-        if scheduler_state:
-            scheduler_state.unshard(async_op=async_op)
+        hsdp_state = self.hsdp_scheduler.hsdp_state
+        if hsdp_state:
+            hsdp_state.unshard(async_op)  # pylint: disable=too-many-function-args
             if async_op:
-                return _UnshardHandle(hsdp_state=scheduler_state)
+                return _UnshardHandle(hsdp_state=hsdp_state)
         return None
 
     def load_state_dict(

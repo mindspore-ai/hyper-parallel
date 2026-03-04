@@ -20,10 +20,11 @@ import torch
 # pylint: disable=W0611
 import torch_npu
 from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.fully_shard.api import fully_shard, HSDPModule, _UnshardHandle
+from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.common_net import DenseNet
 from tests.torch.utils import init_dist
-from hyper_parallel.core.fully_shard.api import fully_shard, HSDPModule
-from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy
 
 
 def test_fully_shard_module_01():
@@ -34,7 +35,8 @@ def test_fully_shard_module_01():
     """
     init_dist()
     # Assume 8 devices as per torchrun default
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    world_size = 8
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("dp",))
 
     # Create models
     model1 = DenseNet(32, 32, has_bias=False)
@@ -102,9 +104,9 @@ def test_fully_shard_module_01():
 
     # Test set_requires_all_reduce
     model1.set_requires_all_reduce(True)
-    assert model1.hsdp_scheduler.hsdp_state.all_reduce_grads is True
+    assert model1.hsdp_scheduler.hsdp_state.requires_all_reduce is True
     model1.set_requires_all_reduce(False)
-    assert model1.hsdp_scheduler.hsdp_state.all_reduce_grads is False
+    assert model1.hsdp_scheduler.hsdp_state.requires_all_reduce is False
     try:
         model1.set_requires_all_reduce(1)
         assert False, "Should raise ValueError for non-bool input"
@@ -135,16 +137,42 @@ def test_fully_shard_module_01():
     except ValueError:
         pass
 
-    # Test unshard
-    handle = model1.unshard(async_op=True)
-    if handle:
-        handle.wait()
-    model1.unshard(async_op=False)
-    try:
-        model1.unshard(async_op=1)
-        assert False, "Should raise ValueError for non-bool async_op"
-    except ValueError:
-        pass
+    # Test unshard and reshard
+    hsdp_scheduler = model1.hsdp_scheduler
+    hsdp_state = hsdp_scheduler.hsdp_state
 
-    # Test reshard
+    assert hsdp_state.is_shard is True
+    expected_sharded_shape = torch.Size([32 // world_size, 32])
+    param = next(model1.parameters())
+    assert isinstance(param, DTensor), f"Expected DTensor, got {type(param)}"
+    assert param.local_shape == expected_sharded_shape, f"Expected {expected_sharded_shape}, got {param.local_shape}"
+
+    model1.unshard(async_op=False)
+    assert hsdp_state.is_shard is False
+    param = next(model1.parameters())
+    assert isinstance(param, torch.nn.Parameter), f"Expected torch.nn.Parameter (not DTensor), got {type(param)}"
+    assert param.shape == torch.Size([32, 32])
+
     model1.reshard()
+    assert hsdp_state.is_shard is True
+    param = next(model1.parameters())
+    assert isinstance(param, DTensor), f"Expected DTensor, got {type(param)}"
+    assert param.local_shape == expected_sharded_shape
+
+    handle = model1.unshard(async_op=True)
+    assert isinstance(handle, _UnshardHandle)
+    assert hsdp_state.is_shard is True
+
+    handle.wait()
+    assert hsdp_state.is_shard is False
+    param = next(model1.parameters())
+    assert isinstance(param, torch.nn.Parameter), f"Expected torch.nn.Parameter (not DTensor), got {type(param)}"
+    assert param.shape == torch.Size([32, 32])
+    assert handle._hsdp_state is None
+
+    model1.unshard(async_op=False)
+    assert hsdp_state.is_shard is False
+
+    model1.reshard()
+    model1.reshard()
+    assert hsdp_state.is_shard is True
