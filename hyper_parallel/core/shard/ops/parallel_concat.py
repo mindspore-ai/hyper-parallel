@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,90 +16,66 @@
 Distributed implementation for Concat operator.
 """
 
-from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
 
 
 class ConcatDistributedOp(DistributedOp):
-    """Distributed implementation for Concat operator."""
+    """Distributed implementation for Concat."""
 
     def infer_layout(self, layouts, extra_args):
         """
-        Infer output layouts for Concat operations.
+        Infer output layout for Concat and normalize the concatenation dimension.
+        Raises an error if the specified concatenation dimension is sharded.
 
         Args:
-            layouts (tuple): Layouts of input tensors.
-            extra_args (tuple): Extra arguments.
-                For MindSpore Concat: (axis, )
-                For PyTorch cat: (dim, ) or () - dim defaults to 0.
+            layouts (tuple): Layouts of input tensors and scalar arguments.
+            extra_args (list): Additional arguments (e.g., dim). Modified in-place
+                               to store the normalized positive dimension.
 
         Returns:
-            tuple: Layout for output tensor.
-
-        Raises:
-            ValueError: If input layouts are not compatible or have partial status.
+            Layout: The inferred output layout (identical to the input layouts).
         """
-        # Check partial inputs
-        if not self._allow_partial_inputs:
-            self._check_partial_inputs(layouts)
+        # Filter out None values which correspond to scalar arguments (e.g., dim)
+        valid_layouts = [layout for layout in layouts if layout is not None]
 
-        # Parse input layout
-        base_layout = layouts[0]
-        rank = len(base_layout.tensor_map)
+        if not valid_layouts:
+            raise ValueError(f"Operation {self.op_name}: cat requires at least one input DTensor.")
 
-        # Determine concatenation dimension based on op_name and arguments
-        dim = 0
-        if self.op_name == "cat":
-            # PyTorch 'cat': dim is optional and defaults to 0
-            if extra_args:
-                dim = extra_args[0]
-        elif self.op_name == "Concat":
-            # MindSpore 'Concat': axis is usually required and provided
-            if not extra_args:
-                # Fallback to 0 if not provided, though typically required for Concat
-                # Or raise error if strict validation is needed
-                pass
-            else:
-                dim = extra_args[0]
+        # In this framework, we assume inputs must be aligned to the same layout
+        # for concatenation. We use the first valid layout as the reference.
+        base_layout = valid_layouts[0]
 
-        # Handle negative dimension
-        if dim < 0:
-            dim += rank
+        # Verify consistency across all valid input layouts
+        for _, layout in enumerate(valid_layouts):
+            if layout != base_layout:
+                raise ValueError(
+                    f"Operation {self.op_name}: All input tensors must have the same layout. "
+                    f"Expected layout: {base_layout}, Mismatched layout: {layout}"
+                )
 
-        if dim < 0 or dim >= rank:
+        # Extract dim from extra_args, assuming the framework populates it correctly
+        dim = extra_args[0] if extra_args else 0
+
+        # Convert negative dim to positive
+        ndim = len(base_layout.tensor_map)
+        actual_dim = dim if dim >= 0 else dim + ndim
+
+        # Check if the concatenation dimension is sharded
+        mapping = base_layout.tensor_map[actual_dim]
+        mapping_list = mapping if isinstance(mapping, tuple) else (mapping,)
+        is_sharded = any(m != -1 for m in mapping_list)
+
+        if is_sharded:
             raise ValueError(
-                f"Operation {self.op_name}: dim value is out of valid range"
+                f"Operation {self.op_name}: Concatenation along a sharded dimension "
+                f"(dim={dim}, normalized_dim={actual_dim}) is not supported."
             )
 
-        base_map = base_layout.tensor_map
-        base_mesh_shape = base_layout.mesh_shape
+        # Store the normalized actual_dim back into extra_args
+        # so get_expand_impl can use it directly as a positive integer
+        if extra_args:
+            extra_args[0] = actual_dim
+        else:
+            extra_args.append(actual_dim)
 
-        for layout in layouts[1:]:
-            if not layout:
-                continue
-
-            if layout.mesh_shape != base_mesh_shape:
-                raise ValueError(
-                    f"Operation {self.op_name}: Concat inputs must have same mesh_shape"
-                )
-
-            # Check consistency of tensor map on non-concatenation dimensions
-            # The sharding strategy must be identical for all dimensions except the concat dimension
-            if layout.tensor_map[:dim] + layout.tensor_map[dim + 1 :] != base_map[:dim] + base_map[dim + 1 :]:
-                raise ValueError(
-                    f"Operation {self.op_name}: Except for dim, the tensor map of inputs must be equal"
-                )
-
-        # Create output layout
-        output_layout = Layout(
-            mesh_shape=base_layout.mesh_shape,
-            alias_name=base_layout.alias_name,
-            rank_list=base_layout.rank_list,
-        )
-
-        # Apply the alias strategy from the first input layout
-
-        output_layout = output_layout(*base_layout.alias_tensor_map)
-
-
-        return (output_layout,)
+        return base_layout

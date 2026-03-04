@@ -12,21 +12,127 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test parallel op embedding"""
+"""test parallel op cat"""
+from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import parallel_run, TorchCase
-
-PARALLEL_OP_EMBEDDING = "parallel_op_embedding.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_embedding_group1():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_distributed_embedding_layout_inference
+def test_distributed_cat_basic():
+    '''
+    Feature: test parallel op cat.
+    Description: basic cat with aligned shards.
     Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(PARALLEL_OP_EMBEDDING, "test_distributed_embedding_layout_inference", 10890, 4),
-    ])
+    '''
+    master_port = 10359
+    file_name = "parallel_op_cat.py"
+    case_name = "test_distributed_cat_basic"
+    torchrun_case(file_name, case_name, master_port)
+
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_distributed_cat_3d_complex():
+    '''
+    Feature: test parallel op cat.
+    Description: 3D cat on complex device mesh.
+    Expectation: Run success.
+    '''
+    master_port = 10359
+    file_name = "parallel_op_cat.py"
+    case_name = "test_distributed_cat_3d_complex"
+    torchrun_case(file_name, case_name, master_port)
+
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_distributed_cat_multiple_tensors():
+    '''
+    Feature: test parallel op cat.
+    Description: Concatenate more than 2 tensors at once.
+    Expectation: Run success.
+    '''
+    master_port = 10361
+    file_name = "parallel_op_cat.py"
+    case_name = "test_distributed_cat_multiple_tensors"
+    torchrun_case(file_name, case_name, master_port, num_proc=8)
+
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_distributed_cat_mismatched_shapes():
+    '''
+    Feature: test parallel op cat.
+    Description: Concatenate tensors with differing sizes in the target dimension.
+    Expectation: Run success.
+    '''
+    master_port = 10363
+    file_name = "parallel_op_cat.py"
+    case_name = "test_distributed_cat_mismatched_shapes"
+    torchrun_case(file_name, case_name, master_port, num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_distributed_cat_with_empty():
+    '''
+    Feature: test parallel op cat.
+    Description: Concatenate with a dimension size of zero (empty tensor).
+    Expectation: Run success.
+    '''
+    master_port = 10365
+    file_name = "parallel_op_cat.py"
+    case_name = "test_distributed_cat_with_empty"
+    torchrun_case(file_name, case_name, master_port, num_proc=4)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_distributed_cat_4d_tensor():
+    '''
+    Feature: test parallel op cat.
+    Description: Concatenate 4D tensors on a 2D device mesh.
+    Expectation: Run success.
+    '''
+    master_port = 10366
+    file_name = "parallel_op_cat.py"
+    case_name = "test_distributed_cat_4d_tensor"
+    torchrun_case(file_name, case_name, master_port, num_proc=8)
+
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_distributed_cat_5d_mixed_placements():
+    '''
+    Feature: test parallel op cat.
+    Description: 5D tensors with mixed sharding and replication placements.
+    Expectation: Run success.
+    '''
+    master_port = 10368
+    file_name = "parallel_op_cat.py"
+    case_name = "test_distributed_cat_5d_mixed_placements"
+    torchrun_case(file_name, case_name, master_port, num_proc=8)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_distributed_cat_shard_last_cat_first():
+    '''
+    Feature: test parallel op cat.
+    Description: Shard on the last dimension but concatenate on the first.
+    Expectation: Run success.
+    '''
+    master_port = 10369
+    file_name = "parallel_op_cat.py"
+    case_name = "test_distributed_cat_shard_last_cat_first"
+    torchrun_case(file_name, case_name, master_port, num_proc=8)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_distributed_cat_singleton_dimension():
+    '''
+    Feature: test parallel op cat.
+    Description: Concatenate tensors along a singleton dimension.
+    Expectation: Run success.
+    '''
+    master_port = 10370
+    file_name = "parallel_op_cat.py"
+    case_name = "test_distributed_cat_singleton_dimension"
+    torchrun_case(file_name, case_name, master_port, num_proc=4)

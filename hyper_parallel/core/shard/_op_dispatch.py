@@ -308,6 +308,38 @@ class OpDispatcher:
 
         return DTensor.from_local(py_output, output_layout.mesh, output_layout.placements)
 
+    def _extract_single_arg_layout(self, arg, cache_key, extra_args, input_layouts):
+        """Helper to extract layout and cache info for a single argument."""
+        if arg is None:
+            input_layouts.append(None)
+            return
+
+        if not hasattr(arg, "_layout"):
+            id_str = "scalar" if isinstance(arg, Tensor) else str(arg)
+            cache_key.layout_ids.append(id_str)
+            extra_args.append(arg)
+            input_layouts.append(None)
+        else:
+            layout = arg.layout
+            cache_key.layout_ids.append(str(layout.compact_str))
+            input_layouts.append(layout)
+
+    def _pack_infer_output(self, py_output, output_layout):
+        """Helper to pack py_output into DTensors using output_layout."""
+        if isinstance(py_output, (tuple, list)):
+            if not isinstance(output_layout, (tuple, list)):
+                raise RuntimeError("Output is a tuple but layout is not")
+            if len(py_output) != len(output_layout):
+                raise RuntimeError(f"Output tuple size ({len(py_output)}) "
+                                   f"does not match layout tuple size ({len(output_layout)})")
+
+            return tuple(
+                DTensor.from_local(item, layout.mesh, layout.placements)
+                for item, layout in zip(py_output, output_layout)
+            )
+
+        return DTensor.from_local(py_output, output_layout.mesh, output_layout.placements)
+
     def _with_layout_infer_with_tuple_expand(self, func: callable, *args, **kwargs) -> Tensor:
         """_with_layout_infer_with_tuple_expand"""
         expanded_args = []
@@ -321,27 +353,20 @@ class OpDispatcher:
                 expanded_args.append(arg)
                 input_args.append(arg.to_local() if isinstance(arg, DTensor) else arg)
 
+        # Process kwargs into local tensors
+        input_kwargs = {k: (v.to_local() if isinstance(v, DTensor) else v) for k, v in kwargs.items()}
+
         cache_key = LayoutCacheKey([])
         input_layouts = []
         extra_args = []
 
+        # Extract layouts for positional args
         for arg in expanded_args:
-            if arg is None:
-                input_layouts.append(None)
-                continue
+            self._extract_single_arg_layout(arg, cache_key, extra_args, input_layouts)
 
-            if not hasattr(arg, "_layout"):
-                id_str = "scalar"
-                if not isinstance(arg, Tensor):
-                    id_str = str(arg)
-                cache_key.layout_ids.append(id_str)
-                extra_args.append(arg)
-                input_layouts.append(None)
-            else:
-                layout = arg.layout
-                layout_id = layout.compact_str
-                cache_key.layout_ids.append(str(layout_id))
-                input_layouts.append(layout)
+        # Extract layouts for keyword args
+        for val in kwargs.values():
+            self._extract_single_arg_layout(val, cache_key, extra_args, input_layouts)
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
@@ -350,8 +375,8 @@ class OpDispatcher:
             layout_cache[func_name] = {}
 
         op_layout_cache = layout_cache[func_name]
-
         distribute_op = cache_manager.distributed_op(func_name)
+
         if cache_key in op_layout_cache:
             output_layout, op_impl = op_layout_cache[cache_key]
         else:
@@ -363,22 +388,9 @@ class OpDispatcher:
         if op_impl is None:
             op_impl = func
 
-        py_output = op_impl(*input_args, **kwargs)
+        py_output = op_impl(*input_args, **input_kwargs)
 
-        if isinstance(py_output, (tuple, list)):
-            output = ()
-            if isinstance(output_layout, (tuple, list)):
-                if len(py_output) == len(output_layout):
-                    for i, output_item in enumerate(py_output):
-                        output += (DTensor.from_local(output_item, output_layout[i].mesh, output_layout[i].placements),)
-                else:
-                    raise RuntimeError(f"Output tuple size ({len(py_output)}) "
-                                       f"does not match layout tuple size ({len(output_layout)})")
-            else:
-                raise RuntimeError("Output is a tuple but layout is not")
-            return output
-
-        return DTensor.from_local(py_output, output_layout.mesh, output_layout.placements)
+        return self._pack_infer_output(py_output, output_layout)
 
     def _with_layout_infer_reshape(self, func: callable, *args) -> Tensor:
         """_with_layout_infer_reshape"""
