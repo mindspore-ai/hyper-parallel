@@ -1,0 +1,4 @@
+FlashAttentionScore:
+  dist_op_name: _fusion_attention_dist_op
+  distributed_op_class: FlashAttentionScoreDistributedOp
+  distributed_op_file: parallel_ms_flash_attention_score
