@@ -130,14 +130,20 @@ class TorchHSDPParamV2(HSDPParamV2):
                 and/or all-reduce.
             param_type (Optional[torch.dtype]): Target dtype for the gradient (if conversion is needed).
         """
-        sharded_grad = self.sharded_param.grad
+        sharded_grad = None
+        if not self.mp_policy.apply_grad_on_fp32_main_grad:
+            sharded_grad = self.sharded_param.grad
+        else:
+            if not hasattr(self.sharded_param, "main_grad"):
+                self.sharded_param.main_grad = None
+            sharded_grad = self.sharded_param.main_grad
         sharded_param_local_shape = (
             self.sharded_param.local_shape
             if isinstance(self.sharded_param, DTensor)
             else self.sharded_param.shape
         )
         reduced_grad = reduced_grad.view(sharded_param_local_shape)
-        if param_type is not None and reduced_grad.dtype != param_type:
+        if not self.mp_policy.apply_grad_on_fp32_main_grad and param_type is not None and reduced_grad.dtype != param_type:
             reduced_grad = reduced_grad.to(param_type)
         to_accumulate_grad = sharded_grad is not None
         need_synchronize = False
@@ -148,9 +154,17 @@ class TorchHSDPParamV2(HSDPParamV2):
             )
             need_synchronize = True
         if sharded_grad is None:
-            self.sharded_param.grad = self.to_sharded_dtensor(reduced_grad)
+            if not self.mp_policy.apply_grad_on_fp32_main_grad:
+                self.sharded_param.grad = self.to_sharded_dtensor(reduced_grad)
+            else:
+                self.sharded_param.main_grad = self.to_sharded_dtensor(reduced_grad)
+                self.sharded_param.grad = None
         else:
-            self.sharded_param.grad._local_tensor += reduced_grad
+            if not self.mp_policy.apply_grad_on_fp32_main_grad:
+                self.sharded_param.grad._local_tensor += reduced_grad
+            else:
+                self.sharded_param.main_grad._local_tensor += reduced_grad
+                self.sharded_param.grad = None
         if self.unsharded_accumulated_grad_data is not None:
             self.unsharded_accumulated_grad_data = None
         elif self.unsharded_param.grad is not None:

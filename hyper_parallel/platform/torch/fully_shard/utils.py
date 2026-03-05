@@ -21,6 +21,7 @@ class MixedPrecisionPolicy:
     reduce_dtype: Optional[torch.dtype] = None
     output_dtype: Optional[torch.dtype] = None
     cast_forward_inputs: bool = True
+    apply_grad_on_fp32_main_grad: bool = False
 
 
 @dataclass

@@ -21,6 +21,7 @@ from torch import nn
 from torch.distributed.checkpoint.state_dict import StateDictOptions
 
 from hyper_parallel.platform.platform import PlatformType
+from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy
 from hyper_parallel import DeviceMesh, init_device_mesh
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor import DTensor, distribute_tensor
@@ -359,8 +360,8 @@ def fully_shard(
         mesh: Optional[DeviceMesh] = None,
         reshard_after_forward: Optional[Union[bool, int]] = None,
         shard_placement_fn: None = None,
-        mp_policy: None = None,
-        offload_policy: None = None,
+        mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
+        offload_policy: OffloadPolicy = OffloadPolicy(),
         ignored_params: Optional[set[nn.Parameter]] = None,
         device = None,
 ):

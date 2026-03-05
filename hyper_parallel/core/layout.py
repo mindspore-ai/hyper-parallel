@@ -76,7 +76,7 @@ def _get_slice_tensor_by_layout(global_tensor, layout):
         area = ()
         for begin, end in offset:
             area += (slice(begin, end),)
-        return full_data[area]
+        return full_data[area].clone()
 
     local_tensor = get_slice_data(global_tensor, slice_area)
     return local_tensor
