@@ -54,6 +54,7 @@ venv/
 # --- IDE & System ---
 .idea/
 .vscode/
+.trae/
 .DS_Store
 *.swp
 
