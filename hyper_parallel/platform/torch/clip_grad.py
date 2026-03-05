@@ -59,31 +59,43 @@ __all__: list[str] = ["clip_grad_norm_"]
 # (id(mesh) or None, shard_dims) -> list of local grads for norm computation
 _GradGroupKey = Tuple[Optional[int], Tuple[int, ...]]
 
-# (mesh_dim_index, dist.ReduceOp)
-_PartialReduceInfo = Tuple[int, "dist.ReduceOp"]
+# (mesh_dim_index, dist.ReduceOp, needs_manual_avg)
+_PartialReduceInfo = Tuple[int, "dist.ReduceOp", bool]
 
 
 # ---------------------------------------------------------------------------
 # Reduce-op mapping
 # ---------------------------------------------------------------------------
 
+_REDUCE_OP_AVG_SUPPORTED = hasattr(dist.ReduceOp, "AVG")
+
 _STR_TO_REDUCE_OP: Dict[str, "dist.ReduceOp"] = {
     "sum": dist.ReduceOp.SUM,
-    "avg": dist.ReduceOp.AVG,
     "max": dist.ReduceOp.MAX,
     "min": dist.ReduceOp.MIN,
 }
+if _REDUCE_OP_AVG_SUPPORTED:
+    _STR_TO_REDUCE_OP["avg"] = dist.ReduceOp.AVG
 
 
-def _str_to_reduce_op(op_str: str) -> "dist.ReduceOp":
-    """Map a ``Partial`` placement's *reduce_op* string to ``dist.ReduceOp``."""
-    op = _STR_TO_REDUCE_OP.get(op_str.lower())
+def _str_to_reduce_op(op_str: str) -> Tuple["dist.ReduceOp", bool]:
+    """Map a ``Partial`` placement's *reduce_op* string to ``dist.ReduceOp``.
+
+    Returns ``(reduce_op, needs_manual_avg)`` where *needs_manual_avg*
+    is ``True`` when ``"avg"`` is requested but the backend does not
+    support ``dist.ReduceOp.AVG`` — the caller should use SUM and
+    manually divide by the group size.
+    """
+    lower = op_str.lower()
+    if lower == "avg" and not _REDUCE_OP_AVG_SUPPORTED:
+        return dist.ReduceOp.SUM, True
+    op = _STR_TO_REDUCE_OP.get(lower)
     if op is None:
         raise ValueError(
             f"Unsupported Partial reduce_op: {op_str!r}. "
-            f"Supported: {list(_STR_TO_REDUCE_OP)}"
+            f"Supported: {sorted(set(list(_STR_TO_REDUCE_OP) + ['avg']))}"
         )
-    return op
+    return op, False
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +155,10 @@ def _get_param_mesh_info(
     the local shard tensor).
 
     Returns ``(mesh, shard_dims, partial_info)`` where *partial_info*
-    is a tuple of ``(mesh_dim, dist.ReduceOp)`` pairs that respect the
-    ``Partial`` placement's ``reduce_op`` attribute.
+    is a tuple of ``(mesh_dim, dist.ReduceOp, needs_manual_avg)``
+    triples that respect the ``Partial`` placement's ``reduce_op``
+    attribute.  *needs_manual_avg* is ``True`` when ``"avg"`` was
+    requested but the backend lacks ``dist.ReduceOp.AVG`` support.
     """
     grad = param.grad
     # Prefer grad's spec (most accurate); fall back to param's.
@@ -157,14 +171,69 @@ def _get_param_mesh_info(
         if p.is_shard()
     )
     partial_info = tuple(
-        (i, _str_to_reduce_op(p.reduce_op))
+        (i, *_str_to_reduce_op(p.reduce_op))
         for i, p in enumerate(spec_source.placements)
         if isinstance(p, Partial)
     )
     return spec_source.device_mesh, shard_dims, partial_info
 
 
-def _compute_local_norm(
+def _sum_p_norms(
+    dev_grads: List[torch.Tensor],
+    norm_type: float,
+    device: torch.device,
+    total: torch.Tensor,
+) -> None:
+    """Accumulate sum-of-p-th-powers for *dev_grads* into *total*."""
+    for g in dev_grads:
+        n = torch.linalg.vector_norm(
+            g, norm_type, dtype=torch.float32,
+        )
+        total.add_(n.to(device=device) ** norm_type)
+
+
+def _foreach_p_norms(
+    grads: List[torch.Tensor],
+    norm_type: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Fast path: fuse per-tensor norms via ``_foreach_norm``.
+
+    Restricted to float32 tensors to preserve the same numerical
+    precision as ``vector_norm(dtype=float32)``.  Non-float32 tensors
+    and backends that raise ``RuntimeError`` fall back to per-tensor
+    ``vector_norm``.
+    """
+    total = torch.tensor(0.0, device=device, dtype=torch.float32)
+    grouped = _group_tensors_by_device_and_dtype(
+        [[g.detach() for g in grads]],
+    )
+    for (dev, _), ([dev_grads], _) in grouped.items():
+        if (
+            dev_grads[0].dtype == torch.float32
+            and _has_foreach_support(dev_grads, dev)
+        ):
+            try:
+                per_norms = torch._foreach_norm(  # pylint: disable=W0212
+                    dev_grads, norm_type,
+                )
+            except RuntimeError:
+                per_norms = None
+            if per_norms is not None:
+                total.add_(
+                    torch.stack([
+                        n.to(device=device) ** norm_type
+                        for n in per_norms
+                    ]).sum(),
+                )
+            else:
+                _sum_p_norms(dev_grads, norm_type, device, total)
+        else:
+            _sum_p_norms(dev_grads, norm_type, device, total)
+    return total
+
+
+def _compute_local_norm(  # pylint: disable=R0911
     grads: List[torch.Tensor],
     norm_type: float,
     device: torch.device,
@@ -215,6 +284,14 @@ def _compute_local_norm(
         return torch.stack(norms).sum().to(device)
 
     # Finite p-norm: return sum of p-th powers.
+    if (
+        len(grads) > 1
+        and _group_tensors_by_device_and_dtype is not None
+        and hasattr(torch, "_foreach_norm")
+    ):
+        return _foreach_p_norms(grads, norm_type, device)
+
+    # Scalar fallback when foreach utilities are unavailable.
     norms = [
         torch.linalg.vector_norm(
             g.detach(), norm_type, dtype=torch.float32,
@@ -307,59 +384,141 @@ def _total_norm_sum(grad_groups, norm_type, mesh_cache, device):
                     local_val, op=dist.ReduceOp.SUM,
                     group=mesh.get_group(dim),
                 )
-        total = total + local_val
+        total.add_(local_val)
     return total
 
 
-def _participate_partial_zero(
-    param: torch.Tensor,
-    mesh: Optional[object],
-    partial_info: Tuple[_PartialReduceInfo, ...],
-) -> None:
-    """Join Partial all-reduce with a zero tensor for a grad-free param.
+def _build_coalesce_buffer(
+    param_infos: List[Tuple],
+    indices: List[int],
+) -> Tuple[List[torch.Tensor], List[int], List[bool], List[int]]:
+    """Build flat fp32 chunks for one coalesce group.
+
+    Returns ``(chunks, chunk_sizes, has_grad, active_indices)``.
+    Frozen params are skipped; trainable grad-free params contribute
+    zeros so the collective matches ranks that have a grad.
+    """
+    chunks: List[torch.Tensor] = []
+    chunk_sizes: List[int] = []
+    has_grad: List[bool] = []
+    active_indices: List[int] = []
+
+    for idx in indices:
+        param = param_infos[idx][0]
+        local_grad = param_infos[idx][1]
+        if local_grad is not None:
+            chunks.append(
+                local_grad.detach().reshape(-1).to(torch.float32),
+            )
+            chunk_sizes.append(local_grad.numel())
+            has_grad.append(True)
+            active_indices.append(idx)
+        elif param.requires_grad:
+            local_p = (
+                param._local_tensor  # pylint: disable=W0212
+                if isinstance(param, DTensor) else param.data
+            )
+            numel = local_p.numel()
+            chunks.append(
+                torch.zeros(
+                    numel, device=local_p.device,
+                    dtype=torch.float32,
+                ),
+            )
+            chunk_sizes.append(numel)
+            has_grad.append(False)
+            active_indices.append(idx)
+
+    return chunks, chunk_sizes, has_grad, active_indices
+
+
+def _coalesce_partial_reduce(  # pylint: disable=R0914
+    param_infos: List[Tuple],
+    mesh_cache: Dict[int, object],
+) -> Dict[int, torch.Tensor]:
+    """Coalesce Partial all-reduces: O(N) collectives → O(G).
+
+    Groups parameters sharing the same ``(mesh, partial_info)`` and
+    flattens their gradients (or zeros for trainable grad-free params)
+    into a single fp32 buffer.  **One** ``all_reduce`` per buffer
+    replaces the previous per-parameter collective calls.
+
+    For TP+FSDP (all params share the same mesh / placements), this
+    turns ~200 individual all-reduces into 1 — saving 10-20 ms per
+    training step at typical HCCS/NCCL latencies.
 
     Frozen params (``requires_grad=False``) are consistently grad-free
-    across all ranks, so zero participation is unnecessary — this avoids
-    per-param zero all-reduces in fine-tuning / param-freezing scenarios.
+    across all ranks and are excluded from the buffer to avoid wasting
+    bandwidth.
 
-    Trainable params with transient ``grad=None`` (e.g. unused in this
-    forward) may differ across ranks, so we must participate to match the
-    Partial all-reduce that other ranks enter.
+    All buffers use float32 to guarantee dtype consistency across ranks
+    in mixed-precision training (grad may be fp16/bf16 while param is
+    fp32).
+
+    Returns a dict mapping *param_infos* index → reduced gradient view
+    (1-D fp32 slice of the coalesced buffer).  Only entries for params
+    with actual gradients are included.
     """
-    if not param.requires_grad or mesh is None or not partial_info:
-        return
-    local_p = (
-        param._local_tensor  # pylint: disable=W0212
-        if isinstance(param, DTensor) else param.data
-    )
-    zero = torch.zeros_like(local_p)
-    for pdim, reduce_op in partial_info:
-        dist.all_reduce(zero, op=reduce_op, group=mesh.get_group(pdim))
+    # Group by Partial coalesce key: (mesh_id, partial_info)
+    coalesce_groups: Dict[
+        Tuple, List[int],
+    ] = defaultdict(list)
+    for idx, info in enumerate(param_infos):
+        mesh, partial_info = info[2], info[3]
+        if partial_info:
+            if mesh is None:
+                raise RuntimeError(
+                    "clip_grad_norm_: parameter has Partial placements "
+                    "but no DeviceMesh. This is a DTensor invariant "
+                    "violation."
+                )
+            pck = (id(mesh), partial_info)
+            coalesce_groups[pck].append(idx)
 
+    reduced: Dict[int, torch.Tensor] = {}
 
-def _pre_reduce_partial(
-    local_grad: torch.Tensor,
-    mesh: Optional[object],
-    partial_info: Tuple[_PartialReduceInfo, ...],
-) -> torch.Tensor:
-    """Pre-reduce a Partial gradient via all-reduce for norm computation.
-
-    Returns a clone with the reduced values when Partial placements
-    exist, so the original ``local_grad`` is not mutated (the clip step
-    later operates on the original via scalar multiplication which
-    distributes over the reduction).
-    """
-    if mesh is None or not partial_info:
-        return local_grad
-    norm_grad = local_grad.clone()
-    for pdim, reduce_op in partial_info:
-        dist.all_reduce(
-            norm_grad, op=reduce_op, group=mesh.get_group(pdim),
+    for (mesh_id, partial_info), indices in coalesce_groups.items():
+        mesh = mesh_cache[mesh_id]
+        chunks, chunk_sizes, has_grad, active_indices = (
+            _build_coalesce_buffer(param_infos, indices)
         )
-    return norm_grad
+
+        if not chunks:
+            continue  # all params frozen, no collective needed
+
+        # Sanity check: same mesh → same device.  Fail fast on
+        # misconfigured inputs rather than silent NCCL errors.
+        buf_device = chunks[0].device
+        for chunk in chunks[1:]:
+            if chunk.device != buf_device:
+                raise RuntimeError(
+                    f"clip_grad_norm_: parameters in the same Partial "
+                    f"coalesce group are on different devices "
+                    f"({buf_device} vs {chunk.device}). All parameters "
+                    f"sharing the same DeviceMesh must reside on the "
+                    f"same local device."
+                )
+
+        buf = torch.cat(chunks)
+
+        for pdim, reduce_op, needs_avg in partial_info:
+            group = mesh.get_group(pdim)
+            dist.all_reduce(buf, op=reduce_op, group=group)
+            if needs_avg:
+                buf /= dist.get_world_size(group=group)
+
+        # Extract views for params with actual gradients.
+        offset = 0
+        for i, idx in enumerate(active_indices):
+            numel = chunk_sizes[i]
+            if has_grad[i]:
+                reduced[idx] = buf[offset:offset + numel]
+            offset += numel
+
+    return reduced
 
 
-def _build_grad_groups(
+def _build_grad_groups(  # pylint: disable=R0914
     params: List[torch.Tensor],
 ) -> Tuple[
     Dict[_GradGroupKey, List[torch.Tensor]],
@@ -375,38 +534,60 @@ def _build_grad_groups(
     collectives, preventing deadlocks (aligned with FSDP1 where all
     ranks unconditionally execute the same all-reduce path).
 
+    Partial gradients are reduced via a **coalesced** all-reduce
+    (see ``_coalesce_partial_reduce``), turning O(N) per-parameter
+    collectives into O(G) where G is the number of distinct
+    ``(mesh, partial_info)`` groups (typically 1 for TP+FSDP).
+
     Returns ``(grad_groups, all_grads, mesh_cache, device)``.
     """
-    grad_groups: Dict[_GradGroupKey, List[torch.Tensor]] = defaultdict(list)
-    all_grads: List[torch.Tensor] = []
+    # --- Phase 1: classify all parameters ---
+    param_infos: List[Tuple] = []
     mesh_cache: Dict[int, object] = {}
     device: Optional[torch.device] = None
 
     for param in params:
         mesh, shard_dims, partial_info = _get_param_mesh_info(param)
-
         key: _GradGroupKey = (
             id(mesh) if mesh is not None else None, shard_dims,
         )
         if mesh is not None:
             mesh_cache[id(mesh)] = mesh
-
         if device is None:
             device = _param_device(param)
-
         local_grad = _get_local_grad(param)
-        if local_grad is None:
-            if key not in grad_groups:
-                grad_groups[key] = []
-            _participate_partial_zero(param, mesh, partial_info)
-            continue
-
-        all_grads.append(local_grad)
-        norm_grad = _pre_reduce_partial(local_grad, mesh, partial_info)
-        grad_groups[key].append(norm_grad)
+        param_infos.append(
+            (param, local_grad, mesh, partial_info, key),
+        )
 
     if device is None:
         device = torch.device("cpu")
+
+    # --- Phase 2: coalesced Partial reduction (O(N) → O(G)) ---
+    reduced = _coalesce_partial_reduce(param_infos, mesh_cache)
+
+    # --- Phase 3: build grad_groups ---
+    grad_groups: Dict[_GradGroupKey, List[torch.Tensor]] = defaultdict(
+        list,
+    )
+    all_grads: List[torch.Tensor] = []
+
+    for idx, info in enumerate(param_infos):
+        param, local_grad, key = info[0], info[1], info[4]
+        if local_grad is None:
+            # Ensure the key exists so the Shard norm all-reduce is
+            # entered even when this rank has no grads for the group.
+            if key not in grad_groups:
+                grad_groups[key] = []
+            continue
+
+        all_grads.append(local_grad)
+        if idx in reduced:
+            # Use Partial-reduced view for norm computation.
+            grad_groups[key].append(reduced[idx])
+        else:
+            # Non-Partial: use original grad directly.
+            grad_groups[key].append(local_grad)
 
     return grad_groups, all_grads, mesh_cache, device
 

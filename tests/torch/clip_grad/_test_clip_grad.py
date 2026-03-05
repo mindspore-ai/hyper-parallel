@@ -290,13 +290,18 @@ def test_clip_grad_norm_comprehensive():  # pylint: disable=R0914,R0915
 # Test B – TP+FSDP: multi-shard-dim with Partial pre-reduction
 # ===================================================================
 
-def test_clip_grad_norm_partial_shard():  # pylint: disable=R0914
+def test_clip_grad_norm_partial_shard():  # pylint: disable=R0914,R0915
     """Verify clip_grad_norm_ with Partial + Shard placements (TP+FSDP).
 
     Manually constructs DTensor parameters with
     ``[Partial("sum"), Shard(0)]`` placements on a (tp=2, dp=4) mesh
     to simulate a TP+FSDP scenario without requiring full TP training
     infrastructure.
+
+    Sub-sections:
+      (a) Single param with Partial("sum") + Shard — norm & clip parity
+      (b) Multi Partial params in same coalesce group — norm parity
+      (c) Partial("avg") placement — AVG fallback norm parity
 
     The Partial dimension models TP's output gradient (partial sum),
     the Shard dimension models FSDP's weight sharding.
@@ -388,6 +393,92 @@ def test_clip_grad_norm_partial_shard():  # pylint: disable=R0914
     assert _close(clipped_local, expected_local), (
         f"TP+FSDP clipped grad mismatch on rank {rank}"
     )
+
+    # ---- (b) Multi Partial params in same coalesce group ----
+    # Two params with identical (mesh, partial_info) are coalesced
+    # into one buffer.  Verify the total norm matches nn.utils on
+    # the concatenated full gradients.
+    torch.manual_seed(_SEED + 10)
+    full_grad_b1 = torch.randn(32, 64, device=device)
+    full_grad_b2 = torch.randn(16, 32, device=device)
+    shard_rows_b2 = 16 // dp_size  # 4
+
+    local_partial_b1 = full_grad_b1[
+        dp_rank * shard_rows : (dp_rank + 1) * shard_rows
+    ].clone() / tp_size
+    local_partial_b2 = full_grad_b2[
+        dp_rank * shard_rows_b2 : (dp_rank + 1) * shard_rows_b2
+    ].clone() / tp_size
+
+    w_b1 = torch.ones(shard_rows, 64, device=device)
+    w_b2 = torch.ones(shard_rows_b2, 32, device=device)
+
+    param_b1 = nn.Parameter(
+        DTensor.from_local(w_b1, mesh, placements),
+    )
+    param_b2 = nn.Parameter(
+        DTensor.from_local(w_b2, mesh, placements),
+    )
+    param_b1.grad = DTensor.from_local(
+        local_partial_b1, mesh, placements,
+    )
+    param_b2.grad = DTensor.from_local(
+        local_partial_b2, mesh, [Partial("sum"), Shard(0)],
+    )
+
+    max_norm_b = 0.01
+    with SkipDTensorDispatch():
+        our_norm_b = clip_grad_norm_(
+            [param_b1, param_b2], max_norm_b, norm_type=2.0,
+        )
+
+    ref_p1 = nn.Parameter(torch.ones(32, 64, device=device))
+    ref_p2 = nn.Parameter(torch.ones(16, 32, device=device))
+    ref_p1.grad = full_grad_b1.clone()
+    ref_p2.grad = full_grad_b2.clone()
+    ref_norm_b = torch.nn.utils.clip_grad_norm_(
+        [ref_p1, ref_p2], max_norm_b, norm_type=2.0,
+    )
+    assert _close(our_norm_b, ref_norm_b), (
+        f"Multi-Partial norm: {our_norm_b.item():.6f} vs "
+        f"{ref_norm_b.item():.6f}"
+    )
+    _assert_ranks_agree(our_norm_b, "Multi-Partial-coalesce")
+
+    # ---- (c) Partial("avg") placement ----
+    # Verify AVG reduction (with SUM+divide fallback) produces
+    # the same norm as nn.utils on the full gradient.
+    torch.manual_seed(_SEED + 20)
+    full_grad_c = torch.randn(32, 64, device=device)
+    local_avg_c = full_grad_c[
+        dp_rank * shard_rows : (dp_rank + 1) * shard_rows
+    ].clone()
+
+    placements_avg = [Partial("avg"), Shard(0)]
+    w_c = torch.ones(shard_rows, 64, device=device)
+    param_c = nn.Parameter(
+        DTensor.from_local(w_c, mesh, placements_avg),
+    )
+    param_c.grad = DTensor.from_local(
+        local_avg_c, mesh, placements_avg,
+    )
+
+    max_norm_c = 0.01
+    with SkipDTensorDispatch():
+        our_norm_c = clip_grad_norm_(
+            [param_c], max_norm_c, norm_type=2.0,
+        )
+
+    ref_pc = nn.Parameter(torch.ones(32, 64, device=device))
+    ref_pc.grad = full_grad_c.clone()
+    ref_norm_c = torch.nn.utils.clip_grad_norm_(
+        [ref_pc], max_norm_c, norm_type=2.0,
+    )
+    assert _close(our_norm_c, ref_norm_c), (
+        f"Partial-avg norm: {our_norm_c.item():.6f} vs "
+        f"{ref_norm_c.item():.6f}"
+    )
+    _assert_ranks_agree(our_norm_c, "Partial-avg")
 
 
 # ===================================================================
@@ -512,7 +603,7 @@ def test_clip_grad_norm_edge_cases():  # pylint: disable=R0914
 # Test D – Empty / sparse gradients (no deadlock)
 # ===================================================================
 
-def test_clip_grad_norm_empty_grads():  # pylint: disable=R0914
+def test_clip_grad_norm_empty_grads():  # pylint: disable=R0914,R0915
     """Verify no deadlock with empty or sparse gradients.
 
     Sub-sections:
@@ -521,6 +612,8 @@ def test_clip_grad_norm_empty_grads():  # pylint: disable=R0914
       (c) HSDP 2D: symmetric null weight grad → no deadlock, ranks agree
       (d) Partial placement: asymmetric grad=None across tp group →
           deadlock regression for zero-participation fix
+      (e) Mixed precision (fp16) + Partial + asymmetric grad=None →
+          coalesced buffer dtype-safety regression
     """
     rank, _ = init_dist()
 
@@ -624,4 +717,44 @@ def test_clip_grad_norm_empty_grads():  # pylint: disable=R0914
                 f"Partial-grad-None: rank {r} norm "
                 f"{all_norms[r].item():.6f} != rank {rank} "
                 f"norm {t_d.item():.6f}"
+            )
+
+    # ---- (e) Mixed precision + Partial + asymmetric grad=None ----
+    # Same topology as (d) but gradient is fp16.  Verifies that the
+    # coalesced buffer correctly casts fp16 grads to fp32 before the
+    # collective, preventing dtype mismatch with the fp32 zeros
+    # contributed by grad-free ranks.
+    torch.manual_seed(_SEED + 2)
+    full_grad_e = torch.randn(32, 64, device=device)
+    local_weight_e = torch.ones(shard_rows, 64, device=device)
+
+    param_e = nn.Parameter(
+        DTensor.from_local(local_weight_e, mesh_tp, placements_d),
+    )
+    if tp_rank == 0:
+        local_partial_e = full_grad_e[
+            dp_rank * shard_rows : (dp_rank + 1) * shard_rows
+        ].clone().to(torch.float16) / 2
+        param_e.grad = DTensor.from_local(
+            local_partial_e, mesh_tp, placements_d,
+        )
+    else:
+        param_e.grad = None
+
+    with SkipDTensorDispatch():
+        norm_e = clip_grad_norm_([param_e], 1.0, norm_type=2.0)
+    assert norm_e.isfinite() and norm_e >= 0, (
+        f"MixedPrec-Partial: expected finite norm, got {norm_e.item()}"
+    )
+    t_e = norm_e.clone().float()
+    all_norms_e = [
+        torch.zeros_like(t_e) for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather(all_norms_e, t_e)
+    for r in range(dist.get_world_size()):
+        if r // dp_size == tp_rank:
+            assert _close(all_norms_e[r], t_e), (
+                f"MixedPrec-Partial: rank {r} norm "
+                f"{all_norms_e[r].item():.6f} != rank {rank} "
+                f"norm {t_e.item():.6f}"
             )
