@@ -62,3 +62,6 @@ CellBackwardHook:
 
 Tile:
   dist_op_name: _tile_dist_op
+
+OnesLikeExt:
+  dist_op_name: _ones_like_ext_dist_op
