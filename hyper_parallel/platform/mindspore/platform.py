@@ -16,6 +16,7 @@
 from datetime import timedelta
 from typing import Optional
 
+import contextlib
 import numpy as np
 import mindspore as ms
 import mindspore.common.dtype as mstype
@@ -605,3 +606,7 @@ class MindSporePlatform(Platform):
     def tensor_to_numpy(tensor) -> np.ndarray:
         """Convert MindSpore tensor to numpy array."""
         return tensor.asnumpy()
+
+    @staticmethod
+    def profiler_record(name):
+        return contextlib.nullcontext()
