@@ -466,6 +466,10 @@ class Platform:
     def tensor_to_numpy(tensor) -> np.ndarray:
         raise NotImplementedError("Platform subclasses must implement tensor_to_numpy")
 
+    @staticmethod
+    def profiler_record(name):
+        raise NotImplementedError("Platform subclasses must implement profiler_record")
+
     def cast_fp_tensor(self, dtype, x):
         """
         Cast floating-point tensor to target dtype if applicable.
