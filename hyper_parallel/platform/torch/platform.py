@@ -295,10 +295,12 @@ class TorchPlatform(Platform):
         return output_tensor
 
     @staticmethod
-    def get_device_handle():
-        if hasattr(torch, "npu"):
-            return torch.npu
-        return torch.cuda
+    def get_device_handle(device_type: str = "npu"):
+        try:
+            handle =  getattr(torch, device_type)
+        except AttributeError as e:
+            raise RuntimeError(f"TorchPlatform expect got device handle: 'torch.{device_type}' failed.") from e
+        return handle
 
     @staticmethod
     def get_param_type_size(param):

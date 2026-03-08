@@ -27,7 +27,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
     root_bp_state = False
 
     def __init__(self, *args, **kwargs):
-        """init"""
+        """Initialize TorchHSDPSchedulerV2 and register forward/backward hooks."""
         super().__init__(*args, **kwargs)
         self._backup_forward_fetch = None
 
@@ -37,6 +37,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _init_platform(self):
         """Initialize the platform."""
+        # pylint: disable=C0415
         from hyper_parallel.platform.torch.platform import TorchPlatform
         self.platform = get_platform()
         if not isinstance(self.platform, TorchPlatform):
@@ -46,7 +47,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         """Create a new cell state for torch."""
         if self.mesh.ndim not in (1, 2):
             raise ValueError("fully_shard only support 1D and 2D mesh.")
-        elif self.mesh.ndim == 1:
+        if self.mesh.ndim == 1:
             # FSDP2
             self.mesh_info = FSDPMeshInfo(mesh=self.mesh, shard_mesh_dim=0)
         else:
@@ -54,13 +55,9 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             self.mesh_info = HSDPMeshInfo(mesh=self.mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
         self.hsdp_state = TorchHSDPStateV2(self.cell, self.mesh_info, self.config, self.platform, self.device)
 
-    def _new_grad_hook(self):
-        """Create and initialize a new TorchHSDPGradHook instance."""
-        # TorchHSDPScheduler don't need param hook, using param.grad
-        pass
 
     def _register_post_backward_hook(self, args, kwargs):
-        """Register backward hook using backward function."""
+        """Wrap forward args/kwargs through PostBackwardFunction to register backward hook."""
         args_list, args_spec = tree_flatten(args)
         kwargs_list, kwargs_spec = tree_flatten(kwargs)
         args_kwargs_list = list(args_list) + list(kwargs_list)
@@ -80,14 +77,14 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         return self._register_post_backward_hook(args, kwargs)
 
     def _register_backward_pre_hook(self, outputs):
-        """Register output hook to trigger backward pre hook."""
+        """Register gradient hooks on all requires-grad outputs to trigger backward pre hook."""
         flat_outputs, _ = tree_flatten(outputs)
         for output in flat_outputs:
             if isinstance(output, torch.Tensor) and output.requires_grad:
                 output.register_hook(self._backward_pre_hook)
         return outputs
 
-    def _forward_hook(self, cell, inputs, outputs):
+    def _forward_hook(self, cell, inputs, outputs):  # pylint: disable=R1710
         """Execute forward hook."""
         self._register_backward_pre_hook(outputs)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
@@ -97,8 +94,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
                 self.forward_prefetch_cells = self._backup_forward_fetch
                 self._backup_forward_fetch = []
             return
-        outputs = self._hsdp_forward_hook(cell, inputs, outputs)
-        return outputs
+        return self._hsdp_forward_hook(cell, inputs, outputs)
 
     # pylint: disable=W0212
     def _backward_pre_hook(self, grad):
@@ -111,6 +107,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         return grad
 
     def _root_backward_hook(self):
+        """Final backward callback: run backward hook and apply remaining gradient reductions."""
         apply_final_reduce = self.scheduler_state != FSDPSchedulerState.BACKWARD
         self._backward_hook()
         if apply_final_reduce:

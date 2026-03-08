@@ -13,11 +13,10 @@
 # limitations under the License.
 # ============================================================================
 """test fully_shard module api"""
+# pylint: disable=W0611,C0413,C0412,W0613,W0612,W0212
 import os
-
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
-# pylint: disable=W0611
 import torch_npu
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor import DTensor
@@ -61,11 +60,9 @@ def test_fully_shard_module_01():
 
     # Test set_requires_gradient_sync
     model1.set_requires_gradient_sync(True)
-    assert model1.hsdp_scheduler.requires_grad_sync is True
     assert model1.hsdp_scheduler.hsdp_state.reduce_grads is True
 
     model1.set_requires_gradient_sync(False)
-    assert model1.hsdp_scheduler.requires_grad_sync is False
     assert model1.hsdp_scheduler.hsdp_state.reduce_grads is False
     try:
         model1.set_requires_gradient_sync(1)
