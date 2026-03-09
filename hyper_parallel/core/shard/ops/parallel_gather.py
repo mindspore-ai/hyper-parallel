@@ -17,8 +17,8 @@ Distributed implementation for Gather operator.
 """
 
 from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
-
 
 class IndexSelectDistributedOp(DistributedOp):
     """Distributed implementation for Index Select operator."""
@@ -41,7 +41,7 @@ class IndexSelectDistributedOp(DistributedOp):
         if not self._allow_partial_inputs:
             self._check_partial_inputs(layouts)
 
-        # Check
+        # Check inputs
         if len(layouts) != 3:
             raise ValueError(f"Gather ops requires 3 layouts, but {len(layouts)}")
         if len(extra_args) != 1:
@@ -49,38 +49,122 @@ class IndexSelectDistributedOp(DistributedOp):
 
         # Parse layout info
         p_layout, i_layout = layouts[0], layouts[2]
-        axis, batch_dims = extra_args[0], 0
+        axis = extra_args[0]
 
         p_tensor_map = p_layout.alias_tensor_map
         i_tensor_map = i_layout.alias_tensor_map
 
-        # Create output layout
-        if p_tensor_map[axis] != "None":
+        # 1. Validate the axis range before any manipulation
+        if axis < -len(p_tensor_map) or axis >= len(p_tensor_map):
             raise ValueError(
-                f"Operation {self.op_name}: Cannot perform sharding on params along the axis"
+                f"Operation {self.op_name}: dim value {axis} is out of valid range"
             )
+
+        # 2. Convert negative axis to positive index to avoid Python slicing bugs
+        if axis < 0:
+            axis += len(p_tensor_map)
 
         if len(i_tensor_map) != 1:
             raise ValueError(
                 f"Operation {self.op_name}: index is not a one-dimensional Tensor"
             )
 
-        if axis < -len(p_tensor_map) or axis >= len(p_tensor_map):
-            raise ValueError(
-                f"Operation {self.op_name}: dim value is out of valid range"
-            )
+        # 3. Create output layout map
+        # We allow sharding on the `axis`. Since `index_select` replaces the `axis`
+        # dimension with the `index` dimension, if `axis` was sharded, that mesh
+        # dimension is removed from the output tensor map.
+        output_tensor_map = list(p_tensor_map[:axis]) + list(i_tensor_map) + list(p_tensor_map[axis + 1 :])
 
-        output_tensor_map = (
-            p_tensor_map[:axis] + i_tensor_map[batch_dims:] + p_tensor_map[axis + 1 :]
-        )
-        output_layout = i_layout
         output_layout = Layout(
-            mesh_shape=output_layout.mesh_shape,
-            alias_name=output_layout.alias_name,
-            rank_list=output_layout.rank_list,
+            mesh_shape=p_layout.mesh_shape,
+            alias_name=p_layout.alias_name,
+            rank_list=p_layout.rank_list,
         )
         output_layout = output_layout(*output_tensor_map)
+
+        # 4. Implicit Communication via Partial Layout
+        # If the gather axis was sharded, the local output will only be a masked partial result.
+        # We set the output layout to Partial('sum') for that specific mesh dimension so the
+        # OpDispatcher handles the AllReduce automatically when this tensor is used later.
+        shard_mesh_dim_name = p_tensor_map[axis]
+        if shard_mesh_dim_name != "None":
+            # Handle possible multi-axis sharding tuple
+            if isinstance(shard_mesh_dim_name, tuple):
+                for dim_name in shard_mesh_dim_name:
+                    if dim_name != "None":
+                        output_layout.set_partial_by_dev_axis(dim_name, 'sum')
+            else:
+                output_layout.set_partial_by_dev_axis(shard_mesh_dim_name, 'sum')
+
         return output_layout
+
+
+    def get_expand_impl(self, func, output_layout, layouts, extra_args):
+        """
+        Get the expanded execution implementation for Index Select.
+        """
+        p_layout = layouts[0]
+        axis = extra_args[0]
+        if axis < 0:
+            axis += len(p_layout.alias_tensor_map)
+
+        shard_mesh_dim_name = p_layout.alias_tensor_map[axis]
+
+        # If the axis is NOT sharded, fallback to standard execution
+        if shard_mesh_dim_name == "None":
+            return func
+
+        # If the axis IS sharded, return a custom function with Masking ONLY.
+        # The explicit AllReduce is completely removed.
+        def expand_impl(input_tensor, dim, index, **kwargs):
+            platform = get_platform()
+            mesh = p_layout.mesh
+
+            # Fetch the communication group for the sharded mesh dimension
+            if isinstance(shard_mesh_dim_name, tuple):
+                target_dim_name = next(d for d in shard_mesh_dim_name if d != "None")
+            else:
+                target_dim_name = shard_mesh_dim_name
+
+            comm_group_info = mesh.get_comm_group_by_axis(target_dim_name)
+            group = comm_group_info.group if hasattr(comm_group_info, 'group') else comm_group_info
+
+            # Get the rank of the current device within this specific communication group
+            group_rank = platform.get_group_local_rank(group=group)
+
+            # Calculate global index boundaries for the local chunk
+            local_dim_size = input_tensor.shape[dim]
+            start_idx = group_rank * local_dim_size
+            end_idx = start_idx + local_dim_size
+
+            # 1. Compute mask: True for indices that belong to the current rank
+            mask = (index >= start_idx) & (index < end_idx)
+
+            # 2. Shift global indices to local indices
+            safe_index = index - start_idx
+
+            # Clamp safe_index to valid local ranges to prevent CUDA out-of-bounds
+            # errors during the local index_select (invalid ones will be masked out anyway).
+            safe_index = safe_index.clamp(min=0, max=local_dim_size - 1)
+
+            # 3. Perform local index_select using tensor's built-in method
+            local_out = input_tensor.index_select(dim, safe_index, **kwargs)
+
+            # 4. Mask out the invalid indices (set them to 0)
+            # Reshape the 1D mask to broadcast against the output shape
+            mask_shape = [1] * local_out.ndim
+            mask_shape[dim] = -1
+            mask_reshaped = mask.reshape(mask_shape).to(local_out.dtype)
+
+            local_out = local_out * mask_reshaped
+
+            # Return the partial local tensor directly. The framework's layout engine
+            # and OpDispatcher will trigger the AllReduce when this Partial tensor
+            # is redistributed to a non-partial layout.
+            return local_out
+
+        return expand_impl
+
 
 class GatherDDistributedOp(DistributedOp):
     """Distributed implementation for GatherD operator.
@@ -93,6 +177,7 @@ class GatherDDistributedOp(DistributedOp):
     - Input and index must have the same number of dimensions
     - Output inherits the sharding pattern of the input tensor
     """
+
     def infer_layout(self, layouts, extra_args):
         """
         Infer output layouts for GatherD operations.
