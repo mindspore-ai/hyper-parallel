@@ -236,6 +236,12 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement parameters_dict")
 
     @staticmethod
+    def get_model_state_dict(model, *, options=None):
+        raise NotImplementedError(
+            "Platform subclasses must implement get_model_state_dict"
+        )
+
+    @staticmethod
     def save_checkpoint(cell, file_path: str) -> None:
         raise NotImplementedError("Platform subclasses must implement save_checkpoint")
 

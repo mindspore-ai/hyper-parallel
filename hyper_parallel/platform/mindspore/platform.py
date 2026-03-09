@@ -392,6 +392,12 @@ class MindSporePlatform(Platform):
         return _MicroBatch(micro_batch_num, args_batch_dim, kwargs_batch_dim)
 
     @staticmethod
+    def get_model_state_dict(model, *, options=None):
+        raise NotImplementedError(
+            "get_model_state_dict is not yet supported on MindSpore"
+        )
+
+    @staticmethod
     def save_checkpoint(cell: Cell, file_path: str) -> None:
         save_dict = cell._params
         ms.save_checkpoint(save_obj=save_dict, ckpt_file_name=file_path, format="safetensors")
