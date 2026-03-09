@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """hybrid shard data parallel interface"""
+import warnings
+from collections import namedtuple
 from typing import Any, Mapping, cast, Optional, Union
 
 import torch
@@ -29,6 +31,53 @@ from hyper_parallel.core.dtensor import DTensor, distribute_tensor
 platform = get_platform()
 
 origin_class_to_extend_class = {}
+
+
+def _check_strict_keys(
+    module: nn.Module, state_dict: Mapping[str, Any],
+) -> None:
+    """Raise ``RuntimeError`` if *state_dict* keys do not match *module*."""
+    expected_keys = set(module.state_dict().keys())
+    missing = expected_keys - set(state_dict.keys())
+    unexpected = set(state_dict.keys()) - expected_keys
+    error_msgs: list[str] = []
+    if missing:
+        error_msgs.append(
+            "Missing key(s): " + ", ".join(repr(k) for k in sorted(missing))
+        )
+    if unexpected:
+        error_msgs.append(
+            "Unexpected key(s): " + ", ".join(repr(k) for k in sorted(unexpected))
+        )
+    if error_msgs:
+        raise RuntimeError(
+            f"Error(s) in loading state_dict for "
+            f"{module.__class__.__name__}:\n\t"
+            + "\n\t".join(error_msgs)
+        )
+
+
+def _resolve_local_tensor(
+    key: str, val: torch.Tensor, target: DTensor,
+) -> torch.Tensor:
+    """Return the local shard tensor to be loaded into *target*."""
+    if isinstance(val, DTensor):
+        return val.to_local()
+    local_shape = tuple(target.local_shape)
+    global_shape = tuple(target.shape)
+    val_shape = tuple(val.shape)
+    if val_shape == local_shape:
+        return val
+    if val_shape == global_shape:
+        wrapped = distribute_tensor(
+            val.detach(), target.device_mesh, target.placements,
+        )
+        return wrapped.to_local()
+    raise ValueError(
+        f"load '{key}': plain tensor shape {val_shape} "
+        f"matches neither local shard {local_shape} "
+        f"nor global {global_shape}."
+    )
 
 
 class _UnshardHandle:
@@ -166,14 +215,21 @@ class HSDPModule:
             strict (bool): If ``True`` (default), missing or unexpected keys
                 raise ``RuntimeError``, matching ``nn.Module.load_state_dict``
                 semantics.
-            assign (bool): Reserved for API compatibility with
-                ``nn.Module.load_state_dict(assign=True)``. Currently unused.
+            assign (bool): Accepted for API compatibility with
+                ``nn.Module.load_state_dict(assign=True)`` but currently
+                ignored; HSDP always copies into existing DTensor storage.
 
         Raises:
             RuntimeError: When ``strict`` is ``True`` and keys do not match.
             ValueError: When a plain tensor shape matches neither the local
                 shard shape nor the global shape of the target DTensor.
         """
+        if assign:
+            warnings.warn(
+                "HSDPModule.load_state_dict: assign=True is ignored; "
+                "HSDP always copies into existing DTensor parameters.",
+                stacklevel=2,
+            )
         self_module = cast(nn.Module, self)
 
         target_map: dict[str, torch.Tensor] = {}
@@ -183,24 +239,7 @@ class HSDPModule:
             target_map[name] = b
 
         if strict:
-            expected_keys = set(self_module.state_dict().keys())
-            missing = expected_keys - set(state_dict.keys())
-            unexpected = set(state_dict.keys()) - expected_keys
-            error_msgs: list[str] = []
-            if missing:
-                error_msgs.append(
-                    "Missing key(s): " + ", ".join(repr(k) for k in sorted(missing))
-                )
-            if unexpected:
-                error_msgs.append(
-                    "Unexpected key(s): " + ", ".join(repr(k) for k in sorted(unexpected))
-                )
-            if error_msgs:
-                raise RuntimeError(
-                    f"Error(s) in loading state_dict for "
-                    f"{self_module.__class__.__name__}:\n\t"
-                    + "\n\t".join(error_msgs)
-                )
+            _check_strict_keys(self_module, state_dict)
 
         with torch.no_grad():
             for key, val in state_dict.items():
@@ -209,28 +248,17 @@ class HSDPModule:
                     continue
 
                 if isinstance(target, DTensor):
-                    if isinstance(val, DTensor):
-                        local_val = val.to_local()
-                    else:
-                        local_shape = tuple(target.local_shape)
-                        global_shape = tuple(target.shape)
-                        val_shape = tuple(val.shape)
-                        if val_shape == local_shape:
-                            local_val = val
-                        elif val_shape == global_shape:
-                            wrapped = distribute_tensor(
-                                val.detach(), target.device_mesh, target.placements,
-                            )
-                            local_val = wrapped.to_local()
-                        else:
-                            raise ValueError(
-                                f"load '{key}': plain tensor shape {val_shape} "
-                                f"matches neither local shard {local_shape} "
-                                f"nor global {global_shape}."
-                            )
+                    local_val = _resolve_local_tensor(key, val, target)
                     if target.to_local().is_meta:
-                        # Meta tensor materialisation: replace the placeholder
+                        # Meta tensor materialisation: replace the placeholder.
+                        # Preserve the original requires_grad so that parameters
+                        # remain trainable after loading, matching the behaviour
+                        # of torch.nn.Module._load_from_state_dict (which uses
+                        # in-place copy_ that keeps the destination's grad flag).
+                        orig_requires_grad = target.requires_grad
                         target._local_tensor = local_val  # pylint: disable=protected-access
+                        if local_val.requires_grad != orig_requires_grad:
+                            target.requires_grad_(orig_requires_grad)
                     else:
                         target.to_local().copy_(local_val)
                 else:
@@ -238,10 +266,14 @@ class HSDPModule:
 
         # Trigger load_state_dict post-hooks so that HSDP internal
         # bookkeeping (e.g. _sharded_param_data) stays in sync.
+        # Pass an IncompatibleKeys with the same attribute names as PyTorch
+        # so external hooks can safely read .missing_keys/.unexpected_keys.
+        _IK = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
+        incompatible_keys = _IK([], [])
         for _, module in self_module.named_modules():
             hooks = module._load_state_dict_post_hooks  # pylint: disable=protected-access
             for hook in hooks.values():
-                hook(module, None)
+                hook(module, incompatible_keys)
 
     def set_is_last_backward(self, is_last_backward: bool):
         """set is_last_backward flag"""
