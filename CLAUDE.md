@@ -206,7 +206,14 @@ msrun_case(glog_v=3, file_name="base_shard.py", case_name="test_base_shard", mas
 
 6. **`is_partial()`** — this is a **method**, not a property (defined in `layout.py:473`); always call with parentheses: `layout.is_partial()`
 
-7. **Memory leak prevention** — tensor allocation and deallocation must be carefully managed to avoid memory leaks; ensure tensors are properly released when no longer needed, especially in long training loops and gradient accumulation scenarios.
+7. **Memory leak prevention** — tensor allocation and deallocation must be carefully managed to avoid memory leaks; ensure tensors are properly released when no longer needed, especially in long training loops and gradient accumulation scenarios. Key patterns used in this codebase:
+   - **Storage resize to zero**: Call `tensor.untyped_storage().resize_(0)` to immediately free device memory (e.g., `free_unsharded_param()` in `param.py` frees all-gather outputs after resharding)
+   - **Clear communication buffers**: Call `clear_reduce_scatter_output()` / `clear_all_reduce_output()` immediately after consuming reduced gradients in `reduce_params()` to avoid holding stale references
+   - **Null gradient references**: Set `param.grad = None` and `unsharded_accumulated_grad = None` after gradient has been consumed to release the tensor; forgetting this causes gradients from previous iterations to persist
+   - **Buffer reuse over reallocation**: `alloc_all_gather_outputs()` resizes existing storage via `resize_(expected_size)` rather than allocating new tensors; `init_all_gather_outputs()` skips if buffers already exist (`force_recreate=False`)
+   - **WeakSet for swap groups**: `SwapGroup._storages` uses `weakref.WeakSet` so storage references are automatically released when the owning objects are garbage collected
+   - **Pipeline micro-batch cleanup**: `_clear_recv_buffer()` and `clear_cache()` in pipeline stage must be called after each micro-batch to prevent accumulation of forward/backward caches
+   - **Activation swap lifecycle**: `SwapTensor.wait_offload()` frees device storage (`resize_(0)`) after offload completes; `wait_load()` frees CPU storage — missing either side causes memory to grow with layer count
 
 8. **Stream synchronization rules** — Missing stream sync is the leading root cause of memory stomping and stale data bugs. When modifying code involving async operations, verify each of the following:
    - **Async collectives**: `handle` returned by `async_op=True` must be waited via `handle.wait()` before accessing the output tensor. `handle.wait()` establishes a **GPU-side dependency** on the current stream via `cudaStreamWaitEvent`, not just a CPU block
