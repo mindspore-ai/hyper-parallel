@@ -1,0 +1,4 @@
+outer:
+  dist_op_name: _torch_outer_dist_op
+  distributed_op_class: OuterDistributedOp
+  distributed_op_file: parallel_outer
