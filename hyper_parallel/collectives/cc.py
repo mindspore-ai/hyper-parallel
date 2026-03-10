@@ -14,7 +14,7 @@
 # ============================================================================
 """Distributed process group API"""
 from datetime import timedelta
-from typing import Optional, Any
+from typing import Optional, Any, Union
 
 from hyper_parallel import get_platform
 
@@ -104,3 +104,21 @@ def split_group(parent_pg: Any = None,
     """
     return platform.split_group(parent_pg=parent_pg, split_ranks=split_ranks, timeout=timeout, pg_options=pg_options,
                                 group_desc=group_desc)
+
+
+def get_group_local_rank(group=None) -> int:
+    """get group local rank id"""
+    return platform.get_group_local_rank(group=group)
+
+
+def mark_created_groups(process_group: Union[Any, list[Any]]):
+    """
+    mark created groups
+
+    Args:
+        process_group (Union[Any, list[Any]]): A process group or a list of process groups.
+
+    Returns:
+        group corresponding to rank list if it exists, else None
+    """
+    return platform.mark_created_groups(process_group=process_group)

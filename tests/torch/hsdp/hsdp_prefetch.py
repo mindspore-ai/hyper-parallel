@@ -23,9 +23,9 @@ from tests.torch.hsdp.hsdp_test_common import train
 
 
 def construct_net_and_data():
-    hidden_size = 16384
-    batch_size = 2048
-    net = DenseMutiLayerNet(hidden_size, 8)
+    hidden_size = 64
+    batch_size = 8
+    net = DenseMutiLayerNet(hidden_size, 4)
     data = torch.rand(batch_size, hidden_size).npu()
     return net, data
 

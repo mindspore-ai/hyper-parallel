@@ -65,6 +65,8 @@ def test_process_group():
         assert rank_list == split_rank
         backend = get_backend(split_group_from_group)
         assert backend == "hccl"
+        local_rank = platform.get_group_local_rank(split_group_from_group)
+        assert local_rank == rank_id % 2
 
         destroy_process_group(split_group_from_group)
 

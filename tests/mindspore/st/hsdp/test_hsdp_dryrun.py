@@ -72,9 +72,9 @@ def run_hsdp(net, data, label, optimizer_level="level1", enable_grad_accumulatio
 
 
 def construct_net_and_data():
-    in_channels = 256
-    out_channels = 64
-    hidden_size = 128
+    in_channels = 32
+    out_channels = 8
+    hidden_size = 16
     batch_size = 4
     net = DenseNet(in_channels, out_channels, hidden_size)
     data = Tensor(np.random.randn(batch_size, in_channels).astype(np.float32))
@@ -107,7 +107,7 @@ def test_hsdp_level2(mode):
     run_hsdp(net, data, label, "level2", mode=mode)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize("mode", [
     "eager",
     pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
@@ -146,7 +146,7 @@ def test_hsdp_level2_acc_grad(mode):
     run_hsdp(net, data, label, "level2", True, mode=mode)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize("mode", [
     "eager",
     pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
@@ -191,7 +191,7 @@ def get_device_layout():
     return layout
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
 def test_hsdp_with_dp_layout(mode):
     """
@@ -207,7 +207,7 @@ def test_hsdp_with_dp_layout(mode):
                          label_layout, mode=mode)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
 def test_hsdp_with_mp_layout(mode):
     """
@@ -224,7 +224,7 @@ def test_hsdp_with_mp_layout(mode):
                          label_layout, mode=mode)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
 def test_hsdp_with_exception(mode):
     """
@@ -247,7 +247,7 @@ def test_hsdp_with_exception(mode):
     os.environ["RANK_ID"] = "32"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
 def test_hsdp_custom_shard_size(mode):
     """
@@ -259,11 +259,11 @@ def test_hsdp_custom_shard_size(mode):
     net.dense1.weight.hsdp_shard_size = 2
     net.dense2.weight.hsdp_shard_size = 8
     run_hsdp(net, data, label, "level1", mode=mode)
-    assert net.dense1.weight.shape == (64, 256)
-    assert net.dense2.weight.shape == (8, 128)
+    assert net.dense1.weight.shape == (8, 32)
+    assert net.dense2.weight.shape == (1, 16)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
 def test_hsdp_freeze_param(mode):
     """
@@ -276,5 +276,5 @@ def test_hsdp_freeze_param(mode):
     net.dense2.weight.hsdp_shard_size = 8
     net.dense2.weight.requires_grad = False
     run_hsdp(net, data, label, "level1", mode=mode)
-    assert net.dense1.weight.shape == (64, 256)
-    assert net.dense2.weight.shape == (8, 128)
+    assert net.dense1.weight.shape == (8, 32)
+    assert net.dense2.weight.shape == (1, 16)

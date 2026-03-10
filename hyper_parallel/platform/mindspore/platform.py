@@ -35,7 +35,7 @@ from mindspore.communication import comm_func
 from mindspore._c_expression import TensorTransform
 import mindspore.mint.distributed as dist
 
-from hyper_parallel.platform.platform import Platform, PlatformType
+from hyper_parallel.platform.platform import Platform, PlatformType, EXISTING_COMM_GROUPS
 from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 from hyper_parallel.platform.mindspore.pipeline_parallel.stage import PipelineStageBase
 from hyper_parallel.platform.mindspore.parameter_init import init_parameters as _init_parameters
@@ -269,7 +269,7 @@ class MindSporePlatform(Platform):
             # has been init, get slice data
             param_dtensor = DTensor.from_local(
                 _get_slice_tensor_by_layout(param, layout).value(), layout.mesh, layout.placements
-                )
+            )
             param = Parameter(param_dtensor, name=name, requires_grad=requires_grad)
             param.param_info = param_info
         else:
@@ -343,11 +343,10 @@ class MindSporePlatform(Platform):
         """
         input_tensor.requires_grad_()
 
-    def _create_group(self, rank_list, group_name=None):
-        if group_name is None:
-            hash_str_rank_list = '-'.join([str(rank) for rank in rank_list])
-            group_name = f"{len(rank_list)}-{hash_str_rank_list}"
+    def _create_group(self, rank_list):
+        group_name = str(tuple(sorted(rank_list)))
         new_group(rank_ids=rank_list, group=group_name)
+        EXISTING_COMM_GROUPS[group_name] = group_name
         return group_name
 
     @staticmethod
@@ -470,6 +469,10 @@ class MindSporePlatform(Platform):
                 is None or "hccl_world_group", destroy global process group and all process groups relative to global
                 process group.
         """
+        if group in EXISTING_COMM_GROUPS.values():
+            keys_to_destroy = [k for k, v in EXISTING_COMM_GROUPS.items() if v == group]
+            for k in keys_to_destroy:
+                del EXISTING_COMM_GROUPS[k]
         dist.destroy_process_group(group)
 
     @staticmethod
@@ -524,13 +527,20 @@ class MindSporePlatform(Platform):
         rank_id = MindSporePlatform.get_rank()
         for split_rank in split_ranks:
             if rank_id in split_rank:
-                if pg_options is None:
-                    hash_str_rank_list = '-'.join([str(rank) for rank in split_rank])
-                    pg_options = f"{len(split_rank)}-{hash_str_rank_list}"
-                new_group(rank_ids=split_rank, group=pg_options)
-                return pg_options
+                split_group = MindSporePlatform.get_created_group(split_rank)
+                if split_group:
+                    return split_group
+                group_name = str(tuple(sorted(split_rank)))
+                new_group(rank_ids=split_rank, group=group_name)
+                EXISTING_COMM_GROUPS[group_name] = group_name
+                return group_name
         raise ValueError(f"Split group invalid rank, the Split_ranks {split_ranks} does not contain current rank"
                          f" {rank_id}")
+
+    @staticmethod
+    def get_group_local_rank(group=None) -> int:
+        """get group local rank id."""
+        return dist.get_group_rank(group, MindSporePlatform.get_rank())
 
     @staticmethod
     def no_grad():

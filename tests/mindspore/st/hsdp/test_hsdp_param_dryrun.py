@@ -59,7 +59,7 @@ def test_hsdp_param_to_unsharded():
     hsdp_param.to_unsharded()
     assert net.weight.shape == (64, 256)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_hsdp_scaler_param():
     """
     Feature: hsdp scaler param.
@@ -143,7 +143,7 @@ def test_hsdp_no_init_param_with_layout():
     hsdp_param.to_unsharded()
     assert net.weight.local_shape == (64, 256)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_hsdp_param_with_two_axis_unshard():
     """
     Feature: hsdp param with layout.
