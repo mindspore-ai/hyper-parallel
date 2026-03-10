@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-HyperParallel is a **high-performance distributed parallel acceleration library** that simplifies distributed model training, inference and reinforcement learning. It provides unified abstractions for:
+HyperParallel is an **easy-to-use, high-performance distributed parallel acceleration library** for distributed model training, inference and reinforcement learning. It provides unified abstractions for:
 - **Data Parallelism (DP)** — replicate model across devices, aggregate gradients
 - **Fully Sharded Data Parallelism (FSDP)** — shard parameters, gradients, and optimizer states across data-parallel ranks
 - **Tensor Parallelism (TP)** — shard model weights/activations across devices
@@ -194,19 +194,14 @@ msrun_case(glog_v=3, file_name="base_shard.py", case_name="test_base_shard", mas
 
 ## Key Implementation Notes
 
-1. **`_build_layout(device_mesh, placements, tensor_dim)`** — creates a `Layout` and calls `placement_to_tensor_map`; called on every `DTensor` construction and `redistribute()`
+1. **DTensor 编程要点**
+   - **Layout 构建**: `_build_layout(device_mesh, placements, tensor_dim)` 在每次 `DTensor` 构造和 `redistribute()` 时调用，内部调用 `placement_to_tensor_map`
+   - **上下文管理器**: `SkipDTensorDispatch` 禁用 DTensor op dispatch（用于梯度 hook 中操作原始本地张量）；`no_init_parameters()` 跳过权重初始化（sharding 前创建模型时使用）
+   - **Partial 状态处理**: `reduce_partial` 必须在 redistribution 前调用；排序规则见 `tensor_redistribution.py`（ReduceScatter 先于 AllReduce）
+   - **Op 注册**: 分布式算子通过 `core/shard/ops/yaml/` 中的 YAML 文件注册，Python 实现在 `core/shard/ops/parallel_*.py`
+   - **注意**: `is_partial()` 是**方法**而非属性（定义在 `layout.py:473`），必须加括号调用
 
-2. **`SkipDTensorDispatch` context manager** — disables DTensor op dispatch; used when operating on raw local tensors inside gradient hooks
-
-3. **`no_init_parameters()` context manager** — skips weight initialization; required when creating model before sharding to avoid allocating full-size tensors
-
-4. **`reduce_partial`** — must be called before redistribution if layout is in partial state; see `tensor_redistribution.py` for ordering rules (ReduceScatter before AllReduce)
-
-5. **Op dispatch** — distributed ops are registered via YAML files in `core/shard/ops/yaml/`; Python implementations in `core/shard/ops/parallel_*.py`
-
-6. **`is_partial()`** — this is a **method**, not a property (defined in `layout.py:473`); always call with parentheses: `layout.is_partial()`
-
-7. **Memory leak prevention** — tensor allocation and deallocation must be carefully managed to avoid memory leaks; ensure tensors are properly released when no longer needed, especially in long training loops and gradient accumulation scenarios. Key patterns used in this codebase:
+2. **Memory leak prevention** — tensor allocation and deallocation must be carefully managed to avoid memory leaks; ensure tensors are properly released when no longer needed, especially in long training loops and gradient accumulation scenarios. Key patterns used in this codebase:
    - **Storage resize to zero**: Call `tensor.untyped_storage().resize_(0)` to immediately free device memory (e.g., `free_unsharded_param()` in `param.py` frees all-gather outputs after resharding)
    - **Clear communication buffers**: Call `clear_reduce_scatter_output()` / `clear_all_reduce_output()` immediately after consuming reduced gradients in `reduce_params()` to avoid holding stale references
    - **Null gradient references**: Set `param.grad = None` and `unsharded_accumulated_grad = None` after gradient has been consumed to release the tensor; forgetting this causes gradients from previous iterations to persist
@@ -215,12 +210,20 @@ msrun_case(glog_v=3, file_name="base_shard.py", case_name="test_base_shard", mas
    - **Pipeline micro-batch cleanup**: `_clear_recv_buffer()` and `clear_cache()` in pipeline stage must be called after each micro-batch to prevent accumulation of forward/backward caches
    - **Activation swap lifecycle**: `SwapTensor.wait_offload()` frees device storage (`resize_(0)`) after offload completes; `wait_load()` frees CPU storage — missing either side causes memory to grow with layer count
 
-8. **Stream synchronization rules** — Missing stream sync is the leading root cause of memory stomping and stale data bugs. When modifying code involving async operations, verify each of the following:
+3. **Stream synchronization rules** — Missing stream sync is the leading root cause of memory stomping and stale data bugs. When modifying code involving async operations, verify each of the following:
    - **Async collectives**: `handle` returned by `async_op=True` must be waited via `handle.wait()` before accessing the output tensor. `handle.wait()` establishes a **GPU-side dependency** on the current stream via `cudaStreamWaitEvent`, not just a CPU block
    - **`non_blocking` transfers**: `tensor.to(device, non_blocking=True)` executes asynchronously on the current stream; the destination tensor must not be read until the stream has completed (via synchronize or event wait)
    - **Cross-stream dependencies**: Must use events to establish GPU-side ordering: `event.record(stream_A)` → `event.wait(stream_B)`. CPU-side code order does **not** guarantee GPU execution order across streams
    - **`grad_sync_stream`**: Only used in the legacy HSDP path (`HSDPSchedulerV2 + comm_async=True`, per-parameter grad hooks). The new `TorchHSDPSchedulerV2` path (module-level backward hook → `post_backward()` → `reduce_params()`) does not use `grad_sync_stream`
    - **Activation Swap**: `SwapGroup.launch_offload/launch_load` execute on `copy_stream`; tensors must not be accessed on the compute stream until `wait_offload/wait_load` completes the event wait
+
+---
+
+## Git Workflow
+
+- **Commits**: Conventional Commits (`feat:`, `fix:`, `docs:`), ~80 chars subject,
+  imperative voice, reasoning in body
+- **Squash**: Squash WIP commits before opening PR
 
 ---
 
