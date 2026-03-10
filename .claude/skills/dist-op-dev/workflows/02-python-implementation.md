@@ -6,7 +6,7 @@ Create distributed operator implementation class, implement `infer_layout` and `
 
 ## Input
 
-- **Analysis Report**: `.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md` (from Step 1 output)
+- **Analysis Report**: `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md` (from Step 1 output)
 
 ## Output
 

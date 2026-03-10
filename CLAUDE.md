@@ -227,11 +227,42 @@ msrun_case(glog_v=3, file_name="base_shard.py", case_name="test_base_shard", mas
 
 ---
 
-## Skills (`.agentic/skills/`)
+## Claude Code Configuration (`.claude/`)
+
+### Skills
 
 | Skill | Description | Usage |
 |-------|-------------|-------|
-| **autogit** | GitCode fork workflow automation (commit, PR, status, squash), supports origin (fork) + upstream (main repo) pattern | `/skill autogit` |
-| **dist-op-dev** | Distributed operator development main workflow, automatically calls analysis tools to complete the entire process from operator analysis to code push | `/skill dist-op-dev` |
-| **ms-op-analysis** | [Internal] Analyze MindSpore operator primitive definitions and distributed implementations, automatically called by `dist-op-dev` | — |
-| **pt-op-analysis** | [Internal] Analyze PyTorch operator interfaces and map to MindSpore operators, automatically called by `dist-op-dev` | — |
+| **autogit** | GitCode fork workflow automation (commit, PR, status, squash) | `/skill autogit` |
+| **code-review** | Code review for distributed correctness, stream sync, memory safety, cross-platform consistency | `/skill code-review` |
+| **dist-op-dev** | Distributed operator development workflow (analysis → impl → test → commit) | `/skill dist-op-dev` |
+| **ms-op-analysis** | [Internal] MindSpore operator analysis, called by `dist-op-dev` | — |
+| **pt-op-analysis** | [Internal] PyTorch operator analysis, called by `dist-op-dev` | — |
+
+### Commands
+
+| Command | Description |
+| ------- | ----------- |
+| `/commit` | Stage, lint-check, commit, push to origin |
+| `/create-pr` | Create PR from feature branch to upstream/master |
+| `/code-review` | Delegates to code-review skill |
+
+### Agents
+
+| Agent | Model | Role |
+| ----- | ----- | ---- |
+| **planner** | default | Read-only implementation planning before multi-file changes |
+| **code-verifier** | haiku | Automated lint + test verification |
+| **code-reviewer** | sonnet | Post-change code review (distributed-first) |
+| **dtensor-expert** | opus | DTensor, Layout, redistribution, op dispatch |
+| **fsdp-expert** | opus | FSDP/HSDP, parameter sharding, gradient reduction |
+| **pipeline-expert** | opus | Pipeline parallelism, micro-batch, activation swap |
+
+### Rules (auto-applied by path)
+
+| Rule | Scope |
+| ---- | ----- |
+| **code-style** | Global — conventions, naming, patterns |
+| **distributed** | `core/**`, `collectives/**`, `fully_shard/**` — stream sync, memory, DTensor |
+| **platform** | `platform/**` — cross-platform abstraction |
+| **testing** | `tests/**` — test patterns, markers, distributed test helpers |

@@ -12,7 +12,7 @@ Obtain the operator's interface definition, distributed implementation plan, and
 ## Output
 
 - **Analysis Report File**: `{OpName}-analysis.md` (🔴required)
-- **Report Location**: `.agentic/skills/dist-op-dev/analysis-results/`
+- **Report Location**: `.claude/skills/dist-op-dev/analysis-results/`
 - **Not committed to Git**: Clearly marked at the beginning of the document, saved in local skill directory
 
 ---
@@ -71,7 +71,7 @@ Path requirements:
    - Implementation strategy planning
 5. Implementation checklist
 
-**Save Path**: `.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
+**Save Path**: `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
 
 ---
 
@@ -81,7 +81,7 @@ Path requirements:
 - [ ] Analyzed distributed Info class implementation (Layout flow/subgraph replacement)
 - [ ] Marked MindSpore reference source (function name, file location, key code)
 - [ ] Recommended HyperParallel base class and implementation method
-- [ ] **[Key] Generated analysis report file** `.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
+- [ ] **[Key] Generated analysis report file** `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
 - [ ] User confirmed: interface definition, reference source, base class selection, implementation plan
 
 ---
@@ -90,6 +90,6 @@ Path requirements:
 
 After analysis is complete, proceed to **[Workflow 2: Python Implementation](./02-python-implementation.md)**
 
-**Input:** `.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
+**Input:** `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
 
 **Goal:** Create distributed operator implementation class, implement `infer_layout` and `get_expand_impl`

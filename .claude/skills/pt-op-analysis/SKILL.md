@@ -76,7 +76,7 @@ When using this SKILL to analyze PyTorch operators, create a TODOLIST, execute t
 - [ ] **[🔴Step 5](workflows/05-analysis-output.md)**: Analysis Result Output (Required, cannot skip)
   - Goal: Generate standardized analysis report document
   - Input: Complete analysis results
-  - Output: Standardized analysis report `.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
+  - Output: Standardized analysis report `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
 
 > **🔴 Special Warning**: Step 5 (Analysis Result Output) is **required and cannot be skipped**. If report is not generated, subsequent development process will not execute correctly due to missing reference sources!
 
@@ -122,7 +122,7 @@ When using this SKILL to analyze PyTorch operators, create a TODOLIST, execute t
 
 ### Output Document Structure
 
-Generated analysis report `.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md` contains:
+Generated analysis report `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md` contains:
 
 1. **PyTorch Interface Definition**: Parameters, return values, semantics
 2. **MindSpore Mapping Relationship**: Corresponding MindSpore operator, difference description

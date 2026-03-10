@@ -71,7 +71,7 @@ When using this SKILL to develop distributed operators, create a TODOLIST, then 
 
   - Goal: Get operator interface definition, distributed implementation plan, implementation reference
   - Input: Operator name, platform type
-  - Output: Analysis report file `.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md` (🔴required)
+  - Output: Analysis report file `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md` (🔴required)
 
 - [ ] **[Step 2](workflows/02-python-implementation.md)**: Python Implementation
 

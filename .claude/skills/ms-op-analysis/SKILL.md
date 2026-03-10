@@ -88,7 +88,7 @@ When using this SKILL to analyze MindSpore operators, create a TODOLIST, execute
 - [ ] **[🔴Step 5](workflows/05-analysis-output.md)**: Analysis Result Output (Required, cannot skip)
   - Goal: Generate standardized analysis report document
   - Input: Complete analysis results, reference code annotations, fallback plan (if applicable)
-  - Output: Standardized analysis report `.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
+  - Output: Standardized analysis report `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
   - Execution: Read template; fill analysis results; save document; **quality checklist item-by-item confirmation**
 
 > **🔴 Special Warning**: Step 5 (Analysis Result Output) is **required and cannot be skipped**. If report is not generated, subsequent development process will not execute correctly due to missing reference sources!
@@ -135,7 +135,7 @@ MindSpore distributed operators have **two inference flows**:
 
 ### Output Document Structure
 
-Generated analysis report `.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md` contains:
+Generated analysis report `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md` contains:
 
 1. **Operator Interface Definition**: Input, output, parameter info
 2. **Distributed Implementation Plan** (Core):
@@ -193,5 +193,5 @@ ls mindspore/ccsrc/frontend/parallel/ops_info/ | head -5
 2. **Execute in order**: Core flow (1-5) must execute in numbered order, subsequent depends on previous knowledge
 3. **Input requirements**: When providing operator name, must specify naming format (prefer YAML snake_case naming, e.g., `matmul` not `MatMul`)
 4. **Incomplete marking**: If distributed implementation not found, must execute fallback handling flow (step 4.4), cannot terminate analysis directly
-5. **🔴Required output**: After analysis completes **must** execute Workflow 5 "Analysis Result Output", generate `.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md` document
+5. **🔴Required output**: After analysis completes **must** execute Workflow 5 "Analysis Result Output", generate `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md` document
 6. **Checklist**: After completion, must confirm item-by-item against the checklist in Workflow 5
