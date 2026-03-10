@@ -31,3 +31,8 @@ split:
   distributed_op_class: SplitDistributedOp
   distributed_op_file: parallel_split
   infer_layout_suffix: WithShape
+
+tensor_split:
+  dist_op_name: _torch_tensor_split_dist_op
+  distributed_op_class: TensorSplitDistributedOp
+  distributed_op_file: parallel_split
