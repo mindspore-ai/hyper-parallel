@@ -211,7 +211,7 @@ class TensorRedistribution:
             return DTensor.from_local(x, to_layout.mesh, to_layout.placements)
 
         if self._apply_eazy_redistribute(from_layout, to_layout):
-            if from_layout.is_partial:
+            if from_layout.is_partial():
                 from_layout.reset_partial()
             x = self._redistribution_without_shape(x, from_layout, to_layout, key)
         else:
@@ -261,7 +261,7 @@ class TensorRedistribution:
         """Reduce partial status."""
         from_layout = input_x.layout
         x = input_x
-        if from_layout is None or not from_layout.is_partial:
+        if from_layout is None or not from_layout.is_partial():
             return x
 
         x = x.to_local()

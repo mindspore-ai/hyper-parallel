@@ -40,7 +40,7 @@ def run_scenario(scenario_name, x_layout, y_layout, expected_map, extra_args):
     print(f"Test {op_name}, Scenario: {scenario_name}")
     print("=" * 80)
 
-    if x_layout.is_partial or y_layout.is_partial:
+    if x_layout.is_partial() or y_layout.is_partial():
         op_ = op_with_partial
         op_name_ = op_name_with_partial
     else:
@@ -62,7 +62,7 @@ def run_single_input_scenario(scenario_name, x_layout, expected_map, extra_args)
     print(f"Test {op_name}, Scenario: {scenario_name}")
     print("=" * 80)
 
-    if x_layout.is_partial:
+    if x_layout.is_partial():
         op_ = op_with_partial
         op_name_ = op_name_with_partial
     else:
