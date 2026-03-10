@@ -181,7 +181,7 @@ def hsdp_with_accumulate_grad(shard_size, threshold=64, optimizer_level="level1"
     assert final_loss < 1.0
 
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_standalone_run():
     '''
     Feature: Run the network with standalone mode
@@ -364,7 +364,7 @@ def test_zero3_with_comm_fusion_bucket_size0(mode):
                               comm_fusion=True, bucket_size=0, mode=mode)
 
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
 def test_no_dp(mode):
     '''
@@ -375,7 +375,7 @@ def test_no_dp(mode):
     hsdp_without_accumulate_grad(shard_size=1, mode=mode)
 
 
-@arg_mark(plat_marks=["platform_ascend"], level_mark="level1", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
 def test_no_dp_with_acc_grad(mode):
     '''

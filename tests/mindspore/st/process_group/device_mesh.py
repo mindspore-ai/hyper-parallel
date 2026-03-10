@@ -127,6 +127,11 @@ def test_device_mesh_slice_invalid_without_mesh_dim_names():
     except RuntimeError as e:
         result = str(e)
     assert "without mesh_dim_names" in result
+    try:
+        device_mesh_init.axis_id("dp")
+    except RuntimeError as e:
+        result = str(e)
+    assert "mesh_dim_names not specified" in result
 
 
 def test_device_mesh_get_group_invalid_without_init_backend():

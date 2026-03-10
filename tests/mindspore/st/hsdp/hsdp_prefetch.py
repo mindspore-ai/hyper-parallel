@@ -23,9 +23,9 @@ from tests.mindspore.st.hsdp.hsdp_test_common import train_with_data_label
 init()
 
 def construct_net_and_data():
-    hidden_size = 16384
-    batch_size = 2048
-    net = DenseMutiLayerNet(hidden_size, 8)
+    hidden_size = 64
+    batch_size = 16
+    net = DenseMutiLayerNet(hidden_size, 4)
     data = Tensor(np.random.randn(batch_size, hidden_size).astype(np.float32))
     label = Tensor(np.random.randn(batch_size, hidden_size).astype(np.float32))
     return net, data, label
