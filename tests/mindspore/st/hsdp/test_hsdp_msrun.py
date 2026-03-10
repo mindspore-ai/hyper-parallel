@@ -24,7 +24,7 @@ LOSS_REL_ABSOLUTE_TOL: float = 1e-2
 FIRST_STEP_LOSS_REL_ABSOLUTE_TOL: float = 5e-3
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 @pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
 def test_pure_dp(mode):
     '''
@@ -112,7 +112,7 @@ def test_zero3_fully_shard(mode):
     case_name = f"{inspect.stack()[0].function}[{mode}]"
     msrun_case(glob_v, file_name, case_name, master_port)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 @pytest.mark.parametrize("mode", [
     "eager",
     pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
@@ -185,7 +185,7 @@ def test_zero2_fully_shard_with_acc_grad(mode):
     case_name = f"{inspect.stack()[0].function}[{mode}]"
     msrun_case(glob_v, file_name, case_name, master_port)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 @pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
 def test_zero2_partial_shard_with_acc_grad(mode):
     '''
@@ -233,7 +233,7 @@ def test_zero3_partial_shard_with_acc_grad(mode):
     case_name = f"{inspect.stack()[0].function}[{mode}]"
     msrun_case(glob_v, file_name, case_name, master_port)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 @pytest.mark.parametrize("mode", [
     "eager",
     pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
@@ -284,7 +284,7 @@ def test_zero3_with_comm_fusion_bucket_size(mode):
     case_name = f"{inspect.stack()[0].function}[{mode}]"
     msrun_case(glob_v, file_name, case_name, master_port)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 @pytest.mark.parametrize("mode", [
     "eager",
     pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])

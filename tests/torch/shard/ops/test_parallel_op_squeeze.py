@@ -28,7 +28,7 @@ def test_distributed_squeeze_basic():
     case_name = "test_distributed_squeeze_basic"
     torchrun_case(file_name, case_name, master_port)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_squeeze_no_args_all_dims():
     '''
     Feature: test parallel op squeeze.
@@ -40,7 +40,7 @@ def test_distributed_squeeze_no_args_all_dims():
     case_name = "test_distributed_squeeze_no_args_all_dims"
     torchrun_case(file_name, case_name, master_port)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_squeeze_specific_axis_negative():
     '''
     Feature: test parallel op squeeze.

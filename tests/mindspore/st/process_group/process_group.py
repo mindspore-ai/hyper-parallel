@@ -56,14 +56,15 @@ def test_process_group():
         split_rank.insert(0, rank_id - 1)
 
     # split group name
-    hash_str_split_rank = '-'.join([str(rank) for rank in split_rank])
-    split_group_name = f"{len(split_rank)}-{hash_str_split_rank}"
+    split_group_name = str(tuple(sorted(split_rank)))
 
-    split_group(group_name, split_ranks, pg_options=split_group_name)
+    split_group(group_name, split_ranks)
     rank_list = get_process_group_ranks(split_group_name)
     assert rank_list == split_rank
     backend = get_backend(split_group_name)
     assert backend == "hccl"
+    local_rank = platform.get_group_local_rank(split_group_name)
+    assert local_rank == rank_id % 2
 
     # destroy process group
     destroy_process_group(split_group_name)

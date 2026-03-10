@@ -322,20 +322,24 @@ class Layout:
 
     def _build_readable_tensor_map(self):
         """Build human-readable alias tensor map from tensor_map."""
+        mesh_dim_names = self._mesh.mesh_dim_names
+        has_names = mesh_dim_names is not None
+
+        def _map_dim(dim):
+            """covert dimension index to dimension name."""
+            if dim == -1:
+                return "None"
+            if not has_names:
+                return f"dim_{dim}"
+            return mesh_dim_names[len(mesh_dim_names) - 1 - dim]
+
         readable_map = []
         for item in self._tensor_map:
-            if self._mesh.mesh_dim_names is None:
-                readable_map.append("None")
-            elif isinstance(item, tuple):
-                mapped_tuple = tuple(
-                    self._mesh.mesh_dim_names[len(self._mesh.mesh_dim_names) - 1 - dim] if dim != -1 else "None"
-                    for dim in item
-                )
+            if isinstance(item, tuple):
+                mapped_tuple = tuple(_map_dim(dim) for dim in item)
                 readable_map.append(mapped_tuple)
             else:
-                readable_map.append(
-                    self._mesh.mesh_dim_names[len(self._mesh.mesh_dim_names) - 1 - item] if item != -1 else "None"
-                )
+                readable_map.append(_map_dim(item))
         return tuple(readable_map)
 
     def tensor_map_to_placement(self):

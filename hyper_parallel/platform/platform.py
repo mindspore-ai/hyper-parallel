@@ -16,9 +16,10 @@
 import os
 from datetime import timedelta
 from enum import auto, Enum
-from typing import Optional, Any
+from typing import Optional, Any, Union
 
 import numpy as np
+
 # Environment variable name used to specify the AI framework platform to use
 HYPER_PARALLEL_PLATFORM = "HYPER_PARALLEL_PLATFORM"
 
@@ -249,7 +250,7 @@ class Platform:
     def load_checkpoint(file_path: str) -> dict:
         raise NotImplementedError("Platform subclasses must implement load_checkpoint")
 
-    def _create_group(self, rank_list, group_name=None):
+    def _create_group(self, rank_list):
         raise NotImplementedError("Platform subclasses must implement _create_group")
 
     def new_stream(self):
@@ -270,17 +271,13 @@ class Platform:
     def micro_batch(micro_batch_num, args_batch_dim=None, kwargs_batch_dim=None):
         raise NotImplementedError("Platform subclasses must implement micro_batch")
 
-    def create_group(self, rank_list, group_name=None):
+    def create_group(self, rank_list):
         """create comm group with rank list"""
-        if group_name is None:
-            group_key = hash(tuple(rank_list))
-        else:
-            group_key = group_name
+        group_key = str(tuple(sorted(rank_list)))
         if group_key in EXISTING_COMM_GROUPS:
             return EXISTING_COMM_GROUPS[group_key]
 
-        group = self._create_group(rank_list, group_name)
-        EXISTING_COMM_GROUPS[group_key] = group
+        group = self._create_group(rank_list)
         return group
 
     def _process_current_handle(self):
@@ -412,6 +409,11 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement split_group")
 
     @staticmethod
+    def get_group_local_rank(group=None) -> int:
+        """get group local rank of the given process group."""
+        raise NotImplementedError("Platform subclasses must implement get_group_local_rank")
+
+    @staticmethod
     def no_grad():
         raise NotImplementedError("Platform subclasses must implement no_grad")
 
@@ -499,3 +501,37 @@ class Platform:
         raise NotImplementedError(
             "Platform subclasses must implement clip_grad_norm_"
         )
+
+    @staticmethod
+    def get_created_group(rank_list: Union[list[int], tuple[int]]):
+        """
+        mark created groups
+
+        Args:
+            rank_list: tuple or list of ranks.
+
+        Returns:
+            group corresponding to rank list if it exists, else None
+        """
+        group_key = str(tuple(sorted(rank_list)))
+        if group_key in EXISTING_COMM_GROUPS:
+            return EXISTING_COMM_GROUPS[group_key]
+        return None
+
+    @classmethod
+    def mark_created_groups(cls, process_group: Union[Any, list[Any]]) -> None:
+        """
+        mark created groups
+
+        Args:
+            process_group (Union[Any, list[Any]]): A process group or a list of process groups.
+
+        Returns:
+            group corresponding to rank list if it exists, else None
+        """
+        if not isinstance(process_group, list):
+            process_group = [process_group]
+        for group in process_group:
+            rank_list = cls.get_process_group_ranks(group)
+            group_key = str(tuple(sorted(rank_list)))
+            EXISTING_COMM_GROUPS[group_key] = group

@@ -35,7 +35,7 @@ import torch.distributed as dist
 from hyper_parallel.platform.torch.dtensor import DTensorBase
 from hyper_parallel.platform.torch.pipeline_parallel.stage import PipelineStageBase
 from hyper_parallel.platform.torch.group_utils import create_sub_groups
-from hyper_parallel.platform.platform import Platform, PlatformType
+from hyper_parallel.platform.platform import Platform, PlatformType, EXISTING_COMM_GROUPS
 from hyper_parallel.platform.torch.function_override import override_functions
 
 override_functions()
@@ -344,7 +344,7 @@ class TorchPlatform(Platform):
         if input_tensor.is_leaf:
             input_tensor.requires_grad = True
 
-    def _create_group(self, rank_list, group_name=None):
+    def _create_group(self, rank_list):
         group_dict = create_sub_groups(rank_list)
         return group_dict[tuple(rank_list)]
 
@@ -479,6 +479,10 @@ class TorchPlatform(Platform):
                 will be destroyed.
         """
         group = group or _get_default_group()
+        if group in EXISTING_COMM_GROUPS.values():
+            keys_to_destroy = [k for k, v in EXISTING_COMM_GROUPS.items() if v == group]
+            for k in keys_to_destroy:
+                del EXISTING_COMM_GROUPS[k]
         dist.destroy_process_group(group)
 
     @staticmethod
@@ -538,11 +542,20 @@ class TorchPlatform(Platform):
 
         split_group = None
         for split_rank in split_ranks:
-            dist_group = dist.new_group(ranks=split_rank)
+            dist_group = TorchPlatform.get_created_group(split_rank)
+            if dist_group is None:
+                dist_group = dist.new_group(ranks=split_rank)
+                EXISTING_COMM_GROUPS[str(tuple(sorted(split_rank)))] = dist_group
             if TorchPlatform.get_rank() in split_rank:
                 split_group = dist_group
 
         return split_group
+
+    @staticmethod
+    def get_group_local_rank(group: ProcessGroup = None) -> int:
+        """get group local rank id."""
+        group = group or _get_default_group()
+        return group.rank()
 
     @staticmethod
     def no_grad():
@@ -606,7 +619,7 @@ class TorchPlatform(Platform):
             error_if_nonfinite=error_if_nonfinite, foreach=foreach,
         )
 
-    def cast_fp_tensor(self,dtype, x):
+    def cast_fp_tensor(self, dtype, x):
         """
         Cast floating-point tensor to target dtype if applicable.
         """

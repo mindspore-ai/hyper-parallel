@@ -224,9 +224,8 @@ class HSDPParam:
             return "hsdp_sharded_dp_group_invalid", None
 
         rank_list = self._get_op_rank_list()
-        rank_list_str = "_".join([str(i) for i in rank_list])
-        group_name = "hsdp_sharded_dp_group_" + rank_list_str
-        group = self.platform.create_group(rank_list, group_name)
+        group_name = str(tuple(sorted(rank_list)))
+        group = self.platform.create_group(rank_list)
         return group_name, group
 
     def _create_unsharded_dp_group(self):
@@ -235,9 +234,8 @@ class HSDPParam:
             return "hsdp_unsharded_dp_group_invalid", None
 
         rank_list = self._get_dp_rank_list()
-        rank_list_str = "_".join([str(i) for i in rank_list])
-        group_name = "hsdp_unshared_dp_group_" + rank_list_str
-        group = self.platform.create_group(rank_list, group_name)
+        group_name = str(tuple(sorted(rank_list)))
+        group = self.platform.create_group(rank_list)
         return group_name, group
 
     def _init_param(self):
