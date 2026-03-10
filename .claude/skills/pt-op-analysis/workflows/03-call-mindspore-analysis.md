@@ -38,7 +38,7 @@ If the MindSpore operator has already been analyzed, directly reuse existing ana
 
 ```
 Read existing report:
-.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md
+.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md
 ```
 
 ---

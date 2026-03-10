@@ -21,7 +21,7 @@ Generate a standardized analysis report document based on all results from previ
 
 ## Output
 
-- **Standardized Analysis Report**: `.agentic/skills/dist-op-dev/analysis-results/torch.{OpName}-analysis.md`
+- **Standardized Analysis Report**: `.claude/skills/dist-op-dev/analysis-results/torch.{OpName}-analysis.md`
 
 ---
 
@@ -31,7 +31,7 @@ Generate a standardized analysis report document based on all results from previ
 
 Template file location:
 ```
-.agentic/skills/dist-op-dev/templates/operator-analysis-template.md
+.claude/skills/dist-op-dev/templates/operator-analysis-template.md
 ```
 
 ### Step 2: Fill in Analysis Results
@@ -114,7 +114,7 @@ matmul:
 
 Document save location:
 ```
-.agentic/skills/dist-op-dev/analysis-results/torch.{OpName}-analysis.md
+.claude/skills/dist-op-dev/analysis-results/torch.{OpName}-analysis.md
 ```
 
 **Naming Rules:**
@@ -155,7 +155,7 @@ After completing the analysis document, check each item:
 ## Success Criteria
 
 - [ ] Generated standardized analysis report
-- [ ] Document save location is correct: `.agentic/skills/dist-op-dev/analysis-results/torch.{OpName}-analysis.md`
+- [ ] Document save location is correct: `.claude/skills/dist-op-dev/analysis-results/torch.{OpName}-analysis.md`
 - [ ] Completed all checklist items in quality check
 - [ ] All reference sources are accurately annotated
 - [ ] Reuse strategy is clearly defined

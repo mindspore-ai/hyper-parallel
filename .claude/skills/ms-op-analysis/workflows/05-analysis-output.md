@@ -21,7 +21,7 @@ Generate standardized analysis report document based on all results from previou
 
 ## Output
 
-- **Standardized Analysis Report**: `.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
+- **Standardized Analysis Report**: `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
 
 ---
 
@@ -31,7 +31,7 @@ Generate standardized analysis report document based on all results from previou
 
 Template file location:
 ```
-.agentic/skills/dist-op-dev/templates/operator-analysis-template.md
+.claude/skills/dist-op-dev/templates/operator-analysis-template.md
 ```
 
 This template defines standardized report structure and required content.
@@ -84,7 +84,7 @@ From **Workflow 4.4: Fallback Handling**
 
 Document save location:
 ```
-.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md
+.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md
 ```
 
 **Naming Rules:**
@@ -180,7 +180,7 @@ After completing analysis document, must check item by item:
 ## Success Criteria
 
 - [ ] Generated standardized analysis report
-- [ ] Document save location correct: `.agentic/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
+- [ ] Document save location correct: `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
 - [ ] Completed all checklist items in quality checklist
 - [ ] All reference sources accurately annotated
 - [ ] If applicable, fallback plan clearly marked
