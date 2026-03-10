@@ -37,6 +37,9 @@ Mul:
 Div:
   dist_op_name: _div_dist_op
 
+div_:
+  dist_op_name: _torch_div__dist_op
+
 SubExt:
   dist_op_name: _sub_ext_dist_op
   distributed_op_class: AddDistributedOp
