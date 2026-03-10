@@ -19,8 +19,9 @@ import numpy as np
 import pytest
 
 from hyper_parallel.core.device_mesh import (
-    init_device_mesh, DeviceMesh, _group_map, Tensor, _DEVICE_MESH_MAP
+    init_device_mesh, DeviceMesh, Tensor, _DEVICE_MESH_MAP
 )
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
 
 @pytest.fixture(name="mock_platform")
@@ -45,12 +46,12 @@ def fixture_mock_platform():
 
 
 @pytest.fixture(autouse=True)
-def fixture_clear_group_map():
+def fixture_clear_group_cache():
     """Auto clear global group cache to avoid test case pollution, effective for all test cases"""
-    _group_map.clear()
+    EXISTING_COMM_GROUPS.clear()
     _DEVICE_MESH_MAP.clear()
     yield
-    _group_map.clear()
+    EXISTING_COMM_GROUPS.clear()
     _DEVICE_MESH_MAP.clear()
 
 

@@ -1,5 +1,7 @@
 import torch
 from dataclasses import dataclass
+
+from hyper_parallel.collectives.cc import get_group_local_rank
 from hyper_parallel.core.device_mesh import DeviceMesh
 from typing import Optional
 
@@ -73,7 +75,7 @@ class FSDPMeshInfo(DataParallelMeshInfo):
             raise AssertionError("Expects non-None shard_mesh_dim")
         self.shard_mesh_size: int = self.mesh.mesh_shape[self.shard_mesh_dim]
         self.shard_process_group = self.mesh.get_group(self.shard_mesh_dim)
-        self.shard_mesh_rank: int = self.shard_process_group.rank()
+        self.shard_mesh_rank: int = get_group_local_rank(self.shard_process_group)
 
 
 @dataclass
@@ -84,7 +86,7 @@ class DDPMeshInfo(DataParallelMeshInfo):
             raise AssertionError("Expects non-None replicate_mesh_dim")
         self.replicate_mesh_size: int = self.mesh.mesh_shape[self.replicate_mesh_dim]
         self.replicate_process_group = self.mesh.get_group(self.replicate_mesh_dim)
-        self.replicate_mesh_rank: int = self.replicate_process_group.rank()
+        self.replicate_mesh_rank: int = get_group_local_rank(self.replicate_process_group)
 
 
 @dataclass

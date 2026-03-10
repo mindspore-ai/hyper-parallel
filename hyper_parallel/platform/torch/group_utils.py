@@ -18,6 +18,8 @@ from typing import Dict, List, Tuple, Union
 
 import torch.distributed as dist
 
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+
 
 def _validate_intra_step(normalized_template: List[int], template_len: int) -> int:
     """Verify consistent intra-group step and return intra_step."""
@@ -207,6 +209,7 @@ def create_sub_groups(
 
         # 关键：所有进程都参与每个组的创建
         group = dist.new_group(ranks=sorted_ranks)
+        EXISTING_COMM_GROUPS[str(tuple(sorted_ranks))] = group
 
         # 只在当前进程在组内时保存
         if my_rank in sorted_ranks:
