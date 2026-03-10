@@ -70,9 +70,9 @@ class ParallelInput:
             reader = csv.DictReader(csvfile)
             for row in reader:
                 # key = "_".join([row['dp'], row['tp'], row['pp'], row['ep']])
-                key_columns = list(row.keys())[:-5]  # 获取前N-5列的列名
+                key_columns = list(row.keys())[:-5]  # get first N-5 column names
                 key = "_".join([row[col] for col in key_columns])
-                value = [float(row['dmratio']), float(row['bfratio']), float(row['re_grow_ration']),
+                value = [float(row['dmratio']), float(row['bfratio']), float(row['re_grow_ratio']),
                          float(row['hratio']), float(row['moe_fw'])]
                 result_dict[key] = value
         return result_dict
@@ -93,7 +93,7 @@ class ParallelInput:
         elif args.toml_path:
             model_files = files_dir.glob('*.toml')
         else:
-            raise Exception("No yaml_path or shell_path specified")
+            raise ValueError("No yaml_path or shell_path specified")
         return model_files
 
     def get_args_info(self, para, config_file):
@@ -114,7 +114,7 @@ class ParallelInput:
         args = para.args
         model_files = self.get_model_files_dir(args, profile_file_dir)
         csv_result = {}
-        # 若用户直接输入profiling解析信息---csv文件，则从文件中读入
+        # if user provides profiling parse info (csv), read from file
         if args.parser_result is not None:
             csv_result = self.parse_results_by_csv(args.parser_result)
 
@@ -140,7 +140,7 @@ class ParallelInput:
                     profile_list = csv_result[config_str]
                 else:
                     profile_list = []
-               # todo: profiling解析的输入有待确认,例如rank
+                # TODO: profiling parse input to be confirmed, e.g. rank
                 profile_info = ProfileInfo(args.profile_data_dir, profile_list)
                 input_args = self.get_args_info(para, config_file)
                 pipeline_input_config = PipelineInputConfig(profile_info, config_file, input_args)

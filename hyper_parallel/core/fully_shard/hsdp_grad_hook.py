@@ -39,7 +39,7 @@ class HSDPGradHook:
         output = output.to(origin_dtype)
         return output
 
-    def _get_final_grad_hook(self, param, grad_hook, no_cast=False):
+    def _get_final_grad_hook(self, param, grad_hook, no_cast=False):  # pylint: disable=unused-argument
         """add cast and scale grad"""
         def scale_with_cast_hook(grad):
             output = self._cast_hook(grad_hook, grad)

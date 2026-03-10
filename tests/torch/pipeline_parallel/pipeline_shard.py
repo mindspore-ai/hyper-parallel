@@ -16,7 +16,7 @@
 import numpy as np
 import torch
 # pylint: disable=W0611
-import torch_npu  # 昇腾NPU核心适配
+import torch_npu  # Ascend NPU core adapter
 from hyper_parallel import DTensor, shard_module, init_device_mesh
 from hyper_parallel import PipelineStage
 from hyper_parallel import ScheduleInterleaved1F1B

@@ -67,27 +67,27 @@ def generate_groups_from_template(
     verbose: bool = False
 ) -> List[List[int]]:
     """
-    根据模板组自动生成所有通信组（支持任意合法起始的模板）。
+    Auto-generate all communication groups from a template (supports any valid starting template).
 
-    参数:
-        template: 模板组，例如 [0,1]、[0,2,4,6] 或 [1,3,5,7]
-        world_size: 总进程数
-        my_rank: 当前进程rank（用于打印调试信息）
-        verbose: 是否打印调试信息
+    Args:
+        template: Template group, e.g. [0,1], [0,2,4,6] or [1,3,5,7]
+        world_size: Total number of processes
+        my_rank: Current process rank (for debug output)
+        verbose: Whether to print debug info
 
-    返回:
-        完整的rank列表，例如：
-        - 模板[0,1] + world_size=8 → [[0,1], [2,3], [4,5], [6,7]]
-        - 模板[0,2,4,6] + world_size=8 → [[0,2,4,6], [1,3,5,7]]
-        - 模板[1,3,5,7] + world_size=8 → [[0,2,4,6], [1,3,5,7]]
+    Returns:
+        Full rank list, e.g.:
+        - template [0,1] + world_size=8 -> [[0,1], [2,3], [4,5], [6,7]]
+        - template [0,2,4,6] + world_size=8 -> [[0,2,4,6], [1,3,5,7]]
+        - template [1,3,5,7] + world_size=8 -> [[0,2,4,6], [1,3,5,7]]
 
-    原理:
-        1. 模板归一化：将任意起始的模板转换为以0为起点的基准模板
-        2. 分析基准模板的模式（组内步长、模板跨度）
-        3. 按块遍历，在每个块内生成所有合法子组
-        4. 确保每个rank恰好出现在一个组中
+    Algorithm:
+        1. Template normalization: convert any starting template to 0-based
+        2. Analyze pattern (intra-step, template span)
+        3. Iterate by blocks, generate valid sub-groups per block
+        4. Ensure each rank appears in exactly one group
     """
-    # 将模板转换为整数列表并排序（rank_list 可能来自 numpy/tensor 等为 float）
+    # convert template to int list and sort (rank_list may come from numpy/tensor as float)
     template = sorted([int(x) for x in list(template)])
     world_size = int(world_size)
     my_rank = int(my_rank)
@@ -102,20 +102,20 @@ def generate_groups_from_template(
     if template_len < 2:
         raise ValueError(f"Template must have at least 2 ranks, got {template}")
 
-    # 1. 模板归一化：转换为以0为起点的基准模板（消除起始值影响）
-    template_base = template[0] # 原始模板的起始值
-    normalized_template = [x - template_base for x in template] # 归一化到0起点
+    # 1. Template normalization: convert to 0-based template
+    template_base = template[0]  # original template start value
+    normalized_template = [x - template_base for x in template]  # normalize to 0-based
     if verbose:
         print(f"Rank {my_rank}: Normalized Template = {normalized_template}")
 
-    # 2. 分析归一化后的模板核心参数
-    # 组内步长（模板内元素的间隔）
+    # 2. Analyze normalized template core params
+    # intra-step: spacing between elements in template
     intra_step = _validate_intra_step(normalized_template, template_len)
-    # 模板跨度（归一化模板最后一个元素 - 第一个元素）
+    # template span: last - first element of normalized template
     template_span = normalized_template[-1] - normalized_template[0]
-    # 块大小：每个块可容纳的rank数（决定组间步长）
+    # block size: ranks per block (determines inter-step)
     block_size = int(intra_step * template_len)
-    # 组间步长：相邻块的起始间隔（等于块大小）
+    # inter-step: spacing between adjacent blocks (equals block_size)
     inter_step = block_size
 
     if verbose:
@@ -125,25 +125,25 @@ def generate_groups_from_template(
             f"block_size={block_size}, inter_step={inter_step}"
         )
 
-    # 3. 计算所有合法的块起始位置
+    # 3. Compute all valid block start positions
     group_starts = _compute_group_starts(world_size, block_size, inter_step)
     if verbose:
         print(f"Rank {my_rank}: Possible block starts: {group_starts}")
 
-    # 4. 为每个块生成所有合法子组
+    # 4. Generate all valid sub-groups for each block
     template_span_int = int(template_span)
     all_groups = _build_groups_for_blocks(
         group_starts, block_size, template_span_int,
         normalized_template, template_len, world_size
     )
 
-    # 5. 验证：确保每个rank只出现一次
+    # 5. Validate: ensure each rank appears exactly once
     all_ranks = [rank for group in all_groups for rank in group]
     unique_ranks = set(all_ranks)
     if len(all_ranks) != len(unique_ranks):
         raise ValueError("Duplicate ranks found! Some ranks appear in multiple groups.")
 
-    # 6. 排序：确保所有进程生成的组顺序一致
+    # 6. Sort: ensure all processes generate groups in same order
     all_groups.sort(key=lambda x: (x[0], x[1] if len(x) > 1 else 0))
 
     if verbose:
@@ -161,16 +161,16 @@ def create_sub_groups(
     verbose: bool = False
 ) -> Dict[tuple, dist.ProcessGroup]:
     """
-    创建子通信组，支持模板组自动扩展。
+    Create sub-communication groups, supports template auto-expansion.
 
-    参数:
-        rank_list: 可以是以下两种格式之一：
-                  1. 完整的组列表，例如 [[0,1], [2,3], [4,5], [6,7]]
-                  2. 模板组，例如 [0,1] 或 [0,2]，会自动扩展
-        verbose: 是否打印调试信息
+    Args:
+        rank_list: One of:
+                  1. Full group list, e.g. [[0,1], [2,3], [4,5], [6,7]]
+                  2. Template group, e.g. [0,1] or [0,2], will auto-expand
+        verbose: Whether to print debug info
 
-    返回:
-        字典，键为组ranks的元组，值为该组的ProcessGroup对象
+    Returns:
+        Dict, key is tuple of group ranks, value is ProcessGroup
     """
     my_rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -180,7 +180,7 @@ def create_sub_groups(
     if verbose:
         print(f"Rank {my_rank}: Full rank list to create: {full_rank_list}")
 
-    # 验证完整组列表格式
+    # validate full group list format
     for i, group in enumerate(full_rank_list):
         if not isinstance(group, (list, tuple)):
             raise ValueError(f"Group {i} must be a list or tuple, got {type(group)}")
@@ -192,26 +192,26 @@ def create_sub_groups(
             if not isinstance(rank, int):
                 raise ValueError(f"Rank must be integer, got {type(rank)} in group {i}")
 
-    # 按照第一个元素的顺序排序，确保所有进程以相同顺序创建组
+    # sort by first element to ensure all processes create groups in same order
     sorted_groups = sorted(full_rank_list, key=lambda x: x[0])
 
     if verbose:
         print(f"Rank {my_rank}: Sorted groups for creation: {sorted_groups}")
 
-    # 创建所有组并收集当前进程所在的组
+    # create all groups and collect groups current process belongs to
     group_dict = {}
     for group_ranks in sorted_groups:
-        # 确保ranks有序，这样每个进程传入相同的顺序
+        # ensure ranks are ordered so each process passes same order
         sorted_ranks = sorted(group_ranks)
 
         if verbose:
             print(f"Rank {my_rank}: Creating group with ranks {sorted_ranks}")
 
-        # 关键：所有进程都参与每个组的创建
+        # key: all processes participate in each group creation
         group = dist.new_group(ranks=sorted_ranks)
         EXISTING_COMM_GROUPS[str(tuple(sorted_ranks))] = group
 
-        # 只在当前进程在组内时保存
+        # only save when current process is in the group
         if my_rank in sorted_ranks:
             group_dict[tuple(sorted_ranks)] = group
 

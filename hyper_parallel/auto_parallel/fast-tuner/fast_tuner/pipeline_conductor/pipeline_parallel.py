@@ -91,13 +91,13 @@ def pipeline_proc(pipeline_input: ParallelInput):
         candidate_input.layer_ratio = candidate.profiling_info.dmratio
         candidate_input.backward_ratio = candidate.profiling_info.bfratio
         candidate_input.head_loss = candidate.profiling_info.hratio
-        candidate_input.recompute_ratio = candidate.profiling_info.re_grow_ration
+        candidate_input.recompute_ratio = candidate.profiling_info.re_grow_ratio
         num_cur += 1
         logger.info(f'--------------------- Testing {num_cur}/{num_all}:{candidate.config_path} ---------------------')
         try:
             cur_solution = pp_calculator(candidate_input)
             result_csv.result_to_csv(cur_solution)
-        except Exception as e:
+        except (RuntimeError, ValueError, TypeError) as e:
             logger.error(f'{candidate.config_path} error: {e}. Continue to next one')
 
 
@@ -131,7 +131,7 @@ def solve_problem(init_config: InitConfig):
         pp_util.highs_solve_mps(mps_file, sol_file, origin_model, init_config.expert_input.time_limit)
     elif init_config.expert_input.solver_name == 'QIUQI':
         is_origin_solver = False
-        solver_file = '/home/zhugelu/MIXSolver/bin/MIXSolver'  # 更改为本地的求解器地址
+        solver_file = '/home/zhugelu/MIXSolver/bin/MIXSolver'  # change to local solver path
         pp_util.qiuqi_solver_mps(solver_file, mps_file, sol_file, origin_model)
     else:
         is_origin_solver = True
@@ -148,7 +148,7 @@ if __name__ == '__main__':
             'Balance layers onto pipeline stages, '
             + 'considering recomputation and interleaving'),
                                      epilog='')
-    # 大模型类别
+    # large model type
     parser.add_argument('-llm', '--llm_class', type=int, default=0,
                         help="0-deepseek,1-boss")
     # Training Yaml configuration
@@ -179,19 +179,19 @@ if __name__ == '__main__':
     # Search time
     parser.add_argument('-t', '--time_limit', type=int, default=sys.maxsize,
                         help="Limitation on searching time")
-    # 是否自动Dryrun
+    # auto dryrun
     parser.add_argument('-dryrun', '--dryrun', type=pp_util.str2bool, default=True,
                         help="Is auto dryrun")
-    # 是否自动check
+    # auto check
     parser.add_argument('-check', '--check', type=pp_util.str2bool, default=True,
                         help="IS double check")
     parser.add_argument('-is_write', '--is_write', type=pp_util.str2bool, default=True,
                         help="IS write solution to config file")
-    # fit level，0：超内存时直接减少内存上限求解；1：超内存时线性回归拟合内存信息求解
+    # fit level: 0=reduce mem limit when OOM; 1=linear fit mem info when OOM
     parser.add_argument('-fit', '--fit_level', type=int, default=0,
                         help="Fit memory when the result is over the limit: 0-reduce the memory limit;"
                              " 1 or >1-fit the memory info")
-    # 是否提取solution信息
+    # extract solution info
     parser.add_argument('-extract', '--extract', type=pp_util.str2bool, default=False,
                         help="Extract solution file separately")
     parser.add_argument('-solution', '--solution', default=None, help="The solution file")

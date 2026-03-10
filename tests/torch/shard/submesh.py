@@ -139,7 +139,7 @@ def test_sub_mesh_column_parallel_forward():
 
     rank = platform.get_rank()
     x_input_np_2 = None
-    if rank in (0, 1): # 相当于手动做x的dp轴Shard(0)
+    if rank in (0, 1):  # manually Shard(0) on dp axis of x
         x_input_np_2 = np.array([
             [0, 1, 2, 3],
             [4, 5, 6, 7]
@@ -327,7 +327,7 @@ def test_sub_mesh_row_parallel_forward():
 
     rank = platform.get_rank()
     x_input_np_2 = None
-    if rank in (0, 1): # 相当于手动做x的dp轴Shard(0)
+    if rank in (0, 1):  # manually Shard(0) on dp axis of x
         x_input_np_2 = np.array([
             [0, 1, 2, 3],
             [4, 5, 6, 7]
@@ -430,7 +430,7 @@ def test_sub_mesh_row_parallel_redistribute_forward():
 
     rank = platform.get_rank()
     x_input_np_2 = None
-    if rank in (0, 1): # 相当于手动做x的dp轴Shard(0)
+    if rank in (0, 1):  # manually Shard(0) on dp axis of x
         x_input_np_2 = np.array([
             [0, 1, 0, 1],
             [0, 1, 0, 1]
@@ -534,7 +534,7 @@ def test_sub_mesh_row_parallel_redistribute_forward():
     )
 
     # redistribute y：Shard(0)
-    dst_placements2 = (Shard(0),) # 先rank0,1 reduce，再tp上切0轴
+    dst_placements2 = (Shard(0),)  # rank0,1 reduce first, then shard 0-axis on tp
     redist_y2 = dist_y.redistribute(tp_mesh, dst_placements2)
     redist_out_network2 = redist_y2 + dist_b
     redist_out_network2 = redist_out_network2.reduce_partial()

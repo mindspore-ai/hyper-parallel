@@ -53,7 +53,7 @@ def save_layout(layout_dict: dict, file_path: Union[Path, str]) -> None:
     """
     Save layout to file
     """
-    # todo: check and create file path
+    # TODO: check and create file path
     with open(file_path, 'w', encoding="utf-8") as f:
         json.dump(layout_dict, f, ensure_ascii=False)
 
@@ -62,7 +62,7 @@ def load_layout(file_path: Union[Path, str]) -> dict:
     """
     Load layout from file
     """
-    # todo check path
+    # TODO: check path
     with open(file_path, 'r', encoding='utf-8') as f:
         param_layout_dict = json.load(f)
     return param_layout_dict

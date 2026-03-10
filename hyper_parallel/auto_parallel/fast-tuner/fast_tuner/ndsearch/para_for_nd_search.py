@@ -56,7 +56,7 @@ class ParaForNd:
         self.pipeline_parallel_schedule = "Interleaved1F1B"
         self.model_name = None
 
-        # for profile parser todo: 只为mindspeed服务，不应该在这里
+        # for profile parser TODO: mindspeed only, should not be here
         self.num_layer_list = [4, 3]
         self.recompute_method = 'block'
         self.recompute_num_layers = 1
@@ -68,99 +68,99 @@ class ParaForNd:
             logger.info(f"{attr}: {value}")
 
     def convert_value(self, value_str):
-        """尝试将字符串转换为整数/浮点数，失败则返回原字符串"""
+        """Try to convert string to int/float, return original on failure"""
         if not value_str:
             return value_str
-        # 尝试整数转换（处理正负整数）
+        # try int conversion (handle +/- integers)
         if value_str.lstrip('-').isdigit():
             return int(value_str)
-        # 尝试浮点数转换（处理正负浮点数、科学计数法）
+        # try float conversion (handle +/- float, scientific notation)
         try:
             return float(value_str)
         except ValueError:
-            return value_str  # 非数字则返回原字符串
+            return value_str  # return original if not numeric
 
     def parse_toml_parameters(self, toml_file_path):
         params = toml.load(toml_file_path)
         return params
 
-    # 部分变量没有解析出来，多行参数和引用都能解析
+    # some vars not parsed, multi-line params and refs are parsed
     def parse_sh_parameters(self, sh_file_path):
         """
-        解析 shell 脚本内容中的参数，返回包含各模块参数的字典
+        Parse shell script params, return dict of module params.
 
         Args:
-            sh_content: 读取的 shell 脚本内容（字符串）
+            sh_content: shell script content (string)
         Returns:
-            dict: 按模块分组的参数字典，格式为 {模块名: {参数名: 参数值}}
+            dict: params by module, format {module_name: {param_name: param_value}}
         """
-        # 存储结果：模块名 -> {参数名: 参数值}
+        # result: module_name -> {param_name: param_value}
 
         with open(sh_file_path, 'r', encoding='utf-8') as f:
             sh_content = f.read()
         result = {}
 
-        # 1. 提取所有变量（如 TP=1, DATA_PATH="xxx" 等），用于替换参数中的变量引用（如 ${TP}）
+        # 1. Extract all vars (e.g. TP=1, DATA_PATH="xxx") for replacing refs like ${TP}
         variables = self.parse_variable(sh_content)
 
-        # 2. 提取模块参数（如 GPT_ARGS、DATA_ARGS）
+        # 2. Extract module params (e.g. GPT_ARGS, DATA_ARGS)
         self.parse_module_args(result, sh_content, variables)
 
-        # 3. 展开 result：将所有模块的参数字典合并为一个扁平字典
+        # 3. Flatten result: merge all module param dicts
         flattened_params = {}
         for _, params in result.items():
-            # 合并到全局字典（若有重复参数，后面的模块会覆盖前面的）
+            # merge to global dict (later module overwrites on conflict)
             flattened_params.update(params)
 
         return flattened_params
 
     def parse_module_args(self, result, sh_content, variables):
         """
-        匹配模块定义（如 GPT_ARGS="...参数..."）
+        Match module definition (e.g. GPT_ARGS="...params...")
         """
         module_pattern = re.compile(r'^(\w+)\s*=\s*"(.*?)"$', re.DOTALL | re.MULTILINE)
         for module_match in module_pattern.finditer(sh_content):
-            module_name = module_match.group(1)  # 模块名：GPT_ARGS 或 DATA_ARGS
-            module_content = module_match.group(2)  # 模块内的参数内容
+            module_name = module_match.group(1)  # e.g. GPT_ARGS or DATA_ARGS
+            module_content = module_match.group(2)  # param content in module
 
-            # 解析模块内的参数（--key value 形式）
+            # parse params in module (--key value form)
             param_pattern = re.compile(r'--(\w[\w-]*)\s+([^\s\\]+)')
-            # 处理无值参数（如 --use-flash-attn）
+            # handle flag params (e.g. --use-flash-attn)
             flag_pattern = re.compile(r'--(\w[\w-]*)')
 
             module_params = {}
 
-            # 先提取带值的参数（如 --data-path $DATA_PATH）
+            # extract params with value first (e.g. --data-path $DATA_PATH)
             for match in param_pattern.finditer(module_content):
-                param_key = match.group(1)  # 参数名：data-path
-                param_value = match.group(2)  # 参数值：$DATA_PATH
+                param_key = match.group(1)  # param name: data-path
+                param_value = match.group(2)  # param value: $DATA_PATH
 
-                # 替换变量引用（如 $DATA_PATH 替换为实际值）
+                # replace var refs (e.g. $DATA_PATH -> actual value)
                 for var_name, var_val in variables.items():
                     param_value = param_value.replace(f'${var_name}', var_val).replace(f'${{{var_name}}}', var_val)
 
                 module_params[param_key.replace('-', '_')] = self.convert_value(param_value)
 
-            # 再提取无值参数（如 --use-flash-attn）
+            # then extract flag params (e.g. --use-flash-attn)
             for match in flag_pattern.finditer(module_content):
                 param_key = match.group(1)
                 standard_key = param_key.replace('-', '_')
-                if standard_key not in module_params:  # 避免覆盖已提取的带值参数
-                    module_params[param_key.replace('-', '_')] = True  # 用 True 表示开关参数开启
+                if standard_key not in module_params:  # avoid overwriting value params
+                    module_params[param_key.replace('-', '_')] = True  # True for flag on
             if module_params:
                 result[module_name] = module_params
 
     def parse_variable(self, sh_content):
         """
-        提取所有变量（如 TP=1, DATA_PATH="xxx" 等），用于替换参数中的变量引用（如 ${TP}）
+        Extract all vars (e.g. TP=1, DATA_PATH="xxx") for replacing refs like ${TP}
         """
         variables = {}
         var_pattern = re.compile(r'^(\w+)\s*=\s*([\'"])(.*?)\2$', re.MULTILINE)
         for match in var_pattern.finditer(sh_content):
-            var_name = match.group(1)  # 变量名（如 A）
-            var_value = match.group(3)  # 变量值（如 cccc）
+            var_name = match.group(1)  # var name (e.g. A)
+            var_value = match.group(3)  # var value (e.g. cccc)
             variables[var_name] = var_value
-        # 补充处理不带引号的变量（如 TP=1, PP=4）
+        # handle unquoted vars (e.g. TP=1, PP=4)
         var_pattern2 = re.compile(r'^(\w+)\s*=\s*([\w.]+)$', re.MULTILINE)
         for match in var_pattern2.finditer(sh_content):
             var_name = match.group(1)
@@ -247,7 +247,7 @@ class ParaForNd:
                 getattr(model_args, 'moe_args', None), 'num_shared_experts', 0)
             self.multi_latent_attention = bool(self.q_lora_rank)
 
-        except Exception as e:
+        except (ImportError, AttributeError) as e:
             print(f'Error is: {e}')
         self.profile_steps = 1
 
@@ -270,7 +270,7 @@ class ParaForNd:
 
     def cal_ffn_hidden_size(self, model_args):
         """
-        更新ffn_hidden_size
+        Update ffn_hidden_size
         """
         print(f"origin_ffn_hidden_size {self.ffn_hidden_size}")
         multiple_of = getattr(model_args, 'multiple_of', None)

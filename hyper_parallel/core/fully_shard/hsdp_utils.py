@@ -47,6 +47,7 @@ class HSDPConfigV2:
 
     def __init__(self, mesh, reshard_after_forward, shard_placement_fn, mp_policy, offload_policy, ignored_param,
                  reduce_dtype=None, comm_async=False, comm_fusion=False, bucket_size=-1):
+        # pylint: disable=unused-argument
         """
             HSDP config init method
             Args:
@@ -67,7 +68,7 @@ class HSDPConfigV2:
         self.mp_policy = mp_policy
         self.offload_policy = offload_policy
         self.reduce_dtype = self.mp_policy.reduce_dtype if self.mp_policy else None
-        # TODO: 下方属性待删除
+        # TODO: attributes below are to be removed
         self.comm_async = False
         self.comm_fusion = False
         self.bucket_size = 9999

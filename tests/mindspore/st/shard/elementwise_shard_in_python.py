@@ -162,7 +162,7 @@ def test_minimum_same_shape_parallel_1():
         mesh_dim_names=base_alias_name
     )
 
-    # Placement元组: (dp轴行为, cp轴行为, tp轴行为)
+    # Placement tuple: (dp axis, cp axis, tp axis)
     x_placements = (Shard(0), Shard(1), Shard(2))
     y_placements = (Shard(0), Shard(1), Shard(2))
     relu_placements = (Shard(0), Shard(1), Shard(2))

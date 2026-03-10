@@ -16,10 +16,11 @@
 # enhanced with fully_shard parameter management
 # ============================================================================
 """HSDP parameter"""
+# pylint: disable=protected-access
 from typing import List, Callable, Optional, cast, Tuple
 import itertools
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.distributed as dist
 from torch._prims_common import make_contiguous_strides_for
 from hyper_parallel.platform.torch.fully_shard.utils import (
@@ -143,7 +144,8 @@ class TorchHSDPParamV2(HSDPParamV2):
             else self.sharded_param.shape
         )
         reduced_grad = reduced_grad.view(sharded_param_local_shape)
-        if not self.mp_policy.apply_grad_on_fp32_main_grad and param_type is not None and reduced_grad.dtype != param_type:
+        if (not self.mp_policy.apply_grad_on_fp32_main_grad and param_type is not None
+                and reduced_grad.dtype != param_type):
             reduced_grad = reduced_grad.to(param_type)
         to_accumulate_grad = sharded_grad is not None
         need_synchronize = False
@@ -267,7 +269,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.sharded_param = nn.Parameter(DTensor.from_local(sharded_param, self._spmd_mesh, self._spmd_placements))
         self.sharded_param.requires_grad_(param.requires_grad)
         self._setattr_on_modules(self.sharded_param)
-        # 初始化后，self.sharded_param替换掉原先的param，后续梯度也需要注意要累加到这个Parameter的grad上
+        # after init, self.sharded_param replaces original param, gradients must accumulate to this Parameter's grad
         self.sharded_param._hsdp_param_initialized = True
         self.sharded_state = ShardedState.SHARDED
         self.param_dtype = None
@@ -402,6 +404,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.sharded_state = ShardedState.UNSHARDED
 
     def _setattr_on_modules(self, param: nn.Parameter) -> None:
+        """Set parameter on module and shared modules, preserving pointer consistency."""
         if getattr(self._module_info.module.__setattr__, "__func__", None) is nn.Module.__setattr__:
             # fast path
             self._module_info.module._parameters[self._module_info.param_name] = param
@@ -484,13 +487,11 @@ class TorchHSDPParamV2(HSDPParamV2):
                 )
             if self.param_dtype is not None and self.param_dtype != sharded_param_data.dtype:
                 return [sharded_param_data.to(self.param_dtype)]
-            else:
-                return [sharded_param_data]
-        elif self.sharded_state == ShardedState.SHARDED_POST_FORWARD:
+            return [sharded_param_data]
+        if self.sharded_state == ShardedState.SHARDED_POST_FORWARD:
             if self.param_dtype is not None and self.param_dtype != self._sharded_post_forward_param_data.dtype:
                 return [self._sharded_post_forward_param_data.to(self.param_dtype)]
-            else:
-                return [self._sharded_post_forward_param_data]
+            return [self._sharded_post_forward_param_data]
         return [torch.empty(0)]
 
     @property
@@ -572,7 +573,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         # and use `sd` without calling .state_dict() per iteration
         same_local_tensor = False
         # TODO: need to support tensor subclass
-        if type(self._sharded_param_data) is torch.Tensor:
+        if type(self._sharded_param_data) is torch.Tensor:  # pylint: disable=unidiomatic-typecheck
             same_local_tensor = (
                 # when sharding param with shape (1, ...) over 2 ranks
                 # local_tensor on rank 1 can be size 0, data_ptr() can be 0
@@ -659,7 +660,7 @@ class TorchHSDPParamV2(HSDPParamV2):
 
     def unshard(self, async_op: bool = False) -> None:
         if self.prefetch_handle is not None:
-            # 已经被prefetch 触发过了，直接return
+            # already triggered by prefetch, return directly
             return  # no-op
 
         _, handle = self._get_unsharded_param_data(async_op=async_op)
@@ -733,7 +734,7 @@ class TorchHSDPParamV2(HSDPParamV2):
             group=shard_group,
             async_op=async_op,
         )
-
+        return self._reduce_scatter_output, self.reduce_scatter_handle
 
     def all_reduce_grad(
         self,
@@ -775,6 +776,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.all_reduce_handle = dist.all_reduce(grad, op=reduce_op,
                                                  group=replicate_group, async_op=async_op)
         self._all_reduce_output = grad
+        return grad, self.all_reduce_handle
 
 
 def set_requires_grad_if_needed(

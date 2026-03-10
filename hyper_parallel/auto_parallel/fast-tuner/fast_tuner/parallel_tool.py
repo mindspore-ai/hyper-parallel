@@ -32,7 +32,7 @@ from fast_tuner.utils.ppc_input import ParallelInput
 from fast_tuner.utils.profiling.profile_launch import ProfileLaunch
 from fast_tuner.utils.profiling.profile_parser import ProfileParser, ProfileMemParser
 from fast_tuner.utils.profiling.profile_prepare import profile_prepare
-# 这里不应该有的
+# should not be here
 from fast_tuner.pipeline_conductor import pp_util
 from fast_tuner.pipeline_conductor.pipeline_parallel import pipeline_proc
 
@@ -44,7 +44,7 @@ def taylor_search_tool(para):
     A function for find out optimal ND parallel configuration.
 
     Args:
-        param para: 用户输入自定义的参数
+        param para: user custom params
 
     Returns:
         parallel config fill back to yaml file: [dp, cp, tp, ...] and candidate csv file.
@@ -75,18 +75,18 @@ def taylor_search_tool(para):
     if para.ALG_PHASE == 1:
         logger.info(f"ALG_PHASE: {para.ALG_PHASE}, no need to profile and solve pipeline")
         return
-    # 自动执行profile
+    # auto run profile
     profile_launch = ProfileLaunch(profile_configs, para)
     profile_launch.profile_launch(profile_file_dir)
-    # 自动profile解析
+    # auto profile parse
     profile_parser = ProfileParser(input_args, para)
     profile_parser.parse_batch_profile_result(profile_configs)
 
-    # 内存解析
+    # memory parse
     profile_mem_parser = ProfileMemParser(input_args, para)
     profile_mem_parser.mem_parser(profile_configs)
 
-    # 流水线求解 todo: 想办法把candidate_configs传进去，不用csv读取
+    # pipeline solve TODO: pass candidate_configs in instead of parsing csv
     pipeline_input = ParallelInput(para, profile_file_dir)
     pipeline_proc(pipeline_input)
 

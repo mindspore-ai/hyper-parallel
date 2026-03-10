@@ -68,7 +68,7 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def get_rng_state(device=None, device_handle=None):
-        """Get RNG state """
+        """Get RNG state"""
         _ = device, device_handle
         return ms.get_rng_state()
 

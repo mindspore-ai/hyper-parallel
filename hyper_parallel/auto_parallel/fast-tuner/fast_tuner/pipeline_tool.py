@@ -25,7 +25,7 @@ from fast_tuner.pipeline_conductor import pp_util
 
 if __name__ == '__main__':
     logger.info('start to run pipeline tool')
-    # 用户输入profiling结果，候选配置等信息，流水线工具给出配置cost排序
+    # user provides profiling result, candidate configs; pipeline tool outputs config cost order
     parser = argparse.ArgumentParser(description='Run taylor pipeline_search_tool with user input parameters')
     parser.add_argument('--files_dir', type=str, default='./output/dryrun_yaml/',
                         help='Path to the YAML or SHELL file directory')

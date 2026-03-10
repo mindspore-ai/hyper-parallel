@@ -227,7 +227,7 @@ def build_recompute_config(is_select_recompute, is_recompute, select_recompute_l
     }
 
     if is_select_recompute:
-        # 选择对应层的算子进行重计算
+        # select recompute ops for corresponding layers
         recompute_config['select_recompute'] = {}
         recompute_config['select_recompute'][r'feed_forward\.null'] = select_recompute_layers
         recompute_config['select_recompute'][r'feed_forward\.w1\.activation\.silu'] = select_recompute_layers
@@ -235,7 +235,7 @@ def build_recompute_config(is_select_recompute, is_recompute, select_recompute_l
         recompute_config['select_recompute'][r'feed_forward\.w2\.reshape'] = select_recompute_layers
         recompute_config['select_recompute'][r'add'] = select_recompute_layers
         recompute_config['select_recompute'][r'cast_up'] = select_recompute_layers
-        # 选择对应层的算子进行通信重计算
+        # select comm recompute ops for corresponding layers
         recompute_config['select_comm_recompute'] = {}
         recompute_config['select_comm_recompute'][r'.*\.norm'] = select_recompute_layers
         recompute_config['select_comm_recompute'][r'attention\.wq\.reshape'] = select_recompute_layers
@@ -282,7 +282,7 @@ def sort_micro(parts, num_vpp, num_stage, distribution, low_mem, seq_split, is_f
             for micro_id in range(distribution[part]):
                 for split in range(seq_split - 1, -1, -1):
                     backward.append((part, vpp, 'b', micro_id, split))
-    # f-then-b的调度规则，待启用
+    # f-then-b schedule rule, to be enabled
     if is_f_then_b:
         for stage in range(num_stage):
             stage_order = []
@@ -299,7 +299,7 @@ def sort_micro(parts, num_vpp, num_stage, distribution, low_mem, seq_split, is_f
             warmup = min(((num_vpp - 1) * distribution[0] + (num_stage - stage - 1)) * seq_split, len(forward))
         else:
             warmup = min(((num_vpp - 1) * distribution[0] + (num_stage - stage - 1) * 2) * seq_split, len(forward))
-        # 最后一个stage，第一个micro前向做完之后才能做后向
+        # last stage: backward only after first micro forward done
         if stage == num_stage - 1:
             warmup = warmup + seq_split - 1
         stage_order = []
@@ -352,7 +352,7 @@ def find_most_times_stage(layer_num_of_stage):
     Finds the stage with the most frequent occurrence
     in the layer distribution configuration
     """
-    # key 为各个stage的layer数，value 为layer数对应的stage编号List
+    # key: layer count per stage, value: stage index list for that layer count
     frequency_dict = {}
     layer_num = layer_num_of_stage[0]
     max_time = 0
@@ -407,7 +407,7 @@ def get_peak_batch(micro_batch_num, num_stage, num_vpp, low_mem, offset, num_lay
     distribution = construct_distribution(micro_batch_num, num_stage)
     final_orders = sort_micro(micro_batch_num // num_stage, num_vpp, num_stage, distribution, low_mem, 1)
     layers_stage_vpp = get_layers_distribution(offset, num_layers, num_stage, num_vpp)
-    # 求峰值内存时的激活份数
+    # activation count for peak memory
     peaks = [0] * num_stage
     for stage in range(num_stage):
         cur_mem = 0
@@ -479,7 +479,7 @@ def bulid_shell(old_shell_file, offset, num_layers, num_vpp, num_stage, dense_la
     layer_num = num_layers//num_stage
     layer_list = flatten_to_str(offset, layer_num)
     configs['NUM_LAYERS_LIST'] = layer_list
-    # 内存不够，重计算全开
+    # OOM: enable full recompute
     if 'RECOMPUTE_NUM_LAYERS' in configs:
         configs['RECOMPUTE_NUM_LAYERS'] = max(layer_list)
     if 'FIRST_K_DENSE_REPLACE' in configs:

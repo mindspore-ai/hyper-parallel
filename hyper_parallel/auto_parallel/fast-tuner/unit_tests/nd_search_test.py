@@ -24,9 +24,9 @@ from fast_tuner.utils.profiling.profile_parser import ProfileParser
 
 
 class NdTestCase(unittest.TestCase):
-    """ND搜索单元测试用例"""
+    """ND search unit tests"""
     def test_memory_prune(self):
-        """测试根据dryrun的内存信息对候选配置剪枝功能"""
+        """Test candidate config pruning by dryrun memory info"""
         # input construct
         input_args = InputConfig('../../config/pretrain_deepseek3_671b.yaml')
         dryrun_info_init = [
@@ -86,14 +86,14 @@ class NdTestCase(unittest.TestCase):
     def test_initial_expert_space(self):
         input_args = InputConfig('../../config/pretrain_deepseek3_671b.yaml')
         initial_configs = build_initial_spaces(input_args)
-        # 生成搜索空间test
+        # generate search space test
         assert len(initial_configs) == 576030
 
-        # 专家剪枝test
+        # expert pruning test
         expert_prune_search_space = expert_filter_configs(initial_configs, input_args, 1024)
         assert len(expert_prune_search_space) == 8753
 
-    # dryrun yaml生成test
+    # dryrun yaml generation test
 
     # parser test
     def test_profile_parser(self):

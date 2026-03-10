@@ -58,7 +58,7 @@ class ResultCsv:
         new_row[h.index('low_mem')] = low_mem
         new_row[h.index('dense:moe')] = candidate.profiling_info.dmratio
         new_row[h.index('反向:正向')] = candidate.profiling_info.bfratio
-        new_row[h.index('重计算增加比率')] = candidate.profiling_info.re_grow_ration
+        new_row[h.index('重计算增加比率')] = candidate.profiling_info.re_grow_ratio
         new_row[h.index('mtp+head')] = candidate.profiling_info.hratio
         new_row[h.index('moe时长')] = candidate.profiling_info.moe_fw
         if DryRun.config_file_type == 0:

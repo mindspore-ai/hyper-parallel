@@ -62,7 +62,7 @@ def test_full_mesh_shard_forward_1():
     w_p = (Replicate(), Shard(1))
     b_p = (Replicate(), Shard(0))
 
-    # 创建分布式张量
+    # create distributed tensor
     dist_x = distribute_tensor(x_input, mesh, x_p)
     dist_w = distribute_tensor(w_input, mesh, w_p)
     dist_b = distribute_tensor(b_input, mesh, b_p)

@@ -24,7 +24,7 @@ from fast_tuner.utils.logger import logger
 
 
 def env_update(rank_size, env_variable_json):
-    # 设置环境变量
+    # set env vars
     with open(env_variable_json, 'r', encoding='utf-8') as f:
         env_vars = json.load(f)
     env_vars['RANK_SIZE'] = str(rank_size)
@@ -43,7 +43,7 @@ def execute_command(para, config_file_path, target_dir, rank_id, tp):
     else:
         command = ['bash', config_file_path]
     try:
-        # 构建日志文件路径
+        # build log file path
         os.environ['RANK_ID'] = str(rank_id)
         os.environ['MODEL_PARALLEL'] = str(tp)
         os.makedirs(target_dir, exist_ok=True)
@@ -51,7 +51,7 @@ def execute_command(para, config_file_path, target_dir, rank_id, tp):
         with open(log_file_path, 'w', encoding='utf-8') as log_file:
             logger.info(f"Command: {' '.join(command)} rank {rank_id} start run")
             subprocess.run(command, stdout=log_file, stderr=subprocess.STDOUT, check=False)
-    except Exception as e:
+    except OSError as e:
         logger.error(f"The command execution failed.: {e}")
 
 def calculate_rank_id(input_args, match, layer_num, rank_size):
@@ -68,7 +68,7 @@ def read_dryrun_info(root_dir):
     '''read the peak mem from dryrun log'''
     logger.info(f"Reading dryrun info from {root_dir}")
     result_list = []
-    # 预编译正则表达式，提高匹配性能
+    # precompile regex for performance
     pattern = re.compile(r'DP(\d+)_TP(\d+)_PP(\d+)_EP(\d+)')
 
     for entry in os.scandir(root_dir):
@@ -86,7 +86,7 @@ def read_dryrun_info(root_dir):
                     peak_value = int(peak_value.rstrip('M'))
                     break
             else:
-                # 如果没有找到 peak 值，跳过当前目录
+                # skip if no peak value found
                 continue
 
         match = pattern.search(entry.name)
@@ -117,7 +117,7 @@ def launch_dryrun(input_args, dryrun_file_dir, dryrun_data_dir, para):
     tasks = []
     layer_num = input_args.num_layers
 
-    # 遍历指定目录下的所有文件
+    # iterate all files under directory
     for root, _, files in os.walk(dryrun_file_dir):
         for file in files:
             pattern = get_file_pattern(root, input_args, para)

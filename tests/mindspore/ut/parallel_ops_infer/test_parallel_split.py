@@ -19,12 +19,12 @@ from hyper_parallel.core.shard.ops.parallel_split import (SplitDistributedOp, Sp
                                                                     SplitTensorDistributedOp)
 from hyper_parallel import Layout
 
-# 初始化一个SplitDistributedOp实例
+# init SplitDistributedOp instance
 split_op = SplitDistributedOp("split")
 torch_split_op = SplitDistributedOp("split")
 
 
-# 定义一个辅助函数来创建Layout对象
+# helper to create Layout object
 def create_layout(tensor_map):
     base_mesh_shape = (2, 2, 2)
     base_alias_name = ("dp", "mp", "cp")

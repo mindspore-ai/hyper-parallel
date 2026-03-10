@@ -15,7 +15,7 @@
 """test torch dtensor api"""
 import torch
 # pylint: disable=W0611
-import torch_npu  # 昇腾NPU核心适配
+import torch_npu  # Ascend NPU core adapter
 from hyper_parallel import DTensor, init_device_mesh
 from hyper_parallel.core.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist

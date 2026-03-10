@@ -18,7 +18,7 @@ import torch
 from torch import nn
 from torch import optim
 # pylint: disable=W0611
-import torch_npu  # 昇腾NPU核心适配
+import torch_npu  # Ascend NPU core adapter
 from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan

@@ -486,7 +486,7 @@ def test_1d_to_3d_broadcast_23():
     run_scenario(
         "23. 1D to 3D broadcast",
         x_layout, y_layout,
-        expected_map=(2, 1, 0),  # dp在维度0，sp在维度1，mp在维度2
+        expected_map=(2, 1, 0),  # dp at dim 0, sp at dim 1, mp at dim 2
         extra_args={"input_shapes": [(16,), (4, 8, 16)]},
     )
 

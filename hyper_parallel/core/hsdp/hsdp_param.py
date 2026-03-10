@@ -285,7 +285,7 @@ class HSDPParam:
         self.prefetch_data = unshared_param_data
         self.prefetch_handle = handle
 
-    #pylint: disable=W0212
+    # pylint: disable=W0212
     def to_unsharded(self):
         """change parameter to unsharded state"""
         if self.prefetch_handle is not None:

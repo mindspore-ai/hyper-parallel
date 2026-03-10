@@ -27,7 +27,7 @@ from tests.torch.utils import init_dist
 
 
 def base_global_layout():
-    """ base global layout """
+    """base global layout"""
     init_dist()
     step = 2
     torch.manual_seed(1)

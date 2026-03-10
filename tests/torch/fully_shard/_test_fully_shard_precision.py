@@ -13,20 +13,19 @@
 # limitations under the License.
 # ============================================================================
 """test data parallel"""
-# pylint: disable=W0611
+# pylint: disable=W0611,C0413,C0412,W0613,W0612
 import os
+
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import numpy as np
 import torch
 import torch_npu
 from torch import optim
-from tests.torch.utils import init_dist
-from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy, CPUOffloadPolicy, OffloadPolicy
-from hyper_parallel import DTensor
+from hyper_parallel import DTensor, init_device_mesh, DeviceMesh, SkipDTensorDispatch
 from hyper_parallel.core.fully_shard.api import fully_shard
-from hyper_parallel import init_device_mesh, DeviceMesh
+from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy, CPUOffloadPolicy, OffloadPolicy
+from tests.torch.utils import init_dist
 from tests.torch.common_net import SimpleModel
-from hyper_parallel import SkipDTensorDispatch
 
 
 torch.manual_seed(0)
@@ -46,7 +45,7 @@ def _get_standard_fully_shard_kwargs(mp_policy, offload_policy=None):
     return fsdp_kwargs
 
 
-def get_standalone_result(step, acc_grad=False):
+def get_standalone_result(step, acc_grad=False):  # pylint: disable=unused-argument
     """
     Get results from standalone (non-distributed) model training for comparison.
 
@@ -75,7 +74,7 @@ def get_standalone_result(step, acc_grad=False):
     return standalone_loss, standalone_grad
 
 
-def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):
+def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):  # pylint: disable=unused-argument
     """
     Get results from HSDP (Hybrid Sharded Data Parallel) distributed training.
 
@@ -91,7 +90,7 @@ def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):
     dist_model = SimpleModel().npu()
     dist_x = standalone_x.npu()
     dist_model = fully_shard(dist_model, **fsdp_kwargs)
-    # 当loss类型为sum，且没有使用DTensor时，和单卡比较精度需要设置梯度通信类型为sum
+    # when loss is sum and DTensor not used, set grad comm type to sum for single-card precision compare
     dist_model.set_reduce_op_type("sum")
     dist_optimizer = optim.SGD(dist_model.parameters(), lr=0.01)
     mesh: DeviceMesh = fsdp_kwargs['mesh']
@@ -100,7 +99,7 @@ def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):
     with SkipDTensorDispatch():
         dist_grad = None
         for _ in range(acc_epoch):
-            for i in range(acc_step):
+            for _ in range(acc_step):
                 # if i == acc_step - 1:
                 #     dist_model.set_requires_grad_sync(True)
                 # else:

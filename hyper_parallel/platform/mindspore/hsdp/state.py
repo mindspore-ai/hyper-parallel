@@ -27,7 +27,7 @@ class MindSporeHSDPState(HSDPState):
         """init hsdp parameters for cell"""
         cells = self.cell.cells_and_names()
         for _, sub_cell in cells:
-            params = sub_cell._params.items() #pylint: disable=W0212
+            params = sub_cell._params.items()  # pylint: disable=W0212
             for param_name, param in params:
                 if hasattr(param, "has_hsdp_param"):
                     continue
