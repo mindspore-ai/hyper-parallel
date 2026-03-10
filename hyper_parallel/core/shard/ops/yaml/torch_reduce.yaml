@@ -18,3 +18,12 @@ all:
   distributed_op_class: AllExtDistributedOp
   distributed_op_file: parallel_reduce
 
+max:
+  dist_op_name: _torch_max_dist_op
+  distributed_op_class: MaxDistributedOp
+  distributed_op_file: parallel_reduce
+
+min:
+  dist_op_name: _torch_min_dist_op
+  distributed_op_class: MinDistributedOp
+  distributed_op_file: parallel_reduce

@@ -309,3 +309,19 @@ class MaxDistributedOp(ReduceExtDistributedOpBase):
         # OpDispatcher logic expects tuple of layouts.
         indices_layout = deepcopy(values_layout)
         return (values_layout, indices_layout)
+
+class MinDistributedOp(MaxDistributedOp):
+    """
+    Distributed implementation for Pytorch style Min operator.
+    
+    Supports three Pytorch behaviors:
+    1. torch.min(input) -> Global reduction (returns single Tensor)
+    2. torch.min(input, dim, keepdim=False) -> Dimension reduction (returns (values, indices))
+    3. torch.min(input, other) -> Element-wise min (returns single Tensor)
+    """
+
+    def __init__(self, op_name="min"):
+        # Call the parent class (MaxDistributedOp) initialization
+        super().__init__(op_name=op_name)
+        # Override the partial_type to use "min" instead of "max" for the underlying communication
+        self.partial_type = ["min"]
