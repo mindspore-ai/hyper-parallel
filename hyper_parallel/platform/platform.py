@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -473,3 +473,29 @@ class Platform:
     def apply_to_tensors(self, fn, container):
         """Recursively apply to all tensor in different kinds of container types."""
         raise NotImplementedError("Platform subclasses must implement apply_to_tensors")
+
+    @staticmethod
+    def clip_grad_norm_(
+        parameters, max_norm: float, norm_type: float = 2.0,
+        error_if_nonfinite: bool = False, foreach=None,
+    ):
+        """Compute and clip gradient norms for distributed models.
+
+        Communication is derived from each parameter's DTensor spec.
+        Subclasses must implement this method.
+
+        Args:
+            parameters: An ``nn.Module``, a single ``Tensor``, or an
+                iterable of ``Tensor`` s whose gradients to clip.
+            max_norm: Maximum allowed gradient norm.
+            norm_type: Type of the norm (default ``2.0``).
+            error_if_nonfinite: If ``True``, raise when total norm is
+                non-finite. Default ``False``.
+            foreach: Unused, accepted for API compatibility.
+
+        Returns:
+            The total (unclipped) gradient norm.
+        """
+        raise NotImplementedError(
+            "Platform subclasses must implement clip_grad_norm_"
+        )
