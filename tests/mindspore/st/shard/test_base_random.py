@@ -15,57 +15,36 @@
 """parallel_base_shard test"""
 
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+BASE_RANDOM = "base_random.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_tracker_initialization():
-    '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial.
-    Description: Test base shard.
+def test_base_random_group1():
+    """
+    Feature: parallel run case in base_random
+    Description:
+        1. test_tracker_initialization
     Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "base_random.py"
-    case_name = "test_tracker_initialization"
-    master_port = 11333
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(BASE_RANDOM, "test_tracker_initialization", 18306, 2, 2)
+    ])
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_distribute_region_disabled():
-    '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial.
-    Description: Test base shard.
+def test_base_random_group2():
+    """
+    Feature: parallel run case in base_random
+    Description:
+        1. test_distribute_region_disabled
+        2. test_multi_dim_sharding_offset
+        3. test_rng_tracker
     Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "base_random.py"
-    case_name = "test_distribute_region_disabled"
-    master_port = 11333
-    msrun_case(glog_v, file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_multi_dim_sharding_offset():
-    '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial.
-    Description: Test base shard.
-    Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "base_random.py"
-    case_name = "test_multi_dim_sharding_offset"
-    master_port = 11333
-    msrun_case(glog_v, file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_rng_tracker():
-    '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial.
-    Description: Test base shard.
-    Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "base_random.py"
-    case_name = "test_rng_tracker"
-    master_port = 11333
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(BASE_RANDOM, "test_distribute_region_disabled", 18309, 2, 2),
+        MindSporeCase(BASE_RANDOM, "test_multi_dim_sharding_offset", 18310, 4, 4),
+        MindSporeCase(BASE_RANDOM, "test_rng_tracker", 11336, 2, 2)
+    ])

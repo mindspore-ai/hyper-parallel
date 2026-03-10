@@ -15,18 +15,19 @@
 """parallel_base_shard test"""
 
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+BASE_SHARD = "base_shard.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_base_shard():
-    '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial.
-    Description: Test base shard.
+def test_base_shard_group1():
+    """
+    Feature: parallel run case in base_shard
+    Description:
+        1. test_base_shard
     Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "base_shard.py"
-    case_name = "test_base_shard"
-    master_port = 11333
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(BASE_SHARD, "test_base_shard", 11337, 8, 8)
+    ])

@@ -13,215 +13,181 @@
 # limitations under the License.
 # ============================================================================
 """test sub_mesh"""
+
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+SUBMESH = "submesh.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_full_mesh_shard_forward_1():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group1():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_full_mesh_shard_forward_1
+        2. test_sub_mesh_column_parallel_forward
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_full_mesh_shard_forward_1"
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num=4, local_worker_num=4)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_full_mesh_shard_forward_1", 11654, 4, 4),
+        MindSporeCase(SUBMESH, "test_sub_mesh_column_parallel_forward", 11655, 4, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_column_parallel_forward():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group2():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_full_mesh_shard_forward_2
+        2. test_sub_mesh_row_parallel_forward
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11655
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_column_parallel_forward"
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num=4, local_worker_num=4)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_full_mesh_shard_forward_2", 18313, 4, 4),
+        MindSporeCase(SUBMESH, "test_sub_mesh_row_parallel_forward", 11656, 4, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_full_mesh_shard_forward_2():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group3():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_sub_mesh_row_parallel_redistribute_forward
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_full_mesh_shard_forward_2"
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num=4, local_worker_num=4)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_sub_mesh_row_parallel_redistribute_forward", 18314, 4, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_row_parallel_forward():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group4():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_sub_mesh_redistribute_1
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11656
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_row_parallel_forward"
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num=4, local_worker_num=4)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_sub_mesh_redistribute_1", 18315, 8, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_row_parallel_redistribute_forward():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group5():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_sub_mesh_redistribute_2
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_row_parallel_redistribute_forward"
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num=4, local_worker_num=4)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_sub_mesh_redistribute_2", 18316, 8, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_1():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group6():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_sub_mesh_redistribute_3
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_1"
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_sub_mesh_redistribute_3", 18317, 8, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_2():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group7():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_sub_mesh_redistribute_4
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_2"
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_sub_mesh_redistribute_4", 18318, 8, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_3():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group8():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_sub_mesh_redistribute_5
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_3"
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_sub_mesh_redistribute_5", 11657, 8, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_4():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group9():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_sub_mesh_redistribute_6
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_4"
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_sub_mesh_redistribute_6", 18319, 8, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_5():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group10():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_sub_mesh_redistribute_7
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11657
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_5"
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_sub_mesh_redistribute_7", 18320, 8, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_6():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group11():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_sub_mesh_redistribute_8
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_6"
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_sub_mesh_redistribute_8", 18321, 8, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_7():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group12():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_sub_mesh_redistribute_9
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_7"
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_sub_mesh_redistribute_9", 18322, 8, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_8():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group13():
+    """
+    Feature: parallel run case in submesh
+    Description:
+        1. test_sub_mesh_redistribute_10
     Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_8"
-    msrun_case(glog_v, file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_9():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
-    Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_9"
-    msrun_case(glog_v, file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_10():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
-    Expectation: Run success.
-    '''
-    glog_v = 3
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_10"
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(SUBMESH, "test_sub_mesh_redistribute_10", 18323, 8, 8),
+    ])

@@ -14,19 +14,20 @@
 # ============================================================================
 """parallel_split test"""
 
-import os
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+PARALLEL_SPLIT = "parallel_split.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_shard_in_python_pynative():
-    '''
-    Feature: run shard in python.
-    Description: Test shard in python.
+def test_parallel_split_group1():
+    """
+    Feature: parallel run case in parallel_split
+    Description:
+        1. test_parallel_split
     Expectation: Run success.
-    '''
-    return_code = os.system(
-        "msrun --worker_num=8 --local_worker_num=8 --master_addr=127.0.0.1 --master_port=10677 --join=True " \
-        "pytest -s parallel_split.py"
-    )
-    assert return_code == 0
+    """
+    parallel_run([
+        MindSporeCase(PARALLEL_SPLIT, "test_parallel_split", 10677, 8, 8)
+    ])

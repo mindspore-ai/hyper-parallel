@@ -32,7 +32,7 @@ def test_shard_to_replicate():
     # Create DeviceMesh
     mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(1, 8),
+        mesh_shape=(1, 2),
         mesh_dim_names=("dp", "tp")
     )
 
@@ -40,11 +40,11 @@ def test_shard_to_replicate():
     x_placements = (Replicate(), Shard(1))
     dst_placements = (Replicate(), Replicate())
 
-    x_slice = Tensor(np.ones([8, 1]), dtype=ms.float32)
+    x_slice = Tensor(np.ones([2, 1]), dtype=ms.float32)
     dist_x = DTensor.from_local(x_slice, mesh, x_placements)
     out = dist_x.redistribute(mesh, dst_placements)
 
-    expect_out = Tensor(np.ones([8, 8]), dtype=ms.float32)
+    expect_out = Tensor(np.ones([2, 2]), dtype=ms.float32)
 
     assert np.allclose(expect_out.asnumpy(),
                        out.to_local().asnumpy(),
@@ -62,7 +62,7 @@ def test_replicate_to_shard():
     # Create DeviceMesh
     mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(1, 8),
+        mesh_shape=(1, 2),
         mesh_dim_names=("dp", "tp")
     )
 
@@ -70,11 +70,11 @@ def test_replicate_to_shard():
     x_placements = (Replicate(), Replicate())
     dst_placements = (Replicate(), Shard(1))
 
-    x_slice = Tensor(np.ones([8, 8]), dtype=ms.float32)
+    x_slice = Tensor(np.ones([2, 2]), dtype=ms.float32)
     dist_x = DTensor.from_local(x_slice, mesh, x_placements)
     out = dist_x.redistribute(mesh, dst_placements)
 
-    expect_out = Tensor(np.ones([8, 1]), dtype=ms.float32)
+    expect_out = Tensor(np.ones([2, 1]), dtype=ms.float32)
 
     assert np.allclose(expect_out.asnumpy(),
                        out.to_local().asnumpy(),
@@ -92,7 +92,7 @@ def test_different_mesh():
     # Create destination DeviceMesh (3D mesh)
     dst_mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(1, 8, 1),
+        mesh_shape=(1, 2, 1),
         mesh_dim_names=("dp", "tp", "sp")
     )
     dst_placements = (Replicate(), Shard(1), Replicate())
@@ -100,16 +100,16 @@ def test_different_mesh():
     # Create source DeviceMesh (2D mesh)
     src_mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(1, 8),
+        mesh_shape=(1, 2),
         mesh_dim_names=("dp", "tp")
     )
     x_placements = (Replicate(), Replicate())
 
-    x_slice = Tensor(np.ones([8, 8]), dtype=ms.float32)
+    x_slice = Tensor(np.ones([2, 2]), dtype=ms.float32)
     dist_x = DTensor.from_local(x_slice, src_mesh, x_placements)
     out = dist_x.redistribute(dst_mesh, dst_placements)
 
-    expect_out = Tensor(np.ones([8, 1]), dtype=ms.float32)
+    expect_out = Tensor(np.ones([2, 1]), dtype=ms.float32)
 
     assert np.allclose(expect_out.asnumpy(),
                        out.to_local().asnumpy(),

@@ -124,9 +124,9 @@ def base_case(dp, mp):
 
 
 def test_loss_repeat_mean_0():
-    '''
+    """
     Feature: Transpose parallel op.
     Description: Test Transpose parallel op.
     Expectation: Run success.
-    '''
+    """
     base_case(dp=2, mp=2)

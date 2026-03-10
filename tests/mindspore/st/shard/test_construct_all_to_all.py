@@ -15,34 +15,32 @@
 """parallel_construct_all_to_all test"""
 
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+CONSTRUCT_ALL_TO_ALL = "construct_all_to_all.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_construct_all_to_all():
-    '''
-    Feature: loss repeat mean.
-    Description: Test loss repeat mean.
+def test_construct_all_to_all_group1():
+    """
+    Feature: parallel run case in construct_all_to_all
+    Description:
+        1. test_construct_all_to_all
     Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "construct_all_to_all.py"
-    case_name = "test_construct_all_to_all"
-    master_port = 13296
-    worker_num = 2
-    local_worker_num = 2
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)
+    """
+    parallel_run([
+        MindSporeCase(CONSTRUCT_ALL_TO_ALL, "test_construct_all_to_all", 13296, 2, 2)
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_construct_all_to_all_8p():
-    '''
-    Feature: loss repeat mean.
-    Description: Test loss repeat mean.
+def test_construct_all_to_all_group2():
+    """
+    Feature: parallel run case in construct_all_to_all
+    Description:
+        1. test_construct_all_to_all_8p
     Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "construct_all_to_all.py"
-    case_name = "test_construct_all_to_all_8p"
-    master_port = 13297
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(CONSTRUCT_ALL_TO_ALL, "test_construct_all_to_all_8p", 13297, 8, 8)
+    ])

@@ -46,7 +46,7 @@ def test_shard_with_args_and_kwargs_non_dtensor_input():
     # Create DeviceMesh
     mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(2, 4),
+        mesh_shape=(2, 2),
         mesh_dim_names=("dp", "tp")
     )
 
@@ -72,9 +72,9 @@ def test_shard_with_args_and_kwargs_non_dtensor_input():
     )
     shard_module(model, device_mesh=mesh, sharding_plan=sharding_plan)
 
-    x = Tensor(np.ones((4, 8)))
-    y = Tensor(np.zeros((4, 8)))
-    z = Tensor(np.arange(32).reshape(4, 8))
+    x = Tensor(np.ones((4, 4)))
+    y = Tensor(np.zeros((4, 4)))
+    z = Tensor(np.arange(16).reshape(4, 4))
 
     # All inputs all Non-DTensor, and has multiple outputs
     # test inputs for both args and kwargs

@@ -28,7 +28,9 @@ def test_hsdp_forward_prefetch():
     file_name = "hsdp_prefetch.py"
     case_name = "test_hsdp_forward_prefetch"
     master_port = 18182
-    msrun_case(glog_v, file_name, case_name, master_port)
+    worker_num = 8
+    local_worker_num = 8
+    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -42,7 +44,9 @@ def test_hsdp_backward_prefetch():
     file_name = "hsdp_prefetch.py"
     case_name = "test_hsdp_backward_prefetch"
     master_port = 18182
-    msrun_case(glog_v, file_name, case_name, master_port)
+    worker_num = 8
+    local_worker_num = 8
+    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -56,7 +60,9 @@ def test_hsdp_comm_async():
     file_name = "hsdp_comm_async.py"
     case_name = "test_hsdp_comm_async"
     master_port = 18182
-    msrun_case(glog_v, file_name, case_name, master_port)
+    worker_num = 8
+    local_worker_num = 8
+    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -70,4 +76,6 @@ def test_hsdp_comm_fusion():
     file_name = "hsdp_comm_fusion.py"
     case_name = "test_hsdp_comm_fusion"
     master_port = 18182
-    msrun_case(glog_v, file_name, case_name, master_port)
+    worker_num = 8
+    local_worker_num = 8
+    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)

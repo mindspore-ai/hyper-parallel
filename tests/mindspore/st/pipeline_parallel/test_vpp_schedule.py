@@ -27,4 +27,6 @@ def test_simple_mlp():
     file_name = "vpp_schedule.py"
     case_name = "test"
     master_port = 12346
-    msrun_case(glog_v, file_name, case_name, master_port)
+    worker_num = 8
+    local_worker_num = 8
+    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)

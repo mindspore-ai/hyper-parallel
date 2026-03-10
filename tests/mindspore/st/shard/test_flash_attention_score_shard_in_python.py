@@ -12,21 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Test save and load checkpoint"""
-
+"""parallel_flash_attention_score_shard_in_python test"""
+from tests.common.parallel_case import parallel_run, MindSporeCase
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+
+FLASH_ATTENTION_SCORE_SHARD_IN_PYTHON = "flash_attention_score_shard_in_python.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_saver_loader():
+def test_flash_attention_score_shard_in_python_group1():
     """
-    Feature: save checkpoint and load checkpoint.
-    Description: save and load checkpoint.
+    Feature: parallel run case in flash_attention_score_shard_in_python
+    Description:
+        1. test_flash_attention_score_model_parallel
     Expectation: Run success.
     """
-    glog_v = 3
-    file_name = "base_shard.py"
-    case_name = "test_saver_loader"
-    master_port = 11318
-    msrun_case(glog_v, file_name, case_name, master_port)
+    parallel_run([
+        MindSporeCase(FLASH_ATTENTION_SCORE_SHARD_IN_PYTHON, "test_flash_attention_score_model_parallel", 18289, 4, 4)
+    ])

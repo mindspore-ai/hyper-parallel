@@ -12,38 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""layout save load test"""
+"""parallel_bmm_shell test"""
 
-from hyper_parallel.core.checkpoint.layout import combine_layout
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+BMM_SHARD_IN_PYTHON = "bmm_shard_in_python.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_base_layout():
+def test_bmm_shard_in_python_group1():
     """
-    Feature: layout save, load and combine.
-    Description: save layout, load layout, and combine layout.
+    Feature: parallel run case in bmm_shard_in_python
+    Description:
+        1. test_bmm_ext_partial_model_parallel
     Expectation: Run success.
     """
-    glog_v = 3
-    file_name = "base_shard.py"
-    case_name = "test_base_layout"
-    master_port = 11222
-    msrun_case(glog_v, file_name, case_name, master_port)
-    layout_dict = combine_layout(".")
-    assert isinstance(layout_dict, dict)
+    parallel_run([
+        MindSporeCase(BMM_SHARD_IN_PYTHON, "test_bmm_ext_partial_model_parallel", 18286, 8, 8, 2),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_get_global_layout():
+def test_bmm_shard_in_python_group2():
     """
-    Feature: Test get global layout on all ranks.
-    Description: Test when a simple model sharded by dp and mp, gather global layout on all ranks.
+    Feature: parallel run case in bmm_shard_in_python
+    Description:
+        1. test_bmm_partial_transpose_model_parallel
     Expectation: Run success.
     """
-    glog_v = 3
-    file_name = "base_shard.py"
-    case_name = "test_get_global_layout"
-    master_port = 11224
-    msrun_case(glog_v, file_name, case_name, master_port)
+    parallel_run([
+        MindSporeCase(BMM_SHARD_IN_PYTHON, "test_bmm_partial_transpose_model_parallel", 18287, 8, 8, 2),
+    ])

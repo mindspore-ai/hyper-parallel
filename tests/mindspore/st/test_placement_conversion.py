@@ -13,190 +13,32 @@
 # limitations under the License.
 # ============================================================================
 """test placement and tensor_map conversion"""
-import pytest
 from tests.common.mark_utils import arg_mark
-from hyper_parallel.core.layout import Layout
-from hyper_parallel.core.device_mesh import init_device_mesh
-from hyper_parallel.core.placement_types import Shard, Replicate, Partial
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+PLACEMENT_CONVERSION = "placement_conversion.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-def test_basic_conversion():
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_placement_conversion_group1():
     """
-    Feature: Layout conversion.
-    Description: Test basic conversion between placements and tensor_map.
-    Expectation: Conversion results match expected tuple values.
+    Feature: parallel run case in placement_conversion
+    Description:
+        1. test_basic_conversion
+        2. test_shard_combinations
+        3. test_full_replication
+        4. test_partial_shard_mixed
+        5. test_partial_reduce_ops
+        6. test_conversion_errors
+        7. test_from_device_mesh
+    Expectation: Run success.
     """
-    mesh_shape = (2, 2)
-    alias_name = ("dp", "tp")
-    layout = Layout(mesh_shape, alias_name, init_backend=False)
-
-    # Test placement_to_tensor_map
-    layout.set_placements([Shard(0), Shard(1)])
-    t_map = layout.placement_to_tensor_map(dim=2)
-    assert tuple(t_map) == (1, 0), f"Expected (1, 0), got {tuple(t_map)}"
-
-    layout.set_placements([Replicate(), Shard(0)])
-    t_map = layout.placement_to_tensor_map(dim=1)
-    assert tuple(t_map) == (0,), f"Expected (0,), got {tuple(t_map)}"
-
-    # Test tensor_map_to_placement
-    layout.set_tensor_map((1, 0))
-    layout.set_placements(None)
-    placements = layout.tensor_map_to_placement()
-    assert placements[0] == Shard(0)
-    assert placements[1] == Shard(1)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-def test_shard_combinations():
-    """
-    Feature: Shard permutations.
-    Description: Test various Shard combinations and permutations.
-    Expectation: Round-trip conversion preserves Shard logic.
-    """
-    mesh_shape = (4, 2)
-    alias_name = ("dp", "mp")
-    layout = Layout(mesh_shape, alias_name, init_backend=False)
-
-    # Case 1: Reverse sharding
-    layout.set_placements([Shard(1), Shard(0)])
-    t_map = layout.placement_to_tensor_map(dim=2)
-    assert tuple(t_map) == (0, 1), f"Expected (0, 1), got {tuple(t_map)}"
-
-    # Verify round trip
-    placements = layout.tensor_map_to_placement()
-    assert placements[0] == Shard(1)
-    assert placements[1] == Shard(0)
-
-    # Case 2: Skip dimension
-    layout.set_placements([Shard(0), Replicate()])
-    t_map = layout.placement_to_tensor_map(dim=3)
-    assert tuple(t_map) == (1, -1, -1), f"Expected (1, -1, -1), got {tuple(t_map)}"
-
-    # Verify round trip
-    placements = layout.tensor_map_to_placement()
-    assert placements[0] == Shard(0)
-    assert isinstance(placements[1], Replicate)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-def test_full_replication():
-    """
-    Feature: Full replication.
-    Description: Test scenarios with full replication across all mesh dimensions.
-    Expectation: All dimensions mapped to -1 and placements are Replicate.
-    """
-    mesh_shape = (2, 2, 2)
-    alias_name = ("dp", "sp", "mp")
-    layout = Layout(mesh_shape, alias_name, init_backend=False)
-
-    layout.set_placements([Replicate(), Replicate(), Replicate()])
-    t_map = layout.placement_to_tensor_map(dim=4)
-    assert tuple(t_map) == (-1, -1, -1, -1)
-
-    # Round trip
-    placements = layout.tensor_map_to_placement()
-    assert all(isinstance(p, Replicate) for p in placements)
-    assert len(placements) == 3
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-def test_partial_shard_mixed():
-    """
-    Feature: Mixed placements.
-    Description: Test mixed placements of Partial and Shard.
-    Expectation: Partial ops and Shard dims are correctly converted.
-    """
-    mesh_shape = (2, 2)
-    alias_name = ("dp", "mp")
-    layout = Layout(mesh_shape, alias_name, init_backend=False)
-
-    # Mesh 0 -> Partial(sum), Mesh 1 -> Shard(0)
-    layout.set_placements([Partial("sum"), Shard(0)])
-    t_map = layout.placement_to_tensor_map(dim=2)
-
-    assert tuple(t_map) == (0, -1)
-    assert layout.partial[0] == "sum"
-    assert layout.partial[1] is None
-
-    # Round trip
-    placements = layout.tensor_map_to_placement()
-    assert isinstance(placements[0], Partial)
-    assert placements[0].reduce_op == "sum"
-    assert placements[1] == Shard(0)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-def test_partial_reduce_ops():
-    """
-    Feature: Partial operations.
-    Description: Test different partial reduction operations (min, max, avg).
-    Expectation: Reduction ops are correctly preserved in conversion.
-    """
-    mesh_shape = (2,)
-    alias_name = ("dp",)
-    layout = Layout(mesh_shape, alias_name, init_backend=False)
-
-    for op in ["min", "max", "avg"]:
-        layout.set_placements([Partial(op)])
-        t_map = layout.placement_to_tensor_map(dim=1)
-        assert tuple(t_map) == (-1,)
-        assert layout.partial[0] == op
-
-        placements = layout.tensor_map_to_placement()
-        assert isinstance(placements[0], Partial)
-        assert placements[0].reduce_op == op
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-def test_conversion_errors():
-    """
-    Feature: Error handling.
-    Description: Test error handling and boundary conditions for conversion.
-    Expectation: ValueError raised for invalid inputs.
-    """
-    mesh_shape = (2, 2)
-    alias_name = ("dp", "mp")
-    layout = Layout(mesh_shape, alias_name, init_backend=False)
-
-    # 1. Shard dimension out of bounds
-    layout.set_placements([Shard(5), Replicate()])
-    with pytest.raises(ValueError, match="out of bounds"):
-        layout.placement_to_tensor_map(dim=2)
-
-    # 2. Duplicate sharding on same tensor dimension
-    layout.set_placements([Shard(0), Shard(0)])
-    with pytest.raises(ValueError, match="has been sharded"):
-        layout.placement_to_tensor_map(dim=2)
-
-    # 3. Invalid tensor dimension
-    with pytest.raises(ValueError, match="positive"):
-        layout.placement_to_tensor_map(dim=-1)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
-def test_from_device_mesh():
-    """
-    Feature: Layout creation.
-    Description: Test Layout creation from device_mesh.
-    Expectation: Layout initialized with correct mesh properties and empty state.
-    """
-    mesh_shape = (4, 2)
-    alias_name = ("dp", "mp")
-    rank_list = tuple(range(8))
-    device_mesh = init_device_mesh("npu", mesh_shape, mesh_dim_names=alias_name, init_backend=False)
-
-    layout = Layout.from_device_mesh(device_mesh)
-
-    assert layout.mesh_shape == mesh_shape
-    assert layout.alias_name == alias_name
-    assert layout.rank_list == rank_list
-    assert layout.tensor_map is None
-    assert layout.placements is None
-    assert layout.partial == [None, None]
-
-    layout.set_placements([Shard(0), Replicate()])
-    t_map = layout.placement_to_tensor_map(dim=2)
-    assert tuple(t_map) == (1, -1)
-    assert layout.mesh.mesh_shape == mesh_shape
+    parallel_run([
+        MindSporeCase(PLACEMENT_CONVERSION, "test_basic_conversion", 11664),
+        MindSporeCase(PLACEMENT_CONVERSION, "test_shard_combinations", 11665),
+        MindSporeCase(PLACEMENT_CONVERSION, "test_full_replication", 11666),
+        MindSporeCase(PLACEMENT_CONVERSION, "test_partial_shard_mixed", 11667),
+        MindSporeCase(PLACEMENT_CONVERSION, "test_partial_reduce_ops", 11668),
+        MindSporeCase(PLACEMENT_CONVERSION, "test_conversion_errors", 11669),
+        MindSporeCase(PLACEMENT_CONVERSION, "test_from_device_mesh", 11670)
+    ])

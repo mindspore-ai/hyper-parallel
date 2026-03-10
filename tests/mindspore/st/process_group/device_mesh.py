@@ -28,15 +28,15 @@ def test_device_mesh_from_1d_group_valid():
     """
     device_mesh_init = init_device_mesh(
         device_type="npu",
-        mesh_shape=(8,),
+        mesh_shape=(2,),
         mesh_dim_names=("dp",)
     )
     group = device_mesh_init.get_group()
     device_mesh = DeviceMesh.from_group(group, "npu", mesh_dim_names=("tp",))
     tp_mesh = device_mesh["tp"]
-    assert tp_mesh.mesh_shape == (8,)
+    assert tp_mesh.mesh_shape == (2,)
     assert tp_mesh.mesh_dim_names == ("tp",)
-    assert tp_mesh.rank_list == (0, 1, 2, 3, 4, 5, 6, 7)
+    assert tp_mesh.rank_list == (0, 1)
 
 
 def test_device_mesh_from_2d_group_valid():
@@ -47,7 +47,7 @@ def test_device_mesh_from_2d_group_valid():
     """
     device_mesh_init = init_device_mesh(
         device_type="npu",
-        mesh_shape=(2, 4),
+        mesh_shape=(2, 2),
         mesh_dim_names=("dp", "tp")
     )
     dp_group = device_mesh_init.get_group("dp")
@@ -63,7 +63,7 @@ def test_device_mesh_from_2d_group_valid():
     cp_mesh = device_mesh["cp"]
     rank_id = platform.get_rank()
     world_size = platform.get_world_size()
-    tp_rank_list = tuple(sorted((rank_id, rank_id + 4 if rank_id < world_size // 2 else rank_id - 4)))
+    tp_rank_list = tuple(sorted((rank_id, rank_id + 2 if rank_id < world_size // 2 else rank_id - 2)))
     cp_rank_lists = (
         tuple(range(world_size // 2)),
         tuple(range(world_size // 2, world_size)),
@@ -73,7 +73,7 @@ def test_device_mesh_from_2d_group_valid():
     assert tp_mesh.mesh_dim_names == ("tp",)
     assert tp_mesh.root_mesh == device_mesh
     assert tp_mesh.rank_list == tp_rank_list
-    assert cp_mesh.mesh_shape == (4,)
+    assert cp_mesh.mesh_shape == (2,)
     assert cp_mesh.mesh_dim_names == ("cp",)
     assert cp_mesh.root_mesh == device_mesh
     assert cp_mesh.rank_list == cp_rank_list
@@ -120,7 +120,7 @@ def test_device_mesh_slice_invalid_without_mesh_dim_names():
     result = ""
     device_mesh_init = init_device_mesh(
         device_type="npu",
-        mesh_shape=(2, 2, 2)
+        mesh_shape=(2, 1)
     )
     try:
         device_mesh_init["dp"]
@@ -143,11 +143,11 @@ def test_device_mesh_get_group_invalid_without_init_backend():
     result = ""
     device_mesh_init = init_device_mesh(
         device_type="npu",
-        mesh_shape=(2, 2, 2),
+        mesh_shape=(2, 1),
         init_backend=False
     )
     try:
-        device_mesh_init.get_group(2)
+        device_mesh_init.get_group(0)
     except RuntimeError as e:
         result = str(e)
     assert "process groups not initialized" in result
@@ -161,19 +161,19 @@ def test_device_mesh_invalid_different_mesh_dim_names():
     """
     result = ""
     try:
-        init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp", "tp"))
+        init_device_mesh(device_type="npu", mesh_shape=(2,), mesh_dim_names=("dp", "tp"))
     except ValueError as e:
         result = str(e)
     assert "mesh_dim_names length" in result
 
     try:
-        init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "dp"))
+        init_device_mesh(device_type="npu", mesh_shape=(2, 1), mesh_dim_names=("dp", "dp"))
     except ValueError as e:
         result = str(e)
     assert "element of mesh_dim_names" in result
 
     try:
-        init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("interleaved_parallel", "dp"))
+        init_device_mesh(device_type="npu", mesh_shape=(2, 1), mesh_dim_names=("interleaved_parallel", "dp"))
     except ValueError as e:
         result = str(e)
     assert "'interleaved_parallel' should be at the last dim of mesh_dim_names" in result

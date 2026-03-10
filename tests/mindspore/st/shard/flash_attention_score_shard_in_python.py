@@ -93,7 +93,7 @@ def test_flash_attention_score_model_parallel():
                                               input_layout=input_layout,
                                               sparse_mode=sparse_mode)
     # Parallel
-    mesh_shape = (2, 1, 4)
+    mesh_shape = (2, 1, 2)
     alias_name = ("dp", "cp", "tp")
 
     mesh = init_device_mesh(

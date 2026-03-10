@@ -15,18 +15,19 @@
 """test parallelize value and grad"""
 
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+PARALLELIZE_VALUE_AND_GRAD = "parallelize_value_and_grad.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_parallelize_value_and_grad():
-    '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial.
-    Description: Test base shard.
+def test_parallelize_value_and_grad_group1():
+    """
+    Feature: parallel run case in parallelize_value_and_grad
+    Description:
+        1. test_parallelize_value_and_grad
     Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "parallelize_value_and_grad.py"
-    case_name = "test_parallelize_value_and_grad"
-    master_port = 11333
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(PARALLELIZE_VALUE_AND_GRAD, "test_parallelize_value_and_grad", 18307, 4, 4),
+    ])

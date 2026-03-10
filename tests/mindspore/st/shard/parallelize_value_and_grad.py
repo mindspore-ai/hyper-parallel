@@ -156,4 +156,4 @@ def test_parallelize_value_and_grad():
     Description: Test base case.
     Expectation: Run success.
     '''
-    base_case(dp=4, mp=2, hsdp_shard_size=4)
+    base_case(dp=2, mp=2, hsdp_shard_size=4)
