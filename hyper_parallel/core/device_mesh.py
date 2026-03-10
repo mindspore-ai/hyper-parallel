@@ -71,12 +71,13 @@ class DeviceMesh:
 
     Args:
         device_type (str): Device type.
-        mesh (Union[Tensor, list, tuple, np.ndarray]): A multi-dimensional array, list, or integer
+        mesh (Union[Tensor, list, tuple, np.ndarray, None]): A multi-dimensional array, list, or integer
             tensor describing the device layout. The IDs in the mesh are global IDs of the
             default process group, representing the multi-dimensional networking structure
             of devices in distributed training (e.g., [[0,1],[2,3]] represents a 2x2 device mesh).
             If a list or non-int32 tensor is provided, it will be automatically converted
-            to an int32 tensor.
+            to an int32 tensor. If None, a 1D mesh containing all ranks
+            (i.e., ``[0, 1, ..., world_size-1]``) will be created automatically.
         mesh_dim_names (tuple[str]): A tuple[str] of mesh dim names for each dimension of mesh.
         _init_backend (boolean): Whether initial process group.
 
@@ -90,9 +91,11 @@ class DeviceMesh:
     Examples:
         >>> # Using Tensor
         >>> mesh = Tensor([[0, 1], [2, 3]])
-        >>> device_mesh = DeviceMesh("npu", mesh, nesh_dim_names=("dp", "tp"))
+        >>> device_mesh = DeviceMesh("npu", mesh, mesh_dim_names=("dp", "tp"))
         >>> # Using list
-        >>> device_mesh = DeviceMesh("npu", [[0, 1], [2, 3]], nesh_dim_names=("dp", "tp"))
+        >>> device_mesh = DeviceMesh("npu", [[0, 1], [2, 3]], mesh_dim_names=("dp", "tp"))
+        >>> # Using mesh=None (auto 1D mesh with all ranks)
+        >>> device_mesh = DeviceMesh("npu")
         >>> # Get sub mesh
         >>> dp_mesh = device_mesh["dp"]
         >>> # Access ndim
@@ -103,12 +106,17 @@ class DeviceMesh:
 
     def __init__(self,
                  device_type: str,
-                 mesh: Union[Tensor, list, tuple, np.ndarray],
+                 mesh: Union[Tensor, list, tuple, np.ndarray, None] = None,
                  *,
                  mesh_dim_names: Union[tuple[str, ...], list[str], None] = None,
                  _init_backend: bool = True,
                  ):
         self._device_type = device_type
+
+        if mesh is None:
+            world_size = platform.get_world_size()
+            mesh = list(range(world_size))
+
         # Convert mesh to Tensor with int32 dtype
         mesh = self._convert_mesh_to_tensor(mesh)
 
@@ -305,6 +313,11 @@ class DeviceMesh:
         return self._ndim
 
     @property
+    def shape(self) -> tuple:
+        """Returns the shape of the device mesh. Alias for mesh_shape, consistent with PyTorch DeviceMesh API."""
+        return self._mesh_shape
+
+    @property
     def root_mesh(self) -> Optional['DeviceMesh']:
         return self._root_mesh
 
@@ -463,7 +476,7 @@ class DeviceMesh:
 
         # Create sub mesh
         sub_mesh = DeviceMesh(
-            device_type="npu",
+            device_type=self._device_type,
             mesh=sub_mesh_tensor,
             mesh_dim_names=sub_mesh_dim_names,
             _init_backend=False
@@ -527,6 +540,31 @@ class DeviceMesh:
             return flattened_mesh.get_comm_group_by_axis(mesh_dim)
 
         return self.get_comm_group_by_axis(mesh_dim)
+
+    def get_all_groups(self) -> list:
+        """
+        Returns a list of process groups for all mesh dimensions.
+
+        This is useful when you need to iterate over all communication groups
+        in the DeviceMesh instead of querying them one by one.
+
+        Returns:
+            A list of process group objects, one per mesh dimension.
+
+        Raises:
+            RuntimeError: If DeviceMesh process groups have not been initialized.
+
+        Examples:
+            >>> mesh = Tensor([[0, 1], [2, 3]])
+            >>> device_mesh = DeviceMesh("npu", mesh, mesh_dim_names=("dp", "tp"))
+            >>> all_groups = device_mesh.get_all_groups()
+            >>> len(all_groups) == 2  # one group per dimension
+            True
+        """
+        if not hasattr(self, "_dim_group_names"):
+            raise RuntimeError("DeviceMesh process groups not initialized!")
+
+        return [self.get_group(i) for i in range(self.ndim)]
 
     @staticmethod
     def from_group(group: Union[Any, list[Any]],
@@ -735,7 +773,7 @@ class DeviceMesh:
 
         # Create the flattened mesh
         res_flattened_mesh = DeviceMesh(
-            device_type="npu",
+            device_type=root_mesh.device_type(),
             mesh=flattened_mesh_tensor,
             mesh_dim_names=flattened_mesh_dim
         )
