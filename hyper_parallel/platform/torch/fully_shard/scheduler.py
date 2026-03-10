@@ -27,7 +27,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
     root_bp_state = False
 
     def __init__(self, *args, **kwargs):
-        """init"""
+        """Initialize TorchHSDPSchedulerV2 and register forward/backward hooks."""
         super().__init__(*args, **kwargs)
         self._backup_forward_fetch = None
 
@@ -54,13 +54,9 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             self.mesh_info = HSDPMeshInfo(mesh=self.mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
         self.hsdp_state = TorchHSDPStateV2(self.cell, self.mesh_info, self.config, self.platform, self.device)
 
-    def _new_grad_hook(self):
-        """Create and initialize a new TorchHSDPGradHook instance."""
-        # TorchHSDPScheduler don't need param hook, using param.grad
-        pass
 
     def _register_post_backward_hook(self, args, kwargs):
-        """Register backward hook using backward function."""
+        """Wrap forward args/kwargs through PostBackwardFunction to register backward hook."""
         args_list, args_spec = tree_flatten(args)
         kwargs_list, kwargs_spec = tree_flatten(kwargs)
         args_kwargs_list = list(args_list) + list(kwargs_list)
@@ -80,7 +76,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         return self._register_post_backward_hook(args, kwargs)
 
     def _register_backward_pre_hook(self, outputs):
-        """Register output hook to trigger backward pre hook."""
+        """Register gradient hooks on all requires-grad outputs to trigger backward pre hook."""
         flat_outputs, _ = tree_flatten(outputs)
         for output in flat_outputs:
             if isinstance(output, torch.Tensor) and output.requires_grad:
@@ -111,6 +107,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         return grad
 
     def _root_backward_hook(self):
+        """Final backward callback: run backward hook and apply remaining gradient reductions."""
         apply_final_reduce = self.scheduler_state != FSDPSchedulerState.BACKWARD
         self._backward_hook()
         if apply_final_reduce:

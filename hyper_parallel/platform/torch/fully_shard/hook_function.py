@@ -21,11 +21,13 @@ class PostBackwardFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, hsdp_scheduler, *inputs):
+        """Save the scheduler reference and pass inputs through unchanged."""
         ctx.hsdp_scheduler = hsdp_scheduler
         return inputs
 
     @staticmethod
     def backward(ctx, *grads):
+        """Trigger the scheduler's backward hook and pass gradients through unchanged."""
         # pylint: disable=W0212
         ctx.hsdp_scheduler._backward_hook()
         return (None,) + grads
