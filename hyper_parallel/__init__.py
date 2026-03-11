@@ -19,6 +19,7 @@ from hyper_parallel.core.layout import Layout
 from hyper_parallel.core.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.core.dtensor import DTensor, SkipDTensorDispatch
 from hyper_parallel.core.parameter_init import init_parameters
+from hyper_parallel.core.init_weights import init_empty_weights, init_on_device
 from hyper_parallel.core.shard.api import shard_module
 from hyper_parallel.core.shard.api import parallelize_value_and_grad
 from hyper_parallel.core.shard.local_func import custom_shard
@@ -27,9 +28,10 @@ from hyper_parallel.core.pipeline_parallel import (PipelineStage, ScheduleInterl
 from hyper_parallel.collectives.cc import (init_process_group, destroy_process_group, get_process_group_ranks,
                                            get_backend, split_group, get_group_local_rank, mark_created_groups)
 
-__all__ = ["get_platform", "hsdp", "hsdp_sync_stream", "HSDPCell", "Layout", "DTensor",
+__all__ = ["get_platform", "hsdp", "hsdp_sync_stream", "HSDPCell", "DTensor",
            "Layout", "DeviceMesh", "init_device_mesh",
-           "init_parameters", "shard_module", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch",
+           "init_parameters", "init_empty_weights", "init_on_device",
+           "shard_module", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch",
            "MetaStep", "MetaStepType", "BatchDimSpec", "PipelineStage", "ScheduleInterleaved1F1B",
            "init_process_group", "destroy_process_group", "get_process_group_ranks", "get_backend", "split_group",
            "get_group_local_rank", "mark_created_groups"]

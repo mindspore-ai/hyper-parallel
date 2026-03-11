@@ -182,7 +182,7 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
                     yield  # execute the region code
                 finally:
                     # update offset to synchronize among ranks
-                    self._set_post_op_offset(state, device_mesh, old_offset)
+                    self._set_post_op_offset(state, global_shape, old_offset)
 
         else:
             yield
@@ -270,7 +270,7 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
         state.offset = current_offset + offset_incr
 
     def _set_post_op_offset(
-        self, state: _PhiloxState, device_mesh, old_offset: int
+        self, state: _PhiloxState, global_shape, old_offset: int
     ) -> None:
         """Sets the RNG to a synchronized state after running the local random op.
         Restores the random number generator to a globally consistent state following
@@ -280,14 +280,13 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
 
         Args:
             state (`Tensor`): The generator state to modify.
-            device_mesh (DeviceMesh): The device mesh describing the device topology.
+            global_shape: The global shape of the distributed tensor.
+            old_offset (int): The RNG offset before the operation.
 
         Returns:
             None
         """
-        dtensor_shape = device_mesh.mesh_shape
-
-        numel = functools.reduce(operator.mul, dtensor_shape, 1)
+        numel = functools.reduce(operator.mul, global_shape, 1)
         numel = (numel + 3) // 4 * 4
         state.offset = old_offset + numel
 
@@ -314,7 +313,7 @@ def _calc_first_shard_size(device_mesh, placements, global_shape) -> list[int]:
             mesh_dim_size = device_mesh.size(idx)
             shard_dim = placement.dim
             local_size_on_rank_0[shard_dim], _ = local_shard_size_and_offset(
-                device_mesh.mesh_shape[shard_dim],
+                global_shape[shard_dim],
                 mesh_dim_size,
                 0,
             )

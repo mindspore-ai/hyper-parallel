@@ -39,6 +39,7 @@ from hyper_parallel.platform.platform import Platform, PlatformType, EXISTING_CO
 from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 from hyper_parallel.platform.mindspore.pipeline_parallel.stage import PipelineStageBase
 from hyper_parallel.platform.mindspore.parameter_init import init_parameters as _init_parameters
+from hyper_parallel.platform.mindspore.init_weights import init_on_device as _init_on_device
 
 _tensor_transform = TensorTransform.get_instance()
 
@@ -620,3 +621,10 @@ class MindSporePlatform(Platform):
         raise NotImplementedError(
             "clip_grad_norm_ is not yet supported on MindSpore"
         )
+
+    @property
+    def meta_device(self):
+        return "meta"
+
+    def init_on_device(self, device, include_buffers=False):
+        return _init_on_device(device, include_buffers=include_buffers)

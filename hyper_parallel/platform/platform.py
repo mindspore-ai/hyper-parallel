@@ -535,3 +535,12 @@ class Platform:
             rank_list = cls.get_process_group_ranks(group)
             group_key = str(tuple(sorted(rank_list)))
             EXISTING_COMM_GROUPS[group_key] = group
+
+    @property
+    def meta_device(self):
+        """Return the framework-specific meta device (no real storage)."""
+        raise NotImplementedError("Platform subclasses must implement meta_device")
+
+    def init_on_device(self, device, include_buffers=False):
+        """Context manager: create module parameters (and optionally buffers) on *device*."""
+        raise NotImplementedError("Platform subclasses must implement init_on_device")

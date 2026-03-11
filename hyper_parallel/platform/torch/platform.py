@@ -37,6 +37,7 @@ from hyper_parallel.platform.torch.pipeline_parallel.stage import PipelineStageB
 from hyper_parallel.platform.torch.group_utils import create_sub_groups
 from hyper_parallel.platform.platform import Platform, PlatformType, EXISTING_COMM_GROUPS
 from hyper_parallel.platform.torch.function_override import override_functions
+from hyper_parallel.platform.torch.init_weights import init_on_device as _init_on_device
 
 override_functions()
 
@@ -662,3 +663,10 @@ class TorchPlatform(Platform):
             return x
 
         return apply(container)
+
+    @property
+    def meta_device(self):
+        return torch.device("meta")
+
+    def init_on_device(self, device, include_buffers=False):
+        return _init_on_device(device, include_buffers=include_buffers)
