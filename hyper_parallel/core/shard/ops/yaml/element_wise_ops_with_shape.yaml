@@ -40,3 +40,6 @@ Div:
 SubExt:
   dist_op_name: _sub_ext_dist_op
   distributed_op_class: AddDistributedOp
+
+isnan:
+  dist_op_name: _torch_isnan_dist_op
