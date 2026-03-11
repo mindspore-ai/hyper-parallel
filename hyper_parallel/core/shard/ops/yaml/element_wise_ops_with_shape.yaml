@@ -9,6 +9,9 @@ LessEqual:
 GreaterEqual:
   dist_op_name: _greater_equal_dist_op
 
+ne:
+  dist_op_name: _torch_ne_dist_op
+
 LogicalOr:
   dist_op_name: _logical_or_dist_op
 
