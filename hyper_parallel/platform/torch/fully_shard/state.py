@@ -276,16 +276,16 @@ class TorchHSDPStateV2(HSDPState):
                     dtype=self._reduce_dtype,
                     reduce_op=self.reduce_op_type
                 )
-                TorchHSDPStateV2.pre_reduce_scatter_params.append(hsdp_param)
+                TorchHSDPStateV2.pre_reduce_scatter_params.append([hsdp_param, self._orig_dtype])
 
             if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
                 assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
                 reduced_grad = hsdp_param.reduce_scatter_output()
                 hsdp_param.all_reduce_grad(grad=reduced_grad, dtype=self._reduce_dtype, reduce_op=self.reduce_op_type)
                 if TorchHSDPStateV2.pre_reduce_scatter_params and \
-                        TorchHSDPStateV2.pre_reduce_scatter_params[-1] == hsdp_param:
+                        TorchHSDPStateV2.pre_reduce_scatter_params[-1][0] == hsdp_param:
                     TorchHSDPStateV2.pre_reduce_scatter_params.pop()
-                TorchHSDPStateV2.pre_all_reduce_params.append(hsdp_param)
+                TorchHSDPStateV2.pre_all_reduce_params.append([hsdp_param, self._orig_dtype])
         self._finish_ignored_allreduce()
         if self.reshard_after_backward:
             self.shard()
@@ -312,16 +312,16 @@ class TorchHSDPStateV2(HSDPState):
         """
         need_synchronize = False
         while TorchHSDPStateV2.pre_reduce_scatter_params:
-            pre_hsdp_param = TorchHSDPStateV2.pre_reduce_scatter_params.pop(0)
+            pre_hsdp_param, pre_orig_dtype = TorchHSDPStateV2.pre_reduce_scatter_params.pop(0)
             reduced_grad = pre_hsdp_param.reduce_scatter_output()
             pre_hsdp_param.clear_reduce_scatter_output()
-            need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, self._orig_dtype) or need_synchronize
+            need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype) or need_synchronize
 
         while TorchHSDPStateV2.pre_all_reduce_params:
-            pre_hsdp_param = TorchHSDPStateV2.pre_all_reduce_params.pop(0)
+            pre_hsdp_param, pre_orig_dtype = TorchHSDPStateV2.pre_all_reduce_params.pop(0)
             reduced_grad = pre_hsdp_param.all_reduce_output()
             pre_hsdp_param.clear_all_reduce_output()
-            need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, self._orig_dtype) or need_synchronize
+            need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype) or need_synchronize
         if need_synchronize:
             if self.device.type == "npu":
                 torch.npu.current_stream().synchronize()
