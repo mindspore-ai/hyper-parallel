@@ -55,6 +55,7 @@
 /tests/mindspore/st/fully_shard/ @DavidFFFan
 /tests/mindspore/ut/fully_shard/ @DavidFFFan
 /tests/mindspore/ut/checkpoint/ @zhangbuxue
+/tests/ut/checkpoint/ @zhangbuxue
 
 /tests/torch/ @yangzhenzhang
 /tests/torch/activation_checkpoint/ @DavidFFFan

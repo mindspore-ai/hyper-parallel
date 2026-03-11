@@ -567,6 +567,20 @@ class TorchPlatform(Platform):
         return torch._utils._element_size(param.dtype)
 
     @staticmethod
+    def is_tensor(obj: Any) -> bool:
+        """Return True if ``obj`` is a ``torch.Tensor``."""
+        return isinstance(obj, Tensor)
+
+    @staticmethod
+    def get_tensor_storage_size(tensor: Any) -> int:
+        """Return serialized byte size (numel * element size) for a PyTorch tensor."""
+        if not TorchPlatform.is_tensor(tensor):
+            raise TypeError(
+                f"TorchPlatform.get_tensor_storage_size expects torch.Tensor, got {type(tensor)!r}"
+            )
+        return int(tensor.numel()) * int(tensor.element_size())
+
+    @staticmethod
     def parameters_dict(cell: Module):
         return cell.named_parameters()
 
@@ -993,9 +1007,30 @@ class TorchPlatform(Platform):
 
         return apply(container)
 
+
     @property
     def meta_device(self):
         return torch.device("meta")
 
     def init_on_device(self, device, include_buffers=False):
         return _init_on_device(device, include_buffers=include_buffers)
+
+    def str_to_dtype(self, dtype_str: str) -> torch.dtype:
+        """Map ``torch.<type>`` strings from checkpoint metadata to ``torch.dtype``."""
+        parts = dtype_str.split(".", 1)
+        if len(parts) != 2:
+            raise ValueError(
+                f"Expected dtype string like 'torch.float32', got {dtype_str!r}."
+            )
+        prefix, name = parts
+        if prefix != "torch":
+            raise ValueError(
+                f"Expected PyTorch dtype string with prefix 'torch', got {dtype_str!r}."
+            )
+        dtype = getattr(torch, name)
+        if isinstance(dtype, torch.dtype):
+            return dtype
+        raise ValueError(f"{dtype_str!r} does not resolve to a torch.dtype.")
+
+    def list_to_size(self, size_list: list[int]) -> torch.Size:
+        return torch.Size(size_list)

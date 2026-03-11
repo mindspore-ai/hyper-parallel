@@ -15,6 +15,7 @@
 """Common utility functions."""
 import dataclasses
 from collections import defaultdict
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Any, Union
 
@@ -23,6 +24,7 @@ from hyper_parallel.core.distributed_checkpoint.planner import SavePlan, WriteIt
 from hyper_parallel.core.distributed_checkpoint.reshard import infer_slice_area_by_rank
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform import get_platform
+
 
 platform = get_platform()
 Tensor = platform.Tensor
@@ -233,3 +235,94 @@ def remove_redundant_plans(
         )
         for plan, item_set in zip(all_plans, remaining_items)
     ]
+
+
+def traverse_state_dict(
+    state_dict: Any,
+    visitor: Any,
+) -> None:
+    """
+    Invoke ``visitor`` for each value recursively in ``state_dict``.
+    Mapping will be traversed and ``visitor`` will be applied to the leaf elements.
+    ``visitor`` will only be applied to elements in a list or a tuple, if the
+    container contains tensors or mappings.
+    """
+
+    def _is_terminal(value: Any) -> bool:
+        """Leaf-like container: no nested mappings/lists/tuples/tensors to recurse into."""
+        values: Collection
+        if isinstance(value, Mapping):
+            return False
+        if isinstance(value, (list, tuple)):
+            values = value
+        else:
+            return True
+
+        for entry in values:
+            if isinstance(entry, (Mapping, list, tuple)) and not _is_terminal(entry):
+                return False
+            if isinstance(entry, Tensor):
+                return False
+        return True
+
+    def _traverse_obj(path: tuple[Any, ...], value: Any) -> None:
+        if isinstance(value, Mapping):
+            for k, v in value.items():
+                _traverse_obj(path + (str(k),), v)
+        elif _is_terminal(value):
+            visitor(path, value)
+        elif isinstance(value, (list, tuple)):
+            for i, v in enumerate(value):
+                _traverse_obj(path + (i,), v)
+
+    for key, value in state_dict.items():
+        _traverse_obj((str(key),), value)
+
+
+def flatten_state_dict(state_dict: Any) -> tuple[dict[str, Any], dict[str, tuple[Any, ...]]]:
+    """Flatten a nested state dict to dotted FQN keys; returns ``(flat_dict, fqn -> path)``."""
+    fqn_names: dict[str, Any] = {}
+    mappings: dict[str, tuple[Any, ...]] = {}
+
+    def flat_copy(path: tuple[Any, ...], value: Any) -> None:
+        new_fqn = ".".join(map(str, path))
+        if new_fqn in fqn_names:
+            raise ValueError(
+                f"Duplicate flattened FQN {new_fqn!r} when converting nested state_dict; "
+                "two different values map to the same dotted name."
+            )
+        fqn_names[new_fqn] = value
+        mappings[new_fqn] = path
+
+    traverse_state_dict(state_dict, flat_copy)
+    return fqn_names, mappings
+
+
+def set_element(root_dict: Any, path: tuple[Any, ...], value: Any) -> None:
+    """Set ``value`` in ``root_dict`` along the ``path`` object path."""
+    if not path:
+        raise ValueError("path must be non-empty")
+    cur_container: Any = root_dict
+
+    def extend_list(lst: list[Any], idx: int) -> None:
+        while len(lst) <= idx:
+            lst.append(None)
+
+    for i in range(1, len(path)):
+        prev_key = path[i - 1]
+        next_key = path[i]
+        def_val: Any = {} if isinstance(next_key, str) else []
+
+        if isinstance(cur_container, Mapping):
+            cur_container = cur_container.setdefault(prev_key, def_val)
+        else:
+            extend_list(cur_container, prev_key)
+            if cur_container[prev_key] is None:
+                cur_container[prev_key] = def_val
+            cur_container = cur_container[prev_key]
+
+    last_key = path[-1]
+    if isinstance(last_key, int):
+        extend_list(cur_container, last_key)
+
+    cur_container[last_key] = value

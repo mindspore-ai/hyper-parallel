@@ -74,7 +74,7 @@ class FileSystemWriter(StorageWriter):
             **kwargs: Additional keyword arguments (e.g., rank, use_collectives).
         """
         self.is_coordinator = is_coordinator
-        self.rank = kwargs.get("rank", get_platform().get_rank())
+        self.rank = kwargs.get("rank") if "rank" in kwargs else get_platform().get_rank()
         self.use_collectives = kwargs.get("use_collectives", True)
 
     def optimize_local_plan(self, plan: SavePlan) -> SavePlan:
@@ -406,7 +406,7 @@ class FileSystemReader(StorageReader):
         # This mirrors torch.filesystem, where reader keeps a storage_data dict.
         self.storage_data = getattr(metadata, "storage_data", None)
         self.is_coordinator = is_coordinator
-        self.rank = kwargs.get("rank", get_platform().get_rank())
+        self.rank = kwargs.get("rank") if "rank" in kwargs else get_platform().get_rank()
 
     def optimize_local_plan(self, plan: LoadPlan) -> LoadPlan:
         """
