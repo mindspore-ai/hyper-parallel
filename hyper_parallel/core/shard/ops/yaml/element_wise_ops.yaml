@@ -65,3 +65,6 @@ Tile:
 
 OnesLikeExt:
   dist_op_name: _ones_like_ext_dist_op
+
+dropout:
+  dist_op_name: _torch_dropout_dist_op
