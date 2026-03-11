@@ -34,6 +34,10 @@ Mul:
   dist_op_name: _mul_dist_op
   distributed_op_class: ElementWiseWithPartialDistributedOp
 
+mul_:
+  dist_op_name: _torch_mul__dist_op
+  distributed_op_class: ElementWiseWithPartialDistributedOp
+
 Div:
   dist_op_name: _div_dist_op
 
