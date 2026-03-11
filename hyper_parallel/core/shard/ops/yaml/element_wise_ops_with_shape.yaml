@@ -56,3 +56,6 @@ SubExt:
 
 isnan:
   dist_op_name: _torch_isnan_dist_op
+
+isinf:
+  dist_op_name: _torch_isinf_dist_op
