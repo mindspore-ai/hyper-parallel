@@ -145,7 +145,7 @@ class ActivationWrapper(torch.nn.Module, ABC):
         module: nn.Module,  # pylint: disable=W0613
         state_dict: dict[str, Any],
         prefix: str,
-        *args: Any, # pylint: disable=W0613
+        *args: Any,  # pylint: disable=W0613
     ) -> dict[str, Any]:
         """
         _post_state_dict_hook() is called after the state_dict() of this FSDP module is executed.

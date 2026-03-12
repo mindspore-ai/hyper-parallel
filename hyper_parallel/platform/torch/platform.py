@@ -230,8 +230,8 @@ class TorchPlatform(Platform):
         # Remove the "self." prefix from param_name
         param_name = param_name.replace("self.", "")
         # Case 1: The parameter is a direct parameter of the current Module
-        if param_name in cell._parameters:  # pylint:disable=protected-access
-            return (cell, param_name, cell._parameters[param_name])  # pylint:disable=protected-access
+        if param_name in cell._parameters:  # pylint: disable=protected-access
+            return (cell, param_name, cell._parameters[param_name])  # pylint: disable=protected-access
 
         # Case 2: The parameter is in a sub-Module
         if "." in param_name:
@@ -240,8 +240,8 @@ class TorchPlatform(Platform):
                 # Locate the sub-Module where the parameter resides (supports multi-level paths)
                 target_cell = cell.get_submodule(cell_path)
                 # Check if the sub-Module directly contains this parameter
-                if param_key in target_cell._parameters:  # pylint:disable=protected-access
-                    return target_cell, param_key, target_cell._parameters[param_key]  # pylint:disable=protected-access
+                if param_key in target_cell._parameters:  # pylint: disable=protected-access
+                    return target_cell, param_key, target_cell._parameters[param_key]  # pylint: disable=protected-access
             except AttributeError:
                 pass
 
@@ -261,15 +261,15 @@ class TorchPlatform(Platform):
         """
         parent_cell, param_key, _ = result
         # Key operation: directly modify the _parameters dictionary.
-        if param_key in parent_cell._parameters:  # pylint:disable=protected-access
-            parent_cell._parameters[param_key] = new_param  # pylint:disable=protected-access
+        if param_key in parent_cell._parameters:  # pylint: disable=protected-access
+            parent_cell._parameters[param_key] = new_param  # pylint: disable=protected-access
         else:
             parent_cell.register_parameter(param_key, new_param)
         return True
 
     @staticmethod
     def set_layout_into_parameter(param, layout):
-        """Set layout in to parameter"""
+        """Set layout into parameter"""
         from hyper_parallel.core.dtensor import DTensor  # pylint: disable=import-outside-toplevel
         from hyper_parallel.core.layout import _get_slice_tensor_by_layout  # pylint: disable=import-outside-toplevel
         if isinstance(param, DTensor):
@@ -575,7 +575,7 @@ class TorchPlatform(Platform):
         return device.Event()
 
     def tree_map(self, fn, tree):
-        return torch.utils._pytree.tree_map(fn, tree)  # pylint:disable=protected-access
+        return torch.utils._pytree.tree_map(fn, tree)  # pylint: disable=protected-access
 
     @property
     def checkpoint(self):

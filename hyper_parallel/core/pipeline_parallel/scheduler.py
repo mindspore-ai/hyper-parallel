@@ -294,24 +294,24 @@ def add_send_recv(scheduler, stage_num, real_stage_num, style='loop'):
                 _need_com(operation, style, stage_num) and nxt_rank is not None):
             new_schedule[rank].append(MetaStep(
                 micro_index=operation.micro_index,
-                meta_type=MetaStepType.FWD_SEND,  # 注意：使用 FWD_SEND 而不是 FWD_SEND
+                meta_type=MetaStepType.FWD_SEND,  # Note: use FWD_SEND
                 stage_index=stage_index
             ))
             new_schedule[nxt_rank].append(MetaStep(
                 micro_index=operation.micro_index,
-                meta_type=MetaStepType.FWD_RECV,  # 注意：使用 FWD_RECV 而不是 FWD_RECV
+                meta_type=MetaStepType.FWD_RECV,  # Note: use FWD_RECV
                 stage_index=stage_index + 1
             ))
         elif (operation.type == MetaStepType.BWD and
               _need_com(operation, style, stage_num) and pre_rank is not None):
             new_schedule[rank].append(MetaStep(
                 micro_index=operation.micro_index,
-                meta_type=MetaStepType.BWD_SEND,  # 注意：使用 BWD_SEND 而不是 BWD_SEND
+                meta_type=MetaStepType.BWD_SEND,  # Note: use BWD_SEND
                 stage_index=stage_index
             ))
             new_schedule[pre_rank].append(MetaStep(
                 micro_index=operation.micro_index,
-                meta_type=MetaStepType.BWD_RECV,  # 注意：使用 BWD_RECV 而不是 BWD_RECV
+                meta_type=MetaStepType.BWD_RECV,  # Note: use BWD_RECV
                 stage_index=stage_index - 1
             ))
 

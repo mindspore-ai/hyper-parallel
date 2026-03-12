@@ -405,7 +405,7 @@ class PlotMgr:
         """Display the figure and save to PDF"""
         self.fig.legend(bbox_to_anchor=(0.22, 0.45))
         plt.show()
-        plt.savefig("figure.pdf")  # 默认存储在当前目录
+        plt.savefig("figure.pdf")  # save to current dir by default
 
 
 @dataclass
@@ -1379,7 +1379,7 @@ class PipelineSimulator:
         return lines
 
 def test_comm_imba_zero():
-    """ test case """
+    """Test case."""
     for pp in range(2, 10):
         for m in range(pp, 3*pp+1): # check vp=1 imba
             sim = PipelineSimulator(np.ones(pp).tolist(), m, comm_time=0.1).run(print_info=False)

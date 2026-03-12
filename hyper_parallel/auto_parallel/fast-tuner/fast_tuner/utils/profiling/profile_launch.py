@@ -8,13 +8,13 @@ from fast_tuner.utils.common import GENERAL_TOML
 from fast_tuner.utils.logger import logger
 
 class ProfileLaunch:
-    """自动执行profile"""
+    """Auto run profile"""
     def __init__(self, profile_configs, para):
         self.profile_configs = profile_configs
         self.para = para
 
     def profile_launch(self, profile_file_dir):
-        """遍历指定目录下的所有文件"""
+        """Iterate all files under directory"""
         for root, _, files in os.walk(profile_file_dir):
             for file in files:
                 # if '_EP' in file:
@@ -33,7 +33,7 @@ class ProfileLaunch:
                     logger.error(f"file type: {file} is not supported.")
 
     def run_shell(self, profile_file_dir):
-        """执行megatron shell脚本"""
+        """Run megatron shell script"""
         cmd = ["bash", profile_file_dir]
         logger.info(f"profile command: {cmd}")
 
@@ -42,14 +42,14 @@ class ProfileLaunch:
             preexec_fn=os.setpgrp,
             check=False,
         )
-        # 为避免profile子进程未结束生成profile文件失败，增加sleep
+        # sleep to avoid profile file failure before subprocess exits
         time.sleep(60)
         return_code = process.returncode
         logger.info("Last job returns %d.", return_code)
 
 
     def run_torchtitan(self, profile_file_toml):
-        """执行torch titan"""
+        """Run torch titan"""
         run_file = self.para.TORCHTITAN_PATH
         regex_pattern = GENERAL_TOML.replace('{}', r'(\d+)')
         match = re.match(regex_pattern, Path(profile_file_toml).name)
@@ -70,7 +70,7 @@ class ProfileLaunch:
             shell=True,
             check=False,
         )
-        # 为避免profile子进程未结束生成profile文件失败，增加sleep
+        # sleep to avoid profile file failure before subprocess exits
         time.sleep(20)
         return_code = process.returncode
         logger.info("Last job returns %d.", return_code)

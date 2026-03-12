@@ -197,7 +197,7 @@ def test_saver_loader():
 
 
 def base_global_layout(dp: int, mp: int):
-    """ base global layout """
+    """base global layout"""
     D.init()
 
     # standalone

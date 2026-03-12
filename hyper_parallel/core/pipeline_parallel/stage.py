@@ -15,7 +15,8 @@
 """pipeline stage"""
 from hyper_parallel import DTensor
 from hyper_parallel.platform import get_platform
-from .utils import _RecvInfo  # pylint: disable = E0402
+from .utils import _RecvInfo  # pylint: disable=E0402
+
 platform = get_platform()
 PipelineStageBase = platform.PipelineStageBase
 

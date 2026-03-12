@@ -13,20 +13,20 @@
 # limitations under the License.
 # ============================================================================
 """test fully_shard api"""
+# pylint: disable=C0413,C0412
 import os
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 # pylint: disable=W0611
 import torch_npu
-from hyper_parallel import DeviceMesh, init_device_mesh
+from hyper_parallel import DeviceMesh, init_device_mesh, SkipDTensorDispatch
 from hyper_parallel.platform.platform import get_torch_platform
+from hyper_parallel.core.fully_shard.api import fully_shard
+from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.common_net import FullyShardTestNet, DenseNet, BufferTestNet, MetaInitNet
 from tests.torch.utils import init_dist
 from tests.torch.hsdp.hsdp_test_common import train
-from hyper_parallel.core.fully_shard.api import fully_shard
-from hyper_parallel import SkipDTensorDispatch
-from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy
 
 
 def test_fully_shard_01():
@@ -72,7 +72,7 @@ def test_fully_shard_02():
                     mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32,
                                                    output_dtype=torch.float32, cast_forward_inputs=True)
                     )
-    # 对最顶层的Module也处理，管理剩下的参数。
+    # handle top-level Module too, manage remaining params
     fully_shard(multi_layer_net,
                 mesh=mesh,
                 reshard_after_forward=True,
@@ -123,7 +123,7 @@ def test_fully_shard_meta_init():
     hidden_size = 32
     init_dist()
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
- 
+
     with torch.device("meta"):
         model = MetaInitNet(hidden_size)
 

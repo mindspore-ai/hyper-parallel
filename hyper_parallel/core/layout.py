@@ -569,7 +569,7 @@ class Layout:
             readable_map = []
             for item in self._tensor_map:
                 if isinstance(item, tuple):
-                    # 处理嵌套元组
+                    # handle nested tuple
                     mapped_tuple = tuple(
                         self._mesh.mesh_dim_names[len(self._mesh.mesh_dim_names) - 1 - dim] if dim != -1 else "None"
                         for dim in item

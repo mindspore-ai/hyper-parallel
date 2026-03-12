@@ -25,7 +25,7 @@ def _construct_layout_tuple_for_transform_operator_list(from_layout, to_layout, 
     from_layout_dict = from_layout.to_dict()
     to_layout_dict = to_layout.to_dict()
     from_layout_tuple = (from_layout_dict["mesh_shape"], from_layout_dict["tensor_map"], list(from_full_shape))
-    to_layout_tuple = (to_layout_dict["mesh_shape"], to_layout_dict["tensor_map"], list(from_full_shape))  # TODO: 考虑reshape的场景
+    to_layout_tuple = (to_layout_dict["mesh_shape"], to_layout_dict["tensor_map"], list(from_full_shape))  # TODO: consider reshape scenario
     return from_layout_tuple, to_layout_tuple
 
 
@@ -175,7 +175,7 @@ class TensorRedistribution:
         return local_x
 
     def redistribution(self, input_x, to_layout):
-        """ tensor redistribution """
+        """tensor redistribution"""
         x_layout = input_x.layout
         x = input_x
         if input_x.layout.is_partial():
@@ -280,7 +280,7 @@ class TensorRedistribution:
             else:
                 dev_map_order[dev_axis] = 0
 
-        pending_reduce_op_list = [] # List[Tuple[comm_op, op, dev_dim, reduce_dim]]
+        pending_reduce_op_list = []  # List[Tuple[comm_op, op, dev_dim, reduce_dim]]
         for dev_axis_index, op in enumerate(from_layout.partial):
             if op is None:
                 continue
@@ -292,7 +292,7 @@ class TensorRedistribution:
         # sort reduce op
         # 1. ReduceScatter is executed before AllReduce
         # 2. If multiple split, the dev axis split outer will be execute first.
-        #    e.g ("cp", "tp"), will execute reduce_scatter along "cp" before "tp"
+        #    e.g. ("cp", "tp"), will execute reduce_scatter along "cp" before "tp"
         # 3. Lower dev_id execute before higher dev_id
         sorted_pending_reduce_op_list = \
             sorted(pending_reduce_op_list, key=lambda reduce_pair: (reduce_pair[0] != "ReduceScatter",

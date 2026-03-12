@@ -46,7 +46,8 @@ class HSDPParamV2:
     def _init_extensions(self):
         raise NotImplementedError("HSDP param subclasses must implement _init_extensions")
 
-    def init_all_gather_outputs(self, all_gather_input_numels, all_gather_input_dtypes, world_size, device, force_recreate=False):
+    def init_all_gather_outputs(
+            self, all_gather_input_numels, all_gather_input_dtypes, world_size, device, force_recreate=False):
         raise NotImplementedError("HSDP param subclasses must implement init_all_gather_outputs")
 
     def init_unsharded_param(self):
@@ -101,18 +102,18 @@ class HSDPParamV2:
 
     def _get_unsharded_param_data(self, async_op=False):
         raise NotImplementedError("HSDP param subclasses must implement _get_unsharded_param_data")
-    
+
     def unshard(self, async_op=False):
         raise NotImplementedError("HSDP param subclasses must implement unshard")
 
     def wait_for_unshard(self):
         raise NotImplementedError("HSDP param subclasses must implement wait_for_unshard")
-    
+
     def shard(self):
         raise NotImplementedError("HSDP param subclasses must implement shard")
-    
+
     def reduce_scatter_grad(self):
         raise NotImplementedError("HSDP param subclasses must implement reduce_scatter_grad")
-    
+
     def all_reduce_grad(self):
         raise NotImplementedError("HSDP param subclasses must implement all_reduce_grad")

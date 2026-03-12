@@ -19,7 +19,7 @@ from hyper_parallel import init_device_mesh
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_isin import IsinDistributedOp
 
-# 创建 isin 算子实例
+# create isin op instance
 op = IsinDistributedOp("isin")
 
 

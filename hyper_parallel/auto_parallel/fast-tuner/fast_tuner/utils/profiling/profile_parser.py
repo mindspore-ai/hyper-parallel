@@ -37,13 +37,13 @@ def median_mean(durs):
     if len(durs) == 0:
         logger.info("get durs no values")
         return 0
-    median_durs = durs[len(durs)//4 : len(durs) - len(durs)//4]
+    median_durs = durs[len(durs)//4:len(durs) - len(durs)//4]
     return round(statistics.mean(median_durs)/1000, 3)
 
 class ProfileParser:
     '''
-    The recommend config for different pp is：
-    pp2: [6,5] recomp [6,0], reduce laysers when OOM, layers at least [5,4]
+    The recommended config for different pp is:
+    pp2: [6,5] recomp [6,0], reduce layers when OOM, layers at least [5,4]
     if still OOM, do another profile wrt [3,1] no recomp w/ dense_replace = 1
     pp4: [3,3,3,2] recomp [3,3,0,0]
     pp8: [3,1,1,1,1,2,2,2] recomp [3,1,1,1,1,2,0,2] (or try pp4 with layers [3,2,2,2] w/ recomp [3,2,0,2])
@@ -71,13 +71,13 @@ class ProfileParser:
         self.model_name = input_args.model_name
 
     def parse_batch_profile_result(self, profile_configs_results):
-        """解析批profile文件"""
-        # step1. 解析profile文件
-        # ep填1, dmratrion:0.33, bfratio=dense_bw/dense_fw, re_grow_ration = 1,hratio=0.68
-        # [dp, tp, pp, dmratio, bfratio, re_grow_ration, hratio, moe_fw]
+        """Parse batch profile files"""
+        # step1: parse profile files
+        # ep=1, dmratio:0.33, bfratio=dense_bw/dense_fw, re_grow_ratio=1, hratio=0.68
+        # [dp, tp, pp, dmratio, bfratio, re_grow_ratio, hratio, moe_fw]
         profile_result = []
         dense_flag = False
-        #Todo 这里para.YAML_PATH的实现待修改
+        # TODO: para.YAML_PATH implementation to be modified
         if self.para.YAML_PATH:
             for result in profile_configs_results:
                 profile_dir = result[-1]
@@ -121,50 +121,50 @@ class ProfileParser:
                 self.refresh()
                 profile_result.append(config)
 
-        # step2. 生成csv文件
-        # dense模型的result长度是8，moe模型的result长度是9
+        # step2: generate csv file
+        # dense model result len=8, moe model result len=9
         if len(profile_result[0]) == 8:
             dense_flag = True
         self.write_result_to_csv(profile_result, dense_flag)
 
     def write_result_to_csv(self, profile_result, is_llama=False):
-        """"把profile结果写入csv"""
+        """Write profile results to csv"""
         if self.para.YAML_PATH or self.para.SHELL_PATH:
             if is_llama:
-                headers = ['dp', 'tp', 'pp', 'dmratio', 'bfratio', 're_grow_ration', 'hratio', 'moe_fw']
+                headers = ['dp', 'tp', 'pp', 'dmratio', 'bfratio', 're_grow_ratio', 'hratio', 'moe_fw']
             else:
-                headers = ['dp', 'tp', 'pp', 'ep', 'dmratio', 'bfratio', 're_grow_ration', 'hratio', 'moe_fw']
+                headers = ['dp', 'tp', 'pp', 'ep', 'dmratio', 'bfratio', 're_grow_ratio', 'hratio', 'moe_fw']
         else:
-            headers = ['dp', 'tp', 'pp', 'ep', 'cp', 'op', 'dmratio', 'bfratio', 're_grow_ration', 'hratio', 'moe_fw']
-        # 写入 CSV 文件
+            headers = ['dp', 'tp', 'pp', 'ep', 'cp', 'op', 'dmratio', 'bfratio', 're_grow_ratio', 'hratio', 'moe_fw']
+        # write CSV file
         try:
             csv_path = os.path.join(os.path.abspath(self.para.OUTPUT_PATH), 'profile_parser_result.csv')
             with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.writer(csvfile)
-                # 写入表头
+                # write headers
                 writer.writerow(headers)
-                # 写入数据
+                # write data
                 writer.writerows(profile_result)
-            logger.info(f"CSV file {csv_path} generate succ.")
+            logger.info(f"CSV file {csv_path} generate success.")
             self.para.args.parser_result = csv_path
-        except Exception as e:
+        except OSError as e:
             print(f"write CSV file fail: {e}")
 
     def load_profile(self, file, rk):
-        """读取profile文件trace view"""        
+        """Read profile file trace view"""        
         path = os.path.abspath('.\\profile_info') + '\\' + str(file)
         path = find_file_by_name(path + '\\rank_' + str(rk), 'trace_view.json')
         with open(path, 'r', encoding=encoding) as f:
             self.profile_data = json.load(f)
 
     def load_profile_by_dir(self, rank_dir):
-        """从文件夹读取profile文件kernel details"""
+        """Read profile file kernel details from folder"""
         path = find_file_by_name(rank_dir, 'trace_view.json')
         with open(path, 'r', encoding=encoding) as f:
             self.profile_data = json.load(f)
 
     def load_profile_by_kernel(self, file):
-        """读取profile文件kernel details"""
+        """Read profile file kernel details"""
         path = find_file_by_name(file, 'kernel_details.csv')
         if path is None:
             logger.error(f"can not find kernel details file {file}")
@@ -176,7 +176,7 @@ class ProfileParser:
         return True
 
     def load_profile_no_recompute(self, file, rk):
-        """读取profile文件不重算算子"""
+        """Read profile file without recompute ops"""
         path = os.path.abspath('.\\profile_info') + '\\' + str(file)
         path = find_file_by_name(path + '\\rank_' + str(rk) + '_norecomp' , 'trace_view.json')
         with open(path, 'r', encoding=encoding) as f:
@@ -208,7 +208,7 @@ class ProfileParser:
         return atts, grad_atts
 
     def extract_atts_by_kernel(self):
-        """从kernel details文件读取attributes"""
+        """Read attributes from kernel details file"""
         atts, grad_atts = [], []
         try:
             with open(self.profile_data, 'r', encoding='utf-8') as file:
@@ -224,12 +224,12 @@ class ProfileParser:
                             grad_atts.append(ts_value)
             logger.info(f'extract by kernel_details.csv num of atts is {len(atts)}, num of grad_atts')
             return atts, grad_atts
-        except Exception as e:
+        except (OSError, KeyError, ValueError) as e:
             logger.error(f'extract by kernel_details.csv fail: {e}')
             return [], []
 
     def extract_atts_by_loaded_data(self):
-        """读取profile文件kernel details"""
+        """Read profile file kernel details"""
         atts, grad_atts = [], []
         try:
             for row in self.profile_data:
@@ -239,7 +239,7 @@ class ProfileParser:
                     grad_atts.append(float(row['Start Time(us)']))
             logger.info(f'num of atts is {len(atts)}, num of grad_atts is {len(grad_atts)}')
             return atts, grad_atts
-        except Exception as e:
+        except (KeyError, ValueError, TypeError) as e:
             logger.error(f'extract by loaded_data fail: {e}')
             return [], []
 
@@ -258,12 +258,12 @@ class ProfileParser:
                     grad_atts.append(float(row['Start Time(us)']))
             logger.info(f'num of atts is {len(atts)}, num of grad_atts is {len(grad_atts)}')
             return atts, grad_atts
-        except Exception as e:
+        except (KeyError, ValueError, TypeError) as e:
             logger.error(f'extract by loaded_data fail: {e}')
             return [], []
 
-    #todo: 待修改
-    def stage_anal(self, pp, stage): #assuming we profiled 2 steps w/ micro = 32
+    # TODO: to be modified
+    def stage_anal(self, pp, stage):  # assuming we profiled 2 steps w/ micro = 32
         """
         Docstring for stage_anal
         
@@ -274,9 +274,9 @@ class ProfileParser:
         atts, grad_atts = self.extract_atts_by_kernel()
         layers, xlayers = len(grad_atts) // 64,  2 * len(grad_atts) // 64
         warm_up = (pp-1-stage) * layers
-        atts = atts[warm_up : 32*xlayers - warm_up] + atts[32*xlayers + warm_up : 32*xlayers + 32*xlayers-warm_up]
-        grad_atts = (grad_atts[warm_up : 32*layers - warm_up]
-                     + grad_atts[32*layers + warm_up : 32*layers + 32*layers-warm_up])
+        atts = atts[warm_up:32*xlayers - warm_up] + atts[32*xlayers + warm_up:32*xlayers + 32*xlayers-warm_up]
+        grad_atts = (grad_atts[warm_up:32*layers - warm_up]
+                     + grad_atts[32*layers + warm_up:32*layers + 32*layers-warm_up])
         att_chunks = [atts[xlayers*i:xlayers*(i+1)] for i in range(len(atts)//xlayers-1)]
         grad_chunks = [grad_atts[layers*i:layers*(i+1)] for i in range(len(grad_atts)//layers-1)]
         if pp == 2:
@@ -365,7 +365,7 @@ class ProfileParser:
         :param self: Description
         """
         atts, grad_atts = self.extract_atts_for_titan()
-        layer_num = 10  # 与titan的__init__.py中的
+        layer_num = 10  # from titan __init__.py
         try:
             # pylint: disable=C0415
             import torchtitan.protocols.train_spec as train_spec_module
@@ -373,7 +373,7 @@ class ProfileParser:
             train_spec = train_spec_module.get_train_spec(self.model_name)
             model_args = train_spec.model_args[model_flavor]
             layer_num = model_args.n_layers
-        except Exception as e:
+        except (ImportError, AttributeError) as e:
             print(f'Error is: {e}, and do not get layer_num for profile parser.')
 
         atts_per_step = len(atts) // self.step
@@ -466,23 +466,23 @@ class ProfileParser:
 
     def process_folders(self, profile_result_dir, pp, profile_result):
         """
-        遍历根目录下的所有文件夹，并使用 parser 函数解析每个文件夹中的内容
+        Iterate all folders under root and parse each with parser function.
 
-        参数:
-        profile_result_dir (str): 根目录路径
+        Args:
+        profile_result_dir (str): root directory path
         """
         root_path = Path(profile_result_dir)
         if not root_path.is_dir():
             logger.info(f"profile_result_dir:{profile_result_dir} not exist")
             return
 
-        # 获取所有子文件夹--每个rank的文件夹
+        # get all sub-folders, one per rank
         folders = [f for f in root_path.iterdir() if f.is_dir()]
         folders.sort()
         i = 0
         for rank_folder in folders:
             logger.info(f"parsing: {rank_folder}")
-            # Todo para.YAML_PATH的分支待修改
+            # TODO: para.YAML_PATH branch to be modified
             if self.para.YAML_PATH:
                 self.load_profile_by_dir(rank_folder)
                 self.stage_anal(pp, i)
@@ -731,9 +731,9 @@ class ProfileMemParser:
                     continue
                 end = int(release_time.strip().split('.')[0])
 
-                real_memory_changes[start] += size  # 在start时增加内存
+                real_memory_changes[start] += size  # add memory at start
                 real_memory_changes[end - 1] += 0  # for plt
-                real_memory_changes[end] -= size  # 在end时减少内存
+                real_memory_changes[end] -= size  # release memory at end
 
                 if flag is False:
                     static_memory = int(row['Allocation Total Allocated(MB)'].strip().split('.')[0])
@@ -772,7 +772,7 @@ class ProfileMemParser:
         '''
 
         Args:
-            profile_dir: profile结果的路径
+            profile_dir: path to profile result
 
         Returns:
 

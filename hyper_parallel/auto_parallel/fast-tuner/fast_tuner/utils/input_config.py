@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-""" Transformer-Config dict parse module """
+"""Transformer-Config dict parse module."""
 
 import os
 import yaml
@@ -63,7 +63,7 @@ class InputConfig(dict):
 
         filepath = os.path.realpath(filename)
         with open(filepath, encoding='utf-8') as fp:
-            # 文件指针重置到文件开头
+            # reset file pointer to start
             fp.seek(0)
             cfg_dict = yaml.safe_load(fp)
 

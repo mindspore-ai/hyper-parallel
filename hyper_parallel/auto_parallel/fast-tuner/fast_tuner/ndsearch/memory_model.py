@@ -57,11 +57,12 @@ def trans_format(dryrun_info_init, test_ep):
 
 def grey_box_memory_prune(mindformers_args, dryrun_info_init, test_ep, max_expert_parallel):
     """
-    ep灰盒剪枝
+    EP grey-box pruning
 
-    :param max_expert_parallel: ep最大值
+    Args:
+        max_expert_parallel (int): Max EP value.
+        dryrun_info_init (list): List containing [dp, tp, pp, ep, peak_value].
     :param test_ep:
-    :param dryrun_info_init: [dp, tp, pp, ep, peak_value]
     :param mindformers_args:
     :return: [dp, tp, pp, ep, evaluate_peak_mem]
     """
@@ -79,15 +80,15 @@ def grey_box_memory_prune(mindformers_args, dryrun_info_init, test_ep, max_exper
     logger.info("format: dp_tp_pp_ep_evaluateMem")
     ep_power = find_power_of_two(max_expert_parallel)
     for dp, tp, pp, peak_ep, peak_ep_double in dryrun_info:
-        # 线性拟合ep会影响到的内存和ep不会影响到的内存
-        ep_memory = (peak_ep - peak_ep_double) * test_ep[1] #所有专家的内存
+        # linear fit: memory affected by ep vs memory not affected by ep
+        ep_memory = (peak_ep - peak_ep_double) * test_ep[1]  # memory for all experts
         base_memory = peak_ep - ep_memory / test_ep[0]
-        # 确定ep最大能开多大,最大为6, ep最大64
+        # determine max ep, max power 6, ep max 64
         ep_upperbound = 0
         for i in range(ep_power+1):
             if (dp*tp) % (2**i) == 0:
                 ep_upperbound += 1
-        # 输出满足内存上限的ep，如果ep64都不够就不返回
+        # Output EP that satisfies memory limit, skip if EP64 is not enough.
         for j in range(ep_upperbound):
             ep = 2 ** j
             evaluate_mem = base_memory + ep_memory / ep
@@ -108,9 +109,9 @@ def filter_oom(search_space, input_args, para):
     """
     filter evaluate oom configs
     """
-    # todo: 是否dryurn返回值不同，需判断这里是否需要处理
+    # TODO: Check if dryrun return value differs, may need handling here.
     if para.DRYRUN:
-        # 生成要做dryrun的配置
+        # generate configs for dryrun
         care_part_configs = select_dry_config(search_space, input_args)
         test_ep = (8, 16)
         dry_config = generate_dry_config(care_part_configs, input_args, test_ep)
@@ -122,7 +123,7 @@ def filter_oom(search_space, input_args, para):
             generate_files(dry_config, dryrun_file_dir, file_task, para, input_args)
             dryrun_data_dir = os.path.join(os.path.abspath(para.OUTPUT_PATH), "dryrun_output")
             if input_args.mf_args:
-                # 基于mindformers(mindspore)才做dryrun
+                # dryrun only for mindformers (mindspore)
                 launch_dryrun(input_args, dryrun_file_dir, dryrun_data_dir, para)
         else:
             dryrun_data_dir = para.DRYRUN_DATA_DIR
@@ -161,12 +162,13 @@ def filter_oom(search_space, input_args, para):
                  + moe_size * (input_args.num_layers // input_args.pp - input_args.first_k_dense_replace))
             estimated_general = moe_size * math.ceil((input_args.num_layers + 2) / input_args.pp)
             evaluate_memory = max(estimated_first, estimated_general)
-        if op_disable: op = -1
+        if op_disable:
+            op = -1
         if evaluate_memory <= max_mem:
             if [dp, tp, pp, ep, cp, op, evaluate_memory] not in candidate_configs:
                 candidate_configs.append([dp, tp, pp, ep, cp, op, evaluate_memory])
         else:
-            logger.info(f"mem over limit: evaluate mem {evaluate_memory}"
+            logger.info(f"mem over limit: evaluate mem {evaluate_memory} "
                         f"config dp {dp} tp {tp} pp {pp} ep {ep} cp {cp} op {op}")
     logger.info(f"Prune Search space size: {len(candidate_configs)},"
                 f"format: [dp, tp, pp, ep, cp, op/fsdp, evaluate_peak_mem]")
@@ -176,9 +178,9 @@ def select_dry_config(valid_configs, input_args):
     """
 
     :param valid_configs: [[(dp, tp, cp, pp), (ep, op, vp, mbs)], sp]
-    :param input_args: 配置文件参数
+    :param input_args: config file params
     :return: [[(dp, tp, cp, pp), (ep, op, vp, mbs)], sp]
-             其中vp=1, mbs=1, sp=true  每个(dp, tp, cp, pp)，对应ep最大的配置列表
+             where vp=1, mbs=1, sp=true, each (dp, tp, cp, pp) maps to config list with max ep
     """
     first = valid_configs[0][0][0]
     max_ep = valid_configs[0][0][1][0]
@@ -203,7 +205,7 @@ def select_dry_config(valid_configs, input_args):
             first = current_first
             max_ep = current_ep
             op_with_ep = current_op
-    # 添加最后一组数据
+    # append last group
     ans.append([[first, [max_ep, op_with_ep, 1, 1]], True])
     logger.info(f"Dryrun candidate config size: {len(ans)}")
     return ans
@@ -212,23 +214,23 @@ def generate_csv(output_path, dryrun_config, input_args):
     """
     generate nd result to csv file
     """
-    # 表头
+    # headers
     if input_args.expert_num is not None:
         headers = ['dp', 'tp', 'pp', 'ep', 'evaluate_mem']
     else:
         headers = ['dp', 'tp', 'pp', 'evaluate_mem']
 
-    # 写入 CSV 文件
+    # write CSV file
     try:
         csv_path = os.path.join(os.path.abspath(output_path), "nd_candidate_config.csv")
         with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
-            # 写入表头
+            # write headers
             writer.writerow(headers)
-            # 写入数据
+            # write data
             writer.writerows(dryrun_config)
-        logger.info("CSV file generate succ.")
-    except Exception as e:
+        logger.info("CSV file generate success.")
+    except OSError as e:
         logger.info(f"write CSV file fail: {e}")
 
 class CareTpye(Enum):
@@ -240,10 +242,10 @@ class CareTpye(Enum):
 def generate_dry_config(care_part_configs, input_args, test_ep):
     """
 
-    :param test_ep: 要做dryrun的ep
+    :param test_ep: ep for dryrun
     :param care_part_configs: [[(dp, tp, cp, pp), (ep, op, vp, mbs)], sp]
-    :param input_args: 模型及环境等信息
-    :return: [dp, tp, pp, ep, offset] 或 [dp, tp, pp]
+    :param input_args: model and config info
+    :return: [dp, tp, pp, ep, offset] or [dp, tp, pp]
     """
     dry_run_config = []
     layers_num = input_args.num_layers
@@ -261,10 +263,10 @@ def generate_dry_config(care_part_configs, input_args, test_ep):
     for config in care_part_configs:
         dp, tp, _, pp = config[0][0]
         ep = config[0][1][0]
-        # 若为deepseek模型
+        # if deepseek model
         if care_type == CareTpye.WITH_EXPERT_MF:
             for ep in test_ep:
-                # mindformers的约束
+                # mindformers constraint
                 if input_args.mf_args is not None and dp * tp % ep != 0:
                     continue
 

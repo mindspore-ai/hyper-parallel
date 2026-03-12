@@ -33,10 +33,10 @@ double_check_dryrun_filename = 'double_check_dryrun'
 HIGHS_NAME = 'HIGHS'
 default_low_mem = False
 default_time_limit = 1e10
-# 0：deepseek模型；1：boss模型
+# 0: deepseek model; 1: boss model
 model_class = 0
 
-# 专家输入：专家可根据环境变化更改
+# expert input: expert can change per environment
 class ExpertInput:
     """Expert input configuration for pipeline tuning.
 
@@ -409,7 +409,7 @@ class InitConfig:
         self.memory.act_mem12 = max((peak_mem[0][5] - peak_mem[0][6]) / (peaks[5] - peaks[6]), 0)
         self.memory.act_mem0 = self.memory.act_mem12
         self.memory.act_mem = (peak_mem[0][12] - peak_mem[0][13]) / (peaks[12] - peaks[13])
-        # 更正re_comp_mem
+        # correct re_comp_mem
         if dryrun.DryRun.config_file_type == 1:
             self.memory.re_comp_mem = self.memory.act_mem
 

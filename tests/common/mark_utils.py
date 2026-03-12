@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-""" define marks """
+"""define marks"""
 import pytest
 from tests.common.random_generator import set_numpy_global_seed
 
 
 def arg_mark(plat_marks, level_mark, card_mark, essential_mark):
+    """Apply pytest marks for platform, level, card and essential."""
     optional_plat_marks = ['platform_ascend', 'platform_ascend910b', 'platform_ascend310p', 'platform_gpu',
                            'cpu_linux', 'cpu_windows', 'cpu_macos']
     optional_level_marks = ['level0', 'level1', 'level2', 'level3', 'level4']

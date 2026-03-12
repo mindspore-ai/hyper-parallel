@@ -13,9 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Torch HSDP cell state"""
-from typing import List, Optional
+# pylint: disable=protected-access
+from typing import Optional
 import torch
-from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
@@ -73,12 +73,12 @@ class TorchHSDPStateV2(HSDPState):
 
     def _init_hsdp_params(self):
         """init hsdp parameters for cell"""
-        # Cell 树内的全部parameters
+        # all parameters in the cell tree
         filtered_params = []
         for _, param in self.cell.named_parameters():
             if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
-                # 在HSDPParam._init_sharded_param中添加该属性，避免重复初始化
-                # 通过_setattr_重新给cell绑定了param后，named_parameters会重复遍历到该param
+                # attribute added in HSDPParam._init_sharded_param to avoid re-initialization
+                # after _setattr_ rebinds param to cell, named_parameters will traverse it again
                 continue
             filtered_params.append(param)
 
@@ -93,7 +93,7 @@ class TorchHSDPStateV2(HSDPState):
                                           )
             self.hsdp_params.append(hsdp_param)
             if hsdp_param.is_sharded:
-                # TODO: 这个可能不需要了，后续根据mesh处理是否切分。
+                # TODO: may not be needed, handle sharding based on mesh later
                 self.sharded_hsdp_params.append(hsdp_param)
 
     def _init_mp_dtypes(self):
@@ -129,7 +129,7 @@ class TorchHSDPStateV2(HSDPState):
                 "HSDP parameters should be materialized on CPU when enabling CPU offloading. "
                 'For example, load a CPU state dict or call module.to_empty(device="cpu"). '
                 "Found following parameters on non-CPU device: "
-                f"{[(hsdp_param._param_fqn, hsdp_param.sharded_param.device) for hsdp_param in hsdp_params_not_on_cpu]}\n"
+                f"{[(p._param_fqn, p.sharded_param.device) for p in hsdp_params_not_on_cpu]}\n"
             )
 
     def lazy_init(self):
@@ -157,8 +157,9 @@ class TorchHSDPStateV2(HSDPState):
                 "call module.reset_parameters() on each module to initialize values."
             )
 
-    def reshard(self,):
-        # TODO：补齐reshard接口，当前我们不考虑reshard_after_forward配置是int的情况，只考虑True/False
+    def reshard(self):
+        """Reshard parameters after forward or backward."""
+        # TODO: complete reshard interface, currently only consider reshard_after_forward as True/False, not int
         # if self.scheduler_state == FSDPSchedulerState.FORWARD:
         #     if not self.reshard_after_forward:
         #         return
@@ -172,7 +173,8 @@ class TorchHSDPStateV2(HSDPState):
         #         return
         self.shard()
 
-    def post_backward(self, *unused):
+    def post_backward(self, *unused):  # pylint: disable=unused-argument
+        """Reduce gradients and reshard parameters after backward."""
         for hsdp_param in self.hsdp_params:
             hsdp_param.accumulate_unsharded_grad_if_needed()
         if not self.reduce_grads:
@@ -251,7 +253,8 @@ class TorchHSDPStateV2(HSDPState):
             elif self.device.type == "cuda":
                 torch.cuda.current_stream().synchronize()
             else:
-                raise NotImplementedError(f"Unsupported device type {self.device.type} for synchronization after CPU offload.")
+                raise NotImplementedError(
+                    f"Unsupported device type {self.device.type} for synchronization after CPU offload.")
 
     def set_requires_grad_sync(self, requires_grad_sync):
         """set requires grad sync flag to control gradient sync."""
@@ -264,6 +267,8 @@ class TorchHSDPStateV2(HSDPState):
             "avg": torch.distributed.ReduceOp.AVG,
         }
         if reduce_op_type not in fsdp_support_reduce_op:
-            raise ValueError(f"Unsupported reduce op type {reduce_op_type}, supported types are {list(fsdp_support_reduce_op.keys())}")
+            raise ValueError(
+                f"Unsupported reduce op type {reduce_op_type}, "
+                f"supported types are {list(fsdp_support_reduce_op.keys())}")
         reduce_op: str = reduce_op_type.lower().strip()
         self.reduce_op_type = fsdp_support_reduce_op[reduce_op]

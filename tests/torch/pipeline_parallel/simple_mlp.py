@@ -17,7 +17,7 @@ import torch
 from torch import nn
 import torch.distributed as dist
 # pylint: disable=W0611
-import torch_npu  # 昇腾NPU核心适配
+import torch_npu  # Ascend NPU core adapter
 from hyper_parallel import DTensor
 
 

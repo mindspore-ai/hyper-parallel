@@ -24,7 +24,7 @@ sys.path.append(os.getcwd())
 
 
 class PipeTestCase(unittest.TestCase):
-    """流水线负载均衡算法单元测试用例"""
+    """Pipeline load balance algorithm unit tests"""
 
     def get_yaml_path(self, filename):
         yaml_file_path = Path(__file__).resolve().parents[2] / 'config' / filename
@@ -213,7 +213,7 @@ class PipeTestCase(unittest.TestCase):
         self.assertLessEqual(cur_solution.object_value, object_value + 0.01)
         self.assertGreaterEqual(cur_solution.object_value, object_value - 0.01)
 
-    # 此用例运行时间较长，大概40分钟
+    # this case runs long, ~40 min
     def test512_8k_swap(self):
         """test6"""
         yaml_file = self.get_yaml_path('512_8k_swap.yaml')

@@ -81,26 +81,30 @@ class ExpertFilterManager:
 
     def add_experience(self, experience_function):
         """
-        添加一个专家经验函数到列表中
-        :param experience_function:要添加的专家经验函数
+        Add an expert experience function to the list.
+
+        Args:
+            experience_function (callable): Expert experience function to add.
         """
         self.expert_filters.append(experience_function)
-        logger.info(f"add experience succ:{experience_function.__name__}")
+        logger.info(f"add experience success:{experience_function.__name__}")
 
     def remove_experience(self, experience_function):
         """
-        从列表中移除一个专家经验函数
-        :param experience_function:要移除的专家经验函数
+        Remove an expert experience function from the list.
+
+        Args:
+            experience_function (callable): Expert experience function to remove.
         """
         if experience_function in self.expert_filters:
             self.expert_filters.remove(experience_function)
             logger.info(f"remove experience succ:{experience_function.__name__}")
         else:
-            logger.info(f"can not find experience:{experience_function.__name__}，无法移除。")
+            logger.info(f"can not find experience:{experience_function.__name__}, cannot remove.")
 
     def ep_for_torchtitan(self, candidate_space):
         """
-        这里默认为etp=1的场景
+        Default for etp=1 scenario.
         """
         configs = []
         for config in candidate_space:
@@ -124,7 +128,7 @@ class ExpertFilterManager:
         return configs
 
     def cp_for_deepseek_expert(self, candidate_space):
-        # 2.28deepseek版本cp = 1
+        # deepseek 2.28 version cp = 1
         return [config for config in candidate_space if self.get_cp(config) == 1]
 
     def dp_cp_ep_for_megatron_expert(self, candidate_space):
@@ -133,23 +137,23 @@ class ExpertFilterManager:
                 if self.get_dp(config) * self.get_cp(config) % self.get_ep(config) == 0]
 
     def pp_for_deepseek(self, candidate_space):
-        # 万卡训练deepseek, 要求pp>1, pp过小内存会超
+        # 10k-card deepseek training requires pp>1, pp too small causes OOM
         return [config for config in candidate_space if self.get_pp(config) > 1]
 
     def pp_for_768die(self, candidate_space):
-        # 768die, 要求pp<=32,
+        # 768die, requires pp<=32
         return [config for config in candidate_space if self.get_pp(config) <= 32]
 
     def tp_for_910b_expert(self, candidate_space):
-        # 910b为1机8卡，机间通信耗时过大，因此不能超过8
+        # 910b is 8 cards per node, inter-node comm too slow, so tp cannot exceed 8
         return [config for config in candidate_space if self.get_tp(config) <= 8]
 
     def tp_for_large_scale_expert(self, candidate_space):
-        # 超节点技术，专家经验不超过64即可
+        # super-node tech, expert experience tp <= 64
         return [config for config in candidate_space if self.get_tp(config) <= 64]
 
     def tp_for_large_scale_768die(self, candidate_space):
-        # 768die, tp要是2的幂
+        # 768die, tp must be power of 2
         return [config for config in candidate_space if self.get_tp(config) % 3 != 0]
 
     def tp_for_yoco_expert(self, candidate_space):
@@ -159,7 +163,7 @@ class ExpertFilterManager:
         return [config for config in candidate_space if self.get_ep(config) <= 64]
 
     def sp_for_lm_expert(self, candidate_space):
-        # 在千卡规模及以上sp一定开启，千卡规模以下可支持sp搜索
+        # at 1k+ scale sp must be on, below 1k scale supports sp search
         world_size = self.get_world_size(candidate_space[0])
         return [config for config in candidate_space
                 if world_size < 1000 or (self.get_tp(config) ==1 or self.get_sp_switch(config))]
@@ -174,11 +178,11 @@ class ExpertFilterManager:
 
 def expert_filter_configs(search_spaces, input_args, gbs):
     """
-
-    :param search_spaces: 初始搜索空间 [[(dp, tp, cp, pp), (ep, op, vp, mbs)], sp]
-    :param input_args: 用户输入模型配置信息
+    :param search_spaces: initial search space [[(dp, tp, cp, pp), (ep, op, vp, mbs)], sp]
+    :param input_args: user input model config
     :param gbs: global batch size
-    :return: 使用专家经验剪枝搜索空间后得到的配置 [[(dp, tp, cp, pp), (ep, op, vp, mbs)], sp]
+    Returns:
+        list: Configs after expert experience pruning.
     """
     expert_manager = ExpertFilterManager(input_args, gbs)
     expert_manager.add_experience(expert_manager.cp_for_deepseek_expert)

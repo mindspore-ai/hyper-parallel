@@ -76,13 +76,13 @@ def offset_for_dualpipe(pipeline_stage, num_layers):
     origin_base = new_layers // pipeline_stage
 
     for stage in range(pipeline_stage):
-        # 获取当前stage的层数
+        # get layer count for current stage
         if remainder == 0:
             cur_layer = base
         else:
             cur_layer = base + 1
             remainder -= 1
-        # 给vpp分配层
+        # assign layers to vpp
         vpp1_layer = cur_layer // pp_interleave_num
         if pipeline_stage - stage - 1 == 0:
             offset[0][pipeline_stage - stage - 1] = vpp1_layer + 2 - origin_base
@@ -99,15 +99,15 @@ def cal_world_size(input_args):
 
 def generate_dryrun_yaml(destination_file, config, para):
     """
-    :param para: 用户输入参数
-    :param destination_file: 修改并行参数的配置yaml文件
+    :param para: user input params
+    :param destination_file: config yaml file for parallel params
     :param config: [dp, tp, pp, ep]
     :return:
     """
-    # 复制YAML文件
+    # copy YAML file
     shutil.copy2(para.YAML_PATH, destination_file)
 
-    # 读取复制后的YAML文件, 修改config_para字段的值
+    # read copied YAML and modify config_para fields
     with open(destination_file, 'r', encoding='utf-8') as file:
         yaml_data = yaml.safe_load(file)
         yaml_data['parallel_config']['data_parallel'] = config[0]
@@ -119,14 +119,14 @@ def generate_dryrun_yaml(destination_file, config, para):
         if yaml_data['parallel'].get('dataset_strategy') is not None:
             strategy_size = len(yaml_data['parallel']['dataset_strategy'])
             yaml_data['parallel']['dataset_strategy'] = [[config[0], 1] for _ in range(strategy_size)]
-        # 重计算设置为true
+        # set recompute to true
         yaml_data['recompute_config']['recompute'] = True
 
-        # todo: 适配tnd
+        # TODO: adapt for tnd
         yaml_data['train_dataset']['data_loader']['dataset_dir'] = para.DATASET
 
 
-    # 将修改后的数据写回YAML文件
+    # write modified data back to YAML file
     with open(destination_file, 'w', encoding='utf-8') as file:
         yaml.dump(yaml_data, file, default_flow_style=False, allow_unicode=True)
 
@@ -135,8 +135,8 @@ def generate_dryrun_yaml(destination_file, config, para):
 def generate_dryrun_shell(destination_file, config, para):
     """
 
-        :param para: 用户输入参数
-        :param destination_file: 修改并行参数的配置shell文件
+        :param para: user input params
+        :param destination_file: config shell file for parallel params
         :param config: [dp, tp, pp, ep, offset] or [dp, tp, pp]
         :return:
     """
@@ -149,16 +149,16 @@ def generate_dryrun_shell(destination_file, config, para):
 
 def generate_profile_yaml(destination_file, config, para):
     """
-    :param para: 用户输入参数
+    :param para: user input params
 
     :param destination_file:
     :param config: [dp, tp, pp, ep, offset, num_layers]
     :return:
     """
-    # 复制YAML文件
+    # copy YAML file
     shutil.copy2(para.YAML_PATH, destination_file)
 
-    # 读取复制后的YAML文件, 修改config_para字段的值
+    # read copied YAML and modify config_para fields
     with open(destination_file, 'r', encoding='utf-8') as file:
         yaml_data = yaml.safe_load(file)
         yaml_data['parallel_config']['data_parallel'] = config[0]
@@ -180,7 +180,7 @@ def generate_profile_yaml(destination_file, config, para):
         yaml_data['profile_start_step'] = 4
         yaml_data['profile_stop_step'] = 6
 
-    # 将修改后的数据写回YAML文件
+    # write modified data back to YAML file
     with open(destination_file, 'w', encoding='utf-8') as file:
         yaml.dump(yaml_data, file, default_flow_style=False, allow_unicode=True)
 
@@ -188,7 +188,7 @@ def generate_profile_yaml(destination_file, config, para):
 
 def generate_profile_shell(destination_file, config, para):
     """
-    :param para: 用户输入参数
+    :param para: user input params
 
     :param destination_file:
     :param config: [dp, tp, pp, ep, offset, num_layers]
@@ -202,8 +202,8 @@ def generate_profile_shell(destination_file, config, para):
         configs['EP'] = config[3]
         configs['FIRST_K_DENSE_RAPLACE'] = 3
     else:
-        configs['EP'] = 0  # 或者这里不需要写入EP
-        # TODO 应该需要读NPUS_PER_NODE，当前硬编码为8
+        configs['EP'] = 0  # or EP not needed here
+        # TODO: should read NPUS_PER_NODE, currently hardcoded as 8
     profile_need_rank_num = configs['DP'] * configs['TP'] * configs['PP']
     if profile_need_rank_num < para.RANK_NUM:
         configs['NNODES'] = profile_need_rank_num // 8
@@ -216,7 +216,7 @@ def generate_profile_shell(destination_file, config, para):
         configs['NPUS_PER_NODE'] = 8
     configs['NUM_LAYERS'] = config[-1]
     configs['MINDSPEED_PATH'] = para.MINDSPEED_PATH
-    # 生成要分析的进程编号列表
+    # generate process rank list to profile
     step = profile_need_rank_num // config[2]
     profile_ranks = ' '.join(map(str, range(0, profile_need_rank_num, step)))
     if '_EP' in destination_file:
@@ -225,7 +225,7 @@ def generate_profile_shell(destination_file, config, para):
     else:
         output_dir = os.path.join(para.OUTPUT_PATH, "profile_result",
                                   f"DP{config[0]}_TP{config[1]}_PP{config[2]}_profile")
-    # 使用f-string构建参数字符串，提高可读性
+    # use f-string to build param string for readability
     profile_args = (
         "--profile "
         "--profile-step-start 5 "
@@ -233,10 +233,10 @@ def generate_profile_shell(destination_file, config, para):
         "--profile-level level1 "
         "--profile-with-stack "
         "--profile-with-cpu "
-        f"--profile-ranks {profile_ranks} "  # 确保参数之间有空格
+        f"--profile-ranks {profile_ranks} "  # ensure space between params
         f"--profile-save-path {output_dir}"
     )
-    # todo: 需要适配原有的args內容
+    # TODO: adapt to existing args content
     if configs['EP'] == 0:
         mem_args = (
             "--use-distributed-optimizer "
@@ -255,7 +255,7 @@ def generate_profile_shell(destination_file, config, para):
             "--first-k-dense-replace 3 "
         )
 
-    # 存入配置字典
+    # store in config dict
     configs['PROFILE_ARGS'] = profile_args
     configs['MEM_ARGS'] = mem_args
     configs_to_shell(destination_file, configs, unparses)
@@ -266,12 +266,12 @@ def generate_profile_shell(destination_file, config, para):
 def generate_profile_toml(destination_file, config, para):
     '''generate toml file for profile'''
     def read_toml(file_path):
-        """读取 TOML 文件并返回字典"""
+        """Read TOML file and return dict"""
         with open(file_path, 'r', encoding='utf-8') as f:
             return toml.load(f)
 
     def write_toml(data, file_path):
-        """将字典写入 TOML 文件"""
+        """Write dict to TOML file"""
         with open(file_path, 'w', encoding='utf-8') as f:
             toml.dump(data, f)
 
@@ -304,40 +304,40 @@ def insert_profile_args_final(shell_file_path, profile_args="$PROFILE_ARGS \\"):
     with open(shell_file_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
 
-    # 标记是否在 torchrun 命令块内
+    # flag whether inside torchrun command block
     in_torchrun_block = False
     modified_lines = []
 
     for line in lines:
         stripped = line.strip()
 
-        # 检测命令块开始
+        # detect command block start
         if "$MEM_ARGS" in stripped:
             in_torchrun_block = True
             modified_lines.append(line)
             modified_lines.append(f"    {profile_args}\n")
             continue
 
-        # 检测命令块结束（最后一个参数行，以 \ 结尾）
+        # detect command block end (last param line ends with \)
         if in_torchrun_block and stripped.endswith("\\"):
             modified_lines.append(line)
             continue
 
-        # 命令块结束后的行
+        # line after command block end
         if in_torchrun_block:
             in_torchrun_block = False
 
-        # 普通行
+        # normal line
         modified_lines.append(line)
 
-    # 写入修改后的内容
+    # write modified content
     with open(shell_file_path, 'w', encoding='utf-8') as f:
         f.writelines(modified_lines)
 
     logger.info(f"insert PROFILE_ARGS to {shell_file_path}")
 
 
-# 定义一个映射，将yaml_task和对应的生成函数关联起来
+# map yaml_task to corresponding generator function
 TASK_FUNCTION_MAP = {
     "dryrun_yaml": generate_dryrun_yaml,
     "dryrun_shell": generate_dryrun_shell,
@@ -348,11 +348,11 @@ TASK_FUNCTION_MAP = {
 
 def generate_files(candidate_configs, des_file_directory, file_task, para, input_args):
     '''generate config files w.r.t your training library'''
-    # 如果目录不存在，则创建它
+    # create dir if not exists
     if not os.path.exists(des_file_directory):
         os.makedirs(des_file_directory)
 
-    # 检查file_task是否有效
+    # check if file_task is valid
     if file_task not in TASK_FUNCTION_MAP:
         logger.error(f"Invalid file_task value: {file_task}. Please use one of {list(TASK_FUNCTION_MAP.keys())}.")
         return None
@@ -368,10 +368,10 @@ def generate_files(candidate_configs, des_file_directory, file_task, para, input
     file_path_list = []
     output_dir_list = []
     for config in candidate_configs:
-        # 生成输出文件路径,包括文件名
+        # generate output file path including filename
         destination_file = (des_file_directory + pattern).format(*config)
         file_path_list.append(destination_file)
-        # 只有file_task=profile_shell时才会返回output_dir
+        # output_dir only returned when file_task=profile_shell
         output_dir = generate_function(destination_file, config, para)
         output_dir_list.append(output_dir)
     return file_path_list, output_dir_list
@@ -390,7 +390,7 @@ def is_dualpipe_open(input_args):
 
 def check_dryrun_parallel_number(parallel_num):
     if parallel_num > 16:
-        raise Exception(f"The parallel number {parallel_num} is too large.")
+        raise ValueError(f"The parallel number {parallel_num} is too large.")
 
 def parse_args_from_json(args):
     with open(args.config, 'r', encoding='utf-8') as f:

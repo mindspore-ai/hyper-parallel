@@ -26,7 +26,7 @@ def cal_factor(num):
 
 def find_integers_less_than_ceil(num_layers, pp):
     if pp == 1:
-        # 不开pp时, vpp为1
+        # when pp is off, vpp=1
         return [1]
     ceil_value = math.ceil(num_layers / pp)
     result = list(range(1, ceil_value))
@@ -45,11 +45,11 @@ def build_initial_spaces(input_args, para):
     """
     generate initial space for nd
     """
-    # part1. 求[dp, tp, cp, pp]的取值范围
-    # 找到 world_size 的所有因子
+    # part1: get [dp, tp, cp, pp] value ranges
+    # find all factors of world_size
     factors = cal_factor(input_args.world_size)
 
-    # 找出所有可能的四个正整数乘积等于world_size
+    # find all 4 positive integers whose product equals world_size
     part1_combinations = []
     for combination in itertools.combinations_with_replacement(factors, 4):
         product = 1
@@ -62,33 +62,33 @@ def build_initial_spaces(input_args, para):
             part1_combinations = filter_specify_strategy(para, part1_combinations)
 
     # part2. [ep, op, vp, mbs]
-    # ep是dp*tp的约数
-    # vp是 < ceil(总层数/pp)的任意整数
-    # mbs 取值(1， 2， 4)中
+    # ep is divisor of dp*tp
+    # vp is any int < ceil(num_layers/pp)
+    # mbs in (1, 2, 4)
     part2_combinations = []
     num_layers = input_args.num_layers
     for world_size_config in part1_combinations:
         op_options = get_op_options(world_size_config)
         vp_options = find_integers_less_than_ceil(num_layers, world_size_config[3])
         mbs_options = [1, 2, 4]
-        # todo: mindformers 和 mindspeed 对ep的限制不同，当前是mindformers的，待修改，把这个挪到专家剪枝
+        # TODO: mindformers and mindspeed have different ep limits, currently mindformers, move to expert pruning
         ep_options = find_ep(input_args.expert_num)
         result = list(itertools.product(ep_options, op_options, vp_options, mbs_options))
 
         dp = world_size_config[0]
         for tmp_result in result:
             op = tmp_result[1]
-            # 格式 [(dp, tp, cp, pp), (ep, op, vp, mbs)]
+            # format [(dp, tp, cp, pp), (ep, op, vp, mbs)]
             if not para.STRATEGY.FSDP:
                 if op != dp:
-                    # 这里不搜FSDP的含义是: FSDP取剩余的空间
+                    # not searching FSDP here means: FSDP takes remaining space
                     tmp_result = (tmp_result[0], -1, tmp_result[2], tmp_result[3])
             part2_combinations.append([world_size_config, tmp_result])
 
 
     if not para.STRATEGY.EP:
         part2_combinations = [config for config in part2_combinations if config[1][0] == 1]
-    # part3. sp只有开关与否 格式 [[(dp, tp, cp, pp), (ep, op, vp, mbs)], sp]
+    # part3: sp is on/off only, format [[(dp, tp, cp, pp), (ep, op, vp, mbs)], sp]
     final_combinations = []
     for part2_config in part2_combinations:
         final_combinations.append([part2_config, False])
@@ -109,7 +109,7 @@ def filter_specify_strategy(para, part1_combinations):
     return part1_combinations
 
 
-# 优化器并行可以是dp的任意因子
+# optimizer parallel can be any factor of dp
 def get_op_options(world_size_config):
     dp = world_size_config[0]
     op_options = cal_factor(dp)

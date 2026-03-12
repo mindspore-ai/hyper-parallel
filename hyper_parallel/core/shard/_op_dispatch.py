@@ -534,7 +534,7 @@ class OpDispatcher:
         else:
             py_output = op_impl(*input_args, **input_kwargs)
 
-        # 设置输出布局
+        # set output layout
         if isinstance(py_output, (tuple, list)):
             output = ()
             if isinstance(output_layout, (tuple, list)):
@@ -556,7 +556,7 @@ class OpDispatcher:
         begin = args[1]
         end = args[2]
 
-        # 输入布局
+        # input layout
         cache_key = LayoutCacheKey([])
         input_layouts = []
 

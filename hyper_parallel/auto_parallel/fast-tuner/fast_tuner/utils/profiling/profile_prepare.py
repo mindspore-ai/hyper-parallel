@@ -34,19 +34,19 @@ def decide_pp_dp(config, available_devices):
     """
 
     :param config: [config, available_devices]
-    :param available_devices: 可用来做profiling的卡数
+    :param available_devices: number of devices available for profiling
     :return: [dp, tp, pp, ep]
     """
     dp, tp, origin_pp, ep, cp, op = config[:6]
     world_size = dp * tp * origin_pp * cp
     device_multiple = world_size //available_devices
-    min_pp = 2   # pp最小取2
+    min_pp = 2   # pp min 2
 
-    # 检查设备数量是足够的, dp * tp >= ep
+    # check device count: dp * tp >= ep
     if max(min_pp * tp * cp, min_pp * ep) > available_devices:
         print(f'not enough devices for config: dp: {dp}, tp: {tp}, pp: 2, ep: {ep}')
 
-    # 裁剪pp
+    # trim pp
     if device_multiple >= origin_pp // min_pp:
         pp = 2
     else:
@@ -58,7 +58,7 @@ def decide_pp_dp(config, available_devices):
         else:
             pp = origin_pp // device_multiple
 
-    # 调整dp以满足设备数量限制
+    # adjust dp to satisfy device limit
     cur_multiple = pp * dp * tp * cp // available_devices
     if cur_multiple > 1:
         dp //= cur_multiple
@@ -67,18 +67,18 @@ def decide_pp_dp(config, available_devices):
 def decide_dp(config, available_devices):
     """
     :param config: [config, available_devices]
-    :param available_devices: 可用来做profiling的卡数
+    :param available_devices: number of devices available for profiling
     :return: [dp, tp, pp, ep]
     """
     dp, tp, _, ep = config[:4]
-    pp = 2  # pp取2
+    pp = 2  # pp=2
 
-    # 检查设备数量是足够的, dp * tp >= ep
+    # check device count: dp * tp >= ep
     if max(pp * tp, pp * ep) > available_devices:
         print(f'not enough devices for config: dp: {dp}, tp: {tp}, pp: {pp}, ep: {ep}')
         return None
 
-    # 调整dp以满足设备数量限制
+    # adjust dp to satisfy device limit
     cur_multiple = pp * dp * tp // available_devices
     if cur_multiple > 1:
         dp //= cur_multiple
@@ -107,7 +107,7 @@ def decide_dp_for_titan(config, available_devices):
                         f'equals the number of available devices {available_devices} within a single node')
             return None
         return config[:6]
-    # 调整dp以满足设备数量限制
+    # adjust dp to satisfy device limit
     cur_multiple = pp * dp * cp * tp // available_devices
     if cur_multiple > 1:
         if op // cur_multiple == 0:
@@ -121,20 +121,20 @@ def decide_pp_dp_llama(config, available_devices):
     """
 
     :param config: [config, available_devices]
-    :param available_devices: 可用来做profiling的卡数
+    :param available_devices: number of devices available for profiling
     :return: [dp, tp, pp]
     """
     dp, tp, origin_pp = config[:3]
     world_size = dp * tp * origin_pp
     device_multiple = world_size // available_devices
-    min_pp = 1   # pp最小取2
+    min_pp = 1   # pp min 2
 
-    # 检查设备数量是足够的, dp * tp >= ep
+    # check device count: dp * tp >= ep
     if min_pp * tp > available_devices:
         print(f'not enough devices for config: dp: {dp}, tp: {tp}, pp: 2')
         return None
 
-    # 裁剪pp
+    # trim pp
     if device_multiple >= origin_pp // min_pp:
         pp = min_pp
     else:
@@ -146,7 +146,7 @@ def decide_pp_dp_llama(config, available_devices):
         else:
             pp = origin_pp // device_multiple
 
-    # 调整dp以满足设备数量限制
+    # adjust dp to satisfy device limit
     cur_multiple = pp * dp * tp // available_devices
     if cur_multiple > 1:
         dp //= cur_multiple
@@ -167,11 +167,11 @@ def trans_config_satisfy_rank_num(mem_prune_space, para, input_args):
         if trans_config is not None and trans_config not in profile_configs:
             profile_configs.append(trans_config)
     logger.info(f"profile configs len: {len(profile_configs)} by {rank_num} devices")
-    # todo: 待添加注释，说明筛选逻辑
+    # TODO: add comment for filter logic
     if len(profile_configs) > 10:
         # pp <= 16
         profile_configs = [cand for cand in profile_configs if cand[2] <= 16]
-        # 按tp , cp, 越小越好,  ep从大到小排
+        # sort by tp, cp ascending, ep descending
         profile_configs = sorted(profile_configs, key=lambda x: (x[1], x[4], -x[3]))
         profile_configs = profile_configs[:10]
     print(*(config for config in profile_configs), sep='\n')
@@ -179,13 +179,13 @@ def trans_config_satisfy_rank_num(mem_prune_space, para, input_args):
 
 def budget_profile_config_generator(config, para, available_devices):
     """
-    根据可用卡数，将config转换成当前卡资源可满足的并行配置做profile,先裁剪pp, pp最小为2，然后再缩减dp
-    一次profiling同时获取不开重计算和完全重计算的信息
+    Convert config to parallel config satisfiable by available devices for profile.
+    First trim pp (min 2), then reduce dp. One profiling gets both no-recompute and full-recompute info.
 
     :param config: [dp, tp, pp, ep, cp, op, evaluate_peak_mem]
     :param para: user config para for tool
     :param available_devices:
-    :return: [dp, tp, pp, ep, offset, recompute, num_layers], min(pp)=2, 层数(num_layers+MTP)
+    :return: [dp, tp, pp, ep, offset, recompute, num_layers], min(pp)=2, layers (num_layers+MTP)
     """
     if para.YAML_PATH:
         if len(config) < 4:
@@ -219,7 +219,7 @@ def budget_profile_config_generator(config, para, available_devices):
         return basic_config
     if para.SHELL_PATH:
         if len(config) < 4:
-            # TODO llama系模型待适配
+            # TODO: llama family models to be adapted
             basic_config = decide_pp_dp_llama(config, available_devices)
         else:
             basic_config = decide_dp(config, available_devices)
@@ -257,7 +257,7 @@ def profile_prepare(mem_prune_space, para, input_args):
     :param input_args: model args and train args from config file
     :return: ordered [dp, tp, pp, ep, cost]
     """
-    # 配置转换可在现有卡资源下profile的配置
+    # config conversion for profile under available devices
     profile_configs = trans_config_satisfy_rank_num(mem_prune_space, para, input_args)
     profile_dir = 'profile_yaml' if para.YAML_PATH else 'profile_shell' if para.SHELL_PATH else 'profile_toml'
     profile_file_dir = os.path.abspath(para.OUTPUT_PATH)  + os.sep + profile_dir + os.sep
@@ -266,7 +266,7 @@ def profile_prepare(mem_prune_space, para, input_args):
 
     result = []
     for config, shell_file_path, profile_dir in zip(profile_configs, file_path_list, output_dir_list):
-        # 创建子列表的副本并添加元素（避免修改原列表）
+        # create sub-list copy and add element (avoid modifying original)
         new_config = config.copy()
         new_config.append(shell_file_path)
         new_config.append(profile_dir)

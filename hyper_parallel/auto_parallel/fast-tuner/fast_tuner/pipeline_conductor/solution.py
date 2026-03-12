@@ -191,7 +191,7 @@ class Solution:
                 if micro_batch.state == 'b':
                     s_time[stage].append(self.backward_s[stage][micro_batch.vpp][micro_batch.part][micro_batch.micro_id]
                                          [micro_batch.split])
-        # 各stage的micro0batch start time单调递增
+        # micro0 batch start time monotonically increases per stage
         for stage in range(self.init_config.pipeline_stage):
             for i in range(len(self.peak_num.sort_micro.final_orders[stage]) - 1):
                 if s_time[stage][i] > s_time[stage][i + 1]:
