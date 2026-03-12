@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -277,7 +277,6 @@ class DeviceMesh:
         assert not dim_non_none_group_names or len(dim_non_none_group_names) == len(dim_group_names)
         return dim_non_none_group_names
 
-
     @property
     def rank(self):
         return self._rank
@@ -285,7 +284,6 @@ class DeviceMesh:
     @property
     def mesh_shape(self):
         return self._mesh_shape
-
 
     @property
     def rank_list(self):
@@ -752,7 +750,7 @@ class DeviceMesh:
 
         # Create the flattened mesh
         res_flattened_mesh = DeviceMesh(
-            device_type=root_mesh.device_type(),
+            device_type=root_mesh.device_type,
             mesh=flattened_mesh_tensor,
             mesh_dim_names=flattened_mesh_dim
         )
