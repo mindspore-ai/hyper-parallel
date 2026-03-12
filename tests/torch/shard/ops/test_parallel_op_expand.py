@@ -30,7 +30,7 @@ def test_distributed_expand_basic_unsharded():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_expand_3d():
     '''
     Feature: test parallel op expand.
@@ -43,7 +43,7 @@ def test_distributed_expand_3d():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_expand_prepend_new_dimensions():
     '''
     Feature: test parallel op expand.
@@ -95,7 +95,7 @@ def test_distributed_expand_as_basic():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_expand_as_3d_preservation():
     '''
     Feature: test parallel op expand.
@@ -108,7 +108,7 @@ def test_distributed_expand_as_3d_preservation():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_expand_as_prepend_dimensions():
     '''
     Feature: test parallel op expand.

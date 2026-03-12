@@ -32,7 +32,7 @@ _PORT_BASE = 12370
 
 # ---------- 8-card tests (T6–T9): get_model_state_dict ----------
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_t6_get_model_sd_sharded():
     """
@@ -44,7 +44,7 @@ def test_t6_get_model_sd_sharded():
     torchrun_case(_FILE, "test_t6_get_model_sd_sharded", _PORT_BASE + 6, num_proc=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_t7_get_model_sd_full_cpu():
     """
@@ -56,7 +56,7 @@ def test_t7_get_model_sd_full_cpu():
     torchrun_case(_FILE, "test_t7_get_model_sd_full_cpu", _PORT_BASE + 7, num_proc=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_t8_get_model_sd_ignore_frozen():
     """
@@ -68,7 +68,7 @@ def test_t8_get_model_sd_ignore_frozen():
     torchrun_case(_FILE, "test_t8_get_model_sd_ignore_frozen", _PORT_BASE + 8, num_proc=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_t9_get_model_sd_sharded_cpu():
     """
@@ -82,7 +82,7 @@ def test_t9_get_model_sd_sharded_cpu():
 
 # ---------- 8-card test (T11): meta init -> load -> backward ----------
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_t11_meta_load_backward():
     """
@@ -97,7 +97,7 @@ def test_t11_meta_load_backward():
 
 # ---------- 0-card dryrun test (T10): _to_dtype_if_needed ----------
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="dryrun", essential_mark="essential")
 def test_t10_to_dtype_if_needed():
     """

@@ -17,7 +17,7 @@ from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_masked_scatter_basic_replicated():
     '''
     Feature: test parallel op masked_scatter.
@@ -30,7 +30,7 @@ def test_masked_scatter_basic_replicated():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_masked_scatter_input_sharded_error():
     '''
     Feature: test parallel op masked_scatter.
@@ -43,7 +43,7 @@ def test_masked_scatter_input_sharded_error():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_masked_scatter_mask_sharded_error():
     '''
     Feature: test parallel op masked_scatter.
@@ -56,7 +56,7 @@ def test_masked_scatter_mask_sharded_error():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_masked_scatter_source_sharded_error():
     '''
     Feature: test parallel op masked_scatter.
@@ -67,7 +67,7 @@ def test_masked_scatter_source_sharded_error():
     file_name = "parallel_op_masked_scatter.py"
     case_name = "test_masked_scatter_source_sharded_error"
     torchrun_case(file_name, case_name, master_port)
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_masked_scatter_1d_replicated():
     '''
     Feature: test parallel op masked_scatter.
@@ -80,7 +80,7 @@ def test_masked_scatter_1d_replicated():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_masked_scatter_3d_broadcast():
     '''
     Feature: test parallel op masked_scatter.
@@ -93,7 +93,7 @@ def test_masked_scatter_3d_broadcast():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_masked_scatter_oversized_source():
     '''
     Feature: test parallel op masked_scatter.
@@ -106,7 +106,7 @@ def test_masked_scatter_oversized_source():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_masked_scatter_all_false_mask():
     '''
     Feature: test parallel op masked_scatter.
