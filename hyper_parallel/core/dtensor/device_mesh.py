@@ -1130,7 +1130,7 @@ class DeviceMesh:
     def __repr__(self):
         """__repr__"""
         return (
-            f"DeviceMesh(device_type='npu', mesh_shape={self._mesh_shape}, "
+            f"DeviceMesh(device_type='{self.device_type}', mesh_shape={self._mesh_shape}, "
             f"mesh_dim_names={self.mesh_dim_names}, rank_list={self._rank_list})"
         )
 
