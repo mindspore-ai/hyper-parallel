@@ -17,7 +17,7 @@ from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_split_default_dim():
     '''
     Feature: test parallel op linear.
@@ -30,7 +30,7 @@ def test_distributed_split_default_dim():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_split():
     '''
     Feature: test parallel op linear.
@@ -43,7 +43,7 @@ def test_distributed_split():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_split_split_list():
     '''
     Feature: test parallel op linear.
@@ -56,7 +56,7 @@ def test_distributed_split_split_list():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_split_on_sharded_dim():
     '''
     Feature: test parallel op linear.

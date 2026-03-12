@@ -44,7 +44,7 @@ def test_bsh_dp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_bsh_mp():
     """
     Feature: test npu_fusion_attention with BSH layout, head parallelism.
@@ -57,7 +57,7 @@ def test_bsh_mp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_bsh_sp():
     """
     Feature: test npu_fusion_attention with BSH layout, sequence parallelism.
@@ -83,7 +83,7 @@ def test_bsh_dp_mp_2d():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_bsh_sp_mp_2d():
     """
     Feature: test npu_fusion_attention with BSH layout, SP + MP on 2D mesh.
@@ -109,7 +109,7 @@ def test_bsh_dp_sp_mp_3d():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
 def test_bnsd_dp_mp():
     """
     Feature: test npu_fusion_attention with BNSD layout, DP + MP.
@@ -122,7 +122,7 @@ def test_bnsd_dp_mp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
 def test_bnsd_sp():
     """
     Feature: test npu_fusion_attention with BNSD layout, DP + SP.
@@ -226,7 +226,7 @@ def test_sp_sparse_mode_2():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sp_sparse_mode_3():
     """
     Feature: test npu_fusion_attention SP with sparse_mode=3.
@@ -239,7 +239,7 @@ def test_sp_sparse_mode_3():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sp_sparse_mode_4():
     """
     Feature: test npu_fusion_attention SP with sparse_mode=4.
@@ -252,7 +252,7 @@ def test_sp_sparse_mode_4():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dp_sparse_mode_1():
     """
     Feature: test npu_fusion_attention DP with sparse_mode=1.
@@ -382,7 +382,7 @@ def test_bsh_dropout():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
 def test_bsh_long_sequence_sp():
     """
     Feature: test npu_fusion_attention SP with long sequence.
@@ -395,7 +395,7 @@ def test_bsh_long_sequence_sp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
 def test_bsh_large_batch_dp():
     """
     Feature: test npu_fusion_attention DP with large batch.
@@ -460,7 +460,7 @@ def test_bnsd_sp_correctness():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_tnd_dp_correctness():
     """
     Feature: test npu_fusion_attention TND DP correctness with actual_seq_len adjustment.
@@ -475,7 +475,7 @@ def test_tnd_dp_correctness():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_tnd_cp():
     """
     Feature: test npu_fusion_attention TND layout with context parallelism.
@@ -489,7 +489,7 @@ def test_tnd_cp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_fa_vs_sdpa_cross_validation():
     """
     Feature: Cross-validate npu_fusion_attention (FA) against SDPA as ground truth.
@@ -504,7 +504,7 @@ def test_fa_vs_sdpa_cross_validation():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_fa_vs_sdpa_distributed_cross_validation():
     """
     Feature: Cross-validate FA against SDPA under distributed sharding.
@@ -588,7 +588,7 @@ def test_error_tnd_cp_qk_global_t_mismatch():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_tnd_dp_kv_sharded():
     """
     Feature: test npu_fusion_attention TND DP with kv_is_sharded=True.

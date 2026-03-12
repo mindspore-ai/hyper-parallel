@@ -18,7 +18,7 @@ from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_get_global_layout():
     """
     Feature: Test get global layout on all ranks.

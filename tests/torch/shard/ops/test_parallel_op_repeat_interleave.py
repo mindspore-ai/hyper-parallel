@@ -17,7 +17,7 @@ from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_repeat_interleave_layout_inference():
     """
     Feature: test parallel op repeat_interleave.
@@ -29,7 +29,7 @@ def test_distributed_repeat_interleave_layout_inference():
     case_name = "test_distributed_repeat_interleave_layout_inference"
     torchrun_case(file_name, case_name, master_port)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_repeat_interleave_with_tensor():
     """
     Feature: test parallel op repeat_interleave.
@@ -41,7 +41,7 @@ def test_distributed_repeat_interleave_with_tensor():
     case_name = "test_distributed_repeat_interleave_with_tensor"
     torchrun_case(file_name, case_name, master_port)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_repeat_interleave_dim_none():
     """
     Feature: test parallel op repeat_interleave.
@@ -53,7 +53,7 @@ def test_distributed_repeat_interleave_dim_none():
     case_name = "test_distributed_repeat_interleave_dim_none"
     torchrun_case(file_name, case_name, master_port)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_repeat_interleave_sharded_dim_error():
     """
     Feature: test parallel op repeat_interleave.

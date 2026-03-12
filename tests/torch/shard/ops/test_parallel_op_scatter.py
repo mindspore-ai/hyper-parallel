@@ -17,7 +17,7 @@ from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_scatter_basic():
     '''
     Feature: test parallel op scatter.
@@ -30,7 +30,7 @@ def test_distributed_scatter_basic():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_scatter_scalar_src():
     '''
     Feature: test parallel op scatter.
@@ -43,7 +43,7 @@ def test_distributed_scatter_scalar_src():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_scatter_sharded_dim_error():
     '''
     Feature: test parallel op scatter.
@@ -56,7 +56,7 @@ def test_distributed_scatter_sharded_dim_error():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_scatter_layout_mismatch_index():
     '''
     Feature: test parallel op scatter.
@@ -69,7 +69,7 @@ def test_distributed_scatter_layout_mismatch_index():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_scatter_layout_mismatch_src():
     '''
     Feature: test parallel op scatter.

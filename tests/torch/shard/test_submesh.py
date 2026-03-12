@@ -29,7 +29,7 @@ def test_full_mesh_shard_forward_1():
     torchrun_case(file_name, case_name, master_port, num_proc=4)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_column_parallel_forward():
     '''
     Feature: dtensor redistribute.
@@ -55,7 +55,7 @@ def test_full_mesh_shard_forward_2():
     torchrun_case(file_name, case_name, master_port, num_proc=4)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_row_parallel_forward():
     '''
     Feature: dtensor redistribute.
@@ -68,7 +68,7 @@ def test_sub_mesh_row_parallel_forward():
     torchrun_case(file_name, case_name, master_port, num_proc=4)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_row_parallel_redistribute_forward():
     '''
     Feature: dtensor redistribute.
@@ -133,7 +133,7 @@ def test_sub_mesh_redistribute_4():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_redistribute_5():
     '''
     Feature: dtensor redistribute.
@@ -146,7 +146,7 @@ def test_sub_mesh_redistribute_5():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_redistribute_6():
     '''
     Feature: dtensor redistribute.
@@ -159,7 +159,7 @@ def test_sub_mesh_redistribute_6():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_redistribute_7():
     '''
     Feature: dtensor redistribute.
@@ -172,7 +172,7 @@ def test_sub_mesh_redistribute_7():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_redistribute_8():
     '''
     Feature: dtensor redistribute.
@@ -185,7 +185,7 @@ def test_sub_mesh_redistribute_8():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_redistribute_9():
     '''
     Feature: dtensor redistribute.

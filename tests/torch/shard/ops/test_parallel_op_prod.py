@@ -16,7 +16,7 @@
 from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_prod():
     '''
     Feature: test parallel op prod.
@@ -28,7 +28,7 @@ def test_distributed_prod():
     case_name = "test_distributed_prod_unsharded_dim"
     torchrun_case(file_name, case_name, master_port)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_prod_partial():
     '''
     Feature: test parallel op prod partial.

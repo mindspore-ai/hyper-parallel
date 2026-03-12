@@ -31,7 +31,7 @@ def test_dcp_api_with_dtensor_and_tensor_and_scalar():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dcp_api_with_full_tensor():
     """
     Feature: Test checkpoint save and load API with state_dict containing only torch Tensors.
