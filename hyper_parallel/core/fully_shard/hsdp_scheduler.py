@@ -16,17 +16,14 @@
 import functools
 from hyper_parallel.core.device_mesh import DeviceMesh
 from hyper_parallel.core.fully_shard.hsdp_utils import HSDPConfigV2, FSDPSchedulerState
-from hyper_parallel.core.fully_shard.hsdp_grad_hook import HSDPGradHook
-from hyper_parallel.core.fully_shard.hsdp_async_grad_hook import HSDPAsyncGradHook
 
 
 class HSDPSchedulerContext:
     """HSDPSchedulerContext"""
 
     def __init__(self) -> None:
-        self.post_backward_final_callback_queued: bool = False
+        # Currently only record is_last_backward flag for scheduler context.
         self.is_last_backward: bool = True
-        self.post_optim_event = None
 
 
 class HSDPSchedulerV2:
@@ -56,7 +53,6 @@ class HSDPSchedulerV2:
         )
         self._init_platform()
         self._new_cell_state()
-        self._new_grad_hook()
         self._register_hooks()
 
     def _init_platform(self):
@@ -67,26 +63,9 @@ class HSDPSchedulerV2:
         """Create a new cell state."""
         raise NotImplementedError("HSDPScheduler subclasses must implement _new_cell_state")
 
-    def _new_grad_hook(self):
-        """Create a new grad hook."""
-        if self.config.comm_async:
-            self.grad_hook = HSDPAsyncGradHook(self.config, self.platform)
-        else:
-            self.grad_hook = HSDPGradHook(self.config, self.platform)
-
     def _register_hooks(self):
         """Register hooks."""
         raise NotImplementedError("HSDPScheduler subclasses must implement _register_hooks.")
-
-    def _register_grad_hook(self):
-        """Register parameter grad hook."""
-        for hsdp_param in self.hsdp_state.hsdp_params:
-            if not hsdp_param.param.requires_grad:
-                continue
-            if self.config.grad_fusion:
-                hsdp_param.param.register_hook(self._get_grad_buffer_hook(hsdp_param))
-            else:
-                hsdp_param.param.register_hook(self.grad_hook.get_hook(hsdp_param))
 
     def _register_forward_backward_hooks(self):
         """Register module forward and backward hook."""
@@ -117,13 +96,7 @@ class HSDPSchedulerV2:
         """Set requires grad sync flag to control gradient sync."""
         if not isinstance(requires_grad_sync, bool):
             raise ValueError(f"requires_grad_sync should be a bool, got {type(requires_grad_sync)}")
-        self.requires_grad_sync = requires_grad_sync
         self.hsdp_state.set_requires_grad_sync(requires_grad_sync)
-
-    def zero_grads(self):
-        """Set gradient to zero."""
-        if self.requires_acc_grad:
-            self.hsdp_state.zero_grads()
 
     # pylint: disable=W0613
     def _hsdp_forward_pre_hook(self, cell, args, kwargs):
@@ -170,17 +143,6 @@ class HSDPSchedulerV2:
         self.scheduler_state = FSDPSchedulerState.BACKWARD
         self.hsdp_state.post_backward()
 
-
-    def _get_grad_buffer_hook(self, hsdp_param):
-        """Set grad ready."""
-
-        def hook(grad):
-            hsdp_param.grad = grad
-            self.hsdp_state.set_grad_ready(hsdp_param)
-            return grad
-
-        return hook
-
     def set_forward_prefetch_cells(self, hsdp_cell_list):
         """Set forward prefetch cells."""
         self.forward_prefetch_cells = hsdp_cell_list
@@ -188,7 +150,3 @@ class HSDPSchedulerV2:
     def set_backward_prefetch_cells(self, hsdp_cell_list):
         """Set backward prefetch cells."""
         self.backward_prefetch_cells = hsdp_cell_list
-
-    def reshard(self):
-        """Reshard parameters after forward or backward."""
-        self.hsdp_state.reshard()

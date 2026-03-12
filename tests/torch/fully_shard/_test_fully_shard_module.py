@@ -61,11 +61,9 @@ def test_fully_shard_module_01():
 
     # Test set_requires_gradient_sync
     model1.set_requires_gradient_sync(True)
-    assert model1.hsdp_scheduler.requires_grad_sync is True
     assert model1.hsdp_scheduler.hsdp_state.reduce_grads is True
 
     model1.set_requires_gradient_sync(False)
-    assert model1.hsdp_scheduler.requires_grad_sync is False
     assert model1.hsdp_scheduler.hsdp_state.reduce_grads is False
     try:
         model1.set_requires_gradient_sync(1)

@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Torch HSDP cell state"""
-from typing import List, Optional
+from typing import Optional
 import torch
 from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
@@ -37,10 +37,22 @@ def _to_dtype_if_needed(
 
 class TorchHSDPStateV2(HSDPState):
     """Torch HSDP cell state"""
+    # Record grad reduce-scatter handle.
     pre_reduce_scatter_params = []
+    # Record grad allreduce handle (only for HSDP).
     pre_all_reduce_params = []
 
     def __init__(self, cell, mesh_info, config, platform, device):
+        """
+        Initialize TorchHSDPStateV2.
+
+        Args:
+            cell (nn.Module): The module whose parameters are managed by this state.
+            mesh_info: Mesh topology for shard/replicate dimensions.
+            config (HSDPConfigV2): HSDP configuration.
+            platform (TorchPlatform): Torch platform abstraction.
+            device (torch.device): Target device.
+        """
         super().__init__(cell, mesh_info, config, platform, device)
         # Do ReduceScatter/AllReduce for grad
         self.device = device
@@ -51,7 +63,6 @@ class TorchHSDPStateV2(HSDPState):
         self.reshard_after_backward = True
         # Requires AllReduce for grad When HSDP
         self.requires_all_reduce = True
-        self._use_post_forward_mesh = False
         # Reduce Op type for gradient reduction, default to AVG.
         self.reduce_op_type = torch.distributed.ReduceOp.AVG
         self._validate_cpu_offload_params()
@@ -59,7 +70,6 @@ class TorchHSDPStateV2(HSDPState):
 
     def _move_states_to_device(self):
         """move states to device"""
-        # TODO: @celia DTensor support
         for param in self.cell.parameters():
             if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
                 continue
@@ -93,7 +103,6 @@ class TorchHSDPStateV2(HSDPState):
                                           )
             self.hsdp_params.append(hsdp_param)
             if hsdp_param.is_sharded:
-                # TODO: 这个可能不需要了，后续根据mesh处理是否切分。
                 self.sharded_hsdp_params.append(hsdp_param)
 
     def _init_mp_dtypes(self):
@@ -117,6 +126,7 @@ class TorchHSDPStateV2(HSDPState):
         self._reduce_dtype = next(iter(reduce_dtypes)) if trainable_params else None
 
     def _validate_cpu_offload_params(self):
+        """Validate that all parameters are on CPU when CPU offload policy is enabled."""
         if not isinstance(self.offload_policy, CPUOffloadPolicy):
             return
         hsdp_params_not_on_cpu = [
@@ -132,30 +142,20 @@ class TorchHSDPStateV2(HSDPState):
                 f"{[(hsdp_param._param_fqn, hsdp_param.sharded_param.device) for hsdp_param in hsdp_params_not_on_cpu]}\n"
             )
 
-    def lazy_init(self):
-        raise NotImplementedError("lazy_init not implemented in TorchHSDPStateV2")
-
-    def reshard(self,):
-        # TODO：补齐reshard接口，当前我们不考虑reshard_after_forward配置是int的情况，只考虑True/False
-        # if self.scheduler_state == FSDPSchedulerState.FORWARD:
-        #     if not self.reshard_after_forward:
-        #         return
-        #     if self._use_post_forward_mesh:
-        #         # TODO: support reshard_after_forward=(int)
-        #         raise NotImplementedError(f"For reshard, need support reshard_after_forward=(int).")
-        #         self._to_sharded_post_forward()
-        #         self._reshard_after_forward_event = self.device_handle.Event()
-        #         if self._reshard_after_forward_event is not None:
-        #             self._reshard_after_forward_event.record()
-        #         return
-        self.shard()
 
     def post_backward(self, *unused):
+        """
+        Execute post-backward gradient reduction and reshard parameters.
+
+        Accumulates unsharded gradients if needed, performs reduce-scatter and
+        all-reduce (for HSDP) on each parameter's gradient, then reshards
+        parameters if reshard_after_backward is set.
+        """
         for hsdp_param in self.hsdp_params:
             hsdp_param.accumulate_unsharded_grad_if_needed()
         if not self.reduce_grads:
             if self.reshard_after_backward:
-                self.reshard()
+                self.shard()
             for hsdp_param in self.hsdp_params:
                 hsdp_param.to_accumulated_grad_if_needed()
             return
@@ -189,7 +189,7 @@ class TorchHSDPStateV2(HSDPState):
                 TorchHSDPStateV2.pre_all_reduce_params.append(hsdp_param)
 
         if self.reshard_after_backward:
-            self.reshard()
+            self.shard()
 
     def reduce_params(self):
         """Apply reduced gradients from pre-staged HSDP parameters to sharded parameters.
