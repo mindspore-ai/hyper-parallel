@@ -3,6 +3,7 @@
 ## Project Overview
 
 HyperParallel is an **easy-to-use, high-performance distributed parallel acceleration library** for distributed model training, inference and reinforcement learning. It provides unified abstractions for:
+
 - **Data Parallelism (DP)** — replicate model across devices, aggregate gradients
 - **Fully Sharded Data Parallelism (FSDP)** — shard parameters, gradients, and optimizer states across data-parallel ranks
 - **Tensor Parallelism (TP)** — shard model weights/activations across devices
@@ -25,7 +26,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 |--------|----------|---------|
 | **Platform** | `platform/` (`platform.py`, `torch/`, `mindspore/`) | Abstraction layer — use `get_platform()`, never import torch/mindspore directly |
 | **DTensor** | `core/dtensor.py`, `device_mesh.py`, `layout.py`, `placement_types.py`, `tensor_redistribution.py`, `redistribute_infer.py` | Distributed tensor (local shard + DeviceMesh + Placements); DeviceMesh defines multi-dim device topology; Layout maps tensor-to-mesh; redistribution cached by `compact_str + rank_id` |
-| **Shard** | `core/shard/` (`api.py`, `local_func.py`, `_op_dispatch.py`, `ops/`) | `shard_module()` / `custom_shard()` entry points; YAML registry (`ops/yaml/`) + Python impl (`ops/parallel_*.py`) |
+| **Shard** | `core/shard/` (`api.py`, `custom_shard.py`, `_op_dispatch.py`, `ops/`) | `shard_module()` / `custom_shard()` entry points; YAML registry (`ops/yaml/`) + Python impl (`ops/parallel_*.py`) |
 | **FSDP** | `core/fully_shard/`, `platform/*/fully_shard/` | Parameter sharding/unsharding lifecycle |
 | **HSDP** | `core/hsdp/`, `platform/*/hsdp/` | Hybrid shard data parallel (legacy + new scheduler) |
 | **Pipeline** | `core/pipeline_parallel/`, `platform/*/pipeline_parallel/` | Stage scheduling, micro-batch, cross-stage comm |

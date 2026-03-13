@@ -14,7 +14,7 @@ from mindspore import nn, Tensor, mint, ops
 from mindspore.common import dtype as mstype
 from mindspore.communication import GlobalComm
 from mindspore.mint.distributed.distributed import _object_to_tensor, send, recv
-from hyper_parallel.core.shard.local_func import custom_shard
+from hyper_parallel.core.shard.custom_shard import custom_shard
 
 
 class _MicroBatch(nn.Cell):
