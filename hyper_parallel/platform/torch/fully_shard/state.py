@@ -19,7 +19,7 @@ import torch
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
-from hyper_parallel.platform.torch.fully_shard.utils import HSDPMeshInfo, CPUOffloadPolicy
+from hyper_parallel.core.fully_shard.utils import HSDPMeshInfo, CPUOffloadPolicy
 
 
 def _to_dtype_if_needed(
@@ -34,6 +34,7 @@ def _to_dtype_if_needed(
     if dtype is not None and tensor.dtype != dtype:
         return tensor.to(dtype)
     return tensor
+
 
 class TorchHSDPStateV2(HSDPState):
     """Torch HSDP cell state"""

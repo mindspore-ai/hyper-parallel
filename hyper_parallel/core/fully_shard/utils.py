@@ -1,9 +1,12 @@
-import torch
+"""Common policy and mesh metadata for fully_shard APIs."""
 from dataclasses import dataclass
+from typing import Optional
 
 from hyper_parallel.collectives.cc import get_group_local_rank
 from hyper_parallel.core.device_mesh import DeviceMesh
-from typing import Optional
+from hyper_parallel.platform import get_platform
+
+platform = get_platform()
 
 
 @dataclass
@@ -19,9 +22,9 @@ class MixedPrecisionPolicy:
         reduce_dtype: Data type for gradient reduction. If None, uses param_dtype.
         output_dtype: Data type for module outputs. If None, no casting applied.
     """
-    param_dtype: Optional[torch.dtype] = None
-    reduce_dtype: Optional[torch.dtype] = None
-    output_dtype: Optional[torch.dtype] = None
+    param_dtype: Optional[platform.dtype] = None
+    reduce_dtype: Optional[platform.dtype] = None
+    output_dtype: Optional[platform.dtype] = None
     cast_forward_inputs: bool = True
     apply_grad_on_fp32_main_grad: bool = False
 

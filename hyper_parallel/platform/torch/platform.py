@@ -73,6 +73,7 @@ class TorchPlatform(Platform):
     PipelineStageBase = PipelineStageBase
     platform_type = PlatformType.PYTORCH
     tensor_dtype = torch
+    dtype = torch.dtype
 
     @staticmethod
     def device_count(device_handle):

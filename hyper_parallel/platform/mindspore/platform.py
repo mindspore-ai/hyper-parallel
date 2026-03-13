@@ -15,6 +15,8 @@
 """MindSpore platform api"""
 from datetime import timedelta
 from typing import Optional
+import dataclasses
+from collections import OrderedDict
 
 import numpy as np
 import mindspore as ms
@@ -57,6 +59,7 @@ class MindSporePlatform(Platform):
     PipelineStageBase = PipelineStageBase
     platform_type = PlatformType.MINDSPORE
     tensor_dtype = mstype
+    dtype = ms.Type
 
     def device_count(self, device_handle):
         device_type = self.device_type()
@@ -628,3 +631,44 @@ class MindSporePlatform(Platform):
 
     def init_on_device(self, device, include_buffers=False):
         return _init_on_device(device, include_buffers=include_buffers)
+
+    def cast_fp_tensor(self, dtype, x):
+        """
+        Cast floating-point tensor to target dtype if applicable.
+        """
+        if (
+            not isinstance(x, ms.Tensor)
+            or not ms.ops.is_floating_point(x)
+            or x.dtype == dtype
+        ):
+            return x
+        return x.to(dtype)
+
+    def apply_to_tensors(self, fn, container):
+        """Recursively apply to all tensor in different kinds of container types."""
+
+        def apply(x):
+
+            if isinstance(x, ms.Tensor):
+                return fn(x)
+            if hasattr(x, "__dataclass_fields__"):
+                dc = dataclasses.replace(x)
+                changes = {
+                    f.name: apply(getattr(dc, f.name)) for f in dataclasses.fields(dc)
+                }
+                return dataclasses.replace(dc, **changes)
+            if isinstance(x, OrderedDict):
+                od = x.__class__()
+                for key, value in x.items():
+                    od[key] = apply(value)
+                return od
+            if isinstance(x, dict):
+                return {key: apply(value) for key, value in x.items()}
+            if isinstance(x, tuple) and hasattr(x, "_asdict") and hasattr(x, "_fields"):
+                res = (apply(el) for el in x)
+                return type(x)(*res)
+            if isinstance(x, (list, tuple, set)):
+                return type(x)(apply(el) for el in x)
+            return x
+
+        return apply(container)

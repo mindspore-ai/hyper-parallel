@@ -1,0 +1,226 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""MindSpore HSDP cell state"""
+from typing import Optional
+import mindspore as ms
+from mindspore import ops
+from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
+from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos
+from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
+from hyper_parallel.core.fully_shard.utils import HSDPMeshInfo
+
+
+def _to_dtype_if_needed(
+    tensor: ms.Tensor, dtype: Optional[ms.Type]
+) -> ms.Tensor:
+    """Cast tensor to the given dtype if it differs from current dtype.
+
+    Args:
+        tensor: The input tensor to potentially cast.
+        dtype: Target dtype. If None or same as tensor dtype, no-op.
+    """
+    if dtype is not None and tensor.dtype != dtype:
+        return tensor.to(dtype)
+    return tensor
+
+
+class MindSporeHSDPStateV2(HSDPState):
+    """MindSpore HSDP cell state"""
+
+    def __init__(self, cell, mesh_info, config, platform, device=None):
+        super().__init__(cell, mesh_info, config, platform, device)
+        # self._init_mp_dtypes()
+        # Do ReduceScatter/AllReduce for grad
+        self.mp_policy = config.mp_policy
+        self.offload_policy = config.offload_policy
+        self.reduce_grads = True
+        # Reshard parameter after backward
+        self.reshard_after_backward = True
+        # Requires AllReduce for grad When HSDP
+        self.requires_all_reduce = True
+        # Reduce Op type for gradient reduction, default to AVG.
+        self.reduce_op_type = ops.ReduceOp.SUM
+        self._need_div = True
+        self._init_mp_dtypes()
+
+    def zero_grad(self):
+        """zero grad"""
+        for hsdp_param in self.hsdp_params:
+            hsdp_param.zero_grad()
+
+    def _div_if_needed(self, x, divisor):
+        if not self._need_div:
+            return
+        if divisor == 1:
+            return
+        x.div_(divisor)
+
+    def _move_states_to_device(self):
+        """move states to device"""
+        for param in self.cell.get_parameters():
+            if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
+                continue
+            if param.device.startswith("Ascend") and self.device == "npu" or param.device == "meta":
+                continue
+            param.data = param.to(self.device)
+        for buffer in self.cell.buffers():
+            if buffer.device in (self.device, "meta"):
+                continue
+            buffer.data = buffer.to(self.device)
+
+    def _init_hsdp_params(self):
+        """init hsdp parameters for cell"""
+        # Cell 树内的全部parameters
+        filtered_params = []
+        for _, param in self.cell.parameters_and_names():
+            if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
+                # 在HSDPParam._init_sharded_param中添加该属性，避免重复初始化
+                # 通过_setattr_重新给cell绑定了param后，named_parameters会重复遍历到该param
+                continue
+            filtered_params.append(param)
+
+        module_infos = _get_param_module_infos(filtered_params, [self.cell,])
+        for param, module_info in zip(filtered_params, module_infos):
+            hsdp_param = MindSporeHSDPParamV2(param,
+                                              module_info,
+                                              self.mesh_info,
+                                              mp_policy=self.mp_policy,
+                                              offload_policy=self.offload_policy,
+                                              device=self.device,
+                                              )
+            self.hsdp_params.append(hsdp_param)
+            if hsdp_param.is_sharded:
+                self.sharded_hsdp_params.append(hsdp_param)
+
+    def _init_mp_dtypes(self):
+        """init mp dtypes for hsdp parameters"""
+        for hsdp_param in self.hsdp_params:
+            hsdp_param.init_dtype_attrs(self.mp_policy)
+        trainable_params: list[MindSporeHSDPParamV2] = [
+            p for p in self.hsdp_params if p.sharded_param.requires_grad
+        ]
+        orig_dtypes = {p.orig_dtype for p in trainable_params}
+        reduce_dtypes = {p.reduce_dtype for p in trainable_params}
+        if len(trainable_params) > 0 and len(orig_dtypes) != 1:
+            raise AssertionError(
+                f"hsdp expects uniform original parameter dtype but got {orig_dtypes}"
+            )
+        self._orig_dtype = next(iter(orig_dtypes)) if trainable_params else None
+        if len(trainable_params) > 0 and len(reduce_dtypes) != 1:
+            raise AssertionError(
+                f"hsdp expects uniform reduce dtype but got {reduce_dtypes}"
+            )
+        self._reduce_dtype = next(iter(reduce_dtypes)) if trainable_params else None
+
+    def lazy_init(self):
+        pass
+
+    def _apply_reduced_grad(self, hsdp_param, reduced_grad):
+        """
+        Apply reduced gradient to the sharded parameter.
+
+        Reshapes ``reduced_grad`` to match the local shard, optionally
+        offloads to CPU, then accumulates or assigns onto
+        ``hsdp_param.sharded_param.grad``.
+
+        Args:
+            hsdp_param (MindSporeHSDPParamV2): The HSDP parameter wrapper.
+            reduced_grad (ms.Tensor): Gradient after reduce-scatter
+                and/or all-reduce.
+        """
+        sharded_grad = hsdp_param.sharded_param.grad
+        sharded_param_local_shape = (
+            hsdp_param.sharded_param.local_shape
+            if isinstance(hsdp_param.sharded_param, DTensor)
+            else hsdp_param.sharded_param.shape
+        )
+        reduced_grad = reduced_grad.view(sharded_param_local_shape)
+        reduced_grad = _to_dtype_if_needed(reduced_grad, self._orig_dtype)
+        to_accumulate_grad = sharded_grad is not None
+        if hsdp_param.offload_to_cpu:
+            non_blocking = hsdp_param.pin_memory and not to_accumulate_grad
+            reduced_grad = reduced_grad.to(
+                "cpu", non_blocking=non_blocking
+            )
+        if sharded_grad is None:
+            hsdp_param.sharded_param.grad = reduced_grad
+        else:
+            hsdp_param.sharded_param.grad += reduced_grad
+
+        # update unsharded_param.grad
+        hsdp_param.unsharded_param.grad._update_data(hsdp_param.sharded_param.grad)
+
+        if hsdp_param.unsharded_accumulated_grad_data is not None:
+            hsdp_param.unsharded_accumulated_grad_data = None
+        elif hsdp_param.unsharded_param.grad is not None:
+            hsdp_param.unsharded_param.grad = None
+
+    def post_backward(self, *_):
+        for hsdp_param in self.hsdp_params:
+            hsdp_param.accumulate_unsharded_grad_if_needed()
+        if not self.reduce_grads:
+            if self.reshard_after_backward:
+                self.shard()
+            for hsdp_param in self.hsdp_params:
+                hsdp_param.to_accumulated_grad_if_needed()
+            return
+        for hsdp_param in self.hsdp_params:
+            if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
+                continue
+            # Frozen parameters (requires_grad=False) produce no
+            # gradient — skip all reduce-scatter / all-reduce work.
+            if not hsdp_param.sharded_param.requires_grad:
+                continue
+            if hsdp_param.shard_world_size > 1:
+                if hsdp_param.unsharded_param.grad is None:
+                    # Parameter requires grad but was not used in
+                    # forward — all ranks skip consistently.
+                    continue
+                reduced_grad, _ = hsdp_param.reduce_scatter_grad(
+                    dtype=self._reduce_dtype,
+                    reduce_op=self.reduce_op_type
+                )
+                self._div_if_needed(reduced_grad, hsdp_param.shard_world_size)
+            if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
+                assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
+                reduced_grad, _ = hsdp_param.all_reduce_grad(
+                    grad=reduced_grad,
+                    reduce_op=self.reduce_op_type,
+                )
+                self._div_if_needed(reduced_grad, hsdp_param.replicate_world_size)
+            # Bind the reduced gradient to hsdp_param.sharded_param
+            self._apply_reduced_grad(hsdp_param, reduced_grad)
+
+        if self.reshard_after_backward:
+            self.shard()
+
+    def set_requires_grad_sync(self, requires_grad_sync):
+        """set requires grad sync flag to control gradient sync."""
+        self.reduce_grads = requires_grad_sync
+
+    def set_reduce_op_type(self, reduce_op_type: str):
+        """set reduce op type for gradient reduction."""
+        fsdp_support_reduce_op = {
+            "sum": ops.ReduceOp.SUM,
+            "avg": ops.ReduceOp.SUM,
+        }
+        if reduce_op_type not in fsdp_support_reduce_op:
+            raise ValueError(
+                f"Unsupported reduce op type {reduce_op_type}, "
+                f"supported types are {list(fsdp_support_reduce_op.keys())}")
+        self._need_div = reduce_op_type == "avg"
+        reduce_op: str = reduce_op_type.lower().strip()
+        self.reduce_op_type = fsdp_support_reduce_op[reduce_op]

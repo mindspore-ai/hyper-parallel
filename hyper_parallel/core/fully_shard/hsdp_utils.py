@@ -16,7 +16,10 @@
 from dataclasses import dataclass, field
 from typing import Any, List
 from enum import auto, Enum
-from torch import nn
+from hyper_parallel.platform import get_platform
+from hyper_parallel.platform.platform import PlatformType
+platform = get_platform()
+
 
 
 class HSDPConfigV2:
@@ -31,12 +34,14 @@ class HSDPConfigV2:
         self.ignored_params = ignored_params
         self.reduce_dtype = self.mp_policy.reduce_dtype if self.mp_policy else None
 
+
 class ShardedState(Enum):
     """
     Parameter shard state
     """
     SHARDED = auto()
     UNSHARDED = auto()
+
 
 class FSDPSchedulerState(Enum):
     """
@@ -64,7 +69,7 @@ class ParamModuleInfo:
     This dataclass maintains the mapping between a parameter and its module(s),
     enabling parameter swapping during sharding/unsharding transitions. Shared
     weights are parameters referenced by multiple modules (e.g., tied embeddings).
-    
+
     This class tracks all references to ensure proper parameter replacement during 
     sharding/unsharding operations.
 
@@ -74,15 +79,15 @@ class ParamModuleInfo:
         shared_modules: List of other modules sharing this same parameter object.
         shared_param_names: Corresponding parameter names in shared_modules (aligned by index).
     """
-    module: nn.Module
+    module: platform.Module
     param_name: str
-    shared_modules: List[nn.Module] = field(default_factory=list)
+    shared_modules: List[platform.Module] = field(default_factory=list)
     shared_param_names: List[str] = field(default_factory=list)
 
 
 def _named_parameters_with_duplicates(
-    module: nn.Module, **kwargs: Any
-) -> list[tuple[str, nn.Parameter]]:
+    module: platform.Module, **kwargs: Any
+) -> list[tuple[str, platform.Parameter]]:
     """
     This API is required as some modules overwrite `named_parameters()` but do not support
     `remove_duplicate`.
@@ -91,16 +96,22 @@ def _named_parameters_with_duplicates(
         raise AssertionError(
             "_named_parameters_with_duplicates cannot be used with `remove_duplicate` argument."
         )
+
+    def get_named_parameters(module, **kwargs):
+        if platform.platform_type == PlatformType.PYTORCH:
+            return module.named_parameters(**kwargs)
+        return module.parameters_and_names(expand=False)
     kwargs["remove_duplicate"] = False
     try:
-        ret = list(module.named_parameters(**kwargs))
+        ret = list(get_named_parameters(module, **kwargs))
     except AssertionError:
         kwargs.pop("remove_duplicate")
-        ret = list(module.named_parameters(**kwargs))
+        ret = list(get_named_parameters(module, **kwargs))
     return ret
 
+
 def _get_param_module_infos(
-    params: list[nn.Parameter], modules: tuple[nn.Module, ...]
+    params: list[platform.Parameter], modules: tuple[platform.Module, ...]
 ) -> list['ParamModuleInfo']:
     """
     Shared parameter: lin1.weight = lin2.weight
@@ -109,9 +120,15 @@ def _get_param_module_infos(
     find shared modules' parameters and shared parameters within a module.
     """
     params_set = set(params)
-    param_to_module_info: dict[nn.Parameter, ParamModuleInfo] = {}
+    param_to_module_info: dict[platform.Parameter, ParamModuleInfo] = {}
+
+    def get_named_modules(module):
+        if platform.platform_type == PlatformType.PYTORCH:
+            return module.named_modules(remove_duplicate=False)
+        return module.cells_and_names()
+
     for module in modules:
-        for _, submodule in module.named_modules(remove_duplicate=False):
+        for _, submodule in get_named_modules(module):
             for param_name, param in _named_parameters_with_duplicates(
                 submodule, recurse=False
             ):

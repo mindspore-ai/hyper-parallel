@@ -16,10 +16,12 @@
 
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, MindSporeCase
+from tests.mindspore.st.utils import skip_if_ms_version_ge
 
 PARALLEL_RESHAPE = "parallel_reshape.py"
 
 
+@skip_if_ms_version_ge("2.9.0")
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_reshape_group1():
     """
