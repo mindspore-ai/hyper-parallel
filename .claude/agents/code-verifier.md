@@ -22,16 +22,15 @@ git diff --cached --name-only
 ```
 
 ### Phase 2: Lint Checks
-For Python files:
-- Run pylint with project settings (max-line-length=120, disable=design,similarities)
-- Check license header presence (Apache 2.0, lines 1-16)
-- Verify import style (lazy imports use `# pylint: disable=C0415`)
+Delegate to the autogit check pipeline (runs pylint, lizard, codespell, markdownlint, etc.):
+```bash
+python3 .claude/skills/autogit/scripts/autogit.py check
+```
 
-For C/C++ files:
-- Check clang-format compliance
-
-For Markdown files:
-- Run markdownlint if available
+If autogit is unavailable, fall back to running checks directly:
+- Python: `pylint --max-line-length=120 --disable=design,similarities <files>`
+- C/C++: `clang-format --dry-run <files>`
+- Markdown: `markdownlint-cli2 <files>`
 
 ### Phase 3: Run Tests
 - Identify relevant unit tests for changed modules
@@ -41,7 +40,7 @@ For Markdown files:
 ### Phase 4: Summary Report
 Output a structured report:
 
-```
+```markdown
 ## Verification Report
 
 ### Files Changed

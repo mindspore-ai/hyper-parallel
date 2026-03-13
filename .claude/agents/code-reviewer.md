@@ -6,6 +6,7 @@ tools:
   - Read
   - Grep
   - Glob
+  - Bash
 ---
 
 # Code Reviewer Agent

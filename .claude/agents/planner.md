@@ -5,6 +5,7 @@ tools:
   - Read
   - Grep
   - Glob
+  - Bash
 ---
 
 # Planner Agent
