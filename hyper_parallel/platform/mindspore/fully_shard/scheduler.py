@@ -101,6 +101,7 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         self._hsdp_backward_hook(self.cell, None, None)
 
     def _register_forward_backward_hooks(self):
-        """Register module forward and backward hook."""
-        self.cell.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
-        self.cell.register_forward_hook(self._forward_hook)
+        """Register module forward and backward hook on all managed modules."""
+        for mod in self.modules:
+            mod.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
+            mod.register_forward_hook(self._forward_hook)

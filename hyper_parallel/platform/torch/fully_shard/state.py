@@ -71,29 +71,33 @@ class TorchHSDPStateV2(HSDPState):
 
     def _move_states_to_device(self):
         """move states to device"""
-        for param in self.cell.parameters():
-            if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
-                continue
-            if param.device == self.device or param.device.type == "meta":
-                continue
-            param.data = param.to(self.device)
-        for buffer in self.cell.buffers():
-            if buffer.device == self.device or buffer.device.type == "meta":
-                continue
-            buffer.data = buffer.to(self.device)
+        for mod in self.modules:
+            for param in mod.parameters():
+                if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
+                    continue
+                if param.device == self.device or param.device.type == "meta":
+                    continue
+                param.data = param.to(self.device)
+            for buffer in mod.buffers():
+                if buffer.device == self.device or buffer.device.type == "meta":
+                    continue
+                buffer.data = buffer.to(self.device)
 
     def _init_hsdp_params(self):
-        """init hsdp parameters for cell"""
-        # all parameters in the cell tree
+        """init hsdp parameters for cell(s)"""
+        # all parameters in the module tree(s), deduplicated
+        visited_params = set()
         filtered_params = []
-        for _, param in self.cell.named_parameters():
-            if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
-                # attribute added in HSDPParam._init_sharded_param to avoid re-initialization
-                # after _setattr_ rebinds param to cell, named_parameters will traverse it again
-                continue
-            filtered_params.append(param)
+        for mod in self.modules:
+            for _, param in mod.named_parameters():
+                if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
+                    continue
+                if param in visited_params:
+                    continue
+                visited_params.add(param)
+                filtered_params.append(param)
 
-        module_infos = _get_param_module_infos(filtered_params, [self.cell,])
+        module_infos = _get_param_module_infos(filtered_params, tuple(self.modules))
         for param, module_info in zip(filtered_params, module_infos):
             hsdp_param = TorchHSDPParamV2(param,
                                           module_info,

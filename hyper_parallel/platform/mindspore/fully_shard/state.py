@@ -70,29 +70,33 @@ class MindSporeHSDPStateV2(HSDPState):
 
     def _move_states_to_device(self):
         """move states to device"""
-        for param in self.cell.get_parameters():
-            if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
-                continue
-            if param.device.startswith("Ascend") and self.device == "npu" or param.device == "meta":
-                continue
-            param.data = param.to(self.device)
-        for buffer in self.cell.buffers():
-            if buffer.device in (self.device, "meta"):
-                continue
-            buffer.data = buffer.to(self.device)
+        for mod in self.modules:
+            for param in mod.get_parameters():
+                if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
+                    continue
+                if param.device.startswith("Ascend") and self.device == "npu" or param.device == "meta":
+                    continue
+                param.data = param.to(self.device)
+            for buffer in mod.buffers():
+                if buffer.device in (self.device, "meta"):
+                    continue
+                buffer.data = buffer.to(self.device)
 
     def _init_hsdp_params(self):
-        """init hsdp parameters for cell"""
-        # Cell 树内的全部parameters
+        """init hsdp parameters for cell(s)"""
+        # all parameters in the module tree(s), deduplicated
+        visited_params = set()
         filtered_params = []
-        for _, param in self.cell.parameters_and_names():
-            if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
-                # 在HSDPParam._init_sharded_param中添加该属性，避免重复初始化
-                # 通过_setattr_重新给cell绑定了param后，named_parameters会重复遍历到该param
-                continue
-            filtered_params.append(param)
+        for mod in self.modules:
+            for _, param in mod.parameters_and_names():
+                if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
+                    continue
+                if param in visited_params:
+                    continue
+                visited_params.add(param)
+                filtered_params.append(param)
 
-        module_infos = _get_param_module_infos(filtered_params, [self.cell,])
+        module_infos = _get_param_module_infos(filtered_params, tuple(self.modules))
         for param, module_info in zip(filtered_params, module_infos):
             hsdp_param = MindSporeHSDPParamV2(param,
                                               module_info,

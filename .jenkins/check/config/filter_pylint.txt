@@ -15,6 +15,8 @@
 "hyper-parallel/hyper_parallel/core/fully_shard/"                     "missing-final-newline"
 "hyper-parallel/hyper_parallel/core/fully_shard/"                     "unnecessary-pass"
 "hyper-parallel/hyper_parallel/core/fully_shard/"                     "useless-parent-delegation"
+"hyper-parallel/hyper_parallel/core/fully_shard/"                     "import-outside-toplevel"
+"hyper-parallel/hyper_parallel/core/fully_shard/"                     "wrong-import-position"
 
 # 2. Platform Implementation: hyper_parallel/platform/torch/fully_shard/
 "hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "consider-using-from-import"
@@ -57,6 +59,7 @@
 
 # 4. Tests UT: tests/ut/
 "hyper-parallel/tests/ut/"                                              "protected-access"
+"hyper-parallel/tests/ut/"                                              "import-outside-toplevel"
 "hyper-parallel/tests/ut/"                                              "unused-argument"
 "hyper-parallel/tests/ut/"                                              "unused-variable"
 "hyper-parallel/tests/ut/"                                              "unused-import"
@@ -65,6 +68,9 @@
 "hyper-parallel/tests/ut/"                                              "ungrouped-imports"
 "hyper-parallel/tests/ut/"                                              "line-too-long"
 "hyper-parallel/tests/ut/"                                              "trailing-whitespace"
+
+# 4b. Tests MindSpore UT: tests/mindspore/ut/
+"hyper-parallel/tests/mindspore/ut/"                                    "wrong-import-position"
 
 # 5. Tests Base HSDP: tests/torch/hsdp/
 "hyper-parallel/tests/torch/hsdp/"                                      "missing-final-newline"

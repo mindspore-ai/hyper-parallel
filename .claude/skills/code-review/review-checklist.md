@@ -91,6 +91,7 @@ When a change introduces new API patterns, evaluate broader implications:
 - [ ] **Docstrings** — Google-style with `Args:`, `Returns:`, `Raises:`, `Example:` sections on public APIs
 - [ ] **Type hints** — Present on all public function signatures
 - [ ] **Lazy imports** — Inside methods use `# pylint: disable=C0415`
+- [ ] **Pylint compliance** — Run `pylint` on changed `.py` files; add violations to `.jenkins/check/config/filter_pylint.txt` for unified suppression (do not use inline `# pylint: disable=` in code)
 
 ### Common Issues to Flag
 

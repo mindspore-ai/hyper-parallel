@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,29 +13,38 @@
 # limitations under the License.
 # ============================================================================
 """HSDP cell state"""
-from typing import List
+from typing import List, Tuple, Union
+
+from hyper_parallel.platform import get_platform
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.hsdp_utils import HSDPConfigV2
 
+platform = get_platform()
+
+
 class HSDPState:
     """HSDP state for cell"""
-    def __init__(self, cell, mesh_info, config: HSDPConfigV2, platform, device=None):
+    def __init__(self, cell: Union[platform.Module, Tuple[platform.Module, ...]], mesh_info,
+                 config: HSDPConfigV2, platform_impl, device=None):
         """
         Initialize HSDPState.
 
         Args:
-            cell (nn.Module): The module whose parameters are managed by this state.
+            cell (platform.Module or Tuple[platform.Module, ...]): The module(s) whose parameters
+                are managed by this state. When a tuple is passed, all modules are
+                treated as one FSDP unit.
             mesh_info: Mesh topology for shard/replicate dimensions.
             config (HSDPConfigV2): HSDP configuration (mesh, mp_policy, offload_policy, etc.).
-            platform: Platform abstraction layer (Torch or MindSpore).
+            platform_impl: Platform abstraction layer (Torch or MindSpore).
             device (torch.device, optional): Target device for parameters.
         """
-        self.cell = cell
+        self.modules = (cell,) if isinstance(cell, platform.Module) else tuple(cell)
+        self.cell = self.modules[0]
         self.mesh_info = mesh_info
         self.config = config
         self.mp_policy = config.mp_policy
         self.offload_policy = config.offload_policy
-        self.platform = platform
+        self.platform = platform_impl
         self.device = device
         self.hsdp_params: List[HSDPParamV2] = []
         self.sharded_hsdp_params: List[HSDPParamV2] = []
