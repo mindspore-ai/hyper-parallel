@@ -202,7 +202,7 @@ def infer_layout(
 
 ### Docstring Format
 
-**Use NumPy style or Google style:**
+**Use Google style (project standard):**
 
 ```python
 def infer_layout(

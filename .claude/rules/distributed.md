@@ -5,6 +5,8 @@ paths:
   - hyper_parallel/collectives/**
   - hyper_parallel/platform/torch/fully_shard/**
   - hyper_parallel/platform/torch/hsdp/**
+  - hyper_parallel/platform/mindspore/fully_shard/**
+  - hyper_parallel/platform/mindspore/hsdp/**
 ---
 
 ## DTensor
