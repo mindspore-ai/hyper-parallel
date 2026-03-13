@@ -12,61 +12,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""loss_repeat_mean test"""
+"""parallel_expand_dims_shell test"""
 
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, MindSporeCase
 
-LOSS_REPEAT_MEAN = "loss_repeat_mean.py"
+EXPAND_DIMS_SHARD_IN_PYTHON = "expand_dims_shard_in_python.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_loss_repeat_mean_group1():
+def test_expand_dims_shard_in_python_group1():
     """
-    Feature: parallel run case in loss_repeat_mean
+    Feature: parallel run case in expand_dims_shard_in_python
     Description:
-        1. test_loss_repeat_mean_0
+        1. test_expanddims_data_parallel_1
     Expectation: Run success.
     """
     parallel_run([
-        MindSporeCase(LOSS_REPEAT_MEAN, "test_loss_repeat_mean_0", 11296, 8, 8)
+        MindSporeCase(EXPAND_DIMS_SHARD_IN_PYTHON, "test_expanddims_data_parallel_1", 18290, 8, 8, 2),
     ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_loss_repeat_mean_group2():
+def test_expand_dims_shard_in_python_group2():
     """
-    Feature: parallel run case in loss_repeat_mean
+    Feature: parallel run case in expand_dims_shard_in_python
     Description:
-        1. test_loss_repeat_mean_1
+        1. test_expanddims_model_parallel_2
     Expectation: Run success.
     """
     parallel_run([
-        MindSporeCase(LOSS_REPEAT_MEAN, "test_loss_repeat_mean_1", 11297, 8, 8)
+        MindSporeCase(EXPAND_DIMS_SHARD_IN_PYTHON, "test_expanddims_model_parallel_2", 18292, 8, 8, 2),
     ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_loss_repeat_mean_group3():
+def test_expand_dims_shard_in_python_group3():
     """
-    Feature: parallel run case in loss_repeat_mean
+    Feature: parallel run case in expand_dims_shard_in_python
     Description:
-        1. test_loss_repeat_mean_2
+        1. test_expanddims_hybrid_parallel_3
     Expectation: Run success.
     """
     parallel_run([
-        MindSporeCase(LOSS_REPEAT_MEAN, "test_loss_repeat_mean_2", 11298, 8, 8)
+        MindSporeCase(EXPAND_DIMS_SHARD_IN_PYTHON, "test_expanddims_hybrid_parallel_3", 18294, 8, 8, 2),
     ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_loss_repeat_mean_group4():
+def test_expand_dims_shard_in_python_group4():
     """
-    Feature: parallel run case in loss_repeat_mean
+    Feature: parallel run case in expand_dims_shard_in_python
     Description:
-        1. test_loss_repeat_mean_3
+        1. test_expanddims_insert_middle_4
     Expectation: Run success.
     """
     parallel_run([
-        MindSporeCase(LOSS_REPEAT_MEAN, "test_loss_repeat_mean_3", 11299, 8, 8)
+        MindSporeCase(EXPAND_DIMS_SHARD_IN_PYTHON, "test_expanddims_insert_middle_4", 18295, 8, 8, 2),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_expand_dims_shard_in_python_group5():
+    """
+    Feature: parallel run case in expand_dims_shard_in_python
+    Description:
+        1. test_expanddims_negative_axis_5
+    Expectation: Run success.
+    """
+    parallel_run([
+        MindSporeCase(EXPAND_DIMS_SHARD_IN_PYTHON, "test_expanddims_negative_axis_5", 18298, 8, 8, 2),
     ])

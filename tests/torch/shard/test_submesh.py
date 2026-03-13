@@ -13,33 +13,24 @@
 # limitations under the License.
 # ============================================================================
 """test sub_mesh"""
+from tests.common.parallel_case import parallel_run, TorchCase
 from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_full_mesh_shard_forward_1():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_full_and_sub_mesh_forward_parallel():
+    """
+    Feature: parallel run testcases are list below:
+    Description:
+        submesh.py::test_full_mesh_shard_forward_1
+        submesh.py::test_sub_mesh_column_parallel_forward
     Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_full_mesh_shard_forward_1"
-    torchrun_case(file_name, case_name, master_port, num_proc=4)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_column_parallel_forward():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
-    Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_column_parallel_forward"
-    torchrun_case(file_name, case_name, master_port, num_proc=4)
+    """
+    parallel_run([
+        TorchCase("submesh.py", "test_full_mesh_shard_forward_1", 18311, 4),
+        TorchCase("submesh.py", "test_sub_mesh_column_parallel_forward", 18312, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")

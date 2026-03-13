@@ -15,18 +15,19 @@
 """return_local_tensor_shard test"""
 
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+RETURN_LOCAL_TENSOR_SHARD = "return_local_tensor_shard.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_return_local_tensor_shard():
-    '''
-    Feature: return_local_tensor functionality.
-    Description: Test return_local_tensor.
+def test_return_local_tensor_shard_group1():
+    """
+    Feature: parallel run case in return_local_tensor_shard
+    Description:
+        1. test_return_local_tensor_shard
     Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "return_local_tensor_shard.py"
-    case_name = "test_return_local_tensor_shard"
-    master_port = 10234
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(RETURN_LOCAL_TENSOR_SHARD, "test_return_local_tensor_shard", 10234, 4, 4),
+    ])

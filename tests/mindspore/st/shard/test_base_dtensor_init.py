@@ -15,57 +15,58 @@
 """parallel_base_custom_shard test"""
 
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+BASE_DTENSOR_INIT = "base_dtensor_init.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_ones():
-    '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial + custom shard.
-    Description: Test base shard.
+def test_base_dtensor_init_group1():
+    """
+    Feature: parallel run case in base_dtensor_init
+    Description:
+        1. test_ones
     Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "base_dtensor_init.py"
-    case_name = "test_ones"
-    master_port = 11333
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(BASE_DTENSOR_INIT, "test_ones", 18302, 8, 8)
+    ])
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_empty():
-    '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial + custom shard.
-    Description: Test base shard.
+def test_base_dtensor_init_group2():
+    """
+    Feature: parallel run case in base_dtensor_init
+    Description:
+        1. test_empty
     Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "base_dtensor_init.py"
-    case_name = "test_empty"
-    master_port = 11333
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(BASE_DTENSOR_INIT, "test_empty", 18303, 2, 2)
+    ])
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_full():
-    '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial + custom shard.
-    Description: Test base shard.
+def test_base_dtensor_init_group3():
+    """
+    Feature: parallel run case in base_dtensor_init
+    Description:
+        1. test_full
     Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "base_dtensor_init.py"
-    case_name = "test_full"
-    master_port = 11333
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(BASE_DTENSOR_INIT, "test_full", 18304, 8, 8)
+    ])
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_zeros():
-    '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial + custom shard.
-    Description: Test base shard.
+def test_base_dtensor_init_group4():
+    """
+    Feature: parallel run case in base_dtensor_init
+    Description:
+        1. test_zeros
     Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "base_dtensor_init.py"
-    case_name = "test_zeros"
-    master_port = 11333
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(BASE_DTENSOR_INIT, "test_zeros", 18305, 8, 8)
+    ])

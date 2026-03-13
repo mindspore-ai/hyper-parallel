@@ -12,22 +12,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test_process_group.py"""
+"""test process group"""
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+DEVICE_MESH = "device_mesh.py"
+PROCESS_GROUP = "process_group.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_process_group():
+def test_process_group_group1():
     """
-    Feature: Init process group, get rank list and backend in group, then destroy the group.
-    Description: Test init process group with backend is ``hccl``, then try to get rank list and backend in this
-        process group. After that, create a sub process group and get rank list and backend in sub process group.
-        Finally, destroy the sub process group and process group.
+    Feature: parallel run case in process_group
+    Description:
+        1.test_device_mesh_from_1d_group_valid
+        2.test_device_mesh_slice_invalid_without_mesh_dim_names
+        3.test_device_mesh_get_group_invalid_without_init_backend
+        4.test_device_mesh_invalid_different_mesh_dim_names
     Expectation: Run success.
     """
-    glog_v = 3
-    file_name = "process_group.py"
-    case_name = "test_process_group"
-    master_port = 10111
-    msrun_case(glog_v, file_name, case_name, master_port)
+    parallel_run([
+        MindSporeCase(DEVICE_MESH, "test_device_mesh_from_1d_group_valid", 10114, 2, 2),
+        MindSporeCase(DEVICE_MESH, "test_device_mesh_slice_invalid_without_mesh_dim_names", 10117, 2, 2),
+        MindSporeCase(DEVICE_MESH, "test_device_mesh_get_group_invalid_without_init_backend", 10118, 2, 2),
+        MindSporeCase(DEVICE_MESH, "test_device_mesh_invalid_different_mesh_dim_names", 10119, 2, 2)
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_process_group_group2():
+    """
+    Feature: parallel run case in process_group
+    Description:
+        1.test_device_mesh_from_3d_group_valid
+    Expectation: Run success.
+    """
+    parallel_run([
+        MindSporeCase(DEVICE_MESH, "test_device_mesh_from_3d_group_valid", 10116, 8, 8),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_process_group_group3():
+    """
+    Feature: parallel run case in process_group
+    Description:
+        1.test_device_mesh_from_2d_group_valid
+        2.test_process_group
+    Expectation: Run success.
+    """
+    parallel_run([
+        MindSporeCase(DEVICE_MESH, "test_device_mesh_from_2d_group_valid", 10115, 4, 4),
+        MindSporeCase(PROCESS_GROUP, "test_process_group", 10111, 4, 4)
+    ])

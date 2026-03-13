@@ -137,4 +137,4 @@ def test_return_local_tensor_shard():
     Description: Test return_local_tensor with SimpleModelCheck.
     Expectation: Run success.
     '''
-    base_case(dp=4, mp=2, hsdp_shard_size=4)
+    base_case(dp=2, mp=2, hsdp_shard_size=4)

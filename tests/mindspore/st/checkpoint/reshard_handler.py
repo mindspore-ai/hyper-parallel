@@ -56,7 +56,7 @@ def reshard_tensor_func(param_name, full_shape, from_layout, to_layout, to_rank_
     assert np.all(actual_result == expect_result)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_reshard_between_layout_and_none_layout():
     """
     Feature: Resharding between a normal layout and a none layout.
@@ -75,7 +75,7 @@ def test_reshard_between_layout_and_none_layout():
     reshard_tensor_func(param_name, full_shape, None, layout, rank_id)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_wrong_to_rank_id_while_to_layout_not_none():
     """
     Feature: Resharding when to_layout is normal, but to_rank_id is not in to_rank_list.
@@ -94,7 +94,7 @@ def test_wrong_to_rank_id_while_to_layout_not_none():
         ReshardHandler(param_name, full_shape, None, layout, rank_id)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_wrong_to_rank_id_while_to_layout_is_none():
     """
     Feature: Resharding between a normal layout and a none layout, to_layout is none and to_rank_id is not 0.
@@ -111,7 +111,7 @@ def test_wrong_to_rank_id_while_to_layout_is_none():
     reshard_tensor_func(param_name, full_shape, layout, None, 2)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_shape_not_even_divided_by_mesh_shape():
     """
     Feature: Resharding when dev can not divide tensor shape.
@@ -152,7 +152,7 @@ def test_reshard_between_fully_shard():
     reshard_tensor_func(param_name, full_shape, to_layout, from_layout, from_rank_id)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_reshard_between_fully_shard_and_not_shard():
     """
     Feature: Resharding between fully sharded and non-sharded modes.
@@ -198,7 +198,7 @@ def test_reshard_between_not_fully_shard():
     reshard_tensor_func(param_name, full_shape, to_layout, from_layout, from_rank_id)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_from_tensor_map_missing_rank():
     """
     Feature: Exception handling for incomplete from_tensor_map.
@@ -233,7 +233,7 @@ def test_from_tensor_map_missing_rank():
         reshard.get_real_tensor(from_tensor_map)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_from_tensor_map_has_unexpected_data():
     """
     Feature: Exception handling for invalid data in from_tensor_map.

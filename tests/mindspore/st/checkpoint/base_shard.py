@@ -28,7 +28,8 @@ from mindspore.communication import get_rank
 from hyper_parallel import shard_module, parallelize_value_and_grad, init_device_mesh
 from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
-from hyper_parallel.core.checkpoint.layout import get_current_layout, save_layout, load_layout, get_global_layout
+from hyper_parallel.core.checkpoint.layout import get_current_layout, save_layout, load_layout, get_global_layout, \
+    combine_layout
 from hyper_parallel.core.checkpoint.loader import load_checkpoint
 from hyper_parallel.core.checkpoint.saver import save_checkpoint
 
@@ -38,6 +39,7 @@ epochs = 2
 
 class SimpleModel(nn.Cell):
     """simple model"""
+
     def __init__(self, input_size, output_size):
         super().__init__()
         self.weight = ms.Parameter(initializer("ones", [input_size, output_size], ms.float32), name='weight')
@@ -52,6 +54,7 @@ class SimpleModel(nn.Cell):
 
 def run_model(x, model, parallel=False):
     """rum model"""
+
     def forward_fn(data):
         logits = model(data)
         return logits
@@ -72,13 +75,17 @@ def run_model(x, model, parallel=False):
         end = time.time()
         ret_loss = loss_value
         ret_grads = grads
-        print(f"[standalone] Epoch: {epoch+1}/{epochs}, Loss: {loss_value}, Time: {end - start}")
+        print(f"[standalone] Epoch: {epoch + 1}/{epochs}, Loss: {loss_value}, Time: {end - start}")
 
     return ret_loss, ret_grads
 
 
-def base_case(dp, mp):
-    """base case"""
+def test_base_layout():
+    """
+    Feature: test layout save and load.
+    Description: Test base layout save.
+    Expectation: Run success.
+    """
     D.init()
 
     # standalone
@@ -86,7 +93,7 @@ def base_case(dp, mp):
     output_size = 2
 
     # Create DeviceMesh
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(dp, mp), mesh_dim_names=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 1), mesh_dim_names=("dp", "mp"))
 
     # Define placements using Placement format
     x_placements = (Shard(0), Shard(1))
@@ -101,7 +108,7 @@ def base_case(dp, mp):
 
     # step 2: shard
     model_stra = ShardingPlan(
-        plan = {"weight": w_placements},
+        plan={"weight": w_placements},
         input_plan={"input": x_placements},
         output_plan={"output": out_placements},
     )
@@ -120,17 +127,65 @@ def base_case(dp, mp):
     save_layout(layout_dict, file_name)
     assert os.path.isfile(file_name)
     layout_dict = load_layout(file_name)
-    os.remove(file_name)
     assert isinstance(layout_dict, dict)
+    if rank_id == 0:
+        combine_dict = combine_layout(".")
+        print(combine_dict)
+        assert isinstance(combine_dict, dict)
+    os.remove(file_name)
 
 
-def save_load_checkpoint(dp: int, mp: int) -> None:
+def test_get_global_layout():
     """
-    Test using saver to save checkpoint to safetensors file, and then using loader to load checkpoint from this
-    safetensors file.
+    Feature: Test get global layout on all ranks.
+    Description: Test when a simple model sharded by dp and mp, gather global layout on all ranks.
+    Expectation: Run success.
+    """
+    D.init()
 
-    Args:
-        dp, mp: Mesh shape coordinate.
+    # standalone
+    input_size = 32
+    output_size = 4
+
+    # Create DeviceMesh
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 1), mesh_dim_names=("dp", "mp"))
+
+    # Define placements using Placement format
+    x_placements = (Shard(0), Shard(1))
+    w_placements = (Replicate(), Shard(0))
+    out_placements = (Replicate(), Replicate())
+    relu_input_placements = (Shard(0), Replicate())
+    relu_output_placements = (Shard(0), Replicate())
+
+    # step 1: define network with no init parameters
+    with no_init_parameters():
+        model = SimpleModel(input_size, output_size)
+
+    # step 2: shard
+    model_stra = ShardingPlan(
+        plan={"weight": w_placements},
+        input_plan={"input": x_placements},
+        output_plan={"output": out_placements},
+    )
+    shard_module(model, device_mesh=mesh, sharding_plan=model_stra)
+
+    model_relu_stra = ShardingPlan(
+        input_plan={"input": relu_input_placements},
+        output_plan={"output": relu_output_placements},
+    )
+    shard_module(model.relu, device_mesh=mesh, sharding_plan=model_relu_stra)
+
+    # step 3: get global layout
+    global_layout = get_global_layout(model)
+    assert isinstance(global_layout, dict)
+
+
+def test_saver_loader():
+    """
+    Feature: Test checkpoint saver and loader.
+    Description: Test when a simple model sharded by dp and mp, use saver and loader to save checkpoint to safetensors
+    file, and use loader to load checkpoint from this safetensors file.
+    Expectation: Run success.
     """
     D.init()
 
@@ -139,7 +194,7 @@ def save_load_checkpoint(dp: int, mp: int) -> None:
     output_size = 2
 
     # Create DeviceMesh
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(dp, mp), mesh_dim_names=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 1), mesh_dim_names=("dp", "mp"))
 
     # Define placements using Placement format
     x_placements = (Shard(0), Shard(1))
@@ -175,72 +230,3 @@ def save_load_checkpoint(dp: int, mp: int) -> None:
     param_dict = load_checkpoint(file_path)
     os.remove(file_path)
     assert isinstance(param_dict, dict)
-
-
-def test_base_layout():
-    """
-    Feature: test layout save and load.
-    Description: Test base layout save.
-    Expectation: Run success.
-    """
-    base_case(dp=4, mp=2)
-
-
-def test_saver_loader():
-    """
-    Feature: Test checkpoint saver and loader.
-    Description: Test when a simple model sharded by dp and mp, use saver and loader to save checkpoint to safetensors
-    file, and use loader to load checkpoint from this safetensors file.
-    Expectation: Run success.
-    """
-    save_load_checkpoint(dp=4, mp=2)
-
-
-def base_global_layout(dp: int, mp: int):
-    """base global layout"""
-    D.init()
-
-    # standalone
-    input_size = 32
-    output_size = 4
-
-    # Create DeviceMesh
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(dp, mp), mesh_dim_names=("dp", "mp"))
-
-    # Define placements using Placement format
-    x_placements = (Shard(0), Shard(1))
-    w_placements = (Replicate(), Shard(0))
-    out_placements = (Replicate(), Replicate())
-    relu_input_placements = (Shard(0), Replicate())
-    relu_output_placements = (Shard(0), Replicate())
-
-    # step 1: define network with no init parameters
-    with no_init_parameters():
-        model = SimpleModel(input_size, output_size)
-
-    # step 2: shard
-    model_stra = ShardingPlan(
-        plan = {"weight": w_placements},
-        input_plan={"input": x_placements},
-        output_plan={"output": out_placements},
-    )
-    shard_module(model, device_mesh=mesh, sharding_plan=model_stra)
-
-    model_relu_stra = ShardingPlan(
-        input_plan={"input": relu_input_placements},
-        output_plan={"output": relu_output_placements},
-    )
-    shard_module(model.relu, device_mesh=mesh, sharding_plan=model_relu_stra)
-
-    # step 3: get global layout
-    global_layout = get_global_layout(model)
-    assert isinstance(global_layout, dict)
-
-
-def test_get_global_layout():
-    """
-    Feature: Test get global layout on all ranks.
-    Description: Test when a simple model sharded by dp and mp, gather global layout on all ranks.
-    Expectation: Run success.
-    """
-    base_global_layout(dp=4, mp=2)

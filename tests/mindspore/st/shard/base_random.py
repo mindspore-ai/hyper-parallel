@@ -99,10 +99,10 @@ def test_multi_dim_sharding_offset():
         print("Requires at least 4 devices for 2D mesh test, skipping")
         return
 
-    # Create 2D mesh: 2x4
+    # Create 2D mesh: 2x2
     mesh_2d = DeviceMesh(
         "npu",
-        ms.mint.arange(world_size).reshape(2, 4).tolist(),
+        ms.mint.arange(world_size).reshape(2, 2).tolist(),
         mesh_dim_names=("dp", "tp")
     )
 

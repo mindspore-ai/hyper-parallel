@@ -15,18 +15,19 @@
 """test hyper_parallel.shard with different type of args"""
 
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+SHARD_API_ARGS = "shard_api_args.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_shard_with_args_and_kwargs_non_dtensor_input():
-    '''
-    Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial.
-    Description: Test base shard.
+def test_shard_api_args_group1():
+    """
+    Feature: parallel run case in shard_api_args
+    Description:
+        1. test_shard_with_args_and_kwargs_non_dtensor_input
     Expectation: Run success.
-    '''
-    glog_v = 3
-    file_name = "shard_api_args.py"
-    case_name = "test_shard_with_args_and_kwargs_non_dtensor_input"
-    master_port = 11333
-    msrun_case(glog_v, file_name, case_name, master_port)
+    """
+    parallel_run([
+        MindSporeCase(SHARD_API_ARGS, "test_shard_with_args_and_kwargs_non_dtensor_input", 18308, 4, 4),
+    ])

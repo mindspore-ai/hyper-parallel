@@ -146,9 +146,9 @@ def base_case(dp, mp, hsdp_shard_size):
 
 
 def test_parallel_split():
-    '''
+    """
     Feature: with no_init_parameters + cell shard + hsdp + init param + loss repeat + partial.
     Description: Test base shard.
     Expectation: Run success.
-    '''
+    """
     base_case(dp=4, mp=2, hsdp_shard_size=4)
