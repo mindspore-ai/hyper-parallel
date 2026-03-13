@@ -14,72 +14,28 @@
 # ============================================================================
 """HSDP optimizer shared level"""
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, List
 from enum import auto, Enum
 from torch import nn
-
-class OptimizerLevel(Enum):
-    """
-        Optimizer level:
-                - SHARD_OPT:
-                  Splitting is performed on optimizer state.
-                - SHARD_OPT_GRAD:
-                  Splitting is performed on optimizer state, and gradients.
-                - SHARD_OPT_GRAD_PARAM:
-                  Splitting is performed on optimizer state, gradients and weights.
-    """
-    SHARD_OPT = auto()
-    SHARD_OPT_GRAD = auto()
-    SHARD_OPT_GRAD_PARAM = auto()
-
-class GroupInfo:
-    """
-    GroupInfo
-    """
-    def __init__(self, group_name, group, rank_size):
-        self.group_name = group_name
-        self.group = group
-        self.rank_size = rank_size
 
 
 class HSDPConfigV2:
     """HSDPConfigV2 inspect by torch fully_shard"""
 
-    def __init__(self, mesh, reshard_after_forward, shard_placement_fn, mp_policy, offload_policy, ignored_param,
-                 reduce_dtype=None, comm_async=False, comm_fusion=False, bucket_size=-1):
-        # pylint: disable=unused-argument
-        """
-            HSDP config init method
-            Args:
-                shard_size: optimizer weight sharded size.
-                threshold: minimum weight size to shard.
-                requires_acc_grad: requires gradient accumulation.
-                grad_scale: use grad_scale to scale grad.
-                shard_level: optimizer shard level.
-                use_eager_hook: use eager hook or graph hook to implement hsdp.
-                reduce_dtype: set gradient reduce dtype.
-                comm_async: use async communication op for grad reduction.
-                comm_fusion: use communication op fusion to reduce the number of communication op.
-                bucket_size: the size of comm fusion buffer.
-        """
+    def __init__(self, mesh, reshard_after_forward, shard_placement_fn, mp_policy, offload_policy, ignored_params=None):
         self.mesh = mesh
         self.reshard_after_forward = reshard_after_forward
         self.shard_placement_fn = shard_placement_fn
         self.mp_policy = mp_policy
         self.offload_policy = offload_policy
+        self.ignored_params = ignored_params
         self.reduce_dtype = self.mp_policy.reduce_dtype if self.mp_policy else None
-        # TODO: attributes below are to be removed
-        self.comm_async = False
-        self.comm_fusion = False
-        self.bucket_size = 9999
-        self.grad_fusion = False
 
 class ShardedState(Enum):
     """
     Parameter shard state
     """
     SHARDED = auto()
-    SHARDED_POST_FORWARD = auto()
     UNSHARDED = auto()
 
 class FSDPSchedulerState(Enum):
@@ -91,7 +47,7 @@ class FSDPSchedulerState(Enum):
                   already run hook after forward.
                 - PRE_BACKWARD:
                   already run hook before backward.
-                - PRE_BACKWARD:
+                - BACKWARD:
                   already run hook after backward.
     """
     PRE_FORWARD = auto()
@@ -122,28 +78,6 @@ class ParamModuleInfo:
     param_name: str
     shared_modules: List[nn.Module] = field(default_factory=list)
     shared_param_names: List[str] = field(default_factory=list)
-
-
-@dataclass
-class ExtensionsData:
-    """
-    Stores metadata for custom all-gather extensions.
-
-    This enables users to implement custom pre/post all-gather transforms
-    by passing metadata between the two phases. The input sizes are saved
-    to properly reshape the gathered outputs back to their original dimensions.
-
-    Attributes:
-        all_gather_metadata: Custom metadata passed from pre to post all-gather.
-        all_gather_input_sizes: Original tensor shapes before flattening for all-gather.
-    """
-    all_gather_metadata: Optional[Any] = None
-    all_gather_input_sizes: Sequence[Tuple[int, ...]] = ()
-
-    def clear(self):
-        """Reset all extension data to default values."""
-        self.all_gather_metadata = None
-        self.all_gather_input_sizes = ()
 
 
 def _named_parameters_with_duplicates(

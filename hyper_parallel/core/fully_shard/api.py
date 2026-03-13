@@ -15,7 +15,7 @@
 """hybrid shard data parallel interface"""
 import warnings
 from collections import namedtuple
-from typing import Any, Mapping, cast, Optional, Union
+from typing import Any, Mapping, cast, Optional
 
 import torch
 from torch import nn
@@ -79,10 +79,18 @@ def _resolve_local_tensor(
 
 
 class _UnshardHandle:
+    """Unshard handle for user call HSDPModule.unshard(async_op=True)"""
     def __init__(self, hsdp_state=None):
+        """
+        Initialize an async unshard handle.
+
+        Args:
+            hsdp_state (HSDPState, optional): The state to wait on. None means a no-op handle.
+        """
         self._hsdp_state = hsdp_state
 
     def wait(self):
+        """Block until the async unshard operation completes."""
         if self._hsdp_state is not None:
             self._hsdp_state.wait_for_unshard()
             self._hsdp_state = None
@@ -135,15 +143,15 @@ class HSDPModule:
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_requires_grad_sync(requires_grad_sync)
 
-    def zero_grads(self):
+    def zero_grad(self):
         """zero accumunication grads"""
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call hsdp interface first.")
-        if platform == PlatformType.PYTORCH:
+        if platform.platform_type == PlatformType.PYTORCH:
             raise RuntimeError("zero_grads shouldn't be called in torch platform, use optimizer.zero_grad() instead.")
         for _, module in platform.get_cells_and_names(self):
             if isinstance(module, HSDPModule):
-                module.hsdp_scheduler.zero_grads()
+                module.hsdp_scheduler.zero_grad()
 
     def set_modules_to_forward_prefetch(self, modules):
         """set forward prefetch module list to prefetch all gather for unsharded parameters"""
@@ -284,8 +292,10 @@ class HSDPModule:
                 f"requires_all_reduce should be a bool, got {type(requires_all_reduce)}"
             )
         if not recurse:
-            raise NotImplementedError(f"Currently impl is equal to recurse=True,\
-                                      need support module_param mapping.")
+            raise NotImplementedError(
+                "Currently impl is equal to recurse=True, "
+                "need support module_param mapping."
+            )
         self_module = cast(nn.Module, self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
@@ -299,8 +309,10 @@ class HSDPModule:
                 f"reshard_after_forward should be a bool, got {type(reshard_after_forward)}"
             )
         if not recurse:
-            raise NotImplementedError(f"Currently impl is equal to recurse=True,\
-                                      need support module_param mapping.")
+            raise NotImplementedError(
+                "Currently impl is equal to recurse=True, "
+                "need support module_param mapping."
+            )
         self_module = cast(nn.Module, self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
@@ -314,8 +326,10 @@ class HSDPModule:
                 f"reshard_after_backward should be a bool, got {type(reshard_after_backward)}"
             )
         if not recurse:
-            raise NotImplementedError(f"Currently impl is equal to recurse=True,\
-                                      need support module_param mapping.")
+            raise NotImplementedError(
+                "Currently impl is equal to recurse=True, "
+                "need support module_param mapping."
+            )
         self_module = cast(nn.Module, self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
@@ -332,7 +346,7 @@ class HSDPModule:
 
 
 def _extend_module_with_hsdp_interface(module):
-    """extend Module with HSDPModule interface"""
+    """Dynamically extend module's class to inherit from HSDPModule, adding HSDP capabilities."""
     origin_class = module.__class__
     extend_class = origin_class_to_extend_class.get(origin_class, None)
     if extend_class is None:
@@ -341,72 +355,93 @@ def _extend_module_with_hsdp_interface(module):
     module.__class__ = extend_class
 
 
-# pylint: disable=C0415
-def _check_module_valid(platform_type, module):
-    """check module valid"""
-    if platform_type == PlatformType.MINDSPORE:
-        from mindspore.nn.cell import Cell
-        if not isinstance(module, Cell):
-            raise ValueError(f"module's type must be nn.cell but got {type(module)}.")
-    else:
-        from torch.nn import Module
-        if not isinstance(module, Module):
-            raise ValueError(f"module's type must be nn.Module but got {type(module)}.")
-
-
-# pylint: disable=C0415
-def _check_hsdp_input_valid(platform_type, module, shard_size, threshold, optimizer_level, enable_grad_accumulation,
-                            grad_scale, reduce_dtype, comm_async, comm_fusion, bucket_size):
-    """check hsdp input valid"""
-    _check_module_valid(platform_type, module)
-    if not isinstance(shard_size, int) or (shard_size <= 0 and shard_size != -1):
-        raise ValueError(f"shard_size must be a positive integer, but got {shard_size}.")
-    if not isinstance(threshold, int) or threshold < 0:
-        raise ValueError(f"threshold must be a positive integer or 0, but got {threshold}.")
-    if optimizer_level not in ["level1", "level2", "level3"]:
-        raise ValueError(f"Optimizer level should in ['level1', 'level2', 'level3'], but got {optimizer_level}.")
-    if not isinstance(enable_grad_accumulation, bool):
-        raise ValueError(f"enable_grad_accumulation must be bool but got {enable_grad_accumulation}.")
-    if not isinstance(grad_scale, float):
-        raise ValueError(f"grad_scale must be float but got {grad_scale}.")
-    if platform_type == PlatformType.MINDSPORE:
-        from mindspore._c_expression.typing import Type
-        if reduce_dtype is not None and not isinstance(reduce_dtype, Type):
-            raise ValueError(f"reduce_dtype must be mindspore.dtype but got {reduce_dtype}.")
-    else:
-        if reduce_dtype is not None and not isinstance(reduce_dtype, torch.dtype):
-            raise ValueError(f"reduce_dtype must be torch.dtype but got {reduce_dtype}.")
-    if not isinstance(comm_async, bool):
-        raise ValueError(f"comm_async must be bool but got {comm_async}.")
-    if not isinstance(comm_fusion, bool):
-        raise ValueError(f"comm_fusion must be bool but got {comm_fusion}.")
-    if not isinstance(bucket_size, int) or (bucket_size < 0 and bucket_size != -1):
-        raise ValueError(f"bucket_size must be a positive integer or 0, but got {bucket_size}.")
-
+def _get_device_from_mesh(mesh: DeviceMesh):
+    """Extract and validate the torch device from the device mesh."""
+    device = None
+    device_type = mesh.device_type
+    if device_type not in ("npu", "gpu"):
+        raise AssertionError(
+            f"hyper_parallel.fully_shard support device in [torch.npu, torch.gpu], "
+            f"but got '{device_type}'"
+        )
+    device_handle = platform.get_device_handle(device_type)
+    if device_handle is None:
+        raise ValueError(
+            f"hyper_parallel.fully_shard can't find device_handle of "
+            f"'torch.{device_type}', check the environment."
+        )
+    if device_handle.is_available():
+        device = torch.device(device_handle.current_device())
+    return device
 
 def fully_shard(
         module: nn.Module,
         *,
         mesh: Optional[DeviceMesh] = None,
-        reshard_after_forward: Optional[Union[bool, int]] = None,
+        reshard_after_forward: bool = True,
         shard_placement_fn: None = None,
         mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
         offload_policy: OffloadPolicy = OffloadPolicy(),
         ignored_params: Optional[set[nn.Parameter]] = None,
-        device = None,
 ):
+    """
+    Apply fully_shard to a module for distributed training with parameter sharding.
+
+    This interface provides PyTorch-compatible HSDP (Hybrid Sharded Data Parallelism)
+    functionality, enabling efficient training of large models by sharding parameters
+    across multiple devices. The module is automatically enhanced with distributed
+    capabilities including parameter sharding, gradient synchronization, and memory
+    management.
+
+    The function dynamically extends the module's class to inherit from HSDPModule,
+    adding methods for manual control over sharding/unsharding, prefetching, and
+    state management. This allows fine-grained control over when parameters are
+    gathered for computation and resharded after use.
+
+    Parameters:
+        module (nn.Module):
+            The module to apply fully_shard to. The module is modified in-place and
+            enhanced with HSDP capabilities.
+
+        mesh (Optional[DeviceMesh], default=None):
+            The device mesh defining the process topology for distributed training.
+            If None, a default 1D mesh with all processes in the sharding dimension
+            is created. For HSDP mode, use a 2D mesh with dimensions configured
+            for sharding (dim 1) and replication (dim 0).
+
+        reshard_after_forward (bool, default=True):
+            Whether to automatically reshard parameters after forward. When True,
+            parameters are resharded immediately after they are no longer needed,
+            freeing memory for subsequent operations. Set to False if you want to
+            keep parameters unsharded for backward pass or manual control.
+    
+        shard_placement_fn (Callable, default=None):
+            A callable that determines how to shard each parameter. The function
+            should accept a parameter and return a Shard object specifying the
+            sharding dimension, or None to use default sharding (dimension 0)
+
+        mp_policy (MixedPrecisionPolicy, default=MixedPrecisionPolicy()):
+            Mixed precision training policy controlling data type conversions.
+            offload_policy (OffloadPolicy, default=OffloadPolicy()):
+            Memory offload policy for reducing device memory usage.
+    
+        ignored_params (Optional[set[nn.Parameter]], default=None):
+            Set of parameters to exclude from sharding. These parameters remain
+            fully replicated across all devices. Useful for small parameters where
+            sharding overhead outweighs memory benefits, or parameters that must
+            remain unsharded for correctness.
+
+    Returns:
+        nn.Module: The input module with HSDP capabilities added. The module's
+            class is dynamically extended to inherit from HSDPModule, providing
+            additional methods for distributed training control.
+    """
+
     platform_type = platform.platform_type
     _extend_module_with_hsdp_interface(module)
-    # TODO: mindspore does not support get_device_handle
-    if device is None:
-        device_handle = platform.get_device_handle()  # return torch.npu or torch.cuda
-        if device_handle.is_available():
-            device = torch.device(device_handle.current_device())
-        else:
-            device = torch.device("cpu")
-
-    mesh = mesh or init_device_mesh(device_type=device, mesh_shape=(platform.get_world_size(),))
-
+    # if mesh is None, Using Default npu mesh
+    mesh = mesh or init_device_mesh(device_type="npu", mesh_shape=(platform.get_world_size(),))
+    device = _get_device_from_mesh(mesh)
     module.hsdp_init(
         platform_type,
         module,
@@ -428,10 +463,3 @@ def get_model_state_dict(model, *, options=None):
     Users import from here instead of platform internals.
     """
     return platform.get_model_state_dict(model, options=options)
-
-
-def hsdp_sync_stream():
-    """wait for hsdp gradient handle to be completed"""
-    if platform is None:
-        return
-    platform.wait_grad_handle()

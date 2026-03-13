@@ -13,5 +13,5 @@
 # limitations under the License.
 # ============================================================================
 """Interfaces for hybrid sharded data parallel"""
-from hyper_parallel.core.fully_shard.api import fully_shard, hsdp_sync_stream, HSDPModule
-__all__ = ["fully_shard", "hsdp_sync_stream", "HSDPModule"]
+from hyper_parallel.core.fully_shard.api import fully_shard, HSDPModule
+__all__ = ["fully_shard", "HSDPModule"]
