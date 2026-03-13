@@ -470,6 +470,24 @@ class TorchHSDPParamV2(HSDPParamV2):
                 )
             self.sharded_param = new_param
 
+        # Handle materialization from meta device via model.to_empty(device=...).
+        # to_empty() → _apply → compute_should_use_set_data → _has_compatible_shallow_copy_type
+        # (now whitelisted) → strips DTensor → returns False for meta vs npu types →
+        # PyTorch replaces the DTensor parameter with a plain Parameter(plain_npu_tensor).
+        # This plain Parameter has no _local_tensor attribute, so we detect it by hasattr
+        # and re-wrap it back into a DTensor to restore the HSDP parameter lifecycle.
+        if not hasattr(new_param, '_local_tensor'):
+            local_tensor = new_param.data
+            new_dtensor_param = nn.Parameter(
+                DTensor.from_local(local_tensor, self._spmd_mesh, self._spmd_placements)
+            )
+            new_dtensor_param.requires_grad_(new_param.requires_grad)
+            self.sharded_param = new_dtensor_param
+            self._sharded_param_data = local_tensor.view(-1)
+            self._sharding_spec = cast(DTensor, self.sharded_param).layout
+            self._setattr_on_modules(self.sharded_param)
+            return
+
         local_tensor = new_param._local_tensor
         if local_tensor.is_meta:
             return

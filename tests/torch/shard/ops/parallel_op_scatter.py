@@ -56,7 +56,7 @@ def test_distributed_scatter_basic():
     # Mesh: (2, 4) -> "dp", "tp"
     # Shard input on dim 0 ("dp"), Replicate on dim 1
     # Scatter dimension is 1 (Replicated), so this is allowed.
-    mesh = init_device_mesh(device_type="npu",mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu",mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     # All tensors (input, index, src) must share the same layout for consistency
     placements = (Shard(0), Replicate())
@@ -100,7 +100,7 @@ def test_distributed_scatter_scalar_src():
     standalone_output = standalone_input.scatter(1, standalone_index, scalar_val)
 
     # 2. Distributed
-    mesh = init_device_mesh(device_type="npu",mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu",mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, placements)
@@ -133,7 +133,7 @@ def test_distributed_scatter_sharded_dim_error():
     standalone_index = torch.zeros(input_shape, dtype=torch.long).npu()
     standalone_src = torch.randn(input_shape).npu()
 
-    mesh = init_device_mesh(device_type="npu",mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu",mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     # Shard on dim 0
     placements = (Shard(0), Replicate())
@@ -166,7 +166,7 @@ def test_distributed_scatter_layout_mismatch_index():
     index_data = torch.zeros(input_shape, dtype=torch.long).npu()
     src_data = torch.randn(input_shape).npu()
 
-    mesh = init_device_mesh(device_type="npu",mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu",mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     # Input is Sharded on dim 0
     input_placements = (Shard(0), Replicate())
@@ -201,7 +201,7 @@ def test_distributed_scatter_layout_mismatch_src():
     index_data = torch.zeros(input_shape, dtype=torch.long).npu()
     src_data = torch.randn(input_shape).npu()
 
-    mesh = init_device_mesh(device_type="npu",mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu",mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     # Input/Index correct
     placements = (Shard(0), Replicate())

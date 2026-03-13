@@ -12,45 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op transpose_permute"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_TRANSPOSE_PERMUTE = "parallel_op_transpose_permute.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_permute():
-    '''
-    Feature: test parallel op permute.
-    Description: test parallel op permute layout inference and correctness.
+def test_parallel_op_transpose_permute_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_permute_layout_inference
+        2.test_distributed_transpose_layout_inference
     Expectation: Run success.
-    '''
-    master_port = 10889  # Ensure distinct port if run in parallel
-    file_name = "parallel_op_transpose_permute.py"
-    case_name = "test_distributed_permute_layout_inference"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_TRANSPOSE_PERMUTE, "test_distributed_permute_layout_inference", 10889, 4),
+        TorchCase(PARALLEL_OP_TRANSPOSE_PERMUTE, "test_distributed_transpose_layout_inference", 10890, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_transpose():
-    '''
-    Feature: test parallel op transpose.
-    Description: test parallel op transpose layout inference and correctness.
+def test_parallel_op_transpose_permute_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_transpose_negative_dim
     Expectation: Run success.
-    '''
-    master_port = 10890
-    file_name = "parallel_op_transpose_permute.py"
-    case_name = "test_distributed_transpose_layout_inference"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_transpose_neg():
-    '''
-    Feature: test parallel op transpose with negative dims.
-    Description: test parallel op transpose negative dimension support.
-    Expectation: Run success.
-    '''
-    master_port = 10891
-    file_name = "parallel_op_transpose_permute.py"
-    case_name = "test_distributed_transpose_negative_dim"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_TRANSPOSE_PERMUTE, "test_distributed_transpose_negative_dim", 10891, 4),
+    ])

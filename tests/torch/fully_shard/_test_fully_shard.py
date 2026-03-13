@@ -32,14 +32,14 @@ from tests.torch.hsdp.hsdp_test_common import train
 def test_fully_shard_01():
     """
     Feature: Test fully_shard with simple network, optimization level is default ZeRO-3
-    Description: The DenseNet only have one weight and no bias, verify the basic process of fully_shard
+    Description: The DenseNet has only one weight and no bias, verify the basic process of fully_shard
     Expectation: run successfully
     """
     batch_size = 4
     hidden_size = 32
     hidden_out = 64
     init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     dense_model = DenseNet(hidden_size, hidden_out, has_bias=False)
     dense_model = fully_shard(dense_model,
                               mesh=mesh,
@@ -62,7 +62,7 @@ def test_fully_shard_02():
     hidden_size = 32
     dense_layer_num = 2
     init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     multi_layer_net = FullyShardTestNet(32, dense_layer_num, has_bias=False)
     for dense_layer in multi_layer_net.dense_layers.layers:
         # Wrap each layer with fully_shard
@@ -94,7 +94,7 @@ def test_fully_shard_03():
     batch_size = 4
     hidden_size = 32
     init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     net = BufferTestNet(hidden_size=hidden_size)
     net = fully_shard(
         net,
@@ -122,7 +122,7 @@ def test_fully_shard_meta_init():
     batch_size = 4
     hidden_size = 32
     init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
 
     with torch.device("meta"):
         model = MetaInitNet(hidden_size)
@@ -151,14 +151,14 @@ def test_fully_shard_meta_init():
 def test_fully_shard_from_group_mesh():
     """
     Feature: When mesh created by from_group, test fully_shard with simple network, optimization level is default ZeRO-3
-    Description: The DenseNet only have one weight and no bias, verify the basic process of fully_shard
+    Description: The DenseNet has only one weight and no bias, verify the basic process of fully_shard
     Expectation: run successfully
     """
     batch_size = 4
     hidden_size = 32
     hidden_out = 64
     init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=["dp"])
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=["dp"])
     dp_group = mesh.get_group()
     device_mesh = DeviceMesh.from_group(dp_group, device_type="npu", mesh_dim_names=["shard"])
     dense_model = DenseNet(hidden_size, hidden_out, has_bias=False)
@@ -176,7 +176,7 @@ def test_fully_shard_from_group_mesh():
 def test_fully_shard_none_mesh():
     """
     Feature: When pass none mesh, test fully_shard with simple network, optimization level is default ZeRO-3
-    Description: The DenseNet only have one weight and no bias, verify the basic process of fully_shard
+    Description: The DenseNet has only one weight and no bias, verify the basic process of fully_shard
     Expectation: run successfully
     """
     batch_size = 4

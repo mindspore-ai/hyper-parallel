@@ -15,6 +15,7 @@
 """test base shard"""
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch import optim
 # pylint: disable=W0611
@@ -86,7 +87,7 @@ def test_base_shard():
     # Create DeviceMesh
     mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(1, 8),
+        mesh_shape=(1, 2),
         mesh_dim_names=("dp", "tp")
     )
 
@@ -136,8 +137,10 @@ def test_base_shard():
                        dist_loss.to_local().cpu().detach().numpy(),
                        rtol=1e-3, atol=1e-3)
 
-    start = rank
-    end = rank + 1
+    tp_size = dist.get_world_size()
+    cols_per_rank = 8 // tp_size
+    start = rank * cols_per_rank
+    end = (rank + 1) * cols_per_rank
     standalone_grad_slice = standalone_grad[:, start:end]
 
     assert np.allclose(standalone_grad_slice.cpu().detach().numpy(),

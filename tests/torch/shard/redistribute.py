@@ -34,7 +34,7 @@ def test_shard_to_replicate():
     # Create DeviceMesh
     mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(1, 8),
+        mesh_shape=(1, 2),
         mesh_dim_names=("dp", "tp")
     )
 
@@ -42,7 +42,7 @@ def test_shard_to_replicate():
     x_placements = (Replicate(), Shard(1))
     dst_placements = (Replicate(), Replicate())
 
-    dist_x = DTensor.from_local(torch.ones(8, 1).npu(), mesh, x_placements)
+    dist_x = DTensor.from_local(torch.ones(8, 4).npu(), mesh, x_placements)
     out = dist_x.redistribute(mesh, dst_placements)
 
     expect_out = torch.ones(8, 8)
@@ -63,7 +63,7 @@ def test_replicate_to_shard():
     # Create DeviceMesh
     mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(1, 8),
+        mesh_shape=(1, 2),
         mesh_dim_names=("dp", "tp")
     )
 
@@ -74,7 +74,7 @@ def test_replicate_to_shard():
     dist_x = DTensor.from_local(torch.ones(8, 8).npu(), mesh, x_placements)
     out = dist_x.redistribute(mesh, dst_placements)
 
-    expect_out = torch.ones(8, 1)
+    expect_out = torch.ones(8, 4)
 
     assert np.allclose(expect_out.cpu().detach().numpy(),
                        out.to_local().cpu().detach().numpy(),  # use to_local()
@@ -92,7 +92,7 @@ def test_different_mesh():
     # Create DeviceMesh with 3 dimensions
     mesh_3d = init_device_mesh(
         device_type="npu",
-        mesh_shape=(1, 8, 1),
+        mesh_shape=(1, 2, 1),
         mesh_dim_names=("dp", "tp", "sp")
     )
 
@@ -102,7 +102,7 @@ def test_different_mesh():
     # Create DeviceMesh with 2 dimensions
     mesh_2d = init_device_mesh(
         device_type="npu",
-        mesh_shape=(1, 8),
+        mesh_shape=(1, 2),
         mesh_dim_names=("dp", "tp")
     )
 

@@ -42,7 +42,7 @@ def test_distributed_prod_unsharded_dim():
     standalone_result = torch.prod(standalone_input, dim=dim)
 
     # Distributed setup
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     # Shard dim 0 (dp), keep dim 1 (unsharded/None)
     x_layout = layout("dp", "None")
 
@@ -91,7 +91,7 @@ def test_distributed_prod_sharded_dim():
     standalone_result = torch.prod(standalone_input, dim=dim)
 
     # Distributed setup
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     # Shard dim 0 (dp) AND dim 1 (tp)
     x_layout = layout("dp", "tp")
 

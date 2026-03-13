@@ -49,7 +49,7 @@ def test_distributed_unbind_dim0():
     standalone_output = torch.unbind(standalone_input, dim=0)
 
     # Distributed setup: Shard dim1 ("tp"), keep dim0 unsharded (to unbind)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Shard(1))
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
@@ -92,7 +92,7 @@ def test_distributed_unbind_dim1():
     standalone_output = torch.unbind(standalone_input, dim=1)
 
     # Distributed setup: Shard dim0 ("dp"), keep dim1 unsharded
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
@@ -128,9 +128,9 @@ def test_distributed_unbind_negative_dim():
     standalone_input = torch.from_numpy(input_3d_np).npu()
     standalone_output = torch.unbind(standalone_input, dim=-1)
 
-    # Distributed setup: Shard dim0 ("dp"), dim1 ("tp"), Replicate dim2
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "tp", "mp"))
-    x_placements = (Shard(0), Shard(1), Replicate())
+    # Distributed setup: Shard dim0 ("dp"), dim1 ("tp")
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    x_placements = (Shard(0), Shard(1))
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = torch.unbind(dist_input, dim=-1)
@@ -138,11 +138,10 @@ def test_distributed_unbind_negative_dim():
     assert len(dist_output) == input_3d_shape[2]
 
     # Layout validation:
-    # Mesh Rank 3.
+    # Mesh Rank 2.
     # Mesh dim 0 shards Out Dim 0 (Shard(0)).
     # Mesh dim 1 shards Out Dim 1 (Shard(1)).
-    # Mesh dim 2 is Replicate.
-    expected_layout = _build_layout(mesh, (Shard(0), Shard(1), Replicate()), 2)
+    expected_layout = _build_layout(mesh, (Shard(0), Shard(1)), 2)
 
     for i, dist_tensor in enumerate(dist_output):
         assert dist_tensor.layout == expected_layout, \
@@ -165,7 +164,7 @@ def test_distributed_unbind_sharded_dim_error():
     standalone_input = torch.from_numpy(input_2d_np).npu()
 
     # Setup: Shard dim0 ("dp"), Replicate dim1
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)

@@ -12,45 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op cumsum"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_CUMSUM = "parallel_op_cumsum.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_cumsum():
-    '''
-    Feature: test parallel op cumsum.
-    Description: test parallel op cumsum.
+def test_parallel_op_cumsum_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_cumsum_layout_inference
+        2.test_distributed_cumsum_negative_dim_support
     Expectation: Run success.
-    '''
-    master_port = 10558
-    file_name = "parallel_op_cumsum.py"
-    case_name = "test_distributed_cumsum_layout_inference"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_CUMSUM, "test_distributed_cumsum_layout_inference", 10558, 4),
+        TorchCase(PARALLEL_OP_CUMSUM, "test_distributed_cumsum_negative_dim_support", 10559, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_cumsum_dim_error():
-    '''
-    Feature: test parallel op cumsum dim error.
-    Description: test parallel op cumsum dim error.
+def test_parallel_op_cumsum_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_cumsum_sharded_dim_error
     Expectation: Run success.
-    '''
-    master_port = 10558
-    file_name = "parallel_op_cumsum.py"
-    case_name = "test_distributed_cumsum_sharded_dim_error"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_cumsum_negative_dim():
-    '''
-    Feature: test parallel op cumsum negative dim support.
-    Description: test parallel op cumsum negative dim support.
-    Expectation: Run success.
-    '''
-    master_port = 10558
-    file_name = "parallel_op_cumsum.py"
-    case_name = "test_distributed_cumsum_negative_dim_support"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_CUMSUM, "test_distributed_cumsum_sharded_dim_error", 10558, 4),
+    ])

@@ -17,6 +17,7 @@
 import os
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
+import torch.distributed as dist
 import torch_npu
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor import DTensor
@@ -33,8 +34,7 @@ def test_fully_shard_module_01():
     Expectation: run successfully
     """
     init_dist()
-    # Assume 8 devices as per torchrun default
-    world_size = 8
+    world_size = dist.get_world_size()
     mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("dp",))
 
     # Create models

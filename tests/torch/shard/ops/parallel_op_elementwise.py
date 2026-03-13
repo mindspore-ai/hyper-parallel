@@ -453,7 +453,7 @@ def test_distributed_linear_with_elementwise_ops():
     # bias:   (4,)   -> broadcast (no split)
     local_b = torch.zeros(4).npu()
 
-    layout = Layout((4, 2), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     w_layout = layout("None", "tp")
     b_layout = layout("None",)
     x_layout = layout("dp", "tp")

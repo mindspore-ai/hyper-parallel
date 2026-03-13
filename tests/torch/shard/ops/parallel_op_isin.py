@@ -48,7 +48,7 @@ def test_distributed_isin_layout_inference():
     # Distributed setup:
     # elements: sharded on dim0 ("dp")
     # test_elements: MUST be fully replicated (critical constraint)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     elements_placements = (Shard(0), Replicate()) # tensor_map = (1, -1)
     test_elements_placements = (Replicate(), Replicate()) # tensor_map = (-1,) - fully replicated 1D tensor
 
@@ -84,7 +84,7 @@ def test_distributed_isin_sharded_test_elements_error():
     standalone_elements = torch.from_numpy(standalone_elements_np).npu()
     standalone_test_elements = torch.from_numpy(standalone_test_elements_np).npu()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     elements_placements = (Shard(0), Replicate()) # tensor_map = (1, -1)
     test_elements_placements = (Shard(0), Replicate())
 
@@ -133,7 +133,7 @@ def test_distributed_isin_invert_and_assume_unique():
     )
 
     # Distributed setup (same as normal case)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     elements_placements = (Shard(0), Replicate()) # tensor_map = (1, -1)
     test_elements_placements = (Replicate(), Replicate())
 
@@ -177,9 +177,9 @@ def test_distributed_isin_mixed_parallel_3d():
     standalone_output = torch.isin(standalone_elements_3d, standalone_test_elements)
 
     # Distributed setup: mixed parallelism on 3D tensor
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "tp", "mp"))
-    elements_placements = (Shard(0), Replicate(), Shard(2)) # tensor_map = (2, -1, 0)
-    test_elements_placements = (Replicate(), Replicate(), Replicate())
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
+    elements_placements = (Shard(0), Shard(2)) # tensor_map = (2, 0)
+    test_elements_placements = (Replicate(), Replicate())
 
     # Convert and execute
     dist_elements = distribute_tensor(standalone_elements_3d, mesh, elements_placements)

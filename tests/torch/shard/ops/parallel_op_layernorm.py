@@ -46,7 +46,7 @@ def test_distributed_layer_norm_layout_inference():
     )
 
     # Distributed setup
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     x_layout = layout("dp", "None")
 
     dist_input = global_to_local(standalone_input, x_layout)
@@ -77,7 +77,7 @@ def test_distributed_layer_norm_sharded_normalized_dim_error():
     init_dist()
     normalized_shape = (16,)
 
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     # WRONG: shard on dim=1, which is part of normalized_shape → invalid
     x_layout = layout("dp", "tp")
 

@@ -14,18 +14,20 @@
 # ============================================================================
 """test base layout"""
 
-from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+BASE_SHARD = "base_shard.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_get_global_layout():
     """
-    Feature: Test get global layout on all ranks.
-    Description: Test when a simple model sharded by dp and tp, gather global layout on all ranks.
+    Feature: parallel run case in checkpoint
+    Description:
+        1.test_get_global_layout
     Expectation: Run success.
     """
-    master_port = 12251
-    file_name = "base_shard.py"
-    case_name = "test_get_global_layout"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(BASE_SHARD, "test_get_global_layout", 12251, 2)
+    ])

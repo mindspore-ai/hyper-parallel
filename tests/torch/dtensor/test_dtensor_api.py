@@ -13,18 +13,20 @@
 # limitations under the License.
 # ============================================================================
 """test dtensor api"""
-from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+DTENSOR_API = "dtensor_api.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dtensor_api():
     """
-    Feature: DTensor numel and to API.
-    Description: Test numel and to API of DTensor.
+    Feature: parallel run case in dtensor
+    Description:
+        1.test_dtensor_api
     Expectation: Run success.
     """
-    master_port = 12781
-    file_name = "dtensor_api.py"
-    case_name = "test_dtensor_api"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(DTENSOR_API, "test_dtensor_api", 12781, 8)
+    ])

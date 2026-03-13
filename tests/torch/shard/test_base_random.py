@@ -13,54 +13,37 @@
 # limitations under the License.
 # ============================================================================
 """test base random"""
-from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
 
+BASE_RANDOM = "base_random.py"
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_tracker_initialization():
-    '''
-    Feature: dtensor dispatch/infer_layout/redistribute.
-    Description:
-    Expectation: Run success.
-    '''
-    master_port = 11335
-    file_name = "base_random.py"
-    case_name = "test_tracker_initialization"
-    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_distribute_region_disabled():
-    '''
-    Feature: dtensor dispatch/infer_layout/redistribute.
+def test_base_random_group1():
+    """
+    Feature: parallel run case in shard
     Description:
+        1.test_tracker_initialization
+        2.test_distribute_region_disabled
+        3.test_rng_tracker
     Expectation: Run success.
-    '''
-    master_port = 11335
-    file_name = "base_random.py"
-    case_name = "test_distribute_region_disabled"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(BASE_RANDOM, "test_tracker_initialization", 11335, 2),
+        TorchCase(BASE_RANDOM, "test_distribute_region_disabled", 11336, 2),
+        TorchCase(BASE_RANDOM, "test_rng_tracker", 11337, 2),
+    ])
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_multi_dim_sharding_offset():
-    '''
-    Feature: dtensor dispatch/infer_layout/redistribute.
+def test_base_random_group2():
+    """
+    Feature: parallel run case in shard
     Description:
+        1.test_multi_dim_sharding_offset
     Expectation: Run success.
-    '''
-    master_port = 11335
-    file_name = "base_random.py"
-    case_name = "test_multi_dim_sharding_offset"
-    torchrun_case(file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_rng_tracker():
-    '''
-    Feature: dtensor dispatch/infer_layout/redistribute.
-    Description:
-    Expectation: Run success.
-    '''
-    master_port = 11335
-    file_name = "base_random.py"
-    case_name = "test_rng_tracker"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(BASE_RANDOM, "test_multi_dim_sharding_offset", 11338, 4)
+    ])

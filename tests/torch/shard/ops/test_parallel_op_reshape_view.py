@@ -12,45 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op reshape_view"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_RESHAPE_VIEW = "parallel_op_reshape_view.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_reshape():
-    '''
-    Feature: test parallel op reshape.
-    Description: test parallel op reshape (flatten and expand).
+def test_parallel_op_reshape_view_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_reshape_layout_inference
+        2.test_distributed_view_layout_inference
     Expectation: Run success.
-    '''
-    master_port = 10889
-    file_name = "parallel_op_reshape_view.py"
-    case_name = "test_distributed_reshape_layout_inference"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_RESHAPE_VIEW, "test_distributed_reshape_layout_inference", 10889, 4),
+        TorchCase(PARALLEL_OP_RESHAPE_VIEW, "test_distributed_view_layout_inference", 10890, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_view():
-    '''
-    Feature: test parallel op view.
-    Description: test parallel op view (tuple args and preserving sharded dim).
+def test_parallel_op_reshape_view_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_reshape_fail_mismatch
     Expectation: Run success.
-    '''
-    master_port = 10890
-    file_name = "parallel_op_reshape_view.py"
-    case_name = "test_distributed_view_layout_inference"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_reshape_error():
-    '''
-    Feature: test parallel op reshape error.
-    Description: test parallel op reshape invalid cases.
-    Expectation: Run success.
-    '''
-    master_port = 10891
-    file_name = "parallel_op_reshape_view.py"
-    case_name = "test_distributed_reshape_fail_mismatch"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_RESHAPE_VIEW, "test_distributed_reshape_fail_mismatch", 10891, 4),
+    ])

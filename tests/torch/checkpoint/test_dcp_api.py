@@ -14,45 +14,46 @@
 # ============================================================================
 """test checkpoint dcp API"""
 
-from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+DCP_API = "dcp_api.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_dcp_api_with_dtensor_and_tensor_and_scalar():
+def test_dcp_api_group1():
     """
-    Feature: Test checkpoint save and load API with DTensor state_dict using different mesh_shape and layouts.
-    Description: Test save and load function with state_dict containing DTensors on 8-card setup with mesh_shape (4, 2).
+    Feature: parallel run case in checkpoint
+    Description:
+        1.test_dcp_api_with_dtensor_and_tensor_and_scalar
     Expectation: Run success.
     """
-    master_port = 12253
-    file_name = "dcp_api.py"
-    case_name = "test_dcp_api_with_dtensor_and_tensor_and_scalar"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(DCP_API, "test_dcp_api_with_dtensor_and_tensor_and_scalar", 12253, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_dcp_api_with_full_tensor():
+def test_dcp_api_group2():
     """
-    Feature: Test checkpoint save and load API with state_dict containing only torch Tensors.
-    Description: Test save and load function with state_dict containing purely torch Tensors.
+    Feature: parallel run case in checkpoint
+    Description:
+        1.test_dcp_api_with_full_tensor
     Expectation: Run success.
     """
-    master_port = 12255
-    file_name = "dcp_api.py"
-    case_name = "test_dcp_api_with_full_tensor"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(DCP_API, "test_dcp_api_with_full_tensor", 12255, 2),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level3", card_mark="allcards", essential_mark="essential")
-def test_dcp_api_save_8card_load_4card():
+def test_dcp_api_group3():
     """
-    Feature: Test checkpoint save with 8-card cluster and load with 4-card cluster.
-    Description: Test save function with state_dict containing DTensors and scalars on 8-card setup,
-                 then load with 4-card setup. This tests resharding capability.
+    Feature: parallel run case in checkpoint
+    Description:
+        1.test_dcp_api_save_8card_load_4card
     Expectation: Run success.
     """
-    master_port = 12254
-    file_name = "dcp_api.py"
-    case_name = "test_dcp_api_save_8card_load_4card"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(DCP_API, "test_dcp_api_save_8card_load_4card", 12254, 4),
+    ])

@@ -12,71 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op max"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_MAX = "parallel_op_max.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_max_element_wise():
-    '''
-    Feature: test parallel op max.
-    Description: test parallel op max element wise.
+def test_parallel_op_max_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_max_element_wise
+        2.test_distributed_max_dim_reduce_sharded
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_max.py"
-    case_name = "test_distributed_max_element_wise"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MAX, "test_distributed_max_element_wise", 10359, 4),
+        TorchCase(PARALLEL_OP_MAX, "test_distributed_max_dim_reduce_sharded", 10360, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_max_dim_reduce_sharded():
-    '''
-    Feature: test parallel op max.
-    Description: test parallel op max reduce sharded dim.
+def test_parallel_op_max_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_max_dim_reduce_replicated
+        2.test_distributed_max_global_reduce
     Expectation: Run success.
-    '''
-    master_port = 10360
-    file_name = "parallel_op_max.py"
-    case_name = "test_distributed_max_dim_reduce_sharded"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MAX, "test_distributed_max_dim_reduce_replicated", 10361, 4),
+        TorchCase(PARALLEL_OP_MAX, "test_distributed_max_global_reduce", 10362, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_max_dim_reduce_replicated():
-    '''
-    Feature: test parallel op max.
-    Description: test parallel op max reduce replicated dim.
+def test_parallel_op_max_group3():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_max_keepdim
     Expectation: Run success.
-    '''
-    master_port = 10361
-    file_name = "parallel_op_max.py"
-    case_name = "test_distributed_max_dim_reduce_replicated"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_max_global_reduce():
-    '''
-    Feature: test parallel op max.
-    Description: test parallel op max global reduce.
-    Expectation: Run success.
-    '''
-    master_port = 10362
-    file_name = "parallel_op_max.py"
-    case_name = "test_distributed_max_global_reduce"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_max_keepdim():
-    '''
-    Feature: test parallel op max.
-    Description: test parallel op max keepdim.
-    Expectation: Run success.
-    '''
-    master_port = 10363
-    file_name = "parallel_op_max.py"
-    case_name = "test_distributed_max_keepdim"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MAX, "test_distributed_max_keepdim", 10363, 4),
+    ])

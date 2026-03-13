@@ -12,71 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor scatter"""
-from tests.torch.utils import torchrun_case
+"""test parallel op scatter"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_SCATTER = "parallel_op_scatter.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_scatter_basic():
-    '''
-    Feature: test parallel op scatter.
-    Description: test parallel op scatter with basic sharding.
+def test_parallel_op_scatter_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_scatter_basic
+        2.test_distributed_scatter_scalar_src
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_scatter.py"
-    case_name = "test_distributed_scatter_basic"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SCATTER, "test_distributed_scatter_basic", 10359, 4),
+        TorchCase(PARALLEL_OP_SCATTER, "test_distributed_scatter_scalar_src", 10360, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_scatter_scalar_src():
-    '''
-    Feature: test parallel op scatter.
-    Description: test parallel op scatter with scalar source.
+def test_parallel_op_scatter_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_scatter_sharded_dim_error
+        2.test_distributed_scatter_layout_mismatch_index
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_scatter.py"
-    case_name = "test_distributed_scatter_scalar_src"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SCATTER, "test_distributed_scatter_sharded_dim_error", 10361, 4),
+        TorchCase(PARALLEL_OP_SCATTER, "test_distributed_scatter_layout_mismatch_index", 10362, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_scatter_sharded_dim_error():
-    '''
-    Feature: test parallel op scatter.
-    Description: test error raising when scattering on sharded dim.
+def test_parallel_op_scatter_group3():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_scatter_layout_mismatch_src
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_scatter.py"
-    case_name = "test_distributed_scatter_sharded_dim_error"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_scatter_layout_mismatch_index():
-    '''
-    Feature: test parallel op scatter.
-    Description: test error raising when index layout mismatch.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_scatter.py"
-    case_name = "test_distributed_scatter_layout_mismatch_index"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_scatter_layout_mismatch_src():
-    '''
-    Feature: test parallel op scatter.
-    Description: test error raising when src layout mismatch.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_scatter.py"
-    case_name = "test_distributed_scatter_layout_mismatch_src"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SCATTER, "test_distributed_scatter_layout_mismatch_src", 10363, 4),
+    ])

@@ -43,7 +43,7 @@ def test_distributed_topk_layout_inference():
     standalone_values, standalone_indices = torch.topk(standalone_input, k, dim=dim)
 
     # Distributed setup
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     x_layout = layout("dp", "None") # shard on dim=0 (dp), keep dim=1 unsharded
 
     dist_input = global_to_local(standalone_input, x_layout)
@@ -78,7 +78,7 @@ def test_distributed_topk_sharded_dim_error():
     k = 3
     dim = 1  # this dim will be sharded
 
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     x_layout = layout("dp", "tp")
 
     standalone_input = torch.from_numpy(standalone_input_np).npu()

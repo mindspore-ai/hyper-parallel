@@ -13,43 +13,35 @@
 # limitations under the License.
 # ============================================================================
 """test redistribute"""
-from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_shard_to_replicate():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
-    Expectation: Run success.
-    '''
-    master_port = 11333
-    file_name = "redistribute.py"
-    case_name = "test_shard_to_replicate"
-    torchrun_case(file_name, case_name, master_port)
+REDISTRIBUTE = "redistribute.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_replicate_to_shard():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_redistribute_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_shard_to_replicate
+        2.test_replicate_to_shard
     Expectation: Run success.
-    '''
-    master_port = 11334
-    file_name = "redistribute.py"
-    case_name = "test_replicate_to_shard"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(REDISTRIBUTE, "test_shard_to_replicate", 11333, 2),
+        TorchCase(REDISTRIBUTE, "test_replicate_to_shard", 11334, 2),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_different_mesh():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_redistribute_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_different_mesh
     Expectation: Run success.
-    '''
-    master_port = 11335
-    file_name = "redistribute.py"
-    case_name = "test_different_mesh"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(REDISTRIBUTE, "test_different_mesh", 11335, 2),
+    ])

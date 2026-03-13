@@ -12,72 +12,73 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor with distributed outer"""
-
-from tests.torch.utils import torchrun_case
+"""test parallel op outer"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_OUTER = "parallel_op_outer.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_outer_both_replicated():
-    '''
-    Feature: test parallel op outer.
-    Description: test parallel op outer with both inputs replicated.
+def test_parallel_op_outer_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_outer_both_replicated
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_outer.py"
-    case_name = "test_distributed_outer_both_replicated"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_OUTER, "test_distributed_outer_both_replicated", 10359, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_outer_both_sharded():
-    '''
-    Feature: test parallel op outer.
-    Description: test parallel op outer with orthogonal sharding.
+def test_parallel_op_outer_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_outer_both_sharded
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_outer.py"
-    case_name = "test_distributed_outer_both_sharded"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_OUTER, "test_distributed_outer_both_sharded", 10359, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_outer_first_sharded():
-    '''
-    Feature: test parallel op outer.
-    Description: test parallel op outer with one sharded input.
+def test_parallel_op_outer_group3():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_outer_first_sharded
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_outer.py"
-    case_name = "test_distributed_outer_first_sharded"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_OUTER, "test_distributed_outer_first_sharded", 10359, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_outer_same_dim_error():
-    '''
-    Feature: test parallel op outer.
-    Description: test parallel op outer catching overlapping mesh dim error.
+def test_parallel_op_outer_group4():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_outer_same_dim_error
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_outer.py"
-    case_name = "test_distributed_outer_same_dim_error"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_OUTER, "test_distributed_outer_same_dim_error", 10359, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_outer_not_1d_error():
-    '''
-    Feature: test parallel op outer.
-    Description: test parallel op outer catching non 1-D input error.
+def test_parallel_op_outer_group5():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_outer_not_1d_error
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_outer.py"
-    case_name = "test_distributed_outer_not_1d_error"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_OUTER, "test_distributed_outer_not_1d_error", 10359, 8),
+    ])

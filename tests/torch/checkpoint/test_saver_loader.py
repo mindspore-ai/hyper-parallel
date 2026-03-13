@@ -13,33 +13,20 @@
 # limitations under the License.
 # ============================================================================
 """test saver loader"""
-import os
-
-from hyper_parallel.core.checkpoint.loader import load_checkpoint
-from hyper_parallel.core.checkpoint.saver import save_checkpoint
 from tests.common.mark_utils import arg_mark
-from tests.torch.common_net import SimpleModel
+from tests.common.parallel_case import parallel_run, TorchCase
+
+SAVER_LOADER = "saver_loader.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_save_load_checkpoint():
     """
-    Feature: Test checkpoint saver and loader.
-    Description: Test using saver to save checkpoint to safetensors file, and then using loader to load checkpoint from
-    this safetensors file.
+    Feature: parallel run case in checkpoint
+    Description:
+        1.test_save_load_checkpoint
     Expectation: Run success.
     """
-    model = SimpleModel().npu()
-    original_state_dict = model.state_dict()
-    save_data = {
-        "model_state_dict": original_state_dict,
-    }
-
-    # save checkpoint
-    file_path = "tmp1.safetensors"
-    save_checkpoint(save_data, file_path)
-
-    # load checkpoint
-    load_dict = load_checkpoint(file_path)
-    os.remove(file_path)
-    assert isinstance(load_dict, dict)
+    parallel_run([
+        TorchCase(SAVER_LOADER, "test_save_load_checkpoint", 12403, 1)
+    ])

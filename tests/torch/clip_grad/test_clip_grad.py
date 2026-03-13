@@ -15,83 +15,58 @@
 """test clip_grad_norm_ API (torchrun runner)"""
 
 from tests.common.mark_utils import arg_mark
-from tests.torch.utils import torchrun_case
+from tests.common.parallel_case import parallel_run, TorchCase
+
+_TEST_CLIP_GRAD = "_test_clip_grad.py"
 
 
-@arg_mark(
-    plat_marks=["platform_ascend910b"], level_mark="level0",
-    card_mark="allcards", essential_mark="essential",
-)
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_clip_grad_norm_comprehensive():
     """
-    Feature: clip_grad_norm_ comprehensive semantics + E2E SGD closed loop
-    Description: Verify norm & clipped-grad parity across HSDP 2D (L2,
-        Linf) and FSDP 1D (L2) meshes with model and parameters() APIs.
-        Combo 1 additionally verifies post-SGD-step parameter parity.
-    Expectation: run successfully
+    Feature: parallel run case in clip_grad
+    Description:
+        1.test_clip_grad_norm_comprehensive
+    Expectation: Run success.
     """
-    torchrun_case(
-        "_test_clip_grad.py",
-        "test_clip_grad_norm_comprehensive",
-        12360,
-    )
+    parallel_run([
+        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_comprehensive", 12360, 8)
+    ])
 
 
-@arg_mark(
-    plat_marks=["platform_ascend910b"], level_mark="level0",
-    card_mark="allcards", essential_mark="essential",
-)
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_clip_grad_norm_partial_shard():
     """
-    Feature: clip_grad_norm_ with TP+FSDP Partial + Shard placements
-    Description: Manually construct DTensor params with [Partial(SUM),
-        Shard(0)] on a (tp=2, dp=4) mesh. Verify total_norm and clipped
-        grads match nn.utils reference on the full gradient, and all
-        ranks agree on the norm.
-    Expectation: run successfully
+    Feature: parallel run case in clip_grad
+    Description:
+        1.test_clip_grad_norm_partial_shard
+    Expectation: Run success.
     """
-    torchrun_case(
-        "_test_clip_grad.py",
-        "test_clip_grad_norm_partial_shard",
-        12361,
-    )
+    parallel_run([
+        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_partial_shard", 12361, 8)
+    ])
 
 
-@arg_mark(
-    plat_marks=["platform_ascend910b"], level_mark="level1",
-    card_mark="allcards", essential_mark="essential",
-)
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_clip_grad_norm_edge_cases():
     """
-    Feature: clip_grad_norm_ edge cases (single card)
-    Description: Verify unusual norm_types (0/1/-inf), foreach variants
-        (None/False/True), error_if_nonfinite with inf/nan injection,
-        and mixed fp16/fp32 dtype promotion on plain non-DTensor params.
-    Expectation: run successfully
+    Feature: parallel run case in clip_grad
+    Description:
+        1.test_clip_grad_norm_edge_cases
+    Expectation: Run success.
     """
-    torchrun_case(
-        "_test_clip_grad.py",
-        "test_clip_grad_norm_edge_cases",
-        12362,
-        num_proc=1,
-    )
+    parallel_run([
+        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_edge_cases", 12362, 1)
+    ])
 
 
-@arg_mark(
-    plat_marks=["platform_ascend910b"], level_mark="level1",
-    card_mark="allcards", essential_mark="essential",
-)
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_clip_grad_norm_empty_grads():
     """
-    Feature: clip_grad_norm_ empty/sparse gradient handling
-    Description: Verify no deadlock when all or some ranks have grad=None.
-        All-None returns norm=0.0 in float32; sparse grads produce
-        consistent finite norm across all ranks.  Includes Partial
-        placement deadlock regression (asymmetric grad=None in tp group).
-    Expectation: run successfully
+    Feature: parallel run case in clip_grad
+    Description:
+        1.test_clip_grad_norm_empty_grads
+    Expectation: Run success.
     """
-    torchrun_case(
-        "_test_clip_grad.py",
-        "test_clip_grad_norm_empty_grads",
-        12363,
-    )
+    parallel_run([
+        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_empty_grads", 12363, 8)
+    ])

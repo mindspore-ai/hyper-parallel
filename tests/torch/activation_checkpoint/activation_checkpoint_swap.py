@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Test Activation Swap memory comparison: None vs Swap"""
-from tests.common.mark_utils import arg_mark
+"""Activation Swap memory comparison: None vs Swap"""
 from tests.torch.common_net import SimpleTransformer
 from tests.torch.activation_checkpoint.utils import prepare_data, train_one_mode, seed_memory_time_context
 from hyper_parallel.core.activation_checkpoint import SwapManager
@@ -48,7 +47,6 @@ def apply_swap(model, mode):
     return model
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_act_swap_memory_comparison():
     """
     Feature: Activation Swap Memory Behavior
@@ -63,7 +61,7 @@ def test_act_swap_memory_comparison():
     """
     print("🚀 Starting memory and time comparison: none vs swap vs swap_with_policy")
     dataloader = prepare_data()
-    train_steps=3
+    train_steps = 3
 
     modes = ["none", "swap", "swap_with_policy"]
     results = {}

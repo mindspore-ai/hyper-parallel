@@ -96,7 +96,7 @@ def test_sdpa_dp():
     init_dist()
     expected = run_standalone()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     q, k, v = bnsd_tensors()
     placements = (Shard(0),)
     dq = distribute_tensor(q, mesh, placements)
@@ -104,7 +104,7 @@ def test_sdpa_dp():
     dv = distribute_tensor(v, mesh, placements)
 
     result = F.scaled_dot_product_attention(dq, dk, dv, scale=SCALE)
-    assert result.to_local().shape == (BATCH_SIZE // 8, NUM_HEADS, SEQ_LEN, HEAD_DIM)
+    assert result.to_local().shape == (BATCH_SIZE // 4, NUM_HEADS, SEQ_LEN, HEAD_DIM)
 
     gathered = result.redistribute(mesh, (Replicate(),)).to_local()
     assert_close(gathered, expected)
@@ -115,7 +115,7 @@ def test_sdpa_mp():
     init_dist()
     expected = run_standalone()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("mp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("mp",))
     q, k, v = bnsd_tensors()
     placements = (Shard(1),)
     dq = distribute_tensor(q, mesh, placements)
@@ -123,7 +123,7 @@ def test_sdpa_mp():
     dv = distribute_tensor(v, mesh, placements)
 
     result = F.scaled_dot_product_attention(dq, dk, dv, scale=SCALE)
-    assert result.to_local().shape == (BATCH_SIZE, NUM_HEADS // 8, SEQ_LEN, HEAD_DIM)
+    assert result.to_local().shape == (BATCH_SIZE, NUM_HEADS // 4, SEQ_LEN, HEAD_DIM)
 
     gathered = result.redistribute(mesh, (Replicate(),)).to_local()
     assert_close(gathered, expected)
@@ -133,14 +133,14 @@ def test_sdpa_sp():
     """Verify SDPA with sequence parallelism produces correct local shape."""
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     q, k, v = bnsd_tensors()
     dq = distribute_tensor(q, mesh, (Shard(2),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
 
     result = F.scaled_dot_product_attention(dq, dk, dv, scale=SCALE)
-    assert result.to_local().shape == (BATCH_SIZE, NUM_HEADS, SEQ_LEN // 8, HEAD_DIM)
+    assert result.to_local().shape == (BATCH_SIZE, NUM_HEADS, SEQ_LEN // 4, HEAD_DIM)
 
 
 def test_sdpa_dp_mp_2d():
@@ -148,7 +148,7 @@ def test_sdpa_dp_mp_2d():
     init_dist()
     expected = run_standalone()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bnsd_tensors()
     placements = (Shard(0), Shard(1))
     dq = distribute_tensor(q, mesh, placements)
@@ -156,7 +156,7 @@ def test_sdpa_dp_mp_2d():
     dv = distribute_tensor(v, mesh, placements)
 
     result = F.scaled_dot_product_attention(dq, dk, dv, scale=SCALE)
-    assert result.to_local().shape == (BATCH_SIZE // 4, NUM_HEADS // 2, SEQ_LEN, HEAD_DIM)
+    assert result.to_local().shape == (BATCH_SIZE // 2, NUM_HEADS // 2, SEQ_LEN, HEAD_DIM)
 
     gathered = result.redistribute(mesh, (Replicate(), Replicate())).to_local()
     assert_close(gathered, expected)
@@ -166,14 +166,14 @@ def test_sdpa_sp_mp_2d():
     """Verify SDPA with SP + MP on 2D mesh produces correct local shape."""
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("sp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("sp", "mp"))
     q, k, v = bnsd_tensors()
     dq = distribute_tensor(q, mesh, (Shard(2), Shard(1)))
     dk = distribute_tensor(k, mesh, (Replicate(), Shard(1)))
     dv = distribute_tensor(v, mesh, (Replicate(), Shard(1)))
 
     result = F.scaled_dot_product_attention(dq, dk, dv, scale=SCALE)
-    assert result.to_local().shape == (BATCH_SIZE, NUM_HEADS // 2, SEQ_LEN // 4, HEAD_DIM)
+    assert result.to_local().shape == (BATCH_SIZE, NUM_HEADS // 2, SEQ_LEN // 2, HEAD_DIM)
 
 
 def test_sdpa_sp_causal():
@@ -181,14 +181,14 @@ def test_sdpa_sp_causal():
     init_dist()
     expected = run_standalone(is_causal=True)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     q, k, v = bnsd_tensors()
     dq = distribute_tensor(q, mesh, (Shard(2),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
 
     result = F.scaled_dot_product_attention(dq, dk, dv, is_causal=True, scale=SCALE)
-    assert result.to_local().shape == (BATCH_SIZE, NUM_HEADS, SEQ_LEN // 8, HEAD_DIM)
+    assert result.to_local().shape == (BATCH_SIZE, NUM_HEADS, SEQ_LEN // 4, HEAD_DIM)
 
     gathered = result.redistribute(mesh, (Replicate(),)).to_local()
     assert_close(gathered, expected)
@@ -200,14 +200,14 @@ def test_sdpa_sp_explicit_mask():
     mask = torch.ones(SEQ_LEN, SEQ_LEN, dtype=torch.bool).npu().tril(diagonal=0)
     expected = run_standalone(attn_mask=mask)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     q, k, v = bnsd_tensors()
     dq = distribute_tensor(q, mesh, (Shard(2),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
 
     result = F.scaled_dot_product_attention(dq, dk, dv, attn_mask=mask, scale=SCALE)
-    assert result.to_local().shape == (BATCH_SIZE, NUM_HEADS, SEQ_LEN // 8, HEAD_DIM)
+    assert result.to_local().shape == (BATCH_SIZE, NUM_HEADS, SEQ_LEN // 4, HEAD_DIM)
 
     gathered = result.redistribute(mesh, (Replicate(),)).to_local()
     assert_close(gathered, expected)
@@ -217,7 +217,7 @@ def test_sdpa_error_kv_strategy_mismatch():
     """Verify SDPA rejects mismatched Key and Value sharding strategies."""
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("mp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("mp",))
     q, k, v = bnsd_tensors()
     dq = distribute_tensor(q, mesh, (Shard(1),))
     dk = distribute_tensor(k, mesh, (Shard(1),))
@@ -231,7 +231,7 @@ def test_sdpa_error_kv_seq_sharding():
     """Verify SDPA rejects KV sequence sharding without Ring Attention."""
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     q, k, v = bnsd_tensors()
     placements = (Shard(2),)
     dq = distribute_tensor(q, mesh, placements)
@@ -248,7 +248,7 @@ def test_sdpa_custom_scale():
     custom_scale = 0.125
     expected = run_standalone(scale=custom_scale)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     q, k, v = bnsd_tensors()
     placements = (Shard(0),)
     dq = distribute_tensor(q, mesh, placements)
@@ -264,7 +264,7 @@ def test_sdpa_dropout():
     """Verify SDPA with dropout_p=0.1 produces correct output shape."""
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     q, k, v = bnsd_tensors()
     placements = (Shard(0),)
     dq = distribute_tensor(q, mesh, placements)
@@ -272,7 +272,7 @@ def test_sdpa_dropout():
     dv = distribute_tensor(v, mesh, placements)
 
     result = F.scaled_dot_product_attention(dq, dk, dv, dropout_p=0.1, scale=SCALE)
-    assert result.to_local().shape == (BATCH_SIZE // 8, NUM_HEADS, SEQ_LEN, HEAD_DIM)
+    assert result.to_local().shape == (BATCH_SIZE // 4, NUM_HEADS, SEQ_LEN, HEAD_DIM)
 
 
 def test_sdpa_enable_gqa():
@@ -280,13 +280,13 @@ def test_sdpa_enable_gqa():
     init_dist()
     q, k, v = gqa_tensors(q_heads=NUM_HEADS, kv_heads=4)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     dq = distribute_tensor(q, mesh, (Shard(0),))
     dk = distribute_tensor(k, mesh, (Shard(0),))
     dv = distribute_tensor(v, mesh, (Shard(0),))
 
     result = F.scaled_dot_product_attention(dq, dk, dv, enable_gqa=True, scale=SCALE)
-    assert result.to_local().shape == (BATCH_SIZE // 8, NUM_HEADS, SEQ_LEN, HEAD_DIM)
+    assert result.to_local().shape == (BATCH_SIZE // 4, NUM_HEADS, SEQ_LEN, HEAD_DIM)
 
 
 def test_sdpa_sp_correctness():
@@ -294,7 +294,7 @@ def test_sdpa_sp_correctness():
     init_dist()
     expected = run_standalone()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     q, k, v = bnsd_tensors()
     dq = distribute_tensor(q, mesh, (Shard(2),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))

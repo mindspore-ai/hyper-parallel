@@ -357,7 +357,7 @@ def test_t6_get_model_sd_sharded():
     """get_model_state_dict with default options returns sharded DTensors."""
     init_dist()
     torch.manual_seed(42 + _rank())
-    model = _make_model(8)
+    model = _make_model(4)
     x = torch.randn(BATCH, HIDDEN).npu()
     _train_step(model, x)
 
@@ -384,7 +384,7 @@ def test_t7_get_model_sd_full_cpu():
     """get_model_state_dict with full_state_dict=True, cpu_offload=True."""
     init_dist()
     torch.manual_seed(42 + _rank())
-    num_cards = 8
+    num_cards = 4
     model = _make_model(num_cards)
     x = torch.randn(BATCH, HIDDEN).npu()
     _train_step(model, x)
@@ -418,7 +418,7 @@ def test_t8_get_model_sd_ignore_frozen():
     """get_model_state_dict with ignore_frozen_params=True excludes frozen params."""
     init_dist()
     torch.manual_seed(42 + _rank())
-    model = _make_model(8)
+    model = _make_model(4)
 
     # Freeze the first dense layer's weight
     all_params = list(model.named_parameters())
@@ -448,7 +448,7 @@ def test_t9_get_model_sd_sharded_cpu():
     """get_model_state_dict with full_state_dict=False, cpu_offload=True."""
     init_dist()
     torch.manual_seed(42 + _rank())
-    model = _make_model(8)
+    model = _make_model(4)
     x = torch.randn(BATCH, HIDDEN).npu()
     _train_step(model, x)
 
@@ -503,9 +503,9 @@ def test_t11_meta_load_backward():
     'element 0 of tensors does not require grad'.
     """
     init_dist()
-    assert dist.get_world_size() >= 8, "T11 requires 8 cards"
+    assert dist.get_world_size() >= 4, "T11 requires 4 cards"
     torch.manual_seed(42 + _rank())
-    num_cards = 8
+    num_cards = 4
 
     # Phase 1: reference model — train and extract a global checkpoint
     model_ref = _make_model(num_cards)

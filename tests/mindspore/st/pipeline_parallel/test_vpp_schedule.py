@@ -14,7 +14,7 @@
 # ============================================================================
 """vpp test"""
 
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
 
 
 def test_simple_mlp():
@@ -23,10 +23,6 @@ def test_simple_mlp():
     Description: Test pp with shared parameter.
     Expectation: Run success.
     """
-    glog_v = 3
-    file_name = "vpp_schedule.py"
-    case_name = "test"
-    master_port = 12346
-    worker_num = 8
-    local_worker_num = 8
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)
+    parallel_run([
+        MindSporeCase("vpp_schedule.py", "test", 12346, 8, 8, 3)
+    ])

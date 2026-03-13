@@ -12,53 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""launch _test_fully_shard_precison.py cases"""
-from tests.torch.utils import torchrun_case
+"""launch _test_fully_shard_precision.py cases"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
 
+_TEST_FULLY_SHARD_PRECISION = "_test_fully_shard_precision.py"
 
-file_name = "_test_fully_shard_precision.py"
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_zero3_fully_shard():
+def test_fully_shard_precision_group1():
     """
-    Feature: Test_zero3_fully_shard.
-    Description: Test_zero3_fully_shard with 1D FSDP mesh.
-    Expectation: case run successfully.
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_zero3_fully_shard
+        2.test_zero3_fully_shard_with_mp
+    Expectation: Run success.
     """
-    master_port = 12343
-    case_name = "test_zero3_fully_shard"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_fully_shard", 12343, 4),
+        TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_fully_shard_with_mp", 12401, 4),
+    ])
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_zero3_fully_shard_with_mp():
+def test_fully_shard_precision_group2():
     """
-    Feature: Test_zero3_fully_shard_with_mp_policy.
-    Description: Test_zero3_fully_shard with 1D FSDP mesh and mixed precision.
-    Expectation: case run successfully.
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_zero3_fully_shard_with_offload
+        2.test_zero3_partial_shard
+    Expectation: Run success.
     """
-    master_port = 12343
-    case_name = "test_zero3_fully_shard_with_mp"
-    torchrun_case(file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_zero3_fully_shard_with_offload():
-    """
-    Feature: Test_zero3_fully_shard_with_offload.
-    Description: Test_zero3_fully_shard with 1D FSDP mesh and offload.
-    Expectation: case run successfully.
-    """
-    master_port = 12345
-    case_name = "test_zero3_fully_shard_with_offload"
-    torchrun_case(file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_zero3_partial_shard():
-    """
-    Feature: Test_zero3_fully_shard.
-    Description: Test_zero3_fully_shard with 2D HSDP mesh.
-    Expectation: case run successfully.
-    """
-    master_port = 12344
-    case_name = "test_zero3_partial_shard"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_fully_shard_with_offload", 12345, 4),
+        TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_partial_shard", 12344, 4),
+    ])

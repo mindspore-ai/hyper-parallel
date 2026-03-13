@@ -14,146 +14,72 @@
 # ============================================================================
 """test TorchHSDPParamV2"""
 from tests.common.mark_utils import arg_mark
-from tests.torch.utils import torchrun_case
+from tests.common.parallel_case import parallel_run, TorchCase
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_fsdp_1d_mesh():
-    """
-    Feature: TorchHSDPParamV2.
-    Description: Test TorchHSDPParamV2 with 1D FSDP mesh
-    Expectation: assertion pass.
-    """
-    master_port = 12343
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_fsdp_1d_mesh"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_hsdp_2d_mesh():
-    """
-    Feature: TorchHSDPParamV2.
-    Description: Test TorchHSDPParamV2 with 2D HSDP mesh (replicate + shard)
-    Expectation: assertion pass.
-    """
-    master_port = 12344
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_hsdp_2d_mesh"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_sharded_state_transitions():
-    """
-    Feature: TorchHSDPParamV2.
-    Description: Test state transitions (sharded -> unsharded -> sharded)
-    Expectation: assertion pass.
-    """
-    master_port = 12345
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_sharded_state_transitions"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_custom_shard_placement():
-    """
-    Feature: TorchHSDPParamV2.
-    Description: Test TorchHSDPParamV2 with custom shard placement function
-    Expectation: assertion pass.
-    """
-    master_port = 12346
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_custom_shard_placement"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_mixed_precision():
-    """
-    Feature: TorchHSDPParamV2.
-    Description: Test TorchHSDPParamV2 with mixed precision policy
-    Expectation: assertion pass.
-    """
-    master_port = 12347
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_mixed_precision"
-    torchrun_case(file_name, case_name, master_port)
+_TEST_HSDP_PARAM = "_test_hsdp_param.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_all_gather_comm():
+def test_hsdp_param_group1():
     """
-    Feature: TorchHSDPParamV2.
-    Description: Test param-level all-gather communication
-    Expectation: assertion pass.
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_hsdp_param_v2_fsdp_1d_mesh
+        2.test_hsdp_param_v2_sharded_state_transitions
+        3.test_hsdp_param_v2_custom_shard_placement
+        4.test_hsdp_param_v2_mixed_precision
+    Expectation: Run success.
     """
-    master_port = 12348
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_all_gather_comm"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_prefetch_unshard():
-    """
-    Feature: TorchHSDPParamV2.
-    Description: Test async prefetch and unshard workflow
-    Expectation: assertion pass.
-    """
-    master_port = 12349
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_prefetch_unshard"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_unshard_shard_cycle():
-    """
-    Feature: TorchHSDPParamV2.
-    Description: Test complete unshard -> shard cycle with communication
-    Expectation: assertion pass.
-    """
-    master_port = 12350
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_unshard_shard_cycle"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_reduce_scatter_grad():
-    """
-    Feature: TorchHSDPParamV2.
-    Description: Test reduce-scatter gradient communication
-    Expectation: assertion pass.
-    """
-    master_port = 12351
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_reduce_scatter_grad"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_fsdp_1d_mesh", 12343, 2),
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_sharded_state_transitions", 12345, 2),
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_custom_shard_placement", 12346, 2),
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_mixed_precision", 12347, 2),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_all_reduce_grad():
+def test_hsdp_param_group2():
     """
-    Feature: TorchHSDPParamV2.
-    Description: Test all-reduce gradient communication in HSDP mode
-    Expectation: assertion pass.
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_hsdp_param_v2_all_gather_comm
+        2.test_hsdp_param_v2_prefetch_unshard
+        3.test_hsdp_param_v2_unshard_shard_cycle
+        4.test_hsdp_param_v2_reduce_scatter_grad
+    Expectation: Run success.
     """
-    master_port = 12352
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_all_reduce_grad"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_all_gather_comm", 12348, 2),
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_prefetch_unshard", 12349, 2),
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_unshard_shard_cycle", 12350, 2),
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_reduce_scatter_grad", 12351, 2),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_hsdp_param_group3():
+    """
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_hsdp_param_v2_hsdp_2d_mesh
+        2.test_hsdp_param_v2_all_reduce_grad
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_hsdp_2d_mesh", 12344, 4),
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_all_reduce_grad", 12352, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_accumulate_grad():
+def test_hsdp_param_group4():
     """
-    Feature: TorchHSDPParamV2.
-    Description: Test gradient accumulation workflow
-    Expectation: assertion pass.
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_hsdp_param_v2_accumulate_grad
+    Expectation: Run success.
     """
-    master_port = 12355
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_accumulate_grad"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_accumulate_grad", 12355, 2),
+    ])

@@ -12,123 +12,81 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op expand"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_EXPAND = "parallel_op_expand.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_expand_basic_unsharded():
-    '''
-    Feature: test parallel op expand.
-    Description: test parallel op expand.
+def test_parallel_op_expand_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_expand_basic_unsharded
+        2.test_distributed_expand_sharded_dim_error
     Expectation: Run success.
-    '''
-    master_port = 10358
-    file_name = "parallel_op_expand.py"
-    case_name = "test_distributed_expand_basic_unsharded"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_basic_unsharded", 10358, 4),
+        TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_sharded_dim_error", 10359, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_expand_3d():
-    '''
-    Feature: test parallel op expand.
-    Description: test parallel op expand.
+def test_parallel_op_expand_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_expand_scalar_tensor
+        2.test_distributed_expand_as_basic
     Expectation: Run success.
-    '''
-    master_port = 10358
-    file_name = "parallel_op_expand.py"
-    case_name = "test_distributed_expand_3d"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_scalar_tensor", 10360, 4),
+        TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_as_basic", 10361, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_expand_prepend_new_dimensions():
-    '''
-    Feature: test parallel op expand.
-    Description: test parallel op expand.
+def test_parallel_op_expand_group3():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_expand_as_scalar_to_tensor
     Expectation: Run success.
-    '''
-    master_port = 10358
-    file_name = "parallel_op_expand.py"
-    case_name = "test_distributed_expand_prepend_new_dimensions"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_as_scalar_to_tensor", 10362, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_expand_sharded_dim_error():
-    '''
-    Feature: test parallel op expand.
-    Description: test parallel op expand.
+def test_parallel_op_expand_group4():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_expand_3d
+        2.test_distributed_expand_prepend_new_dimensions
     Expectation: Run success.
-    '''
-    master_port = 10358
-    file_name = "parallel_op_expand.py"
-    case_name = "test_distributed_expand_sharded_dim_error"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_3d", 10358, 4),
+        TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_prepend_new_dimensions", 10359, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_expand_scalar_tensor():
-    '''
-    Feature: test parallel op expand.
-    Description: test parallel op expand.
+def test_parallel_op_expand_group5():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_expand_as_3d_preservation
+        2.test_distributed_expand_as_prepend_dimensions
     Expectation: Run success.
-    '''
-    master_port = 10358
-    file_name = "parallel_op_expand.py"
-    case_name = "test_distributed_expand_scalar_tensor"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_expand_as_basic():
-    '''
-    Feature: test parallel op expand.
-    Description: test parallel op expand.
-    Expectation: Run success.
-    '''
-    master_port = 10358
-    file_name = "parallel_op_expand.py"
-    case_name = "test_distributed_expand_as_basic"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_expand_as_3d_preservation():
-    '''
-    Feature: test parallel op expand.
-    Description: test parallel op expand.
-    Expectation: Run success.
-    '''
-    master_port = 10358
-    file_name = "parallel_op_expand.py"
-    case_name = "test_distributed_expand_as_3d_preservation"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_expand_as_prepend_dimensions():
-    '''
-    Feature: test parallel op expand.
-    Description: test parallel op expand.
-    Expectation: Run success.
-    '''
-    master_port = 10358
-    file_name = "parallel_op_expand.py"
-    case_name = "test_distributed_expand_as_prepend_dimensions"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_expand_as_scalar_to_tensor():
-    '''
-    Feature: test parallel op expand.
-    Description: test parallel op expand.
-    Expectation: Run success.
-    '''
-    master_port = 10358
-    file_name = "parallel_op_expand.py"
-    case_name = "test_distributed_expand_as_scalar_to_tensor"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_as_3d_preservation", 10360, 4),
+        TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_as_prepend_dimensions", 10361, 4),
+    ])

@@ -45,7 +45,7 @@ def test_distributed_softmax_layout_inference():
 
     # Distributed setup
     # Mesh: (2, 4), Alias: ("dp", "tp")
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
 
     # Strategy: Shard on dim=0 ("dp"), Keep dim=1 ("None").
     # Softmax is performed on dim=1, so dim=1 must NOT be sharded.
@@ -84,7 +84,7 @@ def test_distributed_softmax_sharded_dim_error():
     init_dist()
     dim = 1  # Softmax along dim 1
 
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
 
     # Strategy: Keep dim=0 ("dp"), Shard dim=1 ("tp").
     # We will try to Softmax on dim=1, which is sharded.

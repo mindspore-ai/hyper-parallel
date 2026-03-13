@@ -12,31 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op softmax"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_SOFTMAX = "parallel_op_softmax.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_softmax():
-    '''
-    Feature: test parallel op softmax.
-    Description: test parallel op softmax layout inference and calculation.
+def test_parallel_op_softmax_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_softmax_layout_inference
+        2.test_distributed_softmax_sharded_dim_error
     Expectation: Run success.
-    '''
-    master_port = 10889  # Ensure port is different if running concurrently, or let the framework handle it
-    file_name = "parallel_op_softmax.py"
-    case_name = "test_distributed_softmax_layout_inference"
-    torchrun_case(file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_softmax_dim_error():
-    '''
-    Feature: test parallel op softmax error handling.
-    Description: test parallel op softmax raises error when axis is sharded.
-    Expectation: Run success (by catching exception).
-    '''
-    master_port = 10889
-    file_name = "parallel_op_softmax.py"
-    case_name = "test_distributed_softmax_sharded_dim_error"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SOFTMAX, "test_distributed_softmax_layout_inference", 10889, 4),
+        TorchCase(PARALLEL_OP_SOFTMAX, "test_distributed_softmax_sharded_dim_error", 10890, 4),
+    ])

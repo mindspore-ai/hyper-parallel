@@ -90,7 +90,7 @@ def test_multi_dim_sharding_offset():
     '''
     # Create 2D mesh
     world_size = dist.get_world_size()
-    mesh_2d = DeviceMesh("npu", torch.arange(world_size).reshape(2, 4), mesh_dim_names=("dp","tp"))
+    mesh_2d = DeviceMesh("npu", torch.arange(world_size).reshape(2, 2), mesh_dim_names=("dp","tp"))
 
     tracker = OffsetBasedRNGTracker(run_state_sync=False)
     tracker._manual_seed(42)

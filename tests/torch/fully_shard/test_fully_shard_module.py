@@ -14,18 +14,20 @@
 # ============================================================================
 """test fully_shard module api"""
 
-from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+_TEST_FULLY_SHARD_MODULE = "_test_fully_shard_module.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_fully_shard_module_01():
+def test_fully_shard_module_group1():
     """
-    Feature: Test fully_shard module interface
-    Description: Verify the HSDPCell interface methods
-    Expectation: run successfully
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_fully_shard_module_01
+    Expectation: Run success.
     """
-    master_port = 12343
-    file_name = "_test_fully_shard_module.py"
-    case_name = "test_fully_shard_module_01"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(_TEST_FULLY_SHARD_MODULE, "test_fully_shard_module_01", 12343, 4)
+    ])

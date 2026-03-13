@@ -40,7 +40,7 @@ def test_distributed_squeeze_basic():
     standalone_output = standalone_input.squeeze(1)
 
     # Distributed setup: shard dim=0 ("dp"), dim=1 is unsharded (Replicate)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
@@ -133,7 +133,7 @@ def test_distributed_squeeze_error_non_singleton():
     input_np = np.random.randn(8, 2).astype(np.float32)
     standalone_input = torch.from_numpy(input_np).npu()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
@@ -158,7 +158,7 @@ def test_distributed_squeeze_scalar_like():
     standalone_input = torch.from_numpy(input_np).npu()
     standalone_output = standalone_input.squeeze()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)

@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test hsdp performancee feature with msrun 8 card"""
+"""test hsdp performance feature"""
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -24,13 +24,9 @@ def test_hsdp_forward_prefetch():
     Description: test hsdp forward prefetch
     Expectation: run success
     """
-    glog_v = 2
-    file_name = "hsdp_prefetch.py"
-    case_name = "test_hsdp_forward_prefetch"
-    master_port = 18182
-    worker_num = 8
-    local_worker_num = 8
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)
+    parallel_run([
+        MindSporeCase("hsdp_prefetch.py", "test_hsdp_forward_prefetch", 18200, 8, 8, 2)
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -40,13 +36,9 @@ def test_hsdp_backward_prefetch():
     Description: test hsdp backward prefetch
     Expectation: run success
     """
-    glog_v = 2
-    file_name = "hsdp_prefetch.py"
-    case_name = "test_hsdp_backward_prefetch"
-    master_port = 18182
-    worker_num = 8
-    local_worker_num = 8
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)
+    parallel_run([
+        MindSporeCase("hsdp_prefetch.py", "test_hsdp_backward_prefetch", 18201, 8, 8, 2)
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -56,13 +48,9 @@ def test_hsdp_comm_async():
     Description: test hsdp async comm performance
     Expectation: run success
     """
-    glog_v = 2
-    file_name = "hsdp_comm_async.py"
-    case_name = "test_hsdp_comm_async"
-    master_port = 18182
-    worker_num = 8
-    local_worker_num = 8
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)
+    parallel_run([
+        MindSporeCase("hsdp_comm_async.py", "test_hsdp_comm_async", 18202, 8, 8, 2)
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -72,10 +60,6 @@ def test_hsdp_comm_fusion():
     Description: test hsdp comm fusion performance
     Expectation: run success
     """
-    glog_v = 2
-    file_name = "hsdp_comm_fusion.py"
-    case_name = "test_hsdp_comm_fusion"
-    master_port = 18182
-    worker_num = 8
-    local_worker_num = 8
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num, local_worker_num)
+    parallel_run([
+        MindSporeCase("hsdp_comm_fusion.py", "test_hsdp_comm_fusion", 18203, 8, 8, 2)
+    ])
