@@ -285,6 +285,9 @@ class DTensor(DTensorBase):
         # Clear partial status from original layout since Replicate has no partial
         replicated_layout.reset_partial()
 
+        if shard_num(self._layout) == 1:
+            return self._local_tensor.clone()
+
         # Redistribute to the replicated layout and return local tensor
         # pylint: disable=C0415
         from hyper_parallel.core.tensor_redistribution import _tensor_redistribution
@@ -484,3 +487,34 @@ def zeros(
         device_mesh=device_mesh,
         placements=placements,
     )
+
+
+def shard_num(layout) -> int:
+    """
+    Calculate the total number of shards this tensor is split into across the device mesh.
+
+    This method calculates the product of device counts for all mesh dimensions 
+    that actively shard the tensor (where tensor_map >= 0).
+
+    For example:
+    layout = Layout((2, 4), ("dp", "mp"))
+    x_layout = layout("dp", "None")
+    The tensor is only sharded along the 'dp' axis, which has two devices.
+    Theorefore, shard_num returns 2.
+    """
+    # pylint: disable=protected-access
+    if layout._tensor_map is None:
+        raise ValueError(f"The tensor_map is None, the mesh_shape is {layout._mesh.mesh_shape},"
+                            f" alias_name is {layout._mesh.mesh_dim_names}")
+
+    used_dev_num = 1
+    for ele in layout._tensor_map:
+        if isinstance(ele, tuple):
+            for item in ele:
+                if item >= 0:
+                    used_dev_num *= layout._mesh.mesh_shape[len(layout._mesh.mesh_shape) - item - 1]
+            continue
+        if ele >= 0:
+            used_dev_num *= layout._mesh.mesh_shape[len(layout._mesh.mesh_shape) - ele - 1]
+
+    return used_dev_num

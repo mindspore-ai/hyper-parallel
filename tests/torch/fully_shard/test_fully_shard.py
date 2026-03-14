@@ -58,9 +58,23 @@ def test_fully_shard_03():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_fully_shard_04():
+    """
+    Feature: Test fully_shard with buffer network, CPU init
+    Description: DenseMutiLayerNet contains 2 DenseNet
+    Expectation: run successfully
+    """
+    master_port = 17345
+    file_name = "_test_fully_shard.py"
+    case_name = "test_fully_shard_04"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_fully_shard_from_group_mesh():
     """
-    Feature: When mesh created by from_group, test fully_shard with multi-layer network, optimization level is default ZeRO-3
+    Feature: When mesh created by from_group, test fully_shard with multi-layer network,
+    optimization level is default ZeRO-3
     Description: The FullyShardTestNet is a multi-layer module, verify the basic process of fully_shard
     Expectation: run successfully
     """

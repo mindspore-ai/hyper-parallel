@@ -182,18 +182,6 @@ class DTensorBase(Tensor):
             super().zero_()  # sync wrapper's in-place zero
         return self
 
-    def copy_(self, src: Tensor, non_blocking: bool = False):
-        """Copy data from src tensor"""
-        if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
-            new_local = src.to(self._local_tensor.device, non_blocking=non_blocking).detach().clone()
-            new_local.requires_grad = self._local_tensor.requires_grad
-            super().copy_(new_local)
-            self._local_tensor = new_local
-        else:
-            self._local_tensor.copy_(src, non_blocking=non_blocking)
-            super().copy_(src, non_blocking=non_blocking)
-        return self
-
     def fill_(self, value):
         """Fill tensor with value"""
         if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
