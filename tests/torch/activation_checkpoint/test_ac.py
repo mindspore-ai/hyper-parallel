@@ -18,8 +18,7 @@ import torch
 from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, checkpoint_wrapper
 from tests.common.mark_utils import arg_mark
 from tests.torch.common_net import SimpleTransformer
-
-from .utils import prepare_data, seed_memory_time_context, train_one_mode
+from tests.torch.activation_checkpoint.utils import prepare_data, seed_memory_time_context, train_one_mode
 
 
 def apply_recompute(model, mode):
