@@ -25,7 +25,7 @@ from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.core.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState, ParamModuleInfo
 from hyper_parallel.core.placement_types import Shard, Replicate
-from hyper_parallel.platform.torch.fully_shard.utils import HSDPMeshInfo, FSDPMeshInfo, MixedPrecisionPolicy
+from hyper_parallel.core.fully_shard.utils import HSDPMeshInfo, FSDPMeshInfo, MixedPrecisionPolicy
 
 from hyper_parallel.platform.platform import get_torch_platform
 
@@ -91,10 +91,8 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             param=kwargs.get('param', self.param),
             module_info=kwargs.get('module_info', self.module_info),
             mesh_info=kwargs.get('mesh_info', self.mesh_info),
-            post_forward_mesh_info=kwargs.get('post_forward_mesh_info'),
             shard_placement_fn=kwargs.get('shard_placement_fn', self.shard_placement_fn),
             mp_policy=kwargs.get('mp_policy', self.mp_policy),
-            threshold=kwargs.get('threshold', 0),
             device=kwargs.get('device', self.device)
         )
 
@@ -153,7 +151,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
 
         param_v2 = self._create_param_v2(
             param=small_param,
-            threshold=1024  # Threshold
         )
 
         # Verify parameter is not sharded
@@ -393,7 +390,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         post_forward_mesh.shard_mesh_size = 2
 
         # Create parameter
-        param_v2 = self._create_param_v2(post_forward_mesh_info=post_forward_mesh)
+        param_v2 = self._create_param_v2()
 
         # Simulate state after unshard
         self._simulate_unsharded_state(param_v2)

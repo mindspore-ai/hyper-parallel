@@ -27,7 +27,7 @@ from hyper_parallel.core.dtensor import DTensor  # pylint: disable=C0413
 from hyper_parallel.core.fully_shard.api import fully_shard  # pylint: disable=C0413
 from hyper_parallel.core.placement_types import Partial, Shard  # pylint: disable=C0413
 from hyper_parallel.core.utils.clip_grad import clip_grad_norm_  # pylint: disable=C0413
-from hyper_parallel.platform.torch.fully_shard.utils import (  # pylint: disable=C0413
+from hyper_parallel.core.fully_shard.utils import (  # pylint: disable=C0413
     MixedPrecisionPolicy,
 )
 

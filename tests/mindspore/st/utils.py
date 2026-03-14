@@ -45,6 +45,16 @@ def skip_if_ms_version_lt(min_ms_version):
     )
 
 
+def skip_if_ms_version_ge(max_ms_version):
+    """
+    Skip if mindspore version greater than or equal to `max_ms_version`.
+    """
+    return pytest.mark.skipif(
+        version.parse(ms.__version__) >= version.parse(max_ms_version),
+        reason=f"Test broken on MindSpore >= {max_ms_version}, got {ms.__version__}"
+    )
+
+
 def skip_if_ms_plugin_not_exist():
     """
     Skip if mindspore plugin does not exist.

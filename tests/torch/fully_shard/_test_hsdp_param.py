@@ -22,7 +22,7 @@ import torch
 from tests.torch.utils import init_dist
 from tests.torch.common_net import DenseNet
 from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.torch.fully_shard.utils import (
+from hyper_parallel.core.fully_shard.utils import (
     FSDPMeshInfo,
     HSDPMeshInfo,
     MixedPrecisionPolicy,

@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import skip_if_ms_version_lt, skip_if_ms_plugin_not_exist
+from tests.mindspore.st.utils import skip_if_ms_version_lt, skip_if_ms_version_ge, skip_if_ms_plugin_not_exist
 import mindspore as ms
 from mindspore import nn, ops
 from mindspore.ops import all_gather_into_tensor
@@ -439,6 +439,7 @@ def count_pattern(saved_graphs_path, pattern, ir):
 
 
 @skip_if_ms_version_lt("2.8.1")
+@skip_if_ms_version_ge("2.9.0")
 @skip_if_ms_plugin_not_exist()
 @arg_mark(
     plat_marks=['platform_ascend910b'],

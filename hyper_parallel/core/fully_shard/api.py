@@ -17,11 +17,8 @@ import warnings
 from collections import namedtuple
 from typing import Any, Mapping, cast, Optional
 
-import torch
-from torch import nn
-
 from hyper_parallel.platform.platform import PlatformType
-from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy
+from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy
 from hyper_parallel import DeviceMesh, init_device_mesh
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor import DTensor, distribute_tensor
@@ -32,7 +29,7 @@ origin_class_to_extend_class = {}
 
 
 def _check_strict_keys(
-    module: nn.Module, state_dict: Mapping[str, Any],
+    module: platform.Module, state_dict: Mapping[str, Any],
 ) -> None:
     """Raise ``RuntimeError`` if *state_dict* keys do not match *module*."""
     expected_keys = set(module.state_dict().keys())
@@ -56,8 +53,8 @@ def _check_strict_keys(
 
 
 def _resolve_local_tensor(
-    key: str, val: torch.Tensor, target: DTensor,
-) -> torch.Tensor:
+    key: str, val: platform.Tensor, target: DTensor,
+) -> platform.Tensor:
     """Return the local shard tensor to be loaded into *target*."""
     if isinstance(val, DTensor):
         return val.to_local()
@@ -110,8 +107,8 @@ class HSDPModule:
         """init hsdp2 scheduler."""
         scheduler_class = None
         if platform_type == PlatformType.MINDSPORE:
-            from hyper_parallel.platform.mindspore.hsdp.scheduler import MindSporeHSDPScheduler
-            scheduler_class = MindSporeHSDPScheduler
+            from hyper_parallel.platform.mindspore.fully_shard.scheduler import MindSporeHSDPSchedulerV2
+            scheduler_class = MindSporeHSDPSchedulerV2
         else:
             from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
             scheduler_class = TorchHSDPSchedulerV2
@@ -236,9 +233,9 @@ class HSDPModule:
                 "HSDP always copies into existing DTensor parameters.",
                 stacklevel=2,
             )
-        self_module = cast(nn.Module, self)
+        self_module = cast(platform.Module, self)
 
-        target_map: dict[str, torch.Tensor] = {}
+        target_map: dict[str, platform.Tensor] = {}
         for name, p in self_module.named_parameters():
             target_map[name] = p
         for name, b in self_module.named_buffers():
@@ -247,7 +244,7 @@ class HSDPModule:
         if strict:
             _check_strict_keys(self_module, state_dict)
 
-        with torch.no_grad():
+        with platform.no_grad():
             for key, val in state_dict.items():
                 target = target_map.get(key)
                 if target is None:
@@ -296,7 +293,7 @@ class HSDPModule:
                 "Currently impl is equal to recurse=True, "
                 "need support module_param mapping."
             )
-        self_module = cast(nn.Module, self)
+        self_module = cast(platform.Module, self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
             if isinstance(module, HSDPModule):
@@ -313,7 +310,7 @@ class HSDPModule:
                 "Currently impl is equal to recurse=True, "
                 "need support module_param mapping."
             )
-        self_module = cast(nn.Module, self)
+        self_module = cast(platform.Module, self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
             if isinstance(module, HSDPModule):
@@ -330,7 +327,7 @@ class HSDPModule:
                 "Currently impl is equal to recurse=True, "
                 "need support module_param mapping."
             )
-        self_module = cast(nn.Module, self)
+        self_module = cast(platform.Module, self)
         modules = list(self_module.modules()) if recurse else [self_module]
         for module in modules:
             if isinstance(module, HSDPModule):
@@ -364,25 +361,29 @@ def _get_device_from_mesh(mesh: DeviceMesh):
             f"hyper_parallel.fully_shard support device in [torch.npu, torch.gpu], "
             f"but got '{device_type}'"
         )
-    device_handle = platform.get_device_handle(device_type)
-    if device_handle is None:
-        raise ValueError(
-            f"hyper_parallel.fully_shard can't find device_handle of "
-            f"'torch.{device_type}', check the environment."
-        )
-    if device_handle.is_available():
-        device = torch.device(device_handle.current_device())
+    if platform.platform_type == PlatformType.PYTORCH:
+        device_handle = platform.get_device_handle(device_type)
+        if device_handle is None:
+            raise ValueError(
+                f"hyper_parallel.fully_shard can't find device_handle of "
+                f"'torch.{device_type}', check the environment."
+            )
+        if device_handle.is_available():
+            import torch  # pylint: disable=import-outside-toplevel
+            device = torch.device(device_handle.current_device())
+    else:
+        device = device_type
     return device
 
 def fully_shard(
-        module: nn.Module,
+        module: platform.Module,
         *,
         mesh: Optional[DeviceMesh] = None,
         reshard_after_forward: bool = True,
         shard_placement_fn: None = None,
         mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
         offload_policy: OffloadPolicy = OffloadPolicy(),
-        ignored_params: Optional[set[nn.Parameter]] = None,
+        ignored_params: Optional[set[platform.Parameter]] = None
 ):
     """
     Apply fully_shard to a module for distributed training with parameter sharding.

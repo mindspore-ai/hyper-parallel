@@ -118,3 +118,20 @@ class NetWithScaler(nn.Cell):
         if isinstance(x, DTensor):
             x = x.reduce_partial()
         return x
+
+class SlimLeNet16(nn.Cell):
+    """Slim LeNet variant for 16-class classification"""
+    def __init__(self):
+        super().__init__()
+        self.flatten = nn.Flatten()
+        self.dense_relu_sequential = nn.SequentialCell(
+            nn.Dense(28*28, 512, weight_init="normal", bias_init="zeros"),
+            nn.ReLU(),
+            nn.Dense(512, 512, weight_init="normal", bias_init="zeros"),
+            nn.ReLU(),
+            nn.Dense(512, 16, weight_init="normal", bias_init="zeros")
+        )
+
+    def construct(self, x):
+        x = self.flatten(x)
+        return self.dense_relu_sequential(x)

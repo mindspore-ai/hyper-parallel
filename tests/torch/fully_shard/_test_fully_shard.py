@@ -23,7 +23,7 @@ import torch_npu
 from hyper_parallel import DeviceMesh, init_device_mesh, SkipDTensorDispatch
 from hyper_parallel.platform.platform import get_torch_platform
 from hyper_parallel.core.fully_shard.api import fully_shard
-from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy
+from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.common_net import FullyShardTestNet, DenseNet, BufferTestNet, MetaInitNet
 from tests.torch.utils import init_dist
 from tests.torch.hsdp.hsdp_test_common import train
