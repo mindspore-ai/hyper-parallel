@@ -15,20 +15,20 @@
 """state_dict / load_state_dict tests for fully_shard.
 
 Verified scenarios:
-  T2  (2-card): state_dict shape + load_state_dict with hyper DTensor (copy + assign)
-  T3  (2-card): load_state_dict with torch Tensor (local shard + global + vanilla checkpoint)
-  T5  (8-card): full training round-trip (DTensor + local + global)
-  T6  (8-card): get_model_state_dict (sharded default + sharded cpu_offload)
-  T7  (8-card): get_model_state_dict full + cpu_offload
-  T8  (8-card): get_model_state_dict ignore_frozen_params
-  T10 (1-card): _to_dtype_if_needed cast / no-op
-  T11 (8-card): meta init -> load_state_dict -> backward (requires_grad regression)
-  T13 (2-card): _extra_state error paths (missing + unexpected)
-  T15 (2-card): nested _extra_state round-trip (multi-level module tree)
-  T16 (2-card): _extra_state with wrapper that strips prefix (Float16Module scenario)
-  T17 (2-card): asymmetric get/set override — only get_extra_state overridden
-  T18 (2-card): pre-hook injects missing _extra_state — strict=True succeeds
-  T19 (2-card): pre-hook + wrapper prefix rewrite — strict=True succeeds
+  T2  (allcards 2-card): state_dict shape + load DTensor (copy + assign)
+  T3  (allcards 2-card): load Tensor (local shard + global + vanilla checkpoint)
+  T5  (allcards 8-card): full training round-trip (DTensor + local + global)
+  T6  (allcards 8-card): get_model_state_dict (sharded default + sharded cpu_offload)
+  T7  (allcards 8-card): get_model_state_dict full + cpu_offload
+  T8  (allcards 2-card): get_model_state_dict ignore_frozen_params
+  T10 (onecard): _to_dtype_if_needed cast / no-op
+  T11 (allcards 2-card): meta init -> load_state_dict -> backward
+  T13 (allcards 2-card): _extra_state error paths (missing + unexpected)
+  T15 (allcards 2-card): nested _extra_state round-trip (HSDP success-path integration)
+  T16 (onecard): _extra_state with wrapper that strips prefix (Float16Module scenario)
+  T17 (onecard): asymmetric get/set override — only get_extra_state overridden
+  T18 (allcards 2-card): pre-hook injects missing _extra_state (HSDP Phase 0 integration)
+  T19 (allcards 2-card): pre-hook + wrapper (HSDP integration, PrefixStrippingWrapper + injection)
 """
 import os
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
@@ -41,7 +41,16 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions
 
 from hyper_parallel import init_device_mesh, SkipDTensorDispatch
 from hyper_parallel.core.dtensor import DTensor
-from hyper_parallel.core.fully_shard.api import fully_shard, get_model_state_dict
+from hyper_parallel.core.fully_shard.api import (
+    _build_prefix_to_module,
+    _collect_missing_keys,
+    _load_extra_states,
+    _prepare_mutable_state_dict,
+    _raise_if_incompatible,
+    _run_load_pre_hooks,
+    fully_shard,
+    get_model_state_dict,
+)
 from hyper_parallel.platform.torch.fully_shard.state import _to_dtype_if_needed
 from hyper_parallel.platform.torch.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.common_net import FullyShardTestNet
@@ -126,8 +135,46 @@ def _assert_fwd_match(fwd_expected, fwd_actual, tag="", tol=1e-4):
     )
 
 
+def _run_extra_state_load_ut(module: torch.nn.Module, state_dict, strict: bool = True):
+    """Replay the HSDP _extra_state load path on a plain nn.Module.
+
+    This unit-test helper exercises the same prefix-discovery, pre-hook replay,
+    _extra_state dispatch, and strict missing/unexpected classification used by
+    HSDPModule.load_state_dict(), without requiring distributed init or DTensor.
+    """
+    expected_state = module.state_dict(keep_vars=True)
+    mutable_sd = _prepare_mutable_state_dict(state_dict)
+    prefix_to_module = _build_prefix_to_module(module, expected_state)
+
+    module_to_prefix: dict[int, str] = {}
+    for prefix, submodule in prefix_to_module.items():
+        mid = id(submodule)
+        if mid not in module_to_prefix:
+            module_to_prefix[mid] = prefix
+
+    _run_load_pre_hooks(module, mutable_sd, module_to_prefix, strict)
+
+    missing_keys: list[str] = []
+    unexpected_keys: list[str] = []
+    _load_extra_states(
+        module, mutable_sd, expected_state, strict,
+        missing_keys, unexpected_keys, prefix_to_module,
+    )
+
+    if strict:
+        missing_keys.extend(
+            _collect_missing_keys(expected_state, set(mutable_sd.keys()))
+        )
+        if missing_keys or unexpected_keys:
+            _raise_if_incompatible(
+                module.__class__.__name__, missing_keys, unexpected_keys,
+            )
+
+    return mutable_sd, missing_keys, unexpected_keys
+
+
 # =====================================================================
-# T2 (2-card): state_dict shape + load_state_dict with hyper DTensor
+# T2 (allcards 2-card): state_dict shape + load DTensor
 # =====================================================================
 def test_t2_load_dtensor_2cards():
     """state_dict shape check + load_state_dict with hyper DTensor: copy and assign."""
@@ -170,7 +217,7 @@ def test_t2_load_dtensor_2cards():
 
 
 # =====================================================================
-# T3 (2-card): load_state_dict with torch Tensor (local + global + vanilla)
+# T3 (allcards 2-card): load Tensor (local + global + vanilla)
 # =====================================================================
 def test_t3_load_tensor_2cards():
     """load_state_dict with plain torch.Tensor: local shard, global, and vanilla checkpoint."""
@@ -245,15 +292,16 @@ def test_t3_load_tensor_2cards():
 
 
 # =====================================================================
-# T5 (8-card): full training round-trip
+# T5 (allcards 8-card): full training round-trip
 # =====================================================================
 def test_t5_roundtrip_8cards():
     """Full training round-trip on 8 cards: DTensor + local + global."""
     init_dist()
     assert dist.get_world_size() >= 8, "T5 requires 8 cards"
+    num_cards = 8
     torch.manual_seed(2026 + _rank())
 
-    model = _make_model(8)
+    model = _make_model(num_cards)
     x = torch.randn(BATCH, HIDDEN).npu()
 
     # Phase 1: train 3 steps
@@ -263,19 +311,19 @@ def test_t5_roundtrip_8cards():
     sd = model.state_dict()
 
     # Phase 2: load hyper DTensor
-    model2 = _make_model(8)
+    model2 = _make_model(num_cards)
     model2.load_state_dict(sd, assign=True)
     _assert_fwd_match(fwd_trained, _forward_val(model2, x), "DTensor")
 
     # Phase 3: load torch Tensor (local shard)
     local_sd = _to_local_sd(sd)
-    model3 = _make_model(8)
+    model3 = _make_model(num_cards)
     model3.load_state_dict(local_sd)
     _assert_fwd_match(fwd_trained, _forward_val(model3, x), "local Tensor")
 
     # Phase 4: load torch Tensor (global full)
     full_sd = _to_full_sd(sd)
-    model4 = _make_model(8)
+    model4 = _make_model(num_cards)
     model4.load_state_dict(full_sd, assign=True)
     _assert_fwd_match(fwd_trained, _forward_val(model4, x), "global Tensor")
 
@@ -283,19 +331,20 @@ def test_t5_roundtrip_8cards():
     for _ in range(2):
         _train_step(model4, x)
     assert _forward_val(model4, x) != fwd_trained, "training had no effect"
-    _assert_all_dtensor(model4, "8-card round-trip")
+    _assert_all_dtensor(model4, "round-trip")
 
     print(f"[rank{_rank()}] T5 PASS: 8-card round-trip (DTensor + local + global)")
 
 
 # =====================================================================
-# T6 (8-card): get_model_state_dict (sharded default + sharded cpu_offload)
+# T6 (allcards 8-card): get_model_state_dict (sharded + cpu_offload)
 # =====================================================================
 def test_t6_get_model_sd_sharded():
     """get_model_state_dict: default sharded options AND sharded + cpu_offload."""
     init_dist()
+    num_cards = 8
     torch.manual_seed(42 + _rank())
-    model = _make_model(8)
+    model = _make_model(num_cards)
     x = torch.randn(BATCH, HIDDEN).npu()
     _train_step(model, x)
 
@@ -329,13 +378,13 @@ def test_t6_get_model_sd_sharded():
 
 
 # =====================================================================
-# T7 (8-card): get_model_state_dict full + cpu_offload
+# T7 (allcards 8-card): get_model_state_dict full + cpu_offload
 # =====================================================================
 def test_t7_get_model_sd_full_cpu():
     """get_model_state_dict with full_state_dict=True, cpu_offload=True."""
     init_dist()
-    torch.manual_seed(42 + _rank())
     num_cards = 8
+    torch.manual_seed(42 + _rank())
     model = _make_model(num_cards)
     x = torch.randn(BATCH, HIDDEN).npu()
     _train_step(model, x)
@@ -363,13 +412,14 @@ def test_t7_get_model_sd_full_cpu():
 
 
 # =====================================================================
-# T8 (8-card): get_model_state_dict ignore_frozen_params
+# T8 (allcards 2-card): get_model_state_dict ignore_frozen_params
 # =====================================================================
 def test_t8_get_model_sd_ignore_frozen():
     """get_model_state_dict with ignore_frozen_params=True excludes frozen params."""
     init_dist()
+    num_cards = 2
     torch.manual_seed(42 + _rank())
-    model = _make_model(8)
+    model = _make_model(num_cards)
 
     # Freeze the first dense layer's weight
     all_params = list(model.named_parameters())
@@ -393,26 +443,25 @@ def test_t8_get_model_sd_ignore_frozen():
 
 
 # =====================================================================
-# T10 (unit): _to_dtype_if_needed
+# T10 (dryrun): _to_dtype_if_needed
 # =====================================================================
 def test_t10_to_dtype_if_needed():
     """_to_dtype_if_needed: cast when dtype differs, no-op when same."""
-    # Same dtype → returns same object
+    # Same dtype -> returns same object
     t_fp32 = torch.randn(4, 4)
     result = _to_dtype_if_needed(t_fp32, torch.float32)
     assert result is t_fp32, "same dtype should return same object"
 
-    # None dtype → returns same object
+    # None dtype -> returns same object
     result_none = _to_dtype_if_needed(t_fp32, None)
     assert result_none is t_fp32, "None dtype should return same object"
 
-    # Different dtype → returns cast tensor
+    # Different dtype -> returns cast tensor
     result_fp16 = _to_dtype_if_needed(t_fp32, torch.float16)
     assert result_fp16 is not t_fp32, "different dtype should return new tensor"
     assert result_fp16.dtype == torch.float16, (
         f"expected float16, got {result_fp16.dtype}"
     )
-    # Values should be approximately equal
     assert torch.allclose(t_fp32, result_fp16.float(), atol=1e-3), (
         "cast values should be approximately equal"
     )
@@ -421,7 +470,7 @@ def test_t10_to_dtype_if_needed():
 
 
 # =====================================================================
-# T11 (8-card): meta init -> load_state_dict -> backward
+# T11 (allcards 2-card): meta init -> load_state_dict -> backward
 # =====================================================================
 def test_t11_meta_load_backward():
     """Regression: load_state_dict into meta-init model must preserve
@@ -429,18 +478,17 @@ def test_t11_meta_load_backward():
     'element 0 of tensors does not require grad'.
     """
     init_dist()
-    assert dist.get_world_size() >= 8, "T11 requires 8 cards"
+    num_cards = 2
     torch.manual_seed(42 + _rank())
-    num_cards = 8
 
-    # Phase 1: reference model — train and extract a global checkpoint
+    # Phase 1: reference model -- train and extract a global checkpoint
     model_ref = _make_model(num_cards)
     x = torch.randn(BATCH, HIDDEN).npu()
     _train_step(model_ref, x)
     fwd_ref = _forward_val(model_ref, x)
     checkpoint = _to_full_sd(model_ref.state_dict())
 
-    # Phase 2: target model — convert DTensor params to meta (simulate
+    # Phase 2: target model -- convert DTensor params to meta (simulate
     # lazy / meta init, e.g. HuggingFace init_empty_weights)
     model = _make_model(num_cards)
     grad_flags: dict[str, bool] = {}
@@ -473,7 +521,7 @@ def test_t11_meta_load_backward():
     # Phase 6: backward must succeed (the actual reported crash)
     _train_step(model, x)
 
-    print(f"[rank{_rank()}] T11 PASS: 8-card meta init -> load -> backward")
+    print(f"[rank{_rank()}] T11 PASS: meta init -> load -> backward")
 
 
 # =====================================================================
@@ -505,7 +553,7 @@ class _ExtraStateNet(torch.nn.Module):
 
 
 # =====================================================================
-# T13 (2-card): _extra_state error paths (missing + unexpected)
+# T13 (allcards 2-card): _extra_state error paths (missing + unexpected)
 # =====================================================================
 def test_t13_extra_state_error_paths():
     """_extra_state strict-mode error paths: missing AND unexpected keys.
@@ -516,6 +564,9 @@ def test_t13_extra_state_error_paths():
     Part B (unexpected, absorbed from T14): state_dict has _extra_state
     but target model has no set_extra_state override.
     strict=True should raise, strict=False OK.
+
+    Runs through real HSDPModule.load_state_dict() to ensure error paths
+    exercise the full HSDP dispatch, not just the helper functions.
     """
     init_dist()
     num_cards = 2
@@ -524,18 +575,16 @@ def test_t13_extra_state_error_paths():
     )
 
     # ---- Part A: missing _extra_state ----
-    # Source: vanilla Linear (no extra state)
     model_src = torch.nn.Module()
     model_src.linear = torch.nn.Linear(HIDDEN, HIDDEN, bias=False)
     vanilla_sd = {k: v.clone().detach() for k, v in model_src.state_dict().items()}
     assert "linear._extra_state" not in vanilla_sd
 
-    # Target: model WITH extra state
+    # strict=True should raise because _extra_state is missing
     model_dst = _ExtraStateNet(HIDDEN)
     fully_shard(model_dst.linear, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
     fully_shard(model_dst, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
 
-    # strict=True should raise because _extra_state is missing
     raised = False
     try:
         model_dst.load_state_dict(vanilla_sd, strict=True)
@@ -553,14 +602,12 @@ def test_t13_extra_state_error_paths():
     assert model_dst2.linear.get_extra_state() == {"scale": 2.5, "version": 3}
 
     # ---- Part B: unexpected _extra_state (absorbed from T14) ----
-    # Source: model WITH extra state
     model_src_b = _ExtraStateNet(HIDDEN)
     fully_shard(model_src_b.linear, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
     fully_shard(model_src_b, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
     sd_with_extra = model_src_b.state_dict()
     assert "linear._extra_state" in sd_with_extra
 
-    # Target: vanilla model WITHOUT set_extra_state override
     class _PlainNet(torch.nn.Module):  # pylint: disable=C0115
         def __init__(self, hidden: int):
             super().__init__()
@@ -593,7 +640,7 @@ def test_t13_extra_state_error_paths():
 
 
 # =====================================================================
-# T15 (2-card): nested _extra_state round-trip
+# T15 (allcards 2-card): nested _extra_state round-trip
 # =====================================================================
 class _NestedExtraStateNet(torch.nn.Module):
     """Model with _extra_state at multiple nesting levels."""
@@ -612,9 +659,9 @@ class _NestedExtraStateNet(torch.nn.Module):
 def test_t15_nested_extra_state_roundtrip():
     """_extra_state round-trip with multi-level nested modules.
 
-    Verifies _load_extra_states recursion handles deeper module trees:
-    encoder.layer0._extra_state and encoder.layer1._extra_state should both
-    be saved and restored correctly.
+    HSDP integration smoke for _extra_state success path: verifies
+    HSDPModule.load_state_dict() correctly dispatches set_extra_state
+    for multiple nested modules via the real Phase 0 / Phase 2 pipeline.
     """
     init_dist()
     num_cards = 2
@@ -634,26 +681,23 @@ def test_t15_nested_extra_state_roundtrip():
 
     sd = model_src.state_dict()
 
-    # Verify both _extra_state keys are present
     assert "encoder.layer0._extra_state" in sd
     assert "encoder.layer1._extra_state" in sd
     assert sd["encoder.layer0._extra_state"] == {"scale": 1.0, "version": 10}
     assert sd["encoder.layer1._extra_state"] == {"scale": 2.0, "version": 20}
 
-    # Target model — load and verify
+    # Target model -- load and verify
     model_dst = _NestedExtraStateNet(HIDDEN)
     for module in model_dst.modules():
         if isinstance(module, _ExtraStateLinear):
             fully_shard(module, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
     fully_shard(model_dst, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
 
-    # Before load: defaults
     assert model_dst.encoder.layer0.get_extra_state() == {"scale": 2.5, "version": 3}
     assert model_dst.encoder.layer1.get_extra_state() == {"scale": 2.5, "version": 3}
 
     model_dst.load_state_dict(sd, strict=True)
 
-    # After load: both levels restored
     assert model_dst.encoder.layer0.get_extra_state() == {"scale": 1.0, "version": 10}, (
         f"layer0 extra_state not restored: {model_dst.encoder.layer0.get_extra_state()}"
     )
@@ -665,7 +709,7 @@ def test_t15_nested_extra_state_roundtrip():
 
 
 # =====================================================================
-# T16 (2-card): _extra_state with wrapper that strips prefix
+# T16 (dryrun UT): _extra_state with wrapper that strips prefix
 # =====================================================================
 class _PrefixStrippingWrapper(torch.nn.Module):
     """Simulates Float16Module: wraps an inner model as self.module and
@@ -697,54 +741,37 @@ def test_t16_extra_state_prefix_stripped_wrapper():
     'module.') and could never match, causing all _extra_state keys to be
     falsely reported as unexpected.
     """
-    init_dist()
-    num_cards = 2
-    mesh = init_device_mesh(
-        device_type="npu", mesh_shape=(num_cards,), mesh_dim_names=("dp",),
-    )
-
-    # Build inner model with _extra_state
     inner_src = _ExtraStateNet(HIDDEN)
-    fully_shard(inner_src.linear, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
-    fully_shard(inner_src, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
     inner_src.linear.set_extra_state({"scale": 5.0, "version": 42})
 
-    # Wrap with prefix-stripping wrapper and apply fully_shard
     wrapper_src = _PrefixStrippingWrapper(inner_src)
-    fully_shard(wrapper_src, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
-
     sd = wrapper_src.state_dict()
 
-    # Keys should NOT have 'module.' prefix (stripped by wrapper)
     assert "linear._extra_state" in sd, (
         f"expected 'linear._extra_state', got keys: {list(sd.keys())}"
     )
     assert "module.linear._extra_state" not in sd
 
-    # Build target with the same structure
     inner_dst = _ExtraStateNet(HIDDEN)
-    fully_shard(inner_dst.linear, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
-    fully_shard(inner_dst, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
     wrapper_dst = _PrefixStrippingWrapper(inner_dst)
-    fully_shard(wrapper_dst, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
-
-    # Before load: default extra state
     assert wrapper_dst.module.linear.get_extra_state() == {"scale": 2.5, "version": 3}
 
-    # This was the bug: strict=True would raise "Unexpected key(s): linear._extra_state"
-    wrapper_dst.load_state_dict(sd, strict=True)
+    expected_state = wrapper_dst.state_dict(keep_vars=True)
+    prefix_to_module = _build_prefix_to_module(wrapper_dst, expected_state)
+    assert prefix_to_module["linear."] is wrapper_dst.module.linear
 
-    # After load: extra state should be restored
+    _run_extra_state_load_ut(wrapper_dst, sd, strict=True)
+
     loaded = wrapper_dst.module.linear.get_extra_state()
     assert loaded == {"scale": 5.0, "version": 42}, (
         f"extra_state not restored through wrapper: {loaded}"
     )
 
-    print(f"[rank{_rank()}] T16 PASS: _extra_state with prefix-stripping wrapper")
+    print("T16 PASS: _extra_state with prefix-stripping wrapper")
 
 
 # =====================================================================
-# T17 (2-card): asymmetric get/set override
+# T17 (dryrun UT): asymmetric get/set override
 # =====================================================================
 class _GetOnlyExtraStateLinear(torch.nn.Linear):
     """Linear that overrides get_extra_state but NOT set_extra_state.
@@ -774,63 +801,40 @@ def test_t17_asymmetric_extra_state_override():
 
     state_dict() includes the _extra_state key (via get_extra_state), but
     load_state_dict should treat it as unexpected because set_extra_state
-    is not overridden — matching PyTorch's _load_from_state_dict check.
+    is not overridden -- matching PyTorch's _load_from_state_dict check.
     """
-    init_dist()
-    num_cards = 2
-    mesh = init_device_mesh(
-        device_type="npu", mesh_shape=(num_cards,), mesh_dim_names=("dp",),
-    )
-
-    # Build model and get state_dict (includes _extra_state via get_extra_state)
     model_src = _AsymmetricNet(HIDDEN)
-    fully_shard(model_src.linear, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
-    fully_shard(model_src, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
     sd = model_src.state_dict()
     assert "linear._extra_state" in sd, f"expected _extra_state key, got: {list(sd.keys())}"
 
-    # Load into same model type — strict=True should raise because
-    # set_extra_state is not overridden
     model_dst = _AsymmetricNet(HIDDEN)
-    fully_shard(model_dst.linear, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
-    fully_shard(model_dst, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
-
     raised = False
     try:
-        model_dst.load_state_dict(sd, strict=True)
+        _run_extra_state_load_ut(model_dst, sd, strict=True)
     except RuntimeError as exc:
         raised = True
         assert "Unexpected key(s)" in str(exc), f"unexpected error: {exc}"
         assert "linear._extra_state" in str(exc), f"wrong key in error: {exc}"
     assert raised, "strict=True should raise for asymmetric get/set override"
 
-    # strict=False should succeed silently
     model_dst2 = _AsymmetricNet(HIDDEN)
-    fully_shard(model_dst2.linear, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
-    fully_shard(model_dst2, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
-    model_dst2.load_state_dict(sd, strict=False)
+    _run_extra_state_load_ut(model_dst2, sd, strict=False)
 
-    # ---- Missing-side: checkpoint lacks _extra_state, module only overrides
-    # get_extra_state (not set_extra_state) → strict=True must NOT report missing,
-    # matching PyTorch _load_from_state_dict semantics. ----
     sd_no_extra = {k: v for k, v in sd.items() if not k.endswith("_extra_state")}
     assert "linear._extra_state" not in sd_no_extra
 
     model_dst3 = _AsymmetricNet(HIDDEN)
-    fully_shard(model_dst3.linear, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
-    fully_shard(model_dst3, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
-    # This must NOT raise — module has no set_extra_state, so missing key is OK.
-    model_dst3.load_state_dict(sd_no_extra, strict=True)
+    _run_extra_state_load_ut(model_dst3, sd_no_extra, strict=True)
 
-    print(f"[rank{_rank()}] T17 PASS: asymmetric get/set _extra_state override")
+    print("T17 PASS: asymmetric get/set _extra_state override")
 
 
 # =====================================================================
-# T18 (2-card): pre-hook injects missing _extra_state
+# T18 (allcards 2-card): pre-hook injects missing _extra_state
 # =====================================================================
 class _PreHookExtraStateLinear(torch.nn.Linear):
     """Linear with get/set_extra_state AND a pre-hook that injects a
-    default _extra_state key when the checkpoint lacks it — mirroring the
+    default _extra_state key when the checkpoint lacks it -- mirroring the
     real-world pattern used by ColumnParallelLinear / output_layer.
     """
 
@@ -870,7 +874,8 @@ class _PreHookNet(torch.nn.Module):
 def test_t18_pre_hook_injects_extra_state():
     """Pre-hook injects _extra_state when checkpoint lacks it.
 
-    Without Phase 0 pre-hook replay, HSDP would report
+    HSDP integration test for the Phase 0 bug fix: without pre-hook
+    replay, HSDPModule.load_state_dict() would report
     Missing key(s): 'linear._extra_state'.  With Phase 0 the hook
     fires, injects the key, and strict=True succeeds.
     """
@@ -906,55 +911,16 @@ def test_t18_pre_hook_injects_extra_state():
 
 
 # =====================================================================
-# T19 (2-card): pre-hook + wrapper prefix rewrite
+# T19 (allcards 2-card): pre-hook + wrapper (PrefixStrippingWrapper + injection)
 # =====================================================================
-class _HookBasedWrapper(torch.nn.Module):
-    """Wrapper that uses state_dict hooks to strip/add 'module.' prefix,
-    AND the inner module has a pre-hook that injects _extra_state.
-
-    This is the combined scenario: Float16Module-style wrapper + pre-hook.
-    """
-
-    def __init__(self, inner: torch.nn.Module):
-        super().__init__()
-        self.module = inner
-        # Register hooks to strip 'module.' prefix from state_dict keys
-        self._register_state_dict_hook(self._strip_prefix_hook)
-        self.register_load_state_dict_pre_hook(
-            self._add_prefix_pre_hook, with_module=False,
-        )
-
-    def forward(self, x):
-        return self.module(x)
-
-    @staticmethod
-    def _strip_prefix_hook(module, state_dict, prefix, local_metadata):
-        """state_dict post-hook: strip 'module.' from keys."""
-        keys = list(state_dict.keys())
-        for key in keys:
-            inner_prefix = prefix + "module."
-            if key.startswith(inner_prefix):
-                new_key = prefix + key[len(inner_prefix):]
-                state_dict[new_key] = state_dict.pop(key)
-
-    @staticmethod
-    def _add_prefix_pre_hook(
-        state_dict, prefix, local_metadata, strict,
-        missing_keys, unexpected_keys, error_msgs,
-    ):
-        """load_state_dict pre-hook: add 'module.' back to keys."""
-        keys = list(state_dict.keys())
-        for key in keys:
-            if key.startswith(prefix) and not key.startswith(prefix + "module."):
-                new_key = prefix + "module." + key[len(prefix):]
-                state_dict[new_key] = state_dict.pop(key)
-
-
 def test_t19_pre_hook_with_wrapper_prefix():
-    """Pre-hook rewrites keys AND inner module's pre-hook injects _extra_state.
+    """PrefixStrippingWrapper + inner module pre-hook that injects _extra_state.
 
-    This combines the wrapper prefix scenario (T16) with the pre-hook
-    injection scenario (T18) — the most complex real-world case.
+    HSDP integration test combining wrapper prefix stripping (T16) with
+    pre-hook injection (T18) through real HSDPModule.load_state_dict().
+    Checkpoint lacks _extra_state; wrapper strips prefix; Phase 0 runs
+    inner module's pre-hook which injects the key under the correct
+    (stripped) prefix; Phase 2 loads it via set_extra_state.
     """
     init_dist()
     num_cards = 2
@@ -962,38 +928,35 @@ def test_t19_pre_hook_with_wrapper_prefix():
         device_type="npu", mesh_shape=(num_cards,), mesh_dim_names=("dp",),
     )
 
-    # Build inner model with pre-hook injection
+    # Source: build wrapped model, get state_dict with stripped keys
     inner_src = _PreHookNet(HIDDEN)
     fully_shard(inner_src.linear, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
     fully_shard(inner_src, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
     inner_src.linear.set_extra_state({"injected": False, "value": 42})
 
-    # Wrap with hook-based prefix wrapper
-    wrapper_src = _HookBasedWrapper(inner_src)
+    wrapper_src = _PrefixStrippingWrapper(inner_src)
     fully_shard(wrapper_src, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
 
     sd = wrapper_src.state_dict()
-
-    # Keys should NOT have 'module.' prefix (stripped by hook)
     assert "linear._extra_state" in sd, (
         f"expected 'linear._extra_state', got keys: {list(sd.keys())}"
     )
+    assert "module.linear._extra_state" not in sd
 
-    # Now simulate loading a checkpoint WITHOUT _extra_state
+    # Simulate checkpoint WITHOUT _extra_state
     sd_no_extra = {k: v for k, v in sd.items() if not k.endswith("_extra_state")}
     assert "linear._extra_state" not in sd_no_extra
 
-    # Build target with same structure
+    # Target: same structure, load through real HSDP path
     inner_dst = _PreHookNet(HIDDEN)
     fully_shard(inner_dst.linear, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
     fully_shard(inner_dst, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
-    wrapper_dst = _HookBasedWrapper(inner_dst)
+    wrapper_dst = _PrefixStrippingWrapper(inner_dst)
     fully_shard(wrapper_dst, mesh=mesh, reshard_after_forward=True, mp_policy=MP)
 
-    # Wrapper pre-hook adds 'module.' back, then inner pre-hook injects _extra_state
+    # Phase 0 pre-hook injects _extra_state, Phase 2 loads it
     wrapper_dst.load_state_dict(sd_no_extra, strict=True)  # must NOT raise
 
-    # Verify the injected default was applied
     loaded = wrapper_dst.module.linear.get_extra_state()
     assert loaded == {"injected": True, "value": 0}, (
         f"pre-hook default not applied through wrapper: {loaded}"
