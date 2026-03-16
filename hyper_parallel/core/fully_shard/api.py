@@ -550,6 +550,10 @@ def fully_shard(
         ignored_params,
         device,
     )
+    # Share the same scheduler handle with other roots so mods[i].unshard()/prefetch work
+    if len(modules) > 1:
+        for mod in modules[1:]:
+            mod.hsdp_scheduler = modules[0].hsdp_scheduler
     return arg_module
 
 

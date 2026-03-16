@@ -3,6 +3,7 @@
 ## Project Overview
 
 HyperParallel is an **easy-to-use, high-performance distributed parallel acceleration library** for distributed model training, inference and reinforcement learning. It provides unified abstractions for:
+
 - **Data Parallelism (DP)** — replicate model across devices, aggregate gradients
 - **Fully Sharded Data Parallelism (FSDP)** — shard parameters, gradients, and optimizer states across data-parallel ranks
 - **Tensor Parallelism (TP)** — shard model weights/activations across devices
@@ -120,4 +121,5 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 | **code-style** | Global — conventions, naming, patterns |
 | **distributed** | `core/**`, `collectives/**`, `**/fully_shard/**`, `**/hsdp/**` — stream sync, memory, DTensor |
 | **platform** | `platform/**` — cross-platform abstraction |
+| **multi-platform-features** | `core/**`, `platform/**` — multi-backend and list/collection API consistency |
 | **testing** | `tests/**` — test patterns, markers, distributed test helpers |

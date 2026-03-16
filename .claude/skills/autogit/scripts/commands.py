@@ -182,7 +182,7 @@ def cmd_pylint_review(base_ref: Optional[str] = None) -> str:
     if not files:
         return "No Python files changed (pylint-review skipped).\n"
     print(f"Running pylint on {len(files)} changed .py files (base: {ref})...")
-    passed, report = run_pylint_review(files)
+    _, report = run_pylint_review(files)
     print(report)
     return report
 

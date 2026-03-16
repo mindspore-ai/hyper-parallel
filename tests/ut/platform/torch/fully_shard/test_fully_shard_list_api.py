@@ -321,6 +321,40 @@ class TestFullyShardListAPI(unittest.TestCase):
             )
         self.assertIn("empty list", str(ctx.exception))
 
+    @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    def test_fully_shard_list_second_root_has_scheduler_and_unshard_prefetch_ok(
+        self, mock_platform, mock_get_device
+    ):
+        """fully_shard([m1, m2]) backfills hsdp_scheduler to m2; m2.unshard() and prefetch work."""
+        mock_platform.platform_type = PlatformType.PYTORCH
+        mock_get_device.return_value = self.device
+        mesh = self._create_mock_mesh()
+        linear1 = SimpleLinear(4, 4)
+        linear2 = SimpleLinear(4, 4)
+        scheduler_mock = MagicMock()
+        scheduler_mock.hsdp_state = MagicMock()
+
+        def fake_hsdp_init(self, *args, **kwargs):
+            self.hsdp_scheduler = scheduler_mock
+
+        with patch(
+            "hyper_parallel.core.fully_shard.api.HSDPModule.hsdp_init",
+            fake_hsdp_init,
+        ):
+            result = fully_shard(
+                [linear1, linear2],
+                mesh=mesh,
+                reshard_after_forward=True,
+                mp_policy=_default_mp_policy(),
+            )
+        self.assertIs(result, [linear1, linear2])
+        self.assertIs(linear2.hsdp_scheduler, linear1.hsdp_scheduler)
+        linear2.unshard()
+        linear2.reshard()
+        linear1.set_modules_to_forward_prefetch([linear2])
+        linear1.set_modules_to_backward_prefetch([linear2])
+
 
 if __name__ == "__main__":
     unittest.main()

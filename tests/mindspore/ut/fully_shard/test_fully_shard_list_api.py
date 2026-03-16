@@ -240,13 +240,14 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
         mesh = self._create_mock_mesh()
         cell1 = ms_nn.Dense(4, 4)
         cell2 = ms_nn.Dense(4, 4)
+        cells_list = [cell1, cell2]
         result = fully_shard(
-            [cell1, cell2],
+            cells_list,
             mesh=mesh,
             reshard_after_forward=True,
             mp_policy=_default_mp_policy(),
         )
-        self.assertIs(result, [cell1, cell2])
+        self.assertIs(result, cells_list)
         self.assertTrue(hasattr(cell1, "hsdp_scheduler"), "cell1 should have hsdp_scheduler")
         hsdp_state = cell1.hsdp_scheduler.hsdp_state
         self.assertEqual(len(hsdp_state.modules), 2)
@@ -258,6 +259,31 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
             4,
             "hsdp_state.hsdp_params must include params from both cells (2 Dense -> 4 params)",
         )
+
+    @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    def test_fully_shard_list_second_root_has_scheduler_and_unshard_prefetch_ok(
+        self, mock_platform, mock_get_device
+    ):
+        """fully_shard([cell1, cell2]) backfills hsdp_scheduler to cell2; cell2.unshard() and prefetch work."""
+        mock_platform.platform_type = PlatformType.MINDSPORE
+        mock_get_device.return_value = "CPU"
+        mesh = self._create_mock_mesh()
+        cell1 = ms_nn.Dense(4, 4)
+        cell2 = ms_nn.Dense(4, 4)
+        cells_list = [cell1, cell2]
+        result = fully_shard(
+            cells_list,
+            mesh=mesh,
+            reshard_after_forward=True,
+            mp_policy=_default_mp_policy(),
+        )
+        self.assertIs(result, cells_list)
+        self.assertIs(cell2.hsdp_scheduler, cell1.hsdp_scheduler)
+        cell2.unshard()
+        cell2.reshard()
+        cell1.set_modules_to_forward_prefetch([cell2])
+        cell1.set_modules_to_backward_prefetch([cell2])
 
     @patch("hyper_parallel.core.fully_shard.api.platform")
     def test_fully_shard_empty_list_raises(self, mock_platform):
