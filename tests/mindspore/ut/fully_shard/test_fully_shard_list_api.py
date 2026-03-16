@@ -229,6 +229,36 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
         self.assertIs(result, cells_list)
         self.assertEqual(len(result), 2)
 
+    @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    def test_fully_shard_two_sibling_cells_second_params_in_hsdp_state(
+        self, mock_platform, mock_get_device
+    ):
+        """fully_shard([cell1, cell2]) puts both cells' params into hsdp_state.hsdp_params."""
+        mock_platform.platform_type = PlatformType.MINDSPORE
+        mock_get_device.return_value = "CPU"
+        mesh = self._create_mock_mesh()
+        cell1 = ms_nn.Dense(4, 4)
+        cell2 = ms_nn.Dense(4, 4)
+        result = fully_shard(
+            [cell1, cell2],
+            mesh=mesh,
+            reshard_after_forward=True,
+            mp_policy=_default_mp_policy(),
+        )
+        self.assertIs(result, [cell1, cell2])
+        self.assertTrue(hasattr(cell1, "hsdp_scheduler"), "cell1 should have hsdp_scheduler")
+        hsdp_state = cell1.hsdp_scheduler.hsdp_state
+        self.assertEqual(len(hsdp_state.modules), 2)
+        self.assertIn(cell1, hsdp_state.modules)
+        self.assertIn(cell2, hsdp_state.modules)
+        # Each Dense(4,4) has weight and bias -> 4 params total; both cells must be in hsdp_params
+        self.assertGreaterEqual(
+            len(hsdp_state.hsdp_params),
+            4,
+            "hsdp_state.hsdp_params must include params from both cells (2 Dense -> 4 params)",
+        )
+
     @patch("hyper_parallel.core.fully_shard.api.platform")
     def test_fully_shard_empty_list_raises(self, mock_platform):
         """fully_shard with empty list raises ValueError."""

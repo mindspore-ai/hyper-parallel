@@ -50,7 +50,9 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         else:
             # HSDP
             self.mesh_info = HSDPMeshInfo(mesh=self.mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
-        self.hsdp_state = MindSporeHSDPStateV2(self.cell, self.mesh_info, self.config, self.platform, self.device)
+        self.hsdp_state = MindSporeHSDPStateV2(
+            self.modules, self.mesh_info, self.config, self.platform, self.device
+        )
 
     def _register_post_backward_hook(self, args, kwargs):
         """Register backward hook using backward function."""
