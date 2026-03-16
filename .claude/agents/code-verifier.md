@@ -21,21 +21,17 @@ git diff --name-only HEAD
 git diff --cached --name-only
 ```
 
-### Phase 2: Lint Checks
-Delegate to the autogit check pipeline (runs pylint, lizard, codespell, markdownlint, etc.):
+### Phase 2 & 3: Test Stage (pylint + lints + pytest)
+Delegate to the autogit **test** command (runs pylint, lizard, codespell, markdownlint, then pytest):
 ```bash
-python3 .claude/skills/autogit/scripts/autogit.py check
+python3 .claude/skills/autogit/scripts/autogit.py test
 ```
 
-If autogit is unavailable, fall back to running checks directly:
+If autogit is unavailable, fall back to running checks and tests directly:
 - Python: `pylint --max-line-length=120 --disable=design,similarities <files>`
+- Then: `pytest tests/ -v`
 - C/C++: `clang-format --dry-run <files>`
 - Markdown: `markdownlint-cli2 <files>`
-
-### Phase 3: Run Tests
-- Identify relevant unit tests for changed modules
-- Run `pytest` on applicable test files
-- Report pass/fail with output
 
 ### Phase 4: Summary Report
 Output a structured report:

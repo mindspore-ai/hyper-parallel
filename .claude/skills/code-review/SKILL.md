@@ -103,16 +103,18 @@ Evaluate distributed system implications. See [distributed-guidelines.md](distri
 - Cross-platform compatibility requirements
 - DTensor invariants and common pitfalls
 
-### Step 5: Check Pylint
+### Step 5: Run Pylint (review-PR stage)
 
-Run pylint on changed Python files and include violations in the review:
+**Always run** the project's pylint on changed Python files and include the output in the review:
 
 ```bash
-# On changed .py files
-pylint <changed_py_files>  # or use project's pylint config
+# From repo root — uses same config as CI (max-line-length, disable list, filter_pylint.txt)
+python3 .claude/skills/autogit/scripts/autogit.py pylint-review
+# Optional: specify base ref (default is upstream default branch)
+python3 .claude/skills/autogit/scripts/autogit.py pylint-review --base upstream/master
 ```
 
-- Report any violations in the **Code Quality** section.
+- Paste the pylint report into the **Code Quality** section of your review.
 - **Suppression policy**: Add violations to `.jenkins/check/config/filter_pylint.txt` for unified suppression. Do **not** use inline `# pylint: disable=` in source code.
 - Format in filter_pylint.txt: `"hyper-parallel/<path_to_dir_or_file>"` followed by `"<pylint-message-id>"` (one per line, see existing entries for examples).
 

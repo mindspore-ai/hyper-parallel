@@ -31,9 +31,10 @@ python3 {skill_dir}/scripts/autogit.py <command> [options]
 
 | Command | Purpose | Example |
 |---------|---------|---------|
-| `commit` | Stage, lint-check, commit, push to origin | `commit -m "feat: add X"` |
+| `commit` | Stage, lint-check (no pylint), commit, push to origin | `commit -m "feat: add X"` |
 | `commit --no-check` | Commit without lint checks | `commit --no-check` |
-| `check` | Run lint checks only (no commit) | `check` |
+| `check` | Run lint checks only, includes pylint (no commit) | `check` |
+| `test` | **Test stage**: pylint + lints + pytest | `test` |
 | `pr` | Create PR to upstream | `pr --reviewer zhangsan` |
 | `pr --to #N` | Append commits to existing PR | `pr --to #160 --amend` |
 | `status #N` | Show PR status (read-only) | `status #160` |
@@ -72,7 +73,7 @@ Always work on a feature branch. If you commit on master, AutoGit auto-creates a
 - **Uncommitted changes block PR** — must commit first.
 - **Rebase failures auto-abort** — restores original state on conflict.
 - **Stash on branch switch** — auto-stash before switching, restore after.
-- **Lint gate on commit** — default pre-commit checks (pylint, lizard, dt_design, codespell, markdownlint); skip with `--no-check`.
+- **Lint gate on commit** — pre-commit checks (lizard, dt_design, codespell, markdownlint; **pylint runs in test stage**); skip with `--no-check`. Run `autogit test` for test stage (pylint + pytest).
 
 ## Red Flags
 

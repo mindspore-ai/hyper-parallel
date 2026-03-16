@@ -23,4 +23,4 @@ The review covers:
 - **Cross-platform consistency** — torch/mindspore parity
 - **Code quality** — conventions, patterns, design
 - **Testing** — coverage, distributed test patterns
-- **Pylint / code style** — Run pylint on changed Python files; add violations to `.jenkins/check/config/filter_pylint.txt` for unified suppression (do not use inline `# pylint: disable=` in code)
+- **Pylint (review-PR stage)** — Run `autogit pylint-review` on changed Python files and include the report in the Code Quality section; add violations to `.jenkins/check/config/filter_pylint.txt` for unified suppression (do not use inline `# pylint: disable=` in code)

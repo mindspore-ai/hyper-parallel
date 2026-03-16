@@ -39,7 +39,10 @@ from api import (  # pylint: disable=wrong-import-position
     update_pr_description,
 )
 from pr_content import generate_pr_content  # pylint: disable=wrong-import-position
-from lint_check import run_checks  # pylint: disable=wrong-import-position
+from lint_check import (  # pylint: disable=wrong-import-position
+    run_checks,
+    run_pylint_review,
+)
 
 
 # ============================================================================
@@ -136,17 +139,75 @@ def _stage_and_filter_cosmetic(base_ref: Optional[str] = None) -> None:
 
 
 def _run_lint_checks_on_staged() -> None:
-    """Run lint checks on staged files; unstage and raise on failure."""
+    """Run lint checks (no pylint; pylint runs in test stage) on staged files."""
     staged_output = run_git("diff", "--cached", "--name-only").stdout.strip()
     staged_files = staged_output.split("\n") if staged_output else []
     if not staged_files:
         return
-    print("Running lint checks...")
-    passed, report = run_checks(staged_files)
+    print("Running lint checks (commit stage, pylint in test stage)...")
+    passed, report = run_checks(staged_files, include_pylint=False)
     print(report)
     if not passed:
         run_git("reset", check=False)
         raise AutoGitError("Lint checks failed, staging reverted. Please fix and retry.")
+
+
+def _get_files_for_test_stage() -> List[str]:
+    """Return file list for test stage: changed files, or all tracked .py under repo."""
+    diff_out = run_git("diff", "--name-only", "HEAD").stdout.strip()
+    if diff_out:
+        return [f for f in diff_out.split("\n") if f.strip()]
+    ls_out = run_git("ls-files").stdout.strip()
+    if not ls_out:
+        return []
+    return [
+        f for f in ls_out.split("\n")
+        if f.endswith(".py") and (f.startswith("hyper_parallel/") or f.startswith("tests/"))
+    ]
+
+
+def cmd_pylint_review(base_ref: Optional[str] = None) -> str:
+    """Run pylint on changed Python files (for review-PR stage). Returns report.
+
+    Args:
+        base_ref: Git ref to diff against (default: detect_base_ref(), e.g. upstream/master).
+
+    Returns:
+        Pylint report string.
+    """
+    check_env(require_token=False)
+    ref = base_ref or detect_base_ref() or "upstream/master"
+    diff_out = run_git("diff", "--name-only", f"{ref}...HEAD").stdout.strip()
+    files = [f for f in diff_out.split("\n") if f.strip().endswith(".py")]
+    if not files:
+        return "No Python files changed (pylint-review skipped).\n"
+    print(f"Running pylint on {len(files)} changed .py files (base: {ref})...")
+    passed, report = run_pylint_review(files)
+    print(report)
+    return report
+
+
+def cmd_test() -> None:
+    """Run test stage: pylint + other lints on target files, then pytest."""
+    check_env(require_token=False)
+    files = _get_files_for_test_stage()
+    if not files:
+        raise AutoGitError("No Python files to check (no changes and no hyper_parallel/tests)")
+    print("Running test-stage checks (including pylint)...")
+    passed, report = run_checks(files, include_pylint=True)
+    print(report)
+    if not passed:
+        raise AutoGitError("Test-stage lint checks failed (pylint and/or others)")
+    print("Running pytest...")
+    result = subprocess.run(
+        ["pytest", "tests/", "-v"],
+        capture_output=False,
+        timeout=300,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise AutoGitError("pytest failed")
+    print("Test stage passed (lint + pytest).")
 
 
 # ============================================================================
@@ -871,6 +932,8 @@ HELP_TEXT = """AutoGit - Automated Git Workflow for GitCode
 Commands:
   commit [-m MSG] [--no-check]       Commit and push (runs lint checks by default)
   check                              Run lint checks (no commit)
+  test                               Run test stage (pylint + lints + pytest)
+  pylint-review [--base REF]         Run pylint on changed .py (review-PR stage)
   pr [--base B] [--reviewer R]       Create a PR
   pr --to #N [--amend|--no-rebase|--no-check]  Append to existing PR
   status #N                          View PR status
@@ -911,6 +974,20 @@ def main() -> None:
     )
 
     subparsers.add_parser("check", help="Run lint checks (no commit)")
+    subparsers.add_parser(
+        "test",
+        help="Run test stage: pylint + lints on target files, then pytest"
+    )
+    pylint_review_parser = subparsers.add_parser(
+        "pylint-review",
+        help="Run pylint on changed .py files (for review-PR stage)"
+    )
+    pylint_review_parser.add_argument(
+        "--base",
+        type=str,
+        default=None,
+        help="Base ref to diff against (default: upstream default branch)",
+    )
 
     pr_parser = subparsers.add_parser("pr", help="Create or append to a PR")
     pr_parser.add_argument("--to", dest="append_to", type=str, help="Append to existing PR")
@@ -961,6 +1038,16 @@ def _dispatch(args: argparse.Namespace) -> None:
     """
     if args.command == "check":
         cmd_check()
+
+    elif args.command == "test":
+        cmd_test()
+
+    elif args.command == "pylint-review":
+        cmd_pylint_review(base_ref=getattr(args, "base", None))
+        print()
+        print("=" * 60)
+        print("Pylint review report above — include in Code Quality section.")
+        print("=" * 60)
 
     elif args.command == "commit":
         result = cmd_commit(args.message, no_check=args.no_check)
