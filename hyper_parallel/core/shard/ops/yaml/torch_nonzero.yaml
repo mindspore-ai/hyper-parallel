@@ -1,0 +1,4 @@
+nonzero:
+  dist_op_name: _torch_nonzero_dist_op
+  distributed_op_class: NonzeroDistributedOp
+  distributed_op_file: parallel_nonzero
