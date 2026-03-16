@@ -21,6 +21,9 @@ Minimum:
 Mod:
   dist_op_name: _mod_dist_op
 
+remainder:
+  dist_op_name: _torch_remainder_dist_op
+
 AddExt:
   dist_op_name: _add_ext_dist_op
   distributed_op_class: AddDistributedOp
