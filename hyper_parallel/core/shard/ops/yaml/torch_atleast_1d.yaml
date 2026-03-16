@@ -1,0 +1,4 @@
+atleast_1d:
+  dist_op_name: _torch_atleast_1d_dist_op
+  distributed_op_class: Atleast1DDistributedOp
+  distributed_op_file: parallel_atleast_1d
