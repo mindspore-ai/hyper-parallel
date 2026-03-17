@@ -52,6 +52,16 @@ This checklist covers areas that CI cannot check. Focus on distributed system co
 - Gradient computation API differences
 - Process group creation/management differences
 
+### Multi-Platform & List/Collection APIs
+
+When an API supports multiple backends (e.g. Torch + MindSpore) or list/collection inputs (e.g. `fully_shard([m1, m2])`), verify:
+
+- [ ] **Same semantics on all backends** — Torch and MindSpore paths receive the same logical inputs (e.g. single module vs tuple of modules); compare state/scheduler construction and who gets the handle
+- [ ] **List/collection contract clear** — If API accepts a list, document and implement whether every element gets a handle, can be used in follow-up APIs (e.g. prefetch), and participates in state
+- [ ] **State/handle covers all managed objects** — When one logical unit spans multiple user-visible objects (e.g. multiple roots), either every object gets the same handle or docs/tests make “only first is handle” explicit
+- [ ] **Tests use real user scenarios** — At least one test exercises “non-first” element (e.g. second root `.unshard()`, or second root in prefetch list); avoid mocking away the code path under test
+- [ ] **In-place return assertions** — When asserting “return is the same container as input”, use a named variable: `in_list = [a, b]; result = api(in_list); assert result is in_list`; never `assert result is [a, b]`
+
 ## Code Quality
 
 ### Abstractions and Design
@@ -91,6 +101,7 @@ When a change introduces new API patterns, evaluate broader implications:
 - [ ] **Docstrings** — Google-style with `Args:`, `Returns:`, `Raises:`, `Example:` sections on public APIs
 - [ ] **Type hints** — Present on all public function signatures
 - [ ] **Lazy imports** — Inside methods use `# pylint: disable=C0415`
+- [ ] **Pylint compliance** — Run `pylint` on changed `.py` files; add violations to `.jenkins/check/config/filter_pylint.txt` for unified suppression (do not use inline `# pylint: disable=` in code)
 
 ### Common Issues to Flag
 

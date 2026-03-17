@@ -3,6 +3,7 @@
 ## Project Overview
 
 HyperParallel is an **easy-to-use, high-performance distributed parallel acceleration library** for distributed model training, inference and reinforcement learning. It provides unified abstractions for:
+
 - **Data Parallelism (DP)** — replicate model across devices, aggregate gradients
 - **Fully Sharded Data Parallelism (FSDP)** — shard parameters, gradients, and optimizer states across data-parallel ranks
 - **Tensor Parallelism (TP)** — shard model weights/activations across devices
@@ -96,7 +97,8 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 
 | Command | Description |
 | ------- | ----------- |
-| `/commit` | Delegates to `autogit commit` — stage, lint-check, commit, push |
+| `/commit` | Delegates to `autogit commit` — stage, lint-check (no pylint), commit, push |
+| `/test` | Delegates to `autogit test` — test stage: pylint + lints + pytest |
 | `/create-pr` | Delegates to `autogit pr` — create PR to upstream/master |
 | `/code-review` | Delegates to `code-review` skill |
 
@@ -105,7 +107,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
 | **planner** | default | Read, Grep, Glob, Bash | Read-only implementation planning before multi-file changes |
-| **code-verifier** | haiku | Read, Grep, Glob, Bash | Automated lint + test verification (delegates to `autogit check`) |
+| **code-verifier** | haiku | Read, Grep, Glob, Bash | Automated lint + test verification (delegates to `autogit test`) |
 | **code-reviewer** | sonnet | Read, Grep, Glob, Bash | Post-change code review (distributed-first) |
 | **dtensor-dev-expert** | opus | Read, Grep, Glob, Bash | DTensor, Layout, redistribution, op dispatch |
 | **fsdp-dev-expert** | opus | Read, Grep, Glob, Bash | FSDP/HSDP, parameter sharding, gradient reduction |
@@ -119,4 +121,5 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 | **code-style** | Global — conventions, naming, patterns |
 | **distributed** | `core/**`, `collectives/**`, `**/fully_shard/**`, `**/hsdp/**` — stream sync, memory, DTensor |
 | **platform** | `platform/**` — cross-platform abstraction |
+| **multi-platform-features** | `core/**`, `platform/**` — multi-backend and list/collection API consistency |
 | **testing** | `tests/**` — test patterns, markers, distributed test helpers |

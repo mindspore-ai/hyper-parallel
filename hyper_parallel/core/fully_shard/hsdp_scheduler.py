@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,8 +14,13 @@
 # ============================================================================
 """HSDP scheduler"""
 import functools
+from typing import Tuple, Union
+
+from hyper_parallel.platform import get_platform
 from hyper_parallel.core.device_mesh import DeviceMesh
 from hyper_parallel.core.fully_shard.hsdp_utils import HSDPConfigV2, FSDPSchedulerState
+
+platform = get_platform()
 
 
 class HSDPSchedulerContext:
@@ -28,10 +33,16 @@ class HSDPSchedulerContext:
 
 class HSDPSchedulerV2:
     """HSDPScheduler is used to scheduler hsdp"""
-    def __init__(self, cell, mesh, reshard_after_forward, shard_placement_fn,
+    def __init__(self, cell: Union[platform.Module, Tuple[platform.Module, ...]], mesh,
+                 reshard_after_forward, shard_placement_fn,
                  mp_policy, offload_policy, ignored_params, device):
-        """init hsdp scheduler."""
-        self.cell = cell
+        """init hsdp scheduler.
+
+        Args:
+            cell: A single platform.Module or tuple of platform.Module to manage as one FSDP unit.
+        """
+        self.modules = (cell,) if isinstance(cell, platform.Module) else tuple(cell)
+        self.cell = self.modules[0]
         self.mesh: DeviceMesh = mesh
         self.reshard_after_forward = reshard_after_forward
         self.shard_placement_fn = shard_placement_fn

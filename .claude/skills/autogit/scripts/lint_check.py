@@ -952,10 +952,20 @@ def _find_pylint_filter() -> Optional[str]:
     return None
 
 
+def run_pylint_review(files: List[str]) -> Tuple[bool, str]:
+    """Run pylint on a file list (e.g. for review-PR stage). Uses project filter.
+
+    Args:
+        files: List of .py file paths to check.
+    """
+    return run_pylint(files, filter_file=_find_pylint_filter())
+
+
 def _build_check_plan(
     by_type: dict,
     filter_file: Optional[str],
     changed_lines: Optional[Dict[str, Set[int]]],
+    include_pylint: bool = True,
 ) -> list:
     """Build the check plan: [(checker, files, kwargs), ...].
 
@@ -963,9 +973,13 @@ def _build_check_plan(
         by_type: Files grouped by type from ``_classify_files``.
         filter_file: Optional pylint filter file path.
         changed_lines: Per-file added line numbers for diff-aware checks.
+        include_pylint: If True, include pylint in the plan (test stage);
+            if False, omit pylint (commit stage).
     """
-    return [
-        (run_pylint,          by_type["py"],                  {"filter_file": filter_file}),
+    plan = []
+    if include_pylint:
+        plan.append((run_pylint, by_type["py"], {"filter_file": filter_file}))
+    plan.extend([
         (run_lizard,          by_type["py"] + by_type["cpp"], {}),
         (run_docstring_check, by_type["py"],                  {"changed_lines": changed_lines}),
         (run_dt_design,       by_type["py"],                  {"changed_lines": changed_lines}),
@@ -977,10 +991,11 @@ def _build_check_plan(
         (run_cmakelint,       by_type["cmake"],               {}),
         (run_shellcheck,      by_type["sh"],                  {}),
         (run_codespell,       by_type["all"],                 {}),
-    ]
+    ])
+    return plan
 
 
-def run_checks(files: List[str]) -> Tuple[bool, str]:
+def run_checks(files: List[str], include_pylint: bool = True) -> Tuple[bool, str]:
     """Run all checks on the given file list.
 
     Automatically computes diff-aware line ranges from staged changes
@@ -989,6 +1004,8 @@ def run_checks(files: List[str]) -> Tuple[bool, str]:
 
     Args:
         files: File paths to check (typically staged files).
+        include_pylint: If True, run pylint (use in test stage);
+            if False, skip pylint (use in commit stage).
     """
     if not files:
         return True, "No files to check\n"
@@ -996,7 +1013,9 @@ def run_checks(files: List[str]) -> Tuple[bool, str]:
     by_type = _classify_files(files)
     filter_file = _find_pylint_filter()
     changed_lines = get_staged_diff_added_lines()
-    plan = _build_check_plan(by_type, filter_file, changed_lines or None)
+    plan = _build_check_plan(
+        by_type, filter_file, changed_lines or None, include_pylint=include_pylint
+    )
 
     all_passed = True
     report_parts = []

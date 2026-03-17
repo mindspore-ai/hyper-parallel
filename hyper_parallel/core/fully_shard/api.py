@@ -15,7 +15,7 @@
 """hybrid shard data parallel interface"""
 import warnings
 from collections import namedtuple
-from typing import Any, Mapping, cast, Optional
+from typing import Any, List, Mapping, cast, Optional, Union
 
 from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy
@@ -352,6 +352,96 @@ def _extend_module_with_hsdp_interface(module):
     module.__class__ = extend_class
 
 
+def _get_root_modules(modules: List[platform.Module]) -> List[platform.Module]:
+    """
+    Returns the modules in ``modules`` that are root modules (i.e. parent-less)
+    with respect to the set ``modules``. In other words, these are the modules
+    in ``modules`` that are not the child of any other module in ``modules``.
+
+    Aligned with PyTorch torch.distributed.utils._get_root_modules.
+    """
+    root_modules: List[platform.Module] = []
+
+    def _get_submodules(mod):
+        if platform.platform_type == PlatformType.MINDSPORE:
+            return set(c for _, c in mod.cells_and_names())
+        return set(mod.modules())
+
+    module_to_modules: dict[platform.Module, set] = {
+        m: _get_submodules(m) for m in modules
+    }
+    for candidate in modules:
+        is_root = True
+        for mod, submodules in module_to_modules.items():
+            if candidate is not mod and candidate in submodules:
+                is_root = False
+                break
+        if is_root:
+            root_modules.append(candidate)
+    return root_modules
+
+
+def _check_module_valid(platform_type, module):
+    """check module valid"""
+    if platform_type == PlatformType.MINDSPORE:
+        from mindspore.nn.cell import Cell
+        if not isinstance(module, Cell):
+            raise ValueError(f"module's type must be nn.cell but got {type(module)}.")
+    else:
+        from torch.nn import Module
+        if not isinstance(module, Module):
+            raise ValueError(f"module's type must be nn.Module but got {type(module)}.")
+
+
+def _validate_module_for_fully_shard(
+    module: Union[platform.Module, List[platform.Module]], platform_type
+) -> None:
+    """Validate module(s) for fully_shard. Platform-aware for single module."""
+    if isinstance(module, list):
+        if len(module) == 0:
+            raise ValueError("fully_shard does not support empty list of modules.")
+        for i, m in enumerate(module):
+            try:
+                _check_module_valid(platform_type, m)
+            except ValueError:
+                raise ValueError(
+                    f"fully_shard expects nn.Module or list[nn.Module], "
+                    f"but got list with {type(m).__name__} at index {i}."
+                ) from None
+    else:
+        _check_module_valid(platform_type, module)
+
+
+def _check_hsdp_input_valid(platform_type, module, shard_size, threshold, optimizer_level, enable_grad_accumulation,
+                            grad_scale, reduce_dtype, comm_async, comm_fusion, bucket_size):
+    """check hsdp input valid"""
+    _check_module_valid(platform_type, module)
+    if not isinstance(shard_size, int) or (shard_size <= 0 and shard_size != -1):
+        raise ValueError(f"shard_size must be a positive integer, but got {shard_size}.")
+    if not isinstance(threshold, int) or threshold < 0:
+        raise ValueError(f"threshold must be a positive integer or 0, but got {threshold}.")
+    if optimizer_level not in ["level1", "level2", "level3"]:
+        raise ValueError(f"Optimizer level should in ['level1', 'level2', 'level3'], but got {optimizer_level}.")
+    if not isinstance(enable_grad_accumulation, bool):
+        raise ValueError(f"enable_grad_accumulation must be bool but got {enable_grad_accumulation}.")
+    if not isinstance(grad_scale, float):
+        raise ValueError(f"grad_scale must be float but got {grad_scale}.")
+    if platform_type == PlatformType.MINDSPORE:
+        from mindspore._c_expression.typing import Type
+        if reduce_dtype is not None and not isinstance(reduce_dtype, Type):
+            raise ValueError(f"reduce_dtype must be mindspore.dtype but got {reduce_dtype}.")
+    else:
+        import torch
+        if reduce_dtype is not None and not isinstance(reduce_dtype, torch.dtype):
+            raise ValueError(f"reduce_dtype must be torch.dtype but got {reduce_dtype}.")
+    if not isinstance(comm_async, bool):
+        raise ValueError(f"comm_async must be bool but got {comm_async}.")
+    if not isinstance(comm_fusion, bool):
+        raise ValueError(f"comm_fusion must be bool but got {comm_fusion}.")
+    if not isinstance(bucket_size, int) or (bucket_size < 0 and bucket_size != -1):
+        raise ValueError(f"bucket_size must be a positive integer or 0, but got {bucket_size}.")
+
+
 def _get_device_from_mesh(mesh: DeviceMesh):
     """Extract and validate the torch device from the device mesh."""
     device = None
@@ -369,24 +459,24 @@ def _get_device_from_mesh(mesh: DeviceMesh):
                 f"'torch.{device_type}', check the environment."
             )
         if device_handle.is_available():
-            import torch  # pylint: disable=import-outside-toplevel
+            import torch
             device = torch.device(device_handle.current_device())
     else:
         device = device_type
     return device
 
 def fully_shard(
-        module: platform.Module,
+        module: Union[platform.Module, List[platform.Module]],
         *,
         mesh: Optional[DeviceMesh] = None,
         reshard_after_forward: bool = True,
         shard_placement_fn: None = None,
         mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
         offload_policy: OffloadPolicy = OffloadPolicy(),
-        ignored_params: Optional[set[platform.Parameter]] = None
-):
+        ignored_params: Optional[set[platform.Parameter]] = None,
+) -> Union[platform.Module, List[platform.Module]]:
     """
-    Apply fully_shard to a module for distributed training with parameter sharding.
+    Apply fully_shard to a module (or list of modules) for distributed training with parameter sharding.
 
     This interface provides PyTorch-compatible HSDP (Hybrid Sharded Data Parallelism)
     functionality, enabling efficient training of large models by sharding parameters
@@ -394,15 +484,13 @@ def fully_shard(
     capabilities including parameter sharding, gradient synchronization, and memory
     management.
 
-    The function dynamically extends the module's class to inherit from HSDPModule,
-    adding methods for manual control over sharding/unsharding, prefetching, and
-    state management. This allows fine-grained control over when parameters are
-    gathered for computation and resharded after use.
+    When a list of modules is passed, they are treated as one FSDP unit (parameters
+    grouped together). Both PyTorch and MindSpore platforms support list input.
 
     Parameters:
-        module (nn.Module):
-            The module to apply fully_shard to. The module is modified in-place and
-            enhanced with HSDP capabilities.
+        module (nn.Module or List[nn.Module]):
+            The module(s) to apply fully_shard to. Modified in-place. When a list
+            is passed, parameters from all modules are grouped as one FSDP unit.
 
         mesh (Optional[DeviceMesh], default=None):
             The device mesh defining the process topology for distributed training.
@@ -415,7 +503,7 @@ def fully_shard(
             parameters are resharded immediately after they are no longer needed,
             freeing memory for subsequent operations. Set to False if you want to
             keep parameters unsharded for backward pass or manual control.
-    
+
         shard_placement_fn (Callable, default=None):
             A callable that determines how to shard each parameter. The function
             should accept a parameter and return a Shard object specifying the
@@ -423,9 +511,9 @@ def fully_shard(
 
         mp_policy (MixedPrecisionPolicy, default=MixedPrecisionPolicy()):
             Mixed precision training policy controlling data type conversions.
-            offload_policy (OffloadPolicy, default=OffloadPolicy()):
+        offload_policy (OffloadPolicy, default=OffloadPolicy()):
             Memory offload policy for reducing device memory usage.
-    
+
         ignored_params (Optional[set[nn.Parameter]], default=None):
             Set of parameters to exclude from sharding. These parameters remain
             fully replicated across all devices. Useful for small parameters where
@@ -433,19 +521,27 @@ def fully_shard(
             remain unsharded for correctness.
 
     Returns:
-        nn.Module: The input module with HSDP capabilities added. The module's
-            class is dynamically extended to inherit from HSDPModule, providing
-            additional methods for distributed training control.
+        nn.Module or List[nn.Module]: The input module(s) with HSDP capabilities added.
     """
-
     platform_type = platform.platform_type
-    _extend_module_with_hsdp_interface(module)
-    # if mesh is None, Using Default npu mesh
+    _validate_module_for_fully_shard(module, platform_type)
+
+    arg_module = module
+    if isinstance(module, list):
+        modules = tuple(_get_root_modules(module))
+    else:
+        modules = (module,)
+
+    for mod in modules:
+        _extend_module_with_hsdp_interface(mod)
+
     mesh = mesh or init_device_mesh(device_type="npu", mesh_shape=(platform.get_world_size(),))
     device = _get_device_from_mesh(mesh)
-    module.hsdp_init(
+
+    init_modules = modules
+    modules[0].hsdp_init(
         platform_type,
-        module,
+        init_modules,
         mesh,
         reshard_after_forward,
         shard_placement_fn,
@@ -454,7 +550,11 @@ def fully_shard(
         ignored_params,
         device,
     )
-    return module
+    # Share the same scheduler handle with other roots so mods[i].unshard()/prefetch work
+    if len(modules) > 1:
+        for mod in modules[1:]:
+            mod.hsdp_scheduler = modules[0].hsdp_scheduler
+    return arg_module
 
 
 def get_model_state_dict(model, *, options=None):
@@ -464,3 +564,8 @@ def get_model_state_dict(model, *, options=None):
     Users import from here instead of platform internals.
     """
     return platform.get_model_state_dict(model, options=options)
+
+
+def hsdp_sync_stream():
+    """Wait for hsdp gradient handle to be completed."""
+    platform.wait_grad_handle()

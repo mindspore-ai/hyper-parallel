@@ -103,7 +103,22 @@ Evaluate distributed system implications. See [distributed-guidelines.md](distri
 - Cross-platform compatibility requirements
 - DTensor invariants and common pitfalls
 
-### Step 5: Formulate Review
+### Step 5: Run Pylint (review-PR stage)
+
+**Always run** the project's pylint on changed Python files and include the output in the review:
+
+```bash
+# From repo root — uses same config as CI (max-line-length, disable list, filter_pylint.txt)
+python3 .claude/skills/autogit/scripts/autogit.py pylint-review
+# Optional: specify base ref (default is upstream default branch)
+python3 .claude/skills/autogit/scripts/autogit.py pylint-review --base upstream/master
+```
+
+- Paste the pylint report into the **Code Quality** section of your review.
+- **Suppression policy**: Add violations to `.jenkins/check/config/filter_pylint.txt` for unified suppression. Do **not** use inline `# pylint: disable=` in source code.
+- Format in filter_pylint.txt: `"hyper-parallel/<path_to_dir_or_file>"` followed by `"<pylint-message-id>"` (one per line, see existing entries for examples).
+
+### Step 6: Formulate Review
 
 Structure feedback with actionable suggestions organized by category.
 
@@ -138,7 +153,7 @@ Brief overall assessment (1-2 sentences).
 [Layout issues, placement bugs, YAML registration gaps, or "No DTensor concerns"]
 
 ### Code Quality
-[Design issues, convention violations, or "No concerns"]
+[Design issues, convention violations, pylint violations (add to filter_pylint.txt, not inline disable), or "No concerns"]
 
 ### Testing
 - [ ] Tests exist for new functionality
