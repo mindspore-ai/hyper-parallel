@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for fully_shard hsdp_utils (no NPU required)."""
+"""Unit tests for fully_shard hsdp_utils (no NPU required).
+
+Covers ParamModuleInfo, _get_param_module_infos, and _named_parameters_with_duplicates
+from hyper_parallel.core.fully_shard.hsdp_utils. All tests use CPU and simple nn.Modules.
+"""
 import os
 import unittest
 
@@ -28,6 +32,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     _get_param_module_infos,
     _named_parameters_with_duplicates,
 )
+from tests.common.mark_utils import arg_mark
 
 
 class SimpleLinear(nn.Module):
@@ -56,15 +61,21 @@ class SharedParamModule(nn.Module):
 
 
 class TestParamModuleInfo(unittest.TestCase):
-    """Unit tests for ParamModuleInfo."""
+    """Unit tests for ParamModuleInfo (module, param_name, shared_modules)."""
 
     def setUp(self):
         """Set up test fixtures before each test method."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_basic_param_module_info(self):
-        """ParamModuleInfo stores module and param_name correctly."""
+        """ParamModuleInfo stores module and param_name correctly.
+
+        description: Create ParamModuleInfo(module, param_name='weight') with no shared.
+        expectation: module and param_name match; shared_modules/names are empty.
+        feature: hsdp_utils ParamModuleInfo.
+        """
         # Arrange
         mod = SimpleLinear(4, 4)
         # Act
@@ -75,8 +86,14 @@ class TestParamModuleInfo(unittest.TestCase):
         self.assertEqual(info.shared_modules, [])
         self.assertEqual(info.shared_param_names, [])
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_param_module_info_with_shared(self):
-        """ParamModuleInfo tracks shared modules."""
+        """ParamModuleInfo tracks shared modules.
+
+        description: Create ParamModuleInfo with shared_modules and shared_param_names.
+        expectation: shared_modules and shared_param_names stored and match.
+        feature: hsdp_utils ParamModuleInfo shared parameter tracking.
+        """
         # Arrange
         mod1 = SimpleLinear(4, 4)
         mod2 = SimpleLinear(4, 4)
@@ -94,15 +111,21 @@ class TestParamModuleInfo(unittest.TestCase):
 
 
 class TestNamedParametersWithDuplicates(unittest.TestCase):
-    """Unit tests for _named_parameters_with_duplicates."""
+    """Unit tests for _named_parameters_with_duplicates (name, param) iterator."""
 
     def setUp(self):
         """Set up test fixtures before each test method."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_returns_named_params(self):
-        """_named_parameters_with_duplicates returns (name, param) tuples."""
+        """_named_parameters_with_duplicates returns (name, param) tuples.
+
+        description: Call with recurse=False on SimpleLinear; collect names.
+        expectation: List of (name, param); 'weight' and 'bias' in names.
+        feature: hsdp_utils _named_parameters_with_duplicates.
+        """
         # Arrange
         mod = SimpleLinear(4, 4)
         # Act
@@ -113,8 +136,14 @@ class TestNamedParametersWithDuplicates(unittest.TestCase):
         self.assertIn("weight", names)
         self.assertIn("bias", names)
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_remove_duplicate_raises(self):
-        """_named_parameters_with_duplicates raises if remove_duplicate in kwargs."""
+        """_named_parameters_with_duplicates raises if remove_duplicate in kwargs.
+
+        description: Call with remove_duplicate=True (disallowed).
+        expectation: AssertionError mentioning 'remove_duplicate'.
+        feature: hsdp_utils _named_parameters_with_duplicates API constraint.
+        """
         # Arrange
         mod = SimpleLinear(4, 4)
         # Act & Assert
@@ -124,15 +153,21 @@ class TestNamedParametersWithDuplicates(unittest.TestCase):
 
 
 class TestGetParamModuleInfos(unittest.TestCase):
-    """Unit tests for _get_param_module_infos."""
+    """Unit tests for _get_param_module_infos (param -> ParamModuleInfo mapping)."""
 
     def setUp(self):
         """Set up test fixtures before each test method."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_single_module_single_param(self):
-        """_get_param_module_infos returns correct info for single param."""
+        """_get_param_module_infos returns correct info for single param.
+
+        description: Pass one module and its params; call _get_param_module_infos.
+        expectation: One ParamModuleInfo per param; each info.module is the module.
+        feature: hsdp_utils _get_param_module_infos.
+        """
         # Arrange
         mod = SimpleLinear(4, 4)
         params = list(mod.parameters())
@@ -144,8 +179,14 @@ class TestGetParamModuleInfos(unittest.TestCase):
             self.assertIsInstance(info, ParamModuleInfo)
             self.assertIs(info.module, mod)
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_param_not_in_module_tree_raises(self):
-        """_get_param_module_infos raises when param not in module tree."""
+        """_get_param_module_infos raises when param not in module tree.
+
+        description: Pass an orphan parameter not belonging to the given modules.
+        expectation: AssertionError containing 'not in the module tree'.
+        feature: hsdp_utils _get_param_module_infos validation.
+        """
         # Arrange
         mod = SimpleLinear(4, 4)
         orphan_param = nn.Parameter(torch.ones(2, 2))
@@ -154,8 +195,14 @@ class TestGetParamModuleInfos(unittest.TestCase):
             _get_param_module_infos([orphan_param], (mod,))
         self.assertIn("not in the module tree", str(ctx.exception))
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_multiple_modules(self):
-        """_get_param_module_infos works with multiple modules."""
+        """_get_param_module_infos works with multiple modules.
+
+        description: Pass two modules and combined params; call _get_param_module_infos.
+        expectation: Number of infos equals number of params.
+        feature: hsdp_utils _get_param_module_infos multi-module.
+        """
         # Arrange
         mod1 = SimpleLinear(4, 4)
         mod2 = SimpleLinear(4, 4)

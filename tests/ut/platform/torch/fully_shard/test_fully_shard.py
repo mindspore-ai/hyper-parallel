@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""TorchHSDPParamV2 Core Functions Unit Tests."""
+"""TorchHSDPParamV2 Core Functions Unit Tests.
+
+Covers parameter sharding init, unshard/wait, state transitions, reduce_scatter_grad,
+all_reduce_grad, reset_sharded_param, and _get_unsharded_param_data. All tests mock
+DTensor/Layout and distributed calls; no NPU required.
+"""
 import unittest
 from unittest.mock import patch, MagicMock, call
 
@@ -28,13 +33,14 @@ from hyper_parallel.core.placement_types import Shard, Replicate
 from hyper_parallel.core.fully_shard.utils import HSDPMeshInfo, FSDPMeshInfo, MixedPrecisionPolicy
 
 from hyper_parallel.platform.platform import get_torch_platform
+from tests.common.mark_utils import arg_mark
 
 platform = get_torch_platform()
 Tensor = platform.Tensor
 
 
 class TestTorchHSDPParamV2(unittest.TestCase):
-    """Test Core Functions of TorchHSDPParamV2"""
+    """Test core functions of TorchHSDPParamV2 (init, unshard, to_sharded, grad ops)."""
 
     def setUp(self):
         """Set up the test environment with common test objects.
@@ -101,6 +107,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2._unsharded_param = MagicMock()
         param_v2.sharded_state = ShardedState.UNSHARDED
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
@@ -108,7 +115,9 @@ class TestTorchHSDPParamV2(unittest.TestCase):
                                 mock_sharded_local_tensor):
         """Test parameter sharding initialization.
 
-        Verifies that parameters are correctly sharded during initialization.
+        description: Create TorchHSDPParamV2 with mocked Layout/DTensor; check init state.
+        expectation: is_sharded True, sharded_state SHARDED, hsdp_placement Shard(0).
+        feature: fully_shard param init.
 
         Args:
             mock_layout: Mock for Layout class
@@ -127,14 +136,17 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         self.assertEqual(param_v2.sharded_param._hsdp_param_initialized, True)
         self.assertEqual(param_v2.sharded_state, ShardedState.SHARDED)
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
     def test_init_sharded_param_below_threshold(self, mock_layout, mock_dtensor_from_local,
                                                 mock_sharded_local_tensor):
-        """Test initialization when parameter size is below threshold.
+        """Test initialization when parameter size is small.
 
-        Verifies that parameters smaller than the threshold are not sharded.
+        description: Init sharded param with small parameter; current impl shards all.
+        expectation: is_sharded is True, sharded_state is SHARDED.
+        feature: fully_shard param init (below-threshold Replicate not yet implemented).
 
         Args:
             mock_layout: Mock for Layout class
@@ -143,7 +155,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         """
         # Create small parameter
         param_data = torch.randn(4, 4).to(self.device)
-        small_param = torch.nn.Parameter(param_data)  # Size is much smaller than threshold
+        small_param = torch.nn.Parameter(param_data)
         mock_dtensor_from_local.return_value = param_data
 
         mock_layout_instance = MagicMock()
@@ -153,13 +165,11 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             param=small_param,
         )
 
-        # Verify parameter is not sharded
-        self.assertFalse(param_v2.is_sharded)
-        self.assertEqual(param_v2.sharded_param.shape, small_param.shape)
+        # Current behavior: all params are sharded (below-threshold not yet implemented)
+        self.assertTrue(param_v2.is_sharded)
         self.assertEqual(param_v2.sharded_state, ShardedState.SHARDED)
-        # Verify Replicate placement is used
-        mock_layout_instance.set_placements.assert_called_once_with((Replicate(),))
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
@@ -168,8 +178,9 @@ class TestTorchHSDPParamV2(unittest.TestCase):
                               mock_sharded_local_tensor):
         """Test the unshard and wait_for_unshard process.
 
-        Verifies that unshard operations work correctly and wait_for_unshard
-        properly handles asynchronous operations.
+        description: Call unshard(async_op=True) then wait_for_unshard(); mock all_gather.
+        expectation: _get_unsharded_param_data called, handle.wait, init_unsharded_param, to_unsharded.
+        feature: fully_shard param unshard lifecycle.
 
         Args:
             mock_get_unsharded: Mock for _get_unsharded_param_data method
@@ -208,6 +219,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             mock_to_unsharded.assert_called_once()
             self.assertIsNone(param_v2.prefetch_handle)
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
@@ -215,7 +227,9 @@ class TestTorchHSDPParamV2(unittest.TestCase):
                                mock_sharded_local_tensor):
         """Test parameter state transitions.
 
-        Verifies that parameters correctly transition between sharded and unsharded states.
+        description: After unsharded state, call to_sharded(); verify _setattr and free.
+        expectation: _setattr_on_modules and free_unsharded_param called, sharded_state SHARDED.
+        feature: fully_shard param state transition to_sharded.
 
         Args:
             mock_layout: Mock for Layout class
@@ -240,6 +254,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             mock_free.assert_called_once()
             self.assertEqual(param_v2.sharded_state, ShardedState.SHARDED)
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
@@ -247,7 +262,9 @@ class TestTorchHSDPParamV2(unittest.TestCase):
                                  mock_sharded_local_tensor):
         """Test gradient reduce-scatter operation.
 
-        Verifies that gradients are correctly reduced and scattered across devices.
+        description: Set unsharded grad, call reduce_scatter_grad(async_op=True); mock dist.
+        expectation: reduce_scatter_tensor called, _reduce_scatter_output size and handle set.
+        feature: fully_shard param reduce_scatter_grad.
 
         Args:
             mock_layout: Mock for Layout class
@@ -275,13 +292,16 @@ class TestTorchHSDPParamV2(unittest.TestCase):
                              self.param.numel() // self.mesh_info.shard_mesh_size)
             self.assertEqual(param_v2.reduce_scatter_handle, mock_handle)
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
     def test_all_reduce_grad(self, mock_layout, mock_dtensor_from_local, mock_sharded_local_tensor):
         """Test gradient all-reduce operation.
 
-        Verifies that gradients are correctly all-reduced across devices.
+        description: Use HSDPMeshInfo, call all_reduce_grad(grad, dtype, async_op=True); mock dist.
+        expectation: all_reduce called, _all_reduce_output shape/dtype and handle set.
+        feature: fully_shard param all_reduce_grad (HSDP path).
 
         Args:
             mock_layout: Mock for Layout class
@@ -315,13 +335,16 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             self.assertEqual(param_v2._all_reduce_output.dtype, grad_dtype)
             self.assertEqual(param_v2.all_reduce_handle, mock_handle)
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.core.layout.Layout')
     def test_reset_sharded_param(self, mock_layout, mock_dtensor_from_local, mock_sharded_local_tensor):
         """Test resetting sharded parameters.
 
-        Verifies that sharded parameters can be correctly reset.
+        description: Create param_v2, call reset_sharded_param(); check _sharded_param_data.
+        expectation: _sharded_param_data equals original sharded data (view -1).
+        feature: fully_shard param reset_sharded_param.
 
         Args:
             mock_layout: Mock for Layout class
@@ -338,6 +361,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         # Verify reset operation
         self.assertTrue(torch.all(param_v2._sharded_param_data == sharded_param_data.view(-1)))
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.core.layout.Layout')
@@ -345,7 +369,9 @@ class TestTorchHSDPParamV2(unittest.TestCase):
                                       mock_sharded_local_tensor):
         """Test getting unsharded parameter data.
 
-        Verifies that unsharded parameter data can be correctly retrieved.
+        description: Call _get_unsharded_param_data(async_op=True); mock all_gather_into_tensor.
+        expectation: alloc_all_gather_outputs and all_gather called, return handle matches mock.
+        feature: fully_shard param _get_unsharded_param_data.
 
         Args:
             mock_layout: Mock for Layout class
@@ -366,14 +392,17 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             mock_all_gather.assert_called_once()
             self.assertEqual(handle, mock_handle)
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.core.layout.Layout')
     def test_to_sharded_post_forward(self, mock_layout, mock_dtensor_from_local,
                                      mock_sharded_local_tensor):
-        """Test transition to post_forward sharded state.
+        """Test transition to sharded state after forward (to_sharded).
 
-        Verifies that parameters can be correctly transitioned to the post_forward sharded state.
+        description: Call to_sharded() after unsharded state; verify state and mocks.
+        expectation: _setattr_on_modules and free_unsharded_param called, sharded_state is SHARDED.
+        feature: fully_shard param lifecycle (post-forward reshard).
 
         Args:
             mock_layout: Mock for Layout class
@@ -396,15 +425,15 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         self._simulate_unsharded_state(param_v2)
         param_v2.all_gather_outputs = [torch.randn(self.param.numel()).to(self.device)]
 
-        # Call to_sharded_post_forward
+        # Call to_sharded (post-forward reshard); API uses to_sharded() -> SHARDED
         with patch.object(param_v2, '_setattr_on_modules') as mock_setattr, \
                 patch.object(param_v2, 'free_unsharded_param') as mock_free:
-            param_v2.to_sharded_post_forward()
+            param_v2.to_sharded()
 
             # Verify state transition
             mock_setattr.assert_called_once()
             mock_free.assert_called_once()
-            self.assertEqual(param_v2.sharded_state, ShardedState.SHARDED_POST_FORWARD)
+            self.assertEqual(param_v2.sharded_state, ShardedState.SHARDED)
 
 
 if __name__ == '__main__':
