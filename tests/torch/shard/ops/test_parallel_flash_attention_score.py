@@ -18,7 +18,7 @@ from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_bsh_replicate():
     """
     Feature: test npu_fusion_attention with BSH layout, no parallelism.
@@ -31,7 +31,7 @@ def test_bsh_replicate():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_bsh_dp():
     """
     Feature: test npu_fusion_attention with BSH layout, data parallelism.
@@ -109,7 +109,7 @@ def test_bsh_dp_sp_mp_3d():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bnsd_dp_mp():
     """
     Feature: test npu_fusion_attention with BNSD layout, DP + MP.
@@ -122,7 +122,7 @@ def test_bnsd_dp_mp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bnsd_sp():
     """
     Feature: test npu_fusion_attention with BNSD layout, DP + SP.
@@ -213,7 +213,7 @@ def test_sp_sparse_mode_0():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sp_sparse_mode_2():
     """
     Feature: test npu_fusion_attention SP with sparse_mode=2.
@@ -278,7 +278,7 @@ def test_dp_sparse_mode_4():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_error_kv_strategy_mismatch():
     """
     Feature: test npu_fusion_attention rejects mismatched KV strategies.
@@ -291,7 +291,7 @@ def test_error_kv_strategy_mismatch():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_error_head_num_not_divisible():
     """
     Feature: test npu_fusion_attention rejects non-divisible head_num.
@@ -304,7 +304,7 @@ def test_error_head_num_not_divisible():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_error_kv_seq_sharding_blocked():
     """
     Feature: test npu_fusion_attention blocks KV sequence sharding for BSH.
@@ -317,7 +317,7 @@ def test_error_kv_seq_sharding_blocked():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_error_sparse_mode_1_no_mask():
     """
     Feature: test npu_fusion_attention rejects sparse_mode=1 without mask.
@@ -330,7 +330,7 @@ def test_error_sparse_mode_1_no_mask():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_error_tnd_sp_without_actual_seq_len():
     """
     Feature: test npu_fusion_attention rejects TND SP without actual_seq_len.
@@ -343,7 +343,7 @@ def test_error_tnd_sp_without_actual_seq_len():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_error_bnsd_kv_seq_sharding_blocked():
     """
     Feature: test npu_fusion_attention blocks KV sequence sharding for BNSD.
@@ -356,7 +356,7 @@ def test_error_bnsd_kv_seq_sharding_blocked():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bsh_custom_scale():
     """
     Feature: test npu_fusion_attention with custom scale value.
@@ -395,7 +395,7 @@ def test_bsh_long_sequence_sp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bsh_large_batch_dp():
     """
     Feature: test npu_fusion_attention DP with large batch.
@@ -447,7 +447,7 @@ def test_sp_sparse_mode_3_with_2way_split():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bnsd_sp_correctness():
     """
     Feature: test npu_fusion_attention BNSD SP correctness.
@@ -521,7 +521,7 @@ def test_fa_vs_sdpa_distributed_cross_validation():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_error_batch_sharding_mismatch():
     """
     Feature: test npu_fusion_attention rejects mismatched Q/K batch sharding.
@@ -534,7 +534,7 @@ def test_error_batch_sharding_mismatch():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_error_hidden_sharding_mismatch():
     """
     Feature: test npu_fusion_attention rejects mismatched Q/K hidden sharding.
@@ -547,7 +547,7 @@ def test_error_hidden_sharding_mismatch():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_error_dim_sharding_mismatch():
     """
     Feature: test npu_fusion_attention rejects mismatched Q/K dim sharding.
@@ -560,7 +560,7 @@ def test_error_dim_sharding_mismatch():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_error_tnd_cp_wrong_sparse_mode():
     """
     Feature: test npu_fusion_attention rejects TND CP with wrong sparse_mode.
@@ -574,7 +574,7 @@ def test_error_tnd_cp_wrong_sparse_mode():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_error_tnd_cp_qk_global_t_mismatch():
     """
     Feature: test npu_fusion_attention rejects TND CP with mismatched global T.
