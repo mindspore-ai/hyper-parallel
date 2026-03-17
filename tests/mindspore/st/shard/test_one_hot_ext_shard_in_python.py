@@ -20,7 +20,7 @@ from tests.common.parallel_case import parallel_run, MindSporeCase
 ONE_HOT_EXT_SHARD_IN_PYTHON = "one_hot_ext_shard_in_python.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_one_hot_ext_shard_in_python_group1():
     """
     Feature: parallel run case in one_hot_ext_shard_in_python
@@ -33,7 +33,7 @@ def test_one_hot_ext_shard_in_python_group1():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_one_hot_ext_shard_in_python_group2():
     """
     Feature: parallel run case in one_hot_ext_shard_in_python
@@ -46,7 +46,7 @@ def test_one_hot_ext_shard_in_python_group2():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_one_hot_ext_shard_in_python_group3():
     """
     Feature: parallel run case in one_hot_ext_shard_in_python
@@ -59,7 +59,7 @@ def test_one_hot_ext_shard_in_python_group3():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_one_hot_ext_shard_in_python_group4():
     """
     Feature: parallel run case in one_hot_ext_shard_in_python
@@ -72,7 +72,7 @@ def test_one_hot_ext_shard_in_python_group4():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_one_hot_ext_shard_in_python_group5():
     """
     Feature: parallel run case in one_hot_ext_shard_in_python
@@ -86,7 +86,7 @@ def test_one_hot_ext_shard_in_python_group5():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_one_hot_ext_shard_in_python_group6():
     """
     Feature: parallel run case in one_hot_ext_shard_in_python

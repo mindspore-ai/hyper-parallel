@@ -19,7 +19,7 @@ from tests.common.parallel_case import parallel_run, MindSporeCase
 PARALLEL_TRANSPOSE = "parallel_transpose.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_transpose_group1():
     """
     Feature: parallel run case in parallel_transpose

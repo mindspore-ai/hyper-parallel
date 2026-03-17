@@ -17,7 +17,7 @@ from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_argsort_basic_unsharded():
     '''
     Feature: test parallel op argsort.
@@ -30,7 +30,7 @@ def test_distributed_argsort_basic_unsharded():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_argsort_specific_dim():
     '''
     Feature: test parallel op argsort.
@@ -43,7 +43,7 @@ def test_distributed_argsort_specific_dim():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_argsort_descending():
     '''
     Feature: test parallel op argsort.
@@ -56,7 +56,7 @@ def test_distributed_argsort_descending():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_argsort_sharded_dim_error():
     '''
     Feature: test parallel op argsort.

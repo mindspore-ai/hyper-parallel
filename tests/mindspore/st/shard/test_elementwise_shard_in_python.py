@@ -33,7 +33,7 @@ def test_elementwise_shard_in_python_group1():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group2():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -46,7 +46,7 @@ def test_elementwise_shard_in_python_group2():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group3():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -59,7 +59,7 @@ def test_elementwise_shard_in_python_group3():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group4():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -72,7 +72,7 @@ def test_elementwise_shard_in_python_group4():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group5():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -85,7 +85,7 @@ def test_elementwise_shard_in_python_group5():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group6():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -98,7 +98,7 @@ def test_elementwise_shard_in_python_group6():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group7():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -111,7 +111,7 @@ def test_elementwise_shard_in_python_group7():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group8():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -124,7 +124,7 @@ def test_elementwise_shard_in_python_group8():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group9():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -137,7 +137,7 @@ def test_elementwise_shard_in_python_group9():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group10():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -150,7 +150,7 @@ def test_elementwise_shard_in_python_group10():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group11():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -163,7 +163,7 @@ def test_elementwise_shard_in_python_group11():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group12():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -176,7 +176,7 @@ def test_elementwise_shard_in_python_group12():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group13():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -189,7 +189,7 @@ def test_elementwise_shard_in_python_group13():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group14():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -202,7 +202,7 @@ def test_elementwise_shard_in_python_group14():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group15():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -215,7 +215,7 @@ def test_elementwise_shard_in_python_group15():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group16():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -228,7 +228,7 @@ def test_elementwise_shard_in_python_group16():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group17():
     """
     Feature: parallel run case in elementwise_shard_in_python
@@ -241,7 +241,7 @@ def test_elementwise_shard_in_python_group17():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_elementwise_shard_in_python_group18():
     """
     Feature: parallel run case in elementwise_shard_in_python
