@@ -22,7 +22,7 @@ from hyper_parallel.core.parameter_init import init_parameters
 from hyper_parallel.core.init_weights import init_empty_weights, init_on_device
 from hyper_parallel.core.shard.api import shard_module
 from hyper_parallel.core.shard.api import parallelize_value_and_grad
-from hyper_parallel.core.shard.local_func import custom_shard
+from hyper_parallel.core.shard.custom_shard import custom_shard
 from hyper_parallel.core.pipeline_parallel import (PipelineStage, ScheduleInterleaved1F1B, MetaStep, MetaStepType,
                                                    BatchDimSpec)
 from hyper_parallel.collectives.cc import (init_process_group, destroy_process_group, get_process_group_ranks,
