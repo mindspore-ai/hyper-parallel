@@ -20,7 +20,7 @@ import torch_npu  # Ascend NPU core adapter
 from hyper_parallel import DTensor, shard_module, init_device_mesh
 from hyper_parallel import PipelineStage
 from hyper_parallel import ScheduleInterleaved1F1B
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from .simple_mlp import SimpleMLP, model_split_manual, run_standalone, init_hccl, get_stage_index, get_rank_list
 

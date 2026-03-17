@@ -17,7 +17,7 @@ import functools
 from typing import Tuple, Union
 
 from hyper_parallel.platform import get_platform
-from hyper_parallel.core.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.fully_shard.hsdp_utils import HSDPConfigV2, FSDPSchedulerState
 
 platform = get_platform()

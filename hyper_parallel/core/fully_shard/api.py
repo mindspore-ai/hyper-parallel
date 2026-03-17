@@ -21,7 +21,7 @@ from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, OffloadPolicy
 from hyper_parallel import DeviceMesh, init_device_mesh
 from hyper_parallel.platform import get_platform
-from hyper_parallel.core.dtensor import DTensor, distribute_tensor
+from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 
 platform = get_platform()
 

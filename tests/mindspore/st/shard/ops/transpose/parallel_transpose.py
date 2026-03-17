@@ -19,7 +19,7 @@ import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
 from hyper_parallel import hsdp, shard_module, DTensor, init_device_mesh
-from hyper_parallel.core.placement_types import Shard
+from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 learning_rate = 0.01

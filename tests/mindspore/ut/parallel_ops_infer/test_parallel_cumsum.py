@@ -14,9 +14,9 @@
 """parallel_cumsum test"""
 
 import pytest
-from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel import init_device_mesh
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_cumsum import CumsumDistributedOp
 
 # create cumsum op instance

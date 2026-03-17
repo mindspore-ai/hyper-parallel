@@ -16,9 +16,9 @@
 import inspect
 from typing import Union, Callable, Dict, List
 from functools import wraps
-from hyper_parallel.core.layout import Layout, DeviceMesh
-from hyper_parallel.core.dtensor import DTensor
-from hyper_parallel.core.placement_types import Placement
+from hyper_parallel.core.dtensor.layout import Layout, DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Placement
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.platform import get_platform
 

@@ -21,8 +21,8 @@ import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import Tensor, ops
 from hyper_parallel import DTensor, init_device_mesh
-from hyper_parallel.core.dtensor import distribute_tensor
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.dtensor import distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 
 
 def setup_module():

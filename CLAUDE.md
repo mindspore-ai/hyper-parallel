@@ -25,7 +25,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 | Module | Location | Purpose |
 |--------|----------|---------|
 | **Platform** | `platform/` (`platform.py`, `torch/`, `mindspore/`) | Abstraction layer — use `get_platform()`, never import torch/mindspore directly |
-| **DTensor** | `core/dtensor.py`, `device_mesh.py`, `layout.py`, `placement_types.py`, `tensor_redistribution.py`, `redistribute_infer.py` | Distributed tensor (local shard + DeviceMesh + Placements); DeviceMesh defines multi-dim device topology; Layout maps tensor-to-mesh; redistribution cached by `compact_str + rank_id` |
+| **DTensor** | `core/dtensor/` (`dtensor.py`, `device_mesh.py`, `layout.py`, `placement_types.py`, `tensor_redistribution.py`, `redistribute_infer.py`, `random.py`, `init_weights.py`, `parameter_init.py`) | Distributed tensor (local shard + DeviceMesh + Placements); DeviceMesh defines multi-dim device topology; Layout maps tensor-to-mesh; redistribution cached by `compact_str + rank_id` |
 | **Shard** | `core/shard/` (`api.py`, `custom_shard.py`, `_op_dispatch.py`, `ops/`) | `shard_module()` / `custom_shard()` entry points; YAML registry (`ops/yaml/`) + Python impl (`ops/parallel_*.py`) |
 | **FSDP** | `core/fully_shard/`, `platform/*/fully_shard/` | Parameter sharding/unsharding lifecycle |
 | **HSDP** | `core/hsdp/`, `platform/*/hsdp/` | Hybrid shard data parallel (legacy + new scheduler) |

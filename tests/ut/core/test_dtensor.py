@@ -25,7 +25,7 @@ from unittest.mock import patch, MagicMock, call
 import os
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-from hyper_parallel.core.dtensor import (
+from hyper_parallel.core.dtensor.dtensor import (
     DTensor,
     _build_layout,
     _dtensor_init_helper,
@@ -35,8 +35,8 @@ from hyper_parallel.core.dtensor import (
     full,
     _LAYOUT_CACHE,
 )
-from hyper_parallel.core.placement_types import Shard, Replicate
-from hyper_parallel.core.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.utils.shape_utils import compute_local_shape_and_global_offset
 
 
@@ -83,7 +83,7 @@ class TestBuildLayout(unittest.TestCase):
         placements = [Shard(0), Replicate()]
         tensor_dim = 3
 
-        with patch('hyper_parallel.core.dtensor.Layout') as mock_layout_class:
+        with patch('hyper_parallel.core.dtensor.dtensor.Layout') as mock_layout_class:
             mock_layout_instance = MagicMock()
             # Layout.from_device_mesh() returns the layout instance
             mock_layout_class.from_device_mesh.return_value = mock_layout_instance
@@ -119,7 +119,7 @@ class TestBuildLayout(unittest.TestCase):
         placements = [Shard(0)]
         tensor_dim = 2
 
-        with patch('hyper_parallel.core.dtensor.Layout') as mock_layout_class:
+        with patch('hyper_parallel.core.dtensor.dtensor.Layout') as mock_layout_class:
             mock_layout_instance = MagicMock()
             mock_layout_class.from_device_mesh.return_value = mock_layout_instance
             mock_layout_instance.return_value = mock_layout_instance
@@ -158,7 +158,7 @@ class TestBuildLayout(unittest.TestCase):
         placements2 = [Replicate()]
         tensor_dim = 2
 
-        with patch('hyper_parallel.core.dtensor.Layout') as mock_layout_class:
+        with patch('hyper_parallel.core.dtensor.dtensor.Layout') as mock_layout_class:
             mock_layout_instances = [MagicMock(), MagicMock(), MagicMock(), MagicMock()]
             mock_layout_class.from_device_mesh.side_effect = lambda m: {
                 mock_mesh1: mock_layout_instances[0],
@@ -275,8 +275,8 @@ class TestDtensorInitHelper(unittest.TestCase):
         """
         _LAYOUT_CACHE.clear()
 
-    @patch('hyper_parallel.core.dtensor.DTensor')
-    @patch('hyper_parallel.core.dtensor.compute_local_shape_and_global_offset')
+    @patch('hyper_parallel.core.dtensor.dtensor.DTensor')
+    @patch('hyper_parallel.core.dtensor.dtensor.compute_local_shape_and_global_offset')
     def test_init_helper_with_full_op(self, mock_compute_local, mock_dtensor_class):
         """Test _dtensor_init_helper with full operation (requires fill_value).
 
@@ -328,8 +328,8 @@ class TestDtensorInitHelper(unittest.TestCase):
             mock_local_tensor, mock_mesh, placements
         )
 
-    @patch('hyper_parallel.core.dtensor.DTensor')
-    @patch('hyper_parallel.core.dtensor.compute_local_shape_and_global_offset')
+    @patch('hyper_parallel.core.dtensor.dtensor.DTensor')
+    @patch('hyper_parallel.core.dtensor.dtensor.compute_local_shape_and_global_offset')
     def test_init_helper_with_ones_op(self, mock_compute_local, mock_dtensor_class):
         """Test _dtensor_init_helper with ones operation (no fill_value).
 
@@ -378,8 +378,8 @@ class TestOnes(unittest.TestCase):
     function and parameters.
     """
 
-    @patch('hyper_parallel.core.dtensor._dtensor_init_helper')
-    @patch('hyper_parallel.core.dtensor.platform')
+    @patch('hyper_parallel.core.dtensor.dtensor._dtensor_init_helper')
+    @patch('hyper_parallel.core.dtensor.dtensor.platform')
     def test_ones_calls_helper_correctly(self, mock_platform, mock_helper):
         """Test that ones function calls _dtensor_init_helper with correct parameters.
 
@@ -421,8 +421,8 @@ class TestZeros(unittest.TestCase):
     function and parameters.
     """
 
-    @patch('hyper_parallel.core.dtensor._dtensor_init_helper')
-    @patch('hyper_parallel.core.dtensor.platform')
+    @patch('hyper_parallel.core.dtensor.dtensor._dtensor_init_helper')
+    @patch('hyper_parallel.core.dtensor.dtensor.platform')
     def test_zeros_calls_helper_correctly(self, mock_platform, mock_helper):
         """Test that zeros function calls _dtensor_init_helper with correct parameters.
 
@@ -465,8 +465,8 @@ class TestEmpty(unittest.TestCase):
     uninitialized memory.
     """
 
-    @patch('hyper_parallel.core.dtensor._dtensor_init_helper')
-    @patch('hyper_parallel.core.dtensor.platform')
+    @patch('hyper_parallel.core.dtensor.dtensor._dtensor_init_helper')
+    @patch('hyper_parallel.core.dtensor.dtensor.platform')
     def test_empty_calls_helper_correctly(self, mock_platform, mock_helper):
         """Test that empty function calls _dtensor_init_helper with correct parameters.
 
@@ -509,8 +509,8 @@ class TestFull(unittest.TestCase):
     with a specified value.
     """
 
-    @patch('hyper_parallel.core.dtensor._dtensor_init_helper')
-    @patch('hyper_parallel.core.dtensor.platform')
+    @patch('hyper_parallel.core.dtensor.dtensor._dtensor_init_helper')
+    @patch('hyper_parallel.core.dtensor.dtensor.platform')
     def test_full_calls_helper_correctly(self, mock_platform, mock_helper):
         """Test that full function calls _dtensor_init_helper with correct parameters.
 

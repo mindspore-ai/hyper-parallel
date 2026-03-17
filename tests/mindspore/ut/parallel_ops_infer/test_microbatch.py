@@ -21,8 +21,8 @@ import numpy as np
 import mindspore as ms
 from mindspore import Tensor
 from mindspore import context
-from hyper_parallel.core.layout import Layout
-from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform.mindspore.pipeline_parallel._utils import _MicroBatch, BatchDimSpec
 
 def test_microbatch_basic_args_only():

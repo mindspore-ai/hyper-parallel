@@ -17,8 +17,8 @@
 import numpy as np
 import torch
 from hyper_parallel import init_device_mesh
-from hyper_parallel.core.dtensor import distribute_tensor
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.dtensor import distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global
 

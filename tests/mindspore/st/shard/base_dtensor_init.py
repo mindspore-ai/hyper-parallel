@@ -4,9 +4,9 @@ MindSpore distributed tensor initialization tests.
 import mindspore
 from mindspore.communication import get_rank, get_group_size
 import mindspore.communication.management as D
-from hyper_parallel.core.device_mesh import init_device_mesh
-from hyper_parallel.core.placement_types import Shard, Replicate
-from hyper_parallel.core.dtensor import ones, empty, full, zeros
+from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.dtensor import ones, empty, full, zeros
 
 D.init()
 

@@ -11,7 +11,7 @@ from typing import Optional
 import functools
 import operator
 
-from hyper_parallel.core.placement_types import Shard
+from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()

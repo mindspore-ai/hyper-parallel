@@ -15,9 +15,9 @@
 """parallel_masked_scatter test"""
 
 import pytest
-from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel import init_device_mesh
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_masked_scatter import MaskedScatterDistributedOp
 
 # Initialize the operator
@@ -29,10 +29,7 @@ def test_masked_scatter_success():
     Description: All inputs (input, mask, source) are Replicated
     Expectation: Output layout is the same as input layout (Replicated)
     """
-    mesh = init_device_mesh(
-        mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
-    )
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # 1. Prepare fully replicated layouts
     # Input: (Replicate, Replicate) -> Unsharded
@@ -63,10 +60,7 @@ def test_masked_scatter_fail_sharded_input():
     Description: The 'input' tensor is sharded
     Expectation: ValueError raised (masked_scatter does not support sharded inputs)
     """
-    mesh = init_device_mesh(
-        mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
-    )
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # Input is sharded on dim 0
     input_placements = (Shard(0), Replicate())
@@ -85,10 +79,7 @@ def test_masked_scatter_fail_sharded_mask():
     Description: The 'mask' tensor is sharded
     Expectation: ValueError raised (masked_scatter does not support sharded mask)
     """
-    mesh = init_device_mesh(
-        mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
-    )
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
@@ -108,10 +99,7 @@ def test_masked_scatter_fail_sharded_source():
     Description: The 'source' tensor is sharded
     Expectation: ValueError raised (masked_scatter does not support sharded source)
     """
-    mesh = init_device_mesh(
-        mesh_shape=(2, 4),
-        alias_name=("dp", "mp")
-    )
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     mask_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
@@ -130,7 +118,7 @@ def test_masked_scatter_success_scalar():
     Description: Inputs are 0-D scalars (fully replicated implicitly)
     Expectation: Success, output is scalar layout
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # 0-D tensor layout (empty placements)
     scalar_layout = _build_layout(mesh, (), 0)
@@ -148,7 +136,7 @@ def test_masked_scatter_success_high_dim2():
     Description: 4D tensors (e.g. NCHW image batch) fully replicated
     Expectation: Success
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # 4D Replicated
     placements = (Replicate(), Replicate(), Replicate(), Replicate())
@@ -169,7 +157,7 @@ def test_masked_scatter_success_mixed_ranks():
     Description: Input/Mask are 3D, Source is 1D (typical PyTorch usage)
     Expectation: Success, output follows input layout
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # Input: (B, S, H)
     layout_3d = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
@@ -188,7 +176,7 @@ def test_masked_scatter_fail_shard_last_dim():
     Description: Sharding the last dimension (common in Tensor Parallelism)
     Expectation: ValueError raised
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # Input sharded on last dim (dim 1)
     input_placements = (Replicate(), Shard(1))
@@ -207,7 +195,7 @@ def test_masked_scatter_success_1d_mesh():
     Description: Verify logic works on a simple 1D device mesh
     Expectation: Success if replicated
     """
-    mesh = init_device_mesh(mesh_shape=(8,), alias_name=("dp",))
+    mesh = init_device_mesh("npu", (8,), mesh_dim_names=("dp",), init_backend=False)
 
     layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     source = _build_layout(mesh, (Replicate(),), 1)
@@ -222,7 +210,7 @@ def test_masked_scatter_success_3d_mesh():
     Description: Verify logic works on complex 3D device mesh
     Expectation: Success if replicated
     """
-    mesh = init_device_mesh(mesh_shape=(2, 2, 2), alias_name=("dp", "tp", "pp"))
+    mesh = init_device_mesh("npu", (2, 2, 2), mesh_dim_names=("dp", "tp", "pp"), init_backend=False)
 
     layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     source = _build_layout(mesh, (Replicate(),), 1)
@@ -237,7 +225,7 @@ def test_masked_scatter_fail_multiple_sharded():
     Description: Both Input and Mask are sharded
     Expectation: ValueError raised (should fail fast on the first one)
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # Both sharded
     input_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
@@ -255,7 +243,7 @@ def test_masked_scatter_ignore_extra_args():
     Description: Verify that passing extra arguments doesn't break inference
     Expectation: Success
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     source = _build_layout(mesh, (Replicate(),), 1)
@@ -274,7 +262,7 @@ def test_masked_scatter_success_scalar_inputs():
     Description: All inputs are 0-D scalars.
     Expectation: Success, output is 0-D scalar layout (empty tensor_map).
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # 0-D tensor layout
     scalar_layout = _build_layout(mesh, (), 0)
@@ -292,7 +280,7 @@ def test_masked_scatter_success_1d_tensors():
     Description: All inputs are 1D vectors, fully replicated.
     Expectation: Success.
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # 1D Replicated layout
     layout_1d = _build_layout(mesh, (Replicate(),), 1)
@@ -308,7 +296,7 @@ def test_masked_scatter_success_source_broadcast():
     Description: Input and Mask are 3D, but Source is 1D (Common PyTorch usage).
     Expectation: Success, output layout matches Input layout.
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # Input/Mask: (B, S, H) Replicated
     layout_3d = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
@@ -327,7 +315,7 @@ def test_masked_scatter_success_high_dim():
     Description: 5D tensors (e.g. video batch), fully replicated.
     Expectation: Success.
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # 5D Replicated
     placements = (Replicate(),) * 5
@@ -344,7 +332,7 @@ def test_masked_scatter_fail_1d_mesh_sharded():
     Description: Sharding on a simple 1D mesh.
     Expectation: ValueError raised.
     """
-    mesh = init_device_mesh(mesh_shape=(8,), alias_name=("dp",))
+    mesh = init_device_mesh("npu", (8,), mesh_dim_names=("dp",), init_backend=False)
 
     # Input sharded
     input_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
@@ -360,7 +348,7 @@ def test_masked_scatter_fail_3d_mesh_sharded_inner():
     Description: Sharding on the 'tp' dimension of a (dp, tp, pp) mesh.
     Expectation: ValueError raised.
     """
-    mesh = init_device_mesh(mesh_shape=(2, 2, 2), alias_name=("dp", "tp", "pp"))
+    mesh = init_device_mesh("npu", (2, 2, 2), mesh_dim_names=("dp", "tp", "pp"), init_backend=False)
 
     # Shard on 'tp' (which is dimension 1 of the mesh, mapped to tensor dim 0)
     # Note: _build_layout map logic depends on implementation, but Shard(0) means tensor dim 0 is sharded.
@@ -377,7 +365,7 @@ def test_masked_scatter_fail_last_dim_sharding():
     Description: Input is sharded on the last dimension (common in Tensor Parallelism).
     Expectation: ValueError raised.
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # Input: (Replicate, Shard(1)) -> Sharded on last dim
     input_placements = (Replicate(), Shard(1))
@@ -395,7 +383,7 @@ def test_masked_scatter_fail_sharded_mask_only():
     Description: Input is Replicated, but Mask is sharded.
     Expectation: ValueError raised identifying Input 1 (Mask).
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     # Mask sharded
@@ -412,7 +400,7 @@ def test_masked_scatter_fail_multiple_bad_inputs():
     Description: Input and Source are both sharded.
     Expectation: ValueError raised for Input 0 (Fail Fast).
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     # Both sharded
     bad_layout_2d = _build_layout(mesh, (Shard(0), Replicate()), 2)
@@ -429,7 +417,7 @@ def test_masked_scatter_ignore_extra_args2():
     Description: Verify that passing unknown extra arguments does not cause failure.
     Expectation: Success.
     """
-    mesh = init_device_mesh(mesh_shape=(2, 4), alias_name=("dp", "mp"))
+    mesh = init_device_mesh("npu", (2, 4), mesh_dim_names=("dp", "mp"), init_backend=False)
 
     layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     source = _build_layout(mesh, (Replicate(),), 1)

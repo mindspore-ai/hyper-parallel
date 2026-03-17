@@ -20,7 +20,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.distributed.checkpoint.state_dict import StateDictOptions
 
-from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.dtensor.dtensor import DTensor
 
 
 def _gather_full_state_dict(

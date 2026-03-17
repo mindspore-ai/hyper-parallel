@@ -31,7 +31,7 @@ from hyper_parallel.platform.torch.fully_shard.param import (
     TorchHSDPParamV2,
     ParamModuleInfo
 )
-from hyper_parallel.core.placement_types import Shard
+from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
 from hyper_parallel import init_device_mesh
 

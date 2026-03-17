@@ -21,7 +21,7 @@ from typing import Any, Union
 from hyper_parallel.core.checkpoint.metadata import ChunkStorageMetadata, MetadataIndex
 from hyper_parallel.core.checkpoint.planner import SavePlan, WriteItem
 from hyper_parallel.core.checkpoint.reshard import infer_slice_area_by_rank
-from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()

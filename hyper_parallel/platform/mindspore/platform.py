@@ -259,8 +259,8 @@ class MindSporePlatform(Platform):
     @staticmethod
     def set_layout_into_parameter(param, layout):
         """Set layout in to parameter"""
-        from hyper_parallel.core.dtensor import DTensor  # pylint: disable=import-outside-toplevel
-        from hyper_parallel.core.layout import _infer_slice_shape_by_layout, \
+        from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=import-outside-toplevel
+        from hyper_parallel.core.dtensor.layout import _infer_slice_shape_by_layout, \
             _get_slice_tensor_by_layout  # pylint: disable=import-outside-toplevel
         if isinstance(param, DTensor):
             raise ValueError(f"Parameter {param.name} has been configured layout, cannot be set repeatedly.")

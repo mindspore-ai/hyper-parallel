@@ -18,7 +18,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 
-from hyper_parallel.core.device_mesh import (
+from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh, DeviceMesh, Tensor, _DEVICE_MESH_MAP
 )
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
@@ -27,7 +27,7 @@ from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 @pytest.fixture(name="mock_platform")
 def fixture_mock_platform():
     """Mock platform-related interfaces (avoid dependency on real hardware/distributed environment)"""
-    with patch("hyper_parallel.core.device_mesh.platform") as platform_mock:
+    with patch("hyper_parallel.core.dtensor.device_mesh.platform") as platform_mock:
         # Mock rank=0, world_size=8
         platform_mock.get_rank.return_value = 0
         platform_mock.get_world_size.return_value = 8

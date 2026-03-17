@@ -17,8 +17,8 @@ Distributed implementation for OneHotExt operator.
 """
 
 # pylint: disable=import-outside-toplevel
-from hyper_parallel.core.layout import Layout
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
 

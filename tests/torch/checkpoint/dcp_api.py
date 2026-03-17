@@ -23,8 +23,8 @@ import torch
 from hyper_parallel import DTensor
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.checkpoint import save, load
-from hyper_parallel.core.device_mesh import init_device_mesh
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 
 

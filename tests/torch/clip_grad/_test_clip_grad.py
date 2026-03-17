@@ -23,9 +23,9 @@ from torch import nn  # pylint: disable=C0413
 import torch_npu  # pylint: disable=C0413,W0611
 
 from hyper_parallel import init_device_mesh, SkipDTensorDispatch  # pylint: disable=C0413
-from hyper_parallel.core.dtensor import DTensor  # pylint: disable=C0413
+from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0413
 from hyper_parallel.core.fully_shard.api import fully_shard  # pylint: disable=C0413
-from hyper_parallel.core.placement_types import Partial, Shard  # pylint: disable=C0413
+from hyper_parallel.core.dtensor.placement_types import Partial, Shard  # pylint: disable=C0413
 from hyper_parallel.core.utils.clip_grad import clip_grad_norm_  # pylint: disable=C0413
 from hyper_parallel.core.fully_shard.utils import (  # pylint: disable=C0413
     MixedPrecisionPolicy,

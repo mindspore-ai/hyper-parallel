@@ -20,7 +20,7 @@ from torch import optim
 # pylint: disable=W0611
 import torch_npu  # Ascend NPU core adapter
 from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 
 

@@ -24,7 +24,7 @@ from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
 from hyper_parallel import init_device_mesh, hsdp, init_parameters, shard_module, parallelize_value_and_grad
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from tests.mindspore.st.shard.utils import create_dtensor
 
 learning_rate = 0.01

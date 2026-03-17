@@ -18,7 +18,7 @@ from typing import List, Optional
 from mindspore import Tensor, mint
 from mindspore.communication import get_rank, create_group
 from hyper_parallel import Layout, DTensor
-from hyper_parallel.core.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 
 
 def create_dtensor(data, device_mesh, placements, dtype=None):

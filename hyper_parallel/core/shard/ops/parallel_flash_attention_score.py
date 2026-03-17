@@ -19,7 +19,7 @@ Distributed implementation for MatMul operator.
 from mindspore import nn
 from mindspore import Tensor
 from mindspore.ops import flash_attention_score
-from hyper_parallel.core.layout import Layout
+from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.shard.custom_shard import custom_shard
 
 

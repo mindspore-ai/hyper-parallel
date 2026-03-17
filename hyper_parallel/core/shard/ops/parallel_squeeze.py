@@ -15,7 +15,7 @@
 """
 Distributed implementation for ExpandDims operator.
 """
-from hyper_parallel.core.layout import Layout
+from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
 
 

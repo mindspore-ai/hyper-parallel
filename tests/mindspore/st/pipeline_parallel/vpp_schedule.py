@@ -23,7 +23,7 @@ from hyper_parallel import PipelineStage, ScheduleInterleaved1F1B
 from hyper_parallel import DTensor, init_device_mesh
 from hyper_parallel.core.hsdp import hsdp
 from hyper_parallel import shard_module
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 

@@ -18,7 +18,7 @@ import mindspore as ms
 from mindspore import Tensor
 import mindspore.communication.management as D
 from hyper_parallel import DTensor, init_device_mesh
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 
 
 def test_shard_to_replicate():

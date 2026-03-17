@@ -15,9 +15,9 @@
 """parallel_atleast_1d test"""
 
 import pytest
-from hyper_parallel.core.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel import init_device_mesh
-from hyper_parallel.core.placement_types import Shard, Replicate, Partial
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, Partial
 from hyper_parallel.core.shard.ops.parallel_atleast_1d import Atleast1DDistributedOp
 
 op = Atleast1DDistributedOp("atleast_1d")

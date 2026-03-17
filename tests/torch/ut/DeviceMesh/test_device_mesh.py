@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 import torch
 
-from hyper_parallel.core.device_mesh import (
+from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh, DeviceMesh, _group_map, _DEVICE_MESH_MAP
 )
 
@@ -31,7 +31,7 @@ from hyper_parallel.core.device_mesh import (
 @pytest.fixture(name="mock_platform")
 def fixture_mock_platform():
     """Mock platform to avoid dependency on real distributed environment."""
-    with patch("hyper_parallel.core.device_mesh.platform") as platform_mock:
+    with patch("hyper_parallel.core.dtensor.device_mesh.platform") as platform_mock:
         platform_mock.get_rank.return_value = 0
         platform_mock.get_world_size.return_value = 8
         platform_mock.Tensor = torch.Tensor
@@ -48,7 +48,7 @@ def fixture_mock_platform():
 
         platform_mock.tensor_to_numpy.side_effect = mock_tensor_to_numpy
 
-        with patch("hyper_parallel.core.device_mesh.Tensor", torch.Tensor):
+        with patch("hyper_parallel.core.dtensor.device_mesh.Tensor", torch.Tensor):
             yield platform_mock
 
 

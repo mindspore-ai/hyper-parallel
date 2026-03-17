@@ -32,7 +32,7 @@ from hyper_parallel.core.checkpoint.util import (
     create_chunk_list_for_tensor,
     remove_redundant_plans,
 )
-from hyper_parallel.core.dtensor import DTensor, Layout
+from hyper_parallel.core.dtensor.dtensor import DTensor, Layout
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()

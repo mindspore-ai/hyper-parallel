@@ -18,8 +18,8 @@ import copy
 import functools
 import numpy as np
 
-from hyper_parallel.core.placement_types import Placement, Shard, Replicate, Partial
-from hyper_parallel.core.device_mesh import DeviceMesh, _create_device_mesh
+from hyper_parallel.core.dtensor.placement_types import Placement, Shard, Replicate, Partial
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _create_device_mesh
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -166,8 +166,8 @@ class Layout:
             Layout: A new Layout instance initialized with the properties of the provided device mesh.
 
         Examples:
-            >>> from hyper_parallel.core.layout import Layout, DeviceMesh
-            >>> device_mesh = DeviceMesh("npu", (2, 2), nesh_dim_names=("dp", "mp"))
+            >>> from hyper_parallel.core.dtensor.layout import Layout, DeviceMesh
+            >>> device_mesh = DeviceMesh("npu", (2, 2), mesh_dim_names=("dp", "mp"))
             >>> layout = Layout.from_device_mesh(device_mesh)
         """
         obj = cls.__new__(cls)

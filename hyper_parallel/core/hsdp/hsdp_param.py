@@ -14,7 +14,7 @@
 # ============================================================================
 """HSDP parameter"""
 import functools
-from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.hsdp.hsdp_utils import OptimizerLevel, GroupInfo
 
 

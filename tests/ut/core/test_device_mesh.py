@@ -18,18 +18,18 @@ This module provides comprehensive unit tests for the DeviceMesh class and
 related functions in the hyper_parallel framework. All tests use mocking to avoid
 dependencies on actual hardware or distributed communication.
 """
+import os
 import unittest
 from unittest.mock import patch, MagicMock
 
 import numpy as np
 
 # Set platform to torch for testing
-import os
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.platform import get_platform
-from hyper_parallel.core.device_mesh import (
+from hyper_parallel.core.dtensor.device_mesh import (
     DeviceMesh,
     _get_sub_rank_list,
     _create_device_mesh,
@@ -65,7 +65,7 @@ class TestDeviceMesh(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_init_device_mesh_basic(self, mock_platform):
         """Test basic DeviceMesh construction with explicit mesh.
 
@@ -81,7 +81,7 @@ class TestDeviceMesh(unittest.TestCase):
         mock_platform.get_world_size.return_value = 4
         mock_group = MagicMock()
         mock_platform.split_group.return_value = mock_group
-        mock_platform.tensor_to_numpy.side_effect = lambda t: np.array(t)
+        mock_platform.tensor_to_numpy.side_effect = np.array
 
         # Act - use DeviceMesh directly to avoid caching issues with init_device_mesh
         mesh = DeviceMesh(
@@ -98,7 +98,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(mesh.ndim, 2)
         self.assertEqual(mesh.rank, 0)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_init_device_mesh_caching(self, mock_platform):
         """Test that init_device_mesh caches results correctly.
 
@@ -121,7 +121,7 @@ class TestDeviceMesh(unittest.TestCase):
         # Assert - same parameters should return same cached instance
         self.assertIs(mesh1, mesh2)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_with_tensor(self, mock_platform):
         """Test DeviceMesh construction with custom mesh tensor.
 
@@ -147,7 +147,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(device_mesh.rank_list, (0, 2, 1, 3))
         self.assertEqual(device_mesh.ndim, 2)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_with_list(self, mock_platform):
         """Test DeviceMesh construction with list input."""
         # Arrange
@@ -162,7 +162,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(device_mesh.mesh_shape, (2, 2))
         self.assertEqual(device_mesh.rank_list, (0, 2, 1, 3))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_with_numpy(self, mock_platform):
         """Test DeviceMesh construction with numpy array mesh.
 
@@ -186,7 +186,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(device_mesh.mesh_shape, (2, 2))
         self.assertEqual(device_mesh.rank_list, (0, 2, 1, 3))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_getitem_single_dim(self, mock_platform):
         """Test DeviceMesh __getitem__ with single dimension."""
         # Arrange
@@ -215,7 +215,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(tp_mesh.root_mesh, mesh)
         self.assertEqual(tp_mesh.rank_list, (0, 1, 2, 3))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_getitem_multiple_dims(self, mock_platform):
         """Test DeviceMesh __getitem__ with multiple dimensions."""
         # Arrange
@@ -237,7 +237,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(dp_cp_mesh.mesh_dim_names, ("dp", "cp"))
         self.assertEqual(dp_cp_mesh.rank_list, (0, 2, 4, 6))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_local_rank(self, mock_platform):
         """Test DeviceMesh get_local_rank method.
 
@@ -269,7 +269,7 @@ class TestDeviceMesh(unittest.TestCase):
             self.assertEqual(mesh.get_local_rank("dp"), 1)
             self.assertEqual(mesh.get_local_rank(1), 1)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_flatten(self, mock_platform):
         """Test DeviceMesh flatten method.
 
@@ -301,7 +301,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(flat_mesh.rank_list, (0, 2, 4, 6))
         self.assertEqual(flat_mesh.root_mesh, mesh)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_size(self, mock_platform):
         """Test DeviceMesh size method.
 
@@ -327,7 +327,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(mesh.size(0), 2)
         self.assertEqual(mesh.size(1), 4)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_properties(self, mock_platform):
         """Test DeviceMesh basic properties.
 
@@ -357,7 +357,7 @@ class TestDeviceMesh(unittest.TestCase):
         # rank_list contains all ranks from 0 to world_size-1
         self.assertEqual(len(mesh.rank_list), 8)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_repr(self, mock_platform):
         """Test DeviceMesh __repr__ method.
 
@@ -386,7 +386,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertIn("device_type='npu'", repr_str)
         self.assertIn("mesh_shape=(2, 2)", repr_str)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_axis_methods(self, mock_platform):
         """Test DeviceMesh axis-related methods.
 
@@ -415,7 +415,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(mesh.get_device_num_along_axis("dp"), 2)
         self.assertEqual(mesh.get_device_num_along_axis("tp"), 4)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_rank_list_along_axis(self, mock_platform):
         """Test DeviceMesh get_rank_list_along_axis method.
 
@@ -444,7 +444,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(rank_list_dp, [0, 4])
         self.assertEqual(rank_list_tp, [0, 1, 2, 3])
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_global_shape(self, mock_platform):
         """Test DeviceMesh get_global_shape method.
 
@@ -478,7 +478,7 @@ class TestDeviceMesh(unittest.TestCase):
         # Expected: (4 * 2, 8 * 4) = (8, 32)
         self.assertEqual(global_shape, (8, 32))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_get_sub_rank_list(self, mock_platform):
         """Test _get_sub_rank_list helper function.
 
@@ -504,7 +504,7 @@ class TestDeviceMesh(unittest.TestCase):
         # Assert
         self.assertEqual(sub_rank_list, [0, 4])
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_with_none_mesh(self, mock_platform):
         """Test DeviceMesh with mesh=None (auto 1D mesh).
 
@@ -527,7 +527,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(device_mesh.ndim, 1)
         self.assertEqual(device_mesh.rank_list, (0, 1, 2, 3))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_invalid_mesh_type(self, mock_platform):
         """Test DeviceMesh with invalid mesh type raises TypeError.
 
@@ -548,7 +548,7 @@ class TestDeviceMesh(unittest.TestCase):
             DeviceMesh("npu", mesh=0, _init_backend=False)
         self.assertIn("mesh must be Tensor, list, tuple or numpy array", str(context.exception))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_invalid_mesh_dim_names_length(self, mock_platform):
         """Test DeviceMesh with mismatched mesh_dim_names length raises ValueError.
 
@@ -568,7 +568,7 @@ class TestDeviceMesh(unittest.TestCase):
             DeviceMesh("npu", mesh=[[0, 1], [2, 3]], mesh_dim_names=("dp", "tp", "cp"), _init_backend=False)
         self.assertIn("mesh dimensions", str(context.exception))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_invalid_mesh_dim_names_duplicate(self, mock_platform):
         """Test DeviceMesh with duplicate mesh_dim_names raises ValueError.
 
@@ -588,7 +588,7 @@ class TestDeviceMesh(unittest.TestCase):
             DeviceMesh("npu", mesh=[[0, 1], [2, 3]], mesh_dim_names=("dp", "dp"), _init_backend=False)
         self.assertIn("Each element of mesh_dim_names", str(context.exception))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_getitem_no_dim_names_raises(self, mock_platform):
         """Test DeviceMesh __getitem__ without mesh_dim_names raises RuntimeError.
 
@@ -610,7 +610,7 @@ class TestDeviceMesh(unittest.TestCase):
             _ = mesh["dp"]
         self.assertIn("Cannot slice a DeviceMesh without mesh_dim_names", str(context.exception))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_getitem_invalid_dim_name(self, mock_platform):
         """Test DeviceMesh __getitem__ with invalid dimension name raises KeyError.
 
@@ -636,7 +636,7 @@ class TestDeviceMesh(unittest.TestCase):
             _ = mesh["invalid_dim"]
         self.assertIn("invalid_dim", str(context.exception))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_getitem_out_of_order(self, mock_platform):
         """Test DeviceMesh __getitem__ with out-of-order dimensions raises ValueError.
 
@@ -662,7 +662,7 @@ class TestDeviceMesh(unittest.TestCase):
             _ = mesh[("cp", "dp")]  # Wrong order, should be ("dp", "cp")
         self.assertIn("must follow the order", str(context.exception))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_size_method(self, mock_platform):
         """Test DeviceMesh size method.
 
@@ -689,7 +689,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(mesh.size(0), 2)
         self.assertEqual(mesh.size(1), 4)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_coordinate(self, mock_platform):
         """Test DeviceMesh get_coordinate method.
 
@@ -716,7 +716,7 @@ class TestDeviceMesh(unittest.TestCase):
         # Assert - rank 0 in 2x4 mesh should be at position (0, 0)
         self.assertEqual(coordinate, (0, 0))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_root_mesh_property(self, mock_platform):
         """Test DeviceMesh root_mesh property.
 
@@ -744,7 +744,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertIsNone(mesh.root_mesh)  # Root mesh has no parent
         self.assertEqual(dp_mesh.root_mesh, mesh)  # Submesh has parent
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_sub_mesh_property(self, mock_platform):
         """Test DeviceMesh sub_mesh property.
 
@@ -774,7 +774,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(len(mesh.sub_mesh), 1)
         self.assertEqual(dp_mesh, mesh.sub_mesh[0])
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_flatten_mapping(self, mock_platform):
         """Test DeviceMesh flatten mapping methods.
 
@@ -803,7 +803,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertIn("dp_tp", mesh.get_flatten_mapping())
         self.assertEqual(mesh.get_flatten_mapping()["dp_tp"], flat_dp_tp)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_to_hash(self, mock_platform):
         """Test DeviceMesh to_hash method.
 
@@ -831,7 +831,7 @@ class TestDeviceMesh(unittest.TestCase):
         expected = ((2, 2), ("dp", "tp"), (0, 1, 2, 3))
         self.assertEqual(hash_key, expected)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_all_groups(self, mock_platform):
         """Test DeviceMesh get_all_groups method.
 
@@ -868,7 +868,7 @@ class TestDeviceMesh(unittest.TestCase):
         # Assert
         self.assertEqual(len(all_groups), 2)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_assert_axis(self, mock_platform):
         """Test DeviceMesh assert_axis method.
 
@@ -898,7 +898,7 @@ class TestDeviceMesh(unittest.TestCase):
             mesh.assert_axis("invalid", "test_op")
         self.assertIn("invalid", str(context.exception))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_without_dim_names(self, mock_platform):
         """Test DeviceMesh without mesh_dim_names.
 
@@ -923,7 +923,7 @@ class TestDeviceMesh(unittest.TestCase):
         # axis_id without dim names should work
         self.assertEqual(mesh.axis_id("None"), -1)
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_from_group_with_1d_group(self, mock_platform):
         """Test DeviceMesh.from_group with 1D group.
 
@@ -953,7 +953,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(device_mesh.rank_list, (0, 1, 2, 3))
         self.assertEqual(device_mesh.mesh_dim_names, ("dp",))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_from_group_with_nd_groups(self, mock_platform):
         """Test DeviceMesh.from_group with nD groups.
 
@@ -988,7 +988,7 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(device_mesh.rank_list, (0, 1, 2, 3))
         self.assertEqual(device_mesh.mesh_dim_names, ("dp", "tp"))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_from_group_invalid_mesh(self, mock_platform):
         """Test DeviceMesh.from_group with invalid mesh raises ValueError.
 
@@ -1016,7 +1016,7 @@ class TestDeviceMesh(unittest.TestCase):
             )
         self.assertIn("Invalid mesh", str(context.exception))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_devices_for_axis_with_str(self, mock_platform):
         """Test DeviceMesh.get_devices_for_axis with string dimension name.
 
@@ -1044,7 +1044,7 @@ class TestDeviceMesh(unittest.TestCase):
         # Assert - rank 0 and 1 are in the same dp group
         self.assertEqual(sorted(devices), [0, 2])
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_devices_for_axis_with_int(self, mock_platform):
         """Test DeviceMesh.get_devices_for_axis with integer dimension index.
 
@@ -1072,7 +1072,7 @@ class TestDeviceMesh(unittest.TestCase):
         # Assert - rank 0 and 2 are in the same dp group
         self.assertEqual(sorted(devices), [0, 2])
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_devices_for_axis_invalid_dim(self, mock_platform):
         """Test DeviceMesh.get_devices_for_axis with invalid dimension raises ValueError.
 
@@ -1099,7 +1099,7 @@ class TestDeviceMesh(unittest.TestCase):
             mesh.get_devices_for_axis("invalid", 0)
         self.assertIn("not found", str(context.exception))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_devices_for_axis_no_dim_names(self, mock_platform):
         """Test DeviceMesh.get_devices_for_axis without mesh_dim_names raises ValueError.
 
@@ -1125,7 +1125,7 @@ class TestDeviceMesh(unittest.TestCase):
             mesh.get_devices_for_axis("dp", 0)
         self.assertIn("not set", str(context.exception))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_devices_for_axis_invalid_rank(self, mock_platform):
         """Test DeviceMesh.get_devices_for_axis with invalid rank raises ValueError.
 
@@ -1152,7 +1152,7 @@ class TestDeviceMesh(unittest.TestCase):
             mesh.get_devices_for_axis("dp", 100)
         self.assertIn("not found", str(context.exception))
 
-    @patch("hyper_parallel.core.device_mesh.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_devices_for_axis_out_of_range(self, mock_platform):
         """Test DeviceMesh.get_devices_for_axis with out-of-range dimension index raises ValueError.
 

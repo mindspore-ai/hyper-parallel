@@ -20,8 +20,8 @@ import copy
 import warnings
 
 from typing import List, Tuple, Optional, Any
-from hyper_parallel.core.layout import Layout
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_ops_register import register_distributed_op
 from hyper_parallel.platform import get_platform
 

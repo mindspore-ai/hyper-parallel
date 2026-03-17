@@ -16,8 +16,8 @@
 import copy as cp
 from typing import Sequence, Tuple
 import numpy as np
-from hyper_parallel.core.layout import Layout, DeviceMesh, _get_slice_tensor_by_layout
-from hyper_parallel.core.placement_types import Placement, Replicate
+from hyper_parallel.core.dtensor.layout import Layout, DeviceMesh, _get_slice_tensor_by_layout
+from hyper_parallel.core.dtensor.placement_types import Placement, Replicate
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.utils import compute_local_shape_and_global_offset
 
@@ -96,7 +96,7 @@ class DTensor(DTensorBase):
             Each element should be a Placement object (Shard, Replicate, Partial, etc.).
 
     Example:
-        >>> from hyper_parallel.core.placement_types import Shard, Replicate
+        >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
         >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
         >>> local_tensor = Tensor(np.ones((4, 4)))
         >>> dtensor = DTensor.from_local(local_tensor, mesh, [Shard(0), Replicate()])
@@ -155,7 +155,7 @@ class DTensor(DTensorBase):
             DTensor: A new DTensor instance.
 
         Example:
-            >>> from hyper_parallel.core.placement_types import Shard, Replicate
+            >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
             >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
             >>> local_tensor = Tensor(np.ones((4, 4)))
             >>> dtensor = DTensor.from_local(local_tensor, mesh, [Shard(0), Replicate()])
@@ -223,7 +223,7 @@ class DTensor(DTensorBase):
             DTensor: A new DTensor with the specified distribution.
 
         Example:
-            >>> from hyper_parallel.core.placement_types import Shard, Replicate
+            >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
             >>> new_dtensor = dtensor.redistribute(mesh, [Replicate(), Shard(1)])
         """
         # Build dst_layout from device_mesh and placements
@@ -232,7 +232,7 @@ class DTensor(DTensorBase):
         )
 
         # pylint: disable=C0415
-        from hyper_parallel.core.tensor_redistribution import _tensor_redistribution
+        from hyper_parallel.core.dtensor.tensor_redistribution import _tensor_redistribution
         out = _tensor_redistribution.redistribution(self, dst_layout)
         return out
 
@@ -248,7 +248,7 @@ class DTensor(DTensorBase):
         to_layout = cp.deepcopy(self._layout)
         to_layout.reset_partial()
         # pylint: disable=C0415
-        from hyper_parallel.core.tensor_redistribution import _tensor_redistribution
+        from hyper_parallel.core.dtensor.tensor_redistribution import _tensor_redistribution
         out = _tensor_redistribution.reduce_partial(self, to_layout)
         return out
 
@@ -287,7 +287,7 @@ class DTensor(DTensorBase):
 
         # Redistribute to the replicated layout and return local tensor
         # pylint: disable=C0415
-        from hyper_parallel.core.tensor_redistribution import _tensor_redistribution
+        from hyper_parallel.core.dtensor.tensor_redistribution import _tensor_redistribution
         out = _tensor_redistribution.redistribution(self, replicated_layout)
         return out.to_local()
 
@@ -316,8 +316,8 @@ def distribute_tensor(
         data, use `from_local` instead.
 
     Example:
-        >>> from hyper_parallel.core.placement_types import Shard, Replicate
-        >>> mesh = init_device_mesh(mesh_shape=(2, 2), alias_name=("dp", "tp"))
+        >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+        >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
         >>> global_tensor = Tensor(np.arange(16).reshape(4, 4))
         >>> dtensor = distribute_tensor(global_tensor, mesh, [Shard(0), Replicate()])
         >>> # rank 0 and rank1 gets: [[0,1,2,3], [4,5,6,7]]
