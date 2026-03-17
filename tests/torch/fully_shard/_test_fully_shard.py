@@ -112,6 +112,95 @@ def test_fully_shard_03():
         train(net, input_data, comm_async=True, train_steps=2)
 
 
+class DenseMutiLayerNet(torch.nn.Module):
+    """dense net with configurable layer number"""
+    def __init__(self, hidden_size, has_bias=True):
+        super().__init__()
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+        layer = DenseNet(hidden_size, hidden_size, has_bias)
+        self.layers1 = fully_shard(
+            layer,
+            mesh=mesh,
+            reshard_after_forward=True,
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+                output_dtype=torch.float32,
+                cast_forward_inputs=True,
+            ),
+        )
+        layer = DenseNet(hidden_size, hidden_size, has_bias).to(torch.bfloat16)
+        self.layers2 = fully_shard(
+            layer,
+            mesh=mesh,
+            reshard_after_forward=True,
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+                output_dtype=torch.float32,
+                cast_forward_inputs=True,
+            ),
+        )
+
+    def forward(self, x):
+        x = self.layers1(x)
+        x = self.layers2(x)
+        x = torch.sum(x)
+        return x
+
+
+def test_fully_shard_04():
+    """
+    Feature: Test fully_shard with networks that have different orig_dtype, initialized on CPU
+    Description: DenseMutiLayerNet contains 2 DenseNet.
+    Model is on CPU at init, _move_states_to_device moves params and buffers to NPU.
+    Expectation: run successfully
+    """
+    batch_size = 4
+    hidden_size = 32
+    init_dist()
+    net = DenseMutiLayerNet(hidden_size, 2)
+    input_data = torch.rand(batch_size, hidden_size).npu()
+    with SkipDTensorDispatch():
+        train(net, input_data, comm_async=True, train_steps=2)
+
+
+def test_fully_shard_meta_init():
+    """
+    Feature: Test fully_shard with meta device initialization
+    Description: Model is created on meta device, then materialized to NPU before training.
+    This validates the lazy_init path: reset_sharded_param and _validate_no_meta_params.
+    Expectation: run successfully
+    """
+    batch_size = 4
+    hidden_size = 32
+    init_dist()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+
+    with torch.device("meta"):
+        model = MetaInitNet(hidden_size)
+
+    model = fully_shard(
+        model,
+        mesh=mesh,
+        reshard_after_forward=True,
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+            cast_forward_inputs=True,
+        ),
+    )
+    model.to_empty(device="npu")
+    for module in model.modules():
+        if hasattr(module, "reset_parameters"):
+            module.reset_parameters()
+
+    input_data = torch.rand(batch_size, hidden_size).npu()
+    with SkipDTensorDispatch():
+        train(model, input_data, comm_async=True, train_steps=2)
+
+
 def test_fully_shard_from_group_mesh():
     """
     Feature: When mesh created by from_group, test fully_shard with simple network, optimization level is default ZeRO-3
