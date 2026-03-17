@@ -177,3 +177,24 @@ def test_zero3_partial_shard():
     hsdp_mesh = init_device_mesh(device_type="npu", mesh_shape=(4, op_size), mesh_dim_names=("dp", "op"))
     fsdp_kwargs['mesh'] = hsdp_mesh
     shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)
+
+
+def test_zero3_fully_shard_comm_fusion():
+    """test zero3 fully shard parallel with comm_fusion"""
+    init_dist()
+    mp_policy = MixedPrecisionPolicy()
+    fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
+    fsdp_kwargs["comm_fusion"] = True
+    shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)
+
+
+def test_zero3_partial_shard_comm_fusion():
+    """test zero3 partial shard parallel with comm_fusion"""
+    init_dist()
+    op_size = 2
+    mp_policy = MixedPrecisionPolicy()
+    fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
+    hsdp_mesh = init_device_mesh(device_type="npu", mesh_shape=(4, op_size), mesh_dim_names=("dp", "op"))
+    fsdp_kwargs['mesh'] = hsdp_mesh
+    fsdp_kwargs["comm_fusion"] = True
+    shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)

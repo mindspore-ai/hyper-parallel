@@ -15,17 +15,18 @@
 """Torch HSDP cell state"""
 from typing import Optional
 import torch
-from hyper_parallel.core.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
 from hyper_parallel.platform.torch.fully_shard.utils import HSDPMeshInfo, CPUOffloadPolicy
+from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx
 
 
 def _to_dtype_if_needed(
         tensor: torch.Tensor, dtype: Optional[torch.dtype]
 ) -> torch.Tensor:
     """Cast tensor to the given dtype if it differs from current dtype.
+
 
     Args:
         tensor: The input tensor to potentially cast.
@@ -34,6 +35,7 @@ def _to_dtype_if_needed(
     if dtype is not None and tensor.dtype != dtype:
         return tensor.to(dtype)
     return tensor
+
 
 class TorchHSDPStateV2(HSDPState):
     """Torch HSDP cell state"""
@@ -54,6 +56,7 @@ class TorchHSDPStateV2(HSDPState):
             device (torch.device): Target device.
         """
         super().__init__(cell, mesh_info, config, platform, device)
+        self.comm_fusion = config.comm_fusion
         # Do ReduceScatter/AllReduce for grad
         self.device = device
         self.mp_policy = config.mp_policy
@@ -159,19 +162,11 @@ class TorchHSDPStateV2(HSDPState):
             for hsdp_param in self.hsdp_params:
                 hsdp_param.to_accumulated_grad_if_needed()
             return
-        # reduce pre post_backward parameters, overlap with computing
-        self.reduce_params()
-        for hsdp_param in self.hsdp_params:
-            if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
-                continue
-            # Frozen parameters (requires_grad=False) produce no
-            # gradient — skip all reduce-scatter / all-reduce work.
-            if not hsdp_param.sharded_param.requires_grad:
-                continue
-            if hsdp_param.shard_world_size > 1:
-                if hsdp_param.unsharded_param.grad is None:
-                    # Parameter requires grad but was not used in
-                    # forward — all ranks skip consistently.
+        if not self.comm_fusion:
+            # reduce pre post_backward parameters, overlap with computing
+            self.reduce_params()
+            for hsdp_param in self.hsdp_params:
+                if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
                     continue
                 hsdp_param.reduce_scatter_grad(
                     dtype=self._reduce_dtype,
@@ -187,6 +182,22 @@ class TorchHSDPStateV2(HSDPState):
                         TorchHSDPStateV2.pre_reduce_scatter_params[-1][0] == hsdp_param:
                     TorchHSDPStateV2.pre_reduce_scatter_params.pop()
                 TorchHSDPStateV2.pre_all_reduce_params.append([hsdp_param, self._orig_dtype])
+        else:
+            # Fused gradient reduction path: first apply any pending async reduction
+            # from the previous module's backward (pipelined overlap), then issue
+            # this module's fused reduce-scatter (+ all-reduce for HSDP).
+            comm_ctx = get_comm_ctx()
+            # Phase 2: apply grads for the param group whose all_reduce is done
+            if comm_ctx.all_reduce_param_group is not None:
+                comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
+                comm_ctx.all_reduce_param_group = None
+            # Phase 1: wait reduce_scatter, issue async all_reduce for previous layer
+            if comm_ctx.pre_param_group is not None:
+                comm_ctx.pre_param_group.wait_reduce_scatter_and_issue_all_reduce()
+                comm_ctx.pre_param_group = None
+            self.param_group.foreach_reduce(
+                reduce_scatter_reduce_op=self.reduce_op_type
+            )
 
         if self.reshard_after_backward:
             self.shard()

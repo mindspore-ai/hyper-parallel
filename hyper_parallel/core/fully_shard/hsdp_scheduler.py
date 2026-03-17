@@ -29,8 +29,14 @@ class HSDPSchedulerContext:
 class HSDPSchedulerV2:
     """HSDPScheduler is used to scheduler hsdp"""
     def __init__(self, cell, mesh, reshard_after_forward, shard_placement_fn,
-                 mp_policy, offload_policy, ignored_params, device):
-        """init hsdp scheduler."""
+                 mp_policy, offload_policy, ignored_params, device, comm_fusion):
+        """Initialize HSDP scheduler.
+
+        Args:
+            comm_fusion: If True, enables fused communication: all parameters within
+                the module are packed into a single buffer for one all-gather (forward)
+                and one reduce-scatter (backward), reducing collective launch overhead.
+        """
         self.cell = cell
         self.mesh: DeviceMesh = mesh
         self.reshard_after_forward = reshard_after_forward
@@ -49,7 +55,8 @@ class HSDPSchedulerV2:
             shard_placement_fn,
             mp_policy,
             offload_policy,
-            ignored_params
+            ignored_params,
+            comm_fusion=comm_fusion
         )
         self._init_platform()
         self._new_cell_state()

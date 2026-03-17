@@ -16,6 +16,7 @@
 from typing import List
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.hsdp_utils import HSDPConfigV2
+from hyper_parallel.platform.torch.fully_shard.param_group import HSDPParamGroup
 
 class HSDPState:
     """HSDP state for cell"""
@@ -41,6 +42,7 @@ class HSDPState:
         self.sharded_hsdp_params: List[HSDPParamV2] = []
         self._move_states_to_device()
         self._init_hsdp_params()
+        self._init_param_group()
         self.is_shard = True
 
     def _init_hsdp_params(self):
@@ -51,6 +53,17 @@ class HSDPState:
         """move states to device"""
         raise NotImplementedError("HSDPState subclasses must implement _move_states_to_device")
 
+    def _init_param_group(self):
+        """Initialize fused parameter group for communication fusion.
+
+        When ``comm_fusion`` is enabled, creates an ``HSDPParamGroup`` that packs all
+        parameters into a single buffer for fused all-gather and reduce-scatter,
+        replacing the per-parameter communication pattern.
+        """
+        if not self.config.comm_fusion:
+            return
+        self.param_group = HSDPParamGroup(self.hsdp_params, self.mesh_info, self.device, self.mp_policy)
+
     def shard(self):
         """change parameters to sharded state"""
         if self.is_shard:
@@ -59,14 +72,18 @@ class HSDPState:
         for param in self.sharded_hsdp_params:
             param.to_sharded()
         self.is_shard = True
+        return
 
     def unshard(self, async_op=False):
         """change parameters to unsharded state"""
         if not self.is_shard:
             return
 
-        for param in self.sharded_hsdp_params:
-            param.unshard(async_op)
+        if self.config.comm_fusion:
+            self.param_group.unshard(async_op)
+        else:
+            for param in self.sharded_hsdp_params:
+                param.unshard(async_op)
         if not async_op:
             self.wait_for_unshard()
 
@@ -78,6 +95,9 @@ class HSDPState:
         """wait for all unshard parameters"""
         if not self.is_shard:
             return
-        for param in self.sharded_hsdp_params:
-            param.wait_for_unshard()
+        if self.config.comm_fusion:
+            self.param_group.wait_for_unshard()
+        else:
+            for param in self.sharded_hsdp_params:
+                param.wait_for_unshard()
         self.is_shard = False

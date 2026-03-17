@@ -171,7 +171,7 @@ class TorchHSDPParamV2(HSDPParamV2):
                 self.sharded_param.main_grad._local_tensor += reduced_grad
                 self.sharded_param.grad = None
         if self.unsharded_accumulated_grad_data is not None:
-            self.unsharded_accumulated_grad_data = None
+            self.unsharded_accumulated_grad = None
         elif self.unsharded_param.grad is not None:
             self.unsharded_param.grad = None
         return need_synchronize
