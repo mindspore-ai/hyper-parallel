@@ -21,8 +21,11 @@ git diff --name-only HEAD
 git diff --cached --name-only
 ```
 
-### Phase 2 & 3: Test Stage (pylint + lints + pytest)
-Delegate to the autogit **test** command (runs pylint, lizard, codespell, markdownlint, then pytest):
+### Phase 2: Lint Stage (pylint + lints)
+Run pylint and other linters (lizard, codespell, markdownlint, dt_design, arg_mark, etc.).
+
+### Phase 3: Test Stage (pytest)
+Run pytest for the project. Both phases are invoked together by the autogit **test** command:
 ```bash
 python3 .claude/skills/autogit/scripts/autogit.py test
 ```

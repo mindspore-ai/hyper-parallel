@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for fully_shard state helpers (no NPU required)."""
+"""Unit tests for fully_shard state helpers (no NPU required).
+
+Covers _to_dtype_if_needed from hyper_parallel.platform.torch.fully_shard.state:
+dtype no-op vs cast, and invalid input handling. All tests run on CPU.
+"""
 import os
 import unittest
 
@@ -23,18 +27,25 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 
 from hyper_parallel.platform.torch.fully_shard.state import _to_dtype_if_needed
+from tests.common.mark_utils import arg_mark
 
 
 class TestToDtypeIfNeeded(unittest.TestCase):
-    """Unit tests for _to_dtype_if_needed."""
+    """Unit tests for _to_dtype_if_needed (tensor dtype cast or no-op)."""
 
     def setUp(self):
         """Set up test fixtures before each test method."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_to_dtype_if_needed_parameterized(self):
-        """Parameterized test: same dtype/no-op, None dtype, cast to float16/bfloat16."""
+        """Parameterized test: same dtype/no-op, None dtype, cast to float16/bfloat16.
+
+        description: Call _to_dtype_if_needed with same dtype, None, float16, bfloat16.
+        expectation: Same/None dtype returns same tensor; target dtype triggers copy and dtype.
+        feature: fully_shard state _to_dtype_if_needed.
+        """
         test_cases = [
             (torch.float32, torch.float32, True, "same dtype no-op"),
             (torch.float32, None, True, "None dtype no-op"),
@@ -57,8 +68,14 @@ class TestToDtypeIfNeeded(unittest.TestCase):
                 else:
                     self.assertEqual(result.dtype, tensor_dtype)
 
+    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_invalid_tensor_raises(self):
-        """_to_dtype_if_needed raises when first arg is not a tensor."""
+        """_to_dtype_if_needed raises when first arg is not a tensor.
+
+        description: Call _to_dtype_if_needed(None, torch.float32).
+        expectation: AttributeError (None has no .dtype).
+        feature: fully_shard state _to_dtype_if_needed input validation.
+        """
         # Act & Assert (None has no .dtype attribute)
         with self.assertRaises(AttributeError):
             _to_dtype_if_needed(None, torch.float32)
