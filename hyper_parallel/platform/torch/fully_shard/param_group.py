@@ -291,6 +291,62 @@ class HSDPParamGroup:
         self._reduce_output = None  # Fused reduce-scatter output, consumed by apply_fusion_reduced_grad
         self._reduce_op = None  # Reduce op saved from foreach_reduce for use in apply_fusion_reduced_grad
         self._init_mp_dtypes()
+        self._flat_param_buffer = None  # Contiguous buffer holding all params' sharded data
+        self._flat_cast_buffer = None  # Cast buffer for mixed precision (param_dtype)
+        self._init_flat_param_buffer()
+
+    def _init_flat_param_buffer(self):
+        """Initialize a contiguous flat buffer and rebase all params' sharded data into it.
+
+        This enables zero-copy all-gather by making all local shards contiguous in memory,
+        so they can be passed directly to ``all_gather_into_tensor`` without ``foreach_copy_``.
+        When mixed-precision casting is needed, a separate cast buffer is also allocated.
+        """
+        if self.shard_world_size <= 1:
+            return
+        if len(self.hsdp_params) == 0:
+            return
+        if any(p.offload_to_cpu for p in self.hsdp_params):
+            return
+
+        total_numel = sum(p._sharded_param_data.numel() for p in self.hsdp_params)
+        orig_dtype = self.hsdp_params[0]._sharded_param_data.dtype
+        flat_buffer = torch.empty(total_numel, dtype=orig_dtype, device=self.device)
+
+        offset = 0
+        for hsdp_param in self.hsdp_params:
+            numel = hsdp_param._sharded_param_data.numel()
+            flat_slice = flat_buffer.narrow(0, offset, numel)
+            flat_slice.copy_(hsdp_param._sharded_param_data)
+            # Rebase _sharded_param_data to be a view into the flat buffer
+            hsdp_param._sharded_param_data = flat_slice
+            # Rebase DTensor's local tensor so optimizer in-place updates write to flat buffer
+            new_local = flat_slice.view(hsdp_param.sharded_size)
+            req_grad = hsdp_param.sharded_param.requires_grad
+            hsdp_param.sharded_param._local_tensor = new_local
+            hsdp_param.sharded_param.data = new_local
+            if req_grad:
+                new_local.requires_grad_(True)
+                hsdp_param.sharded_param.requires_grad_(True)
+            offset += numel
+
+        self._flat_param_buffer = flat_buffer
+
+        # Allocate cast buffer for mixed precision if needed
+        has_param_dtype = any(p.param_dtype is not None for p in self.hsdp_params)
+        if has_param_dtype:
+            cast_dtype = next(p.param_dtype for p in self.hsdp_params if p.param_dtype is not None)
+            self._flat_cast_buffer = torch.empty(total_numel, dtype=cast_dtype, device=self.device)
+
+    def _is_flat_buffer_valid(self):
+        """Check if the flat buffer is still backing the params' sharded data.
+
+        The flat buffer becomes invalid after ``load_state_dict`` triggers
+        ``reset_sharded_param``, which re-assigns ``_sharded_param_data``.
+        """
+        if self._flat_param_buffer is None or len(self.hsdp_params) == 0:
+            return False
+        return self.hsdp_params[0]._sharded_param_data.data_ptr() == self._flat_param_buffer.data_ptr()
 
     def unshard(self, async_op: bool = False):
         """Trigger fused all-gather to reconstruct full parameters from shards.
@@ -384,15 +440,10 @@ class HSDPParamGroup:
     def foreach_all_gather(self, async_op=False):
         """Perform a fused all-gather for all parameters in the group.
 
-        Steps:
-            1. Collect all local shard tensors into a flat list.
-            2. Allocate (or resize) a contiguous output buffer of size
-               ``total_input_numel * world_size``.
-            3. Copy local shards into this rank's slice of the buffer via
-               ``all_gather_copy_in``.
-            4. Issue a single ``dist.all_gather_into_tensor`` collective.
-            5. Store the result (buffer + handle) in ``self._result`` for later
-               consumption by ``wait_for_unshard()``.
+        When a flat parameter buffer is available (see ``_init_flat_param_buffer``),
+        the local shards are already contiguous and can be passed directly to
+        ``all_gather_into_tensor`` without any copy-in.  Otherwise falls back to
+        the ``all_gather_copy_in`` path.
 
         Args:
             async_op: If True, the collective runs asynchronously.
@@ -401,11 +452,7 @@ class HSDPParamGroup:
             self.metadata_cache = AllGatherMetadataCache()
         # pylint: disable=W0108
         metadata = self.metadata_cache.get_metadata(self.hsdp_params, lambda p: get_all_gather_metadata(p))
-        all_gather_inputs = []
-        for hsdp_param in self.hsdp_params:
-            inputs = hsdp_param.all_gather_inputs
-            all_gather_inputs.extend(inputs)
-        if len(all_gather_inputs) == 0:
+        if metadata.total_input_numel == 0:
             return
         world_size, rank = self.shard_group.size(), self.shard_group.rank()
         total_output_numel = metadata.total_input_numel * world_size
@@ -414,17 +461,36 @@ class HSDPParamGroup:
                                          dtype=metadata.dtype, device=self.device)
         else:
             self.alloc_all_gather_output(total_output_numel)
-        # Copy local shards into this rank's slot in the fused buffer
-        all_gather_input, updated_output = all_gather_copy_in(
-            all_gather_inputs,
-            self.ag_output,
-            metadata.inp_split_sizes,
-            metadata.total_input_numel,
-            rank
-        )
-        del all_gather_inputs  # Free references to individual shard tensors
-        handle = dist.all_gather_into_tensor(updated_output, all_gather_input, self.shard_group, async_op)
-        self._result = AllGatherResult(updated_output, metadata, handle)
+
+        if not self._is_flat_buffer_valid():
+            self._init_flat_param_buffer()
+        use_flat_buffer = self._flat_param_buffer is not None
+        if use_flat_buffer:
+            # Zero-copy path: flat buffer already holds contiguous shard data
+            if self._flat_cast_buffer is not None:
+                # Mixed precision: single contiguous cast instead of N small copies
+                self._flat_cast_buffer.copy_(self._flat_param_buffer)
+                all_gather_input = self._flat_cast_buffer
+            else:
+                all_gather_input = self._flat_param_buffer
+        else:
+            # Fallback: collect inputs and copy into the rank-local slice of ag_output
+            all_gather_inputs = []
+            for hsdp_param in self.hsdp_params:
+                all_gather_inputs.extend(hsdp_param.all_gather_inputs)
+            if len(all_gather_inputs) == 0:
+                return
+            all_gather_input, _ = all_gather_copy_in(
+                all_gather_inputs,
+                self.ag_output,
+                metadata.inp_split_sizes,
+                metadata.total_input_numel,
+                rank
+            )
+            del all_gather_inputs  # Free references to individual shard tensors
+
+        handle = dist.all_gather_into_tensor(self.ag_output, all_gather_input, self.shard_group, async_op)
+        self._result = AllGatherResult(self.ag_output, metadata, handle)
 
     @torch.no_grad()
     def foreach_all_gather_copy_out(self):
