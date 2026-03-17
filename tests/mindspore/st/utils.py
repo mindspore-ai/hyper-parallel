@@ -24,7 +24,7 @@ from hyper_parallel.platform.mindspore.hsdp.scheduler import MindSporeHSDPSchedu
 def msrun_case(glog_v, file_name, case_name, master_port, worker_num=8, local_worker_num=8):
     """Run test case."""
     filename = file_name.split(".py")[0]
-    log_path = f"./log_{filename}/{case_name}"
+    log_path = f"./logs/{filename}/{case_name}"
     if os.path.exists(log_path):
         shutil.rmtree(log_path)
     cmd = f"export GLOG_v={glog_v} && msrun --worker_num={worker_num} --local_worker_num={local_worker_num} " \
