@@ -1,4 +1,4 @@
-# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2025 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,91 +13,170 @@
 # limitations under the License.
 # ============================================================================
 """test torch dtensor with distributed softmax"""
+
 import numpy as np
 import torch
-from hyper_parallel import Layout
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
-from tests.torch.shard.utils import local_to_global, global_to_local
+from tests.torch.shard.utils import local_to_global
 
-# Generate input data using numpy at file header
 np.random.seed(42)
-# Shape (8, 16), float32
-standalone_input_np = np.random.randn(8, 16).astype(np.float32)
+standalone_input_2d_np = np.random.randn(8, 16).astype(np.float32)
+standalone_input_3d_np = np.random.randn(4, 4, 4).astype(np.float32)
 
-def test_distributed_softmax_layout_inference():
+
+def test_distributed_softmax_data_parallel():
     """
-    Feature: dtensor + torch.softmax layout inference
+    Feature: dtensor + torch.nn.functional.softmax with data parallel
     Description:
-        ▪ Test layout inference for torch.softmax in distributed setting.
-        ▪ Ensure that:
-            a) The output layout matches input layout (ActivationWithAxis logic).
-            b) Results are consistent between standalone and distributed.
-            c) Sharding occurs on non-softmax dimensions.
-    Expectation: Success.
+        - Input: (8, 8) sharded on dim 0 (batch dimension).
+        - Softmax on dim 1 (feature dimension, unsharded).
+        - Output layout should preserve sharding on dim 0.
+    Expectation: Success with correct layout and numerical equivalence.
     """
     init_dist()
-    dim = -1  # Softmax along the last dimension (dim=1)
 
-    # Standalone (single-device) execution for ground truth
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
-    # Using positional argument for dim to ensure it is captured by _op_dispatch
-    standalone_output = torch.softmax(standalone_input, dim)
+    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
+    standalone_output = torch.softmax(standalone_input, dim=1)
 
-    # Distributed setup
-    # Mesh: (2, 4), Alias: ("dp", "tp")
-    layout = Layout((2, 2), ("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    x_placements = (Shard(0), Replicate())
 
-    # Strategy: Shard on dim=0 ("dp"), Keep dim=1 ("None").
-    # Softmax is performed on dim=1, so dim=1 must NOT be sharded.
-    x_layout = layout("dp", "None")
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
+    dist_output = torch.softmax(dist_input, dim=1)
 
-    # Convert global view to local shard
-    dist_input = global_to_local(standalone_input, x_layout)
+    expected_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+    assert dist_output.layout == expected_layout, \
+        (f"Softmax data parallel layout mismatch: "
+         f"expected={expected_layout}, got={dist_output.layout}")
 
-    # Execute distributed op
-    # 【Fix】: Must use positional argument for 'dim' because _op_dispatch.py
-    # does not extract kwargs into extra_args for layout inference.
-    # Wrong: torch.softmax(dist_input, dim=dim)
-    # Right: torch.softmax(dist_input, dim)
-    dist_output = torch.softmax(dist_input, dim)
-
-    # Layout correctness check
-    assert dist_output.layout == x_layout, "Torch Softmax: output layout must match input layout"
-
-    # Gather distributed results back to global view
     gathered_output = local_to_global(dist_output)
-
-    # Value correctness check
-    assert torch.allclose(
-        standalone_output, gathered_output, atol=1e-5
-    ), "Softmax output mismatch between standalone and distributed"
+    assert torch.allclose(standalone_output, gathered_output, rtol=1e-5, atol=1e-5), \
+        (f"Softmax data parallel output mismatch: "
+         f"standalone={standalone_output}, parallel={gathered_output}")
 
 
-def test_distributed_softmax_sharded_dim_error():
+def test_distributed_softmax_model_parallel():
     """
-    Feature: dtensor + torch.softmax error on sharded dim
+    Feature: dtensor + torch.nn.functional.softmax with model parallel
     Description:
-        ▪ Attempt to perform softmax along a sharded dimension.
-        ▪ According to ActivationWithAxisDistributedOp.check_layout, this must fail.
-    Expectation: Raise ValueError.
+        - Input: (8, 8) sharded on dim 1 (feature dimension).
+        - Softmax on dim 0 (batch dimension, unsharded).
+        - Output layout should preserve sharding on dim 1.
+    Expectation: Success with correct layout and numerical equivalence.
     """
     init_dist()
-    dim = 1  # Softmax along dim 1
 
-    layout = Layout((2, 2), ("dp", "tp"))
+    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
+    standalone_output = torch.softmax(standalone_input, dim=0)
 
-    # Strategy: Keep dim=0 ("dp"), Shard dim=1 ("tp").
-    # We will try to Softmax on dim=1, which is sharded.
-    x_layout = layout("dp", "tp")
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    x_placements = (Replicate(), Shard(1))
 
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
-    dist_input = global_to_local(standalone_input, x_layout)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
+    dist_output = torch.softmax(dist_input, dim=0)
 
-    try:
-        # 【Fix】: Use positional argument for 'dim' here as well
-        torch.softmax(dist_input, dim)
-        assert False, "Expected ValueError when performing softmax along sharded dimension"
-    except ValueError as e:
-        # Verify the error message format from ActivationWithAxisDistributedOp
-        assert "requires the reduction axis to be un-sharded" in str(e), \
-            f"Unexpected error message: {str(e)}"
+    expected_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
+    assert dist_output.layout == expected_layout, \
+        (f"Softmax model parallel layout mismatch: "
+         f"expected={expected_layout}, got={dist_output.layout}")
+
+    gathered_output = local_to_global(dist_output)
+    assert torch.allclose(standalone_output, gathered_output, rtol=1e-5, atol=1e-5), \
+        (f"Softmax model parallel output mismatch: "
+         f"standalone={standalone_output}, parallel={gathered_output}")
+
+
+def test_distributed_softmax_hybrid_parallel():
+    """
+    Feature: dtensor + torch.nn.functional.softmax with hybrid parallel
+    Description:
+        - Input: (4, 4, 4) 3D tensor with hybrid sharding.
+        - Softmax on unsharded dimension.
+        - Output layout should preserve input sharding.
+    Expectation: Success with correct layout and numerical equivalence.
+    """
+    init_dist()
+
+    standalone_input = torch.from_numpy(standalone_input_3d_np).npu()
+    standalone_output = torch.softmax(standalone_input, dim=1)
+
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "cp", "tp"))
+    x_placements = (Shard(0), Replicate(), Shard(2))
+
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
+    dist_output = torch.softmax(dist_input, dim=1)
+
+    expected_layout = _build_layout(mesh, (Shard(0), Replicate(), Shard(2)), 3)
+    assert dist_output.layout == expected_layout, \
+        (f"Softmax hybrid parallel layout mismatch: "
+         f"expected={expected_layout}, got={dist_output.layout}")
+
+    gathered_output = local_to_global(dist_output)
+    assert torch.allclose(standalone_output, gathered_output, rtol=1e-5, atol=1e-5), \
+        (f"Softmax hybrid parallel output mismatch: "
+         f"standalone={standalone_output}, parallel={gathered_output}")
+
+
+def test_distributed_softmax_all_replicated():
+    """
+    Feature: dtensor + torch.nn.functional.softmax with all replicated
+    Description:
+        - Input: (8, 8) fully replicated.
+        - Softmax on any dimension.
+        - Output should remain replicated.
+    Expectation: Success with correct layout and numerical equivalence.
+    """
+    init_dist()
+
+    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
+    standalone_output = torch.softmax(standalone_input, dim=-1)
+
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    x_placements = (Replicate(), Replicate())
+
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
+    dist_output = torch.softmax(dist_input, dim=-1)
+
+    expected_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+    assert dist_output.layout == expected_layout, \
+        (f"Softmax all replicated layout mismatch: "
+         f"expected={expected_layout}, got={dist_output.layout}")
+
+    gathered_output = local_to_global(dist_output)
+    assert torch.allclose(standalone_output, gathered_output, rtol=1e-5, atol=1e-5), \
+        (f"Softmax all replicated output mismatch: "
+         f"standalone={standalone_output}, parallel={gathered_output}")
+
+
+def test_distributed_softmax_negative_dim():
+    """
+    Feature: dtensor + torch.nn.functional.softmax with negative dimension index
+    Description:
+        - Input: (8, 8) sharded on dim 0.
+        - Softmax with dim=-1 (last dimension).
+        - Output layout should preserve sharding.
+    Expectation: Success with correct layout and numerical equivalence.
+    """
+    init_dist()
+
+    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
+    standalone_output = torch.softmax(standalone_input, dim=-1)
+
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    x_placements = (Shard(0), Replicate())
+
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
+    dist_output = torch.softmax(dist_input, dim=-1)
+
+    expected_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+    assert dist_output.layout == expected_layout, \
+        (f"Softmax negative dim layout mismatch: "
+         f"expected={expected_layout}, got={dist_output.layout}")
+
+    gathered_output = local_to_global(dist_output)
+    assert torch.allclose(standalone_output, gathered_output, rtol=1e-5, atol=1e-5), \
+        (f"Softmax negative dim output mismatch: "
+         f"standalone={standalone_output}, parallel={gathered_output}")
