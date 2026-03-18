@@ -319,8 +319,11 @@ class TorchHSDPParamV2(HSDPParamV2):
 
     def to_sharded(self) -> None:
         self._setattr_on_modules(self.sharded_param)
-        self.free_unsharded_param()
         self.sharded_state = ShardedState.SHARDED
+        if not isinstance(self.mesh_info, FSDPMeshInfo) or self.shard_world_size <= 1:
+            return
+        self.free_unsharded_param()
+
 
     def to_unsharded(self) -> None:
         set_requires_grad_if_needed(self.sharded_param, self._unsharded_param)
@@ -523,6 +526,9 @@ class TorchHSDPParamV2(HSDPParamV2):
         Returns:
             (unsharded_param, handle): Unsharded parameter data and communication handle.
         """
+
+        # Get input data
+        all_gather_input = self.all_gather_inputs[0]
         # If parameter is not sharded (below threshold), no communication needed
         if not self.is_sharded:
             self.init_all_gather_outputs(
@@ -532,11 +538,11 @@ class TorchHSDPParamV2(HSDPParamV2):
                 device=self.device,
             )
             self.alloc_all_gather_outputs()
-            self.all_gather_outputs[0].copy_(self._sharded_param_data)
+            cloned_data = all_gather_input.clone()
+            self.all_gather_outputs = [cloned_data]
             return self.all_gather_outputs[0], None
 
-        # Get input data
-        all_gather_input = self.all_gather_inputs[0]
+
 
         # Initialize output buffer
         self.init_all_gather_outputs(
@@ -552,7 +558,8 @@ class TorchHSDPParamV2(HSDPParamV2):
 
         if shard_group is None or self.shard_world_size <= 1:
             # No communication needed, just copy
-            self.all_gather_outputs[0].copy_(all_gather_input)
+            cloned_data = all_gather_input.clone()
+            self.all_gather_outputs = [cloned_data]
             return self.all_gather_outputs[0], None
 
         # Execute all_gather_into_tensor
@@ -620,14 +627,18 @@ class TorchHSDPParamV2(HSDPParamV2):
 
         # If parameter is not sharded (below threshold), no reduce-scatter needed
         if not self.is_sharded:
-            return grad_flat, None
+            self._reduce_scatter_output = grad_flat
+            self.reduce_scatter_handle = None
+            return
 
         # Get communication group
         shard_group = self.mesh_info.shard_process_group if isinstance(self.mesh_info, FSDPMeshInfo) else None
 
         if shard_group is None or self.shard_world_size <= 1:
             # No communication needed
-            return grad_flat, None
+            self._reduce_scatter_output = grad_flat
+            self.reduce_scatter_handle = None
+            return
 
         # Calculate output size
         output_numel = grad_flat.numel() // self.shard_world_size
@@ -672,13 +683,16 @@ class TorchHSDPParamV2(HSDPParamV2):
         if dtype is not None and dtype != grad.dtype:
             grad = grad.to(dtype)
 
+        self._all_reduce_output = grad
+        self.all_reduce_handle = None
+
         if not isinstance(self.mesh_info, HSDPMeshInfo):
             # Not HSDP mode, no all-reduce needed
-            return grad, None
+            return
 
         replicate_group = self.mesh_info.replicate_process_group
         if replicate_group is None or self.replicate_world_size <= 1:
-            return grad, None
+            return
 
         self.all_reduce_handle = dist.all_reduce(grad, op=reduce_op,
                                                  group=replicate_group, async_op=async_op)

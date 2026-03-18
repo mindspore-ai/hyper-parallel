@@ -41,8 +41,6 @@ class TorchHSDPStateV2(HSDPState):
     """Torch HSDP cell state"""
     # Record grad reduce-scatter handle.
     pre_reduce_scatter_params = []
-    # Record grad allreduce handle (only for HSDP).
-    pre_all_reduce_params = []
 
     def __init__(self, cell, mesh_info, config, platform, device):
         """
@@ -172,16 +170,7 @@ class TorchHSDPStateV2(HSDPState):
                     dtype=self._reduce_dtype,
                     reduce_op=self.reduce_op_type
                 )
-                TorchHSDPStateV2.pre_reduce_scatter_params.append([hsdp_param, self._orig_dtype])
-
-            if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
-                assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
-                reduced_grad = hsdp_param.reduce_scatter_output()
-                hsdp_param.all_reduce_grad(grad=reduced_grad, dtype=self._reduce_dtype, reduce_op=self.reduce_op_type)
-                if TorchHSDPStateV2.pre_reduce_scatter_params and \
-                        TorchHSDPStateV2.pre_reduce_scatter_params[-1][0] == hsdp_param:
-                    TorchHSDPStateV2.pre_reduce_scatter_params.pop()
-                TorchHSDPStateV2.pre_all_reduce_params.append([hsdp_param, self._orig_dtype])
+                TorchHSDPStateV2.pre_reduce_scatter_params.append((hsdp_param, self._orig_dtype))
         else:
             # Fused gradient reduction path: first apply any pending async reduction
             # from the previous module's backward (pipelined overlap), then issue
@@ -226,14 +215,15 @@ class TorchHSDPStateV2(HSDPState):
         while TorchHSDPStateV2.pre_reduce_scatter_params:
             pre_hsdp_param, pre_orig_dtype = TorchHSDPStateV2.pre_reduce_scatter_params.pop(0)
             reduced_grad = pre_hsdp_param.reduce_scatter_output()
+            if self._is_hsdp and self.requires_all_reduce and pre_hsdp_param.replicate_world_size > 1:
+                pre_hsdp_param.all_reduce_grad(grad=reduced_grad, dtype=self._reduce_dtype,
+                                               reduce_op=self.reduce_op_type, async_op=False)
+                reduced_grad = pre_hsdp_param.all_reduce_output()
+                pre_hsdp_param.clear_all_reduce_output()
+
             pre_hsdp_param.clear_reduce_scatter_output()
             need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype) or need_synchronize
 
-        while TorchHSDPStateV2.pre_all_reduce_params:
-            pre_hsdp_param, pre_orig_dtype = TorchHSDPStateV2.pre_all_reduce_params.pop(0)
-            reduced_grad = pre_hsdp_param.all_reduce_output()
-            pre_hsdp_param.clear_all_reduce_output()
-            need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype) or need_synchronize
         if need_synchronize:
             if self.device.type == "npu":
                 torch.npu.current_stream().synchronize()
@@ -245,6 +235,10 @@ class TorchHSDPStateV2(HSDPState):
     def set_requires_grad_sync(self, requires_grad_sync):
         """set requires grad sync flag to control gradient sync."""
         self.reduce_grads = requires_grad_sync
+
+    @property
+    def _is_hsdp(self) -> bool:
+        return isinstance(self.mesh_info, HSDPMeshInfo)
 
     def set_reduce_op_type(self, reduce_op_type: str):
         """set reduce op type for gradient reduction."""
