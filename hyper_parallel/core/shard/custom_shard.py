@@ -16,9 +16,9 @@
 
 import queue
 from typing import Callable, Tuple, Optional
-from hyper_parallel.core.layout import DeviceMesh
-from hyper_parallel.core.dtensor import DTensor
-from hyper_parallel.core.placement_types import Placement
+from hyper_parallel.core.dtensor.layout import DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Placement
 from hyper_parallel.platform import get_platform
 platform = get_platform()
 Tensor = platform.Tensor

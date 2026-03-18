@@ -23,8 +23,8 @@ from typing import Optional, Tuple
 
 import pytest
 
-from hyper_parallel.core.layout import Layout
-from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.dtensor import DTensor
 
 _TEST_FILE_DIR = Path(__file__).resolve().parent
 _TESTS_ROOT_DIR = _TEST_FILE_DIR.parent.parent.parent.parent
@@ -137,7 +137,7 @@ def _require_mindspore():
     """
     try:
         importlib.import_module("mindspore")
-    except Exception as e:
+    except ImportError as e:
         pytest.skip(f"mindspore not available: {e}")
 
 

@@ -40,8 +40,8 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.dtensor import DTensor
-from hyper_parallel.core.placement_types import Partial
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Partial
 
 try:
     from torch.utils._foreach_utils import (

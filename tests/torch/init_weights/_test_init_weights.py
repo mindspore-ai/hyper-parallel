@@ -24,8 +24,8 @@ import torch.distributed as dist
 import torch_npu  # pylint: disable=W0611
 
 from hyper_parallel import init_device_mesh
-from hyper_parallel.core.dtensor import DTensor
-from hyper_parallel.core.init_weights import init_empty_weights
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.utils import init_dist

@@ -4,7 +4,7 @@ Utility functions for distributed tensor operations.
 This module provides helper functions for computing local shapes, global offsets,
 and other layout-related calculations in distributed settings.
 """
-from hyper_parallel.core.layout import Layout
+from hyper_parallel.core.dtensor.layout import Layout
 
 def compute_local_shape_and_global_offset(global_shape, device_mesh, placement):
     """

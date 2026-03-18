@@ -16,7 +16,7 @@
 from mindspore import ops, jit_class
 from mindspore.common.parameter import Parameter
 from mindspore.common.initializer import initializer
-from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.hsdp.hsdp_param import HSDPParam
 
 

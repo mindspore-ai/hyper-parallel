@@ -21,7 +21,7 @@ from mindspore._c_expression import NoFallbackGuard
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
 from hyper_parallel import hsdp, DTensor, parallelize_value_and_grad, shard_module, init_device_mesh
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 learning_rate = 0.01

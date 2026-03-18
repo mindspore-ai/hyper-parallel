@@ -22,8 +22,8 @@ import mindspore.common.dtype as mstype
 from mindspore import Tensor
 from mindspore.ops import flash_attention_score
 from hyper_parallel import init_device_mesh, shard_module
-from hyper_parallel.core.dtensor import distribute_tensor
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.dtensor import distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.core.shard.ops.parallel_flash_attention_score import ParallelFlashAttention
 

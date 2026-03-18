@@ -282,8 +282,8 @@ class TestTorchPlatformCore(unittest.TestCase):
         self.assertIs(model.weight, new_param)
 
     @mock.patch('hyper_parallel.platform.torch.platform.Parameter')
-    @mock.patch('hyper_parallel.core.dtensor.DTensor.from_local')
-    @mock.patch('hyper_parallel.core.layout._get_slice_tensor_by_layout')
+    @mock.patch('hyper_parallel.core.dtensor.dtensor.DTensor.from_local')
+    @mock.patch('hyper_parallel.core.dtensor.layout._get_slice_tensor_by_layout')
     def test_set_layout_into_parameter(self, mock_get_slice, mock_dtensor_from_local, mock_parameter):
         """Test parameter layout setting logic.
         
@@ -316,7 +316,7 @@ class TestTorchPlatformCore(unittest.TestCase):
 
         # Test case where parameter is already a DTensor
         with self.assertRaises(ValueError):
-            from hyper_parallel.core.dtensor import DTensor  # pylint: disable=import-outside-toplevel
+            from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=import-outside-toplevel
 
             TorchPlatform.set_layout_into_parameter(MagicMock(spec=DTensor), mock_layout)
 

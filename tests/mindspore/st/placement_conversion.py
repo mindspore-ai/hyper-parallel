@@ -14,9 +14,9 @@
 # ============================================================================
 """test placement and tensor_map conversion"""
 import pytest
-from hyper_parallel.core.layout import Layout
-from hyper_parallel.core.device_mesh import init_device_mesh
-from hyper_parallel.core.placement_types import Shard, Replicate, Partial
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, Partial
 
 
 def test_basic_conversion():

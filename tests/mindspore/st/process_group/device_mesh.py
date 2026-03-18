@@ -14,7 +14,7 @@
 # ============================================================================
 """test_process_group.py"""
 
-from hyper_parallel.core.device_mesh import init_device_mesh, DeviceMesh
+from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, DeviceMesh
 from hyper_parallel import get_platform
 
 platform = get_platform()

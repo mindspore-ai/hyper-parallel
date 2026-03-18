@@ -30,11 +30,11 @@ from hyper_parallel.core.fully_shard.utils import (
     DDPMeshInfo,
     HSDPMeshInfo,
 )
-from hyper_parallel.core.dtensor import DTensor
-from hyper_parallel.core.layout import Layout
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo
 
 

@@ -16,7 +16,7 @@
 Distributed implementation for Reshape operator.
 """
 
-from hyper_parallel.core.layout import Layout
+from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
 platform = get_platform()

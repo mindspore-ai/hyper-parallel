@@ -24,6 +24,6 @@ def init_parameters(module, stage_index=0):
         Raises:
             ValueError: If the `module` is not a module.
     """
-    from hyper_parallel.platform import get_platform
+    from hyper_parallel.platform import get_platform  # pylint: disable=C0415
     platform = get_platform()
     return platform.init_parameters(module, stage_index)

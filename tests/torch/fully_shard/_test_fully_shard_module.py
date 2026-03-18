@@ -19,7 +19,7 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 import torch_npu
 from hyper_parallel import init_device_mesh
-from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.fully_shard.api import fully_shard, HSDPModule, _UnshardHandle
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.common_net import DenseNet

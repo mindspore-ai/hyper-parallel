@@ -16,7 +16,7 @@
 import numpy as np
 import mindspore as ms
 import mindspore.communication.management as D
-from hyper_parallel.core.tensor_redistribution import TensorRedistribution
+from hyper_parallel.core.dtensor.tensor_redistribution import TensorRedistribution
 
 D.init()
 

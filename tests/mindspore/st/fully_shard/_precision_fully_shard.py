@@ -25,7 +25,7 @@ from mindspore.communication import init
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.fully_shard.api import fully_shard
-from hyper_parallel.core.dtensor import DTensor
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from tests.mindspore.st.common_net import SlimLeNet16
 
 # Use to same temp directory as precision_baseline.py

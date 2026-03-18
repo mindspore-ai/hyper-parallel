@@ -26,10 +26,10 @@ import torch
 from torch import nn
 
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
-from hyper_parallel.core.dtensor import DTensor
-from hyper_parallel.core.device_mesh import DeviceMesh, init_device_mesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState, ParamModuleInfo
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.fully_shard.utils import HSDPMeshInfo, FSDPMeshInfo, MixedPrecisionPolicy
 
 from hyper_parallel.platform.platform import get_torch_platform
@@ -338,7 +338,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
     @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
-    @patch('hyper_parallel.core.layout.Layout')
+    @patch('hyper_parallel.core.dtensor.layout.Layout')
     def test_reset_sharded_param(self, mock_layout, mock_dtensor_from_local, mock_sharded_local_tensor):
         """Test resetting sharded parameters.
 
@@ -364,7 +364,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
     @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
-    @patch('hyper_parallel.core.layout.Layout')
+    @patch('hyper_parallel.core.dtensor.layout.Layout')
     def test_get_unsharded_param_data(self, mock_layout, mock_dtensor_from_local,
                                       mock_sharded_local_tensor):
         """Test getting unsharded parameter data.
@@ -395,7 +395,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
     @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
-    @patch('hyper_parallel.core.layout.Layout')
+    @patch('hyper_parallel.core.dtensor.layout.Layout')
     def test_to_sharded_post_forward(self, mock_layout, mock_dtensor_from_local,
                                      mock_sharded_local_tensor):
         """Test transition to sharded state after forward (to_sharded).

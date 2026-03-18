@@ -26,7 +26,7 @@ from mindspore.common.initializer import initializer
 from mindspore.communication import get_rank
 
 from hyper_parallel import shard_module, parallelize_value_and_grad, init_device_mesh
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.core.checkpoint.layout import get_current_layout, save_layout, load_layout, get_global_layout, \
     combine_layout

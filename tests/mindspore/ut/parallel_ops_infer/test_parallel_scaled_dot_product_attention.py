@@ -16,8 +16,8 @@
 
 import pytest
 from hyper_parallel import Layout, init_device_mesh
-from hyper_parallel.core.dtensor import _build_layout
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_scaled_dot_product_attention import (
     ScaledDotProductAttentionDistributedOp,
 )

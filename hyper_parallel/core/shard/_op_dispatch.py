@@ -24,8 +24,8 @@ from itertools import chain
 import yaml
 
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
-from hyper_parallel.core.dtensor import DTensor
-from hyper_parallel.core.random import OffsetBasedRNGTracker, is_rng_supported_mesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.random import OffsetBasedRNGTracker, is_rng_supported_mesh
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()

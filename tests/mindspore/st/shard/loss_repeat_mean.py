@@ -20,7 +20,7 @@ import mindspore as ms
 import mindspore.communication.management as D
 from mindspore import nn, Tensor
 from hyper_parallel import init_device_mesh, hsdp, shard_module, DTensor, parallelize_value_and_grad
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from tests.mindspore.st.shard.utils import create_dtensor
 

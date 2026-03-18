@@ -18,8 +18,8 @@ import mindspore as ms
 from mindspore import nn, Tensor, ops
 from mindspore.communication.management import get_rank, init
 from hyper_parallel import init_device_mesh
-from hyper_parallel.core.dtensor import distribute_tensor
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.dtensor import distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()

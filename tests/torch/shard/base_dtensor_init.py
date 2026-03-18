@@ -1,9 +1,9 @@
 """Distributed tensor initialization consistency tests."""
 import torch
 import torch.distributed as dist
-from hyper_parallel.core.device_mesh import init_device_mesh
-from hyper_parallel.core.placement_types import Shard, Replicate
-from hyper_parallel.core.dtensor import ones, empty, full, zeros
+from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.dtensor import ones, empty, full, zeros
 from tests.torch.utils import init_dist
 
 init_dist()

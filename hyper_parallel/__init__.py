@@ -15,11 +15,11 @@
 """hyper parallel interface"""
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.hsdp.api import hsdp, hsdp_sync_stream, HSDPCell
-from hyper_parallel.core.layout import Layout
-from hyper_parallel.core.device_mesh import DeviceMesh, init_device_mesh
-from hyper_parallel.core.dtensor import DTensor, SkipDTensorDispatch
-from hyper_parallel.core.parameter_init import init_parameters
-from hyper_parallel.core.init_weights import init_empty_weights, init_on_device
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, init_device_mesh
+from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch
+from hyper_parallel.core.dtensor.parameter_init import init_parameters
+from hyper_parallel.core.dtensor.init_weights import init_empty_weights, init_on_device
 from hyper_parallel.core.shard.api import shard_module
 from hyper_parallel.core.shard.api import parallelize_value_and_grad
 from hyper_parallel.core.shard.custom_shard import custom_shard

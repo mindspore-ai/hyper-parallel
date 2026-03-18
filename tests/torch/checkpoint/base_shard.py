@@ -18,7 +18,7 @@ import torch
 from torch import optim
 from hyper_parallel import shard_module, init_device_mesh
 from hyper_parallel.core.checkpoint.layout import get_global_layout
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from tests.torch.common_net import SimpleModel
 from tests.torch.shard.base_shard import mse_loss_sum

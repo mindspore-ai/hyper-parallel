@@ -19,8 +19,8 @@ import pytest
 import torch
 import torch_npu
 from hyper_parallel import DTensor, init_device_mesh
-from hyper_parallel.core.dtensor import distribute_tensor
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.dtensor import distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from tests.torch.utils import init_dist
 
 

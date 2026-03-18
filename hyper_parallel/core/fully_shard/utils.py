@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from hyper_parallel.collectives.cc import get_group_local_rank
-from hyper_parallel.core.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()

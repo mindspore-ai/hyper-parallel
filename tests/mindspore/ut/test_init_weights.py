@@ -23,7 +23,7 @@ import numpy as np
 import mindspore as ms
 from mindspore import nn, mint
 from mindspore.common.initializer import initializer
-from hyper_parallel.core.init_weights import init_empty_weights, init_on_device
+from hyper_parallel.core.dtensor.init_weights import init_empty_weights, init_on_device
 
 HAS_NPU = ms.device_context.ascend.is_available()
 

@@ -26,7 +26,7 @@ from mindspore.common.initializer import initializer
 
 from hyper_parallel import init_device_mesh, hsdp, init_parameters, custom_shard, shard_module, \
     parallelize_value_and_grad, DTensor
-from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from tests.mindspore.st.shard.utils import create_dtensor
 
