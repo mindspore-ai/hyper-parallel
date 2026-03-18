@@ -4,8 +4,8 @@ IndexSelect:
   distributed_op_file: parallel_gather
 
 GatherD:
-  dist_op_name: _gather_dist_op
-  distributed_op_class: GatherDistributedOp
+  dist_op_name: _gather_d_dist_op
+  distributed_op_class: GatherDDistributedOp
   distributed_op_file: parallel_gather
 
 GatherNd:
