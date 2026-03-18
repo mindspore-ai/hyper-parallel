@@ -599,6 +599,11 @@ class TorchPlatform(Platform):
         """Convert PyTorch tensor to numpy array."""
         return tensor.cpu().numpy()
 
+    @staticmethod
+    def profiler_record(name):
+        """Profiler context manager for recording operations using torch.profiler."""
+        return torch.profiler.record_function(name)
+
     def cast_fp_tensor(self,dtype, x):
         """
         Cast floating-point tensor to target dtype if applicable.
