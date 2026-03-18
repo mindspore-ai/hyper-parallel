@@ -188,6 +188,9 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             shard_rank = 0
             shard_world_size = 1
 
+        if isinstance(param_data, DTensor) and isinstance(self.mesh_info, DDPMeshInfo):
+            param_data.data = param_data.full_tensor()
+
         self.is_sharded = True
 
         if param_data.shape[shard_dim] % shard_world_size != 0:

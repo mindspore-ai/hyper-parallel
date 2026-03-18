@@ -25,13 +25,22 @@ platform = get_platform()
 class HSDPConfigV2:
     """HSDPConfigV2 inspect by torch fully_shard"""
 
-    def __init__(self, mesh, reshard_after_forward, shard_placement_fn, mp_policy, offload_policy, ignored_params=None):
+    def __init__(self,
+        mesh,
+        reshard_after_forward,
+        shard_placement_fn,
+        mp_policy,
+        offload_policy,
+        ignored_params=None,
+        replicate_params=None,
+    ):
         self.mesh = mesh
         self.reshard_after_forward = reshard_after_forward
         self.shard_placement_fn = shard_placement_fn
         self.mp_policy = mp_policy
         self.offload_policy = offload_policy
         self.ignored_params = ignored_params
+        self.replicate_params = replicate_params
         self.reduce_dtype = self.mp_policy.reduce_dtype if self.mp_policy else None
 
 

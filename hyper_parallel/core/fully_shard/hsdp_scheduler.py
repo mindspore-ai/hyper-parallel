@@ -35,7 +35,7 @@ class HSDPSchedulerV2:
     """HSDPScheduler is used to scheduler hsdp"""
     def __init__(self, cell: Union[platform.Module, Tuple[platform.Module, ...]], mesh,
                  reshard_after_forward, shard_placement_fn,
-                 mp_policy, offload_policy, ignored_params, device):
+                 mp_policy, offload_policy, ignored_params, replicate_params, device):
         """init hsdp scheduler.
 
         Args:
@@ -48,7 +48,7 @@ class HSDPSchedulerV2:
         self.shard_placement_fn = shard_placement_fn
         self.mp_policy = mp_policy
         self.offload_policy = offload_policy
-        self.ignored_params = ignored_params
+        self.replicate_params = replicate_params
         self.device = device
         self.scheduler_state = None
         self.forward_prefetch_cells = []
@@ -60,7 +60,8 @@ class HSDPSchedulerV2:
             shard_placement_fn,
             mp_policy,
             offload_policy,
-            ignored_params
+            ignored_params,
+            replicate_params,
         )
         self._init_platform()
         self._new_cell_state()
@@ -132,7 +133,7 @@ class HSDPSchedulerV2:
             return
         self.scheduler_state = FSDPSchedulerState.FORWARD
         if self.reshard_after_forward:
-            self.hsdp_state.shard()
+            self.hsdp_state.shard(shard_replicate=False)
         if self.mp_policy.output_dtype is not None:
             outputs = self.platform.apply_to_tensors(
                 functools.partial(self.platform.cast_fp_tensor, self.mp_policy.output_dtype),
@@ -145,7 +146,7 @@ class HSDPSchedulerV2:
         """Backward pre hook to unsharded parameter for backward process."""
         self.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
         if self.reshard_after_forward:
-            self.hsdp_state.unshard()
+            self.hsdp_state.unshard(unshard_replicate=False)
         for prefetch_cell in self.backward_prefetch_cells:
             prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()
 
