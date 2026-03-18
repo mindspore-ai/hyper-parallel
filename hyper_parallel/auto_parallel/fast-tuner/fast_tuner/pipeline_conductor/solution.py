@@ -27,6 +27,7 @@ from fast_tuner.pipeline_conductor import micro
 from fast_tuner.pipeline_conductor.start_service import ExpertInput
 from fast_tuner.utils.logger import logger
 
+
 class Solution:
     '''
     parse and record various properties of
@@ -171,10 +172,14 @@ class Solution:
                        (self.init_config.pp_interleave_num * self.init_config.pipeline_stage))
         self.rs_dis = self.rs_type1 + self.rs_type2
         self.ra_dis = self.ra_type1 + self.ra_type2
-        self.layer1_dis_stage = [sum(self.x_type1[v][s] for v in range(self.init_config.pp_interleave_num)) for s in
-                                 range(self.init_config.pipeline_stage)]
-        self.layer2_dis_stage = [sum(self.x_type2[v][s] for v in range(self.init_config.pp_interleave_num)) for s in
-                                 range(self.init_config.pipeline_stage)]
+        self.layer1_dis_stage = []
+        for s in range(self.init_config.pipeline_stage):
+            stage_sum = sum(self.x_type1[v][s] for v in range(self.init_config.pp_interleave_num))
+            self.layer1_dis_stage.append(stage_sum)
+        self.layer2_dis_stage = []
+        for s in range(self.init_config.pipeline_stage):
+            stage_sum = sum(self.x_type2[v][s] for v in range(self.init_config.pp_interleave_num))
+            self.layer2_dis_stage.append(stage_sum)
 
     def check_time_list(self):
         '''
@@ -245,6 +250,7 @@ class Solution:
         logger.info(list(self.peak_num.peak_num_select_recom_type2.values()))
         logger.info('the number of full recomputes of the type of layer2')
         logger.info(list(self.peak_num.peak_num_recompute_type2.values()))
+
 
 def extract_solution_file(yaml_file, sol_file):
     expert_input = ExpertInput(yaml_file, '')

@@ -136,11 +136,14 @@ class TorchHSDPStateV2(HSDPState):
             if hsdp_param.sharded_param.device.type != "cpu"
         ]
         if hsdp_params_not_on_cpu:
+            params_info = [
+                (hsdp_param._param_fqn, hsdp_param.sharded_param.device)
+                for hsdp_param in hsdp_params_not_on_cpu
+            ]
             raise RuntimeError(
                 "HSDP parameters should be materialized on CPU when enabling CPU offloading. "
                 'For example, load a CPU state dict or call module.to_empty(device="cpu"). '
-                "Found following parameters on non-CPU device: "
-                f"{[(hsdp_param._param_fqn, hsdp_param.sharded_param.device) for hsdp_param in hsdp_params_not_on_cpu]}\n"
+                f"Found following parameters on non-CPU device: {params_info}"
             )
 
 
@@ -230,7 +233,9 @@ class TorchHSDPStateV2(HSDPState):
             elif self.device.type == "cuda":
                 torch.cuda.current_stream().synchronize()
             else:
-                raise NotImplementedError(f"Unsupported device type {self.device.type} for synchronization after CPU offload.")
+                raise NotImplementedError(
+                    f"Unsupported device type {self.device.type} for synchronization after CPU offload."
+                )
 
     def set_requires_grad_sync(self, requires_grad_sync):
         """set requires grad sync flag to control gradient sync."""
@@ -247,6 +252,9 @@ class TorchHSDPStateV2(HSDPState):
             "avg": torch.distributed.ReduceOp.AVG,
         }
         if reduce_op_type not in fsdp_support_reduce_op:
-            raise ValueError(f"Unsupported reduce op type {reduce_op_type}, supported types are {list(fsdp_support_reduce_op.keys())}")
+            raise ValueError(
+                f"Unsupported reduce op type {reduce_op_type}, "
+                f"supported types are {list(fsdp_support_reduce_op.keys())}"
+            )
         reduce_op: str = reduce_op_type.lower().strip()
-        self.reduce_op_type = fsdp_support_reduce_op[reduce_op]
+        self.reduce_op_type = fsdp_support_reduce_op.get(reduce_op)

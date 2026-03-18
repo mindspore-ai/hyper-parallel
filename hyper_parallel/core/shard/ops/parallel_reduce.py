@@ -62,7 +62,6 @@ class ReduceExtDistributedOpBase(DistributedOp):
         if x_layout.mesh_shape is None:
             raise ValueError("Input layouts cannot be None.")
 
-        # [dim, keepdim]
         if not extra_args:
             dim = None
             keepdim = False
@@ -230,6 +229,7 @@ class ReduceMaxDistributedOp(ReduceExtDistributedOpBase):
     def __init__(self, op_name="ReduceMax"):
         super().__init__(op_name, partial_type=["max"])
 
+
 class ProdExtDistributedOp(ReduceExtDistributedOpBase):
     """
     Distributed implementation for ProdExt operator (product of all elements or along a dim).
@@ -239,6 +239,7 @@ class ProdExtDistributedOp(ReduceExtDistributedOpBase):
     def __init__(self, op_name="prod"):
         super().__init__(op_name, partial_type=["prod"])
 
+
 class AllExtDistributedOp(ReduceExtDistributedOpBase):
     """
     Distributed implementation for All operator
@@ -247,6 +248,7 @@ class AllExtDistributedOp(ReduceExtDistributedOpBase):
 
     def __init__(self, op_name="all"):
         super().__init__(op_name, partial_type=["all"])
+
 
 class MaxDistributedOp(ReduceExtDistributedOpBase):
     """
@@ -299,9 +301,6 @@ class MaxDistributedOp(ReduceExtDistributedOpBase):
 
         if dim is None:
             # torch.max(input) -> Single Tensor
-            # OpDispatcher logic:
-            # if isinstance(py_output, tuple): ...
-            # else: DTensor.from_local(py_output, output_layout.mesh, ...)
             # So here output_layout MUST be a Layout object, not a tuple.
             return values_layout
 

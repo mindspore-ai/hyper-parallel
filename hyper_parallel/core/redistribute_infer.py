@@ -15,6 +15,7 @@
 """redistribute_infer"""
 from typing import Dict, List, Tuple, Union
 
+
 class Status:
     SUCCESS = 0
     FAILED = 1
@@ -24,6 +25,7 @@ CONCAT_BY_AXIS = 0
 SPLIT_BY_AXIS = 1
 PERMUTE_BY_AXIS = 2
 NONE = -1
+
 
 class TensorMap:
     """Enhanced tensor map struct supporting tuples for combined dimensions"""
@@ -48,6 +50,7 @@ class TensorMap:
             if not isinstance(value, tuple) and value == dim[-1]:
                 return i
         return NONE
+
 
 class DevMat:
     """
@@ -624,7 +627,7 @@ class RedistributionOperatorInfer:
         for op in self.operator_list_:
             if op[0] == CONCAT_BY_AXIS:
                 tensor_map = [self.dev_ranks - 1 - d for d in op[1][1]] if isinstance(op[1][1], tuple) \
-                    else self.dev_ranks  - 1 - op[1][1]
+                    else self.dev_ranks - 1 - op[1][1]
                 group = self.dev_mat_.GetDevicesAlongDim(rank, rank_list, tensor_map)
                 concat_dim = op[1][0]
                 concat_size = op[1][2]
@@ -633,7 +636,7 @@ class RedistributionOperatorInfer:
                 ops_list.append(("all_concat", (concat_dim, concat_size, group)))
             elif op[0] == SPLIT_BY_AXIS:
                 tensor_map = [self.dev_ranks - 1 - d for d in op[1][1]] if isinstance(op[1][1], tuple) \
-                    else self.dev_ranks  - 1 - op[1][1]
+                    else self.dev_ranks - 1 - op[1][1]
                 group = self.dev_mat_.GetDevicesAlongDim(rank, rank_list, tensor_map)
                 split_dim = op[1][0]
                 split_size = op[1][2]
@@ -642,7 +645,7 @@ class RedistributionOperatorInfer:
                 ops_list.append(("all_split", (split_dim, split_size, group)))
             else:
                 tensor_map = [self.dev_ranks - 1 - d for d in op[1][3]] if isinstance(op[1][3], tuple) \
-                    else self.dev_ranks  - 1 - op[1][3]
+                    else self.dev_ranks - 1 - op[1][3]
                 group = self.dev_mat_.GetDevicesAlongDim(rank, rank_list, tensor_map)
                 concat_dim = op[1][2]
                 split_dim = op[1][1]

@@ -256,7 +256,7 @@ class FlashAttentionScoreDistributedOp:
         split_id: int,
         kv_is_sharded: bool,
         is_dynamic: bool,
-        device = None,
+        device=None,
     ) -> Tuple[List[int], List[int]]:
         """Adjust actual_seq_len for both static and dynamic shapes.
 

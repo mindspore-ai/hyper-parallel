@@ -47,9 +47,9 @@ if __name__ == '__main__':
                         help='Path to nd result file')
     parser.add_argument('--env_json', type=str, required=True,
                         default='./config/boss_env_config.json', help="Path of environment config (.json)")
-    parser.add_argument('--register_path', type=str,default='research/jiutian',
+    parser.add_argument('--register_path', type=str, default='research/jiutian',
                         help="Path of register")
-    parser.add_argument('--parallel_num',  type=pp_util.str2int, default=16,
+    parser.add_argument('--parallel_num', type=pp_util.str2int, default=16,
                         help="The number of dryrun at once")
     parser.add_argument('--dryrun', type=pp_util.str2bool, default=True,
                         help="Is auto dryrun")

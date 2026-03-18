@@ -18,6 +18,7 @@ Element-wise distributed operator implementation.
 
 from .parallel_ops import DistributedOp
 
+
 class TupleElementWiseDistributedOp(DistributedOp):
     """
     Distributed implementation for tuple element-wise operators.

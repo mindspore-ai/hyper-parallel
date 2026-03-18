@@ -148,6 +148,7 @@ class Layout:
             self._rank_list = tuple(rank_list)
         self._partial = [None] * len(mesh_shape)  # partial status for each dev dim
         self._support_partial_op = ['sum', 'max', 'min', 'avg', 'prod', 'all', None]
+        self.partial_ops = {}  # initialized in _build_dim_map_from_placements
         self._alias_tensor_map = None
         self._mesh = _create_device_mesh("npu", mesh_shape, mesh_dim_names=alias_name, rank_list=self._rank_list,
                                          init_backend=init_backend)

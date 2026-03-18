@@ -296,7 +296,7 @@ class TorchPlatform(Platform):
     @staticmethod
     def get_device_handle(device_type: str = "npu"):
         try:
-            handle =  getattr(torch, device_type)
+            handle = getattr(torch, device_type)
         except AttributeError as e:
             raise RuntimeError(f"TorchPlatform expect got device handle: 'torch.{device_type}' failed.") from e
         return handle
@@ -604,7 +604,7 @@ class TorchPlatform(Platform):
         """Profiler context manager for recording operations using torch.profiler."""
         return torch.profiler.record_function(name)
 
-    def cast_fp_tensor(self,dtype, x):
+    def cast_fp_tensor(self, dtype, x):
         """
         Cast floating-point tensor to target dtype if applicable.
         """

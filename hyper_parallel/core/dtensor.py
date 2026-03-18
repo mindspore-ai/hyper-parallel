@@ -39,9 +39,8 @@ class SkipDTensorDispatch():
 
 
 # Cache for _build_layout to avoid redundant Layout computations
-# Key: (device_mesh.to_hash(), tuple(placements), tensor_dim)
-# Value: Layout
 _LAYOUT_CACHE = {}
+
 
 def _build_layout(
         device_mesh: DeviceMesh,
@@ -334,6 +333,7 @@ def distribute_tensor(
 
     return DTensor(local_tensor, device_mesh, placements)
 
+
 def _dtensor_init_helper(
         init_op,
         size,
@@ -371,6 +371,7 @@ def _dtensor_init_helper(
             placements,
     )
 
+
 def ones(
     size,
     device_mesh,
@@ -399,6 +400,7 @@ def ones(
         device_mesh=device_mesh,
         placements=placements,
     )
+
 
 def empty(
     size,
@@ -460,6 +462,7 @@ def full(
         device_mesh=device_mesh,
         placements=placements,
     )
+
 
 def zeros(
     size,

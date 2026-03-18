@@ -7,6 +7,7 @@ from pathlib import Path
 from fast_tuner.utils.common import GENERAL_TOML
 from fast_tuner.utils.logger import logger
 
+
 class ProfileLaunch:
     """自动执行profile"""
     def __init__(self, profile_configs, para):
@@ -17,13 +18,6 @@ class ProfileLaunch:
         """遍历指定目录下的所有文件"""
         for root, _, files in os.walk(profile_file_dir):
             for file in files:
-                # if '_EP' in file:
-                #     pattern = MOE_PATTERN_REG_SHELL
-                # else:
-                #     pattern = LLAMA_PATTERN_REG_SHELL
-                # match = re.match(pattern, file)
-                # if not match:
-                #     continue
                 profile_file_path = os.path.join(root, file)
                 if file.endswith(".toml"):
                     self.run_torchtitan(profile_file_path)

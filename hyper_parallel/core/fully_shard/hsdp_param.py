@@ -55,7 +55,14 @@ class HSDPParamV2:
         """Initialize dtype attributes from mixed precision policy."""
         raise NotImplementedError("HSDP param subclasses must implement init_dtype_attrs")
 
-    def init_all_gather_outputs(self, all_gather_input_numels, all_gather_input_dtypes, world_size, device, force_recreate=False):
+    def init_all_gather_outputs(
+            self,
+            all_gather_input_numels,
+            all_gather_input_dtypes,
+            world_size,
+            device,
+            force_recreate=False,
+    ):
         """Allocate or reuse output buffers for all-gather communication."""
         raise NotImplementedError("HSDP param subclasses must implement init_all_gather_outputs")
 

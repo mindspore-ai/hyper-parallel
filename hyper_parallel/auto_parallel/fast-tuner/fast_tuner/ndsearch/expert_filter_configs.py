@@ -162,15 +162,19 @@ class ExpertFilterManager:
         # 在千卡规模及以上sp一定开启，千卡规模以下可支持sp搜索
         world_size = self.get_world_size(candidate_space[0])
         return [config for config in candidate_space
-                if world_size < 1000 or (self.get_tp(config) ==1 or self.get_sp_switch(config))]
+                if world_size < 1000 or (self.get_tp(config) == 1 or self.get_sp_switch(config))]
 
     def pp_for_mbs_expert(self, candidate_space):
-        return [config for config in candidate_space if
-                self.get_pp(config) <=
-                min(self.get_num_layers(), self.get_gbs() // self.get_dp(config) // self.get_mbs(config))]
+        result = []
+        for config in candidate_space:
+            max_pp = min(self.get_num_layers(), self.get_gbs() // self.get_dp(config) // self.get_mbs(config))
+            if self.get_pp(config) <= max_pp:
+                result.append(config)
+        return result
 
     def gbs_for_dp_expert(self, candidate_space):
         return [config for config in candidate_space if self.get_gbs() % self.get_dp(config) == 0]
+
 
 def expert_filter_configs(search_spaces, input_args, gbs):
     """
@@ -187,14 +191,9 @@ def expert_filter_configs(search_spaces, input_args, gbs):
     expert_manager.add_experience(expert_manager.sp_for_lm_expert)
     expert_manager.add_experience(expert_manager.pp_for_mbs_expert)
     expert_manager.add_experience(expert_manager.gbs_for_dp_expert)
-    #expert_manager.add_experience(expert_manager.pp_for_deepseek)
-    #expert_manager.add_experience(expert_manager.dp_cp_ep_for_megatron_expert)
     expert_manager.add_experience(expert_manager.ep_for_torchtitan)
-    #expert_manager.add_experience(expert_manager.ep_for_mindspore)
     # add for 768die
     expert_manager.add_experience(expert_manager.pp_for_768die)
     expert_manager.add_experience(expert_manager.tp_for_large_scale_768die)
-    # # add for yoco model
-    # expert_manager.add_experience(expert_manager.tp_for_yoco_expert)
     valid_configs = expert_manager.sequential_combination(expert_manager.expert_filters, search_spaces)
     return valid_configs

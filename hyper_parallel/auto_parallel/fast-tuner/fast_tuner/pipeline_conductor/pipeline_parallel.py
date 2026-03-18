@@ -200,7 +200,7 @@ if __name__ == '__main__':
                         default='./config/boss_env_config.json', help="Path of environment config (.json)")
     parser.add_argument('-register', '--register_path', type=str, default='research/jiutian',
                         help="Path of register")
-    parser.add_argument('-dryrun_lim', '--dryrun_lim',  type=pp_util.str2int, default=16,
+    parser.add_argument('-dryrun_lim', '--dryrun_lim', type=pp_util.str2int, default=16,
                         help="The number of dryrun at once")
 
     args = parser.parse_args()

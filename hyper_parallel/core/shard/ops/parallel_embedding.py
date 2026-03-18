@@ -40,7 +40,6 @@ class EmbeddingDistributedOp(DistributedOp):
 
 
         # Step 2: Now it is safe to extract common weight layout info
-        # MS: layouts[1] is weight
         # Torch: embedding(input, weight), so layouts[1] is weight
         w_layout = layouts[1]
         w_dict = w_layout.to_dict()

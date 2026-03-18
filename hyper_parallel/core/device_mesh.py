@@ -266,7 +266,11 @@ class DeviceMesh:
 
         # Filter out None values. If any are None then they should all be None.
         dim_non_none_group_names = [n for n in dim_group_names if n is not None]
-        assert not dim_non_none_group_names or len(dim_non_none_group_names) == len(dim_group_names)
+        if dim_non_none_group_names and len(dim_non_none_group_names) != len(dim_group_names):
+            raise ValueError(
+                f"Inconsistent None values in dim_group_names: "
+                f"{len(dim_non_none_group_names)} non-None values out of {len(dim_group_names)} total"
+            )
         return dim_non_none_group_names
 
 
@@ -871,7 +875,8 @@ class DeviceMesh:
                 )
 
         group_key = self._dim_group_names[mesh_dim]
-        assert group_key in EXISTING_COMM_GROUPS, f"{group_key} not in group cache {EXISTING_COMM_GROUPS.keys()}"
+        if group_key not in EXISTING_COMM_GROUPS:
+            raise KeyError(f"{group_key} not in group cache {EXISTING_COMM_GROUPS.keys()}")
         return EXISTING_COMM_GROUPS[group_key]
 
     def get_devices_for_axis(self, mesh_dim: Union[str, int], rank: int):

@@ -47,6 +47,7 @@ class PipelineStageBase:
         self.fwd_inputs_cache = {}
         self.fwd_outputs_cache = {}
         self.bwd_cache = {}
+        self.last_stage_outputs = None
 
     def clear_cache(self):
         """clear cache."""
@@ -119,7 +120,6 @@ class PipelineStageBase:
         self._clear_recv_buffer(self.args_recv_info, micro_index)
         if not self.is_first_stage:
             self.bwd_cache[micro_index] = grad_out[0][:self._recv_num]
-        # return grads for parameters
         if self.is_first_stage:
             return grad_out
         return grad_out[1]

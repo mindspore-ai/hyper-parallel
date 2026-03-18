@@ -39,6 +39,7 @@ from fast_tuner.pipeline_conductor.pipeline_parallel import pipeline_proc
 
 __all__ = ['taylor_search_tool']
 
+
 def taylor_search_tool(para):
     """
     A function for find out optimal ND parallel configuration.
@@ -89,6 +90,7 @@ def taylor_search_tool(para):
     # 流水线求解 todo: 想办法把candidate_configs传进去，不用csv读取
     pipeline_input = ParallelInput(para, profile_file_dir)
     pipeline_proc(pipeline_input)
+
 
 def main():
     logger.info('start to run parallel tool')

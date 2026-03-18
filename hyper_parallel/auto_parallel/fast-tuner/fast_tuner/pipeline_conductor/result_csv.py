@@ -23,6 +23,7 @@ from fast_tuner.utils.logger import logger
 from fast_tuner.pipeline_conductor import pp_util
 from fast_tuner.pipeline_conductor.dryrun import DryRun, DRYRUN_CONFIG_ERROR
 
+
 class ResultCsv:
     """
     generate result csv
@@ -47,7 +48,7 @@ class ResultCsv:
         with open(self.path, 'w', encoding='utf-8-sig') as file:
             header = ','.join(self.header) + '\n'
             file.write(header)
-        logger.info (f'Successfully created {self.path}')
+        logger.info(f'Successfully created {self.path}')
 
     def config_to_csv(self, candidate, low_mem, solver_name):
         """write detail info to csv"""
@@ -126,7 +127,7 @@ class ResultCsv:
         """
         fill solution result to csv
         """
-        row_cost =[]
+        row_cost = []
         row_no_cost = []
         with open(self.path, 'r', newline='', encoding='utf-8-sig') as file:
             reader = csv.reader(file)

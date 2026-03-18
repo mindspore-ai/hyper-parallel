@@ -23,6 +23,7 @@ from hyper_parallel.core.checkpoint.planner import LoadPlan, LoadPlanner, SavePl
 
 _metadata_file_name = ".metadata"
 
+
 @dataclass
 class StorageInfo:
     """

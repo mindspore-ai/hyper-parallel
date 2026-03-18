@@ -47,6 +47,7 @@ class PipelineStageBase:
         self.stage_index = stage_index
         self.stage_num = stage_num
         self.fwd_outputs_cache = {}
+        self.last_stage_outputs = None
 
     def clear_cache(self):
         """clear cache."""

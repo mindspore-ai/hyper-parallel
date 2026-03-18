@@ -19,6 +19,7 @@ Distributed implementation for Expand operator.
 from hyper_parallel.core.layout import Layout
 from .parallel_ops import DistributedOp
 
+
 class ExpandDistributedOp(DistributedOp):
     """Distributed implementation for torch.Tensor.expand."""
 
@@ -70,7 +71,6 @@ class ExpandDistributedOp(DistributedOp):
             sizes.append(extra_args[i])
         sizes = tuple(sizes)
 
-        # output_ndim = len(sizes)
         num_new_dims = output_ndim - input_ndim
 
         # PyTorch only allows prepending new dimensions (not inserting in middle)

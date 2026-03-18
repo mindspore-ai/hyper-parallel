@@ -25,7 +25,7 @@ def _construct_layout_tuple_for_transform_operator_list(from_layout, to_layout, 
     from_layout_dict = from_layout.to_dict()
     to_layout_dict = to_layout.to_dict()
     from_layout_tuple = (from_layout_dict["mesh_shape"], from_layout_dict["tensor_map"], list(from_full_shape))
-    to_layout_tuple = (to_layout_dict["mesh_shape"], to_layout_dict["tensor_map"], list(from_full_shape))  # TODO: 考虑reshape的场景
+    to_layout_tuple = (to_layout_dict["mesh_shape"], to_layout_dict["tensor_map"], list(from_full_shape))
     return from_layout_tuple, to_layout_tuple
 
 
@@ -193,7 +193,7 @@ class TensorRedistribution:
         if self.rank_list != to_layout.rank_list:
             raise ValueError(f"The from_layout rank list: {self.rank_list} is not equal to "
                              f"to_layout rank list: {to_layout.rank_list}")
-        key = from_layout.compact_str + to_layout.compact_str +  str(self.rank_id)
+        key = from_layout.compact_str + to_layout.compact_str + str(self.rank_id)
         if key in self._transform_cache:
             x = x.to_local()
             transform_operator_list = self._transform_cache[key]

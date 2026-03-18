@@ -66,6 +66,7 @@ class TensorProperties:
 class BytesStorageMetadata:
     """Metadata for bytes data stored in checkpoint."""
 
+
 @dataclass(frozen=True)
 class TensorStorageMetadata:
     """

@@ -30,13 +30,16 @@ Tensor = platform.Tensor
 
 _dtensor_dispatch = True
 
+
 def enable_dtensor_dispatch():
     global _dtensor_dispatch
     _dtensor_dispatch = True
 
+
 def disable_dtensor_dispatch():
     global _dtensor_dispatch
     _dtensor_dispatch = False
+
 
 def get_dtensor_dispatch():
     return _dtensor_dispatch
@@ -60,6 +63,7 @@ class LayoutCacheKey:
             h = hash(id_str)
             seed ^= h + 0x9e3779b9 + (seed << 6) + (seed >> 2)
         return seed
+
 
 class LayoutCacheManager:
     """
@@ -95,6 +99,8 @@ class OpDispatcher:
     def __init__(self):
         self._env_yaml_dir: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_YAML_DIR")
         self._env_python_path: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_PYTHON_PATH")
+        self.yaml_dir = ""  # initialized in _setup_yaml_dir()
+        self.work_dir = ""  # initialized in _setup_yaml_dir()
 
         self._setup_paths_from_env()
 
@@ -177,13 +183,15 @@ class OpDispatcher:
             module = importlib.import_module(module_name)
             op_class = getattr(module, class_name)
             _ = op_class(op_name)
-        except (ModuleNotFoundError, ImportError):
+        except ModuleNotFoundError:
             if self._env_python_path:
                 module = importlib.import_module(module_file)
                 op_class = getattr(module, class_name)
                 _ = op_class(op_name)
             else:
                 raise
+        except ImportError:
+            raise  # pylint: disable=try-except-raise
 
     def _process_args_and_kwargs(
         self, args, kwargs, cache_key: "LayoutCacheKey"
@@ -196,7 +204,8 @@ class OpDispatcher:
         input_args = []
         input_kwargs = kwargs.copy()
 
-        # Normal ops pass real inputs directly (e.g. SumExt: args = (dtensor, axis: list, keep_dims: bool, dtype: None)).
+        # Normal ops pass real inputs directly
+        # (e.g. SumExt: args = (dtensor, axis: list, keep_dims: bool, dtype: None))
         for arg in args:
             if arg is None:
                 input_layouts.append(None)
@@ -246,9 +255,10 @@ class OpDispatcher:
         """_with_layout_infer"""
         func_name = platform.get_op_name(func)
         packed_call = None
-        # Ops in unpack_ops use packed fallback args (e.g. ScatterUpdate: (prim_obj, op_name: str, (input_x, indices, updates))).
-        if(func_name in self.unpack_ops and len(args) == 3 and
-            isinstance(args[1], str) and isinstance(args[2],(tuple,list))):
+        # Ops in unpack_ops use packed fallback args
+        # (e.g. ScatterUpdate: (prim_obj, op_name: str, (input_x, indices, updates)))
+        if (func_name in self.unpack_ops and len(args) == 3 and (
+                isinstance(args[1], str) and isinstance(args[2], (tuple, list)))):
             packed_call = (args[0], args[1])
             args = tuple(args[2])
 

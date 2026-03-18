@@ -148,7 +148,9 @@ class TorchHSDPParamV2(HSDPParamV2):
             else self.sharded_param.shape
         )
         reduced_grad = reduced_grad.view(sharded_param_local_shape)
-        if not self.mp_policy.apply_grad_on_fp32_main_grad and param_type is not None and reduced_grad.dtype != param_type:
+        if (not self.mp_policy.apply_grad_on_fp32_main_grad
+                and param_type is not None
+                and reduced_grad.dtype != param_type):
             reduced_grad = reduced_grad.to(param_type)
         to_accumulate_grad = sharded_grad is not None
         need_synchronize = False
@@ -483,7 +485,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         # this makes it possible for trainer to call `sd = model.state_dict()` before the training loop
         # and use `sd` without calling .state_dict() per iteration
         same_local_tensor = False
-        if type(self._sharded_param_data) is torch.Tensor:
+        if isinstance(self._sharded_param_data, torch.Tensor):
             same_local_tensor = (
                 # when sharding param with shape (1, ...) over 2 ranks
                 # local_tensor on rank 1 can be size 0, data_ptr() can be 0

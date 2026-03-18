@@ -17,6 +17,7 @@
 import os
 import yaml
 
+
 class InputConfig(dict):
     """
     A class for configuration that inherits from Python's dict class.

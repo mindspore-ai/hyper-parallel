@@ -323,6 +323,9 @@ class HSDPModule:
         ``MindSpore`` ``torch``
     """
 
+    def __init__(self):
+        self.hsdp_scheduler = None  # initialized in hsdp_init()
+
     # pylint: disable=C0415
     def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
                   shard_placement_fn, mp_policy, offload_policy, ignored_params, device, comm_fusion):
@@ -616,13 +619,19 @@ def _get_device_from_mesh(mesh: DeviceMesh):
     device = None
     device_type = mesh.device_type
     if device_type not in ("npu", "gpu"):
-        raise AssertionError(f"hyper_parallel.fully_shard support device in [torch.npu, torch.gpu], but got '{device_type}'")
+        raise AssertionError(
+            f"hyper_parallel.fully_shard support device in [torch.npu, torch.gpu], but got '{device_type}'"
+        )
     device_handle = platform.get_device_handle(device_type)
     if device_handle is None:
-        raise ValueError(f"hyper_parallel.fully_shard can't find device_handle of 'torch.{device_type}', check the environment.")
+        raise ValueError(
+            f"hyper_parallel.fully_shard can't find device_handle of 'torch.{device_type}', "
+            "check the environment."
+        )
     if device_handle.is_available():
         device = torch.device(device_handle.current_device())
     return device
+
 
 def fully_shard(
         module: nn.Module,

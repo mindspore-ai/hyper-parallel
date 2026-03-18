@@ -135,6 +135,7 @@ class Model:
         self.model_status = None
         self.solution_status = None
         self.run_time = None
+        self.stable_dur = None
 
     def define_variables(self):
         """

@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Adapted from https://github.com/pytorch/pytorch/blob/release/2.6/torch/distributed/algorithms/_checkpoint/checkpoint_wrapper.py
-# enhanced with activation swap functionality.
+# Adapted from pytorch checkpoint_wrapper.py
+# https://github.com/pytorch/pytorch/blob/release/2.6/torch/distributed/algorithms/_checkpoint/checkpoint_wrapper.py
 # ============================================================================
 """Activation Swap implementation for PyTorch."""
 # pylint: disable=W0212, W0613
@@ -44,7 +44,8 @@ def base_check_fn(tensor) -> bool:
     - Skip Parameters and their views.
     - Skip empty storage tensors.
     """
-    if isinstance(tensor._base, torch.nn.parameter.Parameter) or isinstance(tensor, torch.nn.parameter.Parameter):  # pylint: disable=W0212
+    if (isinstance(tensor._base, torch.nn.parameter.Parameter)
+            or isinstance(tensor, torch.nn.parameter.Parameter)):  # pylint: disable=W0212
         return False
     if tensor.storage().size() <= 0:
         return False
@@ -68,7 +69,7 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
             if not base_check_fn(tensor):
                 return tensor
 
-            if (policy_fn is not None) and (policy_fn(tensor)==ActivationPolicy.SAVE):
+            if (policy_fn is not None) and (policy_fn(tensor) == ActivationPolicy.SAVE):
                 return tensor
 
             if not self.add_to_storage:

@@ -489,7 +489,7 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
         self.n_microbatch_per_round_accu.insert(0, 0)
         for stage_index in range(self.real_stage_num):
             self.exec_order[stage_index] = self.construct_stage_exec_order(stage_index)
-        self.exec_order = add_send_recv(self.exec_order, self._stage_num, self.real_stage_num, style = 'loop')
+        self.exec_order = add_send_recv(self.exec_order, self._stage_num, self.real_stage_num, style='loop')
 
     def warmup_ops(self, stage_index):
         """warmup phase."""
