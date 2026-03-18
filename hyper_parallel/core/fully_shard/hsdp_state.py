@@ -48,6 +48,7 @@ class HSDPState:
         self.device = device
         self.hsdp_params: List[HSDPParamV2] = []
         self.sharded_hsdp_params: List[HSDPParamV2] = []
+        self.replicate_params: List[HSDPParamV2] = []
         self._move_states_to_device()
         self._init_hsdp_params()
         self.is_shard = True
@@ -60,33 +61,42 @@ class HSDPState:
         """move states to device"""
         raise NotImplementedError("HSDPState subclasses must implement _move_states_to_device")
 
-    def shard(self):
+    def shard(self, shard_replicate: bool = True):
         """change parameters to sharded state"""
         if self.is_shard:
             return
 
         for param in self.sharded_hsdp_params:
             param.to_sharded()
+        if shard_replicate:
+            for param in self.replicate_params:
+                param.to_sharded()
         self.is_shard = True
 
-    def unshard(self, async_op=False):
+    def unshard(self, async_op=False, unshard_replicate: bool = True):
         """change parameters to unsharded state"""
         if not self.is_shard:
             return
 
         for param in self.sharded_hsdp_params:
             param.unshard(async_op)
+        if unshard_replicate:
+            for param in self.replicate_params:
+                param.unshard(async_op)
         if not async_op:
-            self.wait_for_unshard()
+            self.wait_for_unshard(unshard_replicate)
 
     def prefetch(self):
         """prefetch unsharded parameters"""
         self.unshard(async_op=True)
 
-    def wait_for_unshard(self):
+    def wait_for_unshard(self, wait_for_replicate: bool = True):
         """wait for all unshard parameters"""
         if not self.is_shard:
             return
         for param in self.sharded_hsdp_params:
             param.wait_for_unshard()
+        if wait_for_replicate:
+            for param in self.replicate_params:
+                param.wait_for_unshard()
         self.is_shard = False

@@ -103,7 +103,7 @@ class HSDPModule:
 
     # pylint: disable=C0415
     def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
-                  shard_placement_fn, mp_policy, offload_policy, ignored_params, device):
+                  shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device):
         """init hsdp2 scheduler."""
         scheduler_class = None
         if platform_type == PlatformType.MINDSPORE:
@@ -120,6 +120,7 @@ class HSDPModule:
                                               mp_policy,
                                               offload_policy,
                                               ignored_params,
+                                              replicate_params,
                                               device,
                                               )
 
@@ -465,6 +466,29 @@ def _get_device_from_mesh(mesh: DeviceMesh):
         device = device_type
     return device
 
+
+def _normalize_replicate_params(
+    replicate_params: Optional[set[platform.Parameter]],
+) -> set[platform.Parameter]:
+    """
+    Normalize replicate_params for fully_shard
+    Args:
+        replicate_params (Optional[set[nn.Parameter]]): Set of parameters to exclude from sharding.
+    Returns:
+        set[nn.Parameter]: Set of parameters to exclude from sharding.
+    """
+    if replicate_params is None:
+        return set()
+    out = set(replicate_params)
+    for p in out:
+        if not isinstance(p, (platform.Parameter, DTensor)):
+            raise TypeError(
+                "replicate_params must contain only nn.Parameter or DTensor, "
+                f"got {type(p).__name__}."
+            )
+    return out
+
+
 def fully_shard(
         module: Union[platform.Module, List[platform.Module]],
         *,
@@ -474,6 +498,7 @@ def fully_shard(
         mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
         offload_policy: OffloadPolicy = OffloadPolicy(),
         ignored_params: Optional[set[platform.Parameter]] = None,
+        replicate_params: Optional[set[platform.Parameter]] = None,
 ) -> Union[platform.Module, List[platform.Module]]:
     """
     Apply fully_shard to a module (or list of modules) for distributed training with parameter sharding.
@@ -520,6 +545,11 @@ def fully_shard(
             sharding overhead outweighs memory benefits, or parameters that must
             remain unsharded for correctness.
 
+        replicate_params (Optional[set[nn.Parameter]], default=None):
+            Set of parameters to exclude from sharding. These parameters remain
+            fully replicated across all devices. The gradients of these parameters
+            will be processed according to DDP.
+
     Returns:
         nn.Module or List[nn.Module]: The input module(s) with HSDP capabilities added.
     """
@@ -537,7 +567,7 @@ def fully_shard(
 
     mesh = mesh or init_device_mesh(device_type="npu", mesh_shape=(platform.get_world_size(),))
     device = _get_device_from_mesh(mesh)
-
+    replicate_params = _normalize_replicate_params(replicate_params)
     init_modules = modules
     modules[0].hsdp_init(
         platform_type,
@@ -548,6 +578,7 @@ def fully_shard(
         mp_policy,
         offload_policy,
         ignored_params,
+        replicate_params,
         device,
     )
     # Share the same scheduler handle with other roots so mods[i].unshard()/prefetch work

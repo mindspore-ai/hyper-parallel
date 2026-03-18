@@ -62,7 +62,7 @@ def get_forward_fn(net):
 # Global hyper parameters:
 local_bs = 32
 learning_rate = 1e-3
-max_step = 100
+max_step = 20
 
 
 def generate_checkpoint():
