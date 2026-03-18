@@ -90,6 +90,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 | **autogit** | GitCode fork workflow automation (commit, PR, status, squash) | `/skill autogit` |
 | **code-review** | Code review for distributed correctness, stream sync, memory safety, cross-platform consistency | `/skill code-review` |
 | **dist-op-dev** | Distributed operator development workflow (analysis → impl → test → commit) | `/skill dist-op-dev` |
+| **platform-dev** | Platform abstraction layer development (new APIs, FSDP/HSDP/Pipeline, DTensorBase, collectives) | `/skill platform-dev` |
 | **ms-op-analysis** | [Internal] MindSpore operator analysis, called by `dist-op-dev` | — |
 | **pt-op-analysis** | [Internal] PyTorch operator analysis, called by `dist-op-dev` | — |
 
