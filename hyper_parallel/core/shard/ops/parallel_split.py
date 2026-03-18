@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """
-Distributed implementation for TopK operator.
+Distributed implementation for Split operator.
 """
 
 import math
@@ -205,6 +205,70 @@ class SplitTensorViewDistributedOp(DistributedOp):
         output_num = input_shape[axis] // split_size
         if input_shape[axis] % split_size != 0:
             output_num += 1
+
+        output_layouts = (input_layout,) * output_num
+        return output_layouts
+
+class TensorSplitDistributedOp(DistributedOp):
+    """Distributed implementation for tensor_split operator."""
+
+    def infer_layout(self, layouts, extra_args):
+        """
+        Infer output layouts for tensor_split operator.
+
+        Rules:
+        1. Shared (sharded) axis cannot be split.
+        2. Default: dim = 0 if not specified.
+
+        Args:
+            layouts (list): Layout of the input tensor.
+            extra_args (list): Extracted non-tensor arguments and input shapes. Expected:
+                extra_args[0]: indices_or_sections (int, tuple, list, or 1D tensor)
+                extra_args[1]: dim (optional, default is 0)
+                extra_args[-1]: input_shapes (list containing the shape of the input tensor)
+
+        Returns:
+            tuple: Layouts for the output tensors
+        """
+        if not layouts or layouts[0] is None:
+            raise ValueError("tensor_split requires a valid input tensor layout.")
+
+        input_layout = layouts[0]
+
+        # Parse extra_args based on the dispatcher's WithShape suffix rules
+        if len(extra_args) == 1:
+            indices_or_sections = extra_args[0]
+            dim = 0  # default
+        elif len(extra_args) == 2:
+            indices_or_sections = extra_args[0]
+            dim = extra_args[1]
+        else:
+            raise ValueError("tensor_split ops extra_args requires 'indices_or_sections' and optionally 'dim'.")
+
+        tensor_map = input_layout.tensor_map
+        input_dim = len(tensor_map)
+
+        # Handle negative dimensions
+        if dim < 0:
+            dim = input_dim + dim
+
+        if not 0 <= dim < input_dim:
+            raise ValueError(f"Dimension out of range (expected [0, {input_dim}), got {dim}).")
+
+        # Check: shared (sharded) axis cannot be split
+        if tensor_map[dim] != -1:
+            raise ValueError(f"Cannot perform tensor_split on sharded axis[{dim}], layout: {input_layout}")
+
+        # Calculate the number of output tensors based on PyTorch's tensor_split rules
+        if isinstance(indices_or_sections, int):
+            output_num = indices_or_sections
+        elif isinstance(indices_or_sections, (list, tuple)):
+            output_num = len(indices_or_sections) + 1
+        elif hasattr(indices_or_sections, "shape") and len(indices_or_sections.shape) == 1:
+            # Handle 1D Tensor case
+            output_num = indices_or_sections.shape[0] + 1
+        else:
+            raise TypeError("tensor_split: indices_or_sections must be an integer, list, tuple, or 1D tensor.")
 
         output_layouts = (input_layout,) * output_num
         return output_layouts
