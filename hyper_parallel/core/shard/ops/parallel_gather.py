@@ -82,21 +82,25 @@ class IndexSelectDistributedOp(DistributedOp):
         output_layout = output_layout(*output_tensor_map)
         return output_layout
 
-
-class GatherDistributedOp(DistributedOp):
-    """Distributed implementation for Gather operator."""
-
+class GatherDDistributedOp(DistributedOp):
+    """Distributed implementation for GatherD operator.
+    
+    GatherD gathers values along a specified axis from the input tensor using the index tensor.
+    
+    Signature: GatherD(input, dim, index) -> output
+    
+    Key constraints:
+    - Input and index must have the same number of dimensions
+    - Output inherits the sharding pattern of the input tensor
+    """
     def infer_layout(self, layouts, extra_args):
         """
-        Infer output layouts for Gather operations.
-
+        Infer output layouts for GatherD operations.
         Args:
-            layouts: Layouts of input tensors
-            extra_args: extra_args of input tensors
-
+            layouts: Layouts of input tensors [input_layout, dim_layout, index_layout]
+            extra_args: Extra arguments containing [dim]
         Returns:
-            tuple: Layout for output tensor.
-
+            Layout: Layout for output tensor.
         Raises:
             ValueError: If input layouts are not compatible or have partial status.
         """
@@ -104,45 +108,142 @@ class GatherDistributedOp(DistributedOp):
         if not self._allow_partial_inputs:
             self._check_partial_inputs(layouts)
 
-        # Check
+        # Validate input count
         if len(layouts) != 3:
-            raise ValueError(f"Gather ops requires 3 layouts, but {len(layouts)}")
+            raise ValueError(
+                f"Operation {self.op_name}: requires 3 layouts (input, dim, index), "
+                f"but got {len(layouts)}"
+            )
+        # Validate extra_args (should contain dim)
         if len(extra_args) != 1:
-            raise ValueError(f"Gather ops requires 1 extra args, but {len(extra_args)}")
-
-        # Parse layout info
-        p_layout, i_layout = layouts[0], layouts[2]
-        axis = extra_args[0]
-
-        p_tensor_map = p_layout.alias_tensor_map
-        i_tensor_map = i_layout.alias_tensor_map
-
-        # Create output layout
-        if p_tensor_map[axis] != "None":
             raise ValueError(
-                f"Operation {self.op_name}: Cannot perform sharding on params along the axis"
+                f"Operation {self.op_name}: requires 1 extra arg (dim), "
+                f"but got {len(extra_args)}"
             )
-
-        if len(p_tensor_map) != len(i_tensor_map):
+        # Parse layouts: [input, dim (non-tensor), index]
+        # Note: dim is a scalar, so layouts[1] should be None
+        input_layout = layouts[0]
+        index_layout = layouts[2]
+        dim = extra_args[0]
+        # Validate layouts exist
+        if input_layout is None or not hasattr(input_layout, "tensor_map"):
+            raise ValueError(f"Operation {self.op_name}: input layout cannot be None")
+        if index_layout is None or not hasattr(index_layout, "tensor_map"):
+            raise ValueError(f"Operation {self.op_name}: index layout cannot be None")
+        input_tensor_map = input_layout.tensor_map
+        index_tensor_map = index_layout.tensor_map
+        # Validate same rank
+        if len(input_tensor_map) != len(index_tensor_map):
             raise ValueError(
-                f"Operation {self.op_name}: input and index must have the same number of dimensions"
+                f"Operation {self.op_name}: input and index must have the same number of dimensions. "
+                f"Got input rank={len(input_tensor_map)}, index rank={len(index_tensor_map)}"
             )
-
-        if axis < -len(p_tensor_map) or axis >= len(p_tensor_map):
+        # Validate dim is in valid range
+        rank = len(input_tensor_map)
+        if dim < -rank or dim >= rank:
             raise ValueError(
-                f"Operation {self.op_name}: dim value is out of valid range"
+                f"Operation {self.op_name}: dim value {dim} is out of valid range [{-rank}, {rank-1}]"
             )
-
-        output_tensor_map = i_tensor_map
-        output_layout = i_layout
+        # Normalize negative dim
+        if dim < 0:
+            dim = dim + rank
+        for axis, (input_axis_map, index_axis_map) in enumerate(zip(input_tensor_map, index_tensor_map)):
+            if axis == dim:
+                continue
+            if input_axis_map != index_axis_map:
+                raise ValueError(
+                    f"Operation {self.op_name}: input and index must use the same sharding on non-dim axis {axis}. "
+                    f"Got input tensor_map={input_tensor_map}, index tensor_map={index_tensor_map}, dim={dim}"
+                )
+        # Output inherits index layout
         output_layout = Layout(
-            mesh_shape=output_layout.mesh_shape,
-            alias_name=output_layout.alias_name,
-            rank_list=output_layout.rank_list,
+            mesh_shape=index_layout.mesh_shape,
+            alias_name=index_layout.alias_name,
+            rank_list=index_layout.rank_list,
         )
-        output_layout = output_layout(*output_tensor_map)
+        output_layout.set_tensor_map(index_layout.tensor_map)
+        if input_tensor_map[dim] != -1:
+            # pylint: disable=protected-access
+            # Inherit current partial state from index layout
+            output_layout._partial = list(index_layout.partial)
+            # Calculate the device axis name for the dim dimension
+            # tensor_map uses reverse indexing: tensor_map[i] = len(alias_name) - 1 - device_axis
+            device_axis_idx = len(index_layout.alias_name) - 1 - input_tensor_map[dim]
+            dim_axis_name = index_layout.alias_name[device_axis_idx]
+            output_layout.set_partial_by_dev_axis(dim_axis_name, 'sum')
+        # pylint: disable=protected-access
+        # Rebuild readable alias tensor map
+        output_layout._alias_tensor_map = output_layout._build_readable_tensor_map()
+        # pylint: disable=protected-access
+        # Sync tensor_map to placement representation
+        output_layout.tensor_map_to_placement()
+        # Update compact string description
+        output_layout.update_compact_str()
         return output_layout
-
+    def get_expand_impl(self, func, output_layout, layouts, extra_args):
+        """
+        Returns the execution implementation wrapper for distributed GatherD.
+        
+        When the dim axis is sharded, each rank gathers from its local slice of the input tensor.
+        The indices need to be adjusted to account for the local partition offset.
+        
+        Args:
+            func: The original GatherD function to wrap
+            output_layout: The inferred output layout
+            layouts: Layouts of input tensors [input_layout, dim_layout, index_layout]
+            extra_args: Extra arguments containing [dim]
+            
+        Returns:
+            Callable: Distributed implementation wrapper, or None if no sharding
+        """
+        input_layout = layouts[0]
+        dim = extra_args[0]
+        # Get tensor maps
+        input_tensor_map = input_layout.tensor_map
+        # Check if dim axis is sharded (enhanced MP)
+        # tensor_map[dim] == -1 means replicated, otherwise sharded
+        if input_tensor_map[dim] == -1: # native sharding, no need for custom implementation
+            return None
+        def distributed_gatherd_impl(*args, **kwargs):
+            """
+            Distributed GatherD implementation for sharded dim axis.
+            
+            Each rank gathers from its local slice of input tensor.
+            Indices are adjusted by subtracting the local partition offset.
+            """
+            input_tensor = args[0]
+            index_tensor = args[2]
+            # Calculate local partition offset for the dim axis
+            mesh = input_layout.mesh
+            # Convert tensor_map index to mesh axis index (reverse order)
+            mesh_dim_idx = len(mesh.mesh_shape) - 1 - input_tensor_map[dim]
+            # Get the coordinate of current rank along the mesh dimension
+            dim_coord = mesh.get_local_rank(mesh_dim_idx)
+            # Calculate the size of input tensor's dim dimension per partition
+            input_dim_size = input_tensor.shape[dim]
+            # Calculate the starting index of local partition
+            local_start_index = int(dim_coord * input_dim_size)
+            local_end_index = int(local_start_index + input_dim_size)
+            # Adjust indices: subtract local_start_index to map global indices to local range
+            # This is similar to how Embedding shifts indices for Row Parallelism
+            adjusted_index = index_tensor - local_start_index
+            # Create mask to identify out-of-bounds indices
+            # Indices outside [0, local_dim_size) belong to other partitions
+            mask = (index_tensor >= local_start_index) & (index_tensor < local_end_index)
+            # Cross-platform cast to matching int dtype
+            mask_int = mask.to(index_tensor.dtype)
+            # Zero out invalid indices to prevent out-of-bounds access
+            safe_index = adjusted_index * mask_int
+            # Replace original index tensor with adjusted index
+            new_args = list(args)
+            new_args[2] = safe_index
+            # Execute native GatherD with adjusted indices
+            output = func(*new_args, **kwargs)
+            # Zero out outputs corresponding to invalid indices
+            mask_int = mask_int.to(output.dtype)
+            output = output * mask_int
+            return output
+        return distributed_gatherd_impl
 
 class GatherNdDistributedOp(DistributedOp):
     """Distributed implementation for GatherNd operator."""
