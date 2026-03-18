@@ -13,7 +13,3 @@ ReduceMax:
   distributed_op_class: ReduceMaxDistributedOp
   distributed_op_file: parallel_reduce
 
-max:
-  dist_op_name: _torch_max_dist_op
-  distributed_op_class: MaxDistributedOp
-  distributed_op_file: parallel_reduce
