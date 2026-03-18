@@ -12,71 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test parallel sort op"""
-from tests.torch.utils import torchrun_case
+"""test parallel op sort"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_SORT = "parallel_op_sort.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_sort_basic():
-    '''
-    Feature: test parallel op sort.
-    Description: test parallel op sort basic functionality.
+def test_parallel_op_sort_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_sort_basic
+        2.test_distributed_sort_descending
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_sort.py"
-    case_name = "test_distributed_sort_basic"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SORT, "test_distributed_sort_basic", 10359, 4),
+        TorchCase(PARALLEL_OP_SORT, "test_distributed_sort_descending", 10360, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_sort_descending():
-    '''
-    Feature: test parallel op sort.
-    Description: test parallel op sort with descending=True.
+def test_parallel_op_sort_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_sort_middle_dim
+        2.test_distributed_sort_negative_dim
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_sort.py"
-    case_name = "test_distributed_sort_descending"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SORT, "test_distributed_sort_middle_dim", 10361, 4),
+        TorchCase(PARALLEL_OP_SORT, "test_distributed_sort_negative_dim", 10362, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_sort_middle_dim():
-    '''
-    Feature: test parallel op sort.
-    Description: test parallel op sort on middle dimension of 3D tensor.
+def test_parallel_op_sort_group3():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_sort_sharded_dim_error
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_sort.py"
-    case_name = "test_distributed_sort_middle_dim"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_sort_negative_dim():
-    '''
-    Feature: test parallel op sort.
-    Description: test parallel op sort with negative dimension index.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_sort.py"
-    case_name = "test_distributed_sort_negative_dim"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_sort_sharded_dim_error():
-    '''
-    Feature: test parallel op sort.
-    Description: test error raising when sorting sharded dimension.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_sort.py"
-    case_name = "test_distributed_sort_sharded_dim_error"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SORT, "test_distributed_sort_sharded_dim_error", 10363, 4),
+    ])

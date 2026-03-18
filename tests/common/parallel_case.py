@@ -14,6 +14,7 @@
 # ============================================================================
 """parallel run case"""
 import os
+import signal
 import multiprocessing as mp
 from typing import Union
 
@@ -45,6 +46,9 @@ def run_case(visible_devices, case: Union[TorchCase, MindSporeCase]):
     """
     run case in child process
     """
+    # become the leader of a new process group so that os.killpg on timeout
+    # kills torchrun/msrun worker sub-processes as well as this wrapper
+    os.setsid()
     # set visible devices for current case
     os.environ['ASCEND_RT_VISIBLE_DEVICES'] = ','.join(map(str, visible_devices))
     if isinstance(case, TorchCase):
@@ -78,19 +82,28 @@ def parallel_run(cases: Union[list[TorchCase], list[MindSporeCase]], global_num_
     assert sum_num_proc <= global_num_proc, (f"sum num_proc {sum_num_proc} greater than "
                                              f"global_num_proc {global_num_proc}")
 
-    # create child process
+    # create child process (run_case calls os.setsid to own a process group,
+    # so os.killpg on timeout kills torchrun/msrun workers too)
     processes = []
     for _, (case, devices) in enumerate(zip(cases, assignments)):
         p = mp.Process(target=run_case, args=(devices, case))
         p.start()
         processes.append(p)
 
-    # wait child process terminates (timeout=600s to prevent infinite hang on distributed deadlock)
-    for p in processes:
+    # wait child process terminates (timeout=900s to prevent infinite hang on distributed deadlock)
+    timed_out = []
+    for i, p in enumerate(processes):
         p.join(timeout=900)
         if p.is_alive():
-            p.kill()
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.join()
+            timed_out.append(cases[i].case_name)
 
     # check results for all cases
+    if timed_out:
+        raise AssertionError(f"Cases timed out (possible collective deadlock): {timed_out}")
     failed = [cases[i].case_name for i, p in enumerate(processes) if p.exitcode != 0]
     assert not failed, f"List cases failed: {failed}"

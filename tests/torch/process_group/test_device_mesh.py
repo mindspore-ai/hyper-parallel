@@ -12,62 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test_process_group.py"""
+"""test device mesh"""
 from tests.common.mark_utils import arg_mark
-from tests.torch.utils import torchrun_case
+from tests.common.parallel_case import parallel_run, TorchCase
+
+DEVICE_MESH = "device_mesh.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_device_mesh_from_1d_group_valid():
+def test_device_mesh_group1():
     """
-    Feature: Test case test_device_mesh_from_1d_group_valid in device_mesh.py.
-    Description: Initial environments for torch, and execute case test_device_mesh_from_1d_group_valid in
-        device_mesh.py.
+    Feature: parallel run case in process_group
+    Description:
+        1.test_device_mesh_from_1d_group_valid
+        2.test_device_mesh_from_2d_group_use_list_valid
     Expectation: Run success.
     """
-    file_name = "device_mesh.py"
-    case_name = "test_device_mesh_from_1d_group_valid"
-    master_port = 10124
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(DEVICE_MESH, "test_device_mesh_from_1d_group_valid", 10124, 2),
+        TorchCase(DEVICE_MESH, "test_device_mesh_from_2d_group_use_list_valid", 10127, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_device_mesh_from_2d_group_valid():
+def test_device_mesh_group2():
     """
-    Feature: Test case test_device_mesh_from_2d_group_valid in device_mesh.py.
-    Description: Initial environments for torch, and execute case test_device_mesh_from_2d_group_valid in
-        device_mesh.py.
+    Feature: parallel run case in process_group
+    Description:
+        1.test_device_mesh_from_2d_group_valid
+        2.test_device_mesh_from_3d_group_valid
     Expectation: Run success.
     """
-    file_name = "device_mesh.py"
-    case_name = "test_device_mesh_from_2d_group_valid"
-    master_port = 10125
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_device_mesh_from_2d_group_use_list_valid():
-    """
-    Feature: Test case test_device_mesh_from_2d_group_valid in device_mesh.py.
-    Description: Initial environments for torch, and execute case test_device_mesh_from_2d_group_valid in
-        device_mesh.py.
-    Expectation: Run success.
-    """
-    file_name = "device_mesh.py"
-    case_name = "test_device_mesh_from_2d_group_use_list_valid"
-    master_port = 10127
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_device_mesh_from_3d_group_valid():
-    """
-    Feature: Test case test_device_mesh_from_3d_group_valid in device_mesh.py.
-    Description: Initial environments for torch, and execute case test_device_mesh_from_3d_group_valid in
-        device_mesh.py.
-    Expectation: Run success.
-    """
-    file_name = "device_mesh.py"
-    case_name = "test_device_mesh_from_3d_group_valid"
-    master_port = 10126
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(DEVICE_MESH, "test_device_mesh_from_2d_group_valid", 10125, 4),
+        TorchCase(DEVICE_MESH, "test_device_mesh_from_3d_group_valid", 10126, 4),
+    ])

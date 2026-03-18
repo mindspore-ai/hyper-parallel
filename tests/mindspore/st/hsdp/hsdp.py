@@ -28,6 +28,17 @@ from tests.common.mark_utils import arg_mark
 from tests.mindspore.st.common_net import SlimLeNet
 from tests.mindspore.st.hsdp.hsdp_test_common import hsdp_network_ckpt_path
 from tests.mindspore.st.utils import skip_if_ms_version_lt, skip_if_ms_plugin_not_exist
+
+_MODE_PARAMS = ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])]
+_MODE_PARAMS_WITH_PLUGIN = [
+    "eager",
+    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
+]
+_MODE_PARAMS_COMM_FUSION_SKIP = [
+    "eager",
+    pytest.param("jit_ast", marks=pytest.mark.skip(reason="comm_fusion is not supported in jit_ast mode now"))
+]
+
 rt.launch_blocking()
 ms.set_seed(1)
 ms.set_deterministic(True)
@@ -191,121 +202,103 @@ def test_standalone_run():
     make_baseline_by_standalone_run()
 
 
-@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+@pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_pure_dp(mode):
     init()
     hsdp_without_accumulate_grad(shard_size=1, mode=mode)
 
 
-@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+@pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_zero1_fully_shard(mode):
     init()
     hsdp_without_accumulate_grad(
         shard_size=8, optimizer_level="level1", mode=mode)
 
 
-@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+@pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_zero1_partial_shard(mode):
     init()
     hsdp_without_accumulate_grad(
         shard_size=4, optimizer_level="level1", mode=mode)
 
 
-@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+@pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_zero2_fully_shard(mode):
     init()
     hsdp_without_accumulate_grad(
         shard_size=8, optimizer_level="level2", mode=mode)
 
 
-@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+@pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_zero2_partial_shard(mode):
     init()
     hsdp_without_accumulate_grad(
         shard_size=4, optimizer_level="level2", mode=mode)
 
 
-@pytest.mark.parametrize("mode", [
-    "eager",
-    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
-])
+@pytest.mark.parametrize("mode", _MODE_PARAMS_WITH_PLUGIN)
 def test_zero3_fully_shard(mode):
     init()
     hsdp_without_accumulate_grad(
         shard_size=8, optimizer_level="level3", mode=mode)
 
 
-@pytest.mark.parametrize("mode", [
-    "eager",
-    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
-])
+@pytest.mark.parametrize("mode", _MODE_PARAMS_WITH_PLUGIN)
 def test_zero3_partial_shard(mode):
     init()
     hsdp_without_accumulate_grad(
         shard_size=4, optimizer_level="level3", mode=mode)
 
 
-@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+@pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_pure_dp_with_acc_grad(mode):
     init()
     hsdp_with_accumulate_grad(shard_size=1, micro_step=8, mode=mode)
 
 
-@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+@pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_zero1_fully_shard_with_acc_grad(mode):
     init()
     hsdp_with_accumulate_grad(
         shard_size=8, optimizer_level="level1", micro_step=8, mode=mode)
 
 
-@pytest.mark.parametrize("mode", [
-    "eager",
-    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
-])
+@pytest.mark.parametrize("mode", _MODE_PARAMS_WITH_PLUGIN)
 def test_zero1_partial_shard_with_acc_grad(mode):
     init()
     hsdp_with_accumulate_grad(
         shard_size=4, optimizer_level="level1", micro_step=8, mode=mode)
 
 
-@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+@pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_zero2_fully_shard_with_acc_grad(mode):
     init()
     hsdp_with_accumulate_grad(
         shard_size=8, optimizer_level="level2", micro_step=8, mode=mode)
 
 
-@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+@pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_zero2_partial_shard_with_acc_grad(mode):
     init()
     hsdp_with_accumulate_grad(
         shard_size=4, optimizer_level="level2", micro_step=8, mode=mode)
 
 
-@pytest.mark.parametrize("mode", [
-    "eager",
-    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
-])
+@pytest.mark.parametrize("mode", _MODE_PARAMS_WITH_PLUGIN)
 def test_zero3_fully_shard_with_acc_grad(mode):
     init()
     hsdp_with_accumulate_grad(
         shard_size=8, optimizer_level="level3", micro_step=8, mode=mode)
 
 
-@pytest.mark.parametrize("mode", [
-    "eager",
-    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
-])
+@pytest.mark.parametrize("mode", _MODE_PARAMS_WITH_PLUGIN)
 def test_zero3_partial_shard_with_acc_grad(mode):
     init()
     hsdp_with_accumulate_grad(
         shard_size=4, optimizer_level="level3", micro_step=8, mode=mode)
 
 
-@pytest.mark.parametrize("mode", [
-    "eager",
-    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
-])
+@pytest.mark.parametrize("mode", _MODE_PARAMS_WITH_PLUGIN)
 def test_zero3_partial_shard_with_async_acc_grad(mode):
     '''
     Feature: zero3 partial shard data parallel with async grad accumulation.
@@ -317,11 +310,7 @@ def test_zero3_partial_shard_with_async_acc_grad(mode):
         shard_size=4, optimizer_level="level3", micro_step=8, comm_async=True, mode=mode)
 
 
-@pytest.mark.parametrize("mode", [
-    "eager",
-    pytest.param("jit_ast", marks=pytest.mark.skip(
-        reason="comm_fusion is not supported in jit_ast mode now"))  # TODO: support this
-])
+@pytest.mark.parametrize("mode", _MODE_PARAMS_COMM_FUSION_SKIP)  # TODO: support jit_ast
 def test_zero3_with_comm_fusion(mode):
     '''
     Feature: zero3 with comm fusion, gradient will be fused to only one buffer.
@@ -333,11 +322,7 @@ def test_zero3_with_comm_fusion(mode):
                               micro_step=8, comm_async=True, comm_fusion=True, mode=mode)
 
 
-@pytest.mark.parametrize("mode", [
-    "eager",
-    pytest.param("jit_ast", marks=pytest.mark.skip(
-        reason="comm_fusion is not supported in jit_ast mode now"))  # TODO: support this
-])
+@pytest.mark.parametrize("mode", _MODE_PARAMS_COMM_FUSION_SKIP)  # TODO: support jit_ast
 def test_zero3_with_comm_fusion_bucket_size(mode):
     '''
     Feature: zero3 with comm fusion bucket size, gradient will be fused to buffer whose size is limited by bucket size.
@@ -349,10 +334,7 @@ def test_zero3_with_comm_fusion_bucket_size(mode):
                               comm_fusion=True, bucket_size=2000, mode=mode)
 
 
-@pytest.mark.parametrize("mode", [
-    "eager",
-    pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1"), skip_if_ms_plugin_not_exist()])
-])
+@pytest.mark.parametrize("mode", _MODE_PARAMS_WITH_PLUGIN)
 def test_zero3_with_comm_fusion_bucket_size0(mode):
     '''
     Feature: zero3 with comm fusion bucket size 0 which mean gradient will not be fused into buffer.
@@ -365,7 +347,7 @@ def test_zero3_with_comm_fusion_bucket_size0(mode):
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
-@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+@pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_no_dp(mode):
     '''
     Feature: apply hsdp with single node.
@@ -376,7 +358,7 @@ def test_no_dp(mode):
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
-@pytest.mark.parametrize("mode", ["eager", pytest.param("jit_ast", marks=[skip_if_ms_version_lt("2.8.1")])])
+@pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_no_dp_with_acc_grad(mode):
     '''
     Feature: apply hsdp with single node gradient accumulation.

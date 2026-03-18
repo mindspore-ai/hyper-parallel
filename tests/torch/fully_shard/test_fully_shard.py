@@ -15,82 +15,51 @@
 """test fully_shard api"""
 
 from tests.common.mark_utils import arg_mark
-from tests.torch.utils import torchrun_case
+from tests.common.parallel_case import parallel_run, TorchCase
+
+_TEST_FULLY_SHARD = "_test_fully_shard.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_fully_shard_01():
+def test_fully_shard_group1():
     """
-    Feature: Test fully_shard with simple network, optimization level is default ZeRO-3
-    Description: The DenseNet only have one weight and no bias, verify the basic process of fully_shard
-    Expectation: run successfully
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_fully_shard_01
+        2.test_fully_shard_02
+    Expectation: Run success.
     """
-    master_port = 12342
-    file_name = "_test_fully_shard.py"
-    case_name = "test_fully_shard_01"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(_TEST_FULLY_SHARD, "test_fully_shard_01", 12342, 4),
+        TorchCase(_TEST_FULLY_SHARD, "test_fully_shard_02", 12400, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_fully_shard_02():
+def test_fully_shard_group2():
     """
-    Feature: Test fully_shard with multi-layer network, optimization level is default ZeRO-3
-    Description: The FullyShardTestNet is a multi-layer module, verify the basic process of fully_shard
-    Expectation: run successfully
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_fully_shard_03
+        2.test_fully_shard_meta_init
+    Expectation: Run success.
     """
-    master_port = 12342
-    file_name = "_test_fully_shard.py"
-    case_name = "test_fully_shard_02"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(_TEST_FULLY_SHARD, "test_fully_shard_03", 12345, 4),
+        TorchCase(_TEST_FULLY_SHARD, "test_fully_shard_meta_init", 12346, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_fully_shard_03():
+def test_fully_shard_group3():
     """
-    Feature: Test fully_shard with buffer network, CPU init
-    Description: NetWithBuffer has BatchNorm buffers, init on CPU, _move_states_to_device moves to NPU
-    Expectation: run successfully
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_fully_shard_from_group_mesh
+        2.test_fully_shard_none_mesh
+    Expectation: Run success.
     """
-    master_port = 12345
-    file_name = "_test_fully_shard.py"
-    case_name = "test_fully_shard_03"
-    torchrun_case(file_name, case_name, master_port)
-
-
-# @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_fully_shard_meta_init():
-    """
-    Feature: Test fully_shard with meta device initialization
-    Description: Model is created on meta device, then materialized to NPU before training
-    Expectation: run successfully
-    """
-    master_port = 12346
-    file_name = "_test_fully_shard.py"
-    case_name = "test_fully_shard_meta_init"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_fully_shard_from_group_mesh():
-    """
-    Feature: When mesh created by from_group, test fully_shard with multi-layer network, optimization level is default ZeRO-3
-    Description: The FullyShardTestNet is a multi-layer module, verify the basic process of fully_shard
-    Expectation: run successfully
-    """
-    master_port = 12343
-    file_name = "_test_fully_shard.py"
-    case_name = "test_fully_shard_from_group_mesh"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_fully_shard_none_mesh():
-    """
-    Feature: When pass none mesh, test fully_shard with simple network, optimization level is default ZeRO-3
-    Description: The DenseNet only have one weight and no bias, verify the basic process of fully_shard
-    Expectation: run successfully
-    """
-    master_port = 12344
-    file_name = "_test_fully_shard.py"
-    case_name = "test_fully_shard_none_mesh"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(_TEST_FULLY_SHARD, "test_fully_shard_from_group_mesh", 12343, 4),
+        TorchCase(_TEST_FULLY_SHARD, "test_fully_shard_none_mesh", 12344, 4),
+    ])

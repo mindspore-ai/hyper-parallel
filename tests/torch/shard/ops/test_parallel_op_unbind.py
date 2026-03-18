@@ -12,58 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor unbind"""
-from tests.torch.utils import torchrun_case
+"""test parallel op unbind"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_UNBIND = "parallel_op_unbind.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_unbind_dim0():
-    '''
-    Feature: test parallel op unbind.
-    Description: test parallel op unbind on dim 0.
+def test_parallel_op_unbind_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_unbind_dim0
+        2.test_distributed_unbind_dim1
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_unbind.py"
-    case_name = "test_distributed_unbind_dim0"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_UNBIND, "test_distributed_unbind_dim0", 10359, 4),
+        TorchCase(PARALLEL_OP_UNBIND, "test_distributed_unbind_dim1", 10360, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_unbind_dim1():
-    '''
-    Feature: test parallel op unbind.
-    Description: test parallel op unbind on dim 1.
+def test_parallel_op_unbind_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_unbind_negative_dim
+        2.test_distributed_unbind_sharded_dim_error
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_unbind.py"
-    case_name = "test_distributed_unbind_dim1"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_unbind_negative_dim():
-    '''
-    Feature: test parallel op unbind.
-    Description: test parallel op unbind with negative dim.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_unbind.py"
-    case_name = "test_distributed_unbind_negative_dim"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_unbind_sharded_dim_error():
-    '''
-    Feature: test parallel op unbind.
-    Description: test parallel op unbind error handling.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_unbind.py"
-    case_name = "test_distributed_unbind_sharded_dim_error"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_UNBIND, "test_distributed_unbind_negative_dim", 10361, 4),
+        TorchCase(PARALLEL_OP_UNBIND, "test_distributed_unbind_sharded_dim_error", 10362, 4),
+    ])

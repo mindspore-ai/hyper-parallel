@@ -44,7 +44,7 @@ def test_distributed_reshape_layout_inference():
 
     # Distributed Setup
     # Mesh: (2, 4), dp splits dim 0, tp is unused (None)
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     x_layout = layout("dp", "None", "None", "None") # Shard Batch dim
 
     dist_input = global_to_local(standalone_input, x_layout)
@@ -98,7 +98,7 @@ def test_distributed_view_layout_inference():
     standalone_input = torch.from_numpy(standalone_input_np).npu()
 
     # Scenario: Input [8, 4, 4, 4], Layout: Shard dim 1 (Channel)
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     x_layout = layout("None", "tp", "None", "None") # Shard Channel
 
     dist_input = global_to_local(standalone_input, x_layout)
@@ -135,7 +135,7 @@ def test_distributed_reshape_fail_mismatch():
     """
     init_dist()
 
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     x_layout = layout("dp", "None") # [8, 64] -> split 8
 
     input_np = np.random.randn(8, 64).astype(np.float32)

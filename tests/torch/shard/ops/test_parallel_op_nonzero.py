@@ -12,45 +12,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor nonzero"""
-from tests.torch.utils import torchrun_case
+"""test parallel op nonzero"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_NONZERO = "parallel_op_nonzero.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_nonzero_basic():
-    '''
-    Feature: test parallel op nonzero.
-    Description: test parallel op nonzero with default as_tuple=False.
+def test_parallel_op_nonzero_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_nonzero_basic
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_nonzero.py"
-    case_name = "test_distributed_nonzero_basic"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_NONZERO, "test_distributed_nonzero_basic", 10359, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_nonzero_as_tuple():
-    '''
-    Feature: test parallel op nonzero.
-    Description: test parallel op nonzero with as_tuple=True.
+def test_parallel_op_nonzero_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_nonzero_as_tuple
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_nonzero.py"
-    case_name = "test_distributed_nonzero_as_tuple"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_NONZERO, "test_distributed_nonzero_as_tuple", 10359, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_nonzero_sharded_error():
-    '''
-    Feature: test parallel op nonzero error handling.
-    Description: test parallel op nonzero rejects sharded inputs to prevent dynamic shape crashes.
-    Expectation: Run success (properly raises ValueError).
-    '''
-    master_port = 10359
-    file_name = "parallel_op_nonzero.py"
-    case_name = "test_distributed_nonzero_sharded_error"
-    torchrun_case(file_name, case_name, master_port)
+def test_parallel_op_nonzero_group3():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_nonzero_sharded_error
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_NONZERO, "test_distributed_nonzero_sharded_error", 10359, 8),
+    ])

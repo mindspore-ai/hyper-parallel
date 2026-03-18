@@ -12,55 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op repeat_interleave"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_REPEAT_INTERLEAVE = "parallel_op_repeat_interleave.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_interleave_layout_inference():
+def test_parallel_op_repeat_interleave_group1():
     """
-    Feature: test parallel op repeat_interleave.
-    Description: test parallel op repeat_interleave.
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_repeat_interleave_layout_inference
+        2.test_distributed_repeat_interleave_with_tensor
     Expectation: Run success.
     """
-    master_port = 10890
-    file_name = "parallel_op_repeat_interleave.py"
-    case_name = "test_distributed_repeat_interleave_layout_inference"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_distributed_repeat_interleave_layout_inference", 10890, 4),
+        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_distributed_repeat_interleave_with_tensor", 10891, 4),
+    ])
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_interleave_with_tensor():
+def test_parallel_op_repeat_interleave_group2():
     """
-    Feature: test parallel op repeat_interleave.
-    Description: test parallel op repeat_interleave.
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_repeat_interleave_dim_none
+        2.test_distributed_repeat_interleave_sharded_dim_error
     Expectation: Run success.
     """
-    master_port = 10890
-    file_name = "parallel_op_repeat_interleave.py"
-    case_name = "test_distributed_repeat_interleave_with_tensor"
-    torchrun_case(file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_interleave_dim_none():
-    """
-    Feature: test parallel op repeat_interleave.
-    Description: test parallel op repeat_interleave.
-    Expectation: Run success.
-    """
-    master_port = 10890
-    file_name = "parallel_op_repeat_interleave.py"
-    case_name = "test_distributed_repeat_interleave_dim_none"
-    torchrun_case(file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_interleave_sharded_dim_error():
-    """
-    Feature: test parallel op repeat_interleave.
-    Description: test parallel op repeat_interleave.
-    Expectation: Run success.
-    """
-    master_port = 10890
-    file_name = "parallel_op_repeat_interleave.py"
-    case_name = "test_distributed_repeat_interleave_sharded_dim_error"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_distributed_repeat_interleave_dim_none", 10892, 4),
+        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_distributed_repeat_interleave_sharded_dim_error", 10893, 4),
+    ])

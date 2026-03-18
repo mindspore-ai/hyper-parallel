@@ -79,7 +79,7 @@ def test_distributed_linear_with_bias():
     # bias:   (4,)   -> broadcast (no split)
     local_b = torch.zeros(4).npu()
 
-    layout = Layout((4, 2), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     w_layout = layout("None", "tp")
     b_layout = layout("None",)
     x_layout = layout("dp", "tp")
@@ -146,7 +146,7 @@ def test_distributed_linear_without_bias():
     # weight:  (8,4)  -> split on second dim
     local_w = torch.ones(4, 4).npu()
 
-    layout = Layout((4, 2), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     w_layout = layout("None", "tp")
     x_layout = layout("dp", "tp")
 
@@ -205,15 +205,15 @@ def test_distributed_linear_with_bias_shard():
 
     dist_model = SimpleModel(dist=True).npu()
 
-    # weight:  (8,4)  -> split on second dim
-    local_w = torch.ones(2, 4).npu()
-    # bias:   (4,)   -> split on first dim
+    # weight:  (4,8)  -> split on first dim (column parallel, out_features per tp rank: 2)
+    local_w = torch.ones(2, 8).npu()
+    # bias:   (4,)   -> sharded on out_features (2 per tp rank)
     local_b = torch.zeros(2).npu()
 
-    layout = Layout((2, 2, 2), ("dp", "tp1", "tp2"))
-    x_layout = layout("dp", "tp1")
-    w_layout = layout("tp2", "tp1")
-    b_layout = layout("tp2")
+    layout = Layout((2, 2), ("dp", "tp"))
+    x_layout = layout("dp", "None")
+    w_layout = layout("tp", "None")
+    b_layout = layout("tp",)
 
     dist_model.register_parameter(
         "weight",

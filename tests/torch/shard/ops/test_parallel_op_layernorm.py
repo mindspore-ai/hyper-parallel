@@ -12,32 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op layernorm"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_LAYERNORM = "parallel_op_layernorm.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_layernorm():
-    '''
-    Feature: test parallel op linear.
-    Description: test parallel op linear.
+def test_parallel_op_layernorm_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_layer_norm_layout_inference
     Expectation: Run success.
-    '''
-    master_port = 10890
-    file_name = "parallel_op_layernorm.py"
-    case_name = "test_distributed_layer_norm_layout_inference"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_LAYERNORM, "test_distributed_layer_norm_layout_inference", 10890, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_layernorm_dim_error():
-    '''
-    Feature: test parallel op linear.
-    Description: test parallel op linear.
+def test_parallel_op_layernorm_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_layer_norm_sharded_normalized_dim_error
     Expectation: Run success.
-    '''
-    master_port = 10890
-    file_name = "parallel_op_layernorm.py"
-    case_name = "test_distributed_layer_norm_sharded_normalized_dim_error"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_LAYERNORM, "test_distributed_layer_norm_sharded_normalized_dim_error", 10890, 4),
+    ])

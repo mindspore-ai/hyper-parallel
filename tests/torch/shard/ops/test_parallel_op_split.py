@@ -12,58 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op split"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_SPLIT = "parallel_op_split.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_split_default_dim():
-    '''
-    Feature: test parallel op linear.
-    Description: test parallel op linear.
+def test_parallel_op_split_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_split_layout_inference_default_dim
+        2.test_distributed_split_layout_inference
     Expectation: Run success.
-    '''
-    master_port = 10889
-    file_name = "parallel_op_split.py"
-    case_name = "test_distributed_split_layout_inference_default_dim"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SPLIT, "test_distributed_split_layout_inference_default_dim", 10889, 4),
+        TorchCase(PARALLEL_OP_SPLIT, "test_distributed_split_layout_inference", 10890, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_split():
-    '''
-    Feature: test parallel op linear.
-    Description: test parallel op linear.
+def test_parallel_op_split_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_split_layout_inference_split_list
+        2.test_distributed_split_on_sharded_dim_error
     Expectation: Run success.
-    '''
-    master_port = 10889
-    file_name = "parallel_op_split.py"
-    case_name = "test_distributed_split_layout_inference"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_split_split_list():
-    '''
-    Feature: test parallel op linear.
-    Description: test parallel op linear.
-    Expectation: Run success.
-    '''
-    master_port = 10889
-    file_name = "parallel_op_split.py"
-    case_name = "test_distributed_split_layout_inference_split_list"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_split_on_sharded_dim():
-    '''
-    Feature: test parallel op linear.
-    Description: test parallel op linear.
-    Expectation: Run success.
-    '''
-    master_port = 10889
-    file_name = "parallel_op_split.py"
-    case_name = "test_distributed_split_on_sharded_dim_error"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SPLIT, "test_distributed_split_layout_inference_split_list", 10891, 4),
+        TorchCase(PARALLEL_OP_SPLIT, "test_distributed_split_on_sharded_dim_error", 10892, 4),
+    ])

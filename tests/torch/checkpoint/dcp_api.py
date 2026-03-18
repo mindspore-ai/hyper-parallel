@@ -176,45 +176,45 @@ def _run_dcp_save_load_test(
 def test_dcp_api_with_dtensor_and_tensor_and_scalar() -> None:
     """
     Feature: Test checkpoint save and load API with DTensor state_dict using different mesh_shape and layouts.
-    Description: Test save and load function with state_dict containing DTensors on 8-card setup with mesh_shape (4, 2).
+    Description: Test save and load function with state_dict containing DTensors on 4-card setup with mesh_shape (2, 2).
     Expectation: Run success, checkpoint saved correctly, and loaded values match original values.
     """
     checkpoint_path = Path("./test_dcp_api")
-    mesh_shape = (4, 2)  # Different mesh_shape: 4 data parallel, 2 tensor parallel
+    mesh_shape = (2, 2)  # Different mesh_shape: 2 data parallel, 2 tensor parallel
 
     # Parameter configurations:
     # Note: placements order is [dp_mesh_dim, tp_mesh_dim]
     # param1: sharded along dp dimension (tensor dim 0 sharded on dp mesh dim)
-    #   Global shape: (16, 8), Local shape: (4, 8) per rank (dp dimension has 4 devices)
+    #   Global shape: (16, 8), Local shape: (8, 8) per rank (dp dimension has 2 devices)
     # param2: sharded along both dimensions (tensor dim 0 on dp, dim 1 on tp)
-    #   Global shape: (12, 8), Local shape: (3, 4) per rank (dp has 4 devices, tp has 2 devices)
+    #   Global shape: (12, 8), Local shape: (6, 4) per rank (dp has 2 devices, tp has 2 devices)
     # param3: replicated (all dimensions replicated)
     #   Global shape: (6, 6), Local shape: (6, 6) per rank
     # param4: sharded along tp dimension (tensor dim 1 sharded on tp mesh dim)
     #   Global shape: (8, 8), Local shape: (8, 4) per rank (tp dimension has 2 devices)
     # param5: sharded along dp dimension (tensor dim 0 sharded on dp mesh dim)
-    #   Global shape: (20, 10), Local shape: (5, 10) per rank (dp dimension has 4 devices)
+    #   Global shape: (20, 10), Local shape: (10, 10) per rank (dp dimension has 2 devices)
     # param6: sharded along both dimensions (tensor dim 0 on dp, dim 1 on tp)
-    #   Global shape: (16, 12), Local shape: (4, 6) per rank (dp has 4 devices, tp has 2 devices)
+    #   Global shape: (16, 12), Local shape: (8, 6) per rank (dp has 2 devices, tp has 2 devices)
     # param7: replicated (all dimensions replicated)
     #   Global shape: (10, 10), Local shape: (10, 10) per rank
     # param8: sharded along tp dimension (tensor dim 1 sharded on tp mesh dim)
     #   Global shape: (14, 6), Local shape: (14, 3) per rank (tp dimension has 2 devices)
     # param9: sharded along dp dimension (tensor dim 0 sharded on dp mesh dim)
-    #   Global shape: (24, 8), Local shape: (6, 8) per rank (dp dimension has 4 devices)
+    #   Global shape: (24, 8), Local shape: (12, 8) per rank (dp dimension has 2 devices)
     # param10: sharded along both dimensions (tensor dim 0 on dp, dim 1 on tp)
-    #   Global shape: (8, 10), Local shape: (2, 5) per rank (dp has 4 devices, tp has 2 devices)
+    #   Global shape: (8, 10), Local shape: (4, 5) per rank (dp has 2 devices, tp has 2 devices)
     param_configs = [
-        {'name': 'param1', 'placements': [Shard(0), Replicate()], 'local_shape': (4, 8)},
-        {'name': 'param2', 'placements': [Shard(0), Shard(1)], 'local_shape': (3, 4)},
+        {'name': 'param1', 'placements': [Shard(0), Replicate()], 'local_shape': (8, 8)},
+        {'name': 'param2', 'placements': [Shard(0), Shard(1)], 'local_shape': (6, 4)},
         {'name': 'param3', 'placements': [Replicate(), Replicate()], 'local_shape': (6, 6)},
         {'name': 'param4', 'placements': [Replicate(), Shard(1)], 'local_shape': (8, 4)},
-        {'name': 'param5', 'placements': [Shard(0), Replicate()], 'local_shape': (5, 10)},
-        {'name': 'param6', 'placements': [Shard(0), Shard(1)], 'local_shape': (4, 6)},
+        {'name': 'param5', 'placements': [Shard(0), Replicate()], 'local_shape': (10, 10)},
+        {'name': 'param6', 'placements': [Shard(0), Shard(1)], 'local_shape': (8, 6)},
         {'name': 'param7', 'placements': [Replicate(), Replicate()], 'local_shape': (10, 10)},
         {'name': 'param8', 'placements': [Replicate(), Shard(1)], 'local_shape': (14, 3)},
-        {'name': 'param9', 'placements': [Shard(0), Replicate()], 'local_shape': (6, 8)},
-        {'name': 'param10', 'placements': [Shard(0), Shard(1)], 'local_shape': (2, 5)},
+        {'name': 'param9', 'placements': [Shard(0), Replicate()], 'local_shape': (12, 8)},
+        {'name': 'param10', 'placements': [Shard(0), Shard(1)], 'local_shape': (4, 5)},
     ]
 
     # Add scalar values (int and float) to test mixed DTensor and scalar save/load
@@ -262,7 +262,7 @@ def test_dcp_api_with_full_tensor() -> None:
     Expectation: Run success, checkpoint saved correctly, and loaded values match original values.
     """
     checkpoint_path = Path("./test_dcp_full_tensor")
-    mesh_shape = (2, 4)
+    mesh_shape = (1, 2)
 
     # Only torch Tensors - no DTensor, no scalars
     tensor_values = {
@@ -444,11 +444,11 @@ def test_dcp_api_save_8card_load_4card() -> None:
     """
     checkpoint_path = Path("./test_dcp_8card_reshard_to_4card")
 
-    # Save phase: 8-card cluster (2 data parallel, 4 tensor parallel)
-    save_mesh_shape = (2, 4)
+    # Save phase: 4-card cluster (1 data parallel, 4 tensor parallel)
+    save_mesh_shape = (1, 4)
 
-    # Load phase: 4-card cluster (2 data parallel, 2 tensor parallel)
-    load_mesh_shape = (2, 2)
+    # Load phase: 2-card cluster (1 data parallel, 2 tensor parallel)
+    load_mesh_shape = (1, 2)
 
     # Parameter configurations for save (8-card):
     # param1: sharded along tp dimension (tensor dim 1 sharded on tp mesh dim)

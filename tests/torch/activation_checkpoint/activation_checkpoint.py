@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Test Activation checkpoint memory comparison: None vs Recompute vs Save vs Swap"""
+"""Activation checkpoint memory comparison: None vs Recompute vs Save vs Swap"""
 import torch
 
 from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, checkpoint_wrapper
-from tests.common.mark_utils import arg_mark
 from tests.torch.common_net import SimpleTransformer
 from tests.torch.activation_checkpoint.utils import prepare_data, seed_memory_time_context, train_one_mode
 
@@ -58,7 +57,6 @@ def apply_recompute(model, mode):
     return model
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_ac_memory_comparison():
     """
     Feature: Activation Checkpointing and Swapping Memory Behavior

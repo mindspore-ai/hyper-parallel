@@ -12,19 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test base shard"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+BASE_SHARD = "base_shard.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_base_shard():
-    '''
-    Feature: test base shard.
+    """
+    Feature: parallel run case in shard
     Description:
+        1.test_base_shard
     Expectation: Run success.
-    '''
-    master_port = 10999
-    file_name = "base_shard.py"
-    case_name = "test_base_shard"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(BASE_SHARD, "test_base_shard", 10999, 2)
+    ])

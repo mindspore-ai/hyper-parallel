@@ -12,58 +12,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor with atleast_1d"""
-from tests.torch.utils import torchrun_case
+"""test parallel op atleast_1d"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_ATLEAST_1D = "parallel_op_atleast_1d.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_atleast_1d_0d():
-    '''
-    Feature: test parallel op atleast_1d.
-    Description: test parallel op atleast_1d with 0-dimensional scalar tensor.
+def test_parallel_op_atleast_1d_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_atleast_1d_0d
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_atleast_1d.py"
-    case_name = "test_distributed_atleast_1d_0d"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_ATLEAST_1D, "test_distributed_atleast_1d_0d", 10359, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_atleast_1d_1d():
-    '''
-    Feature: test parallel op atleast_1d.
-    Description: test parallel op atleast_1d with 1-dimensional sharded tensor.
+def test_parallel_op_atleast_1d_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_atleast_1d_1d
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_atleast_1d.py"
-    case_name = "test_distributed_atleast_1d_1d"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_ATLEAST_1D, "test_distributed_atleast_1d_1d", 10359, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_atleast_1d_2d():
-    '''
-    Feature: test parallel op atleast_1d.
-    Description: test parallel op atleast_1d with 2-dimensional tensor with mixed sharding.
+def test_parallel_op_atleast_1d_group3():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_atleast_1d_2d
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_atleast_1d.py"
-    case_name = "test_distributed_atleast_1d_2d"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_ATLEAST_1D, "test_distributed_atleast_1d_2d", 10359, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_atleast_1d_multiple_tensors():
-    '''
-    Feature: test parallel op atleast_1d.
-    Description: test parallel op atleast_1d with multiple tensors as input arguments.
+def test_parallel_op_atleast_1d_group4():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_atleast_1d_multiple_tensors
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_atleast_1d.py"
-    case_name = "test_distributed_atleast_1d_multiple_tensors"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_ATLEAST_1D, "test_distributed_atleast_1d_multiple_tensors", 10359, 8),
+    ])

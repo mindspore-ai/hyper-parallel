@@ -12,58 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor multinomial"""
-from tests.torch.utils import torchrun_case
+"""test parallel op multinomial"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_MULTINOMIAL = "parallel_op_multinomial.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_multinomial_1d_replicated():
-    '''
-    Feature: test parallel op multinomial.
-    Description: test parallel op multinomial with 1D replicated input.
+def test_parallel_op_multinomial_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_multinomial_1d_replicated
+        2.test_distributed_multinomial_2d_batch_sharded
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_multinomial.py"
-    case_name = "test_distributed_multinomial_1d_replicated"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_distributed_multinomial_1d_replicated", 10359, 4),
+        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_distributed_multinomial_2d_batch_sharded", 10360, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_multinomial_2d_batch_sharded():
-    '''
-    Feature: test parallel op multinomial.
-    Description: test parallel op multinomial with 2D batch sharded input.
+def test_parallel_op_multinomial_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_multinomial_2d_fully_replicated
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_multinomial.py"
-    case_name = "test_distributed_multinomial_2d_batch_sharded"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_distributed_multinomial_2d_fully_replicated", 10361, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_multinomial_2d_fully_replicated():
-    '''
-    Feature: test parallel op multinomial.
-    Description: test parallel op multinomial with 2D fully replicated input.
+def test_parallel_op_multinomial_group3():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_multinomial_error_sharded_prob
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_multinomial.py"
-    case_name = "test_distributed_multinomial_2d_fully_replicated"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_multinomial_error_sharded_prob():
-    '''
-    Feature: test parallel op multinomial.
-    Description: test parallel op multinomial error handling.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_multinomial.py"
-    case_name = "test_distributed_multinomial_error_sharded_prob"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_distributed_multinomial_error_sharded_prob", 10359, 4),
+    ])

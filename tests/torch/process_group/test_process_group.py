@@ -12,21 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test_process_group.py"""
+"""test process group"""
 from tests.common.mark_utils import arg_mark
-from tests.torch.utils import torchrun_case
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PROCESS_GROUP = "process_group.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_process_group():
     """
-    Feature: Init process group, get rank list and backend in group, then destroy the group.
-    Description: Test init process group with backend is ``hccl``, then try to get rank list and backend in this
-        process group. After that, create a sub process group and get rank list and backend in sub process group.
-        Finally, destroy the sub process group and process group.
+    Feature: parallel run case in process_group
+    Description:
+        1.test_process_group
     Expectation: Run success.
     """
-    file_name = "process_group.py"
-    case_name = "test_process_group"
-    master_port = 10133
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(PROCESS_GROUP, "test_process_group", 10133, 4)
+    ])

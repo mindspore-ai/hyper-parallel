@@ -14,189 +14,157 @@
 # ============================================================================
 """test sub_mesh"""
 from tests.common.parallel_case import parallel_run, TorchCase
-from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
+
+SUBMESH = "submesh.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_full_and_sub_mesh_forward_parallel():
+def test_submesh_group1():
     """
-    Feature: parallel run testcases are list below:
+    Feature: parallel run case in shard
     Description:
-        submesh.py::test_full_mesh_shard_forward_1
-        submesh.py::test_sub_mesh_column_parallel_forward
+        1.test_full_mesh_shard_forward_1
+        2.test_sub_mesh_column_parallel_forward
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase("submesh.py", "test_full_mesh_shard_forward_1", 18311, 4),
-        TorchCase("submesh.py", "test_sub_mesh_column_parallel_forward", 18312, 4),
+        TorchCase(SUBMESH, "test_full_mesh_shard_forward_1", 18311, 4),
+        TorchCase(SUBMESH, "test_sub_mesh_column_parallel_forward", 18312, 4),
     ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_full_mesh_shard_forward_2():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_full_mesh_shard_forward_2
+        2.test_sub_mesh_row_parallel_forward
     Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_full_mesh_shard_forward_2"
-    torchrun_case(file_name, case_name, master_port, num_proc=4)
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_full_mesh_shard_forward_2", 11754, 4),
+        TorchCase(SUBMESH, "test_sub_mesh_row_parallel_forward", 11755, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_row_parallel_forward():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group3():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_sub_mesh_row_parallel_redistribute_forward
     Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_row_parallel_forward"
-    torchrun_case(file_name, case_name, master_port, num_proc=4)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_row_parallel_redistribute_forward():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
-    Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_row_parallel_redistribute_forward"
-    torchrun_case(file_name, case_name, master_port, num_proc=4)
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_sub_mesh_row_parallel_redistribute_forward", 11756, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_1():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group4():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_sub_mesh_redistribute_1
+        2.test_sub_mesh_redistribute_2
     Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_1"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_1", 11757, 4),
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_2", 11758, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_2():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+def test_submesh_group5():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_sub_mesh_redistribute_3
+        2.test_sub_mesh_redistribute_4
     Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_2"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_3():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
-    Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_3"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_sub_mesh_redistribute_4():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
-    Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_4"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_3", 11759, 2),
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_4", 11760, 2),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_redistribute_5():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_sub_mesh_redistribute_5
     Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_5"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_5", 11761, 8)
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_redistribute_6():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_sub_mesh_redistribute_6
     Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_6"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_6", 11762, 8)
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_redistribute_7():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_sub_mesh_redistribute_7
     Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_7"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_7", 11763, 8)
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_redistribute_8():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_sub_mesh_redistribute_8
     Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_8"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_8", 11764, 8)
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_redistribute_9():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_sub_mesh_redistribute_9
     Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_9"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_9", 11765, 8)
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_redistribute_10():
-    '''
-    Feature: dtensor redistribute.
-    Description: 
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_sub_mesh_redistribute_10
     Expectation: Run success.
-    '''
-    master_port = 11654
-    file_name = "submesh.py"
-    case_name = "test_sub_mesh_redistribute_10"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_10", 11766, 8)
+    ])

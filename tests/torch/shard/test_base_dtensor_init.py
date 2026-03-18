@@ -12,55 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test base dtensor init"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
 
+BASE_DTENSOR_INIT = "base_dtensor_init.py"
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ones():
-    '''
-    Feature: dtensor dispatch/infer_layout/redistribute.
-    Description:
-    Expectation: Run success.
-    '''
-    master_port = 11335
-    file_name = "base_dtensor_init.py"
-    case_name = "test_ones"
-    torchrun_case(file_name, case_name, master_port)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_empty():
-    '''
-    Feature: dtensor dispatch/infer_layout/redistribute.
+def test_base_dtensor_init_group1():
+    """
+    Feature: parallel run case in shard
     Description:
+        1.test_ones
+        2.test_empty
+        3.test_full
+        4.test_zeros
     Expectation: Run success.
-    '''
-    master_port = 11335
-    file_name = "base_dtensor_init.py"
-    case_name = "test_empty"
-    torchrun_case(file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_full():
-    '''
-    Feature: dtensor dispatch/infer_layout/redistribute.
-    Description:
-    Expectation: Run success.
-    '''
-    master_port = 11335
-    file_name = "base_dtensor_init.py"
-    case_name = "test_full"
-    torchrun_case(file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_zeros():
-    '''
-    Feature: dtensor dispatch/infer_layout/redistribute.
-    Description:
-    Expectation: Run success.
-    '''
-    master_port = 11335
-    file_name = "base_dtensor_init.py"
-    case_name = "test_zeros"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(BASE_DTENSOR_INIT, "test_ones", 11335, 2),
+        TorchCase(BASE_DTENSOR_INIT, "test_empty", 11336, 2),
+        TorchCase(BASE_DTENSOR_INIT, "test_full", 11337, 2),
+        TorchCase(BASE_DTENSOR_INIT, "test_zeros", 11338, 2),
+    ])

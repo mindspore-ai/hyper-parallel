@@ -42,7 +42,7 @@ def test_distributed_split_layout_inference_default_dim():
     assert len(standalone_outputs) == 4  # 16 / 4 = 4 chunks
 
     # Distributed setup
-    layout = Layout((4, 2), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     # Shard only on dim=0
     x_layout = layout("None", "dp")
 
@@ -82,7 +82,7 @@ def test_distributed_split_layout_inference():
     assert len(standalone_outputs) == 5  # 20 / 4 = 5 chunks
 
     # Distributed setup
-    layout = Layout((4, 2), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     # Shard only on dim=0
     x_layout = layout("dp", "None")
 
@@ -122,7 +122,7 @@ def test_distributed_split_layout_inference_split_list():
     assert len(standalone_outputs) == 2
 
     # Distributed setup
-    layout = Layout((4, 2), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     # Shard only on dim=0
     x_layout = layout("dp", "None")
 
@@ -154,7 +154,7 @@ def test_distributed_split_on_sharded_dim_error():
     split_size = 4
     axis = 0  # this dim is sharded
 
-    layout = Layout((4, 2), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     x_layout = layout("dp", "tp")
 
     local_tensor = torch.randn(4, 12).npu()

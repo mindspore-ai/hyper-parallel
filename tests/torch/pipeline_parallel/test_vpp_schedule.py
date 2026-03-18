@@ -12,20 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test vpp"""
+"""test vpp schedule"""
 from tests.common.mark_utils import arg_mark
-from tests.torch.utils import torchrun_case
+from tests.common.parallel_case import parallel_run, TorchCase
+
+VPP_SCHEDULE = "vpp_schedule.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
-def test_simple_mlp():
+def test_vpp_schedule_group1():
     """
-    Feature: schedule vpp.
-    Description: Test pp.
+    Feature: parallel run case in pipeline_parallel
+    Description:
+        1.test_vpp
     Expectation: Run success.
     """
-    file_name = "vpp_schedule.py"
-    case_name = "test_vpp"
-    master_port = 12346
-    num_proc = 4
-    torchrun_case(file_name, case_name, master_port, num_proc)
+    parallel_run([
+        TorchCase(VPP_SCHEDULE, "test_vpp", 12346, 4)
+    ])

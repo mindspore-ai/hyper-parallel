@@ -12,108 +12,68 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor masked_scatter"""
-from tests.torch.utils import torchrun_case
+"""test parallel op masked_scatter"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_MASKED_SCATTER = "parallel_op_masked_scatter.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_masked_scatter_basic_replicated():
-    '''
-    Feature: test parallel op masked_scatter.
-    Description: test parallel op masked_scatter with replicated inputs.
+def test_parallel_op_masked_scatter_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_masked_scatter_basic_replicated
+        2.test_masked_scatter_input_sharded_error
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_masked_scatter.py"
-    case_name = "test_masked_scatter_basic_replicated"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_basic_replicated", 10359, 4),
+        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_input_sharded_error", 10360, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_masked_scatter_input_sharded_error():
-    '''
-    Feature: test parallel op masked_scatter.
-    Description: test parallel op masked_scatter error handling for sharded input.
+def test_parallel_op_masked_scatter_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_masked_scatter_mask_sharded_error
+        2.test_masked_scatter_source_sharded_error
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_masked_scatter.py"
-    case_name = "test_masked_scatter_input_sharded_error"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_mask_sharded_error", 10361, 4),
+        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_source_sharded_error", 10362, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_masked_scatter_mask_sharded_error():
-    '''
-    Feature: test parallel op masked_scatter.
-    Description: test parallel op masked_scatter error handling for sharded mask.
+def test_parallel_op_masked_scatter_group3():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_masked_scatter_1d_replicated
+        2.test_masked_scatter_3d_broadcast
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_masked_scatter.py"
-    case_name = "test_masked_scatter_mask_sharded_error"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_1d_replicated", 10363, 4),
+        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_3d_broadcast", 10364, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_masked_scatter_source_sharded_error():
-    '''
-    Feature: test parallel op masked_scatter.
-    Description: test parallel op masked_scatter error handling for sharded source.
+def test_parallel_op_masked_scatter_group4():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_masked_scatter_oversized_source
+        2.test_masked_scatter_all_false_mask
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_masked_scatter.py"
-    case_name = "test_masked_scatter_source_sharded_error"
-    torchrun_case(file_name, case_name, master_port)
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_masked_scatter_1d_replicated():
-    '''
-    Feature: test parallel op masked_scatter.
-    Description: test parallel op masked_scatter with 1D inputs.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_masked_scatter.py"
-    case_name = "test_masked_scatter_1d_replicated"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_masked_scatter_3d_broadcast():
-    '''
-    Feature: test parallel op masked_scatter.
-    Description: test parallel op masked_scatter with 3D inputs and broadcasting.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_masked_scatter.py"
-    case_name = "test_masked_scatter_3d_broadcast"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_masked_scatter_oversized_source():
-    '''
-    Feature: test parallel op masked_scatter.
-    Description: test parallel op masked_scatter with oversized source.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_masked_scatter.py"
-    case_name = "test_masked_scatter_oversized_source"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_masked_scatter_all_false_mask():
-    '''
-    Feature: test parallel op masked_scatter.
-    Description: test parallel op masked_scatter with all-false mask.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_masked_scatter.py"
-    case_name = "test_masked_scatter_all_false_mask"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_oversized_source", 10365, 4),
+        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_all_false_mask", 10366, 4),
+    ])

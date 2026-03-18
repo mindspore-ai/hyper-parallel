@@ -144,7 +144,7 @@ def test_bsh_replicate():
     init_dist()
     expected = run_standalone_bsh()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     q, k, v = bsh_tensors()
     dq = DTensor.from_local(q, mesh, (Replicate(),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
@@ -169,7 +169,7 @@ def test_bsh_dp():
     init_dist()
     expected = run_standalone_bsh()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     q, k, v = bsh_tensors()
     placements = (Shard(0),)
     dq = distribute_tensor(q, mesh, placements)
@@ -196,7 +196,7 @@ def test_bsh_mp():
     init_dist()
     expected = run_standalone_bsh()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("mp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("mp",))
     q, k, v = bsh_tensors()
     placements = (Shard(2),)
     dq = distribute_tensor(q, mesh, placements)
@@ -223,7 +223,7 @@ def test_bsh_sp():
     init_dist()
     expected = run_standalone_bsh()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     q, k, v = bsh_tensors()
     dq = distribute_tensor(q, mesh, (Shard(1),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
@@ -250,7 +250,7 @@ def test_bsh_dp_mp_2d():
     init_dist()
     expected = run_standalone_bsh()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bsh_tensors()
     placements = (Shard(0), Shard(2))
     dq = distribute_tensor(q, mesh, placements)
@@ -278,7 +278,7 @@ def test_bsh_sp_mp_2d():
     init_dist()
     expected = run_standalone_bsh()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("sp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("sp", "mp"))
     q, k, v = bsh_tensors()
     dq = distribute_tensor(q, mesh, (Shard(1), Shard(2)))
     dk = distribute_tensor(k, mesh, (Replicate(), Shard(2)))
@@ -305,17 +305,17 @@ def test_bsh_dp_sp_mp_3d():
     init_dist()
     expected = run_standalone_bsh()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "sp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bsh_tensors()
-    dq = distribute_tensor(q, mesh, (Shard(0), Shard(1), Shard(2)))
-    dk = distribute_tensor(k, mesh, (Shard(0), Replicate(), Shard(2)))
-    dv = distribute_tensor(v, mesh, (Shard(0), Replicate(), Shard(2)))
+    dq = distribute_tensor(q, mesh, (Shard(0), Shard(2)))
+    dk = distribute_tensor(k, mesh, (Shard(0), Shard(2)))
+    dv = distribute_tensor(v, mesh, (Shard(0), Shard(2)))
 
     result = torch_npu.npu_fusion_attention(
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
         scale=SCALE, sparse_mode=0,
     )
-    full_replicate = (Replicate(), Replicate(), Replicate())
+    full_replicate = (Replicate(), Replicate())
     gathered = result[0].redistribute(mesh, full_replicate).to_local()
     assert_close(gathered, expected)
 
@@ -332,7 +332,7 @@ def test_bnsd_dp_mp():
     """
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bnsd_tensors()
     placements = (Shard(0), Shard(1))
     dq = distribute_tensor(q, mesh, placements)
@@ -344,7 +344,7 @@ def test_bnsd_dp_mp():
         scale=SCALE, sparse_mode=0,
     )
     out = result[0]
-    assert out.to_local().shape == (BATCH_SIZE // 4, HEAD_NUM // 2, SEQ_LEN, HEAD_DIM)
+    assert out.to_local().shape == (BATCH_SIZE // 2, HEAD_NUM // 2, SEQ_LEN, HEAD_DIM)
 
 
 def test_bnsd_sp():
@@ -358,7 +358,7 @@ def test_bnsd_sp():
     """
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "sp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "sp"))
     q, k, v = bnsd_tensors()
     dq = distribute_tensor(q, mesh, (Shard(0), Shard(2)))
     dk = distribute_tensor(k, mesh, (Shard(0), Replicate()))
@@ -369,7 +369,7 @@ def test_bnsd_sp():
         scale=SCALE, sparse_mode=0,
     )
     out = result[0]
-    assert out.to_local().shape == (BATCH_SIZE // 4, HEAD_NUM, SEQ_LEN // 2, HEAD_DIM)
+    assert out.to_local().shape == (BATCH_SIZE // 2, HEAD_NUM, SEQ_LEN // 2, HEAD_DIM)
 
 
 def test_sbh_dp():
@@ -382,7 +382,7 @@ def test_sbh_dp():
     """
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     q, k, v = sbh_tensors()
     placements = (Shard(1),)
     dq = distribute_tensor(q, mesh, placements)
@@ -394,7 +394,7 @@ def test_sbh_dp():
         scale=SCALE, sparse_mode=0,
     )
     out = result[0]
-    assert out.to_local().shape == (SEQ_LEN, BATCH_SIZE // 8, HIDDEN_SIZE)
+    assert out.to_local().shape == (SEQ_LEN, BATCH_SIZE // 4, HIDDEN_SIZE)
 
 
 def test_bsnd_dp_mp():
@@ -408,7 +408,7 @@ def test_bsnd_dp_mp():
     """
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bsnd_tensors()
     placements = (Shard(0), Shard(2))
     dq = distribute_tensor(q, mesh, placements)
@@ -420,7 +420,7 @@ def test_bsnd_dp_mp():
         scale=SCALE, sparse_mode=0,
     )
     out = result[0]
-    assert out.to_local().shape == (BATCH_SIZE // 4, SEQ_LEN, HEAD_NUM // 2, HEAD_DIM)
+    assert out.to_local().shape == (BATCH_SIZE // 2, SEQ_LEN, HEAD_NUM // 2, HEAD_DIM)
 
 
 def test_tnd_dp():
@@ -437,7 +437,7 @@ def test_tnd_dp():
 
     q, k, v, actual_seq_qlen, actual_seq_kvlen = tnd_tensors()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     placements = (Shard(0),)
     dq = distribute_tensor(q, mesh, placements)
     dk = distribute_tensor(k, mesh, placements)
@@ -451,7 +451,7 @@ def test_tnd_dp():
     )
     total_tokens = BATCH_SIZE * SEQ_LEN
     out = result[0]
-    assert out.to_local().shape == (total_tokens // 8, HEAD_NUM, HEAD_DIM)
+    assert out.to_local().shape == (total_tokens // 4, HEAD_NUM, HEAD_DIM)
 
 
 def test_tnd_mp():
@@ -467,7 +467,7 @@ def test_tnd_mp():
 
     q, k, v, actual_seq_qlen, actual_seq_kvlen = tnd_tensors()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("mp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("mp",))
     placements = (Shard(1),)
     dq = distribute_tensor(q, mesh, placements)
     dk = distribute_tensor(k, mesh, placements)
@@ -481,7 +481,7 @@ def test_tnd_mp():
     )
     total_tokens = BATCH_SIZE * SEQ_LEN
     out = result[0]
-    assert out.to_local().shape == (total_tokens, HEAD_NUM // 8, HEAD_DIM)
+    assert out.to_local().shape == (total_tokens, HEAD_NUM // 4, HEAD_DIM)
 
 
 def test_tnd_dp_mp():
@@ -497,7 +497,7 @@ def test_tnd_dp_mp():
 
     q, k, v, actual_seq_qlen, actual_seq_kvlen = tnd_tensors()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
     dq = distribute_tensor(q, mesh, (Shard(0), Shard(1)))
     dk = distribute_tensor(k, mesh, (Shard(0), Shard(1)))
     dv = distribute_tensor(v, mesh, (Shard(0), Shard(1)))
@@ -510,7 +510,7 @@ def test_tnd_dp_mp():
     )
     total_tokens = BATCH_SIZE * SEQ_LEN
     out = result[0]
-    assert out.to_local().shape == (total_tokens // 4, HEAD_NUM // 2, HEAD_DIM)
+    assert out.to_local().shape == (total_tokens // 2, HEAD_NUM // 2, HEAD_DIM)
 
 
 def test_sp_sparse_mode_0():
@@ -526,7 +526,7 @@ def test_sp_sparse_mode_0():
     init_dist()
     expected = run_standalone_bsh(sparse_mode=0)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     q, k, v = bsh_tensors()
     dq = distribute_tensor(q, mesh, (Shard(1),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
@@ -553,7 +553,7 @@ def test_sp_sparse_mode_2():
     init_dist()
     expected = run_standalone_bsh(sparse_mode=2)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     q, k, v = bsh_tensors()
     mask = create_attention_mask(2)
     dq = distribute_tensor(q, mesh, (Shard(1),))
@@ -581,7 +581,7 @@ def test_sp_sparse_mode_3():
     init_dist()
     expected = run_standalone_bsh(sparse_mode=3)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     q, k, v = bsh_tensors()
     mask = create_attention_mask(3)
     dq = distribute_tensor(q, mesh, (Shard(1),))
@@ -610,7 +610,7 @@ def test_sp_sparse_mode_4():
     pre, nxt = 256, 256
     expected = run_standalone_bsh(sparse_mode=4, pre_tockens=pre, next_tockens=nxt)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     q, k, v = bsh_tensors()
     mask = create_attention_mask(4)
     dq = distribute_tensor(q, mesh, (Shard(1),))
@@ -639,7 +639,7 @@ def test_dp_sparse_mode_1():
     init_dist()
     expected = run_standalone_bsh(sparse_mode=1)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     q, k, v = bsh_tensors()
     mask = create_attention_mask(1)
     placements = (Shard(0),)
@@ -668,7 +668,7 @@ def test_dp_sparse_mode_4():
     pre, nxt = 256, 256
     expected = run_standalone_bsh(sparse_mode=4, pre_tockens=pre, next_tockens=nxt)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     q, k, v = bsh_tensors()
     mask = create_attention_mask(4)
     placements = (Shard(0),)
@@ -695,7 +695,7 @@ def test_error_kv_strategy_mismatch():
     """
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bsh_tensors()
     dq = distribute_tensor(q, mesh, (Shard(0), Shard(2)))
     dk = distribute_tensor(k, mesh, (Shard(0), Shard(2)))
@@ -725,7 +725,7 @@ def test_error_head_num_not_divisible():
     k = torch.from_numpy(data).npu()
     v = torch.from_numpy(data).npu()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("mp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("mp",))
     placements = (Shard(2),)
     dq = distribute_tensor(q, mesh, placements)
     dk = distribute_tensor(k, mesh, placements)
@@ -748,7 +748,7 @@ def test_error_kv_seq_sharding_blocked():
     """
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     q, k, v = bsh_tensors()
     placements = (Shard(1),)
     dq = distribute_tensor(q, mesh, placements)
@@ -772,7 +772,7 @@ def test_error_sparse_mode_1_no_mask():
     """
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     q, k, v = bsh_tensors()
     placements = (Shard(0),)
     dq = distribute_tensor(q, mesh, placements)
@@ -798,7 +798,7 @@ def test_error_tnd_sp_without_actual_seq_len():
 
     q, k, v, _, _ = tnd_tensors()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "sp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "sp"))
     dq = distribute_tensor(q, mesh, (Shard(0), Shard(1)))
     dk = distribute_tensor(k, mesh, (Shard(0), Shard(1)))
     dv = distribute_tensor(v, mesh, (Shard(0), Shard(1)))
@@ -821,7 +821,7 @@ def test_error_bnsd_kv_seq_sharding_blocked():
     """
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "sp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "sp"))
     q, k, v = bnsd_tensors()
     placements = (Shard(0), Shard(2))
     dq = distribute_tensor(q, mesh, placements)
@@ -848,7 +848,7 @@ def test_bsh_custom_scale():
     custom_scale = 0.125
     expected = run_standalone_bsh(scale=custom_scale)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     q, k, v = bsh_tensors()
     placements = (Shard(0),)
     dq = distribute_tensor(q, mesh, placements)
@@ -873,7 +873,7 @@ def test_bsh_dropout():
     """
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     q, k, v = bsh_tensors()
     placements = (Shard(0),)
     dq = distribute_tensor(q, mesh, placements)
@@ -885,7 +885,7 @@ def test_bsh_dropout():
         scale=SCALE, sparse_mode=0, keep_prob=0.9,
     )
     out = result[0]
-    assert out.to_local().shape == (BATCH_SIZE // 8, SEQ_LEN, HIDDEN_SIZE)
+    assert out.to_local().shape == (BATCH_SIZE // 4, SEQ_LEN, HIDDEN_SIZE)
 
 
 def test_bsh_long_sequence_sp():
@@ -907,7 +907,7 @@ def test_bsh_long_sequence_sp():
     k = torch.from_numpy(k_np).npu()
     v = torch.from_numpy(v_np).npu()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     dq = distribute_tensor(q, mesh, (Shard(1),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
@@ -917,7 +917,7 @@ def test_bsh_long_sequence_sp():
         scale=SCALE, sparse_mode=0,
     )
     out = result[0]
-    assert out.to_local().shape == (BATCH_SIZE, long_seq // 8, HIDDEN_SIZE)
+    assert out.to_local().shape == (BATCH_SIZE, long_seq // 4, HIDDEN_SIZE)
 
 
 def test_bsh_large_batch_dp():
@@ -936,7 +936,7 @@ def test_bsh_large_batch_dp():
     k = torch.from_numpy(q_np).npu()
     v = torch.from_numpy(q_np).npu()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     placements = (Shard(0),)
     dq = distribute_tensor(q, mesh, placements)
     dk = distribute_tensor(k, mesh, placements)
@@ -947,7 +947,7 @@ def test_bsh_large_batch_dp():
         scale=SCALE, sparse_mode=0,
     )
     out = result[0]
-    assert out.to_local().shape == (large_batch // 8, SEQ_LEN, HIDDEN_SIZE)
+    assert out.to_local().shape == (large_batch // 4, SEQ_LEN, HIDDEN_SIZE)
 
 
 def test_bsh_redistribute_then_attention():
@@ -962,7 +962,7 @@ def test_bsh_redistribute_then_attention():
     init_dist()
     expected = run_standalone_bsh()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     q, k, v = bsh_tensors()
     dq = DTensor.from_local(q, mesh, (Replicate(),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
@@ -993,7 +993,7 @@ def test_sp_sparse_mode_2_with_2way_split():
     init_dist()
     expected = run_standalone_bsh(sparse_mode=2)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("sp", "dp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("sp", "dp"))
     q, k, v = bsh_tensors()
     dq = distribute_tensor(q, mesh, (Shard(1), Shard(0)))
     dk = distribute_tensor(k, mesh, (Replicate(), Shard(0)))
@@ -1021,7 +1021,7 @@ def test_sp_sparse_mode_3_with_2way_split():
     init_dist()
     expected = run_standalone_bsh(sparse_mode=3)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("sp", "dp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("sp", "dp"))
     q, k, v = bsh_tensors()
     dq = distribute_tensor(q, mesh, (Shard(1), Shard(0)))
     dk = distribute_tensor(k, mesh, (Replicate(), Shard(0)))
@@ -1054,7 +1054,7 @@ def test_bnsd_sp_correctness():
         atten_mask=mask, scale=SCALE, sparse_mode=0,
     )[0]
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("sp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("sp",))
     dq = distribute_tensor(q_bnsd, mesh, (Shard(2),))
     dk = DTensor.from_local(k_bnsd, mesh, (Replicate(),))
     dv = DTensor.from_local(v_bnsd, mesh, (Replicate(),))
@@ -1083,7 +1083,7 @@ def test_tnd_dp_correctness():
     # 8 batches with varying lengths, total = 4096
     q, k, v, actual_seq_qlen, actual_seq_kvlen = tnd_tensors()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     placements = (Shard(0),)
     dq = distribute_tensor(q, mesh, placements)
     dk = distribute_tensor(k, mesh, placements)
@@ -1118,7 +1118,7 @@ def test_tnd_dp_correctness():
 
     total_tokens = BATCH_SIZE * SEQ_LEN
     out = result[0]
-    assert out.to_local().shape == (total_tokens // 8, HEAD_NUM, HEAD_DIM)
+    assert out.to_local().shape == (total_tokens // 4, HEAD_NUM, HEAD_DIM)
 
     gathered = result[0].redistribute(mesh, (Replicate(),)).to_local()
     assert_close(gathered, expected)
@@ -1147,7 +1147,7 @@ def test_tnd_cp():
         actual_seq_kvlen=actual_seq_kvlen,
     )[0]
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("cp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("cp",))
     dq = distribute_tensor(q, mesh, (Shard(0),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
@@ -1159,7 +1159,7 @@ def test_tnd_cp():
         actual_seq_kvlen=actual_seq_kvlen,
     )
     total_tokens = BATCH_SIZE * SEQ_LEN
-    assert result[0].to_local().shape == (total_tokens // 8, HEAD_NUM, HEAD_DIM)
+    assert result[0].to_local().shape == (total_tokens // 4, HEAD_NUM, HEAD_DIM)
 
     gathered = result[0].redistribute(mesh, (Replicate(),)).to_local()
     assert_close(gathered, expected)
@@ -1198,7 +1198,7 @@ def test_fa_vs_sdpa_distributed_cross_validation():
     k_bnsd = k.reshape(BATCH_SIZE, SEQ_LEN, HEAD_NUM, HEAD_DIM).transpose(1, 2)
     v_bnsd = v.reshape(BATCH_SIZE, SEQ_LEN, HEAD_NUM, HEAD_DIM).transpose(1, 2)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("sp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("sp", "mp"))
     full_replicate = (Replicate(), Replicate())
 
     # FA path: BSH, Q=Shard(1)+Shard(2), KV=Replicate+Shard(2)
@@ -1245,7 +1245,7 @@ def test_error_batch_sharding_mismatch():
     """
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bsh_tensors()
     dq = distribute_tensor(q, mesh, (Shard(0), Shard(2)))
     dk = distribute_tensor(k, mesh, (Replicate(), Shard(2)))
@@ -1268,7 +1268,7 @@ def test_error_hidden_sharding_mismatch():
     """
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bsh_tensors()
     dq = distribute_tensor(q, mesh, (Shard(0), Shard(2)))
     dk = distribute_tensor(k, mesh, (Shard(0), Replicate()))
@@ -1291,7 +1291,7 @@ def test_error_dim_sharding_mismatch():
     """
     init_dist()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
     q, k, v = bnsd_tensors()
     dq = distribute_tensor(q, mesh, (Shard(0), Shard(3)))
     dk = distribute_tensor(k, mesh, (Shard(0), Replicate()))
@@ -1317,7 +1317,7 @@ def test_error_tnd_cp_wrong_sparse_mode():
 
     q, k, v, actual_seq_qlen, actual_seq_kvlen = tnd_tensors()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("cp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("cp",))
     dq = distribute_tensor(q, mesh, (Shard(0),))
     dk = DTensor.from_local(k, mesh, (Replicate(),))
     dv = DTensor.from_local(v, mesh, (Replicate(),))
@@ -1348,7 +1348,7 @@ def test_error_tnd_cp_qk_global_t_mismatch():
     k_short = k[:half_total]
     v_short = v[:half_total]
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("cp", "mp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("cp", "mp"))
     dq = distribute_tensor(q, mesh, (Shard(0), Shard(1)))
     dk = DTensor.from_local(k_short, mesh, (Replicate(), Shard(1)))
     dv = DTensor.from_local(v_short, mesh, (Replicate(), Shard(1)))
@@ -1386,7 +1386,7 @@ def test_tnd_dp_kv_sharded():
         actual_seq_kvlen=actual_seq_kvlen,
     )[0]
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
     placements = (Shard(0),)
     dq = distribute_tensor(q, mesh, placements)
     dk = distribute_tensor(k, mesh, placements)
@@ -1400,7 +1400,7 @@ def test_tnd_dp_kv_sharded():
     )
     total_tokens = BATCH_SIZE * SEQ_LEN
     out = result[0]
-    assert out.to_local().shape == (total_tokens // 8, HEAD_NUM, HEAD_DIM)
+    assert out.to_local().shape == (total_tokens // 4, HEAD_NUM, HEAD_DIM)
 
     gathered = result[0].redistribute(mesh, (Replicate(),)).to_local()
     assert_close(gathered, expected)

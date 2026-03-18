@@ -50,7 +50,7 @@ def test_distributed_permute_layout_inference():
     # Distributed setup
     # Mesh: 2x4 (8 devices)
     # Layout strategy: dim0 -> dp (shard), dim1 -> tp (shard), dim2 -> None (replicate)
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     x_layout = layout("dp", "tp", "None")
 
     dist_input = global_to_local(standalone_input, x_layout)
@@ -99,7 +99,7 @@ def test_distributed_transpose_layout_inference():
     standalone_output = torch.transpose(standalone_input, dim0, dim1)
 
     # Distributed setup
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     x_layout = layout("dp", "tp", "None")
 
     dist_input = global_to_local(standalone_input, x_layout)
@@ -140,7 +140,7 @@ def test_distributed_transpose_negative_dim():
     standalone_output = torch.transpose(standalone_input, dim0, dim1)
 
     # Distributed setup
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
     x_layout = layout("dp", "tp", "None")
 
     dist_input = global_to_local(standalone_input, x_layout)

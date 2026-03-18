@@ -12,19 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op embedding"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_EMBEDDING = "parallel_op_embedding.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_embedding():
-    '''
-    Feature: test parallel op embedding.
-    Description: test parallel op embedding layout inference and calculation.
+def test_parallel_op_embedding_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_embedding_layout_inference
     Expectation: Run success.
-    '''
-    master_port = 10890
-    file_name = "parallel_op_embedding.py"
-    case_name = "test_distributed_embedding_layout_inference"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_EMBEDDING, "test_distributed_embedding_layout_inference", 10890, 4),
+    ])

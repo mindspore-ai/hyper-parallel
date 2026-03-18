@@ -12,58 +12,60 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op argsort"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_ARGSORT = "parallel_op_argsort.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_argsort_basic_unsharded():
-    '''
-    Feature: test parallel op argsort.
-    Description: test parallel op argsort on an unsharded dimension.
+def test_parallel_op_argsort_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_argsort_basic_unsharded
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_argsort.py"
-    case_name = "test_distributed_argsort_basic_unsharded"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_ARGSORT, "test_distributed_argsort_basic_unsharded", 10359, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_argsort_specific_dim():
-    '''
-    Feature: test parallel op argsort.
-    Description: test parallel op argsort on a specific unsharded dimension.
+def test_parallel_op_argsort_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_argsort_specific_dim
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_argsort.py"
-    case_name = "test_distributed_argsort_specific_dim"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_ARGSORT, "test_distributed_argsort_specific_dim", 10359, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_argsort_descending():
-    '''
-    Feature: test parallel op argsort.
-    Description: test parallel op argsort with descending set to True.
+def test_parallel_op_argsort_group3():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_argsort_descending
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_argsort.py"
-    case_name = "test_distributed_argsort_descending"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_ARGSORT, "test_distributed_argsort_descending", 10359, 8),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_argsort_sharded_dim_error():
-    '''
-    Feature: test parallel op argsort.
-    Description: test parallel op argsort error trigger when sorting a sharded dimension.
+def test_parallel_op_argsort_group4():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_argsort_sharded_dim_error
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_argsort.py"
-    case_name = "test_distributed_argsort_sharded_dim_error"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_ARGSORT, "test_distributed_argsort_sharded_dim_error", 10359, 8),
+    ])

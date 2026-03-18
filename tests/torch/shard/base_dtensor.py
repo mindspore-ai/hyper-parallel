@@ -50,7 +50,7 @@ def test_base_dtensor():
     Description:
     Expectation: Run success.
     '''
-    init_dist()
+    rank, _ = init_dist()
     step = 2
 
     # -----------------------------------standalone----------------------------------
@@ -68,7 +68,7 @@ def test_base_dtensor():
     # Create DeviceMesh
     mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(1, 8),
+        mesh_shape=(1, 2),
         mesh_dim_names=("dp", "tp")
     )
 
@@ -79,7 +79,7 @@ def test_base_dtensor():
     w_placements = (Replicate(), Shard(1))
 
     dist_x = DTensor.from_local(torch.ones(8, 8).npu(), mesh, x_placements)
-    local_w = torch.ones(8, 1).npu()
+    local_w = torch.ones(8, 4).npu()
 
     # pylint: disable=W0212
     for key, param in dist_model._parameters.items():
@@ -110,7 +110,10 @@ def test_base_dtensor():
                        dist_loss.to_local().cpu().detach().numpy(),  # use to_local()
                        0.001, 0.001)
 
-    assert np.allclose(standalone_grad.cpu().detach().numpy(),
+    # dist_grad is a local shard (Shard(1)): compare only the matching columns
+    w_shard_size = local_w.shape[1]
+    standalone_grad_local = standalone_grad[:, rank * w_shard_size:(rank + 1) * w_shard_size]
+    assert np.allclose(standalone_grad_local.cpu().detach().numpy(),
                        dist_grad.cpu().detach().numpy(),
                        0.001, 0.001)
 
@@ -124,7 +127,7 @@ def test_dtensor_float():
     init_dist()
     mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(1, 8),
+        mesh_shape=(1, 2),
         mesh_dim_names=("dp", "tp")
     )
     local_tensor = torch.ones(8, 8).npu().half()

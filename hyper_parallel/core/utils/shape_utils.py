@@ -28,5 +28,13 @@ def compute_local_shape_and_global_offset(global_shape, device_mesh, placement):
             axis_name = (axis_name,)
         for sub_axis_name in axis_name:
             if sub_axis_name != "None":
-                slice_shape[i] = slice_shape[i] // layout.mesh.get_device_num_along_axis(sub_axis_name)
+                num_devices = layout.mesh.get_device_num_along_axis(sub_axis_name)
+                local_rank = layout.mesh.get_local_rank(sub_axis_name)
+                global_size = slice_shape[i]
+                remainder = global_size % num_devices
+                # Consistent with torch.chunk: first `remainder` ranks get one extra element
+                if remainder != 0 and local_rank < remainder:
+                    slice_shape[i] = global_size // num_devices + 1
+                else:
+                    slice_shape[i] = global_size // num_devices
     return slice_shape

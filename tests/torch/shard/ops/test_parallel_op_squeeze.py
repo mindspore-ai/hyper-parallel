@@ -13,65 +13,50 @@
 # limitations under the License.
 # ============================================================================
 """test parallel op squeeze"""
-from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_SQUEEZE = "parallel_op_squeeze.py"
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_squeeze_basic():
-    '''
-    Feature: test parallel op squeeze.
-    Description: test parallel op squeeze.
+def test_parallel_op_squeeze_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_squeeze_basic
+        2.test_distributed_squeeze_no_args_all_dims
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_squeeze.py"
-    case_name = "test_distributed_squeeze_basic"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_distributed_squeeze_basic", 10359, 4),
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_distributed_squeeze_no_args_all_dims", 10360, 4),
+    ])
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_squeeze_no_args_all_dims():
-    '''
-    Feature: test parallel op squeeze.
-    Description: test parallel op squeeze.
+def test_parallel_op_squeeze_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_squeeze_specific_axis_negative
+        2.test_distributed_squeeze_scalar_like
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_squeeze.py"
-    case_name = "test_distributed_squeeze_no_args_all_dims"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_distributed_squeeze_specific_axis_negative", 10361, 4),
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_distributed_squeeze_scalar_like", 10362, 4),
+    ])
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_squeeze_specific_axis_negative():
-    '''
-    Feature: test parallel op squeeze.
-    Description: test parallel op squeeze.
+def test_parallel_op_squeeze_group3():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_squeeze_error_non_singleton
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_squeeze.py"
-    case_name = "test_distributed_squeeze_specific_axis_negative"
-    torchrun_case(file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_squeeze_error_non_singleton():
-    '''
-    Feature: test parallel op squeeze.
-    Description: test parallel op squeeze.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_squeeze.py"
-    case_name = "test_distributed_squeeze_error_non_singleton"
-    torchrun_case(file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_squeeze_scalar_like():
-    '''
-    Feature: test parallel op squeeze.
-    Description: test parallel op squeeze.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_squeeze.py"
-    case_name = "test_distributed_squeeze_scalar_like"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_distributed_squeeze_error_non_singleton", 10359, 4),
+    ])

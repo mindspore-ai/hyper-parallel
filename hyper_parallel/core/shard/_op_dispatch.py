@@ -105,7 +105,8 @@ class OpDispatcher:
         self.whitelist = ["InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv", "typeof", "DistCommIsend",
                           "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather",
                           "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__", "register_hook",
-                          "is_complex", "chunk", "__bool__", "__len__", "__format__", "dim", "empty_like", "zeros_like"]
+                          "is_complex", "chunk", "__bool__", "__len__", "__format__", "dim", "empty_like", "zeros_like",
+                          "_has_compatible_shallow_copy_type"]
 
         # Ops requiring args unpacking for layout inference (packed as prim, name, real_args).
         self.unpack_ops = ["ScatterUpdate", "Mod", "GatherNd"]

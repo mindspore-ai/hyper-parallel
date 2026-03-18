@@ -55,7 +55,7 @@ def test_distributed_embedding_layout_inference():
 
     # Distributed setup
     # Mesh: (2, 4), Alias: ("dp", "tp")
-    layout = Layout((2, 4), ("dp", "tp"))
+    layout = Layout((2, 2), ("dp", "tp"))
 
     # 1. Define Input Layout: Shard on Batch (dim 0), Keep Seq (dim 1)
     # Map: ("dp", "None")

@@ -12,45 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op pad"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_PAD = "parallel_op_pad.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_pad_basic_unsharded():
-    '''
-    Feature: test parallel op pad.
-    Description: test parallel op pad.
+def test_parallel_op_pad_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_pad_basic_unsharded
+        2.test_distributed_pad_zero_on_sharded_dim
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_pad.py"
-    case_name = "test_distributed_pad_basic_unsharded"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_PAD, "test_distributed_pad_basic_unsharded", 10359, 4),
+        TorchCase(PARALLEL_OP_PAD, "test_distributed_pad_zero_on_sharded_dim", 10360, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_pad_zero_on_sharded_dim():
-    '''
-    Feature: test parallel op pad.
-    Description: test parallel op pad.
+def test_parallel_op_pad_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_pad_sharded_dim_error
     Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_pad.py"
-    case_name = "test_distributed_pad_zero_on_sharded_dim"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_pad_sharded_dim_error():
-    '''
-    Feature: test parallel op pad.
-    Description: test parallel op pad.
-    Expectation: Run success.
-    '''
-    master_port = 10359
-    file_name = "parallel_op_pad.py"
-    case_name = "test_distributed_pad_sharded_dim_error"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_PAD, "test_distributed_pad_sharded_dim_error", 10361, 4),
+    ])

@@ -12,19 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test vpp"""
+"""test vpp + shard"""
 from tests.common.mark_utils import arg_mark
-from tests.torch.utils import torchrun_case
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PIPELINE_SHARD = "pipeline_shard.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_simple_mlp():
     """
-    Feature: schedule vpp + shard.
-    Description: Test pp.
+    Feature: parallel run case in pipeline_parallel
+    Description:
+        1.test_vpp_shard
     Expectation: Run success.
     """
-    file_name = "pipeline_shard.py"
-    case_name = "test_vpp_shard"
-    master_port = 12300
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(PIPELINE_SHARD, "test_vpp_shard", 12300, 8)
+    ])

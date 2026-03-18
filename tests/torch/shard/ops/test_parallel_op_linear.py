@@ -12,57 +12,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""test parallel op linear"""
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+PARALLEL_OP_LINEAR = "parallel_op_linear.py"
+PARALLEL_OP_ELEMENTWISE = "parallel_op_elementwise.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_linear_with_bias():
-    '''
-    Feature: test parallel op linear.
-    Description: test parallel op linear.
+def test_parallel_op_linear_group1():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_linear_with_bias
+        2.test_distributed_linear_without_bias
     Expectation: Run success.
-    '''
-    master_port = 10999
-    file_name = "parallel_op_linear.py"
-    case_name = "test_distributed_linear_with_bias"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_LINEAR, "test_distributed_linear_with_bias", 10999, 4),
+        TorchCase(PARALLEL_OP_LINEAR, "test_distributed_linear_without_bias", 11000, 4),
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_linear_without_bias():
-    '''
-    Feature: test parallel op linear without bias.
-    Description: test parallel op linear without bias.
+def test_parallel_op_linear_group2():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_distributed_linear_with_bias_shard
+        2.test_distributed_linear_with_elementwise_ops
     Expectation: Run success.
-    '''
-    master_port = 11000
-    file_name = "parallel_op_linear.py"
-    case_name = "test_distributed_linear_without_bias"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_linear_with_bias_shard():
-    '''
-    Feature: test parallel op linear with bias shard.
-    Description: test parallel op linear with bias shard.
-    Expectation: Run success.
-    '''
-    master_port = 11001
-    file_name = "parallel_op_linear.py"
-    case_name = "test_distributed_linear_with_bias_shard"
-    torchrun_case(file_name, case_name, master_port)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_linear_with_elementwise_ops():
-    '''
-    Feature: test parallel op linear with elementwise ops.
-    Description: test parallel op linear with elementwise ops.
-    Expectation: Run success.
-    '''
-    master_port = 11002
-    file_name = "parallel_op_elementwise.py"
-    case_name = "test_distributed_linear_with_elementwise_ops"
-    torchrun_case(file_name, case_name, master_port)
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_LINEAR, "test_distributed_linear_with_bias_shard", 11001, 4),
+        TorchCase(PARALLEL_OP_ELEMENTWISE, "test_distributed_linear_with_elementwise_ops", 11002, 4),
+    ])
