@@ -185,6 +185,12 @@ class Layout:
     def __call__(self, *alias_tensor_map):
         obj = copy.deepcopy(self)
 
+        # Clear the inherited partial status.
+        # When creating a new layout mapping configuration via __call__,
+        # it should not inherit the dynamic execution state (Partial) of the original layout.
+        # If the user intends to create a Partial placement, it will be parsed from alias_tensor_map.
+        obj._partial = [None] * len(obj.mesh_shape)
+
         if len(alias_tensor_map) == 1 and isinstance(alias_tensor_map[0], (list, tuple)):
             if len(alias_tensor_map[0]) > 0 and isinstance(alias_tensor_map[0][0], Placement):
                 return self._process_placement_layout(obj, alias_tensor_map[0])
