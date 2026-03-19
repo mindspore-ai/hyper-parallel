@@ -29,7 +29,7 @@ def test_hsdp_param_v2_fsdp_1d_mesh():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_hsdp_2d_mesh():
     """
     Feature: TorchHSDPParamV2.
@@ -133,7 +133,7 @@ def test_hsdp_param_v2_reduce_scatter_grad():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_hsdp_param_v2_all_reduce_grad():
     """
     Feature: TorchHSDPParamV2.
