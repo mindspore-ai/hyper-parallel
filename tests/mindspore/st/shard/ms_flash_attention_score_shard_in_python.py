@@ -158,7 +158,10 @@ def test_bsh_replicate():
         scalar_value=SCALE, sparse_mode=0,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH replicate test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_bsh_dp():
@@ -184,7 +187,10 @@ def test_bsh_dp():
         scalar_value=SCALE, sparse_mode=0,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH data parallel test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_bsh_mp():
@@ -210,7 +216,10 @@ def test_bsh_mp():
         scalar_value=SCALE, sparse_mode=0,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH model parallel test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_bsh_sp():
@@ -235,7 +244,10 @@ def test_bsh_sp():
         scalar_value=SCALE, sparse_mode=0,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH sequence parallel test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_bsh_dp_mp_2d():
@@ -262,7 +274,10 @@ def test_bsh_dp_mp_2d():
         scalar_value=SCALE, sparse_mode=0,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH DP+MP 2D test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_bsh_sp_mp_2d():
@@ -288,7 +303,10 @@ def test_bsh_sp_mp_2d():
         scalar_value=SCALE, sparse_mode=0,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH SP+MP 2D test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_bsh_dp_sp_mp_3d():
@@ -316,7 +334,10 @@ def test_bsh_dp_sp_mp_3d():
         scalar_value=SCALE, sparse_mode=0,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH DP+SP+MP 3D test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_bnsd_dp_mp():
@@ -339,7 +360,11 @@ def test_bnsd_dp_mp():
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BNSD',
         scalar_value=SCALE, sparse_mode=0,
     )
-    assert result.to_local().shape == (BATCH_SIZE // 2, HEAD_NUM // 2, SEQ_LEN, HEAD_DIM)
+    assert result.to_local().shape == (BATCH_SIZE // 2, HEAD_NUM // 2, SEQ_LEN, HEAD_DIM), (
+        f"BNSD DP+MP test failed: output shape mismatch, "
+        f"expected {(BATCH_SIZE // 2, HEAD_NUM // 2, SEQ_LEN, HEAD_DIM)}, "
+        f"got {result.to_local().shape}"
+    )
 
 
 def test_bnsd_sp():
@@ -361,7 +386,11 @@ def test_bnsd_sp():
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BNSD',
         scalar_value=SCALE, sparse_mode=0,
     )
-    assert result.to_local().shape == (BATCH_SIZE // 2, HEAD_NUM, SEQ_LEN // 2, HEAD_DIM)
+    assert result.to_local().shape == (BATCH_SIZE // 2, HEAD_NUM, SEQ_LEN // 2, HEAD_DIM), (
+        f"BNSD DP+SP test failed: output shape mismatch, "
+        f"expected {(BATCH_SIZE // 2, HEAD_NUM, SEQ_LEN // 2, HEAD_DIM)}, "
+        f"got {result.to_local().shape}"
+    )
 
 
 def test_sbh_dp():
@@ -383,7 +412,11 @@ def test_sbh_dp():
         dq, dk, dv, head_num=HEAD_NUM, input_layout='SBH',
         scalar_value=SCALE, sparse_mode=0,
     )
-    assert result.to_local().shape == (SEQ_LEN, BATCH_SIZE // 2, HIDDEN_SIZE)
+    assert result.to_local().shape == (SEQ_LEN, BATCH_SIZE // 2, HIDDEN_SIZE), (
+        f"SBH DP test failed: output shape mismatch, "
+        f"expected {(SEQ_LEN, BATCH_SIZE // 2, HIDDEN_SIZE)}, "
+        f"got {result.to_local().shape}"
+    )
 
 
 def test_bsnd_dp_mp():
@@ -406,7 +439,11 @@ def test_bsnd_dp_mp():
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSND',
         scalar_value=SCALE, sparse_mode=0,
     )
-    assert result.to_local().shape == (BATCH_SIZE // 2, SEQ_LEN, HEAD_NUM // 2, HEAD_DIM)
+    assert result.to_local().shape == (BATCH_SIZE // 2, SEQ_LEN, HEAD_NUM // 2, HEAD_DIM), (
+        f"BSND DP+MP test failed: output shape mismatch, "
+        f"expected {(BATCH_SIZE // 2, SEQ_LEN, HEAD_NUM // 2, HEAD_DIM)}, "
+        f"got {result.to_local().shape}"
+    )
 
 
 def test_tnd_dp():
@@ -434,7 +471,11 @@ def test_tnd_dp():
         actual_seq_kvlen=actual_seq_kvlen,
     )
     total_tokens = BATCH_SIZE * SEQ_LEN
-    assert result.to_local().shape == (total_tokens // 2, HEAD_NUM, HEAD_DIM)
+    assert result.to_local().shape == (total_tokens // 2, HEAD_NUM, HEAD_DIM), (
+        f"TND DP test failed: output shape mismatch, "
+        f"expected {(total_tokens // 2, HEAD_NUM, HEAD_DIM)}, "
+        f"got {result.to_local().shape}"
+    )
 
 
 def test_tnd_mp():
@@ -461,7 +502,11 @@ def test_tnd_mp():
         actual_seq_kvlen=actual_seq_kvlen,
     )
     total_tokens = BATCH_SIZE * SEQ_LEN
-    assert result.to_local().shape == (total_tokens, HEAD_NUM // 2, HEAD_DIM)
+    assert result.to_local().shape == (total_tokens, HEAD_NUM // 2, HEAD_DIM), (
+        f"TND MP test failed: output shape mismatch, "
+        f"expected {(total_tokens, HEAD_NUM // 2, HEAD_DIM)}, "
+        f"got {result.to_local().shape}"
+    )
 
 
 def test_tnd_dp_mp():
@@ -487,7 +532,11 @@ def test_tnd_dp_mp():
         actual_seq_kvlen=actual_seq_kvlen,
     )
     total_tokens = BATCH_SIZE * SEQ_LEN
-    assert result.to_local().shape == (total_tokens // 2, HEAD_NUM // 2, HEAD_DIM)
+    assert result.to_local().shape == (total_tokens // 2, HEAD_NUM // 2, HEAD_DIM), (
+        f"TND DP+MP test failed: output shape mismatch, "
+        f"expected {(total_tokens // 2, HEAD_NUM // 2, HEAD_DIM)}, "
+        f"got {result.to_local().shape}"
+    )
 
 
 def test_sp_sparse_mode_0():
@@ -513,7 +562,10 @@ def test_sp_sparse_mode_0():
         scalar_value=SCALE, sparse_mode=0,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH SP sparse_mode=0 test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_sp_sparse_mode_2():
@@ -540,7 +592,10 @@ def test_sp_sparse_mode_2():
         attn_mask=mask, scalar_value=SCALE, sparse_mode=2,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH SP sparse_mode=2 test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_sp_sparse_mode_3():
@@ -567,7 +622,10 @@ def test_sp_sparse_mode_3():
         attn_mask=mask, scalar_value=SCALE, sparse_mode=3,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH SP sparse_mode=3 test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_sp_sparse_mode_4():
@@ -596,7 +654,10 @@ def test_sp_sparse_mode_4():
         pre_tokens=pre, next_tokens=nxt,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH SP sparse_mode=4 test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_dp_sparse_mode_1():
@@ -624,7 +685,10 @@ def test_dp_sparse_mode_1():
         attn_mask=mask, scalar_value=SCALE, sparse_mode=1,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH DP sparse_mode=1 test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_dp_sparse_mode_4():
@@ -653,7 +717,10 @@ def test_dp_sparse_mode_4():
         pre_tokens=pre, next_tokens=nxt,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH DP sparse_mode=4 test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_bsh_custom_scale():
@@ -680,7 +747,10 @@ def test_bsh_custom_scale():
         scalar_value=custom_scale, sparse_mode=0,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH DP custom_scale test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_bsh_dropout():
@@ -702,7 +772,10 @@ def test_bsh_dropout():
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
         scalar_value=SCALE, sparse_mode=0, keep_prob=0.9,
     )
-    assert result.to_local().shape == (BATCH_SIZE // 2, SEQ_LEN, HIDDEN_SIZE)
+    assert result.to_local().shape == (BATCH_SIZE // 2, SEQ_LEN, HIDDEN_SIZE), (
+        f"BSH DP dropout test failed: output mismatch, "
+        f"expected {(BATCH_SIZE // 2, SEQ_LEN, HIDDEN_SIZE)}, got {result.to_local().shape}"
+    )
 
 
 def test_bsh_long_sequence_sp():
@@ -731,7 +804,10 @@ def test_bsh_long_sequence_sp():
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
         scalar_value=SCALE, sparse_mode=0,
     )
-    assert result.to_local().shape == (BATCH_SIZE, long_seq // 2, HIDDEN_SIZE)
+    assert result.to_local().shape == (BATCH_SIZE, long_seq // 2, HIDDEN_SIZE), (
+        f"BSH SP long sequence test failed: output mismatch, "
+        f"expected {(BATCH_SIZE, long_seq // 2, HIDDEN_SIZE)}, got {result.to_local().shape}"
+    )
 
 
 def test_bsh_large_batch_dp():
@@ -758,7 +834,10 @@ def test_bsh_large_batch_dp():
         dq, dk, dv, head_num=HEAD_NUM, input_layout='BSH',
         scalar_value=SCALE, sparse_mode=0,
     )
-    assert result.to_local().shape == (large_batch // 2, SEQ_LEN, HIDDEN_SIZE)
+    assert result.to_local().shape == (large_batch // 2, SEQ_LEN, HIDDEN_SIZE), (
+        f"BSH DP large batch test failed: output mismatch, "
+        f"expected {(large_batch // 2, SEQ_LEN, HIDDEN_SIZE)}, got {result.to_local().shape}"
+    )
 
 
 def test_bsh_redistribute_then_attention():
@@ -787,7 +866,10 @@ def test_bsh_redistribute_then_attention():
         scalar_value=SCALE, sparse_mode=0,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH redistribute then attention test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_sp_sparse_mode_2_with_2way_split():
@@ -814,7 +896,10 @@ def test_sp_sparse_mode_2_with_2way_split():
         attn_mask=mask, scalar_value=SCALE, sparse_mode=2,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH SP sparse_mode=2 with 2-way sequence split test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_sp_sparse_mode_3_with_2way_split():
@@ -841,7 +926,10 @@ def test_sp_sparse_mode_3_with_2way_split():
         attn_mask=mask, scalar_value=SCALE, sparse_mode=3,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"BSH SP sparse_mode=3 with 2-way sequence split test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_bnsd_sp_correctness():
@@ -869,7 +957,10 @@ def test_bnsd_sp_correctness():
         scalar_value=SCALE, sparse_mode=0,
     )
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), standalone.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), standalone.asnumpy(), 1e-2, 1e-2), (
+        f"BNSD SP correctness test failed: output mismatch, "
+        f"expected {standalone.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_tnd_dp_correctness():
@@ -916,10 +1007,16 @@ def test_tnd_dp_correctness():
     )
 
     total_tokens = BATCH_SIZE * SEQ_LEN
-    assert result.to_local().shape == (total_tokens // 2, HEAD_NUM, HEAD_DIM)
+    assert result.to_local().shape == (total_tokens // 2, HEAD_NUM, HEAD_DIM), (
+        f"TND DP correctness test failed: output mismatch, "
+        f"expected {(total_tokens // 2, HEAD_NUM, HEAD_DIM)}, got {result.to_local().shape}"
+    )
 
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"TND DP correctness test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_tnd_cp():
@@ -953,10 +1050,16 @@ def test_tnd_cp():
         actual_seq_kvlen=actual_seq_kvlen,
     )
     total_tokens = BATCH_SIZE * SEQ_LEN
-    assert result.to_local().shape == (total_tokens // 2, HEAD_NUM, HEAD_DIM)
+    assert result.to_local().shape == (total_tokens // 2, HEAD_NUM, HEAD_DIM), (
+        f"TND CP test failed: output mismatch, "
+        f"expected {(total_tokens // 2, HEAD_NUM, HEAD_DIM)}, got {result.to_local().shape}"
+    )
 
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"TND CP correctness test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )
 
 
 def test_tnd_dp_kv_sharded():
@@ -990,7 +1093,13 @@ def test_tnd_dp_kv_sharded():
         actual_seq_kvlen=actual_seq_kvlen,
     )
     total_tokens = BATCH_SIZE * SEQ_LEN
-    assert result.to_local().shape == (total_tokens // 2, HEAD_NUM, HEAD_DIM)
+    assert result.to_local().shape == (total_tokens // 2, HEAD_NUM, HEAD_DIM), (
+        f"TND DP test failed: output mismatch, "
+        f"expected {(total_tokens // 2, HEAD_NUM, HEAD_DIM)}, got {result.to_local().shape}"
+    )
 
     output = result.full_tensor()
-    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2)
+    assert np.allclose(output.asnumpy(), expected.asnumpy(), 1e-2, 1e-2), (
+        f"TND DP correctness test failed: output mismatch, "
+        f"expected {expected.asnumpy().shape}, got {output.asnumpy().shape}"
+    )

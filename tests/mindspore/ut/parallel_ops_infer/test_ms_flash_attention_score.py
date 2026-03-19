@@ -42,17 +42,30 @@ def make_extra_args(head_num=16, input_layout="BSH", sparse_mode=0):
 
 
 def run_scenario(scenario_name, mesh, q_placements, k_placements, v_placements,
-                 ndim, expected_out_map, extra_args):
-    """Infer layout and verify attention output tensor_map."""
+                 ndim, expected_out_map, extra_args, expect_expand_impl=True):
+    """Infer layout and verify attention output tensor_map and get_expand_impl."""
     q_layout = _build_layout(mesh, q_placements, ndim)
     k_layout = _build_layout(mesh, k_placements, ndim)
     v_layout = _build_layout(mesh, v_placements, ndim)
 
     output_layouts = op.infer_layout((q_layout, k_layout, v_layout), extra_args)
     attention_out_layout = output_layouts[ATTENTION_OUT_IDX]
-    assert attention_out_layout.to_dict()["tensor_map"] == expected_out_map, \
-        f"Scenario '{scenario_name}' failed. " \
-        f"Expected {expected_out_map}, got {attention_out_layout.to_dict()['tensor_map']}"
+    assert attention_out_layout.tensor_map == expected_out_map, (
+        f"Scenario '{scenario_name}' failed. "
+        f"Expected {expected_out_map}, got {attention_out_layout.tensor_map}"
+    )
+
+    impl = op.get_expand_impl(None, output_layouts, (q_layout, k_layout, v_layout), extra_args)
+    if expect_expand_impl:
+        assert callable(impl), (
+            f"Scenario '{scenario_name}' get_expand_impl failed. "
+            f"Expected callable, got {type(impl)}"
+        )
+    else:
+        assert impl is None, (
+            f"Scenario '{scenario_name}' get_expand_impl failed. "
+            f"Expected None, got {type(impl)}"
+        )
 
 
 def test_flash_attention_no_parallel_1():
@@ -197,10 +210,10 @@ def test_flash_attention_hybrid_dp_sp_mp_6():
 
 def test_flash_attention_kv_different_layout_7():
     """
-    Feature: Layout inference with different KV sharding.
-    Description: Key has sp sharding but Value does not. Layout inference does not
-        validate KV consistency; that is deferred to get_expand_impl at runtime.
-    Expectation: Layout inference succeeds based on query layout.
+    Feature: Error handling for K/V inconsistent tensor_map in get_expand_impl.
+    Description: Key and Value have different tensor_map (sp sharding mismatch).
+    Expectation: infer_layout succeeds with correct tensor_map,
+        get_expand_impl raises ValueError for K/V tensor_map mismatch.
     """
     mesh = init_device_mesh(
         device_type="npu",
@@ -212,13 +225,18 @@ def test_flash_attention_kv_different_layout_7():
     k_placements = (Shard(0), Shard(1), Shard(2))
     v_placements = (Shard(0), Replicate(), Shard(2))
 
-    run_scenario(
-        "KV Different Layout",
-        mesh, q_placements, k_placements, v_placements,
-        ndim=3,
-        expected_out_map=(2, 1, 0),
-        extra_args=make_extra_args()
+    q_layout = _build_layout(mesh, q_placements, 3)
+    k_layout = _build_layout(mesh, k_placements, 3)
+    v_layout = _build_layout(mesh, v_placements, 3)
+
+    output_layouts = op.infer_layout((q_layout, k_layout, v_layout), make_extra_args())
+    assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (2, 1, 0), (
+        f"Attention output tensor_map mismatch: expected (2, 1, 0), "
+        f"got {output_layouts[ATTENTION_OUT_IDX].tensor_map}"
     )
+
+    with pytest.raises(ValueError, match="Key and Value must have identical sharding"):
+        op.get_expand_impl(None, output_layouts, (q_layout, k_layout, v_layout), make_extra_args())
 
 
 def test_flash_attention_bnsd_layout_8():
@@ -406,8 +424,18 @@ def test_flash_attention_output_count_15():
         (q_layout, k_layout, v_layout), make_extra_args()
     )
 
-    assert len(output_layouts) == 4
-    assert output_layouts[ATTENTION_OUT_IDX].to_dict()["tensor_map"] == (2, -1, 0)
+    assert len(output_layouts) == 4, (
+        f"Expected 4 output layouts, got {len(output_layouts)}"
+    )
+    assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (2, -1, 0), (
+        f"Attention output tensor_map mismatch: expected (2, -1, 0), "
+        f"got {output_layouts[ATTENTION_OUT_IDX].tensor_map}"
+    )
+
+    impl = op.get_expand_impl(None, output_layouts, (q_layout, k_layout, v_layout), make_extra_args())
+    assert callable(impl), (
+        f"get_expand_impl test failed. Expected callable, got {type(impl)}"
+    )
 
 
 def test_flash_attention_output_layouts_bsh_16():
@@ -439,15 +467,38 @@ def test_flash_attention_output_layouts_bsh_16():
     softmax_out = output_layouts[SOFTMAX_OUT_IDX]
     attention_out = output_layouts[ATTENTION_OUT_IDX]
 
-    assert attention_out.to_dict()["tensor_map"] == q_layout.to_dict()["tensor_map"]
-    assert attention_out.to_dict()["tensor_map"] == (1, -1, 0)
+    assert attention_out.tensor_map == q_layout.tensor_map, (
+        f"Attention output should match query layout: "
+        f"expected {q_layout.tensor_map}, got {attention_out.tensor_map}"
+    )
+    assert attention_out.tensor_map == (1, -1, 0), (
+        f"Attention output tensor_map mismatch: expected (1, -1, 0), "
+        f"got {attention_out.tensor_map}"
+    )
 
-    assert len(softmax_max.to_dict()["tensor_map"]) == 4
-    assert len(softmax_sum.to_dict()["tensor_map"]) == 4
-    assert softmax_max.to_dict()["tensor_map"] == (1, 0, -1, -1)
-    assert softmax_sum.to_dict()["tensor_map"] == (1, 0, -1, -1)
+    assert len(softmax_max.tensor_map) == 4, (
+        f"Softmax max should have 4D tensor_map, got {len(softmax_max.tensor_map)}"
+    )
+    assert len(softmax_sum.tensor_map) == 4, (
+        f"Softmax sum should have 4D tensor_map, got {len(softmax_sum.tensor_map)}"
+    )
+    assert softmax_max.tensor_map == (1, 0, -1, -1), (
+        f"Softmax max tensor_map mismatch: expected (1, 0, -1, -1), "
+        f"got {softmax_max.tensor_map}"
+    )
+    assert softmax_sum.tensor_map == (1, 0, -1, -1), (
+        f"Softmax sum tensor_map mismatch: expected (1, 0, -1, -1), "
+        f"got {softmax_sum.tensor_map}"
+    )
 
-    assert softmax_out.to_dict()["tensor_map"] == ()
+    assert softmax_out.tensor_map == (), (
+        f"Softmax out should have empty tensor_map, got {softmax_out.tensor_map}"
+    )
+
+    impl = op.get_expand_impl(None, output_layouts, (q_layout, k_layout, v_layout), make_extra_args())
+    assert callable(impl), (
+        f"get_expand_impl test failed. Expected callable, got {type(impl)}"
+    )
 
 
 def test_flash_attention_multi_dimensional_mesh_17():
@@ -547,9 +598,26 @@ def test_flash_attention_output_layouts_bnsd_20():
     softmax_max = output_layouts[SOFTMAX_MAX_IDX]
     softmax_sum = output_layouts[SOFTMAX_SUM_IDX]
 
-    assert attention_out.to_dict()["tensor_map"] == (1, 0, -1, -1)
-    assert softmax_max.to_dict()["tensor_map"] == (1, 0, -1, -1)
-    assert softmax_sum.to_dict()["tensor_map"] == (1, 0, -1, -1)
+    assert attention_out.tensor_map == (1, 0, -1, -1), (
+        f"Attention output tensor_map mismatch: expected (1, 0, -1, -1), "
+        f"got {attention_out.tensor_map}"
+    )
+    assert softmax_max.tensor_map == (1, 0, -1, -1), (
+        f"Softmax max tensor_map mismatch: expected (1, 0, -1, -1), "
+        f"got {softmax_max.tensor_map}"
+    )
+    assert softmax_sum.tensor_map == (1, 0, -1, -1), (
+        f"Softmax sum tensor_map mismatch: expected (1, 0, -1, -1), "
+        f"got {softmax_sum.tensor_map}"
+    )
+
+    impl = op.get_expand_impl(
+        None, output_layouts, (q_layout, k_layout, v_layout),
+        make_extra_args(input_layout="BNSD")
+    )
+    assert callable(impl), (
+        f"get_expand_impl test failed. Expected callable, got {type(impl)}"
+    )
 
 
 def test_flash_attention_output_layouts_sbh_21():
@@ -579,9 +647,26 @@ def test_flash_attention_output_layouts_sbh_21():
     softmax_max = output_layouts[SOFTMAX_MAX_IDX]
     softmax_sum = output_layouts[SOFTMAX_SUM_IDX]
 
-    assert attention_out.to_dict()["tensor_map"] == (-1, 1, 0)
-    assert softmax_max.to_dict()["tensor_map"] == (1, 0, -1, -1)
-    assert softmax_sum.to_dict()["tensor_map"] == (1, 0, -1, -1)
+    assert attention_out.tensor_map == (-1, 1, 0), (
+        f"Attention output tensor_map mismatch: expected (-1, 1, 0), "
+        f"got {attention_out.tensor_map}"
+    )
+    assert softmax_max.tensor_map == (1, 0, -1, -1), (
+        f"Softmax max tensor_map mismatch: expected (1, 0, -1, -1), "
+        f"got {softmax_max.tensor_map}"
+    )
+    assert softmax_sum.tensor_map == (1, 0, -1, -1), (
+        f"Softmax sum tensor_map mismatch: expected (1, 0, -1, -1), "
+        f"got {softmax_sum.tensor_map}"
+    )
+
+    impl = op.get_expand_impl(
+        None, output_layouts, (q_layout, k_layout, v_layout),
+        make_extra_args(input_layout="SBH")
+    )
+    assert callable(impl), (
+        f"get_expand_impl test failed. Expected callable, got {type(impl)}"
+    )
 
 
 def test_flash_attention_output_layouts_tnd_22():
@@ -611,9 +696,26 @@ def test_flash_attention_output_layouts_tnd_22():
     softmax_max = output_layouts[SOFTMAX_MAX_IDX]
     softmax_sum = output_layouts[SOFTMAX_SUM_IDX]
 
-    assert attention_out.to_dict()["tensor_map"] == (1, 0, -1)
-    assert softmax_max.to_dict()["tensor_map"] == (1, 0, -1, -1)
-    assert softmax_sum.to_dict()["tensor_map"] == (1, 0, -1, -1)
+    assert attention_out.tensor_map == (1, 0, -1), (
+        f"Attention output tensor_map mismatch: expected (1, 0, -1), "
+        f"got {attention_out.tensor_map}"
+    )
+    assert softmax_max.tensor_map == (1, 0, -1, -1), (
+        f"Softmax max tensor_map mismatch: expected (1, 0, -1, -1), "
+        f"got {softmax_max.tensor_map}"
+    )
+    assert softmax_sum.tensor_map == (1, 0, -1, -1), (
+        f"Softmax sum tensor_map mismatch: expected (1, 0, -1, -1), "
+        f"got {softmax_sum.tensor_map}"
+    )
+
+    impl = op.get_expand_impl(
+        None, output_layouts, (q_layout, k_layout, v_layout),
+        make_extra_args(input_layout="TND")
+    )
+    assert callable(impl), (
+        f"get_expand_impl test failed. Expected callable, got {type(impl)}"
+    )
 
 
 def test_flash_attention_output_layouts_mixed_parallel_23():
@@ -644,9 +746,23 @@ def test_flash_attention_output_layouts_mixed_parallel_23():
     softmax_max = output_layouts[SOFTMAX_MAX_IDX]
     softmax_sum = output_layouts[SOFTMAX_SUM_IDX]
 
-    assert attention_out.to_dict()["tensor_map"] == (2, 1, 0)
-    assert softmax_max.to_dict()["tensor_map"] == (2, 0, 1, -1)
-    assert softmax_sum.to_dict()["tensor_map"] == (2, 0, 1, -1)
+    assert attention_out.tensor_map == (2, 1, 0), (
+        f"Attention output tensor_map mismatch: expected (2, 1, 0), "
+        f"got {attention_out.tensor_map}"
+    )
+    assert softmax_max.tensor_map == (2, 0, 1, -1), (
+        f"Softmax max tensor_map mismatch: expected (2, 0, 1, -1), "
+        f"got {softmax_max.tensor_map}"
+    )
+    assert softmax_sum.tensor_map == (2, 0, 1, -1), (
+        f"Softmax sum tensor_map mismatch: expected (2, 0, 1, -1), "
+        f"got {softmax_sum.tensor_map}"
+    )
+
+    impl = op.get_expand_impl(None, output_layouts, (q_layout, k_layout, v_layout), make_extra_args())
+    assert callable(impl), (
+        f"get_expand_impl test failed. Expected callable, got {type(impl)}"
+    )
 
 
 def test_flash_attention_softmax_no_sharding_24():
@@ -674,8 +790,19 @@ def test_flash_attention_softmax_no_sharding_24():
     softmax_max = output_layouts[SOFTMAX_MAX_IDX]
     softmax_sum = output_layouts[SOFTMAX_SUM_IDX]
 
-    assert softmax_max.to_dict()["tensor_map"] == (-1, -1, -1, -1)
-    assert softmax_sum.to_dict()["tensor_map"] == (-1, -1, -1, -1)
+    assert softmax_max.tensor_map == (-1, -1, -1, -1), (
+        f"Softmax max tensor_map mismatch: expected (-1, -1, -1, -1), "
+        f"got {softmax_max.tensor_map}"
+    )
+    assert softmax_sum.tensor_map == (-1, -1, -1, -1), (
+        f"Softmax sum tensor_map mismatch: expected (-1, -1, -1, -1), "
+        f"got {softmax_sum.tensor_map}"
+    )
+
+    impl = op.get_expand_impl(None, output_layouts, (q_layout, k_layout, v_layout), make_extra_args())
+    assert callable(impl), (
+        f"get_expand_impl test failed. Expected callable, got {type(impl)}"
+    )
 
 
 def test_flash_attention_tnd_sp_25():
@@ -731,9 +858,24 @@ def test_flash_attention_tnd_softmax_output_sp_26():
     softmax_max = output_layouts[SOFTMAX_MAX_IDX]
     softmax_sum = output_layouts[SOFTMAX_SUM_IDX]
 
-    assert attention_out.to_dict()["tensor_map"] == (1, 0, -1)
-    assert len(softmax_max.to_dict()["tensor_map"]) == 4
-    assert len(softmax_sum.to_dict()["tensor_map"]) == 4
+    assert attention_out.tensor_map == (1, 0, -1), (
+        f"Attention output tensor_map mismatch: expected (1, 0, -1), "
+        f"got {attention_out.tensor_map}"
+    )
+    assert len(softmax_max.tensor_map) == 4, (
+        f"Softmax max should have 4D tensor_map, got {len(softmax_max.tensor_map)}"
+    )
+    assert len(softmax_sum.tensor_map) == 4, (
+        f"Softmax sum should have 4D tensor_map, got {len(softmax_sum.tensor_map)}"
+    )
+
+    impl = op.get_expand_impl(
+        None, output_layouts, (q_layout, k_layout, v_layout),
+        make_extra_args(input_layout="TND")
+    )
+    assert callable(impl), (
+        f"get_expand_impl test failed. Expected callable, got {type(impl)}"
+    )
 
 
 def test_flash_attention_bsnd_sp_27():
@@ -927,7 +1069,18 @@ def test_flash_attention_invalid_input_layout_34():
     )
 
     attention_out = output_layouts[ATTENTION_OUT_IDX]
-    assert attention_out.to_dict()["tensor_map"] == q_layout.to_dict()["tensor_map"]
+    assert attention_out.tensor_map == q_layout.tensor_map, (
+        f"Attention output should match query layout: "
+        f"expected {q_layout.tensor_map}, got {attention_out.tensor_map}"
+    )
+
+    impl = op.get_expand_impl(
+        None, output_layouts, (q_layout, k_layout, v_layout),
+        make_extra_args(input_layout="INVALID")
+    )
+    assert callable(impl), (
+        f"get_expand_impl test failed. Expected callable, got {type(impl)}"
+    )
 
 
 def test_flash_attention_missing_extra_args_35():
@@ -975,7 +1128,17 @@ def test_flash_attention_ndim_mismatch_layout_36():
     )
 
     attention_out = output_layouts[ATTENTION_OUT_IDX]
-    assert len(attention_out.to_dict()["tensor_map"]) == 3
+    assert len(attention_out.tensor_map) == 3, (
+        f"Attention output should have 3D tensor_map, got {len(attention_out.tensor_map)}"
+    )
+
+    impl = op.get_expand_impl(
+        None, output_layouts, (q_layout, k_layout, v_layout),
+        make_extra_args(input_layout="BNSD")
+    )
+    assert callable(impl), (
+        f"get_expand_impl test failed. Expected callable, got {type(impl)}"
+    )
 
 
 def test_flash_attention_integer_input_layout_37():
@@ -1004,5 +1167,48 @@ def test_flash_attention_integer_input_layout_37():
         (q_layout, k_layout, v_layout), make_extra_args(input_layout="BSH")
     )
 
-    assert output_int[ATTENTION_OUT_IDX].to_dict()["tensor_map"] == \
-        output_str[ATTENTION_OUT_IDX].to_dict()["tensor_map"]
+    assert output_int[ATTENTION_OUT_IDX].tensor_map == output_str[ATTENTION_OUT_IDX].tensor_map, (
+        f"Integer and string input_layout should produce same result: "
+        f"int={output_int[ATTENTION_OUT_IDX].tensor_map}, "
+        f"str={output_str[ATTENTION_OUT_IDX].tensor_map}"
+    )
+
+    impl_int = op.get_expand_impl(
+        None, output_int, (q_layout, k_layout, v_layout),
+        make_extra_args(input_layout=0)
+    )
+    impl_str = op.get_expand_impl(
+        None, output_str, (q_layout, k_layout, v_layout),
+        make_extra_args(input_layout="BSH")
+    )
+    assert callable(impl_int), (
+        f"get_expand_impl test failed for int input_layout. Expected callable, got {type(impl_int)}"
+    )
+    assert callable(impl_str), (
+        f"get_expand_impl test failed for str input_layout. Expected callable, got {type(impl_str)}"
+    )
+
+
+def test_flash_attention_query_layout_none_38():
+    """
+    Feature: get_expand_impl returns None when query layout is None.
+    Description: Query layout is None, which causes get_expand_impl to return None.
+    Expectation: infer_layout raises ValueError, get_expand_impl returns None.
+    """
+    mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(4, 2),
+        mesh_dim_names=("dp", "mp"),
+        init_backend=False
+    )
+    placements = (Shard(0), Replicate())
+    k_layout = _build_layout(mesh, placements, 3)
+    v_layout = _build_layout(mesh, placements, 3)
+
+    with pytest.raises(ValueError, match="Query layout cannot be None"):
+        op.infer_layout((None, k_layout, v_layout), make_extra_args())
+
+    impl = op.get_expand_impl(None, None, (None, k_layout, v_layout), make_extra_args())
+    assert impl is None, (
+        f"get_expand_impl should return None when query layout is None, got {type(impl)}"
+    )

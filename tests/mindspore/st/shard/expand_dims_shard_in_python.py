@@ -87,7 +87,10 @@ def test_expanddims_data_parallel_1():
 
     # Validate
     parallel_output = parallel_output.full_tensor()
-    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3), (
+        f"Data Parallel test failed: output mismatch, "
+        f"expected {standalone_output.asnumpy().shape}, got {parallel_output.asnumpy().shape}"
+    )
 
 
 def test_expanddims_model_parallel_2():
@@ -123,7 +126,10 @@ def test_expanddims_model_parallel_2():
 
     # Validate
     parallel_output = parallel_output.full_tensor()
-    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3), (
+        f"Model Parallel test failed: output mismatch, "
+        f"expected {standalone_output.asnumpy().shape}, got {parallel_output.asnumpy().shape}"
+    )
 
 
 def test_expanddims_hybrid_parallel_3():
@@ -159,7 +165,10 @@ def test_expanddims_hybrid_parallel_3():
 
     # Validate
     parallel_output = parallel_output.full_tensor()
-    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3), (
+        f"Hybrid Parallel test failed: output mismatch, "
+        f"expected {standalone_output.asnumpy().shape}, got {parallel_output.asnumpy().shape}"
+    )
 
 
 def test_expanddims_insert_middle_4():
@@ -195,7 +204,10 @@ def test_expanddims_insert_middle_4():
 
     # Validate
     parallel_output = parallel_output.full_tensor()
-    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3), (
+        f"Insert Middle test failed: output mismatch, "
+        f"expected {standalone_output.asnumpy().shape}, got {parallel_output.asnumpy().shape}"
+    )
 
 
 def test_expanddims_negative_axis_5():
@@ -231,4 +243,46 @@ def test_expanddims_negative_axis_5():
 
     # Validate
     parallel_output = parallel_output.full_tensor()
-    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3)
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3), (
+        f"Negative Axis test failed: output mismatch, "
+        f"expected {standalone_output.asnumpy().shape}, got {parallel_output.asnumpy().shape}"
+    )
+
+
+def test_expanddims_all_replicated_6():
+    '''
+    Feature: ExpandDims in python shard.
+    Description: Test ExpandDims with all replicated (no sharding).
+    Expectation: Run success.
+    '''
+    ms.set_seed(1)
+    d, m, k = 16, 256, 128
+    x = Tensor(np.random.randn(d, m, k).astype(np.float32))
+
+    # Standalone
+    standalone_net = ExpandDimsNet()
+    standalone_output = standalone_net(x, axis=1)
+
+    # Parallel
+    # Create DeviceMesh
+    mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=base_mesh_shape,
+        mesh_dim_names=base_alias_name
+    )
+
+    # Define placements using Placement format - all replicated
+    x_placements = (Replicate(), Replicate(), Replicate())
+    relu_input_placements = (Replicate(), Replicate(), Replicate(), Replicate())
+
+    x_local = distribute_tensor(x, mesh, x_placements)
+
+    parallel_net = ExpandDimsNet(device_mesh=mesh, relu_strategy=relu_input_placements)
+    parallel_output = parallel_net(x_local, axis=1)
+
+    # Validate
+    parallel_output = parallel_output.full_tensor()
+    assert np.allclose(standalone_output.asnumpy(), parallel_output.asnumpy(), 1e-3, 1e-3), (
+        f"All Replicated test failed: output mismatch, "
+        f"expected {standalone_output.asnumpy().shape}, got {parallel_output.asnumpy().shape}"
+    )
