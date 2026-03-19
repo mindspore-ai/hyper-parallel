@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -254,7 +254,7 @@ class TensorRedistribution:
         """Do reduce_scatter at specified axis along dev_dim."""
         dev_num = layout.mesh_shape[layout.alias_name.index(dev_dim)]
         group = layout.get_comm_group_by_axis(dev_dim)
-        output_tensor = self.platform.reduce_scatter(x, dev_num, axis, op, group)
+        output_tensor = platform.differentiable_reduce_scatter(x, dev_num, axis, op, group)
         return output_tensor
 
     def reduce_partial(self, input_x, to_layout):

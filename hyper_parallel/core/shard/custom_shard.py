@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,7 +45,7 @@ def custom_shard(
         Callable: Wrapped function that handles distributed tensors.
 
     Examples:
-        >>> mesh = DeviceMesh("npu", (2, 2), nesh_dim_names=("dp", "tp"))
+        >>> mesh = DeviceMesh("npu", (2, 2), mesh_dim_names=("dp", "tp"))
         >>> @custom_shard(
         ...     device_mesh=mesh,
         ...     out_placements=((Shard(0), Replicate()),),

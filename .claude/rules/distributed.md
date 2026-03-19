@@ -17,6 +17,23 @@ paths:
 - Use `SkipDTensorDispatch` context manager when operating on raw local tensors inside gradient hooks
 - Distributed ops are registered via YAML in `core/shard/ops/yaml/`; implementations in `core/shard/ops/parallel_*.py`
 
+## Platform API Calling Conventions
+
+### Module-level `platform` vs `self.platform`
+- **Always use module-level `platform = get_platform()`** — never store platform as `self.platform` on instances
+- If you see `self.platform` in existing code, treat it as a bug and fix it to use the module-level `platform`
+
+### `differentiable_*` vs non-differentiable collective APIs
+- Code in `TensorRedistribution` and any forward/backward computation path **must** use `platform.differentiable_all_reduce`, `platform.differentiable_reduce_scatter`, etc.
+- Non-differentiable versions (`platform.all_reduce`, `platform.reduce_scatter`) are only for contexts outside autograd (e.g., parameter sync, buffer broadcast)
+- When adding a new collective call, ask: "Does this tensor need gradients?" — if yes, use `differentiable_*`
+
+### `group` vs `group_info` parameter types
+- `platform.all_reduce`, `platform.all_gather_into_tensor`, `platform.reduce_scatter_tensor` expect a **`group_info` object** with `.group` attribute (Torch) or a `str` (MindSpore)
+- `platform.differentiable_all_reduce`, `platform.differentiable_reduce_scatter` expect a **raw `group`** (ProcessGroup or str)
+- `platform.create_group()` returns a **raw group** — wrap it with `SimpleNamespace(group=group)` before passing to non-differentiable APIs
+- When calling any collective API, **check the platform base class signature** in `platform/platform.py` to confirm the expected parameter type
+
 ## Stream Synchronization
 
 - `async_op=True` handles must be waited via `handle.wait()` before accessing the output tensor
