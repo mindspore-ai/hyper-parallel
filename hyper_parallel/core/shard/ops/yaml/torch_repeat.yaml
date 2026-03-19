@@ -1,0 +1,4 @@
+repeat:
+  dist_op_name: _torch_repeat_dist_op
+  distributed_op_class: RepeatDistributedOp
+  distributed_op_file: parallel_repeat
