@@ -24,7 +24,6 @@ from mindspore import nn, ops
 from mindspore.communication import init
 from hyper_parallel import hsdp, hsdp_sync_stream
 from hyper_parallel import parallelize_value_and_grad
-from tests.common.mark_utils import arg_mark
 from tests.mindspore.st.common_net import SlimLeNet
 from tests.mindspore.st.hsdp.hsdp_test_common import hsdp_network_ckpt_path
 from tests.mindspore.st.utils import skip_if_ms_version_lt, skip_if_ms_plugin_not_exist
@@ -192,7 +191,6 @@ def hsdp_with_accumulate_grad(shard_size, threshold=64, optimizer_level="level1"
     assert final_loss < 1.0
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_standalone_run():
     '''
     Feature: Run the network with standalone mode
@@ -346,7 +344,6 @@ def test_zero3_with_comm_fusion_bucket_size0(mode):
                               comm_fusion=True, bucket_size=0, mode=mode)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_no_dp(mode):
     '''
@@ -357,7 +354,6 @@ def test_no_dp(mode):
     hsdp_without_accumulate_grad(shard_size=1, mode=mode)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 @pytest.mark.parametrize("mode", _MODE_PARAMS)
 def test_no_dp_with_acc_grad(mode):
     '''
