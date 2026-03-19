@@ -52,6 +52,7 @@ class HSDPState:
         self._move_states_to_device()
         self._init_hsdp_params()
         self.is_shard = True
+        self.module_name = None
 
     def _init_hsdp_params(self):
         """init hsdp parameters for cell"""

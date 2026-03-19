@@ -26,11 +26,12 @@ from hyper_parallel.platform import get_platform
 class TorchHSDPSchedulerV2(HSDPSchedulerV2):
     """TorchHSDPScheduler is used to implement optimizer level."""
     root_bp_state = False
-
+    _root_module = None
     def __init__(self, *args, **kwargs):
         """Initialize TorchHSDPSchedulerV2 and register forward/backward hooks."""
         super().__init__(*args, **kwargs)
         self._backup_forward_fetch = None
+        self._is_root = False
 
     def _register_hooks(self):
         """Register hooks."""
@@ -76,6 +77,14 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         if TorchHSDPSchedulerV2.root_bp_state:
             self._backup_forward_fetch = self.forward_prefetch_cells
             self.forward_prefetch_cells = []
+        if TorchHSDPSchedulerV2._root_module is None:
+            TorchHSDPSchedulerV2._root_module = self.cell
+            self._is_root = True
+        if not self._is_root and not self.hsdp_state.module_name:
+            for module_name, module in TorchHSDPSchedulerV2._root_module.named_modules():
+                if module == self.cell:
+                    self.hsdp_state.module_name = module_name
+                    break
         args, kwargs = self._hsdp_forward_pre_hook(cell, args, kwargs)
         return self._register_post_backward_hook(args, kwargs)
 
@@ -115,7 +124,8 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         self._backward_hook()
         if apply_final_reduce:
             TorchHSDPSchedulerV2.root_bp_state = False
-            self.hsdp_state.reduce_params()
+            with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
+                self.hsdp_state.reduce_params()
 
     def _backward_hook(self):
         """Execute backward hook."""

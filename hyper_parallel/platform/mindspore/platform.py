@@ -18,6 +18,7 @@ from typing import Optional
 import dataclasses
 from collections import OrderedDict
 
+import contextlib
 import numpy as np
 import mindspore as ms
 import mindspore.common.dtype as mstype
@@ -617,6 +618,7 @@ class MindSporePlatform(Platform):
         return tensor.asnumpy()
 
     @staticmethod
+
     def clip_grad_norm_(
         parameters, max_norm, norm_type=2.0,
         error_if_nonfinite=False, foreach=None,
@@ -648,7 +650,6 @@ class MindSporePlatform(Platform):
         """Recursively apply to all tensor in different kinds of container types."""
 
         def apply(x):
-
             if isinstance(x, ms.Tensor):
                 return fn(x)
             if hasattr(x, "__dataclass_fields__"):
@@ -672,3 +673,8 @@ class MindSporePlatform(Platform):
             return x
 
         return apply(container)
+
+    @staticmethod
+    def profiler_record(name):
+        """Profiler context manager for recording operations using mindspore.profiler."""
+        return contextlib.nullcontext()
