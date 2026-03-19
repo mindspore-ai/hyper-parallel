@@ -33,7 +33,7 @@ def run_case(file_name, case_name, master_port):
     assert ret == 0
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_scatter_update_data_parallel_1():
     """
     Feature: ScatterUpdate operator.
@@ -46,7 +46,7 @@ def test_scatter_update_data_parallel_1():
     run_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_scatter_update_model_parallel_2():
     """
     Feature: ScatterUpdate operator.
@@ -59,7 +59,7 @@ def test_scatter_update_model_parallel_2():
     run_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_scatter_update_hybrid_parallel_3():
     """
     Feature: ScatterUpdate operator.
@@ -72,7 +72,7 @@ def test_scatter_update_hybrid_parallel_3():
     run_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_scatter_update_multi_dim_indices_4():
     """
     Feature: ScatterUpdate operator.
@@ -85,7 +85,7 @@ def test_scatter_update_multi_dim_indices_4():
     run_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_scatter_update_replicate_all_5():
     """
     Feature: ScatterUpdate operator.

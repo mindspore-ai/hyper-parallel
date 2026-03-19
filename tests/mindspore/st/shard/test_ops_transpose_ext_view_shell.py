@@ -39,7 +39,7 @@ def test_transpose_ext_view_basic_3d_1():
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -58,7 +58,7 @@ def test_transpose_ext_view_negative_dims_2():
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )

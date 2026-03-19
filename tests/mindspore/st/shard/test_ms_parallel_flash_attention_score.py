@@ -47,7 +47,7 @@ def test_bsh_dp():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_bsh_mp():
     """
     Feature: test flash_attention_score with BSH layout, head parallelism.
@@ -75,7 +75,7 @@ def test_bsh_sp():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_bsh_dp_mp_2d():
     """
     Feature: test flash_attention_score with BSH layout, DP + MP on 2D mesh.
@@ -89,7 +89,7 @@ def test_bsh_dp_mp_2d():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_bsh_sp_mp_2d():
     """
     Feature: test flash_attention_score with BSH layout, SP + MP on 2D mesh.
@@ -117,7 +117,7 @@ def test_bsh_dp_sp_mp_3d():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bnsd_dp_mp():
     """
     Feature: test flash_attention_score with BNSD layout, DP + MP.
@@ -131,7 +131,7 @@ def test_bnsd_dp_mp():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bnsd_sp():
     """
     Feature: test flash_attention_score with BNSD layout, DP + SP.
@@ -229,7 +229,7 @@ def test_sp_sparse_mode_0():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sp_sparse_mode_2():
     """
     Feature: test flash_attention_score SP with sparse_mode=2.
@@ -243,7 +243,7 @@ def test_sp_sparse_mode_2():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sp_sparse_mode_3():
     """
     Feature: test flash_attention_score SP with sparse_mode=3.
@@ -257,7 +257,7 @@ def test_sp_sparse_mode_3():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sp_sparse_mode_4():
     """
     Feature: test flash_attention_score SP with sparse_mode=4.
@@ -271,7 +271,7 @@ def test_sp_sparse_mode_4():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dp_sparse_mode_1():
     """
     Feature: test flash_attention_score DP with sparse_mode=1.
@@ -299,7 +299,7 @@ def test_dp_sparse_mode_4():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bsh_custom_scale():
     """
     Feature: test flash_attention_score with custom scalar_value.
@@ -369,7 +369,7 @@ def test_bsh_redistribute_then_attention():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_sp_sparse_mode_2_with_2way_split():
     """
     Feature: test flash_attention_score SP sparse_mode=2 with 2-way split.
@@ -397,7 +397,7 @@ def test_sp_sparse_mode_3_with_2way_split():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_bnsd_sp_correctness():
     """
     Feature: test flash_attention_score BNSD SP correctness.
@@ -411,7 +411,7 @@ def test_bnsd_sp_correctness():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_tnd_dp_correctness():
     """
     Feature: test flash_attention_score TND DP correctness with actual_seq_len adjustment.
@@ -427,7 +427,7 @@ def test_tnd_dp_correctness():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_tnd_cp():
     """
     Feature: test flash_attention_score TND layout with context parallelism.
@@ -442,7 +442,7 @@ def test_tnd_cp():
     msrun_case(glog_v, file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="unessential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_tnd_dp_kv_sharded():
     """
     Feature: test flash_attention_score TND DP with kv_is_sharded=True.

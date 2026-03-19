@@ -70,7 +70,7 @@ def test_t5_roundtrip_8cards():
     torchrun_case(_FILE, "test_t5_roundtrip_8cards", _PORT_BASE + 5, num_proc=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_t6_get_model_sd_sharded():
     """
@@ -82,7 +82,7 @@ def test_t6_get_model_sd_sharded():
     torchrun_case(_FILE, "test_t6_get_model_sd_sharded", _PORT_BASE + 6, num_proc=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_t7_get_model_sd_full_cpu():
     """
@@ -94,7 +94,7 @@ def test_t7_get_model_sd_full_cpu():
     torchrun_case(_FILE, "test_t7_get_model_sd_full_cpu", _PORT_BASE + 7, num_proc=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_t8_get_model_sd_ignore_frozen():
     """
@@ -106,7 +106,7 @@ def test_t8_get_model_sd_ignore_frozen():
     torchrun_case(_FILE, "test_t8_get_model_sd_ignore_frozen", _PORT_BASE + 8, num_proc=2)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_t11_meta_load_backward():
     """
@@ -135,7 +135,7 @@ def test_t13_extra_state_error_paths():
 
 # ---------- onecard tests: _to_dtype_if_needed + _extra_state UT ----------
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="onecard", essential_mark="essential")
 def test_t10_to_dtype_if_needed():
     """

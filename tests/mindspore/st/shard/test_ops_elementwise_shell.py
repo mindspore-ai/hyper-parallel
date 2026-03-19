@@ -55,7 +55,7 @@ class TestMinimumSameShape(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -76,7 +76,7 @@ class TestLessEqualSameShape(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -97,7 +97,7 @@ class TestGreaterEqualSameShape(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -118,7 +118,7 @@ class TestLogicalOrSameShape(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -139,7 +139,7 @@ class TestMinimumBroadcastDim0(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -160,7 +160,7 @@ class TestMinimumBroadcastDim1(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -181,7 +181,7 @@ class TestMinimumBroadcastDim2(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -202,7 +202,7 @@ class TestMinimumBroadcastRankMismatch(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -223,7 +223,7 @@ class TestMinimumBroadcastScalarLike(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -244,7 +244,7 @@ class TestLessEqualBroadcastMultiDim(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -265,7 +265,7 @@ class TestMinimumPartialShard(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -286,7 +286,7 @@ class TestModSameShape(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -307,7 +307,7 @@ class TestModBroadcastDim0(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -328,7 +328,7 @@ class TestModBroadcastDim1(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -349,7 +349,7 @@ class TestModBroadcastDim2(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -370,7 +370,7 @@ class TestModBroadcastRankMismatch(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -391,7 +391,7 @@ class TestModTensorScalar(ElementWiseShellBase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )

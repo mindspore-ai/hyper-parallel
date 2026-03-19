@@ -18,7 +18,7 @@ from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_sdpa_replicate():
     """
     Feature: test scaled_dot_product_attention with no parallelism.
@@ -31,7 +31,7 @@ def test_sdpa_replicate():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sdpa_dp():
     """
     Feature: test scaled_dot_product_attention with data parallelism.
@@ -44,7 +44,7 @@ def test_sdpa_dp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sdpa_mp():
     """
     Feature: test scaled_dot_product_attention with head parallelism.
@@ -57,7 +57,7 @@ def test_sdpa_mp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sdpa_sp():
     """
     Feature: test scaled_dot_product_attention with sequence parallelism.
@@ -70,7 +70,7 @@ def test_sdpa_sp():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sdpa_dp_mp_2d():
     """
     Feature: test scaled_dot_product_attention with DP + MP on 2D mesh.
@@ -83,7 +83,7 @@ def test_sdpa_dp_mp_2d():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sdpa_sp_mp_2d():
     """
     Feature: test scaled_dot_product_attention with SP + MP on 2D mesh.
@@ -96,7 +96,7 @@ def test_sdpa_sp_mp_2d():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sdpa_sp_causal():
     """
     Feature: test scaled_dot_product_attention SP with is_causal=True.
@@ -109,7 +109,7 @@ def test_sdpa_sp_causal():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sdpa_sp_explicit_mask():
     """
     Feature: test scaled_dot_product_attention SP with explicit attn_mask.
@@ -122,7 +122,7 @@ def test_sdpa_sp_explicit_mask():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sdpa_error_kv_strategy_mismatch():
     """
     Feature: test scaled_dot_product_attention rejects mismatched KV strategies.
@@ -135,7 +135,7 @@ def test_sdpa_error_kv_strategy_mismatch():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sdpa_error_kv_seq_sharding():
     """
     Feature: test scaled_dot_product_attention rejects KV sequence sharding.

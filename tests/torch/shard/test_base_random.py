@@ -41,7 +41,7 @@ def test_distribute_region_disabled():
     case_name = "test_distribute_region_disabled"
     torchrun_case(file_name, case_name, master_port)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_multi_dim_sharding_offset():
     '''
     Feature: dtensor dispatch/infer_layout/redistribute.
