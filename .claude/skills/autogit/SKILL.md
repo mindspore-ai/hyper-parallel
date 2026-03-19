@@ -102,6 +102,11 @@ STOP and ask the user if you are about to:
 | Rebase conflict | Use `--no-rebase` or resolve manually |
 | Cherry-pick failed | Use a feature branch instead |
 
+
+## Important Restrictions (Must Follow)
+
+DO NOT add "Co-Authored-By: Claude ..." in commit messages.
+
 ## References
 
 - **Command details**: [references/commands.md](references/commands.md) — full parameter docs, execution flows, setup instructions.
