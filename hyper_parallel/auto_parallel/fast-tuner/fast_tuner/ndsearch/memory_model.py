@@ -35,6 +35,7 @@ def memory_simple_prune(config, profile_info):
         return False
     return True
 
+
 def trans_format(dryrun_info_init, test_ep):
     """
     trans dryrun_info_init to [dp, tp, pp, ep, peak_mem_ep1, peak_mem_ep2]
@@ -54,6 +55,7 @@ def trans_format(dryrun_info_init, test_ep):
         config_mem_dict[key][index] = peak_mem
 
     return [list(key) + value for key, value in config_mem_dict.items()]
+
 
 def grey_box_memory_prune(mindformers_args, dryrun_info_init, test_ep, max_expert_parallel):
     """
@@ -80,7 +82,7 @@ def grey_box_memory_prune(mindformers_args, dryrun_info_init, test_ep, max_exper
     ep_power = find_power_of_two(max_expert_parallel)
     for dp, tp, pp, peak_ep, peak_ep_double in dryrun_info:
         # 线性拟合ep会影响到的内存和ep不会影响到的内存
-        ep_memory = (peak_ep - peak_ep_double) * test_ep[1] #所有专家的内存
+        ep_memory = (peak_ep - peak_ep_double) * test_ep[1]  # 所有专家的内存
         base_memory = peak_ep - ep_memory / test_ep[0]
         # 确定ep最大能开多大,最大为6, ep最大64
         ep_upperbound = 0
@@ -96,6 +98,7 @@ def grey_box_memory_prune(mindformers_args, dryrun_info_init, test_ep, max_exper
                 memory_aware_configs.append([dp, tp, pp, ep, evaluate_mem])
     return memory_aware_configs
 
+
 def find_power_of_two(m):
     if m <= 0:
         return None
@@ -104,11 +107,11 @@ def find_power_of_two(m):
         return int(power)
     return None
 
+
 def filter_oom(search_space, input_args, para):
     """
     filter evaluate oom configs
     """
-    # todo: 是否dryurn返回值不同，需判断这里是否需要处理
     if para.DRYRUN:
         # 生成要做dryrun的配置
         care_part_configs = select_dry_config(search_space, input_args)
@@ -135,7 +138,7 @@ def filter_oom(search_space, input_args, para):
         generate_csv(para.OUTPUT_PATH, candidate_configs, input_args)
         return candidate_configs
 
-    candidate_configs = [] #the format is [dp, tp, pp, ep, cp, op, evaluate_mem]
+    candidate_configs = []  # the format is [dp, tp, pp, ep, cp, op, evaluate_mem]
     for config in search_space:
         op_disable = False
         dp, tp, cp, pp = config[0][0]
@@ -161,7 +164,8 @@ def filter_oom(search_space, input_args, para):
                  + moe_size * (input_args.num_layers // input_args.pp - input_args.first_k_dense_replace))
             estimated_general = moe_size * math.ceil((input_args.num_layers + 2) / input_args.pp)
             evaluate_memory = max(estimated_first, estimated_general)
-        if op_disable: op = -1
+        if op_disable:
+            op = -1
         if evaluate_memory <= max_mem:
             if [dp, tp, pp, ep, cp, op, evaluate_memory] not in candidate_configs:
                 candidate_configs.append([dp, tp, pp, ep, cp, op, evaluate_memory])
@@ -171,6 +175,7 @@ def filter_oom(search_space, input_args, para):
     logger.info(f"Prune Search space size: {len(candidate_configs)},"
                 f"format: [dp, tp, pp, ep, cp, op/fsdp, evaluate_peak_mem]")
     return candidate_configs
+
 
 def select_dry_config(valid_configs, input_args):
     """
@@ -208,6 +213,7 @@ def select_dry_config(valid_configs, input_args):
     logger.info(f"Dryrun candidate config size: {len(ans)}")
     return ans
 
+
 def generate_csv(output_path, dryrun_config, input_args):
     """
     generate nd result to csv file
@@ -231,11 +237,13 @@ def generate_csv(output_path, dryrun_config, input_args):
     except Exception as e:
         logger.info(f"write CSV file fail: {e}")
 
+
 class CareTpye(Enum):
     UNKNOWN = 0
     WITH_EXPERT_MF = 1
     NO_EXPERT = 2
     WITH_EXPERT_NO_MF = 3
+
 
 def generate_dry_config(care_part_configs, input_args, test_ep):
     """
@@ -289,6 +297,7 @@ def generate_dry_config(care_part_configs, input_args, test_ep):
 
 NUM_BYTES_IN_MEGA = 1024 * 1024
 
+
 def compute_weight_and_optimizer_memory(input_args):
     """
 
@@ -297,9 +306,10 @@ def compute_weight_and_optimizer_memory(input_args):
     """
     #Attention projection size
     if input_args.kv_channels:
-        query_projection_to_hidden_size_ratio =(
+        query_projection_to_hidden_size_ratio = (
                 input_args.kv_channels * input_args.num_attention_heads / input_args.hidden_size)
-    else: query_projection_to_hidden_size_ratio = 1
+    else:
+        query_projection_to_hidden_size_ratio = 1
     # Group Query Attention.
     if not input_args.group_query_attention:
         input_args.num_query_groups = input_args.num_attention_heads
@@ -333,7 +343,8 @@ def compute_weight_and_optimizer_memory(input_args):
         else:
             qk_pos_emb_head_dim = 0
             print('qk pos head dim not specified')
-        assert not input_args.group_query_attention
+        if input_args.group_query_attention:
+            raise ValueError("group_query_attention is not supported in this configuration")
         if input_args.q_lora_rank is None:
             q_term = input_args.hidden_size * input_args.num_attention_heads * (qk_head_dim + qk_pos_emb_head_dim)
         else:

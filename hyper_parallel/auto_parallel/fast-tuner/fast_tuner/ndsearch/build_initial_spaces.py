@@ -17,12 +17,14 @@
 import itertools
 import math
 
+
 def cal_factor(num):
     factors = []
     for i in range(1, num + 1):
         if num % i == 0:
             factors.append(i)
     return factors
+
 
 def find_integers_less_than_ceil(num_layers, pp):
     if pp == 1:
@@ -32,6 +34,7 @@ def find_integers_less_than_ceil(num_layers, pp):
     result = list(range(1, ceil_value))
     return result
 
+
 def find_ep(expert_num):
     if expert_num is None:
         return [1]
@@ -40,6 +43,7 @@ def find_ep(expert_num):
         if i == 1 or i % 2 == 0:
             ep_list.append(i)
     return ep_list
+
 
 def build_initial_spaces(input_args, para):
     """
@@ -71,7 +75,6 @@ def build_initial_spaces(input_args, para):
         op_options = get_op_options(world_size_config)
         vp_options = find_integers_less_than_ceil(num_layers, world_size_config[3])
         mbs_options = [1, 2, 4]
-        # todo: mindformers 和 mindspeed 对ep的限制不同，当前是mindformers的，待修改，把这个挪到专家剪枝
         ep_options = find_ep(input_args.expert_num)
         result = list(itertools.product(ep_options, op_options, vp_options, mbs_options))
 

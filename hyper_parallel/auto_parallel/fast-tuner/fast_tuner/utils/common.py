@@ -40,6 +40,7 @@ MODULE_PATTERN_REG_YAML = r'DP(\d+)_TP(\d+)_PP(\d+)_EP(\d+)_pretrain.yaml'
 MOE_PATTERN_REG_SHELL = r'DP(\d+)_TP(\d+)_PP(\d+)_EP(\d+)_pretrain.sh'
 LLAMA_PATTERN_REG_SHELL = r'DP(\d+)_TP(\d+)_PP(\d+)_pretrain.sh'
 
+
 def initial_offset(pipeline_stage, num_layers):
     '''
     set offset in a memory friendly way such that
@@ -55,13 +56,14 @@ def initial_offset(pipeline_stage, num_layers):
     remainder = num_layers % (pp_interleave_num * pipeline_stage)
     for vpp in range(pp_interleave_num):
         offset[0][0] += 1
-        remainder-=1
+        remainder -= 1
         for stage in range(pipeline_stage):
             if remainder == 0:
                 break
             offset[vpp][pipeline_stage - stage - 2] += 1
             remainder -= 1
     return offset[0]
+
 
 def offset_for_dualpipe(pipeline_stage, num_layers):
     '''
@@ -92,10 +94,12 @@ def offset_for_dualpipe(pipeline_stage, num_layers):
         offset[1][stage] = vpp2_layer - origin_base
     return offset
 
+
 def cal_world_size(input_args):
     '''compute the worldsize from config'''
     world_size = input_args.dp * input_args.tp * input_args.pp * input_args.cp
     return world_size
+
 
 def generate_dryrun_yaml(destination_file, config, para):
     """
@@ -122,7 +126,6 @@ def generate_dryrun_yaml(destination_file, config, para):
         # 重计算设置为true
         yaml_data['recompute_config']['recompute'] = True
 
-        # todo: 适配tnd
         yaml_data['train_dataset']['data_loader']['dataset_dir'] = para.DATASET
 
 
@@ -131,6 +134,7 @@ def generate_dryrun_yaml(destination_file, config, para):
         yaml.dump(yaml_data, file, default_flow_style=False, allow_unicode=True)
 
     logger.info(f"The dryrun YAML file copied and modified, new file is: {destination_file}")
+
 
 def generate_dryrun_shell(destination_file, config, para):
     """
@@ -146,6 +150,7 @@ def generate_dryrun_shell(destination_file, config, para):
     configs['PP'] = config[2]
     configs_to_shell(destination_file, configs, unparses)
     logger.info(f'The dryrun SHELL file copied and modified, new file is {destination_file}')
+
 
 def generate_profile_yaml(destination_file, config, para):
     """
@@ -186,6 +191,7 @@ def generate_profile_yaml(destination_file, config, para):
 
     logger.info(f"The profile YAML file copied and modified, config_para is: {config}")
 
+
 def generate_profile_shell(destination_file, config, para):
     """
     :param para: 用户输入参数
@@ -203,7 +209,6 @@ def generate_profile_shell(destination_file, config, para):
         configs['FIRST_K_DENSE_RAPLACE'] = 3
     else:
         configs['EP'] = 0  # 或者这里不需要写入EP
-        # TODO 应该需要读NPUS_PER_NODE，当前硬编码为8
     profile_need_rank_num = configs['DP'] * configs['TP'] * configs['PP']
     if profile_need_rank_num < para.RANK_NUM:
         configs['NNODES'] = profile_need_rank_num // 8
@@ -236,7 +241,6 @@ def generate_profile_shell(destination_file, config, para):
         f"--profile-ranks {profile_ranks} "  # 确保参数之间有空格
         f"--profile-save-path {output_dir}"
     )
-    # todo: 需要适配原有的args內容
     if configs['EP'] == 0:
         mem_args = (
             "--use-distributed-optimizer "
@@ -263,6 +267,7 @@ def generate_profile_shell(destination_file, config, para):
     logger.info(f'The profile SHELL file copied and modified, new file is {destination_file}')
     return output_dir
 
+
 def generate_profile_toml(destination_file, config, para):
     '''generate toml file for profile'''
     def read_toml(file_path):
@@ -277,17 +282,13 @@ def generate_profile_toml(destination_file, config, para):
 
     dp, tp, pp, ep, cp, op = config[:6]
     template_data = read_toml(para.TOML_PATH)
-    # [profiling]
     template_data['profiling']['enable_profiling'] = True
     template_data['profiling']['profile_freq'] = 20
     output_trace_dir = os.path.join(os.path.abspath(para.OUTPUT_PATH), "profile_result",
                                   f"DP{dp}_TP{tp}_PP{pp}_EP{ep}_CP{cp}_OP{op}_trace")
     template_data['profiling']['save_traces_folder'] = output_trace_dir
-    # [model]
     template_data['model']['flavor'] = 'tune'
-    # [training]
     template_data['training']['steps'] = 20
-    # [parallelism]
     template_data['parallelism']['data_parallel_replicate_degree'] = dp // op
     template_data['parallelism']['data_parallel_shard_degree'] = op
     template_data['parallelism']['tensor_parallel_degree'] = tp
@@ -346,6 +347,7 @@ TASK_FUNCTION_MAP = {
     "profile_toml": generate_profile_toml,
 }
 
+
 def generate_files(candidate_configs, des_file_directory, file_task, para, input_args):
     '''generate config files w.r.t your training library'''
     # 如果目录不存在，则创建它
@@ -388,9 +390,11 @@ def is_dualpipe_open(input_args):
     )
     return use_zero_bubble_v
 
+
 def check_dryrun_parallel_number(parallel_num):
     if parallel_num > 16:
         raise Exception(f"The parallel number {parallel_num} is too large.")
+
 
 def parse_args_from_json(args):
     with open(args.config, 'r', encoding='utf-8') as f:

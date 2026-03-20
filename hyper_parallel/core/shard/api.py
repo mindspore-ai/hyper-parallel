@@ -147,7 +147,6 @@ def _convert_sharding_plan(sharding_plan: Dict, device_mesh: DeviceMesh) -> Dict
                 if value is None:
                     converted[key] = None
                 elif isinstance(value, dict):
-                    # Dict format for kwargs: {"x": placements, "activation": placements}
                     converted[key] = {k: _convert_value(v) for k, v in value.items()}
                 elif isinstance(value, (list, tuple)):
                     # Check if it's a single placement tuple or a list/tuple of placement tuples
@@ -313,7 +312,7 @@ def _register_hook(model: Module, sharding_plan: Dict):
 
         set_inputs_layout = suffix == "input"
         set_outputs_layout = not set_inputs_layout
-        register_cell = cell_dict[prefix]
+        register_cell = cell_dict.get(prefix)
 
         _set_layouts(register_cell, value, set_inputs_layout, set_outputs_layout)
         _register_cell_hook(register_cell, set_inputs_layout, set_outputs_layout)
@@ -340,7 +339,7 @@ def _register_local_tensor_hook(cell: Module, return_local_tensor_list: List[str
         cell_dict[name] = sub_cell
 
     for cell_name in return_local_tensor_list:
-        register_cell = cell_dict[cell_name]
+        register_cell = cell_dict.get(cell_name)
         register_cell.register_forward_hook(hook_func)
 
 

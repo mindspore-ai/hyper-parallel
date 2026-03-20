@@ -30,6 +30,7 @@ def find_file_by_name(directory, filename):
             return os.path.join(root, filename)
     return None
 
+
 def decide_pp_dp(config, available_devices):
     """
 
@@ -39,7 +40,7 @@ def decide_pp_dp(config, available_devices):
     """
     dp, tp, origin_pp, ep, cp, op = config[:6]
     world_size = dp * tp * origin_pp * cp
-    device_multiple = world_size //available_devices
+    device_multiple = world_size // available_devices
     min_pp = 2   # pp最小取2
 
     # 检查设备数量是足够的, dp * tp >= ep
@@ -64,6 +65,7 @@ def decide_pp_dp(config, available_devices):
         dp //= cur_multiple
     return [dp, tp, pp, ep, cp, op]
 
+
 def decide_dp(config, available_devices):
     """
     :param config: [config, available_devices]
@@ -87,6 +89,7 @@ def decide_dp(config, available_devices):
                 f'dp_size ({dp}) is not divisible by ep_size({ep}), for config: dp: {dp}, tp: {tp}, pp: {pp}, ep: {ep}')
             return None
     return [dp, tp, pp, ep]
+
 
 def decide_dp_for_titan(config, available_devices):
     """
@@ -116,6 +119,7 @@ def decide_dp_for_titan(config, available_devices):
         op //= cur_multiple
         dp //= cur_multiple
     return [dp, tp, pp, ep, cp, op]
+
 
 def decide_pp_dp_llama(config, available_devices):
     """
@@ -152,6 +156,7 @@ def decide_pp_dp_llama(config, available_devices):
         dp //= cur_multiple
     return [dp, tp, pp]
 
+
 def trans_config_satisfy_rank_num(mem_prune_space, para, input_args):
     """
 
@@ -167,15 +172,14 @@ def trans_config_satisfy_rank_num(mem_prune_space, para, input_args):
         if trans_config is not None and trans_config not in profile_configs:
             profile_configs.append(trans_config)
     logger.info(f"profile configs len: {len(profile_configs)} by {rank_num} devices")
-    # todo: 待添加注释，说明筛选逻辑
     if len(profile_configs) > 10:
-        # pp <= 16
         profile_configs = [cand for cand in profile_configs if cand[2] <= 16]
         # 按tp , cp, 越小越好,  ep从大到小排
         profile_configs = sorted(profile_configs, key=lambda x: (x[1], x[4], -x[3]))
         profile_configs = profile_configs[:10]
     print(*(config for config in profile_configs), sep='\n')
     return profile_configs
+
 
 def budget_profile_config_generator(config, para, available_devices):
     """
@@ -219,7 +223,6 @@ def budget_profile_config_generator(config, para, available_devices):
         return basic_config
     if para.SHELL_PATH:
         if len(config) < 4:
-            # TODO llama系模型待适配
             basic_config = decide_pp_dp_llama(config, available_devices)
         else:
             basic_config = decide_dp(config, available_devices)
@@ -237,16 +240,19 @@ def budget_profile_config_generator(config, para, available_devices):
     print('Error: No config file path!')
     return None
 
+
 def taylor_pp_adaptor(profile_info):
     layer_ratio = (profile_info['dense_fw']+profile_info['dense_bw'])/(profile_info['moe_fw']+profile_info['moe_bw'])
     backward_ratio = profile_info['moe_bw']/profile_info['moe_fw']
     return layer_ratio, backward_ratio
+
 
 def sapp_adaptor(profile_info):
     body_dense = (profile_info['dense_fw']+profile_info['dense_bw'])/3
     body_moe = (profile_info['moe_fw']+profile_info['moe_bw'])/3
     tail = profile_info['head']/3
     return profile_info['embed'], body_dense, body_moe, tail
+
 
 def profile_prepare(mem_prune_space, para, input_args):
     """
@@ -260,7 +266,7 @@ def profile_prepare(mem_prune_space, para, input_args):
     # 配置转换可在现有卡资源下profile的配置
     profile_configs = trans_config_satisfy_rank_num(mem_prune_space, para, input_args)
     profile_dir = 'profile_yaml' if para.YAML_PATH else 'profile_shell' if para.SHELL_PATH else 'profile_toml'
-    profile_file_dir = os.path.abspath(para.OUTPUT_PATH)  + os.sep + profile_dir + os.sep
+    profile_file_dir = os.path.abspath(para.OUTPUT_PATH) + os.sep + profile_dir + os.sep
     file_task = "profile_yaml" if para.YAML_PATH else "profile_shell" if para.SHELL_PATH else 'profile_toml'
     file_path_list, output_dir_list = generate_files(profile_configs, profile_file_dir, file_task, para, input_args)
 

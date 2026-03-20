@@ -52,3 +52,21 @@
 "hyper-parallel/tests/torch/hsdp/"                                      "ungrouped-imports"
 "hyper-parallel/tests/torch/hsdp/"                                      "line-too-long"
 "hyper-parallel/tests/torch/hsdp/"                                      "unused-import"
+
+# 5. Auto Parallel Fast-Tuner: hyper_parallel/auto_parallel/fast-tuner/
+"hyper-parallel/hyper_parallel/auto_parallel/fast-tuner/"              "broad-exception-caught"
+"hyper-parallel/hyper_parallel/auto_parallel/fast-tuner/"              "broad-exception-raised"
+"hyper-parallel/hyper_parallel/auto_parallel/fast-tuner/"              "invalid-name"
+"hyper-parallel/hyper_parallel/auto_parallel/fast-tuner/"              "unused-variable"
+"hyper-parallel/hyper_parallel/auto_parallel/fast-tuner/"              "missing-function-docstring"
+
+# 6. Core Module: hyper_parallel/core/
+"hyper-parallel/hyper_parallel/core/"                                  "import-outside-toplevel"
+"hyper-parallel/hyper_parallel/core/"                                  "try-except-raise"
+
+# 7. Platform MindSpore: hyper_parallel/platform/mindspore/
+"hyper-parallel/hyper_parallel/platform/mindspore/"                    "arguments-renamed"
+"hyper-parallel/hyper_parallel/platform/mindspore/"                    "broad-exception-caught"
+
+# 8. Platform Torch: hyper_parallel/platform/torch/
+"hyper-parallel/hyper_parallel/platform/torch/"                        "unused-import"

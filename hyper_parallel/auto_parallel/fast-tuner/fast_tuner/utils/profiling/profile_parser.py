@@ -26,6 +26,7 @@ from fast_tuner.ndsearch.memory_model import compute_weight_and_optimizer_memory
 
 encoding = 'utf-8'
 
+
 def find_file_by_name(directory, filename):
     for root, _, files in os.walk(directory):
         if filename in files:
@@ -33,12 +34,14 @@ def find_file_by_name(directory, filename):
     logger.error(f'No such file {filename} in directory {directory}')
     return None
 
+
 def median_mean(durs):
     if len(durs) == 0:
         logger.info("get durs no values")
         return 0
-    median_durs = durs[len(durs)//4 : len(durs) - len(durs)//4]
-    return round(statistics.mean(median_durs)/1000, 3)
+    median_durs = durs[len(durs) // 4: len(durs) - len(durs) // 4]
+    return round(statistics.mean(median_durs) / 1000, 3)
+
 
 class ProfileParser:
     '''
@@ -53,8 +56,6 @@ class ProfileParser:
 
     profile_data = None
     config = ''
-    # recomp_bws, moe_fws1, moe_fws2, moe_bws, dense_fws, dense_bws, totals = [], [], [], [], [], [], []
-    # moe_fw1, moe_fw2, moe_bw, recomp_bw, dense_fw, dense_bw, head_ratio, num_last_stage_layers, mtp = 0
     dense_fws, dense_bws, recomp_dense_bws, moe_fws, moe_bws, recomp_moe_bws, totals = [], [], [], [], [], [], []
     (dense_fw, dense_bw, recomp_dense_bw, moe_fw, moe_bw,
      recomp_moe_bw, total, head_ratio, num_last_stage_layers, mtp) = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
@@ -74,10 +75,8 @@ class ProfileParser:
         """解析批profile文件"""
         # step1. 解析profile文件
         # ep填1, dmratrion:0.33, bfratio=dense_bw/dense_fw, re_grow_ration = 1,hratio=0.68
-        # [dp, tp, pp, dmratio, bfratio, re_grow_ration, hratio, moe_fw]
         profile_result = []
         dense_flag = False
-        #Todo 这里para.YAML_PATH的实现待修改
         if self.para.YAML_PATH:
             for result in profile_configs_results:
                 profile_dir = result[-1]
@@ -151,9 +150,10 @@ class ProfileParser:
             print(f"write CSV file fail: {e}")
 
     def load_profile(self, file, rk):
-        """读取profile文件trace view"""        
-        path = os.path.abspath('.\\profile_info') + '\\' + str(file)
-        path = find_file_by_name(path + '\\rank_' + str(rk), 'trace_view.json')
+        """读取profile文件trace view"""
+        path = os.path.join(os.path.abspath('./profile_info'), str(file))
+        path = os.path.join(path, 'rank_' + str(rk))
+        path = find_file_by_name(path, 'trace_view.json')
         with open(path, 'r', encoding=encoding) as f:
             self.profile_data = json.load(f)
 
@@ -177,8 +177,9 @@ class ProfileParser:
 
     def load_profile_no_recompute(self, file, rk):
         """读取profile文件不重算算子"""
-        path = os.path.abspath('.\\profile_info') + '\\' + str(file)
-        path = find_file_by_name(path + '\\rank_' + str(rk) + '_norecomp' , 'trace_view.json')
+        path = os.path.join(os.path.abspath('./profile_info'), str(file))
+        path = os.path.join(path, 'rank_' + str(rk) + '_norecomp')
+        path = find_file_by_name(path, 'trace_view.json')
         with open(path, 'r', encoding=encoding) as f:
             self.profile_data = json.load(f)
 
@@ -262,8 +263,7 @@ class ProfileParser:
             logger.error(f'extract by loaded_data fail: {e}')
             return [], []
 
-    #todo: 待修改
-    def stage_anal(self, pp, stage): #assuming we profiled 2 steps w/ micro = 32
+    def stage_anal(self, pp, stage):  # assuming we profiled 2 steps w/ micro = 32
         """
         Docstring for stage_anal
         
@@ -272,13 +272,14 @@ class ProfileParser:
         :param stage: Description
         """
         atts, grad_atts = self.extract_atts_by_kernel()
-        layers, xlayers = len(grad_atts) // 64,  2 * len(grad_atts) // 64
-        warm_up = (pp-1-stage) * layers
-        atts = atts[warm_up : 32*xlayers - warm_up] + atts[32*xlayers + warm_up : 32*xlayers + 32*xlayers-warm_up]
-        grad_atts = (grad_atts[warm_up : 32*layers - warm_up]
-                     + grad_atts[32*layers + warm_up : 32*layers + 32*layers-warm_up])
-        att_chunks = [atts[xlayers*i:xlayers*(i+1)] for i in range(len(atts)//xlayers-1)]
-        grad_chunks = [grad_atts[layers*i:layers*(i+1)] for i in range(len(grad_atts)//layers-1)]
+        layers, xlayers = len(grad_atts) // 64, 2 * len(grad_atts) // 64
+        warm_up = (pp - 1 - stage) * layers
+        atts = atts[warm_up: 32 * xlayers - warm_up] + atts[
+                                                       32 * xlayers + warm_up: 32 * xlayers + 32 * xlayers - warm_up]
+        grad_atts = (grad_atts[warm_up: 32 * layers - warm_up]
+                     + grad_atts[32 * layers + warm_up: 32 * layers + 32 * layers - warm_up])
+        att_chunks = [atts[xlayers * i:xlayers * (i + 1)] for i in range(len(atts) // xlayers - 1)]
+        grad_chunks = [grad_atts[layers * i:layers * (i + 1)] for i in range(len(grad_atts) // layers - 1)]
         if pp == 2:
             self.pp2_analysis(att_chunks, grad_chunks, layers, pp, stage)
         else:
@@ -482,7 +483,6 @@ class ProfileParser:
         i = 0
         for rank_folder in folders:
             logger.info(f"parsing: {rank_folder}")
-            # Todo para.YAML_PATH的分支待修改
             if self.para.YAML_PATH:
                 self.load_profile_by_dir(rank_folder)
                 self.stage_anal(pp, i)
@@ -574,6 +574,7 @@ class ProfileParser:
             profile_result[-4] = self.moe_bw / self.moe_fw
             profile_result[-5] = 0.3
 
+
 class MemoryInfo:
     """
     Memory information
@@ -617,18 +618,21 @@ class MemoryInfo:
             file.write(f'lm_head_mem={self.lm_head_mem}\n')
             logger.info(f'Write memory info to {memory_file_name}')
 
+
 class ProfileMemParser:
     """
     Docstring for ProfileMemParser
     """
     pipeline_output_file = 'pipeline_output'
     memory_info_dir = 'memory_info'
+
     def __init__(self, input_args, para):
         self.profile_mem_data = None
         self.input_args = input_args
         self.para = para
-        self.peak_memory_usage = 0.0      # MB
-        self.static_memory_usage = 0.0    # MB
+        self.peak_memory_usage = 0.0  # MB
+        self.static_memory_usage = 0.0  # MB
+        self.real_memory_changes = None
 
     def write_mem_info_to_txt(self, config, mem_info):
         '''
@@ -671,8 +675,6 @@ class ProfileMemParser:
             mem_info.act_mem0 = dynamic_mem_layer
             mem_info.act_mem12 = dynamic_mem_layer
             mem_info.act_mem = dynamic_mem_layer
-
-
 
     def manage_mem_infos(self, need_cumlate=True):
         """

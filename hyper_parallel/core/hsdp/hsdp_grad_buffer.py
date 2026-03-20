@@ -42,6 +42,10 @@ class HSDPGradBuffer:
         self.reduce_type = self.dtype
         if self.config.reduce_dtype is not None:
             self.reduce_type = self.config.reduce_dtype
+        self.num_grad = 0  # initialized in init()
+        self.num_ready_grad = 0  # initialized in init()
+        self.acc_grad_buffer_dim0 = 0  # initialized in _init_acc_grad_buffer()
+        self.acc_grad_buffer = None  # initialized in _init_acc_grad_buffer()
 
     def add_param(self, hsdp_param):
         """add param to buffer"""
@@ -168,6 +172,7 @@ class HSDPGradBuffer:
             output, handle = self.platform.reduce_scatter_tensor(self.unsharded_grad_buffer, self.sharded_group_info,
                                                                  async_op=True)
             self.sharded_grad_buffer = output
+
             def post_process():
                 self.acc_grad_buffer.add_(output)
                 self._set_grad_data(self.acc_grad_buffer)

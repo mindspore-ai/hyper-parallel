@@ -23,6 +23,7 @@ from hyper_parallel.platform import get_platform
 platform = get_platform()
 Tensor = platform.Tensor
 
+
 def custom_shard(
         func: Callable,
         device_mesh: DeviceMesh,
@@ -56,10 +57,11 @@ def custom_shard(
     """
     def wrapped(*args, **kwargs):
         if in_placements is not None:
-            assert len(in_placements) == len(args), (
-                f"in_placements length {len(in_placements)} does not match "
-                f"the number of input args {len(args)}!"
-            )
+            if len(in_placements) != len(args):
+                raise ValueError(
+                    f"in_placements length {len(in_placements)} does not match "
+                    f"the number of input args {len(args)}!"
+                )
 
         local_args = []
         contain_distributed_arg = False
@@ -101,10 +103,11 @@ def custom_shard(
         out_is_tuple = isinstance(out, tuple)
         out_tuple = (out,) if not out_is_tuple else out
 
-        assert len(out_tuple) == len(out_placements), (
-            f"Output count {len(out_tuple)} does not match "
-            f"out_placements count {len(out_placements)}!"
-        )
+        if len(out_tuple) != len(out_placements):
+            raise ValueError(
+                f"Output count {len(out_tuple)} does not match "
+                f"out_placements count {len(out_placements)}!"
+            )
 
         dist_output = []
         for item, out_placement in zip(out_tuple, out_placements):

@@ -23,6 +23,7 @@ from fast_tuner.utils.profiling.profile_info import ProfileInfo
 from fast_tuner.pipeline_conductor.dryrun import DryRun, DRYRUN_CONFIG_ERROR
 from fast_tuner.ndsearch.para_for_nd_search import ParaForNd
 
+
 class ParallelConfig:
     def __init__(self, gbs, config):
         self.dp = config[0]
@@ -32,11 +33,13 @@ class ParallelConfig:
         self.ep = config[3]
         self.micro = gbs / self.dp
 
+
 class PipelineInputConfig:
-    def __init__(self, profiling_info: ProfileInfo, config_path, model_args = None):
+    def __init__(self, profiling_info: ProfileInfo, config_path, model_args=None):
         self.profiling_info = profiling_info
         self.config_path = config_path
         self.model_args = model_args
+
 
 class ParallelInput:
     """define the input of parallel"""
@@ -69,7 +72,6 @@ class ParallelInput:
         with open(csv_file, mode='r', encoding='utf-8') as csvfile:
             reader = csv.DictReader(csvfile)
             for row in reader:
-                # key = "_".join([row['dp'], row['tp'], row['pp'], row['ep']])
                 key_columns = list(row.keys())[:-5]  # 获取前N-5列的列名
                 key = "_".join([row[col] for col in key_columns])
                 value = [float(row['dmratio']), float(row['bfratio']), float(row['re_grow_ration']),
@@ -132,15 +134,12 @@ class ParallelInput:
         for config_file in model_files:
             match = pattern.search(config_file.name)
             if match:
-                # dp_num, tp_num, pp_num, ep_num = map(int, match.groups())
-                # config = [dp_num, tp_num, pp_num, ep_num]
                 config = [int(x) for x in match.groups()]
                 config_str = "_".join(map(str, config))
                 if csv_result.get(config_str):
                     profile_list = csv_result[config_str]
                 else:
                     profile_list = []
-               # todo: profiling解析的输入有待确认,例如rank
                 profile_info = ProfileInfo(args.profile_data_dir, profile_list)
                 input_args = self.get_args_info(para, config_file)
                 pipeline_input_config = PipelineInputConfig(profile_info, config_file, input_args)

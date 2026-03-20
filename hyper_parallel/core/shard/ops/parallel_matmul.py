@@ -19,6 +19,7 @@ Distributed implementation for MatMul operator.
 from hyper_parallel.core.layout import Layout
 from .parallel_ops import DistributedOp
 
+
 class MatMulExtDistributedOp(DistributedOp):
     """Distributed implementation for MatMul operator."""
     def infer_layout(self, layouts, extra_args):
@@ -338,6 +339,7 @@ class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
         merged_batch = self._merge_batches(x_map, w_map)
 
         return self._build_output_layout(x_layout, merged_batch, x_n, w_p, x_contract)
+
 
 class LinearDistributedOp(DistributedOp):
     """Distributed implementation for Linear operator."""

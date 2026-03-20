@@ -42,8 +42,6 @@ class MindSporeHSDPScheduler(HSDPScheduler):
 
     def _new_cell_state(self):
         """Create a new cell state."""
-        # TODO: why reset use_eager_hook here?
-        # self.config.use_eager_hook = ms.get_context("mode") != ms.GRAPH_MODE
         self.hsdp_state = MindSporeHSDPState(self.cell, self.config, self.platform)
 
     def _new_grad_hook(self):
@@ -138,6 +136,7 @@ class MindSporeHSDPScheduler(HSDPScheduler):
     def _get_param_backward_hook(self, hsdp_param):
         """Get hook for param backward process."""
         grad_hook = self.grad_hook.get_hook(hsdp_param)
+
         def backward_hook(grad):
             return grad_hook(grad)
 
@@ -157,8 +156,10 @@ class MindSporeHSDPScheduler(HSDPScheduler):
             def __init__(self, hsdp_forward_hook) -> None:
                 super().__init__()
                 self.hsdp_forward_hook = hsdp_forward_hook
+
             def construct(self, param):
                 return self.hsdp_forward_hook(param)
+
             def bprop(self, param, out, dout):  # pylint: disable=W0613
                 return (dout,)
 
@@ -187,6 +188,7 @@ class MindSporeHSDPScheduler(HSDPScheduler):
     def _get_grad_buffer_hook(self, hsdp_param):
         """Set grad for hsdp parameter."""
         origin_hook = super()._get_grad_buffer_hook(hsdp_param)
+
         def set_grad_hook(grad):
             grad = origin_hook(grad)
             hsdp_param.param.grad = grad

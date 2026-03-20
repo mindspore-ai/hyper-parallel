@@ -38,6 +38,7 @@ class TorchHSDPGradHook(HSDPGradHook):
                     and parameter gradient management
         """
         final_hook = super()._get_final_grad_hook(param, grad_hook, no_cast)
+
         def set_grad_hook(grad):
             final_grad = final_hook(grad)
             grad.data = final_grad

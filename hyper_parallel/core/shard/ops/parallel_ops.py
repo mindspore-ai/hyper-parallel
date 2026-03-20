@@ -18,6 +18,7 @@ Distributed operator implementation.
 
 from .parallel_ops_register import register_distributed_op
 
+
 class DistributedOp:
     """
     Base class for distributed operator implementations.

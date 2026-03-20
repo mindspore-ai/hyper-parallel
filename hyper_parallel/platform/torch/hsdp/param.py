@@ -27,7 +27,8 @@ class TorchHSDPParam(HSDPParam):
         """add and init sharded param"""
         slice_index = self.hsdp_rank % self.shard_size
         local_param = self.platform.get_param_local_data(self.param)
-        param_slice = torch.chunk(local_param, self.shard_size, 0)[slice_index] + 0  # avoid error when handle view tensor
+        # avoid error when handle view tensor
+        param_slice = torch.chunk(local_param, self.shard_size, 0)[slice_index] + 0
         self.platform.update_param_data(self.param, param_slice)
         self.sharded_param = param_slice
 

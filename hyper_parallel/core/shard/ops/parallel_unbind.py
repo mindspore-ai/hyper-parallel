@@ -40,7 +40,6 @@ class UnbindDistributedOp(DistributedOp):
         input_shapes = extra_args[-1]
         args = extra_args[:-1]
 
-        # Pytorch unbind(input, dim=0)
         dim = args[0] if args else 0
 
         layout = layouts[0]

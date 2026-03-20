@@ -114,7 +114,6 @@ def save(
     world_size = platform.get_world_size()
     is_coordinator = rank == 0
 
-    # Configure planner (remove_redundancy=False when use_collectives=False)
     planner.configure_planner(
         state_dict=state_dict,
         is_coordinator=is_coordinator,

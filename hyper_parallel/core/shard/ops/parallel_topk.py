@@ -18,6 +18,7 @@ Distributed implementation for TopK operator.
 
 from .parallel_ops import DistributedOp
 
+
 class TopKDistributedOp(DistributedOp):
     """Distributed implementation for TopK operator."""
 

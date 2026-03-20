@@ -16,6 +16,7 @@
 from hyper_parallel.platform.mindspore.platform import MindSporePlatform
 from mindspore import ops
 
+
 class MindSporeGraphPlatform(MindSporePlatform):
     """MindSpore platform api"""
 

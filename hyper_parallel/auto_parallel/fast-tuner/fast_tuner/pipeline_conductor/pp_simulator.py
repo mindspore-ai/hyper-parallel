@@ -26,6 +26,7 @@ from matplotlib import colors
 from matplotlib.transforms import ScaledTranslation
 sys.setrecursionlimit(8192)
 
+
 def format_2d_inputs(a, raw, col):
     """
     format 2d inputs info
@@ -56,6 +57,7 @@ def apply_format(l:list):
     for i in range(len(l) - 1):
         s = f'{s}{symbol[i]}{l[i + 1]:^22}'
     return s
+
 
 def color_mix(c1, c2, w1=0.5, w2=0.5):
     """apply mix"""
@@ -88,6 +90,7 @@ class CausalError(Exception):
         plt.show()
         return f"{self.msg}"
 
+
 class CausalCommError(Exception):
     """
     Exception raised for communication causal errors in pipeline simulation.
@@ -111,6 +114,7 @@ class CausalCommError(Exception):
     def __str__(self):
         plt.show()
         return f"{self.msg}"
+
 
 def dfs_builder(comm=False):
     """dfs builder"""
@@ -159,6 +163,7 @@ class PlotMgr:
     def __init__(self, num_plots=2, ax_type='block', subplot_args=None, **kwargs):
         self.fig = plt.figure(figsize=kwargs.get('figsize', (12, 8)))
         self.fig.subplots_adjust(wspace=0, hspace=0.4)
+        self.msg = ""
         ax_type = ax_type if isinstance(ax_type, (list, tuple)) else [ax_type] * num_plots
         self.ax = []
         for i in range(num_plots):
@@ -1010,6 +1015,10 @@ class PipelineSimulator:
         self._statistic_init()
         self._comm = True
         self.adjust_func_list = [self.swap_send_rec]
+        self.lines = None
+        self.canvas = None
+        self.peak_memory = None
+        self.end_time = None
         # Construct pipeline blocks
         if self.vp == 1:
             self.blocks = [PipelineBuild.build_1f1b(self.pp, self.micro_num, p,
@@ -1241,7 +1250,7 @@ class PipelineSimulator:
             block = self.blocks[p][0]
             while block:
                 pre_label = self._get_pre_label(block.label)
-                block.pre = books[pre_label]
+                block.pre = books.get(pre_label)
                 block = block.right
 
     def _build_comm_block(self) -> None:
@@ -1377,6 +1386,7 @@ class PipelineSimulator:
                 elif block.phase == 'stable':
                     self._send_block_delay(lines, p, b, 1)
         return lines
+
 
 def test_comm_imba_zero():
     """ test case """

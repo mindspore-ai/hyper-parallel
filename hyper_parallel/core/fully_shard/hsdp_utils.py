@@ -33,12 +33,14 @@ class HSDPConfigV2:
         self.reduce_dtype = self.mp_policy.reduce_dtype if self.mp_policy else None
         self.comm_fusion = comm_fusion
 
+
 class ShardedState(Enum):
     """
     Parameter shard state
     """
     SHARDED = auto()
     UNSHARDED = auto()
+
 
 class FSDPSchedulerState(Enum):
     """
@@ -100,6 +102,7 @@ def _named_parameters_with_duplicates(
         kwargs.pop("remove_duplicate")
         ret = list(module.named_parameters(**kwargs))
     return ret
+
 
 def _get_param_module_infos(
     params: list[nn.Parameter], modules: tuple[nn.Module, ...]

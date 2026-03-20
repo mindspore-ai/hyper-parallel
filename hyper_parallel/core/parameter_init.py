@@ -14,6 +14,7 @@
 # ============================================================================
 """Parameter init"""
 
+
 def init_parameters(module, stage_index=0):
     r"""
         init parameters.

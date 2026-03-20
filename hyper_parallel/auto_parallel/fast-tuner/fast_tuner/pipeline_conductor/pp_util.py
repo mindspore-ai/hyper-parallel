@@ -33,6 +33,7 @@ dryrun_yaml_dir = 'dryrun_yaml'
 dryrun_shell_dir = 'dryrun_shell'
 dryrun_error = 'Dryrun failed, please check the mindspore environment!'
 
+
 def update_yaml_value(yaml_file, key, value):
     with open(yaml_file, 'r', encoding='utf-8') as file:
         yaml_data = yaml.safe_load(file)
@@ -54,7 +55,6 @@ def highs_solve_mps(mps_file, solution_file, origin_model, time_limit):
     highs_solver.readModel(mps_file)
     if time_limit != sys.maxsize:
         highs_solver.setOptionValue('time_limit', time_limit)
-    # highs_solver.setOptionValue('threads', 8)
 
     highs_solver.run()
 
@@ -284,7 +284,7 @@ def sort_micro(parts, num_vpp, num_stage, distribution, low_mem, seq_split, is_f
                     backward.append((part, vpp, 'b', micro_id, split))
     # f-then-b的调度规则，待启用
     if is_f_then_b:
-        for stage in range(num_stage):
+        for _ in range(num_stage):
             stage_order = []
             for part in range(parts):
                 for micro_id in range(distribution[part]):
@@ -363,7 +363,7 @@ def find_most_times_stage(layer_num_of_stage):
         if len(frequency_dict[num]) > max_time:
             max_time = len(frequency_dict[num])
             layer_num = num
-    return frequency_dict[layer_num]
+    return frequency_dict.get(layer_num)
 
 
 def extract_peak_memory(file_path):
