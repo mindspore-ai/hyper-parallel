@@ -196,6 +196,31 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
         else:
             self._set_device_state(state.state)
 
+    def compute_offset_incr(self, device_mesh, placements, global_shape) -> int:
+        """Compute the per-shard RNG offset increment for the current rank.
+
+        Based on the shard linear index and local shard size, computes how much to
+        advance the offset so that each shard gets a unique portion of the random stream.
+
+        Args:
+            device_mesh (DeviceMesh): The device mesh describing the device topology.
+            placements (Sequence[Placement]): The placement strategy for each mesh dimension.
+            global_shape: input global shape
+
+        Returns:
+            int: The offset increment, 4-byte aligned.
+        """
+        mesh_coordinate = device_mesh.get_coordinate()
+        shard_idx_by_dim, total_num_shards_by_dim = _calc_shard_info(
+            mesh_coordinate, device_mesh, placements
+        )
+        shard_linear_idx = self._calc_shard_linear_idx(
+            shard_idx_by_dim, total_num_shards_by_dim
+        )
+        local_size_on_rank_0 = _calc_first_shard_size(device_mesh, placements, global_shape)
+        local_size = functools.reduce(operator.mul, local_size_on_rank_0, 1)
+        return (shard_linear_idx * local_size + 3) // 4 * 4
+
     def _set_pre_op_offset(self, state: _PhiloxState, device_mesh, placements, global_shape) -> None:
         """Set the starting random number generator (RNG) offset for the local shard
         on the current process before operation execution.The offset value begins from
@@ -246,28 +271,8 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
             The last value to calculate before obtaining the starting offset is the shard linear index.
             The starting offset for each rank will be its shard_linear_index * local_tensor_numel.
         """
-        mesh = device_mesh
-        mesh_coordinate = mesh.get_coordinate()
-
-        # Compute shard index and total number of shards on each tensor dim
-        shard_idx_by_dim, total_num_shards_by_dim = _calc_shard_info(
-            mesh_coordinate, device_mesh, placements
-        )
-
-        # compute shard linear index
-        shard_linear_idx = self._calc_shard_linear_idx(
-            shard_idx_by_dim, total_num_shards_by_dim
-        )
-
-        # compute starting offset using the first shard's size
-        local_size_on_rank_0 = _calc_first_shard_size(device_mesh, placements, global_shape)
-
-        local_size = functools.reduce(operator.mul, local_size_on_rank_0, 1)
-
-        # get current RNG offset
         current_offset = state.offset
-
-        offset_incr = (shard_linear_idx * local_size + 3) // 4 * 4
+        offset_incr = self.compute_offset_incr(device_mesh, placements, global_shape)
         state.offset = current_offset + offset_incr
 
     def _set_post_op_offset(

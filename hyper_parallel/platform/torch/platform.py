@@ -295,6 +295,22 @@ class TorchPlatform(Platform):
         param.data = data
 
     @staticmethod
+    def load_into_param(param, data):
+        """Load tensor *data* into *param* (plain tensor or DTensor)."""
+        if isinstance(param, DTensorBase):
+            local = param._local_tensor # pylint: disable=W0212
+            if local.is_meta:
+                # Meta tensor materialisation: replace the placeholder.
+                orig_requires_grad = param.requires_grad
+                param._local_tensor = data # pylint: disable=W0212
+                if data.requires_grad != orig_requires_grad:
+                    param.requires_grad_(orig_requires_grad)
+            else:
+                local.copy_(data)
+        else:
+            param.copy_(data)
+
+    @staticmethod
     def get_op_name(func):
         """
         Extract the operation name from various function types.

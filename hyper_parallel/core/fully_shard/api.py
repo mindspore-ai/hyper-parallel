@@ -70,10 +70,11 @@ def _resolve_local_tensor(
         return val
     if val_shape == global_shape:
         wrapped = distribute_tensor(
-            val.detach(), target.device_mesh,
+            val, target.device_mesh,
             target.layout.alias_placements if target.layout else target.placements,
         )
         return wrapped.to_local()
+
     raise ValueError(
         f"load '{key}': plain tensor shape {val_shape} "
         f"matches neither local shard {local_shape} "
@@ -249,7 +250,7 @@ class HSDPModule:
         self_module = cast(platform.Module, self)
 
         target_map: dict[str, platform.Tensor] = {}
-        for name, p in self_module.named_parameters():
+        for name, p in platform.parameters_dict(self_module):
             target_map[name] = p
         for name, b in self_module.named_buffers():
             target_map[name] = b
@@ -264,21 +265,8 @@ class HSDPModule:
                     continue
 
                 if isinstance(target, DTensor):
-                    local_val = _resolve_local_tensor(key, val, target)
-                    if target.to_local().is_meta:
-                        # Meta tensor materialisation: replace the placeholder.
-                        # Preserve the original requires_grad so that parameters
-                        # remain trainable after loading, matching the behaviour
-                        # of torch.nn.Module._load_from_state_dict (which uses
-                        # in-place copy_ that keeps the destination's grad flag).
-                        orig_requires_grad = target.requires_grad
-                        target._local_tensor = local_val  # pylint: disable=protected-access
-                        if local_val.requires_grad != orig_requires_grad:
-                            target.requires_grad_(orig_requires_grad)
-                    else:
-                        target.to_local().copy_(local_val)
-                else:
-                    target.copy_(val)
+                    val = _resolve_local_tensor(key, val, target)
+                platform.load_into_param(target, val)
 
         # Trigger load_state_dict post-hooks so that HSDP internal
         # bookkeeping (e.g. _sharded_param_data) stays in sync.
@@ -286,7 +274,7 @@ class HSDPModule:
         # so external hooks can safely read .missing_keys/.unexpected_keys.
         _IK = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
         incompatible_keys = _IK([], [])
-        for _, module in self_module.named_modules():
+        for _, module in platform.get_cells_and_names(self_module):
             hooks = module._load_state_dict_post_hooks  # pylint: disable=protected-access
             for hook in hooks.values():
                 hook(module, incompatible_keys)
