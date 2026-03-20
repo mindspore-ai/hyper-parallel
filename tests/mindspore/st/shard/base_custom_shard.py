@@ -18,8 +18,8 @@ import time
 import numpy as np
 import mindspore as ms
 from mindspore._c_expression import NoFallbackGuard
-import mindspore.communication as comm
 import mindspore.communication.management as D
+from mindspore.ops.function import comm_func
 from mindspore import nn, Tensor
 from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
@@ -53,7 +53,7 @@ class SimpleModel(nn.Cell):
 
 def local_func(x, w, group):
     x = ms.mint.matmul(x, w)
-    x, _ = comm.comm_func.all_reduce(x, "sum", group)
+    x, _ = comm_func.all_reduce(x, "sum", group)
     return x
 
 

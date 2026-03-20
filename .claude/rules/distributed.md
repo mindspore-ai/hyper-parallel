@@ -34,6 +34,10 @@ paths:
 - `platform.create_group()` returns a **raw group** — wrap it with `SimpleNamespace(group=group)` before passing to non-differentiable APIs
 - When calling any collective API, **check the platform base class signature** in `platform/platform.py` to confirm the expected parameter type
 
+## Communication Ops
+
+- MindSpore platform: use `mindspore.ops.function.comm_func` (or `mindspore.ops.communication`), NOT the deprecated `mindspore.communication.comm_func`
+
 ## Stream Synchronization
 
 - `async_op=True` handles must be waited via `handle.wait()` before accessing the output tensor
