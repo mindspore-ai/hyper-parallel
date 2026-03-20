@@ -5,7 +5,7 @@ Concat:
   infer_layout_suffix: WithTupleExpand
 
 cat:
-  dist_op_name: _torch_concat_dist_op
+  dist_op_name: _torch_cat_dist_op
   distributed_op_class: ConcatDistributedOp
   distributed_op_file: parallel_concat
   infer_layout_suffix: WithTupleExpand
