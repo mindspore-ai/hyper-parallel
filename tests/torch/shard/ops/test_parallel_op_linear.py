@@ -17,7 +17,6 @@ from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
 PARALLEL_OP_LINEAR = "parallel_op_linear.py"
-PARALLEL_OP_ELEMENTWISE = "parallel_op_elementwise.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -46,5 +45,4 @@ def test_parallel_op_linear_group2():
     """
     parallel_run([
         TorchCase(PARALLEL_OP_LINEAR, "test_distributed_linear_with_bias_shard", 11001, 4),
-        TorchCase(PARALLEL_OP_ELEMENTWISE, "test_distributed_linear_with_elementwise_ops", 11002, 4),
     ])

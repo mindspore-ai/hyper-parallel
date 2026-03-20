@@ -425,7 +425,7 @@ class SimpleModel(nn.Module):
         return out
 
 
-def test_distributed_linear_with_elementwise_ops():
+def test_distributed_ops_base():
     """
     Feature: dtensor + torch.nn.functional.linear with bias
     Description:
