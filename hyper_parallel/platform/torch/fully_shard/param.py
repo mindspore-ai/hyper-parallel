@@ -73,6 +73,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.pin_memory = (
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
         )
+        self._orig_param_hooks: List[Callable] = []
         self.grad_offload_event: Optional[torch.Event] = None
         self._init_sharded_param(param, shard_placement_fn)
         self.all_gather_outputs: List[torch.Tensor] = []
@@ -89,6 +90,37 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.reduce_scatter_handle = None
         self._all_reduce_output = None
         self.all_reduce_handle = None
+        self._save_backward_hooks(param)
+
+    def _save_backward_hooks(self, param: nn.Parameter) -> None:
+        """Save the backward hooks of the original parameter"""
+        if not hasattr(param, '_backward_hooks') or param._backward_hooks is None:
+            return
+
+        # Get the set of saved hook function IDs for deduplication
+        if not hasattr(self, '_saved_hook_ids'):
+            object.__setattr__(self, '_saved_hook_ids', set())
+
+        for hook_id, hook_func in param._backward_hooks.items():
+            # Use the id of hook_func to avoid adding the same function object repeatedly
+            hook_func_id = id(hook_func)
+            if hook_func_id not in self._saved_hook_ids:
+                self._orig_param_hooks.append(hook_func)
+                self._saved_hook_ids.add(hook_func_id)
+
+    def _migrate_backward_hooks(self, new_param: nn.Parameter) -> None:
+        """Migrate backward hooks from the original parameter to the new parameter"""
+        if not self._orig_param_hooks:
+            return
+
+        # Properly register each hook using the register_hook method
+        for hook_func in self._orig_param_hooks:
+            try:
+                if new_param.requires_grad:
+                    new_param.register_hook(hook_func)
+            except RuntimeError:
+                # Skip hook registration if the parameter does not require gradients
+                pass
 
     def reduce_scatter_output(self):
         """
@@ -337,7 +369,8 @@ class TorchHSDPParamV2(HSDPParamV2):
         else:
             # slow path
             setattr(self._module_info.module, self._module_info.param_name, param)
-
+        self._save_backward_hooks(self.sharded_param)
+        self._migrate_backward_hooks(param)
         # Iterate through all modules that share this parameter to prevent pointer desync.
         for shared_module, shared_param_name in zip(
             self._module_info.shared_modules, self._module_info.shared_param_names
