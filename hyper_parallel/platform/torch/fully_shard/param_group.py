@@ -306,7 +306,7 @@ class HSDPParamGroup:
             return
         if len(self.hsdp_params) == 0:
             return
-        if any(p.offload_to_cpu for p in self.hsdp_params):
+        if any(p.offload_to_cpu or p.sharded_param.device.type == "meta" for p in self.hsdp_params):
             return
 
         total_numel = sum(p._sharded_param_data.numel() for p in self.hsdp_params)
