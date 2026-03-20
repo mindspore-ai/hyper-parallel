@@ -47,3 +47,15 @@ def test_fully_shard_precision_group2():
         TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_fully_shard_with_offload", 12345, 4),
         TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_partial_shard", 12344, 4),
     ])
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_zero3_fully_shard_comm_fusion():
+    """
+    Feature: Test_zero3_fully_shard_comm_fusion.
+    Description: Test_zero3_fully_shard with comm fusion.
+    Expectation: case run successfully.
+    """
+    parallel_run([
+        TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_fully_shard_comm_fusion", 12315, 4),
+        TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_partial_shard_comm_fusion", 12314, 4)
+    ])

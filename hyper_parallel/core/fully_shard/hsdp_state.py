@@ -73,16 +73,20 @@ class HSDPState:
             for param in self.replicate_params:
                 param.to_sharded()
         self.is_shard = True
+        return
 
     def unshard(self, async_op=False, unshard_replicate: bool = True):
         """change parameters to unsharded state"""
         if not self.is_shard:
             return
 
-        for param in self.sharded_hsdp_params:
-            param.unshard(async_op)
         if unshard_replicate:
             for param in self.replicate_params:
+                param.unshard(async_op)
+        if self.config.comm_fusion:
+            self.param_group.unshard(async_op)
+        else:
+            for param in self.sharded_hsdp_params:
                 param.unshard(async_op)
         if not async_op:
             self.wait_for_unshard(unshard_replicate)
@@ -95,9 +99,12 @@ class HSDPState:
         """wait for all unshard parameters"""
         if not self.is_shard:
             return
-        for param in self.sharded_hsdp_params:
-            param.wait_for_unshard()
         if wait_for_replicate:
             for param in self.replicate_params:
+                param.wait_for_unshard()
+        if self.config.comm_fusion:
+            self.param_group.wait_for_unshard()
+        else:
+            for param in self.sharded_hsdp_params:
                 param.wait_for_unshard()
         self.is_shard = False
