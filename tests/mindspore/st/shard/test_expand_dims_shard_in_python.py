@@ -83,3 +83,16 @@ def test_expand_dims_shard_in_python_group5():
     parallel_run([
         MindSporeCase(EXPAND_DIMS_SHARD_IN_PYTHON, "test_expanddims_negative_axis_5", 18298, 8, 8, 2),
     ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_expand_dims_shard_in_python_group6():
+    """
+    Feature: parallel run case in expand_dims_shard_in_python
+    Description:
+        1. test_expanddims_all_replicated_6
+    Expectation: Run success.
+    """
+    parallel_run([
+        MindSporeCase(EXPAND_DIMS_SHARD_IN_PYTHON, "test_expanddims_all_replicated_6", 18300, 8, 8, 2),
+    ])

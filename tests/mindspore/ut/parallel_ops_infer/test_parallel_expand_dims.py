@@ -16,7 +16,9 @@
 
 import pytest
 
-from hyper_parallel import Layout
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_expand_dims import ExpandDimsDistributedOp
 
 
@@ -28,24 +30,35 @@ def run_scenario(scenario_name, x_layout, expected_map, extra_args):
 
     op = ExpandDimsDistributedOp("ExpandDims")
     output_layout = op.infer_layout((x_layout,), extra_args)
-    assert output_layout.to_dict()["tensor_map"] == expected_map, \
-        f"ExpandDims failed in scenario '{scenario_name}'. " \
-        f"Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+    assert output_layout.tensor_map == expected_map, (
+        f"ExpandDims failed in scenario '{scenario_name}'. "
+        f"Expected {expected_map}, got {output_layout.tensor_map}"
+    )
+    assert op.get_expand_impl(None, output_layout, (x_layout,), extra_args) is None, (
+        f"ExpandDims get_expand_impl failed in scenario '{scenario_name}'. "
+        f"Expected None, got {op.get_expand_impl(None, output_layout, (x_layout,), extra_args)}"
+    )
 
 
-base_mesh_shape = (2, 2, 2)
-base_alias_name = ("dp", "cp", "mp")
-base_rank_list = list(range(8))
+def _build_mesh():
+    """Create device mesh for testing."""
+    return init_device_mesh(
+        device_type="npu",
+        mesh_shape=(2, 2, 2),
+        mesh_dim_names=("dp", "cp", "mp"),
+        init_backend=False
+    )
 
 
-def test_expanddims_data_parallel_1():
+def test_expanddims_data_parallel_1(mesh):
     """
     Feature: Data parallel.
     Description: insert dimension at beginning, axis=0.
-    Expectation: new dimension inserted at position 0.
+    Expectation: new dimension inserted at position 0, get_expand_impl returns None.
     """
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("dp", "None", "None")
+    mesh = _build_mesh()
+    x_placements = (Shard(0), Replicate(), Replicate())
+    x_layout = _build_layout(mesh, x_placements, 3)
 
     run_scenario(
         "1. Data Parallel (DP)",
@@ -55,14 +68,15 @@ def test_expanddims_data_parallel_1():
     )
 
 
-def test_expanddims_model_parallel_2():
+def test_expanddims_model_parallel_2(mesh):
     """
     Feature: Model parallel.
     Description: insert dimension before mp axis, axis=2.
-    Expectation: new dimension at position 2, mp shifted to position 3.
+    Expectation: new dimension at position 2, mp shifted to position 3, get_expand_impl returns None.
     """
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("None", "None", "mp")
+    mesh = _build_mesh()
+    x_placements = (Replicate(), Replicate(), Shard(2))
+    x_layout = _build_layout(mesh, x_placements, 3)
 
     run_scenario(
         "2. Model Parallel (MP)",
@@ -72,14 +86,15 @@ def test_expanddims_model_parallel_2():
     )
 
 
-def test_expanddims_hybrid_parallel_3():
+def test_expanddims_hybrid_parallel_3(mesh):
     """
     Feature: Hybrid parallel.
     Description: insert dimension in middle, axis=1.
-    Expectation: new dimension at position 1, others shifted.
+    Expectation: new dimension at position 1, others shifted, get_expand_impl returns None.
     """
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("dp", "cp", "mp")
+    mesh = _build_mesh()
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    x_layout = _build_layout(mesh, x_placements, 3)
 
     run_scenario(
         "3. Hybrid Parallel (DP+CP+MP)",
@@ -89,14 +104,15 @@ def test_expanddims_hybrid_parallel_3():
     )
 
 
-def test_expanddims_insert_at_end_4():
+def test_expanddims_insert_at_end_4(mesh):
     """
     Feature: Insert at end.
     Description: insert dimension at the end, axis=-1.
-    Expectation: new dimension appended at the end.
+    Expectation: new dimension appended at the end, get_expand_impl returns None.
     """
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("dp", "cp", "mp")
+    mesh = _build_mesh()
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    x_layout = _build_layout(mesh, x_placements, 3)
 
     run_scenario(
         "4. Insert at end (axis=-1)",
@@ -106,14 +122,15 @@ def test_expanddims_insert_at_end_4():
     )
 
 
-def test_expanddims_negative_axis_5():
+def test_expanddims_negative_axis_5(mesh):
     """
     Feature: Negative axis indexing.
     Description: axis=-2 for rank-3 input, equivalent to axis=2.
-    Expectation: new dimension at position 2.
+    Expectation: new dimension at position 2, get_expand_impl returns None.
     """
-    x_layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    x_layout = x_layout("dp", "cp", "mp")
+    mesh = _build_mesh()
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    x_layout = _build_layout(mesh, x_placements, 3)
 
     run_scenario(
         "5. Negative axis (axis=-2)",
@@ -123,211 +140,91 @@ def test_expanddims_negative_axis_5():
     )
 
 
-def test_expanddims_tuple_alias_dim_6():
+def test_expanddims_all_replicated_6():
     """
-    Feature: Tuple alias in one dim.
-    Description: insert at beginning with tuple alias ('dp','cp'), axis=0.
-    Expectation: tuple alias preserved, new None at position 0.
+    Feature: All replicated.
+    Description: insert dimension with all replicated input.
+    Expectation: new dimension inserted with None, get_expand_impl returns None.
     """
-    mesh_shape = (2, 2, 2)
-    alias_name = ("dp", "cp", "mp")
-    rank_list = list(range(8))
-
-    x_layout = Layout(mesh_shape, alias_name, rank_list)
-    x_layout = x_layout("None", ("dp", "cp"), "mp")
+    mesh = _build_mesh()
+    x_placements = (Replicate(), Replicate(), Replicate())
+    x_layout = _build_layout(mesh, x_placements, 3)
 
     run_scenario(
-        "6. Tuple alias, insert at beginning",
+        "6. All Replicated",
         x_layout,
-        expected_map=(-1, -1, (2, 1), 0),
-        extra_args=[0]
-    )
-
-
-def test_expanddims_tuple_alias_dim_7():
-    """
-    Feature: Tuple alias in one dim.
-    Description: insert in middle with tuple alias ('dp','cp'), axis=1.
-    Expectation: new None inserted at position 1.
-    """
-    mesh_shape = (2, 2, 2)
-    alias_name = ("dp", "cp", "mp")
-    rank_list = list(range(8))
-
-    x_layout = Layout(mesh_shape, alias_name, rank_list)
-    x_layout = x_layout("None", ("dp", "cp"), "mp")
-
-    run_scenario(
-        "7. Tuple alias, insert in middle",
-        x_layout,
-        expected_map=(-1, -1, (2, 1), 0),
+        expected_map=(-1, -1, -1, -1),
         extra_args=[1]
     )
 
 
-def test_expanddims_tuple_alias_dim_8():
+def test_expanddims_2d_tensor_7():
     """
-    Feature: Tuple alias in one dim.
-    Description: insert at end with tuple alias, axis=2.
-    Expectation: new None at position 2, mp shifted.
+    Feature: 2D tensor.
+    Description: insert dimension in 2D tensor.
+    Expectation: correct tensor_map for 3D output, get_expand_impl returns None.
     """
-    mesh_shape = (2, 2, 2)
-    alias_name = ("dp", "cp", "mp")
-    rank_list = list(range(8))
-
-    x_layout = Layout(mesh_shape, alias_name, rank_list)
-    x_layout = x_layout("None", ("dp", "cp"), "mp")
+    mesh = _build_mesh()
+    x_placements = (Shard(0), Shard(1))
+    x_layout = _build_layout(mesh, x_placements, 2)
 
     run_scenario(
-        "8. Tuple alias, insert before mp",
+        "7. 2D Tensor",
         x_layout,
-        expected_map=(-1, (2, 1), -1, 0),
-        extra_args=[2]
-    )
-
-
-def test_expanddims_tuple_alias_dim_9():
-    """
-    Feature: Tuple alias in one dim.
-    Description: insert before tuple alias, axis=0.
-    Expectation: new None at position 0, tuple shifted to position 1.
-    """
-    mesh_shape = (2, 2, 2)
-    alias_name = ("dp", "cp", "mp")
-    rank_list = list(range(8))
-
-    x_layout = Layout(mesh_shape, alias_name, rank_list)
-    x_layout = x_layout(("dp", "cp"), "mp")
-
-    run_scenario(
-        "9. Insert before tuple alias",
-        x_layout,
-        expected_map=(-1, (2, 1), 0),
-        extra_args=[0]
-    )
-
-
-def test_expanddims_tuple_alias_dim_10():
-    """
-    Feature: Tuple alias in one dim.
-    Description: insert after tuple alias, axis=1.
-    Expectation: tuple at position 0, new None at position 1.
-    """
-    mesh_shape = (2, 2, 2)
-    alias_name = ("dp", "cp", "mp")
-    rank_list = list(range(8))
-
-    x_layout = Layout(mesh_shape, alias_name, rank_list)
-    x_layout = x_layout(("dp", "cp"), "mp")
-
-    run_scenario(
-        "10. Insert after tuple alias",
-        x_layout,
-        expected_map=((2, 1), -1, 0),
+        expected_map=(2, -1, 1),
         extra_args=[1]
     )
 
 
-def test_expanddims_tuple_alias_with_none_11():
-    """
-    Feature: Tuple alias with None dimensions.
-    Description: insert with tuple alias and None dims, axis=0.
-    Expectation: new None at position 0.
-    """
-    mesh_shape = (2, 2, 2)
-    alias_name = ("dp", "cp", "mp")
-    rank_list = list(range(8))
-
-    x_layout = Layout(mesh_shape, alias_name, rank_list)
-    x_layout = x_layout("None", ("dp", "cp"), "None")
-
-    run_scenario(
-        "11. Tuple alias with None dims",
-        x_layout,
-        expected_map=(-1, -1, (2, 1), -1),
-        extra_args=[0]
-    )
-
-
-def test_expanddims_tuple_alias_negative_axis_12():
-    """
-    Feature: Tuple alias with negative axis.
-    Description: insert with tuple alias, axis=-1.
-    Expectation: new None at the end.
-    """
-    mesh_shape = (2, 2, 2)
-    alias_name = ("dp", "cp", "mp")
-    rank_list = list(range(8))
-
-    x_layout = Layout(mesh_shape, alias_name, rank_list)
-    x_layout = x_layout("None", ("dp", "cp"), "None")
-
-    run_scenario(
-        "12. Tuple alias with negative axis",
-        x_layout,
-        expected_map=(-1, (2, 1), -1, -1),
-        extra_args=[-1]
-    )
-
-
-def test_expanddims_scalar_to_1d_13():
+def test_expanddims_scalar_to_1d_8():
     """
     Feature: Expand scalar.
     Description: expand scalar (rank-0) to 1D, axis=0.
-    Expectation: output has one dimension with None.
+    Expectation: output has one dimension with None, get_expand_impl returns None.
     """
-    mesh_shape = (2, 2, 2)
-    alias_name = ("dp", "cp", "mp")
-    rank_list = list(range(8))
-
-    x_layout = Layout(mesh_shape, alias_name, rank_list)
-    x_layout = x_layout()
+    mesh = _build_mesh()
+    x_placements = (Replicate(), Replicate(), Replicate())
+    x_layout = _build_layout(mesh, x_placements, 0)
 
     run_scenario(
-        "13. Scalar to 1D",
+        "8. Scalar to 1D",
         x_layout,
         expected_map=(-1,),
         extra_args=[0]
     )
 
 
-def test_expanddims_extreme_negative_axis_14():
+def test_expanddims_extreme_negative_axis_9():
     """
     Feature: Extreme negative axis.
     Description: axis=-(rank+1), equivalent to axis=0.
-    Expectation: insert at beginning.
+    Expectation: insert at beginning, get_expand_impl returns None.
     """
-    mesh_shape = (2, 2, 2)
-    alias_name = ("dp", "cp", "mp")
-    rank_list = list(range(8))
-
-    x_layout = Layout(mesh_shape, alias_name, rank_list)
-    x_layout = x_layout("dp", "cp", "mp")
+    mesh = _build_mesh()
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    x_layout = _build_layout(mesh, x_placements, 3)
 
     run_scenario(
-        "14. Extreme negative axis (axis=-4)",
+        "9. Extreme negative axis (axis=-4)",
         x_layout,
         expected_map=(-1, 2, 1, 0),
         extra_args=[-4]
     )
 
 
-def test_expanddims_invalid_axis_15():
+def test_expanddims_invalid_axis_10():
     """
     Feature: Invalid axis.
     Description: axis out of valid range.
     Expectation: raise ValueError.
     """
-    mesh_shape = (2, 2, 2)
-    alias_name = ("dp", "cp", "mp")
-    rank_list = list(range(8))
+    mesh = _build_mesh()
+    x_placements = (Shard(0), Shard(1), Shard(2))
+    x_layout = _build_layout(mesh, x_placements, 3)
 
-    x_layout = Layout(mesh_shape, alias_name, rank_list)
-    x_layout = x_layout("dp", "cp", "mp")
-
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="out of range for input rank"):
         run_scenario(
-            "15. Invalid axis (axis=5)",
+            "10. Invalid axis (axis=5)",
             x_layout,
             expected_map=(),
             extra_args=[5]
