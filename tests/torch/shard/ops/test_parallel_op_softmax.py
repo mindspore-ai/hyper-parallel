@@ -1,4 +1,4 @@
-# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2025 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,23 +12,71 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test parallel op softmax"""
+"""test base dtensor"""
+from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import parallel_run, TorchCase
-
-PARALLEL_OP_SOFTMAX = "parallel_op_softmax.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_softmax_group1():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_distributed_softmax_layout_inference
-        2.test_distributed_softmax_sharded_dim_error
+def test_distributed_softmax_data_parallel():
+    '''
+    Feature: test parallel op softmax.
+    Description: test parallel op softmax data parallel.
     Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(PARALLEL_OP_SOFTMAX, "test_distributed_softmax_layout_inference", 10889, 4),
-        TorchCase(PARALLEL_OP_SOFTMAX, "test_distributed_softmax_sharded_dim_error", 10890, 4),
-    ])
+    '''
+    master_port = 10400
+    file_name = "parallel_op_softmax.py"
+    case_name = "test_distributed_softmax_data_parallel"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_distributed_softmax_model_parallel():
+    '''
+    Feature: test parallel op softmax.
+    Description: test parallel op softmax model parallel.
+    Expectation: Run success.
+    '''
+    master_port = 10401
+    file_name = "parallel_op_softmax.py"
+    case_name = "test_distributed_softmax_model_parallel"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_distributed_softmax_hybrid_parallel():
+    '''
+    Feature: test parallel op softmax.
+    Description: test parallel op softmax hybrid parallel.
+    Expectation: Run success.
+    '''
+    master_port = 10402
+    file_name = "parallel_op_softmax.py"
+    case_name = "test_distributed_softmax_hybrid_parallel"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_distributed_softmax_all_replicated():
+    '''
+    Feature: test parallel op softmax.
+    Description: test parallel op softmax all replicated.
+    Expectation: Run success.
+    '''
+    master_port = 10403
+    file_name = "parallel_op_softmax.py"
+    case_name = "test_distributed_softmax_all_replicated"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_distributed_softmax_negative_dim():
+    '''
+    Feature: test parallel op softmax.
+    Description: test parallel op softmax negative dim.
+    Expectation: Run success.
+    '''
+    master_port = 10404
+    file_name = "parallel_op_softmax.py"
+    case_name = "test_distributed_softmax_negative_dim"
+    torchrun_case(file_name, case_name, master_port)

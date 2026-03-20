@@ -47,6 +47,14 @@ class ArgMaxWithValueDistributedOp(DistributedOp):
         input_tensor_map = input_layout.tensor_map
         input_alias_tensor_map = input_layout.alias_tensor_map
         axis, keep_dims = extra_args[0], extra_args[1]
+        rank = len(input_tensor_map)
+
+        if not isinstance(axis, int):
+            raise ValueError(f"ArgMaxWithValue axis must be int, but got {type(axis)}")
+        if axis < 0:
+            axis += rank
+        if axis < 0 or axis >= rank:
+            raise ValueError(f"ArgMaxWithValue axis out of range: axis={extra_args[0]}, rank={rank}")
 
         def is_shard(index):
             mapping = input_tensor_map[index]
@@ -62,9 +70,8 @@ class ArgMaxWithValueDistributedOp(DistributedOp):
             return True
 
         # Create output layout
-        for i in range(len(input_tensor_map)):
-            if axis != i and is_shard(i):
-                raise ValueError(f"{self.__class__.__name__} cannot perform sharding on non axis dim")
+        if is_shard(axis):
+            raise ValueError(f"{self.__class__.__name__} cannot perform sharding on axis dim")
 
         if not keep_dims:
             tensor_map = input_alias_tensor_map[:axis] + input_alias_tensor_map[axis + 1 :]
