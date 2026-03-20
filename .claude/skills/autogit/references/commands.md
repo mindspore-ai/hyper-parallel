@@ -45,6 +45,12 @@ Check for changes → git add -A → lint checks (pylint/lizard/codespell/markdo
 | `test:` | Tests |
 | `chore:` | Build/tooling |
 
+**No AI/IDE attribution or third-party references** — Commit messages should only describe business-side changes. Must not contain attribution trailers (`Made-with: Cursor`, `Co-authored-by: Claude`) or third-party tool names (Cursor, Copilot, ChatGPT, Claude, Gemini, etc.). autogit rejects such messages. To also catch manual/Cursor UI commits, install the commit-msg hook:
+
+```bash
+cp .claude/hooks/commit-msg .git/hooks/commit-msg && chmod +x .git/hooks/commit-msg
+```
+
 ---
 
 ## 2. check — Run Lint Checks Only

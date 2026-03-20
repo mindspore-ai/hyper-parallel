@@ -204,6 +204,82 @@ The `wait_load()` implementation should free CPU storage after loading back to d
 | Grad API difference | `tensor.grad` vs `.gradient()` | Use platform wrapper |
 | Process group creation | Raw `dist.new_group()` | Use `platform.create_group()` |
 
+## Platform API Calling Conventions
+
+### Module-level `platform` vs `self.platform`
+
+**Always use module-level `platform`**. Never store platform as an instance attribute.
+
+**Bad:**
+```python
+class TensorRedistribution:
+    def __init__(self):
+        self.platform = get_platform()  # BAD: instance attribute
+
+    def some_method(self, x):
+        return self.platform.reduce_scatter(x, ...)  # BAD: self.platform
+```
+
+**Good:**
+```python
+platform = get_platform()  # module-level
+
+class TensorRedistribution:
+    def some_method(self, x):
+        return platform.differentiable_reduce_scatter(x, ...)  # GOOD: module-level
+```
+
+Why: `self.platform` creates ambiguity. If the attribute is never set in `__init__`, the code silently breaks only when that path is executed. Module-level `platform` is always available and consistent.
+
+### `differentiable_*` vs Non-differentiable Collective APIs
+
+Code in autograd computation paths (forward/backward) **must** use `differentiable_*` variants. Non-differentiable variants are only for parameter sync, buffer broadcast, etc.
+
+**Bad:**
+```python
+# In TensorRedistribution (participates in autograd)
+def _reduce_scatter_along_dev_dim_with_axis(self, x, axis, op, layout, dev_dim):
+    group = layout.get_comm_group_by_axis(dev_dim)
+    output = platform.reduce_scatter(x, dev_num, axis, op, group)  # BAD: non-differentiable
+    return output
+```
+
+**Good:**
+```python
+def _reduce_scatter_along_dev_dim_with_axis(self, x, axis, op, layout, dev_dim):
+    group = layout.get_comm_group_by_axis(dev_dim)
+    output = platform.differentiable_reduce_scatter(x, dev_num, axis, op, group)  # GOOD
+    return output
+```
+
+Why: Non-differentiable collectives break gradient flow. The tensor redistribution path is part of the autograd graph — using `reduce_scatter` instead of `differentiable_reduce_scatter` silently produces zero gradients.
+
+### `group` vs `group_info` Parameter Types
+
+Platform APIs have **two different parameter conventions** — mixing them causes `AttributeError` at runtime:
+
+| API Category | Parameter Name | Expected Type | Example |
+|-------------|---------------|---------------|---------|
+| `platform.all_reduce`, `all_gather_into_tensor`, `reduce_scatter_tensor` | `group_info` | Object with `.group` attribute | `SimpleNamespace(group=pg)` |
+| `platform.differentiable_all_reduce`, `differentiable_reduce_scatter` | `group` | Raw ProcessGroup or str | `pg` directly |
+| `platform.create_group()` | (return value) | Raw ProcessGroup | Must wrap before passing to `all_reduce` |
+
+**Bad:**
+```python
+group = platform.create_group(group_ranks)
+platform.all_reduce(grad, group)  # BAD: all_reduce expects group_info, not raw group
+# Crashes: AttributeError: 'ProcessGroup' object has no attribute 'group'
+```
+
+**Good:**
+```python
+group = platform.create_group(group_ranks)
+group_info = group if isinstance(group, str) else SimpleNamespace(group=group)
+platform.all_reduce(grad, group_info)  # GOOD: wrapped for Torch, passthrough for MindSpore
+```
+
+Why: `platform.create_group()` returns a raw ProcessGroup, but `platform.all_reduce` internally accesses `group_info.group`. This mismatch is invisible until the code path is actually executed.
+
 ## Review Checklist Summary
 
 When reviewing a PR, ask these questions:
@@ -213,4 +289,5 @@ When reviewing a PR, ask these questions:
 3. **Gradient cleanup**: Are grad references nulled after use?
 4. **Platform parity**: Does the other backend need a matching change?
 5. **DTensor invariants**: Is `is_partial()` called correctly? Is partial state reduced before redistribution?
-6. If still unsure about correctness, **flag it** — silent bugs are worse than false positives.
+6. **Platform API conventions**: Is `platform` referenced at module level (not `self.platform`)? Are `differentiable_*` variants used in autograd paths? Is `group` vs `group_info` type correct for the API being called?
+7. If still unsure about correctness, **flag it** — silent bugs are worse than false positives.

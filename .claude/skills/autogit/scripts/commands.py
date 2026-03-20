@@ -43,6 +43,7 @@ from lint_check import (  # pylint: disable=wrong-import-position
     run_checks,
     run_pylint_review,
 )
+from commit_msg_check import validate_commit_message  # pylint: disable=wrong-import-position
 
 
 # ============================================================================
@@ -246,6 +247,10 @@ def cmd_commit(message: Optional[str] = None,
         else:
             message = f"Update {len(changed_files)} files"
 
+    err = validate_commit_message(message)
+    if err:
+        raise AutoGitError(err)
+
     run_git("commit", "-m", message)
     sha = run_git("rev-parse", "HEAD").stdout.strip()
     print(f"Created commit: {sha[:8]}")
@@ -412,7 +417,11 @@ def _squash_if_needed(squash: bool, commits: List[str],
 
     run_git("reset", "--soft", base_ref)
     msg = run_git("log", "-1", "--pretty=format:%s", commits[0]).stdout.strip()
-    run_git("commit", "-m", msg or "Update code")
+    msg = msg or "Update code"
+    err = validate_commit_message(msg)
+    if err:
+        raise AutoGitError(err)
+    run_git("commit", "-m", msg)
     print("Squashed into a single commit")
     return 1
 
@@ -605,6 +614,9 @@ def _commit_append(amend: bool, message: Optional[str],
         if not no_check:
             _run_lint_checks_on_staged()
         if message:
+            err = validate_commit_message(message)
+            if err:
+                raise AutoGitError(err)
             run_git("commit", "--amend", "-m", message)
         else:
             run_git("commit", "--amend", "--no-edit")
@@ -620,6 +632,9 @@ def _commit_append(amend: bool, message: Optional[str],
             message = f"Update {len(changed)} files"
         else:
             message = f"Update {changed[0].split('/')[-1]}"
+    err = validate_commit_message(message)
+    if err:
+        raise AutoGitError(err)
     run_git("commit", "-m", message)
     sha = run_git("rev-parse", "HEAD").stdout.strip()
     print(f"New commit: {sha[:8]}")
@@ -899,6 +914,10 @@ def cmd_squash(pr_ref: str, message: Optional[str] = None) -> Dict[str, Any]:
         print("Squashing commits...")
         run_git("reset", "--soft", f"upstream/{target_branch}")
 
+        err = validate_commit_message(message)
+        if err:
+            run_git("checkout", current_branch, check=False)
+            raise AutoGitError(err)
         run_git("commit", "-m", message)
         sha = run_git("rev-parse", "HEAD").stdout.strip()
         print(f"Squash complete: {sha[:8]}")

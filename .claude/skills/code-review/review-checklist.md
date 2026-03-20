@@ -44,6 +44,9 @@ This checklist covers areas that CI cannot check. Focus on distributed system co
 - [ ] **Both backends updated** — Changes in `platform/torch/` have corresponding `platform/mindspore/` changes (or explicit justification)
 - [ ] **Base class updated first** — New platform APIs added to `platform/platform.py` abstract class before implementations
 - [ ] **Collective ops via platform** — `all_reduce`, `all_gather`, `reduce_scatter` go through `platform.*`, not raw framework calls
+- [ ] **No `self.platform`** — Platform is always referenced via module-level `platform = get_platform()`, never stored as an instance attribute
+- [ ] **`differentiable_*` in autograd paths** — Code in forward/backward computation (e.g., `TensorRedistribution`, op dispatch) must use `platform.differentiable_all_reduce` / `platform.differentiable_reduce_scatter`, not the non-differentiable variants
+- [ ] **`group` vs `group_info` type correct** — `platform.all_reduce/all_gather_into_tensor/reduce_scatter_tensor` expect `group_info` (object with `.group` attr); `platform.differentiable_*` expect raw `group`; `platform.create_group()` returns raw `group` — verify callers wrap/unwrap correctly
 
 ### Common Cross-Platform Pitfalls
 
@@ -51,6 +54,9 @@ This checklist covers areas that CI cannot check. Focus on distributed system co
 - Device string handling differences between backends
 - Gradient computation API differences
 - Process group creation/management differences
+- Using `self.platform` instead of module-level `platform` (hides bugs, may reference stale or nonexistent attribute)
+- Mixing `differentiable_*` and non-differentiable collective APIs in autograd paths (breaks gradient flow)
+- Passing raw `ProcessGroup` to APIs that expect `group_info` wrapper, or vice versa (causes `AttributeError` at runtime)
 
 ### Multi-Platform & List/Collection APIs
 

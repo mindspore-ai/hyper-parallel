@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """pipeline stage"""
+from types import SimpleNamespace
+
 from hyper_parallel import DTensor
 from hyper_parallel.platform import get_platform
 from .utils import _RecvInfo  # pylint: disable=E0402
@@ -171,7 +173,9 @@ class PipelineStage(PipelineStageBase):
                 continue
             grad = param.grad
             group = shared_param_info.group
-            platform.all_reduce(grad, group)
+            # platform.all_reduce expects group_info (with .group for Torch, or str for MindSpore)
+            group_info = group if isinstance(group, str) else SimpleNamespace(group=group)
+            platform.all_reduce(grad, group_info)
 
     def _check_src_stage(self, src_stage):
         """check type for src_stage."""
@@ -283,6 +287,7 @@ class PipelineStage(PipelineStageBase):
             buffer = platform.new_tensor(shape, tensor_send.dtype, device=self.device)
             return _RecvInfo(global_rank, buffer)
         recv_info = self.grad_recv_info[micro_index][idx]
+        shape = tensor_send.shape if not isinstance(tensor_send, DTensor) else tensor_send.local_shape
         recv_info.buffer = platform.new_tensor(shape, tensor_send.dtype, device=self.device)
         return None
 
