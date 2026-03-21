@@ -17,7 +17,7 @@ from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_flatten_all_dims():
     '''
     Feature: test parallel op flatten.
@@ -31,7 +31,7 @@ def test_distributed_flatten_all_dims():
 
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_flatten_middle_dims():
     '''
     Feature: dtensor + torch.Tensor.flatten on middle dimensions with partial sharding
@@ -47,7 +47,7 @@ def test_distributed_flatten_middle_dims():
     torchrun_case(file_name, case_name, master_port, num_proc=4)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_flatten_unsharded():
     '''
     Feature: dtensor + torch.Tensor.flatten on unsharded middle dimensions
@@ -63,7 +63,7 @@ def test_distributed_flatten_unsharded():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_flatten_negative_dims():
     '''
     Feature: dtensor + torch.Tensor.flatten with negative dimension indices
@@ -79,7 +79,7 @@ def test_distributed_flatten_negative_dims():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_flatten_scalar():
     '''
     Feature: dtensor + torch.Tensor.flatten on a distributed scalar
@@ -92,7 +92,7 @@ def test_distributed_flatten_scalar():
     file_name = "parallel_op_flatten.py"
     case_name = "test_distributed_flatten_scalar"
     torchrun_case(file_name, case_name, master_port)
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_flatten_default_args():
     '''
     Feature: dtensor + torch.Tensor.flatten with default arguments
@@ -107,7 +107,7 @@ def test_distributed_flatten_default_args():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_flatten_single_dim():
     '''
     Feature: dtensor + torch.Tensor.flatten with start_dim == end_dim
@@ -123,7 +123,7 @@ def test_distributed_flatten_single_dim():
 
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_flatten_2d_to_1d():
     '''
     Feature: dtensor + torch.Tensor.flatten from 2D to 1D

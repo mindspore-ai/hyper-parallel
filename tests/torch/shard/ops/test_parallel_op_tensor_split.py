@@ -17,7 +17,7 @@ from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_tensor_split_by_sections_unsharded():
     """
     Feature: test parallel op tensor_split.
@@ -30,7 +30,7 @@ def test_distributed_tensor_split_by_sections_unsharded():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_tensor_split_by_indices_unsharded():
     """
     Feature: test parallel op tensor_split.
@@ -43,7 +43,7 @@ def test_distributed_tensor_split_by_indices_unsharded():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_tensor_split_default_dim():
     """
     Feature: test parallel op tensor_split.
@@ -56,7 +56,7 @@ def test_distributed_tensor_split_default_dim():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_tensor_split_negative_dim():
     """
     Feature: test parallel op tensor_split.
@@ -70,7 +70,7 @@ def test_distributed_tensor_split_negative_dim():
 
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_tensor_split_3d_sections():
     """
     Feature: test parallel op tensor_split.
@@ -83,7 +83,7 @@ def test_distributed_tensor_split_3d_sections():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_tensor_split_1d_tensor_indices():
     """
     Feature: test parallel op tensor_split.
@@ -96,7 +96,7 @@ def test_distributed_tensor_split_1d_tensor_indices():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_tensor_split_uneven_sections():
     """
     Feature: test parallel op tensor_split.
@@ -109,7 +109,7 @@ def test_distributed_tensor_split_uneven_sections():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_tensor_split_out_of_bounds_indices():
     """
     Feature: test parallel op tensor_split.

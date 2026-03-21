@@ -17,7 +17,7 @@ from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_min_element_wise():
     '''
     Feature: test parallel op min.
@@ -30,7 +30,7 @@ def test_distributed_min_element_wise():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_min_dim_reduce_sharded():
     '''
     Feature: test parallel op min.
@@ -43,7 +43,7 @@ def test_distributed_min_dim_reduce_sharded():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_min_dim_reduce_replicated():
     '''
     Feature: test parallel op min.
@@ -56,7 +56,7 @@ def test_distributed_min_dim_reduce_replicated():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_min_global_reduce():
     '''
     Feature: test parallel op min.
@@ -69,7 +69,7 @@ def test_distributed_min_global_reduce():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_min_keepdim():
     '''
     Feature: test parallel op min.
@@ -81,7 +81,7 @@ def test_distributed_min_keepdim():
     case_name = "test_distributed_min_keepdim"
     torchrun_case(file_name, case_name, master_port)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_min_3d_element_wise():
     '''
     Feature: test parallel op min.
@@ -94,7 +94,7 @@ def test_distributed_min_3d_element_wise():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_min_3d_reduce_negative_dim():
     '''
     Feature: test parallel op min.
@@ -107,7 +107,7 @@ def test_distributed_min_3d_reduce_negative_dim():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_min_3d_reduce_sharded_dim():
     '''
     Feature: test parallel op min.
