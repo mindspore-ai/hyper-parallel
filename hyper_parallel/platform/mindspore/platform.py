@@ -461,6 +461,11 @@ class MindSporePlatform(Platform):
         """
         if backend is None:
             backend = "hccl"
+        try:
+            if dist.is_initialized():
+                return
+        except AttributeError:
+            pass
         dist.init_process_group(backend=backend, init_method=init_method, timeout=timeout, world_size=world_size,
                                 rank=rank, store=store, pg_options=pg_options, device_id=device_id)
 

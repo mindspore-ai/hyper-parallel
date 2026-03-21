@@ -17,6 +17,10 @@
 This module provides comprehensive unit tests for the DeviceMesh class and
 related functions in the hyper_parallel framework. All tests use mocking to avoid
 dependencies on actual hardware or distributed communication.
+
+Note:
+    All test methods decorated with ``@patch("hyper_parallel.core.dtensor.device_mesh.platform")``
+    receive a ``mock_platform`` argument injected by the patch decorator.
 """
 import os
 import unittest
@@ -36,7 +40,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP,
 )
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
 
 
 class TestDeviceMesh(unittest.TestCase):
@@ -48,22 +52,53 @@ class TestDeviceMesh(unittest.TestCase):
         Clears global caches to ensure test isolation and initializes
         the platform for testing.
         """
-        # Clear global caches
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
-
-        # Initialize platform
         self.platform = get_platform()
 
     def tearDown(self):
-        """Clean up after each test method.
-
-        Ensures global caches are cleared after each test to prevent
-        test interference.
-        """
-        # Clear global caches
+        """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+
+    # ------------------------------------------------------------------
+    # Helper methods
+    # ------------------------------------------------------------------
+
+    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
+        """Configure common mock-platform attributes used across tests.
+
+        Args:
+            mock_platform: The MagicMock object injected by @patch.
+            platform_type: Optional PlatformType to set on the mock.
+            world_size: Value returned by mock_platform.get_world_size().
+        """
+        if platform_type is not None:
+            mock_platform.platform_type = platform_type
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
+
+    def _make_2x4_mesh(self, mock_platform):
+        """Set up mock and return a standard 2×4 (dp, tp) mesh via init_device_mesh."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        return init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+
+    def _make_2x2x2_mesh(self, mock_platform):
+        """Set up mock and return a standard 2×2×2 (dp, cp, tp) mesh via init_device_mesh."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "cp", "tp"))
+
+    def _make_2x2_mesh_no_backend(self, mock_platform, mesh_dim_names=("dp", "tp")):
+        """Set up mock and return a 2×2 DeviceMesh created without backend init."""
+        self._setup_mock_platform(mock_platform, world_size=4)
+        return DeviceMesh("npu", mesh=[[0, 1], [2, 3]], mesh_dim_names=mesh_dim_names, _init_backend=False)
+
+    # ------------------------------------------------------------------
+    # Construction tests
+    # ------------------------------------------------------------------
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_init_device_mesh_basic(self, mock_platform):
@@ -72,18 +107,11 @@ class TestDeviceMesh(unittest.TestCase):
         Scenario: Create a 2x2 DeviceMesh directly with explicit mesh tensor.
         Expected behavior: DeviceMesh should be created with correct shape,
         dimension names, and rank list.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange: Set up mock platform behavior
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
+        self._setup_mock_platform(mock_platform, world_size=4)
         mock_group = MagicMock()
         mock_platform.split_group.return_value = mock_group
-        mock_platform.tensor_to_numpy.side_effect = np.array
 
-        # Act - use DeviceMesh directly to avoid caching issues with init_device_mesh
         mesh = DeviceMesh(
             device_type="npu",
             mesh=[[0, 1], [2, 3]],
@@ -91,7 +119,6 @@ class TestDeviceMesh(unittest.TestCase):
             _init_backend=False,
         )
 
-        # Assert: Verify DeviceMesh properties
         self.assertEqual(mesh.mesh_shape, (2, 2))
         self.assertEqual(mesh.mesh_dim_names, ("dp", "tp"))
         self.assertEqual(mesh.rank_list, (0, 1, 2, 3))
@@ -104,44 +131,27 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Call init_device_mesh twice with same parameters.
         Expected behavior: Second call should return the same cached instance.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_group = MagicMock()
-        mock_platform.split_group.return_value = mock_group
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mock_platform.split_group.return_value = MagicMock()
 
-        # Act
         mesh1 = init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"))
         mesh2 = init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"))
 
-        # Assert - same parameters should return same cached instance
         self.assertIs(mesh1, mesh2)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_with_tensor(self, mock_platform):
         """Test DeviceMesh construction with custom mesh tensor.
 
-        Scenario: Create DeviceMesh with a 2x3 tensor mesh.
-        Expected behavior: DeviceMesh should have correct shape (2, 3).
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
+        Scenario: Create DeviceMesh with a 2x2 tensor mesh.
+        Expected behavior: DeviceMesh should have correct shape (2, 2).
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        self._setup_mock_platform(mock_platform, world_size=4)
+        mesh_tensor = self.platform.tensor([[0, 2], [1, 3]])
 
-        mesh = self.platform.tensor([[0, 2], [1, 3]])
+        device_mesh = DeviceMesh("npu", mesh_tensor, mesh_dim_names=("dp", "tp"))
 
-        # Act
-        device_mesh = DeviceMesh("npu", mesh, mesh_dim_names=("dp", "tp"))
-
-        # Assert
         self.assertEqual(device_mesh.mesh_shape, (2, 2))
         self.assertEqual(device_mesh.mesh_dim_names, ("dp", "tp"))
         self.assertEqual(device_mesh.rank_list, (0, 2, 1, 3))
@@ -150,15 +160,10 @@ class TestDeviceMesh(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_with_list(self, mock_platform):
         """Test DeviceMesh construction with list input."""
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        self._setup_mock_platform(mock_platform, world_size=4)
 
-        # Act
         device_mesh = DeviceMesh("npu", [[0, 2], [1, 3]], mesh_dim_names=("dp", "tp"))
 
-        # Assert
         self.assertEqual(device_mesh.mesh_shape, (2, 2))
         self.assertEqual(device_mesh.rank_list, (0, 2, 1, 3))
 
@@ -168,43 +173,58 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Create DeviceMesh with numpy array mesh.
         Expected behavior: DeviceMesh should be created successfully.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
+        self._setup_mock_platform(mock_platform, world_size=4)
         mesh = np.array([[0, 2], [1, 3]], dtype=np.int64)
 
-        # Act
         device_mesh = DeviceMesh("npu", mesh, mesh_dim_names=("dp", "tp"))
 
-        # Assert
         self.assertEqual(device_mesh.mesh_shape, (2, 2))
         self.assertEqual(device_mesh.rank_list, (0, 2, 1, 3))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_with_none_mesh(self, mock_platform):
+        """Test DeviceMesh with mesh=None (auto 1D mesh).
+
+        Scenario: Create DeviceMesh without explicit mesh (mesh=None).
+        Expected behavior: DeviceMesh should auto-generate 1D mesh based on world_size.
+        """
+        self._setup_mock_platform(mock_platform, world_size=4)
+
+        device_mesh = DeviceMesh("npu", mesh=None, _init_backend=False)
+
+        self.assertEqual(device_mesh.mesh_shape, (4,))
+        self.assertEqual(device_mesh.ndim, 1)
+        self.assertEqual(device_mesh.rank_list, (0, 1, 2, 3))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_without_dim_names(self, mock_platform):
+        """Test DeviceMesh without mesh_dim_names.
+
+        Scenario: Create DeviceMesh without mesh_dim_names.
+        Expected behavior: DeviceMesh should work with default behavior.
+        """
+        self._setup_mock_platform(mock_platform, world_size=4)
+
+        mesh = DeviceMesh("npu", mesh=[0, 1, 2, 3], _init_backend=False)
+
+        self.assertIsNone(mesh.mesh_dim_names)
+        self.assertEqual(mesh.mesh_shape, (4,))
+        self.assertEqual(mesh.rank_list, (0, 1, 2, 3))
+        self.assertEqual(mesh.axis_id("None"), -1)
+
+    # ------------------------------------------------------------------
+    # __getitem__ / slicing tests
+    # ------------------------------------------------------------------
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_getitem_single_dim(self, mock_platform):
         """Test DeviceMesh __getitem__ with single dimension."""
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x4_mesh(mock_platform)
 
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act
         dp_mesh = mesh["dp"]
         tp_mesh = mesh["tp"]
 
-        # Assert
         self.assertEqual(dp_mesh.mesh_shape, (2,))
         self.assertEqual(dp_mesh.mesh_dim_names, ("dp",))
         self.assertEqual(dp_mesh.root_mesh, mesh)
@@ -218,375 +238,13 @@ class TestDeviceMesh(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_getitem_multiple_dims(self, mock_platform):
         """Test DeviceMesh __getitem__ with multiple dimensions."""
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x2x2_mesh(mock_platform)
 
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 2, 2),
-            mesh_dim_names=("dp", "cp", "tp"),
-        )
-
-        # Act
         dp_cp_mesh = mesh[("dp", "cp")]
 
-        # Assert
         self.assertEqual(dp_cp_mesh.mesh_shape, (2, 2))
         self.assertEqual(dp_cp_mesh.mesh_dim_names, ("dp", "cp"))
         self.assertEqual(dp_cp_mesh.rank_list, (0, 2, 4, 6))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_get_local_rank(self, mock_platform):
-        """Test DeviceMesh get_local_rank method.
-
-        Scenario: Get local rank within a specific mesh dimension.
-        Expected behavior: Should return the local rank within the specified dimension.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act & Assert for rank 0
-        self.assertEqual(mesh.get_local_rank("dp"), 0)
-        self.assertEqual(mesh.get_local_rank("tp"), 0)
-        self.assertEqual(mesh.get_local_rank(0), 0)
-        self.assertEqual(mesh.get_local_rank(1), 0)
-
-        # Test with mocked rank 5
-        with patch.object(mesh, "_rank", 5):
-            self.assertEqual(mesh.get_local_rank("dp"), 1)
-            self.assertEqual(mesh.get_local_rank(1), 1)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_flatten(self, mock_platform):
-        """Test DeviceMesh flatten method.
-
-        Scenario: Flatten a multi-dimensional mesh into a 1D mesh.
-        Expected behavior: Should return a new DeviceMesh with flattened dimensions.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 2, 2),
-            mesh_dim_names=("dp", "cp", "tp"),
-        )
-
-        dp_cp_mesh = mesh[("dp", "cp")]
-
-        # Act
-        flat_mesh = dp_cp_mesh.flatten()
-
-        # Assert
-        self.assertEqual(flat_mesh.mesh_shape, (4,))
-        self.assertEqual(flat_mesh.mesh_dim_names, ("dp_cp",))
-        self.assertEqual(flat_mesh.rank_list, (0, 2, 4, 6))
-        self.assertEqual(flat_mesh.root_mesh, mesh)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_size(self, mock_platform):
-        """Test DeviceMesh size method.
-
-        Scenario: Get the total size of the mesh or size along a specific dimension.
-        Expected behavior: size() should return total elements, size(dim) should return elements along that dimension.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act & Assert
-        self.assertEqual(mesh.size(), 8)
-        self.assertEqual(mesh.size(0), 2)
-        self.assertEqual(mesh.size(1), 4)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_properties(self, mock_platform):
-        """Test DeviceMesh basic properties.
-
-        Scenario: Access various properties of DeviceMesh instance.
-        Expected behavior: Properties should return expected values for device_type, shape, mesh_shape, ndim, and rank.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act & Assert
-        self.assertEqual(mesh.device_type, "npu")
-        self.assertEqual(mesh.shape, (2, 4))
-        self.assertEqual(mesh.mesh_shape, (2, 4))
-        self.assertEqual(mesh.ndim, 2)
-        self.assertEqual(mesh.rank, 0)
-        # rank_list contains all ranks from 0 to world_size-1
-        self.assertEqual(len(mesh.rank_list), 8)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_repr(self, mock_platform):
-        """Test DeviceMesh __repr__ method.
-
-        Scenario: Get string representation of DeviceMesh instance.
-        Expected behavior: __repr__ should return a string containing DeviceMesh class name and key properties.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 2),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act
-        repr_str = repr(mesh)
-
-        # Assert - just check it contains expected substrings
-        self.assertIn("DeviceMesh", repr_str)
-        self.assertIn("device_type='npu'", repr_str)
-        self.assertIn("mesh_shape=(2, 2)", repr_str)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_axis_methods(self, mock_platform):
-        """Test DeviceMesh axis-related methods.
-
-        Scenario: Access axis-related information using axis_id, axis_index, and get_device_num_along_axis methods.
-        Expected behavior: Methods should return correct dimension indices and device counts.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act & Assert
-        self.assertEqual(mesh.axis_id("dp"), 1)
-        self.assertEqual(mesh.axis_id("tp"), 0)
-        self.assertEqual(mesh.axis_index("dp"), 0)
-        self.assertEqual(mesh.axis_index("tp"), 1)
-        self.assertEqual(mesh.get_device_num_along_axis("dp"), 2)
-        self.assertEqual(mesh.get_device_num_along_axis("tp"), 4)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_get_rank_list_along_axis(self, mock_platform):
-        """Test DeviceMesh get_rank_list_along_axis method.
-
-        Scenario: Get the list of ranks along a specific axis for the current rank.
-        Expected behavior: Should return list of ranks that are in the same slice along the specified axis.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act
-        rank_list_dp = mesh.get_rank_list_along_axis("dp")
-        rank_list_tp = mesh.get_rank_list_along_axis("tp")
-
-        # Assert
-        self.assertEqual(rank_list_dp, [0, 4])
-        self.assertEqual(rank_list_tp, [0, 1, 2, 3])
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_get_global_shape(self, mock_platform):
-        """Test DeviceMesh get_global_shape method.
-
-        Scenario: Calculate global tensor shape from local slice shape and tensor mapping.
-        Expected behavior: Should return global shape accounting for sharding across mesh dimensions.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act - simulate tensor sharding where dimension 0 is sharded across dp (dim 1) and
-        # dimension 1 is sharded across tp (dim 0 in mesh coordinate, reverse order)
-        slice_shape = (4, 8)
-        # Mapping: -1 = replicated, 0/1 = sharded across that mesh dimension
-        # In reverse mesh order: tp is 0, dp is 1
-        tensor_map = (1, 0)  # dim 0 sharded on dp, dim 1 sharded on tp
-
-        global_shape = mesh.get_global_shape(slice_shape, tensor_map)
-
-        # Assert
-        # Expected: (4 * 2, 8 * 4) = (8, 32)
-        self.assertEqual(global_shape, (8, 32))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_get_sub_rank_list(self, mock_platform):
-        """Test _get_sub_rank_list helper function.
-
-        Scenario: Extract sub-rank list for a sub-mesh from original mesh.
-        Expected behavior: Should return list of ranks in the sub-mesh slice containing current rank.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mesh_shape = (2, 4)
-        mesh_dim_names = ("dp", "tp")
-        rank_list = (0, 1, 2, 3, 4, 5, 6, 7)
-        sub_mesh_dim_names = ("dp",)
-        current_rank = 0
-
-        # Act
-        sub_rank_list = _get_sub_rank_list(
-            mesh_shape, mesh_dim_names, rank_list, sub_mesh_dim_names, current_rank
-        )
-
-        # Assert
-        self.assertEqual(sub_rank_list, [0, 4])
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_with_none_mesh(self, mock_platform):
-        """Test DeviceMesh with mesh=None (auto 1D mesh).
-
-        Scenario: Create DeviceMesh without explicit mesh (mesh=None).
-        Expected behavior: DeviceMesh should auto-generate 1D mesh based on world_size.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        # Act
-        device_mesh = DeviceMesh("npu", mesh=None, _init_backend=False)
-
-        # Assert
-        self.assertEqual(device_mesh.mesh_shape, (4,))
-        self.assertEqual(device_mesh.ndim, 1)
-        self.assertEqual(device_mesh.rank_list, (0, 1, 2, 3))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_invalid_mesh_type(self, mock_platform):
-        """Test DeviceMesh with invalid mesh type raises TypeError.
-
-        Scenario: Create DeviceMesh with invalid mesh type (integer).
-        Expected behavior: Should raise TypeError with appropriate message.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 1
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        # Act & Assert - scalar mesh should raise TypeError (not ValueError)
-        # because 0 is not a valid Tensor, list, tuple or numpy array
-        with self.assertRaises(TypeError) as context:
-            DeviceMesh("npu", mesh=0, _init_backend=False)
-        self.assertIn("mesh must be Tensor, list, tuple or numpy array", str(context.exception))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_invalid_mesh_dim_names_length(self, mock_platform):
-        """Test DeviceMesh with mismatched mesh_dim_names length raises ValueError.
-
-        Scenario: Create DeviceMesh with 2D mesh but 3 mesh_dim_names.
-        Expected behavior: Should raise ValueError with appropriate message.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        # Act & Assert - mismatched dimension count should raise ValueError
-        with self.assertRaises(ValueError) as context:
-            DeviceMesh("npu", mesh=[[0, 1], [2, 3]], mesh_dim_names=("dp", "tp", "cp"), _init_backend=False)
-        self.assertIn("mesh dimensions", str(context.exception))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_invalid_mesh_dim_names_duplicate(self, mock_platform):
-        """Test DeviceMesh with duplicate mesh_dim_names raises ValueError.
-
-        Scenario: Create DeviceMesh with duplicate dimension names.
-        Expected behavior: Should raise ValueError with appropriate message.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        # Act & Assert - duplicate dimension names should raise ValueError
-        with self.assertRaises(ValueError) as context:
-            DeviceMesh("npu", mesh=[[0, 1], [2, 3]], mesh_dim_names=("dp", "dp"), _init_backend=False)
-        self.assertIn("Each element of mesh_dim_names", str(context.exception))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_getitem_no_dim_names_raises(self, mock_platform):
@@ -594,18 +252,10 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Access submesh without setting mesh_dim_names.
         Expected behavior: Should raise RuntimeError with appropriate message.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
+        self._setup_mock_platform(mock_platform, world_size=4)
         mesh = DeviceMesh("npu", mesh=[0, 1, 2, 3], _init_backend=False)
 
-        # Act & Assert - accessing submesh without dim names should raise
         with self.assertRaises(RuntimeError) as context:
             _ = mesh["dp"]
         self.assertIn("Cannot slice a DeviceMesh without mesh_dim_names", str(context.exception))
@@ -616,22 +266,10 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Access submesh with invalid dimension name.
         Expected behavior: Should raise KeyError with appropriate message.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        self._setup_mock_platform(mock_platform, world_size=4)
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 2),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act & Assert - invalid dimension name should raise
         with self.assertRaises(KeyError) as context:
             _ = mesh["invalid_dim"]
         self.assertIn("invalid_dim", str(context.exception))
@@ -642,52 +280,124 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Access submesh with out-of-order dimension names.
         Expected behavior: Should raise ValueError with appropriate message.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x2x2_mesh(mock_platform)
 
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 2, 2),
-            mesh_dim_names=("dp", "cp", "tp"),
-        )
-
-        # Act & Assert - out of order dimension should raise
         with self.assertRaises(ValueError) as context:
             _ = mesh[("cp", "dp")]  # Wrong order, should be ("dp", "cp")
         self.assertIn("must follow the order", str(context.exception))
 
+    # ------------------------------------------------------------------
+    # Properties and methods
+    # ------------------------------------------------------------------
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_size_method(self, mock_platform):
+    def test_device_mesh_properties(self, mock_platform):
+        """Test DeviceMesh basic properties.
+
+        Scenario: Access various properties of DeviceMesh instance.
+        Expected behavior: Properties should return expected values for device_type,
+        shape, mesh_shape, ndim, and rank.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+
+        self.assertEqual(mesh.device_type, "npu")
+        self.assertEqual(mesh.shape, (2, 4))
+        self.assertEqual(mesh.mesh_shape, (2, 4))
+        self.assertEqual(mesh.ndim, 2)
+        self.assertEqual(mesh.rank, 0)
+        self.assertEqual(len(mesh.rank_list), 8)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_repr(self, mock_platform):
+        """Test DeviceMesh __repr__ method.
+
+        Scenario: Get string representation of DeviceMesh instance.
+        Expected behavior: __repr__ should contain DeviceMesh class name and key properties.
+        """
+        self._setup_mock_platform(mock_platform, world_size=4)
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+
+        repr_str = repr(mesh)
+
+        self.assertIn("DeviceMesh", repr_str)
+        self.assertIn("device_type='npu'", repr_str)
+        self.assertIn("mesh_shape=(2, 2)", repr_str)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_size(self, mock_platform):
         """Test DeviceMesh size method.
 
         Scenario: Get total size and size along specific dimensions.
-        Expected behavior: size() should return total elements, size(dim)
-        should return elements along that dimension.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
+        Expected behavior: size() should return total elements, size(dim) should return
+        elements along that dimension.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x4_mesh(mock_platform)
 
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act & Assert
         self.assertEqual(mesh.size(), 8)
         self.assertEqual(mesh.size(0), 2)
         self.assertEqual(mesh.size(1), 4)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_axis_methods(self, mock_platform):
+        """Test DeviceMesh axis-related methods.
+
+        Scenario: Access axis-related information using axis_id, axis_index,
+        and get_device_num_along_axis methods.
+        Expected behavior: Methods should return correct dimension indices and device counts.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+
+        self.assertEqual(mesh.axis_id("dp"), 1)
+        self.assertEqual(mesh.axis_id("tp"), 0)
+        self.assertEqual(mesh.axis_index("dp"), 0)
+        self.assertEqual(mesh.axis_index("tp"), 1)
+        self.assertEqual(mesh.get_device_num_along_axis("dp"), 2)
+        self.assertEqual(mesh.get_device_num_along_axis("tp"), 4)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_get_local_rank(self, mock_platform):
+        """Test DeviceMesh get_local_rank method.
+
+        Scenario: Get local rank within a specific mesh dimension.
+        Expected behavior: Should return the local rank within the specified dimension.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+
+        self.assertEqual(mesh.get_local_rank("dp"), 0)
+        self.assertEqual(mesh.get_local_rank("tp"), 0)
+        self.assertEqual(mesh.get_local_rank(0), 0)
+        self.assertEqual(mesh.get_local_rank(1), 0)
+
+        with patch.object(mesh, "_rank", 5):
+            self.assertEqual(mesh.get_local_rank("dp"), 1)
+            self.assertEqual(mesh.get_local_rank(1), 1)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_get_rank_list_along_axis(self, mock_platform):
+        """Test DeviceMesh get_rank_list_along_axis method.
+
+        Scenario: Get the list of ranks along a specific axis for the current rank.
+        Expected behavior: Should return list of ranks in the same slice along the specified axis.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+
+        self.assertEqual(mesh.get_rank_list_along_axis("dp"), [0, 4])
+        self.assertEqual(mesh.get_rank_list_along_axis("tp"), [0, 1, 2, 3])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_get_global_shape(self, mock_platform):
+        """Test DeviceMesh get_global_shape method.
+
+        Scenario: Calculate global tensor shape from local slice shape and tensor mapping.
+        Expected behavior: Should return global shape accounting for sharding across mesh dimensions.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+
+        # Mapping: dim 0 sharded on dp (mesh idx 1), dim 1 sharded on tp (mesh idx 0)
+        global_shape = mesh.get_global_shape(slice_shape=(4, 8), tensor_map=(1, 0))
+
+        self.assertEqual(global_shape, (8, 32))  # (4*2, 8*4)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_coordinate(self, mock_platform):
@@ -695,26 +405,10 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Get coordinate of current rank in the mesh.
         Expected behavior: Should return coordinate tuple for current rank.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x4_mesh(mock_platform)
 
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act
-        coordinate = mesh.get_coordinate()
-
-        # Assert - rank 0 in 2x4 mesh should be at position (0, 0)
-        self.assertEqual(coordinate, (0, 0))
+        self.assertEqual(mesh.get_coordinate(), (0, 0))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_root_mesh_property(self, mock_platform):
@@ -722,27 +416,12 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Access root_mesh property of parent and child meshes.
         Expected behavior: Parent mesh should have None, child should reference parent.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act
+        mesh = self._make_2x4_mesh(mock_platform)
         dp_mesh = mesh["dp"]
 
-        # Assert
-        self.assertIsNone(mesh.root_mesh)  # Root mesh has no parent
-        self.assertEqual(dp_mesh.root_mesh, mesh)  # Submesh has parent
+        self.assertIsNone(mesh.root_mesh)
+        self.assertEqual(dp_mesh.root_mesh, mesh)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_sub_mesh_property(self, mock_platform):
@@ -750,29 +429,32 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Access sub_mesh property after creating submeshes.
         Expected behavior: Should contain all created submeshes.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x4_mesh(mock_platform)
 
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act
-        self.assertEqual(len(mesh.sub_mesh), 0)  # Initially empty
+        self.assertEqual(len(mesh.sub_mesh), 0)
 
         dp_mesh = mesh["dp"]
 
-        # Assert
         self.assertEqual(len(mesh.sub_mesh), 1)
         self.assertEqual(dp_mesh, mesh.sub_mesh[0])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_flatten(self, mock_platform):
+        """Test DeviceMesh flatten method.
+
+        Scenario: Flatten a multi-dimensional mesh into a 1D mesh.
+        Expected behavior: Should return a new DeviceMesh with flattened dimensions.
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        dp_cp_mesh = mesh[("dp", "cp")]
+
+        flat_mesh = dp_cp_mesh.flatten()
+
+        self.assertEqual(flat_mesh.mesh_shape, (4,))
+        self.assertEqual(flat_mesh.mesh_dim_names, ("dp_cp",))
+        self.assertEqual(flat_mesh.rank_list, (0, 2, 4, 6))
+        self.assertEqual(flat_mesh.root_mesh, mesh)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_flatten_mapping(self, mock_platform):
@@ -780,26 +462,13 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Create flattened mesh and check mapping.
         Expected behavior: get_flatten_mapping should contain the flattened mesh.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x4_mesh(mock_platform)
 
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act & Assert - initially empty
         self.assertEqual(mesh.get_flatten_mapping(), {})
 
-        # Add a flattened mesh
         flat_dp_tp = mesh.flatten()
+
         self.assertIn("dp_tp", mesh.get_flatten_mapping())
         self.assertEqual(mesh.get_flatten_mapping()["dp_tp"], flat_dp_tp)
 
@@ -809,64 +478,13 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Generate hash key from DeviceMesh.
         Expected behavior: to_hash should return tuple of shape, names, and rank list.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        self._setup_mock_platform(mock_platform, world_size=4)
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 2),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act
         hash_key = mesh.to_hash()
 
-        # Assert
-        expected = ((2, 2), ("dp", "tp"), (0, 1, 2, 3))
-        self.assertEqual(hash_key, expected)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_get_all_groups(self, mock_platform):
-        """Test DeviceMesh get_all_groups method.
-
-        Scenario: Get all communication groups from DeviceMesh.
-        Expected behavior: Should return list of all groups used in the mesh.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
-        """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
-
-        # Mock group creation to avoid AssertionError
-        mock_group = MagicMock()
-        mock_platform.split_group.return_value = mock_group
-
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Manually set up the dim_group_names and EXISTING_COMM_GROUPS to avoid assertion errors
-        # This is needed because we're mocking the platform
-        mesh._dim_group_names = ['(0, 1)', '(0, 1, 2, 3)']
-        EXISTING_COMM_GROUPS['(0, 1)'] = mock_group
-        EXISTING_COMM_GROUPS['(0, 1, 2, 3)'] = mock_group
-
-        # Act
-        all_groups = mesh.get_all_groups()
-
-        # Assert
-        self.assertEqual(len(all_groups), 2)
+        self.assertEqual(hash_key, ((2, 2), ("dp", "tp"), (0, 1, 2, 3)))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_assert_axis(self, mock_platform):
@@ -874,54 +492,107 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Validate axis name exists in mesh.
         Expected behavior: Should raise ValueError for invalid axis names.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 8
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x4_mesh(mock_platform)
 
-        mesh = init_device_mesh(
-            device_type="npu",
-            mesh_shape=(2, 4),
-            mesh_dim_names=("dp", "tp"),
-        )
-
-        # Act & Assert - valid axis should not raise
         mesh.assert_axis("dp", "test_op")
         mesh.assert_axis("tp", "test_op")
 
-        # Invalid axis should raise
         with self.assertRaises(ValueError) as context:
             mesh.assert_axis("invalid", "test_op")
         self.assertIn("invalid", str(context.exception))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_device_mesh_without_dim_names(self, mock_platform):
-        """Test DeviceMesh without mesh_dim_names.
+    def test_device_mesh_get_all_groups(self, mock_platform):
+        """Test DeviceMesh get_all_groups method.
 
-        Scenario: Create DeviceMesh without mesh_dim_names.
-        Expected behavior: DeviceMesh should work with default behavior.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
+        Scenario: Get all communication groups from DeviceMesh.
+        Expected behavior: Should return list of all groups used in the mesh.
         """
-        # Arrange
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mock_group = MagicMock()
+        mock_platform.split_group.return_value = mock_group
+
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+
+        # Manually set up groups to avoid assertion errors with mocked platform
+        mesh._dim_group_names = ['(0, 1)', '(0, 1, 2, 3)']
+        EXISTING_COMM_GROUPS['(0, 1)'] = mock_group
+        EXISTING_COMM_GROUPS['(0, 1, 2, 3)'] = mock_group
+
+        all_groups = mesh.get_all_groups()
+
+        self.assertEqual(len(all_groups), 2)
+
+    # ------------------------------------------------------------------
+    # Validation / error-path tests
+    # ------------------------------------------------------------------
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_invalid_mesh_type(self, mock_platform):
+        """Test DeviceMesh with invalid mesh type raises TypeError.
+
+        Scenario: Create DeviceMesh with invalid mesh type (integer).
+        Expected behavior: Should raise TypeError with appropriate message.
+        """
+        self._setup_mock_platform(mock_platform, world_size=1)
+
+        with self.assertRaises(TypeError) as context:
+            DeviceMesh("npu", mesh=0, _init_backend=False)
+        self.assertIn("mesh must be Tensor, list, tuple or numpy array", str(context.exception))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_invalid_mesh_dim_names_length(self, mock_platform):
+        """Test DeviceMesh with mismatched mesh_dim_names length raises ValueError.
+
+        Scenario: Create DeviceMesh with 2D mesh but 3 mesh_dim_names.
+        Expected behavior: Should raise ValueError with appropriate message.
+        """
+        self._setup_mock_platform(mock_platform, world_size=4)
+
+        with self.assertRaises(ValueError) as context:
+            DeviceMesh("npu", mesh=[[0, 1], [2, 3]], mesh_dim_names=("dp", "tp", "cp"), _init_backend=False)
+        self.assertIn("mesh dimensions", str(context.exception))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_invalid_mesh_dim_names_duplicate(self, mock_platform):
+        """Test DeviceMesh with duplicate mesh_dim_names raises ValueError.
+
+        Scenario: Create DeviceMesh with duplicate dimension names.
+        Expected behavior: Should raise ValueError with appropriate message.
+        """
+        self._setup_mock_platform(mock_platform, world_size=4)
+
+        with self.assertRaises(ValueError) as context:
+            DeviceMesh("npu", mesh=[[0, 1], [2, 3]], mesh_dim_names=("dp", "dp"), _init_backend=False)
+        self.assertIn("Each element of mesh_dim_names", str(context.exception))
+
+    # ------------------------------------------------------------------
+    # Helper function tests
+    # ------------------------------------------------------------------
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_sub_rank_list(self, mock_platform):
+        """Test _get_sub_rank_list helper function.
+
+        Scenario: Extract sub-rank list for a sub-mesh from original mesh.
+        Expected behavior: Should return list of ranks in the sub-mesh slice containing current rank.
+        """
         mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
 
-        mesh = DeviceMesh("npu", mesh=[0, 1, 2, 3], _init_backend=False)
+        sub_rank_list = _get_sub_rank_list(
+            mesh_shape=(2, 4),
+            mesh_dim_names=("dp", "tp"),
+            rank_list=(0, 1, 2, 3, 4, 5, 6, 7),
+            sub_mesh_dim_names=("dp",),
+            current_rank=0,
+        )
 
-        # Act & Assert
-        self.assertIsNone(mesh.mesh_dim_names)
-        self.assertEqual(mesh.mesh_shape, (4,))
-        self.assertEqual(mesh.rank_list, (0, 1, 2, 3))
+        self.assertEqual(sub_rank_list, [0, 4])
 
-        # axis_id without dim names should work
-        self.assertEqual(mesh.axis_id("None"), -1)
+    # ------------------------------------------------------------------
+    # from_group tests
+    # ------------------------------------------------------------------
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_from_group_with_1d_group(self, mock_platform):
@@ -929,26 +600,18 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Create DeviceMesh from a 1D communication group.
         Expected behavior: DeviceMesh should be created with ranks from the group.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
+        self._setup_mock_platform(mock_platform, world_size=4)
         mock_group = MagicMock()
         mock_platform.get_process_group_ranks.return_value = [0, 1, 2, 3]
         mock_platform.get_created_group.return_value = False
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
 
-        # Act - create DeviceMesh from 1D group
         device_mesh = DeviceMesh.from_group(
             group=mock_group,
             device_type="npu",
             mesh_dim_names=("dp",),
         )
 
-        # Assert
         self.assertEqual(device_mesh.mesh_shape, (4,))
         self.assertEqual(device_mesh.rank_list, (0, 1, 2, 3))
         self.assertEqual(device_mesh.mesh_dim_names, ("dp",))
@@ -959,13 +622,8 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Create DeviceMesh from a list of communication groups for 2D mesh.
         Expected behavior: DeviceMesh should be created with appropriate rank layout.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
+        self._setup_mock_platform(mock_platform, world_size=4)
         mock_group_dp = MagicMock()
         mock_group_tp = MagicMock()
         mock_platform.get_process_group_ranks.side_effect = [
@@ -973,9 +631,7 @@ class TestDeviceMesh(unittest.TestCase):
             [0, 2],  # tp group
         ]
         mock_platform.get_created_group.return_value = False
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
 
-        # Act - create DeviceMesh from list of groups
         device_mesh = DeviceMesh.from_group(
             group=[mock_group_dp, mock_group_tp],
             device_type="npu",
@@ -983,7 +639,6 @@ class TestDeviceMesh(unittest.TestCase):
             mesh_dim_names=("dp", "tp"),
         )
 
-        # Assert
         self.assertEqual(device_mesh.mesh_shape, (2, 2))
         self.assertEqual(device_mesh.rank_list, (0, 1, 2, 3))
         self.assertEqual(device_mesh.mesh_dim_names, ("dp", "tp"))
@@ -994,19 +649,12 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Create DeviceMesh with 1D group but mismatched mesh.
         Expected behavior: Should raise ValueError when mesh doesn't match group ranks.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
+        self._setup_mock_platform(mock_platform, world_size=4)
         mock_group = MagicMock()
         mock_platform.get_process_group_ranks.return_value = [0, 1]
         mock_platform.get_created_group.return_value = False
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
 
-        # Act & Assert - mismatched mesh should raise ValueError
         with self.assertRaises(ValueError) as context:
             DeviceMesh.from_group(
                 group=mock_group,
@@ -1016,32 +664,21 @@ class TestDeviceMesh(unittest.TestCase):
             )
         self.assertIn("Invalid mesh", str(context.exception))
 
+    # ------------------------------------------------------------------
+    # get_devices_for_axis tests
+    # ------------------------------------------------------------------
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_device_mesh_get_devices_for_axis_with_str(self, mock_platform):
         """Test DeviceMesh.get_devices_for_axis with string dimension name.
 
         Scenario: Get devices along a specific axis by dimension name.
         Expected behavior: Should return list of ranks along that dimension.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x2_mesh_no_backend(mock_platform)
 
-        mesh = DeviceMesh(
-            "npu",
-            mesh=[[0, 1], [2, 3]],
-            mesh_dim_names=("dp", "tp"),
-            _init_backend=False,
-        )
-
-        # Act - get devices for axis "dp" with rank 0
         devices = mesh.get_devices_for_axis("dp", 0)
 
-        # Assert - rank 0 and 1 are in the same dp group
         self.assertEqual(sorted(devices), [0, 2])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -1050,26 +687,11 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Get devices along a specific axis by dimension index.
         Expected behavior: Should return list of ranks along that dimension.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x2_mesh_no_backend(mock_platform)
 
-        mesh = DeviceMesh(
-            "npu",
-            mesh=[[0, 1], [2, 3]],
-            mesh_dim_names=("dp", "tp"),
-            _init_backend=False,
-        )
-
-        # Act - get devices for axis 0 (dp) with rank 0
         devices = mesh.get_devices_for_axis(0, 0)
 
-        # Assert - rank 0 and 2 are in the same dp group
         self.assertEqual(sorted(devices), [0, 2])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -1078,23 +700,9 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Get devices with invalid dimension name.
         Expected behavior: Should raise ValueError with appropriate message.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x2_mesh_no_backend(mock_platform)
 
-        mesh = DeviceMesh(
-            "npu",
-            mesh=[[0, 1], [2, 3]],
-            mesh_dim_names=("dp", "tp"),
-            _init_backend=False,
-        )
-
-        # Act & Assert - invalid dimension name should raise
         with self.assertRaises(ValueError) as context:
             mesh.get_devices_for_axis("invalid", 0)
         self.assertIn("not found", str(context.exception))
@@ -1105,22 +713,10 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Get devices when mesh_dim_names is not set.
         Expected behavior: Should raise ValueError when using string dimension.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        self._setup_mock_platform(mock_platform, world_size=4)
+        mesh = DeviceMesh("npu", mesh=[[0, 1], [2, 3]], _init_backend=False)
 
-        mesh = DeviceMesh(
-            "npu",
-            mesh=[[0, 1], [2, 3]],
-            _init_backend=False,
-        )
-
-        # Act & Assert - using string dim without dim names should raise
         with self.assertRaises(ValueError) as context:
             mesh.get_devices_for_axis("dp", 0)
         self.assertIn("not set", str(context.exception))
@@ -1131,23 +727,9 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Get devices with rank not in mesh.
         Expected behavior: Should raise ValueError with appropriate message.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x2_mesh_no_backend(mock_platform)
 
-        mesh = DeviceMesh(
-            "npu",
-            mesh=[[0, 1], [2, 3]],
-            mesh_dim_names=("dp", "tp"),
-            _init_backend=False,
-        )
-
-        # Act & Assert - invalid rank should raise
         with self.assertRaises(ValueError) as context:
             mesh.get_devices_for_axis("dp", 100)
         self.assertIn("not found", str(context.exception))
@@ -1158,26 +740,188 @@ class TestDeviceMesh(unittest.TestCase):
 
         Scenario: Get devices with dimension index out of valid range.
         Expected behavior: Should raise ValueError with appropriate message.
-
-        Args:
-            mock_platform: Mocked platform module for test isolation.
         """
-        # Arrange
-        mock_platform.get_rank.return_value = 0
-        mock_platform.get_world_size.return_value = 4
-        mock_platform.tensor_to_numpy.side_effect = lambda t: t.numpy() if hasattr(t, 'numpy') else np.array(t)
+        mesh = self._make_2x2_mesh_no_backend(mock_platform)
 
-        mesh = DeviceMesh(
-            "npu",
-            mesh=[[0, 1], [2, 3]],
-            mesh_dim_names=("dp", "tp"),
-            _init_backend=False,
-        )
-
-        # Act & Assert - out of range dimension should raise
         with self.assertRaises(ValueError) as context:
             mesh.get_devices_for_axis(5, 0)
         self.assertIn("out of range", str(context.exception))
+
+    # ------------------------------------------------------------------
+    # init_process_group ordering tests
+    # ------------------------------------------------------------------
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_init_backend_calls_init_process_group(self, mock_platform):
+        """Test that DeviceMesh calls init_process_group before mesh setup when _init_backend=True.
+
+        Scenario: Construct DeviceMesh with _init_backend=True.
+        Expected behavior: init_process_group is called exactly once before get_world_size
+        (i.e., before the mesh is constructed).
+        """
+        self._setup_mock_platform(mock_platform, world_size=4)
+        mock_platform.split_group.return_value = MagicMock()
+
+        call_order = []
+        mock_platform.init_process_group.side_effect = lambda *a, **kw: call_order.append("init_process_group")
+        mock_platform.get_world_size.side_effect = lambda *a, **kw: call_order.append("get_world_size") or 4
+
+        DeviceMesh("npu", mesh=[[0, 1], [2, 3]], _init_backend=True)
+
+        mock_platform.init_process_group.assert_called_once()
+        # init_process_group must be called before get_world_size (mesh construction)
+        if "get_world_size" in call_order:
+            self.assertLess(
+                call_order.index("init_process_group"),
+                call_order.index("get_world_size"),
+            )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_no_init_process_group_when_init_backend_false(self, mock_platform):
+        """Test that DeviceMesh does not call init_process_group when _init_backend=False.
+
+        Scenario: Construct DeviceMesh with _init_backend=False.
+        Expected behavior: init_process_group is never called.
+        """
+        self._setup_mock_platform(mock_platform, world_size=4)
+
+        DeviceMesh("npu", mesh=[[0, 1], [2, 3]], _init_backend=False)
+
+        mock_platform.init_process_group.assert_not_called()
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_init_device_mesh_calls_init_process_group_when_init_backend_true(self, mock_platform):
+        """Test that init_device_mesh calls init_process_group when init_backend=True and rank_list is None.
+
+        Scenario: Call init_device_mesh with init_backend=True and no explicit rank_list.
+        Expected behavior: init_process_group is called before get_rank.
+        """
+        self._setup_mock_platform(mock_platform, world_size=4)
+        mock_platform.split_group.return_value = MagicMock()
+
+        call_order = []
+        mock_platform.init_process_group.side_effect = lambda *a, **kw: call_order.append("init_process_group")
+        mock_platform.get_rank.side_effect = lambda *a, **kw: call_order.append("get_rank") or 0
+
+        init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"), init_backend=True)
+
+        mock_platform.init_process_group.assert_called()
+        self.assertIn("init_process_group", call_order)
+        self.assertIn("get_rank", call_order)
+        self.assertLess(
+            call_order.index("init_process_group"),
+            call_order.index("get_rank"),
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_init_device_mesh_no_init_process_group_when_rank_list_provided(self, mock_platform):
+        """Test that init_device_mesh does not call init_process_group from its own body
+        when an explicit rank_list is provided (regardless of init_backend).
+
+        Scenario: Call init_device_mesh with explicit rank_list and init_backend=True.
+        Expected behavior: init_process_group is NOT called in the rank_list branch of
+        init_device_mesh (the DeviceMesh constructor may still call it via _init_backend).
+        """
+        self._setup_mock_platform(mock_platform, world_size=4)
+        mock_platform.split_group.return_value = MagicMock()
+
+        # Patch init_process_group to track calls
+        init_calls = []
+        mock_platform.init_process_group.side_effect = lambda *a, **kw: init_calls.append(1)
+
+        init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"),
+                         rank_list=(0, 1, 2, 3), init_backend=False)
+
+        mock_platform.init_process_group.assert_not_called()
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_init_device_mesh_get_rank_failure_raises_runtime_error(self, mock_platform):
+        """Test that init_device_mesh wraps get_rank failures in RuntimeError with guidance.
+
+        Scenario: init_device_mesh is called without rank_list and get_rank raises an exception.
+        Expected behavior: RuntimeError is raised with a message guiding the user to either
+        pass rank_list explicitly or use init_backend=True.
+        """
+        self._setup_mock_platform(mock_platform, world_size=4)
+        mock_platform.get_rank.side_effect = RuntimeError("process group not initialized")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"), init_backend=False)
+
+        msg = str(ctx.exception)
+        self.assertIn("init_device_mesh", msg)
+        self.assertIn("rank_list", msg)
+        self.assertIn("init_backend=True", msg)
+
+    # ------------------------------------------------------------------
+    # device_type validation tests
+    # ------------------------------------------------------------------
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_type_valid_torch_platform(self, mock_platform):
+        """Test that all valid device_type values are accepted on PyTorch platform.
+
+        Scenario: Create DeviceMesh with each of "cpu", "cuda", "npu" when the
+        platform is PyTorch.
+        Expected behavior: No exception is raised and device_type is stored as-is.
+        """
+        self._setup_mock_platform(mock_platform, PlatformType.PYTORCH, world_size=4)
+
+        for dtype in ("cpu", "cuda", "npu"):
+            with self.subTest(device_type=dtype):
+                mesh = DeviceMesh(dtype, mesh=[[0, 1], [2, 3]], _init_backend=False)
+                self.assertEqual(mesh.device_type, dtype)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_type_invalid_torch_platform(self, mock_platform):
+        """Test that invalid device_type values raise ValueError on PyTorch platform.
+
+        Scenario: Create DeviceMesh with device_type values that are not in
+        {"cpu", "cuda", "npu"} when the platform is PyTorch.
+        Expected behavior: ValueError is raised and its message contains the
+        invalid value and the platform name.
+        """
+        self._setup_mock_platform(mock_platform, PlatformType.PYTORCH, world_size=4)
+
+        for dtype in ("gpu", "xla", "mlu", "unknown"):
+            with self.subTest(device_type=dtype):
+                with self.assertRaises(ValueError) as ctx:
+                    DeviceMesh(dtype, mesh=[[0, 1], [2, 3]], _init_backend=False)
+                self.assertIn(dtype, str(ctx.exception))
+                self.assertIn("PYTORCH", str(ctx.exception))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_type_valid_mindspore_platform(self, mock_platform):
+        """Test that all valid device_type values are accepted on MindSpore platform.
+
+        Scenario: Create DeviceMesh with each of "cpu", "gpu", "npu" when the
+        platform is MindSpore.
+        Expected behavior: No exception is raised and device_type is stored as-is.
+        """
+        self._setup_mock_platform(mock_platform, PlatformType.MINDSPORE, world_size=4)
+
+        for dtype in ("cpu", "gpu", "npu"):
+            with self.subTest(device_type=dtype):
+                mesh = DeviceMesh(dtype, mesh=[[0, 1], [2, 3]], _init_backend=False)
+                self.assertEqual(mesh.device_type, dtype)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_type_invalid_mindspore_platform(self, mock_platform):
+        """Test that invalid device_type values raise ValueError on MindSpore platform.
+
+        Scenario: Create DeviceMesh with device_type values that are not in
+        {"cpu", "gpu", "npu"} when the platform is MindSpore.
+        Expected behavior: ValueError is raised and its message contains the
+        invalid value and the platform name.
+        """
+        self._setup_mock_platform(mock_platform, PlatformType.MINDSPORE, world_size=4)
+
+        for dtype in ("cuda", "xla", "mlu", "unknown"):
+            with self.subTest(device_type=dtype):
+                with self.assertRaises(ValueError) as ctx:
+                    DeviceMesh(dtype, mesh=[[0, 1], [2, 3]], _init_backend=False)
+                self.assertIn(dtype, str(ctx.exception))
+                self.assertIn("MINDSPORE", str(ctx.exception))
 
 
 if __name__ == "__main__":

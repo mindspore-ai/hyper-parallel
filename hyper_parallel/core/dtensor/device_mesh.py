@@ -15,10 +15,10 @@
 """device mesh"""
 
 import os
-from typing import Optional, Union, List, Any
+from typing import Literal, Optional, Union, List, Any
 import numpy as np
 from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
 
 platform = get_platform()
 Tensor = platform.Tensor
@@ -69,7 +69,12 @@ class DeviceMesh:
     Topological abstraction describing cluster devices.
 
     Args:
-        device_type (str): Device type.
+        device_type (str): Device type. Valid values depend on the active platform:
+
+            - **PyTorch** (same as ``torch.distributed.device_mesh.DeviceMesh``):
+              ``"cpu"``, ``"cuda"``, ``"npu"``.
+            - **MindSpore** (mapped to the corresponding communication backend):
+              ``"cpu"`` → mccl, ``"gpu"`` → nccl, ``"npu"`` → hccl.
         mesh (Union[Tensor, list, tuple, np.ndarray, None]): A multi-dimensional array, list, or integer
             tensor describing the device layout. The IDs in the mesh are global IDs of the
             default process group, representing the multi-dimensional networking structure
@@ -103,18 +108,35 @@ class DeviceMesh:
         >>> print(device_mesh.rank_list)  # Output: (0, 1, 2, 3)
     """
 
-    device_type: str
+    device_type: Literal["cpu", "cuda", "gpu", "npu"]
     mesh: Union[Tensor, list, tuple, np.ndarray]
     mesh_dim_names: Union[tuple[str, ...], list[str], None]
 
+    # Valid device_type values per platform:
+    #   PyTorch  — "cpu", "cuda", "npu"  (same as torch.distributed.device_mesh.DeviceMesh)
+    #   MindSpore — "cpu", "gpu", "npu"  (map to mccl / nccl / hccl communication backends)
+    _VALID_DEVICE_TYPES = {
+        PlatformType.PYTORCH: {"cpu", "cuda", "npu"},
+        PlatformType.MINDSPORE: {"cpu", "gpu", "npu"},
+    }
+
     def __init__(self,
-                 device_type: str,
+                 device_type: Literal["cpu", "cuda", "gpu", "npu"],
                  mesh: Union[Tensor, list, tuple, np.ndarray, None] = None,
                  *,
                  mesh_dim_names: Union[tuple[str, ...], list[str], None] = None,
                  _init_backend: bool = True,
                  ):
+        valid_device_types = self._VALID_DEVICE_TYPES.get(platform.platform_type)
+        if valid_device_types is not None and device_type not in valid_device_types:
+            raise ValueError(
+                f"Invalid device_type '{device_type}' for {platform.platform_type.name} platform. "
+                f"Valid device types are: {sorted(valid_device_types)}"
+            )
         self.device_type = device_type
+
+        if _init_backend:
+            platform.init_process_group()
 
         if mesh is None:
             world_size = platform.get_world_size()
@@ -163,7 +185,6 @@ class DeviceMesh:
         self._root_mesh: Optional['DeviceMesh'] = None
         self._sub_mesh: List['DeviceMesh'] = []
         if _init_backend:
-            platform.init_process_group()
             self._dim_group_names = self._init_process_groups(self._mesh_shape, self.mesh_dim_names, self._rank_list)
         if os.getenv("MS_SIMULATION_LEVEL") is None:
             self._coordinate_on_dim = self._compute_coordinate_on_dim()
@@ -1076,7 +1097,16 @@ def init_device_mesh(
             )
         rank_list = tuple(rank_list)
     else:
-        current_rank = platform.get_rank()
+        if init_backend:
+            platform.init_process_group()
+        try:
+            current_rank = platform.get_rank()
+        except Exception as e:
+            raise RuntimeError(
+                "init_device_mesh: failed to get current rank for automatic rank_list generation. "
+                "Either pass rank_list explicitly, or ensure the process group is initialized before calling "
+                "init_device_mesh (or set init_backend=True to let init_device_mesh initialize it)."
+            ) from e
         base = current_rank - (current_rank % total_devices)
         rank_list = tuple(base + i for i in range(total_devices))
 
