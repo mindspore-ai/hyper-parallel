@@ -35,6 +35,7 @@
 /hyper_parallel/platform/mindspore/custom_pass/ @yuanqi1104
 /hyper_parallel/platform/mindspore/hsdp/ @kisnwang
 /hyper_parallel/platform/mindspore/pipeline_parallel/ @lichen666
+/hyper_parallel/platform/mindspore/fully_shard/ @DavidFFFan
 
 /hyper_parallel/platform/torch/ @yangzhenzhang
 /hyper_parallel/platform/torch/activation_checkpoint/ @DavidFFFan
@@ -51,6 +52,8 @@
 /tests/mindspore/st/shard/ @yangzhenzhang
 /tests/mindspore/st/checkpoint/ @zhangbuxue
 /tests/mindspore/ut/parallel_ops_infer/ @yangzhenzhang
+/tests/mindspore/st/fully_shard/ @DavidFFFan
+/tests/mindspore/ut/fully_shard/ @DavidFFFan
 /tests/mindspore/ut/checkpoint/ @zhangbuxue
 
 /tests/torch/ @yangzhenzhang

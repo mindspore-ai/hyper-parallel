@@ -14,23 +14,22 @@
 # ============================================================================
 """Fully_shard multi-card training for precision comparison"""
 import os
-import numpy as np
+
 import mindspore as ms
 import mindspore.dataset as ds
-
-from mindspore._c_expression import NoFallbackGuard
-from mindspore.communication import get_rank, get_group_size
+import numpy as np
 from mindspore import nn, ops
-from mindspore.communication import init
-from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
-from hyper_parallel import init_device_mesh
-from hyper_parallel.core.fully_shard.api import fully_shard
+from mindspore.communication import get_group_size, get_rank, init
+
+from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.fully_shard.api import fully_shard
+from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
+
 from tests.mindspore.st.common_net import SlimLeNet16
 
 # Use to same temp directory as precision_baseline.py
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp_baseline")
-
 
 ms.set_seed(1)
 ms.set_deterministic(True)
@@ -81,14 +80,81 @@ def get_forward_fn(net):
     return forward_fn
 
 
+def assert_sharded_param_layout(
+    net,
+    origin_shapes=None,
+    shard_dim_size=None,
+    expected_dtype=None,
+):
+    """Validate that trainable params stay as sharded DTensor parameters."""
+    param_type_names = []
+    for idx, param in enumerate(net.trainable_params()):
+        param_type_names.append(type(param).__name__)
+        assert isinstance(param, DTensor), f"Parameter {idx} is not a DTensor"
+        if expected_dtype is not None:
+            assert param.dtype == expected_dtype, (
+                f"Parameter {idx} dtype mismatch: expected {expected_dtype}, got {param.dtype}"
+            )
+        if origin_shapes is None or shard_dim_size is None:
+            continue
+        local_shape = param.to_local().shape
+        original_shape = origin_shapes[idx]
+        expected_local_shape = (original_shape[0] // shard_dim_size,) + original_shape[1:]
+        assert local_shape == expected_local_shape, (
+            f"Shape mismatch at index {idx}: "
+            f"Expected {expected_local_shape}, got {local_shape}. "
+            f"Original shape was {original_shape}, shard_size={shard_dim_size}"
+        )
+    return param_type_names
+
+
+def assert_grad_views(net, grads, expected_dtype=None):
+    """Validate sharded grad storage and returned local grad views."""
+    for idx, (param, grad) in enumerate(zip(net.trainable_params(), grads)):
+        assert isinstance(param.grad, DTensor), f"Parameter grad {idx} is not a DTensor"
+        assert grad.shape == param.to_local().shape, (
+            f"Gradient local shape mismatch at index {idx}: "
+            f"Expected {param.to_local().shape}, got {grad.shape}"
+        )
+        if expected_dtype is not None:
+            assert param.grad.to_local().dtype == expected_dtype, (
+                f"Parameter grad {idx} dtype mismatch: "
+                f"expected {expected_dtype}, got {param.grad.to_local().dtype}"
+            )
+            assert grad.dtype == expected_dtype, (
+                f"Returned grad {idx} dtype mismatch: expected {expected_dtype}, got {grad.dtype}"
+            )
+
+
+def run_accumulated_step(data, label, grad_fn):
+    """Run one fully_shard step with per-micro-step gradient accumulation."""
+    micro_step = 4
+    micro_size = data.shape[0] // micro_step
+    data_list = ops.split(data, micro_size)
+    label_list = ops.split(label, micro_size)
+    assert len(data_list) >= micro_step, (
+        f"Expected at least {micro_step} micro batches, got {len(data_list)}"
+    )
+    total_loss = 0
+    grads = None
+    for micro_idx in range(micro_step):
+        (loss, _), grads = grad_fn(data_list[micro_idx], label_list[micro_idx])
+        total_loss = total_loss + loss
+    return total_loss, grads, micro_step
+
+
 # Global hyper parameters:
 local_bs = 32
-learning_rate = 1e-3
+learning_rate = 1e-2
 max_step = 20
 
 
-def run_fully_shard_multi_card(ckpt_path, mesh):
-    """Run fully_shard multi-card training"""
+def run_fully_shard_multi_card(
+    ckpt_path,
+    mesh,
+    accumulate_grad=False
+):
+    """Run fully_shard multi-card training."""
     dp_size = get_group_size()
     rank_id = get_rank()
 
@@ -108,46 +174,50 @@ def run_fully_shard_multi_card(ckpt_path, mesh):
 
     origin_shapes = [p.shape for p in net.trainable_params()]
     shard_dim_size = mesh.shape[-1]
-    print("shard dim size is ", shard_dim_size)
 
     fully_shard(net.dense_relu_sequential[0], mesh=mesh, mp_policy=mp_policy)
     fully_shard(net.dense_relu_sequential[2], mesh=mesh, mp_policy=mp_policy)
     fully_shard(net.dense_relu_sequential[4], mesh=mesh, mp_policy=mp_policy)
     fully_shard(net, mesh=mesh, mp_policy=mp_policy)
 
-    for idx, param in enumerate(net.trainable_params()):
-        assert isinstance(param, DTensor), f"Parameter {idx} is not a DTensor"
-
-        local_shape = param.to_local().shape
-        original_shape = origin_shapes[idx]
-        expected_local_shape = (original_shape[0] // shard_dim_size,) + original_shape[1:]
-        assert local_shape == expected_local_shape, (
-            f"Shape mismatch at index {idx}: "
-            f"Expected {expected_local_shape}, got {local_shape}. "
-            f"Original shape was {original_shape}, shard_size={shard_dim_size}"
-        )
+    assert_sharded_param_layout(net, origin_shapes, shard_dim_size)
 
     grad_fn = ms.value_and_grad(get_forward_fn(net), None, net.trainable_params(), has_aux=True)
     optimizer = nn.Adam(net.trainable_params(), learning_rate=learning_rate)
     loss_sync_allreduce = ops.AllReduce(ops.ReduceOp.SUM)
 
     losses = []
+    final_param_type_names = []
     i = 0
     for data, label in data_set:
         net.zero_grad()
-        (loss, _), grads = grad_fn(data, label)
-        with NoFallbackGuard():
-            optimizer(grads)
-        reduced_loss = loss_sync_allreduce(loss)
-        final_loss = reduced_loss / dp_size
+        if accumulate_grad:
+            total_loss, grads, micro_step = run_accumulated_step(
+                data, label, grad_fn
+            )
+            assert_grad_views(net, grads)
+            with SkipDTensorDispatch():
+                for grad in grads:
+                    grad /= micro_step
+                optimizer(grads)
+            reduced_loss = loss_sync_allreduce(total_loss)
+            final_loss = reduced_loss / (micro_step * dp_size)
+        else:
+            (loss, _), grads = grad_fn(data, label)
+            assert_grad_views(net, grads)
+            with SkipDTensorDispatch():
+                optimizer(grads)
+            reduced_loss = loss_sync_allreduce(loss)
+            final_loss = reduced_loss / dp_size
+        final_param_type_names = assert_sharded_param_layout(net)
         if rank_id == 0:
             losses.append(float(final_loss.asnumpy()))
-            print(f"step: {i}, loss: {final_loss}")
+            print(f"rank: {rank_id} step: {i}, loss: {final_loss}")
         i += 1
         if i >= max_step:
             break
 
-    return losses
+    return losses, final_param_type_names
 
 
 def run_fully_shard_multi_card_ignored(ckpt_path, mesh):
@@ -170,7 +240,7 @@ def run_fully_shard_multi_card_ignored(ckpt_path, mesh):
         cast_forward_inputs=False,
     )
 
-    replicate_params = {p for p in net.trainable_params() if "bias" in p.name}
+    replicate_params = {p for p in net.trainable_params() if "weight" in p.name}
 
     fully_shard(net, mesh=mesh, mp_policy=mp_policy, replicate_params=replicate_params)
 
@@ -183,7 +253,7 @@ def run_fully_shard_multi_card_ignored(ckpt_path, mesh):
     for data, label in data_set:
         net.zero_grad()
         (loss, _), grads = grad_fn(data, label)
-        with NoFallbackGuard():
+        with SkipDTensorDispatch():
             optimizer(grads)
         reduced_loss = loss_sync_allreduce(loss)
         final_loss = reduced_loss / dp_size
@@ -206,7 +276,7 @@ def run_fully_shard(mesh):
     ckpt_path = os.path.join(TEMP_DIR, "init_baseline.ckpt")
     assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please run precision_baseline.py first"
 
-    losses = run_fully_shard_multi_card(ckpt_path, mesh)
+    losses, _ = run_fully_shard_multi_card(ckpt_path, mesh)
 
     if rank_id == 0:
         losses_file = os.path.join(TEMP_DIR, "fully_shard_losses.npy")
@@ -251,10 +321,31 @@ def run_fully_shard_ignored(mesh):
         print("Precision comparison with replicate_params passed!")
 
 
+def run_fully_shard_with_grad_accum(mesh):
+    """Run fully_shard gradient accumulation and compare with large-batch baseline."""
+    init()
+
+    rank_id = get_rank()
+
+    ckpt_path = os.path.join(TEMP_DIR, "init_baseline.ckpt")
+    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please run precision_baseline.py first"
+
+    losses, _ = run_fully_shard_multi_card(ckpt_path, mesh, accumulate_grad=True)
+
+    if rank_id == 0:
+        baseline_losses_file = os.path.join(TEMP_DIR, "baseline_losses.npy")
+        assert os.path.exists(baseline_losses_file), f"Baseline losses not found: {baseline_losses_file}"
+
+        baseline_losses = list(np.load(baseline_losses_file))
+        compare_losses(baseline_losses, losses, rtol=1e-5, atol=1e-5)
+        print("Precision comparison with gradient accumulation passed!")
+
+
 def test_ms_zero3_fully_shard():
     """
     Feature: Compare fully_shard precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training, then compare losses on rank 0
+    Description: Run standalone baseline and fully_shard multi-card training,
+                 then compare reduced losses on rank 0 only
     Expectation: Losses should match within tolerance
     """
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
@@ -264,7 +355,8 @@ def test_ms_zero3_fully_shard():
 def test_ms_zero3_partial_shard():
     """
     Feature: Compare partial_shard precision with standalone baseline
-    Description: Run standalone baseline and partial_shard multi-card training, then compare losses on rank 0
+    Description: Run standalone baseline and partial_shard multi-card training,
+                 then compare reduced losses on rank 0 only
     Expectation: Losses should match within tolerance
     """
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "op"))
@@ -275,8 +367,19 @@ def test_ms_zero3_fully_shard_replicate_params():
     """
     Feature: Compare fully_shard(replicate_params) precision with standalone baseline
     Description: Run standalone baseline and fully_shard multi-card training with replicate_params,
-                 then compare losses on rank 0
+                 then compare reduced losses on rank 0 only
     Expectation: Losses should match within tolerance
     """
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     run_fully_shard_ignored(mesh)
+
+
+def test_ms_zero3_fully_shard_grad_accum():
+    """
+    Feature: Compare fully_shard gradient accumulation precision with large-batch standalone baseline
+    Description: Run fully_shard multi-card training with per-micro-step gradient accumulation,
+                 then compare reduced losses against the large-batch baseline on rank 0 only
+    Expectation: Losses should match the large-batch baseline within tolerance
+    """
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    run_fully_shard_with_grad_accum(mesh)
