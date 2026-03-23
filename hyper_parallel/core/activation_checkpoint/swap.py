@@ -70,7 +70,8 @@ class SwapTensor:
             )
             return
 
-        assert self.val_cpu is not None
+        if self.val_cpu is None:
+            raise ValueError("val_cpu must not be None during async_load")
         self.val.storage().resize_(self.storage_size)
         if self.is_slice_tensor:
             self.val.copy_(self.val_cpu, non_blocking=True)

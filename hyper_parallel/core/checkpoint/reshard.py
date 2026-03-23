@@ -262,6 +262,7 @@ class ReshardHandler:
             if from_layout else [0]
         )
         self.global_union_area_map: dict[int, tuple[tuple[int, int], ...]] = {}
+        self.to_area = ()  # Initialized in infer_all_tensor_offset()
 
     def _infer_inner_deredundancy_rank_list_by_from_layout(self) -> list[int]:
         """

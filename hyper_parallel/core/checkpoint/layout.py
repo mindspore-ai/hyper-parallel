@@ -51,18 +51,21 @@ def get_current_layout(cell):
 
 def save_layout(layout_dict: dict, file_path: Union[Path, str]) -> None:
     """
-    Save layout to file
+    Save layout to file.
     """
-    # TODO: check and create file path
+    file_path = Path(file_path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     with open(file_path, 'w', encoding="utf-8") as f:
         json.dump(layout_dict, f, ensure_ascii=False)
 
 
 def load_layout(file_path: Union[Path, str]) -> dict:
     """
-    Load layout from file
+    Load layout from file.
     """
-    # TODO: check path
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Layout file not found: {file_path}")
     with open(file_path, 'r', encoding='utf-8') as f:
         param_layout_dict = json.load(f)
     return param_layout_dict

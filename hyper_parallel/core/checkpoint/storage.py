@@ -21,7 +21,8 @@ from typing import Optional, Union
 from hyper_parallel.core.checkpoint.metadata import Metadata, MetadataIndex
 from hyper_parallel.core.checkpoint.planner import LoadPlan, LoadPlanner, SavePlan, SavePlanner
 
-_metadata_file_name = ".metadata"
+METADATA_FILE_NAME = ".metadata"
+
 
 @dataclass
 class StorageInfo:

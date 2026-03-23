@@ -46,7 +46,8 @@ class ScaledDotProductAttentionDistributedOp:
         self.op_name = op_name
         register_distributed_op(op_name, self)
 
-    def _tensor_map_to_placements(self, base_layout: Layout, tensor_map: tuple) -> tuple:
+    @staticmethod
+    def _tensor_map_to_placements(base_layout: Layout, tensor_map: tuple) -> tuple:
         """Convert tensor_map to placements."""
         mesh_ndim = len(base_layout.mesh_shape)
         placements = []
@@ -73,7 +74,8 @@ class ScaledDotProductAttentionDistributedOp:
 
         return tuple(placements)
 
-    def _normalize_dim_map(self, dim_map):
+    @staticmethod
+    def _normalize_dim_map(dim_map):
         """Normalize dim_map to string representation."""
         if dim_map is None:
             return "None"
@@ -97,7 +99,7 @@ class ScaledDotProductAttentionDistributedOp:
         if dim_idx >= len(layout.alias_tensor_map):
             return 1
 
-        dim_map = self._normalize_dim_map(layout.alias_tensor_map[dim_idx])
+        dim_map = ScaledDotProductAttentionDistributedOp._normalize_dim_map(layout.alias_tensor_map[dim_idx])
 
         if dim_map == "None":
             return 1
@@ -108,7 +110,7 @@ class ScaledDotProductAttentionDistributedOp:
         if isinstance(dim_map, tuple):
             total = 1
             for axis_name in dim_map:
-                axis_name = self._normalize_dim_map(axis_name)
+                axis_name = ScaledDotProductAttentionDistributedOp._normalize_dim_map(axis_name)
                 if axis_name != "None":
                     total *= layout.mesh.get_device_num_along_axis(axis_name)
             return total
@@ -138,7 +140,7 @@ class ScaledDotProductAttentionDistributedOp:
         if seq_dim_idx >= len(layout.alias_tensor_map):
             return 0
 
-        dim_map = self._normalize_dim_map(layout.alias_tensor_map[seq_dim_idx])
+        dim_map = ScaledDotProductAttentionDistributedOp._normalize_dim_map(layout.alias_tensor_map[seq_dim_idx])
 
         if dim_map == "None":
             return 0
@@ -152,7 +154,7 @@ class ScaledDotProductAttentionDistributedOp:
 
         if isinstance(dim_map, tuple):
             non_none_axes = [
-                ax for ax in dim_map if self._normalize_dim_map(ax) != "None"
+                ax for ax in dim_map if ScaledDotProductAttentionDistributedOp._normalize_dim_map(ax) != "None"
             ]
             if len(non_none_axes) == 0:
                 return 0
@@ -193,8 +195,8 @@ class ScaledDotProductAttentionDistributedOp:
             if dim_idx >= len(q_tm) or dim_idx >= len(k_tm):
                 continue
 
-            q_shard = self._normalize_dim_map(q_tm[dim_idx])
-            k_shard = self._normalize_dim_map(k_tm[dim_idx])
+            q_shard = ScaledDotProductAttentionDistributedOp._normalize_dim_map(q_tm[dim_idx])
+            k_shard = ScaledDotProductAttentionDistributedOp._normalize_dim_map(k_tm[dim_idx])
 
             if q_shard != k_shard:
                 raise ValueError(
@@ -206,8 +208,8 @@ class ScaledDotProductAttentionDistributedOp:
                     f"Key tensor_map: {k_tm}"
                 )
 
+    @staticmethod
     def _build_causal_mask_for_chunk(
-        self,
         local_q_len: int,
         kv_len: int,
         split_id: int,
@@ -259,7 +261,7 @@ class ScaledDotProductAttentionDistributedOp:
             if split_id == 0:
                 return None, True, key, value
 
-            causal_mask = self._build_causal_mask_for_chunk(
+            causal_mask = ScaledDotProductAttentionDistributedOp._build_causal_mask_for_chunk(
                 local_q_len, kv_end, split_id, device,
             )
             return causal_mask, False, key, value
@@ -285,7 +287,7 @@ class ScaledDotProductAttentionDistributedOp:
 
         attention_out_layout = copy.deepcopy(query_layout)
         if attention_out_layout.placements is None and attention_out_layout.tensor_map is not None:
-            placements = self._tensor_map_to_placements(
+            placements = ScaledDotProductAttentionDistributedOp._tensor_map_to_placements(
                 attention_out_layout, attention_out_layout.tensor_map
             )
             attention_out_layout.set_placements(placements)

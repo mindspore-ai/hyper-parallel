@@ -156,7 +156,7 @@ class ParallelFlashAttention(nn.Cell):
 
     def construct(self, query, key, value, attn_mask):
         """Use custom shard for flash attention"""
-        # TODO: actual_seq_qlen/kv_len is tuple type, cannot be described by dtensor
+        # NOTE: actual_seq_qlen/kv_len is tuple type, cannot be described by dtensor
         if self.in_layout is None or self.out_layout is None:
             raise ValueError("Please call the shard function first.")
 
@@ -261,9 +261,12 @@ class ParallelFlashAttention(nn.Cell):
         if head_num_dim == -1:
             head_num_dim = input_layout.find('N')
         seq_dim = input_layout.find('S')
-        assert batch_dim != -1, f"Cannot found batch dim by input_layout: {input_layout}"
-        assert seq_dim != -1, f"Cannot found seq dim dim by input_layout: {input_layout}"
-        assert head_num_dim != -1, f"Cannot found head num dim by input_layout: {input_layout}"
+        if batch_dim == -1:
+            raise ValueError(f"Cannot found batch dim by input_layout: {input_layout}")
+        if seq_dim == -1:
+            raise ValueError(f"Cannot found seq dim dim by input_layout: {input_layout}")
+        if head_num_dim == -1:
+            raise ValueError(f"Cannot found head num dim by input_layout: {input_layout}")
         return batch_dim, seq_dim, head_num_dim
 
     def _infer_split_dim_by_in_strategy(self):
@@ -271,7 +274,8 @@ class ParallelFlashAttention(nn.Cell):
         batch_split_num = self._get_split_num(query_layout, self._batch_dim)
         head_num_split_num = self._get_split_num(query_layout, self._head_num_dim)
         seq_split_num = self._get_split_num(query_layout, self._seq_dim)
-        assert seq_split_num == 1, "The sharding along sequence dimension is not support currently."
+        if seq_split_num != 1:
+            raise ValueError("The sharding along sequence dimension is not support currently.")
         return batch_split_num, head_num_split_num, seq_split_num
 
     @staticmethod

@@ -61,6 +61,7 @@ class HSDPState:
             return
 
         bucket_infos = {}
+
         def get_bucket_key(buffer_key, hsdp_param):
             if self.config.bucket_size < 0:
                 return buffer_key

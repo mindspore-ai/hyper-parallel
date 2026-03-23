@@ -18,6 +18,7 @@ Activation with axis distributed operator implementation.
 
 from .parallel_ops import DistributedOp
 
+
 class ActivationWithAxisDistributedOp(DistributedOp):
     """
     Distributed implementation for activation-with-axis operators (e.g., softmax).

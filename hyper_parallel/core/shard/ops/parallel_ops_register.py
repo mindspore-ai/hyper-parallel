@@ -17,6 +17,7 @@ Parallel layout decorator
 """
 _DISTRIBUTED_OPS = {}
 
+
 def register_distributed_op(op_name, op_class):
     """
     Register a distributed operator implementation.
@@ -26,6 +27,7 @@ def register_distributed_op(op_name, op_class):
         op_class (class): Distributed operator implementation class
     """
     _DISTRIBUTED_OPS[op_name] = op_class
+
 
 def get_distributed_op(op_name):
     """

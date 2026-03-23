@@ -15,7 +15,7 @@
 """Torch HSDP cell state"""
 from hyper_parallel.core.hsdp.hsdp_state import HSDPState
 from hyper_parallel.platform.torch.hsdp.param import TorchHSDPParam
-from hyper_parallel.platform.torch.platform import TorchPlatform
+
 
 class TorchHSDPState(HSDPState):
     """Torch HSDP cell state"""

@@ -77,15 +77,39 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def device_count(device_handle):
+        """
+        Get the number of available devices.
+
+        Args:
+            device_handle: The device handle (e.g., torch.cuda, torch.npu).
+
+        Returns:
+            int: The number of available devices.
+        """
         return device_handle.device_count()
 
     def device_type(self):
+        """
+        Get the current device type.
+
+        Returns:
+            str: The device type string ("npu" for NPU, "cuda" for GPU).
+        """
         device_handle = self.get_device_handle()
         if device_handle == torch.npu:
             return "npu"
         return "cuda"
 
     def device(self, device_idx=None):
+        """
+        Get a torch.device object for the specified device index.
+
+        Args:
+            device_idx (Optional[int]): The device index. If None, returns device without index.
+
+        Returns:
+            torch.device: A torch device object.
+        """
         device_type = self.device_type()
         if device_idx is None:
             return torch.device(device_type)
@@ -93,6 +117,16 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def get_rng_state(device=None, device_handle=None):
+        """
+        Get the random number generator state.
+
+        Args:
+            device (Optional): The device to get RNG state from.
+            device_handle (Optional): The device handle (torch.cuda, torch.npu, etc.).
+
+        Returns:
+            Tensor: The RNG state as a byte tensor.
+        """
         if device_handle is None:
             return torch.get_rng_state()
         if device is None:
@@ -101,6 +135,14 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def set_rng_state(state, device=None, device_handle=None):
+        """
+        Set the random number generator state.
+
+        Args:
+            state (Tensor): The RNG state to set.
+            device (Optional): The device to set RNG state for.
+            device_handle (Optional): The device handle (torch.cuda, torch.npu, etc.).
+        """
         if device_handle is None:
             return torch.set_rng_state(state)
         if device is None:
@@ -109,57 +151,160 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def manual_seed(seed):
+        """
+        Set the random seed for reproducibility.
+
+        Args:
+            seed (int): The random seed value.
+
+        Returns:
+            torch.Generator: The random number generator.
+        """
         return torch.manual_seed(seed)
 
     @staticmethod
     def ones(size, dtype=None):
+        """
+        Create a tensor filled with ones.
+
+        Args:
+            size (tuple): The shape of the output tensor.
+            dtype (Optional[torch.dtype]): The desired data type.
+
+        Returns:
+            Tensor: A tensor filled with ones.
+        """
         return torch.ones(size, dtype=dtype)
 
     @staticmethod
     def zeros(size, dtype=None):
+        """
+        Create a tensor filled with zeros.
+
+        Args:
+            size (tuple): The shape of the output tensor.
+            dtype (Optional[torch.dtype]): The desired data type.
+
+        Returns:
+            Tensor: A tensor filled with zeros.
+        """
         return torch.zeros(size, dtype=dtype)
 
     @staticmethod
     def full(size, fill_value, dtype=None):
+        """
+        Create a tensor filled with a scalar value.
+
+        Args:
+            size (tuple): The shape of the output tensor.
+            fill_value (scalar): The value to fill the tensor with.
+            dtype (Optional[torch.dtype]): The desired data type.
+
+        Returns:
+            Tensor: A tensor filled with the specified value.
+        """
         return torch.full(size, fill_value, dtype=dtype)
 
     @staticmethod
     def empty(size, dtype=None):
+        """
+        Create an uninitialized tensor.
+
+        Args:
+            size (tuple): The shape of the output tensor.
+            dtype (Optional[torch.dtype]): The desired data type.
+
+        Returns:
+            Tensor: An uninitialized tensor.
+        """
         return torch.empty(size, dtype=dtype)
 
     @staticmethod
     def get_rank():
+        """
+        Get the rank of the current process in the distributed group.
+
+        Returns:
+            int: The rank of the current process.
+        """
         return dist.get_rank()
 
     @staticmethod
     def get_global_rank(group, group_rank):
+        """
+        Get the global rank from a group rank.
+
+        Args:
+            group (ProcessGroup): The process group.
+            group_rank (int): The rank within the group.
+
+        Returns:
+            int: The global rank.
+        """
         return dist.get_global_rank(group, group_rank)
 
     @staticmethod
     def get_world_size():
+        """
+        Get the total number of processes in the distributed group.
+
+        Returns:
+            int: The world size.
+        """
         return dist.get_world_size()
 
     @staticmethod
     def get_param_local_shape(param):
-        """get param local shape"""
+        """
+        Get the local shape of a parameter, handling both regular and distributed tensors.
+
+        Args:
+            param (Union[Tensor, DTensorBase]): The parameter tensor.
+
+        Returns:
+            torch.Size: The local shape of the parameter.
+        """
         if isinstance(param, DTensorBase):
             return param.local_shape
         return param.shape
 
     @staticmethod
     def get_param_local_data(param):
-        """get param local shape"""
+        """
+        Get the local data of a parameter, handling both regular and distributed tensors.
+
+        Args:
+            param (Union[Tensor, DTensorBase]): The parameter tensor.
+
+        Returns:
+            Tensor: The local tensor data.
+        """
         if isinstance(param, DTensorBase):
             return param.to_local()
         return param
 
     @staticmethod
     def update_param_data(param, data):
-        """update param data"""
+        """
+        Update the data of a parameter.
+
+        Args:
+            param (Parameter): The parameter to update.
+            data (Tensor): The new data tensor.
+        """
         param.data = data
 
     @staticmethod
     def get_op_name(func):
+        """
+        Extract the operation name from various function types.
+
+        Args:
+            func: The function or operation to extract the name from.
+
+        Returns:
+            str: The operation name.
+        """
         if hasattr(func, "__name__"):
             return func.__name__
         if isinstance(func, OpOverload):

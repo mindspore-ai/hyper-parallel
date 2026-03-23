@@ -24,8 +24,13 @@ def _construct_layout_tuple_for_transform_operator_list(from_layout, to_layout, 
     """_construct_layout_tuple_for_transform_operator_list"""
     from_layout_dict = from_layout.to_dict()
     to_layout_dict = to_layout.to_dict()
-    from_layout_tuple = (from_layout_dict["mesh_shape"], from_layout_dict["tensor_map"], list(from_full_shape))
-    to_layout_tuple = (to_layout_dict["mesh_shape"], to_layout_dict["tensor_map"], list(from_full_shape))  # TODO: consider reshape scenario
+    from_layout_tuple = (
+        from_layout_dict["mesh_shape"], from_layout_dict["tensor_map"], list(from_full_shape)
+    )
+    # NOTE: consider reshape scenario when to_full_shape differs from from_full_shape
+    to_layout_tuple = (
+        to_layout_dict["mesh_shape"], to_layout_dict["tensor_map"], list(from_full_shape)
+    )
     return from_layout_tuple, to_layout_tuple
 
 
@@ -42,7 +47,7 @@ class TensorRedistribution:
             "Reshape": self._construct_reshape,
             "AllConcat": self._construct_all_concat,
             "StridedSlice": self._construct_strided_slice,
-            "all_concat": self._construct_all_concat_new,
+            "all_concat": TensorRedistribution._construct_all_concat_new,
             "all_split": self._construct_all_split,
             "all_to_all": self._construct_all_to_all
         }
@@ -65,7 +70,8 @@ class TensorRedistribution:
         dims = len(args) // 3
         return platform.construct_strided_slice(x, args[0: dims], args[dims: 2 * dims], args[2 * dims:])
 
-    def _construct_all_concat_new(self, x, *args):
+    @staticmethod
+    def _construct_all_concat_new(x, *args):
         """args: (concat_dim, concat_size, group)"""
         rank_list = args[2]
         concat_dim = args[0]
@@ -168,7 +174,7 @@ class TensorRedistribution:
             in_tensor_map=list(src_layout.tensor_map),
             out_tensor_map=list(dst_layout.tensor_map)
         )
-        op_list = inferrer.InferOpsList(self.rank_id, self.rank_list)
+        op_list = inferrer.infer_ops_list(self.rank_id, self.rank_list)
         self._transform_cache[key] = op_list
         for op in op_list:
             local_x = self._construct_op_operator[op[0]](local_x, *op[1])
@@ -230,7 +236,8 @@ class TensorRedistribution:
                                                                       self.rank_list, False, self.rank_id)
         return self._transform_cache[key]
 
-    def _allreduce_along_dev_dim(self, x, op, layout, dev_dim):
+    @staticmethod
+    def _allreduce_along_dev_dim(x, op, layout, dev_dim):
         """Do allreduce at specified axis along dev_dim."""
         group = layout.get_comm_group_by_axis(dev_dim)
         zero_dim = x.dim() == 0
@@ -305,7 +312,7 @@ class TensorRedistribution:
             op = reduce_op_pair[1]
             dev_axis = reduce_op_pair[2]
             if comm_op == "AllReduce":
-                x = self._allreduce_along_dev_dim(x, op, from_layout, dev_axis)
+                x = TensorRedistribution._allreduce_along_dev_dim(x, op, from_layout, dev_axis)
             elif comm_op == "ReduceScatter":
                 reduce_axis = reduce_op_pair[3]
                 x = self._reduce_scatter_along_dev_dim_with_axis(x, reduce_axis, op, from_layout, dev_axis)

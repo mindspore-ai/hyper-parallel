@@ -18,6 +18,7 @@ Distributed operator implementation.
 
 from .parallel_ops_register import register_distributed_op
 
+
 class DistributedOp:
     """
     Base class for distributed operator implementations.
@@ -77,7 +78,8 @@ class DistributedOp:
             return (layouts[0],)
         return None
 
-    def get_expand_impl(self, func, output_layout, layouts, extra_args):
+    @staticmethod
+    def get_expand_impl(func, output_layout, layouts, extra_args):
         """
         Get expand implementation for the operator
         """

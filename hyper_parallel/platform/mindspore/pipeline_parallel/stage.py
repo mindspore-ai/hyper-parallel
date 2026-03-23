@@ -47,6 +47,7 @@ class PipelineStageBase:
         self.fwd_inputs_cache = {}
         self.fwd_outputs_cache = {}
         self.bwd_cache = {}
+        self.last_stage_outputs = None  # Initialized in forward_one_chunk()
 
     def clear_cache(self):
         """clear cache."""
@@ -54,7 +55,8 @@ class PipelineStageBase:
         self.fwd_outputs_cache.clear()
         self.bwd_cache.clear()
 
-    def _check_pp_group(self, group):
+    @staticmethod
+    def _check_pp_group(group):
         """check the type of pipeline group, if it is None, perform default initialization."""
         if group is None:
             return None
@@ -62,7 +64,8 @@ class PipelineStageBase:
             raise TypeError("Argument 'group' must be type of str, but got type of {type(group)}.")
         return group
 
-    def _clear_recv_buffer(self, recv_info, micro_index):
+    @staticmethod
+    def _clear_recv_buffer(recv_info, micro_index):
         """clear fwd and bwd recv buffer."""
         if micro_index not in recv_info:
             return

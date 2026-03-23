@@ -33,7 +33,7 @@ class MindSporeHSDPParam(HSDPParam):
             param_slice = ops.split(local_param, local_param.shape[0] // self.shard_size)[slice_index] + 0
             self.platform.update_param_data(self.param, param_slice)
 
-            # TODO: refactor, mindspore jit ast does not need this
+            # NOTE: mindspore jit ast does not need this
             self.sharded_param = Parameter(param_slice,
                                            name="sharded_"+self.param.name,
                                            requires_grad=self.param.requires_grad)
@@ -55,7 +55,7 @@ class MindSporeHSDPParam(HSDPParam):
                 self.param.shape = init_shape
             self.param.hsdp_init_index = data_slice_index
 
-            # TODO: refactor, mindspore jit ast does not need this
+            # NOTE: mindspore jit ast does not need this
             self.sharded_param = Parameter(initializer("zeros", init_shape, self.param.dtype),
                                            name="sharded_"+self.param.name,
                                            requires_grad=self.param.requires_grad)

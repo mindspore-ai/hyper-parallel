@@ -15,6 +15,7 @@
 """redistribute_infer"""
 from typing import Dict, List, Tuple, Union
 
+
 class Status:
     SUCCESS = 0
     FAILED = 1
@@ -25,21 +26,22 @@ SPLIT_BY_AXIS = 1
 PERMUTE_BY_AXIS = 2
 NONE = -1
 
+
 class TensorMap:
     """Enhanced tensor map struct supporting tuples for combined dimensions"""
     def __init__(self, dims: List[Union[int, Tuple[int, ...]]]):
         self.dims = dims
 
-    def GetDimByIdx(self, index: int) -> Union[int, Tuple[int, ...]]:
+    def get_dim_by_idx(self, index: int) -> Union[int, Tuple[int, ...]]:
         return self.dims[index] if index < len(self.dims) else NONE
 
-    def GetIndexByValue(self, value: Union[int, Tuple[int, ...]]) -> int:
+    def get_index_by_value(self, value: Union[int, Tuple[int, ...]]) -> int:
         for i, dim in enumerate(self.dims):
             if dim == value:
                 return i
         return NONE
 
-    def GetIndexContainValue(self, value: Union[int, Tuple[int, ...]]) -> int:
+    def get_index_contain_value(self, value: Union[int, Tuple[int, ...]]) -> int:
         for i, dim in enumerate(self.dims):
             if not isinstance(dim, tuple):
                 continue
@@ -48,6 +50,7 @@ class TensorMap:
             if not isinstance(value, tuple) and value == dim[-1]:
                 return i
         return NONE
+
 
 class DevMat:
     """
@@ -69,7 +72,7 @@ class DevMat:
         self.dims = dims
         self._combined_dims: Dict[Tuple[int, ...], int] = {}
 
-    def GetDimByReverseIdx(self, idx: Union[int, Tuple[int, ...]]) -> int:
+    def get_dim_by_reverse_idx(self, idx: Union[int, Tuple[int, ...]]) -> int:
         """
         Get dimension size by reverse index or product of combined dimensions.
 
@@ -84,10 +87,10 @@ class DevMat:
             Dimension size (for integer) or product of sizes (for tuple).
         """
         if isinstance(idx, tuple):
-            return self._GetCombinedSize(idx)
+            return self._get_combined_size(idx)
         return self.dims[len(self.dims) - 1 - idx]
 
-    def _GetCombinedSize(self, dims: Union[int, Tuple[int, ...]]) -> int:
+    def _get_combined_size(self, dims: Union[int, Tuple[int, ...]]) -> int:
         """
         Compute and cache the product of sizes for combined dimensions.
 
@@ -105,7 +108,7 @@ class DevMat:
         self._combined_dims[dims] = size
         return size
 
-    def _GetDevicesAlongDim(self, rank: int, rank_list: List[int], dim: int) -> List[int]:
+    def _get_devices_along_dim(self, rank: int, rank_list: List[int], dim: int) -> List[int]:
         """
         Get devices sharing the same coordinates.
 
@@ -157,7 +160,7 @@ class DevMat:
 
         return group
 
-    def GetDevicesAlongDim(self, rank: int, rank_list: List[int], dim: Union[int, List[int]]) -> List[int]:
+    def get_devices_along_dim(self, rank: int, rank_list: List[int], dim: Union[int, List[int]]) -> List[int]:
         """
         Get devices sharing the same coordinates.
 
@@ -177,20 +180,20 @@ class DevMat:
             ValueError: For invalid dimensions or mismatched rank_list size.
         """
         if isinstance(dim, list):
-            result = self._GetDevicesAlongDim(rank, rank_list, dim[0])
+            result = self._get_devices_along_dim(rank, rank_list, dim[0])
             current_layer_len = len(result)
             current_layer_step = 0
             dim_index = 1
             while dim_index < len(dim):
                 sub_rank = result.pop(0)
-                result.extend(self._GetDevicesAlongDim(sub_rank, rank_list, dim[dim_index]))
+                result.extend(self._get_devices_along_dim(sub_rank, rank_list, dim[dim_index]))
                 current_layer_step += 1
                 if current_layer_step == current_layer_len:
                     dim_index += 1
                     current_layer_step = 0
                     current_layer_len = len(result)
             return result
-        return self._GetDevicesAlongDim(rank, rank_list, dim)
+        return self._get_devices_along_dim(rank, rank_list, dim)
 
 
 class RedistributionOperatorInfer:
@@ -221,10 +224,10 @@ class RedistributionOperatorInfer:
         self.in_tensor_map_ = TensorMap(in_tensor_map)
         self.out_tensor_map_ = TensorMap(out_tensor_map)
 
-        self.map_ = {i: self.in_tensor_map_.GetDimByIdx(i)
+        self.map_ = {i: self.in_tensor_map_.get_dim_by_idx(i)
                      for i in range(len(in_tensor_map))}
 
-    def InsertOperator(self, op_type: int, args: Tuple) -> int:
+    def insert_operator(self, op_type: int, args: Tuple) -> int:
         """
         Adds an operator to the internal operator sequence.
 
@@ -238,7 +241,7 @@ class RedistributionOperatorInfer:
         self.operator_list_.append((op_type, args))
         return Status.SUCCESS
 
-    def InferRedistributionOperator(self) -> int:
+    def infer_redistribution_operator(self) -> int:
         """
         Main inference driver coordinating the redistribution sequence.
 
@@ -257,13 +260,13 @@ class RedistributionOperatorInfer:
                 len_split_by_axis = len(self.operator_list_)
 
                 # Step 1: infer split op
-                if self.InferSplitByAxis() == Status.FAILED:
+                if self.infer_split_by_axis() == Status.FAILED:
                     return Status.FAILED
 
                 # Step 2: infer alltoall op
                 while self.map_:
                     len_permute_by_axis = len(self.operator_list_)
-                    if self.InferPermuteByAxis() == Status.FAILED:
+                    if self.infer_permute_by_axis() == Status.FAILED:
                         return Status.FAILED
                     if len_permute_by_axis == len(self.operator_list_):
                         break
@@ -272,21 +275,21 @@ class RedistributionOperatorInfer:
                     break
 
             # Step 3: infer allconcat op
-            if self.InferConcatByAxis() == Status.FAILED:
+            if self.infer_concat_by_axis() == Status.FAILED:
                 return Status.FAILED
 
             if len_global == len(self.operator_list_) and self.map_:
                 index = next(iter(self.map_.keys()))
                 in_dim = self.map_[index]
                 self.map_[index] = NONE
-                dev_dim = self.dev_mat_.GetDimByReverseIdx(in_dim)
+                dev_dim = self.dev_mat_.get_dim_by_reverse_idx(in_dim)
                 args = (index, in_dim, dev_dim)
-                if self.InsertOperator(CONCAT_BY_AXIS, args) == Status.FAILED:
+                if self.insert_operator(CONCAT_BY_AXIS, args) == Status.FAILED:
                     return Status.FAILED
 
         return Status.SUCCESS
 
-    def _HandleSimpleSplitCase(self, index: int, in_dim: Union[int, Tuple[int, ...]],
+    def _handle_simple_split_case(self, index: int, in_dim: Union[int, Tuple[int, ...]],
                                out_dim: Union[int, Tuple[int, ...]]) -> bool:
         """Handle the simple case where input dimension is None and output dimension is not conflicting"""
         if in_dim != NONE:
@@ -300,13 +303,13 @@ class RedistributionOperatorInfer:
             conflict_tuple = any(isinstance(v, tuple) and v[-1] == out_dim for v in self.map_.values())
 
         if not conflict and not conflict_tuple:
-            dev_dim = self.dev_mat_.GetDimByReverseIdx(out_dim)
+            dev_dim = self.dev_mat_.get_dim_by_reverse_idx(out_dim)
             args = (index, out_dim, dev_dim)
-            return self.InsertOperator(SPLIT_BY_AXIS, args) == Status.SUCCESS
+            return self.insert_operator(SPLIT_BY_AXIS, args) == Status.SUCCESS
 
         return False
 
-    def _HandleTupleSplitCase(self, index: int, in_dim: Union[int, Tuple[int, ...]],
+    def _handle_tuple_split_case(self, index: int, in_dim: Union[int, Tuple[int, ...]],
                               out_dim: Union[int, Tuple[int, ...]]) -> bool:
         """Handle the case where output dimension is a tuple and input dimension matches prefix"""
         if not isinstance(out_dim, tuple):
@@ -322,13 +325,13 @@ class RedistributionOperatorInfer:
 
             conflict = any(v == out_dim_rest for v in self.map_.values())
             if not conflict:
-                dev_dim = self.dev_mat_.GetDimByReverseIdx(out_dim_rest)
+                dev_dim = self.dev_mat_.get_dim_by_reverse_idx(out_dim_rest)
                 args = (index, out_dim_rest, dev_dim)
-                return self.InsertOperator(SPLIT_BY_AXIS, args) == Status.SUCCESS
+                return self.insert_operator(SPLIT_BY_AXIS, args) == Status.SUCCESS
 
         return False
 
-    def InferSplitByAxis(self) -> int:
+    def infer_split_by_axis(self) -> int:
         """
         Infers split operations for the current mapping state.
 
@@ -347,25 +350,25 @@ class RedistributionOperatorInfer:
                 continue
 
             in_dim = self.map_[index]
-            out_dim = self.out_tensor_map_.GetDimByIdx(index)
+            out_dim = self.out_tensor_map_.get_dim_by_idx(index)
 
             if in_dim == out_dim:
                 del self.map_[index]
                 continue
 
             # Handle simple case: input dimension is None
-            if self._HandleSimpleSplitCase(index, in_dim, out_dim):
+            if self._handle_simple_split_case(index, in_dim, out_dim):
                 del self.map_[index]
                 continue
 
             # Handle tuple case: output dimension is a tuple
-            if self._HandleTupleSplitCase(index, in_dim, out_dim):
+            if self._handle_tuple_split_case(index, in_dim, out_dim):
                 del self.map_[index]
                 continue
 
         return Status.SUCCESS
 
-    def _HandleNoneDimPermuteCase(self, index: int, in_dim: Union[int, Tuple[int, ...]],
+    def _handle_none_dim_permute_case(self, index: int, in_dim: Union[int, Tuple[int, ...]],
                                   out_dim: Union[int, Tuple[int, ...]]) -> bool:
         """Handle permute case where input dimension is None"""
         if in_dim != NONE:
@@ -377,34 +380,34 @@ class RedistributionOperatorInfer:
             return False
 
         # Handle regular dimension conflict
-        concat_axis = self.in_tensor_map_.GetIndexByValue(out_dim)
+        concat_axis = self.in_tensor_map_.get_index_by_value(out_dim)
         if concat_axis is None:
             return False
 
-        split_dev_num = self.dev_mat_.GetDimByReverseIdx(out_dim)
+        split_dev_num = self.dev_mat_.get_dim_by_reverse_idx(out_dim)
 
         if self.use_permute:
             # concat tensor map value, to get the communication group
-            concat_map = self.in_tensor_map_.GetDimByIdx(concat_axis)
-            concat_dev_num = self.dev_mat_.GetDimByReverseIdx(concat_map)
+            concat_map = self.in_tensor_map_.get_dim_by_idx(concat_axis)
+            concat_dev_num = self.dev_mat_.get_dim_by_reverse_idx(concat_map)
             args_permute = (concat_dev_num, index, concat_axis, concat_map, split_dev_num)
 
-            if self.InsertOperator(PERMUTE_BY_AXIS, args_permute) == Status.FAILED:
+            if self.insert_operator(PERMUTE_BY_AXIS, args_permute) == Status.FAILED:
                 return False
         else:
             args_concat = (concat_axis, out_dim, split_dev_num)
             args_split = (index, out_dim, split_dev_num)
 
-            if self.InsertOperator(CONCAT_BY_AXIS, args_concat) == Status.FAILED:
+            if self.insert_operator(CONCAT_BY_AXIS, args_concat) == Status.FAILED:
                 return False
-            if self.InsertOperator(SPLIT_BY_AXIS, args_split) == Status.FAILED:
+            if self.insert_operator(SPLIT_BY_AXIS, args_split) == Status.FAILED:
                 return False
 
         del self.map_[index]
         self.map_[concat_axis] = NONE
         return True
 
-    def _HandleNoneDimTuplePermuteCase(self, index: int, in_dim: Union[int, Tuple[int, ...]],
+    def _handle_none_dim_tuple_permute_case(self, index: int, in_dim: Union[int, Tuple[int, ...]],
                                        out_dim: Union[int, Tuple[int, ...]]) -> bool:
         """Handle permute case where input dimension is None and output dimension is a tuple with conflicts"""
         if in_dim != NONE:
@@ -419,27 +422,27 @@ class RedistributionOperatorInfer:
         if not conflict_tuple:
             return False
 
-        concat_axis = self.in_tensor_map_.GetIndexContainValue(out_dim)
+        concat_axis = self.in_tensor_map_.get_index_contain_value(out_dim)
         if concat_axis is None:
             return False
 
-        split_dev_num = self.dev_mat_.GetDimByReverseIdx(out_dim)
+        split_dev_num = self.dev_mat_.get_dim_by_reverse_idx(out_dim)
 
         if self.use_permute:
             # concat tensor map value, to get the communication group
             concat_map = out_dim
-            concat_dev_num = self.dev_mat_.GetDimByReverseIdx(concat_map)
+            concat_dev_num = self.dev_mat_.get_dim_by_reverse_idx(concat_map)
             args_permute = (concat_dev_num, index, concat_axis, concat_map, split_dev_num)
 
-            if self.InsertOperator(PERMUTE_BY_AXIS, args_permute) == Status.FAILED:
+            if self.insert_operator(PERMUTE_BY_AXIS, args_permute) == Status.FAILED:
                 return False
         else:
             args_concat = (concat_axis, out_dim, split_dev_num)
             args_split = (index, out_dim, split_dev_num)
 
-            if self.InsertOperator(CONCAT_BY_AXIS, args_concat) == Status.FAILED:
+            if self.insert_operator(CONCAT_BY_AXIS, args_concat) == Status.FAILED:
                 return False
-            if self.InsertOperator(SPLIT_BY_AXIS, args_split) == Status.FAILED:
+            if self.insert_operator(SPLIT_BY_AXIS, args_split) == Status.FAILED:
                 return False
 
         del self.map_[index]
@@ -449,7 +452,7 @@ class RedistributionOperatorInfer:
         self.map_[concat_axis] = new_map_item
         return True
 
-    def _HandleTupleDimPermuteCase(self, index: int, in_dim: Union[int, Tuple[int, ...]],
+    def _handle_tuple_dim_permute_case(self, index: int, in_dim: Union[int, Tuple[int, ...]],
                                    out_dim: Union[int, Tuple[int, ...]]) -> bool:
         """Handle permute case where both input and output dimensions are tuples"""
         if not isinstance(out_dim, tuple):
@@ -468,34 +471,34 @@ class RedistributionOperatorInfer:
         if not conflict:
             return False
 
-        concat_axis = self.in_tensor_map_.GetIndexByValue(out_dim_rest)
+        concat_axis = self.in_tensor_map_.get_index_by_value(out_dim_rest)
         if concat_axis is None:
             return False
 
-        split_dev_num = self.dev_mat_.GetDimByReverseIdx(out_dim_rest)
+        split_dev_num = self.dev_mat_.get_dim_by_reverse_idx(out_dim_rest)
 
         if self.use_permute:
             # concat tensor map value, to get the communication group
             concat_map = out_dim_rest
-            concat_dev_num = self.dev_mat_.GetDimByReverseIdx(concat_map)
+            concat_dev_num = self.dev_mat_.get_dim_by_reverse_idx(concat_map)
             args_permute = (concat_dev_num, index, concat_axis, concat_map, split_dev_num)
 
-            if self.InsertOperator(PERMUTE_BY_AXIS, args_permute) == Status.FAILED:
+            if self.insert_operator(PERMUTE_BY_AXIS, args_permute) == Status.FAILED:
                 return False
         else:
             args_concat = (concat_axis, out_dim_rest, split_dev_num)
             args_split = (index, out_dim_rest, split_dev_num)
 
-            if self.InsertOperator(CONCAT_BY_AXIS, args_concat) == Status.FAILED:
+            if self.insert_operator(CONCAT_BY_AXIS, args_concat) == Status.FAILED:
                 return False
-            if self.InsertOperator(SPLIT_BY_AXIS, args_split) == Status.FAILED:
+            if self.insert_operator(SPLIT_BY_AXIS, args_split) == Status.FAILED:
                 return False
 
         del self.map_[index]
         self.map_[concat_axis] = NONE
         return True
 
-    def InferPermuteByAxis(self) -> int:
+    def infer_permute_by_axis(self) -> int:
         """
         Infers permutation (all-to-all) operations for dimension conflicts.
 
@@ -512,25 +515,25 @@ class RedistributionOperatorInfer:
                 continue
 
             in_dim = self.map_[index]
-            out_dim = self.out_tensor_map_.GetDimByIdx(index)
+            out_dim = self.out_tensor_map_.get_dim_by_idx(index)
 
             if in_dim == out_dim:
                 del self.map_[index]
                 continue
 
             # Handle different permute cases
-            if self._HandleNoneDimPermuteCase(index, in_dim, out_dim):
+            if self._handle_none_dim_permute_case(index, in_dim, out_dim):
                 continue
 
-            if self._HandleNoneDimTuplePermuteCase(index, in_dim, out_dim):
+            if self._handle_none_dim_tuple_permute_case(index, in_dim, out_dim):
                 continue
 
-            if self._HandleTupleDimPermuteCase(index, in_dim, out_dim):
+            if self._handle_tuple_dim_permute_case(index, in_dim, out_dim):
                 continue
 
         return Status.SUCCESS
 
-    def _HandleTupleConcatCase(self, index: int, in_dim: Union[int, Tuple[int, ...]],
+    def _handle_tuple_concat_case(self, index: int, in_dim: Union[int, Tuple[int, ...]],
                                out_dim: Union[int, Tuple[int, ...]]) -> bool:
         """Handle concat case where input dimension is a tuple and output matches prefix"""
         if not isinstance(in_dim, tuple):
@@ -545,28 +548,28 @@ class RedistributionOperatorInfer:
         else:
             in_dim_rest = in_dim[-1] if len(in_dim[1:]) == 1 else in_dim[1:]
 
-        concat_dev_num = self.dev_mat_.GetDimByReverseIdx(in_dim_rest)
+        concat_dev_num = self.dev_mat_.get_dim_by_reverse_idx(in_dim_rest)
         args = (index, in_dim_rest, concat_dev_num)
 
-        if self.InsertOperator(CONCAT_BY_AXIS, args) == Status.FAILED:
+        if self.insert_operator(CONCAT_BY_AXIS, args) == Status.FAILED:
             return False
 
         del self.map_[index]
         return True
 
-    def _HandleSimpleConcatCase(self, index: int, in_dim: Union[int, Tuple[int, ...]],
+    def _handle_simple_concat_case(self, index: int, in_dim: Union[int, Tuple[int, ...]],
                                 out_dim: Union[int, Tuple[int, ...]]) -> bool:
         """Handle simple concat case where input dimension is mapped but output is not"""
         if in_dim == NONE:
             return False
 
-        if self.out_tensor_map_.GetIndexByValue(in_dim) != NONE:
+        if self.out_tensor_map_.get_index_by_value(in_dim) != NONE:
             return False
 
-        concat_dev_num = self.dev_mat_.GetDimByReverseIdx(in_dim)
+        concat_dev_num = self.dev_mat_.get_dim_by_reverse_idx(in_dim)
         args = (index, in_dim, concat_dev_num)
 
-        if self.InsertOperator(CONCAT_BY_AXIS, args) == Status.FAILED:
+        if self.insert_operator(CONCAT_BY_AXIS, args) == Status.FAILED:
             return False
 
         if out_dim == NONE:
@@ -576,7 +579,7 @@ class RedistributionOperatorInfer:
 
         return True
 
-    def InferConcatByAxis(self) -> int:
+    def infer_concat_by_axis(self) -> int:
         """
         Infers concat operations for the current mapping state.
 
@@ -593,19 +596,19 @@ class RedistributionOperatorInfer:
                 continue
 
             in_dim = self.map_[index]
-            out_dim = self.out_tensor_map_.GetDimByIdx(index)
+            out_dim = self.out_tensor_map_.get_dim_by_idx(index)
 
             # Handle tuple concat case
-            if self._HandleTupleConcatCase(index, in_dim, out_dim):
+            if self._handle_tuple_concat_case(index, in_dim, out_dim):
                 continue
 
             # Handle simple concat case
-            if self._HandleSimpleConcatCase(index, in_dim, out_dim):
+            if self._handle_simple_concat_case(index, in_dim, out_dim):
                 continue
 
         return Status.SUCCESS
 
-    def InferOpsList(self, rank: int, rank_list: List[int]):
+    def infer_ops_list(self, rank: int, rank_list: List[int]):
         """
         Converts internal operator sequence to executable communication operations.
 
@@ -619,13 +622,13 @@ class RedistributionOperatorInfer:
             - ("all_split", (dim, size, group))
             - ("all_to_all", (split_dim, concat_dim, size, group))
         """
-        self.InferRedistributionOperator()
+        self.infer_redistribution_operator()
         ops_list = []
         for op in self.operator_list_:
             if op[0] == CONCAT_BY_AXIS:
                 tensor_map = [self.dev_ranks - 1 - d for d in op[1][1]] if isinstance(op[1][1], tuple) \
                     else self.dev_ranks  - 1 - op[1][1]
-                group = self.dev_mat_.GetDevicesAlongDim(rank, rank_list, tensor_map)
+                group = self.dev_mat_.get_devices_along_dim(rank, rank_list, tensor_map)
                 concat_dim = op[1][0]
                 concat_size = op[1][2]
                 if concat_size == 1:
@@ -634,7 +637,7 @@ class RedistributionOperatorInfer:
             elif op[0] == SPLIT_BY_AXIS:
                 tensor_map = [self.dev_ranks - 1 - d for d in op[1][1]] if isinstance(op[1][1], tuple) \
                     else self.dev_ranks  - 1 - op[1][1]
-                group = self.dev_mat_.GetDevicesAlongDim(rank, rank_list, tensor_map)
+                group = self.dev_mat_.get_devices_along_dim(rank, rank_list, tensor_map)
                 split_dim = op[1][0]
                 split_size = op[1][2]
                 if split_size == 1:
@@ -643,7 +646,7 @@ class RedistributionOperatorInfer:
             else:
                 tensor_map = [self.dev_ranks - 1 - d for d in op[1][3]] if isinstance(op[1][3], tuple) \
                     else self.dev_ranks  - 1 - op[1][3]
-                group = self.dev_mat_.GetDevicesAlongDim(rank, rank_list, tensor_map)
+                group = self.dev_mat_.get_devices_along_dim(rank, rank_list, tensor_map)
                 concat_dim = op[1][2]
                 split_dim = op[1][1]
                 permute_size = op[1][0]

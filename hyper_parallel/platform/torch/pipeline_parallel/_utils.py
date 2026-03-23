@@ -13,8 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """pipeline parallel utils"""
-import hyper_parallel
 from torch import nn
+
+import hyper_parallel
 
 
 class _MicroBatch(nn.Module):

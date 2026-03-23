@@ -19,6 +19,7 @@ Distributed implementation for Repeat operator.
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
 
+
 class RepeatDistributedOp(DistributedOp):
     """Distributed implementation for torch.Tensor.repeat."""
 
@@ -77,7 +78,7 @@ class RepeatDistributedOp(DistributedOp):
         output_map = []
 
         # Rule 1: New prepended dimensions are always unsharded
-        for i in range(num_new_dims):
+        for _ in range(num_new_dims):
             output_map.append(-1)
 
         # Rule 2: Process existing dimensions
