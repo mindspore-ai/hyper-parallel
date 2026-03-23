@@ -34,7 +34,7 @@ from mindspore.common.initializer import initializer
 from mindspore.communication import get_group_size
 from mindspore.communication import create_group as new_group
 from mindspore.communication import get_rank as get_rank_id
-from mindspore.communication import comm_func
+from mindspore.ops.function import comm_func
 from mindspore._c_expression import TensorTransform
 import mindspore.mint.distributed as dist
 
@@ -44,6 +44,7 @@ from hyper_parallel.platform.mindspore.pipeline_parallel.stage import PipelineSt
 from hyper_parallel.platform.mindspore.parameter_init import init_parameters as _init_parameters
 from hyper_parallel.platform.mindspore.init_weights import init_on_device as _init_on_device
 
+comm_func.set_comm_ops_inplace(False)
 _tensor_transform = TensorTransform.get_instance()
 
 
@@ -134,7 +135,7 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def differentiable_all_gather_concat(data, group, concat_size, concat_dim):
-        output, _ = comm_func.all_gather_into_tensor(data, group=group)
+        output, _ = comm_func.all_gather_into_tensor(None, data, group=group)
         if concat_dim == 0:
             return output
         output_tensors = ms.ops.Split(output_num=concat_size)(output)
@@ -146,9 +147,9 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def differentiable_all_to_all(input_data, output_shape, group):
-        output_tensor, _ = comm_func.all_to_all_single_with_output_shape(
-            output_shape=output_shape,
-            tensor=input_data,
+        output_tensor, _ = comm_func.all_to_all_single(
+            output_shape,
+            input_data,
             group=group,
             async_op=False
         )
@@ -176,7 +177,7 @@ class MindSporePlatform(Platform):
     def differentiable_reduce_scatter(data, dev_num, axis, op, group):
         if axis > 0:
             data = ms.mint.concat(ms.ops.Split(axis=axis, output_num=dev_num)(data), dim=0)
-        output_tensor, _ = comm_func.reduce_scatter_tensor(data, 'sum', group)
+        output_tensor, _ = comm_func.reduce_scatter_tensor(None, data, 'sum', group)
         if op == 'avg':
             output_tensor = output_tensor / dev_num
         return output_tensor
@@ -356,7 +357,7 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):
-        return comm_func.all_gather_into_tensor(data, group=group_info.group_name, async_op=async_op)
+        return comm_func.all_gather_into_tensor(None, data, group=group_info.group_name, async_op=async_op)
 
     @staticmethod
     def all_reduce(data, group_info, async_op=False):
@@ -375,7 +376,7 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def reduce_scatter_tensor(data, group_info, async_op=False):
-        return comm_func.reduce_scatter_tensor(data, group=group_info.group_name, async_op=async_op)
+        return comm_func.reduce_scatter_tensor(None, data, group=group_info.group_name, async_op=async_op)
 
     @staticmethod
     def parameters_dict(cell: Cell):

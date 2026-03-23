@@ -21,7 +21,7 @@ from mindspore import nn
 from mindspore.common.api import _no_grad
 from mindspore import ops, Parameter, mint
 import mindspore.mint.distributed as dist
-from mindspore.communication.comm_func import CommHandle
+from mindspore.ops.function.comm_func import CommHandle
 from mindspore.ops.auto_generate.gen_ops_def import as_strided
 from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
