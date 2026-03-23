@@ -148,7 +148,7 @@ class HSDPModule:
         if not hasattr(self, "hsdp_scheduler"):
             raise ValueError("call hsdp interface first.")
         if platform.platform_type == PlatformType.PYTORCH:
-            raise RuntimeError("zero_grads shouldn't be called in torch platform, use optimizer.zero_grad() instead.")
+            return super().zero_grad()
         for _, module in platform.get_cells_and_names(self):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.zero_grad()
