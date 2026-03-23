@@ -1,0 +1,525 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Unit tests for MindSpore fully_shard mixed precision.
+
+Covered scenarios:
+  1. Behavior of the _to_dtype_if_needed helper
+  2. dtype initialization and optimization logic in init_dtype_attrs
+  3. Inference of _orig_dtype / _reduce_dtype in _init_mp_dtypes
+     under different dtype combinations
+  4. lazy_init refreshes _orig_dtype after parameter dtype changes
+     such as calling net.to(bfloat16) after fully_shard
+  5. dtype restoration and gradient assignment logic in
+     _apply_reduced_grad
+"""
+import os
+import unittest
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+# pylint: disable=protected-access,wrong-import-position
+
+# Skip entire module if mindspore is not installed (avoids import failure)
+pytest.importorskip("mindspore")
+
+# Force mindspore platform before any hyper_parallel imports
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+
+import mindspore as ms
+
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
+from hyper_parallel.platform.mindspore.fully_shard.state import (
+    MindSporeHSDPStateV2,
+    _to_dtype_if_needed,
+)
+from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
+
+
+# ---------------------------------------------------------------------------
+# Helper: bypass __init__ and construct a state instance with manually injected attributes
+# ---------------------------------------------------------------------------
+
+def _make_state(mp_policy, hsdp_params):
+    """Create a lightweight MindSporeHSDPStateV2 instance without hardware initialization."""
+    state = object.__new__(MindSporeHSDPStateV2)
+    state.mp_policy = mp_policy
+    state.offload_policy = None
+    state.hsdp_params = hsdp_params
+    state.replicate_params = []
+    state._ignored_allreduce_works = []
+    state._reset_sharded_params = True   # Skip the reset_sharded_param branch
+    return state
+
+
+def _make_init_dtype_attrs(mock_param, orig_dtype_value):
+    """Create a bound init_dtype_attrs side effect for a mock hsdp param."""
+
+    def _init_dtype_attrs(policy):
+        mock_param.orig_dtype = orig_dtype_value
+        inferred_reduce_dtype = policy.reduce_dtype
+        if inferred_reduce_dtype == policy.param_dtype:
+            inferred_reduce_dtype = None
+        mock_param.reduce_dtype = inferred_reduce_dtype
+
+    return _init_dtype_attrs
+
+
+def _make_mock_hsdp_param(dtype, requires_grad=True):
+    """Create a minimal hsdp_param mock for init_dtype_attrs calls."""
+    mock_param = MagicMock()
+    mock_param.sharded_param.dtype = dtype
+    mock_param.sharded_param.requires_grad = requires_grad
+    # init_dtype_attrs assigns orig_dtype / param_dtype / reduce_dtype directly
+    # MagicMock allows arbitrary attribute assignment without extra setup
+    return mock_param
+
+
+# ---------------------------------------------------------------------------
+# 1. _to_dtype_if_needed
+# ---------------------------------------------------------------------------
+
+class TestToDtypeIfNeeded(unittest.TestCase):
+    """Test the _to_dtype_if_needed helper."""
+
+    def test_no_cast_when_dtype_is_none(self):
+        """
+        Feature: _to_dtype_if_needed
+        Description: Do not cast when dtype=None; return the original tensor directly
+        Expectation: tensor.to is not called, and the return value is the input tensor
+        """
+        tensor = MagicMock()
+        result = _to_dtype_if_needed(tensor, None)
+        tensor.to.assert_not_called()
+        self.assertIs(result, tensor)
+
+    def test_no_cast_when_same_dtype(self):
+        """
+        Feature: _to_dtype_if_needed
+        Description: Do not cast when the target dtype matches tensor.dtype
+        Expectation: tensor.to is not called, and the return value is the input tensor
+        """
+        tensor = MagicMock()
+        tensor.dtype = ms.float32
+        result = _to_dtype_if_needed(tensor, ms.float32)
+        tensor.to.assert_not_called()
+        self.assertIs(result, tensor)
+
+    def test_cast_when_different_dtype(self):
+        """
+        Feature: _to_dtype_if_needed
+        Description: Perform a cast when the target dtype differs from tensor.dtype
+        Expectation: tensor.to(target_dtype) is called once and returns the cast result
+        """
+        tensor = MagicMock()
+        tensor.dtype = ms.float32
+        casted = MagicMock()
+        tensor.to.return_value = casted
+        result = _to_dtype_if_needed(tensor, ms.float16)
+        tensor.to.assert_called_once_with(ms.float16)
+        self.assertIs(result, casted)
+
+
+# ---------------------------------------------------------------------------
+# 2. init_dtype_attrs (parameter-level dtype initialization logic)
+# ---------------------------------------------------------------------------
+
+class TestInitDtypeAttrs(unittest.TestCase):
+    """Test dtype inference in MindSporeHSDPParamV2.init_dtype_attrs."""
+
+    def _call_init_dtype_attrs(self, orig_dtype, param_dtype, reduce_dtype):
+        """Run init_dtype_attrs on a mock param object and return it."""
+        mock_self = MagicMock()
+        mock_self.sharded_param = MagicMock()
+        mock_self.sharded_param.dtype = orig_dtype
+        policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+        MindSporeHSDPParamV2.init_dtype_attrs(mock_self, policy)
+        return mock_self
+
+    def test_param_dtype_same_as_orig_set_to_none(self):
+        """
+        Feature: init_dtype_attrs
+        Description: When param_dtype matches the parameter's original dtype, it should be set to None (no cast needed)
+        Expectation: self.param_dtype is None
+        """
+        obj = self._call_init_dtype_attrs(ms.float32, ms.float32, ms.float32)
+        self.assertIsNone(obj.param_dtype)
+
+    def test_reduce_dtype_same_as_param_dtype_set_to_none(self):
+        """
+        Feature: init_dtype_attrs
+        Description: When reduce_dtype matches param_dtype, it should be set to None to avoid redundant casts
+        Expectation: self.reduce_dtype is None
+        """
+        obj = self._call_init_dtype_attrs(ms.float32, ms.float16, ms.float16)
+        self.assertIsNone(obj.reduce_dtype)
+
+    def test_different_dtypes_kept(self):
+        """
+        Feature: init_dtype_attrs
+        Description: Keep both values when param_dtype != orig_dtype and reduce_dtype != param_dtype
+        Expectation: self.param_dtype == float16, self.reduce_dtype == float32
+        """
+        obj = self._call_init_dtype_attrs(ms.float32, ms.float16, ms.float32)
+        self.assertEqual(obj.param_dtype, ms.float16)
+        self.assertEqual(obj.reduce_dtype, ms.float32)
+
+    def test_orig_dtype_always_set(self):
+        """
+        Feature: init_dtype_attrs
+        Description: orig_dtype always records the parameter's original dtype
+        Expectation: self.orig_dtype == the parameter's initial dtype
+        """
+        obj = self._call_init_dtype_attrs(ms.bfloat16, ms.float16, ms.float32)
+        self.assertEqual(obj.orig_dtype, ms.bfloat16)
+
+
+# ---------------------------------------------------------------------------
+# 3. _init_mp_dtypes (state-level dtype inference)
+# ---------------------------------------------------------------------------
+
+class TestInitMpDtypes(unittest.TestCase):
+    """Test _orig_dtype / _reduce_dtype inference in MindSporeHSDPStateV2._init_mp_dtypes."""
+
+    def _run(self, mp_policy, params_config):
+        """
+        params_config: list of (orig_dtype, reduce_dtype, requires_grad)
+        """
+        mock_params = []
+        for param_config in params_config:
+            orig_dtype, _, requires_grad = param_config
+            mock_param = _make_mock_hsdp_param(orig_dtype, requires_grad)
+            # init_dtype_attrs runs for real here, so dtype values must be bound
+            mock_param.init_dtype_attrs.side_effect = _make_init_dtype_attrs(
+                mock_param, orig_dtype
+            )
+            mock_params.append(mock_param)
+
+        state = _make_state(mp_policy, mock_params)
+        state._init_mp_dtypes()
+        return state
+
+    def test_basic_fp16_param_dtype(self):
+        """
+        Feature: _init_mp_dtypes
+        Description: param_dtype=float16 and the parameter's original dtype=float32
+        Expectation: _orig_dtype=float32 and _reduce_dtype=None (reduce matches param)
+        """
+        policy = MixedPrecisionPolicy(param_dtype=ms.float16, reduce_dtype=ms.float16)
+        state = self._run(policy, [(ms.float32, None, True)])
+        self.assertEqual(state._orig_dtype, ms.float32)
+        self.assertIsNone(state._reduce_dtype)
+
+    def test_separate_reduce_dtype(self):
+        """
+        Feature: _init_mp_dtypes
+        Description: param_dtype=float16 and reduce_dtype=float32 (different from param_dtype)
+        Expectation: _orig_dtype=float32, _reduce_dtype=float32
+        """
+        policy = MixedPrecisionPolicy(param_dtype=ms.float16, reduce_dtype=ms.float32)
+        state = self._run(policy, [(ms.float32, ms.float32, True)])
+        self.assertEqual(state._orig_dtype, ms.float32)
+        self.assertEqual(state._reduce_dtype, ms.float32)
+
+    def test_no_trainable_params_returns_none(self):
+        """
+        Feature: _init_mp_dtypes
+        Description: When there are no parameters with requires_grad=True, both _orig_dtype and _reduce_dtype are None
+        Expectation: _orig_dtype is None and _reduce_dtype is None
+        """
+        policy = MixedPrecisionPolicy(param_dtype=ms.float16)
+        state = self._run(policy, [(ms.float32, None, False)])
+        self.assertIsNone(state._orig_dtype)
+        self.assertIsNone(state._reduce_dtype)
+
+    def test_non_uniform_orig_dtype_raises(self):
+        """
+        Feature: _init_mp_dtypes
+        Description: Raise AssertionError when multiple parameters have inconsistent orig_dtype values
+        Expectation: Raise AssertionError with a message containing 'uniform original parameter dtype'
+        """
+        policy = MixedPrecisionPolicy(param_dtype=ms.float16)
+        with self.assertRaises(AssertionError) as ctx:
+            self._run(policy, [
+                (ms.float32, None, True),
+                (ms.float16, None, True),
+            ])
+        self.assertIn("uniform original parameter dtype", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# 4. lazy_init refreshes _orig_dtype after parameter dtype changes
+# ---------------------------------------------------------------------------
+
+class TestLazyInitDtypeRefresh(unittest.TestCase):
+    """
+    Verify that lazy_init correctly refreshes _orig_dtype when net.to(bfloat16)
+    is called after fully_shard wrapping and before the next forward pass.
+    """
+
+    def _make_state_with_dtype(self, dtype):
+        """Create a state whose hsdp_param.sharded_param.dtype can change dynamically."""
+        mock_param = MagicMock()
+        mock_param.sharded_param.requires_grad = True
+        mock_param.sharded_param.device = "Ascend:0"
+
+        # init_dtype_attrs reads sharded_param.dtype directly and assigns it to orig_dtype
+        def init_dtype_attrs(policy):
+            mock_param.orig_dtype = mock_param.sharded_param.dtype
+            rd = policy.reduce_dtype
+            pd = policy.param_dtype
+            if rd == pd:
+                rd = None
+            mock_param.reduce_dtype = rd
+        mock_param.init_dtype_attrs.side_effect = init_dtype_attrs
+
+        policy = MixedPrecisionPolicy(param_dtype=ms.float16, reduce_dtype=ms.float16)
+        state = _make_state(policy, [mock_param])
+        state._reset_sharded_params = False  # Trigger the reset_sharded_param branch
+        state.offload_policy = None
+
+        # Initial dtype
+        mock_param.sharded_param.dtype = dtype
+        return state, mock_param
+
+    def test_orig_dtype_refreshed_after_dtype_change(self):
+        """
+        Feature: lazy_init dtype refresh
+        Description: Simulate calling net.to(bfloat16) after fully_shard, then trigger lazy_init
+        Expectation: _orig_dtype is updated from float32 to bfloat16
+        """
+        state, mock_param = self._make_state_with_dtype(ms.float32)
+
+        with patch.object(state, '_validate_no_meta_params'), \
+             patch.object(state, '_validate_cpu_offload_params'), \
+             patch.object(mock_param, 'is_sharded', new=False):
+            # First lazy_init call (parameter is float32)
+            state.lazy_init()
+            self.assertEqual(state._orig_dtype, ms.float32)
+
+            # Simulate net.to(bfloat16)
+            mock_param.sharded_param.dtype = ms.bfloat16
+
+            # Second lazy_init call (parameter has changed to bfloat16)
+            state._reset_sharded_params = True  # Do not trigger reset again
+            state.lazy_init()
+            self.assertEqual(state._orig_dtype, ms.bfloat16)
+
+
+# ---------------------------------------------------------------------------
+# 5. _apply_reduced_grad dtype restoration and gradient assignment
+# ---------------------------------------------------------------------------
+
+class TestApplyReducedGrad(unittest.TestCase):
+    """Test dtype conversion and gradient assignment behavior in _apply_reduced_grad."""
+
+    def _make_state_for_apply(self, orig_dtype):
+        """Create a state for _apply_reduced_grad tests."""
+        policy = MixedPrecisionPolicy(param_dtype=ms.float16, reduce_dtype=ms.float32)
+        state = _make_state(policy, [])
+        state._orig_dtype = orig_dtype
+        return state
+
+    def test_grad_cast_to_orig_dtype(self):
+        """
+        Feature: _apply_reduced_grad
+        Description: Cast to _orig_dtype when reduced_grad.dtype differs from _orig_dtype
+        Expectation: _to_dtype_if_needed is called with _orig_dtype
+        """
+        state = self._make_state_for_apply(ms.float32)
+
+        # Mock hsdp_param
+        hsdp_param = MagicMock()
+        hsdp_param.sharded_size = (8, 8)
+        hsdp_param.offload_to_cpu = False
+        hsdp_param.sharded_param.grad = None
+        hsdp_param.unsharded_accumulated_grad_data = None
+        hsdp_param._return_grad = MagicMock()
+        sharded_grad_dtensor = MagicMock(spec=DTensor)
+        hsdp_param.to_sharded_dtensor.return_value = sharded_grad_dtensor
+
+        # Mock reduced_grad
+        reduced_grad = MagicMock()
+        viewed_grad = MagicMock()
+        viewed_grad.dtype = ms.float16  # Different from _orig_dtype
+        casted_grad = MagicMock()
+        casted_grad.dtype = ms.float32
+        viewed_grad.to.return_value = casted_grad
+        reduced_grad.view.return_value = viewed_grad
+        returned_grad = hsdp_param._return_grad
+
+        with patch(
+            'hyper_parallel.platform.mindspore.fully_shard.state._to_dtype_if_needed',
+            side_effect=lambda t, d: t.to(d) if (d is not None and t.dtype != d) else t
+        ):
+            state._apply_reduced_grad(hsdp_param, reduced_grad)
+
+        # Verify that view is called
+        reduced_grad.view.assert_called_once_with((8, 8))
+        # Verify the cast to orig_dtype
+        viewed_grad.to.assert_called_once_with(ms.float32)
+        # Verify that sharded_param.grad receives the result first,
+        # then syncs it to the returned object
+        hsdp_param.to_sharded_dtensor.assert_called_once_with(casted_grad)
+        self.assertIs(hsdp_param.sharded_param.grad, sharded_grad_dtensor)
+        self.assertEqual(returned_grad.data, sharded_grad_dtensor.to_local())
+        self.assertIsNone(hsdp_param._return_grad)
+
+    def test_grad_accumulated_when_existing(self):
+        """
+        Feature: _apply_reduced_grad
+        Description: When sharded_param.grad already exists,
+        the new gradient should be accumulated instead of overwritten
+        Expectation: hsdp_param.sharded_param.grad._local_tensor += reduced_grad is executed
+        """
+        state = self._make_state_for_apply(ms.float32)
+
+        existing_grad = MagicMock(spec=DTensor)
+        local_tensor = MagicMock()
+        existing_grad._local_tensor = local_tensor
+        hsdp_param = MagicMock()
+        hsdp_param.sharded_size = (4,)
+        hsdp_param.offload_to_cpu = False
+        hsdp_param.sharded_param.grad = existing_grad
+        hsdp_param.unsharded_accumulated_grad_data = None
+        hsdp_param._return_grad = None
+
+        reduced_grad = MagicMock()
+        viewed_grad = MagicMock()
+        viewed_grad.dtype = ms.float32  # Matches _orig_dtype, so no cast is needed
+        reduced_grad.view.return_value = viewed_grad
+
+        with patch(
+            'hyper_parallel.platform.mindspore.fully_shard.state._to_dtype_if_needed',
+            return_value=viewed_grad
+        ):
+            state._apply_reduced_grad(hsdp_param, reduced_grad)
+
+        # Verify that the gradient is accumulated into the underlying local tensor
+        local_tensor.__iadd__.assert_called_once_with(viewed_grad)
+
+    def test_returned_grad_member_cleared_after_apply(self):
+        """
+        Feature: _apply_reduced_grad
+        Description: After gradient assignment,
+        the returned gradient member for value_and_grad should be cleared
+        Expectation: hsdp_param._return_grad is consumed and set to None.
+        The internal full-grad reference is cleared as well.
+        """
+        state = self._make_state_for_apply(ms.float32)
+
+        hsdp_param = MagicMock()
+        hsdp_param.sharded_size = (4,)
+        hsdp_param.offload_to_cpu = False
+        hsdp_param.sharded_param.grad = None
+        hsdp_param.unsharded_accumulated_grad_data = None
+        returned_grad = MagicMock()
+        hsdp_param._return_grad = returned_grad
+        sharded_grad_dtensor = MagicMock(spec=DTensor)
+        hsdp_param.to_sharded_dtensor.return_value = sharded_grad_dtensor
+
+        reduced_grad = MagicMock()
+        casted_grad = MagicMock()
+        reduced_grad.view.return_value = casted_grad
+
+        with patch(
+            'hyper_parallel.platform.mindspore.fully_shard.state._to_dtype_if_needed',
+            return_value=casted_grad
+        ):
+            state._apply_reduced_grad(hsdp_param, reduced_grad)
+
+        hsdp_param.to_sharded_dtensor.assert_called_once_with(casted_grad)
+        self.assertEqual(returned_grad.data, sharded_grad_dtensor.to_local())
+        self.assertIs(hsdp_param.sharded_param.grad, sharded_grad_dtensor)
+        self.assertIsNone(hsdp_param._return_grad)
+        self.assertIsNone(hsdp_param.unsharded_param.grad)
+
+
+class TestReplicateParamGradHandling(unittest.TestCase):
+    """Test gradient handling logic related to replicate_params."""
+
+    def _make_state_for_replicate(self, orig_dtype):
+        """Create a state for replicate_params branch tests."""
+        policy = MixedPrecisionPolicy(param_dtype=ms.float16, reduce_dtype=ms.float32)
+        state = _make_state(policy, [])
+        state._orig_dtype = orig_dtype
+        state._need_div = True
+        return state
+
+    def test_zero_grad_clears_replicate_params(self):
+        """
+        Feature: zero_grad
+        Description: zero_grad should clear both hsdp_params and replicate_params
+        Expectation: zero_grad is called once for both parameter groups
+        """
+        state = self._make_state_for_replicate(ms.float32)
+        hsdp_param = MagicMock()
+        replicate_param = MagicMock()
+        state.hsdp_params = [hsdp_param]
+        state.replicate_params = [replicate_param]
+
+        state.zero_grad()
+
+        hsdp_param.zero_grad.assert_called_once_with()
+        replicate_param.zero_grad.assert_called_once_with()
+
+    def test_finish_ignored_allreduce_updates_returned_grad(self):
+        """
+        Feature: _finish_ignored_allreduce
+        Description: After all-reduce finishes for replicate_params,
+        the final local grad should be synced to the returned gradient object
+        Expectation: _return_grad.data is synced to the final local grad and then cleared
+        """
+        state = self._make_state_for_replicate(ms.float32)
+
+        reduced_grad = MagicMock()
+        reduced_grad.dtype = ms.float32
+        reduced_grad.to.return_value = reduced_grad
+        flat_mesh = MagicMock()
+        flat_mesh.rank_list = [0, 1]
+
+        local_grad = MagicMock()
+        sharded_grad_dtensor = MagicMock(spec=DTensor)
+        sharded_grad_dtensor.to_local.return_value = local_grad
+        returned_grad = MagicMock()
+
+        param = MagicMock()
+        param.all_reduce_handle = MagicMock()
+        param.offload_to_cpu = False
+        param.sharded_param.grad = None
+        param.to_sharded_dtensor.return_value = sharded_grad_dtensor
+        param.unsharded_accumulated_grad_data = None
+        param._return_grad = returned_grad
+
+        state._ignored_allreduce_works = [(param, reduced_grad, flat_mesh)]
+
+        with patch(
+            'hyper_parallel.platform.mindspore.fully_shard.state._to_dtype_if_needed',
+            return_value=reduced_grad
+        ):
+            state._finish_ignored_allreduce()
+
+        param.all_reduce_handle.wait.assert_called_once_with()
+        reduced_grad.view.assert_not_called()
+        param.to_sharded_dtensor.assert_called_once_with(reduced_grad)
+        self.assertEqual(returned_grad.data, local_grad)
+        self.assertIs(param.sharded_param.grad, sharded_grad_dtensor)
+        self.assertIsNone(param._return_grad)
+        self.assertEqual(state._ignored_allreduce_works, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

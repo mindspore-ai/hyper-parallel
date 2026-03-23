@@ -17,11 +17,10 @@ from typing import Optional
 import mindspore as ms
 from mindspore import ops
 import mindspore.mint.distributed as dist
-from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos
 from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
-from hyper_parallel.core.fully_shard.utils import HSDPMeshInfo, DDPMeshInfo
+from hyper_parallel.core.fully_shard.utils import HSDPMeshInfo, DDPMeshInfo, CPUOffloadPolicy
 
 
 def _to_dtype_if_needed(
@@ -43,7 +42,6 @@ class MindSporeHSDPStateV2(HSDPState):
 
     def __init__(self, cell, mesh_info, config, platform, device=None):
         super().__init__(cell, mesh_info, config, platform, device)
-        # self._init_mp_dtypes()
         # Do ReduceScatter/AllReduce for grad
         self.mp_policy = config.mp_policy
         self.offload_policy = config.offload_policy
@@ -56,11 +54,13 @@ class MindSporeHSDPStateV2(HSDPState):
         self.reduce_op_type = ops.ReduceOp.SUM
         self._need_div = True
         self._ignored_allreduce_works = []
-        self._init_mp_dtypes()
+        self._reset_sharded_params = False
 
     def zero_grad(self):
         """zero grad"""
         for hsdp_param in self.hsdp_params:
+            hsdp_param.zero_grad()
+        for hsdp_param in self.replicate_params:
             hsdp_param.zero_grad()
 
     def _div_if_needed(self, x, divisor):
@@ -140,7 +140,46 @@ class MindSporeHSDPStateV2(HSDPState):
         self._reduce_dtype = next(iter(reduce_dtypes)) if trainable_params else None
 
     def lazy_init(self):
-        pass
+        """Refresh parameter views and validate runtime state before first execution."""
+        if not self._reset_sharded_params:
+            for hsdp_param in self.hsdp_params:
+                if hsdp_param.is_sharded:
+                    hsdp_param.reset_sharded_param()
+            self._reset_sharded_params = True
+        self._validate_no_meta_params()
+        self._validate_cpu_offload_params()
+        self._init_mp_dtypes()
+
+    def _validate_cpu_offload_params(self):
+        """Validate that all parameters are on CPU when CPU offload policy is enabled."""
+        if not isinstance(self.offload_policy, CPUOffloadPolicy):
+            return
+        hsdp_params_not_on_cpu = [
+            hsdp_param
+            for hsdp_param in self.hsdp_params
+            if not str(hsdp_param.sharded_param.device).lower().startswith("cpu")
+        ]
+        if hsdp_params_not_on_cpu:
+            raise RuntimeError(
+                "HSDP parameters should be materialized on CPU when enabling CPU offloading. "
+                "For example, load a CPU state dict before training. "
+                "Found following parameters on non-CPU device: "
+                f"{[(p._param_fqn, p.sharded_param.device) for p in hsdp_params_not_on_cpu]}\n"
+            )
+
+    def _validate_no_meta_params(self):
+        """Validate that all parameters have been materialized from meta device."""
+        param_names_on_meta = [
+            hsdp_param._param_fqn
+            for hsdp_param in self.hsdp_params
+            if hsdp_param.sharded_param.device == "meta"
+        ]
+        if param_names_on_meta:
+            raise RuntimeError(
+                "HSDP parameters should be materialized from meta device before training, "
+                f"but the following were still on meta device: {param_names_on_meta}\n"
+                "For example, initialize the module weights on a real device before running training."
+            )
 
     def _apply_reduced_grad(self, hsdp_param, reduced_grad):
         """
@@ -156,12 +195,7 @@ class MindSporeHSDPStateV2(HSDPState):
                 and/or all-reduce.
         """
         sharded_grad = hsdp_param.sharded_param.grad
-        sharded_param_local_shape = (
-            hsdp_param.sharded_param.local_shape
-            if isinstance(hsdp_param.sharded_param, DTensor)
-            else hsdp_param.sharded_param.shape
-        )
-        reduced_grad = reduced_grad.view(sharded_param_local_shape)
+        reduced_grad = reduced_grad.view(hsdp_param.sharded_size)
         reduced_grad = _to_dtype_if_needed(reduced_grad, self._orig_dtype)
         to_accumulate_grad = sharded_grad is not None
         if hsdp_param.offload_to_cpu:
@@ -170,17 +204,18 @@ class MindSporeHSDPStateV2(HSDPState):
                 "cpu", non_blocking=non_blocking
             )
         if sharded_grad is None:
-            hsdp_param.sharded_param.grad = reduced_grad
+            hsdp_param.sharded_param.grad = hsdp_param.to_sharded_dtensor(reduced_grad)
         else:
-            hsdp_param.sharded_param.grad += reduced_grad
+            hsdp_param.sharded_param.grad._local_tensor += reduced_grad
 
-        # update unsharded_param.grad
-        hsdp_param.unsharded_param.grad._update_data(hsdp_param.sharded_param.grad)
+        if hsdp_param._return_grad is not None:
+            hsdp_param._return_grad.data = hsdp_param.sharded_param.grad.to_local()
 
         if hsdp_param.unsharded_accumulated_grad_data is not None:
-            hsdp_param.unsharded_accumulated_grad_data = None
+            hsdp_param.unsharded_accumulated_grad = None
         elif hsdp_param.unsharded_param.grad is not None:
             hsdp_param.unsharded_param.grad = None
+        hsdp_param._return_grad = None
 
     def _allreduce_replicate_params(self, async_op=True) -> None:
         """
@@ -237,10 +272,14 @@ class MindSporeHSDPStateV2(HSDPState):
             else:
                 param.sharded_param.grad._local_tensor += reduced_grad
 
+            if param._return_grad is not None:
+                param._return_grad.data = param.sharded_param.grad.to_local()
+
             if param.unsharded_accumulated_grad_data is not None:
                 param.unsharded_accumulated_grad = None
             elif param.unsharded_param.grad is not None:
                 param.unsharded_param.grad = None
+            param._return_grad = None
 
         self._ignored_allreduce_works.clear()
 

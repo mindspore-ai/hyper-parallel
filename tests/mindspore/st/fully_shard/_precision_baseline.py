@@ -61,7 +61,7 @@ def get_forward_fn(net):
 
 # Global hyper parameters:
 local_bs = 32
-learning_rate = 1e-3
+learning_rate = 1e-2
 max_step = 20
 
 
