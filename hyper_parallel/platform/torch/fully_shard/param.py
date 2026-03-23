@@ -574,7 +574,7 @@ class TorchHSDPParamV2(HSDPParamV2):
             )
             self.alloc_all_gather_outputs()
             cloned_data = all_gather_input.clone()
-            self.all_gather_outputs = [cloned_data]
+            self.all_gather_outputs[0].copy_(cloned_data)
             return self.all_gather_outputs[0], None
 
 
@@ -594,7 +594,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         if shard_group is None or self.shard_world_size <= 1:
             # No communication needed, just copy
             cloned_data = all_gather_input.clone()
-            self.all_gather_outputs = [cloned_data]
+            self.all_gather_outputs[0].copy_(cloned_data)
             return self.all_gather_outputs[0], None
 
         # Execute all_gather_into_tensor
