@@ -22,20 +22,41 @@ import torch
 from tests.torch.utils import init_dist
 from tests.torch.common_net import DenseNet
 from hyper_parallel.platform import get_platform
+from hyper_parallel.core.fully_shard.hsdp_utils import (
+    FullyShardParamMode,
+    ShardedState,
+)
 from hyper_parallel.core.fully_shard.utils import (
+    MixedPrecisionPolicy,
     FSDPMeshInfo,
     HSDPMeshInfo,
-    MixedPrecisionPolicy,
+    DDPMeshInfo,
 )
 from hyper_parallel.platform.torch.fully_shard.param import (
     TorchHSDPParamV2,
     ParamModuleInfo
 )
-from hyper_parallel.core.dtensor.placement_types import Shard
-from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
-from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor.placement_types import Shard, StridedShard, Replicate
+from hyper_parallel import DTensor, init_device_mesh
+
 
 platform = get_platform()
+
+
+def _current_device():
+    device_handle = platform.get_device_handle()
+    return torch.device(device_handle.current_device())
+
+
+def _build_hsdp_param(**kwargs):
+    """Construct TorchHSDPParamV2 with param_mode defaults derived from test inputs."""
+    if "param_mode" not in kwargs:
+        param = kwargs.get("param")
+        if isinstance(param, DTensor):
+            kwargs["param_mode"] = FullyShardParamMode.DTENSOR_UNIFIED
+        else:
+            kwargs["param_mode"] = FullyShardParamMode.LOCAL_PARAM
+    return TorchHSDPParamV2(**kwargs)
 
 def test_hsdp_param_v2_fsdp_1d_mesh():
     """
@@ -56,7 +77,7 @@ def test_hsdp_param_v2_fsdp_1d_mesh():
     module_info = ParamModuleInfo(module=net, param_name="weight")
     device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
@@ -113,7 +134,7 @@ def test_hsdp_param_v2_hsdp_2d_mesh():
     module_info = ParamModuleInfo(module=net, param_name="weight")
     device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
@@ -156,7 +177,7 @@ def test_hsdp_param_v2_sharded_state_transitions():
     module_info = ParamModuleInfo(module=net, param_name="weight")
     device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
@@ -221,7 +242,7 @@ def test_hsdp_param_v2_custom_shard_placement():
         return Shard(1)
     device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2 with custom placement
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
@@ -268,7 +289,7 @@ def test_hsdp_param_v2_mixed_precision():
     )
     device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2 with mixed precision
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
@@ -308,7 +329,7 @@ def test_hsdp_param_v2_all_gather_comm():
     module_info = ParamModuleInfo(module=net, param_name="weight")
     device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
@@ -350,7 +371,7 @@ def test_hsdp_param_v2_prefetch_unshard():
     module_info = ParamModuleInfo(module=net, param_name="weight")
     device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
@@ -391,7 +412,7 @@ def test_hsdp_param_v2_unshard_shard_cycle():
     module_info = ParamModuleInfo(module=net, param_name="weight")
     device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
@@ -433,7 +454,7 @@ def test_hsdp_param_v2_reduce_scatter_grad():
     module_info = ParamModuleInfo(module=net, param_name="weight")
     device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
@@ -500,7 +521,7 @@ def test_hsdp_param_v2_all_reduce_grad():
     module_info = ParamModuleInfo(module=net, param_name="weight")
     device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
@@ -557,7 +578,7 @@ def test_hsdp_param_v2_accumulate_grad():
     module_info = ParamModuleInfo(module=net, param_name="weight")
     device_handle = platform.get_device_handle()
     # Create TorchHSDPParamV2
-    hsdp_param = TorchHSDPParamV2(
+    hsdp_param = _build_hsdp_param(
         param=net.weight,
         module_info=module_info,
         mesh_info=mesh_info,
@@ -606,3 +627,462 @@ def test_hsdp_param_v2_accumulate_grad():
 
     assert torch.allclose(sharded_grad, torch.full_like(sharded_grad, expected_reduced_value)), \
         f"Rank {rank}: Expected reduced {expected_reduced_value}, got {sharded_grad.flatten()[0].item()}"
+
+
+def test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test DTensor param on 2D dp x tp mesh with fully_shard enabled.
+    Expectation: fully_shard only adds DP sharding and preserves TP placement after unshard.
+    """
+    rank, _ = init_dist()
+    world_size = dist.get_world_size()
+    tp_size = 2
+    assert world_size % tp_size == 0, "world_size should be divisible by tp_size"
+    dp_size = world_size // tp_size
+
+    root_mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(dp_size, tp_size),
+        mesh_dim_names=("dp", "tp"),
+    )
+    dp_mesh = root_mesh["dp"]
+    tp_mesh = root_mesh["tp"]
+    mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
+
+    in_channels, hidden_size = 32, 64
+    net = DenseNet(in_channels, hidden_size)
+    local_weight = torch.full((in_channels, hidden_size // tp_size), float(rank), device="npu")
+    net.weight = torch.nn.Parameter(
+        DTensor.from_local(local_weight, tp_mesh, (Shard(1),))
+    )
+    module_info = ParamModuleInfo(module=net, param_name="weight")
+
+    hsdp_param = _build_hsdp_param(
+        param=net.weight,
+        module_info=module_info,
+        mesh_info=mesh_info,
+        device=_current_device(),
+        param_mode=FullyShardParamMode.DTENSOR_UNIFIED,
+    )
+
+    assert hsdp_param.sharded_state == ShardedState.SHARDED
+    assert hsdp_param.sharded_size == torch.Size((in_channels // dp_size, hidden_size // tp_size))
+    assert hsdp_param._spmd_placements[0] == Shard(0)
+    assert hsdp_param._spmd_placements[1] == Shard(1)
+
+    hsdp_param.unshard()
+    hsdp_param.wait_for_unshard()
+    assert hsdp_param.sharded_state == ShardedState.UNSHARDED
+    assert isinstance(hsdp_param.unsharded_param, DTensor)
+    assert tuple(hsdp_param.unsharded_param.placements) == (Shard(1),)
+    assert hsdp_param.unsharded_param.to_local().shape == torch.Size((in_channels, hidden_size // tp_size))
+
+    print(f"[Rank {rank}] 2D dp x tp DTensor preserve TP layout test passed")
+
+
+def test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test DTensor param on 2D dp x tp mesh when TP and fully_shard split the same tensor dim.
+    Expectation: fully_shard uses StridedShard and layout tensor_map preserves the split order.
+    """
+    rank, _ = init_dist()
+    world_size = dist.get_world_size()
+    tp_size = 2
+    assert world_size % tp_size == 0, "world_size should be divisible by tp_size"
+    dp_size = world_size // tp_size
+
+    root_mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(dp_size, tp_size),
+        mesh_dim_names=("dp", "tp"),
+    )
+    dp_mesh = root_mesh["dp"]
+    tp_mesh = root_mesh["tp"]
+    mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
+
+    in_channels, hidden_size = 32, 64
+    net = DenseNet(in_channels, hidden_size)
+    local_weight = torch.full((in_channels // tp_size, hidden_size), float(rank), device="npu")
+    net.weight = torch.nn.Parameter(
+        DTensor.from_local(local_weight, tp_mesh, (Shard(0),))
+    )
+    module_info = ParamModuleInfo(module=net, param_name="weight")
+
+    hsdp_param = _build_hsdp_param(
+        param=net.weight,
+        module_info=module_info,
+        mesh_info=mesh_info,
+        device=_current_device(),
+        param_mode=FullyShardParamMode.DTENSOR_UNIFIED,
+    )
+
+    assert hsdp_param.sharded_state == ShardedState.SHARDED
+    assert hsdp_param.sharded_size == torch.Size((in_channels // (dp_size * tp_size), hidden_size))
+    assert tuple(hsdp_param._spmd_placements) == (StridedShard(0, tp_size), Shard(0))
+    assert hsdp_param._sharding_spec.tensor_map == ((0, 1), -1)
+
+    hsdp_param.unshard()
+    hsdp_param.wait_for_unshard()
+    assert hsdp_param.sharded_state == ShardedState.UNSHARDED
+    assert isinstance(hsdp_param.unsharded_param, DTensor)
+    assert tuple(hsdp_param.unsharded_param.placements) == (Shard(0),)
+    assert hsdp_param.unsharded_param.to_local().shape == torch.Size((in_channels // tp_size, hidden_size))
+
+    print(f"[Rank {rank}] 2D dp x tp same-dim StridedShard test passed")
+
+
+def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test DTensor param on 3D dp x tp x ep mesh.
+    Expectation: unshard only restores the DP/FSDP dim and keeps TP/EP placements unchanged.
+    """
+    rank, _ = init_dist()
+    world_size = dist.get_world_size()
+    dp_size = 2
+    tp_size = 2
+    assert world_size % (dp_size * tp_size) == 0, "world_size should be divisible by dp_size * tp_size"
+    ep_size = world_size // (dp_size * tp_size)
+
+    root_mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(dp_size, tp_size, ep_size),
+        mesh_dim_names=("dp", "tp", "ep"),
+    )
+    dp_mesh = root_mesh["dp"]
+    tp_ep_mesh = root_mesh[("tp", "ep")]
+    mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
+
+    in_channels, hidden_size = 32, 64
+    net = DenseNet(in_channels, hidden_size)
+    local_weight = torch.full((in_channels, hidden_size // tp_size), float(rank), device="npu")
+    net.weight = torch.nn.Parameter(
+        DTensor.from_local(local_weight, tp_ep_mesh, (Shard(1), Replicate()))
+    )
+    module_info = ParamModuleInfo(module=net, param_name="weight")
+
+    hsdp_param = _build_hsdp_param(
+        param=net.weight,
+        module_info=module_info,
+        mesh_info=mesh_info,
+        device=_current_device(),
+        param_mode=FullyShardParamMode.DTENSOR_UNIFIED,
+    )
+
+    assert hsdp_param.sharded_state == ShardedState.SHARDED
+    assert hsdp_param.sharded_size == torch.Size((in_channels // dp_size, hidden_size // tp_size))
+    assert tuple(hsdp_param._spmd_placements) == (Shard(0), Shard(1), Replicate())
+
+    hsdp_param.unshard()
+    hsdp_param.wait_for_unshard()
+    assert hsdp_param.sharded_state == ShardedState.UNSHARDED
+    assert isinstance(hsdp_param.unsharded_param, DTensor)
+    assert tuple(hsdp_param.unsharded_param.placements) == (Shard(1), Replicate())
+    assert hsdp_param.unsharded_param.to_local().shape == torch.Size((in_channels, hidden_size // tp_size))
+
+    print(f"[Rank {rank}] 3D dp x tp x ep DTensor unshard test passed")
+
+
+def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test the DTensor compatibility mode without extra fully_shard parameter sharding.
+    Expectation: TP-replicated parameters are synchronized by all-reduce only.
+    """
+    rank, _ = init_dist()
+    world_size = dist.get_world_size()
+
+    mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(world_size,),
+        mesh_dim_names=("tp",),
+    )
+    mesh_info = DDPMeshInfo(mesh=mesh, replicate_mesh_dim=0)
+
+    in_channels, hidden_size = 32, 64
+    net = DenseNet(in_channels, hidden_size)
+    local_weight = torch.full((in_channels, hidden_size), float(rank), device="npu")
+    net.weight = torch.nn.Parameter(
+        DTensor.from_local(local_weight, mesh, (Replicate(),))
+    )
+    module_info = ParamModuleInfo(module=net, param_name="weight")
+
+    hsdp_param = _build_hsdp_param(
+        param=net.weight,
+        module_info=module_info,
+        mesh_info=mesh_info,
+        device=_current_device(),
+        param_mode=FullyShardParamMode.DTENSOR_COMPAT,
+    )
+
+    assert hsdp_param.is_sharded is False
+    assert hsdp_param.shard_size == 1
+    assert hsdp_param.dp_size == world_size
+    assert hsdp_param.unsharded_group_info.rank_size == world_size
+
+    grad = torch.full_like(local_weight, float(rank))
+    hsdp_param.all_reduce_grad(grad=grad, async_op=False, reduce_op=dist.ReduceOp.SUM)
+    reduced_grad = hsdp_param.all_reduce_output()
+    hsdp_param.clear_all_reduce_output()
+
+    expected_value = float(sum(range(world_size)))
+    assert torch.allclose(
+        reduced_grad,
+        torch.full_like(reduced_grad, expected_value),
+    ), f"Rank {rank}: expected {expected_value}, got {reduced_grad.flatten()[0].item()}"
+
+    print(f"[Rank {rank}] Pure TP no-param-shard all-reduce test passed")
+
+
+def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test DTensor compatibility mode for already sharded distributed parameters.
+    Expectation: TP-sharded parameters do not create an all-reduce group in the compatibility path.
+    """
+    rank, _ = init_dist()
+    world_size = dist.get_world_size()
+
+    mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(world_size,),
+        mesh_dim_names=("tp",),
+    )
+    mesh_info = DDPMeshInfo(mesh=mesh, replicate_mesh_dim=0)
+
+    in_channels, hidden_size = 32, 64
+    net = DenseNet(in_channels, hidden_size)
+    local_weight = torch.full((in_channels, hidden_size // world_size), float(rank), device="npu")
+    net.weight = torch.nn.Parameter(
+        DTensor.from_local(local_weight, mesh, (Shard(1),))
+    )
+    module_info = ParamModuleInfo(module=net, param_name="weight")
+
+    hsdp_param = _build_hsdp_param(
+        param=net.weight,
+        module_info=module_info,
+        mesh_info=mesh_info,
+        device=_current_device(),
+        param_mode=FullyShardParamMode.DTENSOR_COMPAT,
+    )
+
+    assert hsdp_param.is_sharded is False
+    assert hsdp_param.shard_size == 1
+    assert hsdp_param.dp_size == 1
+    assert hsdp_param.unsharded_group_info.rank_size == 1
+
+    grad = torch.full_like(local_weight, float(rank))
+    reduced_grad, handle = hsdp_param.all_reduce_grad(grad=grad, async_op=False, reduce_op=dist.ReduceOp.SUM)
+
+    assert handle is None
+    assert torch.allclose(reduced_grad, grad)
+    print(f"[Rank {rank}] Pure TP sharded parameter skip all-reduce test passed")
+
+
+def test_hsdp_param_v2_explicit_dp_mesh_prefixes_unified_layout():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test unified mesh uses explicit DP mesh prefix followed by TP mesh.
+    Expectation: DP replicate group size stays correct and StridedShard is applied on the FSDP axis.
+    """
+    rank, _ = init_dist()
+    world_size = dist.get_world_size()
+    if world_size % 4 != 0:
+        print(f"[Rank {rank}] Skip explicit DP mesh prefix test because world_size={world_size} is not divisible by 4")
+        return
+
+    tp_size = world_size // 4
+    dp_size = 2
+    fsdp_size = 2
+    root_mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(dp_size, fsdp_size, tp_size),
+        mesh_dim_names=("dp", "fsdp", "tp"),
+    )
+    dp_fsdp_mesh = root_mesh[("dp", "fsdp")]
+    tp_mesh = root_mesh["tp"]
+    mesh_info = HSDPMeshInfo(mesh=dp_fsdp_mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
+
+    in_channels, hidden_size = 32, 64
+    net = DenseNet(in_channels, hidden_size)
+    local_weight = torch.full((in_channels // max(tp_size, 1), hidden_size), float(rank), device="npu")
+    net.weight = torch.nn.Parameter(
+        DTensor.from_local(local_weight, tp_mesh, (Shard(0),))
+    )
+    module_info = ParamModuleInfo(module=net, param_name="weight")
+    hsdp_param = TorchHSDPParamV2(
+        param=net.weight,
+        module_info=module_info,
+        mesh_info=mesh_info,
+        device=_current_device(),
+        param_mode=FullyShardParamMode.DTENSOR_UNIFIED,
+    )
+
+    assert hsdp_param._spmd_mesh.mesh_dim_names == ("dp", "fsdp", "tp")
+    assert hsdp_param._spmd_replicate_mesh_dim == 0
+    assert hsdp_param._spmd_shard_mesh_dim == 1
+    assert hsdp_param.unsharded_group_info.rank_size == dp_size
+    assert hsdp_param.dp_size == dp_size
+
+    if tp_size > 1:
+        assert hsdp_param._spmd_placements[0] == Replicate()
+        assert hsdp_param._spmd_placements[1] == StridedShard(0, tp_size)
+        assert hsdp_param._spmd_placements[2] == Shard(0)
+    print(f"[Rank {rank}] Explicit DP-prefix unified mesh/group-info test passed")
+
+
+def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test DTensor unified layout keeps the explicit DP/FSDP dims on the unified mesh.
+    Expectation: shard/replicate mesh dims and unsharded group construction stay correct.
+    """
+    rank, _ = init_dist()
+    world_size = dist.get_world_size()
+    if world_size % 4 != 0:
+        print(f"[Rank {rank}] Skip reordered mesh remap test because world_size={world_size} is not divisible by 4")
+        return
+
+    tp_size = world_size // 4
+    dp_size = 2
+    fsdp_size = 2
+    root_mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(dp_size, fsdp_size, tp_size),
+        mesh_dim_names=("dp", "fsdp", "tp"),
+    )
+    dp_fsdp_mesh = root_mesh[("dp", "fsdp")]
+    tp_mesh = root_mesh["tp"]
+    mesh_info = HSDPMeshInfo(mesh=dp_fsdp_mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
+
+    in_channels, hidden_size = 32, 64
+    net = DenseNet(in_channels, hidden_size)
+    local_weight = torch.full((in_channels // max(tp_size, 1), hidden_size), float(rank), device="npu")
+    net.weight = torch.nn.Parameter(
+        DTensor.from_local(local_weight, tp_mesh, (Shard(0),))
+    )
+    module_info = ParamModuleInfo(module=net, param_name="weight")
+    hsdp_param = TorchHSDPParamV2(
+        param=net.weight,
+        module_info=module_info,
+        mesh_info=mesh_info,
+        device=_current_device(),
+        param_mode=FullyShardParamMode.DTENSOR_UNIFIED,
+    )
+
+    assert hsdp_param._spmd_mesh.mesh_dim_names == ("dp", "fsdp", "tp")
+    assert hsdp_param._spmd_replicate_mesh_dim == 0
+    assert hsdp_param._spmd_shard_mesh_dim == 1
+    assert hsdp_param.sharded_group_info.rank_size == fsdp_size
+    assert hsdp_param.unsharded_group_info.rank_size == dp_size
+    assert hsdp_param.dp_size == dp_size
+    assert hsdp_param.shard_size == fsdp_size
+
+    if tp_size > 1:
+        assert hsdp_param._spmd_placements[0] == Replicate()
+        assert hsdp_param._spmd_placements[1] == StridedShard(0, tp_size)
+        assert hsdp_param._spmd_placements[2] == Shard(0)
+
+    hsdp_param.unshard()
+    hsdp_param.wait_for_unshard()
+    assert hsdp_param.sharded_state == ShardedState.UNSHARDED
+    assert isinstance(hsdp_param.unsharded_param, DTensor)
+    assert tuple(hsdp_param.unsharded_param.placements) == (Shard(0),)
+
+    print(f"[Rank {rank}] Reordered mesh remap DTensor test passed")
+
+
+def test_hsdp_param_v2_reduce_scatter_guard_non_dim0():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test reduce_scatter_grad rejects non-dim0 fully_shard placement.
+    Expectation: reduce_scatter_grad raises NotImplementedError.
+    """
+    rank, _ = init_dist()
+    world_size = dist.get_world_size()
+    if world_size <= 1:
+        print(f"[Rank {rank}] Skip non-dim0 RS guard test because world_size={world_size}")
+        return
+
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    mesh_info = FSDPMeshInfo(mesh=mesh, shard_mesh_dim=0)
+    in_channels, hidden_size = 16, world_size * 8
+    net = DenseNet(in_channels, hidden_size)
+    module_info = ParamModuleInfo(module=net, param_name="weight")
+
+    def custom_shard_fn(param):  # pylint: disable=unused-argument
+        return Shard(1)
+
+    hsdp_param = _build_hsdp_param(
+        param=net.weight,
+        module_info=module_info,
+        mesh_info=mesh_info,
+        shard_placement_fn=custom_shard_fn,
+        device=_current_device(),
+        param_mode=FullyShardParamMode.LOCAL_PARAM,
+    )
+
+    hsdp_param.unshard()
+    hsdp_param.wait_for_unshard()
+    hsdp_param.unsharded_param.grad = torch.ones(
+        (in_channels, hidden_size), dtype=hsdp_param.unsharded_param.dtype, device=_current_device()
+    )
+    try:
+        hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
+    except NotImplementedError as exc:
+        assert "dim=0" in str(exc)
+    else:
+        raise AssertionError("Expected reduce_scatter_grad to reject non-dim0 fully_shard placement")
+    print(f"[Rank {rank}] Non-dim0 RS guard test passed")
+
+
+def test_hsdp_param_v2_reduce_scatter_guard_strided_shard():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test reduce_scatter_grad rejects StridedShard layout until placement-aware packing is implemented.
+    Expectation: reduce_scatter_grad raises NotImplementedError.
+    """
+    rank, _ = init_dist()
+    world_size = dist.get_world_size()
+    if world_size < 4 or world_size % 2 != 0:
+        print(f"[Rank {rank}] Skip StridedShard RS guard test because world_size={world_size}")
+        return
+
+    tp_size = 2
+    dp_size = world_size // tp_size
+    root_mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(dp_size, tp_size),
+        mesh_dim_names=("dp", "tp"),
+    )
+    dp_mesh = root_mesh["dp"]
+    tp_mesh = root_mesh["tp"]
+    mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
+    in_channels, hidden_size = 32, 64
+    net = DenseNet(in_channels, hidden_size)
+    local_weight = torch.full((in_channels // tp_size, hidden_size), float(rank), device="npu")
+    net.weight = torch.nn.Parameter(
+        DTensor.from_local(local_weight, tp_mesh, (Shard(0),))
+    )
+    module_info = ParamModuleInfo(module=net, param_name="weight")
+    hsdp_param = _build_hsdp_param(
+        param=net.weight,
+        module_info=module_info,
+        mesh_info=mesh_info,
+        device=_current_device(),
+        param_mode=FullyShardParamMode.DTENSOR_UNIFIED,
+    )
+
+    assert any(isinstance(placement, StridedShard) for placement in hsdp_param._spmd_placements)
+    hsdp_param.unshard()
+    hsdp_param.wait_for_unshard()
+    hsdp_param.unsharded_accumulated_grad = torch.ones_like(hsdp_param.unsharded_param.to_local())
+    try:
+        hsdp_param.reduce_scatter_grad(async_op=False, reduce_op=dist.ReduceOp.SUM)
+    except NotImplementedError as exc:
+        assert "StridedShard" in str(exc)
+    else:
+        raise AssertionError("Expected reduce_scatter_grad to reject StridedShard layout")
+    print(f"[Rank {rank}] StridedShard RS guard test passed")

@@ -14,8 +14,9 @@
 # ============================================================================
 """device mesh"""
 
+import copy
 import os
-from typing import Literal, Optional, Union, List, Any
+from typing import Literal, Optional, Union, List, Any, Sequence
 import numpy as np
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
@@ -487,13 +488,14 @@ class DeviceMesh:
         sub_mesh.root_mesh = self._get_root_mesh()
 
         slice_dim_group_name = []
-        for name in sub_mesh_dim_names:
-            # pylint: disable=E1135
-            if name in self.mesh_dim_names:
-                slice_dim_group_name.append(
-                    self._dim_group_names[self.mesh_dim_names.index(name)]
-                )
-        sub_mesh._dim_group_names = slice_dim_group_name  # pylint: disable=W0212
+        if hasattr(self, "_dim_group_names"):
+            for name in sub_mesh_dim_names:
+                # pylint: disable=E1135
+                if name in self.mesh_dim_names:
+                    slice_dim_group_name.append(
+                        self._dim_group_names[self.mesh_dim_names.index(name)]
+                    )
+            sub_mesh._dim_group_names = slice_dim_group_name  # pylint: disable=W0212
 
         # Cache and track
         self._sub_mesh_cache[sub_mesh_dim_names] = sub_mesh
@@ -723,6 +725,47 @@ class DeviceMesh:
             return self
         # pylint: disable=protected-access
         return self._root_mesh._get_root_mesh()
+
+    @staticmethod
+    def concatenate(meshes: Sequence['DeviceMesh']) -> 'DeviceMesh':
+        """
+        Concatenate explicit sub-meshes by following their order on the same root mesh.
+
+        This mirrors the fully_shard use case where data-parallel mesh dimensions are
+        prefixed ahead of the pre-existing DTensor mesh dimensions.
+        """
+        if len(meshes) == 0:
+            raise ValueError("DeviceMesh.concatenate expects at least one mesh.")
+        if len(meshes) == 1:
+            return meshes[0]
+
+        root_mesh = meshes[0]._get_root_mesh()  # pylint: disable=protected-access
+        if not root_mesh.mesh_dim_names:
+            raise ValueError("DeviceMesh.concatenate requires root mesh_dim_names.")
+
+        requested_dim_names: list[str] = []
+        for mesh in meshes:
+            if mesh._get_root_mesh().to_hash() != root_mesh.to_hash():  # pylint: disable=protected-access
+                raise ValueError("DeviceMesh.concatenate expects all meshes to share the same root mesh.")
+            if not mesh.mesh_dim_names:
+                raise ValueError("DeviceMesh.concatenate requires mesh_dim_names on every input mesh.")
+            requested_dim_names.extend(mesh.mesh_dim_names)
+
+        if len(set(requested_dim_names)) != len(requested_dim_names):
+            raise ValueError(
+                f"DeviceMesh.concatenate expects disjoint mesh dims, but got {tuple(requested_dim_names)}."
+            )
+
+        root_dim_names = tuple(root_mesh.mesh_dim_names)
+        requested_indices = [root_dim_names.index(dim_name) for dim_name in requested_dim_names]
+        if requested_indices != sorted(requested_indices):
+            raise ValueError(
+                "DeviceMesh.concatenate expects meshes to follow the root mesh order. "
+                f"Got root mesh dims {root_dim_names} and requested dims {tuple(requested_dim_names)}."
+            )
+        return root_mesh[tuple(requested_dim_names)]
+
+    _concatenate = concatenate
 
     def _create_flatten_mesh(self, mesh_dim_name: Optional[str] = None) -> 'DeviceMesh':
         """Create a flattened 1D mesh from the current mesh.
@@ -995,6 +1038,20 @@ class DeviceMesh:
     def __str__(self):
         """__str__"""
         return self.__repr__()
+
+    def __deepcopy__(self, memo):
+        """Preserve sub-mesh/root-mesh relationships during deepcopy."""
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            if k == "_root_mesh":
+                # Keep the original root mesh reference so copied sub-meshes
+                # still resolve back to the same root mesh graph.
+                setattr(result, k, v)
+            else:
+                setattr(result, k, copy.deepcopy(v, memo))
+        return result
 
 
 _DEVICE_MESH_MAP = {}

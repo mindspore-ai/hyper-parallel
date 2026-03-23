@@ -70,7 +70,7 @@ class Shard(Placement):
         return self._dim == dim
 
     def __eq__(self, other: object) -> bool:
-        return isinstance(other, Shard) and self.dim == other.dim
+        return type(self) is type(other) and self.dim == other.dim
 
     def __hash__(self) -> int:
         return self._dim
@@ -81,6 +81,40 @@ class Shard(Placement):
 
     def __str__(self) -> str:
         return f"S({self._dim})"
+
+
+class StridedShard(Shard):
+    """
+    Placement strategy indicating that the tensor is sharded on a dimension whose
+    right-side mesh dimensions have already split the same tensor dimension.
+    """
+
+    def __init__(self, dim: int, split_factor: int):
+        super().__init__(dim)
+        if split_factor < 1:
+            raise ValueError(f"split_factor must be positive, but got {split_factor}")
+        self._split_factor = split_factor
+
+    @property
+    def split_factor(self) -> int:
+        """Get the split factor contributed by right-side shard dimensions."""
+        return self._split_factor
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, StridedShard)
+            and self.dim == other.dim
+            and self.split_factor == other.split_factor
+        )
+
+    def __hash__(self) -> int:
+        return hash((self._dim, self._split_factor, "StridedShard"))
+
+    def __repr__(self) -> str:
+        return f"StridedShard(dim={self.dim}, split_factor={self.split_factor})"
+
+    def __str__(self) -> str:
+        return f"SS({self._dim}, {self._split_factor})"
 
 
 class Replicate(Placement):

@@ -22,6 +22,11 @@ from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, OffloadP
 from hyper_parallel import DeviceMesh, init_device_mesh
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
+from hyper_parallel.core.fully_shard.hsdp_utils import (
+    get_managed_modules_parameters,
+    is_dtensor_managed_param,
+    get_dtensor_managed_mesh,
+)
 
 platform = get_platform()
 
@@ -338,8 +343,10 @@ class HSDPModule:
 
     def set_reduce_op_type(self, reduce_op_type) -> None:
         """
-        set reduce_op_type for all reduce operations in HSDP
-        support reduce_op_type "avg" and "sum", default is "avg"
+        Set reduce_op_type for all gradient reductions in fully_shard.
+
+        Supports ``"avg"`` and ``"sum"``. Local-parameter FSDP/HSDP keeps the
+        historical ``"avg"`` default, while DTensor-based paths default to ``"sum"``.
         """
         if hsdp_state := self.hsdp_scheduler.hsdp_state:
             hsdp_state.set_reduce_op_type(reduce_op_type)
@@ -491,6 +498,11 @@ def _normalize_replicate_params(
     return out
 
 
+def _get_modules_parameters(modules, ignored_params=None):
+    """Collect deduplicated parameters from module roots."""
+    return get_managed_modules_parameters(modules, ignored_params)
+
+
 def fully_shard(
         module: Union[platform.Module, List[platform.Module]],
         *,
@@ -503,6 +515,7 @@ def fully_shard(
         replicate_params: Optional[set[platform.Parameter]] = None,
         comm_fusion: bool = False
 ) -> Union[platform.Module, List[platform.Module]]:
+
     """
     Apply fully_shard to a module (or list of modules) for distributed training with parameter sharding.
 
@@ -522,9 +535,9 @@ def fully_shard(
 
         mesh (Optional[DeviceMesh], default=None):
             The device mesh defining the process topology for distributed training.
-            If None, a default 1D mesh with all processes in the sharding dimension
-            is created. For HSDP mode, use a 2D mesh with dimensions configured
-            for sharding (dim 1) and replication (dim 0).
+            If None, fully_shard keeps pure-DTensor modules on their original
+            distributed layout and only creates a default 1D mesh when local
+            parameters need explicit data-parallel/FSDP management.
 
         reshard_after_forward (bool, default=True):
             Whether to automatically reshard parameters after forward. When True,
@@ -543,17 +556,22 @@ def fully_shard(
             Memory offload policy for reducing device memory usage.
 
         ignored_params (Optional[set[nn.Parameter]], default=None):
-            Set of parameters to exclude from sharding. These parameters remain
-            fully replicated across all devices. Useful for small parameters where
-            sharding overhead outweighs memory benefits, or parameters that must
-            remain unsharded for correctness.
+            Set of parameters to exclude from fully_shard management entirely.
+            These parameters are left on the original module as regular parameters,
+            are not sharded, and do not participate in fully_shard gradient
+            synchronization. Use this for parameters that should remain outside
+            the fully_shard lifecycle.
+
         comm_fusion  (bool, default=False):
             Whether enable all_gather fusion and reduce_scatter fusion.
 
         replicate_params (Optional[set[nn.Parameter]], default=None):
-            Set of parameters to exclude from sharding. These parameters remain
-            fully replicated across all devices. The gradients of these parameters
-            will be processed according to DDP.
+            Set of parameters to keep replicated while still managing them under
+            fully_shard. These parameters are not sharded, but their gradients
+            are still synchronized with DDP-style all-reduce over the current
+            fully_shard communication domain. This differs from ``ignored_params``,
+            which skips fully_shard management and gradient synchronization
+            entirely for the selected parameters.
 
     Returns:
         nn.Module or List[nn.Module]: The input module(s) with HSDP capabilities added.
@@ -570,9 +588,23 @@ def fully_shard(
     for mod in modules:
         _extend_module_with_hsdp_interface(mod)
 
-    mesh = mesh or init_device_mesh(device_type="npu", mesh_shape=(platform.get_world_size(),))
-    device = _get_device_from_mesh(mesh)
+    params = _get_modules_parameters(modules, ignored_params)
+    has_dtensor_param = any(is_dtensor_managed_param(param) for param in params)
     replicate_params = _normalize_replicate_params(replicate_params)
+
+    if mesh is None and not has_dtensor_param:
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(platform.get_world_size(),))
+    if mesh is not None:
+        device = _get_device_from_mesh(mesh)
+    else:
+        compat_mesh = next(
+            (dtensor_mesh for param in params if (dtensor_mesh := get_dtensor_managed_mesh(param)) is not None),
+            None,
+        )
+        if compat_mesh is None:
+            raise ValueError("fully_shard could not resolve a DTensor mesh for compatibility mode.")
+        device = _get_device_from_mesh(compat_mesh)
+
     init_modules = modules
     modules[0].hsdp_init(
         platform_type,

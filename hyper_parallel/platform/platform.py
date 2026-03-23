@@ -278,6 +278,7 @@ class Platform:
             return EXISTING_COMM_GROUPS[group_key]
 
         group = self._create_group(rank_list)
+        EXISTING_COMM_GROUPS[group_key] = group
         return group
 
     def _process_current_handle(self):
