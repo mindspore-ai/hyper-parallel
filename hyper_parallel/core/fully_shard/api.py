@@ -70,7 +70,8 @@ def _resolve_local_tensor(
         return val
     if val_shape == global_shape:
         wrapped = distribute_tensor(
-            val.detach(), target.device_mesh, target.placements,
+            val.detach(), target.device_mesh,
+            target.layout.alias_placements if target.layout else target.placements,
         )
         return wrapped.to_local()
     raise ValueError(

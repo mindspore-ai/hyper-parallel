@@ -403,14 +403,14 @@ class MindSporePlatform(Platform):
         if not param.has_init:
             # has been init, get slice data
             param_dtensor = DTensor.from_local(
-                _get_slice_tensor_by_layout(param, layout).value(), layout.mesh, layout.placements
+                _get_slice_tensor_by_layout(param, layout).value(), layout.mesh, layout.alias_placements
             )
             param = Parameter(param_dtensor, name=name, requires_grad=requires_grad)
             param.param_info = param_info
         else:
             # has not been init, need to modify init shape
             param.init_mode.shape = slice_shape
-            param_dtensor = DTensor.from_local(param.init_mode, layout.mesh, layout.placements)
+            param_dtensor = DTensor.from_local(param.init_mode, layout.mesh, layout.alias_placements)
             param = Parameter(param_dtensor, name=name, requires_grad=requires_grad)
             param.param_info = param_info
         return param

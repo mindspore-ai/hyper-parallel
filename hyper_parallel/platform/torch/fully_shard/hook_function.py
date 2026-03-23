@@ -66,6 +66,6 @@ class PostBackwardFunction(torch.autograd.Function):
                     output += (output_item,)
                 else:
 
-                    output += (DTensor.from_local(output_item, item_layout.mesh, item_layout.placements),)
+                    output += (DTensor.from_local(output_item, item_layout.mesh, item_layout.alias_placements),)
             return output
         return origin_output

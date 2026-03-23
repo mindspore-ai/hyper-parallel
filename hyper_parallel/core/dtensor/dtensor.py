@@ -14,7 +14,7 @@
 # ============================================================================
 """dtensor"""
 import copy as cp
-from typing import Sequence, Tuple
+from typing import Sequence, Tuple, Union
 import numpy as np
 from hyper_parallel.core.dtensor.layout import Layout, DeviceMesh, _get_slice_tensor_by_layout
 from hyper_parallel.core.dtensor.placement_types import Placement, Replicate
@@ -44,9 +44,35 @@ class SkipDTensorDispatch():
 _LAYOUT_CACHE = {}
 
 
+def _is_alias_placements(placements) -> bool:
+    """
+    Check if placements use alias strings rather than Placement objects.
+
+    Alias placements use mesh dimension names (strings) to specify
+    the sharding strategy, e.g., ("dp", "tp") or (("dp", "tp"), "None").
+    All elements must be strings or tuples of strings for the sequence
+    to be recognized as alias-style.
+
+    Args:
+        placements: A sequence of placement specifications.
+
+    Returns:
+        bool: True if all elements are alias strings or tuples of strings.
+    """
+    if len(placements) == 0:
+        return False
+    for p in placements:
+        if isinstance(p, str):
+            continue
+        if isinstance(p, tuple) and len(p) > 0 and all(isinstance(x, str) for x in p):
+            continue
+        return False
+    return True
+
+
 def _build_layout(
         device_mesh: DeviceMesh,
-        placements: Sequence[Placement],
+        placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]],
         tensor_dim: int
 ) -> Layout:
     """
@@ -57,27 +83,38 @@ def _build_layout(
 
     Args:
         device_mesh: The device mesh describing the device topology.
-        placements: Sequence of Placement objects (Shard, Replicate, etc.).
+        placements: Supports two styles:
+            - Placement objects (Shard, Replicate, etc.)
+            - Alias strings ("dp", "None", ("dp", "tp"), etc.), length must
+              equal the number of tensor dimensions (``tensor_dim``).
         tensor_dim: Number of dimensions in the tensor.
 
     Returns:
         Layout: The built layout object.
+
+    Raises:
+        ValueError: If alias placements length does not match tensor dimensions.
     """
-    # Create cache key using device_mesh hash, placements tuple, and tensor_dim
     mesh_key = device_mesh.to_hash()
-    placements_key = tuple(placements)  # Convert to tuple for hashability
+    placements_key = tuple(placements)
     cache_key = (mesh_key, placements_key, tensor_dim)
 
-    # Check cache
     if cache_key in _LAYOUT_CACHE:
         return _LAYOUT_CACHE[cache_key]
 
-    # Build layout if not in cache
     layout = Layout.from_device_mesh(device_mesh)
-    result = layout(placements)
-    result.placement_to_tensor_map(tensor_dim)
 
-    # Store in cache
+    if _is_alias_placements(placements):
+        if len(placements) != tensor_dim:
+            raise ValueError(
+                f"Alias placements length ({len(placements)}) must equal "
+                f"tensor dimensions ({tensor_dim})."
+            )
+        result = layout(*placements)
+    else:
+        result = layout(placements)
+        result.placement_to_tensor_map(tensor_dim)
+
     _LAYOUT_CACHE[cache_key] = result
 
     return result
@@ -93,14 +130,19 @@ class DTensor(DTensorBase):
     Args:
         local_tensor (Tensor): The local tensor shard on this device.
         device_mesh (DeviceMesh): The device mesh describing the device topology.
-        placements (Sequence[Placement]): The placement strategy for each mesh dimension.
-            Each element should be a Placement object (Shard, Replicate, Partial, etc.).
+        placements: The placement strategy. Supports two styles:
+            - Placement objects (e.g., ``[Shard(0), Replicate()]``).
+            - Alias strings (e.g., ``("dp", "None")`` or
+              ``(("dp", "tp"), "None")``), length must equal the number of
+              tensor dimensions.
 
     Example:
-        >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
         >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
         >>> local_tensor = Tensor(np.ones((4, 4)))
+        >>> # Placement style
         >>> dtensor = DTensor.from_local(local_tensor, mesh, [Shard(0), Replicate()])
+        >>> # Alias style — length matches tensor dims
+        >>> dtensor = DTensor.from_local(local_tensor, mesh, ("dp", "None"))
     """
     _local_tensor: Tensor
     _device_mesh: DeviceMesh
@@ -110,15 +152,14 @@ class DTensor(DTensorBase):
         self,
         local_tensor: Tensor,
         device_mesh: DeviceMesh,
-        placements: Sequence[Placement]
+        placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]]
     ):
         self._local_tensor = local_tensor
         self._device_mesh = device_mesh
-        self._placements = tuple(placements)
-        # Build internal layout for redistribution operations
         self._layout = _build_layout(
             device_mesh, placements, len(local_tensor.shape)
         )
+        self._placements = tuple(self._layout.placements)
 
     @property
     def device_mesh(self) -> DeviceMesh:
@@ -141,7 +182,7 @@ class DTensor(DTensorBase):
     def from_local(
         local_tensor: Tensor,
         device_mesh: DeviceMesh,
-        placements: Sequence[Placement]
+        placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]]
     ) -> 'DTensor':
         """
         Create a DTensor from a local tensor with device mesh and placements.
@@ -149,17 +190,20 @@ class DTensor(DTensorBase):
         Args:
             local_tensor (Tensor): The local tensor shard on this device.
             device_mesh (DeviceMesh): The device mesh describing the device topology.
-            placements (Sequence[Placement]): The placement strategy. Each element
-                should be a Placement object (Shard, Replicate, Partial, etc.).
+            placements: The placement strategy. Supports two styles:
+                - Placement objects (e.g., ``[Shard(0), Replicate()]``).
+                - Alias strings (e.g., ``("dp", "None")`` or
+                  ``(("dp", "tp"), "None")``), length must equal the number
+                  of tensor dimensions.
 
         Returns:
             DTensor: A new DTensor instance.
 
         Example:
-            >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
             >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
             >>> local_tensor = Tensor(np.ones((4, 4)))
             >>> dtensor = DTensor.from_local(local_tensor, mesh, [Shard(0), Replicate()])
+            >>> dtensor = DTensor.from_local(local_tensor, mesh, ("dp", "None"))
         """
         return DTensor(local_tensor, device_mesh, placements)
 
@@ -210,22 +254,22 @@ class DTensor(DTensorBase):
     def redistribute(
         self,
         device_mesh: DeviceMesh,
-        placements: Sequence[Placement]
+        placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]]
     ) -> 'DTensor':
         """
         Redistribute this DTensor to a new device mesh and placements.
 
         Args:
             device_mesh (DeviceMesh): The target device mesh.
-            placements (Sequence[Placement]): The target placements. Each element
-                should be a Placement object (Shard, Replicate, Partial, etc.).
+            placements: The target placements. Supports Placement objects
+                or alias strings.
 
         Returns:
             DTensor: A new DTensor with the specified distribution.
 
         Example:
-            >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
             >>> new_dtensor = dtensor.redistribute(mesh, [Replicate(), Shard(1)])
+            >>> new_dtensor = dtensor.redistribute(mesh, ("None", "tp"))
         """
         # Build dst_layout from device_mesh and placements
         dst_layout = _build_layout(
@@ -296,7 +340,7 @@ class DTensor(DTensorBase):
 def distribute_tensor(
     tensor: Tensor,
     device_mesh: DeviceMesh,
-    placements: Sequence[Placement]
+    placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]]
 ) -> DTensor:
     """
     Distribute a global tensor to the device mesh according to the placements.
@@ -305,8 +349,11 @@ def distribute_tensor(
         tensor (Tensor): The global tensor to be distributed. All ranks
             should have the same tensor data.
         device_mesh (DeviceMesh): The device mesh describing the device topology.
-        placements (Sequence[Placement]): The placement strategy for distribution.
-            Each element should be a Placement object (Shard, Replicate, etc.).
+        placements: The placement strategy. Supports two styles:
+            - Placement objects (e.g., ``[Shard(0), Replicate()]``).
+            - Alias strings (e.g., ``("dp", "None")`` or
+              ``(("dp", "tp"), "None")``), length must equal the number of
+              tensor dimensions.
 
     Returns:
         DTensor: A new DTensor with the local shard on each rank.
@@ -317,20 +364,14 @@ def distribute_tensor(
         data, use `from_local` instead.
 
     Example:
-        >>> from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
         >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
         >>> global_tensor = Tensor(np.arange(16).reshape(4, 4))
         >>> dtensor = distribute_tensor(global_tensor, mesh, [Shard(0), Replicate()])
-        >>> # rank 0 and rank1 gets: [[0,1,2,3], [4,5,6,7]]
-        >>> # rank 2 and rank3 gets: [[8,9,10,11], [12,13,14,15]]
+        >>> dtensor = distribute_tensor(global_tensor, mesh, ("dp", "None"))
     """
-    # Build layout from device_mesh and placements
     layout = _build_layout(device_mesh, placements, len(tensor.shape))
-
-    # Slice the global tensor to get local shard based on layout
     local_tensor = _get_slice_tensor_by_layout(tensor, layout)
-
-    return DTensor(local_tensor, device_mesh, placements)
+    return DTensor(local_tensor, device_mesh, layout.alias_placements)
 
 
 def _dtensor_init_helper(

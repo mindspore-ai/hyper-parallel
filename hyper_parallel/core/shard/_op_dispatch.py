@@ -360,7 +360,9 @@ class OpDispatcher:
             if isinstance(output_layout, (tuple, list)):
                 if len(py_output) == len(output_layout):
                     for i, output_item in enumerate(py_output):
-                        output += (DTensor.from_local(output_item, output_layout[i].mesh, output_layout[i].placements),)
+                        output += (DTensor.from_local(
+                            output_item, output_layout[i].mesh,
+                            output_layout[i].alias_placements),)
                 else:
                     raise RuntimeError(f"Output tuple size ({len(py_output)}) "
                                        f"does not match layout tuple size ({len(output_layout)})")
@@ -368,7 +370,8 @@ class OpDispatcher:
                 raise RuntimeError("Output is a tuple but layout is not")
             return output
 
-        return DTensor.from_local(py_output, output_layout.mesh, output_layout.placements)
+        return DTensor.from_local(
+            py_output, output_layout.mesh, output_layout.alias_placements)
 
     def _extract_single_arg_layout(self, arg, cache_key, extra_args, input_layouts):
         """Helper to extract layout and cache info for a single argument."""
@@ -396,11 +399,11 @@ class OpDispatcher:
                                    f"does not match layout tuple size ({len(output_layout)})")
 
             return tuple(
-                DTensor.from_local(item, layout.mesh, layout.placements)
+                DTensor.from_local(item, layout.mesh, layout.alias_placements)
                 for item, layout in zip(py_output, output_layout)
             )
 
-        return DTensor.from_local(py_output, output_layout.mesh, output_layout.placements)
+        return DTensor.from_local(py_output, output_layout.mesh, output_layout.alias_placements)
 
     def _with_layout_infer_with_tuple_expand(self, func: callable, *args, **kwargs) -> Tensor:
         """_with_layout_infer_with_tuple_expand"""
@@ -500,7 +503,7 @@ class OpDispatcher:
 
         py_output = op_impl(input_tensor.to_local(), local_shape)
 
-        return DTensor.from_local(py_output, infer_output_tuple[0].mesh, infer_output_tuple[0].placements)
+        return DTensor.from_local(py_output, infer_output_tuple[0].mesh, infer_output_tuple[0].alias_placements)
 
     @staticmethod
     def _process_args_and_kwargs_with_shape(
@@ -617,7 +620,9 @@ class OpDispatcher:
             if isinstance(output_layout, (tuple, list)):
                 if len(py_output) == len(output_layout):
                     for i, output_item in enumerate(py_output):
-                        output += (DTensor.from_local(output_item, output_layout[i].mesh, output_layout[i].placements),)
+                        output += (DTensor.from_local(
+                            output_item, output_layout[i].mesh,
+                            output_layout[i].alias_placements),)
                 else:
                     raise RuntimeError(f"Output tuple size ({len(py_output)}) "
                                        f"does not match layout tuple size ({len(output_layout)})")
@@ -625,7 +630,8 @@ class OpDispatcher:
                 raise RuntimeError("Output is a tuple but layout is not")
             return output
 
-        return DTensor.from_local(py_output, output_layout.mesh, output_layout.placements)
+        return DTensor.from_local(
+            py_output, output_layout.mesh, output_layout.alias_placements)
 
     def _with_layout_infer_slice(self, func: callable, *args) -> Tensor:
         """_with_layout_infer_slice"""
@@ -677,7 +683,7 @@ class OpDispatcher:
 
         py_output = op_impl(input_tensor.to_local(), new_begin, new_end)
 
-        return DTensor.from_local(py_output, infer_output_tuple[0].mesh, infer_output_tuple[0].placements)
+        return DTensor.from_local(py_output, infer_output_tuple[0].mesh, infer_output_tuple[0].alias_placements)
 
     @staticmethod
     def _merge_default(config: dict):
@@ -760,12 +766,12 @@ class OpDispatcher:
         # Some ops return tuple/list, e.g. native_dropout returns (output, mask).
         if isinstance(local_results, (tuple, list)):
             return tuple(
-                DTensor.from_local(r, first_arg.device_mesh, first_arg.placements)
+                DTensor.from_local(r, first_arg.device_mesh, first_arg.layout.alias_placements)
                 if isinstance(r, Tensor) else r
                 for r in local_results
             )
         if isinstance(local_results, Tensor):
-            return DTensor.from_local(local_results, first_arg.device_mesh, first_arg.placements)
+            return DTensor.from_local(local_results, first_arg.device_mesh, first_arg.layout.alias_placements)
         # Fallback: return as-is for non-Tensor results (currently unreachable with existing _random_ops).
         return local_results
 

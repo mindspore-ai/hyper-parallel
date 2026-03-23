@@ -31,9 +31,10 @@ class DTensorBase(Tensor):
             placements: The placement strategy for each mesh dimension.
         """
         if isinstance(local_tensor, DTensorBase):
-            # Copy from existing DTensorBase
+            # Copy from existing DTensorBase — use alias_placements to preserve multi-axis ordering
             t = Tensor._make_subclass(cls, local_tensor._local_tensor, local_tensor._local_tensor.requires_grad)
-            t.__init_data__(local_tensor._local_tensor, local_tensor.device_mesh, local_tensor.placements)
+            copy_placements = local_tensor.layout.alias_placements if local_tensor.layout else local_tensor.placements
+            t.__init_data__(local_tensor._local_tensor, local_tensor.device_mesh, copy_placements)
             return t
 
         if device_mesh is None:
@@ -85,13 +86,15 @@ class DTensorBase(Tensor):
         """
         src_local = self._local_tensor
         new_local = src_local.to(*args, **kwargs)
-        return self.__class__(new_local, device_mesh=self._device_mesh, placements=self._placements)
+        alias_p = self._layout.alias_placements if hasattr(self, '_layout') and self._layout else self._placements
+        return self.__class__(new_local, device_mesh=self._device_mesh, placements=alias_p)
 
     def float(self):
         """convert tensor to float dtype"""
         local_tensor = self._local_tensor
         new_local = local_tensor.float()
-        return self.__class__(new_local, device_mesh=self._device_mesh, placements=self._placements)
+        alias_p = self._layout.alias_placements if hasattr(self, '_layout') and self._layout else self._placements
+        return self.__class__(new_local, device_mesh=self._device_mesh, placements=alias_p)
 
     @property
     def grad(self) -> Optional[Tensor]:
@@ -178,7 +181,8 @@ class DTensorBase(Tensor):
             DTensorBase: A new DTensor with the same data but detached from the computation graph.
         """
         detached_local = self._local_tensor.detach()
-        return self.__class__(detached_local, device_mesh=self._device_mesh, placements=self._placements)
+        alias_p = self._layout.alias_placements if hasattr(self, '_layout') and self._layout else self._placements
+        return self.__class__(detached_local, device_mesh=self._device_mesh, placements=alias_p)
 
     def detach_(self):
         """
@@ -278,7 +282,8 @@ class DTensorBase(Tensor):
         if dtype is None:
             return self._local_tensor.type()
         new_local = self._local_tensor.to(dtype=dtype, non_blocking=non_blocking)
-        return self.__class__(new_local, device_mesh=self._device_mesh, placements=self._placements)
+        alias_p = self._layout.alias_placements if hasattr(self, '_layout') and self._layout else self._placements
+        return self.__class__(new_local, device_mesh=self._device_mesh, placements=alias_p)
 
     def size(self, dim: Optional[int] = None):
         """
