@@ -20,7 +20,7 @@ DTensor/Layout and distributed calls; no NPU required.
 """
 import copy
 import unittest
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 
 import numpy as np
 import torch
@@ -32,7 +32,7 @@ from hyper_parallel.platform.torch.fully_shard.param import (
     _GROUP_INFO_CACHE,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, init_device_mesh
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState, ParamModuleInfo
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, StridedShard, Partial
@@ -52,7 +52,7 @@ from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedul
 from hyper_parallel.platform.torch.fully_shard.state import TorchHSDPStateV2
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, get_torch_platform
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
-from tests.common.mark_utils import arg_mark
+
 
 platform = get_torch_platform()
 Tensor = platform.Tensor
@@ -160,7 +160,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2._unsharded_param = MagicMock()
         param_v2.sharded_state = ShardedState.UNSHARDED
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
@@ -189,7 +188,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         self.assertEqual(param_v2.sharded_param._hsdp_param_initialized, True)
         self.assertEqual(param_v2.sharded_state, ShardedState.SHARDED)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
@@ -246,7 +244,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         self.assertEqual(param_v2.shard_size, 1)
         self.assertEqual(param_v2.dp_size, self.mesh_info.shard_mesh_size)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
@@ -296,7 +293,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             mock_to_unsharded.assert_called_once()
             self.assertIsNone(param_v2.prefetch_handle)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
@@ -331,7 +327,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             mock_free.assert_called_once()
             self.assertEqual(param_v2.sharded_state, ShardedState.SHARDED)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
@@ -369,7 +364,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
                              self.param.numel() // self.mesh_info.shard_mesh_size)
             self.assertEqual(param_v2.reduce_scatter_handle, mock_handle)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.platform.torch.fully_shard.param.Layout')
@@ -417,7 +411,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             self.assertEqual(param_v2._all_reduce_output.dtype, grad_dtype)
             self.assertEqual(param_v2.all_reduce_handle, mock_handle)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.core.dtensor.layout.Layout')
@@ -443,7 +436,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         # Verify reset operation
         self.assertTrue(torch.all(param_v2._sharded_param_data == sharded_param_data.view(-1)))
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.core.dtensor.layout.Layout')
@@ -474,7 +466,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             mock_all_gather.assert_called_once()
             self.assertEqual(handle, mock_handle)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.core.dtensor.layout.Layout')

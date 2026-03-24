@@ -31,7 +31,6 @@ from hyper_parallel.core.fully_shard.utils import (
     OffloadPolicy,
     CPUOffloadPolicy,
 )
-from tests.common.mark_utils import arg_mark
 
 
 class TestMixedPrecisionPolicy(unittest.TestCase):
@@ -42,7 +41,6 @@ class TestMixedPrecisionPolicy(unittest.TestCase):
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_default_values(self):
         """Default policy has None dtypes and cast_forward_inputs=True.
 
@@ -59,7 +57,6 @@ class TestMixedPrecisionPolicy(unittest.TestCase):
         self.assertTrue(policy.cast_forward_inputs)
         self.assertFalse(policy.apply_grad_on_fp32_main_grad)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_custom_param_dtype(self):
         """Custom param_dtype is stored correctly.
 
@@ -72,7 +69,6 @@ class TestMixedPrecisionPolicy(unittest.TestCase):
         # Assert
         self.assertEqual(policy.param_dtype, torch.float16)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_custom_reduce_dtype(self):
         """Custom reduce_dtype is stored correctly.
 
@@ -85,7 +81,6 @@ class TestMixedPrecisionPolicy(unittest.TestCase):
         # Assert
         self.assertEqual(policy.reduce_dtype, torch.bfloat16)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_custom_output_dtype(self):
         """Custom output_dtype is stored correctly.
 
@@ -98,7 +93,6 @@ class TestMixedPrecisionPolicy(unittest.TestCase):
         # Assert
         self.assertEqual(policy.output_dtype, torch.float16)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_cast_forward_inputs_false(self):
         """cast_forward_inputs can be set to False.
 
@@ -111,7 +105,6 @@ class TestMixedPrecisionPolicy(unittest.TestCase):
         # Assert
         self.assertFalse(policy.cast_forward_inputs)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_full_mixed_precision_config(self):
         """Full mixed precision config is stored correctly.
 
@@ -140,7 +133,6 @@ class TestOffloadPolicy(unittest.TestCase):
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_offload_policy_instantiation(self):
         """OffloadPolicy can be instantiated (base class).
 
@@ -162,7 +154,6 @@ class TestCPUOffloadPolicy(unittest.TestCase):
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_default_pin_memory_true(self):
         """Default CPUOffloadPolicy has pin_memory=True.
 
@@ -176,7 +167,6 @@ class TestCPUOffloadPolicy(unittest.TestCase):
         self.assertTrue(policy.pin_memory)
         self.assertIsInstance(policy, OffloadPolicy)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_pin_memory_false(self):
         """CPUOffloadPolicy can set pin_memory=False.
 
@@ -189,7 +179,6 @@ class TestCPUOffloadPolicy(unittest.TestCase):
         # Assert
         self.assertFalse(policy.pin_memory)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_inherits_from_offload_policy(self):
         """CPUOffloadPolicy inherits from OffloadPolicy.
 

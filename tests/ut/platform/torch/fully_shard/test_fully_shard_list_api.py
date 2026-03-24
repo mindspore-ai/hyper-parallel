@@ -35,7 +35,6 @@ from hyper_parallel.core.fully_shard.api import (
 )
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.platform.platform import PlatformType
-from tests.common.mark_utils import arg_mark
 
 
 def _default_mp_policy():
@@ -78,7 +77,6 @@ class TestGetRootModules(unittest.TestCase):
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_sibling_modules_both_roots(self):
         """Two sibling modules (neither contains the other) are both roots.
 
@@ -96,7 +94,6 @@ class TestGetRootModules(unittest.TestCase):
         self.assertIn(linear1, roots)
         self.assertIn(linear2, roots)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_parent_child_only_parent_root(self):
         """When list contains parent and child, only parent is root.
 
@@ -114,7 +111,6 @@ class TestGetRootModules(unittest.TestCase):
         self.assertIn(parent, roots)
         self.assertNotIn(child, roots)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_single_module_is_root(self):
         """Single module in list is root.
 
@@ -130,7 +126,6 @@ class TestGetRootModules(unittest.TestCase):
         self.assertEqual(len(roots), 1)
         self.assertIn(mod, roots)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_three_siblings_all_roots(self):
         """Three sibling modules are all roots.
 
@@ -157,7 +152,6 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_single_module_valid(self):
         """Single nn.Module passes validation.
 
@@ -170,7 +164,6 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
         # Act & Assert (no raise)
         _validate_module_for_fully_shard(mod, PlatformType.PYTORCH)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_list_of_modules_valid(self):
         """List of nn.Module passes validation (Torch platform).
 
@@ -183,7 +176,6 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
         # Act & Assert (no raise)
         _validate_module_for_fully_shard(mods, PlatformType.PYTORCH)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_empty_list_raises(self):
         """Empty list raises ValueError.
 
@@ -196,7 +188,6 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
             _validate_module_for_fully_shard([], PlatformType.PYTORCH)
         self.assertIn("empty list", str(ctx.exception))
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_list_with_non_module_raises(self):
         """List containing non-Module raises ValueError.
 
@@ -211,7 +202,6 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
             _validate_module_for_fully_shard([mod, 1], PlatformType.PYTORCH)
         self.assertIn("index 1", str(ctx.exception))
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_non_module_raises(self):
         """Non-Module input raises ValueError (via _check_module_valid).
 
@@ -224,7 +214,6 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
             _validate_module_for_fully_shard("not a module", PlatformType.PYTORCH)
         self.assertIn("nn.Module", str(ctx.exception))
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_list_mindspore_valid(self):
         """List of modules on MindSpore passes validation (both platforms support list).
 
@@ -257,7 +246,6 @@ class TestFullyShardListAPI(unittest.TestCase):
         mesh.ndim = 1
         return mesh
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")
     def test_fully_shard_single_module_returns_module(self, mock_platform, mock_get_device):
@@ -287,7 +275,6 @@ class TestFullyShardListAPI(unittest.TestCase):
         self.assertIs(result, mod)
         self.assertIsInstance(result, nn.Module)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")
     def test_fully_shard_list_returns_list(self, mock_platform, mock_get_device):
@@ -323,7 +310,6 @@ class TestFullyShardListAPI(unittest.TestCase):
         self.assertIsInstance(result, list)
         self.assertEqual(len(result), 2)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")
     def test_fully_shard_list_root_filtering(self, mock_platform, mock_get_device):
@@ -355,7 +341,6 @@ class TestFullyShardListAPI(unittest.TestCase):
         self.assertIs(result, modules_list)
         self.assertEqual(len(result), 2)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")
     def test_fully_shard_list_mindspore_returns_list(self, mock_platform, mock_get_device):
@@ -402,7 +387,6 @@ class TestFullyShardListAPI(unittest.TestCase):
         self.assertIs(result, modules_list)
         self.assertEqual(len(result), 2)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.core.fully_shard.api.platform")
     def test_fully_shard_empty_list_raises(self, mock_platform):
         """fully_shard with empty list raises ValueError.
@@ -424,7 +408,6 @@ class TestFullyShardListAPI(unittest.TestCase):
             )
         self.assertIn("empty list", str(ctx.exception))
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")
     def test_fully_shard_list_second_root_has_scheduler_and_unshard_prefetch_ok(
