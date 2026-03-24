@@ -102,9 +102,9 @@ Key design principles:
     - [ ] PARADISE: Based on Symbolic cost model to simulate memory and compute-communication costs, efficiently generates optimal multi-dimensional hybrid parallel strategies. Currently a demo feature, still under continuous optimisation;
 
 - One-Sided Communication
-    - [ ] Symmetry Memory
+    - [x] Symmetric Memory
     - [ ] AllToAll
-    - [ ] AllGather
+    - [x] AllGather
     - [ ] AllReduce
     - [ ] ReduceScatter
     - [ ] Low-Precision Communication with High-Precision Accumulation

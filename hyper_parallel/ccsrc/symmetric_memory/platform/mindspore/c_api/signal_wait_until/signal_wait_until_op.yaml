@@ -1,0 +1,18 @@
+#operator signal_wait_until
+signal_wait_until:
+  args:
+    depend_target:
+      dtype: tensor
+    signal:
+      dtype: tensor
+    signal_offset:
+      dtype: tensor
+    compare_value:
+      dtype: tensor
+    compare_op:
+      dtype: int
+      default: 0
+  returns:
+    output:
+      dtype: tensor
+      inplace: depend_target

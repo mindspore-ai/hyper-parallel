@@ -1,0 +1,7 @@
+# Hyper-Parallel symmetric_memory Rules
+
+"hyper-parallel/hyper_parallel/ccsrc/symmetric_memory/ops"                               "build/namespaces"
+"hyper-parallel/hyper_parallel/ccsrc/symmetric_memory/ops"                               "build/include_subdir"
+"hyper-parallel/hyper_parallel/ccsrc/symmetric_memory/platform/mindspore/c_api"          "build/namespaces"
+"hyper-parallel/hyper_parallel/ccsrc/symmetric_memory/platform/mindspore/c_api"          "build/include_subdir"
+"hyper-parallel/hyper_parallel/ccsrc/symmetric_memory/platform/torch/torch_bindings.cpp" "build/include_subdir"

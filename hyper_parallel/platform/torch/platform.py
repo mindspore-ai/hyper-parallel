@@ -558,6 +558,13 @@ class TorchPlatform(Platform):
         from hyper_parallel.platform.torch.pipeline_parallel._utils import _MicroBatch
         return _MicroBatch(micro_batch_num, args_batch_dim, kwargs_batch_dim)
 
+    @staticmethod
+    def get_symmetric_memory_handler():
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.symmetric_memory import TorchSymmetricMemoryHandler
+        symmetric_memory = TorchSymmetricMemoryHandler()
+        return symmetric_memory
+
     def new_stream(self):
         device = self.get_device_handle()
         return device.Stream()

@@ -1,0 +1,106 @@
+/**
+ * Copyright 2026 Huawei Technologies Co., Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// =============================================================================
+// PYBOOST MODE IMPLEMENTATION
+// =============================================================================
+
+#include <vector>
+#include <memory>
+
+#include "framework/module.h"
+#include "shmem.h"
+#include "shmem_kernel.h"
+
+namespace ms_custom_ops {
+class GetMemRunner : public ms::pynative::PyboostRunner {
+ public:
+  using ms::pynative::PyboostRunner::PyboostRunner;
+
+  virtual ~GetMemRunner() = default;
+
+  void SetTargetPe(const int64_t &target_pe) { this->target_pe_ = target_pe; }
+
+  int TypeIdToElementSize(mindspore::TypeId type_id) {
+    static const std::unordered_map<mindspore::TypeId, int> type_size_map = {
+      {mindspore::kNumberTypeBool, 1},       {mindspore::kNumberTypeInt8, 1},
+      {mindspore::kNumberTypeUInt8, 1},      {mindspore::kNumberTypeFloat8E4M3FN, 1},
+      {mindspore::kNumberTypeFloat8E5M2, 1}, {mindspore::kNumberTypeHiFloat8, 1},
+
+      {mindspore::kNumberTypeInt16, 2},      {mindspore::kNumberTypeUInt16, 2},
+      {mindspore::kNumberTypeFloat16, 2},    {mindspore::kNumberTypeBFloat16, 2},
+
+      {mindspore::kNumberTypeInt, 4},        {mindspore::kNumberTypeUInt, 4},
+      {mindspore::kNumberTypeInt32, 4},      {mindspore::kNumberTypeUInt32, 4},
+      {mindspore::kNumberTypeFloat, 4},      {mindspore::kNumberTypeFloat32, 4},
+
+      {mindspore::kNumberTypeInt64, 8},      {mindspore::kNumberTypeUInt64, 8},
+      {mindspore::kNumberTypeFloat64, 8},    {mindspore::kNumberTypeDouble, 8},
+      {mindspore::kNumberTypeComplex, 8},    {mindspore::kNumberTypeComplex64, 8}};
+
+    auto iter = type_size_map.find(type_id);
+    if (iter != type_size_map.end()) {
+      return iter->second;
+    }
+
+    std::cerr << "Error: TypeId " << type_id << " is not a valid Number Type, cannot convert to element_size!"
+              << std::endl;
+    return -1;
+  }
+
+ protected:
+  void LaunchKernel() override {
+    auto op_name = this->op_name();
+    MS_LOG(DEBUG) << "Launch " << op_name << " start";
+    uint32_t block_dim_ = 4;
+    uint64_t element_size_ = TypeIdToElementSize(this->inputs()[0].data_type());
+    void *target_ptr = const_cast<void *>(this->inputs()[0].GetDataPtr());
+    void *target_offset_ptr = const_cast<void *>(this->inputs()[1].GetDataPtr());
+    void *src_ptr = const_cast<void *>(this->inputs()[2].GetDataPtr());
+    void *src_offset_ptr = const_cast<void *>(this->inputs()[3].GetDataPtr());
+    void *size_ptr = const_cast<void *>(this->inputs()[4].GetDataPtr());
+    ShmemKernel::aclshmem_get_mem(block_dim_, this->stream(), element_size_, target_ptr, target_offset_ptr, src_ptr,
+                                  src_offset_ptr, size_ptr, this->target_pe_, false);
+    MS_LOG(DEBUG) << "Launch " << op_name << " end";
+  }
+
+ private:
+  int64_t target_pe_{0};
+};
+
+void npu_get_mem(const ms::Tensor &target, const ms::Tensor &target_offset, const ms::Tensor &src,
+                 const ms::Tensor &src_offset, const ms::Tensor &size, const int64_t target_pe) {
+  auto op_name = "GetMem";
+  auto runner = std::make_shared<ms_custom_ops::GetMemRunner>(op_name);
+  MS_EXCEPTION_IF_NULL(runner);
+  runner->SetTargetPe(target_pe);
+  std::vector<ms::Tensor> inputs = {target, target_offset, src, src_offset, size};
+  std::vector<ms::Tensor> outputs = {};
+  runner->Run(inputs, outputs);
+  return;
+}
+}  // namespace ms_custom_ops
+
+auto pyboost_get_mem(const ms::Tensor &target, const ms::Tensor &target_offset, const ms::Tensor &src,
+                     const ms::Tensor &src_offset, const ms::Tensor &size, const int64_t target_pe) {
+  return ms::pynative::PyboostRunner::Call<0>(ms_custom_ops::npu_get_mem, target, target_offset, src, src_offset, size,
+                                              target_pe);  // 0 represent output num = 0
+}
+
+MS_CUSTOM_OPS_EXTENSION_MODULE(m) {
+  m.def("get_mem", &pyboost_get_mem, "Get Mem", pybind11::arg("target"), pybind11::arg("target_offset"),
+        pybind11::arg("src"), pybind11::arg("src_offset"), pybind11::arg("size"), pybind11::arg("target_pe"));
+}

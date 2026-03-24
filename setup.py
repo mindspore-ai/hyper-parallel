@@ -16,6 +16,7 @@
 # ============================================================================
 """setup package."""
 import sys
+import logging
 import os
 import shutil
 import stat
@@ -29,6 +30,11 @@ from setuptools.command.egg_info import egg_info
 from setuptools.command.build import build
 from setuptools.command.build_py import build_py
 from setuptools.command.install import install
+
+ROOT_DIR = os.path.dirname(__file__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 
 def get_readme_content():
@@ -115,9 +121,30 @@ class BuildPy(build_py):
         hyper_parallel_lib_dir = os.path.join(
             os.path.dirname(__file__), 'build', 'lib', 'hyper_parallel')
         shutil.rmtree(hyper_parallel_lib_dir, ignore_errors=True)
+        self._run_shell_script("scripts/build_symmetric_memory.sh")
         super().run()
         update_permissions(hyper_parallel_lib_dir)
 
+    def _run_shell_script(self, script_path, args=None, capture_output=False):
+        """Execute specified shell script with error handling"""
+        if args is None:
+            args = []
+
+        if not os.path.exists(script_path):
+            error_msg = f"Warning: Script not found: {script_path}"
+            logger.error(error_msg)
+            raise FileNotFoundError(error_msg)
+
+        cmd = ["bash", script_path] + args
+        logger.info("Executing: %s", ' '.join(cmd))
+        try:
+            result = subprocess.run(cmd, check=True,capture_output=capture_output, text=True)
+            if result.stdout:
+                logger.info("Success: %s", result.stdout)
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Failed to execute script: {script_path}, error: {e.stderr}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg) from e
 
 class BuildHyperParallelMindSpore(build_py):
     """Custom build command: compile C++ plugin during build phase with version safety"""
@@ -141,7 +168,7 @@ class BuildHyperParallelMindSpore(build_py):
                 print(
                     "⚠️ Mindspore custom pass compilation skipped (version requirement or no MindSpore detected)")
 
-        except Exception as e:
+        except Exception as e: #pylint: disable=broad-exception-caught
             # Only warn if user explicitly requested MindSpore support
             if "MINDSPORE_ROOT" in os.environ:
                 warnings.warn(
@@ -254,9 +281,13 @@ if __name__ == '__main__':
         platforms=[get_platform()],
         include_package_data=True,
         package_data={
-            'hyper_parallel': ['.commit_id'],
+            'hyper_parallel': ['.commit_id',
+                       'lib/*.so',
+                       'lib/*/*.so'],
             'hyper_parallel.core.shard.ops': ['yaml/*.yaml'],
-            "hyper_parallel.platform.mindspore.custom_pass": [BuildHyperParallelMindSpore.MS_SO_NAME],
+            'hyper_parallel.platform.torch.symmetric_memory': ['*.so'],
+            'hyper_parallel.platform.mindspore.symmetric_memory': ['aclshmem_ms/*.so'],
+            'hyper_parallel.platform.mindspore.custom_pass': [BuildHyperParallelMindSpore.MS_SO_NAME],
         },
         cmdclass={
             'egg_info': EggInfo,
@@ -267,6 +298,7 @@ if __name__ == '__main__':
         },
         python_requires='>=3.7',
         install_requires=get_install_requires(),
+        setup_requires=['ninja >= 1.10.0'],
         classifiers=[
             'Development Status :: 4 - Beta',
             'Environment :: Console',
