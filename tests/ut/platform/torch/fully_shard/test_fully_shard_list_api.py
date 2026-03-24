@@ -465,6 +465,5 @@ class TestFullyShardListAPI(unittest.TestCase):
         linear1.set_modules_to_forward_prefetch([linear2])
         linear1.set_modules_to_backward_prefetch([linear2])
 
-
 if __name__ == "__main__":
     unittest.main()

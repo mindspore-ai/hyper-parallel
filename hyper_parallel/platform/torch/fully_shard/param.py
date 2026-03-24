@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,25 +17,73 @@
 # ============================================================================
 """HSDP parameter"""
 # pylint: disable=W0212
-from typing import List, Callable, Optional, cast, Tuple, Union
+import itertools
+from typing import Callable, List, Optional, Tuple, Union, cast
+
 import torch
-from torch import nn
 import torch.distributed as dist
+from torch import nn
 from torch._prims_common import make_contiguous_strides_for
-from hyper_parallel.core.fully_shard.utils import (
-    MixedPrecisionPolicy,
-    CPUOffloadPolicy,
-    OffloadPolicy,
-    FSDPMeshInfo,
-    DDPMeshInfo,
-    HSDPMeshInfo,
-)
-from hyper_parallel.core.dtensor.dtensor import DTensor
+
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch
 from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
-from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
-from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo
+from hyper_parallel.core.fully_shard.hsdp_utils import (
+    FullyShardParamMode,
+    GroupInfo,
+    ParamModuleInfo,
+    ShardedState,
+    get_rank_list_for_axes,
+)
+from hyper_parallel.core.fully_shard.utils import (
+    CPUOffloadPolicy,
+    DDPMeshInfo,
+    FSDPMeshInfo,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
+)
+from hyper_parallel.platform import get_platform
+
+_GROUP_INFO_CACHE = {}
+platform = get_platform()
+
+
+def _build_group_info_from_rank_list(
+    group_name: str,
+    rank_list,
+) -> GroupInfo:
+    """Create group metadata from an explicit rank list."""
+    normalized_rank_list = tuple(sorted(int(rank) for rank in rank_list))
+    if len(normalized_rank_list) <= 1:
+        return GroupInfo(f"{group_name}_invalid", None, 1)
+    if normalized_rank_list in _GROUP_INFO_CACHE:
+        cached_group = _GROUP_INFO_CACHE[normalized_rank_list]
+        return GroupInfo(str(normalized_rank_list), cached_group, len(normalized_rank_list))
+    try:
+        group = platform.create_group(list(normalized_rank_list))
+    except (RuntimeError, ValueError):  # pragma: no cover - UT may run without dist init
+        group = None
+    _GROUP_INFO_CACHE[normalized_rank_list] = group
+    return GroupInfo(str(normalized_rank_list), group, len(normalized_rank_list))
+
+
+def _build_group_info_from_process_group(
+    group_name: str,
+    process_group,
+    rank_size: int,
+) -> GroupInfo:
+    """Create group metadata from an existing process group."""
+    if process_group is None or rank_size <= 1:
+        return GroupInfo(f"{group_name}_invalid", None, 1)
+    try:
+        rank_list = dist.get_process_group_ranks(process_group)
+        resolved_group_name = str(tuple(sorted(rank_list)))
+    except (AssertionError, AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        # pragma: no cover - best-effort naming / mocked process groups in UT
+        resolved_group_name = group_name
+    return GroupInfo(resolved_group_name, process_group, rank_size)
 
 
 class TorchHSDPParamV2(HSDPParamV2):
@@ -52,6 +100,8 @@ class TorchHSDPParamV2(HSDPParamV2):
         mp_policy: Optional[MixedPrecisionPolicy] = None,
         offload_policy: Optional[OffloadPolicy] = None,
         device: Optional[torch.device] = None,
+        param_mode: Optional[FullyShardParamMode] = None,
+        enable_fsdp_shard: bool = True,
     ):
         """
         Initialize TorchHSDPParamV2 and shard the parameter.
@@ -70,12 +120,25 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.mesh_info = mesh_info
         self.mp_policy = mp_policy
         self.device = device
+        if param_mode is None:
+            raise AssertionError("param_mode must be resolved before TorchHSDPParamV2 initialization.")
+        self.param_mode = param_mode
+        self.enable_fsdp_shard = enable_fsdp_shard
+        self.orig_dtype = None
+        self.param_dtype = None
+        self.reduce_dtype = None
         self.offload_to_cpu: bool = isinstance(offload_policy, CPUOffloadPolicy)
         self.pin_memory = (
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
         )
         self.grad_offload_event: Optional[torch.Event] = None
+        self._orig_param_is_dtensor = isinstance(param, DTensor)
+        self._orig_dtensor_mesh = param.device_mesh if self._orig_param_is_dtensor else None
+        self._orig_dtensor_placements = tuple(param.placements) if self._orig_param_is_dtensor else None
+        self._spmd_shard_mesh_dim = self.mesh_info.shard_mesh_dim
+        self._spmd_replicate_mesh_dim = self.mesh_info.replicate_mesh_dim
         self._init_sharded_param(param, shard_placement_fn)
+        self._init_group_infos()
         self.all_gather_outputs: List[torch.Tensor] = []
         self.unsharded_accumulated_grad = None
         self._param_fqn: Optional[str] = None
@@ -90,6 +153,153 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.reduce_scatter_handle = None
         self._all_reduce_output = None
         self.all_reduce_handle = None
+
+    @property
+    def uses_param_shard(self) -> bool:
+        """Whether fully_shard should physically shard parameter storage for this param."""
+        return self.enable_fsdp_shard
+
+    @property
+    def is_dtensor_compat_mode(self) -> bool:
+        """Whether the parameter is managed through the DTensor compatibility path only."""
+        return self.param_mode == FullyShardParamMode.DTENSOR_COMPAT
+
+    def _get_base_spmd_placements(self) -> tuple:
+        if self.param_mode == FullyShardParamMode.DTENSOR_UNIFIED and self._orig_param_is_dtensor:
+            # DTENSOR_UNIFIED keeps the original distributed layout and prefixes
+            # explicit DP/FSDP mesh dimensions ahead of it on the unified mesh.
+            self._spmd_mesh = DeviceMesh.concatenate([self.mesh_info.mesh, self._orig_dtensor_mesh])
+            dp_prefix_placements = tuple(Replicate() for _ in range(self.mesh_info.mesh.ndim))
+            return dp_prefix_placements + tuple(self._orig_dtensor_placements)
+
+        if self.is_dtensor_compat_mode and self._orig_param_is_dtensor:
+            self._spmd_mesh = self._orig_dtensor_mesh
+            return tuple(self._orig_dtensor_placements)
+
+        self._spmd_mesh = self.mesh_info.mesh
+        return tuple(Replicate() for _ in range(self._spmd_mesh.ndim))
+
+    def _apply_data_parallel_placements(self, placements: list, shard_placement: Shard) -> tuple:
+        if len(placements) != self._spmd_mesh.ndim:
+            raise AssertionError(
+                f"Expected {self._spmd_mesh.ndim} unified placements, got {len(placements)}: {placements}"
+            )
+        if (
+            isinstance(self.mesh_info, DDPMeshInfo)
+            and self._spmd_replicate_mesh_dim is not None
+            and not self._orig_param_is_dtensor
+        ):
+            placements[self._spmd_replicate_mesh_dim] = Replicate()
+        if (
+            self.uses_param_shard
+            and isinstance(self.mesh_info, FSDPMeshInfo)
+            and self._spmd_shard_mesh_dim is not None
+        ):
+            # If TP/EP already shards the same tensor dimension, fully_shard must
+            # use StridedShard so the unified placement preserves the intended
+            # shard order on the concatenated mesh.
+            split_factor = 1
+            for mesh_idx, placement in enumerate(placements):
+                if mesh_idx == self._spmd_shard_mesh_dim:
+                    continue
+                if placement.is_shard(shard_placement.dim):
+                    split_factor *= self._spmd_mesh.mesh_shape[mesh_idx]
+            placements[self._spmd_shard_mesh_dim] = (
+                StridedShard(shard_placement.dim, split_factor=split_factor)
+                if split_factor > 1
+                else shard_placement
+            )
+        return tuple(placements)
+
+    def _init_group_infos(self) -> None:
+        if self.uses_param_shard and self.is_sharded and isinstance(self.mesh_info, FSDPMeshInfo):
+            self.sharded_group_info = _build_group_info_from_process_group(
+                "fully_shard_sharded_group",
+                self.mesh_info.shard_process_group,
+                self.mesh_info.shard_mesh_size,
+            )
+        else:
+            self.sharded_group_info = GroupInfo("fully_shard_sharded_group_invalid", None, 1)
+
+        # The all-reduce group is always derived from the final materialized layout.
+        # This keeps replicate_params, DTensor compat, and unified multi-dim layouts
+        # on a single source of truth.
+        self.unsharded_group_info = self._build_layout_driven_group_info()
+
+        self.shard_size = self.sharded_group_info.rank_size
+        self.dp_size = self.unsharded_group_info.rank_size
+        self.rank_size = max(1, self.shard_size * self.dp_size)
+
+    def _build_layout_driven_group_info(self):
+        group_axes = [
+            axis
+            for axis, placement in enumerate(self._spmd_placements)
+            if placement.is_replicate()
+        ]
+        if self.uses_param_shard and self._spmd_shard_mesh_dim is not None:
+            group_axes = [axis for axis in group_axes if axis != self._spmd_shard_mesh_dim]
+        if not group_axes:
+            return GroupInfo("fully_shard_unsharded_group_invalid", None, 1)
+        group_dim_names = getattr(self._spmd_mesh, "mesh_dim_names", None)
+        if group_dim_names:
+            try:
+                mesh_axis_names = tuple(group_dim_names[axis] for axis in group_axes)
+                if len(mesh_axis_names) == 1:
+                    axis_name = mesh_axis_names[0]
+                    process_group = self._spmd_mesh.get_group(axis_name)
+                    if process_group is not None:
+                        rank_size = self._spmd_mesh.mesh_shape[group_dim_names.index(axis_name)]
+                        return _build_group_info_from_process_group(
+                            "fully_shard_unsharded_group",
+                            process_group,
+                            rank_size,
+                        )
+
+                sub_mesh = self._spmd_mesh[mesh_axis_names]
+                flattened_mesh = sub_mesh.flatten(mesh_dim_name="_".join(mesh_axis_names))
+                flattened_axis_name = flattened_mesh.mesh_dim_names[0]
+                process_group = flattened_mesh.get_group(flattened_axis_name)
+                if process_group is not None:
+                    rank_size = 1
+                    for dim_size in sub_mesh.mesh_shape:
+                        rank_size *= dim_size
+                    return _build_group_info_from_process_group(
+                        "fully_shard_unsharded_group",
+                        process_group,
+                        rank_size,
+                    )
+            except (
+                AssertionError,
+                AttributeError,
+                KeyError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ):
+                # Fall back to the explicit rank-list path for mocked meshes in UT
+                # or when a mesh implementation cannot materialize a reusable group.
+                pass
+
+        rank_list = get_rank_list_for_axes(self._spmd_mesh, group_axes)
+        return _build_group_info_from_rank_list("fully_shard_unsharded_group", rank_list)
+
+    def _to_local_unsharded_grad(self, grad):
+        """Normalize a pending gradient to a local tensor expected by fully_shard collectives."""
+        if not isinstance(grad, DTensor):
+            return grad
+
+        if any(placement.is_partial() for placement in grad.placements):
+            grad = grad.reduce_partial()
+
+        if (
+            self._orig_dtensor_mesh is not None
+            and grad.device_mesh.to_hash() != self._orig_dtensor_mesh.to_hash()
+        ) or (
+            self._orig_dtensor_placements is not None
+            and tuple(grad.placements) != tuple(self._orig_dtensor_placements)
+        ):
+            grad = grad.redistribute(self._orig_dtensor_mesh, self._orig_dtensor_placements)
+        return grad.to_local()
 
     def reduce_scatter_output(self):
         """
@@ -167,11 +377,12 @@ class TorchHSDPParamV2(HSDPParamV2):
                 self.sharded_param.main_grad = self.to_sharded_dtensor(reduced_grad)
                 self.sharded_param.grad = None
         else:
-            if not self.mp_policy.apply_grad_on_fp32_main_grad:
-                self.sharded_param.grad._local_tensor += reduced_grad
-            else:
-                self.sharded_param.main_grad._local_tensor += reduced_grad
-                self.sharded_param.grad = None
+            with SkipDTensorDispatch():
+                if not self.mp_policy.apply_grad_on_fp32_main_grad:
+                    self.sharded_param.grad._local_tensor += reduced_grad
+                else:
+                    self.sharded_param.main_grad._local_tensor += reduced_grad
+                    self.sharded_param.grad = None
         if self.unsharded_accumulated_grad_data is not None:
             self.unsharded_accumulated_grad = None
         elif self.unsharded_param.grad is not None:
@@ -202,34 +413,26 @@ class TorchHSDPParamV2(HSDPParamV2):
             )
 
         self.hsdp_placement = hsdp_placement
-        shard_dim = hsdp_placement.dim
-
-        # Non-DTensor parameters have no pre-defined SPMD semantics.
-        # FSDP/DDP solely determines the mesh and placements.
-        self._spmd_mesh = self.mesh_info.mesh
-        if isinstance(self.mesh_info, HSDPMeshInfo):  # HSDP
-            self._spmd_placements = (Replicate(), hsdp_placement)
-        elif isinstance(self.mesh_info, FSDPMeshInfo):  # FSDP
-            self._spmd_placements = (hsdp_placement,)
-        elif isinstance(self.mesh_info, DDPMeshInfo):  # DDP
-            self._spmd_placements = (Replicate(),)
-        param_data = param
+        base_placements = list(self._get_base_spmd_placements())
+        self._spmd_placements = self._apply_data_parallel_placements(base_placements, hsdp_placement)
+        param_data = param.to_local() if self._orig_param_is_dtensor else param
 
         shard_dim = hsdp_placement.dim
         self._orig_size = param_data.size()
         self._contiguous_orig_stride = make_contiguous_strides_for(self._orig_size)
 
-        if isinstance(self.mesh_info, FSDPMeshInfo):  # FSDP or HSDP
+        if self.uses_param_shard and isinstance(self.mesh_info, FSDPMeshInfo):
             shard_rank = self.mesh_info.shard_mesh_rank
             shard_world_size = self.mesh_info.shard_mesh_size
-        else:  # DDP
+        else:
             shard_rank = 0
             shard_world_size = 1
 
         if isinstance(param_data, DTensor) and isinstance(self.mesh_info, DDPMeshInfo):
             param_data.data = param_data.full_tensor()
 
-        self.is_sharded = True
+        self.is_sharded = bool(self.uses_param_shard and shard_world_size > 1)
+
         if param_data.size(shard_dim) % shard_world_size != 0:
             raise NotImplementedError(
                 f"Uneven sharding on dim {shard_dim} not supported: "
@@ -257,7 +460,6 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.sharded_state = ShardedState.SHARDED
         self.param_dtype = None
 
-
     def init_dtype_attrs(self, mp_policy: MixedPrecisionPolicy):
         """Initialize param_dtype and reduce_dtype from the mixed precision policy."""
         param_dtype, reduce_dtype = (mp_policy.param_dtype, mp_policy.reduce_dtype)
@@ -268,7 +470,6 @@ class TorchHSDPParamV2(HSDPParamV2):
             param_dtype = None
         self.param_dtype = param_dtype
         self.reduce_dtype = reduce_dtype
-
 
     def init_all_gather_outputs(
         self,
@@ -317,9 +518,17 @@ class TorchHSDPParamV2(HSDPParamV2):
             self._contiguous_orig_stride,
             storage_offset=0,
         )
-
+        if self._orig_param_is_dtensor:
+            # Rebuild the original DTensor view after all-gather so gradient
+            # consumers keep seeing the source DTensor layout.
+            unsharded_param = DTensor.from_local(
+                unsharded_param,
+                self._orig_dtensor_mesh,
+                self._orig_dtensor_placements,
+            )
         self._unsharded_param = nn.Parameter(
-            unsharded_param, requires_grad=self.sharded_param.requires_grad
+            unsharded_param,
+            requires_grad=self.sharded_param.requires_grad,
         )
 
     def to_sharded(self) -> None:
@@ -362,23 +571,28 @@ class TorchHSDPParamV2(HSDPParamV2):
         )
 
     def to_accumulated_grad_if_needed(self) -> None:
-        if (
-            self._unsharded_param.grad is not None
-            and self.reduce_dtype is not None
-            and self._unsharded_param.grad.dtype != self.reduce_dtype
-        ):
-            # need to handle the gradient even after the parameter is resharded
-            unsharded_grad = self._unsharded_param.grad
-            self._unsharded_param.grad = None
-            self.unsharded_accumulated_grad = unsharded_grad.to(self.reduce_dtype)
+        if self._unsharded_param.grad is None:
+            return
+        # Keep local gradients alive across no-sync / delayed-sync steps even
+        # after the parameter transitions back to the sharded view.
+        unsharded_grad = self._unsharded_param.grad
+        self._unsharded_param.grad = None
+        if self.reduce_dtype is not None and unsharded_grad.dtype != self.reduce_dtype:
+            unsharded_grad = unsharded_grad.to(self.reduce_dtype)
+        if self.unsharded_accumulated_grad is None:
+            self.unsharded_accumulated_grad = unsharded_grad
+        else:
+            self.unsharded_accumulated_grad += unsharded_grad
 
     def accumulate_unsharded_grad_if_needed(self) -> None:
         if (
             self.unsharded_accumulated_grad is not None
             and self.unsharded_param.grad is not None
         ):
-            # need to handle the gradient
-            self.unsharded_accumulated_grad += self.unsharded_param.grad
+            grad = self.unsharded_param.grad
+            if self.reduce_dtype is not None and grad.dtype != self.reduce_dtype:
+                grad = grad.to(self.reduce_dtype)
+            self.unsharded_accumulated_grad += grad
             self.unsharded_param.grad = None
 
     def alloc_all_gather_outputs(self) -> None:
@@ -422,9 +636,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         grad = self.unsharded_param.grad
         if grad is None:
             raise AssertionError("Expects unsharded_param.grad to not be None")
-        if isinstance(grad, DTensor):
-            raise AssertionError("Expected torch.Tensor, got DTensor")
-        return grad
+        return self._to_local_unsharded_grad(grad)
 
     @property
     def unsharded_accumulated_grad_data(self) -> torch.Tensor:
@@ -432,7 +644,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         Get the unsharded accumulated gradient data as a local tensor.
         """
         grad = self.unsharded_accumulated_grad
-        return grad
+        return self._to_local_unsharded_grad(grad)
 
     @property
     def _sharded_local_tensor(self) -> torch.Tensor:
@@ -441,17 +653,13 @@ class TorchHSDPParamV2(HSDPParamV2):
 
     @property
     def shard_world_size(self) -> int:
-        """Return the number of ranks in the shard dimension."""
-        if isinstance(self.mesh_info, FSDPMeshInfo):
-            return self.mesh_info.shard_mesh_size
-        return 1
+        """Get the world size for shard dimension."""
+        return self.shard_size
 
     @property
     def replicate_world_size(self) -> int:
-        """Return the number of ranks in the replicate dimension (HSDP only, 1 for FSDP)."""
-        if isinstance(self.mesh_info, HSDPMeshInfo):
-            return self.mesh_info.replicate_mesh_size
-        return 1
+        """Get the world size for replicate dimension (HSDP only)."""
+        return self.dp_size
 
     def _assert_in_states(self, *states: ShardedState) -> None:
         """Assert current state is one of expected states."""
@@ -570,10 +778,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         )
         self.alloc_all_gather_outputs()
 
-        # Get communication group
-        shard_group = self.mesh_info.shard_process_group if isinstance(self.mesh_info, FSDPMeshInfo) else None
-
-        if shard_group is None or self.shard_world_size <= 1:
+        if self.sharded_group_info.group is None or self.shard_world_size <= 1:
             # No communication needed, just copy
             self.all_gather_outputs[0].copy_(all_gather_input)
             return self.all_gather_outputs[0], None
@@ -582,7 +787,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         handle = dist.all_gather_into_tensor(
             self.all_gather_outputs[0],
             all_gather_input,
-            group=shard_group,
+            group=self.sharded_group_info.group,
             async_op=async_op,
         )
 
@@ -645,12 +850,23 @@ class TorchHSDPParamV2(HSDPParamV2):
         if not self.is_sharded:
             return grad_flat, None
 
-        # Get communication group
-        shard_group = self.mesh_info.shard_process_group if isinstance(self.mesh_info, FSDPMeshInfo) else None
-
-        if shard_group is None or self.shard_world_size <= 1:
+        if self.sharded_group_info.group is None or self.shard_world_size <= 1:
             # No communication needed
             return grad_flat, None
+
+        # The current RS implementation assumes the fully_shard dimension is the
+        # leading tensor dimension and that all other sharding follows the normal
+        # contiguous layout. Once StridedShard or non-dim0 fully_shard layouts are
+        # supported, this packing must become placement-aware instead of flattening.
+        if self.hsdp_placement.dim != 0:
+            raise NotImplementedError(
+                "reduce_scatter_grad currently only supports fully_shard placement on dim=0."
+            )
+        if any(isinstance(placement, StridedShard) for placement in self._spmd_placements):
+            raise NotImplementedError(
+                "reduce_scatter_grad does not support StridedShard layout yet. "
+                "Please disable this path until placement-aware RS packing is implemented."
+            )
 
         # Calculate output size
         output_numel = grad_flat.numel() // self.shard_world_size
@@ -661,7 +877,7 @@ class TorchHSDPParamV2(HSDPParamV2):
             self._reduce_scatter_output,
             grad_flat,
             op=reduce_op,
-            group=shard_group,
+            group=self.sharded_group_info.group,
             async_op=async_op,
         )
         return self._reduce_scatter_output, self.reduce_scatter_handle
@@ -695,16 +911,11 @@ class TorchHSDPParamV2(HSDPParamV2):
         if dtype is not None and dtype != grad.dtype:
             grad = grad.to(dtype)
 
-        if not isinstance(self.mesh_info, HSDPMeshInfo):
-            # Not HSDP mode, no all-reduce needed
-            return grad, None
-
-        replicate_group = self.mesh_info.replicate_process_group
-        if replicate_group is None or self.replicate_world_size <= 1:
+        if self.unsharded_group_info.group is None or self.replicate_world_size <= 1:
             return grad, None
 
         self.all_reduce_handle = dist.all_reduce(grad, op=reduce_op,
-                                                 group=replicate_group, async_op=async_op)
+                                                 group=self.unsharded_group_info.group, async_op=async_op)
         self._all_reduce_output = grad
         return grad, self.all_reduce_handle
 

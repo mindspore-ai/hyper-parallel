@@ -18,7 +18,11 @@ from typing import Tuple, Union
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.core.fully_shard.hsdp_utils import HSDPConfigV2, FSDPSchedulerState
+from hyper_parallel.core.fully_shard.hsdp_utils import (
+    FSDPSchedulerState,
+    HSDPConfigV2,
+    get_managed_modules_parameters,
+)
 
 platform = get_platform()
 
@@ -48,6 +52,7 @@ class HSDPSchedulerV2:
         self.shard_placement_fn = shard_placement_fn
         self.mp_policy = mp_policy
         self.offload_policy = offload_policy
+        self.ignored_params = ignored_params
         self.replicate_params = replicate_params
         self.device = device
         self.scheduler_state = None
@@ -84,6 +89,10 @@ class HSDPSchedulerV2:
         """Register module forward and backward hook."""
         raise NotImplementedError("HSDPScheduler subclasses must implement _register_forward_backward_hooks.")
 
+    def _get_managed_params(self):
+        """Return deduplicated parameters from all managed modules."""
+        return get_managed_modules_parameters(self.modules, self.ignored_params)
+ 
     def set_reshard_after_forward(self, reshard_after_forward: bool):
         """set reshard_after_forward flag"""
         if not isinstance(reshard_after_forward, bool):
@@ -151,7 +160,6 @@ class HSDPSchedulerV2:
         """Backward pre hook to unsharded parameter for backward process."""
         self.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
         if self.reshard_after_forward:
-            self.hsdp_state.unshard(unshard_replicate=False)
             with self.platform.profiler_record(f"pre_backward unshard:{self.hsdp_state.module_name}"):
                 self.hsdp_state.unshard(unshard_replicate=False)
         for prefetch_cell in self.backward_prefetch_cells:

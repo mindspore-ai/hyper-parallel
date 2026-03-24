@@ -16,10 +16,11 @@
 import torch
 from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_unflatten
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2, FSDPSchedulerState
+from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, DDPMeshInfo, HSDPMeshInfo
 from hyper_parallel.platform.torch.fully_shard.hook_function import PostBackwardFunction
 from hyper_parallel.platform.torch.fully_shard.state import TorchHSDPStateV2
-from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, HSDPMeshInfo
 from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx
 from hyper_parallel.platform import get_platform
 
@@ -48,14 +49,33 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _new_cell_state(self):
         """Create a new cell state for torch."""
-        if self.mesh.ndim not in (1, 2):
-            raise ValueError("fully_shard only support 1D and 2D mesh.")
-        if self.mesh.ndim == 1:
-            # FSDP2
+        params = self._get_managed_params()
+        if self.mesh is None:
+            compat_meshes = [
+                param.device_mesh for param in params if isinstance(param, DTensor)
+            ]
+            compat_mesh = compat_meshes[0] if compat_meshes else None
+            if compat_mesh is None:
+                raise ValueError(
+                    "Cannot build fully_shard compatibility mesh_info "
+                    "without a DTensor parameter mesh."
+                )
+            compat_mesh_hash = compat_mesh.to_hash()
+            for param_mesh in compat_meshes[1:]:
+                if param_mesh.to_hash() != compat_mesh_hash:
+                    raise ValueError(
+                        "fully_shard compatibility mode requires all DTensor parameters to share the same mesh."
+                    )
+            self.mesh_info = DDPMeshInfo(mesh=compat_mesh, replicate_mesh_dim=0)
+        elif self.mesh.ndim == 1:
             self.mesh_info = FSDPMeshInfo(mesh=self.mesh, shard_mesh_dim=0)
-        else:
-            # HSDP
+        elif self.mesh.ndim == 2:
             self.mesh_info = HSDPMeshInfo(mesh=self.mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
+        else:
+            raise ValueError(
+                "fully_shard only supports explicit 1D DP/FSDP meshes or 2D HSDP meshes. "
+                f"Got mesh.ndim={self.mesh.ndim}."
+            )
         self.hsdp_state = TorchHSDPStateV2(
             self.modules, self.mesh_info, self.config, self.platform, self.device
         )

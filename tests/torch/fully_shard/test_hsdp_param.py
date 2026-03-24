@@ -15,6 +15,7 @@
 """test TorchHSDPParamV2"""
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
+from tests.torch.utils import torchrun_case
 
 _TEST_HSDP_PARAM = "_test_hsdp_param.py"
 
@@ -83,3 +84,107 @@ def test_hsdp_param_group4():
     parallel_run([
         TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_accumulate_grad", 12355, 2),
     ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test DTensor param on 2D dp x tp mesh with fully_shard enabled.
+    Expectation: assertion pass.
+    """
+    master_port = 12356
+    file_name = "_test_hsdp_param.py"
+    case_name = "test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test DTensor param on 2D dp x tp mesh when TP and fully_shard split the same tensor dim.
+    Expectation: assertion pass.
+    """
+    master_port = 12360
+    file_name = "_test_hsdp_param.py"
+    case_name = "test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test DTensor param on 3D dp x tp x ep mesh.
+    Expectation: assertion pass.
+    """
+    master_port = 12357
+    file_name = "_test_hsdp_param.py"
+    case_name = "test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test the DTensor compatibility mode without extra fully_shard parameter sharding.
+    Expectation: assertion pass.
+    """
+    master_port = 12358
+    file_name = "_test_hsdp_param.py"
+    case_name = "test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test pure TP compatibility mode keeps TP-sharded parameters out of all-reduce groups.
+    Expectation: assertion pass.
+    """
+    master_port = 12359
+    file_name = "_test_hsdp_param.py"
+    case_name = "test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test reordered unified mesh remaps shard/replicate dims and unsharded group construction.
+    Expectation: assertion pass.
+    """
+    master_port = 12361
+    file_name = "_test_hsdp_param.py"
+    case_name = "test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_hsdp_param_v2_reduce_scatter_guard_non_dim0():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test reduce_scatter guard for non-dim0 shard placement.
+    Expectation: assertion pass.
+    """
+    master_port = 12362
+    file_name = "_test_hsdp_param.py"
+    case_name = "test_hsdp_param_v2_reduce_scatter_guard_non_dim0"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_hsdp_param_v2_reduce_scatter_guard_strided_shard():
+    """
+    Feature: TorchHSDPParamV2.
+    Description: Test reduce_scatter guard for StridedShard layout.
+    Expectation: assertion pass.
+    """
+    master_port = 12363
+    file_name = "_test_hsdp_param.py"
+    case_name = "test_hsdp_param_v2_reduce_scatter_guard_strided_shard"
+    torchrun_case(file_name, case_name, master_port)

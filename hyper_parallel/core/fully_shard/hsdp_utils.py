@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,12 +14,17 @@
 # ============================================================================
 """HSDP optimizer shared level"""
 from dataclasses import dataclass, field
-from typing import Any, List
 from enum import auto, Enum
+from typing import Any, List, Optional, Sequence
+
+import numpy as np
+
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
-platform = get_platform()
 
+platform = get_platform()
 
 
 class HSDPConfigV2:
@@ -52,6 +57,36 @@ class ShardedState(Enum):
     """
     SHARDED = auto()
     UNSHARDED = auto()
+
+
+class FullyShardParamMode(Enum):
+    """
+    Internal fully_shard execution modes derived from the original parameter layout.
+
+    LOCAL_PARAM:
+        The parameter is a regular local tensor parameter and fully_shard owns the
+        full data-parallel sharding behaviour.
+    DTENSOR_COMPAT:
+        The parameter already carries a DTensor layout and fully_shard is only used
+        as the compatibility wrapper without adding an extra FSDP shard dimension.
+    DTENSOR_UNIFIED:
+        The parameter already carries a DTensor layout and fully_shard additionally
+        contributes a data-parallel/FSDP mesh that must be unified with the
+        existing distributed layout.
+    """
+
+    LOCAL_PARAM = auto()
+    DTENSOR_COMPAT = auto()
+    DTENSOR_UNIFIED = auto()
+
+
+@dataclass
+class GroupInfo:
+    """Communication group metadata used by fully_shard."""
+
+    group_name: str
+    group: Any
+    rank_size: int
 
 
 class FSDPSchedulerState(Enum):
@@ -156,3 +191,93 @@ def _get_param_module_infos(
     if len(param_to_module_info) != len(params):
         raise AssertionError(f"Some parameters are not in the module tree of {modules}")
     return [param_to_module_info[param] for param in params]
+
+
+def get_managed_modules_parameters(
+    modules: Sequence[platform.Module],
+    ignored_params: Optional[Sequence[platform.Parameter]] = None,
+) -> list[platform.Parameter]:
+    """Collect deduplicated parameters from ``modules`` while skipping ignored params."""
+    params: list[platform.Parameter] = []
+    ignored_params_set = set(ignored_params or ())
+    visited_params: set[platform.Parameter] = set()
+    for mod in modules:
+        for _, param in platform.parameters_dict(mod):
+            if param in ignored_params_set or param in visited_params:
+                continue
+            visited_params.add(param)
+            params.append(param)
+    return params
+
+
+def infer_fully_shard_param_mode(
+    mesh: Optional[DeviceMesh],
+    params: Optional[Sequence[Any]] = None,
+) -> FullyShardParamMode:
+    """
+    Infer the internal fully_shard execution mode from parameter layout and mesh.
+
+    The mode is intentionally phrased around whether parameters already carry a
+    distributed layout instead of assuming the layout came from TP only. DTensor
+    parameters may originate from TP, EP, or other distributed sharding paths.
+    """
+    has_dtensor_param = any(is_dtensor_managed_param(param) for param in params or ())
+    if not has_dtensor_param:
+        return FullyShardParamMode.LOCAL_PARAM
+    if mesh is None:
+        return FullyShardParamMode.DTENSOR_COMPAT
+    return FullyShardParamMode.DTENSOR_UNIFIED
+
+
+def unwrap_dtensor_param(param: Any) -> Optional[DTensor]:
+    """Return the DTensor payload carried by ``param`` if one exists."""
+    if isinstance(param, DTensor):
+        return param
+    param_data = getattr(param, "data", None)
+    if isinstance(param_data, DTensor):
+        return param_data
+    if all(hasattr(param, attr) for attr in ("_device_mesh", "_placements", "_local_tensor")):
+        return param
+    return None
+
+
+def is_dtensor_managed_param(param: Any) -> bool:
+    """Return whether a parameter already carries DTensor layout metadata."""
+    return unwrap_dtensor_param(param) is not None
+
+
+def get_dtensor_managed_mesh(param: Any) -> Optional[DeviceMesh]:
+    """Return the DTensor mesh carried by ``param`` if one exists."""
+    payload = unwrap_dtensor_param(param)
+    if payload is None:
+        return None
+    return getattr(payload, "device_mesh", getattr(payload, "_device_mesh", None))
+
+
+def get_rank_list_for_axes(
+    mesh: DeviceMesh,
+    axes: Sequence[int],
+    rank: Optional[int] = None,
+) -> list[int]:
+    """Return ranks that vary along ``axes`` and keep all other coordinates fixed."""
+    if rank is None:
+        rank = mesh.rank
+    if rank not in mesh.rank_list:
+        raise ValueError(f"Rank {rank} not found in mesh rank list {mesh.rank_list}.")
+
+    normalized_axes = tuple(sorted(set(axes)))
+    if len(normalized_axes) == 0:
+        return [rank]
+
+    mesh_tensor = np.array(mesh.rank_list).reshape(mesh.mesh_shape)
+    rank_index = mesh.rank_list.index(rank)
+    coord = [0] * len(mesh.mesh_shape)
+    temp = rank_index
+    for i in range(len(mesh.mesh_shape) - 1, -1, -1):
+        coord[i] = temp % mesh.mesh_shape[i]
+        temp //= mesh.mesh_shape[i]
+    mesh_slice = []
+    for axis, axis_coord in enumerate(coord):
+        mesh_slice.append(slice(None) if axis in normalized_axes else axis_coord)
+    selected = mesh_tensor[tuple(mesh_slice)]
+    return [int(item) for item in np.array(selected).reshape(-1).tolist()]

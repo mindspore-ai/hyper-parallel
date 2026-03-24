@@ -18,7 +18,8 @@ import copy
 import functools
 import numpy as np
 
-from hyper_parallel.core.dtensor.placement_types import Placement, Shard, Replicate, Partial
+
+from hyper_parallel.core.dtensor.placement_types import Placement, Shard, StridedShard, Replicate, Partial
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _create_device_mesh
 from hyper_parallel.platform import get_platform
 
@@ -200,6 +201,15 @@ class Layout:
 
         return self._process_alias_layout(obj, alias_tensor_map)
 
+    def __deepcopy__(self, memo):
+        """Deep copy layout without rebuilding the underlying device mesh."""
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            setattr(result, k, copy.deepcopy(v, memo))
+        return result
+
     def _process_placement_layout(self, obj, placements):
         """Process layout defined by Placement types."""
         obj.set_placements(placements)
@@ -256,7 +266,8 @@ class Layout:
         """
         Transform placement to tensor map.
 
-        This method converts the `placements` configuration (consisting of Shard, Replicate, Partial)
+        This method converts the `placements` configuration (consisting of Shard, StridedShard,
+        Replicate, Partial)
         into a `tensor_map` representation used for distributed tensor operations.
 
         Args:
@@ -264,13 +275,13 @@ class Layout:
 
         Returns:
             tuple: A tuple representing the tensor map, where each element corresponds to a tensor dimension.
-                   A value of -1 indicates the dimension is not sharded, while other values indicate
-                   the mesh dimension index along which the tensor dimension is sharded.
+                   A value of -1 indicates the dimension is not sharded, an integer indicates the mesh
+                   dimension index along which the tensor dimension is sharded, and a tuple indicates
+                   that the same tensor dimension is sharded multiple times in order.
 
         Raises:
             ValueError: If `dim` is negative.
             ValueError: If a shard dimension in `placements` is out of bounds for the given tensor dimension.
-            ValueError: If a tensor dimension is sharded by multiple mesh axes.
         """
         if dim < 0:
             raise ValueError(f"Tensor dimension must be positive, but got {dim}")
@@ -304,12 +315,72 @@ class Layout:
                     raise ValueError(f"Shard dimension {shard_dim} is out of bounds for tensor of dimension {dim}")
                 if shard_dim < 0:
                     shard_dim += dim
-                if dim_map[shard_dim] != -1:
-                    raise ValueError(f"Dimension {shard_dim} has been sharded by Mesh axis {dim_map[shard_dim]}")
-                dim_map[shard_dim] = mesh_idx
+                if dim_map[shard_dim] == -1:
+                    dim_map[shard_dim] = [mesh_idx]
+                else:
+                    dim_map[shard_dim].append(mesh_idx)
             elif isinstance(placement, Partial):
                 self._partial[mesh_idx] = self._extract_reduce_op(placement)
+        self._validate_strided_shard_split_factor(dim_map)
+        self._reorder_dim_map_for_strided_shard(dim_map)
         return dim_map
+
+    @staticmethod
+    def _placement_split_factor(placement):
+        """Return the effective split factor carried by a placement."""
+        return placement.split_factor if isinstance(placement, StridedShard) else 1
+
+    @staticmethod
+    def _build_order_positions(shard_order):
+        """Build a mesh axis to order position mapping."""
+        return {mesh_idx: order_idx for order_idx, mesh_idx in enumerate(shard_order)}
+
+    def _compute_expected_split_factors(self, shard_axes, shard_order):
+        """Infer the split_factor each mesh axis should carry for the given sharding order."""
+        order_positions = self._build_order_positions(shard_order)
+        expected_split_factors = {}
+        for mesh_idx in shard_axes:
+            split_factor = 1
+            for right_mesh_idx in shard_axes:
+                if right_mesh_idx <= mesh_idx:
+                    continue
+                if order_positions[right_mesh_idx] < order_positions[mesh_idx]:
+                    split_factor *= self.mesh_shape[right_mesh_idx]
+            expected_split_factors[mesh_idx] = split_factor
+        return expected_split_factors
+
+    def _get_effective_shard_axes(self, shard_axes):
+        """Return shard axes ordered by their effective sharding order."""
+        return sorted(
+            shard_axes,
+            key=lambda mesh_idx: self._placement_split_factor(self.placements[mesh_idx]),
+        )
+
+    def _reorder_dim_map_for_strided_shard(self, dim_map):
+        """Reorder dim_map entries to reflect the effective sharding order."""
+        for i, shard_axes in enumerate(dim_map):
+            if shard_axes == -1 or len(shard_axes) <= 1:
+                continue
+            dim_map[i] = self._get_effective_shard_axes(shard_axes)
+
+    def _validate_strided_shard_split_factor(self, dim_map):
+        """Validate that split factors match the effective sharding order."""
+        for shard_axes in dim_map:
+            if shard_axes == -1:
+                continue
+            shard_order = self._get_effective_shard_axes(shard_axes)
+            expected_split_factors = self._compute_expected_split_factors(
+                shard_axes, shard_order
+            )
+            for mesh_idx in shard_axes:
+                placement = self.placements[mesh_idx]
+                actual_split_factor = self._placement_split_factor(placement)
+                expected_split_factor = expected_split_factors[mesh_idx]
+                if actual_split_factor != expected_split_factor:
+                    raise ValueError(
+                        f"StridedShard split_factor mismatch on mesh axis {mesh_idx}: "
+                        f"expected {expected_split_factor}, got {actual_split_factor}."
+                    )
 
     def _extract_reduce_op(self, placement):
         """Extract reduce operation name from Partial placement."""
@@ -321,10 +392,14 @@ class Layout:
     def _convert_dim_map_to_tensor_map(self, dim_map):
         """Convert dimension map to tensor map format."""
         device_dim_count = len(self.mesh_shape)
-        return [
-            device_dim_count - 1 - mesh_idx if mesh_idx != -1 else -1
-            for mesh_idx in dim_map
-        ]
+        tensor_map = []
+        for mesh_idx in dim_map:
+            if mesh_idx == -1:
+                tensor_map.append(-1)
+                continue
+            mapped_axes = tuple(device_dim_count - 1 - axis for axis in mesh_idx)
+            tensor_map.append(mapped_axes[0] if len(mapped_axes) == 1 else mapped_axes)
+        return tensor_map
 
     def _build_readable_tensor_map(self):
         """Build human-readable alias tensor map from tensor_map."""
@@ -353,7 +428,8 @@ class Layout:
         Transform tensor map to placement.
 
         This method converts the existing `tensor_map` and `partial` status into a list of `Placement` objects
-        (Shard, Replicate, Partial). This is the inverse operation of `placement_to_tensor_map`.
+        (Shard, StridedShard, Replicate, Partial). This is the inverse operation of
+        `placement_to_tensor_map`.
 
         Returns:
             list[Placement]: A list of Placement objects describing the distribution strategy for each
@@ -368,10 +444,20 @@ class Layout:
         placements = [Replicate()] * mesh_ndim
         for tensor_dim, mapping in enumerate(self._tensor_map):
             mapping_list = mapping if isinstance(mapping, tuple) else (mapping,)
-            for map_val in mapping_list:
-                if map_val != -1:
-                    root_mesh_idx = mesh_ndim - 1 - map_val
-                    placements[root_mesh_idx] = Shard(dim=tensor_dim)
+            valid_mapping = [map_val for map_val in mapping_list if map_val != -1]
+            mesh_indices = [mesh_ndim - 1 - map_val for map_val in valid_mapping]
+            shard_axes = sorted(mesh_indices)
+            expected_split_factors = self._compute_expected_split_factors(
+                shard_axes, mesh_indices
+            )
+            for mesh_idx in shard_axes:
+                split_factor = expected_split_factors[mesh_idx]
+                placement = (
+                    StridedShard(dim=tensor_dim, split_factor=split_factor)
+                    if split_factor > 1
+                    else Shard(dim=tensor_dim)
+                )
+                placements[mesh_idx] = placement
         for mesh_idx, op in enumerate(self.partial):
             if op is not None:
                 placements[mesh_idx] = Partial(reduce_op=op)

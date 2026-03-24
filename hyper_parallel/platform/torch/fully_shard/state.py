@@ -14,12 +14,18 @@
 # ============================================================================
 """Torch HSDP cell state"""
 # pylint: disable=protected-access
+
 from typing import Optional
+
 import torch
-import torch.distributed as dist
+
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
-from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos
-from hyper_parallel.core.fully_shard.utils import HSDPMeshInfo, DDPMeshInfo, CPUOffloadPolicy
+from hyper_parallel.core.fully_shard.hsdp_utils import (
+    FullyShardParamMode,
+    _get_param_module_infos,
+    infer_fully_shard_param_mode,
+)
+from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
 from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx, HSDPParamGroup
 
@@ -40,10 +46,27 @@ def _to_dtype_if_needed(
 
 class TorchHSDPStateV2(HSDPState):
     """Torch HSDP cell state"""
-    # Record grad reduce-scatter handle.
+    # Record grad reduce-scatter handles across states to preserve the
+    # existing cross-module backward staging / prefetch pipeline.
     pre_reduce_scatter_params = []
-    # Record grad allreduce handle (only for HSDP).
+    # Record grad all-reduce handles (only for HSDP) across states.
     pre_all_reduce_params = []
+
+    @staticmethod
+    def _get_pending_unsharded_grad(hsdp_param):
+        """Return the pending unsharded gradient tensor for all-reduce-based paths."""
+        if hsdp_param.unsharded_accumulated_grad is not None:
+            return hsdp_param.unsharded_accumulated_grad_data
+        return hsdp_param.unsharded_grad_data
+
+    @staticmethod
+    def _has_pending_unsharded_grad(hsdp_param):
+        """Whether the parameter currently has a gradient waiting for reduction."""
+        if hsdp_param.unsharded_accumulated_grad is not None:
+            return True
+        if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
+            return False
+        return hsdp_param.unsharded_param.grad is not None
 
     def __init__(self, cell, mesh_info, config, platform, device):
         """
@@ -67,12 +90,17 @@ class TorchHSDPStateV2(HSDPState):
         self.reshard_after_backward = True
         # Requires AllReduce for grad When HSDP
         self.requires_all_reduce = True
-        # Reduce Op type for gradient reduction, default to AVG.
-        self.reduce_op_type = torch.distributed.ReduceOp.AVG
-        self._ignored_allreduce_works = []
+        # Default reduce op is decided at the fully_shard-state level:
+        # if any managed parameter is DTensor-backed, use SUM; otherwise AVG.
+        self._user_reduce_op_type = None
+        self.reduce_op_type = self._resolve_default_reduce_op()
         self._validate_cpu_offload_params()
         self._reset_sharded_params = False
         self._init_param_group()
+
+    def _iter_managed_params(self):
+        """Return all fully_shard-managed parameters, including replicate_params."""
+        return [*self.hsdp_params, *self.replicate_params]
 
     def _init_param_group(self):
         """Initialize fused parameter group for communication fusion.
@@ -82,6 +110,20 @@ class TorchHSDPStateV2(HSDPState):
         replacing the per-parameter communication pattern.
         """
         if self.config.comm_fusion:
+            unsupported_param = next(
+                (
+                    hsdp_param
+                    for hsdp_param in self._iter_managed_params()
+                    if hsdp_param.param_mode != FullyShardParamMode.LOCAL_PARAM
+                    or not hsdp_param.enable_fsdp_shard
+                ),
+                None,
+            )
+            if unsupported_param is not None:
+                raise NotImplementedError(
+                    "comm_fusion currently only supports local parameters with fully_shard "
+                    "storage sharding enabled."
+                )
             # pylint: disable=E1128
             self.param_group = HSDPParamGroup(self.hsdp_params, self.mesh_info, self.device, self.mp_policy)
 
@@ -101,12 +143,15 @@ class TorchHSDPStateV2(HSDPState):
 
     def _init_hsdp_params(self):
         """init hsdp parameters and replicate parameters for cell."""
-        replicate_params = self.config.replicate_params
+        replicate_params = set(self.config.replicate_params or ())
         # all parameters in the module tree(s), deduplicated
+        ignored_params = set(self.config.ignored_params or ())
         visited_params = set()
         filtered_params = []
         for mod in self.modules:
             for _, param in mod.named_parameters():
+                if param in ignored_params:
+                    continue
                 if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
                     continue
                 if param in visited_params:
@@ -116,14 +161,16 @@ class TorchHSDPStateV2(HSDPState):
 
         module_infos = _get_param_module_infos(filtered_params, tuple(self.modules))
         for param, module_info in zip(filtered_params, module_infos):
-            ddp_mesh_info = DDPMeshInfo(mesh=self.mesh_info.mesh, replicate_mesh_dim=0)
-            mesh_info = ddp_mesh_info if param in replicate_params else self.mesh_info
+            param_mode = infer_fully_shard_param_mode(self.config.mesh, [param])
+            enable_fsdp_shard = param not in replicate_params
             hsdp_param = TorchHSDPParamV2(param,
                                           module_info,
-                                          mesh_info,
+                                          self.mesh_info,
                                           mp_policy=self.mp_policy,
                                           offload_policy=self.offload_policy,
                                           device=self.device,
+                                          param_mode=param_mode,
+                                          enable_fsdp_shard=enable_fsdp_shard,
                                           )
             if param in replicate_params:
                 self.replicate_params.append(hsdp_param)
@@ -139,7 +186,7 @@ class TorchHSDPStateV2(HSDPState):
         for replicate_param in self.replicate_params:
             replicate_param.init_dtype_attrs(self.mp_policy)
         trainable_params: list[TorchHSDPParamV2] = [
-            p for p in self.hsdp_params if p.sharded_param.requires_grad
+            p for p in self._iter_managed_params() if p.sharded_param.requires_grad
         ]
         orig_dtypes = {p.orig_dtype for p in trainable_params}
         reduce_dtypes = {p.reduce_dtype for p in trainable_params}
@@ -160,7 +207,7 @@ class TorchHSDPStateV2(HSDPState):
             return
         hsdp_params_not_on_cpu = [
             hsdp_param
-            for hsdp_param in self.hsdp_params
+            for hsdp_param in self._iter_managed_params()
             if hsdp_param.sharded_param.device.type != "cpu"
         ]
         if hsdp_params_not_on_cpu:
@@ -184,7 +231,7 @@ class TorchHSDPStateV2(HSDPState):
     def _validate_no_meta_params(self):
         param_names_on_meta = [
             hsdp_param._param_fqn
-            for hsdp_param in self.hsdp_params
+            for hsdp_param in self._iter_managed_params()
             if hsdp_param.sharded_param.device.type == "meta"
         ]
         if param_names_on_meta:
@@ -194,74 +241,6 @@ class TorchHSDPStateV2(HSDPState):
                 "For example, call module.to_empty(device) to materialize to device and "
                 "call module.reset_parameters() on each module to initialize values."
             )
-
-    def _allreduce_replicate_params(self, async_op=True) -> None:
-        """
-        DDP-style all-reduce for parameters in config.replicate_params.
-
-        Do one all-reduce over the flattened 2D mesh so the final
-        gradient is reduced over the full mesh.
-        """
-        for param in self.replicate_params:
-            if not hasattr(param, "_unsharded_param") or param.unsharded_param is None:
-                continue
-
-            reduced_grad = _to_dtype_if_needed(param.unsharded_param.grad, self._reduce_dtype)
-            flat_name = "reduce_all"
-            flat_mesh = self.mesh_info.mesh.flatten(mesh_dim_name=flat_name)
-            reduce_group = flat_mesh.get_group(flat_name)
-            if reduce_group is not None and reduce_group.size() > 1:
-                param.all_reduce_handle = torch.distributed.all_reduce(
-                    reduced_grad, group=reduce_group, op=self.reduce_op_type, async_op=async_op
-                )
-            self._ignored_allreduce_works.append((param, reduced_grad))
-
-    def _finish_ignored_allreduce(self) -> None:
-        """
-        Wait for async all-reduce of replicate_params and materialize param.grad.
-
-        For each pending work, this:
-          Waits on all associated handles to complete;
-          Casts reduced_grad back to _orig_dtype if needed;
-          Assigns the final tensor to param.grad.
-        """
-        if not self._ignored_allreduce_works:
-            return
-
-        need_synchronize = False
-        for param, reduced_grad in self._ignored_allreduce_works:
-            if param.all_reduce_handle:
-                param.all_reduce_handle.wait()
-            if self._orig_dtype is not None and reduced_grad.dtype != self._orig_dtype:
-                reduced_grad = reduced_grad.to(self._orig_dtype)
-            sharded_grad = param.sharded_param.grad
-            to_accumulate_grad = sharded_grad is not None
-            if param.offload_to_cpu:
-                non_blocking = param.pin_memory and not to_accumulate_grad
-                reduced_grad = reduced_grad.to(
-                    torch.device("cpu"), non_blocking=non_blocking
-                )
-                need_synchronize = True
-            if sharded_grad is None:
-                param.sharded_param.grad = param.to_sharded_dtensor(reduced_grad)
-            else:
-                param.sharded_param.grad._local_tensor += reduced_grad
-
-            if param.unsharded_accumulated_grad_data is not None:
-                param.unsharded_accumulated_grad = None
-            elif param.unsharded_param.grad is not None:
-                param.unsharded_param.grad = None
-
-        if need_synchronize:
-            if self.device.type == "npu":
-                torch.npu.current_stream().synchronize()
-            elif self.device.type == "cuda":
-                torch.cuda.current_stream().synchronize()
-            else:
-                raise NotImplementedError(
-                    f"Unsupported device type {self.device.type} for synchronization after CPU offload.")
-
-        self._ignored_allreduce_works.clear()
 
     def post_backward_for_comm_fusion(self):
         """post_backward_for_comm_fusion."""
@@ -281,48 +260,86 @@ class TorchHSDPStateV2(HSDPState):
             reduce_scatter_reduce_op=self.reduce_op_type
         )
 
+    def _resolve_default_reduce_op(self):
+        """Resolve the default reduce op for the whole fully_shard state."""
+        for hsdp_param in self._iter_managed_params():
+            if hsdp_param.param_mode in (
+                FullyShardParamMode.DTENSOR_COMPAT,
+                FullyShardParamMode.DTENSOR_UNIFIED,
+            ):
+                return torch.distributed.ReduceOp.SUM
+        return torch.distributed.ReduceOp.AVG
+
+    def _resolve_reduce_op(self, hsdp_param=None):
+        """Resolve the gradient reduction op for the current fully_shard state."""
+        if self._user_reduce_op_type is not None:
+            return self._user_reduce_op_type
+        return self.reduce_op_type
+
+    def _should_run_all_reduce(self, hsdp_param) -> bool:
+        """Whether the current parameter should issue an all-reduce in this backward pass."""
+        return self.requires_all_reduce and hsdp_param.dp_size > 1
+
+    def _queue_reduce_scatter_then_all_reduce(self, hsdp_param, reduce_op):
+        """Queue the standard FSDP/HSDP reduction path."""
+        hsdp_param.reduce_scatter_grad(
+            dtype=self._reduce_dtype,
+            reduce_op=reduce_op,
+        )
+        TorchHSDPStateV2.pre_reduce_scatter_params.append((hsdp_param, self._orig_dtype))
+        if not self._should_run_all_reduce(hsdp_param):
+            return
+        reduced_grad = hsdp_param.reduce_scatter_output()
+        if (
+            TorchHSDPStateV2.pre_reduce_scatter_params
+            and TorchHSDPStateV2.pre_reduce_scatter_params[-1][0] == hsdp_param
+        ):
+            TorchHSDPStateV2.pre_reduce_scatter_params.pop()
+        hsdp_param.all_reduce_grad(
+            grad=reduced_grad,
+            dtype=self._reduce_dtype,
+            reduce_op=reduce_op,
+        )
+        TorchHSDPStateV2.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
+
+    def _queue_compat_all_reduce(self, hsdp_param, reduce_op):
+        """Queue the compatibility all-reduce path without FSDP sharding."""
+        if not self._should_run_all_reduce(hsdp_param):
+            return
+        hsdp_param.all_reduce_grad(
+            grad=self._get_pending_unsharded_grad(hsdp_param),
+            dtype=self._reduce_dtype,
+            reduce_op=reduce_op,
+        )
+        TorchHSDPStateV2.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
+
     def post_backward(self, *unused):  # pylint: disable=unused-argument
         """Reduce gradients and reshard parameters after backward."""
-        for hsdp_param in self.hsdp_params:
+        for hsdp_param in self._iter_managed_params():
             hsdp_param.accumulate_unsharded_grad_if_needed()
-        for replicate_param in self.replicate_params:
-            replicate_param.accumulate_unsharded_grad_if_needed()
         if not self.reduce_grads:
             if self.reshard_after_backward:
                 self.shard()
-            for hsdp_param in self.hsdp_params:
+            for hsdp_param in self._iter_managed_params():
                 hsdp_param.to_accumulated_grad_if_needed()
-            for replicate_param in self.replicate_params:
-                replicate_param.to_accumulated_grad_if_needed()
             return
-        self._allreduce_replicate_params()
         if not self.comm_fusion:
             self.reduce_params()
-            for hsdp_param in self.hsdp_params:
+            for hsdp_param in self._iter_managed_params():
                 if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
                     continue
-                # Frozen parameters (requires_grad=False) produce no
-                # gradient — skip all reduce-scatter / all-reduce work.
+                # Frozen parameters produce no gradient, so there is nothing to reduce.
                 if not hsdp_param.sharded_param.requires_grad:
                     continue
-                if hsdp_param.shard_world_size > 1:
-                    hsdp_param.reduce_scatter_grad(
-                        dtype=self._reduce_dtype,
-                        reduce_op=self.reduce_op_type
-                    )
-                    TorchHSDPStateV2.pre_reduce_scatter_params.append([hsdp_param, self._orig_dtype])
-
-                if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
-                    assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
-                    reduced_grad = hsdp_param.reduce_scatter_output()
-                    hsdp_param.all_reduce_grad(grad=reduced_grad, dtype=self._reduce_dtype, reduce_op=self.reduce_op_type)
-                    if TorchHSDPStateV2.pre_reduce_scatter_params and \
-                            TorchHSDPStateV2.pre_reduce_scatter_params[-1][0] == hsdp_param:
-                        TorchHSDPStateV2.pre_reduce_scatter_params.pop()
-                    TorchHSDPStateV2.pre_all_reduce_params.append([hsdp_param, self._orig_dtype])
+                if not self._has_pending_unsharded_grad(hsdp_param):
+                    continue
+                reduce_op = self._resolve_reduce_op(hsdp_param)
+                if hsdp_param.shard_size > 1:
+                    self._queue_reduce_scatter_then_all_reduce(hsdp_param, reduce_op)
+                elif self._should_run_all_reduce(hsdp_param):
+                    self._queue_compat_all_reduce(hsdp_param, reduce_op)
         else:
             self.post_backward_for_comm_fusion()
-        self._finish_ignored_allreduce()
         if self.reshard_after_backward:
             self.shard()
 
@@ -337,14 +354,14 @@ class TorchHSDPStateV2(HSDPState):
 
         Note:
             - Parameters are processed in **FIFO (First-In-First-Out)** order (via `pop(0)`), ensuring
-              gradient application order matches the order of gradient reduction operations.
+            gradient application order matches the order of gradient reduction operations.
             - After retrieving the reduced gradient, the cached communication output (reduce_scatter_output
-              or all_reduce_output) is cleared to free memory and avoid stale data.
+            or all_reduce_output) is cleared to free memory and avoid stale data.
             - Gradient application logic (in `apply_reduced_grad`) includes:
-              1. Reshaping the flat reduced gradient to match the local shard shape
-              2. Optional dtype conversion to `param_type`
-              3. Optional CPU offloading (per the HSDP parameter's offload policy)
-              4. Assigning or accumulating the gradient to `sharded_param.grad`
+            1. Reshaping the flat reduced gradient to match the local shard shape
+            2. Optional dtype conversion to `param_type`
+            3. Optional CPU offloading (per the HSDP parameter's offload policy)
+            4. Assigning or accumulating the gradient to `sharded_param.grad`
         """
         need_synchronize = False
         while TorchHSDPStateV2.pre_reduce_scatter_params:
@@ -365,7 +382,8 @@ class TorchHSDPStateV2(HSDPState):
                 torch.cuda.current_stream().synchronize()
             else:
                 raise NotImplementedError(
-                    f"Unsupported device type {self.device.type} for synchronization after CPU offload.")
+                    f"Unsupported device type {self.device.type} for synchronization after CPU offload."
+                )
 
     def set_requires_grad_sync(self, requires_grad_sync):
         """set requires grad sync flag to control gradient sync."""
@@ -380,6 +398,8 @@ class TorchHSDPStateV2(HSDPState):
         if reduce_op_type not in fsdp_support_reduce_op:
             raise ValueError(
                 f"Unsupported reduce op type {reduce_op_type}, "
-                f"supported types are {list(fsdp_support_reduce_op.keys())}")
+                f"supported types are {list(fsdp_support_reduce_op.keys())}"
+            )
         reduce_op: str = reduce_op_type.lower().strip()
-        self.reduce_op_type = fsdp_support_reduce_op[reduce_op]
+        self._user_reduce_op_type = fsdp_support_reduce_op[reduce_op]
+        self.reduce_op_type = self._user_reduce_op_type

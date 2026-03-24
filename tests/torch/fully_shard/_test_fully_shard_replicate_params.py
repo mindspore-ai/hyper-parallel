@@ -29,8 +29,7 @@ from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy, CPUOfflo
 from hyper_parallel.core.fully_shard.api import fully_shard, HSDPModule
 from hyper_parallel import init_device_mesh, DeviceMesh
 from hyper_parallel import SkipDTensorDispatch
-from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
-from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.core.dtensor.dtensor import DTensor
 
 
 # -------- Nested model: A -> module_b (B) -> lin_b, module_c (C) -> lin_c; B has subtrahend --------
@@ -38,16 +37,9 @@ from hyper_parallel.core.dtensor.placement_types import Shard
 
 class C(nn.Module):
     """Model C with replicate params"""
-    def __init__(self, dim: int, use_dtensor: bool = False, mesh: DeviceMesh = None) -> None:
+    def __init__(self, dim: int) -> None:
         super().__init__()
         self.lin_c = nn.Linear(dim, dim)
-        if use_dtensor:
-            w = self.lin_c.weight
-            b = self.lin_c.bias
-            w = distribute_tensor(w.clone(), device_mesh=mesh, placements=[Shard(0)])
-            b = distribute_tensor(b.clone(), device_mesh=mesh, placements=[Shard(0)])
-            self.lin_c.weight = nn.Parameter(w, requires_grad=True)
-            self.lin_c.bias = nn.Parameter(b, requires_grad=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.lin_c(x)
@@ -55,10 +47,10 @@ class C(nn.Module):
 
 class B(nn.Module):
     """Model B."""
-    def __init__(self, dim: int, subtrahend: torch.Tensor, use_dtensor: bool = False, mesh: DeviceMesh = None) -> None:
+    def __init__(self, dim: int, subtrahend: torch.Tensor) -> None:
         super().__init__()
         self.lin_b = nn.Linear(dim, dim)
-        self.module_c = C(dim, use_dtensor, mesh)
+        self.module_c = C(dim)
         self.subtrahend = nn.Parameter(subtrahend)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -68,9 +60,9 @@ class B(nn.Module):
 
 class A(nn.Module):
     """Model A."""
-    def __init__(self, dim, addend, subtrahend, use_dtensor=False, mesh=None) -> None:
+    def __init__(self, dim, addend, subtrahend) -> None:
         super().__init__()
-        self.module_b = B(dim, subtrahend, use_dtensor, mesh)
+        self.module_b = B(dim, subtrahend)
         self.addend = nn.Parameter(addend)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -96,9 +88,9 @@ def _discover_params_under_path(module: nn.Module, target_path: str, path: str) 
 
 
 def _get_full_tensor(param):
-    """Full tensor for comparison; DTensor -> full_tensor(), else as-is."""
+    """Tensor view for comparison."""
     if isinstance(param, DTensor):
-        return param.full_tensor()
+        return param.to_local()
     return param
 
 
@@ -157,9 +149,8 @@ def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):
     torch.manual_seed(70)
     subtrahend = torch.randn(dim, dim).npu()
     mesh: DeviceMesh = fsdp_kwargs['mesh']
-    use_dtensor = fsdp_kwargs.pop("use_dtensor", False)
     with SkipDTensorDispatch():
-        model = A(dim, addend, subtrahend, use_dtensor=use_dtensor, mesh=mesh).npu()
+        model = A(dim, addend, subtrahend).npu()
 
     torch.manual_seed(84)
     inp = torch.randn(dim, dim).npu()
@@ -208,12 +199,13 @@ def shard_param_data_parallel(acc_grad=False, **fsdp_kwargs):
     dp_stride = 8 // shard_size
     dp_offset = rank % shard_size * dp_stride
     for (_, ref_param), (_, test_param) in zip(standalone_grad.items(), dist_grad.items()):
-        if ref_param.shape != test_param.shape:
+        compare_param = _get_full_tensor(test_param)
+        if ref_param.shape != compare_param.shape:
             # fully shard
-            _compare_params(ref_param[dp_offset: dp_offset + dp_stride], test_param, rtol=0.001, atol=0.001)
+            _compare_params(ref_param[dp_offset: dp_offset + dp_stride], compare_param, rtol=0.001, atol=0.001)
         else:
             # replicate_params
-            _compare_params(ref_param, test_param, rtol=0.001, atol=0.001)
+            _compare_params(ref_param, compare_param, rtol=0.001, atol=0.001)
 
 
 def _get_standard_fully_shard_kwargs(mp_policy, offload_policy=None):
@@ -257,18 +249,5 @@ def test_zero3_partial_shard_replicate_params():
     fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
     hsdp_mesh = init_device_mesh(device_type="npu", mesh_shape=(4, op_size), mesh_dim_names=("dp", "op"))
     fsdp_kwargs['mesh'] = hsdp_mesh
-    for acc_grad in [False, True]:
-        shard_param_data_parallel(acc_grad=acc_grad, **fsdp_kwargs)
-
-
-def test_zero3_partial_shard_replicate_params_with_dtensor():
-    """test zero3 partial shard parallel"""
-    init_dist()
-    op_size = 2
-    mp_policy = MixedPrecisionPolicy()
-    fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
-    hsdp_mesh = init_device_mesh(device_type="npu", mesh_shape=(4, op_size), mesh_dim_names=("dp", "op"))
-    fsdp_kwargs['mesh'] = hsdp_mesh
-    fsdp_kwargs['use_dtensor'] = True
     for acc_grad in [False, True]:
         shard_param_data_parallel(acc_grad=acc_grad, **fsdp_kwargs)
