@@ -46,8 +46,10 @@ from hyper_parallel.core.fully_shard.utils import (
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     FullyShardParamMode,
     infer_fully_shard_param_mode,
+    get_managed_modules_parameters,
     get_rank_list_for_axes,
 )
+from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
 from hyper_parallel.platform.torch.fully_shard.state import TorchHSDPStateV2
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, get_torch_platform
@@ -838,6 +840,81 @@ class TestFullyShardMeshUtils(unittest.TestCase):
 
         self.assertIsInstance(mesh_info, DDPMeshInfo)
         self.assertEqual(mesh_info.replicate_mesh_dim, 0)
+
+    def test_get_managed_modules_parameters_skips_already_initialized_nested_params(self):
+        """Verify nested fully_shard ignores parameters already initialized by inner wrappers."""
+
+        class Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(2, 2))
+
+        class Outer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inner = Inner()
+                self.outer_weight = nn.Parameter(torch.randn(2, 2))
+
+        module = Outer()
+        nested_mesh = MagicMock(spec=DeviceMesh)
+        nested_dtensor = self._build_fake_dtensor(nested_mesh, (Replicate(),))
+        with torch.no_grad():
+            module.inner.weight.data = nested_dtensor
+        module.inner.weight._hsdp_param_initialized = True
+
+        params = get_managed_modules_parameters((module,))
+
+        self.assertEqual(params, [module.outer_weight])
+
+    def test_nested_fully_shard_with_mesh_none_creates_default_mesh_for_unmanaged_outer_params(self):
+        """Verify outer mesh=None ignores inner fully_shard params and still allocates a default mesh."""
+
+        class Inner(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(2, 2))
+
+        class Outer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inner = Inner()
+                self.outer_weight = nn.Parameter(torch.randn(2, 2))
+
+        module = Outer()
+        nested_mesh = MagicMock(spec=DeviceMesh)
+        nested_dtensor = self._build_fake_dtensor(nested_mesh, (Replicate(),))
+        with torch.no_grad():
+            module.inner.weight.data = nested_dtensor
+        module.inner.weight._hsdp_param_initialized = True
+
+        default_mesh = MagicMock(spec=DeviceMesh)
+
+        def _attach_mock_hsdp(mod):
+            mod.hsdp_init = MagicMock()
+
+        with patch(
+            "hyper_parallel.core.fully_shard.api._validate_module_for_fully_shard"
+        ), patch(
+            "hyper_parallel.core.fully_shard.api._extend_module_with_hsdp_interface",
+            side_effect=_attach_mock_hsdp,
+        ), patch(
+            "hyper_parallel.core.fully_shard.api.platform.get_world_size",
+            return_value=8,
+        ), patch(
+            "hyper_parallel.core.fully_shard.api.init_device_mesh",
+            return_value=default_mesh,
+        ) as mock_init_device_mesh, patch(
+            "hyper_parallel.core.fully_shard.api._get_device_from_mesh",
+            return_value=torch.device("cpu"),
+        ):
+            fully_shard(module, mesh=None)
+
+        mock_init_device_mesh.assert_called_once_with(
+            device_type="npu",
+            mesh_shape=(8,),
+        )
+        module.hsdp_init.assert_called_once()
+        self.assertIs(module.hsdp_init.call_args.args[2], default_mesh)
 
     def test_build_data_parallel_mesh_info_rejects_mesh_with_more_than_2_dims(self):
         mesh = MagicMock(spec=DeviceMesh)

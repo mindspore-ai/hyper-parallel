@@ -197,13 +197,20 @@ def get_managed_modules_parameters(
     modules: Sequence[platform.Module],
     ignored_params: Optional[Sequence[platform.Parameter]] = None,
 ) -> list[platform.Parameter]:
-    """Collect deduplicated parameters from ``modules`` while skipping ignored params."""
+    """Collect deduplicated parameters from ``modules`` while skipping ignored params.
+
+    Parameters that were already initialized by an inner ``fully_shard`` instance
+    are intentionally excluded so nested ``fully_shard(mesh=None)`` resolves mesh
+    mode from the parameters that the current wrapper will actually manage.
+    """
     params: list[platform.Parameter] = []
     ignored_params_set = set(ignored_params or ())
     visited_params: set[platform.Parameter] = set()
     for mod in modules:
         for _, param in platform.parameters_dict(mod):
             if param in ignored_params_set or param in visited_params:
+                continue
+            if getattr(param, "_hsdp_param_initialized", False):
                 continue
             visited_params.add(param)
             params.append(param)
