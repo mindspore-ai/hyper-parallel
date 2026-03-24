@@ -27,7 +27,6 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch
 
 from hyper_parallel.platform.torch.fully_shard.state import _to_dtype_if_needed
-from tests.common.mark_utils import arg_mark
 
 
 class TestToDtypeIfNeeded(unittest.TestCase):
@@ -38,7 +37,6 @@ class TestToDtypeIfNeeded(unittest.TestCase):
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_to_dtype_if_needed_parameterized(self):
         """Parameterized test: same dtype/no-op, None dtype, cast to float16/bfloat16.
 
@@ -68,7 +66,6 @@ class TestToDtypeIfNeeded(unittest.TestCase):
                 else:
                     self.assertEqual(result.dtype, tensor_dtype)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_invalid_tensor_raises(self):
         """_to_dtype_if_needed raises when first arg is not a tensor.
 

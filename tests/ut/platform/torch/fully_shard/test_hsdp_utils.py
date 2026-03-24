@@ -32,7 +32,6 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     _get_param_module_infos,
     _named_parameters_with_duplicates,
 )
-from tests.common.mark_utils import arg_mark
 
 
 class SimpleLinear(nn.Module):
@@ -68,7 +67,6 @@ class TestParamModuleInfo(unittest.TestCase):
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_basic_param_module_info(self):
         """ParamModuleInfo stores module and param_name correctly.
 
@@ -86,7 +84,6 @@ class TestParamModuleInfo(unittest.TestCase):
         self.assertEqual(info.shared_modules, [])
         self.assertEqual(info.shared_param_names, [])
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_param_module_info_with_shared(self):
         """ParamModuleInfo tracks shared modules.
 
@@ -118,7 +115,6 @@ class TestNamedParametersWithDuplicates(unittest.TestCase):
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_returns_named_params(self):
         """_named_parameters_with_duplicates returns (name, param) tuples.
 
@@ -136,7 +132,6 @@ class TestNamedParametersWithDuplicates(unittest.TestCase):
         self.assertIn("weight", names)
         self.assertIn("bias", names)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_remove_duplicate_raises(self):
         """_named_parameters_with_duplicates raises if remove_duplicate in kwargs.
 
@@ -160,7 +155,6 @@ class TestGetParamModuleInfos(unittest.TestCase):
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.device = torch.device("cpu")
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_single_module_single_param(self):
         """_get_param_module_infos returns correct info for single param.
 
@@ -179,7 +173,6 @@ class TestGetParamModuleInfos(unittest.TestCase):
             self.assertIsInstance(info, ParamModuleInfo)
             self.assertIs(info.module, mod)
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_param_not_in_module_tree_raises(self):
         """_get_param_module_infos raises when param not in module tree.
 
@@ -195,7 +188,6 @@ class TestGetParamModuleInfos(unittest.TestCase):
             _get_param_module_infos([orphan_param], (mod,))
         self.assertIn("not in the module tree", str(ctx.exception))
 
-    @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
     def test_multiple_modules(self):
         """_get_param_module_infos works with multiple modules.
 
