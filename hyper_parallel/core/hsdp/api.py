@@ -34,6 +34,11 @@ class HSDPCell:
     Supported Platforms:
         ``MindSpore`` ``torch``
     """
+
+    def __init__(self):
+        """Initialize HSDPCell."""
+        self.hsdp_scheduler = None  # Initialized in hsdp_init()
+
     # pylint: disable=C0415
     def hsdp_init(self, platform_type, cell, shard_size, threshold, optimizer_level, enable_grad_accumulation,
                   use_eager_hook, grad_scale, reduce_dtype, comm_async, comm_fusion, bucket_size):
@@ -106,6 +111,7 @@ class HSDPCell:
             raise ValueError("call hsdp interface first.")
         self.hsdp_scheduler.set_backward_prefetch_cells(hsdp_cell_list)
 
+
 def _extend_cell_with_hsdp_interface(cell):
     """extend Cell with HSDPCell interface"""
     origin_class = cell.__class__
@@ -126,6 +132,7 @@ def _check_cell_valid(platform_type, cell):
         from torch.nn import Module
         if not isinstance(cell, Module):
             raise ValueError(f"cell's type must be nn.Module but got {type(cell)}.")
+
 
 # pylint: disable=C0415
 def _check_hsdp_input_valid(platform_type, cell, shard_size, threshold, optimizer_level, enable_grad_accumulation,
@@ -158,6 +165,7 @@ def _check_hsdp_input_valid(platform_type, cell, shard_size, threshold, optimize
         raise ValueError(f"comm_fusion must be bool but got {comm_fusion}.")
     if not isinstance(bucket_size, int) or (bucket_size < 0 and bucket_size != -1):
         raise ValueError(f"bucket_size must be a positive integer or 0, but got {bucket_size}.")
+
 
 def hsdp(
         cell,
@@ -264,6 +272,7 @@ def hsdp(
         bucket_size * 1024
     )
     return cell
+
 
 def hsdp_sync_stream():
     """wait for hsdp gradient handle to be completed"""

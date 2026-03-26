@@ -19,6 +19,7 @@ Distributed implementation for RepeatInterleave operator.
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
 
+
 class RepeatInterleaveDistributedOp(DistributedOp):
     """Distributed implementation for torch.repeat_interleave."""
 
@@ -48,7 +49,8 @@ class RepeatInterleaveDistributedOp(DistributedOp):
 
         input_layout = layouts[0]
         in_tensor_map = input_layout.tensor_map
-        dim = None # The dimension along which to repeat values. By default, use the flattened input array, and return a flat output array.
+        dim = None  # The dimension along which to repeat values.
+        # By default, use the flattened input array, and return a flat output array.
         if len(extra_args) >= 2 and extra_args[1] is not None:
             dim = extra_args[1]
         if dim is None:
@@ -63,6 +65,7 @@ class RepeatInterleaveDistributedOp(DistributedOp):
                 raise ValueError(
                     f"Operation {self.op_name}: Cannot flatten tensor when dim=None."
                 )
+
             def idx_to_alias(idx, aliases):
                 if idx == -1:
                     return "None"

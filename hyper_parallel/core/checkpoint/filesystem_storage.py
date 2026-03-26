@@ -33,7 +33,7 @@ from hyper_parallel.core.checkpoint.storage import (
     StorageReader,
     StorageWriter,
     WriteResult,
-    _metadata_file_name,
+    METADATA_FILE_NAME,
 )
 from hyper_parallel.core.checkpoint.util import narrow_tensor_by_index
 from hyper_parallel.platform import get_platform
@@ -248,7 +248,7 @@ class FileSystemWriter(StorageWriter):
 
             # Save metadata file
             if self.use_collectives:
-                metadata_file = self.checkpoint_dir / _metadata_file_name
+                metadata_file = self.checkpoint_dir / METADATA_FILE_NAME
             else:
                 metadata_file = self.checkpoint_dir / f".rank{self.rank}_metadata"
             with open(metadata_file, "wb") as f:
@@ -392,7 +392,7 @@ class FileSystemReader(StorageReader):
         if rank is not None:
             metadata_file = self.checkpoint_dir / f".rank{rank}_metadata"
         else:
-            metadata_file = self.checkpoint_dir / _metadata_file_name
+            metadata_file = self.checkpoint_dir / METADATA_FILE_NAME
 
         if not metadata_file.exists():
             raise FileNotFoundError(f"Metadata file not found: {metadata_file}")

@@ -65,6 +65,15 @@ class MindSporePlatform(Platform):
     dtype = ms.Type
 
     def device_count(self, device_handle):
+        """
+        Get the number of available devices.
+
+        Args:
+            device_handle: The device handle (e.g., ms.device_context).
+
+        Returns:
+            int: The number of available devices.
+        """
         device_type = self.device_type()
         if device_type == "cpu":
             return device_handle.device_context.cpu.device_count()
@@ -74,64 +83,183 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def get_rng_state(device=None, device_handle=None):
-        """Get RNG state"""
+        """
+        Get the random number generator state.
+
+        Args:
+            device (Optional): The device to get RNG state from (not used in MindSpore).
+            device_handle (Optional): The device handle (not used in MindSpore).
+
+        Returns:
+            Tensor: The RNG state as a tensor.
+        """
         _ = device, device_handle
         return ms.get_rng_state()
 
     @staticmethod
     def set_rng_state(state, device=None, device_handle=None):
+        """
+        Set the random number generator state.
+
+        Args:
+            state (Tensor): The RNG state to set.
+            device (Optional): The device to set RNG state for (not used in MindSpore).
+            device_handle (Optional): The device handle (not used in MindSpore).
+        """
         _ = device, device_handle
         return ms.set_rng_state(state)
 
     def device_type(self):
+        """
+        Get the current device type.
+
+        Returns:
+            str: The device type string ("npu" for Ascend, "gpu" for GPU, "cpu" for CPU).
+        """
         device_type = ms.get_context("device_target")
         if device_type == "Ascend":
             return "npu"
         return device_type.lower()
 
     def device(self, device_idx=None):
+        """
+        Get the device type string.
+
+        Args:
+            device_idx (Optional[int]): The device index (not used in MindSpore).
+
+        Returns:
+            str: The device type string.
+        """
         _ = device_idx
         device_type = self.device_type()
         return device_type
 
     @staticmethod
     def get_device_handle():
+        """
+        Get the MindSpore module as the device handle.
+
+        Returns:
+            module: The mindspore module.
+        """
         return ms
 
     @staticmethod
     def manual_seed(seed):
+        """
+        Set the random seed for reproducibility.
+
+        Args:
+            seed (int): The random seed value.
+
+        Returns:
+            None
+        """
         return ms.manual_seed(seed)
 
     @staticmethod
     def ones(size, dtype=None):
+        """
+        Create a tensor filled with ones.
+
+        Args:
+            size (tuple): The shape of the output tensor.
+            dtype (Optional[ms.Type]): The desired data type.
+
+        Returns:
+            Tensor: A tensor filled with ones.
+        """
         return mint.ones(size, dtype=dtype)
 
     @staticmethod
     def zeros(size, dtype=None):
+        """
+        Create a tensor filled with zeros.
+
+        Args:
+            size (tuple): The shape of the output tensor.
+            dtype (Optional[ms.Type]): The desired data type.
+
+        Returns:
+            Tensor: A tensor filled with zeros.
+        """
         return mint.zeros(size, dtype=dtype)
 
     @staticmethod
     def full(size, fill_value, dtype=None):
+        """
+        Create a tensor filled with a scalar value.
+
+        Args:
+            size (tuple): The shape of the output tensor.
+            fill_value (scalar): The value to fill the tensor with.
+            dtype (Optional[ms.Type]): The desired data type.
+
+        Returns:
+            Tensor: A tensor filled with the specified value.
+        """
         return mint.full(size, fill_value, dtype=dtype)
 
     @staticmethod
     def empty(size, dtype=None):
+        """
+        Create an uninitialized tensor.
+
+        Args:
+            size (tuple): The shape of the output tensor.
+            dtype (Optional[ms.Type]): The desired data type.
+
+        Returns:
+            Tensor: An uninitialized tensor.
+        """
         return mint.empty(size, dtype=dtype)
 
     @staticmethod
     def get_rank():
+        """
+        Get the rank of the current process in the distributed group.
+
+        Returns:
+            int: The rank of the current process.
+        """
         return get_rank_id()
 
     @staticmethod
     def get_global_rank(group, group_rank):
+        """
+        Get the global rank from a group rank.
+
+        Args:
+            group (str): The process group name.
+            group_rank (int): The rank within the group.
+
+        Returns:
+            int: The global rank.
+        """
         return dist.get_global_rank(group, group_rank)
 
     @staticmethod
     def get_world_size():
+        """
+        Get the total number of processes in the distributed group.
+
+        Returns:
+            int: The world size.
+        """
         return get_group_size()
 
     @staticmethod
     def get_op_name(func):
+        """
+        Extract the operation name from a function.
+
+        Args:
+            func: The function to extract the name from.
+
+        Returns:
+            str: The operation name.
+        """
         return func.name
 
     @staticmethod

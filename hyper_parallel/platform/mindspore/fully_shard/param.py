@@ -15,7 +15,6 @@
 """HSDP parameter"""
 from typing import List, Callable, Optional, cast, Tuple
 import itertools
-# import torch
 import mindspore as ms
 from mindspore import nn
 from mindspore.common.api import _no_grad
@@ -148,7 +147,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         shard_placement_fn: Optional[Callable],
     ) -> None:
         if not (param.device.startswith("Ascend") and self.device == "npu"):
-            # if param.device != self.device and param.device != "meta":
             raise AssertionError(
                 f"Expects the parameter to already be moved to device {self.device} but got {param.device}"
             )
@@ -270,7 +268,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         unsharded_tensor = self.all_gather_outputs[0]
         # Use reshape to safely handle both contiguous and non-contiguous memory layouts.
         # It acts as a zero-copy view if possible, otherwise it performs a copy.
-        # unsharded_param = unsharded_tensor.reshape(self._orig_size)
         unsharded_param = as_strided(
             unsharded_tensor,
             self._orig_size,

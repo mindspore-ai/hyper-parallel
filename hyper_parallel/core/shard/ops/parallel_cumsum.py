@@ -19,6 +19,7 @@ Distributed implementation for Cumsum operator.
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
 
+
 class CumsumDistributedOp(DistributedOp):
     """Distributed implementation for torch.cumsum."""
 

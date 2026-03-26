@@ -191,6 +191,12 @@ class DeviceMesh:
             self._coordinate_on_dim = self._compute_coordinate_on_dim()
 
     def _compute_coordinate_on_dim(self):
+        """
+        Calculate the coordinates of the current global rank on the mesh.
+
+        Returns:
+            Optional[tuple]: A tuple of coordinates if the rank is found in the mesh, None otherwise.
+        """
         # calculate the coordinates of the current global rank on the mesh
         return self._compute_coordinates_from_mesh(self.mesh, self._rank)
 
@@ -225,6 +231,15 @@ class DeviceMesh:
         return tuple(coords)
 
     def size(self, mesh_dim=None) -> int:
+        """
+        Get the size of the mesh along a dimension or total number of devices.
+
+        Args:
+            mesh_dim (Optional[int]): The dimension to query. If None, returns total number of devices.
+
+        Returns:
+            int: The size along the specified dimension or total number of elements.
+        """
         if mesh_dim is not None:
             return self.mesh.shape[mesh_dim]
         return self.mesh.numel()
@@ -238,7 +253,18 @@ class DeviceMesh:
 
     @staticmethod
     def _convert_mesh_to_tensor(mesh: Union[Tensor, list, tuple, np.ndarray]) -> Tensor:
-        """Convert mesh to Tensor with int32 dtype."""
+        """
+        Convert mesh to Tensor with int32 dtype.
+
+        Args:
+            mesh (Union[Tensor, list, tuple, np.ndarray]): The mesh to convert.
+
+        Returns:
+            Tensor: The mesh as an int32 Tensor.
+
+        Raises:
+            TypeError: If mesh is not a supported type.
+        """
         if isinstance(mesh, Tensor):
             mesh = platform.tensor_to_numpy(mesh)
         elif isinstance(mesh, (list, tuple)):
@@ -255,7 +281,16 @@ class DeviceMesh:
     def _init_one_process_group(mesh_shape: tuple[int, ...], mesh_dim_names: tuple[str, ...],
                                 dim_name: str, rank_list: tuple[int, ...]) -> str:
         """
-        init one process group
+        Initialize one process group for a mesh dimension.
+
+        Args:
+            mesh_shape (tuple[int, ...]): Shape of the mesh.
+            mesh_dim_names (tuple[str, ...]): Names of mesh dimensions.
+            dim_name (str): The dimension name to create group for.
+            rank_list (tuple[int, ...]): The list of ranks in the mesh.
+
+        Returns:
+            str: The group key for the current rank's group.
         """
         group_key = None
         split_ranks = set()
@@ -296,49 +331,110 @@ class DeviceMesh:
 
         # Filter out None values. If any are None then they should all be None.
         dim_non_none_group_names = [n for n in dim_group_names if n is not None]
-        assert not dim_non_none_group_names or len(dim_non_none_group_names) == len(dim_group_names)
+        if dim_non_none_group_names and len(dim_non_none_group_names) != len(dim_group_names):
+            raise ValueError(
+                f"Inconsistent group names: dim_non_none_group_names length {len(dim_non_none_group_names)} "
+                f"does not match dim_group_names length {len(dim_group_names)}"
+            )
         return dim_non_none_group_names
 
     @property
     def rank(self):
+        """
+        Get the current process rank.
+
+        Returns:
+            int: The rank of the current process.
+        """
         return self._rank
 
     @property
     def mesh_shape(self):
+        """
+        Get the shape of the device mesh.
+
+        Returns:
+            tuple[int, ...]: The shape of the mesh.
+        """
         return self._mesh_shape
 
     @property
     def rank_list(self):
+        """
+        Get the flattened list of ranks in the mesh.
+
+        Returns:
+            tuple[int, ...]: The list of ranks.
+        """
         return self._rank_list
 
     @property
     def ndim(self) -> int:
+        """
+        Get the number of dimensions in the mesh.
+
+        Returns:
+            int: The number of dimensions.
+        """
         return self._ndim
 
     @property
     def shape(self) -> tuple:
-        """Returns the shape of the device mesh. Alias for mesh_shape, consistent with PyTorch DeviceMesh API."""
+        """
+        Returns the shape of the device mesh. Alias for mesh_shape, consistent with PyTorch DeviceMesh API.
+
+        Returns:
+            tuple[int, ...]: The shape of the mesh.
+        """
         return self._mesh_shape
 
     @property
     def root_mesh(self) -> Optional['DeviceMesh']:
+        """
+        Get the parent mesh if this is a sub mesh.
+
+        Returns:
+            Optional[DeviceMesh]: The parent mesh, or None if this is a root mesh.
+        """
         return self._root_mesh
 
     @root_mesh.setter
     def root_mesh(self, value: Optional['DeviceMesh']):
-        """Set the parent mesh reference."""
+        """
+        Set the parent mesh reference.
+
+        Args:
+            value (Optional[DeviceMesh]): The parent mesh to set.
+        """
         self._root_mesh = value
 
     @property
     def sub_mesh(self) -> List['DeviceMesh']:
+        """
+        Get the list of child meshes created from this mesh.
+
+        Returns:
+            List[DeviceMesh]: List of sub meshes.
+        """
         return self._sub_mesh
 
     def get_flatten_mapping(self) -> dict:
-        """Get the flatten mapping dictionary."""
+        """
+        Get the flatten mapping dictionary.
+
+        Returns:
+            dict: Mapping from flattened dimension names to DeviceMesh objects.
+        """
         return self._flatten_mapping
 
     def add_flatten_mapping(self, name: str, mesh: 'DeviceMesh') -> None:
-        """Add a flattened mesh to the flatten mapping."""
+        """
+        Add a flattened mesh to the flatten mapping.
+
+        Args:
+            name (str): The name for the flattened dimension.
+            mesh (DeviceMesh): The flattened DeviceMesh.
+        """
         self._flatten_mapping[name] = mesh
 
     def __getitem__(self, sub_mesh_dim_names: Union[str, tuple[str, ...]]) -> 'DeviceMesh':
@@ -375,7 +471,7 @@ class DeviceMesh:
         if not self.mesh_dim_names:
             raise RuntimeError("Cannot slice a DeviceMesh without mesh_dim_names!")
 
-        sub_mesh_dim_names = self._normalize_sub_mesh_dim_names(sub_mesh_dim_names)
+        sub_mesh_dim_names = DeviceMesh._normalize_sub_mesh_dim_names(sub_mesh_dim_names)
         flatten_mapping = self._get_root_mesh().get_flatten_mapping()
 
         # Try to get from flatten_mapping first
@@ -389,7 +485,8 @@ class DeviceMesh:
         # Get or create sub mesh for original dimensions
         return self._get_or_create_original_sub_mesh(sub_mesh_dim_names)
 
-    def _normalize_sub_mesh_dim_names(self, sub_mesh_dim_names: Union[str, tuple[str, ...]]) -> tuple[str, ...]:
+    @staticmethod
+    def _normalize_sub_mesh_dim_names(sub_mesh_dim_names: Union[str, tuple[str, ...]]) -> tuple[str, ...]:
         """Convert sub_mesh_dim_names to tuple format and validate basic type."""
         if isinstance(sub_mesh_dim_names, str):
             sub_mesh_dim_names = (sub_mesh_dim_names,)
@@ -404,7 +501,8 @@ class DeviceMesh:
 
         return sub_mesh_dim_names
 
-    def _try_get_from_flatten_mapping(self, sub_mesh_dim_names: tuple[str, ...],
+    @staticmethod
+    def _try_get_from_flatten_mapping(sub_mesh_dim_names: tuple[str, ...],
                                       flatten_mapping: dict) -> Optional['DeviceMesh']:
         """Try to get mesh from flatten_mapping. Returns None if not applicable."""
         if len(sub_mesh_dim_names) == 1 and sub_mesh_dim_names[0] in flatten_mapping:
@@ -971,7 +1069,8 @@ class DeviceMesh:
                 )
 
         group_key = self._dim_group_names[mesh_dim]
-        assert group_key in EXISTING_COMM_GROUPS, f"{group_key} not in group cache {EXISTING_COMM_GROUPS.keys()}"
+        if group_key not in EXISTING_COMM_GROUPS:
+            raise ValueError(f"{group_key} not in group cache {EXISTING_COMM_GROUPS.keys()}")
         return EXISTING_COMM_GROUPS[group_key]
 
     def get_devices_for_axis(self, mesh_dim: Union[str, int], rank: int):

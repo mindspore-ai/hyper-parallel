@@ -209,6 +209,7 @@ class SplitTensorViewDistributedOp(DistributedOp):
         output_layouts = (input_layout,) * output_num
         return output_layouts
 
+
 class TensorSplitDistributedOp(DistributedOp):
     """Distributed implementation for tensor_split operator."""
 

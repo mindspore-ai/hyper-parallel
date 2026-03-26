@@ -19,6 +19,7 @@ Distributed implementation for Expand operator.
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
 
+
 class ExpandDistributedOp(DistributedOp):
     """Distributed implementation for torch.Tensor.expand."""
 

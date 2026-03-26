@@ -154,6 +154,7 @@ class Layout:
                                          init_backend=init_backend)
         self._compact_str = self._to_compact_string()
         self._placements = None
+        self.partial_ops = {}  # Initialized in _build_dim_map_from_placements()
 
     @classmethod
     def from_device_mesh(cls, device_mesh: DeviceMesh) -> 'Layout':
@@ -210,12 +211,14 @@ class Layout:
             setattr(result, k, copy.deepcopy(v, memo))
         return result
 
-    def _process_placement_layout(self, obj, placements):
+    @staticmethod
+    def _process_placement_layout(obj, placements):
         """Process layout defined by Placement types."""
         obj.set_placements(placements)
         return copy.deepcopy(obj)
 
-    def _process_alias_layout(self, obj, alias_tensor_map):
+    @staticmethod
+    def _process_alias_layout(obj, alias_tensor_map):
         """Process layout defined by alias strings."""
         obj.set_alias_tensor_map(alias_tensor_map)
         tensor_map = ()
@@ -382,7 +385,8 @@ class Layout:
                         f"expected {expected_split_factor}, got {actual_split_factor}."
                     )
 
-    def _extract_reduce_op(self, placement):
+    @staticmethod
+    def _extract_reduce_op(placement):
         """Extract reduce operation name from Partial placement."""
         op_name = getattr(placement, "reduce_op", "sum")
         if isinstance(op_name, str):
@@ -470,6 +474,12 @@ class Layout:
 
     @property
     def mesh(self):
+        """
+        Get the device mesh associated with this layout.
+
+        Returns:
+            DeviceMesh: The device mesh describing the device topology.
+        """
         return self._mesh
 
     def update_mesh(self):
@@ -478,7 +488,12 @@ class Layout:
 
     @property
     def rank_list(self):
-        """rank list"""
+        """
+        Get the list of ranks participating in this layout.
+
+        Returns:
+            tuple[int]: The rank list.
+        """
         return self._rank_list
 
     @rank_list.setter

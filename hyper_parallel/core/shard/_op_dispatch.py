@@ -34,14 +34,34 @@ Tensor = platform.Tensor
 _dtensor_dispatch = True
 
 def enable_dtensor_dispatch():
+    """
+    Enable DTensor dispatch for distributed tensor operations.
+
+    When enabled, tensor operations will be dispatched through the
+    distributed operator dispatcher for layout inference and redistribution.
+    """
     global _dtensor_dispatch
     _dtensor_dispatch = True
 
+
 def disable_dtensor_dispatch():
+    """
+    Disable DTensor dispatch for distributed tensor operations.
+
+    When disabled, tensor operations will bypass the distributed operator
+    dispatcher and use native implementations directly.
+    """
     global _dtensor_dispatch
     _dtensor_dispatch = False
 
+
 def get_dtensor_dispatch():
+    """
+    Get the current DTensor dispatch status.
+
+    Returns:
+        bool: True if DTensor dispatch is enabled, False otherwise.
+    """
     return _dtensor_dispatch
 
 
@@ -67,6 +87,10 @@ class LayoutCacheKey:
 class LayoutCacheManager:
     """
     Cache layout in infer layout.
+
+    A singleton class that manages layout caches for distributed operations.
+    It caches the inferred layouts and operation implementations to avoid
+    redundant computation during repeated calls with the same input layouts.
     """
     _instance = None
 
@@ -76,18 +100,46 @@ class LayoutCacheManager:
 
     @classmethod
     def get_instance(cls):
+        """
+        Get the singleton instance of LayoutCacheManager.
+
+        Returns:
+            LayoutCacheManager: The singleton instance.
+        """
         if cls._instance is None:
             cls._instance = LayoutCacheManager()
         return cls._instance
 
     def get_layout_cache(self) -> Dict[str, Dict[LayoutCacheKey, Any]]:
+        """
+        Get the layout cache dictionary.
+
+        Returns:
+            Dict[str, Dict[LayoutCacheKey, Any]]: The nested dictionary mapping
+                operation names to their layout caches.
+        """
         return self.layout_cache
 
     def distributed_op(self, op_name: str) -> Any:
+        """
+        Get the distributed operation implementation by name.
+
+        Args:
+            op_name (str): The name of the distributed operation.
+
+        Returns:
+            Any: The distributed operation class or implementation.
+        """
         op = get_distributed_op(op_name)
         return op
 
     def clear_cache(self):
+        """
+        Clear all cached layouts.
+
+        This method is automatically registered with atexit to ensure
+        cache is cleared when the program exits.
+        """
         self.layout_cache.clear()
 
 
@@ -98,6 +150,9 @@ class OpDispatcher:
     def __init__(self):
         self._env_yaml_dir: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_YAML_DIR")
         self._env_python_path: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_PYTHON_PATH")
+        # The following attributes are initialized in _setup_yaml_dir()
+        self.work_dir = ""  # Initialized in _setup_yaml_dir()
+        self.yaml_dir = ""  # Initialized in _setup_yaml_dir()
 
         self._setup_paths_from_env()
 
@@ -121,6 +176,12 @@ class OpDispatcher:
         self._register_distributed_ops()
 
     def _setup_paths_from_env(self):
+        """
+        Setup YAML directory and Python path from environment variables.
+
+        This method initializes the YAML directory and extends sys.path based on
+        environment variables HYPER_PARALLEL_OPS_YAML_DIR and HYPER_PARALLEL_OPS_PYTHON_PATH.
+        """
         self._setup_yaml_dir(self._env_yaml_dir)
         self._extend_sys_path(self._env_python_path)
 
@@ -196,8 +257,9 @@ class OpDispatcher:
             else:
                 raise
 
+    @staticmethod
     def _process_args_and_kwargs(
-        self, args, kwargs, cache_key: "LayoutCacheKey"
+        args, kwargs, cache_key: "LayoutCacheKey"
     ) -> tuple[list, list, list, dict]:
         """_process_args_and_kwargs"""
         # input_layouts contain prarmeters which have layout, extra_args contain other parameters
@@ -264,7 +326,7 @@ class OpDispatcher:
             args = tuple(args[2])
 
         cache_key = LayoutCacheKey([])
-        input_layouts, extra_args, input_args, input_kwargs = self._process_args_and_kwargs(
+        input_layouts, extra_args, input_args, input_kwargs = OpDispatcher._process_args_and_kwargs(
             args, kwargs, cache_key
         )
         cache_manager = LayoutCacheManager.get_instance()
@@ -392,7 +454,8 @@ class OpDispatcher:
 
         return self._pack_infer_output(py_output, output_layout)
 
-    def _with_layout_infer_reshape(self, func: callable, *args) -> Tensor:
+    @staticmethod
+    def _with_layout_infer_reshape(func: callable, *args) -> Tensor:
         """_with_layout_infer_reshape"""
         input_tensor = args[0]
         shape = args[1]
@@ -439,8 +502,9 @@ class OpDispatcher:
 
         return DTensor.from_local(py_output, infer_output_tuple[0].mesh, infer_output_tuple[0].placements)
 
+    @staticmethod
     def _process_args_and_kwargs_with_shape(
-        self, args, kwargs, cache_key: "LayoutCacheKey"
+        args, kwargs, cache_key: "LayoutCacheKey"
     ) -> tuple[list, list, list, list, dict]:
         """_process_args_and_kwargs_with_shape"""
         input_layouts = []
@@ -520,7 +584,7 @@ class OpDispatcher:
 
         cache_key = LayoutCacheKey([])
         input_layouts, input_shapes, extra_args, input_args, input_kwargs = \
-            self._process_args_and_kwargs_with_shape(args, kwargs, cache_key)
+            OpDispatcher._process_args_and_kwargs_with_shape(args, kwargs, cache_key)
 
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
@@ -615,7 +679,8 @@ class OpDispatcher:
 
         return DTensor.from_local(py_output, infer_output_tuple[0].mesh, infer_output_tuple[0].placements)
 
-    def _merge_default(self, config: dict):
+    @staticmethod
+    def _merge_default(config: dict):
         """Apply __default__ values to all ops in this YAML file."""
         if "__default__" not in config:
             return config
@@ -646,7 +711,7 @@ class OpDispatcher:
             with open(yaml_file_path, 'r', encoding="utf-8") as f:
                 yaml_data = yaml.safe_load(f)
 
-            yaml_data = self._merge_default(yaml_data)
+            yaml_data = OpDispatcher._merge_default(yaml_data)
             for name, data in yaml_data.items():
                 if name in yaml_dict:
                     raise ValueError(f"Duplicate yaml object with name '{name}'.")
@@ -742,7 +807,7 @@ class OpDispatcher:
         if suffix == "WithShape":
             return self._with_layout_infer_with_shape(op_call, *args, **kwargs)
         if suffix == "Reshape":
-            return self._with_layout_infer_reshape(op_call, *args)
+            return OpDispatcher._with_layout_infer_reshape(op_call, *args)
         if suffix == "WithTupleExpand":
             return self._with_layout_infer_with_tuple_expand(op_call, *args, **kwargs)
         if suffix == "Slice":

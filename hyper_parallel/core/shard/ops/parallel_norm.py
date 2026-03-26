@@ -19,6 +19,7 @@ Distributed implementation for TopK operator.
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
 
+
 class NormDistributedOp(DistributedOp):
     """Distributed implementation for Norm operator."""
 
@@ -92,6 +93,7 @@ class NormDistributedOp(DistributedOp):
         output_map = x_layout.alias_tensor_map[:begin_norm_axis] + ("None",) * len(gamma_tensor_map)
         out_layout = output_layout(*output_map)
         return x_layout, out_layout
+
 
 class LayerNormDistributedOp(DistributedOp):
     """Distributed implementation for torch.nn.functional.layer_norm."""

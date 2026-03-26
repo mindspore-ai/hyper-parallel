@@ -67,7 +67,7 @@ class OneHotExtDistributedOp(DistributedOp):
         out_tensor_map = self._infer_output_tensor_map(in_tensor_map, axis)
         out_layout = self._create_layout_from_tensor_map(indices_layout, out_tensor_map)
 
-        out_placements = self._tensor_map_to_placements(indices_layout, out_tensor_map)
+        out_placements = OneHotExtDistributedOp._tensor_map_to_placements(indices_layout, out_tensor_map)
         out_layout.set_placements(out_placements)
 
         return out_layout
@@ -280,7 +280,8 @@ class OneHotExtDistributedOp(DistributedOp):
 
         return tuple(alias_tensor_map)
 
-    def _tensor_map_to_placements(self, base_layout, tensor_map):
+    @staticmethod
+    def _tensor_map_to_placements(base_layout, tensor_map):
         """
         Convert tensor_map to placements.
         

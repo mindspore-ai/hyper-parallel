@@ -30,6 +30,7 @@ class OptimizerLevel(Enum):
     SHARD_OPT_GRAD = auto()
     SHARD_OPT_GRAD_PARAM = auto()
 
+
 class GroupInfo:
     """
     GroupInfo
@@ -38,6 +39,7 @@ class GroupInfo:
         self.group_name = group_name
         self.group = group
         self.rank_size = rank_size
+
 
 class HSDPConfig:
     """HSDP config"""

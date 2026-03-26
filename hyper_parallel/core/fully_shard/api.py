@@ -106,6 +106,10 @@ class HSDPModule:
         ``MindSpore`` ``torch``
     """
 
+    def __init__(self):
+        """Initialize HSDPModule."""
+        self.hsdp_scheduler = None  # Initialized in hsdp_init()
+
     # pylint: disable=C0415
     def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
                   shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device, comm_fusion):

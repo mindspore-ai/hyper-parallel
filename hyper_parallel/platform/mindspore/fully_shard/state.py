@@ -315,7 +315,8 @@ class MindSporeHSDPStateV2(HSDPState):
                 )
                 self._div_if_needed(reduced_grad, hsdp_param.shard_world_size)
             if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
-                assert isinstance(hsdp_param.mesh_info, HSDPMeshInfo)
+                if not isinstance(hsdp_param.mesh_info, HSDPMeshInfo):
+                    raise TypeError("hsdp_param.mesh_info must be HSDPMeshInfo")
                 reduced_grad, _ = hsdp_param.all_reduce_grad(
                     grad=reduced_grad,
                     reduce_op=self.reduce_op_type,

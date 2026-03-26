@@ -4,6 +4,12 @@
 Provides utilities for tracking and synchronizing random number generator states
 across multiple devices in distributed training scenarios.
 """
+
+__all__ = [
+    "is_rng_supported_mesh",
+    "OffsetBasedRNGTracker",
+]
+
 import contextlib
 from logging import getLogger
 import typing
@@ -19,11 +25,6 @@ DTensorBase = platform.DTensorBase
 Tensor = platform.tensor
 
 logger = getLogger(__name__)
-
-__all__ = [
-    "is_rng_supported_mesh",
-    "OffsetBasedRNGTracker",
-]
 
 _rng_tracker: Optional["_RNGStateTracker"] = None
 
@@ -335,14 +336,16 @@ def _calc_shard_info(
                 dim_map[shard_dim] = [i]
             else:
                 mesh_dim_list = dim_map[shard_dim]
-                assert isinstance(mesh_dim_list, list)
+                if not isinstance(mesh_dim_list, list):
+                    raise TypeError(f"Expected mesh_dim_list to be a list, got {type(mesh_dim_list)}")
                 mesh_dim_list.append(i)
 
     # Compute shard coordinate:
     # The coordinate on each tensor dim is a tuple (idx, range)
     # If a DTensor is partitioned on its dim i into n shards, and the current rank
     # holds the j-th, then its shard coordinate will be (idx=j, range=n) on dim i
-    assert mesh_coordinate is not None
+    if mesh_coordinate is None:
+        raise ValueError("mesh_coordinate must not be None")
     shard_idx_by_dim = []
     total_num_shards_by_dim = []  # total number of shards on each tensor dim
     for mesh_dim in dim_map:
@@ -382,6 +385,7 @@ def _resolve_device():
 
     return get_device(device_idx)
 
+
 def local_shard_size_and_offset(
     curr_local_size: int,
     num_chunks: int,
@@ -418,6 +422,7 @@ def local_shard_size_and_offset(
 
 
 _fork_rng_warned_already = False
+
 
 @contextlib.contextmanager
 def fork_rng(

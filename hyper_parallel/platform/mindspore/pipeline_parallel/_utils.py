@@ -9,11 +9,13 @@
 """pipeline parallel utils"""
 import io
 import pickle
-import hyper_parallel
+
 from mindspore import nn, Tensor, mint, ops
 from mindspore.common import dtype as mstype
 from mindspore.communication import GlobalComm
 from mindspore.mint.distributed.distributed import _object_to_tensor, send, recv
+
+import hyper_parallel
 from hyper_parallel.core.shard.custom_shard import custom_shard
 
 

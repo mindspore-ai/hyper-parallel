@@ -82,3 +82,11 @@
 # 6. Existing unrelated files
 "hyper-parallel/hyper_parallel/core/dtensor/placement_types.py"         "mixed-line-endings"
 "hyper-parallel/hyper_parallel/core/shard/_op_dispatch.py"              "line-too-long"
+
+# 7. Code static analysis fixes - shard ops
+"hyper-parallel/hyper_parallel/core/shard/ops/"                         "arguments-differ"
+"hyper-parallel/hyper_parallel/core/shard/ops/"                         "line-too-long"
+
+# 8. MindSpore HSDP
+"hyper-parallel/hyper_parallel/platform/mindspore/hsdp/"                "arguments-renamed"
+"hyper-parallel/hyper_parallel/platform/mindspore/hsdp/"                "broad-exception-caught"

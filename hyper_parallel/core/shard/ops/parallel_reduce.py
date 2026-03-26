@@ -230,6 +230,7 @@ class ReduceMaxDistributedOp(ReduceExtDistributedOpBase):
     def __init__(self, op_name="ReduceMax"):
         super().__init__(op_name, partial_type=["max"])
 
+
 class ProdExtDistributedOp(ReduceExtDistributedOpBase):
     """
     Distributed implementation for ProdExt operator (product of all elements or along a dim).
@@ -239,6 +240,7 @@ class ProdExtDistributedOp(ReduceExtDistributedOpBase):
     def __init__(self, op_name="prod"):
         super().__init__(op_name, partial_type=["prod"])
 
+
 class AllExtDistributedOp(ReduceExtDistributedOpBase):
     """
     Distributed implementation for All operator
@@ -247,6 +249,7 @@ class AllExtDistributedOp(ReduceExtDistributedOpBase):
 
     def __init__(self, op_name="all"):
         super().__init__(op_name, partial_type=["all"])
+
 
 class MaxDistributedOp(ReduceExtDistributedOpBase):
     """
@@ -266,7 +269,7 @@ class MaxDistributedOp(ReduceExtDistributedOpBase):
         Infer output layouts for torch.max.
         """
         # Filter out None layouts (corresponding to non-tensor args like dim, keepdim)
-        valid_layouts = [l for l in layouts if l is not None]
+        valid_layouts = [layout for layout in layouts if layout is not None]
 
         if not valid_layouts:
             raise ValueError("MaxDistributedOp requires at least one input layout")
@@ -309,6 +312,7 @@ class MaxDistributedOp(ReduceExtDistributedOpBase):
         # OpDispatcher logic expects tuple of layouts.
         indices_layout = deepcopy(values_layout)
         return (values_layout, indices_layout)
+
 
 class MinDistributedOp(MaxDistributedOp):
     """

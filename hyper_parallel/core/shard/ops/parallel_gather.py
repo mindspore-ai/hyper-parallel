@@ -20,6 +20,7 @@ from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
 
+
 class IndexSelectDistributedOp(DistributedOp):
     """Distributed implementation for Index Select operator."""
 
@@ -265,6 +266,7 @@ class GatherDDistributedOp(DistributedOp):
         # Update compact string description
         output_layout.update_compact_str()
         return output_layout
+
     def get_expand_impl(self, func, output_layout, layouts, extra_args):
         """
         Returns the execution implementation wrapper for distributed GatherD.
@@ -289,6 +291,7 @@ class GatherDDistributedOp(DistributedOp):
         # tensor_map[dim] == -1 means replicated, otherwise sharded
         if input_tensor_map[dim] == -1: # native sharding, no need for custom implementation
             return None
+
         def distributed_gatherd_impl(*args, **kwargs):
             """
             Distributed GatherD implementation for sharded dim axis.
@@ -329,6 +332,7 @@ class GatherDDistributedOp(DistributedOp):
             output = output * mask_int
             return output
         return distributed_gatherd_impl
+
 
 class GatherNdDistributedOp(DistributedOp):
     """Distributed implementation for GatherNd operator."""
