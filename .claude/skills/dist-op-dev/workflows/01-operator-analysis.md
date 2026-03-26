@@ -6,8 +6,8 @@ Obtain the operator's interface definition, distributed implementation plan, and
 
 ## Input
 
-- **Operator Name**: Operator name (MindSpore: `MatMul`, PyTorch: `torch.matmul`)
-- **Platform Type**: Auto-detected (PascalCase=MindSpore, snake_case=PyTorch)
+- **Operator Name**: Operator name (MindSpore: `MatMul`, PyTorch: `matmul` or `torch.matmul`)
+- **Platform Type**: User-provided when available, otherwise auto-detected
 
 ## Output
 
@@ -46,8 +46,8 @@ Please provide the absolute path to MindSpore source code, for example:
 - Windows: D:\workspace\mindspore
 
 Path requirements:
-- Contains mindspore/ops/op_def/yaml/ directory (operator definitions)
-- Contains mindspore/ccsrc/frontend/parallel/ops_info/ directory (distributed implementations)
+- Contains `mindspore/ops/op_def/yaml/*_op.yaml` and `mindspore/ops/op_def/yaml/doc/*_doc.yaml` (operator definitions)
+- Contains `mindspore/ccsrc/frontend/parallel/ops_info/*_info.cc` and `mindspore/ccsrc/frontend/parallel/ops_info/*_info.h` (distributed implementations)
 ```
 
 ---
@@ -61,10 +61,50 @@ Path requirements:
 1. Operator basic information (name, platform, category, naming mapping)
 2. Interface definition analysis (input parameters, output information, attribute parameters, constraints)
 3. **Distributed Implementation Plan (Core)**
-   - Input constraint and Layout validation (CheckInputLayout) source code logic analysis
-   - Layout inference plan (InferOutputTensorInfo) source code logic analysis
-   - Input replacement/subgraph replacement plan (ReplaceNodeInputOrAttrs / replace_graph) source code logic analysis
-   - **Must mark MindSpore reference source**: function name, file location, key code logic
+   Perform distributed logic analysis based on MindSpore operator implementation.
+
+   The analysis should include the following aspects:
+
+   - **Input constraint and layout validation logic analysis**
+     - Identify how the operator validates distributed strategy or layout compatibility.
+     - Analyze constraints between input tensor layouts (e.g. same tensor_map, shardable axes).
+     - Identify conditions that may raise errors in distributed scenarios.
+
+   - **Layout inference logic analysis**
+     - Determine how the output layout is derived from input layouts.
+     - Extract tensor_map propagation rules.
+     - Identify whether layout is inherited, transformed, or newly constructed.
+     - Identify cases involving broadcast, dimension mapping, or axis transformation.
+     - If the operator introduces reduction or aggregation across a sharded dimension, determine whether the output layout needs a `partial` attribute (e.g., `partial = ['sum']`) and set it accordingly.
+
+   - **Graph replacement or communication expansion logic analysis**
+     - Identify whether the operator introduces distributed communication.
+     - Typical patterns include:
+       - AllReduce
+       - ReduceScatter
+       - AllGather
+       - local computation + aggregation
+     - Analyze the semantic purpose of the communication.
+     - Only recognize the communication pattern for analysis. Do **not** generate or call any communication operators in the code.
+     - If graph replacement exists, explain the transformation strategy.
+
+   - **Source code discovery strategy**
+     - Do not rely on fixed function names.
+     - Instead scan the operator implementation and identify functions related to:
+       - input validation
+       - layout inference
+       - communication inference
+       - graph replacement
+     - Typical candidate functions may include:
+       - `CheckStrategy`
+       - `CheckInputLayout`
+       - `InferTensorMap`
+       - `InferOutputTensorInfo`
+       - `InferForwardCommunication`
+       - `InferBias`
+       - `replace_graph`
+       - `ReplaceNodeInputOrAttrs`
+
 4. HyperParallel local implementation reference
    - Recommended base class
    - Similar operator reference
@@ -84,12 +124,3 @@ Path requirements:
 - [ ] **[Key] Generated analysis report file** `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
 - [ ] User confirmed: interface definition, reference source, base class selection, implementation plan
 
----
-
-## Next Step
-
-After analysis is complete, proceed to **[Workflow 2: Python Implementation](./02-python-implementation.md)**
-
-**Input:** `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md`
-
-**Goal:** Create distributed operator implementation class, implement `infer_layout` and `get_expand_impl`
