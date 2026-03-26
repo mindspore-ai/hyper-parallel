@@ -299,19 +299,19 @@ def test_ac_memory_comparison():
         r = results[mode]
         print(f"{mode.upper():<12} | {r['peak_mem_gb']:<15.5f} | {r['time_sec']:<10.5f} | {r['losses'][-1]:<12.4f}")
 
-    # # loss consistency assertion
-    # base_losses = results["none"]["losses"]
-    # tol = 1e-4
-    # for step in range(train_steps):
-    #     base_val = base_losses[step]
-    #     for mode in ["recompute", "save", "swap"]:
-    #         val = results[mode]["losses"][step]
-    #         diff = abs(val - base_val)
-    #         assert diff < tol, (
-    #             f"Loss mismatch at step {step} in mode '{mode}': "
-    #             f"none={base_val:.8f}, {mode}={val:.8f}, diff={diff:.2e}"
-    #         )
-    # print(f"\nAll {train_steps} steps: losses are consistent across modes (tol={tol}).")
+    # loss consistency assertion
+    base_losses = results["none"]["losses"]
+    tol = 1e-4
+    for step in range(train_steps):
+        base_val = base_losses[step]
+        for mode in ["recompute", "save", "swap"]:
+            val = results[mode]["losses"][step]
+            diff = abs(val - base_val)
+            assert diff < tol, (
+                f"Loss mismatch at step {step} in mode '{mode}': "
+                f"none={base_val:.8f}, {mode}={val:.8f}, diff={diff:.2e}"
+            )
+    print(f"\nAll {train_steps} steps: losses are consistent across modes (tol={tol}).")
 
     # # memory hierarchy assertion: none > save > recompute ≈ swap
     # mem_none = results["none"]["peak_mem_gb"]
