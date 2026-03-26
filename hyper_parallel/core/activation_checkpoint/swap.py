@@ -330,6 +330,11 @@ class SwapManager:
         first_name = _ensure_group_name(first_layer)
         second_name = _ensure_group_name(second_layer)
 
+        if first_name not in self._groups:
+            self._groups[first_name] = SwapGroup(first_name)
+        if second_name not in self._groups:
+            self._groups[second_name] = SwapGroup(second_name)
+
         if first_layer._swap_group_order["next"] is None:
             first_layer._swap_group_order["next"] = second_name
         if second_layer._swap_group_order["prev"] is None:

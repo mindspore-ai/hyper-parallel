@@ -31,6 +31,7 @@ from mindspore.common.dtype import type_size_in_bytes
 from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
 from mindspore.common.initializer import initializer
+from mindspore.common.recompute import null_context_fn
 from mindspore.communication import get_group_size
 from mindspore.communication import create_group as new_group
 from mindspore.communication import get_rank as get_rank_id
@@ -588,7 +589,7 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def register_forward_pre_hook(module, hook, prepend=False, with_kwargs=False):
-        return module.register_forward_pre_hook(hook, with_kwargs)
+        return module.register_forward_pre_hook(hook, with_kwargs=with_kwargs)
 
     @staticmethod
     def register_full_backward_hook(module, hook, prepend=False):
@@ -604,19 +605,26 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
-        raise NotImplementedError("ckpt_wrapper is not supported on MindSpore platform")
+        # pylint: disable=C0415
+        from hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_wrapper import checkpoint_wrapper
+        return checkpoint_wrapper(module, checkpoint_fn=checkpoint_fn, **checkpoint_fn_kwargs)
 
     @property
     def noop_context_fn(self):
-        raise NotImplementedError("noop_context_fn is not supported on MindSpore platform")
+        return null_context_fn
 
     @staticmethod
     def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
-        raise NotImplementedError("create_selective_checkpoint_contexts is not supported on MindSpore platform")
+        # pylint: disable=C0415
+        from hyper_parallel.platform.mindspore.activation_checkpoint.sac import create_selective_checkpoint_contexts
+        return create_selective_checkpoint_contexts(policy_fn_or_list,
+                                                    allow_cache_entry_mutation=allow_cache_entry_mutation)
 
     @staticmethod
     def async_save_on_cpu(policy_fn=None):
-        raise NotImplementedError("async_save_on_cpu is not supported on MindSpore platform")
+        # pylint: disable=C0415
+        from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import AsyncSaveOnCpu
+        return AsyncSaveOnCpu(policy_fn=policy_fn)
 
     @staticmethod
     def tensor_to_numpy(tensor) -> np.ndarray:

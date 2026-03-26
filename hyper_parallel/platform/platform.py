@@ -453,7 +453,7 @@ class Platform:
 
     @property
     def noop_context_fn(self):
-        raise NotImplementedError("Platform subclasses must implement ckpt_wrapper")
+        raise NotImplementedError("Platform subclasses must implement noop_context_fn")
 
     @staticmethod
     def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
