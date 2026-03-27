@@ -18,9 +18,10 @@ from typing import Any, Optional, Union
 
 import mindspore as ms
 from mindspore import MsDispatchMode
-from hyper_parallel.core.activation_checkpoint.swap import SwapManager, SwapTensor, Storage
+from hyper_parallel.core.activation_checkpoint.swap import SwapManager, Storage
 from hyper_parallel.core.activation_checkpoint import CheckpointPolicy
 from hyper_parallel.platform import get_platform
+from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import MindSporeSwapTensor
 
 platform = get_platform()
 
@@ -77,7 +78,7 @@ class _CachingMindSporeDispatchMode(MsDispatchMode):
                 SwapManager().add_storage(group_name, self.storage)
                 self.add_to_storage = True
             storage = self.storage.swap_storage[func.name]
-            storage.append(platform.tree_map(lambda x: SwapTensor(_maybe_detach(x)), out))
+            storage.append(platform.tree_map(lambda x: MindSporeSwapTensor(_maybe_detach(x)), out))
         return out
 
 
