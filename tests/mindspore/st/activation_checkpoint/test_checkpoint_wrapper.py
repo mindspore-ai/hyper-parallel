@@ -251,6 +251,33 @@ def apply_recompute(model, mode):
         for i in range(len(model.layers) - 1):
             SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 
+    elif mode == "funcrecompute":
+        def policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613
+            return CheckpointPolicy.MUST_RECOMPUTE
+        model.layers[0].norm1 = checkpoint_wrapper(model.layers[0].norm1, policy_fn=policy_fn)
+        model.layers[1].ffn1.matmul = checkpoint_wrapper(model.layers[1].ffn1.matmul, policy_fn=policy_fn)
+        model.layers[2].ffn2.reshape = checkpoint_wrapper(model.layers[2].ffn2.reshape, policy_fn=policy_fn)
+
+    elif mode == "funcsave":
+        def policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613
+            return CheckpointPolicy.MUST_SAVE
+        model.layers[1].ffn1.matmul = checkpoint_wrapper(model.layers[1].ffn1.matmul, policy_fn=policy_fn)
+        model.layers[1].ffn1.reshape = checkpoint_wrapper(model.layers[1].ffn1.reshape, policy_fn=policy_fn)
+        model.layers[2] = checkpoint_wrapper(model.layers[2], policy_fn=policy_fn)
+        model.layers[3].qkv.matmul = checkpoint_wrapper(model.layers[3].qkv.matmul, policy_fn=policy_fn)
+
+    elif mode == "funcswap":
+        def policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613
+            return CheckpointPolicy.MUST_SWAP
+        model.layers[0] = checkpoint_wrapper(model.layers[0], policy_fn=policy_fn)
+        model.layers[1].ffn1.matmul = checkpoint_wrapper(model.layers[1].ffn1.matmul, policy_fn=policy_fn)
+        model.layers[2].ffn1 = checkpoint_wrapper(model.layers[2].ffn1, policy_fn=policy_fn)
+        model.layers[2].ffn2.reshape = checkpoint_wrapper(model.layers[2].ffn2.reshape, policy_fn=policy_fn)
+        model.layers[3].qkv.matmul = checkpoint_wrapper(model.layers[3].qkv.matmul, policy_fn=policy_fn)
+
+        for i in range(len(model.layers) - 1):
+            SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
+
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -277,7 +304,7 @@ def test_ac_memory_comparison():
     print("Starting memory and time comparison: none vs recompute vs save vs swap")
     train_steps = 3
 
-    modes = ["none", "recompute", "save", "swap"]
+    modes = ["none", "recompute", "funcrecompute", "save", "funcsave", "swap", "funcswap"]
     results = {}
 
     for mode in modes:
@@ -304,7 +331,7 @@ def test_ac_memory_comparison():
     tol = 1e-4
     for step in range(train_steps):
         base_val = base_losses[step]
-        for mode in ["recompute", "save", "swap"]:
+        for mode in ["recompute", "funcrecompute", "save", "funcsave", "swap", "funcswap"]:
             val = results[mode]["losses"][step]
             diff = abs(val - base_val)
             assert diff < tol, (

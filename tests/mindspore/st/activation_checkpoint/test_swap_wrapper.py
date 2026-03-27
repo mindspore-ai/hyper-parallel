@@ -164,6 +164,9 @@ def apply_swap(model, mode):
     if mode == "swap":
         for i, layer in enumerate(model.layers):
             model.layers[i].attn = swap_wrapper(layer.attn)
+        model.layers[0].ffn[0].matmul = swap_wrapper(model.layers[0].ffn[0].matmul)
+        model.layers[1].ffn[2].matmul = swap_wrapper(model.layers[1].ffn[2].matmul)
+        model.layers[2].ffn[0].reshape = swap_wrapper(model.layers[2].ffn[0].reshape)
 
     elif mode == "swap_with_policy":
         policy_threshold = 32 * 512 * 512
@@ -175,6 +178,9 @@ def apply_swap(model, mode):
 
         for i, layer in enumerate(model.layers):
             model.layers[i].attn = swap_wrapper(layer.attn, policy_fn)
+        model.layers[0].ffn[0].matmul = swap_wrapper(model.layers[0].ffn[0].matmul)
+        model.layers[1].ffn[2].matmul = swap_wrapper(model.layers[1].ffn[2].matmul)
+        model.layers[3].ffn[0].reshape = swap_wrapper(model.layers[3].ffn[0].reshape)
 
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -190,7 +196,7 @@ def run_one_mode(mode, train_steps=3, seed=42):
     data_list = prepare_data()
     try:
         with seed_memory_time_context(seed=seed) as stats:
-            base_model = SimpleTransformer(vocab_size=32000, dim=2048, depth=16)
+            base_model = SimpleTransformer(vocab_size=32000, dim=2048, depth=6)
             model = apply_swap(base_model, mode)
             losses = train_one_mode(model, data_list, train_steps)
         return {
