@@ -1,6 +1,7 @@
-# /test — Run Test Stage (pylint + lints + pytest)
+# /test — Run Test Stage (pytest)
 
 Delegates to the `autogit` skill's `test` command.
+The workflow should be used for repository test execution after lint checks are already handled separately.
 
 ## Usage
 
@@ -10,15 +11,14 @@ Delegates to the `autogit` skill's `test` command.
 
 ## What It Does
 
-Runs the **test stage** (not commit stage):
+Runs the **test stage**:
 
-1. **Lint checks including pylint** on changed files (or all `hyper_parallel/` and `tests/` if no changes)
-2. **pytest** on `tests/`
+1. **pytest** on `tests/ut`
 
-Pylint is executed only in this test stage; the commit stage runs other lints (lizard, docstring, codespell, etc.) but not pylint.
+Lint checks are handled separately through `autogit check`, `pre-commit`, or other repository workflows.
 
 ## See Also
 
 - `.claude/skills/autogit/SKILL.md` — full autogit workflow
-- `autogit check` — lint only (includes pylint), no pytest
-- `autogit commit` — stage, commit-stage lints (no pylint), commit, push
+- `autogit check` — lint only, includes pylint and markdownlint
+- `autogit commit` — stage, commit-stage lints, commit, push

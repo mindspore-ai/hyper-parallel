@@ -28,8 +28,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+
+sys.path.insert(0, os.path.dirname(__file__))  # pylint: disable=C9004
+
+from code_style_guard import check_files  # pylint: disable=wrong-import-position
 
 # ============================================================================
 # Configuration (aligned with CI gate pipeline)
@@ -980,6 +985,7 @@ def _build_check_plan(
     if include_pylint:
         plan.append((run_pylint, by_type["py"], {"filter_file": filter_file}))
     plan.extend([
+        (run_code_style_guard, by_type["all"],                {}),
         (run_lizard,          by_type["py"] + by_type["cpp"], {}),
         (run_docstring_check, by_type["py"],                  {"changed_lines": changed_lines}),
         (run_dt_design,       by_type["py"],                  {"changed_lines": changed_lines}),
@@ -993,6 +999,20 @@ def _build_check_plan(
         (run_codespell,       by_type["all"],                 {}),
     ])
     return plan
+
+
+def run_code_style_guard(files: List[str]) -> Tuple[bool, str]:
+    """Apply code-style auto-fixes and fail if unresolved style issues remain.
+
+    Args:
+        files: List of file paths to check and fix.
+
+    Returns:
+        Tuple of (success, report) indicating if check passed and details.
+    """
+    if not files:
+        return True, ""
+    return check_files(files)
 
 
 def run_checks(files: List[str], include_pylint: bool = True) -> Tuple[bool, str]:

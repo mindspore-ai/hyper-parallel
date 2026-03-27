@@ -13,6 +13,7 @@ description: >
 
 Safe, incremental Git workflow for GitCode fork repos.
 Principle: **never overwrite without explicit request; always back up before danger**.
+Before generating, modifying, reviewing, or committing code, always load and follow `.claude/rules/code-style.md`.
 
 Announce at start of every invocation:
 > Running AutoGit `<command>` …
@@ -29,17 +30,17 @@ python3 {skill_dir}/scripts/autogit.py <command> [options]
 
 ## Quick Reference
 
-| Command | Purpose | Example |
-|---------|---------|---------|
-| `commit` | Stage, lint-check (no pylint), commit, push to origin | `commit -m "feat: add X"` |
-| `commit --no-check` | Commit without lint checks | `commit --no-check` |
-| `check` | Run lint checks only, includes pylint (no commit) | `check` |
-| `test` | **Test stage**: pylint + lints + pytest | `test` |
-| `pr` | Create PR to upstream | `pr --reviewer zhangsan` |
-| `pr --to #N` | Append commits to existing PR | `pr --to #160 --amend` |
-| `status #N` | Show PR status (read-only) | `status #160` |
-| `update #N` | Regenerate PR description | `update #160` |
-| `squash #N` | Squash PR commits into one | `squash #160 -m "msg"` |
+| Command | Purpose                                                                 | Example |
+|---------|-------------------------------------------------------------------------|---------|
+| `commit` | Stage, code-style + pre-commit auto-fix, commit, push to origin  | `commit -m "feat: add X"` |
+| `commit --no-check` | Commit without lint checks                                              | `commit --no-check` |
+| `check` | Run code-style check + lint checks, includes pylint and markdownlint (no commit) | `check` |
+| `test` | **Test stage**: pytest only                                             | `test` |
+| `pr` | Run pytest gate, then create PR to upstream                             | `pr --reviewer zhangsan` |
+| `pr --to #N` | Run pytest gate, then append commits to existing PR                     | `pr --to #160 --amend` |
+| `status #N` | Show PR status (read-only)                                              | `status #160` |
+| `update #N` | Regenerate PR description                                               | `update #160` |
+| `squash #N` | Squash PR commits into one                                              | `squash #160 -m "msg"` |
 
 For full parameter details run `python3 {skill_dir}/scripts/autogit.py <command> --help`.
 
@@ -73,7 +74,10 @@ Always work on a feature branch. If you commit on master, AutoGit auto-creates a
 - **Uncommitted changes block PR** — must commit first.
 - **Rebase failures auto-abort** — restores original state on conflict.
 - **Stash on branch switch** — auto-stash before switching, restore after.
-- **Lint gate on commit** — pre-commit checks (lizard, dt_design, codespell, markdownlint; **pylint runs in test stage**); skip with `--no-check`. Run `autogit test` for test stage (pylint + pytest).
+- **Style and lint gate on commit** — auto-fix basic `code-style.md` issues first, then run commit-stage checks; skip with `--no-check`.
+- **Dedicated lint stage** — use `autogit check` for code-style + lint checks, including pylint and markdownlint. If pylint or markdownlint is missing, install them according to `.pre-commit-config.yaml`.
+- **Dedicated test stage** — use `autogit test` for pytest only.
+- **PR test gate** — `autogit pr` runs `autogit test` by default before continuing. Use `--no-test` to skip explicitly.
 
 ## Red Flags
 
@@ -102,10 +106,10 @@ STOP and ask the user if you are about to:
 | Rebase conflict | Use `--no-rebase` or resolve manually |
 | Cherry-pick failed | Use a feature branch instead |
 
-
 ## Important Restrictions (Must Follow)
 
 DO NOT add "Co-Authored-By: Claude ..." in commit messages.
+If `.claude/rules/code-style.md` conflicts with a user request, explain the conflict and provide a compliant alternative instead of emitting non-compliant code.
 
 ## References
 

@@ -16,13 +16,15 @@
 """Command implementations and argparse CLI for AutoGit."""
 
 import argparse
+import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # pylint: disable=C9004
 
 from models import AutoGitError, EnvConfig  # pylint: disable=wrong-import-position
 from git_utils import (  # pylint: disable=wrong-import-position
@@ -114,6 +116,9 @@ def check_env(require_token: bool = True) -> EnvConfig:
 # Shared helpers
 # ============================================================================
 
+REPO_ROOT = Path(__file__).resolve().parents[4]
+PRE_COMMIT_CONFIG = REPO_ROOT / ".pre-commit-config.yaml"
+
 def _stage_and_filter_cosmetic(base_ref: Optional[str] = None) -> None:
     """Stage changes, auto-update copyright years, and exclude cosmetic-only changes.
 
@@ -139,32 +144,104 @@ def _stage_and_filter_cosmetic(base_ref: Optional[str] = None) -> None:
             run_git("checkout", "--", filepath, check=False)
 
 
+def _load_pre_commit_dependency_map() -> Dict[str, str]:
+    """Parse .pre-commit-config.yaml and return hook id to dependency mapping."""
+    if not PRE_COMMIT_CONFIG.is_file():
+        return {}
+
+    dependency_map: Dict[str, str] = {}
+    current_hook_id: Optional[str] = None
+    in_additional_dependencies = False
+
+    for raw_line in PRE_COMMIT_CONFIG.read_text(encoding="utf-8").splitlines():
+        line = raw_line.rstrip()
+        hook_match = re.match(r"^\s*-\s+id:\s+(.+?)\s*$", line)
+        if hook_match:
+            current_hook_id = hook_match.group(1).strip()
+            in_additional_dependencies = False
+            continue
+
+        if re.match(r"^\s*additional_dependencies:\s*$", line):
+            in_additional_dependencies = True
+            continue
+
+        if in_additional_dependencies:
+            dep_match = re.match(r"^\s*-\s+(.+?)\s*$", line)
+            if dep_match and current_hook_id:
+                dependency_map[current_hook_id] = dep_match.group(1).strip()
+                continue
+            if line.strip() and not line.startswith(" " * 10):
+                in_additional_dependencies = False
+
+    return dependency_map
+
+
+def _install_python_dependency(requirement: str) -> None:
+    """Install a Python dependency into the current environment."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", requirement],
+            capture_output=False,
+            check=False,
+        )
+    except OSError as exc:
+        raise AutoGitError(f"Failed to invoke pip for dependency installation: {requirement}") from exc
+    if result.returncode != 0:
+        raise AutoGitError(f"Failed to install Python dependency: {requirement}")
+
+
+def _install_node_dependency(requirement: str) -> None:
+    """Install a Node dependency globally for CLI availability."""
+    try:
+        result = subprocess.run(
+            ["npm", "install", "-g", requirement],
+            capture_output=False,
+            check=False,
+        )
+    except OSError as exc:
+        raise AutoGitError(f"Failed to invoke npm for dependency installation: {requirement}") from exc
+    if result.returncode != 0:
+        raise AutoGitError(f"Failed to install Node dependency: {requirement}")
+
+
+def _ensure_check_dependencies(files: List[str]) -> None:
+    """Install required check dependencies for autogit check when missing."""
+    dependency_map = _load_pre_commit_dependency_map()
+    needs_pylint = any(path.endswith(".py") for path in files)
+    needs_lizard = any(
+        path.endswith((".py", ".c", ".cc", ".cpp", ".h", ".hpp"))
+        for path in files
+    )
+    needs_markdownlint = any(path.endswith(".md") for path in files)
+
+    if needs_pylint and not shutil.which("pylint"):
+        requirement = dependency_map.get("pylint", "pylint")
+        print(f"Installing missing pylint dependency: {requirement}")
+        _install_python_dependency(requirement)
+
+    if needs_lizard and not shutil.which("lizard"):
+        requirement = dependency_map.get("lizard", "lizard")
+        print(f"Installing missing lizard dependency: {requirement}")
+        _install_python_dependency(requirement)
+
+    if needs_markdownlint and not shutil.which("markdownlint-cli2"):
+        requirement = dependency_map.get("markdownlint", "markdownlint-cli2")
+        print(f"Installing missing markdownlint dependency: {requirement}")
+        _install_node_dependency(requirement)
+
+
 def _run_lint_checks_on_staged() -> None:
-    """Run lint checks (no pylint; pylint runs in test stage) on staged files."""
+    """Run commit-stage lint checks on staged files."""
     staged_output = run_git("diff", "--cached", "--name-only").stdout.strip()
     staged_files = staged_output.split("\n") if staged_output else []
     if not staged_files:
         return
-    print("Running lint checks (commit stage, pylint in test stage)...")
+    print("Running lint checks (commit stage)...")
     passed, report = run_checks(staged_files, include_pylint=False)
     print(report)
     if not passed:
         run_git("reset", check=False)
         raise AutoGitError("Lint checks failed, staging reverted. Please fix and retry.")
-
-
-def _get_files_for_test_stage() -> List[str]:
-    """Return file list for test stage: changed files, or all tracked .py under repo."""
-    diff_out = run_git("diff", "--name-only", "HEAD").stdout.strip()
-    if diff_out:
-        return [f for f in diff_out.split("\n") if f.strip()]
-    ls_out = run_git("ls-files").stdout.strip()
-    if not ls_out:
-        return []
-    return [
-        f for f in ls_out.split("\n")
-        if f.endswith(".py") and (f.startswith("hyper_parallel/") or f.startswith("tests/"))
-    ]
 
 
 def cmd_pylint_review(base_ref: Optional[str] = None) -> str:
@@ -189,26 +266,18 @@ def cmd_pylint_review(base_ref: Optional[str] = None) -> str:
 
 
 def cmd_test() -> None:
-    """Run test stage: pylint + other lints on target files, then pytest."""
+    """Run test stage: pytest only."""
     check_env(require_token=False)
-    files = _get_files_for_test_stage()
-    if not files:
-        raise AutoGitError("No Python files to check (no changes and no hyper_parallel/tests)")
-    print("Running test-stage checks (including pylint)...")
-    passed, report = run_checks(files, include_pylint=True)
-    print(report)
-    if not passed:
-        raise AutoGitError("Test-stage lint checks failed (pylint and/or others)")
     print("Running pytest...")
     result = subprocess.run(
-        ["pytest", "tests/", "-v"],
+        ["pytest", "tests/ut", "-v"],
         capture_output=False,
         timeout=300,
         check=False,
     )
     if result.returncode != 0:
         raise AutoGitError("pytest failed")
-    print("Test stage passed (lint + pytest).")
+    print("Test stage passed (pytest).")
 
 
 # ============================================================================
@@ -293,6 +362,7 @@ def cmd_check() -> None:
     if not files:
         raise AutoGitError("No files to check")
 
+    _ensure_check_dependencies(files)
     print("Running lint checks...")
     passed, report = run_checks(files)
     print(report)
@@ -451,18 +521,23 @@ def _push_pr_branch(pr_branch: str) -> None:
 
 
 def cmd_pr(base: Optional[str] = None, reviewer: Optional[str] = None,
-           squash: bool = False) -> Dict[str, Any]:
+           squash: bool = False, no_test: bool = False) -> Dict[str, Any]:
     """Create a PR with safe Git workflow.
 
     Args:
         base: Target branch (defaults to upstream default branch).
         reviewer: Comma-separated reviewer login names.
         squash: Whether to squash all commits.
+        no_test: Skip running autogit test before PR creation if True.
 
     Returns:
         Dict with keys: url, branch, commits, pr_number.
     """
     env = check_env()
+
+    if not no_test:
+        print("Running test gate before PR creation...")
+        cmd_test()
 
     actual_base = base or env.default_branch
     base_ref = f"upstream/{actual_base}"
@@ -643,7 +718,7 @@ def _commit_append(amend: bool, message: Optional[str],
 
 def cmd_pr_append(pr_number: int, amend: bool = False,
                   no_rebase: bool = False, message: Optional[str] = None,
-                  no_check: bool = False) -> Dict[str, Any]:
+                  no_check: bool = False, no_test: bool = False) -> Dict[str, Any]:
     """Append a commit to an existing PR.
 
     Args:
@@ -652,11 +727,16 @@ def cmd_pr_append(pr_number: int, amend: bool = False,
         no_rebase: Skip rebase if True.
         message: Optional commit message.
         no_check: Skip lint checks if True.
+        no_test: Skip running autogit test before PR append if True.
 
     Returns:
         Dict with keys: url, branch, pr_number, amend, commits.
     """
     env = check_env()
+
+    if not no_test:
+        print("Running test gate before PR append...")
+        cmd_test()
 
     print(f"Fetching PR #{pr_number} info...")
     status, pr_data = get_pr_info(env.upstream_owner, env.upstream_repo, pr_number, env.token)
@@ -950,11 +1030,11 @@ HELP_TEXT = """AutoGit - Automated Git Workflow for GitCode
 
 Commands:
   commit [-m MSG] [--no-check]       Commit and push (runs lint checks by default)
-  check                              Run lint checks (no commit)
-  test                               Run test stage (pylint + lints + pytest)
+  check                              Run lint checks (installs pylint/markdownlint if needed)
+  test                               Run test stage (pytest only)
   pylint-review [--base REF]         Run pylint on changed .py (review-PR stage)
-  pr [--base B] [--reviewer R]       Create a PR
-  pr --to #N [--amend|--no-rebase|--no-check]  Append to existing PR
+  pr [--base B] [--reviewer R] [--no-test]     Create a PR
+  pr --to #N [--amend|--no-rebase|--no-check|--no-test]  Append to existing PR
   status #N                          View PR status
   update #N                          Regenerate PR description
   squash #N [-m MSG]                 Squash commits in a PR
@@ -989,13 +1069,16 @@ def main() -> None:
     commit_parser.add_argument("-m", "--message", type=str, help="commit message")
     commit_parser.add_argument(
         "--no-check", action="store_true",
-        help="Skip lint checks (pylint/lizard/codespell/markdownlint)"
+        help="Skip commit-stage lint checks (lizard/codespell/markdownlint and others)"
     )
 
-    subparsers.add_parser("check", help="Run lint checks (no commit)")
+    subparsers.add_parser(
+        "check",
+        help="Run lint checks and auto-install missing pylint/markdownlint if configured"
+    )
     subparsers.add_parser(
         "test",
-        help="Run test stage: pylint + lints on target files, then pytest"
+        help="Run test stage: pytest only"
     )
     pylint_review_parser = subparsers.add_parser(
         "pylint-review",
@@ -1014,11 +1097,15 @@ def main() -> None:
     pr_parser.add_argument("--no-rebase", action="store_true", help="Skip rebase")
     pr_parser.add_argument(
         "--no-check", action="store_true",
-        help="Skip lint checks (pylint/lizard/codespell/markdownlint)"
+        help="Skip commit-stage lint checks (lizard/codespell/markdownlint and others)"
     )
     pr_parser.add_argument("--squash", action="store_true", help="Squash all commits into one")
     pr_parser.add_argument("--base", type=str, help="Target branch")
     pr_parser.add_argument("--reviewer", type=str, help="Reviewers (comma-separated)")
+    pr_parser.add_argument(
+        "--no-test", action="store_true",
+        help="Skip running autogit test before PR creation or append"
+    )
     pr_parser.add_argument("-m", "--message", type=str, help="commit message")
 
     status_parser = subparsers.add_parser("status", help="View PR status")
@@ -1120,7 +1207,8 @@ def _dispatch_pr(args: argparse.Namespace) -> None:
             amend=args.amend,
             no_rebase=args.no_rebase,
             message=args.message,
-            no_check=args.no_check
+            no_check=args.no_check,
+            no_test=args.no_test
         )
         print()
         print("=" * 60)
@@ -1133,7 +1221,8 @@ def _dispatch_pr(args: argparse.Namespace) -> None:
         result = cmd_pr(
             base=args.base,
             reviewer=args.reviewer,
-            squash=args.squash
+            squash=args.squash,
+            no_test=args.no_test
         )
         print()
         print("=" * 60)

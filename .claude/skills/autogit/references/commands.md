@@ -22,15 +22,16 @@ autogit commit --no-check           # skip lint checks (emergency only)
 ### Execution Flow
 
 ```text
-Check for changes → git add -A → lint checks (pylint/lizard/codespell/markdownlint)
+Load `.claude/rules/code-style.md` → Check for changes → git add -A
+  → code-style auto-fix/check → commit-stage lint checks
   → git commit → git push origin <branch>
 ```
 
 ### Lint Checks
 
-- Runs pylint, lizard, codespell, markdownlint by default before commit.
+- Runs the `code-style.md` guard first and auto-fixes mechanical issues before continuing.
+- Runs commit-stage lint checks before commit.
 - Fails: unstages all changes, prompts for fix.
-- Tool not installed: warns but does not block (graceful degradation).
 - Use `--no-check` to skip all checks (emergency only).
 - Project-level `filter_pylint.txt` supported for known-issue filtering.
 
@@ -60,6 +61,8 @@ autogit check    # check all uncommitted changes, do not commit
 ```
 
 No parameters. Stages files temporarily, runs all checks, then unstages.
+The first step is always `.claude/rules/code-style.md` validation plus auto-fix for mechanical issues.
+If `pylint` or `markdownlint-cli2` is missing, AutoGit installs the dependency declared in `.pre-commit-config.yaml` before continuing.
 
 ### Check Tools & Thresholds
 
@@ -74,17 +77,28 @@ No parameters. Stages files temporarily, runs all checks, then unstages.
 | codespell | Spelling check | All text files |
 | markdownlint-cli2 | Standard rules | `*.md` |
 
-All tools degrade gracefully — if not installed, warns but does not block.
+AutoGit auto-installs missing `pylint` and `markdownlint-cli2` according to `.pre-commit-config.yaml`. Other tools still degrade gracefully if unavailable.
 
 ---
 
-## 3. pr — Create Pull Request
+## 3. test — Run pytest Only
+
+```bash
+autogit test
+```
+
+Runs `pytest tests/ut -v` only. Lint checks are intentionally excluded from the test stage.
+
+---
+
+## 4. pr — Create Pull Request
 
 ```bash
 autogit pr                        # create PR (keep multiple commits)
 autogit pr --squash               # create PR (squash into 1 commit)
 autogit pr --base develop         # target branch
 autogit pr --reviewer zhangsan    # assign reviewer
+autogit pr --no-test              # skip pytest gate before PR
 ```
 
 ### Parameters
@@ -94,6 +108,7 @@ autogit pr --reviewer zhangsan    # assign reviewer
 | `--base <branch>` | PR target branch | upstream default branch (master) |
 | `--reviewer <users>` | Reviewers (comma-separated) | None |
 | `--squash` | Squash all commits into one | Off |
+| `--no-test` | Skip `autogit test` before PR flow | Off (test runs) |
 
 ### Smart Branch Strategy
 
@@ -105,14 +120,15 @@ autogit pr --reviewer zhangsan    # assign reviewer
 ### Execution Flow
 
 ```text
-1. Check env (token, remotes, uncommitted changes)
+1. Run `autogit test` by default
+2. Check env (token, remotes, uncommitted changes)
    ⚠️ Refuse if uncommitted changes exist — commit first
-2. Determine branch type
+3. Determine branch type
    • feature branch → use directly
    • master/main → create new branch + cherry-pick
-3. Push to origin (prompt on conflict, never force)
-4. Analyze diff, auto-generate PR description
-5. Call API to create PR, output URL
+4. Push to origin (prompt on conflict, never force)
+5. Analyze diff, auto-generate PR description
+6. Call API to create PR, output URL
 ```
 
 ### Auto-generated PR Description
@@ -126,12 +142,13 @@ autogit pr --reviewer zhangsan    # assign reviewer
 
 ---
 
-## 4. pr --to — Append to Existing PR
+## 5. pr --to — Append to Existing PR
 
 ```bash
 autogit pr --to #160              # append new commit (default: rebase first)
 autogit pr --to #160 --amend     # amend into last commit
 autogit pr --to #160 --no-rebase # skip rebase, append directly
+autogit pr --to #160 --no-test   # skip pytest gate before append
 ```
 
 ### Parameters
@@ -141,6 +158,7 @@ autogit pr --to #160 --no-rebase # skip rebase, append directly
 | `--to <#N>` | PR number to append to | Required |
 | `--amend` | Merge into last commit instead of new | Off |
 | `--no-rebase` | Skip rebase before appending | Off (rebase on) |
+| `--no-test` | Skip `autogit test` before append flow | Off (test runs) |
 | `-m`, `--message` | Commit message for new commit | Auto-generated |
 
 ### Three Modes Compared
@@ -159,7 +177,7 @@ autogit pr --to #160 --no-rebase # skip rebase, append directly
 
 ---
 
-## 5. status — View PR Status
+## 6. status — View PR Status
 
 ```bash
 autogit status #160
@@ -170,7 +188,7 @@ Read-only. Displays: state (open/merged/closed/draft), author, branches, timesta
 
 ---
 
-## 6. update — Regenerate PR Description
+## 7. update — Regenerate PR Description
 
 ```bash
 autogit update #160
@@ -180,7 +198,7 @@ Re-analyzes PR diff and regenerates description via API. No code or commit chang
 
 ---
 
-## 7. squash — Squash PR Commits
+## 8. squash — Squash PR Commits
 
 ```bash
 autogit squash #160              # squash all commits
