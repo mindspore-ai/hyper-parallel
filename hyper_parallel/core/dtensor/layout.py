@@ -514,6 +514,27 @@ class Layout:
     def alias_tensor_map(self):
         return self._alias_tensor_map
 
+    @property
+    def alias_placements(self):
+        """Return alias_tensor_map when it contains multi-axis tuples, otherwise placements.
+
+        alias_tensor_map preserves multi-axis ordering information
+        (e.g., (("dp", "tp"), "None") vs (("tp", "dp"), "None"))
+        that Placement objects cannot represent, since both map to
+        [Shard(0), Shard(0)].
+
+        For single-axis layouts, Placement objects are preferred because they
+        also carry Partial status which alias_tensor_map cannot encode.
+
+        Use this property when constructing DTensors from an existing Layout
+        to avoid the lossy Placement round-trip for multi-axis cases.
+        """
+        if self._alias_tensor_map is not None and any(
+            isinstance(item, tuple) for item in self._alias_tensor_map
+        ):
+            return self._alias_tensor_map
+        return self._placements
+
     def set_alias_tensor_map(self, alias_tensor_map):
         """Set alias_tensor_map"""
         self._alias_tensor_map = alias_tensor_map

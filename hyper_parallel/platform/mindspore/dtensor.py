@@ -40,7 +40,8 @@ class DTensorBase(Tensor):
             device_local_tensor = local_tensor.to_local() if local_tensor.to_local().has_init else \
                 local_tensor.to_local().to(device)
             t = Tensor._make_subclass(cls, device_local_tensor)
-            t.__init_data__(device_local_tensor, local_tensor.device_mesh, local_tensor.placements)
+            copy_placements = local_tensor.layout.alias_placements if local_tensor.layout else local_tensor.placements
+            t.__init_data__(device_local_tensor, local_tensor.device_mesh, copy_placements)
             t._device = device
             return t
         if device_mesh is None:
@@ -71,15 +72,17 @@ class DTensorBase(Tensor):
         This method ensures that device_mesh and placements are correctly
         propagated when creating a copy (e.g., for optimizer states).
         """
-        # Get device_mesh and placements from either direct attributes or from layout
+        # Get device_mesh and placements from layout (prefer alias_placements to preserve multi-axis ordering)
         device_mesh = getattr(self, '_device_mesh', None)
-        placements = getattr(self, '_placements', None)
+        placements = None
 
-        # If not found directly, try to get from layout
-        if device_mesh is None and hasattr(self, '_layout') and self._layout is not None:
-            device_mesh = self._layout.mesh
-        if placements is None and hasattr(self, '_layout') and self._layout is not None:
-            placements = self._layout.placements
+        if hasattr(self, '_layout') and self._layout is not None:
+            if device_mesh is None:
+                device_mesh = self._layout.mesh
+            placements = self._layout.alias_placements
+
+        if placements is None:
+            placements = getattr(self, '_placements', None)
 
         if device_mesh is None or placements is None:
             raise ValueError("Cannot copy DTensorBase: device_mesh or placements is None")

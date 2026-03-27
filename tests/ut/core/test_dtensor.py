@@ -80,6 +80,7 @@ class TestBuildLayout(unittest.TestCase):
         # Arrange
         mock_mesh = MagicMock()
         mock_mesh.to_hash.return_value = "mesh_hash_123"
+        mock_mesh.mesh_shape = (1, 1)  # len must match placement objects count
         placements = [Shard(0), Replicate()]
         tensor_dim = 3
 
@@ -116,6 +117,7 @@ class TestBuildLayout(unittest.TestCase):
         # Arrange
         mock_mesh = MagicMock()
         mock_mesh.to_hash.return_value = "mesh_hash_456"
+        mock_mesh.mesh_shape = (1,)  # len must match placement objects count
         placements = [Shard(0)]
         tensor_dim = 2
 
@@ -152,8 +154,10 @@ class TestBuildLayout(unittest.TestCase):
         # Arrange
         mock_mesh1 = MagicMock()
         mock_mesh1.to_hash.return_value = "mesh_hash_1"
+        mock_mesh1.mesh_shape = (1,)
         mock_mesh2 = MagicMock()
         mock_mesh2.to_hash.return_value = "mesh_hash_2"
+        mock_mesh2.mesh_shape = (1,)
         placements1 = [Shard(0)]
         placements2 = [Replicate()]
         tensor_dim = 2

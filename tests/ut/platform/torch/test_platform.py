@@ -310,7 +310,7 @@ class TestTorchPlatformCore(unittest.TestCase):
 
         # Verify call flow
         mock_get_slice.assert_called_once_with(param, mock_layout)
-        mock_dtensor_from_local.assert_called_once_with(mock_slice, mock_layout.mesh, mock_layout.placements)
+        mock_dtensor_from_local.assert_called_once_with(mock_slice, mock_layout.mesh, mock_layout.alias_placements)
         mock_parameter.assert_called_once_with(mock_dtensor, requires_grad=True)
         self.assertEqual(result, mock_new_param)
 

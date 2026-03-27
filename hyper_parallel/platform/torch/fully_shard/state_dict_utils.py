@@ -64,7 +64,7 @@ def _offload_sharded_state_dict(
     for key, val in state_dict.items():
         if isinstance(val, DTensor):
             val = DTensor.from_local(
-                val.to_local().cpu(), val.device_mesh, val.placements,
+                val.to_local().cpu(), val.device_mesh, val.layout.alias_placements,
             )
         elif isinstance(val, torch.Tensor):
             val = val.cpu()

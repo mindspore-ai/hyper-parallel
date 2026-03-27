@@ -17,7 +17,7 @@ import inspect
 from typing import Union, Callable, Dict, List
 from functools import wraps
 from hyper_parallel.core.dtensor.layout import Layout, DeviceMesh
-from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.dtensor import DTensor, _is_alias_placements
 from hyper_parallel.core.dtensor.placement_types import Placement
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 from hyper_parallel.platform import get_platform
@@ -100,7 +100,10 @@ def _convert_sharding_plan(sharding_plan: Dict, device_mesh: DeviceMesh) -> Dict
     def _to_layout(value):
         """Convert a single sharding specification to Layout."""
         layout = Layout.from_device_mesh(device_mesh)
-        result = layout(value)
+        if _is_alias_placements(value):
+            result = layout(*value)
+        else:
+            result = layout(value)
         return result
 
     def _convert_value(value, wrap_single_as_list=False):
@@ -212,13 +215,13 @@ def _parallel_in(func, args, kwargs, layouts):
             continue
 
         to_layout = _get_layout(i, is_list)
-        processed_args[i] = arg.redistribute(to_layout.mesh, to_layout.placements)
+        processed_args[i] = arg.redistribute(to_layout.mesh, to_layout.alias_placements)
     for k, v in kwargs.items():
         if not isinstance(v, DTensor) or layouts.get(k) is None:
             processed_kwargs[k] = v
             continue
         to_layout = layouts[k]
-        processed_kwargs[k] = v.redistribute(to_layout.mesh, to_layout.placements)
+        processed_kwargs[k] = v.redistribute(to_layout.mesh, to_layout.alias_placements)
 
     return tuple(processed_args), processed_kwargs
 
@@ -237,13 +240,16 @@ def _parallel_out(outputs, layouts):
                 new_outputs.append(arg)
                 continue
             to_layout = layouts[i]
-            new_outputs.append(arg.redistribute(to_layout.mesh, to_layout.placements))
+            new_outputs.append(arg.redistribute(to_layout.mesh, to_layout.alias_placements))
         return tuple(new_outputs)
     if len(layouts) != 1:
         raise ValueError(f"The size of outputs and out_layout must be equal, but got 1 and "
                          f"{len(layouts)}")
 
-    return outputs.redistribute(layouts[0].mesh, layouts[0].placements) if isinstance(outputs, DTensor) else outputs
+    if isinstance(outputs, DTensor):
+        return outputs.redistribute(
+            layouts[0].mesh, layouts[0].alias_placements)
+    return outputs
 
 
 def _forward_pre_hook(cell, args):
@@ -454,7 +460,8 @@ def shard_module(model: Union[Module, Callable], device_mesh: DeviceMesh, shardi
             if not result:
                 raise ValueError(f"{param_name} is configured with a layout, but no instance was found.")
             _, _, param = result
-            layout.placement_to_tensor_map(param.dim())
+            if layout.tensor_map is None:
+                layout.placement_to_tensor_map(param.dim())
             param = platform.set_layout_into_parameter(param, layout)
             platform.update_parameter_by_name(model, result, param)
 

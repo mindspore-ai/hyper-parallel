@@ -15,13 +15,18 @@ def compute_local_shape_and_global_offset(global_shape, device_mesh, placement):
             global_shape: Shape of the global tensor.
             mesh: Device mesh for distributed execution.
             placements: Sharding placements for each dimension.
+                Supports Placement objects or alias strings.
 
         Returns:
             tuple: (local_shape, global_offset)
     """
+    from hyper_parallel.core.dtensor.dtensor import _is_alias_placements  # pylint: disable=C0415
     total_layout = Layout.from_device_mesh(device_mesh)
-    layout = total_layout(placement)
-    layout.placement_to_tensor_map(len(global_shape))
+    if _is_alias_placements(placement):
+        layout = total_layout(*placement)
+    else:
+        layout = total_layout(placement)
+        layout.placement_to_tensor_map(len(global_shape))
     slice_shape = list(global_shape)
     alias_tensor_map = layout.alias_tensor_map
     for i, axis_name in enumerate(alias_tensor_map):
