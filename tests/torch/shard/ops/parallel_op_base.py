@@ -75,6 +75,31 @@ class SimpleModel(nn.Module):
 
         return result
 
+    def _reshape_operations(self, tensor, allow_flatten=False):
+        """Test reshape operations with partial state
+
+        Args:
+            tensor: input tensor
+            allow_flatten: whether to allow flatten operation (should be True after reduce_partial)
+        """
+        original_shape = tensor.shape
+
+        # Test various reshape operations
+        # 1. Reshape to 2D
+        if tensor.dim() == 1:
+            result = tensor.reshape(-1, 1)
+        else:
+            result = tensor.reshape(-1, tensor.shape[-1])
+
+        # 2. Reshape to 1D (flatten) - only after reduce_partial
+        if allow_flatten:
+            result = result.reshape(-1)
+
+        # 3. Reshape back to original shape
+        result = result.reshape(original_shape)
+
+        return result
+
     def _and_operations(self, tensor):
         """Test __and__ (bitwise AND) operations while preserving float type and range"""
         # Save original tensor
@@ -389,6 +414,9 @@ class SimpleModel(nn.Module):
         # Test add operations (support partial state)
         out = self._add_operations(out)
 
+        # Test reshape operations (support partial state, no flatten allowed)
+        out = self._reshape_operations(out)
+
         # ================== reduce_partial ==================
         if self.dist and isinstance(out, DTensor):
             out = out.reduce_partial()
@@ -398,6 +426,9 @@ class SimpleModel(nn.Module):
 
         # Test add operations again after reduce_partial
         out = self._add_operations(out)
+
+        # Test reshape operations again after reduce_partial (flatten allowed)
+        out = self._reshape_operations(out, allow_flatten=True)
 
         # Test all other operations
         out = self._and_operations(out)
