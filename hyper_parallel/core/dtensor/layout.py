@@ -632,7 +632,6 @@ class Layout:
     def repeat_num(self):
         """
         Number of repeated placements.
-        In pipeline parallel, only the last stage return repeat num, other stages return -1.
         For example:
         layout = Layout((2, 4), ("dp", "mp"))
         x_layout = layout("dp", "None")
@@ -641,11 +640,6 @@ class Layout:
         if self._tensor_map is None:
             raise ValueError(f"The tensor_map is None, the mesh_shape is {self._mesh.mesh_shape},"
                              f" alias_name is {self._mesh.mesh_dim_names}")
-
-        # if it is not the last stage, return -1
-        group_size = platform.get_world_size()
-        if self._rank_list[-1] != (group_size - 1):
-            return -1
 
         all_device_num = functools.reduce(lambda x, y: x * y, self._mesh.mesh_shape)
         used_dev_num = 1
