@@ -19,7 +19,8 @@ placements) rather than any specific parallelism strategy, so a single
 implementation covers FSDP, HSDP, TP+FSDP, and other DTensor-expressed
 parallelisms.
 
-Design aligned with FSDP1 (``fully_sharded_data_parallel.py``):
+Collective safety aligned with FSDP1; numerical precision aligned with
+FSDP2's ``_NormPartial`` norm computation path:
 
 * Gradient norms from sharded parameters are all-reduced across the
   corresponding shard process group.
@@ -55,6 +56,7 @@ except ImportError:
     _has_foreach_support = None  # type: ignore[assignment]
 
 __all__: list[str] = ["clip_grad_norm_"]
+
 
 # (id(mesh) or None, shard_dims) -> list of local grads for norm computation
 _GradGroupKey = Tuple[Optional[int], Tuple[int, ...]]
@@ -125,14 +127,27 @@ def _param_device(param: torch.Tensor) -> torch.device:
     return param.device
 
 
+def _get_grad_obj(param: torch.nn.Parameter) -> Optional[torch.Tensor]:
+    """Return the gradient object for *param*.
+
+    Checks ``param.main_grad`` first (used when
+    ``MixedPrecisionPolicy.apply_grad_on_fp32_main_grad=True``),
+    falling back to ``param.grad``.
+    """
+    grad = getattr(param, "main_grad", None)
+    if grad is not None:
+        return grad
+    return param.grad
+
+
 def _get_local_grad(param: torch.nn.Parameter) -> Optional[torch.Tensor]:
     """Return the local gradient tensor, or ``None`` if absent.
 
-    If the gradient is a DTensor, returns its ``_local_tensor``.
+    Supports ``main_grad`` for fp32 mixed-precision training.
     """
     if not param.requires_grad:
         return None
-    grad = param.grad
+    grad = _get_grad_obj(param)
     if grad is None:
         return None
     if isinstance(grad, DTensor):
@@ -160,7 +175,7 @@ def _get_param_mesh_info(
     attribute.  *needs_manual_avg* is ``True`` when ``"avg"`` was
     requested but the backend lacks ``dist.ReduceOp.AVG`` support.
     """
-    grad = param.grad
+    grad = _get_grad_obj(param)
     # Prefer grad's spec (most accurate); fall back to param's.
     spec_source = grad if isinstance(grad, DTensor) else param
     if not isinstance(spec_source, DTensor):
@@ -186,9 +201,7 @@ def _sum_p_norms(
 ) -> None:
     """Accumulate sum-of-p-th-powers for *dev_grads* into *total*."""
     for g in dev_grads:
-        n = torch.linalg.vector_norm(
-            g, norm_type, dtype=torch.float32,
-        )
+        n = torch.linalg.vector_norm(g, norm_type)
         total.add_(n.to(device=device) ** norm_type)
 
 
@@ -233,6 +246,45 @@ def _foreach_p_norms(
     return total
 
 
+def _per_tensor_norms(
+    grads: List[torch.Tensor],
+    norm_type: float,
+    device: torch.device,
+) -> List[torch.Tensor]:
+    """Return per-tensor norms as a list of scalar tensors on *device*."""
+    if not grads:
+        return []
+
+    if _group_tensors_by_device_and_dtype is None or not hasattr(torch, "_foreach_norm"):
+        return [
+            torch.linalg.vector_norm(g.detach(), norm_type).to(device=device)
+            for g in grads
+        ]
+
+    norms: List[torch.Tensor] = []
+    grouped = _group_tensors_by_device_and_dtype(
+        [[g.detach() for g in grads]],
+    )
+    for (dev, _), ([dev_grads], _) in grouped.items():
+        if dev_grads and _has_foreach_support(dev_grads, dev):
+            try:
+                per_norms = torch._foreach_norm(  # pylint: disable=W0212
+                    dev_grads, norm_type,
+                )
+            except RuntimeError:
+                per_norms = None
+            if per_norms is not None:
+                norms.extend(
+                    [n.to(device=device) for n in per_norms],
+                )
+                continue
+        norms.extend([
+            torch.linalg.vector_norm(g, norm_type).to(device=device)
+            for g in dev_grads
+        ])
+    return norms
+
+
 def _compute_local_norm(  # pylint: disable=R0911
     grads: List[torch.Tensor],
     norm_type: float,
@@ -258,27 +310,21 @@ def _compute_local_norm(  # pylint: disable=R0911
 
     if norm_type == math.inf:
         norms = [
-            torch.linalg.vector_norm(
-                g.detach(), math.inf, dtype=torch.float32,
-            )
+            torch.linalg.vector_norm(g.detach(), math.inf)
             for g in grads
         ]
         return torch.stack(norms).max().to(device)
 
     if norm_type == -math.inf:
         norms = [
-            torch.linalg.vector_norm(
-                g.detach(), -math.inf, dtype=torch.float32,
-            )
+            torch.linalg.vector_norm(g.detach(), -math.inf)
             for g in grads
         ]
         return torch.stack(norms).min().to(device)
 
     if norm_type == 0:
         norms = [
-            torch.linalg.vector_norm(
-                g.detach(), 0, dtype=torch.float32,
-            )
+            torch.linalg.vector_norm(g.detach(), 0)
             for g in grads
         ]
         return torch.stack(norms).sum().to(device)
@@ -293,9 +339,7 @@ def _compute_local_norm(  # pylint: disable=R0911
 
     # Scalar fallback when foreach utilities are unavailable.
     norms = [
-        torch.linalg.vector_norm(
-            g.detach(), norm_type, dtype=torch.float32,
-        )
+        torch.linalg.vector_norm(g.detach(), norm_type)
         for g in grads
     ]
     norm_powers = [n.to(device=device) ** norm_type for n in norms]
@@ -311,42 +355,36 @@ def _get_total_norm(
     norm_type: float,
     mesh_cache: Dict[int, object],
     device: torch.device,
-) -> torch.Tensor:
+    all_grads: Optional[List[torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Compute total gradient norm with per-group all-reduce.
 
-    Each group shares the same ``(mesh, shard_dims)`` signature.  For
-    every ``Shard`` dimension we issue one all-reduce on the
-    corresponding mesh process group.  Groups with **no gradients**
-    still participate in the collective (contributing an identity
-    element) to prevent collective misalignment across ranks.
-
-    * Pure FSDP  -- one group, one shard dim, one all-reduce.
-    * HSDP       -- Replicate dim is ignored, Shard dim is reduced.
-    * TP + FSDP  -- two Shard dims, two sequential all-reduces.
-    * Replicated -- no all-reduce at all.
+    Returns ``(total_norm, local_combined)`` where *local_combined* is
+    set for finite p-norms (FSDP2-aligned path) and ``None`` for others.
     """
     if norm_type == math.inf:
         return _total_norm_inf(
             grad_groups, norm_type, mesh_cache, device,
             dist.ReduceOp.MAX,
-        )
+        ), None
 
     if norm_type == -math.inf:
         return _total_norm_inf(
             grad_groups, norm_type, mesh_cache, device,
             dist.ReduceOp.MIN,
-        )
+        ), None
 
     if norm_type == 0:
         return _total_norm_sum(
             grad_groups, norm_type, mesh_cache, device,
-        )
+        ), None
 
-    # Finite p-norm.
-    total_p = _total_norm_sum(
-        grad_groups, norm_type, mesh_cache, device,
+    # Finite p-norm: FSDP2-aligned sequence with eps on local combined norm.
+    total_p, local_combined = _total_norm_fsdp2_aligned(
+        grad_groups, norm_type, mesh_cache, device, all_grads,
     )
-    return total_p ** (1.0 / norm_type)
+    total_norm = total_p ** (1.0 / norm_type)
+    return total_norm, local_combined
 
 
 def _total_norm_inf(  # pylint: disable=R0913,R0917
@@ -386,6 +424,65 @@ def _total_norm_sum(grad_groups, norm_type, mesh_cache, device):
                 )
         total.add_(local_val)
     return total
+
+
+def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
+                              all_grads=None):
+    """FSDP2-aligned norm for finite p-norms.
+
+    Computes per-param norms in **original parameter order** (matching
+    FSDP2's ``[vector_norm(g) for g in grads]`` iteration), then does
+    ONE stack → ONE vector_norm → ONE all_reduce.
+
+    The original parameter order matters because ``vector_norm(stack(...))``
+    accumulates in stack order. Different orders can produce 1 ULP
+    different results on non-rank-0 ranks, causing the all_reduce sum
+    to differ.
+
+    Returns ``(total_p, local_combined)`` where *total_p* is the global
+    sum of p-th powers (caller takes p-th root), and *local_combined*
+    is the overall local norm (for return value alignment).
+    """
+    # --- Phase 1: find the reduce group ---
+    reduce_mesh = None
+    reduce_shard_dims: Tuple[int, ...] = ()
+
+    for (mesh_id, shard_dims), _ in grad_groups.items():
+        if mesh_id is not None and reduce_mesh is None:
+            reduce_mesh = mesh_cache[mesh_id]
+            reduce_shard_dims = shard_dims
+
+    # --- Phase 1b: per-param norms in ORIGINAL param order ---
+    # all_grads is in the same order as `parameters` passed to clip_grad_norm_,
+    # matching FSDP2's `[p.grad for p in parameters if p.grad is not None]`.
+    if all_grads:
+        all_norms = _per_tensor_norms(all_grads, norm_type, device)
+    else:
+        all_norms = []
+
+    # --- Phase 2: ONE vector_norm + eps on local (passive path) ---
+    if not all_norms:
+        local_combined = torch.tensor(0.0, device=device, dtype=torch.float32)
+        partial_sq = torch.tensor(0.0, device=device, dtype=torch.float32)
+    else:
+        combined = torch.linalg.vector_norm(
+            torch.stack(all_norms), norm_type,
+        )
+        local_combined = combined
+        # Match FSDP2 passive path: eps added to ONE local combined norm
+        # BEFORE squaring and all_reduce. This replicates the _NormPartial
+        # linearity preservation behavior (aten.add.Tensor linearity=True
+        # preserves _NormPartial, so +1e-6 stays on local).
+        combined = combined + 1e-6
+        partial_sq = combined ** norm_type
+
+    # --- Phase 3: ONE all_reduce ---
+    if reduce_mesh is not None:
+        for dim in reduce_shard_dims:
+            dist.all_reduce(partial_sq, op=dist.ReduceOp.SUM,
+                            group=reduce_mesh.get_group(dim))
+
+    return partial_sq, local_combined
 
 
 def _build_coalesce_buffer(
@@ -525,6 +622,7 @@ def _build_grad_groups(  # pylint: disable=R0914
     List[torch.Tensor],
     Dict[int, object],
     torch.device,
+    bool,
 ]:
     """Classify parameters into grad groups and pre-reduce Partial grads.
 
@@ -539,7 +637,7 @@ def _build_grad_groups(  # pylint: disable=R0914
     collectives into O(G) where G is the number of distinct
     ``(mesh, partial_info)`` groups (typically 1 for TP+FSDP).
 
-    Returns ``(grad_groups, all_grads, mesh_cache, device)``.
+    Returns ``(grad_groups, all_grads, mesh_cache, device, has_dtensor_grad)``.
     """
     # --- Phase 1: classify all parameters ---
     param_infos: List[Tuple] = []
@@ -571,6 +669,7 @@ def _build_grad_groups(  # pylint: disable=R0914
         list,
     )
     all_grads: List[torch.Tensor] = []
+    has_dtensor_grad = False
 
     for idx, info in enumerate(param_infos):
         param, local_grad, key = info[0], info[1], info[4]
@@ -581,6 +680,9 @@ def _build_grad_groups(  # pylint: disable=R0914
                 grad_groups[key] = []
             continue
 
+        grad_obj = _get_grad_obj(param)
+        if isinstance(grad_obj, DTensor):
+            has_dtensor_grad = True
         all_grads.append(local_grad)
         if idx in reduced:
             # Use Partial-reduced view for norm computation.
@@ -589,7 +691,7 @@ def _build_grad_groups(  # pylint: disable=R0914
             # Non-Partial: use original grad directly.
             grad_groups[key].append(local_grad)
 
-    return grad_groups, all_grads, mesh_cache, device
+    return grad_groups, all_grads, mesh_cache, device, has_dtensor_grad
 
 
 def _clip_grads_with_norm_(
@@ -597,14 +699,18 @@ def _clip_grads_with_norm_(
     max_norm: float,
     total_norm: torch.Tensor,
     foreach: Optional[bool] = None,
+    eps_in_norm: bool = False,
 ) -> None:
     """Scale gradients in-place so the total norm <= *max_norm*.
 
-    When *foreach* is ``True`` (or ``None`` on a supported device),
-    uses ``torch._foreach_mul_`` grouped by (device, dtype) for
-    better performance.
+    When *eps_in_norm* is True, the 1e-6 epsilon is already baked into
+    *total_norm* (FSDP2-aligned passive path for finite p-norms).
+    Otherwise eps is added here to prevent division by zero.
     """
-    clip_coef = max_norm / (total_norm + 1e-6)
+    if eps_in_norm:
+        clip_coef = max_norm / total_norm
+    else:
+        clip_coef = max_norm / (total_norm + 1e-6)
     clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
 
     if _group_tensors_by_device_and_dtype is not None:
@@ -701,14 +807,18 @@ def clip_grad_norm_(
     norm_type = float(norm_type)
 
     params = _normalize_parameters(parameters)
-    grad_groups, all_grads, mesh_cache, device = _build_grad_groups(params)
+
+    grad_groups, all_grads, mesh_cache, device, has_dtensor_grad = _build_grad_groups(params)
 
     # -- Norm + clip (all ranks participate) --------------------------------
     # _compute_local_norm returns identity elements for empty groups,
     # so the subsequent all-reduce is safe and semantically neutral.
-    total_norm = _get_total_norm(
-        grad_groups, norm_type, mesh_cache, device,
+    total_norm, return_norm = _get_total_norm(
+        grad_groups, norm_type, mesh_cache, device, all_grads,
     )
+    eps_in_norm = return_norm is not None  # finite p-norm has eps baked in
+    if return_norm is None:
+        return_norm = total_norm
 
     if error_if_nonfinite and torch.logical_or(
         total_norm.isnan(), total_norm.isinf()
@@ -722,7 +832,12 @@ def clip_grad_norm_(
         )
 
     if all_grads:
-        _clip_grads_with_norm_(all_grads, max_norm, total_norm, foreach)
+        # Disable foreach for dtensor-backed grads to avoid dispatch issues.
+        effective_foreach = False if has_dtensor_grad and foreach is None else foreach
+        _clip_grads_with_norm_(
+            all_grads, max_norm, total_norm, effective_foreach,
+            eps_in_norm=eps_in_norm,
+        )
 
     # Promote return dtype to match gradient dtypes (FSDP1 convention).
     # When this rank has no gradients, return in the default FP32 dtype
@@ -730,14 +845,16 @@ def clip_grad_norm_(
     if not all_grads:
         warnings.warn(
             "clip_grad_norm_ called on this rank with no gradients -- "
-            "returning the total norm in the default dtype "
-            f"{total_norm.dtype}",
+            "returning the local norm in the default dtype "
+            f"{return_norm.dtype}",
             stacklevel=2,
         )
-        return total_norm
+        return return_norm
 
     total_norm_dtype = functools.reduce(
         torch.promote_types,
         [g.dtype for g in all_grads],
     )
-    return total_norm.to(total_norm_dtype)
+    # Return local combined norm (pre-eps, pre-reduce) to match FSDP2's
+    # _NormPartial DTensor .item() behavior when .full_tensor() is not called.
+    return return_norm.to(total_norm_dtype)

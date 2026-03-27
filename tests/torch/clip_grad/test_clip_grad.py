@@ -21,52 +21,40 @@ _TEST_CLIP_GRAD = "_test_clip_grad.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_clip_grad_norm_comprehensive():
+def test_clip_grad_norm_training_5step():
     """
-    Feature: parallel run case in clip_grad
+    Feature: FSDP2-aligned clip_grad_norm_ precision
     Description:
-        1.test_clip_grad_norm_comprehensive
+        5-step HSDP training loop. At each step, verify clipped grads match
+        torch.nn.utils reference on full gradients. Guarantees loss alignment.
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_comprehensive", 12360, 8)
-    ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_clip_grad_norm_partial_shard():
-    """
-    Feature: parallel run case in clip_grad
-    Description:
-        1.test_clip_grad_norm_partial_shard
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_partial_shard", 12361, 8)
+        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_training_5step", 12360, 8)
     ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_clip_grad_norm_edge_cases():
+def test_clip_grad_norm_main_grad():
     """
-    Feature: parallel run case in clip_grad
+    Feature: main_grad support for clip_grad_norm_
     Description:
-        1.test_clip_grad_norm_edge_cases
+        Verify clip_grad_norm_ reads param.main_grad when param.grad is None.
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_edge_cases", 12362, 1)
+        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_main_grad", 12364, 8)
     ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_clip_grad_norm_empty_grads():
+def test_clip_grad_norm_frozen_params():
     """
-    Feature: parallel run case in clip_grad
+    Feature: frozen param handling for clip_grad_norm_
     Description:
-        1.test_clip_grad_norm_empty_grads
+        Verify clip_grad_norm_ correctly skips frozen params.
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_empty_grads", 12363, 8)
+        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_frozen_params", 12365, 8)
     ])
