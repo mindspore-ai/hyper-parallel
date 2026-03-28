@@ -87,17 +87,17 @@ def _discover_params_under_path(module: nn.Module, target_path: str, path: str) 
     return out
 
 
-def _get_full_tensor(param):
+def _get_tensor_view(param, *, gather_dtensor: bool = False):
     """Tensor view for comparison."""
     if isinstance(param, DTensor):
-        return param.to_local()
+        return param.full_tensor() if gather_dtensor else param.to_local()
     return param
 
 
 def _compare_params(ref_param, test_param, rtol=1e-3, atol=1e-3):
     """Compare two parameters (support DTensor via full_tensor())."""
-    ref_t = _get_full_tensor(ref_param)
-    test_t = _get_full_tensor(test_param)
+    ref_t = _get_tensor_view(ref_param, gather_dtensor=True)
+    test_t = _get_tensor_view(test_param, gather_dtensor=True)
     ref_np = ref_t.detach().cpu().numpy()
     test_np = test_t.detach().cpu().numpy()
     assert np.allclose(ref_np, test_np, rtol=rtol, atol=atol), \
@@ -199,7 +199,7 @@ def shard_param_data_parallel(acc_grad=False, **fsdp_kwargs):
     dp_stride = 8 // shard_size
     dp_offset = rank % shard_size * dp_stride
     for (_, ref_param), (_, test_param) in zip(standalone_grad.items(), dist_grad.items()):
-        compare_param = _get_full_tensor(test_param)
+        compare_param = _get_tensor_view(test_param)
         if ref_param.shape != compare_param.shape:
             # fully shard
             _compare_params(ref_param[dp_offset: dp_offset + dp_stride], compare_param, rtol=0.001, atol=0.001)
@@ -210,7 +210,8 @@ def shard_param_data_parallel(acc_grad=False, **fsdp_kwargs):
 
 def _get_standard_fully_shard_kwargs(mp_policy, offload_policy=None):
     """get standard fully shard kwargs"""
-    default_mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    default_world_size = dist.get_world_size() if dist.is_initialized() else 8
+    default_mesh = init_device_mesh(device_type="npu", mesh_shape=(default_world_size,), mesh_dim_names=("dp",))
     fsdp_kwargs = {
         'mesh': default_mesh,
         'reshard_after_forward': True,

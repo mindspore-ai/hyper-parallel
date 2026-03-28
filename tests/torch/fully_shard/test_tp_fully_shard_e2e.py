@@ -142,3 +142,93 @@ def test_hsdp_plus_tp_on_3d_root_mesh_match_standalone():
     file_name = "_test_tp_fully_shard_e2e.py"
     case_name = "test_hsdp_plus_tp_on_3d_root_mesh_match_standalone"
     torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_tp_plus_fully_shard_replicate_params_group_construction_on_3d_root_mesh():
+    """
+    Feature: diagnose 3D DTENSOR_UNIFIED replicate_params group creation.
+    Description: Inspect the rank-local flattened `(dp, ep)` group built for replicate_params on a 3D root mesh.
+    Expectation: All TP slices create and cache the same flattened `(dp, ep)` group family.
+    """
+    master_port = 12372
+    file_name = "_test_tp_fully_shard_e2e.py"
+    case_name = "test_tp_plus_fully_shard_replicate_params_group_construction_on_3d_root_mesh"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_tp_plus_fully_shard_replicate_params_without_mp_on_2d_mesh():
+    """
+    Feature: replicate_params parity on a 2D dp x tp mesh without mixed precision.
+    Description: Run a 2 x 2 two-step training case with replicate_params off/on.
+    Expectation: Distributed losses and full gradients match at every step.
+    """
+    master_port = 12371
+    file_name = "_test_tp_fully_shard_e2e.py"
+    case_name = "test_tp_plus_fully_shard_replicate_params_without_mp_on_2d_mesh"
+    torchrun_case(file_name, case_name, master_port, num_proc=4)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_tp_plus_fully_shard_replicate_params_with_mp_on_2d_mesh():
+    """
+    Feature: replicate_params parity on a 2D dp x tp mesh with mixed precision.
+    Description: Run a 2 x 2 two-step training case with replicate_params off/on.
+    Expectation: Distributed losses and full gradients match at every step.
+    """
+    master_port = 12370
+    file_name = "_test_tp_fully_shard_e2e.py"
+    case_name = "test_tp_plus_fully_shard_replicate_params_with_mp_on_2d_mesh"
+    torchrun_case(file_name, case_name, master_port, num_proc=4)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_tp_plus_fully_shard_replicate_params_without_mp_on_3d_root_mesh():
+    """
+    Feature: replicate_params parity on a 3D root mesh without mixed precision.
+    Description: Run a dp x tp x ep = 2 x 2 x 2 two-step training case with replicate_params off/on.
+    Expectation: Distributed losses and full gradients match at every step.
+    """
+    master_port = 12373
+    file_name = "_test_tp_fully_shard_e2e.py"
+    case_name = "test_tp_plus_fully_shard_replicate_params_without_mp_on_3d_root_mesh"
+    torchrun_case(file_name, case_name, master_port)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_tp_plus_fully_shard_replicate_params_with_mp_on_3d_root_mesh():
+    """
+    Feature: replicate_params parity on a 3D root mesh with mixed precision.
+    Description: Run a dp x tp x ep = 2 x 2 x 2 two-step training case with replicate_params off/on.
+    Expectation: Distributed losses and full gradients match at every step.
+    """
+    master_port = 12374
+    file_name = "_test_tp_fully_shard_e2e.py"
+    case_name = "test_tp_plus_fully_shard_replicate_params_with_mp_on_3d_root_mesh"
+    torchrun_case(file_name, case_name, master_port)

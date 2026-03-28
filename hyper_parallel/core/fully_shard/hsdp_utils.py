@@ -288,3 +288,35 @@ def get_rank_list_for_axes(
         mesh_slice.append(slice(None) if axis in normalized_axes else axis_coord)
     selected = mesh_tensor[tuple(mesh_slice)]
     return [int(item) for item in np.array(selected).reshape(-1).tolist()]
+
+
+def get_split_rank_lists_for_axes(
+    mesh: DeviceMesh,
+    axes: Sequence[int],
+) -> list[list[int]]:
+    """Return all rank lists induced by varying ``axes`` and fixing the complementary axes."""
+    normalized_axes = tuple(sorted(set(axes)))
+    if len(normalized_axes) == 0:
+        return [[int(rank) for rank in mesh.rank_list]]
+
+    mesh_tensor = np.array(mesh.rank_list).reshape(mesh.mesh_shape)
+    complementary_axes = tuple(
+        axis for axis in range(len(mesh.mesh_shape)) if axis not in normalized_axes
+    )
+    if len(complementary_axes) == 0:
+        return [[int(item) for item in np.array(mesh_tensor).reshape(-1).tolist()]]
+
+    complementary_shape = tuple(mesh.mesh_shape[axis] for axis in complementary_axes)
+    split_rank_lists: list[list[int]] = []
+    for complementary_coord in np.ndindex(*complementary_shape):
+        mesh_slice = []
+        coord_idx = 0
+        for axis in range(len(mesh.mesh_shape)):
+            if axis in normalized_axes:
+                mesh_slice.append(slice(None))
+            else:
+                mesh_slice.append(complementary_coord[coord_idx])
+                coord_idx += 1
+        selected = mesh_tensor[tuple(mesh_slice)]
+        split_rank_lists.append([int(item) for item in np.array(selected).reshape(-1).tolist()])
+    return split_rank_lists

@@ -36,6 +36,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     ParamModuleInfo,
     ShardedState,
     get_rank_list_for_axes,
+    get_split_rank_lists_for_axes,
 )
 from hyper_parallel.core.fully_shard.utils import (
     CPUOffloadPolicy,
@@ -255,14 +256,12 @@ class TorchHSDPParamV2(HSDPParamV2):
                             rank_size,
                         )
 
-                sub_mesh = self._spmd_mesh[mesh_axis_names]
-                flattened_mesh = sub_mesh.flatten(mesh_dim_name="_".join(mesh_axis_names))
-                flattened_axis_name = flattened_mesh.mesh_dim_names[0]
-                process_group = flattened_mesh.get_group(flattened_axis_name)
+                split_rank_lists = get_split_rank_lists_for_axes(self._spmd_mesh, group_axes)
+                process_group = platform.split_group(split_ranks=split_rank_lists)
                 if process_group is not None:
                     rank_size = 1
-                    for dim_size in sub_mesh.mesh_shape:
-                        rank_size *= dim_size
+                    for axis in group_axes:
+                        rank_size *= self._spmd_mesh.mesh_shape[axis]
                     return _build_group_info_from_process_group(
                         "fully_shard_unsharded_group",
                         process_group,
@@ -756,14 +755,15 @@ class TorchHSDPParamV2(HSDPParamV2):
         """
         # If parameter is not sharded (below threshold), no communication needed
         if not self.is_sharded:
+            all_gather_input = self.all_gather_inputs[0]
             self.init_all_gather_outputs(
-                all_gather_input_numels=[self._sharded_param_data.numel()],
-                all_gather_input_dtypes=[self._sharded_param_data.dtype],
+                all_gather_input_numels=[all_gather_input.numel()],
+                all_gather_input_dtypes=[all_gather_input.dtype],
                 world_size=1,
                 device=self.device,
             )
             self.alloc_all_gather_outputs()
-            self.all_gather_outputs[0].copy_(self._sharded_param_data)
+            self.all_gather_outputs[0].copy_(all_gather_input)
             return self.all_gather_outputs[0], None
 
         # Get input data
