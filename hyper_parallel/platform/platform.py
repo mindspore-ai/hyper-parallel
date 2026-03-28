@@ -493,6 +493,25 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement irecv")
 
     @staticmethod
+    def p2p_exchange(tensor, peer_rank: int, group=None):
+        """Differentiable symmetric P2P exchange (send local tensor, receive peer's tensor).
+
+        Sends ``tensor`` to ``peer_rank`` and simultaneously receives the peer's
+        tensor.  The operation is differentiable: the backward pass performs the
+        same symmetric exchange on the upstream gradient.
+
+        Args:
+            tensor: Local tensor to send.
+            peer_rank (int): Global rank of the communication peer.
+            group: Process group. ``None`` uses the default group.
+
+        Returns:
+            Tensor received from ``peer_rank``, with the same shape and dtype as
+            the input ``tensor``.
+        """
+        raise NotImplementedError("Platform subclasses must implement p2p_exchange")
+
+    @staticmethod
     def send_object_list(obj_list, dst=None, group=None):
         """Send a list of Python objects to destination rank.
 
@@ -527,6 +546,66 @@ class Platform:
             The scattered tensor chunk, or a tuple of (tensor, handle) if async_op is True.
         """
         raise NotImplementedError("Platform subclasses must implement reduce_scatter_tensor")
+
+    @staticmethod
+    def all_to_all_single(input_tensor, output_shape, group, async_op=False):
+        """All-to-all single collective with optional async execution.
+
+        Args:
+            input_tensor: Input tensor to scatter.
+            output_shape: Shape of the pre-allocated output tensor.
+            group: Process group (ProcessGroup for torch, group name string for mindspore).
+            async_op: If True, returns a work handle; the output tensor is
+                      filled only after ``work.wait()`` is called.
+
+        Returns:
+            Tuple ``(output, work)`` where *output* is the result tensor and
+            *work* is the async handle (``None`` when ``async_op=False``).
+
+        Raises:
+            NotImplementedError: Must be implemented by platform subclasses.
+        """
+        raise NotImplementedError("Platform subclasses must implement all_to_all_single")
+
+    @staticmethod
+    def differentiable_async_a2a_wait(x, work, out_perm, group, world_size, concat_dim, split_dim,
+                                      handle_box=None):
+        """Differentiable wrapper that waits for a pre-launched async A2A.
+
+        Wraps the wait-and-reconstruct step in the platform autograd mechanism
+        so gradients flow correctly through the all-to-all communication.
+
+        The A2A direction is seq→head (forward): the output gathers along
+        ``concat_dim`` (sequence grows from S/cp to S) and scatters along
+        ``split_dim`` (heads shrink from H to H/ws).
+
+        In backward, launches an async head→seq A2A on the incoming gradient
+        and appends ``(work, out_perm)`` to ``handle_box`` so the caller can
+        wait just before the projection GEMM, achieving GEMM–A2A overlap.
+
+        Args:
+            x:          Original projection output tensor; anchors the op
+                        in the autograd graph.
+            work:       Async work handle from ``all_to_all_single(async_op=True)``.
+            out_perm:   Output buffer filled once ``work.wait()`` completes
+                        (shape ``[ws, ...]``).
+            group:      Process group for the reverse A2A in backward.
+            world_size: CP/Ulysses degree.
+            concat_dim: Dimension that is gathered (concatenated) in forward;
+                        typically the sequence dimension.
+            split_dim:  Dimension that is scattered (split) in forward;
+                        typically the head dimension.
+            handle_box: Optional mutable list ``[]``. In backward, ``(work, out_perm)``
+                        for the reverse A2A is appended here so the pre-hook can wait.
+
+        Returns:
+            Result tensor with ``concat_dim`` gathered and ``split_dim`` split,
+            connected to the autograd graph through *x*.
+
+        Raises:
+            NotImplementedError: Must be implemented by platform subclasses.
+        """
+        raise NotImplementedError("Platform subclasses must implement differentiable_async_a2a_wait")
 
     @staticmethod
     def parameters_dict(cell):
@@ -843,6 +922,11 @@ class Platform:
             A context manager that disables gradient tracking.
         """
         raise NotImplementedError("Platform subclasses must implement no_grad")
+
+    @staticmethod
+    def cat(tensors, dim=0):
+        """Concatenate tensors along a dimension."""
+        raise NotImplementedError("Platform subclasses must implement cat")
 
     @staticmethod
     def empty_like(tensor, *, dtype=None, device=None, pin_memory=False):

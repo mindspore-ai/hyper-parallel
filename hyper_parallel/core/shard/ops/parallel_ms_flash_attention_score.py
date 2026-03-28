@@ -20,6 +20,9 @@ import copy
 import warnings
 
 from typing import List, Tuple, Optional, Any
+from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import (  # pylint: disable=C0415
+    _get_lb_override,
+)
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_ops_register import register_distributed_op
@@ -852,7 +855,9 @@ class FlashAttentionScoreDistributedOp:
             head_split_num = split_info["head"]
             seq_split_num = split_info["seq"]
 
-            if head_split_num == 1 and seq_split_num == 1:
+            lb_split_id, lb_split_num = _get_lb_override()
+
+            if head_split_num == 1 and seq_split_num == 1 and lb_split_id is None:
                 result = func(
                     query, key, value,
                     real_shift, drop_mask, padding_mask, attn_mask, prefix,
@@ -871,13 +876,18 @@ class FlashAttentionScoreDistributedOp:
             adjusted_actual_seq_qlen = actual_seq_qlen
             adjusted_actual_seq_kvlen = actual_seq_kvlen
 
-            if seq_split_num > 1:
+            if seq_split_num > 1 or lb_split_id is not None:
                 dynamic_info = self._get_dynamic_shape_info(
                     query, key, input_layout
                 )
                 is_dynamic = dynamic_info.get('is_dynamic', False)
 
-                split_id = self._get_split_id(query_layout, input_layout)
+                if lb_split_id is not None:
+                    assert lb_split_num is not None
+                    split_id = lb_split_id
+                    seq_split_num = lb_split_num   # override for sparse param computation
+                else:
+                    split_id = self._get_split_id(query_layout, input_layout)
                 seq_dim_idx = self._get_seq_dim_idx(
                     self._layout_dims.get(input_layout, {})
                 )

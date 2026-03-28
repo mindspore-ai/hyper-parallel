@@ -20,6 +20,9 @@ import copy
 import warnings
 
 from typing import List, Tuple, Optional, Any
+from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import (  # pylint: disable=C0415
+    _get_lb_override,
+)
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_ops_register import register_distributed_op
@@ -337,10 +340,12 @@ class ScaledDotProductAttentionDistributedOp:
             split_info = self._get_split_info(query_layout, dims)
             seq_split_num = split_info["seq"]
 
+            lb_split_id, lb_split_num = _get_lb_override()
+
             adjusted_attn_mask = attn_mask
             adjusted_is_causal = is_causal
 
-            if seq_split_num > 1:
+            if seq_split_num > 1 or lb_split_id is not None:
                 kv_seq_split_num = 1
                 if key_layout is not None:
                     kv_split_info = self._get_split_info(key_layout, dims)
@@ -354,7 +359,12 @@ class ScaledDotProductAttentionDistributedOp:
                         f"Key/Value sequence split num: {kv_seq_split_num}"
                     )
 
-                split_id = self._get_split_id(query_layout, dims)
+                if lb_split_id is not None:
+                    assert lb_split_num is not None
+                    split_id = lb_split_id
+                    seq_split_num = lb_split_num   # for global_q_len in _adjust_attn_mask_for_sp
+                else:
+                    split_id = self._get_split_id(query_layout, dims)
                 local_q_len = query.shape[dims["seq"]]
                 global_kv_len = key.shape[dims["seq"]]
 
