@@ -6,6 +6,7 @@ description: Review HyperParallel code changes for distributed correctness, stre
 # HyperParallel Code Review Skill
 
 Review HyperParallel code changes focusing on what CI cannot check: distributed system correctness, stream synchronization safety, memory lifecycle, cross-platform consistency, and code quality.
+Before starting the review, always load `.claude/rules/code-style.md` and treat it as a mandatory review baseline.
 
 ## Usage Modes
 
@@ -14,6 +15,7 @@ Review HyperParallel code changes focusing on what CI cannot check: distributed 
 If the user invokes `/code-review` with no arguments, ask what to review:
 
 > What would you like me to review?
+>
 > - A PR number or URL (e.g., `/code-review #160`)
 > - A local branch (e.g., `/code-review branch`)
 
@@ -21,7 +23,7 @@ If the user invokes `/code-review` with no arguments, ask what to review:
 
 Review changes in the current branch against `upstream/master`:
 
-```
+```text
 /code-review branch
 /code-review branch detailed
 ```
@@ -38,7 +40,7 @@ git log upstream/master..HEAD --oneline
 
 The user provides a PR number or URL:
 
-```
+```text
 /code-review #160
 /code-review https://gitcode.com/mindspore/hyper-parallel/pulls/160
 ```
@@ -49,7 +51,7 @@ Fetch PR data via GitCode API (requires `GITCODE_TOKEN`), or fall back to local 
 
 Append `detailed` for line-by-line specific comments:
 
-```
+```text
 /code-review branch detailed
 /code-review #160 detailed
 ```
@@ -88,6 +90,7 @@ Group changed files by risk level:
 ### Step 3: Deep Review
 
 Perform thorough analysis using the review checklist. See [review-checklist.md](review-checklist.md) for detailed criteria covering:
+
 - Distributed system correctness
 - Stream synchronization safety
 - Memory lifecycle management
@@ -98,6 +101,7 @@ Perform thorough analysis using the review checklist. See [review-checklist.md](
 ### Step 4: Check Distributed Correctness
 
 Evaluate distributed system implications. See [distributed-guidelines.md](distributed-guidelines.md) for:
+
 - Stream synchronization rules and common violations
 - Memory management patterns and leak prevention
 - Cross-platform compatibility requirements
@@ -121,6 +125,7 @@ python3 .claude/skills/autogit/scripts/autogit.py pylint-review --base upstream/
 ### Step 6: Formulate Review
 
 Structure feedback with actionable suggestions organized by category.
+Any `code-style.md` violation is mandatory: identify it explicitly, provide the corrected final code, and do not leave it as a suggestion-only item.
 
 ## Review Areas
 
@@ -153,7 +158,7 @@ Brief overall assessment (1-2 sentences).
 [Layout issues, placement bugs, YAML registration gaps, or "No DTensor concerns"]
 
 ### Code Quality
-[Design issues, convention violations, pylint violations (add to filter_pylint.txt, not inline disable), or "No concerns"]
+[Design issues, `code-style.md` violations, pylint violations (add to filter_pylint.txt, not inline disable), or "No concerns"]
 
 ### Testing
 - [ ] Tests exist for new functionality
@@ -185,6 +190,7 @@ Only include this section if the user requests "detailed" review. Do not repeat 
 4. **Be actionable** — Provide concrete fixes, not vague concerns
 5. **Cross-platform awareness** — Always check if the other backend needs a matching change
 6. **Assume competence** — The author knows distributed systems; explain only non-obvious context
+7. **Style is blocking** — `code-style.md` violations must be called out and accompanied by the fully auto-fixed final code
 
 ---
 

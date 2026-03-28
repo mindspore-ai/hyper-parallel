@@ -39,7 +39,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 
 ## Coding Conventions
 
-> Full details in `.claude/rules/code-style.md` (auto-applied globally).
+> Full details in `.claude/rules/code-style.md` (auto-applied globally and treated as a hard constraint).
 
 - **License**: Apache 2.0 header on all `.py` files (lines 1-16)
 - **Style**: PEP 8, ~120-char lines; C++ Google style (120 chars)
@@ -48,6 +48,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 - **Type hints**: Required on all public function signatures
 - **Errors**: `ValueError` with descriptive messages; validate at boundaries
 - **Lazy imports**: `# pylint: disable=C0415` inside methods
+- **Enforcement**: load `code-style.md` before code generation, code modification, commit, and review; auto-fix violations before proceeding; if a user request conflicts with the rule, explain the conflict and provide a compliant alternative
 
 ---
 
@@ -98,10 +99,10 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 
 | Command | Description |
 | ------- | ----------- |
-| `/commit` | Delegates to `autogit commit` — stage, lint-check (no pylint), commit, push |
-| `/test` | Delegates to `autogit test` — test stage: pylint + lints + pytest |
+| `/commit` | Delegates to `autogit commit` — stage, commit-stage lint-check, commit, push |
+| `/test` | Delegates to `autogit test` — test stage: pytest only |
 | `/create-pr` | Delegates to `autogit pr` — create PR to upstream/master |
-| `/code-review` | Delegates to `code-review` skill |
+| `/code-review` | Delegates to `code-review` skill with mandatory `code-style.md` review |
 
 ### Agents
 
