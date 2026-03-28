@@ -20,7 +20,7 @@ import numpy as np
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
-from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, Partial
 from hyper_parallel.core.shard.ops.parallel_reshape import ReshapeDistributedOp
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -473,6 +473,109 @@ class TestParallelReshape(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "total elements number"):
             op_view.infer_layout((x_layout,), (dst_shape, src_shape))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_reshape_with_partial_basic(self, mock_platform):
+        """
+        Feature: Reshape with partial input
+        Description: Reshape should preserve partial status from input to output
+        Expectation: Output layout has same partial status as input
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Partial(), Replicate()), 2)
+
+        assert x_layout.is_partial(), "Input layout should have partial status"
+
+        src_shape = (8, 16)
+        dst_shape = (4, 4, 8)
+
+        output_layout, _ = op.infer_layout((x_layout,), (dst_shape, src_shape))
+
+        assert output_layout.is_partial(), "Output layout should preserve partial status"
+        assert output_layout.get_partial_by_dev_id("dp") == "sum", (
+            f"Partial op should be 'sum', got {output_layout.get_partial_by_dev_id('dp')}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_reshape_with_partial_sharded_input(self, mock_platform):
+        """
+        Feature: Reshape with partial and sharded input
+        Description: Reshape should preserve both sharding and partial status on different axes
+        Expectation: Output has correct sharding and partial
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Shard(0), Partial()), 2)
+
+        src_shape = (8, 16)
+        dst_shape = (1, -1, 16)
+
+        output_layout, _ = op.infer_layout((x_layout,), (dst_shape, src_shape))
+
+        assert output_layout.is_partial(), "Output layout should preserve partial status"
+        assert output_layout.get_partial_by_dev_id("mp") == "sum", (
+            f"Partial op should be 'sum', got {output_layout.get_partial_by_dev_id('mp')}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_reshape_with_partial_multi_axis(self, mock_platform):
+        """
+        Feature: Reshape with partial on multiple device axes
+        Description: Reshape should preserve partial status on all axes
+        Expectation: Output has partial on both device axes
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Partial(), Partial(), Replicate()), 2)
+
+        src_shape = (4, 8)
+        dst_shape = (2, 16)
+
+        output_layout, _ = op.infer_layout((x_layout,), (dst_shape, src_shape))
+
+        assert output_layout.is_partial(), "Output layout should preserve partial status"
+        assert output_layout.get_partial_by_dev_id("dp") == "sum"
+        assert output_layout.get_partial_by_dev_id("mp") == "sum"
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_reshape_torch_with_partial(self, mock_platform):
+        """
+        Feature: torch.reshape with partial input
+        Description: torch.reshape should preserve partial status
+        Expectation: Output layout has partial status
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+
+        src_shape = (4, 8)
+        dst_shape = (2, 16)
+
+        output_layout, _ = op_torch.infer_layout(
+            (x_layout,), (dst_shape, src_shape)
+        )
+
+        assert output_layout.is_partial(), "Output layout should preserve partial status"
+        assert output_layout.get_partial_by_dev_id("dp") == "sum"
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_view_with_partial(self, mock_platform):
+        """
+        Feature: view with partial input
+        Description: view should preserve partial status
+        Expectation: Output layout has partial status
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+
+        src_shape = (4, 8)
+        dst_shape = (2, 16)
+
+        output_layout, _ = op_view.infer_layout(
+            (x_layout,), (dst_shape, src_shape)
+        )
+
+        assert output_layout.is_partial(), "Output layout should preserve partial status"
+        assert output_layout.get_partial_by_dev_id("dp") == "sum"
 
 
 if __name__ == "__main__":
