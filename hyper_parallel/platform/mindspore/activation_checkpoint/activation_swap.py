@@ -21,7 +21,7 @@ import enum
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from typing import Optional, Callable, Any
+from typing import Optional, Callable, Any, Union
 
 import mindspore as ms
 from mindspore import Tensor
@@ -35,6 +35,31 @@ _CKPT_WRAPPED_MODULE = "_ckpt_wrapped_module"
 _CKPT_PREFIX = _CKPT_WRAPPED_MODULE + "."
 
 
+class FuncCell(Cell):
+    """
+    Thin :class:`~mindspore.nn.Cell` adapter that wraps a plain callable.
+
+    Allows ordinary Python functions (or any callable without Cell
+    parameters) to be passed to :func:`checkpoint_wrapper` and
+    :func:`swap_wrapper` in place of a :class:`~mindspore.nn.Cell`.
+    The wrapped function is stored as ``_fn`` and invoked in
+    :meth:`construct`; the cell has no trainable parameters.
+
+    Args:
+        fn (callable): The function to wrap.
+
+    Example:
+        >>> wrapped = checkpoint_wrapper(lambda x: x * 2)
+    """
+
+    def __init__(self, fn: Callable):
+        super().__init__()
+        self._fn = fn
+
+    def construct(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
 class ActivationWrapper(Cell, ABC):
     """
     Base class for Activation Checkpoint Wrapper in MindSpore.
@@ -46,7 +71,9 @@ class ActivationWrapper(Cell, ABC):
     Not meant to be instantiated directly.
     """
 
-    def __init__(self, module: Cell):
+    def __init__(self, module: Union[Cell, Callable]):
+        if callable(module) and not isinstance(module, Cell):
+            module = FuncCell(module)
         super().__init__(auto_prefix=False)
         self._ckpt_wrapped_module = module
         self._wrapped_param_names = {
@@ -338,7 +365,7 @@ class SwapWrapper(ActivationWrapper):
         >>> model.layers[i].attn = swap_wrapper(model.layers[i].attn, policy_fn)
     """
 
-    def __init__(self, mod: Cell, policy_fn: Optional[Callable] = None):
+    def __init__(self, mod: Union[Cell, Callable], policy_fn: Optional[Callable] = None):
         super().__init__(mod)
         self.policy_fn = policy_fn
 
@@ -347,8 +374,18 @@ class SwapWrapper(ActivationWrapper):
             return self._ckpt_wrapped_module(*args, **kwargs)
 
 
-def swap_wrapper(module: Cell, policy_fn: Optional[Callable] = None) -> SwapWrapper:
+def swap_wrapper(module: Union[Cell, Callable], policy_fn: Optional[Callable] = None) -> SwapWrapper:
     """
     Wrap *module* with async activation swap.
+
+    Args:
+        module (Cell or callable): The cell or plain function to wrap.
+            If a plain callable is passed it is automatically wrapped in a
+            :class:`FuncCell` before being stored.
+        policy_fn (callable, optional): Per-tensor swap policy; see
+            :class:`AsyncSaveOnCpu`.
+
+    Returns:
+        SwapWrapper: The wrapped cell with activation swap enabled.
     """
     return SwapWrapper(module, policy_fn)

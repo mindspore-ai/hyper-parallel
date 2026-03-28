@@ -17,11 +17,11 @@
 # ============================================================================
 """Activation Checkpoint Wrapper implementation for MindSpore."""
 # pylint: disable=W0613
-from typing import Optional, Callable
+from typing import Optional, Callable, Union
 
 from mindspore.nn import Cell
 
-from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import ActivationWrapper
+from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import ActivationWrapper, FuncCell
 
 
 class CheckpointWrapper(ActivationWrapper):
@@ -56,16 +56,17 @@ class CheckpointWrapper(ActivationWrapper):
 
     def __init__(
         self,
-        mod: Cell,
+        mod: Union[Cell, Callable],
         checkpoint_fn: Optional[Callable] = None,
         **checkpoint_fn_kwargs,
     ):
         super().__init__(mod)
         self.checkpoint_fn = checkpoint_fn
         self.checkpoint_fn_kwargs = checkpoint_fn_kwargs
-        if checkpoint_fn is None:
+        if checkpoint_fn is None and not isinstance(self._ckpt_wrapped_module, FuncCell):
             # Use MindSpore's native recompute mechanism (effective in graph /
-            # semi-auto parallel mode).
+            # semi-auto parallel mode).  FuncCell wrappers have no meaningful
+            # recompute graph, so skip the call for plain-function inputs.
             self._ckpt_wrapped_module.recompute()
 
     def construct(self, *args, **kwargs):
@@ -80,7 +81,7 @@ class CheckpointWrapper(ActivationWrapper):
 
 
 def checkpoint_wrapper(
-    module: Cell,
+    module: Union[Cell, Callable],
     checkpoint_fn: Optional[Callable] = None,
     **checkpoint_fn_kwargs,
 ) -> CheckpointWrapper:
@@ -91,10 +92,15 @@ def checkpoint_wrapper(
     ``torch.distributed.algorithms._checkpoint.checkpoint_wrapper.checkpoint_wrapper``.
 
     Args:
-        module (Cell): The cell to wrap.
+        module (Cell or callable): The cell or plain function to wrap.
+            If a plain callable is passed it is automatically wrapped in a
+            :class:`~hyper_parallel.platform.mindspore.activation_checkpoint\
+.activation_swap.FuncCell` before being stored, and the native
+            :meth:`Cell.recompute` call is skipped (use *checkpoint_fn* for
+            custom recompute logic in that case).
         checkpoint_fn (callable, optional): Custom recompute function.  When
             ``None`` (default), MindSpore's native :meth:`Cell.recompute` is
-            used.
+            used (Cell inputs only).
         **checkpoint_fn_kwargs: Extra keyword arguments forwarded to
             *checkpoint_fn* on every forward call.
 
@@ -105,5 +111,6 @@ def checkpoint_wrapper(
     Example:
         >>> from hyper_parallel.platform.mindspore.activation_checkpoint import checkpoint_wrapper
         >>> model.layers[i] = checkpoint_wrapper(model.layers[i])
+        >>> wrapped_fn = checkpoint_wrapper(lambda x: x * 2)
     """
     return CheckpointWrapper(module, checkpoint_fn=checkpoint_fn, **checkpoint_fn_kwargs)
