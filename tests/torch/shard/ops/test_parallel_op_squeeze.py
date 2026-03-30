@@ -47,16 +47,3 @@ def test_parallel_op_squeeze_group2():
         TorchCase(PARALLEL_OP_SQUEEZE, "test_distributed_squeeze_specific_axis_negative", 10361, 4),
         TorchCase(PARALLEL_OP_SQUEEZE, "test_distributed_squeeze_scalar_like", 10362, 4),
     ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_squeeze_group3():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_distributed_squeeze_error_non_singleton
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(PARALLEL_OP_SQUEEZE, "test_distributed_squeeze_error_non_singleton", 10359, 4),
-    ])

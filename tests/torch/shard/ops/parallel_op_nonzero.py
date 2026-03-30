@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
-from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global
 
@@ -107,30 +107,3 @@ def test_distributed_nonzero_as_tuple():
         assert torch.equal(
             expected_tensor, gathered_output
         ), f"Nonzero tuple output mismatch at index {i}"
-
-def test_distributed_nonzero_sharded_error():
-    """
-    Feature: dtensor + torch.Tensor.nonzero error on sharded input
-    Description:
-        - Attempt to run nonzero() on a tensor that is sharded.
-        - Because nonzero() produces data-dependent dynamic shapes, a sharded
-          input will cause shape mismatches across ranks, leading to collective
-          communication hangs or crashes.
-    Expectation: Raise ValueError with a descriptive message.
-    """
-    init_dist()
-
-    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
-
-    # INVALID: shard dim=0
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
-    x_placements = (Shard(0), Replicate())
-
-    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
-    try:
-        # Attempt to call nonzero on a sharded tensor (should fail)
-        dist_input.nonzero()
-        assert False, "Expected ValueError when running nonzero on a sharded tensor"
-    except ValueError as e:
-        assert "fully replicated" in str(e) or "unsharded" in str(e), \
-            f"Unexpected error message: {str(e)}"

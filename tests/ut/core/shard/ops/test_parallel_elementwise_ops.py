@@ -17,7 +17,7 @@ import os
 import unittest
 from unittest.mock import patch
 import copy
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -72,7 +72,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             init_backend=False
         )
 
-    def _run_scenario(self, x_layout, y_layout, expected_map, extra_args):
+    def _run_scenario(self, x_layout, y_layout, expected_map, extra_args, flag=False):
         """Infer layout of element-wise operator"""
         if x_layout.is_partial() or y_layout.is_partial():
             op_ = self.op_with_partial
@@ -83,8 +83,18 @@ class TestParallelElementwiseOps(unittest.TestCase):
         assert got_map == expected_map, (
             f"Element-wise failed. Expected {expected_map}, got {got_map}"
         )
+        impl = op_.get_expand_impl(None, output_layout, (x_layout, y_layout), extra_args)
+        if flag:
+            assert impl is not None, (
+                f"get_expand_impl test failed. Expected non-None, got {impl}"
+            )
+            assert callable(impl), "Returned impl should be a callable function"
+        else:
+            assert impl is None, (
+                f"get_expand_impl test failed. Expected None, got {impl}"
+            )
 
-    def _run_single_input_scenario(self, x_layout, expected_map, extra_args):
+    def _run_single_input_scenario(self, x_layout, expected_map, extra_args, flag=False):
         """Infer layout of element-wise operator with single input"""
         if x_layout.is_partial():
             op_ = self.op_with_partial
@@ -95,6 +105,16 @@ class TestParallelElementwiseOps(unittest.TestCase):
         assert got_map == expected_map, (
             f"Element-wise failed. Expected {expected_map}, got {got_map}"
         )
+        impl = op_.get_expand_impl(None, output_layout, (x_layout,), extra_args)
+        if flag:
+            assert impl is not None, (
+                f"get_expand_impl test failed. Expected non-None, got {impl}"
+            )
+            assert callable(impl), "Returned impl should be a callable function"
+        else:
+            assert impl is None, (
+                f"get_expand_impl test failed. Expected None, got {impl}"
+            )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_single_input_partial_0(self, mock_platform):
@@ -119,11 +139,13 @@ class TestParallelElementwiseOps(unittest.TestCase):
         """
         mesh = self._make_2x2x2_mesh(mock_platform)
         x_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+        x_layout._partial = [None] * len(x_layout._partial)
 
         self._run_single_input_scenario(
             x_layout,
             expected_map=(-1, -1, -1),
             extra_args={"input_shapes": [(4, 8, 16)]},
+            flag=False
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -140,6 +162,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             x_layout,
             expected_map=(2, 1, 0),
             extra_args={"input_shapes": [(4, 8, 16)]},
+            flag=False
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -172,6 +195,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             x_layout, y_layout,
             expected_map=(-1, -1, -1),
             extra_args={"input_shapes": [(4, 8, 16), (4, 8, 16)]},
+            flag=False
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -189,6 +213,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             x_layout, y_layout,
             expected_map=(2, -1, 0),
             extra_args={"input_shapes": [(4, 8, 16), (4, 8, 16)]},
+            flag=False
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -206,6 +231,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             x_layout, y_layout,
             expected_map=(2, -1, 0),
             extra_args={"input_shapes": [(4, 8, 16), (4, 8, 16)]},
+            flag=False
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -256,6 +282,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             x_layout, y_layout,
             expected_map=(2, -1, 0),
             extra_args={"input_shapes": [(1, 8, 16), (4, 8, 16)]},
+            flag=False
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -273,6 +300,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             x_layout, y_layout,
             expected_map=(2, 1, -1),
             extra_args={"input_shapes": [(4, 1, 16), (1, 8, 16)]},
+            flag=False
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -290,6 +318,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             x_layout, y_layout,
             expected_map=(2, 1, 0),
             extra_args={"input_shapes": [(4, 8, 1), (1, 1, 16)]},
+            flag=False
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -307,6 +336,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             x_layout, y_layout,
             expected_map=(2, 1, 0),
             extra_args={"input_shapes": [(), (4, 8, 16)]},
+            flag=False
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -319,12 +349,19 @@ class TestParallelElementwiseOps(unittest.TestCase):
         mesh = self._make_2x2x2_mesh(mock_platform)
         x_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
         x_layout.set_partial_by_dev_axis("dp", "sum")
-        y_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+        y_layout = copy.deepcopy(_build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3))
+        y_layout._partial = [None] * len(y_layout._partial)
 
         extra_args = {"input_shapes": [(4, 8, 16), (4, 8, 16)]}
         output_layout = self.op_with_partial.infer_layout((x_layout, y_layout), extra_args)
 
         assert output_layout.partial[mesh.axis_index("dp")] == "sum"
+
+        impl = self.op_with_partial.get_expand_impl(None, output_layout, (x_layout, y_layout), extra_args)
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_partial_with_partial_same_14(self, mock_platform):
@@ -343,6 +380,11 @@ class TestParallelElementwiseOps(unittest.TestCase):
         output_layout = self.op_with_partial.infer_layout((x_layout, y_layout), extra_args)
 
         assert output_layout.partial[mesh.axis_index("dp")] == "sum"
+
+        impl = self.op_with_partial.get_expand_impl(None, output_layout, (x_layout, y_layout), extra_args)
+        assert impl is None, (
+            f"get_expand_impl test failed. Expected None, got {impl}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_partial_with_partial_different_15(self, mock_platform):
@@ -415,6 +457,13 @@ class TestParallelElementwiseOps(unittest.TestCase):
         got_map = output_layout.tensor_map
         assert got_map == expected_map
 
+        assert self.op.get_expand_impl(None, output_layout,
+                                       (x_layout, y_layout, z_layout), extra_args) is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"""got {self.op.get_expand_impl(None, output_layout,
+                                           (x_layout, y_layout, z_layout), extra_args)}"""
+        )
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_output_shard_partial_conflict_19(self, mock_platform):
         """
@@ -463,6 +512,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
             x_layout, y_layout,
             expected_map=(2, 1, 0),
             extra_args={"input_shapes": [(16,), (4, 8, 16)]},
+            flag=False
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")

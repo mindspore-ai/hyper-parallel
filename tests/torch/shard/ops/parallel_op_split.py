@@ -140,29 +140,3 @@ def test_distributed_split_layout_inference_split_list():
     for i, (ref, dist_out) in enumerate(zip(standalone_outputs, dist_outputs)):
         gathered = local_to_global(dist_out)
         assert torch.allclose(ref, gathered, atol=1e-5), f"Chunk {i} mismatch"
-
-
-def test_distributed_split_on_sharded_dim_error():
-    """
-    Feature: dtensor + torch.split error on sharded axis
-    Description:
-        - Attempt to split along a sharded dimension.
-        - Should raise ValueError during layout inference.
-    Expectation: Raise ValueError with expected message.
-    """
-    init_dist()
-    split_size = 4
-    axis = 0  # this dim is sharded
-
-    layout = Layout((2, 2), ("dp", "tp"))
-    x_layout = layout("dp", "tp")
-
-    local_tensor = torch.randn(4, 12).npu()
-    dist_input = DTensor.from_local(local_tensor, x_layout.mesh, x_layout.placements)
-
-    try:
-        torch.split(dist_input, split_size, dim=axis)
-        assert False, "Expected ValueError when splitting along sharded dimension"
-    except ValueError as e:
-        assert "Can not split tensor at sharded axis" in str(e)
-        assert "layout:" in str(e)

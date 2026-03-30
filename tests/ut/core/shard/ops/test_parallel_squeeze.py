@@ -16,7 +16,7 @@
 import os
 import unittest
 from unittest.mock import patch
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -81,6 +81,13 @@ class TestParallelSqueeze(unittest.TestCase):
         actual_map = output_layout.tensor_map
         assert actual_map == expected_map, (
             f"Squeeze failed. Expected {expected_map}, got {actual_map}"
+        )
+
+        # Since `get_expand_impl` is not overridden, it returns None by default.
+        # The same applies to other test classes, so it is unnecessary to test its return value.
+        assert self.op.get_expand_impl(None, output_layout, (x_layout,), extra_args) is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {self.op.get_expand_impl(None, output_layout, (x_layout,), extra_args)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")

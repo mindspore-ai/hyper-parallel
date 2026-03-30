@@ -17,7 +17,7 @@ import os
 import unittest
 from unittest.mock import patch
 import numpy as np
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -58,7 +58,7 @@ class TestParallelOneHotExt(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "cp", "mp"))
 
-    def _run_scenario(self, indices_layout, expected_map, extra_args):
+    def _run_scenario(self, indices_layout, expected_map, extra_args, flag = False):
         """Infer layout of OneHotExt operator"""
         op = OneHotExtDistributedOp("OneHotExt")
         output_layout = op.infer_layout((indices_layout,), extra_args)

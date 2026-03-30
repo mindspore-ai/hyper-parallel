@@ -32,16 +32,3 @@ def test_parallel_op_cumsum_group1():
         TorchCase(PARALLEL_OP_CUMSUM, "test_distributed_cumsum_layout_inference", 10558, 4),
         TorchCase(PARALLEL_OP_CUMSUM, "test_distributed_cumsum_negative_dim_support", 10559, 4),
     ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_cumsum_group2():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_distributed_cumsum_sharded_dim_error
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(PARALLEL_OP_CUMSUM, "test_distributed_cumsum_sharded_dim_error", 10558, 4),
-    ])

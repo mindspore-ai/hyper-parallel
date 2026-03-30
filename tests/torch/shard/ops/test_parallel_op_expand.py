@@ -25,12 +25,12 @@ def test_parallel_op_expand_group1():
     Feature: parallel run case in shard
     Description:
         1.test_distributed_expand_basic_unsharded
-        2.test_distributed_expand_sharded_dim_error
+        2.test_distributed_expand_scalar_tensor
     Expectation: Run success.
     """
     parallel_run([
         TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_basic_unsharded", 10358, 4),
-        TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_sharded_dim_error", 10359, 4),
+        TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_scalar_tensor", 10360, 4),
     ])
 
 
@@ -39,31 +39,18 @@ def test_parallel_op_expand_group2():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_expand_scalar_tensor
-        2.test_distributed_expand_as_basic
+        1.test_distributed_expand_as_basic
+        2.test_distributed_expand_as_scalar_to_tensor
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_scalar_tensor", 10360, 4),
         TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_as_basic", 10361, 4),
-    ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_expand_group3():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_distributed_expand_as_scalar_to_tensor
-    Expectation: Run success.
-    """
-    parallel_run([
         TorchCase(PARALLEL_OP_EXPAND, "test_distributed_expand_as_scalar_to_tensor", 10362, 4),
     ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_expand_group4():
+def test_parallel_op_expand_group3():
     """
     Feature: parallel run case in shard
     Description:
@@ -78,7 +65,7 @@ def test_parallel_op_expand_group4():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_expand_group5():
+def test_parallel_op_expand_group4():
     """
     Feature: parallel run case in shard
     Description:

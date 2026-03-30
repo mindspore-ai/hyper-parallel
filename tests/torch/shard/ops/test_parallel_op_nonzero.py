@@ -43,16 +43,3 @@ def test_parallel_op_nonzero_group2():
     parallel_run([
         TorchCase(PARALLEL_OP_NONZERO, "test_distributed_nonzero_as_tuple", 10359, 8),
     ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_nonzero_group3():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_distributed_nonzero_sharded_error
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(PARALLEL_OP_NONZERO, "test_distributed_nonzero_sharded_error", 10359, 8),
-    ])

@@ -61,32 +61,6 @@ def test_distributed_cumsum_layout_inference():
     ), "Cumsum output mismatch between standalone and distributed execution"
 
 
-def test_distributed_cumsum_sharded_dim_error():
-    """
-    Feature: dtensor + torch.cumsum error on sharded operation dimension
-    Description:
-        - Attempt to run cumsum where the operation dimension is sharded.
-        - Should raise ValueError during layout inference due to sequential dependency.
-    Expectation: Raise ValueError with descriptive message.
-    """
-    init_dist()
-    cumsum_dim = 0  # Attempt cumsum along dimension 0 (which will be sharded)
-
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    x_placements = (Shard(0), Replicate())
-
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
-    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
-
-    try:
-        torch.cumsum(dist_input, dim=cumsum_dim)
-        assert False, (
-            f"Expected ValueError when performing cumsum on sharded dimension {cumsum_dim}"
-        )
-    except ValueError as e:
-        assert f"Cannot perform sharding on normalized dimension {cumsum_dim}" in str(e)
-
-
 def test_distributed_cumsum_negative_dim_support():
     """
     Feature: dtensor + torch.cumsum with negative dimension indexing

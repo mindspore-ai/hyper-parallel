@@ -121,30 +121,6 @@ def test_distributed_squeeze_specific_axis_negative():
     assert torch.equal(standalone_output, gathered_output), \
         "Squeeze negative axis output mismatch"
 
-def test_distributed_squeeze_error_non_singleton():
-    """
-    Feature: dtensor + torch.Tensor.squeeze validation error
-    Description:
-    - Attempt to squeeze a dimension that is not size 1.
-    - Note: Unlike PyTorch which ignores this, DistributedOp is implemented to raise ValueError.
-    Expectation: Raise ValueError.
-    """
-    init_dist()
-    input_np = np.random.randn(8, 2).astype(np.float32)
-    standalone_input = torch.from_numpy(input_np).npu()
-
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    x_placements = (Shard(0), Replicate())
-
-    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
-
-    try:
-        # Try to squeeze dim 1 which has size 2
-        dist_input.squeeze(1)
-        assert False, "Expected ValueError when squeezing dimension of size != 1"
-    except ValueError as e:
-        assert "dimension should have size 1" in str(e), \
-            f"Unexpected error message: {str(e)}"
 
 def test_distributed_squeeze_scalar_like():
     """

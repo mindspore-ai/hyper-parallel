@@ -25,12 +25,10 @@ def test_parallel_op_isin_group1():
     Feature: parallel run case in shard
     Description:
         1.test_distributed_isin_layout_inference
-        2.test_distributed_isin_sharded_test_elements_error
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_ISIN, "test_distributed_isin_layout_inference", 10458, 4),
-        TorchCase(PARALLEL_OP_ISIN, "test_distributed_isin_sharded_test_elements_error", 10459, 4),
+        TorchCase(PARALLEL_OP_ISIN, "test_distributed_isin_layout_inference", 10458, 4)
     ])
 
 

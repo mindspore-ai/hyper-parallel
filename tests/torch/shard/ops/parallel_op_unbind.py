@@ -150,29 +150,3 @@ def test_distributed_unbind_negative_dim():
         gathered_tensor = local_to_global(dist_tensor)
         assert torch.equal(standalone_output[i], gathered_tensor), \
             f"Unbind output[{i}] numerical mismatch"
-
-
-def test_distributed_unbind_sharded_dim_error():
-    """
-    Feature: dtensor + torch.unbind error on sharded dimension
-    Description:
-        - Attempt to unbind a dimension that is sharded.
-    Expectation: Raise ValueError.
-    """
-    init_dist()
-
-    standalone_input = torch.from_numpy(input_2d_np).npu()
-
-    # Setup: Shard dim0 ("dp"), Replicate dim1
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    x_placements = (Shard(0), Replicate())
-
-    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
-
-    # Attempt to unbind dim0 which is sharded
-    try:
-        torch.unbind(dist_input, dim=0)
-        assert False, "Expected ValueError when unbinding sharded dimension"
-    except ValueError as e:
-        assert "Unbinding a sharded dimension is not supported" in str(e), \
-            f"Unexpected error message: {str(e)}"

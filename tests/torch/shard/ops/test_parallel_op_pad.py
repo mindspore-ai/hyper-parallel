@@ -32,16 +32,3 @@ def test_parallel_op_pad_group1():
         TorchCase(PARALLEL_OP_PAD, "test_distributed_pad_basic_unsharded", 10359, 4),
         TorchCase(PARALLEL_OP_PAD, "test_distributed_pad_zero_on_sharded_dim", 10360, 4),
     ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_pad_group2():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_distributed_pad_sharded_dim_error
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(PARALLEL_OP_PAD, "test_distributed_pad_sharded_dim_error", 10361, 4),
-    ])

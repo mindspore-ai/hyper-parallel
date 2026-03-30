@@ -103,7 +103,7 @@ def test_distributed_ne_scalar():
     ), "Ne scalar comparison output mismatch"
 
 
-def test_distributed_ne_partial_error():
+def test_distributed_ne_partial_error(): # TODO
     """
     Feature: dtensor + torch.ne Partial input handling.
     Description:

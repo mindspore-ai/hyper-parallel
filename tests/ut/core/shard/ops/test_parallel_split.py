@@ -16,7 +16,7 @@
 import os
 import unittest
 from unittest.mock import patch
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -94,6 +94,13 @@ class TestParallelSplit(unittest.TestCase):
         output_layouts = self.split_op.infer_layout([input_layout], extra_args)
         assert len(output_layouts) == 8
         assert all(layout.tensor_map == input_layout.tensor_map for layout in output_layouts)
+
+        # Since `get_expand_impl` is not overridden, it returns None by default.
+        # The same applies to other test classes, so it is unnecessary to test its return value.
+        assert self.split_op.get_expand_impl(None, output_layouts, [input_layout], extra_args) is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {self.split_op.get_expand_impl(None, output_layouts, [input_layout], extra_args)}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_infer_layout_invalid_axis(self, mock_platform):

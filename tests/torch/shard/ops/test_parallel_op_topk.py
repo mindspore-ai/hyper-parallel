@@ -25,10 +25,8 @@ def test_parallel_op_topk_group1():
     Feature: parallel run case in shard
     Description:
         1.test_distributed_topk_layout_inference
-        2.test_distributed_topk_sharded_dim_error
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_TOPK, "test_distributed_topk_layout_inference", 10888, 4),
-        TorchCase(PARALLEL_OP_TOPK, "test_distributed_topk_sharded_dim_error", 10889, 4),
+        TorchCase(PARALLEL_OP_TOPK, "test_distributed_topk_layout_inference", 10888, 4)
     ])

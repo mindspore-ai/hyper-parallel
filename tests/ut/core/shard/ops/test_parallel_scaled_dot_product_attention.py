@@ -17,7 +17,7 @@ import os
 import unittest
 from unittest.mock import patch
 import numpy as np
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout, Layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -365,7 +365,6 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Query layout cannot be None"):
             op.infer_layout((None, k_layout, v_layout), [])
-
 
 if __name__ == "__main__":
     unittest.main()

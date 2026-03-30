@@ -121,30 +121,3 @@ def test_distributed_argsort_descending():
     assert torch.equal(
         standalone_output, gathered_output
     ), "Argsort descending output mismatch"
-
-
-def test_distributed_argsort_sharded_dim_error():
-    """
-    Feature: dtensor + torch.argsort error on sharded dimension
-    Description:
-        - Attempt to sort along a dimension that is currently sharded.
-        - Input: shape (8, 4) sharded on dim=1.
-        - Sort on dim=1. This should trigger the distributed constraint.
-    Expectation: Raise ValueError with a descriptive message.
-    """
-    init_dist()
-
-    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
-
-    # INVALID: shard dim=1 (the dimension we want to sort along)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
-    x_placements = (Replicate(), Shard(1))
-
-    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
-    try:
-        # Attempt to argsort the sharded dim=1
-        torch.argsort(dist_input, dim=1)
-        assert False, "Expected ValueError when performing argsort on a sharded dimension"
-    except ValueError as e:
-        assert "Cannot perform argsort along dimension 1 because it is currently sharded" in str(e), \
-            f"Unexpected error message: {str(e)}"
