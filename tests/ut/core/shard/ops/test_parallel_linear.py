@@ -17,7 +17,7 @@ import os
 import unittest
 from unittest.mock import patch
 import numpy as np
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -87,6 +87,11 @@ class TestParallelLinear(unittest.TestCase):
             f" got {output_layout.tensor_map}"
         )
 
+        assert op.get_expand_impl(None, output_layout, (x_layout, w_layout, None), ())is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {self.op.get_expand_impl(None, output_layout, (x_layout,), None)}"
+        )
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_linear_layout_hybrid_parallel(self, mock_platform):
         """
@@ -103,6 +108,10 @@ class TestParallelLinear(unittest.TestCase):
         assert output_layout.tensor_map == expected_map, (
             f"Hybrid Parallel test failed. Expected {expected_map}, "
             f"got {output_layout.tensor_map}"
+        )
+        assert op.get_expand_impl(None, output_layout, (x_layout, w_layout, bias_layout), ())is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {self.op.get_expand_impl(None, output_layout, (x_layout,), None)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -155,6 +164,11 @@ class TestParallelLinear(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
+        assert op.get_expand_impl(None, output_layout, (x_layout, w_layout, None), ())is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {self.op.get_expand_impl(None, output_layout, (x_layout,), None)}"
+        )
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_linear_layout_partial_without_sharded_contract_dim(self, mock_platform):
         """
@@ -172,7 +186,10 @@ class TestParallelLinear(unittest.TestCase):
             f"Partial status test failed. Expected {expected_partial}, "
             f"got {output_layout.partial}"
         )
-
+        assert op.get_expand_impl(None, output_layout, (x_layout, w_layout, None), ())is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {self.op.get_expand_impl(None, output_layout, (x_layout,), None)}"
+        )
 
 if __name__ == "__main__":
     unittest.main()

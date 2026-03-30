@@ -17,7 +17,7 @@ import os
 import unittest
 from unittest.mock import patch
 import numpy as np
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -89,6 +89,13 @@ class TestParallelTensorSplit(unittest.TestCase):
             assert out_layout.to_dict()["tensor_map"] == x_layout.to_dict()["tensor_map"], (
                 "Output layout should be identical to the input layout."
             )
+
+        # Since `get_expand_impl` is not overridden, it returns None by default.
+        # The same applies to other test classes, so it is unnecessary to test its return value.
+        assert op.get_expand_impl(None, output_layouts, (x_layout,), (3,)) is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {op.get_expand_impl(None, output_layouts, (x_layout,), (3,))}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_tensor_split_tuple_specific_dim(self, mock_platform):

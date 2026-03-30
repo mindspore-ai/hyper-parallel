@@ -17,7 +17,7 @@ import os
 import unittest
 from unittest.mock import patch
 import numpy as np
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -97,6 +97,13 @@ class TestParallelExpand(unittest.TestCase):
         expected_map = (1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"Basic expand failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        )
+
+        # Since `get_expand_impl` is not overridden, it returns None by default.
+        # The same applies to other test classes, so it is unnecessary to test its return value.
+        assert op.get_expand_impl(None, output_layout, (x_layout,), (-1, 5)) is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {op.get_expand_impl(None, output_layout, (x_layout,), (-1, 5))}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")

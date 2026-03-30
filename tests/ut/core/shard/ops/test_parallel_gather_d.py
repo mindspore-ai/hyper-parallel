@@ -17,7 +17,7 @@ import os
 import unittest
 from unittest.mock import patch
 import numpy as np
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate

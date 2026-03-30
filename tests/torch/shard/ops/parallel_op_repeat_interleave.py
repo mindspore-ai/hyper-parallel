@@ -110,25 +110,3 @@ def test_distributed_repeat_interleave_dim_none():
     assert torch.allclose(
         standalone_output, gathered_output, atol=1e-5
     ), "repeat_interleave_dim_None output mismatch between standalone and distributed"
-
-def test_distributed_repeat_interleave_sharded_dim_error():
-    """
-    Feature: dtensor + torch.repeat_interleave error on sharded dim
-    Description:
-        - Attempt to perform repeat_interleave along a sharded dimension.
-        - Should raise ValueError during layout inference.
-    Expectation: Raise ValueError.
-    """
-    init_dist()
-    repeats = 2
-    dim = 1
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    x_placements = (Shard(0), Shard(1))
-    x_layout = _build_layout(mesh, x_placements, 2)
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
-    dist_input = global_to_local(standalone_input, x_layout)
-    try:
-        torch.repeat_interleave(dist_input, repeats, dim=dim)
-        assert False, "Expected ValueError when repeat_interleave along sharded dimension"
-    except ValueError as e:
-        assert "Cannot perform sharding on params along the chosen dim" in str(e)

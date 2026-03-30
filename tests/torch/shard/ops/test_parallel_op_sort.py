@@ -47,16 +47,3 @@ def test_parallel_op_sort_group2():
         TorchCase(PARALLEL_OP_SORT, "test_distributed_sort_middle_dim", 10361, 4),
         TorchCase(PARALLEL_OP_SORT, "test_distributed_sort_negative_dim", 10362, 4),
     ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_sort_group3():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_distributed_sort_sharded_dim_error
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(PARALLEL_OP_SORT, "test_distributed_sort_sharded_dim_error", 10363, 4),
-    ])

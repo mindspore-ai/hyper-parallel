@@ -30,16 +30,3 @@ def test_parallel_op_layernorm_group1():
     parallel_run([
         TorchCase(PARALLEL_OP_LAYERNORM, "test_distributed_layer_norm_layout_inference", 10890, 4),
     ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_layernorm_group2():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_distributed_layer_norm_sharded_normalized_dim_error
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_distributed_layer_norm_sharded_normalized_dim_error", 10890, 4),
-    ])

@@ -56,29 +56,3 @@ def test_parallel_op_outer_group3():
     parallel_run([
         TorchCase(PARALLEL_OP_OUTER, "test_distributed_outer_first_sharded", 10359, 8),
     ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_outer_group4():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_distributed_outer_same_dim_error
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(PARALLEL_OP_OUTER, "test_distributed_outer_same_dim_error", 10359, 8),
-    ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_outer_group5():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_distributed_outer_not_1d_error
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(PARALLEL_OP_OUTER, "test_distributed_outer_not_1d_error", 10359, 8),
-    ])

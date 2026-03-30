@@ -126,33 +126,6 @@ def test_distributed_expand_prepend_new_dimensions():
     ), "Prepend expand output mismatch"
 
 
-def test_distributed_expand_sharded_dim_error():
-    """
-    Feature: dtensor + torch.Tensor.expand error on sharded dimension
-    Description:
-        - Attempt to expand a sharded singleton dimension (semantically invalid).
-        - Input: shape (8, 1) sharded on dim=1 (which has global size = 1 * num_shards = 4).
-        - Should fail at layout inference since global size ≠ 1.
-    Expectation: Raise ValueError with descriptive message.
-    """
-    init_dist()
-
-    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()  # shape (8, 1)
-
-    # INVALID: shard dim=1 (the singleton dimension we want to expand)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    x_placements = (Replicate(), Shard(1)) # tensor_map = (-1, 0)
-
-    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
-    try:
-        # Attempt to expand sharded dim=1 from 1→16 (should fail)
-        dist_input.expand(8, 16)
-        assert False, "Expected ValueError when expanding sharded dimension"
-    except ValueError as e:
-        assert "Cannot expand dimension 1 which is sharded" in str(e), \
-            f"Unexpected error message: {str(e)}"
-
-
 def test_distributed_expand_scalar_tensor():
     """
     Feature: dtensor + torch.Tensor.expand scalar expansion

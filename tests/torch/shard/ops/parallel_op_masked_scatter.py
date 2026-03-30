@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
-from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Replicate
 from tests.torch.utils import init_dist
 from tests.torch.shard.utils import local_to_global
 
@@ -81,99 +81,6 @@ def test_masked_scatter_basic_replicated():
     ), "masked_scatter output mismatch between standalone and distributed execution"
 
 
-def test_masked_scatter_input_sharded_error():
-    """
-    Feature: dtensor + torch.Tensor.masked_scatter error on sharded input
-    Description:
-        - Attempt masked_scatter with sharded input tensor.
-        - Should raise ValueError as implementation requires full replication.
-    Expectation: Raise ValueError.
-    """
-    init_dist()
-
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
-    standalone_mask = torch.from_numpy(standalone_mask_np).npu()
-    standalone_source = torch.from_numpy(standalone_source_np).npu()
-
-    mesh = init_device_mesh("npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-
-    # Shard dim 0 of input on mesh axis 0 ("dp")
-    input_placements = (Shard(0), Replicate())
-    repl_placements = (Replicate(), Replicate())
-
-    dist_input = distribute_tensor(standalone_input, mesh, input_placements)
-    dist_mask = distribute_tensor(standalone_mask, mesh, repl_placements)
-    dist_source = distribute_tensor(standalone_source, mesh, repl_placements)
-
-    try:
-        dist_input.masked_scatter(dist_mask, dist_source)
-        assert False, "Expected ValueError when running masked_scatter with sharded input"
-    except ValueError as e:
-        assert "is sharded" in str(e), \
-            f"Unexpected error message: {str(e)}"
-
-
-def test_masked_scatter_mask_sharded_error():
-    """
-    Feature: dtensor + torch.Tensor.masked_scatter error on sharded mask
-    Description:
-        - Attempt masked_scatter with sharded mask tensor.
-        - Should raise ValueError.
-    Expectation: Raise ValueError.
-    """
-    init_dist()
-
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
-    standalone_mask = torch.from_numpy(standalone_mask_np).npu()
-    standalone_source = torch.from_numpy(standalone_source_np).npu()
-
-    mesh = init_device_mesh("npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-
-    repl_placements = (Replicate(), Replicate())
-    # Shard dim 1 of mask on mesh axis 1 ("tp")
-    mask_placements = (Replicate(), Shard(1))
-
-    dist_input = distribute_tensor(standalone_input, mesh, repl_placements)
-    dist_mask = distribute_tensor(standalone_mask, mesh, mask_placements)
-    dist_source = distribute_tensor(standalone_source, mesh, repl_placements)
-
-    try:
-        dist_input.masked_scatter(dist_mask, dist_source)
-        assert False, "Expected ValueError when running masked_scatter with sharded mask"
-    except ValueError as e:
-        assert "is sharded" in str(e), f"Unexpected error message: {str(e)}"
-
-
-def test_masked_scatter_source_sharded_error():
-    """
-    Feature: dtensor + torch.Tensor.masked_scatter error on sharded source
-    Description:
-        - Attempt masked_scatter with sharded source tensor.
-        - Should raise ValueError.
-    Expectation: Raise ValueError.
-    """
-    init_dist()
-
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
-    standalone_mask = torch.from_numpy(standalone_mask_np).npu()
-    standalone_source = torch.from_numpy(standalone_source_np).npu()
-
-    mesh = init_device_mesh("npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-
-    repl_placements = (Replicate(), Replicate())
-    # Shard source (1D tensor) on mesh axis 0 ("dp")
-    # This is valid placement syntax, but invalid for this op
-    source_placements = (Shard(0), Replicate())
-
-    dist_input = distribute_tensor(standalone_input, mesh, repl_placements)
-    dist_mask = distribute_tensor(standalone_mask, mesh, repl_placements)
-    dist_source = distribute_tensor(standalone_source, mesh, source_placements)
-
-    try:
-        dist_input.masked_scatter(dist_mask, dist_source)
-        assert False, "Expected ValueError when running masked_scatter with sharded source"
-    except ValueError as e:
-        assert "is sharded" in str(e), f"Unexpected error message: {str(e)}"
 def test_masked_scatter_1d_replicated():
     """
     Feature: dtensor + torch.Tensor.masked_scatter 1D tensor

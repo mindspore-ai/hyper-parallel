@@ -93,6 +93,13 @@ class TestParallelArgMaxWithValue(unittest.TestCase):
             f"got {output_layout.tensor_map}"
         )
 
+        # Since `get_expand_impl` is not overridden, it returns None by default.
+        # The same applies to other test classes, so it is unnecessary to test its return value.
+        assert op.get_expand_impl(None, output_layout, (x_layout, None, None), (1, True)) is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {op.get_expand_impl(None, output_layout, (x_layout, None, None), (1, True))}"
+        )
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_argmax_with_value_model_parallel_success(self, mock_platform):
         """

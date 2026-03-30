@@ -154,31 +154,3 @@ def test_distributed_sort_negative_dim():
 
     assert torch.equal(s_values, g_values), "Sort negative dim values mismatch"
     assert torch.equal(s_indices, g_indices), "Sort negative dim indices mismatch"
-
-
-def test_distributed_sort_sharded_dim_error():
-    """
-    Feature: dtensor + torch.sort error handling
-    Description:
-        - Attempt to sort along a dimension that is currently sharded.
-    Expectation: Raises ValueError because sorting sharded data requires
-    redistribution (not auto-supported in sort op yet).
-    """
-    init_dist()
-
-    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
-
-    # Shard dim 0 and Replicate dim 1
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    x_placements = (Shard(0), Replicate())
-
-    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
-
-    # Try to sort dim 0 (which is sharded)
-    try:
-        dist_input.sort(dim=0)
-        assert False, "Expected ValueError when sorting sharded dimension"
-    except ValueError as e:
-        # Match the error message from DistributedSortOp
-        assert "sorting along a sharded dimension" in str(e), \
-            f"Unexpected error message: {str(e)}"

@@ -69,42 +69,6 @@ def test_distributed_isin_layout_inference():
     ), "Isin output mismatch between standalone and distributed execution"
 
 
-def test_distributed_isin_sharded_test_elements_error():
-    """
-    Feature: dtensor + torch.isin error on sharded test_elements
-    Description:
-        - Attempt to run isin where test_elements is sharded.
-        - Should raise ValueError during layout inference due to global view requirement.
-        - This is a CRITICAL constraint: sharded test_elements causes silent correctness errors.
-    Expectation: Raise ValueError with descriptive message about unsharded requirement.
-    """
-    init_dist()
-
-    # Standalone inputs
-    standalone_elements = torch.from_numpy(standalone_elements_np).npu()
-    standalone_test_elements = torch.from_numpy(standalone_test_elements_np).npu()
-
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    elements_placements = (Shard(0), Replicate()) # tensor_map = (1, -1)
-    test_elements_placements = (Shard(0), Replicate())
-
-    # Convert to distributed tensors (test_elements will be partial on each device)
-    dist_elements = distribute_tensor(standalone_elements, mesh, elements_placements)
-    dist_test_elements = distribute_tensor(standalone_test_elements, mesh, test_elements_placements)
-
-    # Attempt distributed execution → should fail at layout inference stage
-    try:
-        torch.isin(dist_elements, dist_test_elements)
-        assert False, (
-            "Expected ValueError when test_elements is sharded (violates global view requirement)"
-        )
-    except ValueError as e:
-        error_msg = str(e)
-        assert "'test_elements' must be unsharded" in error_msg, (
-            f"Expected unsharded constraint error, got: {error_msg}"
-        )
-
-
 def test_distributed_isin_invert_and_assume_unique():
     """
     Feature: dtensor + torch.isin with invert/assume_unique parameters

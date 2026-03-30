@@ -15,8 +15,9 @@
 """parallel_ones_like_shell test"""
 
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import parallel_run, MindSporeCase
 
+ONES_LIKE_SHARD_IN_PYTHON = "ones_like_shard_in_python.py"
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
@@ -30,11 +31,9 @@ def test_ones_like_basic_3d_1():
     Description: Test OnesLike on a 3D tensor in python shard.
     Expectation: Run success.
     """
-    glog_v = 2
-    file_name = "ones_like_shard_in_python.py"
-    case_name = "test_ones_like_basic_3d_1"
-    master_port = 11310
-    msrun_case(glog_v, file_name, case_name, master_port)
+    parallel_run([
+        MindSporeCase(ONES_LIKE_SHARD_IN_PYTHON, "test_ones_like_basic_3d_1", 11310, 8, 8, 2),
+    ])
 
 
 @arg_mark(
@@ -49,8 +48,6 @@ def test_ones_like_with_dtype_2():
     Description: Test OnesLike with dtype conversion in python shard.
     Expectation: Run success.
     """
-    glog_v = 2
-    file_name = "ones_like_shard_in_python.py"
-    case_name = "test_ones_like_with_dtype_2"
-    master_port = 11311
-    msrun_case(glog_v, file_name, case_name, master_port)
+    parallel_run([
+        MindSporeCase(ONES_LIKE_SHARD_IN_PYTHON, "test_ones_like_with_dtype_2", 11311, 8, 8, 2),
+    ])

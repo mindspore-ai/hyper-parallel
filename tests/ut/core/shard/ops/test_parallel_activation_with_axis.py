@@ -16,7 +16,7 @@
 import os
 import unittest
 from unittest.mock import patch
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -97,6 +97,13 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         assert output_layout.tensor_map == expected_map, (
             f"Data Parallel test failed. Expected {expected_map}, "
             f"got {output_layout.tensor_map}"
+        )
+
+        # Since `get_expand_impl` is not overridden, it returns None by default.
+        # The same applies to other test classes, so it is unnecessary to test its return value.
+        assert op.get_expand_impl(None, output_layout, (x_layout,), (1,)) is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {op.get_expand_impl(None, output_layout, (x_layout,), (1,))}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -329,26 +336,6 @@ class TestParallelActivationWithAxis(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
             op.infer_layout((x_layout,), (1,))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_activation_with_axis_get_expand_impl(self, mock_platform):
-        """
-        Feature: ActivationWithAxis get_expand_impl
-        Description: Verify get_expand_impl returns None
-        Expectation: Returns None
-        """
-        op = ActivationWithAxisDistributedOp("Softmax")
-        mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 2)
-
-        output_layout = op.infer_layout((x_layout,), (1,))
-
-        assert op.get_expand_impl(None, output_layout, (x_layout,), (1,)) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x_layout,), (1,))}"
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

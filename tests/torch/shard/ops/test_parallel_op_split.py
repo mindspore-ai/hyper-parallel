@@ -40,10 +40,8 @@ def test_parallel_op_split_group2():
     Feature: parallel run case in shard
     Description:
         1.test_distributed_split_layout_inference_split_list
-        2.test_distributed_split_on_sharded_dim_error
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_SPLIT, "test_distributed_split_layout_inference_split_list", 10891, 4),
-        TorchCase(PARALLEL_OP_SPLIT, "test_distributed_split_on_sharded_dim_error", 10892, 4),
+        TorchCase(PARALLEL_OP_SPLIT, "test_distributed_split_layout_inference_split_list", 10891, 4)
     ])

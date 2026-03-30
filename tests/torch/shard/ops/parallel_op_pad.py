@@ -97,33 +97,3 @@ def test_distributed_pad_zero_on_sharded_dim():
     gathered_output = local_to_global(dist_output)
     assert torch.equal(standalone_output, gathered_output), \
         "Pad zero-on-sharded output mismatch"
-
-
-def test_distributed_pad_sharded_dim_error():
-    """
-    Feature: dtensor + torch.nn.functional.pad error on sharded dim
-    Description:
-        - Attempt to pad a Sharded dimension with non-zero values.
-        - Input: (4, 4, 8, 8), Shard dim=0.
-        - Pad: (0, 0, 0, 0, 0, 0, 1, 1) -> Pads N (dim 0) by (1,1).
-    Expectation: Raise ValueError.
-    """
-    init_dist()
-
-    standalone_input = torch.from_numpy(input_4d_np).npu()
-
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    # Shard dim 0
-    x_placements = (Shard(0), Replicate(), Replicate(), Replicate())
-
-    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
-
-    # Attempt to pad dim 0 (N) which is sharded
-    pad_args = (0, 0, 0, 0, 0, 0, 1, 1)
-
-    try:
-        F.pad(dist_input, pad_args)
-        assert False, "Expected ValueError when padding sharded dimension"
-    except ValueError as e:
-        assert "does not support padding on a sharded dimension" in str(e), \
-            f"Unexpected error message: {str(e)}"

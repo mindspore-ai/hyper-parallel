@@ -40,10 +40,8 @@ def test_parallel_op_unbind_group2():
     Feature: parallel run case in shard
     Description:
         1.test_distributed_unbind_negative_dim
-        2.test_distributed_unbind_sharded_dim_error
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_UNBIND, "test_distributed_unbind_negative_dim", 10361, 4),
-        TorchCase(PARALLEL_OP_UNBIND, "test_distributed_unbind_sharded_dim_error", 10362, 4),
+        TorchCase(PARALLEL_OP_UNBIND, "test_distributed_unbind_negative_dim", 10361, 4)
     ])

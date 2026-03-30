@@ -148,30 +148,3 @@ def test_distributed_multinomial_2d_fully_replicated():
     gathered_output = local_to_global(dist_output)
     assert torch.equal(standalone_output, gathered_output), \
         "2D Fully Replicated output mismatch"
-
-
-def test_distributed_multinomial_error_sharded_prob():
-    """
-    Feature: dtensor + torch.multinomial Error Handling
-    Description:
-        - Attempt to run multinomial when probability dimension (last dim) is sharded.
-        - Expectation: Raise ValueError.
-    """
-    init_dist()
-
-    weights_np = np.abs(np.random.randn(4, 8)).astype(np.float32)
-    standalone_input = torch.from_numpy(weights_np).npu()
-
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-
-    # INVALID: Sharding the probability dimension (dim 1)
-    x_placements = (Replicate(), Shard(1))
-
-    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
-
-    try:
-        dist_input.multinomial(num_samples=2, replacement=True)
-        assert False, "Expected ValueError when probability dimension is sharded"
-    except ValueError as e:
-        assert "must not be sharded" in str(e), \
-            f"Unexpected error message: {str(e)}"

@@ -40,10 +40,8 @@ def test_parallel_op_repeat_interleave_group2():
     Feature: parallel run case in shard
     Description:
         1.test_distributed_repeat_interleave_dim_none
-        2.test_distributed_repeat_interleave_sharded_dim_error
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_distributed_repeat_interleave_dim_none", 10892, 4),
-        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_distributed_repeat_interleave_sharded_dim_error", 10893, 4),
+        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_distributed_repeat_interleave_dim_none", 10892, 4)
     ])

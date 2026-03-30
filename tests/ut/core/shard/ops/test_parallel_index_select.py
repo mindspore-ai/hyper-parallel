@@ -17,7 +17,7 @@ import os
 import unittest
 from unittest.mock import patch
 import numpy as np
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, Partial
@@ -104,6 +104,11 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"Axis 0 inference failed. Expected {expected_map}, got {output_layout.tensor_map}"
         )
 
+        assert op.get_expand_impl(None, output_layout, layouts, extra_args) is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {op.get_expand_impl(None, output_layout, layouts, extra_args)}"
+        )
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_valid_axis_1(self, mock_platform):
         """
@@ -128,6 +133,11 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"Axis 1 inference failed. Expected {expected_map}, got {output_layout.tensor_map}"
         )
 
+        assert op.get_expand_impl(None, output_layout, layouts, extra_args) is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {op.get_expand_impl(None, output_layout, layouts, extra_args)}"
+        )
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_valid_negative_axis(self, mock_platform):
         """
@@ -150,6 +160,11 @@ class TestParallelIndexSelect(unittest.TestCase):
         expected_map = (1, 0)
         assert output_layout.tensor_map == expected_map, (
             f"Negative axis inference failed. Expected {expected_map}, got {output_layout.tensor_map}"
+        )
+
+        assert op.get_expand_impl(None, output_layout, layouts, extra_args) is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {op.get_expand_impl(None, output_layout, layouts, extra_args)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -248,6 +263,11 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"Unsharded axis failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
+        assert op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,)) is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,))}"
+        )
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_sharded_axis_unsharded_index(self, mock_platform):
         """
@@ -269,6 +289,11 @@ class TestParallelIndexSelect(unittest.TestCase):
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"Sharded axis failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
+        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,))
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_negative_axis(self, mock_platform):
@@ -290,6 +315,11 @@ class TestParallelIndexSelect(unittest.TestCase):
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"Negative axis failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
+        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,))
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_axis_out_of_bounds_positive(self, mock_platform):
@@ -410,6 +440,11 @@ class TestParallelIndexSelect(unittest.TestCase):
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"3D input axis 0 failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
+        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,))
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_1d_input_axis_0(self, mock_platform):
@@ -432,6 +467,12 @@ class TestParallelIndexSelect(unittest.TestCase):
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"1D input axis 0 failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
+
+        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (0,))
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_scalar_index_invalid(self, mock_platform):
@@ -512,6 +553,12 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"Negative axis on 3D tensor failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
+        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (-2,))
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_4d_param_axis_2(self, mock_platform):
         """
@@ -532,6 +579,11 @@ class TestParallelIndexSelect(unittest.TestCase):
         expected_map = (1, -1, -1, 0)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"4D tensor axis 2 failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        )
+
+        assert op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (2,)) is None, (
+            f"get_expand_impl test failed. Expected None,"
+            f"got {op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (2,))}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -556,6 +608,12 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"3D mesh fully sharded failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
+        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,))
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_1d_mesh_param_sharded(self, mock_platform):
         """
@@ -578,6 +636,12 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"1D mesh param sharded failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
+        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (0,))
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_1d_mesh_index_sharded(self, mock_platform):
         """
@@ -598,6 +662,11 @@ class TestParallelIndexSelect(unittest.TestCase):
         expected_map = (-1, 0)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"1D mesh index sharded failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        )
+    
+        assert op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,)) is None, (
+            f"get_expand_impl test failed. Expected None,"
+            f"got {op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,))}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -622,6 +691,12 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"1D param negative axis failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
+        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (-1,))
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_5d_param_last_axis(self, mock_platform):
         """
@@ -644,6 +719,12 @@ class TestParallelIndexSelect(unittest.TestCase):
             f"5D param last axis failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
+        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (4,))
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_output_mesh_shape_preservation(self, mock_platform):
         """
@@ -660,6 +741,12 @@ class TestParallelIndexSelect(unittest.TestCase):
         assert output_layout.mesh_shape == p_layout.mesh_shape, (
             "Output mesh shape does not match input mesh shape."
         )
+
+        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (0,))
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_output_alias_name_preservation(self, mock_platform):
@@ -678,6 +765,12 @@ class TestParallelIndexSelect(unittest.TestCase):
             "Output alias name does not match input alias name."
         )
 
+        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (0,))
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_output_rank_list_preservation(self, mock_platform):
         """
@@ -694,6 +787,12 @@ class TestParallelIndexSelect(unittest.TestCase):
         assert output_layout.rank_list == p_layout.rank_list, (
             "Output rank list does not match input rank list."
         )
+
+        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (0,))
+        assert impl is not None, (
+            f"get_expand_impl test failed. Expected non-None, got {impl}"
+        )
+        assert callable(impl), "Returned impl should be a callable function"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_expand_impl_negative_sharded_axis(self, mock_platform):

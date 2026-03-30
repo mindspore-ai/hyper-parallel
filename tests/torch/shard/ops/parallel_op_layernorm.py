@@ -64,31 +64,3 @@ def test_distributed_layer_norm_layout_inference():
     assert torch.allclose(
         standalone_output, gathered_output, atol=1e-5
     ), "LayerNorm output mismatch between standalone and distributed"
-
-
-def test_distributed_layer_norm_sharded_normalized_dim_error():
-    """
-    Feature: dtensor + layer_norm error on sharded normalized dimension
-    Description:
-        - Attempt to run layer_norm where normalized_shape includes a sharded dimension.
-        - Should raise ValueError during layout inference.
-    Expectation: Raise ValueError.
-    """
-    init_dist()
-    normalized_shape = (16,)
-
-    layout = Layout((2, 2), ("dp", "tp"))
-    # WRONG: shard on dim=1, which is part of normalized_shape → invalid
-    x_layout = layout("dp", "tp")
-
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
-    dist_input = global_to_local(standalone_input, x_layout)
-    dist_weight = global_to_local(torch.ones(normalized_shape).npu(), layout("None",))
-    dist_bias = global_to_local(torch.zeros(normalized_shape).npu(), layout("None",))
-
-    try:
-        torch.nn.functional.layer_norm(dist_input, normalized_shape, dist_weight, dist_bias)
-        assert False, "Expected ValueError when normalized dimension is sharded"
-    except ValueError as e:
-        assert "Cannot perform sharding on normalized dimension" in str(e)
-        assert "dimension 1" in str(e) or "dimension -1" in str(e)

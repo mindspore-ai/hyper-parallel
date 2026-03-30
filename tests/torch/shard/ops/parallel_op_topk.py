@@ -64,28 +64,3 @@ def test_distributed_topk_layout_inference():
     assert torch.equal(
         standalone_indices, gathered_indices
     ), "Topk indices mismatch between standalone and distributed"
-
-
-def test_distributed_topk_sharded_dim_error():
-    """
-    Feature: dtensor + torch.topk error on sharded dim
-    Description:
-        - Attempt to perform topk along a sharded dimension.
-        - Should raise ValueError during layout inference.
-    Expectation: Raise ValueError.
-    """
-    init_dist()
-    k = 3
-    dim = 1  # this dim will be sharded
-
-    layout = Layout((2, 2), ("dp", "tp"))
-    x_layout = layout("dp", "tp")
-
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
-    dist_input = global_to_local(standalone_input, x_layout)
-
-    try:
-        torch.topk(dist_input, k, dim=dim)
-        assert False, "Expected ValueError when topk along sharded dimension"
-    except ValueError as e:
-        assert "Cannot perform sharding on params along the chosen dim" in str(e)

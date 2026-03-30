@@ -16,7 +16,7 @@ import os
 import unittest
 from unittest.mock import patch
 import numpy as np
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -79,6 +79,13 @@ class TestParallelPad(unittest.TestCase):
         output_layout = op.infer_layout((x_layout,), extra_args=(pad,))
 
         assert output_layout.to_dict()["tensor_map"] == x_layout.to_dict()["tensor_map"]
+
+        # Since `get_expand_impl` is not overridden, it returns None by default.
+        # The same applies to other test classes, so it is unnecessary to test its return value.
+        assert op.get_expand_impl(None, output_layout, (x_layout,), extra_args=(pad,)) is None, (
+            f"get_expand_impl test failed. Expected None, "
+            f"got {op.get_expand_impl(None, output_layout, (x_layout,), extra_args=(pad,))}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_pad_infer_layout_fail_sharded(self, mock_platform):

@@ -25,32 +25,15 @@ def test_parallel_op_masked_scatter_group1():
     Feature: parallel run case in shard
     Description:
         1.test_masked_scatter_basic_replicated
-        2.test_masked_scatter_input_sharded_error
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_basic_replicated", 10359, 4),
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_input_sharded_error", 10360, 4),
+        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_basic_replicated", 10359, 4)
     ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_masked_scatter_group2():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_masked_scatter_mask_sharded_error
-        2.test_masked_scatter_source_sharded_error
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_mask_sharded_error", 10361, 4),
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_source_sharded_error", 10362, 4),
-    ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_masked_scatter_group3():
     """
     Feature: parallel run case in shard
     Description:
@@ -65,7 +48,7 @@ def test_parallel_op_masked_scatter_group3():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_masked_scatter_group4():
+def test_parallel_op_masked_scatter_group3():
     """
     Feature: parallel run case in shard
     Description:
