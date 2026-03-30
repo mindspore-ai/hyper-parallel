@@ -23,7 +23,7 @@ import mindspore.communication.management as D
 from mindspore import nn
 from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
-from mindspore.communication import get_rank
+from mindspore.communication import get_rank, get_group_size
 
 from hyper_parallel import shard_module, parallelize_value_and_grad, init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -132,7 +132,8 @@ def test_base_layout():
         combine_dict = combine_layout(".")
         print(combine_dict)
         assert isinstance(combine_dict, dict)
-    os.remove(file_name)
+        for i in range(get_group_size()):
+            os.remove(f"test_{i}.layout")
 
 
 def test_get_global_layout():
