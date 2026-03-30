@@ -25,6 +25,7 @@ import torch_npu  # pylint: disable=W0611
 
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
@@ -148,3 +149,45 @@ def test_init_weights_with_randn_like():
             buf.data = torch.rand_like(buf)
 
     _assert_shards_differ(model, rank, world_size)
+
+
+def test_replicate_init_weights_consistency():
+    """
+    Feature: Replicate DTensor random init consistency
+    Description: Verify random init (uniform_) on Replicate DTensors produces
+                 identical local tensors across all ranks when seeded identically,
+                 similar to test_meta_tensor_init in PyTorch DTensor.
+    Expectation: run successfully
+    """
+    rank, _ = init_dist()
+    world_size = dist.get_world_size()
+    device = torch.device(f"npu:{rank}")
+
+    torch.npu.manual_seed(0)
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("dp",))
+    size = [1024, 2048]
+
+    # Create a meta tensor via torch.device("meta"), then materialize on device
+    with torch.device("meta"):
+        meta_weight = nn.Parameter(torch.empty(*size))
+    assert meta_weight.is_meta
+
+    local_tensor = torch.empty(meta_weight.shape, dtype=meta_weight.dtype, device=device)
+    # Wrap as Replicate DTensor BEFORE applying random init,
+    # so uniform_() dispatches through __torch_function__ -> _dispatch_random_op -> _distribute_region
+    dtensor = DTensor.from_local(local_tensor, mesh, [Replicate()])
+    dtensor.uniform_()
+
+    # All-gather the local tensors and verify all ranks hold identical data
+    local = dtensor.to_local()
+    gathered_list = [torch.zeros_like(local) for _ in range(world_size)]
+    dist.all_gather(gathered_list, local)
+    for other_rank in range(world_size):
+        if other_rank != rank:
+            assert torch.equal(
+                local,
+                gathered_list[other_rank]
+            ), (
+                f"replicated tensor rank {rank} != rank {other_rank}, "
+                "expected identical under same RNG seed"
+            )

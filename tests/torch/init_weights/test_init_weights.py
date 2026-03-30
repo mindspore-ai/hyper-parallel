@@ -32,4 +32,5 @@ def test_init_weights_group1():
     parallel_run([
         TorchCase(_TEST_INIT_WEIGHTS, "test_init_weights_consistency", 12350, 2),
         TorchCase(_TEST_INIT_WEIGHTS, "test_init_weights_with_randn_like", 12351, 2),
+        TorchCase(_TEST_INIT_WEIGHTS, "test_replicate_init_weights_consistency", 12352, 2),
     ])
