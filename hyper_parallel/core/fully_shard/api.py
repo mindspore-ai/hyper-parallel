@@ -461,9 +461,9 @@ def _get_device_from_mesh(mesh: DeviceMesh):
     """Extract and validate the torch device from the device mesh."""
     device = None
     device_type = mesh.device_type
-    if device_type not in ("npu", "gpu"):
+    if device_type not in ("npu", "cuda"):
         raise AssertionError(
-            f"hyper_parallel.fully_shard support device in [torch.npu, torch.gpu], "
+            f"hyper_parallel.fully_shard support device in [torch.npu, torch.cuda], "
             f"but got '{device_type}'"
         )
     if platform.platform_type == PlatformType.PYTORCH:

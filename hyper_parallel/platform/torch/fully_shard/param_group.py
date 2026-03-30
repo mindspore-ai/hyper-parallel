@@ -291,6 +291,7 @@ class HSDPParamGroup:
         self._reduce_output = None  # Fused reduce-scatter output, consumed by apply_fusion_reduced_grad
         self._reduce_op = None  # Reduce op saved from foreach_reduce for use in apply_fusion_reduced_grad
         self._needs_avg_div = False  # Whether AVG was split into SUM + deferred div
+        self._reduce_hsdp_params = None
         self._init_mp_dtypes()
         self._flat_param_buffer = None  # Contiguous buffer holding all params' sharded data
         self._flat_cast_buffer = None  # Cast buffer for mixed precision (param_dtype)
@@ -584,6 +585,7 @@ class HSDPParamGroup:
         self._needs_avg_div = reduce_scatter_reduce_op == dist.ReduceOp.AVG
         comm_op = dist.ReduceOp.SUM if self._needs_avg_div else reduce_scatter_reduce_op
         self._reduce_op = comm_op
+        self._reduce_hsdp_params = hsdp_params
         rs_handle = dist.reduce_scatter_tensor(
             output=reduce_output,
             input=reduce_scatter_input,
@@ -682,7 +684,9 @@ class HSDPParamGroup:
         """
         flat_grad_offset = 0
         world_size = self.shard_group.size()
-        for hsdp_param in self.hsdp_params:
+        if self._reduce_hsdp_params is None:
+            return
+        for hsdp_param in self._reduce_hsdp_params:
             # Determine target gradient tensor (regular .grad or fp32 main_grad)
             sharded_grad = None
             if not self.mp_policy.apply_grad_on_fp32_main_grad:
@@ -740,3 +744,4 @@ class HSDPParamGroup:
                     raise NotImplementedError(f"Unsupported device type {self.device} for \
                                               synchronization after CPU offload.")
         self._reduce_output = None  # Release fused reduce buffer
+        self._reduce_hsdp_params = None
