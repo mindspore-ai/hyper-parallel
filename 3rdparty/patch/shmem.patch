@@ -1,0 +1,82 @@
+diff --git a/scripts/build.sh b/scripts/build.sh
+index f8be2ec..a91bea0 100644
+--- a/scripts/build.sh
++++ b/scripts/build.sh
+@@ -8,14 +8,6 @@
+ # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ # See LICENSE in the root of the software repository for the full text of the License.
+ # -----------------------------------------------------------------------------------------------------------
+-if [ -n "$ASCEND_HOME_PATH" ]; then
+-    _ASCEND_INSTALL_PATH=$ASCEND_HOME_PATH
+-fi
+-
+-export ASCEND_TOOLKIT_HOME=${_ASCEND_INSTALL_PATH}
+-export ASCEND_HOME_PATH=${_ASCEND_INSTALL_PATH}
+-
+-source "$(dirname "$_ASCEND_INSTALL_PATH")/set_env.sh"
+ 
+ CURRENT_DIR=$(pwd)
+ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 46b7d11..92cb075 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -54,19 +54,19 @@ target_include_directories(aclshmem_host
+         ${PROJECT_SOURCE_DIR}/src/host/bootstrap/config_store/acc_links/include
+ )
+ 
+-add_library(shmem SHARED $<TARGET_OBJECTS:aclshmem_device> $<TARGET_OBJECTS:aclshmem_host>)
+-target_link_options(shmem PRIVATE --cce-fatobj-link)
++add_library(hpshmem SHARED $<TARGET_OBJECTS:aclshmem_device> $<TARGET_OBJECTS:aclshmem_host>)
++target_link_options(hpshmem PRIVATE --cce-fatobj-link)
+ 
+ if(NOT USE_UNIT_TEST)
+-        target_link_libraries(shmem PRIVATE hybmm_shared config_store_shared)
++        target_link_libraries(hpshmem PRIVATE hybmm_shared config_store_shared)
+ endif()
+ 
+ # MPI
+ if(ACLSHMEM_MPI_SUPPORT)
+     separate_arguments(ACLSHMEM_CXX_LINK_FLAGS NATIVE_COMMAND "${MPI_CXX_LINK_FLAGS}")
+-    target_link_options(shmem INTERFACE ${ACLSHMEM_CXX_LINK_FLAGS})
+-    target_compile_definitions(shmem INTERFACE ${MPI_CXX_COMPILE_DEFINITIONS})
+-    target_compile_options(shmem INTERFACE ${MPI_CXX_COMPILE_OPTIONS})
++    target_link_options(hpshmem INTERFACE ${ACLSHMEM_CXX_LINK_FLAGS})
++    target_compile_definitions(hpshmem INTERFACE ${MPI_CXX_COMPILE_DEFINITIONS})
++    target_compile_options(hpshmem INTERFACE ${MPI_CXX_COMPILE_OPTIONS})
+     
+     add_library(
+     aclshmem_bootstrap_mpi SHARED
+@@ -105,7 +105,7 @@ install(TARGETS aclshmem_bootstrap_uid
+         LIBRARY DESTINATION lib)
+ 
+ # 安装配置
+-install(TARGETS shmem
++install(TARGETS hpshmem
+         LIBRARY DESTINATION lib
+         PUBLIC_HEADER DESTINATION include
+ )
+diff --git a/src/host/bootstrap/config_store/store_num_util.h b/src/host/bootstrap/config_store/store_num_util.h
+index c28255a..81a83a1 100644
+--- a/src/host/bootstrap/config_store/store_num_util.h
++++ b/src/host/bootstrap/config_store/store_num_util.h
+@@ -70,13 +70,13 @@ public:
+     */
+     static uint32_t ExtractBits(uint32_t flag, uint8_t startBit, uint8_t bitLength)
+     {
+-        if (startBit >= UINT32_WIDTH) {
++        if (startBit >= 32) {
+             return UINT32_MAX;
+         }
+-        if (bitLength == 0 || bitLength >= UINT32_WIDTH) {
++        if (bitLength == 0 || bitLength >= 32) {
+             return UINT32_MAX;
+         }
+-        if (startBit + bitLength > UINT32_WIDTH) {
++        if (startBit + bitLength > 32) {
+             return UINT32_MAX;
+         }
+ 
+-- 
+2.47.0.windows.2
+

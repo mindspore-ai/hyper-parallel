@@ -1,0 +1,22 @@
+#operator group_topk
+put_mem:
+  args:
+    target:
+      dtype: tensor
+    target_offset:
+      dtype: tensor
+    src:
+      dtype: tensor
+    src_offset:
+      dtype: tensor
+    size:
+      dtype: tensor
+    target_pe:
+      dtype: int
+  args_signature:
+    rw_write: target
+  labels:
+    side_effect_mem: True
+  returns:
+    fake_out:
+      dtype: tensor

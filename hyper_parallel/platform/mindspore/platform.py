@@ -540,6 +540,13 @@ class MindSporePlatform(Platform):
     def load_checkpoint(file_path: str) -> dict:
         return ms.load_checkpoint(ckpt_file_name=file_path, format="safetensors")
 
+    @staticmethod
+    def get_symmetric_memory_handler():
+        # pylint: disable=C0415
+        from hyper_parallel.platform.mindspore.symmetric_memory import MSSymmetricMemoryHandler
+        symmetric_memory = MSSymmetricMemoryHandler()
+        return symmetric_memory
+
     def new_stream(self):
         return ms.runtime.Stream()
 

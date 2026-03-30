@@ -102,9 +102,9 @@ HyperParallel提供昇腾超节点亲和的分布式并行加速能力，在保�
     - [ ] PARADISE：基于Symbolic代价模型模拟内存和计算通信代价，高效生成最优多维混合并行策略，目前是demo特性，仍在持续优化;
 
 - 单边通信
-    - [ ] Symmetry memory
+    - [x] Symmetric memory
     - [ ] AllToAll
-    - [ ] AllGather
+    - [x] AllGather
     - [ ] AllReduce
     - [ ] ReduceScatter
     - [ ] 低精通信高精累加

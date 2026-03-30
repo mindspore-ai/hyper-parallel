@@ -644,6 +644,10 @@ class Platform:
         """
         raise NotImplementedError("Platform subclasses must implement micro_batch")
 
+    @staticmethod
+    def get_symmetric_memory_handler():
+        raise NotImplementedError("Platform subclasses must implement get_symmetric_memory_handler")
+
     def create_group(self, rank_list):
         """Create or retrieve a communication group with the specified ranks.
 
