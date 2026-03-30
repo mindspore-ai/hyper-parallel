@@ -23,7 +23,7 @@ import mindspore.communication.management as D
 from mindspore import nn
 from mindspore.nn.utils import no_init_parameters
 from mindspore.common.initializer import initializer
-from mindspore.communication import get_rank, get_group_size
+from mindspore.communication import get_rank
 
 from hyper_parallel import shard_module, parallelize_value_and_grad, init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -128,12 +128,13 @@ def test_base_layout():
     assert os.path.isfile(file_name)
     layout_dict = load_layout(file_name)
     assert isinstance(layout_dict, dict)
+    # Sync all ranks before rank 0 reads files written by other ranks
+    ms.ops.AllReduce()(ms.Tensor([1], dtype=ms.float32))
     if rank_id == 0:
         combine_dict = combine_layout(".")
-        print(combine_dict)
         assert isinstance(combine_dict, dict)
-        for i in range(get_group_size()):
-            os.remove(f"test_{i}.layout")
+    ms.ops.AllReduce()(ms.Tensor([1], dtype=ms.float32))
+    os.remove(file_name)
 
 
 def test_get_global_layout():
