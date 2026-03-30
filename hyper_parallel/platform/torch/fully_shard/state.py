@@ -94,7 +94,6 @@ class TorchHSDPStateV2(HSDPState):
         # if any managed parameter is DTensor-backed, use SUM; otherwise AVG.
         self._user_reduce_op_type = None
         self.reduce_op_type = self._resolve_default_reduce_op()
-        self._validate_cpu_offload_params()
         self._reset_sharded_params = False
         self._init_param_group()
 
