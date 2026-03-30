@@ -26,7 +26,7 @@ class DTensorBase(Tensor):
     device mesh and placement specifications.
     """
 
-    def __new__(cls, local_tensor, device_mesh=None, placements=None, device="Ascend"):
+    def __new__(cls, local_tensor, device_mesh=None, placements=None):
         """
         Create a new DTensorBase instance.
 
@@ -36,24 +36,35 @@ class DTensorBase(Tensor):
             placements: The placement strategy for each mesh dimension.
             device: The device type (default: "Ascend").
         """
+        npu_device = "Ascend"
         if isinstance(local_tensor, DTensorBase):
-            device_local_tensor = local_tensor.to_local() if local_tensor.to_local().has_init else \
-                local_tensor.to_local().to(device)
+            device_local_tensor = local_tensor.to_local()
+            if device_local_tensor.device != "meta" and not device_local_tensor.has_init:
+                device_local_tensor = device_local_tensor.to(npu_device)
             t = Tensor._make_subclass(cls, device_local_tensor)
             copy_placements = local_tensor.layout.alias_placements if local_tensor.layout else local_tensor.placements
             t.__init_data__(device_local_tensor, local_tensor.device_mesh, copy_placements)
-            t._device = device
             return t
+
+        if local_tensor is None:
+            raise ValueError(
+                "DTensorBase: local_tensor must not be None when constructing from a raw tensor."
+            )
         if device_mesh is None:
-            raise ValueError("device_mesh is None")
+            raise ValueError(
+                "DTensorBase: device_mesh must be a DeviceMesh instance, got None."
+            )
         if placements is None:
-            raise ValueError("placements is None")
-        device_local_tensor = local_tensor if local_tensor.has_init else local_tensor.to(device)
+            raise ValueError(
+                "DTensorBase: placements must be a sequence of Placement objects, got None."
+            )
+        device_local_tensor = local_tensor
+        if device_local_tensor.device != "meta" and not device_local_tensor.has_init:
+            device_local_tensor = device_local_tensor.to(npu_device)
         if local_tensor.has_init:
-            local_tensor.init_device = device
+            local_tensor.init_device = npu_device
         t = Tensor._make_subclass(cls, device_local_tensor)
         t.__init_data__(device_local_tensor, device_mesh, placements)
-        t._device = device
         return t
 
     def asnumpy(self):
@@ -85,7 +96,11 @@ class DTensorBase(Tensor):
             placements = getattr(self, '_placements', None)
 
         if device_mesh is None or placements is None:
-            raise ValueError("Cannot copy DTensorBase: device_mesh or placements is None")
+            raise ValueError(
+                "DTensorBase.__copy__: cannot copy without device_mesh and placements; "
+                f"device_mesh={device_mesh!r}, placements={placements!r}. "
+                "Ensure the tensor was constructed with a valid layout."
+            )
 
         if self._local_tensor.has_init:
             obj = DTensorBase.__new__(
@@ -124,7 +139,8 @@ class DTensorBase(Tensor):
     @property
     def device(self):
         """Device info for dtensor"""
-        return self._device
+        device_info = self._local_tensor.device
+        return device_info.split(':', 1)[0]
 
     # pylint: disable=W0212
     def set_data(self, data):
@@ -135,7 +151,7 @@ class DTensorBase(Tensor):
             raise ValueError(f"The data type {type(data)} is not Tensor")
         if data.has_init:
             data.init_data()
-            data = data.to(self._device)
+            data = data.to(self.device)
         if isinstance(data, DTensorBase):
             self._local_tensor._update_data(data.to_local())
             self._device_mesh = data.device_mesh

@@ -146,7 +146,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         param: Parameter,
         shard_placement_fn: Optional[Callable],
     ) -> None:
-        if not (param.device.startswith("Ascend") and self.device == "npu"):
+        if param.device != "meta" and not (param.device.startswith("Ascend") and self.device == "npu"):
             raise AssertionError(
                 f"Expects the parameter to already be moved to device {self.device} but got {param.device}"
             )

@@ -648,6 +648,10 @@ class Platform:
     def get_symmetric_memory_handler():
         raise NotImplementedError("Platform subclasses must implement get_symmetric_memory_handler")
 
+    @staticmethod
+    def load_into_param(param, data):
+        raise NotImplementedError("Platform subclasses must implement load_into_param")
+
     def create_group(self, rank_list):
         """Create or retrieve a communication group with the specified ranks.
 

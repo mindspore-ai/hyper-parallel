@@ -27,9 +27,47 @@ from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.random import OffsetBasedRNGTracker, is_rng_supported_mesh
 from hyper_parallel.platform import get_platform
+from hyper_parallel.platform.platform import PlatformType
 
 platform = get_platform()
 Tensor = platform.Tensor
+
+
+def _apply_shard_offset_to_rng_args(args, offset_incr):
+    """Apply per-shard offset increment to seed/offset tensors in MindSpore random op args.
+
+    MindSpore random ops (e.g. ``randn_like_``) receive ``(seed, offset)`` as
+    explicit int64 scalar tensors from ``default_generator._step()`` in the
+    Python wrapper *before* the C++ dispatch triggers ``__fallback__``.  By the
+    time ``_dispatch_random_op`` is called, the kernel will use whatever
+    ``(seed, offset)`` values are in the args—it does **not** read the
+    generator again. This function finds the offset tensor and adds the
+    per-rank offset increment so each shard gets a unique random stream.
+
+    The (seed, offset) pair is identified as the last two consecutive int64
+    0-dim tensors in *args* (scanning from the end to skip trailing dtype /
+    device arguments).
+
+    Args:
+        args: The list of local args for the random op.
+        offset_incr (int): Per-shard offset increment.
+
+    Returns:
+        list: Modified args with the offset tensor adjusted.
+    """
+    int64_dtype = platform.tensor_dtype.int64
+    last_int64_idx = -1
+    for i in range(len(args) - 1, -1, -1):
+        arg = args[i]
+        if isinstance(arg, Tensor) and arg.dtype == int64_dtype and arg.ndim == 0:
+            if last_int64_idx == i + 1:
+                offset_idx = i + 1
+                new_args = list(args)
+                new_offset = int(new_args[offset_idx].item()) + offset_incr
+                new_args[offset_idx] = platform.tensor([new_offset], dtype=int64_dtype).reshape(())
+                return new_args
+            last_int64_idx = i
+    return args
 
 _dtensor_dispatch = True
 
@@ -170,6 +208,13 @@ class OpDispatcher:
             "normal_", "uniform_", "bernoulli", "bernoulli_",
             "native_dropout", "rand", "rand_like", "randn",
             "randn_like", "randint_like", "kaiming_uniform_",
+        }
+        # Only mint random op support
+        # MindSpore use the actual kernel name.
+        self._random_ms_ops = {
+            "BernoulliExt", "MultinomialExt", "RandpermExt",
+            "NormalTensorTensor", "NormalTensorFloat", "NormalFloatTensor", "NormalFloatFloat",
+            "Randn", "RandLikeExt", "RandnLike", "RandInt", "RandIntLike", "RandExt",
         }
         self._rng_tracker: Optional[OffsetBasedRNGTracker] = None
 
@@ -755,6 +800,17 @@ class OpDispatcher:
                 global_shape=first_arg.shape,
                 generator=maybe_user_generator,
             ):
+                # MindSpore random ops (e.g. mint.randn_like) extract (seed, offset)
+                # from default_generator._step() in the Python wrapper *before* the
+                # C++ dispatch triggers __fallback__. The callback reuses these
+                # pre-fetched tensor args, so set_rng_state inside _distribute_region
+                # has no effect on the kernel. Fix: apply the per-shard offset
+                # increment directly to the offset tensor in the args.
+                if platform.platform_type == PlatformType.MINDSPORE:
+                    offset_incr = self._rng_tracker.compute_offset_incr(
+                        first_arg.device_mesh, first_arg.placements, first_arg.shape,
+                    )
+                    local_args = _apply_shard_offset_to_rng_args(local_args, offset_incr)
                 local_results = op_call(*local_args, **local_kwargs)
         else:
             local_results = op_call(*local_args, **local_kwargs)
@@ -799,7 +855,7 @@ class OpDispatcher:
                     input_args.append(arg)
             return op_call(*input_args, **kwargs)
 
-        if op_name in self._random_ops:
+        if op_name in self._random_ops or op_name in self._random_ms_ops:
             return self._dispatch_random_op(op_name, op_call, args, kwargs)
 
         if op_name not in self.layout_infer_ops:

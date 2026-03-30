@@ -325,6 +325,15 @@ class MindSporePlatform(Platform):
             param._update_data(data)
 
     @staticmethod
+    def load_into_param(param, data):
+        copy_tensor = MindSporePlatform.empty_like(data)
+        copy_tensor.copy_(data)
+        if isinstance(param, DTensorBase):
+            param.set_data(copy_tensor)
+        else:
+            param._update(copy_tensor)
+
+    @staticmethod
     def get_cell_construct(cell):
         return cell.construct
 

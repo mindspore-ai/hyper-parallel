@@ -23,6 +23,7 @@ from mindspore.communication import get_group_size, get_rank, init
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 
@@ -220,6 +221,74 @@ def run_fully_shard_multi_card(
     return losses, final_param_type_names
 
 
+def run_fully_shard_multi_card_with_empty_init(
+    ckpt_path,
+    mesh,
+    accumulate_grad=False,
+):
+    """Run fully_shard with empty initializer multi-card training."""
+    dp_size = get_group_size()
+    rank_id = get_rank()
+    data_set = create_dataset(
+        local_batch_size=local_bs, num_shards=dp_size, shard_id=rank_id)
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=ms.float32,
+        reduce_dtype=ms.float32,
+        output_dtype=ms.float32,
+        cast_forward_inputs=False
+    )
+
+    with init_empty_weights():
+        net = SlimLeNet16()
+        fully_shard(net.dense_relu_sequential[0], mesh=mesh, mp_policy=mp_policy)
+        fully_shard(net.dense_relu_sequential[2], mesh=mesh, mp_policy=mp_policy)
+        fully_shard(net.dense_relu_sequential[4], mesh=mesh, mp_policy=mp_policy)
+        fully_shard(net, mesh=mesh, mp_policy=mp_policy)
+
+    origin_shapes = [p.shape for p in net.trainable_params()]
+    shard_dim_size = mesh.shape[-1]
+    assert_sharded_param_layout(net, origin_shapes, shard_dim_size)
+
+    param_dict = ms.load_checkpoint(ckpt_path)
+    net.load_state_dict(param_dict, strict=True)
+    grad_fn = ms.value_and_grad(get_forward_fn(net), None, net.trainable_params(), has_aux=True)
+    optimizer = nn.Adam(net.trainable_params(), learning_rate=learning_rate)
+    loss_sync_allreduce = ops.AllReduce(ops.ReduceOp.SUM)
+
+    losses = []
+    final_param_type_names = []
+    i = 0
+    for data, label in data_set:
+        net.zero_grad()
+        if accumulate_grad:
+            total_loss, grads, micro_step = run_accumulated_step(
+                data, label, grad_fn
+            )
+            assert_grad_views(net, grads)
+            with SkipDTensorDispatch():
+                for grad in grads:
+                    grad /= micro_step
+                optimizer(grads)
+            reduced_loss = loss_sync_allreduce(total_loss)
+            final_loss = reduced_loss / (micro_step * dp_size)
+        else:
+            (loss, _), grads = grad_fn(data, label)
+            assert_grad_views(net, grads)
+            with SkipDTensorDispatch():
+                optimizer(grads)
+            reduced_loss = loss_sync_allreduce(loss)
+            final_loss = reduced_loss / dp_size
+        final_param_type_names = assert_sharded_param_layout(net)
+        if rank_id == 0:
+            losses.append(float(final_loss.asnumpy()))
+            print(f"rank: {rank_id} step: {i}, loss: {final_loss}")
+        i += 1
+        if i >= max_step:
+            break
+
+    return losses, final_param_type_names
+
+
 def run_fully_shard_multi_card_ignored(ckpt_path, mesh):
     """Run fully_shard multi-card training with replicate_params."""
     dp_size = get_group_size()
@@ -267,7 +336,7 @@ def run_fully_shard_multi_card_ignored(ckpt_path, mesh):
     return losses
 
 
-def run_fully_shard(mesh):
+def run_fully_shard(mesh, use_empty_weight=False):
     """Run fully_shard with different mesh"""
     init()
 
@@ -276,7 +345,10 @@ def run_fully_shard(mesh):
     ckpt_path = os.path.join(TEMP_DIR, "init_baseline.ckpt")
     assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please run precision_baseline.py first"
 
-    losses, _ = run_fully_shard_multi_card(ckpt_path, mesh)
+    if use_empty_weight:
+        losses, _ = run_fully_shard_multi_card_with_empty_init(ckpt_path, mesh)
+    else:
+        losses, _ = run_fully_shard_multi_card(ckpt_path, mesh)
 
     if rank_id == 0:
         losses_file = os.path.join(TEMP_DIR, "fully_shard_losses.npy")
@@ -350,6 +422,17 @@ def test_ms_zero3_fully_shard():
     """
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     run_fully_shard(mesh)
+
+
+def test_ms_zero3_fully_shard_empty_weight():
+    """
+    Feature: Compare empty init fully_shard precision with standalone baseline
+    Description: Run standalone baseline and fully_shard multi-card training with init_empty_weights True,
+                 then compare reduced losses on rank 0 only
+    Expectation: Losses should match within tolerance
+    """
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    run_fully_shard(mesh, use_empty_weight=True)
 
 
 def test_ms_zero3_partial_shard():

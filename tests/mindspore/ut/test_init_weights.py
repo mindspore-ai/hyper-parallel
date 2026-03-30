@@ -50,9 +50,12 @@ def _build_ref_state():
     }
 
 
-def _assert_device(model, device):
+def _assert_device(model, device, include_buffers=False):
     for p in model.get_parameters():
         assert p.device == device
+    if include_buffers:
+        for b in model.get_buffers():
+            assert b.device == device
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +86,7 @@ class TestInitOnDeviceCPU:
     def test_include_buffers(self):
         with init_on_device("CPU", include_buffers=True):
             model = Net()
-        _assert_device(model, "CPU")
+        _assert_device(model, "CPU", include_buffers=True)
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +103,7 @@ class TestInitOnDeviceNPU:
     def test_include_buffers(self):
         with init_on_device("Ascend", include_buffers=True):
             model = Net()
-        _assert_device(model, "Ascend:0")
+        _assert_device(model, "Ascend:0", include_buffers=True)
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +130,7 @@ class TestLoadAndTrain:
         """Loaded model must produce the same output as the reference."""
         ref, state = _build_ref_state()
 
-        with init_empty_weights():
+        with init_empty_weights(include_buffers=True):
             model = Net()
         ms.load_param_into_net(model, state)
         model.scale.assign_value(state["scale"].data)
@@ -144,6 +147,8 @@ class TestLoadAndTrain:
         with init_empty_weights():
             model = Net()
         ms.load_param_into_net(model, state)
+        # include_buffers=True is ineffective currently, delete this line later
+        model.scale.assign_value(state["scale"].data)
 
         def forward_fn(x):
             return model(x).sum()
@@ -161,6 +166,8 @@ class TestLoadAndTrain:
         with init_empty_weights():
             model = Net()
         ms.load_param_into_net(model, state)
+        # include_buffers=True is ineffective currently, delete this line later
+        model.scale.assign_value(state["scale"].data)
 
         optimizer = mint.optim.SGD(model.trainable_params(), lr=0.01)
 

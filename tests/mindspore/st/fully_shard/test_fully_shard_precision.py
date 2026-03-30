@@ -93,3 +93,13 @@ def test_ms_zero3_fully_shard_grad_accum():
     Expectation: Losses should match within tolerance
     """
     run_case(case_name=f"{inspect.stack()[0].function}")
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_ms_zero3_fully_shard_empty_weight():
+    """
+    Feature: Compare empty init fully_shard precision with standalone baseline
+    Description: Run standalone baseline and fully_shard multi-card training, then compare losses on rank 0
+    Expectation: Losses should match within tolerance
+    """
+    run_case(case_name=f"{inspect.stack()[0].function}")

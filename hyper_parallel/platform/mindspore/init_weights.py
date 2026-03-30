@@ -16,8 +16,7 @@
 
 from contextlib import contextmanager
 
-from mindspore import nn
-from mindspore.nn.utils import no_init_parameters
+from mindspore import nn, DeviceCtx
 
 
 @contextmanager
@@ -31,7 +30,7 @@ def init_on_device(device, include_buffers=False):
         include_buffers (bool): Also redirect buffers to *device*.
     """
     if device == "meta":
-        with no_init_parameters():
+        with DeviceCtx(device):
             yield
     else:
         orig_insert_param = nn.Cell.insert_param_to_cell
