@@ -64,7 +64,7 @@ def test_ms_zero3_fully_shard():
     run_case(case_name=f"{inspect.stack()[0].function}")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_zero3_partial_shard():
     """
     Feature: Compare partial_shard precision with standalone baseline
