@@ -136,6 +136,7 @@ class TestParallelNonzero(unittest.TestCase):
         mesh = self._make_2x4_mesh(mock_platform)
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
+        x_layout._partial = [None] * len(x_layout._partial)
 
         with self.assertRaisesRegex(ValueError, "input tensor must be fully replicated"):
             op.infer_layout((x_layout,))

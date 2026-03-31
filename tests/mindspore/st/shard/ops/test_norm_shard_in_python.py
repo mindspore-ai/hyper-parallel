@@ -12,60 +12,61 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test parallel op layernorm"""
+"""norm shard in python shell test"""
+
 from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import parallel_run, TorchCase
+from tests.common.parallel_case import parallel_run, MindSporeCase
 
-PARALLEL_OP_LAYERNORM = "parallel_op_layernorm.py"
+NORM_SHARD_IN_PYTHON = "norm_shard_in_python.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_layernorm_group1():
+def test_norm_shard_in_python_group1():
     """
-    Feature: parallel run case in shard
+    Feature: parallel run case in norm_shard_in_python
     Description:
-        1. test_layernorm_data_parallel
+        1. test_norm_data_parallel_1 (RmsNorm)
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_layernorm_data_parallel", 10890, 4),
+        MindSporeCase(NORM_SHARD_IN_PYTHON, "test_norm_data_parallel_1", 11600, 8, 8, 2),
     ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_layernorm_group2():
+def test_norm_shard_in_python_group2():
     """
-    Feature: parallel run case in shard
+    Feature: parallel run case in norm_shard_in_python
     Description:
-        1. test_layernorm_model_parallel
+        1. test_norm_model_parallel_2 (RmsNorm)
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_layernorm_model_parallel", 10892, 4),
+        MindSporeCase(NORM_SHARD_IN_PYTHON, "test_norm_model_parallel_2", 11601, 8, 8, 2),
     ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_layernorm_group3():
+def test_norm_shard_in_python_group3():
     """
-    Feature: parallel run case in shard
+    Feature: parallel run case in norm_shard_in_python
     Description:
-        1. test_layernorm_hybrid_parallel
+        1. test_norm_hybrid_parallel_3 (RmsNorm)
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_layernorm_hybrid_parallel", 10893, 4),
+        MindSporeCase(NORM_SHARD_IN_PYTHON, "test_norm_hybrid_parallel_3", 11602, 8, 8, 2),
     ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_parallel_op_layernorm_group4():
+def test_norm_shard_in_python_group4():
     """
-    Feature: parallel run case in shard
+    Feature: parallel run case in norm_shard_in_python
     Description:
-        1. test_layernorm_all_replicate
+        1. test_norm_all_replicated_4 (RmsNorm)
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_layernorm_all_replicated", 10894, 4),
+        MindSporeCase(NORM_SHARD_IN_PYTHON, "test_norm_all_replicated_4", 11603, 8, 8, 2),
     ])

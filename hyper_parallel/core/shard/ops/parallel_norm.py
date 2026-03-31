@@ -33,7 +33,7 @@ class NormDistributedOp(DistributedOp):
 
         Args:
             layouts (tuple): A tuple of Layout objects representing the input tensor layouts.
-                Expected to contain at least three layouts: input tensor, gamma parameter, and beta parameter.
+                Expected to contain at least three layouts: input tensor, gamma parameter, and bias parameter.
             extra_args (dict, optional): Additional arguments that might be needed for layout inference.
                 Defaults to None.
 

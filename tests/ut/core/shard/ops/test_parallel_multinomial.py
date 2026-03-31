@@ -71,7 +71,7 @@ class TestParallelMultinomial(unittest.TestCase):
         return init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp"))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_multinomial_infer_layout_1d(self, mock_platform):
+    def test_multinomial_infer_layout_1d_replicated(self, mock_platform):
         """
         Feature: Multinomial layout inference for 1D input
         Description: Input is a 1D probability vector (replicated).
@@ -80,18 +80,27 @@ class TestParallelMultinomial(unittest.TestCase):
         mesh = self._make_2x4_mesh(mock_platform)
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 1)
+        extra_args = (10, True, None)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(10, True, None))
+        output_layout = op.infer_layout((x_layout,), extra_args)
 
         expected_map = (-1,)
-        assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"1D inference failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        assert output_layout.tensor_map == expected_map, (
+            f"1D inference failed. Expected {expected_map}, "
+            f"got {output_layout.tensor_map}"
+        )
+
+        # Since `get_expand_impl` is not overridden, it returns None by default.
+        # The same applies to other test classes, so it is unnecessary to test its return value.
+        assert op.get_expand_impl(None, output_layout, (x_layout,), extra_args) is None, (
+            f"get_expand_impl should return None, "
+            f"but got {output_layout}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_multinomial_infer_layout_2d_batch_sharded(self, mock_platform):
+    def test_multinomial_infer_layout_2d_data_parallel(self, mock_platform):
         """
-        Feature: Multinomial layout inference for 2D input (Batch Sharded)
+        Feature: Multinomial layout inference for 2D input (Data Parallel)
         Description: Input (N, C) is sharded on Batch dim (dim 0), C dim (dim 1) is replicated.
         Expectation: Output (N, num_samples) preserves sharding on dim 0, dim 1 is Replicated.
         """
@@ -99,11 +108,13 @@ class TestParallelMultinomial(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(10, True, None))
+        extra_args = (10, True, None)
+        output_layout = op.infer_layout((x_layout,), extra_args=extra_args)
 
         expected_map = (1, -1)
-        assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"2D Batch sharded inference failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        assert output_layout.tensor_map == expected_map, (
+            f"2D Data Parallel inference failed. Expected {expected_map}, "
+            f"got {output_layout.tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -117,11 +128,13 @@ class TestParallelMultinomial(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(10, True, None))
+        extra_args = (10, True, None)
+        output_layout = op.infer_layout((x_layout,), extra_args=extra_args)
 
         expected_map = (-1, -1)
-        assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"2D Replicated inference failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        assert output_layout.tensor_map == expected_map, (
+            f"2D Replicated inference failed. Expected {expected_map}, "
+            f"got {output_layout.tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -152,6 +165,55 @@ class TestParallelMultinomial(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 3)
 
         with self.assertRaisesRegex(ValueError, "input dimension must be 1 or 2"):
+            op.infer_layout((x_layout,), extra_args=(10, True, None))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_multinomial_error_invalid_ndim_0d(self, mock_platform):
+        """
+        Feature: Error handling for 0D input
+        Description: Attempt to run multinomial on a 0D tensor (scalar).
+        Expectation: ValueError raised.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_placements = (Replicate(), Replicate())
+        x_layout = _build_layout(mesh, x_placements, 0)
+
+        with self.assertRaisesRegex(ValueError, "input dimension must be 1 or 2"):
+            op.infer_layout((x_layout,), extra_args=(10, True, None))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_multinomial_2d_with_replacement_false(self, mock_platform):
+        """
+        Feature: Multinomial with replacement=False
+        Description: Test 2D input with replacement=False.
+        Expectation: Output layout follows same sharding rules.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_placements = (Shard(0), Replicate())
+        x_layout = _build_layout(mesh, x_placements, 2)
+
+        extra_args = (5, False, None)
+        output_layout = op.infer_layout((x_layout,), extra_args=extra_args)
+
+        expected_map = (1, -1)
+        assert output_layout.tensor_map == expected_map, (
+            f"2D with replacement=False inference failed. Expected {expected_map}, "
+            f"got {output_layout.tensor_map}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_multinomial_partial_input(self, mock_platform):
+        """
+        Feature: Multinomial with partial input
+        Description: Input with partial state
+        Expectation: Raise ValueError since _allow_partial_inputs is False
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_placements = (Shard(0), Replicate())
+        x_layout = _build_layout(mesh, x_placements, 2)
+        x_layout.set_partial_by_dev_axis("mp", "sum")
+
+        with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
             op.infer_layout((x_layout,), extra_args=(10, True, None))
 
 

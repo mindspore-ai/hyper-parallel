@@ -25,12 +25,14 @@ from tests.torch.shard.utils import local_to_global
 # Set random seed for reproducibility
 SEED = 42
 
+
 def _set_seed(seed=SEED):
     torch.manual_seed(seed)
     np.random.seed(seed)
     # Ensure CUDA/NPU determinism if applicable, though manual_seed suffices for logic checks
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
 
 def test_distributed_multinomial_1d_replicated():
     """
@@ -61,22 +63,25 @@ def test_distributed_multinomial_1d_replicated():
     # 3. Layout Validation
     # Input: (-1,) -> Output: (-1,) ("None")
     expected_layout = _build_layout(mesh, (Replicate(),), 1)
-    assert dist_output.layout == expected_layout, \
-        f"1D Replicated layout mismatch: expected {expected_layout}, got {dist_output.layout}"
+    assert dist_output.layout == expected_layout, (
+        f"1D Replicated layout mismatch: expected {expected_layout}, got={dist_output.layout}"
+    )
 
     # 4. Numerical/Shape Validation
     gathered_output = local_to_global(dist_output)
 
-    # Since it is fully replicated and seeded, outputs should identical on all ranks and match standalone
-    assert torch.equal(standalone_output, gathered_output), \
-        "1D Replicated output mismatch between standalone and distributed execution"
+    assert torch.equal(standalone_output, gathered_output), (
+        f"1D Replicated output mismatch between standalone and distributed execution"
+        f"standalone_output: {standalone_output}, "
+        f"gathered_output: {gathered_output}"
+    )
 
 
-def test_distributed_multinomial_2d_batch_sharded():
+def test_distributed_multinomial_2d_data_parallel():
     """
-    Feature: dtensor + torch.multinomial 2D Input (Batch Sharded)
+    Feature: dtensor + torch.multinomial 2D Input (Data Parallel)
     Description:
-        - Input: 2D (N, C) sharded on Batch dimension (dim 0).
+        - Input: 2D (N, C) sharded on Data Parallel dimension (dim 0).
         - Operation: multinomial sampling.
         - Expectation:
             - Output layout preserves sharding on dim 0.
@@ -103,18 +108,20 @@ def test_distributed_multinomial_2d_batch_sharded():
     # Input: (Shard(0), Replicate()) -> Output: (Shard(0), Replicate())
     # The new dimension is created locally and is not sharded.
     expected_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
-    assert dist_output.layout == expected_layout, \
-        f"2D Batch Sharded layout mismatch: expected {expected_layout}, got {dist_output.layout}"
+    assert dist_output.layout == expected_layout, (
+        f"2D Data Parallel layout mismatch: expected {expected_layout}, got={dist_output.layout}"
+    )
 
     # 2. Shape and Value Sanity Check
     gathered_output = local_to_global(dist_output)
 
-    assert gathered_output.shape == (n, num_samples), \
-        f"Output shape mismatch: expected {(n, num_samples)}, got {gathered_output.shape}"
+    assert gathered_output.shape == (n, num_samples), (
+        f"Output shape mismatch: expected {(n, num_samples)}, got={gathered_output.shape}"
+    )
 
-    # Check values are valid indices [0, C)
-    assert gathered_output.min() >= 0 and gathered_output.max() < c, \
-        "Output contains invalid indices"
+    assert gathered_output.min() >= 0 and gathered_output.max() < c, (
+        f"Output contains invalid indices: {gathered_output.min()} to {gathered_output.max()}"
+    )
 
 
 def test_distributed_multinomial_2d_fully_replicated():
@@ -141,10 +148,14 @@ def test_distributed_multinomial_2d_fully_replicated():
 
     # Layout Validation
     expected_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-    assert dist_output.layout == expected_layout, \
-        f"2D Fully Replicated layout mismatch: expected {expected_layout}, got {dist_output.layout}"
+    assert dist_output.layout == expected_layout, (
+        f"2D Fully Replicated layout mismatch: expected {expected_layout}, got={dist_output.layout}"
+    )
 
     # Value Validation
     gathered_output = local_to_global(dist_output)
-    assert torch.equal(standalone_output, gathered_output), \
-        "2D Fully Replicated output mismatch"
+    assert torch.equal(standalone_output, gathered_output), (
+        f"2D Fully Replicated output mismatch between standalone and distributed execution"
+        f"standalone_output: {standalone_output}, "
+        f"gathered_output: {gathered_output}"
+    )

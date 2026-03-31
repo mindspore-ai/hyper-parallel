@@ -35,6 +35,9 @@ class MultinomialDistributedOp(DistributedOp):
         Returns:
             Layout: Layout for output tensor.
         """
+        # Check partial inputs
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs(layouts)
         layout = layouts[0]
         in_tensor_map = layout.alias_tensor_map
         ndim = len(in_tensor_map)
@@ -56,7 +59,6 @@ class MultinomialDistributedOp(DistributedOp):
                 f"must not be sharded (Replicated). Got layout map: {in_tensor_map}. "
                 f"Please redistribute the tensor to replicate the last dimension before calling multinomial."
             )
-
         out_tensor_map = ()
         if ndim == 1:
             # Input: (C,) -> Probability distribution
