@@ -1,5 +1,5 @@
 diff --git a/scripts/build.sh b/scripts/build.sh
-index f8be2ec..a91bea0 100644
+index 237d76a..2b16f0c 100644
 --- a/scripts/build.sh
 +++ b/scripts/build.sh
 @@ -8,14 +8,6 @@
@@ -18,22 +18,22 @@ index f8be2ec..a91bea0 100644
  CURRENT_DIR=$(pwd)
  SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 46b7d11..92cb075 100644
+index 49d4a1a..d618262 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -54,19 +54,19 @@ target_include_directories(aclshmem_host
-         ${PROJECT_SOURCE_DIR}/src/host/bootstrap/config_store/acc_links/include
+@@ -86,18 +86,23 @@ install(TARGETS shmem_utils
+     LIBRARY DESTINATION lib
  )
  
 -add_library(shmem SHARED $<TARGET_OBJECTS:aclshmem_device> $<TARGET_OBJECTS:aclshmem_host>)
 -target_link_options(shmem PRIVATE --cce-fatobj-link)
+-target_link_libraries(shmem PRIVATE shmem_utils)
 +add_library(hpshmem SHARED $<TARGET_OBJECTS:aclshmem_device> $<TARGET_OBJECTS:aclshmem_host>)
 +target_link_options(hpshmem PRIVATE --cce-fatobj-link)
- 
- if(NOT USE_UNIT_TEST)
--        target_link_libraries(shmem PRIVATE hybmm_shared config_store_shared)
-+        target_link_libraries(hpshmem PRIVATE hybmm_shared config_store_shared)
- endif()
++
++if(NOT USE_UNIT_TEST)
++    target_link_libraries(hpshmem PRIVATE shmem_utils)
++endif()
  
  # MPI
  if(ACLSHMEM_MPI_SUPPORT)
@@ -41,21 +41,69 @@ index 46b7d11..92cb075 100644
 -    target_link_options(shmem INTERFACE ${ACLSHMEM_CXX_LINK_FLAGS})
 -    target_compile_definitions(shmem INTERFACE ${MPI_CXX_COMPILE_DEFINITIONS})
 -    target_compile_options(shmem INTERFACE ${MPI_CXX_COMPILE_OPTIONS})
+-
+-    add_library(aclshmem_bootstrap_mpi SHARED)
 +    target_link_options(hpshmem INTERFACE ${ACLSHMEM_CXX_LINK_FLAGS})
 +    target_compile_definitions(hpshmem INTERFACE ${MPI_CXX_COMPILE_DEFINITIONS})
 +    target_compile_options(hpshmem INTERFACE ${MPI_CXX_COMPILE_OPTIONS})
-     
-     add_library(
-     aclshmem_bootstrap_mpi SHARED
-@@ -105,7 +105,7 @@ install(TARGETS aclshmem_bootstrap_uid
++    
++    add_library(
++    aclshmem_bootstrap_mpi SHARED
++    )
+     target_sources(aclshmem_bootstrap_mpi PRIVATE host/bootstrap/shmemi_bootstrap_mpi.cpp)
+     target_link_libraries(aclshmem_bootstrap_mpi PRIVATE MPI::MPI_CXX shmem_utils)
+     target_include_directories(aclshmem_bootstrap_mpi
+@@ -157,9 +162,9 @@ install(TARGETS aclshmem_bootstrap_config_store
          LIBRARY DESTINATION lib)
  
  # 安装配置
 -install(TARGETS shmem
+-    LIBRARY DESTINATION lib
+-    PUBLIC_HEADER DESTINATION include
 +install(TARGETS hpshmem
-         LIBRARY DESTINATION lib
-         PUBLIC_HEADER DESTINATION include
++        LIBRARY DESTINATION lib
++        PUBLIC_HEADER DESTINATION include
  )
+ 
+ install(DIRECTORY ${PROJECT_SOURCE_DIR}/include/
+diff --git a/src/device/gm2gm/shmem_device_so.hpp b/src/device/gm2gm/shmem_device_so.hpp
+index 3bc6f8c..fdf8066 100644
+--- a/src/device/gm2gm/shmem_device_so.hpp
++++ b/src/device/gm2gm/shmem_device_so.hpp
+@@ -283,22 +283,20 @@ ACLSHMEM_DEVICE void aclshmemi_highlevel_signal_set(__gm__ int32_t *dst, __gm__
+ 
+ ACLSHMEM_DEVICE void aclshmemi_signal_add(__gm__ int32_t *addr, int pe, int32_t val)
+ {
+-    if (AscendC::GetBlockIdx() == 0){
+-        auto ptr = aclshmem_ptr(addr, pe);
+-        if (ptr == nullptr) return;
+-        AscendC::SetAtomicNone();
+-        __gm__ int32_t* remote_ptr = reinterpret_cast<__gm__ int32_t*>(ptr);
++    auto ptr = aclshmem_ptr(addr, pe);
++    if (ptr == nullptr) return;
++    AscendC::SetAtomicNone();
++    __gm__ int32_t* remote_ptr = reinterpret_cast<__gm__ int32_t*>(ptr);
+ 
+-        __ubuf__ int32_t* buf =(__ubuf__ int32_t*)(ACLSHMEM_INTERNAL_UB_BUF_START_ADDR);
+-        *buf = val;
++    __ubuf__ int32_t* buf =(__ubuf__ int32_t*)(ACLSHMEM_INTERNAL_UB_BUF_START_ADDR);
++    *buf = val;
+ 
+-        AscendC::SetAtomicAdd<int32_t>();
+-        aclshmemi_copy_ub2gm(remote_ptr, buf, sizeof(int32_t));
+-        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
++    AscendC::SetAtomicAdd<int32_t>();
++    aclshmemi_copy_ub2gm(remote_ptr, buf, sizeof(int32_t));
++    AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
++    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+ 
+-        AscendC::SetAtomicNone();
+-    }
++    AscendC::SetAtomicNone();
+ }
+ 
+ ACLSHMEM_DEVICE int32_t aclshmemi_signal_wait_until_eq_for_barrier(__gm__ int32_t *sig_addr, int32_t cmp_val)
 diff --git a/src/host/bootstrap/config_store/store_num_util.h b/src/host/bootstrap/config_store/store_num_util.h
 index c28255a..81a83a1 100644
 --- a/src/host/bootstrap/config_store/store_num_util.h
