@@ -90,3 +90,8 @@
 # 8. MindSpore HSDP
 "hyper-parallel/hyper_parallel/platform/mindspore/hsdp/"                "arguments-renamed"
 "hyper-parallel/hyper_parallel/platform/mindspore/hsdp/"                "broad-exception-caught"
+
+# 9. Context Parallel tests — torch_npu and SDPA are runtime-only, not resolvable in lint env
+"hyper-parallel/tests/torch/context_parallel/"                          "no-member"
+"hyper-parallel/tests/torch/context_parallel/"                          "not-callable"
+"hyper-parallel/tests/torch/context_parallel/"                          "line-too-long"

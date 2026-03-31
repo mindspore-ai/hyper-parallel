@@ -17,6 +17,7 @@
 """FlashAttentionScore Distributed Operator"""
 
 import copy
+import threading
 import warnings
 
 from typing import List, Tuple, Optional, Any
@@ -45,6 +46,28 @@ SPARSE_MODE_UPDATE_MAP = {
     SPARSE_RIGHT_DOWN_CAUSAL: RIGHT_DOWN_TO_RIGHT_DOWN,
     SPARSE_BAND: RIGHT_DOWN_TO_RIGHT_DOWN,
 }
+
+# ---------------------------------------------------------------------------
+# Thread-local override for load-balance sub-FA calls
+# ---------------------------------------------------------------------------
+_LB_OVERRIDE = threading.local()
+
+
+def _set_lb_override(split_id: int, split_num: int) -> None:
+    """Set per-thread split_id/split_num override for load-balance FA sub-calls."""
+    _LB_OVERRIDE.split_id = split_id
+    _LB_OVERRIDE.split_num = split_num
+
+
+def _clear_lb_override() -> None:
+    """Clear the load-balance override."""
+    _LB_OVERRIDE.split_id = None
+    _LB_OVERRIDE.split_num = None
+
+
+def _get_lb_override() -> Tuple[Optional[int], Optional[int]]:
+    """Return (split_id, split_num) if override is active, else (None, None)."""
+    return getattr(_LB_OVERRIDE, 'split_id', None), getattr(_LB_OVERRIDE, 'split_num', None)
 
 
 class FlashAttentionScoreDistributedOp:
@@ -135,6 +158,84 @@ class FlashAttentionScoreDistributedOp:
             SPARSE_RIGHT_DOWN_CAUSAL,
             SPARSE_BAND,
         )
+
+    def _validate_atten_mask_for_lb(
+        self,
+        atten_mask: Optional[Tensor],
+        sparse_mode: int,
+        local_q_len: int,
+        seq_split_num: int,
+    ) -> None:
+        """Validate that atten_mask has full (global) shape in load-balance mode.
+
+        In load-balance Colossal AI CP, each sub-FA call has a different Q shard
+        (q_keep or q_peer). There is no communication to redistribute mask shards
+        across ranks, so only a full (global_S, kv_S) mask can be correctly sliced
+        to the per-sub-call local range. A pre-sliced or wrongly-sized mask would
+        silently produce incorrect results.
+
+        Args:
+            atten_mask (Optional[Tensor]): The attention mask tensor (2D or 4D), or None.
+            sparse_mode (int): The sparse mode for npu_fusion_attention.
+            local_q_len (int): The local Q sequence length for this sub-FA call.
+            seq_split_num (int): Total LB split count (= 2 * cp_size).
+
+        Raises:
+            ValueError: If atten_mask.shape[-2] != global_q_len.
+        """
+        if atten_mask is None or self._is_attn_mask_compressed(sparse_mode):
+            return
+        global_q_len = local_q_len * seq_split_num
+        if atten_mask.shape[-2] != global_q_len:
+            raise ValueError(
+                f"load_balance=True requires a full-shaped attention mask "
+                f"(atten_mask.shape[-2] == global_q_len={global_q_len}), "
+                f"but got atten_mask.shape={tuple(atten_mask.shape)}. "
+                f"There is no logic in CP load-balance mode to redistribute mask "
+                f"shards across ranks. Pass the complete (global_S, kv_S) mask. "
+                f"Note: when load_balance=True, q.shape[seq_dim] inside forward() "
+                f"returns S/2 instead of the true global S — use k.shape[seq_dim] "
+                f"to obtain the correct sequence length for building the mask."
+            )
+
+    def _adjust_atten_mask_for_seq_split(
+        self,
+        atten_mask: Optional[Tensor],
+        sparse_mode: int,
+        split_id: int,
+        local_q_len: int,
+        seq_split_num: int,
+    ) -> Optional[Tensor]:
+        """Slice a global-shaped atten_mask to the local Q range for the current rank.
+
+        When forward() runs inside the dispatcher with a DTensor query,
+        q.shape returns the global sequence length, so users naturally build a
+        (global_S, global_S) mask. This function slices it to (local_q_len, kv_len)
+        for the current rank, mirroring the SDPA dispatcher's _adjust_attn_mask_for_sp.
+
+        Only applies when:
+        - sparse_mode is not compressed (compressed modes use fixed 2048x2048 masks)
+        - atten_mask.shape[-2] == global_q_len (already-local masks pass through unchanged)
+
+        Args:
+            atten_mask (Optional[Tensor]): The attention mask tensor (2D or 4D), or None.
+            sparse_mode (int): The sparse mode for npu_fusion_attention.
+            split_id (int): The sequence split index for this rank.
+            local_q_len (int): The local Q sequence length on this rank.
+            seq_split_num (int): Total number of sequence splits (CP degree).
+
+        Returns:
+            Optional[Tensor]: Sliced mask of shape (..., local_q_len, kv_len), or original.
+        """
+        if atten_mask is None or self._is_attn_mask_compressed(sparse_mode):
+            return atten_mask
+        global_q_len = local_q_len * seq_split_num
+        if atten_mask.shape[-2] != global_q_len:
+            return atten_mask
+        offset = split_id * local_q_len
+        if atten_mask.dim() == 2:
+            return atten_mask[offset:offset + local_q_len, :]
+        return atten_mask[:, :, offset:offset + local_q_len, :]
 
     def _compute_sparse_params(
         self,
@@ -837,7 +938,12 @@ class FlashAttentionScoreDistributedOp:
             head_split_num = split_info["head"]
             seq_split_num = split_info["seq"]
 
-            if head_split_num == 1 and seq_split_num == 1:
+            # Check for load-balance override before the early-exit shortcut so that
+            # _lb_colossal_forward can pass plain (non-DTensor) tensors to the FA op
+            # and still have the correct sparse params applied.
+            lb_split_id, lb_split_num = _get_lb_override()
+
+            if head_split_num == 1 and seq_split_num == 1 and lb_split_id is None:
                 result = func(
                     query, key, value, head_num, input_layout,
                     pse, padding_mask, atten_mask, scale, keep_prob,
@@ -849,54 +955,14 @@ class FlashAttentionScoreDistributedOp:
 
             adjusted_head_num = self._adjust_head_num(head_num, head_split_num)
 
-            adjusted_sparse_mode = sparse_mode
-            adjusted_pre_tockens = pre_tockens
-            adjusted_next_tockens = next_tockens
-            adjusted_actual_seq_qlen = actual_seq_qlen
-            adjusted_actual_seq_kvlen = actual_seq_kvlen
-
-            if seq_split_num > 1:
-                dynamic_info = self._get_dynamic_shape_info(query, key, input_layout)
-                is_dynamic = dynamic_info.get('is_dynamic', False)
-
-                split_id = self._get_split_id(query_layout, input_layout)
-                seq_dim_idx = self._get_seq_dim_idx(self._layout_dims.get(input_layout, {}))
-
-                if seq_dim_idx is None:
-                    raise ValueError(
-                        f"Cannot infer seq/total dim for input_layout={input_layout}"
-                    )
-
-                kv_seq_split_num = 1
-                if key_layout is not None:
-                    kv_split_info = self._get_split_info(key_layout, input_layout)
-                    kv_seq_split_num = kv_split_info["seq"]
-
-                self._check_seq_sharding_compatibility(
-                    query_layout, key_layout, input_layout,
-                    seq_dim_idx, seq_split_num, kv_seq_split_num
-                )
-
-                (adjusted_sparse_mode,
-                 adjusted_pre_tockens,
-                 adjusted_next_tockens) = self._compute_adjusted_sparse_params(
-                    query, key,
-                    sparse_mode, pre_tockens, next_tockens,
-                    split_id, seq_split_num, seq_dim_idx,
-                    kv_seq_split_num, is_dynamic,
-                )
-
-                if input_layout == "TND":
-                    (adjusted_sparse_mode,
-                     adjusted_pre_tockens,
-                     adjusted_next_tockens,
-                     adjusted_actual_seq_qlen,
-                     adjusted_actual_seq_kvlen) = self._adjust_tnd_layout_params(
-                        query, key, query_layout, key_layout,
-                        input_layout, sparse_mode, pre_tockens, next_tockens,
-                        actual_seq_qlen, actual_seq_kvlen,
-                        seq_split_num, split_id, kv_seq_split_num, is_dynamic,
-                    )
+            (adjusted_sparse_mode, adjusted_pre_tockens, adjusted_next_tockens,
+             adjusted_actual_seq_qlen, adjusted_actual_seq_kvlen,
+             atten_mask) = self._apply_seq_split_adjustments(
+                query, key, query_layout, key_layout, input_layout,
+                sparse_mode, pre_tockens, next_tockens,
+                actual_seq_qlen, actual_seq_kvlen,
+                atten_mask, seq_split_num, lb_split_id, lb_split_num
+            )
 
             result = func(
                 query, key, value,
@@ -916,6 +982,92 @@ class FlashAttentionScoreDistributedOp:
             return FlashAttentionScoreDistributedOp._truncate_result(result)
 
         return expanded_impl
+
+    def _apply_seq_split_adjustments(  # pylint: disable=too-many-arguments,too-many-locals
+        self,
+        query, key,
+        query_layout, key_layout,
+        input_layout: str,
+        sparse_mode: int,
+        pre_tockens: int,
+        next_tockens: int,
+        actual_seq_qlen,
+        actual_seq_kvlen,
+        atten_mask,
+        seq_split_num: int,
+        lb_split_id,
+        lb_split_num: int,
+    ):
+        """Compute adjusted sparse/mask params for sequence-dimension sharding.
+
+        Returns:
+            Tuple of (adjusted_sparse_mode, adjusted_pre_tockens, adjusted_next_tockens,
+                      adjusted_actual_seq_qlen, adjusted_actual_seq_kvlen, atten_mask).
+        """
+        adjusted_sparse_mode = sparse_mode
+        adjusted_pre_tockens = pre_tockens
+        adjusted_next_tockens = next_tockens
+        adjusted_actual_seq_qlen = actual_seq_qlen
+        adjusted_actual_seq_kvlen = actual_seq_kvlen
+
+        if seq_split_num > 1 or lb_split_id is not None:
+            dynamic_info = self._get_dynamic_shape_info(query, key, input_layout)
+            is_dynamic = dynamic_info.get('is_dynamic', False)
+
+            if lb_split_id is not None:
+                split_id = lb_split_id
+                seq_split_num = lb_split_num
+            else:
+                split_id = self._get_split_id(query_layout, input_layout)
+            seq_dim_idx = self._get_seq_dim_idx(self._layout_dims.get(input_layout, {}))
+
+            if seq_dim_idx is None:
+                raise ValueError(
+                    f"Cannot infer seq/total dim for input_layout={input_layout}"
+                )
+
+            kv_seq_split_num = 1
+            if key_layout is not None:
+                kv_split_info = self._get_split_info(key_layout, input_layout)
+                kv_seq_split_num = kv_split_info["seq"]
+
+            self._check_seq_sharding_compatibility(
+                query_layout, key_layout, input_layout,
+                seq_dim_idx, seq_split_num, kv_seq_split_num
+            )
+
+            (adjusted_sparse_mode,
+             adjusted_pre_tockens,
+             adjusted_next_tockens) = self._compute_adjusted_sparse_params(
+                query, key,
+                sparse_mode, pre_tockens, next_tockens,
+                split_id, seq_split_num, seq_dim_idx,
+                kv_seq_split_num, is_dynamic,
+            )
+
+            if input_layout == "TND":
+                (adjusted_sparse_mode,
+                 adjusted_pre_tockens,
+                 adjusted_next_tockens,
+                 adjusted_actual_seq_qlen,
+                 adjusted_actual_seq_kvlen) = self._adjust_tnd_layout_params(
+                    query, key, query_layout, key_layout,
+                    input_layout, sparse_mode, pre_tockens, next_tockens,
+                    actual_seq_qlen, actual_seq_kvlen,
+                    seq_split_num, split_id, kv_seq_split_num, is_dynamic,
+                )
+
+            local_q_len = query.shape[seq_dim_idx]
+            if lb_split_id is not None:
+                self._validate_atten_mask_for_lb(
+                    atten_mask, adjusted_sparse_mode, local_q_len, seq_split_num
+                )
+            atten_mask = self._adjust_atten_mask_for_seq_split(
+                atten_mask, adjusted_sparse_mode, split_id, local_q_len, seq_split_num
+            )
+
+        return (adjusted_sparse_mode, adjusted_pre_tockens, adjusted_next_tockens,
+                adjusted_actual_seq_qlen, adjusted_actual_seq_kvlen, atten_mask)
 
     def _get_seq_dim_idx(self, dims: dict) -> Optional[int]:
         """Get the sequence dimension index."""

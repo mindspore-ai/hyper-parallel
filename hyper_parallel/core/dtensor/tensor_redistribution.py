@@ -40,8 +40,7 @@ class TensorRedistribution:
     """
     def __init__(self):
         self.is_init = False
-        self.rank_list = None # rank_list for current stage
-        self.rank_id = None # current rank_lid
+        self.rank_id = None # current rank_id (global)
         self._transform_cache = {}
         self._construct_op_operator = {
             "Reshape": self._construct_reshape,
@@ -136,25 +135,36 @@ class TensorRedistribution:
         if post_special_handle:
             return output_tensor.view(final_shape)
 
+        # When pre_special_handle collapsed leading size-1 dims, the A2A was executed
+        # in a reduced-rank space where the effective concat axis is shifted left by
+        # split_dim positions.  Use recon_concat_dim for all post-A2A reshaping so
+        # that split_count is merged into the correct dimension.
+        recon_concat_dim = (concat_dim - split_dim) if pre_special_handle else concat_dim
+
         output_reshape = list(output_tensor.shape)
         output_reshape[0] = split_count
         output_reshape.insert(1, output_tensor.shape[0] // split_count)
 
         out_trans_dims = list(range(len(output_reshape)))
         first_dim = out_trans_dims.pop(0)
-        if concat_dim >= len(out_trans_dims):
+        if recon_concat_dim >= len(out_trans_dims):
             out_trans_dims.append(first_dim)
         else:
-            out_trans_dims.insert(concat_dim, first_dim)
+            out_trans_dims.insert(recon_concat_dim, first_dim)
 
         final_output = output_tensor.reshape(output_reshape).permute(out_trans_dims).contiguous()
 
         final_reshape = list(final_output.shape)
-        if concat_dim < len(final_reshape) - 1:
-            final_reshape[concat_dim] = final_reshape[concat_dim] * final_reshape[concat_dim + 1]
-            final_reshape.pop(concat_dim + 1)
+        if recon_concat_dim < len(final_reshape) - 1:
+            final_reshape[recon_concat_dim] = (
+                final_reshape[recon_concat_dim] * final_reshape[recon_concat_dim + 1]
+            )
+            final_reshape.pop(recon_concat_dim + 1)
 
-        return final_output.reshape(final_reshape)
+        result = final_output.reshape(final_reshape)
+        if pre_special_handle:
+            result = result.view(final_shape)
+        return result
 
     def _apply_eazy_redistribute(self, src_layout, dst_layout):
         """_apply_eazy_redistribute"""
@@ -167,14 +177,14 @@ class TensorRedistribution:
             return False
         return True
 
-    def _redistribution_without_shape(self, local_x, src_layout, dst_layout, key):
+    def _redistribution_without_shape(self, local_x, src_layout, dst_layout, key, rank_list):
         """_redistribution_without_shape"""
         inferrer = RedistributionOperatorInfer(
             dev_mat=src_layout.mesh_shape,
             in_tensor_map=list(src_layout.tensor_map),
             out_tensor_map=list(dst_layout.tensor_map)
         )
-        op_list = inferrer.infer_ops_list(self.rank_id, self.rank_list)
+        op_list = inferrer.infer_ops_list(self.rank_id, rank_list)
         self._transform_cache[key] = op_list
         for op in op_list:
             local_x = self._construct_op_operator[op[0]](local_x, *op[1])
@@ -194,10 +204,9 @@ class TensorRedistribution:
         from_layout = x.layout
         if not self.is_init:
             self.rank_id = platform.get_rank()
-            self.rank_list = from_layout.rank_list
             self.is_init = True
-        if self.rank_list != to_layout.rank_list:
-            raise ValueError(f"The from_layout rank list: {self.rank_list} is not equal to "
+        if from_layout.rank_list != to_layout.rank_list:
+            raise ValueError(f"The from_layout rank list: {from_layout.rank_list} is not equal to "
                              f"to_layout rank list: {to_layout.rank_list}")
         key = from_layout.compact_str + to_layout.compact_str +  str(self.rank_id)
         if key in self._transform_cache:
@@ -216,24 +225,25 @@ class TensorRedistribution:
                 x = self._construct_op_operator[transform_operator[0]](x, *transform_operator[1])
             return DTensor.from_local(x, to_layout.mesh, to_layout.alias_placements)
 
+        rank_list = from_layout.rank_list
         if self._apply_eazy_redistribute(from_layout, to_layout):
             if from_layout.is_partial():
                 from_layout.reset_partial()
-            x = self._redistribution_without_shape(x, from_layout, to_layout, key)
+            x = self._redistribution_without_shape(x, from_layout, to_layout, key, rank_list)
         else:
             transform_operator_list = self._infer_transform_operator_list(from_layout, to_layout,
-                                                                          full_shape, key_and_shape)
+                                                                          full_shape, key_and_shape, rank_list)
             for transform_operator in transform_operator_list:
                 x = self._construct_op_operator[transform_operator[0]](x, *transform_operator[1])
         return DTensor.from_local(x, to_layout.mesh, to_layout.alias_placements)
 
-    def _infer_transform_operator_list(self, from_layout, to_layout, from_full_shape, key):
+    def _infer_transform_operator_list(self, from_layout, to_layout, from_full_shape, key, rank_list):
         """infer transform operator list"""
         from_layout_tuple, to_layout_tuple = \
             _construct_layout_tuple_for_transform_operator_list(from_layout, to_layout, from_full_shape)
         self._transform_cache[key] = \
             platform.get_tensor_transform().transform_tensor_sharding(from_layout_tuple, to_layout_tuple,
-                                                                      self.rank_list, False, self.rank_id)
+                                                                      rank_list, False, self.rank_id)
         return self._transform_cache[key]
 
     @staticmethod

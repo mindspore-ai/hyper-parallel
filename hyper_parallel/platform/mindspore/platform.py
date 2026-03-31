@@ -469,6 +469,12 @@ class MindSporePlatform(Platform):
         return dist.irecv(tensor, src, group, tag)
 
     @staticmethod
+    def p2p_exchange(tensor, peer_rank: int, group=None):  # pylint: disable=unused-argument
+        raise NotImplementedError(
+            "p2p_exchange is not yet supported on the MindSpore platform."
+        )
+
+    @staticmethod
     def send_object_list(obj_list, dst=None, group=None):
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.pipeline_parallel._utils import send_object_list
@@ -515,6 +521,23 @@ class MindSporePlatform(Platform):
     @staticmethod
     def reduce_scatter_tensor(data, group_info, async_op=False):
         return comm_func.reduce_scatter_tensor(None, data, group=group_info.group_name, async_op=async_op)
+
+    @staticmethod
+    def all_to_all_single(input_tensor, output_shape, group, async_op=False):
+        return comm_func.all_to_all_single_with_output_shape(
+            output_shape=output_shape,
+            tensor=input_tensor,
+            group=group,
+            async_op=async_op,
+        )
+
+    @staticmethod
+    def differentiable_async_a2a_wait(x, work, out_perm, group, world_size, concat_dim, split_dim,  # pylint: disable=unused-argument
+                                      handle_box=None):
+        raise NotImplementedError(
+            "differentiable_async_a2a_wait is not yet supported "
+            "on the MindSpore platform."
+        )
 
     @staticmethod
     def parameters_dict(cell: Cell):
@@ -701,6 +724,10 @@ class MindSporePlatform(Platform):
     @staticmethod
     def no_grad():
         return _no_grad()
+
+    @staticmethod
+    def cat(tensors, dim=0):
+        return mint.cat(tensors, dim=dim)
 
     @staticmethod
     def empty_like(tensor, *, dtype=None, device=None, pin_memory=False):

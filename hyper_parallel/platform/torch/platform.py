@@ -41,6 +41,100 @@ from hyper_parallel.platform.torch.init_weights import init_on_device as _init_o
 
 override_functions()
 
+
+# ---------------------------------------------------------------------------
+# Module-level A2A reshape helpers
+# ---------------------------------------------------------------------------
+
+def _a2a_reconstruct(out_perm: torch.Tensor, concat_dim: int) -> torch.Tensor:
+    """Reconstruct A2A result from raw out_perm buffer.
+
+    ``out_perm`` has shape ``[ws, *rest_dims]``, chunk at ``concat_dim + 1``.
+    Returns tensor with merged chunk dimension.
+    """
+    new_ndim = out_perm.dim()
+    chunk_in_perm = concat_dim + 1
+    recon_perm = list(range(1, chunk_in_perm)) + [0] + list(range(chunk_in_perm, new_ndim))
+    x_recon = out_perm.permute(recon_perm).contiguous()
+    shape = list(x_recon.shape)
+    merged = shape[concat_dim] * shape[concat_dim + 1]
+    return x_recon.reshape(shape[:concat_dim] + [merged] + shape[concat_dim + 2:])
+
+
+class _TorchAsyncA2AFunction(torch.autograd.Function):
+    """Differentiable wrapper for pre-launched async all-to-all.
+
+    Forward: wait async handle, reconstruct A2A result.
+    Backward: launch async head→seq A2A and store handle in ``handle_box``
+    for the projection pre-hook to wait, achieving GEMM–A2A overlap.
+    """
+
+    @staticmethod
+    def forward(ctx, x, work, out_perm, group, world_size, concat_dim, split_dim,  # pylint: disable=arguments-differ
+                handle_box):
+        """Wait for pre-launched async A2A and return reconstructed output."""
+        ctx.group = group
+        ctx.world_size = world_size
+        ctx.concat_dim = concat_dim
+        ctx.split_dim = split_dim
+        ctx.handle_box = handle_box
+        ctx.x_shape = x.shape
+        work.wait()
+        return _a2a_reconstruct(out_perm, concat_dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Launch async head→seq A2A for backward overlap, or return zero grad."""
+        if ctx.handle_box is not None:
+            # Launch async head→seq A2A (reverse of forward seq→head)
+            g = grad_output.contiguous()
+            shape = list(g.shape)
+            seq_dim = ctx.concat_dim
+            s_full = shape[seq_dim]
+            ndim = len(shape) + 1
+            x_perm = g.reshape(
+                shape[:seq_dim] + [ctx.world_size, s_full // ctx.world_size] + shape[seq_dim + 1:]
+            ).permute(
+                [seq_dim] + list(range(seq_dim)) + list(range(seq_dim + 1, ndim))
+            ).contiguous()
+            out_perm = torch.empty_like(x_perm)
+            work = dist.all_to_all_single(out_perm, x_perm, group=ctx.group, async_op=True)
+            ctx.handle_box.append((work, out_perm))
+        return grad_output.new_zeros(ctx.x_shape), None, None, None, None, None, None, None
+
+
+class _TorchP2PExchangeFunction(torch.autograd.Function):
+    """Symmetric bidirectional P2P: send local tensor to peer, receive peer's tensor."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, peer_rank: int, group) -> torch.Tensor:  # pylint: disable=arguments-differ
+        """Perform symmetric bidirectional P2P exchange with peer_rank."""
+        ctx.peer_rank = peer_rank
+        ctx.group = group
+        send_buf = tensor.contiguous()
+        recv_buf = torch.empty_like(send_buf)
+        reqs = dist.batch_isend_irecv([
+            dist.P2POp(dist.isend, send_buf, peer_rank, group),
+            dist.P2POp(dist.irecv, recv_buf, peer_rank, group),
+        ])
+        for req in reqs:
+            req.wait()
+        return recv_buf
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Perform symmetric P2P exchange for the backward gradient pass."""
+        send_buf = grad_output.contiguous()
+        recv_buf = torch.empty_like(send_buf)
+        reqs = dist.batch_isend_irecv([
+            dist.P2POp(dist.isend, send_buf, ctx.peer_rank, ctx.group),
+            dist.P2POp(dist.irecv, recv_buf, ctx.peer_rank, ctx.group),
+        ])
+        for req in reqs:
+            req.wait()
+        return recv_buf, None, None
+
+
 # Mapping from string op names to torch.distributed.ReduceOp
 _OP_MAP = {
     'sum': dist.ReduceOp.SUM,
@@ -545,6 +639,12 @@ class TorchPlatform(Platform):
         return dist.irecv(tensor, src, group, tag)
 
     @staticmethod
+    def p2p_exchange(tensor, peer_rank: int, group=None):
+        if peer_rank == dist.get_rank(group):
+            return tensor
+        return _TorchP2PExchangeFunction.apply(tensor, peer_rank, group)
+
+    @staticmethod
     def send_object_list(obj_list, dst=None, group=None):
         dist.send_object_list(obj_list, dst, group)
 
@@ -559,6 +659,31 @@ class TorchPlatform(Platform):
         output = torch.empty(output_shape, dtype=data.dtype, device=data.device)
         handle = dist.reduce_scatter_tensor(output, data, group=group_info.group, async_op=async_op)
         return output, handle
+
+    @staticmethod
+    def all_to_all_single(input_tensor, output_shape, group, async_op=False):
+        output = torch.empty(output_shape, device=input_tensor.device, dtype=input_tensor.dtype)
+        work = dist.all_to_all_single(output, input_tensor, group=group, async_op=async_op)
+        return output, work
+
+    @staticmethod
+    def differentiable_async_a2a_wait(x, work, out_perm, group, world_size, concat_dim, split_dim,
+                                      handle_box=None):
+        """Wait async A2A handle and reconstruct result (differentiable).
+
+        Args:
+            x: Input tensor.
+            work: Async work handle from all_to_all.
+            out_perm: Output buffer from all_to_all.
+            group: Process group.
+            world_size: World size.
+            concat_dim: Dimension for concatenation.
+            split_dim: Dimension for split.
+            handle_box: Optional mutable list; backward appends (work, out_perm) here.
+        """
+        return _TorchAsyncA2AFunction.apply(
+            x, work, out_perm, group, world_size, concat_dim, split_dim, handle_box
+        )
 
     @staticmethod
     def get_tensor_transform():
@@ -734,6 +859,10 @@ class TorchPlatform(Platform):
     @staticmethod
     def no_grad():
         return torch.no_grad()
+
+    @staticmethod
+    def cat(tensors, dim=0):
+        return torch.cat(tensors, dim=dim)
 
     @staticmethod
     def empty_like(tensor, *, dtype=None, device=None, pin_memory=False):
