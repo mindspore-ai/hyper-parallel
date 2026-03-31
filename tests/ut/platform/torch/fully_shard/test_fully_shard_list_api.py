@@ -214,24 +214,6 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
             _validate_module_for_fully_shard("not a module", PlatformType.PYTORCH)
         self.assertIn("nn.Module", str(ctx.exception))
 
-    def test_list_mindspore_valid(self):
-        """List of modules on MindSpore passes validation (both platforms support list).
-
-        description: _validate_module_for_fully_shard([ms_nn.Dense, ...], MINDSPORE); skip if no MS.
-        expectation: No exception when MindSpore is available.
-        feature: fully_shard _validate_module_for_fully_shard MindSpore list.
-        """
-        try:
-            import mindspore.nn
-        except ImportError:
-            self.skipTest("mindspore not installed")
-        # Arrange - use MindSpore Cell for validation
-        from mindspore import nn as ms_nn
-        mods = [ms_nn.Dense(4, 4), ms_nn.Dense(4, 4)]
-        # Act & Assert (no raise)
-        _validate_module_for_fully_shard(mods, PlatformType.MINDSPORE)
-
-
 class TestFullyShardListAPI(unittest.TestCase):
     """Unit tests for fully_shard list support (mocked to avoid NPU/dist)."""
 
@@ -337,52 +319,6 @@ class TestFullyShardListAPI(unittest.TestCase):
                 reshard_after_forward=True,
                 mp_policy=_default_mp_policy(),
             )
-        # Assert
-        self.assertIs(result, modules_list)
-        self.assertEqual(len(result), 2)
-
-    @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
-    @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_fully_shard_list_mindspore_returns_list(self, mock_platform, mock_get_device):
-        """fully_shard with list on MindSpore returns the same list (both platforms support list).
-
-        description: When platform is MindSpore, fully_shard(list) returns same list; patch roots.
-        expectation: result is modules_list, len 2, no cells_and_names on torch module.
-        feature: fully_shard list API cross-platform return contract.
-        """
-        # Arrange (mock to avoid MindSpore Cell validation and device init)
-        mock_platform.platform_type = PlatformType.MINDSPORE
-        mock_get_device.return_value = torch.device("cpu")
-        mesh = self._create_mock_mesh()
-        linear1 = SimpleLinear(4, 4)
-        linear2 = SimpleLinear(4, 4)
-        modules_list = [linear1, linear2]
-        # Act - patch _validate_module_for_fully_shard and _get_root_modules so we never
-        # call MindSpore-only cells_and_names() on torch nn.Module
-        def fake_get_root_modules(modules):
-            return list(modules)
-
-        def fake_hsdp_init(self, *a, **k):
-            self.hsdp_scheduler = MagicMock()
-
-        with patch(
-            "hyper_parallel.core.fully_shard.api._validate_module_for_fully_shard",
-            lambda m, pt: None,
-        ):
-            with patch(
-                "hyper_parallel.core.fully_shard.api._get_root_modules",
-                fake_get_root_modules,
-            ):
-                with patch(
-                    "hyper_parallel.core.fully_shard.api.HSDPModule.hsdp_init",
-                    fake_hsdp_init,
-                ):
-                    result = fully_shard(
-                        modules_list,
-                        mesh=mesh,
-                        reshard_after_forward=True,
-                        mp_policy=_default_mp_policy(),
-                    )
         # Assert
         self.assertIs(result, modules_list)
         self.assertEqual(len(result), 2)

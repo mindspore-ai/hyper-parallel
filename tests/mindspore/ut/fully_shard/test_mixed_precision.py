@@ -41,7 +41,9 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 import mindspore as ms
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState, ShardedState
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
+from hyper_parallel.platform.mindspore.fully_shard.scheduler import MindSporeHSDPSchedulerV2
 from hyper_parallel.platform.mindspore.fully_shard.state import (
     MindSporeHSDPStateV2,
     _to_dtype_if_needed,
@@ -347,7 +349,6 @@ class TestApplyReducedGrad(unittest.TestCase):
         hsdp_param.offload_to_cpu = False
         hsdp_param.sharded_param.grad = None
         hsdp_param.unsharded_accumulated_grad_data = None
-        hsdp_param._return_grad = MagicMock()
         sharded_grad_dtensor = MagicMock(spec=DTensor)
         hsdp_param.to_sharded_dtensor.return_value = sharded_grad_dtensor
 
@@ -359,7 +360,6 @@ class TestApplyReducedGrad(unittest.TestCase):
         casted_grad.dtype = ms.float32
         viewed_grad.to.return_value = casted_grad
         reduced_grad.view.return_value = viewed_grad
-        returned_grad = hsdp_param._return_grad
 
         with patch(
             'hyper_parallel.platform.mindspore.fully_shard.state._to_dtype_if_needed',
@@ -372,11 +372,10 @@ class TestApplyReducedGrad(unittest.TestCase):
         # Verify the cast to orig_dtype
         viewed_grad.to.assert_called_once_with(ms.float32)
         # Verify that sharded_param.grad receives the result first,
-        # then syncs it to the returned object
+        # then becomes the optimizer-visible DTensor grad
         hsdp_param.to_sharded_dtensor.assert_called_once_with(casted_grad)
         self.assertIs(hsdp_param.sharded_param.grad, sharded_grad_dtensor)
-        self.assertEqual(returned_grad.data, sharded_grad_dtensor.to_local())
-        self.assertIsNone(hsdp_param._return_grad)
+        self.assertIsNone(hsdp_param.unsharded_param.grad)
 
     def test_grad_accumulated_when_existing(self):
         """
@@ -395,7 +394,6 @@ class TestApplyReducedGrad(unittest.TestCase):
         hsdp_param.offload_to_cpu = False
         hsdp_param.sharded_param.grad = existing_grad
         hsdp_param.unsharded_accumulated_grad_data = None
-        hsdp_param._return_grad = None
 
         reduced_grad = MagicMock()
         viewed_grad = MagicMock()
@@ -411,13 +409,13 @@ class TestApplyReducedGrad(unittest.TestCase):
         # Verify that the gradient is accumulated into the underlying local tensor
         local_tensor.__iadd__.assert_called_once_with(viewed_grad)
 
-    def test_returned_grad_member_cleared_after_apply(self):
+    def test_unsharded_grad_cleared_after_apply(self):
         """
         Feature: _apply_reduced_grad
         Description: After gradient assignment,
-        the returned gradient member for value_and_grad should be cleared
-        Expectation: hsdp_param._return_grad is consumed and set to None.
-        The internal full-grad reference is cleared as well.
+        the temporary unsharded grad should be cleared
+        Expectation: the reduced DTensor grad is attached to sharded_param.grad
+        and the transient full-grad reference is cleared.
         """
         state = self._make_state_for_apply(ms.float32)
 
@@ -426,8 +424,6 @@ class TestApplyReducedGrad(unittest.TestCase):
         hsdp_param.offload_to_cpu = False
         hsdp_param.sharded_param.grad = None
         hsdp_param.unsharded_accumulated_grad_data = None
-        returned_grad = MagicMock()
-        hsdp_param._return_grad = returned_grad
         sharded_grad_dtensor = MagicMock(spec=DTensor)
         hsdp_param.to_sharded_dtensor.return_value = sharded_grad_dtensor
 
@@ -442,9 +438,7 @@ class TestApplyReducedGrad(unittest.TestCase):
             state._apply_reduced_grad(hsdp_param, reduced_grad)
 
         hsdp_param.to_sharded_dtensor.assert_called_once_with(casted_grad)
-        self.assertEqual(returned_grad.data, sharded_grad_dtensor.to_local())
         self.assertIs(hsdp_param.sharded_param.grad, sharded_grad_dtensor)
-        self.assertIsNone(hsdp_param._return_grad)
         self.assertIsNone(hsdp_param.unsharded_param.grad)
 
 
@@ -476,12 +470,12 @@ class TestReplicateParamGradHandling(unittest.TestCase):
         hsdp_param.zero_grad.assert_called_once_with()
         replicate_param.zero_grad.assert_called_once_with()
 
-    def test_finish_ignored_allreduce_updates_returned_grad(self):
+    def test_finish_ignored_allreduce_materializes_sharded_grad(self):
         """
         Feature: _finish_ignored_allreduce
         Description: After all-reduce finishes for replicate_params,
-        the final local grad should be synced to the returned gradient object
-        Expectation: _return_grad.data is synced to the final local grad and then cleared
+        the reduced local grad should be materialized on sharded_param.grad
+        Expectation: the DTensor grad is assigned and the transient full grad is cleared
         """
         state = self._make_state_for_replicate(ms.float32)
 
@@ -494,7 +488,6 @@ class TestReplicateParamGradHandling(unittest.TestCase):
         local_grad = MagicMock()
         sharded_grad_dtensor = MagicMock(spec=DTensor)
         sharded_grad_dtensor.to_local.return_value = local_grad
-        returned_grad = MagicMock()
 
         param = MagicMock()
         param.all_reduce_handle = MagicMock()
@@ -502,7 +495,6 @@ class TestReplicateParamGradHandling(unittest.TestCase):
         param.sharded_param.grad = None
         param.to_sharded_dtensor.return_value = sharded_grad_dtensor
         param.unsharded_accumulated_grad_data = None
-        param._return_grad = returned_grad
 
         state._ignored_allreduce_works = [(param, reduced_grad, flat_mesh)]
 
@@ -515,10 +507,131 @@ class TestReplicateParamGradHandling(unittest.TestCase):
         param.all_reduce_handle.wait.assert_called_once_with()
         reduced_grad.view.assert_not_called()
         param.to_sharded_dtensor.assert_called_once_with(reduced_grad)
-        self.assertEqual(returned_grad.data, local_grad)
         self.assertIs(param.sharded_param.grad, sharded_grad_dtensor)
-        self.assertIsNone(param._return_grad)
+        self.assertIsNone(param.unsharded_param.grad)
         self.assertEqual(state._ignored_allreduce_works, [])
+
+
+class TestParameterRebinding(unittest.TestCase):
+    """Test MindSpore fully_shard parameter rebinding behavior."""
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.Parameter")
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.as_strided")
+    def test_init_unsharded_param_uses_parameter_empty_then_data_assign(
+        self, mock_as_strided, mock_parameter
+    ):
+        """
+        Feature: init_unsharded_param
+        Description: Build _unsharded_param from Parameter([]) and then assign .data
+        Expectation: Parameter is constructed with [] and its data points to the as_strided tensor view
+        """
+        param = object.__new__(MindSporeHSDPParamV2)
+        param.all_gather_outputs = [MagicMock(name="all_gather_output")]
+        param._orig_size = (2, 3)
+        param._contiguous_orig_stride = (3, 1)
+        param.sharded_param = MagicMock()
+        param.sharded_param.name = "weight"
+        param.sharded_param.requires_grad = True
+
+        unsharded_tensor = MagicMock(name="unsharded_tensor")
+        mock_as_strided.return_value = unsharded_tensor
+        unsharded_param = MagicMock(name="unsharded_param")
+        mock_parameter.return_value = unsharded_param
+
+        param.init_unsharded_param()
+
+        mock_parameter.assert_called_once_with(
+            [],
+            name="weight",
+            requires_grad=True,
+        )
+        mock_as_strided.assert_called_once_with(
+            param.all_gather_outputs[0],
+            (2, 3),
+            (3, 1),
+            storage_offset=0,
+        )
+        self.assertIs(param._unsharded_param, unsharded_param)
+        self.assertIs(unsharded_param.data, unsharded_tensor)
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.set_requires_grad_if_needed")
+    def test_to_unsharded_rebinds_module_param(self, mock_set_requires_grad):
+        """
+        Feature: to_unsharded
+        Description: Switch module references to the unsharded parameter object
+        Expectation: requires_grad is synced, _setattr_on_modules gets _unsharded_param, and state updates
+        """
+        param = object.__new__(MindSporeHSDPParamV2)
+        param.sharded_param = MagicMock(name="sharded_param")
+        param._unsharded_param = MagicMock(name="unsharded_param")
+        param._setattr_on_modules = MagicMock()
+
+        param.to_unsharded()
+
+        mock_set_requires_grad.assert_called_once_with(param.sharded_param, param._unsharded_param)
+        param._setattr_on_modules.assert_called_once_with(param._unsharded_param)
+        self.assertEqual(param.sharded_state, ShardedState.UNSHARDED)
+
+    def test_to_sharded_rebinds_module_param(self):
+        """
+        Feature: to_sharded
+        Description: Switch module references back to the sharded parameter object
+        Expectation: _setattr_on_modules gets sharded_param, unsharded storage is freed, and state updates
+        """
+        param = object.__new__(MindSporeHSDPParamV2)
+        param.sharded_param = MagicMock(name="sharded_param")
+        param._setattr_on_modules = MagicMock()
+        param.free_unsharded_param = MagicMock()
+
+        param.to_sharded()
+
+        param._setattr_on_modules.assert_called_once_with(param.sharded_param)
+        param.free_unsharded_param.assert_called_once_with()
+        self.assertEqual(param.sharded_state, ShardedState.SHARDED)
+
+
+class TestSchedulerBackwardCompatFlow(unittest.TestCase):
+    """Test MindSpore scheduler behavior added by the backward-compat refactor."""
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.scheduler._pynative_executor")
+    def test_backward_pre_hook_queues_final_callback_before_pre_backward(self, mock_executor):
+        """
+        Feature: backward pre hook
+        Description: Queue the final backward callback and then trigger the HSDP pre-backward hook
+        Expectation: queue_backward_final_callback is called and the incoming grad is returned unchanged
+        """
+        scheduler = object.__new__(MindSporeHSDPSchedulerV2)
+        scheduler.scheduler_state = FSDPSchedulerState.PRE_FORWARD
+        scheduler.cell = MagicMock()
+        scheduler._hsdp_backward_pre_hook = MagicMock()
+        scheduler._backward_hook = MagicMock()
+        grad = MagicMock()
+
+        result = scheduler._backward_pre_hook(grad)
+
+        mock_executor.queue_backward_final_callback.assert_called_once_with(scheduler._backward_hook)
+        scheduler._hsdp_backward_pre_hook.assert_called_once_with(scheduler.cell, None)
+        self.assertIs(result, grad)
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.scheduler._pynative_executor")
+    def test_backward_pre_hook_is_noop_when_already_in_pre_backward(self, mock_executor):
+        """
+        Feature: backward pre hook
+        Description: Avoid re-entering pre-backward when already in PRE_BACKWARD state
+        Expectation: only the final callback is queued and the HSDP pre-backward hook is skipped
+        """
+        scheduler = object.__new__(MindSporeHSDPSchedulerV2)
+        scheduler.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
+        scheduler.cell = MagicMock()
+        scheduler._hsdp_backward_pre_hook = MagicMock()
+        scheduler._backward_hook = MagicMock()
+        grad = MagicMock()
+
+        result = scheduler._backward_pre_hook(grad)
+
+        mock_executor.queue_backward_final_callback.assert_called_once_with(scheduler._backward_hook)
+        scheduler._hsdp_backward_pre_hook.assert_not_called()
+        self.assertIs(result, grad)
 
 
 if __name__ == "__main__":

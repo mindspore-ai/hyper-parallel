@@ -7,7 +7,6 @@ Run with: msrun --worker_num=8 --local_worker_num=8 --log_dir=msrun_log --join=T
 import os
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
-import mindspore as ms
 from mindspore import nn
 from mindspore import communication as dist
 from mindspore._c_expression import NoFallbackGuard
@@ -65,14 +64,14 @@ if __name__ == "__main__":
 
     # Optimizer and loss
     forward_fn = get_forward_fn(fsdp_model)
-    grad_fn = ms.value_and_grad(forward_fn, None, fsdp_model.trainable_params(), has_aux=False)
     optimizer = nn.Adam(fsdp_model.trainable_params(), learning_rate=1e-5)
 
     # Simple training loop
     for step in range(10):
         fsdp_model.zero_grad()
-        # For illustration, get dummy loss and dummy grads.
-        loss, grads = grad_fn(dummy_data)
+        loss = forward_fn(dummy_data)
+        loss.backward()
+        grads = tuple(param.grad for param in fsdp_model.trainable_params())
         with NoFallbackGuard():
             optimizer(grads)
         print(f"[step {step}] loss = {loss.item():.4f}")

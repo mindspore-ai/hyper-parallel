@@ -120,9 +120,8 @@ Ground every answer in the current code under `hyper_parallel/core/fully_shard/`
 - Torch unsharded execution relies on module parameters pointing at the existing `TorchHSDPParamV2._unsharded_param` object; hook logic may inspect or use it, but must not swap it out for a new `nn.Parameter`.
 
 ### MindSpore-specific behavior
-- MindSpore cannot follow the Torch pattern of swapping module parameters between sharded and unsharded `Parameter` objects: `value_and_grad` captures parameter object identity up front, so fully_shard must keep the runtime parameter object stable.
-- `MindSporeHSDPParamV2` therefore implements state switching as in-place data and class mutation: `_update_param_data(...)` flips the same parameter object between DTensor-like sharded behavior and plain-Parameter unsharded behavior, while `_local_tensor` continues to represent the local shard.
-- Gradients are bridged through hooks instead of being naturally attached like Torch autograd: `_add_grad_to_unsharded_param()` captures the full gradient into `_unsharded_param.grad`, and `MindSporeHSDPStateV2.post_backward()` reduces it, writes the sharded result to `sharded_param.grad`, and keeps the functional-diff return path aligned.
+- MindSpore `fully_shard()` enables a PyNative backward-compat path through `platform/mindspore/autograd_compat.py`, and the backend runs in a torch-like `loss.backward()` style.
+- `_unsharded_param` is created as `Parameter([])` and then assigned through `.data` so it shares storage with the all-gather buffer.
 - `MindSporeHSDPStateV2.post_backward()` performs most reduction-and-apply work inline, and `avg` reduction is implemented as `ReduceOp.SUM` plus explicit division through `_div_if_needed()`.
 
 ## Debugging And Review Guide

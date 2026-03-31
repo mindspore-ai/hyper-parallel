@@ -81,6 +81,28 @@ def get_forward_fn(net):
     return forward_fn
 
 
+def get_backward_grads(net, expected_dtype=None):
+    """Collect DTensor gradients from fully_shard-managed DTensor params."""
+    grads = []
+    for idx, param in enumerate(net.trainable_params()):
+        grad = param.grad
+        assert isinstance(grad, DTensor), f"Parameter grad {idx} is not a DTensor"
+        assert grad.shape == param.shape, (
+            f"Gradient global shape mismatch at index {idx}: "
+            f"Expected {param.shape}, got {grad.shape}"
+        )
+        assert grad.local_shape == param.local_shape, (
+            f"Gradient local shape mismatch at index {idx}: "
+            f"Expected {param.local_shape}, got {grad.local_shape}"
+        )
+        if expected_dtype is not None:
+            assert grad.dtype == expected_dtype, (
+                f"Returned grad {idx} dtype mismatch: expected {expected_dtype}, got {grad.dtype}"
+            )
+        grads.append(grad)
+    return tuple(grads)
+
+
 def assert_sharded_param_layout(
     net,
     origin_shapes=None,
@@ -109,25 +131,7 @@ def assert_sharded_param_layout(
     return param_type_names
 
 
-def assert_grad_views(net, grads, expected_dtype=None):
-    """Validate sharded grad storage and returned local grad views."""
-    for idx, (param, grad) in enumerate(zip(net.trainable_params(), grads)):
-        assert isinstance(param.grad, DTensor), f"Parameter grad {idx} is not a DTensor"
-        assert grad.shape == param.to_local().shape, (
-            f"Gradient local shape mismatch at index {idx}: "
-            f"Expected {param.to_local().shape}, got {grad.shape}"
-        )
-        if expected_dtype is not None:
-            assert param.grad.to_local().dtype == expected_dtype, (
-                f"Parameter grad {idx} dtype mismatch: "
-                f"expected {expected_dtype}, got {param.grad.to_local().dtype}"
-            )
-            assert grad.dtype == expected_dtype, (
-                f"Returned grad {idx} dtype mismatch: expected {expected_dtype}, got {grad.dtype}"
-            )
-
-
-def run_accumulated_step(data, label, grad_fn):
+def run_accumulated_step(data, label, forward_fn, net):
     """Run one fully_shard step with per-micro-step gradient accumulation."""
     micro_step = 4
     micro_size = data.shape[0] // micro_step
@@ -137,10 +141,11 @@ def run_accumulated_step(data, label, grad_fn):
         f"Expected at least {micro_step} micro batches, got {len(data_list)}"
     )
     total_loss = 0
-    grads = None
     for micro_idx in range(micro_step):
-        (loss, _), grads = grad_fn(data_list[micro_idx], label_list[micro_idx])
+        loss, _ = forward_fn(data_list[micro_idx], label_list[micro_idx])
+        loss.backward()
         total_loss = total_loss + loss
+    grads = get_backward_grads(net)
     return total_loss, grads, micro_step
 
 
@@ -183,7 +188,7 @@ def run_fully_shard_multi_card(
 
     assert_sharded_param_layout(net, origin_shapes, shard_dim_size)
 
-    grad_fn = ms.value_and_grad(get_forward_fn(net), None, net.trainable_params(), has_aux=True)
+    forward_fn = get_forward_fn(net)
     optimizer = nn.Adam(net.trainable_params(), learning_rate=learning_rate)
     loss_sync_allreduce = ops.AllReduce(ops.ReduceOp.SUM)
 
@@ -194,9 +199,8 @@ def run_fully_shard_multi_card(
         net.zero_grad()
         if accumulate_grad:
             total_loss, grads, micro_step = run_accumulated_step(
-                data, label, grad_fn
+                data, label, forward_fn, net
             )
-            assert_grad_views(net, grads)
             with SkipDTensorDispatch():
                 for grad in grads:
                     grad /= micro_step
@@ -204,8 +208,9 @@ def run_fully_shard_multi_card(
             reduced_loss = loss_sync_allreduce(total_loss)
             final_loss = reduced_loss / (micro_step * dp_size)
         else:
-            (loss, _), grads = grad_fn(data, label)
-            assert_grad_views(net, grads)
+            loss, _ = forward_fn(data, label)
+            loss.backward()
+            grads = get_backward_grads(net)
             with SkipDTensorDispatch():
                 optimizer(grads)
             reduced_loss = loss_sync_allreduce(loss)
@@ -251,7 +256,7 @@ def run_fully_shard_multi_card_with_empty_init(
 
     param_dict = ms.load_checkpoint(ckpt_path)
     net.load_state_dict(param_dict, strict=True)
-    grad_fn = ms.value_and_grad(get_forward_fn(net), None, net.trainable_params(), has_aux=True)
+    forward_fn = get_forward_fn(net)
     optimizer = nn.Adam(net.trainable_params(), learning_rate=learning_rate)
     loss_sync_allreduce = ops.AllReduce(ops.ReduceOp.SUM)
 
@@ -262,9 +267,8 @@ def run_fully_shard_multi_card_with_empty_init(
         net.zero_grad()
         if accumulate_grad:
             total_loss, grads, micro_step = run_accumulated_step(
-                data, label, grad_fn
+                data, label, forward_fn, net
             )
-            assert_grad_views(net, grads)
             with SkipDTensorDispatch():
                 for grad in grads:
                     grad /= micro_step
@@ -272,8 +276,9 @@ def run_fully_shard_multi_card_with_empty_init(
             reduced_loss = loss_sync_allreduce(total_loss)
             final_loss = reduced_loss / (micro_step * dp_size)
         else:
-            (loss, _), grads = grad_fn(data, label)
-            assert_grad_views(net, grads)
+            loss, _ = forward_fn(data, label)
+            loss.backward()
+            grads = get_backward_grads(net)
             with SkipDTensorDispatch():
                 optimizer(grads)
             reduced_loss = loss_sync_allreduce(loss)
@@ -313,7 +318,7 @@ def run_fully_shard_multi_card_ignored(ckpt_path, mesh):
 
     fully_shard(net, mesh=mesh, mp_policy=mp_policy, replicate_params=replicate_params)
 
-    grad_fn = ms.value_and_grad(get_forward_fn(net), None, net.trainable_params(), has_aux=True)
+    forward_fn = get_forward_fn(net)
     optimizer = nn.Adam(net.trainable_params(), learning_rate=learning_rate)
     loss_sync_allreduce = ops.AllReduce(ops.ReduceOp.SUM)
 
@@ -321,7 +326,9 @@ def run_fully_shard_multi_card_ignored(ckpt_path, mesh):
     i = 0
     for data, label in data_set:
         net.zero_grad()
-        (loss, _), grads = grad_fn(data, label)
+        loss, _ = forward_fn(data, label)
+        loss.backward()
+        grads = get_backward_grads(net)
         with SkipDTensorDispatch():
             optimizer(grads)
         reduced_loss = loss_sync_allreduce(loss)
