@@ -24,12 +24,12 @@
 |------|---------------|-----------|
 | YAML Registration | `hyper_parallel/core/shard/ops/yaml/*.yaml` | Configure operator to distributed implementation class mapping |
 | Python Implementation | `hyper_parallel/core/shard/ops/parallel_*.py` | Inherit `DistributedOp` or its subclass |
-| Unit Test (UT) | `tests/mindspore/ut/parallel_ops_infer/` | Platform-agnostic, verify `infer_layout` logic |
-| Integration Test (ST) | `tests/mindspore/st/shard/ops` `tests/torch/shard/ops` | 8-card environment verify distributed execution |
+| Unit Test (UT) | `tests/ut/core/shard/ops/` | Platform-agnostic, verify `infer_layout` and `get_expand_impl` logic |
+| Integration Test (ST) | `tests/mindspore/st/shard/ops/` `tests/torch/shard/ops/` | 8-card environment verify distributed execution |
 | Base Class Definition | `hyper_parallel/core/shard/ops/parallel_ops.py` | `DistributedOp` base class |
 | Dispatch Core | `hyper_parallel/core/shard/_op_dispatch.py` | `OpDispatcher.dispatch` method |
-| Layout Definition | `hyper_parallel/core/layout.py` | Distributed layout abstraction |
-| DTensor Definition | `hyper_parallel/core/dtensor.py` | Distributed tensor implementation |
+| Layout Definition | `hyper_parallel/core/dtensor/layout.py` | Distributed layout abstraction |
+| DTensor Definition | `hyper_parallel/core/dtensor/dtensor.py` | Distributed tensor implementation |
 
 ---
 
@@ -60,6 +60,7 @@
 | **`WithShape`** | **Operators supporting broadcast** ⭐ |
 | `Reshape` | Shape transformation |
 | `Slice` | Slice operations |
+| `WithTupleExpand` | Tuple/list argument flattening |
 
 ---
 
@@ -82,10 +83,11 @@
 
 | Item | MindSpore | PyTorch |
 |------|-----------|---------|
-| **Operator Name Style** | PascalCase (`Add`, `MatMul`) | snake_case (`add`, `matmul`) |
+| **Interface Name Style** | `mint.matmul`, `mint.nn.functional.relu` | `torch.matmul`, `torch.nn.functional.linear` |
 | **YAML Files** | `element_wise_ops.yaml`, etc. | `torch_*.yaml` |
-| **YAML Entry** | `Add:` | `add:` |
-| **Test Directories** | `tests/mindspore/` | `tests/torch/` |
+| **YAML Entry** | `MatMul:` | `matmul:` |
+| **UT Test Directory** | `tests/ut/core/shard/ops/` (shared) | `tests/ut/core/shard/ops/` (shared) |
+| **ST Test Directories** | `tests/mindspore/st/shard/ops/` | `tests/torch/shard/ops/` |
 
 > **Important**: MindSpore and PyTorch can reuse the same distributed operator implementation class.
 
@@ -107,12 +109,12 @@
 
 ### UT Test Scenarios
 
-| Scenario Type | Description | Required for WithShape |
-|---------------|-------------|------------------------|
-| **Same Layout** | Two inputs have same tensor_map | ❌ |
-| **Different Layout** | Inputs sharded on different dimensions | ❌ |
-| **Scalar Broadcast** | One input is scalar | ✅ |
-| **Shape Broadcast** | Different rank shapes | ✅ |
+| Scenario Type | Description | Required |
+|---------------|-------------|----------|
+| **Supported Scenarios** | All scenarios listed in analysis report | ✅ Required |
+| **Unsupported Scenarios** | Verify explicit `ValueError` raised | ✅ Required |
+| **Scalar Broadcast** | One input is scalar | ✅ For WithShape |
+| **Shape Broadcast** | Different rank shapes | ✅ For WithShape |
 
 ### ST Test Scenarios
 
@@ -186,7 +188,7 @@ feat(shard): add {OpName} operator distributed support
 | Error | Fix Method |
 |-------|------------|
 | `KeyError: 'input_shapes'` | Add `infer_layout_suffix: WithShape` in YAML |
-| Output tensor_map error | Compare with MindSpore reference code |
+| Output tensor_map error | Compare with analysis report and reference code |
 
 ### Git/autogit Related
 

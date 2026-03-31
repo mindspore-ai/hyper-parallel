@@ -6,8 +6,6 @@ description: Execution-oriented workflow for HyperParallel distributed operator 
 # HyperParallel Distributed Operator Development Workflow
 
 > ✅ 【Unified Entry】When developing HyperParallel distributed operators, **just call this SKILL**, and I will automatically handle the entire process including operator analysis, implementation, testing, etc.
->
-> 🚫 **Do not call directly**: `ms-op-analysis` and `pt-op-analysis` are internal tool SKILLs, automatically called by this SKILL, **no need for users to use directly**.
 
 ## When to Use This Workflow
 
@@ -15,29 +13,17 @@ Use this workflow when developers need to add distributed operator support for t
 
 ## How to Use
 
-Call this SKILL directly, providing the operator name and platform type:
+Call this SKILL directly, providing the MindSpore mint interface name or PyTorch operator name, along with source code paths:
 
 ```bash
-# Develop distributed support for MindSpore operator
-/dist-op-dev I want to develop distributed support for MindSpore operator MatMul, I have MindSpore source code locally at /d/workspace/mindspore for reference.
+# Develop distributed support for MindSpore mint interface
+/dist-op-dev I want to develop distributed support for MindSpore mint interface mint.matmul. MindSpore source code is at /root/workspace/mindspore, PyTorch source code is at /root/workspace/pytorch.
 
 # Develop distributed support for PyTorch operator
-/dist-op-dev I want to develop distributed support for PyTorch operator torch.add, I have MindSpore source code locally at /d/workspace/mindspore for reference.
+/dist-op-dev I want to develop distributed support for PyTorch operator torch.nn.functional.linear. MindSpore source code is at /root/workspace/mindspore, PyTorch source code is at /root/workspace/pytorch.
 ```
 
----
-
-## Terminology Definitions
-
-| Term | Definition | Details |
-|------|------|----------|
-| **Scenario 0/1/2** | Implementation method classification: Scenario 0=fully use base class, Scenario 1=extend base class, Scenario 2=fully custom | See [implementation-decisions.md](references/implementation-decisions.md) |
-| **WithShape** | A type of `infer_layout_suffix`, used for operators that support broadcasting | See [workflow 03](workflows/03-yaml-registration.md) |
-| **DP** | Data Parallel, data is sharded along batch dimension | - |
-| **MP** | Model Parallel, model parameters are sharded along some dimension | - |
-| **Hybrid** | Hybrid Parallel, using both DP and MP | - |
-| **Partial** | Partial state of a tensor, indicating the tensor only contains partial data along some dimension | See [implementation-decisions.md](references/implementation-decisions.md) |
-| **TensorMap** | Describes the sharding strategy for each dimension of a tensor, -1 means not sharded | - |
+**Source code paths are required** — the dist-op-analysis SKILL needs them to locate interface definitions, Primitive mappings, and distributed strategy references.
 
 ---
 
@@ -71,7 +57,7 @@ When using this SKILL to develop distributed operators, create a TODOLIST, then 
 
   - The operator analysis process must follow the procedure described in **workflows/01-operator-analysis.md**. Execute each step in order.
   - Goal: Get operator interface definition, distributed implementation plan, implementation reference
-  - Input: Operator name, platform type
+  - Input: MindSpore mint Interface, PyTorch Interface, MindSpore Source Code Path,PyTorch Source Code Path
   - Output: Analysis report file `.claude/skills/dist-op-dev/analysis-results/{OpName}-analysis.md` (🔴required)
 
 - [ ] **[Step 2](workflows/02-python-implementation.md)**: Python Implementation
@@ -91,16 +77,22 @@ When using this SKILL to develop distributed operators, create a TODOLIST, then 
 - [ ] **[Step 4](workflows/04-unit-testing.md)**: Unit Testing (UT)
 
   - Must: The test generation process must follow the procedure described in **workflows/04-unit-testing.md**. Execute each step in order.
-  - Goal: Verify infer_layout logic correctness, cover various layout combinations
-  - Input: YAML config from Step 3, Python implementation class from Step 2
-  - Output: `tests/mindspore/ut/parallel_ops_infer/test_parallel_{operator_name}.py` file
+  - Goal: Verify infer_layout and get_expand_impl logic correctness, cover supported/unsupported scenarios
+  - Input: Python implementation class from Step 2, analysis report from Step 1
+  - Output: `tests/ut/core/shard/ops/test_parallel_*.py`
 
 - [ ] **[Step 5](workflows/05-integration-testing.md)**: Integration Testing (ST)
 
   - Must: The test generation process must follow the procedure described in **workflows/05-integration-testing.md**. Execute each step in order.
   - Goal: Verify end-to-end distributed execution correctness in 8-card environment
-  - Input: YAML config from Step 3, Python implementation from Step 2, Operator semantics from Step 1
-  - Output: `tests/mindspore/st/shard/ops/test_ops_{operator_name}.py` file
+  - Input: YAML config from Step 3, Python implementation from Step 2, analysis report from Step 1
+  - Output: `tests/mindspore/st/shard/ops/test_ops_*.py` + `*_shard_in_python.py` or `tests/torch/shard/ops/test_parallel_op_*.py` + `parallel_op_*.py`
+
+- [ ] **[Step 6](workflows/06-git-commit.md)**: Git Commit and PR Creation
+
+  - Goal: Create feature branch, call autogit to complete lint check, commit, push, and create PR if needed
+  - Input: All modified code, operator name
+  - Output: Feature branch `feat/{OpName}-distributed-support`, commit pushed, PR created (if needed)
 
 ---
 
@@ -123,19 +115,20 @@ When using this SKILL to develop distributed operators, create a TODOLIST, then 
 |------|---------------|-----------|
 | Python Implementation | `hyper_parallel/core/shard/ops/parallel_*.py` | Inherit `DistributedOp` or its subclass |
 | YAML Registration | `hyper_parallel/core/shard/ops/yaml/*.yaml` | Configure operator to distributed implementation class mapping |
-| Unit Test (UT) | `tests/mindspore/ut/parallel_ops_infer/` | Platform-agnostic, verify `infer_layout` `get_expand_impl`(if contains) logic correctness |
-| Integration Test (ST) | `tests/mindspore/st/shard/ops` `tests/torch/shard/ops` | 8-card environment verify distributed execution correctness |
-**Detailed Test(ST):** See [Quick Reference](references/quick-reference.md)
+| Unit Test (UT) | `tests/ut/core/shard/ops/` | Platform-agnostic, verify `infer_layout` and `get_expand_impl` logic |
+| Integration Test (ST) | `tests/mindspore/st/shard/ops/` `tests/torch/shard/ops/` | 8-card environment verify distributed execution |
+
+> **Detailed quick reference**: See [references/quick-reference.md](references/quick-reference.md)
 
 ### Platform Differences
 
 | Item | MindSpore | PyTorch |
 |------|-----------|---------|
-| **Operator Name Style** | PascalCase (e.g., `Add`, `MatMul`) | snake_case (e.g., `add`, `matmul`) |
+| **Interface Name Style** | mint.matmul, mint.nn.functional.relu | torch.matmul, torch.nn.functional.linear |
 | **YAML Files** | `element_wise_ops.yaml`, `matmul_ops.yaml`, etc. | `torch_*.yaml` |
-| **Integration Test Directories** | `tests/mindspore/st/shard/` | `tests/torch/shard/ops/` |
+| **UT Test Directory** | `tests/ut/core/shard/ops/` (shared) | `tests/ut/core/shard/ops/` (shared) |
+| **ST Test Directories** | `tests/mindspore/st/shard/ops/` | `tests/torch/shard/ops/` |
 
-Unit Test cases are all placed in the directory `tests/mindspore/ut/parallel_ops_infer/`.
 **Important Note:** If MindSpore operator and PyTorch operator have the same semantics, they **can reuse the same distributed operator implementation class**.
 
 ---
@@ -145,8 +138,7 @@ Unit Test cases are all placed in the directory `tests/mindspore/ut/parallel_ops
 | SKILL | Purpose | When Called |
 |-------|---------|-------------|
 | **autogit** | Git workflow automation (commit, pr, status, etc.) | Workflow 6, complete code commit and PR creation |
-| **ms-op-analysis** | MindSpore operator analysis | Workflow 1, automatically called when analyzing MindSpore operators |
-| **pt-op-analysis** | PyTorch operator analysis | Workflow 1, automatically called when analyzing PyTorch operators |
+| **dist-op-analysis** | Internal operator analysis (read-only) | Workflow 1, provides interface specs, distributed strategies, and HyperParallel implementation guidance |
 
 ---
 

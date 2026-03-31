@@ -62,7 +62,7 @@ max-statements=50
 pylint hyper_parallel/core/shard/ops/parallel_elementwise.py
 
 # Check multiple files
-pylint hyper_parallel/core/shard/ops/parallel_*.py tests/mindspore/ut/parallel_ops_infer/*.py
+pylint hyper_parallel/core/shard/ops/parallel_*.py tests/ut/core/shard/ops/*.py
 
 # Ignore specific warnings
 pylint --disable=C0114,R0913 hyper_parallel/core/shard/ops/parallel_elementwise.py
@@ -262,19 +262,19 @@ def infer_layout(
 
 ```bash
 # UT tests
-pytest tests/mindspore/ut/parallel_ops_infer/ -v
+pytest tests/ut/core/shard/ops/ -v
 
 # Single UT file
-pytest tests/mindspore/ut/parallel_ops_infer/test_parallel_elementwise_ops.py -v
+pytest tests/ut/core/shard/ops/test_parallel_elementwise_ops.py -v
 
 # Single test case
-pytest tests/mindspore/ut/parallel_ops_infer/test_parallel_elementwise_ops.py::test_broadcast_scalar_operand -v
+pytest tests/ut/core/shard/ops/test_parallel_elementwise_ops.py::test_broadcast_scalar_operand -v
 
 # Debug mode
-pytest --pdb tests/mindspore/ut/parallel_ops_infer/test_parallel_elementwise_ops.py::test_broadcast_scalar_operand
+pytest --pdb tests/ut/core/shard/ops/test_parallel_elementwise_ops.py::test_broadcast_scalar_operand
 
 # Generate coverage report
-pytest --cov=hyper_parallel tests/mindspore/ut/parallel_ops_infer/ --cov-report=html
+pytest --cov=hyper_parallel tests/ut/core/shard/ops/ --cov-report=html
 ```
 
 ---
