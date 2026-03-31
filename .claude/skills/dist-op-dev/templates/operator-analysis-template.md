@@ -120,7 +120,7 @@ For detailed placeholder descriptions, refer to the analysis workflow documentat
 
 ### Implementation Strategy
 
-**Implementation Method**: `{implementation_approach}` (Scenario 0/1/2)
+**Implementation Method**: `{implementation_approach}` (Scenario 0/1/2: Scenario 0=fully use base class, Scenario 1=extend base class, Scenario 2=fully custom)
 
 #### infer_layout Implementation
 
@@ -132,7 +132,7 @@ def infer_layout(self, layouts, extra_args):
     # 2. Layout inference (refer to {infer_output_func})
     {layout_inference_code}
 
-    # 3. Partial handling (if needed)
+    # 3. Partial handling (if needed, important)
     {partial_handling_code}
 
     return {return_statement}

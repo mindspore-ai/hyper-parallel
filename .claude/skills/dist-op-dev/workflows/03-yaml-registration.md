@@ -15,8 +15,11 @@ Register operator in YAML config file, configure `infer_layout_suffix`, so the f
 
 ---
 
-## infer_layout_suffix Configuration
+## Step 1: Determine Whether `infer_layout_suffix` Is Required
 
+Before registering the operator in the YAML file, determine whether the operator requires an `infer_layout_suffix`.
+
+Use the following table to decide:
 | Suffix Value | Corresponding Method | extra_args Content | Usage Scenario |
 |--------------|---------------------|-------------------|----------------|
 | **(no suffix)** | `_with_layout_infer` | `[scalar/non-tensor args]` | Simple operators (no broadcast) |
@@ -24,14 +27,15 @@ Register operator in YAML config file, configure `infer_layout_suffix`, so the f
 | `Reshape` | `_with_layout_infer_reshape` | `[target_shape, input_shape]` | Shape transformation |
 | `Slice` | `_with_layout_infer_slice` | `[begin, end, global_shape]` | Slice operations |
 
-> **Important Note**: If the operator supports broadcasting (scalar broadcast, shape broadcast), **must** configure `infer_layout_suffix: WithShape`. Otherwise ST test broadcast scenarios will fail with error, unable to get `input_shapes` info.
+> **Important Rule**: If the operator supports broadcasting (scalar broadcast, shape broadcast), **must** configure `infer_layout_suffix: WithShape`. Otherwise ST test broadcast scenarios will fail with error, unable to get `input_shapes` info.
 
 ---
 
-## Configuration Scenarios
+## Step 2: Choose and Implement the Appropriate YAML Registration
 
+**Purpose:**
+Select and implement the appropriate YAML registration configuration according to the scenario below.
 ### Scenario A: Basic Registration (No Broadcast Support)
-
 **Configuration Example**:
 ```yaml
 ReLU:
@@ -41,7 +45,6 @@ ReLU:
 ```
 
 ### Scenario B: Support Broadcast (WithShape) ⭐ Most Common
-
 **Configuration Example**:
 ```yaml
 Greater:
@@ -52,7 +55,6 @@ Greater:
 ```
 
 ### Scenario C: Shape Transformation (Reshape)
-
 **Configuration Example**:
 ```yaml
 Reshape:
@@ -63,7 +65,6 @@ Reshape:
 ```
 
 ### Scenario D: Slice Operation (Slice)
-
 **Configuration Example**:
 ```yaml
 Slice:
@@ -74,7 +75,6 @@ Slice:
 ```
 
 ### Scenario E: Fully Use Base Class (Recommended)
-
 **Configuration Example**:
 ```yaml
 __default__:
@@ -126,11 +126,3 @@ ReLU:
 - [ ] PyTorch operators use snake_case, MindSpore operators use PascalCase
 - [ ] Cross-platform reuse operators point to same implementation class (if applicable)
 
----
-
-## Next Step
-
-After YAML registration is complete, proceed to **[Workflow 4: Unit Testing (UT)](./04-unit-testing.md)**
-
-**Input:** Python implementation class
-**Goal:** Verify `infer_layout` logic correctness, cover various layout combinations

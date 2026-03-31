@@ -1,5 +1,20 @@
 # Workflow 5: Integration Testing (ST)
 
+## Priority Rule
+
+If there is any conflict between:
+
+- previous context code
+- other test files
+- examples generated earlier
+- this document
+
+You **MUST follow the rules defined in this document.**
+
+Do **NOT reuse testing code patterns** from previous context unless they match this specification.
+
+Please follow the testing guidelines defined in: `rules/distributed-op-testing.md`.
+
 ## Goal
 
 Verify end-to-end distributed execution correctness in 8-card distributed environment, compare standalone vs distributed output results.
@@ -12,21 +27,28 @@ Verify end-to-end distributed execution correctness in 8-card distributed enviro
 
 ## Output
 
-- **ST Shell File**: `tests/mindspore/st/shard/test_ops_*.py` or `tests/torch/shard/ops/test_ops_*.py`
-- **ST Implementation File**: `tests/mindspore/st/shard/*_shard_in_python.py` or `tests/torch/shard/ops/*.py`
+- **ST Shell File**: `tests/mindspore/st/shard/ops/test_*_shard_in_python.py` or `tests/torch/shard/ops/test_ops_*.py`
+- **ST Implementation File**: `tests/mindspore/st/shard/ops/*_shard_in_python.py` or `tests/torch/shard/ops/*.py`
 
 ---
 
-## Test Environment
+## Step 1: Configure Distributed Test Environment
 
+ST tests must run in an **8-card distributed environment.**
+
+**MindSpore and Pytorch Launch Command**:
 | Platform | Distributed Launch Command | Card Count Config |
 |----------|---------------------------|-------------------|
-| **MindSpore** | `msrun --worker_num=8` | 8 cards |
-| **PyTorch** | `torchrun --nproc_per_node=8` | 8 cards |
+| **MindSpore** | `MindsporeCase` | 8 cards |
+| **PyTorch** | `TorchCase` | 8 cards |
+
+If the local environment cannot run 8-card tests, still **create or update the ST files**
 
 ---
 
-## Test Dimensions
+## Step 2: Define Test Dimensions
+
+ST tests must cover:
 
 | Test Dimension | Check Item | Description |
 |----------------|------------|-------------|
@@ -37,7 +59,7 @@ Verify end-to-end distributed execution correctness in 8-card distributed enviro
 
 ---
 
-## Test Scenarios
+## Step 3: Define Test Scenarios
 
 | Test Scenario | Operator Examples | Required |
 |---------------|-------------------|----------|
@@ -48,49 +70,33 @@ Verify end-to-end distributed execution correctness in 8-card distributed enviro
 
 ---
 
-## MindSpore ST Implementation
+## Step 4: Implement ST Test Case
 
-### Shell File Location
+Each test case should follow the structure below:
+1. Initialize distributed environment
+2. Configure device mesh
+3. Configure tensor layout
+4. Execute distributed operator
+5. Compare standalone and distributed outputs
 
-`tests/mindspore/st/shard/test_ops_greater.py`
+### Mindspore Example
 
-### run_case Function Template
-
+**Test case Example**
 ```python
-import os
-import shutil
-from tests.common.mark_utils import arg_mark
-
-def run_case(file_name, case_name, master_port):
-    """Run test case."""
-    file_base = os.path.splitext(file_name)[0]
-    dir_to_remove = f"./{file_base}/{case_name}"
-    if os.path.exists(dir_to_remove):
-        shutil.rmtree(dir_to_remove)
-
-    # MindSpore uses msrun to launch distributed
-    cmd = (
-        f"export GLOG_v=2 && "
-        f"msrun --worker_num=8 --local_worker_num=8 "
-        f"--master_addr=127.0.0.1 --master_port={master_port} "
-        f"--join=True --log_dir=./{dir_to_remove}/msrun_log "
-        f"pytest -s -v {file_name}::{case_name}"
-    )
-    ret = os.system(cmd)
-    assert ret == 0, f"Test case {case_name} failed with return code {ret}"
-```
-
-### Test Case Template (with @arg_mark decorator)
-
-```python
-from hyper_parallel import DTensor, Layout, shard
-from hyper_parallel.core.device_mesh import init_device_mesh
 import mindspore as ms
-from mindspore import Tensor
+import mindspore.communication.management as D
+from mindspore import Tensor, ops
+from hyper_parallel import init_device_mesh, shard_module
+from hyper_parallel.core.dtensor import distribute_tensor
+from hyper_parallel.core.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
 # Initialize device mesh
-device_mesh = init_device_mesh((2, 2, 2), ("dp", "cp", "mp"))
-layout = Layout(device_mesh.mesh_shape, device_mesh.alias_name, device_mesh.rank_list)
+mesh = init_device_mesh(
+    device_type="npu",
+    mesh_shape=(2, 4),
+    mesh_dim_names=("dp", "mp")
+)
 
 def compare_results(standalone_output, parallel_output, rtol=1e-5, atol=1e-8):
     """
@@ -111,15 +117,61 @@ def compare_results(standalone_output, parallel_output, rtol=1e-5, atol=1e-8):
         parallel_output = parallel_output.asnumpy()
 
     import numpy as np
-    np.testing.assert_allclose(standalone_output, parallel_output, rtol=rtol, atol=atol)
+    assert np.allclose(standalone_output, parallel_output, rtol=rtol, atol=atol), \
+        f"Standalone output:\n{standalone_output}\nParallel output:\n{parallel_output}"
 ```
 
-### Real Test Case Example
+### Pytorch Example:
 
+**Test case Example**
 ```python
+import torch
+from tests.torch.utils import init_dist
+from tests.torch.shard.utils import local_to_global, global_to_local
+
+def test_add_data_parallel():
+    """Test add operator with data parallel."""
+    # Initialize distributed environment
+    init_dist()
+
+    # Configure sharding
+    from hyper_parallel.core.dtensor import _build_layout
+    from hyper_parallel import init_device_mesh
+    from hyper_parallel.core.placement_types import Shard, Replicate
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    x_placements = (Shard(0), Replicate())
+    x_layout = _build_layout(mesh, x_placements, 2)
+
+    # Execute distributed operator
+    dist_input = global_to_local(standalone_input, x_layout)
+    dist_output = torch.repeat_interleave(dist_input, repeats, dim=dim)
+
+    # Compare with standalone result
+    # Layout correctness check
+    assert dist_output.layout == x_layout, "output layout mismatch input"
+    # output correctness check
+    gathered_output = local_to_global(dist_output)
+    assert torch.allclose(
+        standalone_output, gathered_output, atol=1e-5
+    ), "output mismatch between standalone and distributed"
+```
+
+---
+
+## Step 5: Implement ST Shell File
+
+Every ST test must use the **@arg_mark decorator**.
+
+### Mindspore Example
+```python
+from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+IMPLEMENTATION_FILE = "greater_shard_in_python.py"
+
 @arg_mark(
-    plat_marks=["platform_gpu"],  # Platform marker
-    level_mark="level0",                  # Test level: level0/level1
+    plat_marks=["platform_gpu"],   # Platform marker
+    level_mark="level1",                  # Test level: level0/level1
     card_mark="allcards",                 # Card count marker
     essential_mark="essential"            # Essential marker
 )
@@ -129,79 +181,34 @@ def test_greater_data_parallel():
     Description: Test greater with data parallel.
     Expectation: Run success and match standalone result.
     """
-    file_name = "greater_shard_in_python.py"
-    case_name = "test_greater_data_parallel"
-    master_port = 11400
-    run_case(file_name, case_name, master_port)
-
-    def test_greater_data_parallel():
-        # Test logic
-        pass
+    parallel_run([
+        MindSporeCase(IMPLEMENTATION_FILE, "test_greater_data_parallel", 11500, 8, 8, 2),
+    ])
 ```
 
----
-
-## PyTorch ST Implementation
-
-### Shell File Location
-
-`tests/torch/shard/ops/test_ops_elementwise.py`
-
-### run_case Function Template
-
+### Pytorch Example
 ```python
-import os
-import shutil
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
 
-def run_case(file_name, case_name, master_port):
-    """Run test case."""
-    file_base = os.path.splitext(file_name)[0]
-    dir_to_remove = f"./{file_base}/{case_name}"
-    if os.path.exists(dir_to_remove):
-        shutil.rmtree(dir_to_remove)
+PARALLEL_OP_MAX = "parallel_op_repeat_interleave.py"
 
-    # PyTorch uses torchrun to launch distributed
-    cmd = (
-        f"torchrun --nproc_per_node=8 --master_addr=127.0.0.1 "
-        f"--master_port={master_port} "
-        f"pytest -s -v {file_name}::{case_name}"
-    )
-    ret = os.system(cmd)
-    assert ret == 0, f"Test case {case_name} failed with return code {ret}"
-```
-
-### Test Case Example
-
-```python
-import torch
-import torch.distributed as dist
-
-def test_add_data_parallel():
-    """Test add operator with data parallel."""
-    # Initialize distributed environment
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-
-    # Create test data
-    x = torch.randn(4, 4).to(f"cuda:{rank}")
-    y = torch.randn(4, 4).to(f"cuda:{rank}")
-
-    # Configure sharding
-    from hyper_parallel import Layout, DTensor
-    layout = Layout((2, 2, 2), ("dp", "cp", "mp"), list(range(8)))
-    x_dtensor = DTensor.from_local(x, layout("dp", "None", "None"))
-    y_dtensor = DTensor.from_local(y, layout("dp", "None", "None"))
-
-    # Execute distributed operator
-    result = torch.add(x_dtensor, y_dtensor)
-
-    # Compare with standalone result
-    if rank == 0:
-        x_standalone = x_dtensor.to_local().clone()
-        y_standalone = y_dtensor.to_local().clone()
-        expected = torch.add(x_standalone, y_standalone)
-        assert torch.allclose(result.to_local(), expected)
+@arg_mark(
+    plat_marks=["platform_gpu"],   # Platform marker
+    level_mark="level1",                  # Test level: level0/level1
+    card_mark="allcards",                 # Card count marker
+    essential_mark="essential"            # Essential marker
+)
+def test_distributed_repeat_interleave_layout_inference():
+    """
+    Feature: test parallel op repeat_interleave.
+    Description: test parallel op repeat_interleave.
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MAX, "test_distributed_repeat_interleave_layout_inference", 10500, 8),
+    ])
+    
 ```
 
 ---
@@ -210,9 +217,10 @@ def test_add_data_parallel():
 
 | Reference Type | File Location | Description |
 |----------------|---------------|-------------|
-| **ST Shell File** | `tests/mindspore/st/shard/test_ops_xxx.py` | Test entry, config parameters |
-| **ST Implementation File** | `tests/mindspore/st/shard/xxx_shard_in_python.py` | Actual test logic |
-| **PyTorch ST** | `tests/torch/shard/ops/parallel_op_*.py` | PyTorch platform ST examples |
+| **ST Shell File** | `tests/mindspore/st/shard/test_one_hot_shard_in_python.py` | Test entry, config parameters |
+| **ST Implementation File** | `tests/mindspore/st/shard/one_hot_ext_shard_in_python.py` | Actual test logic |
+| **PyTorch ST** | `tests/torch/shard/ops/parallel_op_repeat_interleave.py` | PyTorch platform ST examples |
+| **PyTorch ST Shell File** | `tests/torch/shard/ops/test_parallel_op_repeat_interleave.py` | PyTorch Test entry, config parameters |
 
 ---
 
@@ -271,7 +279,7 @@ A: Check configuration:
 A: Check markers:
 - `plat_marks` must be valid platform name (e.g., `platform_gpu`)
 - `level_mark` must be `level0` or `level1`
-- `card_mark` must be `allcards` or specific card count
+- `card_mark` must be `allcards` or `onecard`
 
 ---
 
@@ -285,11 +293,3 @@ A: Check markers:
 - [ ] Standalone vs distributed output consistent (rtol=1e-5, atol=1e-8)
 - [ ] Covered required test scenarios (DP/MP/Broadcast)
 
----
-
-## Next Step
-
-After ST tests pass, proceed to **[Workflow 6: Git Commit and PR Creation](./06-git-commit.md)**
-
-**Input:** All modified code, operator name
-**Goal:** Create feature branch, complete lint check, commit, push, and create PR if needed
