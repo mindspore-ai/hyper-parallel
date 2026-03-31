@@ -2,13 +2,14 @@
 build/
 output/
 dist/
-3rdparty/shmem
 *.egg-info/
 *.ir
 st_tests
 kernel_meta/
 somas_meta/
 trace_code_graph_*
+3rdparty/shmem
+multicore_moe_ffn
 
 # Protocol buffers
 *_pb2.py
