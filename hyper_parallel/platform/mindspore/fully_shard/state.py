@@ -208,14 +208,10 @@ class MindSporeHSDPStateV2(HSDPState):
         else:
             hsdp_param.sharded_param.grad._local_tensor += reduced_grad
 
-        if hsdp_param._return_grad is not None:
-            hsdp_param._return_grad.data = hsdp_param.sharded_param.grad.to_local()
-
         if hsdp_param.unsharded_accumulated_grad_data is not None:
             hsdp_param.unsharded_accumulated_grad = None
         elif hsdp_param.unsharded_param.grad is not None:
             hsdp_param.unsharded_param.grad = None
-        hsdp_param._return_grad = None
 
     def _allreduce_replicate_params(self, async_op=True) -> None:
         """
@@ -272,14 +268,10 @@ class MindSporeHSDPStateV2(HSDPState):
             else:
                 param.sharded_param.grad._local_tensor += reduced_grad
 
-            if param._return_grad is not None:
-                param._return_grad.data = param.sharded_param.grad.to_local()
-
             if param.unsharded_accumulated_grad_data is not None:
                 param.unsharded_accumulated_grad = None
             elif param.unsharded_param.grad is not None:
                 param.unsharded_param.grad = None
-            param._return_grad = None
 
         self._ignored_allreduce_works.clear()
 

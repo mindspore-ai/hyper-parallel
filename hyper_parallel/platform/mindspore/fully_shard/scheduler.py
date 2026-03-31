@@ -84,16 +84,15 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         self._register_backward_pre_hook(outputs)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return
-        self._hsdp_forward_hook(cell, inputs, outputs)
-        return outputs
+        return self._hsdp_forward_hook(cell, inputs, outputs)
 
     # pylint: disable=W0212
     def _backward_pre_hook(self, grad):
         """Execute backward pre hook."""
+        _pynative_executor.queue_backward_final_callback(self._backward_hook)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return grad
         self._hsdp_backward_pre_hook(self.cell, None)
-        _pynative_executor.queue_backward_final_callback(self._backward_hook)
         return grad
 
     def _backward_hook(self):

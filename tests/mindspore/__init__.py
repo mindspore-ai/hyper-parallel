@@ -12,3 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
+"""MindSpore test package setup."""
+import os
+
+from hyper_parallel.platform import platform as platform_module
+
+
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+platform_module.platform = None

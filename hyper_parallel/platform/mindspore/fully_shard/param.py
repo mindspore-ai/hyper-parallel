@@ -130,7 +130,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._init_sharded_param(param, shard_placement_fn)
         self.all_gather_outputs: List[ms.Tensor] = []
         self.unsharded_accumulated_grad = None
-        self._return_grad: Optional[ms.Tensor] = None
         self._param_fqn: Optional[str] = None
         # Communication attributes for prefetch pattern
         self.prefetch_handle: Optional[CommHandle] = None
@@ -212,15 +211,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self.sharded_param.requires_grad_(param.requires_grad)
         self.sharded_param.grad = None
 
-        # sharded_param is the single parameter object registered in the module.
-        # State switching (sharded ↔ unsharded) is done by swapping its __class__ and
-        # updating device_sync_ in-place via _update_data, keeping the Python object
-        # identity stable — required for MindSpore functional grad (value_and_grad weights).
-        self._dtensorparam_class = self.sharded_param.__class__
         self._setattr_on_modules(self.sharded_param)
-
-        # Register hook to capture the full grad for reduce-scatter.
-        self._add_grad_to_unsharded_param(self.sharded_param)
         self.sharded_param._hsdp_param_initialized = True
         self.sharded_state = ShardedState.SHARDED
         self.param_dtype = None
@@ -274,66 +265,23 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             self._contiguous_orig_stride,
             storage_offset=0,
         )
-
-        # Create a placeholder parameter to record gradients and enable Torch backend code reuse.
-        # This parameter does not participate in actual computations.
-        # The actual computational parameters are handled separately via 'sharded_param'.
-        self._unsharded_param = Parameter([])
-        # _unsharded_param has the same device storage as the all-gather output
+        # For MindSpore, if use `Parameter(tensor)`, Parameter will create a new Tensor instead of a view
+        # Here we need to share storage, so we use the `.data = tensor` approach to create shared storage
+        self._unsharded_param = Parameter(
+            [],
+            name=self.sharded_param.name,
+            requires_grad=self.sharded_param.requires_grad,
+        )
         self._unsharded_param.data = unsharded_param
-        self._unsharded_param.grad = None
-
-    def _add_grad_to_unsharded_param(self, param):
-        def hook(grad):
-            self._unsharded_param.grad = grad
-            self._return_grad = ms.mint.empty(
-                self.sharded_size,
-                dtype=grad.dtype,
-                device="meta",
-            )
-            return self._return_grad
-
-        param.register_hook(hook)
-
-    # Parameter instance attributes shadowed by DTensorBase @property descriptors.
-    # Must be synced manually on every __class__ switch.
-    _DTENSOR_SHADOWED_ATTRS = ('has_init', 'init')
-
-    def _switch_param_to_dtensor(self, data: ms.Tensor) -> None:
-        """Restore sharded_param to DTensor class and point its data to the given tensor.
-
-        Also cleans up instance-dict entries written by _switch_param_to_parameter.
-        DTensorBase @property descriptors would shadow them automatically, but leaving
-        stale keys in __dict__ pollutes inspection output.
-        """
-        self.sharded_param.__class__ = self._dtensorparam_class
-        self.sharded_param.data = data
-        # Remove temporary instance attributes written during the Parameter phase.
-        for attr in self._DTENSOR_SHADOWED_ATTRS:
-            self.sharded_param.__dict__.pop(attr, None)
-
-    def _switch_param_to_parameter(self, data: Parameter) -> None:
-        """Downgrade sharded_param to plain Parameter and point its data to the given parameter.
-
-        DTensorBase shadows has_init / init with @property descriptors that
-        read from _local_tensor. After the class switch those descriptors are gone, so the
-        attributes must be copied into the instance dict explicitly; otherwise Parameter
-        code reads missing or stale values.
-        """
-        self.sharded_param.__class__ = Parameter
-        self.sharded_param.data = data
-        # Sync attributes that were previously served by DTensorBase @property descriptors.
-        self.sharded_param.has_init = data.has_init
-        if data.has_init:
-            self.sharded_param.init = data.init
 
     def to_sharded(self) -> None:
-        self._switch_param_to_dtensor(self.sharded_param._local_tensor)
+        self._setattr_on_modules(self.sharded_param)
         self.free_unsharded_param()
         self.sharded_state = ShardedState.SHARDED
 
     def to_unsharded(self) -> None:
-        self._switch_param_to_parameter(self._unsharded_param)
+        set_requires_grad_if_needed(self.sharded_param, self._unsharded_param)
+        self._setattr_on_modules(self._unsharded_param)
         self.sharded_state = ShardedState.UNSHARDED
 
     def _setattr_on_modules(self, param: Parameter) -> None:

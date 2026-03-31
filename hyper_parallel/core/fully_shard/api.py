@@ -571,6 +571,10 @@ def fully_shard(
     """
     platform_type = platform.platform_type
     _validate_module_for_fully_shard(module, platform_type)
+    if platform_type == PlatformType.MINDSPORE:
+        from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
+
+        enable_mindspore_backward_compat()
 
     arg_module = module
     if isinstance(module, list):

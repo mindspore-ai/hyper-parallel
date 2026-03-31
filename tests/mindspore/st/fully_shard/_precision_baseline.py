@@ -109,6 +109,7 @@ def test_generate_checkpoint_and_baseline():
     ckpt_path = generate_checkpoint()
     losses = run_baseline_standalone(ckpt_path)
 
+    os.makedirs(TEMP_DIR, exist_ok=True)
     losses_file = os.path.join(TEMP_DIR, "baseline_losses.npy")
     np.save(losses_file, np.array(losses))
     print(f"Saved baseline losses to: {losses_file}")

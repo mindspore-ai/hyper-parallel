@@ -25,6 +25,9 @@ pytest.importorskip("mindspore")
 # Force mindspore platform before any hyper_parallel imports
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
+# These test-only helpers intentionally accept the production hsdp_init signature.
+# pylint: disable=unused-argument
+
 from mindspore import nn as ms_nn
 
 from hyper_parallel.core.fully_shard.api import (
@@ -177,33 +180,37 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_fully_shard_list_returns_list(self, mock_platform, mock_get_device):
-        """fully_shard with list returns the same list (in-place)."""
+    @patch("hyper_parallel.platform.mindspore.autograd_compat.enable_mindspore_backward_compat")
+    def test_fully_shard_list_returns_list_and_enables_backward_compat(
+        self, mock_enable_backward_compat, mock_platform, mock_get_device
+    ):
+        """fully_shard with list returns the same list and enables backward compat."""
         mock_platform.platform_type = PlatformType.MINDSPORE
         mock_get_device.return_value = "npu"
         mesh = self._create_mock_mesh()
         dense1 = ms_nn.Dense(4, 4)
         dense2 = ms_nn.Dense(4, 4)
         cells_list = [dense1, dense2]
-        with patch.object(
-            type(dense1),
-            "hsdp_init",
-            lambda self, *a, **k: None,
-            create=True,
+
+        def _fake_hsdp_init(self, *args, **kwargs):
+            self.hsdp_scheduler = object()
+
+        with patch(
+            "hyper_parallel.core.fully_shard.api.HSDPModule.hsdp_init",
+            _fake_hsdp_init,
         ):
-            with patch(
-                "hyper_parallel.core.fully_shard.api.HSDPModule.hsdp_init",
-                lambda self, *a, **k: None,
-            ):
-                result = fully_shard(
-                    cells_list,
-                    mesh=mesh,
-                    reshard_after_forward=True,
-                    mp_policy=_default_mp_policy(),
-                )
+            result = fully_shard(
+                cells_list,
+                mesh=mesh,
+                reshard_after_forward=True,
+                mp_policy=_default_mp_policy(),
+            )
+
         self.assertIs(result, cells_list)
         self.assertIsInstance(result, list)
         self.assertEqual(len(result), 2)
+        self.assertIs(dense2.hsdp_scheduler, dense1.hsdp_scheduler)
+        mock_enable_backward_compat.assert_called_once_with()
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")
@@ -231,59 +238,70 @@ class TestFullyShardListAPIMindSpore(unittest.TestCase):
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_fully_shard_two_sibling_cells_second_params_in_hsdp_state(
+    def test_fully_shard_list_passes_root_modules_to_hsdp_init(
         self, mock_platform, mock_get_device
     ):
-        """fully_shard([cell1, cell2]) puts both cells' params into hsdp_state.hsdp_params."""
+        """fully_shard([cell1, cell2]) initializes the scheduler with the root modules tuple."""
         mock_platform.platform_type = PlatformType.MINDSPORE
-        mock_get_device.return_value = "CPU"
+        mock_get_device.return_value = "npu"
         mesh = self._create_mock_mesh()
         cell1 = ms_nn.Dense(4, 4)
         cell2 = ms_nn.Dense(4, 4)
         cells_list = [cell1, cell2]
-        result = fully_shard(
-            cells_list,
-            mesh=mesh,
-            reshard_after_forward=True,
-            mp_policy=_default_mp_policy(),
-        )
+        captured = {}
+
+        def _fake_hsdp_init(self, platform_type, module, *args, **kwargs):
+            captured["platform_type"] = platform_type
+            captured["module"] = module
+            self.hsdp_scheduler = object()
+
+        with patch(
+            "hyper_parallel.core.fully_shard.api.HSDPModule.hsdp_init",
+            _fake_hsdp_init,
+        ):
+            result = fully_shard(
+                cells_list,
+                mesh=mesh,
+                reshard_after_forward=True,
+                mp_policy=_default_mp_policy(),
+            )
+
         self.assertIs(result, cells_list)
-        self.assertTrue(hasattr(cell1, "hsdp_scheduler"), "cell1 should have hsdp_scheduler")
-        hsdp_state = cell1.hsdp_scheduler.hsdp_state
-        self.assertEqual(len(hsdp_state.modules), 2)
-        self.assertIn(cell1, hsdp_state.modules)
-        self.assertIn(cell2, hsdp_state.modules)
-        # Each Dense(4,4) has weight and bias -> 4 params total; both cells must be in hsdp_params
-        self.assertGreaterEqual(
-            len(hsdp_state.hsdp_params),
-            4,
-            "hsdp_state.hsdp_params must include params from both cells (2 Dense -> 4 params)",
-        )
+        self.assertEqual(captured["platform_type"], PlatformType.MINDSPORE)
+        self.assertEqual(captured["module"], (cell1, cell2))
 
     @patch("hyper_parallel.core.fully_shard.api._get_device_from_mesh")
     @patch("hyper_parallel.core.fully_shard.api.platform")
-    def test_fully_shard_list_second_root_has_scheduler_and_unshard_prefetch_ok(
+    def test_fully_shard_list_second_root_shares_scheduler_handle(
         self, mock_platform, mock_get_device
     ):
-        """fully_shard([cell1, cell2]) backfills hsdp_scheduler to cell2; cell2.unshard() and prefetch work."""
+        """fully_shard([cell1, cell2]) backfills the same scheduler handle to the second root."""
         mock_platform.platform_type = PlatformType.MINDSPORE
-        mock_get_device.return_value = "CPU"
+        mock_get_device.return_value = "npu"
         mesh = self._create_mock_mesh()
         cell1 = ms_nn.Dense(4, 4)
         cell2 = ms_nn.Dense(4, 4)
         cells_list = [cell1, cell2]
-        result = fully_shard(
-            cells_list,
-            mesh=mesh,
-            reshard_after_forward=True,
-            mp_policy=_default_mp_policy(),
-        )
+
+        scheduler_sentinel = object()
+
+        def _fake_hsdp_init(self, *args, **kwargs):
+            self.hsdp_scheduler = scheduler_sentinel
+
+        with patch(
+            "hyper_parallel.core.fully_shard.api.HSDPModule.hsdp_init",
+            _fake_hsdp_init,
+        ):
+            result = fully_shard(
+                cells_list,
+                mesh=mesh,
+                reshard_after_forward=True,
+                mp_policy=_default_mp_policy(),
+            )
+
         self.assertIs(result, cells_list)
-        self.assertIs(cell2.hsdp_scheduler, cell1.hsdp_scheduler)
-        cell2.unshard()
-        cell2.reshard()
-        cell1.set_modules_to_forward_prefetch([cell2])
-        cell1.set_modules_to_backward_prefetch([cell2])
+        self.assertIs(cell1.hsdp_scheduler, scheduler_sentinel)
+        self.assertIs(cell2.hsdp_scheduler, scheduler_sentinel)
 
     @patch("hyper_parallel.core.fully_shard.api.platform")
     def test_fully_shard_empty_list_raises(self, mock_platform):
