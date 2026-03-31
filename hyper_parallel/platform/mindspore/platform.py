@@ -564,13 +564,13 @@ class MindSporePlatform(Platform):
         )
 
     @staticmethod
-    def save_checkpoint(cell: Cell, file_path: str) -> None:
+    def save_checkpoint(cell: Cell, file_path: str, ckpt_format: str = "safetensors") -> None:
         save_dict = cell._params
-        ms.save_checkpoint(save_obj=save_dict, ckpt_file_name=file_path, format="safetensors")
+        ms.save_checkpoint(save_obj=save_dict, ckpt_file_name=file_path, format=ckpt_format)
 
     @staticmethod
-    def load_checkpoint(file_path: str) -> dict:
-        return ms.load_checkpoint(ckpt_file_name=file_path, format="safetensors")
+    def load_checkpoint(file_path: str, ckpt_format: str = "safetensors") -> dict:
+        return ms.load_checkpoint(ckpt_file_name=file_path, format=ckpt_format)
 
     @staticmethod
     def get_symmetric_memory_handler():
