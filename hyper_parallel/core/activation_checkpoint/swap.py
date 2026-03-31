@@ -80,7 +80,7 @@ class SwapTensor:
         self._state = self.STATE_H2D
 
     def wait_load(self):
-        """chanage state to device after async load is done"""
+        """change state to device after async load is done"""
         if self._state == self.STATE_NON_TENSOR:
             return
 
@@ -253,16 +253,20 @@ class SwapManager:
     _instance: Optional["SwapManager"] = None
     _lock = threading.Lock()
 
+    def __init__(self):
+        if hasattr(self, '_groups'):
+            return
+        self._groups = {}
+        self._current_group_name = ""
+        self._counter_lock = threading.Lock()
+        self._layer_count = 0
+        self._copy_stream = None
+
     def __new__(cls):
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
-                    cls._instance._groups = {}
-                    cls._instance._current_group_name = ""
-                    cls._instance._counter_lock = threading.Lock()
-                    cls._instance._layer_count = 0
-                    cls._copy_stream = None
         return cls._instance
 
     def add_storage(self, group_name: str, storage: Storage) -> None:
