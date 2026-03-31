@@ -638,7 +638,7 @@ class TorchPlatform(Platform):
 
     def _create_group(self, rank_list):
         group_dict = create_sub_groups(rank_list)
-        return group_dict[tuple(rank_list)]
+        return group_dict[tuple(sorted(rank_list))]
 
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):

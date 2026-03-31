@@ -32,6 +32,8 @@ from hyper_parallel.core.fully_shard.api import HSDPModule, hsdp_sync_stream
 from hyper_parallel.core.utils import clip_grad_norm_ as hp_clip_grad_norm_
 from hyper_parallel.integration.llamafactory.utils import fsdp2_prepare_model
 from hyper_parallel.platform import get_platform
+from hyper_parallel import DTensor, init_device_mesh
+from hyper_parallel.core.dtensor.placement_types import Replicate
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +46,7 @@ _HSDP_OPTIMIZER_NAME = "optimizer"
 class HyperParallelArguments:
     """Minimal HyperParallel configuration needed by the trainer backend."""
 
-    tp_size: int = 1
+    tp_size: int = 2
     device_type: str = "auto"
     param_dtype: Optional[str] = None
     reduce_dtype: Optional[str] = None
@@ -52,11 +54,6 @@ class HyperParallelArguments:
 
     def validate(self) -> None:
         """Validate supported argument values."""
-        if self.tp_size != 1:
-            raise ValueError(
-                "Current trainer backend only supports replacing FSDP/fully_shard. "
-                f"Expected tp_size=1, got {self.tp_size}."
-            )
         if self.param_dtype is not None and self.param_dtype not in _VALID_DTYPES:
             raise ValueError(
                 f"param_dtype must be one of {sorted(_VALID_DTYPES)}, got {self.param_dtype!r}."
@@ -365,6 +362,9 @@ class HyperParallelTrainer(Seq2SeqTrainer):
                 ref_logits = ref_outputs.logits
             outputs = model(**inputs)
             return self.compute_loss_func(outputs, inputs["labels"], ref_logits)
+        mesh = init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"))
+        for key, value in inputs.items():
+            inputs[key] = DTensor.from_local(value, mesh["tp"], (Replicate(), ))
         return super().compute_loss(model, inputs, *args, **kwargs)
 
     def prediction_step(

@@ -14,5 +14,6 @@
 # ============================================================================
 """HyperParallel trainer backend for LlamaFactory."""
 from hyper_parallel.integration.llamafactory.trainer import HyperParallelArguments, HyperParallelTrainer
+from hyper_parallel.integration.llamafactory.tensor_parallel import _apply_tensor_parallel
 
-__all__ = ["HyperParallelArguments", "HyperParallelTrainer"]
+__all__ = ["HyperParallelArguments", "HyperParallelTrainer", "_apply_tensor_parallel"]

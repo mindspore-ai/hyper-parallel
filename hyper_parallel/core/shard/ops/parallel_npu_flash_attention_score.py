@@ -474,7 +474,7 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
         softmax_layout_param = ""
 
         if len(extra_args) >= 2:
-            input_layout_str = extra_args[1]
+            input_layout_str = extra_args[3]
             if not isinstance(input_layout_str, str):
                 input_layout_str = None
 

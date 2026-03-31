@@ -30,6 +30,7 @@ from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.fully_shard.api import HSDPModule, fully_shard
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy
 from hyper_parallel.platform import get_platform
+from hyper_parallel.integration.llamafactory.tensor_parallel import _apply_tensor_parallel
 
 _DTYPE_MAP = {
     "float32": torch.float32,
@@ -63,6 +64,11 @@ def _build_device_mesh(accelerator, hp_args):
 
     device_type = _resolve_device_type(hp_args)
     world_size = get_platform().get_world_size()
+    tp_size = getattr(hp_args, "tp_size", 1)
+    if tp_size > 1:
+        dp_size = world_size//tp_size
+        mesh = init_device_mesh(device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+        return mesh["dp"]
     return init_device_mesh(device_type, (world_size,), mesh_dim_names=("dp",))
 
 
@@ -428,7 +434,7 @@ def _maybe_upcast_trainable_params(accelerator, model: nn.Module) -> None:
     if not should_upcast:
         return
 
-    model.to(torch.float32)
+    # model.to(torch.float32)
 
     for module in model.modules():
         if isinstance(module, HSDPModule):
@@ -452,6 +458,10 @@ def fsdp2_prepare_model(accelerator, model: nn.Module, hp_args) -> nn.Module:
     """
     Prepare model following Accelerate FSDP2 flow, using HyperParallel fully_shard.
 
+    When ``hp_args.tp_size > 1``, tensor
+    parallelism is applied **before** FSDP wrapping so that TP-sharded weights
+    are then further managed by FSDP for data-parallel gradient reduction.
+
     This function is designed to be called with the runtime `accelerator`
     instance already created by `transformers.Trainer` / `accelerate`.
 
@@ -470,6 +480,9 @@ def fsdp2_prepare_model(accelerator, model: nn.Module, hp_args) -> nn.Module:
     """
     if _is_fsdp2_wrapped_model(model):
         return model
+
+    device_type = _resolve_device_type(hp_args)
+    model = _apply_tensor_parallel(model, hp_args, device_type)
 
     fsdp2_plugin = accelerator.state.fsdp_plugin
     fsdp2_plugin.set_auto_wrap_policy(model)
