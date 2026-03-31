@@ -717,7 +717,7 @@ def _clip_grads_with_norm_(
         grouped_grads = _group_tensors_by_device_and_dtype(
             [all_grads],
         )
-        for (device, _), ([device_grads], _) in grouped_grads.items():
+        for (device, dtype), ([device_grads], _) in grouped_grads.items():
             if (
                 foreach is None
                 and _has_foreach_support(device_grads, device)
@@ -727,7 +727,7 @@ def _clip_grads_with_norm_(
             ):
                 torch._foreach_mul_(  # pylint: disable=W0212
                     device_grads,
-                    clip_coef_clamped.to(device),
+                    clip_coef_clamped.to(device=device, dtype=dtype),
                 )
             elif foreach:
                 raise RuntimeError(
@@ -735,9 +735,9 @@ def _clip_grads_with_norm_(
                     f"foreach API on {device.type} tensors"
                 )
             else:
-                clip_coef_clamped_device = clip_coef_clamped.to(device)
+                clip_coef_clamped_cast = clip_coef_clamped.to(device=device, dtype=dtype)
                 for g in device_grads:
-                    g.mul_(clip_coef_clamped_device)
+                    g.mul_(clip_coef_clamped_cast)
     else:
         # Fallback when _foreach_utils is unavailable.
         if foreach:
@@ -813,12 +813,10 @@ def clip_grad_norm_(
     # -- Norm + clip (all ranks participate) --------------------------------
     # _compute_local_norm returns identity elements for empty groups,
     # so the subsequent all-reduce is safe and semantically neutral.
-    total_norm, return_norm = _get_total_norm(
+    total_norm, local_norm = _get_total_norm(
         grad_groups, norm_type, mesh_cache, device, all_grads,
     )
-    eps_in_norm = return_norm is not None  # finite p-norm has eps baked in
-    if return_norm is None:
-        return_norm = total_norm
+    eps_in_norm = local_norm is not None  # finite p-norm has eps baked in
 
     if error_if_nonfinite and torch.logical_or(
         total_norm.isnan(), total_norm.isinf()
@@ -846,15 +844,17 @@ def clip_grad_norm_(
         warnings.warn(
             "clip_grad_norm_ called on this rank with no gradients -- "
             "returning the local norm in the default dtype "
-            f"{return_norm.dtype}",
+            f"{total_norm.dtype}",
             stacklevel=2,
         )
-        return return_norm
+        return total_norm
 
     total_norm_dtype = functools.reduce(
         torch.promote_types,
         [g.dtype for g in all_grads],
     )
-    # Return local combined norm (pre-eps, pre-reduce) to match FSDP2's
-    # _NormPartial DTensor .item() behavior when .full_tensor() is not called.
-    return return_norm.to(total_norm_dtype)
+    # Return the global all-reduced norm so that all ranks see the same
+    # value and callers can use it for logging or adaptive clipping.
+    # For finite p-norms total_norm includes a 1e-6 epsilon (matching the
+    # clip denominator); for inf/-inf/0 norms it is the exact global norm.
+    return total_norm.to(total_norm_dtype)
