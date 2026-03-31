@@ -58,3 +58,5 @@ venv/
 
 # tools
 .cursorignore
+.claude/settings.local.json
+.claude/local/
