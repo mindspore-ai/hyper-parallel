@@ -40,7 +40,7 @@ from api import (  # pylint: disable=wrong-import-position
     get_pr_status_display, create_pr, add_reviewers,
     update_pr_description,
 )
-from pr_content import generate_pr_content  # pylint: disable=wrong-import-position
+from pr_content import generate_pr_content, prepare_pr_analysis  # pylint: disable=wrong-import-position
 from lint_check import (  # pylint: disable=wrong-import-position
     run_checks,
     run_pylint_review,
@@ -521,7 +521,8 @@ def _push_pr_branch(pr_branch: str) -> None:
 
 
 def cmd_pr(base: Optional[str] = None, reviewer: Optional[str] = None,
-           squash: bool = False, no_test: bool = False) -> Dict[str, Any]:
+           squash: bool = False, no_test: bool = False,
+           analyze_only: bool = False) -> Dict[str, Any]:
     """Create a PR with safe Git workflow.
 
     Args:
@@ -529,6 +530,8 @@ def cmd_pr(base: Optional[str] = None, reviewer: Optional[str] = None,
         reviewer: Comma-separated reviewer login names.
         squash: Whether to squash all commits.
         no_test: Skip running autogit test before PR creation if True.
+        analyze_only: Only output structured analysis data for LLM-based
+            description generation.
 
     Returns:
         Dict with keys: url, branch, commits, pr_number.
@@ -573,6 +576,16 @@ def cmd_pr(base: Optional[str] = None, reviewer: Optional[str] = None,
     _push_pr_branch(pr_branch)
 
     diff = run_git("diff", f"{base_ref}...HEAD").stdout
+
+    if analyze_only:
+        analysis_json = prepare_pr_analysis(diff, commits)
+        return {
+            "analysis": analysis_json,
+            "base_ref": base_ref,
+            "branch": pr_branch,
+            "commits": [sha[:8] for sha in commits],
+        }
+
     title, body = generate_pr_content(diff, commits)
 
     print("Creating PR...")
