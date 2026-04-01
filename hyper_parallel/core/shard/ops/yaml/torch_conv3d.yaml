@@ -1,0 +1,4 @@
+conv3d:
+  dist_op_name: _torch_conv3d_dist_op
+  distributed_op_class: Conv3dDistributedOp
+  distributed_op_file: parallel_conv3d
