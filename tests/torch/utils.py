@@ -14,6 +14,9 @@
 # ============================================================================
 """test utils"""
 import os
+import subprocess
+import sys
+
 import torch
 import torch.distributed as dist
 
@@ -30,8 +33,26 @@ def init_dist():
 
 
 def torchrun_case(file_name, case_name, master_port, num_proc=8):
-    cmd = f"torchrun --nproc-per-node={num_proc} --log-dir=./logs/{file_name}/{case_name} --redirect=3 " \
-          f"--master_addr=127.0.0.1 --master_port={master_port} " \
-          f"-m pytest -s {file_name}::{case_name}"
-    ret = os.system(cmd)
+    """Spawn *num_proc* workers via ``python -m torch.distributed.run`` (same as torchrun).
+
+    Uses :data:`sys.executable` so conda/env interpreters work when ``torchrun`` is not on ``PATH``.
+    """
+    env = os.environ.copy()
+    env.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        f"--nproc-per-node={num_proc}",
+        f"--log-dir=./logs/{file_name}/{case_name}",
+        "-r",
+        "3",
+        "--master_addr=127.0.0.1",
+        f"--master_port={master_port}",
+        "-m",
+        "pytest",
+        "-s",
+        f"{file_name}::{case_name}",
+    ]
+    ret = subprocess.call(cmd, env=env)
     assert ret == 0

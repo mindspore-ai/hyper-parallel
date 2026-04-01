@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ from typing import Optional
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.parallel_style import ParallelStyle
+from hyper_parallel.core.tensor_parallel.style import ParallelStyle
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.platform import get_platform
 

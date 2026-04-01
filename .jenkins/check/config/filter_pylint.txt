@@ -95,3 +95,21 @@
 "hyper-parallel/tests/torch/context_parallel/"                          "no-member"
 "hyper-parallel/tests/torch/context_parallel/"                          "not-callable"
 "hyper-parallel/tests/torch/context_parallel/"                          "line-too-long"
+
+# 10. Tensor Parallel tests — test helper classes are exempt from full type hints and docstrings
+"hyper-parallel/tests/torch/tensor_parallel/"                           "missing-public-type-hints"
+"hyper-parallel/tests/torch/tensor_parallel/"                           "missing-public-docstring"
+"hyper-parallel/tests/ut/core/tensor_parallel/"                         "missing-public-type-hints"
+"hyper-parallel/tests/ut/core/tensor_parallel/"                         "missing-public-docstring"
+
+# 11. Tensor Parallel tests — protected access is intentional for testing internal counters
+"hyper-parallel/tests/torch/tensor_parallel/"                           "protected-access"
+"hyper-parallel/tests/ut/core/tensor_parallel/"                         "protected-access"
+
+# 12. Tensor Parallel tests — torch and torch_npu imports are conditionally used in distributed tests
+"hyper-parallel/tests/torch/tensor_parallel/"                           "unused-import"
+"hyper-parallel/tests/torch/tensor_parallel/"                           "consider-using-from-import"
+"hyper-parallel/tests/ut/core/tensor_parallel/"                         "consider-using-from-import"
+
+# 13. test_style.py — abstract-class-instantiated is intentional (testing abstract class behavior)
+"hyper-parallel/tests/ut/core/tensor_parallel/test_style.py"           "abstract-class-instantiated"
