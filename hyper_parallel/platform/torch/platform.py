@@ -19,6 +19,7 @@ import dataclasses
 from collections import OrderedDict
 
 import numpy as np
+from safetensors.torch import save_file, load_file
 import torch
 from torch import nn
 from torch import Tensor
@@ -578,11 +579,16 @@ class TorchPlatform(Platform):
         return _get_model_state_dict(model, options=options)
 
     @staticmethod
-    def save_checkpoint(cell: Module, file_path: str) -> None:
-        torch.save(obj=cell, f=file_path)
+    def save_checkpoint(cell: Module, file_path: str, ckpt_format: str = "safetensors") -> None:
+        if ckpt_format == "safetensors":
+            save_file(tensors=cell, filename=file_path)
+        else:
+            torch.save(obj=cell, f=file_path)
 
     @staticmethod
-    def load_checkpoint(file_path: str) -> dict:
+    def load_checkpoint(file_path: str, ckpt_format: str = "safetensors") -> dict:
+        if ckpt_format == "safetensors":
+            return load_file(filename=file_path)
         return torch.load(f=file_path)
 
     @staticmethod

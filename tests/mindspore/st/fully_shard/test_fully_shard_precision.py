@@ -56,7 +56,7 @@ def run_case(case_name):
             print(f"Cleaned up temporary directory: {TEMP_DIR}")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_zero3_fully_shard():
     """
     Feature: Compare fully_shard precision with standalone baseline

@@ -635,21 +635,23 @@ class Platform:
         )
 
     @staticmethod
-    def save_checkpoint(cell, file_path: str) -> None:
+    def save_checkpoint(cell, file_path: str, ckpt_format: str = "safetensors") -> None:
         """Save a cell/module checkpoint to file.
 
         Args:
             cell: The cell or module to save.
             file_path (str): The path to save the checkpoint to.
+            ckpt_format (str): The file format.
         """
         raise NotImplementedError("Platform subclasses must implement save_checkpoint")
 
     @staticmethod
-    def load_checkpoint(file_path: str) -> dict:
+    def load_checkpoint(file_path: str, ckpt_format: str = "safetensors") -> dict:
         """Load a checkpoint from file.
 
         Args:
             file_path (str): The path to load the checkpoint from.
+            ckpt_format (str): The file format.
 
         Returns:
             dict: The loaded checkpoint state dictionary.
