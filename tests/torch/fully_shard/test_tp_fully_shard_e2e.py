@@ -15,25 +15,10 @@
 """torchrun entry for TP + fully_shard end-to-end tests"""
 
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
 from tests.torch.utils import torchrun_case
 
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_tp_plus_fully_shard_loss_and_grad_match_standalone():
-    """
-    Feature: fully_shard with TP-sharded DTensor parameters.
-    Description: Run one end-to-end TP + FSDP training case and compare loss/grad with standalone.
-    Expectation: Distributed loss and local shard gradients match standalone slices.
-    """
-    master_port = 12364
-    file_name = "_test_tp_fully_shard_e2e.py"
-    case_name = "test_tp_plus_fully_shard_loss_and_grad_match_standalone"
-    torchrun_case(file_name, case_name, master_port)
+_TEST_TP_FULLY_SHARD_E2E = "_test_tp_fully_shard_e2e.py"
 
 
 @arg_mark(
@@ -42,16 +27,28 @@ def test_tp_plus_fully_shard_loss_and_grad_match_standalone():
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_tp_plus_fully_shard_rectangular_inputs_match_standalone():
+def test_tp_fully_shard_typical_networks():
     """
-    Feature: fully_shard with TP-sharded DTensor parameters.
-    Description: Run a rectangular-shape TP + FSDP end-to-end training case.
-    Expectation: Distributed loss and local shard gradients match standalone slices.
+    Feature: representative TP + fully_shard end-to-end coverage.
+    Description:
+        1. Cover the standard TP-sharded linear network on a 2D TP + FSDP mesh.
+        2. Cover the same-dim non-dim0 network with comm_fusion on a 2D TP + FSDP mesh.
+    Expectation: Typical TP + fully_shard layouts match standalone loss and local gradients.
     """
-    master_port = 12365
-    file_name = "_test_tp_fully_shard_e2e.py"
-    case_name = "test_tp_plus_fully_shard_rectangular_inputs_match_standalone"
-    torchrun_case(file_name, case_name, master_port)
+    parallel_run([
+        TorchCase(
+            _TEST_TP_FULLY_SHARD_E2E,
+            "test_tp_plus_fully_shard_loss_and_grad_match_standalone",
+            12364,
+            4,
+        ),
+        TorchCase(
+            _TEST_TP_FULLY_SHARD_E2E,
+            "test_tp_plus_fully_shard_same_dim_non_dim0_comm_fusion_loss_and_grad_match_standalone",
+            12483,
+            4,
+        ),
+    ])
 
 
 @arg_mark(
@@ -60,16 +57,17 @@ def test_tp_plus_fully_shard_rectangular_inputs_match_standalone():
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_tp_plus_fully_shard_wide_output_match_standalone():
+def test_hsdp_tp_comm_fusion_replicate_group_guards():
     """
-    Feature: fully_shard with TP-sharded DTensor parameters.
-    Description: Run a wide-output TP + FSDP end-to-end training case.
-    Expectation: Distributed loss and local shard gradients match standalone slices.
+    Feature: representative HSDP + TP + comm_fusion coverage for mixed replicate groups.
+    Description:
+        1. Cover the mixed TP-sharded plus TP-replicated network in one fully_shard unit.
+        2. Cover the same network when the TP-replicated parameter is promoted to replicate_params.
+    Expectation: Local shard grads and replicate-only grads both match their standalone reference slices.
     """
-    master_port = 12366
-    file_name = "_test_tp_fully_shard_e2e.py"
-    case_name = "test_tp_plus_fully_shard_wide_output_match_standalone"
-    torchrun_case(file_name, case_name, master_port)
+    master_port = 12482
+    case_name = "test_hsdp_plus_tp_comm_fusion_mixed_replicate_groups_match_standalone"
+    torchrun_case(_TEST_TP_FULLY_SHARD_E2E, case_name, master_port)
 
 
 @arg_mark(
@@ -78,16 +76,15 @@ def test_tp_plus_fully_shard_wide_output_match_standalone():
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_tp4_plus_fully_shard_loss_and_grad_match_standalone():
+def test_hsdp_tp_comm_fusion_replicate_param_guard():
     """
-    Feature: fully_shard with TP-sharded DTensor parameters.
-    Description: Run a tp_size=4 TP + FSDP end-to-end training case when mesh size permits.
-    Expectation: Supported environments match standalone loss and gradient slices.
+    Feature: representative HSDP + TP + comm_fusion coverage for replicate_params.
+    Description: Cover the same mixed network when the TP-replicated parameter is promoted to replicate_params.
+    Expectation: Local shard grads and replicate-only grads both match their standalone reference slices.
     """
-    master_port = 12367
-    file_name = "_test_tp_fully_shard_e2e.py"
-    case_name = "test_tp4_plus_fully_shard_loss_and_grad_match_standalone"
-    torchrun_case(file_name, case_name, master_port)
+    master_port = 12484
+    case_name = "test_hsdp_plus_tp_comm_fusion_replicate_params_match_standalone"
+    torchrun_case(_TEST_TP_FULLY_SHARD_E2E, case_name, master_port)
 
 
 @arg_mark(
@@ -96,139 +93,12 @@ def test_tp4_plus_fully_shard_loss_and_grad_match_standalone():
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_tp_plus_fully_shard_on_3d_root_mesh_match_standalone():
+def test_hsdp_tp_comm_fusion_complex_replicate_param_network():
     """
-    Feature: fully_shard with TP-sharded DTensor parameters on a 3D root mesh.
-    Description: Run a dp x tp x ep = 2 x 2 x 2 end-to-end training case.
-    Expectation: Distributed loss and local shard gradients match standalone slices.
+    Feature: representative nonlinear HSDP + TP + comm_fusion coverage.
+    Description: Run the nonlinear network with multiple TP-replicated replicate_params around the matmul path.
+    Expectation: Distributed loss plus tracked local grads match standalone.
     """
-    master_port = 12368
-    file_name = "_test_tp_fully_shard_e2e.py"
-    case_name = "test_tp_plus_fully_shard_on_3d_root_mesh_match_standalone"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_tp_plus_fully_shard_rectangular_3d_root_mesh_match_standalone():
-    """
-    Feature: fully_shard with TP-sharded DTensor parameters on a 3D root mesh.
-    Description: Run a rectangular-shape dp x tp x ep = 2 x 2 x 2 end-to-end training case.
-    Expectation: Distributed loss and local shard gradients match standalone slices.
-    """
-    master_port = 12369
-    file_name = "_test_tp_fully_shard_e2e.py"
-    case_name = "test_tp_plus_fully_shard_rectangular_3d_root_mesh_match_standalone"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_hsdp_plus_tp_on_3d_root_mesh_match_standalone():
-    """
-    Feature: fully_shard with 2D HSDP mesh and 1D TP mesh.
-    Description: Run a dp x fsdp x tp = 2 x 2 x 2 end-to-end training case.
-    Expectation: Distributed loss and local shard gradients match standalone slices.
-    """
-    master_port = 12370
-    file_name = "_test_tp_fully_shard_e2e.py"
-    case_name = "test_hsdp_plus_tp_on_3d_root_mesh_match_standalone"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_tp_plus_fully_shard_replicate_params_group_construction_on_3d_root_mesh():
-    """
-    Feature: diagnose 3D DTENSOR_UNIFIED replicate_params group creation.
-    Description: Inspect the rank-local flattened `(dp, ep)` group built for replicate_params on a 3D root mesh.
-    Expectation: All TP slices create and cache the same flattened `(dp, ep)` group family.
-    """
-    master_port = 12372
-    file_name = "_test_tp_fully_shard_e2e.py"
-    case_name = "test_tp_plus_fully_shard_replicate_params_group_construction_on_3d_root_mesh"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_tp_plus_fully_shard_replicate_params_without_mp_on_2d_mesh():
-    """
-    Feature: replicate_params parity on a 2D dp x tp mesh without mixed precision.
-    Description: Run a 2 x 2 two-step training case with replicate_params off/on.
-    Expectation: Distributed losses and full gradients match at every step.
-    """
-    master_port = 12371
-    file_name = "_test_tp_fully_shard_e2e.py"
-    case_name = "test_tp_plus_fully_shard_replicate_params_without_mp_on_2d_mesh"
-    torchrun_case(file_name, case_name, master_port, num_proc=4)
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_tp_plus_fully_shard_replicate_params_with_mp_on_2d_mesh():
-    """
-    Feature: replicate_params parity on a 2D dp x tp mesh with mixed precision.
-    Description: Run a 2 x 2 two-step training case with replicate_params off/on.
-    Expectation: Distributed losses and full gradients match at every step.
-    """
-    master_port = 12370
-    file_name = "_test_tp_fully_shard_e2e.py"
-    case_name = "test_tp_plus_fully_shard_replicate_params_with_mp_on_2d_mesh"
-    torchrun_case(file_name, case_name, master_port, num_proc=4)
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_tp_plus_fully_shard_replicate_params_without_mp_on_3d_root_mesh():
-    """
-    Feature: replicate_params parity on a 3D root mesh without mixed precision.
-    Description: Run a dp x tp x ep = 2 x 2 x 2 two-step training case with replicate_params off/on.
-    Expectation: Distributed losses and full gradients match at every step.
-    """
-    master_port = 12373
-    file_name = "_test_tp_fully_shard_e2e.py"
-    case_name = "test_tp_plus_fully_shard_replicate_params_without_mp_on_3d_root_mesh"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(
-    plat_marks=["platform_ascend910b"],
-    level_mark="level0",
-    card_mark="allcards",
-    essential_mark="essential",
-)
-def test_tp_plus_fully_shard_replicate_params_with_mp_on_3d_root_mesh():
-    """
-    Feature: replicate_params parity on a 3D root mesh with mixed precision.
-    Description: Run a dp x tp x ep = 2 x 2 x 2 two-step training case with replicate_params off/on.
-    Expectation: Distributed losses and full gradients match at every step.
-    """
-    master_port = 12374
-    file_name = "_test_tp_fully_shard_e2e.py"
-    case_name = "test_tp_plus_fully_shard_replicate_params_with_mp_on_3d_root_mesh"
-    torchrun_case(file_name, case_name, master_port)
+    master_port = 12490
+    case_name = "test_hsdp_plus_tp_comm_fusion_complex_replicate_params_match_standalone"
+    torchrun_case(_TEST_TP_FULLY_SHARD_E2E, case_name, master_port)

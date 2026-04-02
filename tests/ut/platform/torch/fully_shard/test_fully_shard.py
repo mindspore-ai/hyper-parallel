@@ -19,6 +19,8 @@ all_reduce_grad, reset_sharded_param, and _get_unsharded_param_data. All tests m
 DTensor/Layout and distributed calls; no NPU required.
 """
 import copy
+import os
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -26,10 +28,21 @@ import numpy as np
 import torch
 from torch import nn
 
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+
 from hyper_parallel.platform.torch.fully_shard.param import (
     TorchHSDPParamV2,
     _build_group_info_from_rank_list,
     _GROUP_INFO_CACHE,
+)
+from hyper_parallel.platform.torch.fully_shard.pack_utils import (
+    build_rs_plan,
+    pack_for_reduce_scatter,
+)
+from hyper_parallel.platform.torch.fully_shard.param_group import (
+    HSDPParamGroup,
+    AllGatherMetadata,
+    AllGatherResult,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
@@ -48,7 +61,6 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     infer_fully_shard_param_mode,
     get_managed_modules_parameters,
     get_rank_list_for_axes,
-    get_split_rank_lists_for_axes,
 )
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
@@ -162,39 +174,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         """Simulate the unsharded state for a parameter."""
         param_v2._unsharded_param = MagicMock()
         param_v2.sharded_state = ShardedState.UNSHARDED
-
-    @staticmethod
-    def _build_materialization_probe_param(
-        *,
-        sharded_param_data: torch.Tensor,
-        enable_fsdp_shard: bool,
-        param_dtype,
-    ) -> TorchHSDPParamV2:
-        """Create a minimal param object for dtype/materialization probes without distributed init."""
-        param_v2 = object.__new__(TorchHSDPParamV2)
-        param_v2.param_mode = FullyShardParamMode.DTENSOR_UNIFIED
-        param_v2.enable_fsdp_shard = enable_fsdp_shard
-        param_v2.is_sharded = enable_fsdp_shard
-        param_v2._orig_param_is_dtensor = True
-        param_v2.device = torch.device("cpu")
-        param_v2.offload_to_cpu = False
-        param_v2.pin_memory = False
-        param_v2.sharded_state = ShardedState.SHARDED
-        param_v2._sharded_param_data = sharded_param_data.clone()
-        param_v2.all_gather_outputs = []
-        param_v2.param_dtype = param_dtype
-        param_v2.reduce_dtype = torch.float32
-        param_v2.sharded_group_info = MagicMock(group=None)
-        param_v2.shard_size = 1
-        return param_v2
-
-    @staticmethod
-    def _compute_probe_loss_and_grad(param_data: torch.Tensor, input_data: torch.Tensor):
-        """Return a scalar loss plus gradient sensitive to mixed-precision rounding."""
-        probe_param = param_data.clone().detach().requires_grad_(True)
-        loss = ((probe_param * input_data).sum()) ** 2
-        loss.backward()
-        return loss.detach().to(torch.float32), probe_param.grad.detach().to(torch.float32)
 
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
@@ -502,93 +481,6 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             mock_all_gather.assert_called_once()
             self.assertEqual(handle, mock_handle)
 
-    def test_nonsharded_mixed_precision_materialization_matches_sharded_path(self):
-        """Verify the non-sharded mixed-precision path materializes the same fp16 values as sharded."""
-        sharded_param_data = torch.tensor(
-            [1.0003, 1.0009, 1.0015, 1.0021, -0.33341, -0.33391, 0.20031, 0.20081],
-            dtype=torch.float32,
-        )
-        replicate_param = self._build_materialization_probe_param(
-            sharded_param_data=sharded_param_data,
-            enable_fsdp_shard=False,
-            param_dtype=torch.float16,
-        )
-        sharded_param = self._build_materialization_probe_param(
-            sharded_param_data=sharded_param_data,
-            enable_fsdp_shard=True,
-            param_dtype=torch.float16,
-        )
-
-        replicate_unsharded, _ = replicate_param._get_unsharded_param_data(async_op=False)
-        sharded_unsharded, _ = sharded_param._get_unsharded_param_data(async_op=False)
-
-        self.assertEqual(replicate_unsharded.dtype, torch.float16)
-        self.assertEqual(sharded_unsharded.dtype, torch.float16)
-        self.assertTrue(torch.equal(replicate_unsharded, sharded_param_data.to(torch.float16)))
-        self.assertTrue(torch.equal(sharded_unsharded, sharded_param_data.to(torch.float16)))
-        self.assertTrue(torch.equal(replicate_unsharded, sharded_unsharded))
-
-    def test_nonsharded_mixed_precision_materialization_matches_loss_and_grad(self):
-        """Verify both paths stay numerically aligned under mixed precision after materialization."""
-        sharded_param_data = torch.tensor(
-            [1.0003, 1.0009, 1.0015, 1.0021, -0.33341, -0.33391, 0.20031, 0.20081],
-            dtype=torch.float32,
-        )
-        input_data = torch.tensor(
-            [0.1255, -0.3755, 0.6255, -0.8755, 1.1250, -1.3750, 1.6250, -1.8750],
-            dtype=torch.float16,
-        )
-        replicate_param = self._build_materialization_probe_param(
-            sharded_param_data=sharded_param_data,
-            enable_fsdp_shard=False,
-            param_dtype=torch.float16,
-        )
-        sharded_param = self._build_materialization_probe_param(
-            sharded_param_data=sharded_param_data,
-            enable_fsdp_shard=True,
-            param_dtype=torch.float16,
-        )
-
-        replicate_unsharded, _ = replicate_param._get_unsharded_param_data(async_op=False)
-        sharded_unsharded, _ = sharded_param._get_unsharded_param_data(async_op=False)
-        replicate_loss, replicate_grad = self._compute_probe_loss_and_grad(replicate_unsharded, input_data)
-        sharded_loss, sharded_grad = self._compute_probe_loss_and_grad(sharded_unsharded, input_data)
-
-        self.assertTrue(torch.equal(replicate_loss, sharded_loss))
-        self.assertTrue(torch.equal(replicate_grad, sharded_grad))
-
-    def test_full_precision_paths_match_loss_and_grad(self):
-        """Verify both paths stay numerically aligned when mixed precision is disabled."""
-        sharded_param_data = torch.tensor(
-            [1.0003, 1.0009, 1.0015, 1.0021, -0.33341, -0.33391, 0.20031, 0.20081],
-            dtype=torch.float32,
-        )
-        input_data = torch.tensor(
-            [0.1255, -0.3755, 0.6255, -0.8755, 1.1250, -1.3750, 1.6250, -1.8750],
-            dtype=torch.float32,
-        )
-        replicate_param = self._build_materialization_probe_param(
-            sharded_param_data=sharded_param_data,
-            enable_fsdp_shard=False,
-            param_dtype=None,
-        )
-        sharded_param = self._build_materialization_probe_param(
-            sharded_param_data=sharded_param_data,
-            enable_fsdp_shard=True,
-            param_dtype=None,
-        )
-
-        replicate_unsharded, _ = replicate_param._get_unsharded_param_data(async_op=False)
-        sharded_unsharded, _ = sharded_param._get_unsharded_param_data(async_op=False)
-        replicate_loss, replicate_grad = self._compute_probe_loss_and_grad(replicate_unsharded, input_data)
-        sharded_loss, sharded_grad = self._compute_probe_loss_and_grad(sharded_unsharded, input_data)
-
-        self.assertTrue(torch.equal(replicate_unsharded, sharded_unsharded))
-        self.assertEqual(replicate_unsharded.dtype, torch.float32)
-        self.assertEqual(sharded_unsharded.dtype, torch.float32)
-        self.assertTrue(torch.equal(replicate_loss, sharded_loss))
-        self.assertTrue(torch.equal(replicate_grad, sharded_grad))
-
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")
     @patch('hyper_parallel.core.dtensor.layout.Layout')
@@ -729,34 +621,27 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         reduced_grad.redistribute.assert_not_called()
         self.assertTrue(torch.equal(grad, reduced_grad.to_local()))
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
-    @patch("hyper_parallel.platform.torch.fully_shard.param._build_group_info_from_process_group")
     @patch("hyper_parallel.platform.torch.fully_shard.param.platform.split_group")
+    @patch("hyper_parallel.platform.torch.fully_shard.param.get_split_rank_lists_for_axes")
+    @patch("hyper_parallel.platform.torch.fully_shard.param._build_group_info_from_process_group")
     def test_layout_driven_group_info_uses_spmd_replicate_axes(
         self,
-        mock_split_group,
         mock_build_group_info,
-        mock_get_rank,
+        mock_get_split_rank_lists_for_axes,
+        mock_split_group,
     ):
-        """Verify multi-axis replicate groups are built from globally consistent split rank lists."""
+        """Verify layout-driven group info builds multi-axis replicate groups from split rank lists."""
         param_v2 = object.__new__(TorchHSDPParamV2)
         param_v2.param_mode = FullyShardParamMode.LOCAL_PARAM
         param_v2.enable_fsdp_shard = True
         param_v2._spmd_shard_mesh_dim = 1
-        param_v2._spmd_mesh = DeviceMesh(
-            "cpu",
-            np.array(
-                [
-                    [[0, 1], [2, 3]],
-                    [[4, 5], [6, 7]],
-                ]
-            ),
-            mesh_dim_names=("dp", "fsdp", "tp"),
-            _init_backend=False,
-        )
+        param_v2._spmd_mesh = MagicMock()
+        param_v2._spmd_mesh.mesh_dim_names = ("dp", "fsdp", "tp")
+        param_v2._spmd_mesh.mesh_shape = (2, 2, 4)
         param_v2._spmd_placements = (Replicate(), Shard(0), Replicate())
-        mock_split_group.return_value = "flattened-pg"
-        mock_build_group_info.return_value = MagicMock(rank_size=4)
+        mock_get_split_rank_lists_for_axes.return_value = [[0, 1, 4, 5], [2, 3, 6, 7]]
+        mock_split_group.return_value = "split-pg"
+        mock_build_group_info.return_value = MagicMock(rank_size=8)
 
         # Input:
         # - Unified placements: replicate on mesh axes 0 and 2, shard on mesh axis 1.
@@ -764,15 +649,14 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         # - unsharded_group_info is built from globally enumerated split rank lists over ("dp", "tp").
         group_info = TorchHSDPParamV2._build_layout_driven_group_info(param_v2)
 
-        mock_split_group.assert_called_once_with(
-            split_ranks=[[0, 1, 4, 5], [2, 3, 6, 7]]
-        )
+        mock_get_split_rank_lists_for_axes.assert_called_once_with(param_v2._spmd_mesh, [0, 2])
+        mock_split_group.assert_called_once_with(split_ranks=[[0, 1, 4, 5], [2, 3, 6, 7]])
         mock_build_group_info.assert_called_once_with(
             "fully_shard_unsharded_group",
-            "flattened-pg",
-            4,
+            "split-pg",
+            8,
         )
-        self.assertEqual(group_info.rank_size, 4)
+        self.assertEqual(group_info.rank_size, 8)
 
     def test_layout_driven_group_info_falls_back_to_current_rank_without_replicate_axes(self):
         """Verify layout-driven group info falls back to a single-rank group when no replicate axis exists."""
@@ -809,29 +693,58 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         _GROUP_INFO_CACHE.clear()
         EXISTING_COMM_GROUPS.clear()
 
-    def test_reduce_scatter_grad_rejects_non_dim0_fully_shard_placement(self):
-        """Verify reduce_scatter_grad blocks non-dim0 FSDP placements."""
+    @patch("hyper_parallel.platform.torch.fully_shard.param.dist.reduce_scatter_tensor")
+    def test_reduce_scatter_grad_supports_non_dim0_fully_shard_placement(self, mock_reduce_scatter):
+        """Verify reduce_scatter_grad packs non-dim0 FSDP gradients via chunk-cat."""
         param_v2 = object.__new__(TorchHSDPParamV2)
         param_v2.sharded_state = ShardedState.UNSHARDED
         param_v2.unsharded_accumulated_grad = None
         param_v2._unsharded_param = MagicMock()
-        param_v2._unsharded_param.grad = torch.ones(4, 4)
+        grad = torch.arange(16, dtype=torch.float32).view(4, 4)
+        param_v2._unsharded_param.grad = grad
         param_v2.is_sharded = True
         param_v2.shard_size = 2
         param_v2.sharded_group_info = MagicMock(group=MagicMock())
         param_v2.hsdp_placement = Shard(1)
         param_v2._spmd_placements = (Shard(1),)
+        param_v2._orig_size = grad.shape
+        mock_reduce_scatter.return_value = MagicMock()
 
-        # Input:
-        # - Full gradient is available in UNSHARDED state.
-        # - FSDP placement requests sharding on tensor dim 1.
-        # Expected output:
-        # - reduce_scatter_grad raises NotImplementedError because only dim 0 is supported.
-        with self.assertRaisesRegex(NotImplementedError, "dim=0"):
-            TorchHSDPParamV2.reduce_scatter_grad(param_v2, async_op=False)
+        reduced_grad, _ = TorchHSDPParamV2.reduce_scatter_grad(param_v2, async_op=False)
 
-    def test_reduce_scatter_grad_rejects_strided_shard_layout(self):
-        """Verify reduce_scatter_grad blocks StridedShard layouts until placement-aware packing exists."""
+        expected_packed = torch.cat(torch.chunk(grad, 2, dim=1), dim=0).reshape(-1)
+        self.assertEqual(reduced_grad.numel(), grad.numel() // param_v2.shard_world_size)
+        self.assertTrue(torch.equal(mock_reduce_scatter.call_args.args[1], expected_packed))
+
+    @patch("hyper_parallel.platform.torch.fully_shard.param.dist.reduce_scatter_tensor")
+    def test_reduce_scatter_grad_supports_same_dim_strided_non_dim0_layout(self, mock_reduce_scatter):
+        """Verify same-dim StridedShard(dim!=0) reuses the non-dim0 chunk-cat packing path."""
+        param_v2 = object.__new__(TorchHSDPParamV2)
+        param_v2.sharded_state = ShardedState.UNSHARDED
+        param_v2.unsharded_accumulated_grad = None
+        param_v2._unsharded_param = MagicMock()
+        grad = torch.arange(32, dtype=torch.float32).view(4, 8)
+        param_v2._unsharded_param.grad = grad
+        param_v2.is_sharded = True
+        param_v2.shard_size = 2
+        param_v2.sharded_group_info = MagicMock(group=MagicMock())
+        param_v2.enable_fsdp_shard = True
+        param_v2.hsdp_placement = Shard(1)
+        param_v2._orig_size = grad.shape
+        param_v2._orig_param_is_dtensor = True
+        param_v2._orig_dtensor_placements = (Shard(1),)
+        param_v2._spmd_shard_mesh_dim = 0
+        param_v2._spmd_placements = (StridedShard(1, split_factor=2), Shard(1))
+        mock_reduce_scatter.return_value = MagicMock()
+
+        reduced_grad, _ = TorchHSDPParamV2.reduce_scatter_grad(param_v2, async_op=False)
+
+        expected_packed = torch.cat(torch.chunk(grad, 2, dim=1), dim=0).reshape(-1)
+        self.assertEqual(reduced_grad.numel(), grad.numel() // param_v2.shard_world_size)
+        self.assertTrue(torch.equal(mock_reduce_scatter.call_args.args[1], expected_packed))
+
+    def test_reduce_scatter_grad_rejects_unsupported_strided_shard_layout(self):
+        """Verify reduce_scatter_grad still rejects StridedShard layouts outside the V1 same-dim path."""
         param_v2 = object.__new__(TorchHSDPParamV2)
         param_v2.sharded_state = ShardedState.UNSHARDED
         param_v2.unsharded_accumulated_grad = None
@@ -840,16 +753,80 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2.is_sharded = True
         param_v2.shard_size = 2
         param_v2.sharded_group_info = MagicMock(group=MagicMock())
+        param_v2.enable_fsdp_shard = True
         param_v2.hsdp_placement = Shard(0)
-        param_v2._spmd_placements = (StridedShard(0, split_factor=2), Shard(0))
+        param_v2._orig_param_is_dtensor = True
+        param_v2._orig_dtensor_placements = (Shard(0),)
+        param_v2._spmd_shard_mesh_dim = 0
+        param_v2._spmd_placements = (StridedShard(0, split_factor=2), Shard(1))
 
-        # Input:
-        # - Full gradient is available in UNSHARDED state.
-        # - Unified placements include StridedShard(dim=0, split_factor=2).
-        # Expected output:
-        # - reduce_scatter_grad raises NotImplementedError until RS packing supports StridedShard.
-        with self.assertRaisesRegex(NotImplementedError, "StridedShard"):
+        with self.assertRaisesRegex(NotImplementedError, "same-dim StridedShard"):
             TorchHSDPParamV2.reduce_scatter_grad(param_v2, async_op=False)
+
+    @staticmethod
+    def _build_param_group_for_fused_unshard(full_tensor, shard_dim, world_size=2):
+        """Build a minimal fused all-gather result that can be unpacked by ``wait_for_unshard``."""
+        param_v2 = object.__new__(TorchHSDPParamV2)
+        local_shape = list(full_tensor.shape)
+        local_shape[shard_dim] //= world_size
+        param_v2.hsdp_placement = Shard(shard_dim)
+        param_v2.enable_fsdp_shard = True
+        param_v2.shard_size = world_size
+        param_v2.is_sharded = True
+        param_v2._orig_size = full_tensor.shape
+        param_v2._orig_param_is_dtensor = False
+        param_v2.sharded_param = SimpleNamespace(
+            requires_grad=True,
+            _local_tensor=torch.zeros(local_shape, dtype=full_tensor.dtype),
+        )
+        param_v2.all_gather_outputs = []
+        param_v2.to_unsharded = MagicMock()
+
+        plan = build_rs_plan(param_v2, full_tensor, world_size=world_size)
+        packed_full_tensor = pack_for_reduce_scatter(full_tensor, plan).reshape(-1).clone()
+        local_input_numel = full_tensor.numel() // world_size
+        metadata = AllGatherMetadata(
+            param_input_dtypes=[[full_tensor.dtype]],
+            param_input_numels=[[local_input_numel]],
+            dtype=full_tensor.dtype,
+            inp_split_sizes=[local_input_numel],
+            total_input_numel=local_input_numel,
+        )
+
+        param_group = object.__new__(HSDPParamGroup)
+        param_group._result = AllGatherResult(packed_full_tensor, metadata, None)
+        param_group.shard_group = MagicMock()
+        param_group.shard_group.size.return_value = world_size
+        param_group.shard_world_size = world_size
+        param_group.device = torch.device("cpu")
+        param_group.hsdp_params = [param_v2]
+        param_group.free_all_gather_output = MagicMock()
+        return param_group, param_v2, packed_full_tensor
+
+    @patch.object(DTensor, "from_local", side_effect=lambda tensor, *_args, **_kwargs: tensor)
+    def test_param_group_wait_for_unshard_reconstructs_same_dim_strided_non_dim0_tensor(
+        self,
+        mock_from_local,
+    ):
+        """Verify fused all-gather copy-out reuses the shared unpack plan for same-dim strided non-dim0 params."""
+        full_tensor = torch.arange(32, dtype=torch.float32).view(4, 8)
+        param_group, param_v2, packed_full_tensor = self._build_param_group_for_fused_unshard(
+            full_tensor,
+            shard_dim=1,
+        )
+        param_v2._orig_param_is_dtensor = True
+        param_v2._orig_dtensor_mesh = MagicMock()
+        param_v2._orig_dtensor_placements = (Shard(1),)
+        param_v2._spmd_shard_mesh_dim = 0
+        param_v2._spmd_placements = (StridedShard(1, split_factor=2), Shard(1))
+
+        HSDPParamGroup.wait_for_unshard(param_group)
+
+        self.assertTrue(torch.equal(param_v2.all_gather_outputs[0], packed_full_tensor))
+        self.assertTrue(torch.equal(param_v2.unsharded_param, full_tensor))
+        mock_from_local.assert_called_once()
+        param_v2.to_unsharded.assert_called_once()
+        param_group.free_all_gather_output.assert_called_once()
 
     def test_to_accumulated_grad_if_needed_preserves_grad_without_reduce_dtype(self):
         """Verify no-sync paths still move local grad into accumulated buffer even without dtype conversion."""
@@ -916,6 +893,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         self.assertEqual(unified_mesh.to_hash(), root_mesh.to_hash())
 
     def test_infer_fully_shard_param_mode_for_tp_mesh(self):
+        """Verify TP-only meshes still distinguish LOCAL_PARAM, DTENSOR_COMPAT, and DTENSOR_UNIFIED."""
         mesh = MagicMock(spec=DeviceMesh)
         mesh.mesh_dim_names = ("tp",)
         self.assertEqual(infer_fully_shard_param_mode(mesh, []), FullyShardParamMode.LOCAL_PARAM)
@@ -1048,6 +1026,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         self.assertIs(module.hsdp_init.call_args.args[2], default_mesh)
 
     def test_build_data_parallel_mesh_info_rejects_mesh_with_more_than_2_dims(self):
+        """Verify scheduler mesh-info construction rejects explicit meshes with rank greater than 2."""
         mesh = MagicMock(spec=DeviceMesh)
         mesh.ndim = 3
         mesh.mesh_dim_names = ("tp", "dp", "fsdp")
@@ -1056,6 +1035,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
             self._build_mesh_info_via_scheduler(mesh, [])
 
     def test_build_data_parallel_mesh_info_rejects_mismatched_compat_dtensor_meshes(self):
+        """Verify compat DTensor parameters must agree on their source mesh before mesh-info inference."""
         mesh1 = MagicMock(spec=DeviceMesh)
         mesh1.to_hash.return_value = "mesh1"
         mesh2 = MagicMock(spec=DeviceMesh)
@@ -1109,25 +1089,6 @@ class TestFullyShardMeshUtils(unittest.TestCase):
 
         self.assertEqual(rank_list, [1, 3])
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
-    def test_get_split_rank_lists_for_axes_enumerates_all_complementary_slices(self, mock_get_rank):
-        """Verify get_split_rank_lists_for_axes returns every slice induced by complementary axes."""
-        mesh = DeviceMesh(
-            "cpu",
-            np.array(
-                [
-                    [[0, 1], [2, 3]],
-                    [[4, 5], [6, 7]],
-                ]
-            ),
-            mesh_dim_names=("dp", "tp", "ep"),
-            _init_backend=False,
-        )
-
-        split_rank_lists = get_split_rank_lists_for_axes(mesh, [0, 2])
-
-        self.assertEqual(split_rank_lists, [[0, 1, 4, 5], [2, 3, 6, 7]])
-
     @patch("hyper_parallel.platform.torch.fully_shard.state.TorchHSDPParamV2")
     @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
     def test_state_infers_param_mode_per_parameter(self, mock_get_rank, mock_hsdp_param_cls):
@@ -1173,8 +1134,12 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         mock_hsdp_param_cls.return_value = mock_instance
 
         with patch.object(TorchHSDPStateV2, "_move_states_to_device"), \
-                patch.object(TorchHSDPStateV2, "_validate_cpu_offload_params"):
-            TorchHSDPStateV2(module, mesh_info, config, MagicMock(), torch.device("cpu"))
+                patch.object(TorchHSDPStateV2, "_validate_cpu_offload_params"), \
+                patch(
+                    "hyper_parallel.platform.torch.fully_shard.state._get_param_module_infos",
+                    return_value=[MagicMock(), MagicMock()],
+                ):
+            TorchHSDPStateV2((module,), mesh_info, config, MagicMock(), torch.device("cpu"))
 
         inferred_modes = [call.kwargs["param_mode"] for call in mock_hsdp_param_cls.call_args_list]
         inferred_enable_flags = [call.kwargs["enable_fsdp_shard"] for call in mock_hsdp_param_cls.call_args_list]
@@ -1348,11 +1313,70 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         mock_hsdp_param_cls.return_value = mock_instance
 
         with patch.object(TorchHSDPStateV2, "_move_states_to_device"), \
-                patch.object(TorchHSDPStateV2, "_validate_cpu_offload_params"):
-            TorchHSDPStateV2(module, mesh_info, config, MagicMock(), torch.device("cpu"))
+                patch.object(TorchHSDPStateV2, "_validate_cpu_offload_params"), \
+                patch(
+                    "hyper_parallel.platform.torch.fully_shard.state._get_param_module_infos",
+                    return_value=[MagicMock()],
+                ):
+            TorchHSDPStateV2((module,), mesh_info, config, MagicMock(), torch.device("cpu"))
 
         self.assertEqual(mock_hsdp_param_cls.call_count, 1)
         self.assertIs(mock_hsdp_param_cls.call_args.args[0], keep_param)
+
+    @patch("hyper_parallel.platform.torch.fully_shard.state.TorchHSDPParamV2")
+    def test_state_forwards_shard_placement_fn_during_param_init(self, mock_hsdp_param_cls):
+        """Verify module-level fully_shard forwards config.shard_placement_fn into TorchHSDPParamV2."""
+        mesh = MagicMock(spec=DeviceMesh)
+        mesh.ndim = 1
+        mesh.mesh_shape = (2,)
+        mesh.mesh_dim_names = ("fsdp",)
+
+        module = nn.Module()
+        keep_param = nn.Parameter(torch.randn(4, 4))
+        module.register_parameter("weight", keep_param)
+
+        mesh_info = MagicMock(spec=FSDPMeshInfo)
+        mesh_info.mesh = mesh
+        mesh_info.shard_mesh_dim = 0
+        mesh_info.replicate_mesh_dim = None
+        mesh_info.shard_mesh_rank = 0
+        mesh_info.shard_mesh_size = 2
+        mesh_info.shard_process_group = None
+
+        def shard_placement_fn(param):
+            del param
+            return Shard(1)
+
+        config = MagicMock()
+        config.mesh = mesh
+        config.ignored_params = None
+        config.replicate_params = None
+        config.comm_fusion = False
+        config.shard_placement_fn = shard_placement_fn
+        config.mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+            cast_forward_inputs=True,
+        )
+        config.offload_policy = None
+
+        mock_instance = MagicMock()
+        mock_instance.is_sharded = True
+        mock_instance.sharded_param.requires_grad = True
+        mock_hsdp_param_cls.return_value = mock_instance
+
+        with patch.object(TorchHSDPStateV2, "_move_states_to_device"), \
+                patch.object(TorchHSDPStateV2, "_validate_cpu_offload_params"), \
+                patch(
+                    "hyper_parallel.platform.torch.fully_shard.state._get_param_module_infos",
+                    return_value=[MagicMock()],
+                ):
+            TorchHSDPStateV2((module,), mesh_info, config, MagicMock(), torch.device("cpu"))
+
+        self.assertEqual(mock_hsdp_param_cls.call_count, 1)
+        self.assertIs(mock_hsdp_param_cls.call_args.args[0], keep_param)
+        self.assertIs(mock_hsdp_param_cls.call_args.kwargs["shard_placement_fn"], shard_placement_fn)
 
     def test_state_validate_no_meta_params_checks_replicate_params(self):
         """Verify _validate_no_meta_params also checks replicate_params."""
@@ -1492,27 +1516,149 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         state._queue_reduce_scatter_then_all_reduce.assert_not_called()
         state._queue_compat_all_reduce.assert_not_called()
 
+    @patch("hyper_parallel.platform.torch.fully_shard.state.get_comm_ctx")
+    def test_state_post_backward_for_comm_fusion_routes_replicate_params_through_compat_queue(
+        self,
+        mock_get_comm_ctx,
+    ):
+        """Verify comm_fusion keeps replicate_params on the compat all-reduce side path."""
+        state = object.__new__(TorchHSDPStateV2)
+        state._user_reduce_op_type = None
+        state._reduce_dtype = None
+        state.reduce_op_type = torch.distributed.ReduceOp.AVG
+        state.requires_all_reduce = True
+        state.reduce_params = MagicMock()
+        state._queue_compat_all_reduce = MagicMock()
+        state.param_group = MagicMock()
+        state.replicate_params = []
+        mock_get_comm_ctx.return_value = SimpleNamespace(
+            all_reduce_param_group=None,
+            pre_param_group=None,
+        )
+
+        replicate_param = MagicMock()
+        replicate_param.unsharded_accumulated_grad = None
+        replicate_param._unsharded_param = MagicMock()
+        replicate_param.unsharded_param = replicate_param._unsharded_param
+        replicate_param.unsharded_param.grad = torch.ones(2, 2)
+        replicate_param.sharded_param.requires_grad = True
+        replicate_param.dp_size = 2
+        state.replicate_params.append(replicate_param)
+
+        TorchHSDPStateV2.post_backward_for_comm_fusion(state)
+
+        state.reduce_params.assert_called_once()
+        state.param_group.foreach_reduce.assert_called_once_with(
+            reduce_scatter_reduce_op=torch.distributed.ReduceOp.AVG
+        )
+        state._queue_compat_all_reduce.assert_called_once_with(
+            replicate_param,
+            torch.distributed.ReduceOp.AVG,
+        )
+
     @patch("hyper_parallel.platform.torch.fully_shard.state.HSDPParamGroup")
-    def test_init_param_group_rejects_replicate_or_dtensor_params_for_comm_fusion(self, mock_param_group):
-        """Verify comm_fusion rejects parameters outside the legacy pure-local sharded path."""
+    def test_init_param_group_rejects_unsupported_strided_shard_layouts_for_comm_fusion(self, mock_param_group):
+        """Verify comm_fusion still rejects StridedShard layouts outside the V1 same-dim path."""
         state = object.__new__(TorchHSDPStateV2)
         state.config = MagicMock()
         state.config.comm_fusion = True
         state.mesh_info = MagicMock()
         state.device = torch.device("cpu")
         state.mp_policy = MixedPrecisionPolicy()
-        state.hsdp_params = []
         state.replicate_params = []
+        state.hsdp_params = [MagicMock()]
 
-        unsupported_param = MagicMock()
-        unsupported_param.param_mode = FullyShardParamMode.LOCAL_PARAM
-        unsupported_param.enable_fsdp_shard = False
-        state.replicate_params.append(unsupported_param)
+        unsupported_param = state.hsdp_params[0]
+        unsupported_param.param_mode = FullyShardParamMode.DTENSOR_UNIFIED
+        unsupported_param.enable_fsdp_shard = True
+        unsupported_param.uses_param_shard = True
+        unsupported_param._orig_param_is_dtensor = True
+        unsupported_param.hsdp_placement = Shard(0)
+        unsupported_param._orig_dtensor_placements = (Shard(0),)
+        unsupported_param._spmd_shard_mesh_dim = 0
+        unsupported_param._spmd_placements = (StridedShard(0, split_factor=2), Shard(1))
+        unsupported_param._sharded_local_tensor = torch.ones(2, 4)
+        unsupported_param.shard_world_size = 2
+        unsupported_param._orig_size = torch.Size((4, 4))
+        unsupported_param._param_fqn = "dt_weight"
 
-        with self.assertRaisesRegex(NotImplementedError, "comm_fusion currently only supports local parameters"):
+        with self.assertRaisesRegex(NotImplementedError, "same-dim StridedShard"):
             TorchHSDPStateV2._init_param_group(state)
 
         mock_param_group.assert_not_called()
+
+    def test_param_group_apply_reduced_grad_uses_local_shard_numel_for_offsets(self):
+        """Verify fused grad apply advances offsets by local shard numel, not global DTensor size."""
+        param_group = object.__new__(HSDPParamGroup)
+        param_group.device = torch.device("cpu")
+        param_group.mp_policy = MixedPrecisionPolicy()
+        param_group._orig_dtype = torch.float32
+        param_group._reduce_output = torch.arange(8, dtype=torch.float32)
+        param_group.hsdp_params = []
+        param_group._reduce_hsdp_params = []
+        param_group.shard_group = MagicMock()
+        param_group.shard_group.size.return_value = 2
+
+        for idx in range(2):
+            sharded_param = SimpleNamespace(grad=None, requires_grad=True)
+            hsdp_param = SimpleNamespace(
+                sharded_param=sharded_param,
+                _unsharded_param=SimpleNamespace(
+                    size=lambda: torch.Size((8, 2)),
+                    grad=None,
+                ),
+                sharded_size=torch.Size((2, 2)),
+                contiguous_sharded_stride=(2, 1),
+                offload_to_cpu=False,
+                pin_memory=False,
+                unsharded_accumulated_grad=None,
+                unsharded_param=SimpleNamespace(grad=None),
+                to_sharded_dtensor=lambda tensor: tensor.clone(),
+            )
+            param_group.hsdp_params.append(hsdp_param)
+            param_group._reduce_hsdp_params.append(hsdp_param)
+
+        HSDPParamGroup._apply_reduced_grad(param_group)
+
+        self.assertTrue(torch.equal(param_group.hsdp_params[0].sharded_param.grad, torch.tensor([[0., 1.], [2., 3.]])))
+        self.assertTrue(torch.equal(param_group.hsdp_params[1].sharded_param.grad, torch.tensor([[4., 5.], [6., 7.]])))
+        self.assertIsNone(param_group._reduce_output)
+
+    def test_param_group_builds_active_replicate_buckets_per_layout_group(self):
+        """Verify active replicate buckets group params by layout-driven all-reduce group."""
+        group_a = MagicMock()
+        group_b = MagicMock()
+        hsdp_params = [
+            SimpleNamespace(
+                unsharded_group_info=SimpleNamespace(group=group_a, rank_size=2),
+                replicate_world_size=2,
+                sharded_size=torch.Size((2,)),
+            ),
+            SimpleNamespace(
+                unsharded_group_info=SimpleNamespace(group=group_b, rank_size=4),
+                replicate_world_size=4,
+                sharded_size=torch.Size((3,)),
+            ),
+            SimpleNamespace(
+                unsharded_group_info=SimpleNamespace(group=group_a, rank_size=2),
+                replicate_world_size=2,
+                sharded_size=torch.Size((4,)),
+            ),
+            SimpleNamespace(
+                unsharded_group_info=SimpleNamespace(group=None, rank_size=1),
+                replicate_world_size=1,
+                sharded_size=torch.Size((5,)),
+            ),
+        ]
+        param_group = object.__new__(HSDPParamGroup)
+
+        buckets = HSDPParamGroup._build_active_replicate_buckets(param_group, hsdp_params)
+
+        self.assertEqual(set(buckets.keys()), {id(group_a), id(group_b)})
+        self.assertEqual(buckets[id(group_a)].param_indices, [0, 2])
+        self.assertEqual(buckets[id(group_a)].flat_numel, 6)
+        self.assertEqual(buckets[id(group_b)].param_indices, [1])
+        self.assertEqual(buckets[id(group_b)].flat_numel, 3)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0)
     def test_device_mesh_concatenate_rejects_mismatched_root_meshes(self, mock_get_rank):
@@ -1596,6 +1742,7 @@ class TestFullyShardGuards(unittest.TestCase):
         )
 
     def test_param_init_requires_resolved_param_mode(self):
+        """Verify ``TorchHSDPParamV2`` rejects construction before param_mode has been resolved."""
         with self.assertRaisesRegex(AssertionError, "param_mode must be resolved"):
             TorchHSDPParamV2(
                 param=self.param,

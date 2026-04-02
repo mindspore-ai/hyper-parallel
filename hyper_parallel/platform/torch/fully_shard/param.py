@@ -46,6 +46,11 @@ from hyper_parallel.core.fully_shard.utils import (
     OffloadPolicy,
 )
 from hyper_parallel.platform import get_platform
+from hyper_parallel.platform.torch.fully_shard.pack_utils import (
+    build_rs_plan,
+    pack_for_reduce_scatter,
+    unpack_from_all_gather,
+)
 
 _GROUP_INFO_CACHE = {}
 platform = get_platform()
@@ -499,24 +504,39 @@ class TorchHSDPParamV2(HSDPParamV2):
         """
         Initialize unsharded parameter from all-gather outputs.
 
-        This reconstructs the full parameter after all-gather by using
-        the gathered data and reshaping it to the original size.
+        This reconstructs the full parameter after all-gather by unpacking the
+        gathered flat buffer back to the original tensor layout.
         """
+        unsharded_param = self._get_unsharded_param_from_all_gather_output()
+        # Always refresh the unsharded Parameter from the latest all-gather output.
+        # Non-dim0 unpack currently materializes a contiguous tensor copy, so
+        # keeping stale .data would otherwise reuse old weights after optimizer.step()
+        # mutates only the sharded local shard. Preserve the Parameter object identity
+        # so autograd-facing module state stays stable across unshard cycles.
         if hasattr(self, "_unsharded_param"):
+            # pylint: disable=access-member-before-definition
+            self._unsharded_param.data = unsharded_param
+            self._unsharded_param.requires_grad_(self.sharded_param.requires_grad)
+            self._unsharded_param.grad = None
             return
+        self._unsharded_param = nn.Parameter(
+            unsharded_param,
+            requires_grad=self.sharded_param.requires_grad,
+        )
 
-        # Get unsharded data from all-gather outputs
+    def _get_unsharded_param_from_all_gather_output(self) -> torch.Tensor:
+        """Reconstruct the full local parameter view from the packed all-gather output."""
         if len(self.all_gather_outputs) != 1:
             raise AssertionError(
                 f"Expected 1 all_gather_output, got {len(self.all_gather_outputs)}"
             )
         unsharded_tensor = self.all_gather_outputs[0]
-        unsharded_param = torch.as_strided(
-            unsharded_tensor,
-            self._orig_size,
-            self._contiguous_orig_stride,
-            storage_offset=0,
+        plan = build_rs_plan(
+            self,
+            self._sharded_local_tensor,
+            self.shard_world_size if self.is_sharded else 1,
         )
+        unsharded_param = unpack_from_all_gather(unsharded_tensor, plan)
         if self._orig_param_is_dtensor:
             # Rebuild the original DTensor view after all-gather so gradient
             # consumers keep seeing the source DTensor layout.
@@ -525,10 +545,7 @@ class TorchHSDPParamV2(HSDPParamV2):
                 self._orig_dtensor_mesh,
                 self._orig_dtensor_placements,
             )
-        self._unsharded_param = nn.Parameter(
-            unsharded_param,
-            requires_grad=self.sharded_param.requires_grad,
-        )
+        return unsharded_param
 
     def to_sharded(self) -> None:
         self._setattr_on_modules(self.sharded_param)
@@ -844,7 +861,15 @@ class TorchHSDPParamV2(HSDPParamV2):
             grad = self.unsharded_grad_data
         reduce_dtype = dtype or grad.dtype
         grad = grad.to(reduce_dtype)
-        grad_flat = grad.view(-1)
+        plan_world_size = (
+            self.shard_world_size
+            if self.is_sharded
+            and self.sharded_group_info.group is not None
+            and self.shard_world_size > 1
+            else 1
+        )
+        plan = build_rs_plan(self, grad, plan_world_size)
+        grad_flat = pack_for_reduce_scatter(grad, plan).reshape(-1)
 
         # If parameter is not sharded (below threshold), no reduce-scatter needed
         if not self.is_sharded:
@@ -853,20 +878,6 @@ class TorchHSDPParamV2(HSDPParamV2):
         if self.sharded_group_info.group is None or self.shard_world_size <= 1:
             # No communication needed
             return grad_flat, None
-
-        # The current RS implementation assumes the fully_shard dimension is the
-        # leading tensor dimension and that all other sharding follows the normal
-        # contiguous layout. Once StridedShard or non-dim0 fully_shard layouts are
-        # supported, this packing must become placement-aware instead of flattening.
-        if self.hsdp_placement.dim != 0:
-            raise NotImplementedError(
-                "reduce_scatter_grad currently only supports fully_shard placement on dim=0."
-            )
-        if any(isinstance(placement, StridedShard) for placement in self._spmd_placements):
-            raise NotImplementedError(
-                "reduce_scatter_grad does not support StridedShard layout yet. "
-                "Please disable this path until placement-aware RS packing is implemented."
-            )
 
         # Calculate output size
         output_numel = grad_flat.numel() // self.shard_world_size
