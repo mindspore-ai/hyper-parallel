@@ -14,6 +14,7 @@
 # ============================================================================
 """Torch HSDP scheduler"""
 import torch
+from typing import List
 from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -83,12 +84,24 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _register_post_backward_hook(self, args, kwargs):
         """Wrap forward args/kwargs through PostBackwardFunction to register backward hook."""
+        if not torch.is_grad_enabled():
+            return args, kwargs
         args_list, args_spec = tree_flatten(args)
         kwargs_list, kwargs_spec = tree_flatten(kwargs)
         args_kwargs_list = list(args_list) + list(kwargs_list)
-        args_kwargs_list = PostBackwardFunction.apply(self, *args_kwargs_list)
+        inp_tensor_indices: List[int] = []
+        inp_tensors: List[torch.Tensor] = []
+        for i, obj in enumerate(args_kwargs_list):
+            if torch.is_tensor(obj) and obj.requires_grad:
+                inp_tensor_indices.append(i)
+                inp_tensors.append(obj)
+        if len(inp_tensors) == 0:
+            return args, kwargs  # no tensors that require gradients
+        processed_tensors = PostBackwardFunction.apply(self, *inp_tensors)
+        for inp_tensor_idx, processed_tensor in zip(inp_tensor_indices, processed_tensors):
+            args_kwargs_list[inp_tensor_idx] = processed_tensor
         args_list = args_kwargs_list[: len(args_list)]
-        kwargs_list = args_kwargs_list[len(args_list):]
+        kwargs_list = args_kwargs_list[len(args_list) :]
         args = tree_unflatten(args_list, args_spec)
         kwargs = tree_unflatten(kwargs_list, kwargs_spec)
         return args, kwargs

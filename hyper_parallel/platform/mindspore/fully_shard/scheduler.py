@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore HSDP scheduler"""
+from typing import List
 import mindspore as ms
 from mindspore.common.api import _pynative_executor
 from mindspore.utils._pytree import tree_flatten, tree_unflatten
@@ -59,7 +60,17 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         args_list, args_spec = tree_flatten(args)
         kwargs_list, kwargs_spec = tree_flatten(kwargs)
         args_kwargs_list = list(args_list) + list(kwargs_list)
-        args_kwargs_list = PostBackwardFunction.apply(self, *args_kwargs_list)
+        inp_tensor_indices: List[int] = []
+        inp_tensors: List[ms.Tensor] = []
+        for i, obj in enumerate(args_kwargs_list):
+            if isinstance(obj, ms.Tensor) and obj.requires_grad:
+                inp_tensor_indices.append(i)
+                inp_tensors.append(obj)
+        if len(inp_tensors) == 0:
+            return args, kwargs
+        processed_tensors = PostBackwardFunction.apply(self, *inp_tensors)
+        for inp_tensor_idx, processed_tensor in zip(inp_tensor_indices, processed_tensors):
+            args_kwargs_list[inp_tensor_idx] = processed_tensor
         args_list = args_kwargs_list[: len(args_list)]
         kwargs_list = args_kwargs_list[len(args_list):]
         args = tree_unflatten(args_spec, args_list)
