@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 Redesign goals vs context_parallel_npu_test.py:
   - All formats covered: BSH, SBH, BSND, BNSD, TND
   - Causal masks: sparse_mode=0 (explicit), sparse_mode=2 (leftUpCausal), sparse_mode=3 (TND)
-  - Every test has a single-card numerical baseline (no pure shape/NaN checks)
+  - Most tests use a numerical baseline; documented exceptions keep targeted checks
   - No profiler, no warmup (those belong in perf tests)
   - AsyncContextParallel tests on NPU with precision comparison
 
@@ -32,18 +32,20 @@ Test groups:
 Run 2-card tests:
     HYPER_PARALLEL_PLATFORM=torch torchrun --nproc-per-node=2 \\
         --master_addr=127.0.0.1 --master_port=13000 \\
-        -m pytest -s tests/torch/context_parallel/cp_npu_test.py \\
+        -m pytest -s tests/torch/context_parallel/_test_context_parallel.py \\
         -k "not hybrid and not tp and not a3"
 
 Run 4-card tests:
     HYPER_PARALLEL_PLATFORM=torch torchrun --nproc-per-node=4 \\
         --master_addr=127.0.0.1 --master_port=13100 \\
-        -m pytest -s tests/torch/context_parallel/cp_npu_test.py \\
+        -m pytest -s tests/torch/context_parallel/_test_context_parallel.py \\
         -k "hybrid or tp or a3"
 """
+from typing import Optional, Sequence
+
 import numpy as np
 import torch
-from torch import nn
+from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch_npu  # type: ignore[import-untyped]
@@ -86,6 +88,12 @@ def _assert_close(actual, expected, rank, label="", atol=1e-2, rtol=1e-2):
         f"Rank {rank}: {label} max_diff={max_diff:.4e}"
 
 
+def _sync_workers():
+    """Synchronize ranks between merged sub-cases."""
+    if dist.is_initialized():
+        dist.barrier()
+
+
 # ---------------------------------------------------------------------------
 # Attention modules
 # ---------------------------------------------------------------------------
@@ -97,11 +105,22 @@ class BshFaAttn(nn.Module):
     not separable from shape alone).
     """
 
-    def __init__(self, head_num: int):
+    def __init__(self, head_num: int) -> None:
+        """Store the head count for BSH flash attention."""
         super().__init__()
         self.head_num = head_num
 
-    def forward(self, q, k, v):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """Run non-causal flash attention on BSH inputs.
+
+        Args:
+            q: Query tensor in BSH layout.
+            k: Key tensor in BSH layout.
+            v: Value tensor in BSH layout.
+
+        Returns:
+            The attention output tensor.
+        """
         scale = (q.shape[-1] // self.head_num) ** -0.5
         return torch_npu.npu_fusion_attention(  # type: ignore[attr-defined]
             q, k, v, self.head_num, "BSH",
@@ -112,11 +131,22 @@ class BshFaAttn(nn.Module):
 class SbhFaAttn(nn.Module):
     """npu_fusion_attention non-causal, SBH layout: [S, B, H*D]."""
 
-    def __init__(self, head_num: int):
+    def __init__(self, head_num: int) -> None:
+        """Store the head count for SBH flash attention."""
         super().__init__()
         self.head_num = head_num
 
-    def forward(self, q, k, v):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """Run non-causal flash attention on SBH inputs.
+
+        Args:
+            q: Query tensor in SBH layout.
+            k: Key tensor in SBH layout.
+            v: Value tensor in SBH layout.
+
+        Returns:
+            The attention output tensor.
+        """
         scale = (q.shape[-1] // self.head_num) ** -0.5
         return torch_npu.npu_fusion_attention(  # type: ignore[attr-defined]
             q, k, v, self.head_num, "SBH",
@@ -127,7 +157,17 @@ class SbhFaAttn(nn.Module):
 class BsndFaAttn(nn.Module):
     """npu_fusion_attention non-causal, BSND layout: [B, S, H, D]."""
 
-    def forward(self, q, k, v):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """Run non-causal flash attention on BSND inputs.
+
+        Args:
+            q: Query tensor in BSND layout.
+            k: Key tensor in BSND layout.
+            v: Value tensor in BSND layout.
+
+        Returns:
+            The attention output tensor.
+        """
         head_num = q.shape[2]
         scale = q.shape[-1] ** -0.5
         return torch_npu.npu_fusion_attention(  # type: ignore[attr-defined]
@@ -145,7 +185,8 @@ class BsndFaCausalLeftupAttn(nn.Module):
     adjusts pre_tockens/next_tockens per rank to achieve globally-correct causal attention.
     """
 
-    def __init__(self, head_num: int):
+    def __init__(self, head_num: int) -> None:
+        """Create the fixed left-up causal mask for BSND attention."""
         super().__init__()
         self.head_num = head_num
         self.register_buffer(
@@ -153,7 +194,17 @@ class BsndFaCausalLeftupAttn(nn.Module):
             torch.triu(torch.ones(2048, 2048, dtype=torch.bool), diagonal=1),
         )
 
-    def forward(self, q, k, v):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """Run left-up causal flash attention on BSND inputs.
+
+        Args:
+            q: Query tensor in BSND layout.
+            k: Key tensor in BSND layout.
+            v: Value tensor in BSND layout.
+
+        Returns:
+            The attention output tensor.
+        """
         scale = q.shape[-1] ** -0.5
         return torch_npu.npu_fusion_attention(  # type: ignore[attr-defined]
             q, k, v, self.head_num, "BSND",
@@ -166,7 +217,17 @@ class BsndFaCausalLeftupAttn(nn.Module):
 class BnsdFaAttn(nn.Module):
     """npu_fusion_attention non-causal, BNSD layout: [B, H, S, D]."""
 
-    def forward(self, q, k, v):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """Run non-causal flash attention on BNSD inputs.
+
+        Args:
+            q: Query tensor in BNSD layout.
+            k: Key tensor in BNSD layout.
+            v: Value tensor in BNSD layout.
+
+        Returns:
+            The attention output tensor.
+        """
         head_num = q.shape[1]
         scale = q.shape[-1] ** -0.5
         return torch_npu.npu_fusion_attention(  # type: ignore[attr-defined]
@@ -183,7 +244,17 @@ class BnsdFaCausalExplicitAttn(nn.Module):
     For Pure Ulysses: after ATA, S_q == S_k == full S, so the mask is the standard upper-tri.
     """
 
-    def forward(self, q, k, v):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """Run causal flash attention with an explicit upper-triangular mask.
+
+        Args:
+            q: Query tensor in BNSD layout.
+            k: Key tensor in BNSD layout.
+            v: Value tensor in BNSD layout.
+
+        Returns:
+            The attention output tensor.
+        """
         head_num = q.shape[1]
         s_q, s_k = q.shape[2], k.shape[2]
         scale = q.shape[-1] ** -0.5
@@ -212,7 +283,17 @@ class BnsdFaCausalColossalAttn(nn.Module):
     mask to (local_s, S) per rank for globally-correct causal attention.
     """
 
-    def forward(self, q, k, v):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """Run Colossal causal flash attention with a global explicit mask.
+
+        Args:
+            q: Local query tensor in BNSD layout.
+            k: Global key tensor in BNSD layout.
+            v: Global value tensor in BNSD layout.
+
+        Returns:
+            The attention output tensor.
+        """
         head_num = q.shape[1]
         s = k.shape[2]  # K is always Replicate → true global S in all Colossal modes
         scale = q.shape[-1] ** -0.5
@@ -233,14 +314,25 @@ class BnsdFaCausalLeftupAttn(nn.Module):
     to achieve globally-correct causal attention.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Create the fixed left-up causal mask for BNSD attention."""
         super().__init__()
         self.register_buffer(
             "atten_mask",
             torch.triu(torch.ones(2048, 2048, dtype=torch.bool), diagonal=1),
         )
 
-    def forward(self, q, k, v):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """Run left-up causal flash attention on BNSD inputs.
+
+        Args:
+            q: Query tensor in BNSD layout.
+            k: Key tensor in BNSD layout.
+            v: Value tensor in BNSD layout.
+
+        Returns:
+            The attention output tensor.
+        """
         head_num = q.shape[1]
         scale = q.shape[-1] ** -0.5
         return torch_npu.npu_fusion_attention(  # type: ignore[attr-defined]
@@ -258,14 +350,31 @@ class NpuFlashAttentionTND(nn.Module):
     The distributed op adjusts them per-rank for Colossal CP automatically.
     """
 
-    def __init__(self, actual_seq_qlen, actual_seq_kvlen, sparse_mode=0, atten_mask=None):
+    def __init__(
+        self,
+        actual_seq_qlen: Sequence[int],
+        actual_seq_kvlen: Sequence[int],
+        sparse_mode: int = 0,
+        atten_mask: Optional[Tensor] = None,
+    ) -> None:
+        """Store TND attention metadata and an optional causal mask."""
         super().__init__()
         self.actual_seq_qlen = actual_seq_qlen
         self.actual_seq_kvlen = actual_seq_kvlen
         self.sparse_mode = sparse_mode
         self.atten_mask = atten_mask
 
-    def forward(self, q, k, v):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """Run flash attention on TND inputs.
+
+        Args:
+            q: Query tensor in TND layout.
+            k: Key tensor in TND layout.
+            v: Value tensor in TND layout.
+
+        Returns:
+            The attention output tensor.
+        """
         head_num = q.shape[1]
         scale = q.shape[-1] ** -0.5
         return torch_npu.npu_fusion_attention(  # type: ignore[attr-defined]
@@ -281,7 +390,17 @@ class NpuFlashAttentionTND(nn.Module):
 class SimpleAttnBSHD(nn.Module):
     """Minimal BSHD matmul attention: [B, S, H, D] input/output."""
 
-    def forward(self, q, k, v):
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        """Compute plain scaled dot-product attention in BSHD layout.
+
+        Args:
+            q: Query tensor in BSHD layout.
+            k: Key tensor in BSHD layout.
+            v: Value tensor in BSHD layout.
+
+        Returns:
+            The attention output tensor.
+        """
         # BSHD → BHSD
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -297,7 +416,7 @@ class SimpleAttnBSHD(nn.Module):
 # Group 1: Pure Ulysses (cp=2)
 # ---------------------------------------------------------------------------
 
-def test_ulysses_bnsd_fa_noncausal():
+def _test_ulysses_bnsd_fa_noncausal():
     """U1: Pure Ulysses CP=2, BNSD, npu_fusion_attention non-causal.
 
     Reference: single-card NpuFA on full tensors → local slice.
@@ -331,7 +450,7 @@ def test_ulysses_bnsd_fa_noncausal():
     _assert_close(cp_out, ref_local, rank, "U1_ulysses_bnsd_fa_noncausal")
 
 
-def test_ulysses_bnsd_fa_causal_explicit():
+def _test_ulysses_bnsd_fa_causal_explicit():
     """U2: Pure Ulysses CP=2, BNSD, npu_fusion_attention causal (sparse_mode=0, explicit mask).
 
     After ATA each rank holds full S but H/cp heads; standard upper-tri mask is correct.
@@ -366,7 +485,7 @@ def test_ulysses_bnsd_fa_causal_explicit():
     _assert_close(cp_out, ref_local, rank, "U2_ulysses_bnsd_fa_causal_explicit")
 
 
-def test_ulysses_bnsd_fa_causal_leftup():
+def _test_ulysses_bnsd_fa_causal_leftup():
     """U2b: Pure Ulysses CP=2, BNSD, npu_fusion_attention causal (sparse_mode=2 leftUpCausal).
 
     In Ulysses mode, after ATA each rank holds full S (not sharded), so the standard
@@ -437,7 +556,7 @@ def test_ulysses_bsnd_fa_noncausal():
     _assert_close(cp_out, ref_local, rank, "U3_ulysses_bsnd_fa_noncausal")
 
 
-def test_ulysses_bnsd_sdpa_noncausal():
+def _test_ulysses_bnsd_sdpa_noncausal():
     """U4: Pure Ulysses CP=2, BNSD, F.scaled_dot_product_attention non-causal.
 
     Reference: single-card F.sdpa on full tensors → local slice.
@@ -457,7 +576,19 @@ def test_ulysses_bnsd_sdpa_noncausal():
     local_v = full_v[:, :, rank * local_s:(rank + 1) * local_s]
 
     class _FsdpaNonCausal(nn.Module):
-        def forward(self, q, k, v):
+        """Local non-causal SDPA wrapper for the Ulysses BNSD suite."""
+
+        def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+            """Run non-causal SDPA on local tensors.
+
+            Args:
+                q: Local query tensor.
+                k: Local key tensor.
+                v: Local value tensor.
+
+            Returns:
+                The attention output tensor.
+            """
             return F.scaled_dot_product_attention(q, k, v)
 
     core_attn = _FsdpaNonCausal()
@@ -474,7 +605,7 @@ def test_ulysses_bnsd_sdpa_noncausal():
     _assert_close(cp_out, ref_local, rank, "U4_ulysses_bnsd_sdpa_noncausal")
 
 
-def test_ulysses_bnsd_sdpa_causal():
+def _test_ulysses_bnsd_sdpa_causal():
     """U5: Pure Ulysses CP=2, BNSD, F.scaled_dot_product_attention causal (is_causal=True).
 
     After ATA each rank holds full S; is_causal=True applies to the complete context.
@@ -495,7 +626,19 @@ def test_ulysses_bnsd_sdpa_causal():
     local_v = full_v[:, :, rank * local_s:(rank + 1) * local_s]
 
     class _FsdpaCausal(nn.Module):
-        def forward(self, q, k, v):
+        """Local causal SDPA wrapper for the Ulysses BNSD suite."""
+
+        def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+            """Run causal SDPA on local tensors.
+
+            Args:
+                q: Local query tensor.
+                k: Local key tensor.
+                v: Local value tensor.
+
+            Returns:
+                The attention output tensor.
+            """
             return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     core_attn = _FsdpaCausal()
@@ -554,6 +697,23 @@ def test_ulysses_tnd_fa_noncausal():
 
     assert cp_out.shape == (t_local, num_heads, head_dim)
     _assert_close(cp_out, ref_local, rank, "U6_ulysses_tnd_fa_noncausal")
+
+
+def test_ulysses_bnsd_suite():
+    """Merged Ulysses BNSD suite.
+
+    Runs the same CP=2 / BNSD setup across FA and SDPA variants in one torchrun
+    session to reduce process-launch overhead.
+    """
+    _test_ulysses_bnsd_fa_noncausal()
+    _sync_workers()
+    _test_ulysses_bnsd_fa_causal_explicit()
+    _sync_workers()
+    _test_ulysses_bnsd_fa_causal_leftup()
+    _sync_workers()
+    _test_ulysses_bnsd_sdpa_noncausal()
+    _sync_workers()
+    _test_ulysses_bnsd_sdpa_causal()
 
 
 # ---------------------------------------------------------------------------
@@ -705,7 +865,7 @@ def test_colossal_bsnd_fa_causal_leftup():
     _assert_close(cp_out, ref_local, rank, "C3b_colossal_bsnd_fa_causal_leftup")
 
 
-def test_colossal_bnsd_fa_noncausal():
+def _test_colossal_bnsd_fa_noncausal():
     """C4: Pure Colossal CP=2, BNSD [B,H,S,D], npu_fusion_attention non-causal.
 
     seq_dim=2, head_dim=1, ulysses_degree=1.
@@ -739,7 +899,7 @@ def test_colossal_bnsd_fa_noncausal():
     _assert_close(cp_out, ref_local, rank, "C4_colossal_bnsd_fa_noncausal")
 
 
-def test_colossal_bnsd_fa_causal_explicit():
+def _test_colossal_bnsd_fa_causal_explicit():
     """C5: Pure Colossal CP=2, BNSD, npu_fusion_attention causal (sparse_mode=0, offset mask).
 
     BnsdFaCausalColossalAttn uses dist.get_rank() to build the globally-correct
@@ -778,7 +938,7 @@ def test_colossal_bnsd_fa_causal_explicit():
     _assert_close(cp_out, ref_local, rank, "C5_colossal_bnsd_fa_causal_explicit")
 
 
-def test_colossal_bnsd_fa_causal_leftup():
+def _test_colossal_bnsd_fa_causal_leftup():
     """C5b: Pure Colossal CP=2, BNSD, npu_fusion_attention causal (sparse_mode=2 leftUpCausal).
 
     Verifies the same dispatcher adjustment as C3b but in BNSD layout.
@@ -813,7 +973,7 @@ def test_colossal_bnsd_fa_causal_leftup():
     _assert_close(cp_out, ref_local, rank, "C5b_colossal_bnsd_fa_causal_leftup")
 
 
-def test_colossal_bnsd_sdpa_noncausal():
+def _test_colossal_bnsd_sdpa_noncausal():
     """C6: Pure Colossal CP=2, BNSD, F.scaled_dot_product_attention non-causal.
 
     Reference: F.sdpa(local_q, full_k, full_v) per rank.
@@ -833,7 +993,19 @@ def test_colossal_bnsd_sdpa_noncausal():
     local_v = full_v[:, :, rank * local_s:(rank + 1) * local_s]
 
     class _FsdpaNonCausal(nn.Module):
-        def forward(self, q, k, v):
+        """Local non-causal SDPA wrapper for the Colossal BNSD suite."""
+
+        def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+            """Run non-causal SDPA on local tensors.
+
+            Args:
+                q: Local query tensor.
+                k: Replicated key tensor.
+                v: Replicated value tensor.
+
+            Returns:
+                The attention output tensor.
+            """
             return F.scaled_dot_product_attention(q, k, v)
 
     core_attn = _FsdpaNonCausal()
@@ -849,7 +1021,7 @@ def test_colossal_bnsd_sdpa_noncausal():
     _assert_close(cp_out, ref_local, rank, "C6_colossal_bnsd_sdpa_noncausal")
 
 
-def test_colossal_bnsd_sdpa_causal():
+def _test_colossal_bnsd_sdpa_causal():
     """C7: Pure Colossal CP=2, BNSD, F.sdpa causal with global offset mask.
 
     In Colossal mode Q is local [B,H,local_s,D] and K/V are full [B,H,S,D].
@@ -881,7 +1053,17 @@ def test_colossal_bnsd_sdpa_causal():
         _adjust_attn_mask_for_sp when attn_mask.shape[-2] == global_q_len.
         """
 
-        def forward(self, q, k, v):
+        def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+            """Run causal SDPA with the Colossal-style global mask.
+
+            Args:
+                q: Query tensor with DTensor global shape metadata.
+                k: Key tensor with DTensor global shape metadata.
+                v: Value tensor with DTensor global shape metadata.
+
+            Returns:
+                The attention output tensor.
+            """
             s_q, s_k = q.shape[2], k.shape[2]   # global S (DTensor global shape)
             q_pos = torch.arange(s_q, device=q.device).unsqueeze(1)   # [S, 1]
             k_pos = torch.arange(s_k, device=q.device).unsqueeze(0)   # [1, S]
@@ -908,7 +1090,7 @@ def test_colossal_bnsd_sdpa_causal():
 
 
 def test_colossal_tnd_fa_causal():
-    """C9: Pure Colossal CP=2, TND format, npu_fusion_attention causal (sparse_mode=3).
+    """C8: Pure Colossal CP=2, TND format, npu_fusion_attention causal (sparse_mode=3).
 
     sparse_mode=3 (RightDownCausal) with 2048×2048 upper-tri bool compressed mask.
     Reference: single-card TND causal NpuFA on full tensors → local slice.
@@ -956,6 +1138,23 @@ def test_colossal_tnd_fa_causal():
     _assert_close(cp_out, ref_local, rank, "C9_colossal_tnd_fa_causal")
 
 
+def test_colossal_bnsd_suite():
+    """Merged Colossal BNSD suite.
+
+    Covers FA / SDPA and causal / non-causal variants for the same CP=2 BNSD
+    setup in one torchrun session.
+    """
+    _test_colossal_bnsd_fa_noncausal()
+    _sync_workers()
+    _test_colossal_bnsd_fa_causal_explicit()
+    _sync_workers()
+    _test_colossal_bnsd_fa_causal_leftup()
+    _sync_workers()
+    _test_colossal_bnsd_sdpa_noncausal()
+    _sync_workers()
+    _test_colossal_bnsd_sdpa_causal()
+
+
 # ---------------------------------------------------------------------------
 # Group 3: Hybrid CP (cp=4, ds=2, co=2)
 # ---------------------------------------------------------------------------
@@ -964,7 +1163,7 @@ def test_colossal_tnd_fa_causal():
     dist.is_initialized() and dist.get_world_size() < 4,
     reason="Hybrid tests require world_size=4",
 )
-def test_hybrid_bnsd_fa_noncausal():
+def _test_hybrid_bnsd_fa_noncausal():
     """H1: Hybrid CP=4 (ds=2, co=2), BNSD, npu_fusion_attention non-causal.
 
     Reference: single-card BnsdFaAttn on full tensors → local slice.
@@ -1007,7 +1206,7 @@ def test_hybrid_bnsd_fa_noncausal():
     dist.is_initialized() and dist.get_world_size() < 4,
     reason="Hybrid tests require world_size=4",
 )
-def test_hybrid_bnsd_fa_causal_leftup():
+def _test_hybrid_bnsd_fa_causal_leftup():
     """H2: Hybrid CP=4 (ds=2, co=2), BNSD, npu_fusion_attention causal (sparse_mode=2).
 
     Verifies dispatcher sparse param adjustment + Ulysses ATA cooperate correctly.
@@ -1049,7 +1248,7 @@ def test_hybrid_bnsd_fa_causal_leftup():
     dist.is_initialized() and dist.get_world_size() < 4,
     reason="Hybrid tests require world_size=4",
 )
-def test_hybrid_bnsd_sdpa_noncausal():
+def _test_hybrid_bnsd_sdpa_noncausal():
     """H3: Hybrid CP=4 (ds=2, co=2), BNSD, F.scaled_dot_product_attention non-causal.
 
     Upgraded from shape-only check to single-card baseline comparison.
@@ -1073,7 +1272,19 @@ def test_hybrid_bnsd_sdpa_noncausal():
     local_v = full_v[:, :, rank * local_s:(rank + 1) * local_s]
 
     class _FsdpaNonCausal(nn.Module):
-        def forward(self, q, k, v):
+        """Local non-causal SDPA wrapper for the Hybrid BNSD suite."""
+
+        def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+            """Run non-causal SDPA on local tensors.
+
+            Args:
+                q: Local query tensor.
+                k: Local key tensor.
+                v: Local value tensor.
+
+            Returns:
+                The attention output tensor.
+            """
             return F.scaled_dot_product_attention(q, k, v)
 
     core_attn = _FsdpaNonCausal()
@@ -1143,6 +1354,23 @@ def test_hybrid_tnd_fa_causal():
 
     assert cp_out.shape == (t_local, num_heads, head_dim)
     _assert_close(cp_out, ref_local, rank, "H4_hybrid_tnd_fa_causal")
+
+
+@pytest.mark.skipif(
+    dist.is_initialized() and dist.get_world_size() < 4,
+    reason="Hybrid tests require world_size=4",
+)
+def test_hybrid_bnsd_suite():
+    """Merged Hybrid BNSD suite.
+
+    Covers FA / SDPA and causal / non-causal variants for the shared
+    CP=4, ds=2, co=2, BNSD setup in one torchrun session.
+    """
+    _test_hybrid_bnsd_fa_noncausal()
+    _sync_workers()
+    _test_hybrid_bnsd_fa_causal_leftup()
+    _sync_workers()
+    _test_hybrid_bnsd_sdpa_noncausal()
 
 
 @pytest.mark.skipif(
@@ -1306,13 +1534,22 @@ class _ProjectionBSHD(nn.Module):
     must have the correct seq_dim=1 (S) and head_dim=2 (H) dimensions.
     """
 
-    def __init__(self, in_dim: int, num_heads: int, head_dim: int):
+    def __init__(self, in_dim: int, num_heads: int, head_dim: int) -> None:
+        """Create the shared linear projection for one Q, K, or V branch."""
         super().__init__()
         self.linear = nn.Linear(in_dim, num_heads * head_dim, bias=False)
         self.num_heads = num_heads
         self.head_dim = head_dim
 
-    def forward(self, x):   # x: [B, S, in_dim]
+    def forward(self, x: Tensor) -> Tensor:
+        """Project hidden states and reshape them into BSHD layout.
+
+        Args:
+            x: Input hidden states in `[B, S, hidden]` layout.
+
+        Returns:
+            Projected tensor in `[B, S, H, D]` layout.
+        """
         batch, seq_len, _ = x.shape
         return self.linear(x).view(batch, seq_len, self.num_heads, self.head_dim)
 
@@ -1324,21 +1561,30 @@ class _AsyncModel(nn.Module):
     The projections output [B, S, H, D] so that AsyncCP can apply A2A on seq_dim=1.
     """
 
-    def __init__(self, hidden: int, num_heads: int, head_dim: int):
+    def __init__(self, hidden: int, num_heads: int, head_dim: int) -> None:
+        """Build the q/k/v projections and BSHD attention module."""
         super().__init__()
         self.q_proj = _ProjectionBSHD(hidden, num_heads, head_dim)
         self.k_proj = _ProjectionBSHD(hidden, num_heads, head_dim)
         self.v_proj = _ProjectionBSHD(hidden, num_heads, head_dim)
         self.attn = SimpleAttnBSHD()
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
+        """Project inputs into q/k/v tensors and run BSHD attention.
+
+        Args:
+            x: Input hidden states in `[B, S, hidden]` layout.
+
+        Returns:
+            Attention output in `[B, S, H, D]` layout.
+        """
         q = self.q_proj(x)  # [B, S, H, D]
         k = self.k_proj(x)  # [B, S, H, D]
         v = self.v_proj(x)  # [B, S, H, D]
         return self.attn(q, k, v)
 
 
-def test_async_ulysses_forward_npu():
+def _test_async_ulysses_forward_npu():
     """A1: AsyncContextParallel (Ulysses CP=2) forward output matches single-card baseline on NPU.
 
     Model: nn.Linear q/k/v projections + BSHD matmul attention.
@@ -1389,7 +1635,7 @@ def test_async_ulysses_forward_npu():
     _assert_close(cp_out, ref_local, rank, "A1_async_ulysses_forward_npu")
 
 
-def test_async_ulysses_backward_npu():
+def _test_async_ulysses_backward_npu():
     """A2: AsyncContextParallel (Ulysses CP=2) backward gradient check on NPU.
 
     Verifies:
@@ -1509,6 +1755,17 @@ def test_async_hybrid_forward_npu():
     _assert_close(cp_out, ref_local, rank, "A3_async_hybrid_forward_npu")
 
 
+def test_async_ulysses_suite():
+    """Merged Async Ulysses suite.
+
+    Runs forward and backward correctness checks in one torchrun session to
+    reduce launch overhead for AsyncContextParallel validation.
+    """
+    _test_async_ulysses_forward_npu()
+    _sync_workers()
+    _test_async_ulysses_backward_npu()
+
+
 # ---------------------------------------------------------------------------
 # Group 6: API & Integration
 # ---------------------------------------------------------------------------
@@ -1533,11 +1790,24 @@ def test_parallelize_module_api_npu():
     local_v = full_v[:, rank * local_s:(rank + 1) * local_s]
 
     class _ModelWithAttn(nn.Module):
-        def __init__(self):
+        """Tiny wrapper model used to validate the parallelize_module API."""
+
+        def __init__(self) -> None:
+            """Wrap the core attention module for API-level parallelization."""
             super().__init__()
             self.core_attn = SimpleAttnBSHD()
 
-        def forward(self, q, k, v):
+        def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+            """Forward inputs to the wrapped attention module.
+
+            Args:
+                q: Query tensor in BSHD layout.
+                k: Key tensor in BSHD layout.
+                v: Value tensor in BSHD layout.
+
+            Returns:
+                The attention output tensor.
+            """
             return self.core_attn(q, k, v)
 
     model = _ModelWithAttn()
