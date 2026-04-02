@@ -23,7 +23,7 @@ Verify end-to-end distributed execution correctness in 8-card distributed enviro
 
 - **YAML Config**: Operator registration config from Workflow 3
 - **Python Implementation**: Distributed operator class from Workflow 2
-- **Operator Semantics**: Interface info from analysis report
+- **Analysis Report**: Operator semantics and supported scenarios from Step 1
 
 ## Output
 
@@ -54,19 +54,26 @@ ST tests must cover:
 |----------------|------------|-------------|
 | **Functional Verification** | 8-card vs standalone | Compare Standalone and Parallel output |
 | **Parallel Strategy** | DP/MP/Hybrid Parallel | Correctness of different parallel strategies |
-| **Performance Verification** | Cache mechanism | Whether Layout inference cache is effective |
 | **Decorator Standards** | @arg_mark marker | Compliant with CI scan requirements |
 
 ---
 
 ## Step 3: Define Test Scenarios
 
-| Test Scenario | Operator Examples | Required |
-|---------------|-------------------|----------|
-| **Data Parallel (DP)** | Any operator | ✅ Required |
-| **Model Parallel (MP)** | Large model operators | ✅ Required |
-| **Hybrid Parallel** | Linear layers | ✅ Required |
-| **Broadcast Scenario** | Greater, Add, etc. | ⚙️ Required for WithShape operators |
+| Test Scenario | Required | Notes |
+|---------------|----------|-------|
+| **Data Parallel (DP)** | ✅ Required | All operators |
+| **Model Parallel (MP)** | ✅ Required | All operators |
+| **Hybrid Parallel** | ✅ Required | If applicable per analysis report |
+| **Broadcast Scenario** | ⚙️ If WithShape | Only for operators with `infer_layout_suffix: WithShape` |
+
+**All ST test cases default to `level_mark="level1"`**.
+
+**Strictly NO negative/exception test cases** — ST tests only verify successful execution paths. Exception scenarios are covered in UT tests.
+
+**Card count constraint**: The total card count across ALL `TorchCase()` or `MindSporeCase()` entries in a single `parallel_run()` call MUST NOT exceed 8. Each case's 5th parameter is the card count. For example, 2 cases with 4 cards each = 8 total (OK); 3 cases with 3 cards each = 9 total (NOT OK).
+
+**Both platforms required**: If the operator is registered for both MindSpore (YAML PascalCase entry) and PyTorch (YAML `torch_*.yaml` entry), ST tests MUST cover both platforms — write MindSpore ST files AND PyTorch ST files.
 
 ---
 
@@ -170,16 +177,16 @@ from tests.common.parallel_case import parallel_run, MindSporeCase
 IMPLEMENTATION_FILE = "greater_shard_in_python.py"
 
 @arg_mark(
-    plat_marks=["platform_gpu"],   # Platform marker
+    plat_marks=["platform_ascend910b"],   # Platform marker
     level_mark="level1",                  # Test level: level0/level1
     card_mark="allcards",                 # Card count marker
     essential_mark="essential"            # Essential marker
 )
-def test_greater_data_parallel():
+def test_{op}_data_parallel():
     """
-    Feature: Greater operator.
-    Description: Test greater with data parallel.
-    Expectation: Run success and match standalone result.
+    Feature: {Op} operator.
+    Description: Test {Op} with data parallel.
+    Expectation: Run success.
     """
     parallel_run([
         MindSporeCase(IMPLEMENTATION_FILE, "test_greater_data_parallel", 11500, 8, 8, 2),
@@ -194,7 +201,7 @@ from tests.common.parallel_case import parallel_run, TorchCase
 PARALLEL_OP_MAX = "parallel_op_repeat_interleave.py"
 
 @arg_mark(
-    plat_marks=["platform_gpu"],   # Platform marker
+    plat_marks=["platform_ascend910b"],   # Platform marker
     level_mark="level1",                  # Test level: level0/level1
     card_mark="allcards",                 # Card count marker
     essential_mark="essential"            # Essential marker
@@ -230,8 +237,8 @@ Before submitting, ensure the following test scenarios are covered:
 
 - [ ] **Functional Verification**
   - [ ] 8-card environment execution successful
-  - [ ] Standalone vs distributed output consistent
-  - [ ] Edge cases handled correctly
+  - [ ] Standalone vs distributed output consistent (rtol=1e-5, atol=1e-8)
+  - [ ] All supported scenarios from analysis report covered
 
 - [ ] **Parallel Strategy**
   - [ ] Data Parallel (DP) test passed
@@ -243,15 +250,18 @@ Before submitting, ensure the following test scenarios are covered:
   - [ ] Shape broadcast test passed
 
 - [ ] **Decorator Standards**
-  - [ ] Using @arg_mark decorator
-  - [ ] plat_marks set correctly
-  - [ ] level_mark set correctly
-  - [ ] card_mark set correctly
-  - [ ] essential_mark set if needed
+  - [ ] Using `@arg_mark` decorator
+  - [ ] `plat_marks` set correctly (e.g., `["platform_ascend910b"]`)
+  - [ ] `level_mark` set to `"level1"` (default for all new ST tests)
+  - [ ] `card_mark` set to `"allcards"`
+  - [ ] `essential_mark` set to `"essential"`
 
----
+- [ ] **Card Count Constraint**
+  - [ ] Total cards across all `TorchCase()`/`MindSporeCase()` entries in one `parallel_run()` ≤ 8
 
-## Common Issues
+- [ ] **Both Platforms**
+  - [ ] MindSpore ST written if operator registered in MindSpore YAML
+  - [ ] PyTorch ST written if operator registered in PyTorch YAML (`torch_*.yaml`)
 
 **Q1: ST test failed with "device not found"?**
 
@@ -277,7 +287,7 @@ A: Check configuration:
 **Q4: @arg_mark marker error causing CI failure?**
 
 A: Check markers:
-- `plat_marks` must be valid platform name (e.g., `platform_gpu`)
+- `plat_marks` must be valid platform name (e.g., `platform_ascend910b`)
 - `level_mark` must be `level0` or `level1`
 - `card_mark` must be `allcards` or `onecard`
 
@@ -285,11 +295,13 @@ A: Check markers:
 
 ## Success Criteria
 
-- [ ] Created ST Shell file (test_ops_*.py)
-- [ ] Created ST Implementation file (*_shard_in_python.py)
-- [ ] Used @arg_mark decorator to mark test cases
-- [ ] Implemented compare_results comparison function
+- [ ] Created ST Shell file (`test_ops_*.py` or `test_parallel_op_*.py`)
+- [ ] Created ST Implementation file (`*_shard_in_python.py` or `parallel_op_*.py`)
+- [ ] Used `@arg_mark` decorator with `level_mark="level1"`
+- [ ] Total card count in `parallel_run()` ≤ 8
+- [ ] Both MindSpore and PyTorch ST written (if operator registered on both platforms)
+- [ ] Implemented standalone vs distributed output comparison (rtol=1e-5, atol=1e-8)
 - [ ] 8-card environment test passed
-- [ ] Standalone vs distributed output consistent (rtol=1e-5, atol=1e-8)
-- [ ] Covered required test scenarios (DP/MP/Broadcast)
+- [ ] All supported scenarios from analysis report covered
+- [ ] No negative/exception test cases included
 
