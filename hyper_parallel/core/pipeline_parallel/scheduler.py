@@ -142,7 +142,7 @@ class PipelineScheduleRuntime(ABC):
         if args or kwargs:
             args_split, kwargs_split = self.split_micro_batch(args, kwargs)
             return args_split, kwargs_split
-        return [[]] * self.micro_batch_num, [{}] * self.micro_batch_num
+        return [[] for _ in range(self.micro_batch_num)], [{} for _ in range(self.micro_batch_num)]
 
     def _check_stages(self, stages):
         """check stages type."""
@@ -369,7 +369,7 @@ class ScheduleGPipe(PipelineScheduleRuntime):
                 if stage_index != 0:
                     order_list.append(MetaStep(mb_index, MetaStepType.FWD_RECV, stage_index))
                 order_list.append(MetaStep(mb_index, MetaStepType.FWD, stage_index))
-                if stage_index != self.stage.stage_num - 1:
+                if stage_index != self.real_stage_num - 1:
                     order_list.append(MetaStep(mb_index, MetaStepType.FWD_SEND, stage_index))
             for mb_index in range(self.micro_batch_num):
                 if stage_index != self.real_stage_num - 1:
