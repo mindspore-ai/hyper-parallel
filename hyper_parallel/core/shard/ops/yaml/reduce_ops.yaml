@@ -13,3 +13,7 @@ ReduceMax:
   distributed_op_class: ReduceMaxDistributedOp
   distributed_op_file: parallel_reduce
 
+MaxDim:
+  dist_op_name: _max_dim_dist_op
+  distributed_op_class: MaxDistributedOp
+  distributed_op_file: parallel_reduce

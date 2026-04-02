@@ -21,7 +21,7 @@ SubScalar:
 Sigmoid:
   dist_op_name: _sigmoid_dist_op
 
-Silu:
+SiLU:
   dist_op_name: _silu_dist_op
 
 Cos:

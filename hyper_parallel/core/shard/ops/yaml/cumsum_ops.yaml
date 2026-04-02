@@ -1,0 +1,4 @@
+CumsumExt:
+  dist_op_name: _cumsum_ext_dist_op
+  distributed_op_class: CumsumDistributedOp
+  distributed_op_file: parallel_cumsum

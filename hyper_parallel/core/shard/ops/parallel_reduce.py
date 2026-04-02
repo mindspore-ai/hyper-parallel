@@ -292,9 +292,9 @@ class MaxDistributedOp(ReduceExtDistributedOpBase):
             if len(extra_args) > 1:
                 keepdim = extra_args[1]
 
-        if isinstance(dim, Tensor):
+        if isinstance(dim, (Tensor, str)):
             raise TypeError(
-                "The `dim` argument should not be a `Tensor`. Instead, use one of the following types: "
+                "The `dim` argument should not be a `Tensor` or a `str`. Instead, use one of the following types: "
                 "`None`, `int`, `tuple[int]`, or `list[int]`."
             )
 
