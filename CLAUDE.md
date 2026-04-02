@@ -102,14 +102,16 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 | `/test` | Delegates to `autogit test` — test stage: pytest only |
 | `/create-pr` | Delegates to `autogit pr` — create PR to upstream/master |
 | `/code-review` | Delegates to `code-review` skill with mandatory `code-style.md` review |
+| `/gen-commit-msg` | Generate commit message from staged changes without running full autogit workflow |
 
 ### Agents
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
 | **planner** | default | Read, Grep, Glob, Bash | Read-only implementation planning before multi-file changes |
-| **code-verifier** | haiku | Read, Grep, Glob, Bash | Automated lint + test verification (delegates to `autogit test`) |
-| **code-reviewer** | sonnet | Read, Grep, Glob, Bash | Post-change code review (distributed-first) |
+| **code-verifier** | haiku | Read, Grep, Glob, Bash | Automated 5-phase verification: file categorization, code-style + lint, tests, cross-platform parity, structured report |
+| **simple-code-reviewer** | sonnet | Read, Grep, Glob | Lightweight quick quality check — platform patterns, DTensor invariants, common mistakes |
+| **code-reviewer** | sonnet | Read, Grep, Glob, Bash | Comprehensive post-change code review (distributed-first, stream sync, memory safety) |
 | **dtensor-dev-expert** | opus | Read, Grep, Glob, Bash | DTensor, Layout, redistribution, op dispatch |
 | **fsdp-dev-expert** | opus | Read, Grep, Glob, Bash | FSDP/HSDP, parameter sharding, gradient reduction |
 | **pipeline-dev-expert** | opus | Read, Grep, Glob, Bash | Pipeline parallelism, micro-batch, activation swap |
