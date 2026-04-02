@@ -14,7 +14,7 @@
 # ============================================================================
 """dtensor"""
 import copy as cp
-from typing import Sequence, Tuple, Union
+from typing import Optional, Sequence, Set, Tuple, Union
 import numpy as np
 from hyper_parallel.core.dtensor.layout import Layout, DeviceMesh, _get_slice_tensor_by_layout
 from hyper_parallel.core.dtensor.placement_types import Placement, Replicate
@@ -27,14 +27,42 @@ Tensor = platform.Tensor
 
 
 class SkipDTensorDispatch():
+    """Context manager that disables DTensor op dispatch for the enclosed block.
+
+    Args:
+        no_skip: Optional set of op callables or canonical op name strings that
+            should still be dispatched through DTensor even within this context.
+            All other ops bypass DTensor dispatch and operate on local tensors.
+
+    Example:
+        >>> import torch
+        >>> with SkipDTensorDispatch(no_skip={torch.zeros_like}):
+        ...     # zeros_like still goes through DTensor dispatch;
+        ...     # everything else uses the local tensor path.
+        ...     result = torch.zeros_like(dtensor)
+    """
+
+    def __init__(self, no_skip: Optional[Set] = None):
+        self._no_skip_names: Set[str] = set()
+        if no_skip:
+            for op in no_skip:
+                if isinstance(op, str):
+                    self._no_skip_names.add(op)
+                else:
+                    self._no_skip_names.add(platform.get_op_name(op))
+
     def __enter__(self):
         # pylint: disable=C0415
-        from hyper_parallel.core.shard._op_dispatch import disable_dtensor_dispatch
+        from hyper_parallel.core.shard._op_dispatch import disable_dtensor_dispatch, add_no_skip_ops
         disable_dtensor_dispatch()
+        if self._no_skip_names:
+            add_no_skip_ops(self._no_skip_names)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         # pylint: disable=C0415
-        from hyper_parallel.core.shard._op_dispatch import enable_dtensor_dispatch
+        from hyper_parallel.core.shard._op_dispatch import enable_dtensor_dispatch, remove_no_skip_ops
+        if self._no_skip_names:
+            remove_no_skip_ops(self._no_skip_names)
         enable_dtensor_dispatch()
 
 
