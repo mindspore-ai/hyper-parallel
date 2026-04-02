@@ -15,8 +15,8 @@
 """test saver loader"""
 import os
 
-from hyper_parallel.core.checkpoint.loader import load_checkpoint
-from hyper_parallel.core.checkpoint.saver import save_checkpoint
+from hyper_parallel.core.distributed_checkpoint.loader import load_checkpoint
+from hyper_parallel.core.distributed_checkpoint.saver import save_checkpoint
 from tests.torch.common_net import SimpleModel
 
 

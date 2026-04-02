@@ -19,8 +19,8 @@ import pytest
 import numpy as np
 
 from hyper_parallel import Layout
-from hyper_parallel.core.checkpoint.reshard import ReshardHandler
-from hyper_parallel.core.checkpoint.reshard import infer_slice_area_by_rank
+from hyper_parallel.core.distributed_checkpoint.reshard import ReshardHandler
+from hyper_parallel.core.distributed_checkpoint.reshard import infer_slice_area_by_rank
 
 
 def get_slice_data(full_data, offset):

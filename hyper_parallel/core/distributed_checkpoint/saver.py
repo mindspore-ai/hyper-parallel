@@ -16,7 +16,7 @@
 from pathlib import Path
 from typing import Union
 
-from hyper_parallel.core.checkpoint.util import check_path, has_valid_filename
+from hyper_parallel.core.distributed_checkpoint.util import check_path, has_valid_filename
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()

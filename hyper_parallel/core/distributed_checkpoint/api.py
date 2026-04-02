@@ -16,11 +16,11 @@
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from hyper_parallel.core.checkpoint.standard_planner import StandardSavePlanner, StandardLoadPlanner
-from hyper_parallel.core.checkpoint.filesystem_storage import FileSystemReader, FileSystemWriter
-from hyper_parallel.core.checkpoint.metadata import Metadata
-from hyper_parallel.core.checkpoint.planner import SavePlanner, LoadPlanner
-from hyper_parallel.core.checkpoint.storage import StorageReader, StorageWriter
+from hyper_parallel.core.distributed_checkpoint.standard_planner import StandardSavePlanner, StandardLoadPlanner
+from hyper_parallel.core.distributed_checkpoint.filesystem_storage import FileSystemReader, FileSystemWriter
+from hyper_parallel.core.distributed_checkpoint.metadata import Metadata
+from hyper_parallel.core.distributed_checkpoint.planner import SavePlanner, LoadPlanner
+from hyper_parallel.core.distributed_checkpoint.storage import StorageReader, StorageWriter
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import Platform
 

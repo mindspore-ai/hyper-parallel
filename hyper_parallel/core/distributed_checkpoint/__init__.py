@@ -64,10 +64,10 @@ __all__ = [
 ]
 
 # Main API
-from hyper_parallel.core.checkpoint.api import load, save
+from hyper_parallel.core.distributed_checkpoint.api import load, save
 
 # Metadata structures
-from hyper_parallel.core.checkpoint.metadata import (
+from hyper_parallel.core.distributed_checkpoint.metadata import (
     BytesStorageMetadata,
     ChunkStorageMetadata,
     Metadata,
@@ -77,7 +77,7 @@ from hyper_parallel.core.checkpoint.metadata import (
 )
 
 # Planner interfaces and data structures
-from hyper_parallel.core.checkpoint.planner import (
+from hyper_parallel.core.distributed_checkpoint.planner import (
     LoadItemType,
     LoadPlan,
     LoadPlanner,
@@ -89,13 +89,13 @@ from hyper_parallel.core.checkpoint.planner import (
 )
 
 # Standard planner implementations
-from hyper_parallel.core.checkpoint.standard_planner import (
+from hyper_parallel.core.distributed_checkpoint.standard_planner import (
     StandardLoadPlanner,
     StandardSavePlanner,
 )
 
 # Storage interfaces and data structures
-from hyper_parallel.core.checkpoint.storage import (
+from hyper_parallel.core.distributed_checkpoint.storage import (
     StorageInfo,
     StorageReader,
     StorageWriter,
@@ -103,13 +103,13 @@ from hyper_parallel.core.checkpoint.storage import (
 )
 
 # File system storage implementations
-from hyper_parallel.core.checkpoint.filesystem_storage import (
+from hyper_parallel.core.distributed_checkpoint.filesystem_storage import (
     FileSystemReader,
     FileSystemWriter,
 )
 
 # Layout I/O utilities
-from hyper_parallel.core.checkpoint.layout import (
+from hyper_parallel.core.distributed_checkpoint.layout import (
     combine_layout,
     get_current_layout,
     get_global_layout,
@@ -118,8 +118,8 @@ from hyper_parallel.core.checkpoint.layout import (
 )
 
 # Base API (backward compatibility)
-from hyper_parallel.core.checkpoint.loader import load_checkpoint
-from hyper_parallel.core.checkpoint.saver import save_checkpoint
+from hyper_parallel.core.distributed_checkpoint.loader import load_checkpoint
+from hyper_parallel.core.distributed_checkpoint.saver import save_checkpoint
 
 # Resharding utilities
-from hyper_parallel.core.checkpoint.reshard import ReshardHandler
+from hyper_parallel.core.distributed_checkpoint.reshard import ReshardHandler

@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 from pathlib import Path
 
 from hyper_parallel import Layout
-from hyper_parallel.core.checkpoint.layout import (
+from hyper_parallel.core.distributed_checkpoint.layout import (
     get_current_layout,
     save_layout,
     load_layout

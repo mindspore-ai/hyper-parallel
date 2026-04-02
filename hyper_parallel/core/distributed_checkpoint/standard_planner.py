@@ -17,16 +17,16 @@ import dataclasses
 import pickle
 from typing import Any, Optional, Union
 
-from hyper_parallel.core.checkpoint.metadata import (
+from hyper_parallel.core.distributed_checkpoint.metadata import (
     Metadata, MetadataIndex, ChunkStorageMetadata,
     TensorStorageMetadata, TensorProperties, BytesStorageMetadata
 )
-from hyper_parallel.core.checkpoint.planner import (
+from hyper_parallel.core.distributed_checkpoint.planner import (
     SavePlan, SavePlanner, LoadPlan, LoadPlanner,
     WriteItem, WriteItemType, ReadItem, LoadItemType
 )
-from hyper_parallel.core.checkpoint.reshard import infer_slice_area_by_rank, infer_intersection
-from hyper_parallel.core.checkpoint.util import (
+from hyper_parallel.core.distributed_checkpoint.reshard import infer_slice_area_by_rank, infer_intersection
+from hyper_parallel.core.distributed_checkpoint.util import (
     narrow_tensor_by_index,
     chunk_to_area,
     create_chunk_list_for_tensor,

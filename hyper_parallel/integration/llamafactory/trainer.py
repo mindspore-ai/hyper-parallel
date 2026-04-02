@@ -497,7 +497,7 @@ class HyperParallelTrainer(Seq2SeqTrainer):
           saved per-rank via ``torch.save``.
         - Scheduler: standard ``torch.save`` (same as Trainer default).
         """
-        from hyper_parallel.core.checkpoint.api import save as hp_save  # pylint: disable=C0415
+        from hyper_parallel.core.distributed_checkpoint.api import save as hp_save  # pylint: disable=C0415
 
         os.makedirs(output_dir, exist_ok=True)
         rank = get_platform().get_rank()
@@ -522,7 +522,7 @@ class HyperParallelTrainer(Seq2SeqTrainer):
 
     def _load_from_checkpoint(self, resume_from_checkpoint: str, model: Optional[nn.Module] = None) -> None:
         """Load model from HSDP sharded checkpoint saved by ``hp_save``."""
-        from hyper_parallel.core.checkpoint.api import load as hp_load  # pylint: disable=C0415
+        from hyper_parallel.core.distributed_checkpoint.api import load as hp_load  # pylint: disable=C0415
 
         target = model if model is not None else self.model
         model_dir = os.path.join(resume_from_checkpoint, f"{_HSDP_MODEL_NAME}_0")

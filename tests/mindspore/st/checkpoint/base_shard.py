@@ -28,10 +28,10 @@ from mindspore.communication import get_rank
 from hyper_parallel import shard_module, parallelize_value_and_grad, init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
-from hyper_parallel.core.checkpoint.layout import get_current_layout, save_layout, load_layout, get_global_layout, \
+from hyper_parallel.core.distributed_checkpoint.layout import get_current_layout, save_layout, load_layout, get_global_layout, \
     combine_layout
-from hyper_parallel.core.checkpoint.loader import load_checkpoint
-from hyper_parallel.core.checkpoint.saver import save_checkpoint
+from hyper_parallel.core.distributed_checkpoint.loader import load_checkpoint
+from hyper_parallel.core.distributed_checkpoint.saver import save_checkpoint
 
 learning_rate = 0.01
 epochs = 2
