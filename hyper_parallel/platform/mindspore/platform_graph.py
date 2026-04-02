@@ -40,6 +40,10 @@ class MindSporeGraphPlatform(MindSporePlatform):
     def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
         raise NotImplementedError("ckpt_wrapper is not supported on MindSpore Graph platform")
 
+    @staticmethod
+    def swap_wrapper(module, policy_fn=None):
+        raise NotImplementedError("swap_wrapper is not supported on MindSpore Graph platform")
+
     @property
     def noop_context_fn(self):
         raise NotImplementedError("noop_context_fn is not supported on MindSpore Graph platform")

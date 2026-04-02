@@ -13,10 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """Activation Swap memory comparison: None vs Swap"""
+import torch
+
 from tests.torch.common_net import SimpleTransformer
 from tests.torch.activation_checkpoint.utils import prepare_data, train_one_mode, seed_memory_time_context
-from hyper_parallel.core.activation_checkpoint import SwapManager
-from hyper_parallel.platform.torch.activation_checkpoint import ActivationPolicy, swap_wrapper
+from hyper_parallel.core.activation_checkpoint import SwapManager, swap_wrapper
+from hyper_parallel.core.activation_checkpoint.activation_checkpoint import CheckpointPolicy, swap
 
 
 def apply_swap(model, mode):
@@ -34,8 +36,8 @@ def apply_swap(model, mode):
         policy_threshold = 32 * 512 * 512
         def policy_fn(x):
             if x.storage().size() <= policy_threshold:
-                return ActivationPolicy.SAVE
-            return ActivationPolicy.SWAP
+                return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.MUST_SWAP
 
         for i, layer in enumerate(model.layers):
             model.layers[i].attn = swap_wrapper(layer.attn, policy_fn)
@@ -116,3 +118,138 @@ def test_act_swap_memory_comparison():
     assert mem_swap_with_policy > mem_swap, \
         f"Expected SWAP_WITH_POLICY ({mem_swap_with_policy:.5f}) > SWAP ({mem_swap:.5f})"
     print(f"✅ Verified: SWAP_WITH_POLICY ({mem_swap_with_policy:.5f}) > SWAP ({mem_swap:.5f})")
+
+
+class _SwapFnTransformer(SimpleTransformer):
+    """SimpleTransformer that uses the swap() interface per layer call in forward.
+
+    Overrides forward() to call swap(block, x) instead of block(x), enabling
+    activation offload to CPU via the async_save_on_cpu context manager.
+    """
+
+    def __init__(self, vocab_size: int, dim: int, depth: int, policy_fn=None):
+        super().__init__(vocab_size, dim, depth)
+        self._policy_fn = policy_fn
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using swap() for each transformer block.
+
+        Args:
+            x: Input token ids of shape (batch, seq_len).
+
+        Returns:
+            Logit tensor of shape (batch, seq_len, vocab_size).
+        """
+        x = self.embed(x)
+        for block in self.layers:
+            x = swap(block, x, policy_fn=self._policy_fn)
+        x = self.norm(x)
+        return self.head(x)
+
+
+def _build_swap_fn_model(mode: str) -> torch.nn.Module:
+    """Build and configure a model using the swap() function interface.
+
+    Args:
+        mode: One of 'none', 'swap_fn', or 'swap_fn_with_policy'.
+
+    Returns:
+        Configured model placed on NPU.
+
+    Raises:
+        ValueError: If mode is not recognised.
+    """
+    vocab_size, dim, depth = 32000, 2048, 16
+
+    if mode == "none":
+        return SimpleTransformer(vocab_size=vocab_size, dim=dim, depth=depth).npu()
+
+    policy_fn = None
+    if mode == "swap_fn_with_policy":
+        policy_threshold = 32 * 512 * 512
+
+        def _size_policy(x: torch.Tensor) -> CheckpointPolicy:
+            if x.storage().size() <= policy_threshold:
+                return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.MUST_SWAP
+
+        policy_fn = _size_policy
+    elif mode != "swap_fn":
+        raise ValueError(f"Unknown mode: {mode!r}")
+
+    model = _SwapFnTransformer(
+        vocab_size=vocab_size, dim=dim, depth=depth, policy_fn=policy_fn
+    ).npu()
+    for i in range(len(model.layers) - 1):
+        SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
+    return model
+
+
+def test_act_swap_function_mode():
+    """
+    Feature: swap() Function Interface
+    Description: Validate the swap() interface by comparing training across three modes:
+                 'none' (baseline), 'swap_fn' (offload all eligible tensors via swap()),
+                 'swap_fn_with_policy' (offload only tensors exceeding a size threshold).
+                 Asserts that losses are numerically identical at every training step and
+                 that device memory is reduced when swap is applied.
+    Expectation: All modes produce consistent losses (within 1e-5 tolerance),
+                 NONE > SWAP_FN and NONE > SWAP_FN_WITH_POLICY in peak device memory.
+    """
+    print("Starting swap() function interface comparison: none vs swap_fn vs swap_fn_with_policy")
+    dataloader = prepare_data()
+    train_steps = 3
+
+    modes = ["none", "swap_fn", "swap_fn_with_policy"]
+    results = {}
+
+    for mode in modes:
+        print(f"\n--- Running mode: {mode.upper()} ---")
+        with seed_memory_time_context() as stats:
+            model = _build_swap_fn_model(mode)
+            losses = train_one_mode(model, dataloader, train_steps)
+        peak_mem = stats.get("peak_mem")
+        duration = stats.get("exec_time")
+        results[mode] = {"losses": losses, "peak_mem_gb": peak_mem, "time_sec": duration}
+        print(f"{mode}: Loss={losses[-1]:.4f}, Peak Mem={peak_mem:.5f} GB, Time={duration:.5f}s")
+
+    print("\n" + "=" * 70)
+    print("FINAL COMPARISON")
+    print("=" * 70)
+    print(f"{'Mode':<25} | {'Peak Mem (GB)':<15} | {'Time (s)':<10} | {'Final Loss':<12}")
+    print("-" * 70)
+    for mode in modes:
+        r = results[mode]
+        print(
+            f"{mode.upper():<25} | {r['peak_mem_gb']:<15.5f} | "
+            f"{r['time_sec']:<10.5f} | {r['losses'][-1]:<12.4f}"
+        )
+
+    # Loss consistency assertion
+    base_losses = results["none"]["losses"]
+    tol = 1e-5
+    for step in range(train_steps):
+        base_val = base_losses[step]
+        for mode in ["swap_fn", "swap_fn_with_policy"]:
+            val = results[mode]["losses"][step]
+            diff = abs(val - base_val)
+            assert diff < tol, (
+                f"Loss mismatch at step {step} in mode '{mode}': "
+                f"none={base_val:.8f}, {mode}={val:.8f}, diff={diff:.2e}"
+            )
+    print(f"\nAll {train_steps} steps: losses are consistent across modes (tol={tol}).")
+
+    # Memory reduction assertion
+    mem_none = results["none"]["peak_mem_gb"]
+    mem_swap_fn = results["swap_fn"]["peak_mem_gb"]
+    mem_swap_fn_with_policy = results["swap_fn_with_policy"]["peak_mem_gb"]
+
+    assert mem_none > mem_swap_fn, (
+        f"Expected NONE ({mem_none:.5f}) > SWAP_FN ({mem_swap_fn:.5f})"
+    )
+    print(f"Verified: NONE ({mem_none:.5f}) > SWAP_FN ({mem_swap_fn:.5f})")
+
+    assert mem_none > mem_swap_fn_with_policy, (
+        f"Expected NONE ({mem_none:.5f}) > SWAP_FN_WITH_POLICY ({mem_swap_fn_with_policy:.5f})"
+    )
+    print(f"Verified: NONE ({mem_none:.5f}) > SWAP_FN_WITH_POLICY ({mem_swap_fn_with_policy:.5f})")

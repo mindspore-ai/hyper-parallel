@@ -893,6 +893,12 @@ class TorchPlatform(Platform):
     def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
         return checkpoint_wrapper(module, checkpoint_fn=checkpoint_fn, **checkpoint_fn_kwargs)
 
+    @staticmethod
+    def swap_wrapper(module, policy_fn=None):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import swap_wrapper
+        return swap_wrapper(module, policy_fn=policy_fn)
+
     @property
     def noop_context_fn(self):
         return noop_context_fn

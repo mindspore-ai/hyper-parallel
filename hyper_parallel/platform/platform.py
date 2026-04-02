@@ -1047,6 +1047,19 @@ class Platform:
         """
         raise NotImplementedError("Platform subclasses must implement ckpt_wrapper")
 
+    @staticmethod
+    def swap_wrapper(module, policy_fn=None):
+        """Wrap a module with activation swap functionality.
+
+        Args:
+            module: The module to wrap with activation swap.
+            policy_fn: Optional per-tensor swap policy function.
+
+        Returns:
+            The wrapped module with activation swap enabled.
+        """
+        raise NotImplementedError("Platform subclasses must implement swap_wrapper")
+
     @property
     def noop_context_fn(self):
         """Get a no-op context function for checkpointing.

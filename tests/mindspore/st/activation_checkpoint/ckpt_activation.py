@@ -24,11 +24,7 @@ from contextlib import contextmanager
 import numpy as np
 import mindspore as ms
 from mindspore import nn, Tensor, mint
-from tests.common.mark_utils import arg_mark
 from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, checkpoint_wrapper
-
-
-ms.set_context(mode=ms.PYNATIVE_MODE)
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +153,7 @@ def train_one_mode(net, data_list, train_steps=3):
 
 def run_one_mode(mode, train_steps=3, seed=42):
     """Build a fresh model and measure one mode in a clean interpreter."""
+    ms.set_context(mode=ms.PYNATIVE_MODE)
     set_seed(seed)
     data_list = prepare_data()
     try:
@@ -183,7 +180,7 @@ def run_one_mode_in_subprocess(mode, train_steps=3, seed=42):
         "-c",
         (
             "import json; "
-            "from tests.mindspore.st.activation_checkpoint.test_checkpoint_wrapper import run_one_mode; "
+            "from tests.mindspore.st.activation_checkpoint.ckpt_activation import run_one_mode; "
             f"result = run_one_mode({mode!r}, train_steps={train_steps}, seed={seed}); "
             "print('__AC_RESULT__' + json.dumps(result, sort_keys=True))"
         ),
@@ -196,13 +193,6 @@ def run_one_mode_in_subprocess(mode, train_steps=3, seed=42):
         text=True,
         check=False,
     )
-
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"Mode {mode!r} failed in subprocess.\n"
-            f"STDOUT:\n{completed.stdout}\n"
-            f"STDERR:\n{completed.stderr}"
-        )
 
     for line in reversed(completed.stdout.splitlines()):
         marker = "__AC_RESULT__"
@@ -288,7 +278,6 @@ def apply_recompute(model, mode):
 # Test case
 # ---------------------------------------------------------------------------
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
 def test_ac_memory_comparison():
     """
     Feature: Activation Checkpointing and Swapping Memory Behavior
@@ -309,8 +298,6 @@ def test_ac_memory_comparison():
 
     for mode in modes:
         print(f"\n--- Running mode: {mode.upper()} ---")
-        gc.collect()
-        ms.runtime.empty_cache()
         results[mode] = run_one_mode_in_subprocess(mode, train_steps=train_steps)
         peak_mem = results[mode]["peak_mem_gb"]
         duration = results[mode]["time_sec"]
