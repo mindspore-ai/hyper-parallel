@@ -30,7 +30,11 @@ from torch import nn
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
+from hyper_parallel.core.dtensor.device_mesh import (
+    _DEVICE_MESH_MAP,
+    _mesh_resources,
+    init_device_mesh,
+)
 from hyper_parallel.core.tensor_parallel.api import (
     _tensor_parallel_mesh_context,
     parallelize_module,
@@ -63,9 +67,7 @@ class TestParallelizeModule(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         # avoid leaking mesh stack if a test failed inside a context manager
-        from hyper_parallel.core.tensor_parallel import api as tp_api
-
-        tp_api._mesh_stack().clear()
+        _mesh_resources.mesh_stack.clear()
 
     def _setup_mock_platform(self, mock_platform, world_size: int = 4):
         mock_platform.platform_type = PlatformType.PYTORCH
@@ -97,14 +99,14 @@ class TestParallelizeModule(unittest.TestCase):
     def test_raises_without_device_mesh(self, mock_platform):
         """
         Feature: parallelize_module validation with missing device_mesh
-        Description: call parallelize_module with device_mesh=None and no implicit mesh context
-        Expectation: throw RuntimeError whose message contains device_mesh
+        Description: call parallelize_module with device_mesh=None and no active mesh context
+        Expectation: RuntimeError from _mesh_resources.get_current_mesh (no active mesh)
         """
         self._setup_mock_platform(mock_platform)
         m = nn.Linear(3, 3)
         with self.assertRaises(RuntimeError) as ctx:
             parallelize_module(m, None, RecordingParallelStyle())
-        self.assertIn("device_mesh", str(ctx.exception).lower())
+        self.assertIn("device mesh", str(ctx.exception).lower())
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_rejects_nd_mesh(self, mock_platform):
@@ -318,14 +320,29 @@ class TestParallelizeModule(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_implicit_mesh_internal_context(self, mock_platform):
         """
-        Feature: parallelize_module with implicit mesh via context manager
+        Feature: parallelize_module with implicit mesh via _tensor_parallel_mesh_context
         Description: enter _tensor_parallel_mesh_context(mesh) then parallelize_module(..., None, style)
-        Expectation: one apply; second apply_log mesh id matches context mesh
+        Expectation: one apply; apply_log mesh id matches context mesh
         """
         mesh = self._make_1d_mesh(mock_platform)
         m = nn.Linear(2, 2)
         style = RecordingParallelStyle()
         with _tensor_parallel_mesh_context(mesh):
+            parallelize_module(m, None, style)
+        self.assertEqual(len(style.apply_log), 1)
+        self.assertEqual(style.apply_log[0][1], id(mesh))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_implicit_mesh_with_statement_like_pytorch(self, mock_platform):
+        """
+        Feature: parallelize_module with implicit mesh via ``with mesh:``
+        Description: use DeviceMesh as context manager (PyTorch parity)
+        Expectation: parallelize_module(..., None, style) resolves mesh from stack
+        """
+        mesh = self._make_1d_mesh(mock_platform)
+        m = nn.Linear(2, 2)
+        style = RecordingParallelStyle()
+        with mesh:
             parallelize_module(m, None, style)
         self.assertEqual(len(style.apply_log), 1)
         self.assertEqual(style.apply_log[0][1], id(mesh))

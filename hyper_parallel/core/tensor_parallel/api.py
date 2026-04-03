@@ -15,13 +15,12 @@
 """High-level API to apply parallel styles to modules (aligned with PyTorch ``parallelize_module``)."""
 from __future__ import annotations
 
-import threading
 import warnings
 from contextlib import contextmanager
 from fnmatch import fnmatch
 from typing import Iterator, Optional, Union
 
-from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _mesh_resources
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
 from hyper_parallel.platform import get_platform
 
@@ -30,33 +29,15 @@ Module = platform.Module
 
 __all__ = ["parallelize_module"]
 
-_thread_local = threading.local()
-
-
-def _mesh_stack() -> list[DeviceMesh]:
-    if not hasattr(_thread_local, "stack"):
-        _thread_local.stack = []
-    return _thread_local.stack
-
 
 @contextmanager
 def _tensor_parallel_mesh_context(device_mesh: DeviceMesh) -> Iterator[DeviceMesh]:
-    """Internal: thread-local default mesh when ``parallelize_module(..., device_mesh=None)``.
+    """Internal: same thread-local stack as ``with device_mesh:`` for ``parallelize_module(..., None)``.
 
-    Library code may use this to mirror PyTorch's implicit mesh stack; callers should normally
-    pass *device_mesh* explicitly and need not use this.
+    Prefer user code using ``with mesh:``; this exists for tests and library helpers.
     """
-    stack = _mesh_stack()
-    stack.append(device_mesh)
-    try:
+    with device_mesh:
         yield device_mesh
-    finally:
-        stack.pop()
-
-
-def _get_current_tensor_parallel_mesh() -> Optional[DeviceMesh]:
-    stack = _mesh_stack()
-    return stack[-1] if stack else None
 
 
 def _validate_tp_mesh_dim(device_mesh: DeviceMesh) -> None:
@@ -80,8 +61,9 @@ def parallelize_module(  # type: ignore[return]
 
     Behaviour follows ``torch.distributed.tensor.parallel.parallelize_module``:
 
-    - *device_mesh* should normally be passed explicitly. Omitting it (``None``) is reserved for
-      internal use with :func:`_tensor_parallel_mesh_context` (PyTorch-style implicit mesh).
+    - *device_mesh* should normally be passed explicitly. Omitting it (``None``) requires an
+      active mesh context: ``with mesh:`` (see :meth:`hyper_parallel.core.dtensor.device_mesh.DeviceMesh.__enter__`)
+      or :func:`_tensor_parallel_mesh_context` for tests/libraries.
     - *parallelize_plan* may be a single :class:`ParallelStyle` (applied to *module*)
       or a dict mapping submodule paths to styles. Path segments support ``fnmatch``
       patterns (e.g. ``\"layers.*\"``) like PyTorch FQN rules.
@@ -96,8 +78,9 @@ def parallelize_module(  # type: ignore[return]
 
     Args:
         module: Root module to parallelize.
-        device_mesh: Mesh for this TP/CP slice. Use ``None`` only inside library code that installs
-            a default mesh via :func:`_tensor_parallel_mesh_context`.
+        device_mesh: Mesh for this TP/CP slice. Use ``None`` only inside ``with mesh:`` (or
+            :func:`_tensor_parallel_mesh_context`) so ``_mesh_resources.get_current_mesh()`` resolves
+            (see PyTorch ``distribute_module``).
         parallelize_plan: A :class:`ParallelStyle` or dict ``{path: ParallelStyle}``.
         src_data_rank: Source rank for global tensor semantics; ``None`` means use local data only
             (PyTorch parity). Default ``0``.
@@ -105,12 +88,8 @@ def parallelize_module(  # type: ignore[return]
     Returns:
         *module* after in-place parallelization.
     """
-    device_mesh = device_mesh or _get_current_tensor_parallel_mesh()
     if device_mesh is None:
-        raise RuntimeError(
-            "No device mesh is currently active. Pass a non-None device_mesh to parallelize_module "
-            "(e.g. mesh[\"cp\"] from init_device_mesh)."
-        )
+        device_mesh = _mesh_resources.get_current_mesh()
     _validate_tp_mesh_dim(device_mesh)
 
     if parallelize_plan is None:

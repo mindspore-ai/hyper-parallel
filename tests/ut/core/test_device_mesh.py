@@ -24,6 +24,7 @@ Note:
 """
 import copy
 import os
+import threading
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -36,10 +37,11 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.device_mesh import (
     DeviceMesh,
+    _DEVICE_MESH_MAP,
     _get_sub_rank_list,
+    _mesh_resources,
     _create_device_mesh,
     init_device_mesh,
-    _DEVICE_MESH_MAP,
 )
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
@@ -62,6 +64,7 @@ class TestDeviceMesh(unittest.TestCase):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _mesh_resources.mesh_stack.clear()
 
     # ------------------------------------------------------------------
     # Helper methods
@@ -1015,6 +1018,147 @@ class TestDeviceMesh(unittest.TestCase):
                     DeviceMesh(dtype, mesh=[[0, 1], [2, 3]], _init_backend=False)
                 self.assertIn(dtype, str(ctx.exception))
                 self.assertIn("MINDSPORE", str(ctx.exception))
+
+    # ------------------------------------------------------------------
+    # Active mesh context: ``with mesh:`` and ``get_current_mesh``
+    # ------------------------------------------------------------------
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_current_mesh_raises_when_no_context(self, mock_platform):
+        """
+        Feature: get_current_mesh validation with empty thread-local stack
+        Description: call get_current_mesh without entering ``with device_mesh``
+        Expectation: RuntimeError whose message indicates no active mesh
+        """
+        self._setup_mock_platform(mock_platform, world_size=2)
+        self.assertEqual(len(_mesh_resources.mesh_stack), 0)
+        with self.assertRaises(RuntimeError) as ctx:
+            _mesh_resources.get_current_mesh()
+        self.assertIn("device mesh", str(ctx.exception).lower())
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_with_mesh_sets_get_current_mesh(self, mock_platform):
+        """
+        Feature: DeviceMesh context manager sets current mesh for get_current_mesh
+        Description: enter ``with`` using a 1-D DeviceMesh with mocked platform
+        Expectation: inside block get_current_mesh() is that mesh and stack length is 1;
+            after exit stack is empty
+        """
+        self._setup_mock_platform(mock_platform, world_size=2)
+        mesh = DeviceMesh(
+            "npu",
+            mesh=[0, 1],
+            mesh_dim_names=("tp",),
+            _init_backend=False,
+        )
+        with mesh:
+            self.assertIs(_mesh_resources.get_current_mesh(), mesh)
+            self.assertEqual(len(_mesh_resources.mesh_stack), 1)
+        self.assertEqual(len(_mesh_resources.mesh_stack), 0)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_with_mesh_as_returns_self(self, mock_platform):
+        """
+        Feature: DeviceMesh __enter__ return value for ``with mesh as m``
+        Description: bind context manager target to a variable
+        Expectation: ``m is mesh`` (same object identity)
+        """
+        self._setup_mock_platform(mock_platform, world_size=2)
+        mesh = DeviceMesh(
+            "npu",
+            mesh=[0, 1],
+            mesh_dim_names=("tp",),
+            _init_backend=False,
+        )
+        with mesh as m:
+            self.assertIs(m, mesh)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_nested_with_inner_mesh_is_current(self, mock_platform):
+        """
+        Feature: nested DeviceMesh context managers stack correctly
+        Description: enter outer then inner 1-D meshes with mocked platform
+        Expectation: inner block sees inner mesh and stack depth 2; after inner exits
+            current is outer and depth 1; after outer exits stack is empty
+        """
+        self._setup_mock_platform(mock_platform, world_size=4)
+        outer = DeviceMesh(
+            "npu",
+            mesh=[0, 1, 2, 3],
+            mesh_dim_names=("tp",),
+            _init_backend=False,
+        )
+        inner = DeviceMesh(
+            "npu",
+            mesh=[0, 1],
+            mesh_dim_names=("tp",),
+            _init_backend=False,
+        )
+        with outer:
+            self.assertIs(_mesh_resources.get_current_mesh(), outer)
+            with inner:
+                self.assertIs(_mesh_resources.get_current_mesh(), inner)
+                self.assertEqual(len(_mesh_resources.mesh_stack), 2)
+            self.assertIs(_mesh_resources.get_current_mesh(), outer)
+            self.assertEqual(len(_mesh_resources.mesh_stack), 1)
+        self.assertEqual(len(_mesh_resources.mesh_stack), 0)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_with_mesh_pops_stack_on_exception(self, mock_platform):
+        """
+        Feature: DeviceMesh __exit__ clears stack when the body raises
+        Description: ``with mesh:`` block raises ValueError after pushing mesh
+        Expectation: exception propagates and thread-local mesh stack is empty afterward
+        """
+        self._setup_mock_platform(mock_platform, world_size=2)
+        mesh = DeviceMesh(
+            "npu",
+            mesh=[0, 1],
+            mesh_dim_names=("tp",),
+            _init_backend=False,
+        )
+        with self.assertRaises(ValueError):
+            with mesh:
+                self.assertEqual(len(_mesh_resources.mesh_stack), 1)
+                raise ValueError("deliberate")
+        self.assertEqual(len(_mesh_resources.mesh_stack), 0)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_current_mesh_thread_local_isolation(self, mock_platform):
+        """
+        Feature: per-thread isolation of active DeviceMesh stack
+        Description: two threads each ``with`` a different DeviceMesh, synchronized with Barrier
+        Expectation: get_current_mesh() in each thread is that thread's mesh object
+        """
+        self._setup_mock_platform(mock_platform, world_size=2)
+        mesh_a = DeviceMesh(
+            "npu",
+            mesh=[0, 1],
+            mesh_dim_names=("tp",),
+            _init_backend=False,
+        )
+        mesh_b = DeviceMesh(
+            "npu",
+            mesh=[0, 1],
+            mesh_dim_names=("tp",),
+            _init_backend=False,
+        )
+        barrier = threading.Barrier(2)
+        results: dict[int, bool] = {}
+
+        def worker(key: int, mesh: DeviceMesh) -> None:
+            with mesh:
+                barrier.wait()
+                results[key] = _mesh_resources.get_current_mesh() is mesh
+
+        t1 = threading.Thread(target=worker, args=(1, mesh_a))
+        t2 = threading.Thread(target=worker, args=(2, mesh_b))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        self.assertTrue(results.get(1), "thread 1 should see mesh_a")
+        self.assertTrue(results.get(2), "thread 2 should see mesh_b")
 
 
 if __name__ == "__main__":
