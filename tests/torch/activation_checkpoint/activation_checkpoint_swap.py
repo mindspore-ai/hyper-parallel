@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Activation Swap memory comparison: None vs Swap"""
+import copy
 import torch
 
 from tests.torch.common_net import SimpleTransformer
@@ -253,3 +254,67 @@ def test_act_swap_function_mode():
         f"Expected NONE ({mem_none:.5f}) > SWAP_FN_WITH_POLICY ({mem_swap_fn_with_policy:.5f})"
     )
     print(f"Verified: NONE ({mem_none:.5f}) > SWAP_FN_WITH_POLICY ({mem_swap_fn_with_policy:.5f})")
+
+
+class _SmallNet(torch.nn.Module):
+    """Two-layer MLP where the hidden activation is exposed as a plain function."""
+
+    def __init__(self, dim: int, use_swap: bool):
+        super().__init__()
+        self.fc1 = torch.nn.Linear(dim, dim)
+        self.fc2 = torch.nn.Linear(dim, dim)
+
+        def _hidden(x):
+            return torch.relu(self.fc1(x))
+
+        self.hidden = swap_wrapper(_hidden) if use_swap else _hidden
+
+    def forward(self, x):
+        return self.fc2(self.hidden(x))
+
+
+def test_swap_wrapper_accepts_func():
+    """
+    Feature: swap_wrapper accepts plain callable (func) as module argument
+    Description: Build a small two-layer MLP whose hidden activation is a plain
+                 Python function.  Run several training steps on two identical
+                 copies of the network — one with the hidden function wrapped by
+                 swap_wrapper, one without — and verify that the per-step losses
+                 are numerically identical.
+    Expectation: Losses across all training steps match within 1e-6 tolerance,
+                 confirming that wrapping a func does not alter forward/backward
+                 semantics.
+    """
+    torch.manual_seed(42)
+    dim = 32
+    batch, train_steps = 8, 5
+    tol = 1e-6
+
+    ref_model = _SmallNet(dim, use_swap=False)
+    swap_model = _SmallNet(dim, use_swap=True)
+    swap_model.fc1.load_state_dict(copy.deepcopy(ref_model.fc1.state_dict()))
+    swap_model.fc2.load_state_dict(copy.deepcopy(ref_model.fc2.state_dict()))
+
+    ref_opt = torch.optim.SGD(ref_model.parameters(), lr=0.01)
+    swap_opt = torch.optim.SGD(swap_model.parameters(), lr=0.01)
+
+    torch.manual_seed(42)
+    for step in range(train_steps):
+        x = torch.randn(batch, dim)
+        target = torch.randn(batch, dim)
+
+        ref_opt.zero_grad()
+        ref_loss = torch.nn.functional.mse_loss(ref_model(x), target)
+        ref_loss.backward()
+        ref_opt.step()
+
+        swap_opt.zero_grad()
+        swap_loss = torch.nn.functional.mse_loss(swap_model(x), target)
+        swap_loss.backward()
+        swap_opt.step()
+
+        diff = abs(ref_loss.item() - swap_loss.item())
+        assert diff < tol, (
+            f"Loss mismatch at step {step}: "
+            f"ref={ref_loss.item():.8f}, swap={swap_loss.item():.8f}, diff={diff:.2e}"
+        )

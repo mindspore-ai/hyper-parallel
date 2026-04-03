@@ -891,6 +891,10 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import FuncModule
+        if callable(module) and not isinstance(module, torch.nn.Module):
+            module = FuncModule(module)
         return checkpoint_wrapper(module, checkpoint_fn=checkpoint_fn, **checkpoint_fn_kwargs)
 
     @staticmethod

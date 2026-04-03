@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Activation checkpoint memory comparison: None vs Recompute vs Save vs Swap"""
+import copy
 import torch
 
 from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, checkpoint_wrapper
@@ -131,3 +132,72 @@ def test_ac_memory_comparison():
     assert abs(mem_recompute - mem_swap) < tol_mem, \
         f"Expected RECOMPUTE ({mem_recompute:.5f}) ≈ SWAP ({mem_swap:.5f})"
     print(f"✅ Verified: RECOMPUTE ({mem_recompute:.5f}) ≈ SWAP ({mem_swap:.5f}) within tolerance ({tol_mem:.5f} GB)")
+
+
+class _SmallNet(torch.nn.Module):
+    """Two-layer MLP where the hidden activation is exposed as a plain function."""
+
+    def __init__(self, dim: int, use_ckpt: bool):
+        super().__init__()
+        self.fc1 = torch.nn.Linear(dim, dim)
+        self.fc2 = torch.nn.Linear(dim, dim)
+
+        def _hidden(x):
+            return torch.relu(self.fc1(x))
+
+        self.hidden = checkpoint_wrapper(_hidden) if use_ckpt else _hidden
+
+    def forward(self, x):
+        return self.fc2(self.hidden(x))
+
+
+def test_checkpoint_wrapper_accepts_func():
+    """
+    Feature: checkpoint_wrapper accepts plain callable (func) as module argument
+    Description: Build a small two-layer MLP whose hidden activation is a plain
+                 Python function.  Run several training steps on two identical
+                 copies of the network — one with the hidden function wrapped by
+                 checkpoint_wrapper, one without — and verify that the per-step
+                 losses are numerically identical.
+    Expectation: Losses across all training steps match within 1e-6 tolerance,
+                 confirming that wrapping a func does not alter forward/backward
+                 semantics.
+    """
+
+    torch.manual_seed(42)
+    dim = 32
+    batch, train_steps = 8, 5
+    tol = 1e-6
+
+    # reference model (no checkpoint)
+    ref_model = _SmallNet(dim, use_ckpt=False)
+    # wrapped model starts from identical weights
+    ckpt_model = _SmallNet(dim, use_ckpt=True)
+    ckpt_model.fc1.load_state_dict(copy.deepcopy(ref_model.fc1.state_dict()))
+    ckpt_model.fc2.load_state_dict(copy.deepcopy(ref_model.fc2.state_dict()))
+
+    ref_opt = torch.optim.SGD(ref_model.parameters(), lr=0.01)
+    ckpt_opt = torch.optim.SGD(ckpt_model.parameters(), lr=0.01)
+
+    torch.manual_seed(42)
+    for step in range(train_steps):
+        x = torch.randn(batch, dim)
+        target = torch.randn(batch, dim)
+
+        # reference forward/backward
+        ref_opt.zero_grad()
+        ref_loss = torch.nn.functional.mse_loss(ref_model(x), target)
+        ref_loss.backward()
+        ref_opt.step()
+
+        # checkpoint-wrapped forward/backward (same input & target)
+        ckpt_opt.zero_grad()
+        ckpt_loss = torch.nn.functional.mse_loss(ckpt_model(x), target)
+        ckpt_loss.backward()
+        ckpt_opt.step()
+
+        diff = abs(ref_loss.item() - ckpt_loss.item())
+        assert diff < tol, (
+            f"Loss mismatch at step {step}: "
+            f"ref={ref_loss.item():.8f}, ckpt={ckpt_loss.item():.8f}, diff={diff:.2e}"
+        )
