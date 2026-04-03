@@ -27,6 +27,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
 )
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
+from hyper_parallel.platform.torch.fully_shard.pack_utils import build_rs_plan
 from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx, HSDPParamGroup
 
 
@@ -101,6 +102,33 @@ class TorchHSDPStateV2(HSDPState):
         """Return all fully_shard-managed parameters, including replicate_params."""
         return [*self.hsdp_params, *self.replicate_params]
 
+    @staticmethod
+    def _comm_fusion_unsupported_reason(hsdp_param) -> Optional[str]:
+        """Return the reason why ``hsdp_param`` cannot participate in comm_fusion."""
+        if not hsdp_param.enable_fsdp_shard:
+            return "non-sharded parameters such as replicate_params are not supported"
+        if hsdp_param.param_mode not in (
+            FullyShardParamMode.LOCAL_PARAM,
+            FullyShardParamMode.DTENSOR_UNIFIED,
+        ):
+            return (
+                "param_mode "
+                f"{hsdp_param.param_mode} is not supported"
+            )
+        local_shard = getattr(hsdp_param, "_sharded_local_tensor", None)
+        if local_shard is None:
+            return "missing local shard tensor for comm_fusion plan validation"
+        plan_world_size = getattr(hsdp_param, "shard_world_size", None)
+        if plan_world_size is None:
+            plan_world_size = getattr(hsdp_param, "shard_size", 1)
+        try:
+            build_rs_plan(hsdp_param, local_shard, plan_world_size)
+        except NotImplementedError as exc:
+            return str(exc)
+        except (AssertionError, ValueError) as exc:
+            return f"cannot build comm_fusion pack plan: {exc}"
+        return None
+
     def _init_param_group(self):
         """Initialize fused parameter group for communication fusion.
 
@@ -112,19 +140,26 @@ class TorchHSDPStateV2(HSDPState):
             unsupported_param = next(
                 (
                     hsdp_param
-                    for hsdp_param in self._iter_managed_params()
-                    if hsdp_param.param_mode != FullyShardParamMode.LOCAL_PARAM
-                    or not hsdp_param.enable_fsdp_shard
+                    for hsdp_param in self.hsdp_params
+                    if self._comm_fusion_unsupported_reason(hsdp_param) is not None
                 ),
                 None,
             )
             if unsupported_param is not None:
+                param_fqn = getattr(unsupported_param, "_param_fqn", "<unknown>")
+                reason = self._comm_fusion_unsupported_reason(unsupported_param)
                 raise NotImplementedError(
-                    "comm_fusion currently only supports local parameters with fully_shard "
-                    "storage sharding enabled."
+                    f"comm_fusion does not support parameter {param_fqn}: {reason}."
                 )
-            # pylint: disable=E1128
-            self.param_group = HSDPParamGroup(self.hsdp_params, self.mesh_info, self.device, self.mp_policy)
+            self.param_group = None
+            if self.hsdp_params:
+                # pylint: disable=E1128
+                self.param_group = HSDPParamGroup(
+                    self.hsdp_params,
+                    self.mesh_info,
+                    self.device,
+                    self.mp_policy,
+                )
 
     def _move_states_to_device(self):
         """move states to device"""
@@ -165,6 +200,7 @@ class TorchHSDPStateV2(HSDPState):
             hsdp_param = TorchHSDPParamV2(param,
                                           module_info,
                                           self.mesh_info,
+                                          shard_placement_fn=self.config.shard_placement_fn,
                                           mp_policy=self.mp_policy,
                                           offload_policy=self.offload_policy,
                                           device=self.device,
@@ -243,6 +279,10 @@ class TorchHSDPStateV2(HSDPState):
 
     def post_backward_for_comm_fusion(self):
         """post_backward_for_comm_fusion."""
+        # Replicate-only params still use the non-fused compat all-reduce path.
+        # Drain any pending side-path reductions before advancing the fused
+        # param-group pipeline for sharded params.
+        self.reduce_params()
         # Fused gradient reduction path: first apply any pending async reduction
         # from the previous module's backward (pipelined overlap), then issue
         # this module's fused reduce-scatter (+ all-reduce for HSDP).
@@ -255,9 +295,19 @@ class TorchHSDPStateV2(HSDPState):
         if comm_ctx.pre_param_group is not None:
             comm_ctx.pre_param_group.wait_reduce_scatter_and_issue_all_reduce()
             comm_ctx.pre_param_group = None
-        self.param_group.foreach_reduce(
-            reduce_scatter_reduce_op=self.reduce_op_type
-        )
+        if self.param_group is not None:
+            self.param_group.foreach_reduce(
+                reduce_scatter_reduce_op=self.reduce_op_type
+            )
+        for hsdp_param in self.replicate_params:
+            if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
+                continue
+            if not hsdp_param.sharded_param.requires_grad:
+                continue
+            if not self._has_pending_unsharded_grad(hsdp_param):
+                continue
+            reduce_op = self._resolve_reduce_op(hsdp_param)
+            self._queue_compat_all_reduce(hsdp_param, reduce_op)
 
     def _resolve_default_reduce_op(self):
         """Resolve the default reduce op for the whole fully_shard state."""

@@ -79,10 +79,14 @@ def test_hsdp_param_group4():
     Feature: parallel run case in fully_shard
     Description:
         1.test_hsdp_param_v2_accumulate_grad
+        2.test_hsdp_param_v2_non_dim0_unshard_round_trip
+        3.test_hsdp_param_v2_non_dim0_reduce_scatter_grad
     Expectation: Run success.
     """
     parallel_run([
         TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_accumulate_grad", 12355, 2),
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_non_dim0_unshard_round_trip", 12362, 2),
+        TorchCase(_TEST_HSDP_PARAM, "test_hsdp_param_v2_non_dim0_reduce_scatter_grad", 12364, 2),
     ])
 
 
@@ -165,26 +169,13 @@ def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_reduce_scatter_guard_non_dim0():
+def test_hsdp_param_v2_same_dim_strided_non_dim0_backward():
     """
     Feature: TorchHSDPParamV2.
-    Description: Test reduce_scatter guard for non-dim0 shard placement.
-    Expectation: assertion pass.
-    """
-    master_port = 12362
-    file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_reduce_scatter_guard_non_dim0"
-    torchrun_case(file_name, case_name, master_port)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_hsdp_param_v2_reduce_scatter_guard_strided_shard():
-    """
-    Feature: TorchHSDPParamV2.
-    Description: Test reduce_scatter guard for StridedShard layout.
+    Description: Test same-dim TP + fully_shard on dim=1 across the backward path.
     Expectation: assertion pass.
     """
     master_port = 12363
     file_name = "_test_hsdp_param.py"
-    case_name = "test_hsdp_param_v2_reduce_scatter_guard_strided_shard"
-    torchrun_case(file_name, case_name, master_port)
+    case_name = "test_hsdp_param_v2_same_dim_strided_non_dim0_backward"
+    torchrun_case(file_name, case_name, master_port, num_proc=4)
