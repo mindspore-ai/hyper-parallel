@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, Union
 
-from hyper_parallel.core.checkpoint.metadata import (
+from hyper_parallel.core.distributed_checkpoint.metadata import (
     Metadata, MetadataIndex
 )
 

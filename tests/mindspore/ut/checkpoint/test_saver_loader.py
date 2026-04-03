@@ -21,8 +21,8 @@ from unittest.mock import MagicMock
 import numpy as np
 import mindspore as ms
 from mindspore import Tensor
-from hyper_parallel.core.checkpoint.loader import load_checkpoint
-from hyper_parallel.core.checkpoint.saver import save_checkpoint
+from hyper_parallel.core.distributed_checkpoint.loader import load_checkpoint
+from hyper_parallel.core.distributed_checkpoint.saver import save_checkpoint
 
 
 class TestSaverLoader(unittest.TestCase):

@@ -18,8 +18,8 @@ import pickle
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from hyper_parallel.core.checkpoint.metadata import Metadata, MetadataIndex
-from hyper_parallel.core.checkpoint.planner import (
+from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, MetadataIndex
+from hyper_parallel.core.distributed_checkpoint.planner import (
     LoadItemType,
     LoadPlan,
     LoadPlanner,
@@ -28,14 +28,14 @@ from hyper_parallel.core.checkpoint.planner import (
     SavePlanner,
     WriteItem,
 )
-from hyper_parallel.core.checkpoint.storage import (
+from hyper_parallel.core.distributed_checkpoint.storage import (
     StorageInfo,
     StorageReader,
     StorageWriter,
     WriteResult,
     METADATA_FILE_NAME,
 )
-from hyper_parallel.core.checkpoint.util import narrow_tensor_by_index
+from hyper_parallel.core.distributed_checkpoint.util import narrow_tensor_by_index
 from hyper_parallel.platform import get_platform
 
 

@@ -31,7 +31,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 | **HSDP** | `core/hsdp/`, `platform/*/hsdp/` | Hybrid shard data parallel (legacy + new scheduler) |
 | **Pipeline** | `core/pipeline_parallel/`, `platform/*/pipeline_parallel/` | Stage scheduling, micro-batch, cross-stage comm |
 | **Activation** | `core/activation_checkpoint/`, `platform/torch/activation_checkpoint/` | Selective activation checkpoint (SAC) + activation swap (offload to CPU, prefetch on backward) |
-| **Checkpoint** | `core/checkpoint/` | Distributed checkpoint save/load (planner, storage, reshard) |
+| **Checkpoint** | `core/distributed_checkpoint/` | Distributed checkpoint save/load (planner, storage, reshard) |
 | **Collectives** | `collectives/cc.py` | Process group management |
 | **Tests** | `tests/torch/`, `tests/mindspore/` | `ut/` (unit), `st/` (system/distributed) |
 

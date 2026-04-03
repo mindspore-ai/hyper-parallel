@@ -21,7 +21,7 @@
 # The maintainers of hyper_parallel/core.
 /hyper_parallel/core/ @yangzhenzhang
 /hyper_parallel/core/activation_checkpoint/ @DavidFFFan
-/hyper_parallel/core/checkpoint/ @zhangbuxue
+/hyper_parallel/core/distributed_checkpoint/ @zhangbuxue
 /hyper_parallel/core/fully_shard/ @Meng107
 /hyper_parallel/core/hsdp/ @kisnwang
 /hyper_parallel/core/pipeline_parallel/ @lichen666

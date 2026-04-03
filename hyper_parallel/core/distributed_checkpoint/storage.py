@@ -18,8 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
-from hyper_parallel.core.checkpoint.metadata import Metadata, MetadataIndex
-from hyper_parallel.core.checkpoint.planner import LoadPlan, LoadPlanner, SavePlan, SavePlanner
+from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, MetadataIndex
+from hyper_parallel.core.distributed_checkpoint.planner import LoadPlan, LoadPlanner, SavePlan, SavePlanner
 
 METADATA_FILE_NAME = ".metadata"
 
