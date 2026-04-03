@@ -19,7 +19,6 @@ from hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_wrapper 
 )
 from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import (
     ActivationWrapper,
-    ActivationPolicy,
     AsyncSaveOnCpu,
     SwapWrapper,
     base_check_fn,
@@ -33,7 +32,6 @@ __all__ = [
     "ActivationWrapper",
     "CheckpointWrapper",
     "checkpoint_wrapper",
-    "ActivationPolicy",
     "AsyncSaveOnCpu",
     "SwapWrapper",
     "base_check_fn",

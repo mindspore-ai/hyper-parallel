@@ -18,24 +18,18 @@
 """Activation Swap implementation for PyTorch."""
 # pylint: disable=W0212, W0613
 
-import enum
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from typing import Optional, Callable, Any
 import torch
 from torch import nn
 from torch.distributed.utils import _replace_by_prefix
+from hyper_parallel.core.activation_checkpoint.activation_checkpoint import CheckpointPolicy
 from hyper_parallel.core.activation_checkpoint.swap import SwapManager, SwapTensor, Storage
 
 
 _SWAP_WRAPPED_MODULE = "_swap_wrapped_module"
 _SWAP_PREFIX = _SWAP_WRAPPED_MODULE + "."
-
-
-class ActivationPolicy(enum.Enum):
-    """Enum for activation policies."""
-    SAVE = 0
-    SWAP = 1
 
 
 def base_check_fn(tensor) -> bool:
@@ -68,7 +62,7 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
             if not base_check_fn(tensor):
                 return tensor
 
-            if (policy_fn is not None) and (policy_fn(tensor)==ActivationPolicy.SAVE):
+            if (policy_fn is not None) and (policy_fn(tensor)==CheckpointPolicy.MUST_SAVE):
                 return tensor
 
             if not self.add_to_storage:

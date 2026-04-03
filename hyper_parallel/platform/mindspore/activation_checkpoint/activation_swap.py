@@ -17,7 +17,6 @@
 # adapted for MindSpore Cell API.
 # ============================================================================
 """Activation Swap Wrapper implementation for MindSpore."""
-import enum
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
@@ -28,6 +27,7 @@ from mindspore import Tensor
 from mindspore.common.parameter import Parameter
 from mindspore.nn import Cell
 
+from hyper_parallel.core.activation_checkpoint.activation_checkpoint import CheckpointPolicy
 from hyper_parallel.core.activation_checkpoint.swap import Storage, SwapManager, SwapTensor
 
 
@@ -176,12 +176,6 @@ class ActivationWrapper(Cell, ABC):
             self._wrapped_param_names[id(param)] = new_name
 
 
-class ActivationPolicy(enum.Enum):
-    """Per-tensor swap policy returned by a user-supplied policy function."""
-    SAVE = 0   # keep tensor on device (do not swap)
-    SWAP = 1   # offload tensor to host memory
-
-
 def base_check_fn(tensor: Any) -> bool:
     """
     Basic eligibility check: returns ``True`` when *tensor* may be offloaded.
@@ -318,7 +312,7 @@ class AsyncSaveOnCpu(ms.saved_tensors_hooks):
             if not base_check_fn(tensor):
                 return tensor
 
-            if (policy_fn is not None) and (policy_fn(tensor)==ActivationPolicy.SAVE):
+            if (policy_fn is not None) and (policy_fn(tensor)==CheckpointPolicy.MUST_SAVE):
                 return tensor
 
             if not self.add_to_storage:

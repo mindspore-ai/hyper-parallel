@@ -76,4 +76,33 @@ def checkpoint(function, *args, swap_inputs=False, policy_fn=None, **kwargs):
         return plat.checkpoint(function, *args, context_fn=context_fn, use_reentrant=False, **kwargs)
 
 
+def swap(function, *args, policy_fn=None, **kwargs):
+    """Apply activation swap to a function call.
+
+    Offloads intermediate activations saved by the autograd engine to CPU
+    during the forward pass and loads them back before the backward pass,
+    trading device memory for host memory bandwidth.  Unlike
+    :func:`checkpoint`, no recomputation is performed.
+
+    Args:
+        function (callable): The function whose activations should be swapped.
+        *args: Positional arguments forwarded to *function*.
+        policy_fn (callable, optional): Per-tensor swap policy.  Receives
+            a tensor and returns a :class:`CheckpointPolicy` value.  Tensors
+            that return ``CheckpointPolicy.MUST_SAVE`` are kept on device;
+            all other eligible tensors are offloaded.  When ``None``, all
+            eligible tensors are offloaded.
+        **kwargs: Keyword arguments forwarded to *function*.
+
+    Returns:
+        The return value of ``function(*args, **kwargs)``.
+
+    Example:
+        >>> output = swap(layer, x, policy_fn=lambda t: CheckpointPolicy.MUST_SAVE)
+    """
+    with plat.async_save_on_cpu(policy_fn=policy_fn):
+        return function(*args, **kwargs)
+
+
 checkpoint_wrapper = partial(plat.ckpt_wrapper, checkpoint_fn=checkpoint)
+swap_wrapper = plat.swap_wrapper
