@@ -2,3 +2,8 @@ ExpandDims:
   dist_op_name: _expand_dims_dist_op
   distributed_op_class: ExpandDimsDistributedOp
   distributed_op_file: parallel_expand_dims
+
+ExpandDimsView:
+  dist_op_name: _expand_dims_dist_op
+  distributed_op_class: ExpandDimsDistributedOp
+  distributed_op_file: parallel_expand_dims

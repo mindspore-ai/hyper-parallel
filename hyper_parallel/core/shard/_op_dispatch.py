@@ -215,6 +215,7 @@ class OpDispatcher:
             "BernoulliExt", "MultinomialExt", "RandpermExt",
             "NormalTensorTensor", "NormalTensorFloat", "NormalFloatTensor", "NormalFloatFloat",
             "Randn", "RandLikeExt", "RandnLike", "RandInt", "RandIntLike", "RandExt",
+            "FuncDropoutExt"
         }
         self._rng_tracker: Optional[OffsetBasedRNGTracker] = None
 
