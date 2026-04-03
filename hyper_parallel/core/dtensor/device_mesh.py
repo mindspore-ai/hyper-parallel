@@ -16,13 +16,32 @@
 
 import copy
 import os
-from typing import Literal, Optional, Union, List, Any, Sequence
+import threading
+from types import TracebackType
+from typing import Any, List, Literal, Optional, Sequence, Type, Union
 import numpy as np
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
 
 platform = get_platform()
 Tensor = platform.Tensor
+
+
+class _MeshEnv(threading.local):
+    """Per-thread stack of active :class:`DeviceMesh` (PyTorch ``_mesh_resources`` parity)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.mesh_stack: List["DeviceMesh"] = []
+
+    def get_current_mesh(self) -> "DeviceMesh":
+        """Return the innermost active :class:`DeviceMesh` for this thread (PyTorch parity)."""
+        if len(self.mesh_stack) == 0:
+            raise RuntimeError("No device mesh is currently active!")
+        return self.mesh_stack[-1]
+
+
+_mesh_resources = _MeshEnv()
 
 
 def _get_sub_rank_list(mesh_shape, mesh_dim_names, rank_list, sub_mesh_dim_names, current_rank):
@@ -107,6 +126,13 @@ class DeviceMesh:
         >>> print(device_mesh.ndim)  # Output: 2
         >>> print(device_mesh.mesh_shape)  # Output: (2, 2)
         >>> print(device_mesh.rank_list)  # Output: (0, 1, 2, 3)
+
+    Context manager:
+        Use ``with device_mesh:`` to set the **current** mesh for this thread. APIs that accept
+        ``device_mesh=None`` (e.g. :func:`hyper_parallel.core.tensor_parallel.parallelize_module`)
+        resolve it via ``_mesh_resources.get_current_mesh()`` (:meth:`_MeshEnv.get_current_mesh`).
+        Nested ``with`` uses a stack; the innermost mesh
+        is current until its block exits.
     """
 
     device_type: Literal["cpu", "cuda", "gpu", "npu"]
@@ -250,6 +276,18 @@ class DeviceMesh:
         dimensions of the mesh. If this rank is not part of the mesh, return None.
         """
         return self._coordinate_on_dim if self._coordinate_on_dim else None
+
+    def __enter__(self) -> "DeviceMesh":
+        _mesh_resources.mesh_stack.append(self)
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> None:
+        _mesh_resources.mesh_stack.pop()
 
     @staticmethod
     def _convert_mesh_to_tensor(mesh: Union[Tensor, list, tuple, np.ndarray]) -> Tensor:
