@@ -19,20 +19,20 @@
 import copy
 import warnings
 
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional
 from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import (  # pylint: disable=C0415
     _get_lb_override,
 )
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from hyper_parallel.core.shard.ops.parallel_ops_register import register_distributed_op
+from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
 Tensor = platform.Tensor
 
 
-class ScaledDotProductAttentionDistributedOp:
+class ScaledDotProductAttentionDistributedOp(DistributedOp):
     """Distributed operator for torch.nn.functional.scaled_dot_product_attention.
 
     Input shape: [B, N, S, D] (4D) or [N, S, D] (3D).
@@ -44,10 +44,6 @@ class ScaledDotProductAttentionDistributedOp:
       - SP: Shard Q sequence dimension, KV replicated
       - Combinations: DP+MP, SP+MP, DP+SP+MP
     """
-
-    def __init__(self, op_name: str):
-        self.op_name = op_name
-        register_distributed_op(op_name, self)
 
     @staticmethod
     def _tensor_map_to_placements(base_layout: Layout, tensor_map: tuple) -> tuple:
@@ -281,10 +277,10 @@ class ScaledDotProductAttentionDistributedOp:
         return attn_mask, is_causal, key, value
 
     def infer_layout(
-        self, input_layouts: List[Optional[Layout]], extra_args: List[Any]
+        self, layouts: List[Optional[Layout]], extra_args: Optional[dict] = None
     ) -> Tuple[Layout, ...]:
         """Infer output layout. Output has the same layout as query."""
-        query_layout = input_layouts[0]
+        query_layout = layouts[0]
         if query_layout is None:
             raise ValueError("Query layout cannot be None")
 
@@ -297,21 +293,15 @@ class ScaledDotProductAttentionDistributedOp:
 
         return attention_out_layout
 
-    def get_expand_impl(
-        self,
-        func: callable,
-        output_layouts: Tuple[Layout, ...],
-        input_layouts: List[Optional[Layout]],
-        extra_args: List[Any],
-    ) -> Optional[callable]:
+    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
         """Create expanded implementation."""
-        query_layout = input_layouts[0]
+        query_layout = layouts[0]
         if query_layout is None:
             return None
 
-        if len(input_layouts) >= 3:
-            key_layout = input_layouts[1]
-            value_layout = input_layouts[2]
+        if len(layouts) >= 3:
+            key_layout = layouts[1]
+            value_layout = layouts[2]
 
             if (key_layout is not None and value_layout is not None and
                 hasattr(key_layout, 'tensor_map') and hasattr(value_layout, 'tensor_map')):
@@ -334,7 +324,7 @@ class ScaledDotProductAttentionDistributedOp:
             scale=None,
             enable_gqa=False,
         ):
-            key_layout = input_layouts[1] if len(input_layouts) > 1 else None
+            key_layout = layouts[1] if len(layouts) > 1 else None
             self._validate_sharding_consistency(query_layout, key_layout, dims)
 
             split_info = self._get_split_info(query_layout, dims)

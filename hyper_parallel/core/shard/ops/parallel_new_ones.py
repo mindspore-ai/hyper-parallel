@@ -24,7 +24,7 @@ from .parallel_ops import DistributedOp
 class NewOnesDistributedOp(DistributedOp):
     """Distributed implementation for new_ones operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for new_ones operator.
 

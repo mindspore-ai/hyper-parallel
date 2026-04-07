@@ -23,7 +23,7 @@ from .parallel_ops import DistributedOp
 class RepeatInterleaveDistributedOp(DistributedOp):
     """Distributed implementation for torch.repeat_interleave."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for RepeatInterleave operator.
 

@@ -181,7 +181,7 @@ class BsndFaCausalLeftupAttn(nn.Module):
 
     Requires a fixed 2048×2048 compressed causal mask.
     Upper-right triangle = True (mask future tokens), lower-left = False (attend past).
-    In Colossal CP, the dispatcher (FlashAttentionScoreDistributedOp._compute_sparse_params)
+    In Colossal CP, the dispatcher (NPUFlashAttentionScoreDistributedOp._compute_sparse_params)
     adjusts pre_tockens/next_tockens per rank to achieve globally-correct causal attention.
     """
 
@@ -829,7 +829,7 @@ def test_colossal_bsnd_fa_noncausal():
 def test_colossal_bsnd_fa_causal_leftup():
     """C3b: Pure Colossal CP=2, BSND, npu_fusion_attention causal (sparse_mode=2 leftUpCausal).
 
-    Core test: FlashAttentionScoreDistributedOp._compute_sparse_params converts
+    Core test: NPUFlashAttentionScoreDistributedOp._compute_sparse_params converts
     sparse_mode=2 to BAND (mode=4) and adjusts pre/next_tockens per rank so that
     each rank's local Q only attends to the globally-correct KV window.
 

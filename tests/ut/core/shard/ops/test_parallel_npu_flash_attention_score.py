@@ -21,7 +21,7 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import FlashAttentionScoreDistributedOp
+from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import NPUFlashAttentionScoreDistributedOp
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
@@ -29,11 +29,11 @@ from hyper_parallel.core.dtensor.device_mesh import (
 )
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
-op = FlashAttentionScoreDistributedOp("npu_fusion_attention")
+op = NPUFlashAttentionScoreDistributedOp("npu_fusion_attention")
 
 
 class TestParallelNpuFlashAttentionScore(unittest.TestCase):
-    """Unit tests for FlashAttentionScoreDistributedOp."""
+    """Unit tests for NPUFlashAttentionScoreDistributedOp."""
     def setUp(self):
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()

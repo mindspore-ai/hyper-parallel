@@ -22,7 +22,7 @@ from .parallel_ops import DistributedOp
 class ConcatDistributedOp(DistributedOp):
     """Distributed implementation for Concat."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for Concat and normalize the concatenation dimension.
         Raises an error if the specified concatenation dimension is sharded.

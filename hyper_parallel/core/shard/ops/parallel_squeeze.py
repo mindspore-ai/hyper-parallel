@@ -22,7 +22,7 @@ from .parallel_ops import DistributedOp
 class SqueezeDistributedOp(DistributedOp):
     """Distributed implementation for Squeeze operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for Squeeze.
 

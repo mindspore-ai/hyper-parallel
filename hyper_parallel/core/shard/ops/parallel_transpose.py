@@ -23,7 +23,7 @@ from .parallel_ops import DistributedOp
 class TransposeDistributedOp(DistributedOp):
     """Distributed implementation for Transpose operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for Transpose operator.
 

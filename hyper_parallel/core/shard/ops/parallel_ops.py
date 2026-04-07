@@ -56,7 +56,24 @@ class DistributedOp:
                 )
 
     # pylint: disable=W0613
-    def infer_layout(self, layouts, extra_args):
+    def preprocess(self, args: tuple, kwargs: dict):
+        """
+        Unified preprocessing: parameter parsing + to_local + cache_values construction.
+
+        Subclasses override this to participate in the new dispatch flow.
+
+        Returns:
+            None: Fall back to legacy dispatch (default).
+            tuple: (local_args, local_kwargs, cache_values)
+                - local_args: Local tensor positional arguments (DTensors already to_local'd).
+                - local_kwargs: Local tensor keyword arguments (DTensors already to_local'd).
+                - cache_values: Values affecting layout inference (fixed order).
+                    Contains Layout objects (with compact_str) and raw values (int, bool, tuple, etc.).
+        """
+        return None
+
+    # pylint: disable=W0613
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts based on input layouts.
 
@@ -78,8 +95,8 @@ class DistributedOp:
             return (layouts[0],)
         return None
 
-    @staticmethod
-    def get_expand_impl(func, output_layout, layouts, extra_args):
+    # pylint: disable=W0613
+    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
         """
         Get expand implementation for the operator
         """

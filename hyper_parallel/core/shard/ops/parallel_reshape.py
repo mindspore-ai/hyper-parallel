@@ -262,7 +262,7 @@ class ReshapeDistributedOp(DistributedOp):
                 if partial_op is not None and i < len(out_layout.alias_name):
                     out_layout.set_partial_by_dev_axis(out_layout.alias_name[i], partial_op)
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for reshape operator.
 

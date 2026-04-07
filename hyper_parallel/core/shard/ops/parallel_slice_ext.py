@@ -22,7 +22,7 @@ from .parallel_ops import DistributedOp
 class SliceExtDistributedOp(DistributedOp):
     """Distributed implementation for SliceExt operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for Split operator.
 

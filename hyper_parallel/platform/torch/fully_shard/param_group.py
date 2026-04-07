@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from contextlib import ExitStack
 import torch
 import torch.distributed as dist
+from torch.distributed import Work
 from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
     FSDPMeshInfo,
@@ -138,7 +139,7 @@ class AllGatherResult(NamedTuple):
     """
     all_gather_output: torch.Tensor
     metadata: AllGatherMetadata
-    handle: dist.distributed_c10d.Work | None
+    handle: Optional[Work]
 
 
 @dataclass
@@ -159,8 +160,8 @@ class CommContext:
         Layer N reduce_scatter ↔ Layer N-1 backward compute
         Layer N all_reduce     ↔ Layer N-1 reduce_scatter
     """
-    comm_handle: dist.distributed_c10d.Work | None = None
-    all_reduce_handle: dist.distributed_c10d.Work | None = None
+    comm_handle: Optional[Work] = None
+    all_reduce_handle: Optional[Work] = None
     pre_param_group = None
     # Param group whose all_reduce has been issued but grad not yet applied
     all_reduce_param_group = None

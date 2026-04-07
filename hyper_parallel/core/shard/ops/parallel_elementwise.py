@@ -31,7 +31,7 @@ class ElementWiseDistributedOp(DistributedOp):
         op_name (str): Name of the operator to register.
     """
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for element-wise operations with broadcasting support.
 
@@ -621,8 +621,7 @@ class AddDistributedOp(ElementWiseWithPartialDistributedOp):
     which is useful for operations like gradient accumulation where partial
     results need to be preserved through the computation graph.
     """
-
-    def get_expand_impl(self, func, output_layout, layouts, extra_args):
+    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
         """
         Get expand implementation for the operator
         """
@@ -633,9 +632,9 @@ class AddDistributedOp(ElementWiseWithPartialDistributedOp):
 
         if x1_partial != x2_partial:
             scaling_factor = 1
-            for i, partial_type in enumerate(output_layout.partial):
+            for i, partial_type in enumerate(infer_result.partial):
                 if partial_type == "sum":
-                    scaling_factor *= output_layout.mesh_shape[i]
+                    scaling_factor *= infer_result.mesh_shape[i]
                 elif partial_type is not None:
                     raise ValueError(
                         f"For {self.op_name}, inputs partial status should be 'sum' or None, "

@@ -24,7 +24,7 @@ from .parallel_ops import DistributedOp
 class IndexSelectDistributedOp(DistributedOp):
     """Distributed implementation for Index Select operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for Index Select operations.
 
@@ -99,8 +99,7 @@ class IndexSelectDistributedOp(DistributedOp):
 
         return output_layout
 
-
-    def get_expand_impl(self, func, output_layout, layouts, extra_args):
+    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
         """
         Get the expanded execution implementation for Index Select.
         """
@@ -179,7 +178,7 @@ class GatherDDistributedOp(DistributedOp):
     - Output inherits the sharding pattern of the input tensor
     """
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for GatherD operations.
         Args:
@@ -267,7 +266,7 @@ class GatherDDistributedOp(DistributedOp):
         output_layout.update_compact_str()
         return output_layout
 
-    def get_expand_impl(self, func, output_layout, layouts, extra_args):
+    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
         """
         Returns the execution implementation wrapper for distributed GatherD.
         
@@ -337,7 +336,7 @@ class GatherDDistributedOp(DistributedOp):
 class GatherNdDistributedOp(DistributedOp):
     """Distributed implementation for GatherNd operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for GatherNd.
 
