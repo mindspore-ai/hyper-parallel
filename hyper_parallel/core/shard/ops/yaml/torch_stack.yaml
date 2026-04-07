@@ -1,0 +1,5 @@
+stack:
+  dist_op_name: _torch_stack_dist_op
+  distributed_op_class: StackDistributedOp
+  distributed_op_file: parallel_stack
+  infer_layout_suffix: WithTupleExpand
