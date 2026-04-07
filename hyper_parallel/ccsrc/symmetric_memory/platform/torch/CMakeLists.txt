@@ -87,7 +87,7 @@ if(BUILD_TORCH_LIB)
     set(TORCH_BINDINGS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/torch_bindings.cpp)
     add_library(aclshmem_torch
         SHARED ${TORCH_BINDINGS_SRC})
-    target_link_libraries(aclshmem_torch PRIVATE config_store hybm_core hpshmem aclshmem_symmetric_memory_kernel)
+    target_link_libraries(aclshmem_torch PRIVATE shmem_utils hpshmem aclshmem_symmetric_memory_kernel)
     set_target_properties(aclshmem_torch PROPERTIES
         INSTALL_RPATH $ORIGIN:$ORIGIN/../../../lib:$ORIGIN/../../../lib/shmem)
     install(TARGETS aclshmem_torch DESTINATION . COMPONENT aclshmem_torch)

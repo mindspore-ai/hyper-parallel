@@ -712,6 +712,12 @@ class TorchPlatform(Platform):
         symmetric_memory = TorchSymmetricMemoryHandler()
         return symmetric_memory
 
+    @staticmethod
+    def get_multicore_handler():
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.multicore import TorchMulticoreHandler
+        return TorchMulticoreHandler()
+
     def new_stream(self):
         device = self.get_device_handle()
         return device.Stream()

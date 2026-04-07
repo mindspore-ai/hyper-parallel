@@ -579,6 +579,12 @@ class MindSporePlatform(Platform):
         symmetric_memory = MSSymmetricMemoryHandler()
         return symmetric_memory
 
+    @staticmethod
+    def get_multicore_handler():
+        # pylint: disable=C0415
+        from hyper_parallel.platform.mindspore.multicore import MSMulticoreHandler
+        return MSMulticoreHandler()
+
     def new_stream(self):
         return ms.runtime.Stream()
 

@@ -122,6 +122,7 @@ class BuildPy(build_py):
             os.path.dirname(__file__), 'build', 'lib', 'hyper_parallel')
         shutil.rmtree(hyper_parallel_lib_dir, ignore_errors=True)
         self._run_shell_script("scripts/build_symmetric_memory.sh")
+        self._run_shell_script_optional("scripts/build_multicore.sh")
         super().run()
         update_permissions(hyper_parallel_lib_dir)
 
@@ -145,6 +146,13 @@ class BuildPy(build_py):
             error_msg = f"Failed to execute script: {script_path}, error: {e.stderr}"
             logger.error(error_msg)
             raise RuntimeError(error_msg) from e
+
+    def _run_shell_script_optional(self, script_path, args=None):
+        """Execute shell script; log a warning on failure instead of raising."""
+        try:
+            self._run_shell_script(script_path, args=args)
+        except (FileNotFoundError, RuntimeError) as e:
+            logger.warning("Optional build step skipped (%s): %s", script_path, e)
 
 class BuildHyperParallelMindSpore(build_py):
     """Custom build command: compile C++ plugin during build phase with version safety"""
@@ -288,6 +296,13 @@ if __name__ == '__main__':
             'hyper_parallel.platform.torch.symmetric_memory': ['*.so'],
             'hyper_parallel.platform.mindspore.symmetric_memory': ['aclshmem_ms/*.so'],
             'hyper_parallel.platform.mindspore.custom_pass': [BuildHyperParallelMindSpore.MS_SO_NAME],
+            'hyper_parallel.core.multicore.platform.mindspore': [
+                'build/lib/*.so',
+                'build/lib/*_auto_generate/*.py',
+            ],
+            'hyper_parallel.core.multicore.platform.torch': [
+                '*.so',
+            ],
         },
         cmdclass={
             'egg_info': EggInfo,
