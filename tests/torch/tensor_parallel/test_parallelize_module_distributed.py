@@ -14,14 +14,13 @@
 # ============================================================================
 """Pytest launchers for ``parallelize_module`` NPU distributed tests.
 
-Each launcher uses ``parallel_run`` to execute several worker cases from
-``_test_parallelize_module_distributed.py`` concurrently on disjoint NPU subsets.
-
-Typical packing:
-  - up to four 2-card worker cases per launcher
+- **Functional**: four 2-card worker cases in one ``parallel_run`` (8 ranks total).
+- **Precision**: two 4-card torchrun workers in one ``parallel_run`` (colwise / rowwise
+  linear vs CPU reference).
 
 Port allocation:
-  10460–10469  2-card tests (single-node ``num_proc=2``)
+  10460–10463  2-card functional
+  10464–10465  4-card precision (colwise + rowwise linear)
 """
 from pathlib import Path
 
@@ -42,9 +41,9 @@ def _run_group(*cases):
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
-def test_parallelize_module_group1():
+def test_parallelize_module_functional_2card():
     """
-    Feature: parallel_run launcher for 2-card parallelize_module coverage
+    Feature: parallel_run launcher for 2-card parallelize_module functional coverage
     Description:
         1. test_parallelize_module_mesh_aligned_with_process_group_npu
         2. test_parallelize_module_dict_fnmatch_npu
@@ -62,15 +61,15 @@ def test_parallelize_module_group1():
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
-def test_parallelize_module_group2():
+def test_parallelize_module_precision_4card():
     """
-    Feature: parallel_run launcher for 2-card parallelize_module precision coverage
+    Feature: parallel_run launcher for 4-card parallelize_module precision vs CPU reference
     Description:
         1. test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu
         2. test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu
     Expectation: Run success.
     """
     _run_group(
-        ("test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu", 10464, 2),
-        ("test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu", 10465, 2),
+        ("test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu", 10464, 4),
+        ("test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu", 10465, 4),
     )

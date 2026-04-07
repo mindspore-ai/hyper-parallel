@@ -81,6 +81,9 @@
 "hyper-parallel/tests/torch/hsdp/"                                      "line-too-long"
 "hyper-parallel/tests/torch/hsdp/"                                      "unused-import"
 
+# 6a. DTensor — distribute_module mirrors PyTorch nn.Module / MindSpore Cell internals (_parameters, _buffers, …)
+"hyper-parallel/hyper_parallel/core/dtensor/dtensor.py"               "protected-access"
+
 # 6. Existing unrelated files
 "hyper-parallel/hyper_parallel/core/dtensor/placement_types.py"         "mixed-line-endings"
 "hyper-parallel/hyper_parallel/core/shard/_op_dispatch.py"              "line-too-long"
