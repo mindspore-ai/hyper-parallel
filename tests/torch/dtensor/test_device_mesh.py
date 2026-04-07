@@ -12,66 +12,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Pytest entry-points for DeviceMesh NPU distributed tests.
+"""Pytest launchers for DeviceMesh NPU distributed tests.
 
-Each test spawns worker processes via torchrun and delegates to the
-corresponding test function in device_mesh.py (NPU/hccl).
+Each launcher uses ``parallel_run`` to execute several worker cases from
+``_test_device_mesh.py`` concurrently on disjoint NPU subsets.
 
-Run from ``tests/torch/dtensor/`` so the worker module path resolves (same pattern
-as ``tests/torch/context_parallel/test_cp_npu.py``).
+Typical packing:
+  - up to four 2-card worker cases per launcher
 
 Port allocation:
-  10520–10529  8-card tests (single-node ``num_proc=8``)
+  10520–10529  2-card tests (single-node ``num_proc=2``)
 """
-from tests.torch.utils import torchrun_case
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
 
-_FILE = "device_mesh.py"
+# Absolute path: torchrun inherits cwd (repo root or this dir); basename alone can fail.
+_WORKER = str(Path(__file__).resolve().parent / "_test_device_mesh.py")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_device_mesh_init_1d_eight_ranks_npu():
-    """DeviceMesh 1-D init with eight ranks.
-
-    Feature: DeviceMesh construction on NPU
-    Description: ``init_device_mesh`` with 1-D mesh (8,) under hccl.
-    Expectation: Run success.
-    """
-    torchrun_case(_FILE, "test_device_mesh_init_1d_eight_ranks_npu", master_port=10520, num_proc=8)
+def _run_group(*cases):
+    """Launch a group of worker cases with ``parallel_run``."""
+    parallel_run([
+        TorchCase(_WORKER, case_name, master_port, num_proc)
+        for case_name, master_port, num_proc in cases
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
-def test_device_mesh_get_current_mesh_raises_without_context_npu():
-    """get_current_mesh raises outside of mesh context (8-rank).
-
-    Feature: DeviceMesh context API
-    Description: No active mesh stack entry before entering context.
+def test_dtensor_device_mesh_group1():
+    """
+    Feature: parallel_run launcher for 2-card DTensor DeviceMesh coverage
+    Description:
+        1. test_device_mesh_init_1d_eight_ranks_npu
+        2. test_device_mesh_get_current_mesh_raises_without_context_npu
+        3. test_device_mesh_with_mesh_current_mesh_identity_npu
+        4. test_device_mesh_nested_with_get_current_mesh_npu
     Expectation: Run success.
     """
-    torchrun_case(_FILE, "test_device_mesh_get_current_mesh_raises_without_context_npu", master_port=10521, num_proc=8)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_device_mesh_with_mesh_current_mesh_identity_npu():
-    """with device_mesh sets current mesh (8-rank).
-
-    Feature: DeviceMesh context API
-    Description: ``get_current_mesh`` matches entered mesh.
-    Expectation: Run success.
-    """
-    torchrun_case(_FILE, "test_device_mesh_with_mesh_current_mesh_identity_npu", master_port=10522, num_proc=8)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_device_mesh_nested_with_get_current_mesh_npu():
-    """Nested mesh contexts and get_current_mesh (8-rank).
-
-    Feature: DeviceMesh nested context
-    Description: Inner ``with`` restores outer current mesh after exit.
-    Expectation: Run success.
-    """
-    torchrun_case(_FILE, "test_device_mesh_nested_with_get_current_mesh_npu", master_port=10523, num_proc=8)
+    _run_group(
+        ("test_device_mesh_init_1d_eight_ranks_npu", 10520, 2),
+        ("test_device_mesh_get_current_mesh_raises_without_context_npu", 10521, 2),
+        ("test_device_mesh_with_mesh_current_mesh_identity_npu", 10522, 2),
+        ("test_device_mesh_nested_with_get_current_mesh_npu", 10523, 2),
+    )

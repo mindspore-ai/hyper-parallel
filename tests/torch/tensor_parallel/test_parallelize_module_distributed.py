@@ -12,100 +12,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Pytest entry-points for ``parallelize_module`` NPU distributed tests.
+"""Pytest launchers for ``parallelize_module`` NPU distributed tests.
 
-Each test spawns worker processes via torchrun and delegates to the
-corresponding test function in parallelize_module_distributed.py (NPU/hccl).
+Each launcher uses ``parallel_run`` to execute several worker cases from
+``_test_parallelize_module_distributed.py`` concurrently on disjoint NPU subsets.
 
-Run from ``tests/torch/tensor_parallel/`` so the worker module path resolves (same
-pattern as ``tests/torch/context_parallel/test_cp_npu.py``).
+Typical packing:
+  - up to four 2-card worker cases per launcher
 
 Port allocation:
-  10460–10469  8-card tests (single-node ``num_proc=8``)
+  10460–10469  2-card tests (single-node ``num_proc=2``)
 """
-from tests.torch.utils import torchrun_case
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
 
-_FILE = "parallelize_module_distributed.py"
+# Absolute path: torchrun inherits cwd (repo root or this dir); basename alone can fail.
+_WORKER = str(Path(__file__).resolve().parent / "_test_parallelize_module_distributed.py")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_parallelize_module_mesh_aligned_with_process_group_npu():
-    """Mesh rank list matches hccl world size (8-rank).
-
-    Feature: parallelize_module under distributed
-    Description: Style apply sees a 1-D mesh consistent with process group.
-    Expectation: Run success.
-    """
-    torchrun_case(_FILE, "test_parallelize_module_mesh_aligned_with_process_group_npu", master_port=10460, num_proc=8)
+def _run_group(*cases):
+    """Launch a group of worker cases with ``parallel_run``."""
+    parallel_run([
+        TorchCase(_WORKER, case_name, master_port, num_proc)
+        for case_name, master_port, num_proc in cases
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
-def test_parallelize_module_dict_fnmatch_npu():
-    """Dict plan with fnmatch on 8 ranks.
-
-    Feature: parallelize_module path patterns
-    Description: ``net*`` matches multiple children on each rank.
+def test_parallelize_module_group1():
+    """
+    Feature: parallel_run launcher for 2-card parallelize_module coverage
+    Description:
+        1. test_parallelize_module_mesh_aligned_with_process_group_npu
+        2. test_parallelize_module_dict_fnmatch_npu
+        3. test_parallelize_module_src_data_rank_npu
+        4. test_parallelize_module_single_style_root_npu
     Expectation: Run success.
     """
-    torchrun_case(_FILE, "test_parallelize_module_dict_fnmatch_npu", master_port=10461, num_proc=8)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_parallelize_module_src_data_rank_npu():
-    """src_data_rank propagated to ParallelStyle (8-rank).
-
-    Feature: parallelize_module keyword args
-    Description: ``src_data_rank`` set on style before apply.
-    Expectation: Run success.
-    """
-    torchrun_case(_FILE, "test_parallelize_module_src_data_rank_npu", master_port=10462, num_proc=8)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_parallelize_module_single_style_root_npu():
-    """Single ParallelStyle on root module (8-rank).
-
-    Feature: parallelize_module single-style form
-    Description: One apply per rank on the root module.
-    Expectation: Run success.
-    """
-    torchrun_case(_FILE, "test_parallelize_module_single_style_root_npu", master_port=10463, num_proc=8)
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu():
-    """Colwise-style linear vs PyTorch TP reference (8-rank).
-
-    Feature: parallelize_module numerical parity
-    Description: Compare sharded linear forward to reference.
-    Expectation: Run success.
-    """
-    torchrun_case(
-        _FILE,
-        "test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu",
-        master_port=10464,
-        num_proc=8,
+    _run_group(
+        ("test_parallelize_module_mesh_aligned_with_process_group_npu", 10460, 2),
+        ("test_parallelize_module_dict_fnmatch_npu", 10461, 2),
+        ("test_parallelize_module_src_data_rank_npu", 10462, 2),
+        ("test_parallelize_module_single_style_root_npu", 10463, 2),
     )
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
-def test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu():
-    """Rowwise-style linear vs PyTorch TP reference (8-rank).
-
-    Feature: parallelize_module numerical parity
-    Description: Compare sharded linear forward to reference.
+def test_parallelize_module_group2():
+    """
+    Feature: parallel_run launcher for 2-card parallelize_module precision coverage
+    Description:
+        1. test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu
+        2. test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu
     Expectation: Run success.
     """
-    torchrun_case(
-        _FILE,
-        "test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu",
-        master_port=10465,
-        num_proc=8,
+    _run_group(
+        ("test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu", 10464, 2),
+        ("test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu", 10465, 2),
     )
