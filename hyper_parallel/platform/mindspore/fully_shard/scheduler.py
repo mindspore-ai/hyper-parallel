@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore HSDP scheduler"""
-from typing import List
+from typing import Any, List, Tuple
 import mindspore as ms
 from mindspore.common.api import _pynative_executor
 from mindspore.utils._pytree import tree_flatten, tree_unflatten
@@ -26,7 +26,7 @@ from hyper_parallel.platform import get_platform
 
 class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
     """MindSporeHSDPScheduler is used to implement optimizer level."""
-    def zero_grad(self):
+    def zero_grad(self) -> None:
         """Zero grad."""
         self.hsdp_state.zero_grad()
 
@@ -112,8 +112,44 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
             return
         self._hsdp_backward_hook(self.cell, None, None)
 
+    def _grouped_forward_pre_hook(self, cell, args, kwargs) -> Tuple[Any, Any]:
+        """Run FSDP pre-forward only for the first module in the group to run forward (PyTorch-aligned)."""
+        pending = self._fsdp_group_post_pending
+        if pending is None:
+            return self._forward_pre_hook(cell, args, kwargs)
+        if len(pending) == 0:
+            pending.update(self.modules)
+            return self._forward_pre_hook(cell, args, kwargs)
+        return args, kwargs
+
+    def _make_grouped_forward_post_hook(self, mod):
+        """Post-forward: last module in the group runs reshard + output backward hooks."""
+
+        def grouped_post_hook(cell: Any, inputs: Any, outputs: Any) -> Any:
+            """Defer forward post until the last module in the FSDP group finishes.
+
+            Args:
+                cell: Managed submodule (MindSpore Cell).
+                inputs: Forward inputs (hook signature).
+                outputs: Forward outputs from this submodule.
+            """
+            pending = self._fsdp_group_post_pending
+            if pending is None:
+                return self._forward_hook(cell, inputs, outputs)
+            pending.discard(mod)
+            if len(pending) == 0:
+                return self._forward_hook(cell, inputs, outputs)
+            return outputs
+
+        return grouped_post_hook
+
     def _register_forward_backward_hooks(self):
         """Register module forward and backward hook on all managed modules."""
+        if self._fsdp_group_post_pending is None:
+            for mod in self.modules:
+                mod.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
+                mod.register_forward_hook(self._forward_hook)
+            return
         for mod in self.modules:
-            mod.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
-            mod.register_forward_hook(self._forward_hook)
+            mod.register_forward_pre_hook(self._grouped_forward_pre_hook, with_kwargs=True)
+            mod.register_forward_hook(self._make_grouped_forward_post_hook(mod))

@@ -13,8 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Torch HSDP scheduler"""
+import inspect
 import torch
-from typing import List
+from typing import Any, List, Optional
 from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -181,8 +182,52 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             return
         self._hsdp_backward_hook(self.cell, None, None)
 
+    def _grouped_forward_pre_hook(self, cell, args, kwargs) -> Optional[tuple]:
+        """Run FSDP pre-forward only for the first module in the group (PyTorch FSDP2-aligned)."""
+        pending = self._fsdp_group_post_pending
+        if pending is None:
+            return self._forward_pre_hook(cell, args, kwargs)
+        if len(pending) == 0:
+            pending.update(self.modules)
+            return self._forward_pre_hook(cell, args, kwargs)
+        return None
+
+    def _make_grouped_forward_post_hook(self, mod):
+        """Post-forward: last module in the group runs reshard + output backward hooks."""
+
+        def grouped_post_hook(cell: Any, inputs: Any, outputs: Any) -> Optional[Any]:
+            """Defer forward post until the last module in the FSDP group finishes.
+
+            Args:
+                cell: Managed submodule (``nn.Module``).
+                inputs: Forward inputs (hook signature).
+                outputs: Forward outputs from this submodule.
+            """
+            pending = self._fsdp_group_post_pending
+            if pending is None:
+                return self._forward_hook(cell, inputs, outputs)
+            pending.discard(mod)
+            if len(pending) == 0:
+                return self._forward_hook(cell, inputs, outputs)
+            return None
+
+        return grouped_post_hook
+
+    def _register_forward_module_hook(self, mod, hook) -> None:
+        """Register forward hook; use ``always_call=True`` when supported (matches PyTorch FSDP)."""
+        sig = inspect.signature(mod.register_forward_hook)
+        if "always_call" in sig.parameters:
+            mod.register_forward_hook(hook, prepend=False, always_call=True)
+        else:
+            mod.register_forward_hook(hook, prepend=False)
+
     def _register_forward_backward_hooks(self):
         """Register module forward and backward hook on all managed modules."""
+        if self._fsdp_group_post_pending is None:
+            for mod in self.modules:
+                mod.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
+                mod.register_forward_hook(self._forward_hook)
+            return
         for mod in self.modules:
-            mod.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
-            mod.register_forward_hook(self._forward_hook)
+            mod.register_forward_pre_hook(self._grouped_forward_pre_hook, with_kwargs=True)
+            self._register_forward_module_hook(mod, self._make_grouped_forward_post_hook(mod))

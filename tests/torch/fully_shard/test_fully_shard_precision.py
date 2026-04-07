@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""launch _test_fully_shard_precision.py cases"""
+"""Launch _test_fully_shard_precision.py and _test_fully_shard_precision_list.py cases."""
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
 _TEST_FULLY_SHARD_PRECISION = "_test_fully_shard_precision.py"
+_TEST_FULLY_SHARD_PRECISION_LIST = "_test_fully_shard_precision_list.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
@@ -48,7 +49,20 @@ def test_fully_shard_precision_group2():
         TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_partial_shard", 12344, 4),
     ])
 
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_fully_shard_precision_list_unit():
+    """
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_list_unit_precision_zero3
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(_TEST_FULLY_SHARD_PRECISION_LIST, "test_list_unit_precision_zero3", 12350, 4),
+    ])
+
+
 def test_zero3_fully_shard_comm_fusion():
     """
     Feature: Test_zero3_fully_shard_comm_fusion.
