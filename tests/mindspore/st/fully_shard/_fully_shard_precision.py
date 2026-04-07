@@ -13,34 +13,39 @@
 # limitations under the License.
 # ============================================================================
 """Fully_shard multi-card training for precision comparison"""
+import argparse
 import os
 
 import mindspore as ms
 import mindspore.dataset as ds
 import numpy as np
-from mindspore import nn, ops
-from mindspore.communication import get_group_size, get_rank, init
-
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
-
+from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
+from mindspore import nn, ops
+from mindspore.communication import get_group_size, get_rank, init
 from tests.mindspore.st.common_net import SlimLeNet16
 
-# Use to same temp directory as precision_baseline.py
+# Shared temp directory for generated baseline artifacts
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp_baseline")
 
 ms.set_seed(1)
 ms.set_deterministic(True)
+enable_mindspore_backward_compat()
 
 
-def create_dataset(local_batch_size: int, num_shards: int, shard_id: int):
+def create_dataset(local_batch_size: int, num_shards=None, shard_id=None):
     """create mnist dataset"""
     dataset_path = "/home/workspace/mindspore_dataset/mnist/train"
-    dataset = ds.MnistDataset(
-        dataset_path, num_shards=num_shards, shard_id=shard_id, shuffle=False)
+    if (num_shards is None) or (shard_id is None):
+        dataset = ds.MnistDataset(dataset_path, shuffle=False)
+    else:
+        dataset = ds.MnistDataset(
+            dataset_path, num_shards=num_shards, shard_id=shard_id, shuffle=False
+        )
     image_transforms = [
         ds.vision.Rescale(1.0 / 255.0, 0),
         ds.vision.Normalize(mean=(0.1307,), std=(0.3081,)),
@@ -153,6 +158,57 @@ def run_accumulated_step(data, label, forward_fn, net):
 local_bs = 32
 learning_rate = 1e-2
 max_step = 20
+
+
+def generate_checkpoint():
+    """Generate the shared initial checkpoint for baseline and fully_shard runs."""
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    net = SlimLeNet16()
+    ckpt_path = os.path.join(TEMP_DIR, "init_baseline.ckpt")
+    ms.save_checkpoint(net, ckpt_path)
+    print(f"Generated checkpoint at: {ckpt_path}")
+    return ckpt_path
+
+
+def run_baseline_standalone(ckpt_path: str):
+    """Run standalone single-card training with the same backward path as distributed."""
+    data_set = create_dataset(local_batch_size=local_bs * 8)
+    net = SlimLeNet16()
+    param_dict = ms.load_checkpoint(ckpt_path)
+    param_not_load, _ = ms.load_param_into_net(net, param_dict)
+    assert not param_not_load, f"For baseline test case, not completely load ckpt from {ckpt_path}"
+
+    params = tuple(net.trainable_params())
+    optimizer = nn.Adam(params, learning_rate=learning_rate)
+
+    losses = []
+    i = 0
+    for data, label in data_set:
+        for param in params:
+            param.grad = None
+        loss, _ = get_forward_fn(net)(data, label)
+        loss.backward()
+        grads = tuple(param.grad for param in params)
+        optimizer(grads)
+        losses.append(float(loss.asnumpy()))
+        print(f"step: {i}, loss: {loss}")
+        i += 1
+        if i >= max_step:
+            break
+
+    return losses
+
+
+def generate_baseline_artifacts():
+    """Generate initial checkpoint and standalone baseline losses."""
+    ckpt_path = generate_checkpoint()
+    losses = run_baseline_standalone(ckpt_path)
+
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    losses_file = os.path.join(TEMP_DIR, "baseline_losses.npy")
+    np.save(losses_file, np.array(losses))
+    print(f"Saved baseline losses to: {losses_file}")
+    print(f"Baseline losses: {losses[:5]}... (total {len(losses)} steps)")
 
 
 def run_fully_shard_multi_card(
@@ -350,7 +406,7 @@ def run_fully_shard(mesh, use_empty_weight=False):
     rank_id = get_rank()
 
     ckpt_path = os.path.join(TEMP_DIR, "init_baseline.ckpt")
-    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please run precision_baseline.py first"
+    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please generate baseline artifacts first"
 
     if use_empty_weight:
         losses, _ = run_fully_shard_multi_card_with_empty_init(ckpt_path, mesh)
@@ -380,7 +436,7 @@ def run_fully_shard_ignored(mesh):
     rank_id = get_rank()
 
     ckpt_path = os.path.join(TEMP_DIR, "init_baseline.ckpt")
-    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please run precision_baseline.py first"
+    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please generate baseline artifacts first"
 
     losses = run_fully_shard_multi_card_ignored(ckpt_path, mesh)
 
@@ -407,7 +463,7 @@ def run_fully_shard_with_grad_accum(mesh):
     rank_id = get_rank()
 
     ckpt_path = os.path.join(TEMP_DIR, "init_baseline.ckpt")
-    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please run precision_baseline.py first"
+    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please generate baseline artifacts first"
 
     losses, _ = run_fully_shard_multi_card(ckpt_path, mesh, accumulate_grad=True)
 
@@ -473,3 +529,19 @@ def test_ms_zero3_fully_shard_grad_accum():
     """
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     run_fully_shard_with_grad_accum(mesh)
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Precision baseline and fully_shard test helper.")
+    parser.add_argument(
+        "--generate-baseline",
+        action="store_true",
+        help="Generate standalone checkpoint and baseline loss artifacts.",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    if args.generate_baseline:
+        generate_baseline_artifacts()

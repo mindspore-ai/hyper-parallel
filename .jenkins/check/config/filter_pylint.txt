@@ -57,6 +57,8 @@
 "hyper-parallel/tests/torch/fully_shard/"                             "unused-variable"
 "hyper-parallel/tests/torch/fully_shard/"                             "ungrouped-imports"
 
+"hyper-parallel/tests/mindspore/st/fully_shard/"                      "wrong-import-position"
+
 # 4. Tests UT: tests/ut/
 "hyper-parallel/tests/ut/"                                              "protected-access"
 "hyper-parallel/tests/ut/"                                              "import-outside-toplevel"

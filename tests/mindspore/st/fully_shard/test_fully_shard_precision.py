@@ -24,13 +24,13 @@ from tests.mindspore.st.utils import msrun_case
 
 # Temporary directory for baseline artifacts
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp_baseline")
-file_name = "_precision_fully_shard.py"
+file_name = "_fully_shard_precision.py"
 
 
 def run_baseline():
     """Run standalone baseline training"""
     print("Running standalone baseline training...")
-    cmd = f"python {os.path.dirname(__file__)}/_precision_baseline.py"
+    cmd = f"python {os.path.dirname(__file__)}/{file_name} --generate-baseline"
     process = subprocess.run(cmd, shell=True, check=False)
 
     assert process.returncode == 0, "Baseline training failed"
