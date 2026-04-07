@@ -19,14 +19,16 @@ from tests.common.parallel_case import parallel_run, TorchCase
 ACTIVATION_CHECKPOINT = "activation_checkpoint.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_ac_memory_comparison():
     """
     Feature: parallel run case in activation_checkpoint
     Description:
         1. test_ac_memory_comparison
+        2. test_checkpoint_wrapper_accepts_func
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(ACTIVATION_CHECKPOINT, "test_ac_memory_comparison", 12404, 1)
+        TorchCase(ACTIVATION_CHECKPOINT, "test_ac_memory_comparison", 12404, 1),
+        TorchCase(ACTIVATION_CHECKPOINT, "test_checkpoint_wrapper_accepts_func", 12405, 1)
     ])

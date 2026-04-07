@@ -20,7 +20,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from typing import Optional, Callable, Any
+from typing import Optional, Callable, Any, Union
 import torch
 from torch import nn
 from torch.distributed.utils import _replace_by_prefix
@@ -30,6 +30,32 @@ from hyper_parallel.core.activation_checkpoint.swap import SwapManager, SwapTens
 
 _SWAP_WRAPPED_MODULE = "_swap_wrapped_module"
 _SWAP_PREFIX = _SWAP_WRAPPED_MODULE + "."
+
+
+class FuncModule(nn.Module):
+    """
+    Thin :class:`~torch.nn.Module` adapter that wraps a plain callable.
+
+    Allows ordinary Python functions (or any callable without Module
+    parameters) to be passed to :func:`swap_wrapper` and
+    :func:`~hyper_parallel.platform.torch.platform.TorchPlatform.ckpt_wrapper`
+    in place of an :class:`~torch.nn.Module`.
+    The wrapped function is stored as ``_fn`` and invoked in
+    :meth:`forward`; the module has no trainable parameters.
+
+    Args:
+        fn (callable): The function to wrap.
+
+    Example:
+        >>> wrapped = swap_wrapper(lambda x: x * 2)
+    """
+
+    def __init__(self, fn: Callable):
+        super().__init__()
+        self._fn = fn
+
+    def forward(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
 
 
 def base_check_fn(tensor) -> bool:
@@ -96,7 +122,9 @@ class ActivationWrapper(torch.nn.Module, ABC):
     Not meant to be instantiated directly.
     """
 
-    def __init__(self, module):
+    def __init__(self, module: Union[nn.Module, Callable]):
+        if callable(module) and not isinstance(module, nn.Module):
+            module = FuncModule(module)
         super().__init__()
         self._swap_wrapped_module = module
         # state_dict post hook to remove prefix to allow loading into a
@@ -173,7 +201,7 @@ class SwapWrapper(ActivationWrapper):
     """
     Customize an nn.Module wrapper class to add an AsyncSaveOnCpu context manager for the target model.
     """
-    def __init__(self, mod: nn.Module, policy_fn: Optional[Callable] = None):
+    def __init__(self, mod: Union[nn.Module, Callable], policy_fn: Optional[Callable] = None):
         super().__init__(mod)
         self.policy_fn = policy_fn
 
@@ -182,5 +210,5 @@ class SwapWrapper(ActivationWrapper):
             return self._swap_wrapped_module(*args, **kwargs)
 
 
-def swap_wrapper(module: nn.Module, policy_fn: Optional[Callable] = None):
+def swap_wrapper(module: Union[nn.Module, Callable], policy_fn: Optional[Callable] = None) -> SwapWrapper:
     return SwapWrapper(module, policy_fn)
