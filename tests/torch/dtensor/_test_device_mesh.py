@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Distributed NPU workers for :class:`DeviceMesh` (torchrun, 8 ranks).
+"""Distributed NPU workers for :class:`DeviceMesh` (torchrun, 2+ ranks).
 
-Launched from ``test_device_mesh.py`` via ``torchrun_case`` with ``num_proc=8`` (single-node 8-card),
-same pattern as ``tests/torch/context_parallel/test_cp_npu.py``.
+Launched from ``test_device_mesh.py`` via ``parallel_run`` with ``num_proc=2``
+(single-node 2-card), same pattern as ``_test_context_parallel.py``.
 """
 import torch.distributed as dist
 
@@ -26,13 +26,7 @@ from hyper_parallel.core.dtensor.device_mesh import _mesh_resources
 from tests.torch.utils import init_dist
 
 
-def _assert_world_size_eight() -> None:
-    ws = dist.get_world_size()
-    assert ws == 8, f"these cases expect single-node 8-card world_size=8, got {ws}"
-
-
 def _make_1d_mesh_all_ranks() -> DeviceMesh:
-    _assert_world_size_eight()
     ws = dist.get_world_size()
     return init_device_mesh(
         device_type="npu",
@@ -43,9 +37,9 @@ def _make_1d_mesh_all_ranks() -> DeviceMesh:
 
 def _verify_init_device_mesh_1d_eight_ranks_npu() -> None:
     """
-    Feature: init_device_mesh 1-D mesh on 8-rank NPU group
-    Description: build mesh_shape (8,) over default process group
-    Expectation: rank_list (0..7); current rank in mesh; coordinate matches 1-D index
+    Feature: init_device_mesh 1-D mesh on NPU group
+    Description: build mesh_shape (ws,) over default process group
+    Expectation: rank_list (0..ws-1); current rank in mesh; coordinate matches 1-D index
     """
     mesh = _make_1d_mesh_all_ranks()
     ws = dist.get_world_size()
@@ -66,7 +60,6 @@ def _verify_get_current_mesh_raises_without_context_npu() -> None:
     Description: ensure stack empty; call get_current_mesh
     Expectation: RuntimeError on every rank
     """
-    _assert_world_size_eight()
     _mesh_resources.mesh_stack.clear()
     try:
         _mesh_resources.get_current_mesh()
@@ -78,7 +71,7 @@ def _verify_get_current_mesh_raises_without_context_npu() -> None:
 
 def _verify_with_mesh_get_current_mesh_identity_npu() -> None:
     """
-    Feature: ``with mesh`` sets thread-local current mesh under torchrun (8 ranks)
+    Feature: ``with mesh`` sets thread-local current mesh under torchrun
     Description: init 1-D mesh over world, enter context on each rank
     Expectation: get_current_mesh() is the same object as mesh; stack empty after exit
     """
@@ -91,8 +84,8 @@ def _verify_with_mesh_get_current_mesh_identity_npu() -> None:
 
 def _verify_nested_with_get_current_mesh_npu() -> None:
     """
-    Feature: nested ``with`` mesh stacks on 8-rank NPU
-    Description: outer 1-D mesh (8,); inner 2-D mesh (2, 4) over the same eight ranks
+    Feature: nested ``with`` mesh stacks on NPU
+    Description: outer 1-D mesh (ws,); inner 2-D mesh (2, ws//2) over the same ranks
     Expectation: inner block sees inner mesh; after inner exit outer is current
     """
     outer = _make_1d_mesh_all_ranks()
@@ -116,7 +109,7 @@ def _verify_nested_with_get_current_mesh_npu() -> None:
 
 def test_device_mesh_init_1d_eight_ranks_npu():
     """
-    Feature: init_device_mesh 1-D mesh on 8-rank NPU (single torchrun job)
+    Feature: init_device_mesh 1-D mesh on NPU (single torchrun job)
     Description: see :func:`_verify_init_device_mesh_1d_eight_ranks_npu`
     Expectation: all assertions pass on every rank
     """
@@ -126,7 +119,7 @@ def test_device_mesh_init_1d_eight_ranks_npu():
 
 def test_device_mesh_get_current_mesh_raises_without_context_npu():
     """
-    Feature: get_current_mesh without active mesh context on 8-rank NPU
+    Feature: get_current_mesh without active mesh context on NPU
     Description: see :func:`_verify_get_current_mesh_raises_without_context_npu`
     Expectation: all assertions pass on every rank
     """
@@ -136,7 +129,7 @@ def test_device_mesh_get_current_mesh_raises_without_context_npu():
 
 def test_device_mesh_with_mesh_current_mesh_identity_npu():
     """
-    Feature: ``with mesh`` current mesh identity on 8-rank NPU
+    Feature: ``with mesh`` current mesh identity on NPU
     Description: see :func:`_verify_with_mesh_get_current_mesh_identity_npu`
     Expectation: all assertions pass on every rank
     """
@@ -146,7 +139,7 @@ def test_device_mesh_with_mesh_current_mesh_identity_npu():
 
 def test_device_mesh_nested_with_get_current_mesh_npu():
     """
-    Feature: nested ``with`` mesh stack on 8-rank NPU
+    Feature: nested ``with`` mesh stack on NPU
     Description: see :func:`_verify_nested_with_get_current_mesh_npu`
     Expectation: all assertions pass on every rank
     """

@@ -14,11 +14,10 @@
 # ============================================================================
 """Distributed NPU tests for ``parallelize_module`` (torchrun, hccl).
 
-Launched from ``tests/torch/tensor_parallel/test_parallelize_module_distributed.py``
-via ``torchrun_case`` with ``num_proc=8`` (single-node 8-card), same pattern as
-``tests/torch/context_parallel/test_cp_npu.py``.
+Launched from ``test_parallelize_module_distributed.py`` via ``parallel_run`` with
+``num_proc=2`` (single-node 2-card), same pattern as ``_test_context_parallel.py``.
 
-8-card precision cases shard ``nn.Linear`` in the same way as PyTorch
+Precision cases shard ``nn.Linear`` in the same way as PyTorch
 ``ColwiseParallel`` / ``RowwiseParallel`` (output dim vs input dim); the reference is
 ``F.linear`` on CPU with the full weight (PyTorch numerical semantics).
 """
@@ -39,7 +38,16 @@ from tests.torch.utils import init_dist
 class _VerifyMeshParallelStyle(ParallelStyle):
     """Asserts process group world size matches *device_mesh* for this rank."""
 
-    def apply(self, module, device_mesh):
+    def apply(self, module: nn.Module, device_mesh: object) -> nn.Module:
+        """Return *module* after asserting mesh matches the process group.
+
+        Args:
+            module: Module being parallelized.
+            device_mesh: Device mesh for the current plan.
+
+        Returns:
+            The same *module* instance.
+        """
         assert dist.is_initialized(), "process group must be initialized"
         ws = dist.get_world_size()
         rk = dist.get_rank()
@@ -57,7 +65,16 @@ class _CountingParallelStyle(ParallelStyle):
         super().__init__()
         self.count = 0
 
-    def apply(self, module, device_mesh):
+    def apply(self, module: nn.Module, device_mesh: object) -> nn.Module:
+        """Increment counters and return *module* unchanged.
+
+        Args:
+            module: Module being parallelized.
+            device_mesh: Device mesh for the current plan.
+
+        Returns:
+            The same *module* instance.
+        """
         self.count += 1
         if not hasattr(module, "_hp_parallelize_apply_count"):
             module._hp_parallelize_apply_count = 0
@@ -72,11 +89,6 @@ def _make_tp_mesh_1d():
         mesh_shape=(dist.get_world_size(),),
         mesh_dim_names=("tp",),
     )
-
-
-def _assert_world_size_eight() -> None:
-    ws = dist.get_world_size()
-    assert ws == 8, f"these precision cases expect single-node 8-card world_size=8, got {ws}"
 
 
 # --- PyTorch-aligned TP shard patterns (golden = CPU F.linear full weight) ---
@@ -101,6 +113,14 @@ class _ColwiseParallelLinear(nn.Module):
         self.bias = nn.Parameter(bias_shard) if bias_shard is not None else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Column-parallel linear then all-gather along the last dim.
+
+        Args:
+            x: Input activations.
+
+        Returns:
+            Full output after all-gather.
+        """
         y_local = F.linear(x, self.weight, self.bias)
         chunks = [torch.empty_like(y_local) for _ in range(self.world_size)]
         dist.all_gather(chunks, y_local)
@@ -111,10 +131,18 @@ class _ColwiseLinearPrecisionStyle(ParallelStyle):
     """Apply column-parallel sharding to ``nn.Linear`` (PyTorch ``ColwiseParallel`` layout)."""
 
     def apply(self, module: nn.Module, device_mesh: object) -> nn.Module:
+        """Replace ``nn.Linear`` with a column-sharded parallel module.
+
+        Args:
+            module: ``nn.Linear`` to shard.
+            device_mesh: Device mesh (unused; 1-D mesh matches process group).
+
+        Returns:
+            A column-parallel linear module for this rank.
+        """
         del device_mesh  # 1-D mesh already matches process group
         if not isinstance(module, nn.Linear):
             raise TypeError(f"expected nn.Linear, got {type(module)}")
-        _assert_world_size_eight()
         world = dist.get_world_size()
         rank = dist.get_rank()
         out_f = module.out_features
@@ -155,6 +183,14 @@ class _RowwiseParallelLinear(nn.Module):
         self._in_len = per
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Row-parallel linear: partial matmul, all-reduce, then optional bias.
+
+        Args:
+            x: Input activations (full width; each rank uses its shard of features).
+
+        Returns:
+            Full output after all-reduce (and bias).
+        """
         x_r = x[:, self._in_start : self._in_start + self._in_len]
         y = F.linear(x_r, self.weight, None)
         dist.all_reduce(y, op=dist.ReduceOp.SUM)
@@ -167,10 +203,18 @@ class _RowwiseLinearPrecisionStyle(ParallelStyle):
     """Apply row-parallel sharding to ``nn.Linear`` (PyTorch ``RowwiseParallel`` layout)."""
 
     def apply(self, module: nn.Module, device_mesh: object) -> nn.Module:
+        """Replace ``nn.Linear`` with a row-sharded parallel module.
+
+        Args:
+            module: ``nn.Linear`` to shard.
+            device_mesh: Device mesh (unused).
+
+        Returns:
+            A row-parallel linear module for this rank.
+        """
         del device_mesh
         if not isinstance(module, nn.Linear):
             raise TypeError(f"expected nn.Linear, got {type(module)}")
-        _assert_world_size_eight()
         world = dist.get_world_size()
         rank = dist.get_rank()
         out_f = module.out_features
@@ -198,12 +242,11 @@ def _npu_precision_close(a: torch.Tensor, b: torch.Tensor) -> None:
 
 def test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu():
     """
-    Feature: column-parallel Linear via parallelize_module matches CPU F.linear (8-rank)
+    Feature: column-parallel Linear via parallelize_module matches CPU F.linear
     Description: shard out_features; all_gather outputs — same layout as PyTorch ColwiseParallel
     Expectation: gathered NPU output close to PyTorch reference on CPU
     """
     init_dist()
-    _assert_world_size_eight()
     mesh = _make_tp_mesh_1d()
     torch.manual_seed(42)
     torch.npu.manual_seed(42)
@@ -226,12 +269,11 @@ def test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu():
 
 def test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu():
     """
-    Feature: row-parallel Linear via parallelize_module matches CPU F.linear (8-rank)
+    Feature: row-parallel Linear via parallelize_module matches CPU F.linear
     Description: shard in_features; allreduce partials — same layout as PyTorch RowwiseParallel
     Expectation: NPU output close to PyTorch reference on CPU
     """
     init_dist()
-    _assert_world_size_eight()
     mesh = _make_tp_mesh_1d()
     torch.manual_seed(43)
     torch.npu.manual_seed(43)
