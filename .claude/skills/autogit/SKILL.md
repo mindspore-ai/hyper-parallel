@@ -37,6 +37,7 @@ python3 {skill_dir}/scripts/autogit.py <command> [options]
 | `check` | Run code-style check + lint checks, includes pylint and markdownlint (no commit) | `check` |
 | `test` | **Test stage**: pytest only                                             | `test` |
 | `pr` | Run pytest gate, then create PR to upstream                             | `pr --reviewer zhangsan` |
+| `pr --analyze-only` | Output structured JSON analysis for LLM PR description | (internal use) |
 | `pr --to #N` | Run pytest gate, then append commits to existing PR                     | `pr --to #160 --amend` |
 | `status #N` | Show PR status (read-only)                                              | `status #160` |
 | `update #N` | Regenerate PR description                                               | `update #160` |
@@ -66,6 +67,66 @@ git checkout -b fix/urgent-bug
 ```
 
 Always work on a feature branch. If you commit on master, AutoGit auto-creates a `pr/<timestamp>` branch to protect master.
+
+## LLM-Enhanced PR Description (IMPORTANT)
+
+When creating or updating a PR, **always** use the two-step flow for description generation:
+
+### Step 1: Get structured analysis
+
+```bash
+python3 {skill_dir}/scripts/autogit.py pr --analyze-only
+```
+
+This outputs a JSON object with: commit messages, file stats, file changes, feature points, public APIs, and module additions.
+
+### Step 2: Generate PR description from analysis
+
+Read the JSON output and generate a high-quality PR description **in Chinese** following this template:
+
+```markdown
+## 相关的Issue
+{issue ref or N/A}
+
+## 原因（目的、解决的问题等）
+{Explain WHY the change is needed. Use numbered list with concrete examples.}
+
+## 描述（做了什么，变更了什么）
+### 核心改动（文件名 +additions/-deletions）
+- **Category**: Describe the change, reference function/class names inline
+- ...
+
+### 变更统计
+| 文件 | 新增 | 删除 |
+|------|------|------|
+| {filename} | +N | -N |
+
+## 测试用例（新增、改动、可能影响的功能）
+{Test coverage description}
+
+## 可能影响的功能
+{Impact assessment}
+```
+
+### Writing rules
+
+1. **Chinese** for all content, English only for code identifiers (`` `func_name` ``)
+2. **Explain the "why"** — what problem existed, how the change addresses it
+3. **Be specific** — reference function names, class names, file paths with inline code
+4. **Group by module/file** when showing changes
+5. **Include statistics** from the analysis (file counts, line counts)
+6. **Do NOT include** `test_*` method names, `Test*` class names, or `_private()` references
+7. Keep total body **30-50 lines**
+
+### Step 3: Create PR with the description
+
+```bash
+python3 {skill_dir}/scripts/autogit.py pr --title "title" --body "body"
+```
+
+Or if PR already exists, update via API using `update_pr_description()`.
+
+> **Fallback**: If `--analyze-only` is unavailable, the standard `pr` command generates a basic description automatically.
 
 ## Safety Guarantees
 

@@ -295,7 +295,10 @@ def _parse_conventional_commits(commits: List[str]) -> List[Dict[str, str]]:
 # ============================================================================
 
 def _match_public_def(line: str) -> Optional[str]:
-    """Match a public def/class definition line and return the name; None if private.
+    """Match a public def/class definition line and return the name; None if private or test.
+
+    Skips private names (``_`` prefix), test methods (``test_`` prefix), and
+    test classes (``Test`` prefix) so they never appear as public API entries.
 
     Args:
         line: Source code line to check.
@@ -308,7 +311,10 @@ def _match_public_def(line: str) -> Optional[str]:
         m = re.match(r'\s*class\s+(\w+)\s*[:(]', line)
     if not m or m.group(1).startswith('_'):
         return None
-    return m.group(1)
+    name = m.group(1)
+    if name.startswith('test_') or name.startswith('Test'):
+        return None
+    return name
 
 
 def _parse_docstring_text(lines: List[str], pos: int, quote: str) -> str:
@@ -412,11 +418,14 @@ def _synthesize_pr_purpose(  # pylint: disable=W0613
 
     Priority:
     1. Domain: commit type + scope
-    2. Feature points: commit subject -> commit body list -> docstring -> fallback
+    2. Feature points: commit subject -> commit body list -> class-level docstring -> fallback
+
+    Only class-level docstrings are included to avoid noise from individual
+    methods.  Test identifiers are pre-filtered by ``_match_public_def``.
 
     Args:
         commit_data: Parsed conventional commit dicts.
-        docstrings: Extracted public API docstrings.
+        docstrings: Extracted public API docstrings (test items pre-filtered).
         analysis: DiffAnalysis result.
         fallback_domain: Domain from structural analysis.
         fallback_points: Feature points from structural analysis.
@@ -442,19 +451,27 @@ def _synthesize_pr_purpose(  # pylint: disable=W0613
             seen_lower.add(key)
             points.append(text.strip())
 
+    # Priority 1: commit subjects
     for cd in commit_data:
         subj = cd.get('subject', '')
         if subj:
             _add_point(subj)
 
+    # Priority 2: commit body bullet points
+    # Strip leading "_function_name: " prefix from body bullets so only
+    # the human-readable description remains.
     for cd in commit_data:
         for line in cd.get('body', '').split('\n'):
             line = line.strip()
             if line.startswith('- '):
-                _add_point(line[2:])
+                text = FUNC_PREFIX_PATTERN.sub('', line[2:])
+                _add_point(text)
 
+    # Priority 3: class-level docstrings only (skip method-level to reduce noise)
     for ds in docstrings:
-        _add_point(f"`{ds['name']}`: {ds['docstring']}")
+        name = ds['name']
+        if name[0].isupper():
+            _add_point(f"`{name}`: {ds['docstring']}")
 
     if not points:
         points = list(fallback_points)
@@ -465,6 +482,9 @@ def _synthesize_pr_purpose(  # pylint: disable=W0613
 # ============================================================================
 # Framework-agnostic sanitization
 # ============================================================================
+
+# Regex to strip "_function_name: " or "_function_name(): " prefix from commit body bullets.
+FUNC_PREFIX_PATTERN = re.compile(r'^_\w+(?:\(\))?:\s*')
 
 _FRAMEWORK_PATTERNS = [
     (re.compile(r'\btorch[- ]style\b', re.IGNORECASE), ''),
@@ -513,9 +533,15 @@ _EXAMPLE_PREFIXES = ("examples/",)
 
 
 def _classify_file_bucket(filepath: str) -> str:
-    """Classify a changed file into a high-level bucket."""
+    """Classify a changed file into a high-level bucket.
+
+    ``.claude/skills/*/scripts/*.py`` are classified as production because
+    they are executable scripts, not documentation.
+    """
     if filepath.startswith(_TEST_PREFIXES):
         return "tests"
+    if filepath.startswith(".claude/skills/") and filepath.endswith(".py"):
+        return "production"
     if filepath.startswith(_DOC_PREFIXES) or "README" in filepath:
         return "docs"
     if filepath.startswith(_EXAMPLE_PREFIXES):
@@ -560,11 +586,15 @@ def _aggregate_module_additions(
 ) -> Dict[str, Dict[str, List[str]]]:
     """Aggregate newly added classes and public methods by functional module.
 
+    Test classes (starting with ``Test``) and test methods (starting with
+    ``test_``) are excluded from the production counts and reported as a
+    separate ``test_count`` entry.
+
     Args:
         analysis: DiffAnalysis result.
 
     Returns:
-        Dict mapping module labels to {'classes': [...], 'funcs': [...]}.
+        Dict mapping module labels to {'classes': [...], 'funcs': [...], 'test_count': int}.
     """
     module_additions: Dict[str, Dict[str, List[str]]] = {}
     for filepath, changes in analysis.file_changes.items():
@@ -572,15 +602,22 @@ def _aggregate_module_additions(
         if not module:
             continue
         bucket = module_additions.setdefault(module, {
-            'classes': [], 'funcs': []
+            'classes': [], 'funcs': [], 'test_count': 0
         })
         for cls in changes.added_classes:
             name = cls['name'] if isinstance(cls, dict) else cls
-            bucket['classes'].append(name)
+            if name.startswith('Test'):
+                bucket['test_count'] = bucket.get('test_count', 0) + 1
+            else:
+                bucket['classes'].append(name)
         for func in changes.added_funcs:
             name = func['name'] if isinstance(func, dict) else func
-            if not name.startswith('_'):
-                bucket['funcs'].append(name)
+            if name.startswith('_'):
+                continue
+            if name.startswith('test_'):
+                bucket['test_count'] = bucket.get('test_count', 0) + 1
+                continue
+            bucket['funcs'].append(name)
     return module_additions
 
 
@@ -588,16 +625,20 @@ def _format_module_line(module: str,
                         items: Dict[str, List[str]]) -> Optional[str]:
     """Generate a summary line for a single module; return None if no content.
 
+    Production classes and methods are listed by name; test additions are
+    shown as a count only.
+
     Args:
         module: Module label string.
-        items: Dict with 'classes' and 'funcs' lists.
+        items: Dict with 'classes', 'funcs', and optionally 'test_count'.
 
     Returns:
         Formatted summary line, or None.
     """
-    cls_names = items['classes']
-    func_names = items['funcs']
-    if not cls_names and not func_names:
+    cls_names = items.get('classes', [])
+    func_names = items.get('funcs', [])
+    test_count = items.get('test_count', 0)
+    if not cls_names and not func_names and test_count == 0:
         return None
     parts = []
     if cls_names:
@@ -607,6 +648,8 @@ def _format_module_line(module: str,
         names = ', '.join(f'`{n}()`' for n in func_names[:5])
         suffix = f"等 {len(func_names)} 个" if len(func_names) > 5 else ""
         parts.append(f"新增公开方法 {names}{suffix}")
+    if test_count > 0:
+        parts.append(f"新增 {test_count} 个测试")
     detail = '；'.join(parts)
     return f"- **{module}**：{detail}"
 
@@ -875,6 +918,9 @@ def _extract_group_changes(analysis: DiffAnalysis,
                            group_files: List[str]) -> List[str]:
     """Extract key changes for a file group.
 
+    For groups where all files are under test directories, returns a
+    summary count instead of listing each test method individually.
+
     Args:
         analysis: DiffAnalysis result.
         group_files: List of file paths in the group.
@@ -883,12 +929,38 @@ def _extract_group_changes(analysis: DiffAnalysis,
         List of change description strings.
     """
     group_changes: List[str] = []
+    is_test_group = all('test' in f.lower() for f in group_files)
+
+    if is_test_group:
+        total_test_funcs = 0
+        total_test_classes = 0
+        for f in group_files:
+            changes = analysis.file_changes.get(f, FileChanges())
+            for cls in changes.added_classes:
+                total_test_classes += 1
+            for func in changes.added_funcs:
+                total_test_funcs += 1
+        parts = []
+        if total_test_classes:
+            parts.append(f"{total_test_classes} 个测试类")
+        if total_test_funcs:
+            parts.append(f"{total_test_funcs} 个测试方法")
+        if parts:
+            group_changes.append(f"新增 {', '.join(parts)}")
+        return group_changes
+
     for f in group_files:
         changes = analysis.file_changes.get(f, FileChanges())
         for cls in changes.added_classes:
+            name = cls['name'] if isinstance(cls, dict) else cls
+            if name.startswith('Test'):
+                continue
             base_info = f"(inherits {cls['base']})" if cls.get('base') else ""
             group_changes.append(f"Add class `{cls['name']}` {base_info}")
         for func in changes.added_funcs:
+            name = func['name'] if isinstance(func, dict) else func
+            if name.startswith('test_'):
+                continue
             group_changes.append(f"Add `{func['name']}()`")
         for cls in changes.removed_classes:
             group_changes.append(f"Remove class `{cls}`")
@@ -1076,19 +1148,61 @@ def _infer_production_change_points(analysis: DiffAnalysis) -> List[str]:
 
 
 def _build_background_section(
-    grouped_files: Dict[str, List[str]], feature_domain: str
+    grouped_files: Dict[str, List[str]], feature_domain: str,
+    feature_points: List[str],
 ) -> str:
-    """Build a concise background section."""
+    """Build a concise background section based on file buckets and feature info."""
     if grouped_files["production"]:
+        if feature_points:
+            return (
+                f"本 PR 围绕{_sanitize_framework_refs(feature_domain or '核心功能调整')}展开，"
+                f"主要解决：{_sanitize_framework_refs(feature_points[0])}。"
+            )
         return (
-            "本 PR 对核心实现进行了调整，并同步更新相关说明与内部验证覆盖，"
-            "使当前实现、文档和测试口径保持一致。"
+            f"本 PR 对核心实现进行了调整"
+            f"（{_sanitize_framework_refs(feature_domain or '功能优化')}），"
+            "并同步更新相关说明与内部验证覆盖。"
         )
     if grouped_files["docs"]:
         return "本 PR 主要用于同步文档与开发说明。"
     if grouped_files["tests"]:
         return "本 PR 主要用于刷新内部验证覆盖。"
     return f"本 PR 主要围绕{_sanitize_framework_refs(feature_domain or '代码调整')}展开。"
+
+
+def _append_fallback_points(
+    parts: List[str], feature_points: List[str], analysis: DiffAnalysis,
+) -> None:
+    """Append fallback change points when no hardcoded production_points match.
+
+    Tries feature_points first; if insufficient, supplements with structural
+    info (modified/added funcs and classes) from the diff analysis.
+
+    Args:
+        parts: Output list to append bullet lines to.
+        feature_points: Feature points from commit messages and docstrings.
+        analysis: DiffAnalysis result.
+    """
+    shown = 0
+    for point in feature_points[1:7]:
+        cleaned = _sanitize_framework_refs(point)
+        if cleaned and "test_" not in cleaned and "Test" not in cleaned:
+            parts.append(f"- {cleaned}")
+            shown += 1
+    if shown >= 2:
+        return
+    if analysis.modified_funcs:
+        names = ', '.join(f'`{f}()`' for f in analysis.modified_funcs[:6])
+        parts.append(f"- 修改方法: {names}")
+    if analysis.modified_classes:
+        names = ', '.join(f'`{c}`' for c in analysis.modified_classes[:4])
+        parts.append(f"- 修改类: {names}")
+    if analysis.added_funcs:
+        names = ', '.join(f'`{f}()`' for f in analysis.added_funcs[:6])
+        parts.append(f"- 新增方法: {names}")
+    if analysis.added_classes:
+        names = ', '.join(f'`{c}`' for c in analysis.added_classes[:4])
+        parts.append(f"- 新增类: {names}")
 
 
 def _build_key_changes_section(
@@ -1098,23 +1212,23 @@ def _build_key_changes_section(
 ) -> List[str]:
     """Build concise key change lines grouped by intent instead of file stats."""
     parts: List[str] = []
+    section_num = 0
 
     if grouped_files["production"]:
-        parts.append("### 1. 核心实现")
+        section_num += 1
+        parts.append(f"### {section_num}. 核心实现")
         production_points = _infer_production_change_points(analysis)
         if production_points:
             for point in production_points:
                 parts.append(f"- {point}")
         else:
-            for point in feature_points[:4]:
-                cleaned = _sanitize_framework_refs(point)
-                if cleaned and "test_" not in cleaned and "Test" not in cleaned:
-                    parts.append(f"- {cleaned}")
+            _append_fallback_points(parts, feature_points, analysis)
 
     if grouped_files["docs"] or grouped_files["examples"]:
         if parts:
             parts.append("")
-        parts.append("### 2. 配套同步")
+        section_num += 1
+        parts.append(f"### {section_num}. 配套同步")
         if grouped_files["docs"]:
             parts.append("- 更新相关文档与开发说明，使其与当前实现保持一致。")
         if grouped_files["examples"]:
@@ -1123,7 +1237,8 @@ def _build_key_changes_section(
     if grouped_files["tests"]:
         if parts:
             parts.append("")
-        parts.append("### 3. 内部验证")
+        section_num += 1
+        parts.append(f"### {section_num}. 内部验证")
         parts.append("- 更新内部验证用例，使断言与当前实现保持一致。")
         parts.append("- 清理已失效的测试写法，并补充重构后关键路径的覆盖。")
 
@@ -1181,31 +1296,152 @@ def generate_pr_content(diff: str, commits: List[str],
         Tuple of (title, body).
     """
     analysis = analyze_diff(diff)
-    grouped_files = _group_files_by_bucket(analysis.files)
 
     fallback_domain, fallback_points = infer_feature_purpose(analysis)
-    commit_data = _parse_conventional_commits(commits) if commits else []
-    docstrings: List[Dict[str, str]] = []
+    # Reverse commits so oldest is first — primary intent should lead
+    ordered_commits = list(reversed(commits)) if commits else []
+    commit_data = _parse_conventional_commits(ordered_commits) if ordered_commits else []
+    docstrings = _extract_docstrings_from_diff(diff)
     feature_domain, feature_points = _synthesize_pr_purpose(
         commit_data, docstrings, analysis, fallback_domain, fallback_points
     )
 
     title = _normalize_title_with_type(
-        _sanitize_framework_refs(_generate_pr_title(analysis, commits, pr_info)),
+        _sanitize_framework_refs(_generate_pr_title(analysis, ordered_commits, pr_info)),
         commit_data,
         analysis,
     )
     related_issue = _collect_related_issues(commits) if commits else "N/A"
+    reason = _build_reason_section(analysis, feature_domain, feature_points)
+
+    desc_parts = _build_architecture_overview(analysis)
+
+    desc_parts.extend(_build_api_section(docstrings))
+
+    skill_files = [f for f in analysis.files if 'skills/' in f]
+    if skill_files:
+        desc_parts.extend(_build_skill_section(skill_files))
+
+    desc_parts.extend(_build_file_stats_section(analysis))
+    description = "\n".join(desc_parts) if desc_parts else "代码优化"
+
+    test_cases = _build_test_section(analysis)
+    affected_str = _build_affected_section(analysis)
+
     body = _sanitize_framework_refs(f"""## 相关的Issue
 {related_issue}
 
 ## 原因（目的、解决的问题等）
-{_build_background_section(grouped_files, feature_domain)}
+{reason}
 
 ## 描述（做了什么，变更了什么）
-{_build_description_section(analysis, grouped_files, feature_points)}
+{description}
 
 ## 测试用例（新增、改动、可能影响的功能）
-{_build_validation_section(grouped_files)}
+{test_cases}
+
+## 可能影响的功能
+{affected_str}
 """)
     return title, body
+
+
+def _extract_name(item: object) -> str:
+    """Extract 'name' field from a dict or return the item as-is."""
+    return item['name'] if isinstance(item, dict) else str(item)
+
+
+def _build_file_stats_list(analysis: DiffAnalysis) -> List[Dict[str, object]]:
+    """Build per-file stats list from analysis."""
+    return [
+        {
+            'path': f,
+            'additions': analysis.file_stats.get(f, (0, 0))[0],
+            'deletions': analysis.file_stats.get(f, (0, 0))[1],
+        }
+        for f in analysis.files
+    ]
+
+
+def _build_file_changes_list(analysis: DiffAnalysis) -> List[Dict[str, object]]:
+    """Build per-file change details with test filtering."""
+    file_changes: List[Dict[str, object]] = []
+    for filepath, changes in analysis.file_changes.items():
+        entry: Dict[str, object] = {'path': filepath}
+        if changes.added_classes:
+            entry['added_classes'] = [
+                n for c in changes.added_classes
+                if not (n := _extract_name(c)).startswith('Test')
+            ]
+        if changes.added_funcs:
+            entry['added_funcs'] = [
+                n for f in changes.added_funcs
+                if not (n := _extract_name(f)).startswith('_')
+                and not n.startswith('test_')
+            ]
+        if changes.removed_classes:
+            entry['removed_classes'] = [_extract_name(c) for c in changes.removed_classes]
+        if changes.removed_funcs:
+            entry['removed_funcs'] = [_extract_name(f) for f in changes.removed_funcs]
+        if any(entry.get(k) for k in ('added_classes', 'added_funcs',
+                                        'removed_classes', 'removed_funcs')):
+            file_changes.append(entry)
+    return file_changes
+
+
+def prepare_pr_analysis(diff: str, commits: List[str]) -> str:
+    """Prepare structured analysis data for LLM-based PR description generation.
+
+    Returns a JSON string containing all extracted information so that
+    Claude can generate a human-friendly PR description from it.
+
+    Args:
+        diff: Raw unified diff text.
+        commits: List of commit SHA strings.
+
+    Returns:
+        JSON string with structured analysis data.
+    """
+    import json  # pylint: disable=C0415
+
+    analysis = analyze_diff(diff)
+
+    ordered_commits = list(reversed(commits)) if commits else []
+    commit_data = _parse_conventional_commits(ordered_commits)
+
+    file_stats = _build_file_stats_list(analysis)
+    file_changes = _build_file_changes_list(analysis)
+    module_additions = _aggregate_module_additions(analysis)
+    docstrings = _extract_docstrings_from_diff(diff)
+
+    fallback_domain, fallback_points = infer_feature_purpose(analysis)
+    feature_domain, feature_points = _synthesize_pr_purpose(
+        commit_data, docstrings, analysis, fallback_domain, fallback_points
+    )
+
+    result = {
+        'summary': {
+            'files_count': len(analysis.files),
+            'additions': analysis.additions,
+            'deletions': analysis.deletions,
+            'feature_domain': feature_domain,
+            'added_classes': analysis.added_classes,
+            'added_funcs': [
+                f for f in analysis.added_funcs
+                if not f.startswith('_') and not f.startswith('test_')
+            ],
+            'modified_classes': analysis.modified_classes,
+            'modified_funcs': analysis.modified_funcs,
+        },
+        'commit_messages': [
+            {'subject': cd.get('subject', ''), 'body': cd.get('body', '')}
+            for cd in commit_data
+        ],
+        'file_stats': file_stats,
+        'file_changes': file_changes,
+        'module_additions': module_additions,
+        'public_apis': docstrings,
+        'feature_points': feature_points,
+    }
+
+    return json.dumps(result, ensure_ascii=False, indent=2)
