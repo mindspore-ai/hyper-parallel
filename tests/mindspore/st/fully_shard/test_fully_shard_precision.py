@@ -25,9 +25,10 @@ from tests.mindspore.st.utils import msrun_case
 # Temporary directory for baseline artifacts
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp_baseline")
 file_name = "_fully_shard_precision.py"
+file_name_list = "_precision_fully_shard_list.py"
 
 
-def run_baseline():
+def run_baseline() -> None:
     """Run standalone baseline training"""
     print("Running standalone baseline training...")
     cmd = f"python {os.path.dirname(__file__)}/{file_name} --generate-baseline"
@@ -38,7 +39,7 @@ def run_baseline():
     print("Baseline training completed successfully")
 
 
-def run_case(case_name):
+def run_case(case_name: str) -> None:
     """Run the specified test case with setup and teardown"""
     try:
         if os.path.exists(TEMP_DIR):
@@ -50,6 +51,23 @@ def run_case(case_name):
         glob_v = 2
         master_port = 18178
         msrun_case(glob_v, file_name, case_name, master_port)
+    finally:
+        if os.path.exists(TEMP_DIR):
+            shutil.rmtree(TEMP_DIR)
+            print(f"Cleaned up temporary directory: {TEMP_DIR}")
+
+
+def run_list_precision_case(case_name: str) -> None:
+    """Run list-unit precision case (reference training lives in-script; no standalone baseline)."""
+    try:
+        if os.path.exists(TEMP_DIR):
+            print(f"Cleaning up existing temporary directory before start: {TEMP_DIR}")
+            shutil.rmtree(TEMP_DIR)
+
+        glob_v = 2
+        master_port = 18525
+        script_path = os.path.join(os.path.dirname(__file__), file_name_list)
+        msrun_case(glob_v, script_path, case_name, master_port)
     finally:
         if os.path.exists(TEMP_DIR):
             shutil.rmtree(TEMP_DIR)
@@ -96,6 +114,17 @@ def test_ms_zero3_fully_shard_grad_accum():
     Expectation: Losses should match within tolerance
     """
     run_case(case_name=f"{inspect.stack()[0].function}")
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_ms_fully_shard_list_unit_precision():
+    """
+    Feature: fully_shard(list) numerical parity vs standalone (MindSpore).
+    Description: Nested fully_shard with ``fully_shard([dense1, dense2], reshard_after_forward=False)``;
+        compare final loss and dense1 grad shard to non-sharded training (same seed).
+    Expectation: Run success (grouped hooks aligned with PyTorch FSDP2 list semantics).
+    """
+    run_list_precision_case(case_name=f"{inspect.stack()[0].function}")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")

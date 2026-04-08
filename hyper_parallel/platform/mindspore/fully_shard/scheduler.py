@@ -25,8 +25,12 @@ from hyper_parallel.platform import get_platform
 
 
 class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
-    """MindSporeHSDPScheduler is used to implement optimizer level."""
-    def zero_grad(self):
+    """MindSpore HSDP scheduler.
+
+    List-unit grouped forward hooks use :class:`HSDPSchedulerV2` defaults for
+    ``_grouped_forward_pre_hook_skip`` / ``_grouped_forward_post_hook_skip`` (no overrides here).
+    """
+    def zero_grad(self) -> None:
         """Zero grad."""
         self.hsdp_state.zero_grad()
 
@@ -114,6 +118,11 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _register_forward_backward_hooks(self):
         """Register module forward and backward hook on all managed modules."""
+        if self._fsdp_group_post_pending is None:
+            for mod in self.modules:
+                mod.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
+                mod.register_forward_hook(self._forward_hook)
+            return
         for mod in self.modules:
-            mod.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
-            mod.register_forward_hook(self._forward_hook)
+            mod.register_forward_pre_hook(self._grouped_forward_pre_hook, with_kwargs=True)
+            mod.register_forward_hook(self._make_grouped_forward_post_hook(mod))

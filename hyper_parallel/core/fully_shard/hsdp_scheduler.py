@@ -14,7 +14,7 @@
 # ============================================================================
 """HSDP scheduler"""
 import functools
-from typing import Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
@@ -59,6 +59,9 @@ class HSDPSchedulerV2:
         self.forward_prefetch_cells = []
         self.backward_prefetch_cells = []
         self.scheduler_ctx = HSDPSchedulerContext()
+        # When ``fully_shard`` is given multiple root modules, forward pre/post hooks coordinate
+        # so unshard / PostBackward / reshard run once per forward (aligned with PyTorch FSDP2).
+        self._fsdp_group_post_pending: Optional[set] = set() if len(self.modules) > 1 else None
         self.config = HSDPConfigV2(
             mesh,
             reshard_after_forward,
@@ -92,30 +95,46 @@ class HSDPSchedulerV2:
     def _get_managed_params(self):
         """Return deduplicated parameters from all managed modules."""
         return get_managed_modules_parameters(self.modules, self.ignored_params)
- 
-    def set_reshard_after_forward(self, reshard_after_forward: bool):
-        """set reshard_after_forward flag"""
+
+    def set_reshard_after_forward(self, reshard_after_forward: bool) -> None:
+        """Set reshard_after_forward flag.
+
+        Args:
+            reshard_after_forward: Whether to reshard parameters after forward.
+        """
         if not isinstance(reshard_after_forward, bool):
             raise ValueError(f"reshard_after_forward should be a bool, got {type(reshard_after_forward)}")
         self.reshard_after_forward = reshard_after_forward
         self.config.reshard_after_forward = reshard_after_forward
 
-    def set_reshard_after_backward(self, reshard_after_backward: bool):
-        """set reshard_after_backward flag"""
+    def set_reshard_after_backward(self, reshard_after_backward: bool) -> None:
+        """Set reshard_after_backward flag.
+
+        Args:
+            reshard_after_backward: Whether to reshard after backward completes.
+        """
         if not isinstance(reshard_after_backward, bool):
             raise ValueError(f"reshard_after_backward should be a bool, got {type(reshard_after_backward)}")
         if self.hsdp_state is not None:
             self.hsdp_state.reshard_after_backward = reshard_after_backward
 
-    def set_requires_all_reduce(self, requires_all_reduce: bool):
-        """set requires_all_reduce flag"""
+    def set_requires_all_reduce(self, requires_all_reduce: bool) -> None:
+        """Set requires_all_reduce flag.
+
+        Args:
+            requires_all_reduce: Whether this unit participates in all-reduce.
+        """
         if not isinstance(requires_all_reduce, bool):
             raise ValueError(f"requires_all_reduce should be a bool, got {type(requires_all_reduce)}")
         if self.hsdp_state is not None:
             self.hsdp_state.requires_all_reduce = requires_all_reduce
 
-    def set_requires_grad_sync(self, requires_grad_sync: bool):
-        """Set requires grad sync flag to control gradient sync."""
+    def set_requires_grad_sync(self, requires_grad_sync: bool) -> None:
+        """Set flag controlling whether gradients are synchronized.
+
+        Args:
+            requires_grad_sync: When True, enable grad sync for this scheduler.
+        """
         if not isinstance(requires_grad_sync, bool):
             raise ValueError(f"requires_grad_sync should be a bool, got {type(requires_grad_sync)}")
         self.hsdp_state.set_requires_grad_sync(requires_grad_sync)
@@ -173,11 +192,61 @@ class HSDPSchedulerV2:
         self.scheduler_state = FSDPSchedulerState.BACKWARD
         with self.platform.profiler_record(f"post_backward:{self.hsdp_state.module_name}"):
             self.hsdp_state.post_backward()
+        if self._fsdp_group_post_pending is not None:
+            self._fsdp_group_post_pending.clear()
 
-    def set_forward_prefetch_cells(self, hsdp_cell_list):
-        """Set forward prefetch cells."""
+    # pylint: disable=W0613
+    def _grouped_forward_pre_hook_skip(self, cell, args, kwargs):
+        """Return value when grouped pre-forward should not run (first module already did).
+
+        Default matches MindSpore Cell forward pre-hooks (explicit ``(args, kwargs)``).
+        ``TorchHSDPSchedulerV2`` overrides this to return ``None`` (``nn.Module`` idiom).
+        """
+        return args, kwargs
+
+    def _grouped_forward_post_hook_skip(self, outputs):
+        """Return value when grouped post-forward is deferred to a later module in the group.
+
+        Default returns ``outputs`` (MindSpore). ``TorchHSDPSchedulerV2`` overrides to ``None``.
+        """
+        return outputs
+
+    def _grouped_forward_pre_hook(self, cell, args, kwargs):
+        """Run FSDP pre-forward only for the first module in the group (PyTorch FSDP2-aligned)."""
+        pending = self._fsdp_group_post_pending
+        if pending is None:
+            return self._forward_pre_hook(cell, args, kwargs)
+        if len(pending) == 0:
+            pending.update(self.modules)
+            return self._forward_pre_hook(cell, args, kwargs)
+        return self._grouped_forward_pre_hook_skip(cell, args, kwargs)
+
+    def _make_grouped_forward_post_hook(self, mod):
+        """Build post-forward hook: last module in the group runs reshard + output backward hooks."""
+
+        def grouped_post_hook(cell, inputs, outputs):
+            pending = self._fsdp_group_post_pending
+            if pending is None:
+                return self._forward_hook(cell, inputs, outputs)
+            pending.discard(mod)
+            if len(pending) == 0:
+                return self._forward_hook(cell, inputs, outputs)
+            return self._grouped_forward_post_hook_skip(outputs)
+
+        return grouped_post_hook
+
+    def set_forward_prefetch_cells(self, hsdp_cell_list: List[Any]) -> None:
+        """Set cells prefetched during forward.
+
+        Args:
+            hsdp_cell_list: HSDP cells to prefetch ahead of forward.
+        """
         self.forward_prefetch_cells = hsdp_cell_list
 
-    def set_backward_prefetch_cells(self, hsdp_cell_list):
-        """Set backward prefetch cells."""
+    def set_backward_prefetch_cells(self, hsdp_cell_list: List[Any]) -> None:
+        """Set cells prefetched during backward.
+
+        Args:
+            hsdp_cell_list: HSDP cells to prefetch ahead of backward.
+        """
         self.backward_prefetch_cells = hsdp_cell_list

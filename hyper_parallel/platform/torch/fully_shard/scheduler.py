@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Torch HSDP scheduler"""
+import inspect
 import torch
 from typing import List
 from torch.autograd import Variable
@@ -181,8 +182,30 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             return
         self._hsdp_backward_hook(self.cell, None, None)
 
+    # pylint: disable=W0613
+    def _grouped_forward_pre_hook_skip(self, cell, args, kwargs) -> None:
+        """Override base ``(args, kwargs)`` return; ``nn.Module`` pre-hook uses ``None`` for no-op."""
+        return None
+
+    def _grouped_forward_post_hook_skip(self, outputs) -> None:
+        """Override base output pass-through; forward hook uses ``None`` for no-op."""
+        return None
+
+    def _register_forward_module_hook(self, mod, hook) -> None:
+        """Register forward hook; use ``always_call=True`` when supported (matches PyTorch FSDP)."""
+        sig = inspect.signature(mod.register_forward_hook)
+        if "always_call" in sig.parameters:
+            mod.register_forward_hook(hook, prepend=False, always_call=True)
+        else:
+            mod.register_forward_hook(hook, prepend=False)
+
     def _register_forward_backward_hooks(self):
         """Register module forward and backward hook on all managed modules."""
+        if self._fsdp_group_post_pending is None:
+            for mod in self.modules:
+                mod.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
+                mod.register_forward_hook(self._forward_hook)
+            return
         for mod in self.modules:
-            mod.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
-            mod.register_forward_hook(self._forward_hook)
+            mod.register_forward_pre_hook(self._grouped_forward_pre_hook, with_kwargs=True)
+            self._register_forward_module_hook(mod, self._make_grouped_forward_post_hook(mod))
