@@ -1,0 +1,4 @@
+HistcExt:
+  dist_op_name: _histc_ext_dist_op
+  distributed_op_class: HistcExtDistributedOp
+  distributed_op_file: parallel_histc_ext
