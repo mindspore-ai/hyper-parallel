@@ -15,7 +15,7 @@
 """Torch HSDP scheduler"""
 import inspect
 import torch
-from typing import Any, List, Optional
+from typing import List
 from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -182,36 +182,14 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             return
         self._hsdp_backward_hook(self.cell, None, None)
 
-    def _grouped_forward_pre_hook(self, cell, args, kwargs) -> Optional[tuple]:
-        """Run FSDP pre-forward only for the first module in the group (PyTorch FSDP2-aligned)."""
-        pending = self._fsdp_group_post_pending
-        if pending is None:
-            return self._forward_pre_hook(cell, args, kwargs)
-        if len(pending) == 0:
-            pending.update(self.modules)
-            return self._forward_pre_hook(cell, args, kwargs)
+    # pylint: disable=W0613
+    def _grouped_forward_pre_hook_skip(self, cell, args, kwargs) -> None:
+        """Override base ``(args, kwargs)`` return; ``nn.Module`` pre-hook uses ``None`` for no-op."""
         return None
 
-    def _make_grouped_forward_post_hook(self, mod):
-        """Post-forward: last module in the group runs reshard + output backward hooks."""
-
-        def grouped_post_hook(cell: Any, inputs: Any, outputs: Any) -> Optional[Any]:
-            """Defer forward post until the last module in the FSDP group finishes.
-
-            Args:
-                cell: Managed submodule (``nn.Module``).
-                inputs: Forward inputs (hook signature).
-                outputs: Forward outputs from this submodule.
-            """
-            pending = self._fsdp_group_post_pending
-            if pending is None:
-                return self._forward_hook(cell, inputs, outputs)
-            pending.discard(mod)
-            if len(pending) == 0:
-                return self._forward_hook(cell, inputs, outputs)
-            return None
-
-        return grouped_post_hook
+    def _grouped_forward_post_hook_skip(self, outputs) -> None:
+        """Override base output pass-through; forward hook uses ``None`` for no-op."""
+        return None
 
     def _register_forward_module_hook(self, mod, hook) -> None:
         """Register forward hook; use ``always_call=True`` when supported (matches PyTorch FSDP)."""

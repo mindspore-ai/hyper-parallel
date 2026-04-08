@@ -195,6 +195,46 @@ class HSDPSchedulerV2:
         if self._fsdp_group_post_pending is not None:
             self._fsdp_group_post_pending.clear()
 
+    # pylint: disable=W0613
+    def _grouped_forward_pre_hook_skip(self, cell, args, kwargs):
+        """Return value when grouped pre-forward should not run (first module already did).
+
+        Default matches MindSpore Cell forward pre-hooks (explicit ``(args, kwargs)``).
+        ``TorchHSDPSchedulerV2`` overrides this to return ``None`` (``nn.Module`` idiom).
+        """
+        return args, kwargs
+
+    def _grouped_forward_post_hook_skip(self, outputs):
+        """Return value when grouped post-forward is deferred to a later module in the group.
+
+        Default returns ``outputs`` (MindSpore). ``TorchHSDPSchedulerV2`` overrides to ``None``.
+        """
+        return outputs
+
+    def _grouped_forward_pre_hook(self, cell, args, kwargs):
+        """Run FSDP pre-forward only for the first module in the group (PyTorch FSDP2-aligned)."""
+        pending = self._fsdp_group_post_pending
+        if pending is None:
+            return self._forward_pre_hook(cell, args, kwargs)
+        if len(pending) == 0:
+            pending.update(self.modules)
+            return self._forward_pre_hook(cell, args, kwargs)
+        return self._grouped_forward_pre_hook_skip(cell, args, kwargs)
+
+    def _make_grouped_forward_post_hook(self, mod):
+        """Build post-forward hook: last module in the group runs reshard + output backward hooks."""
+
+        def grouped_post_hook(cell, inputs, outputs):
+            pending = self._fsdp_group_post_pending
+            if pending is None:
+                return self._forward_hook(cell, inputs, outputs)
+            pending.discard(mod)
+            if len(pending) == 0:
+                return self._forward_hook(cell, inputs, outputs)
+            return self._grouped_forward_post_hook_skip(outputs)
+
+        return grouped_post_hook
+
     def set_forward_prefetch_cells(self, hsdp_cell_list: List[Any]) -> None:
         """Set cells prefetched during forward.
 
