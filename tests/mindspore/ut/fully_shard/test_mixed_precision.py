@@ -516,25 +516,27 @@ class TestParameterRebinding(unittest.TestCase):
     """Test MindSpore fully_shard parameter rebinding behavior."""
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.param.Parameter")
-    @patch("hyper_parallel.platform.mindspore.fully_shard.param.as_strided")
+    @patch(
+        "hyper_parallel.platform.mindspore.fully_shard.param."
+        "MindSporeHSDPParamV2._get_unsharded_param_from_all_gather_output"
+    )
     def test_init_unsharded_param_uses_parameter_empty_then_data_assign(
-        self, mock_as_strided, mock_parameter
+        self, mock_get_unsharded_param, mock_parameter
     ):
         """
         Feature: init_unsharded_param
         Description: Build _unsharded_param from Parameter([]) and then assign .data
-        Expectation: Parameter is constructed with [] and its data points to the as_strided tensor view
+        Expectation: Parameter is constructed with [] and its data points to the unpacked tensor view
         """
         param = object.__new__(MindSporeHSDPParamV2)
-        param.all_gather_outputs = [MagicMock(name="all_gather_output")]
-        param._orig_size = (2, 3)
-        param._contiguous_orig_stride = (3, 1)
+        param._orig_param_is_dtensor = False
+        param._unsharded_param = None
         param.sharded_param = MagicMock()
         param.sharded_param.name = "weight"
         param.sharded_param.requires_grad = True
 
         unsharded_tensor = MagicMock(name="unsharded_tensor")
-        mock_as_strided.return_value = unsharded_tensor
+        mock_get_unsharded_param.return_value = unsharded_tensor
         unsharded_param = MagicMock(name="unsharded_param")
         mock_parameter.return_value = unsharded_param
 
@@ -545,12 +547,7 @@ class TestParameterRebinding(unittest.TestCase):
             name="weight",
             requires_grad=True,
         )
-        mock_as_strided.assert_called_once_with(
-            param.all_gather_outputs[0],
-            (2, 3),
-            (3, 1),
-            storage_offset=0,
-        )
+        mock_get_unsharded_param.assert_called_once_with()
         self.assertIs(param._unsharded_param, unsharded_param)
         self.assertIs(unsharded_param.data, unsharded_tensor)
 
