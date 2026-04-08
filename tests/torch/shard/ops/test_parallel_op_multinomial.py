@@ -25,12 +25,12 @@ def test_parallel_op_multinomial_group1():
     Feature: parallel run case in shard
     Description:
         1.test_distributed_multinomial_1d_replicated
-        2.test_distributed_multinomial_2d_batch_sharded
+        2.test_distributed_multinomial_2d_data_parallel
     Expectation: Run success.
     """
     parallel_run([
         TorchCase(PARALLEL_OP_MULTINOMIAL, "test_distributed_multinomial_1d_replicated", 10359, 4),
-        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_distributed_multinomial_2d_batch_sharded", 10360, 4),
+        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_distributed_multinomial_2d_data_parallel", 10360, 4),
     ])
 
 
