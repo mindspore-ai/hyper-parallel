@@ -62,3 +62,6 @@ contiguous:
 
 square:
   dist_op_name: _torch_square_dist_op
+
+zeros_like:
+  dist_op_name: _torch_zeros_like_dist_op

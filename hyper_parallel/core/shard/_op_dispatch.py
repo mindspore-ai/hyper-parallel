@@ -18,7 +18,7 @@ import sys
 import atexit
 import glob
 import importlib
-from typing import Any, List, Dict, Optional
+from typing import Any, List, Dict, Optional, Set
 from itertools import chain
 
 import yaml
@@ -70,6 +70,33 @@ def _apply_shard_offset_to_rng_args(args, offset_incr):
     return args
 
 _dtensor_dispatch = True
+_no_skip_ops: Set[str] = set()
+
+
+def get_no_skip_ops() -> Set[str]:
+    """Return the set of op names that are exempt from SkipDTensorDispatch."""
+    return _no_skip_ops
+
+
+def add_no_skip_ops(op_names: Set[str]) -> None:
+    """Add op names to the no-skip set so they are always dispatched through DTensor.
+
+    Args:
+        op_names: Set of canonical op name strings to register as no-skip.
+    """
+    global _no_skip_ops
+    _no_skip_ops = _no_skip_ops | op_names
+
+
+def remove_no_skip_ops(op_names: Set[str]) -> None:
+    """Remove op names from the no-skip set.
+
+    Args:
+        op_names: Set of canonical op name strings to remove.
+    """
+    global _no_skip_ops
+    _no_skip_ops = _no_skip_ops - op_names
+
 
 def enable_dtensor_dispatch():
     """
@@ -198,7 +225,7 @@ class OpDispatcher:
         self.whitelist = ["InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv", "typeof", "DistCommIsend",
                           "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather",
                           "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__", "register_hook",
-                          "is_complex", "chunk", "__bool__", "__len__", "__format__", "dim", "empty_like", "zeros_like",
+                          "is_complex", "chunk", "__bool__", "__len__", "__format__", "dim", "empty_like",
                           "_has_compatible_shallow_copy_type", "is_floating_point", "is_contiguous"]
 
         # Ops requiring args unpacking for layout inference (packed as prim, name, real_args).
@@ -218,6 +245,13 @@ class OpDispatcher:
             "FuncDropoutExt"
         }
         self._rng_tracker: Optional[OffsetBasedRNGTracker] = None
+
+        self._suffix_dispatch: Dict[str, str] = {
+            "WithShape": "_with_layout_infer_with_shape",
+            "Reshape": "_with_layout_infer_reshape",
+            "WithTupleExpand": "_with_layout_infer_with_tuple_expand",
+            "Slice": "_with_layout_infer_slice",
+        }
 
         self._register_distributed_ops()
 
@@ -832,49 +866,86 @@ class OpDispatcher:
         # Fallback: return as-is for non-Tensor results (currently unreachable with existing _random_ops).
         return local_results
 
-    def dispatch(self, op_call: callable, args: tuple[object, ...], kwargs: dict[str, object]):
+    @staticmethod
+    def _unwrap_args(args: tuple) -> list:
+        """Strip DTensor wrappers from args, preserving tuple/list container structure.
+
+        Args:
+            args: Op call positional arguments, may contain DTensor instances.
+
+        Returns:
+            List of args with DTensor replaced by their local tensors.
         """
-        dispatch
-        :param op_call:
-        :param args:
-        :param kwargs:
-        :return:
+        def unwrap(arg):
+            if isinstance(arg, DTensor):
+                return arg.to_local()
+            if isinstance(arg, tuple):
+                return tuple(e.to_local() if isinstance(e, DTensor) else e for e in arg)
+            if isinstance(arg, list):
+                return [e.to_local() if isinstance(e, DTensor) else e for e in arg]
+            return arg
+        return [unwrap(arg) for arg in args]
+
+    def _should_bypass_dispatch(self, op_name: str) -> bool:
+        """Return True if the op should bypass DTensor dispatch and run locally.
+
+        Args:
+            op_name: Canonical operator name from platform.get_op_name().
+
+        Returns:
+            True when the op is whitelisted or DTensor dispatch is globally disabled.
+        """
+        skip_dispatch = get_dtensor_dispatch() is False and op_name not in get_no_skip_ops()
+        return op_name in self.whitelist or skip_dispatch
+
+    def _dispatch_layout_infer(
+        self, op_name: str, op_call: callable, args: tuple, kwargs: dict
+    ):
+        """Dispatch an op through the layout-inference path.
+
+        Args:
+            op_name: Canonical operator name.
+            op_call: The raw operator callable.
+            args: Positional arguments for op_call.
+            kwargs: Keyword arguments for op_call.
+
+        Returns:
+            Result of the layout-infer dispatch.
+
+        Raises:
+            RuntimeError: If op_name is not registered or has an unknown suffix.
+        """
+        if op_name not in self.layout_infer_ops:
+            raise RuntimeError(f"Operator {op_name} dose not contain parallel layout infer func.")
+
+        suffix = self.layout_infer_ops[op_name].get('infer_layout_suffix', '')
+        if not suffix:
+            return self._with_layout_infer(op_call, *args, **kwargs)
+
+        handler_name = self._suffix_dispatch.get(suffix)
+        if handler_name is None:
+            raise RuntimeError(f"Operator {op_name} specified wrong suffix in parallel yaml.")
+        return getattr(self, handler_name)(op_call, *args, **kwargs)
+
+    def dispatch(self, op_call: callable, args: tuple, kwargs: dict):
+        """Route an op call through the appropriate DTensor dispatch path.
+
+        Args:
+            op_call: The raw operator callable.
+            args: Positional arguments for op_call.
+            kwargs: Keyword arguments for op_call.
+
+        Returns:
+            Result of the dispatched op call.
         """
         op_name = platform.get_op_name(op_call)
-        if op_name in self.whitelist or get_dtensor_dispatch() is False:
-            input_args = []
-            for arg in args:
-                if isinstance(arg, DTensor):
-                    input_args.append(arg.to_local())
-                elif isinstance(arg, tuple):
-                    input_arg = tuple(e.to_local() if isinstance(e, DTensor) else e for e in arg)
-                    input_args.append(input_arg)
-                elif isinstance(arg, list):
-                    input_arg = [e.to_local() if isinstance(e, DTensor) else e for e in arg]
-                    input_args.append(input_arg)
-                else:
-                    input_args.append(arg)
-            return op_call(*input_args, **kwargs)
+
+        if self._should_bypass_dispatch(op_name):
+            return op_call(*self._unwrap_args(args), **kwargs)
 
         if op_name in self._random_ops or op_name in self._random_ms_ops:
             return self._dispatch_random_op(op_name, op_call, args, kwargs)
 
-        if op_name not in self.layout_infer_ops:
-            raise RuntimeError(f"Operator {op_name} dose not contain parallel layout infer func.")
-
-        layout_infer_info = self.layout_infer_ops[op_name]
-        suffix = layout_infer_info.get('infer_layout_suffix', '')
-        if not suffix:
-            return self._with_layout_infer(op_call, *args, **kwargs)
-
-        if suffix == "WithShape":
-            return self._with_layout_infer_with_shape(op_call, *args, **kwargs)
-        if suffix == "Reshape":
-            return OpDispatcher._with_layout_infer_reshape(op_call, *args)
-        if suffix == "WithTupleExpand":
-            return self._with_layout_infer_with_tuple_expand(op_call, *args, **kwargs)
-        if suffix == "Slice":
-            return self._with_layout_infer_slice(op_call, *args)
-        raise RuntimeError(f"Operator {op_name} specified wrong suffix in parallel yaml.")
+        return self._dispatch_layout_infer(op_name, op_call, args, kwargs)
 
 _OP_DISPATCHER = OpDispatcher()
