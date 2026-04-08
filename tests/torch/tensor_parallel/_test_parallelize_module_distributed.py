@@ -14,8 +14,9 @@
 # ============================================================================
 """Distributed NPU tests for ``parallelize_module`` (torchrun, hccl).
 
-Launched from ``test_parallelize_module_distributed.py`` via ``parallel_run`` with
-``num_proc=2`` (single-node 2-card), same pattern as ``_test_context_parallel.py``.
+Launched from ``test_parallelize_module_distributed.py`` via ``parallel_run``:
+functional cases use ``num_proc=2``; precision cases use ``num_proc=4`` for
+``world_size==4`` linear sharding checks.
 
 Precision cases shard ``nn.Linear`` in the same way as PyTorch
 ``ColwiseParallel`` / ``RowwiseParallel`` (output dim vs input dim); the reference is

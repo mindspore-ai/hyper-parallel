@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,11 +14,17 @@
 # ============================================================================
 """dtensor"""
 import copy as cp
-from typing import Optional, Sequence, Set, Tuple, Union
+import inspect
+import warnings
+from typing import Any, Callable, Optional, Sequence, Set, Tuple, Union
+
 import numpy as np
+
+from hyper_parallel.core.dtensor.device_mesh import _mesh_resources
 from hyper_parallel.core.dtensor.layout import Layout, DeviceMesh, _get_slice_tensor_by_layout
 from hyper_parallel.core.dtensor.placement_types import Placement, Replicate
 from hyper_parallel.platform import get_platform
+from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel.core.utils import compute_local_shape_and_global_offset
 
 platform = get_platform()
@@ -400,6 +406,184 @@ def distribute_tensor(
     layout = _build_layout(device_mesh, placements, len(tensor.shape))
     local_tensor = _get_slice_tensor_by_layout(tensor, layout)
     return DTensor(local_tensor, device_mesh, layout.alias_placements)
+
+
+def _distribute_module_param_source(param: Any) -> Tensor:
+    """Tensor data used as the global tensor for :func:`distribute_tensor` (PyTorch uses ``param.data``)."""
+    if hasattr(param, "data"):
+        return param.data
+    return platform.get_param_local_data(param)
+
+
+def _distribute_module_new_parameter(key: str, dtensor: DTensor, requires_grad: bool) -> Any:
+    """Build a framework :class:`Parameter` holding *dtensor* (Torch vs MindSpore kwargs differ)."""
+    if platform.platform_type == PlatformType.MINDSPORE:
+        return platform.Parameter(dtensor, name=key, requires_grad=requires_grad)
+    return platform.Parameter(dtensor, requires_grad=requires_grad)
+
+
+def _distribute_module_set_param(module: Any, key: str, new_param: Any) -> None:
+    """Register or assign a parameter on *module* (``nn.Module`` or MindSpore ``Cell``)."""
+    if hasattr(module, "register_parameter"):
+        module.register_parameter(key, new_param)
+        return
+    if hasattr(module, "_params"):
+        module._params[key] = new_param
+        if hasattr(module, "_params_list"):
+            module._params_list[key] = new_param
+        if key in module.__dict__:
+            module.__dict__[key] = new_param
+        return
+    raise TypeError(
+        f"distribute_module expects nn.Module-like objects with register_parameter or _params; "
+        f"got {type(module)}."
+    )
+
+
+def _distribute_module_iter_params(module: Any) -> list:
+    """Return ``[(name, param), ...]`` for direct parameters (``_parameters`` or ``_params``)."""
+    if hasattr(module, "_parameters"):
+        return list(module._parameters.items())
+    if hasattr(module, "_params"):
+        return list(module._params.items())
+    return []
+
+
+def _distribute_module_iter_buffers(module: Any) -> list:
+    """Return ``[(name, buffer), ...]`` if the module has ``_buffers`` (PyTorch ``nn.Module``)."""
+    if hasattr(module, "_buffers"):
+        return list(module._buffers.items())
+    return []
+
+
+def _replicate_submodule_params_buffers(sub_mod: Any, mesh: DeviceMesh) -> None:
+    """Convert plain params/buffers on *sub_mod* to fully replicated :class:`DTensor`."""
+    full_replicate = [Replicate()] * mesh.ndim
+    for key, param in _distribute_module_iter_params(sub_mod):
+        if param is None or isinstance(param, DTensorBase):
+            continue
+        src = _distribute_module_param_source(param)
+        requires_grad = bool(getattr(param, "requires_grad", True))
+        dt = distribute_tensor(src, mesh, full_replicate)
+        new_param = _distribute_module_new_parameter(key, dt, requires_grad)
+        _distribute_module_set_param(sub_mod, key, new_param)
+    for key, buffer in _distribute_module_iter_buffers(sub_mod):
+        if buffer is None or isinstance(buffer, DTensorBase):
+            continue
+        sub_mod._buffers[key] = distribute_tensor(buffer, mesh, full_replicate)
+
+
+def _distribute_module_run_partition_and_replicate(
+    module: Any,
+    device_mesh: DeviceMesh,
+    partition_fn: Optional[Callable[[str, Any, DeviceMesh], None]],
+) -> None:
+    """Call optional ``partition_fn`` per ``named_modules`` and replicate remaining tensors."""
+    if partition_fn is None:
+        for submod in module.modules():
+            _replicate_submodule_params_buffers(submod, device_mesh)
+        return
+    for name, submod in module.named_modules():
+        partition_fn(name, submod, device_mesh)
+        _replicate_submodule_params_buffers(submod, device_mesh)
+
+
+def _distribute_module_register_input_fn(
+    module: Any,
+    device_mesh: DeviceMesh,
+    input_fn: Callable[..., Any],
+) -> None:
+    """Register *input_fn* as a forward pre-hook on *module* (2- or 3-arg, PyTorch-compatible)."""
+    num_args = len(inspect.signature(input_fn).parameters)
+    if num_args == 2:
+        warnings.warn(
+            "Deprecating input_fn that takes two arguments (inputs, device_mesh), "
+            "please use input_fn that takes in (module, inputs, device_mesh) instead!",
+            FutureWarning,
+            stacklevel=3,
+        )
+        module.register_forward_pre_hook(
+            lambda _, inputs: input_fn(inputs, device_mesh)
+        )
+    elif num_args == 3:
+        module.register_forward_pre_hook(
+            lambda mod, inputs: input_fn(mod, inputs, device_mesh)
+        )
+    else:
+        raise ValueError(
+            f"input_fn should take in 2 or 3 arguments, but got {num_args} arguments!"
+        )
+
+
+def _distribute_module_register_output_fn(
+    module: Any,
+    device_mesh: DeviceMesh,
+    output_fn: Callable[..., Any],
+) -> None:
+    """Register *output_fn* as a forward hook on *module* (2- or 3-arg, PyTorch-compatible)."""
+    num_args = len(inspect.signature(output_fn).parameters)
+    if num_args == 2:
+        warnings.warn(
+            "Deprecating output_fn that takes two arguments (outputs, device_mesh), "
+            "please use output_fn that takes in (module, outputs, device_mesh) instead!",
+            FutureWarning,
+            stacklevel=3,
+        )
+        module.register_forward_hook(
+            lambda mod, inputs, outputs: output_fn(outputs, device_mesh)
+        )
+    elif num_args == 3:
+        module.register_forward_hook(
+            lambda mod, inputs, outputs: output_fn(mod, outputs, device_mesh)
+        )
+    else:
+        raise ValueError(
+            f"output_fn should take in 2 or 3 arguments, but got {num_args} arguments!"
+        )
+
+
+def distribute_module(
+    module: Any,
+    device_mesh: Optional[DeviceMesh] = None,
+    partition_fn: Optional[Callable[[str, Any, DeviceMesh], None]] = None,
+    input_fn: Optional[Callable[..., Any]] = None,
+    output_fn: Optional[Callable[..., Any]] = None,
+) -> Any:
+    """PyTorch ``distribute_module`` parity: shard/replicate params and optional I/O hooks.
+
+    Unsharded parameters and buffers become fully replicated :class:`DTensor` after
+    ``partition_fn``. ``input_fn`` / ``output_fn`` attach only to the root *module*.
+
+    Args:
+        module: Root ``nn.Module`` or MindSpore ``Cell`` with compatible APIs.
+        device_mesh: Placement mesh; if ``None``, uses ``_mesh_resources.get_current_mesh()``.
+        partition_fn: Per ``named_modules`` callback before replicate pass; ``None`` replicates all.
+        input_fn: ``(module, inputs, mesh)`` or deprecated ``(inputs, mesh)`` pre-hook.
+        output_fn: ``(module, outputs, mesh)`` or deprecated ``(outputs, mesh)`` forward hook.
+
+    Returns:
+        *module* in place, with distributed tensors where applied.
+
+    Raises:
+        RuntimeError: If called twice on the same *module*.
+        ValueError: If ``input_fn`` / ``output_fn`` arity is not 2 or 3.
+
+    Note:
+        XLA / ``torch_xla`` is not supported; strided device :class:`DTensor` only.
+    """
+    if getattr(module, "_distribute_module_applied", False):
+        raise RuntimeError(
+            "distribute_module should only be called once on a module, "
+            "but it has already been called on this module!"
+        )
+    device_mesh = device_mesh or _mesh_resources.get_current_mesh()
+    _distribute_module_run_partition_and_replicate(module, device_mesh, partition_fn)
+    if input_fn is not None:
+        _distribute_module_register_input_fn(module, device_mesh, input_fn)
+    if output_fn is not None:
+        _distribute_module_register_output_fn(module, device_mesh, output_fn)
+    module._distribute_module_applied = True
+    return module
 
 
 def _dtensor_init_helper(
