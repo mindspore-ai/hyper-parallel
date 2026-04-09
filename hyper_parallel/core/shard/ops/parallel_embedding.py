@@ -121,7 +121,7 @@ class EmbeddingDistributedOp(DistributedOp):
 
         return local_input, mask_int
 
-    def get_expand_impl(self, func, output_layout, layouts, extra_args):
+    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
         """
         Returns the execution implementation wrapper.
         Helper functions are used to keep Cyclomatic Complexity (CCN) low.

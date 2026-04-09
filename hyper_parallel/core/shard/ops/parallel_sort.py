@@ -19,32 +19,27 @@ Distributed implementation for Sort operator.
 from .parallel_ops import DistributedOp
 
 
+def _normalize_sort_args(x, dim=-1, descending=False, stable=None):
+    return (x,), {'dim': dim, 'descending': descending, 'stable': stable}
+
+
 class SortDistributedOp(DistributedOp):
     """Distributed implementation for Sort operator."""
 
-    def infer_layout(self, layouts, extra_args):
-        """
-        Infer output layout for Sort operator.
+    def preprocess(self, args, kwargs):
+        args, kwargs = _normalize_sort_args(*args, **kwargs)
+        input_tensor = args[0]
+        dim = kwargs['dim']
+        descending = kwargs['descending']
+        stable = kwargs['stable']
+        local_args = (input_tensor.to_local(),)
+        local_kwargs = {'dim': dim, 'descending': descending, 'stable': stable}
+        cache_values = [input_tensor.layout, dim]
+        return local_args, local_kwargs, cache_values
 
-        The sort operator expects the sorting dimension to be fully available on each device
-        (i.e., not sharded). If the dimension is sharded, a global sort cannot be performed
-        locally without redistribution.
-
-        Args:
-            layouts (tuple): Layouts of input tensor.
-            extra_args (tuple): Arguments for the operator. Expected: (dim, descending, stable).
-                                If empty, dim defaults to -1.
-
-        Returns:
-            tuple: (Layout, Layout) representing the layouts for (values, indices).
-        """
-        layout = layouts[0]
-
-        # Parse dim from extra_args if available, otherwise default to -1
-        dim = -1
-        if extra_args:
-            # extra_args[0] corresponds to 'dim' in torch.sort(input, dim, ...)
-            dim = extra_args[0]
+    def infer_layout(self, cache_values):
+        layout = cache_values[0]
+        dim = cache_values[1]
 
         if not isinstance(dim, int):
             raise TypeError(f"For 'sort', dimension must be int, but got {type(dim)}")
@@ -78,5 +73,4 @@ class SortDistributedOp(DistributedOp):
                 f"Please redistribute the tensor to Replicate status on this dimension before sorting."
             )
 
-        # The output layouts for 'values' and 'indices' are the same as the input layout
-        return (layout, layout)
+        return ((layout, layout), None)

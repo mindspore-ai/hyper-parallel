@@ -28,7 +28,7 @@ platform = get_platform()
 class OneHotExtDistributedOp(DistributedOp):
     """Distributed implementation for OneHotExt operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for OneHotExt.
 
@@ -72,12 +72,12 @@ class OneHotExtDistributedOp(DistributedOp):
 
         return out_layout
 
-    def get_expand_impl(self, func, output_layout, layouts, extra_args):
+    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
         """Get expanded implementation for OneHotExt operator."""
         import mindspore as ms
         from mindspore import ops, Tensor
 
-        del output_layout
+        del infer_result
 
         indices_layout = layouts[0] if layouts else None
         if indices_layout is None:

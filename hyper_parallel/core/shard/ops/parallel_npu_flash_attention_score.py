@@ -20,10 +20,10 @@ import copy
 import threading
 import warnings
 
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from hyper_parallel.core.shard.ops.parallel_ops_register import register_distributed_op
+from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -70,13 +70,11 @@ def _get_lb_override() -> Tuple[Optional[int], Optional[int]]:
     return getattr(_LB_OVERRIDE, 'split_id', None), getattr(_LB_OVERRIDE, 'split_num', None)
 
 
-class FlashAttentionScoreDistributedOp:
+class NPUFlashAttentionScoreDistributedOp(DistributedOp):
     """Distributed operator for torch_npu.npu_fusion_attention."""
 
     def __init__(self, op_name: str):
-        self.op_name = op_name
-        register_distributed_op(op_name, self)
-
+        super().__init__(op_name)
         self._layout_dims = {
             "BSH": {"batch": 0, "seq": 1, "hidden": 2},
             "BNSD": {"batch": 0, "head": 1, "seq": 2, "dim": 3},
@@ -458,16 +456,16 @@ class FlashAttentionScoreDistributedOp:
             warnings.warn("Detected Alibi positional encoding compression scenario")
 
     def infer_layout(
-        self, input_layouts: List[Optional[Layout]], extra_args: List[Any]
+        self, layouts: List[Optional[Layout]], extra_args: Optional[dict] = None
     ) -> Tuple[Layout, ...]:
         """Infer output layouts."""
-        query_layout = input_layouts[0]
+        query_layout = layouts[0]
         if query_layout is None:
             raise ValueError("Query layout cannot be None")
 
         attention_out_layout = copy.deepcopy(query_layout)
         if attention_out_layout.placements is None and attention_out_layout.tensor_map is not None:
-            attention_out_placements = FlashAttentionScoreDistributedOp._tensor_map_to_placements(
+            attention_out_placements = NPUFlashAttentionScoreDistributedOp._tensor_map_to_placements(
                 attention_out_layout, attention_out_layout.tensor_map
             )
             attention_out_layout.set_placements(attention_out_placements)
@@ -504,7 +502,7 @@ class FlashAttentionScoreDistributedOp:
         softmax_sum_layout = copy.deepcopy(softmax_layout)
         softmax_out_layout = self._create_replicated_scalar_layout(query_layout)
         if softmax_out_layout.placements is None and softmax_out_layout.tensor_map is not None:
-            softmax_out_placements = FlashAttentionScoreDistributedOp._tensor_map_to_placements(
+            softmax_out_placements = NPUFlashAttentionScoreDistributedOp._tensor_map_to_placements(
                 softmax_out_layout, softmax_out_layout.tensor_map
             )
             softmax_out_layout.set_placements(softmax_out_placements)
@@ -540,7 +538,7 @@ class FlashAttentionScoreDistributedOp:
             )
 
         softmax_layout.set_tensor_map(softmax_tensor_map)
-        softmax_placements = FlashAttentionScoreDistributedOp._tensor_map_to_placements(softmax_layout, softmax_tensor_map)
+        softmax_placements = NPUFlashAttentionScoreDistributedOp._tensor_map_to_placements(softmax_layout, softmax_tensor_map)
         softmax_layout.set_placements(softmax_placements)
 
         return softmax_layout
@@ -560,7 +558,7 @@ class FlashAttentionScoreDistributedOp:
 
         softmax_layout = Layout.from_device_mesh(query_layout.mesh)
         softmax_layout.set_tensor_map(softmax_tensor_map)
-        softmax_placements = FlashAttentionScoreDistributedOp._tensor_map_to_placements(softmax_layout, softmax_tensor_map)
+        softmax_placements = NPUFlashAttentionScoreDistributedOp._tensor_map_to_placements(softmax_layout, softmax_tensor_map)
         softmax_layout.set_placements(softmax_placements)
 
         return softmax_layout
@@ -644,8 +642,8 @@ class FlashAttentionScoreDistributedOp:
         if batch_idx >= len(q_tm) or batch_idx >= len(k_tm):
             return
 
-        q_batch_shard = FlashAttentionScoreDistributedOp._normalize_dim_map(q_tm[batch_idx])
-        k_batch_shard = FlashAttentionScoreDistributedOp._normalize_dim_map(k_tm[batch_idx])
+        q_batch_shard = NPUFlashAttentionScoreDistributedOp._normalize_dim_map(q_tm[batch_idx])
+        k_batch_shard = NPUFlashAttentionScoreDistributedOp._normalize_dim_map(k_tm[batch_idx])
 
         if q_batch_shard != k_batch_shard:
             raise ValueError(
@@ -666,8 +664,8 @@ class FlashAttentionScoreDistributedOp:
         if hidden_idx >= len(q_tm) or hidden_idx >= len(k_tm):
             return
 
-        q_hidden_shard = FlashAttentionScoreDistributedOp._normalize_dim_map(q_tm[hidden_idx])
-        k_hidden_shard = FlashAttentionScoreDistributedOp._normalize_dim_map(k_tm[hidden_idx])
+        q_hidden_shard = NPUFlashAttentionScoreDistributedOp._normalize_dim_map(q_tm[hidden_idx])
+        k_hidden_shard = NPUFlashAttentionScoreDistributedOp._normalize_dim_map(k_tm[hidden_idx])
 
         if q_hidden_shard != k_hidden_shard:
             raise ValueError(
@@ -690,8 +688,8 @@ class FlashAttentionScoreDistributedOp:
         if dim_idx >= len(q_tm) or dim_idx >= len(k_tm):
             return
 
-        q_dim_shard = FlashAttentionScoreDistributedOp._normalize_dim_map(q_tm[dim_idx])
-        k_dim_shard = FlashAttentionScoreDistributedOp._normalize_dim_map(k_tm[dim_idx])
+        q_dim_shard = NPUFlashAttentionScoreDistributedOp._normalize_dim_map(q_tm[dim_idx])
+        k_dim_shard = NPUFlashAttentionScoreDistributedOp._normalize_dim_map(k_tm[dim_idx])
 
         if q_dim_shard != k_dim_shard:
             raise ValueError(
@@ -738,8 +736,8 @@ class FlashAttentionScoreDistributedOp:
                 f"  - KV sequence sharding (requires Ring Attention)"
             )
 
-        q_seq_shard = FlashAttentionScoreDistributedOp._normalize_dim_map(q_tm[seq_dim_idx])
-        k_seq_shard = FlashAttentionScoreDistributedOp._normalize_dim_map(k_tm[seq_dim_idx])
+        q_seq_shard = NPUFlashAttentionScoreDistributedOp._normalize_dim_map(q_tm[seq_dim_idx])
+        k_seq_shard = NPUFlashAttentionScoreDistributedOp._normalize_dim_map(k_tm[seq_dim_idx])
 
         if q_seq_shard != k_seq_shard:
             if input_layout == "TND":
@@ -881,21 +879,15 @@ class FlashAttentionScoreDistributedOp:
         return (sparse_mode, pre_tockens, next_tockens,
                 adjusted_actual_seq_qlen, adjusted_actual_seq_kvlen)
 
-    def get_expand_impl(
-        self,
-        func: callable,
-        output_layouts: Tuple[Layout, ...],
-        input_layouts: List[Optional[Layout]],
-        extra_args: List[Any],
-    ) -> Optional[callable]:
+    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
         """Create expanded implementation."""
-        query_layout = input_layouts[0]
+        query_layout = layouts[0]
         if query_layout is None:
             return None
 
-        if len(input_layouts) >= 3:
-            key_layout = input_layouts[1]
-            value_layout = input_layouts[2]
+        if len(layouts) >= 3:
+            key_layout = layouts[1]
+            value_layout = layouts[2]
 
             if (key_layout is not None and value_layout is not None and
                 hasattr(key_layout, 'tensor_map') and hasattr(value_layout, 'tensor_map')):
@@ -927,7 +919,7 @@ class FlashAttentionScoreDistributedOp:
             gen_mask_parallel=True,
             sync=False
         ):
-            key_layout = input_layouts[1]
+            key_layout = layouts[1]
             self._validate_sharding_consistency(query_layout, key_layout, input_layout)
 
             is_varlen = input_layout == "TND" and actual_seq_qlen is not None
@@ -951,7 +943,7 @@ class FlashAttentionScoreDistributedOp:
                     prefix, actual_seq_qlen, actual_seq_kvlen,
                     sparse_mode, gen_mask_parallel, sync
                 )
-                return FlashAttentionScoreDistributedOp._truncate_result(result)
+                return NPUFlashAttentionScoreDistributedOp._truncate_result(result)
 
             adjusted_head_num = self._adjust_head_num(head_num, head_split_num)
 
@@ -979,7 +971,7 @@ class FlashAttentionScoreDistributedOp:
                 gen_mask_parallel, sync
             )
 
-            return FlashAttentionScoreDistributedOp._truncate_result(result)
+            return NPUFlashAttentionScoreDistributedOp._truncate_result(result)
 
         return expanded_impl
 
@@ -1140,7 +1132,7 @@ class FlashAttentionScoreDistributedOp:
         if dim_idx >= len(layout.alias_tensor_map):
             return 1
 
-        dim_map = FlashAttentionScoreDistributedOp._normalize_dim_map(layout.alias_tensor_map[dim_idx])
+        dim_map = NPUFlashAttentionScoreDistributedOp._normalize_dim_map(layout.alias_tensor_map[dim_idx])
 
         if dim_map == "None":
             return 1
@@ -1151,7 +1143,7 @@ class FlashAttentionScoreDistributedOp:
         if isinstance(dim_map, tuple):
             total = 1
             for axis_name in dim_map:
-                axis_name = FlashAttentionScoreDistributedOp._normalize_dim_map(axis_name)
+                axis_name = NPUFlashAttentionScoreDistributedOp._normalize_dim_map(axis_name)
                 if axis_name != "None":
                     total *= layout.mesh.get_device_num_along_axis(axis_name)
             return total
@@ -1169,7 +1161,7 @@ class FlashAttentionScoreDistributedOp:
         if seq_dim_idx >= len(layout.alias_tensor_map):
             return 0
 
-        dim_map = FlashAttentionScoreDistributedOp._normalize_dim_map(layout.alias_tensor_map[seq_dim_idx])
+        dim_map = NPUFlashAttentionScoreDistributedOp._normalize_dim_map(layout.alias_tensor_map[seq_dim_idx])
 
         if dim_map == "None":
             return 0
@@ -1183,7 +1175,7 @@ class FlashAttentionScoreDistributedOp:
 
         if isinstance(dim_map, tuple):
             non_none_axes = [
-                ax for ax in dim_map if FlashAttentionScoreDistributedOp._normalize_dim_map(ax) != "None"
+                ax for ax in dim_map if NPUFlashAttentionScoreDistributedOp._normalize_dim_map(ax) != "None"
             ]
             if len(non_none_axes) == 0:
                 return 0

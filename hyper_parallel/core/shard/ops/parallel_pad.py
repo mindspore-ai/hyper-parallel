@@ -22,7 +22,7 @@ from .parallel_ops import DistributedOp
 class PadDistributedOp(DistributedOp):
     """Distributed implementation for Pad operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for Pad operator.
 

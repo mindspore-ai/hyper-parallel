@@ -132,7 +132,7 @@ class Conv3dDistributedOp(DistributedOp):
 
         return output_layout
 
-    def get_expand_impl(self, func, output_layout, layouts, extra_args):
+    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
         """
         Get expand implementation for the operator.
         Intercepts the execution to handle Grouped Convolution with Column Parallelism.

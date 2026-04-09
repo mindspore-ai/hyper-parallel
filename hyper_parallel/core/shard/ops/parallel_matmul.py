@@ -22,7 +22,7 @@ from .parallel_ops import DistributedOp
 
 class MatMulExtDistributedOp(DistributedOp):
     """Distributed implementation for MatMul operator."""
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for MatMul operator.
 
@@ -82,7 +82,7 @@ class MatMulExtDistributedOp(DistributedOp):
 
 class MatMulDistributedOp(DistributedOp):
     """Distributed implementation for MatMul operator."""
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for MatMul operator.
 
@@ -273,7 +273,7 @@ class BatchMatMulExtDistributedOp(BaseBatchMatMulDistributedOp):
 class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
     """Distributed implementation for BatchMatMul operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for BatchMatMul operator. Inputs shape are x=[b, n, m] and w=[b, m, p].
 
@@ -341,9 +341,34 @@ class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
         return self._build_output_layout(x_layout, merged_batch, x_n, w_p, x_contract)
 
 
+def _normalize_linear_args(x, weight, bias=None):
+    return (x, weight), {'bias': bias}
+
+
 class LinearDistributedOp(DistributedOp):
     """Distributed implementation for Linear operator."""
-    def infer_layout(self, layouts, extra_args):
+    def preprocess(self, args, kwargs):
+        """
+        Preprocess arguments for Linear operator.
+
+        Args:
+            args (tuple): Input arguments (x, w)
+            kwargs (dict): Keyword arguments (bias)
+
+        Returns:
+            tuple: Preprocessed arguments (x_local, w_local), local kwargs, cache values
+        """
+        args, kwargs = _normalize_linear_args(*args, **kwargs)
+        x_tensor = args[0]
+        w_tensor = args[1]
+        bias = kwargs['bias']
+        local_args = (x_tensor.to_local(), w_tensor.to_local())
+        local_kwargs = {'bias': bias.to_local() if hasattr(bias, '_layout') else bias}
+        cache_values = [x_tensor.layout, w_tensor.layout,
+                       bias.layout if hasattr(bias, '_layout') else None]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values):
         """
         Infer output layout for MatMul operator.
 
@@ -357,15 +382,16 @@ class LinearDistributedOp(DistributedOp):
         Args:
             x_layout (Layout): Layout of input x
             w_layout (Layout): Layout of input w
+            bias_layout (Layout): Layout of input bias
 
         Returns:
             tuple: Layout for output tensor
         """
-        if len(layouts) != 3:
-            raise ValueError(f"Linear layout length is not 3, but {len(layouts)}")
-        x_layout = layouts[0]
-        w_layout = layouts[1]
-        bias_layout = layouts[2]
+        if len(cache_values) != 3:
+            raise ValueError(f"Linear cache_values length is not 3, but {len(cache_values)}")
+        x_layout = cache_values[0]
+        w_layout = cache_values[1]
+        bias_layout = cache_values[2]
         if not x_layout or not w_layout:
             raise ValueError(f"x_layout : {x_layout}, w_layout : {w_layout}")
         x_mesh_shape = x_layout.mesh_shape
@@ -403,14 +429,16 @@ class LinearDistributedOp(DistributedOp):
             else:
                 out_layout.set_partial_by_dev_axis(x_map[x_contract_dim], 'sum')
 
-        return out_layout
+        return ((out_layout,), None)
 
-    def get_expand_impl(self, func, output_layout, layouts, extra_args):
+    def get_expand_impl(self, func, infer_result, cache_values):
         """
         Get expand implementation for the operator
         """
-        x_layout = layouts[0]
-        bias_layout = layouts[2]
+        output_layouts, _ = infer_result
+        output_layout = output_layouts[0]
+        x_layout = cache_values[0]
+        bias_layout = cache_values[2]
         x_map = x_layout.alias_tensor_map
         x_contract_dim = len(x_map) - 1
         scaling_factor = 1

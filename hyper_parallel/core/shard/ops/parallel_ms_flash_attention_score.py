@@ -19,13 +19,13 @@
 import copy
 import warnings
 
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional
 from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import (  # pylint: disable=C0415
     _get_lb_override,
 )
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from hyper_parallel.core.shard.ops.parallel_ops_register import register_distributed_op
+from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -85,13 +85,11 @@ def _resolve_input_layout(input_layout) -> str:
     return str(input_layout)
 
 
-class FlashAttentionScoreDistributedOp:
+class FlashAttentionScoreDistributedOp(DistributedOp):
     """Distributed operator for mindspore.ops.flash_attention_score."""
 
     def __init__(self, op_name: str):
-        self.op_name = op_name
-        register_distributed_op(op_name, self)
-
+        super().__init__(op_name)
         self._layout_dims = {
             "BSH": {"batch": 0, "seq": 1, "hidden": 2},
             "BNSD": {"batch": 0, "head": 1, "seq": 2, "dim": 3},
@@ -396,10 +394,10 @@ class FlashAttentionScoreDistributedOp:
             warnings.warn("Detected Alibi positional encoding compression scenario")
 
     def infer_layout(
-        self, input_layouts: List[Optional[Layout]], extra_args: List[Any]
+        self, layouts: List[Optional[Layout]], extra_args: Optional[dict] = None
     ) -> Tuple[Layout, ...]:
         """Infer output layouts from input layouts and scalar params in extra_args."""
-        query_layout = input_layouts[0]
+        query_layout = layouts[0]
         if query_layout is None:
             raise ValueError("Query layout cannot be None")
 
@@ -793,13 +791,7 @@ class FlashAttentionScoreDistributedOp:
         return (sparse_mode, pre_tokens, next_tokens,
                 adjusted_actual_seq_qlen, adjusted_actual_seq_kvlen)
 
-    def get_expand_impl(
-        self,
-        func: callable,
-        output_layouts: Tuple[Layout, ...],
-        input_layouts: List[Optional[Layout]],
-        extra_args: List[Any],
-    ) -> Optional[callable]:
+    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
         """Create expanded implementation.
 
         extra_args contains 8 scalar params extracted by _process_args_and_kwargs:
@@ -808,13 +800,13 @@ class FlashAttentionScoreDistributedOp:
         The returned expanded_impl receives 18 positional args matching the
         pyboost flat arg list (10 tensor args + 8 scalar args).
         """
-        query_layout = input_layouts[0]
+        query_layout = layouts[0]
         if query_layout is None:
             return None
 
-        if len(input_layouts) >= 3:
-            key_layout_check = input_layouts[1]
-            value_layout_check = input_layouts[2]
+        if len(layouts) >= 3:
+            key_layout_check = layouts[1]
+            value_layout_check = layouts[2]
 
             if (key_layout_check is not None and value_layout_check is not None and
                 hasattr(key_layout_check, 'tensor_map') and
@@ -842,7 +834,7 @@ class FlashAttentionScoreDistributedOp:
             p_pre_tokens, p_next_tokens, p_inner_precise,
             p_input_layout, p_sparse_mode,
         ):
-            key_layout = input_layouts[1]
+            key_layout = layouts[1]
             self._validate_sharding_consistency(
                 query_layout, key_layout, input_layout
             )

@@ -26,7 +26,7 @@ class ActivationWithAxisDistributedOp(DistributedOp):
     Inherits from DistributedOp and provides activation-with-axis specific implementations.
     """
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for activation-with-axis operations.
 

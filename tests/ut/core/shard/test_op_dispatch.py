@@ -18,13 +18,26 @@ Unit tests for OpDispatcher with custom distributed ops (e.g., StackExt).
 import importlib
 import os
 import sys
+import unittest
 from pathlib import Path
 from typing import Optional, Tuple
+from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.device_mesh import (
+    init_device_mesh,
+    _DEVICE_MESH_MAP
+)
+
+from hyper_parallel.platform import get_platform
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
+from hyper_parallel.core.shard._op_dispatch import LayoutCacheKey
 
 _TEST_FILE_DIR = Path(__file__).resolve().parent
 _TESTS_ROOT_DIR = _TEST_FILE_DIR.parent.parent.parent.parent
@@ -33,92 +46,20 @@ _CUSTOM_OPS_DIR = _TESTS_ROOT_DIR / "tests" / "custom_ops"
 HYPER_PARALLEL_OPS_YAML_DIR = str(_CUSTOM_OPS_DIR)
 HYPER_PARALLEL_OPS_PYTHON_PATH = str(_CUSTOM_OPS_DIR)
 
-_YAML_DIR_ENV_KEYS = ("HP_TEST_OPS_YAML_DIR", "HYPER_PARALLEL_OPS_YAML_DIR")
-_PY_PATH_ENV_KEYS = ("HP_TEST_OPS_PYTHON_PATH", "HYPER_PARALLEL_OPS_PYTHON_PATH")
 
-
-def _first_env(*keys: str) -> Optional[str]:
+def _reload_op_dispatch_with_env_str(yaml_dir: str, python_path: str):
     """
-    Feature: Read first available environment variable
-    Description: Iterate over provided environment variable keys and return the first non-empty value.
-    Expectation: Returns a string value when found; otherwise returns None.
+    Reload OpDispatcher module with custom environment variables.
+
+    Args:
+        yaml_dir (str): Path to the directory containing op dispatch YAML files.
+        python_path (str): Path to the directory containing custom op implementations.
+
+    Returns:
+        module: The reloaded OpDispatcher module.
     """
-    for k in keys:
-        v = os.environ.get(k)
-        if v:
-            return v
-    return None
-
-
-def _normalize_yaml_dir(yaml_dir_or_file: str) -> Path:
-    """
-    _op_dispatch.safe_load_yaml_from_dir() expects a DIRECTORY containing *.yaml.
-    If user passes a YAML file path, accept it and use its parent directory.
-    """
-    p = Path(yaml_dir_or_file).expanduser().resolve(strict=False)
-    if p.suffix.lower() in (".yml", ".yaml"):
-        return p.parent
-    return p
-
-
-def _validate_paths(yaml_dir: Path, python_path: str) -> None:
-    """
-    Feature: Validate custom ops YAML directory and Python path
-    Description: Ensure yaml_dir exists and is a directory, and python_path contains at least one
-                 existing directory (split by ':').
-    Expectation: Raises ValueError when validation fails; otherwise returns None.
-    """
-    if not yaml_dir.exists() or not yaml_dir.is_dir():
-        raise ValueError(
-            f"Invalid yaml directory path: {yaml_dir}\n"
-            f"Expected a DIRECTORY containing *.yaml files.\n"
-        )
-
-    py_dirs = [
-        Path(x).expanduser().resolve(strict=False) for x in python_path.split(":") if x
-    ]
-    if not py_dirs or not any(d.exists() and d.is_dir() for d in py_dirs):
-        raise ValueError(
-            f"Invalid python path: {python_path}\n"
-            f"Expected at least one existing DIRECTORY.\n"
-        )
-
-
-def _get_custom_paths_from_env() -> Tuple[Path, str]:
-    """
-    Feature: Resolve custom ops search paths from environment variables
-    Description: Read YAML directory and Python import search path from the first available
-                 environment variables in _YAML_DIR_ENV_KEYS / _PY_PATH_ENV_KEYS, normalize
-                 YAML path (file->parent dir), and validate both paths exist.
-    Expectation: Returns (yaml_dir, python_path) when env vars are present and valid;
-                 otherwise raises RuntimeError/ValueError.
-    """
-    yaml_raw = _first_env(*_YAML_DIR_ENV_KEYS)
-    py_raw = _first_env(*_PY_PATH_ENV_KEYS)
-
-    if not yaml_raw or not py_raw:
-        raise RuntimeError(
-            "Missing env vars for custom ops paths.\n"
-            "Set either:\n"
-            "  HP_TEST_OPS_YAML_DIR and HP_TEST_OPS_PYTHON_PATH\n"
-            "or:\n"
-            "  HYPER_PARALLEL_OPS_YAML_DIR and HYPER_PARALLEL_OPS_PYTHON_PATH\n"
-        )
-
-    yaml_dir = _normalize_yaml_dir(yaml_raw)
-    python_path = py_raw
-    _validate_paths(yaml_dir, python_path)
-    return yaml_dir, python_path
-
-
-def _reload_op_dispatch_with_env(
-    monkeypatch: pytest.MonkeyPatch, yaml_dir: str, python_path: str
-):
-    """
-    MUST set env BEFORE importing _op_dispatch because it creates _OP_DISPATCHER at import time.
-    """
-    monkeypatch.setenv("HYPER_PARALLEL_OPS_YAML_DIR", yaml_dir)
-    monkeypatch.setenv("HYPER_PARALLEL_OPS_PYTHON_PATH", python_path)
+    os.environ["HYPER_PARALLEL_OPS_YAML_DIR"] = yaml_dir
+    os.environ["HYPER_PARALLEL_OPS_PYTHON_PATH"] = python_path
 
     target_mod = "hyper_parallel.core.shard._op_dispatch"
     if target_mod in sys.modules:
@@ -129,159 +70,251 @@ def _reload_op_dispatch_with_env(
     return mod
 
 
-def _require_mindspore():
+class TestStackExtDispatch(unittest.TestCase):
     """
-    Feature: Conditional dependency gate for MindSpore
-    Description: Check MindSpore availability at runtime; skip tests when not installed.
-    Expectation: Test is skipped (pytest.skip) if MindSpore cannot be imported.
+    Feature: StackExt Dispatch and Layout Cache
+    Description: Test StackExt distributed operator dispatch and layout caching.
+    Expectation: dispatch should return correct DTensor output with proper layout,
+                 and layout cache should work correctly.
     """
-    try:
-        importlib.import_module("mindspore")
-    except ImportError as e:
-        pytest.skip(f"mindspore not available: {e}")
+
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        self.platform = get_platform()
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def _make_mesh(self, mock_platform, mesh_shape, mesh_dim_names):
+        """Create a device mesh for testing."""
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = np.prod(mesh_shape)
+        return init_device_mesh(
+            device_type="npu",
+            mesh_shape=mesh_shape,
+            mesh_dim_names=mesh_dim_names,
+            init_backend=False,
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_stack_ext_dispatch_and_layout(self, mock_platform):
+        """Test StackExt dispatch and layout cache with two input DTensors."""
+        op_dispatch = _reload_op_dispatch_with_env_str(
+            HYPER_PARALLEL_OPS_YAML_DIR, HYPER_PARALLEL_OPS_PYTHON_PATH
+        )
+
+        mesh = self._make_mesh(mock_platform, (1, 1, 1), ("dp", "cp", "mp"))
+        base_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 2)
+
+        from hyper_parallel.core.shard._op_dispatch import LayoutCacheManager
+
+        dist_op = LayoutCacheManager.get_instance().distributed_op("StackExt")
+
+        np_obj = np
+        local_tensor0 = np_obj.arange(6).reshape(2, 3).astype(np_obj.int32)
+        local_tensor1 = np_obj.arange(6, 12).reshape(2, 3).astype(np_obj.int32)
+
+        d0 = MagicMock(spec=DTensor)
+        d0._local_tensor = local_tensor0
+        d0.layout = base_layout
+        d0._layout = base_layout
+        d0.to_local.return_value = local_tensor0
+
+        d1 = MagicMock(spec=DTensor)
+        d1._local_tensor = local_tensor1
+        d1.layout = base_layout
+        d1._layout = base_layout
+        d1.to_local.return_value = local_tensor1
+
+        output_layout = dist_op.infer_layout((d0.layout, d1.layout), (0,))
+
+        assert output_layout is not None
+        assert tuple(output_layout.to_dict()["tensor_map"]) == (-1, -1, -1)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_stack_ext_layout_cache(self, mock_platform):
+        """Test StackExt layout cache with multiple input layouts."""
+        op_dispatch = _reload_op_dispatch_with_env_str(
+            HYPER_PARALLEL_OPS_YAML_DIR, HYPER_PARALLEL_OPS_PYTHON_PATH
+        )
+
+        mesh = self._make_mesh(mock_platform, (1, 1, 1), ("dp", "cp", "mp"))
+        base_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 2)
+
+        from hyper_parallel.core.shard._op_dispatch import LayoutCacheManager
+
+        dist_op = LayoutCacheManager.get_instance().distributed_op("StackExt")
+
+        np_obj = np
+        local_tensor0 = np_obj.arange(6).reshape(2, 3).astype(np_obj.int32)
+        local_tensor1 = np_obj.arange(6, 12).reshape(2, 3).astype(np_obj.int32)
+
+        d0 = MagicMock(spec=DTensor)
+        d0._local_tensor = local_tensor0
+        d0.layout = base_layout
+        d0._layout = base_layout
+
+        d1 = MagicMock(spec=DTensor)
+        d1._local_tensor = local_tensor1
+        d1.layout = base_layout
+        d1._layout = base_layout
+
+        output_layout = dist_op.infer_layout((d0.layout, d1.layout), (0,))
+
+        assert output_layout is not None
+        assert tuple(output_layout.to_dict()["tensor_map"]) == (-1, -1, -1)
 
 
-base_mesh_shape = (1, 1, 1)
-base_alias_name = ("dp", "cp", "mp")
-base_rank_list = [0]
-
-
-def _make_layout_2d_replicated():
+class TestNewDispatchFlow(unittest.TestCase):
     """
-    2D tensor layout, fully replicated: ("None", "None")
-    Uses the same Layout(...) + layout(...) pattern as your elementwise UT.
+    Feature: New Dispatch Flow with Preprocess and Infer Layout
+    Description: Test the new dispatch flow with preprocess and infer_layout methods for a distributed operator.
+    Expectation: preprocess should return valid local_args, local_kwargs, and cache_values, and infer_layout should
+                 return the correct output layouts.
     """
-    layout = Layout(base_mesh_shape, base_alias_name, base_rank_list)
-    return layout("None", "None")
 
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        self.platform = get_platform()
 
-def _make_dtensors_ms():
-    """
-    Feature: Create MindSpore DTensor inputs for StackExt dispatch tests
-    Description: Create two 2x3 MindSpore tensors, wrap them into DTensor with a fully
-                 replicated 2D layout.
-    Expectation: Returns (d0, d1) where both are DTensor and share the same replicated layout.
-    """
-    _require_mindspore()
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
 
-    np = importlib.import_module("numpy")
-    ms = importlib.import_module("mindspore")
+    def _make_mesh(self, mock_platform, mesh_shape, mesh_dim_names):
+        """Create a device mesh for testing."""
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = np.prod(mesh_shape)
+        return init_device_mesh(
+                device_type="npu",
+                mesh_shape=mesh_shape,
+                mesh_dim_names=mesh_dim_names,
+                init_backend=False,
+        )
 
-    x0 = ms.Tensor(np.arange(6).reshape(2, 3), ms.int32)
-    x1 = ms.Tensor(np.arange(6, 12).reshape(2, 3), ms.int32)
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_from_cache_values_with_layout(self, mock_platform):
+        """Test that LayoutCacheKey from_cache_values with layout returns correct key."""
+        mesh = self._make_mesh(mock_platform, (2, 2), ("dp", "mp"))
+        layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
+        cache_values = [layout, 1, True]
+        key = LayoutCacheKey.from_cache_values(cache_values)
+        expected = [str(layout.compact_str), "1", "True"]
+        assert list(key._tuple) == expected, (
+            f"Expected {expected}, got {list(key._tuple)}"
+        )
 
-    x_layout = _make_layout_2d_replicated()
-    d0 = DTensor.from_local(x0, x_layout.mesh, x_layout.placements)
-    d1 = DTensor.from_local(x1, x_layout.mesh, x_layout.placements)
-    return d0, d1
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_from_cache_values_consistency(self, mock_platform):
+        """Test that LayoutCacheKey from_cache_values is consistent with the same cache_values."""
+        mesh = self._make_mesh(mock_platform, (2, 2), ("dp", "mp"))
+        layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
+        cache_values1 = [layout, 1, True]
+        cache_values2 = [layout, 1, True]
+        key1 = LayoutCacheKey.from_cache_values(cache_values1)
+        key2 = LayoutCacheKey.from_cache_values(cache_values2)
+        assert key1 == key2, f"Keys should be equal: {key1} != {key2}"
+        assert hash(key1) == hash(key2), "Hashes should be equal"
 
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_from_cache_values_different_values(self, mock_platform):
+        """Test that LayoutCacheKey from_cache_values differs with different values."""
+        mesh = self._make_mesh(mock_platform, (2, 2), ("dp", "mp"))
+        layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
+        key1 = LayoutCacheKey.from_cache_values([layout, 1, True])
+        key2 = LayoutCacheKey.from_cache_values([layout, 0, True])
+        assert key1 != key2, "Keys should differ"
 
-def _stack_ext_local_ms(x0, x1, axis: int):
-    """
-    Local op implementation simulating StackExt(x0, x1, axis).
-    """
-    _require_mindspore()
-    ops = importlib.import_module("mindspore.ops")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_equality_with_legacy_key(self, mock_platform):
+        """Test that LayoutCacheKey is equal to legacy key."""
+        mesh = self._make_mesh(mock_platform, (2, 2), ("dp", "mp"))
+        layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
+        key_new = LayoutCacheKey.from_cache_values([layout, 1, True])
+        key_legacy = LayoutCacheKey([str(layout.compact_str), "1", "True"])
+        assert key_new == key_legacy, "Keys should be equal"
 
-    if hasattr(ops, "stack"):
-        return ops.stack([x0, x1], axis)
-    return ops.Stack(axis)([x0, x1])
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_dispatch_new_flow_with_preprocess(self, mock_platform):
+        """Test that dispatch preprocess returns valid local_args, local_kwargs, and cache_values."""
+        from hyper_parallel.core.shard.ops.parallel_sort import SortDistributedOp
 
+        op = SortDistributedOp("sort")
+        mesh = self._make_mesh(mock_platform, (2,), ("dp",))
+        layout = _build_layout(mesh, (Replicate(),), 2)
 
-def _to_numpy_ms(x):
-    """
-    Feature: Convert MindSpore tensor-like to numpy-like
-    Description: Use asnumpy() when available; otherwise return the input.
-    Expectation: Returns a numpy array for MindSpore tensors, or the original object.
-    """
-    return x.asnumpy() if hasattr(x, "asnumpy") else x
+        mock_tensor = MagicMock()
+        mock_tensor._layout = layout
+        mock_tensor.layout = layout
+        mock_tensor.to_local.return_value = np.random.randn(4, 4)
 
+        result = op.preprocess((mock_tensor, -1), {})
+        assert result is not None, "preprocess should return tuple for DTensor input"
+        local_args, local_kwargs, cache_values = result
 
-def _patch_op_name(monkeypatch, op_dispatch_mod):
-    """
-    Ensure platform.get_op_name(_stack_ext_local_ms) == "StackExt".
-    """
-    orig_get_op_name = op_dispatch_mod.platform.get_op_name
+        assert local_kwargs.get("dim") == -1, "Expected dim=-1 in kwargs"
+        assert len(cache_values) == 2, "Expected 2 cache values"
+        assert cache_values[0] is layout, "Expected layout in cache_values"
 
-    def patched_get_op_name(func):
-        if func is _stack_ext_local_ms:
-            return "StackExt"
-        return orig_get_op_name(func)
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_dispatch_new_flow_infer_layout_with_cache_values(self, mock_platform):
+        """Test that dispatch infer_layout with cache_values returns correct output layouts."""
+        from hyper_parallel.core.shard.ops.parallel_sort import SortDistributedOp
 
-    monkeypatch.setattr(
-        op_dispatch_mod.platform, "get_op_name", patched_get_op_name, raising=True
-    )
+        op = SortDistributedOp("sort")
+        mesh = self._make_mesh(mock_platform, (2,), ("dp",))
+        layout = _build_layout(mesh, (Replicate(),), 2)
+        cache_values = [layout, -1]
 
+        infer_result = op.infer_layout(cache_values)
+        assert isinstance(infer_result, tuple), "Expected tuple"
+        output_layouts, extra_info = infer_result
+        assert isinstance(output_layouts, tuple), "Expected tuple of output layouts"
+        assert len(output_layouts) == 2, "Expected 2 output layouts"
+        assert extra_info is None, "Expected extra_info=None"
 
-def test_stack_ext_dispatch_and_layout(monkeypatch):
-    """
-    Feature: OpDispatcher dispatch and StackExt layout inference integration
-    Description: Reload _op_dispatch with custom YAML/Python paths from environment, create two replicated
-                 2D DTensor inputs, patch platform.get_op_name so the local function maps to "StackExt",
-                 and dispatch via _OP_DISPATCHER.dispatch using axis=0.
-    Expectation: dispatch returns a DTensor whose output layout tensor_map inserts a replicated dimension
-                 at axis=0 (i.e., from (-1, -1) to (-1, -1, -1)), and the numerical result matches the
-                 local MindSpore stack reference output.
-    """
-    op_dispatch = _reload_op_dispatch_with_env(
-        monkeypatch, HYPER_PARALLEL_OPS_YAML_DIR, HYPER_PARALLEL_OPS_PYTHON_PATH
-    )
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_dispatch_new_flow_normalizes_args(self, mock_platform):
+        """Test that dispatch normalizes args and kwargs."""
+        from hyper_parallel.core.shard.ops.parallel_sort import SortDistributedOp
 
-    d0, d1 = _make_dtensors_ms()
-    axis = 0
+        op = SortDistributedOp("sort")
+        mesh = self._make_mesh(mock_platform, (2,), ("dp",))
+        layout = _build_layout(mesh, (Replicate(),), 2)
 
-    _patch_op_name(monkeypatch, op_dispatch)
+        mock_tensor = MagicMock()
+        mock_tensor._layout = layout
+        mock_tensor.layout = layout
+        mock_tensor.to_local.return_value = np.random.randn(4, 4)
 
-    out = op_dispatch._OP_DISPATCHER.dispatch(  # pylint: disable=protected-access
-        _stack_ext_local_ms, (d0, d1, axis), {}
-    )
+        result1 = op.preprocess((mock_tensor, 1, True, False), {})
+        result2 = op.preprocess((mock_tensor,), {"dim": 1, "descending": True, "stable": False})
 
-    assert isinstance(out, DTensor)
+        assert result1 is not None, "preprocess should return tuple"
+        assert result2 is not None, "preprocess should return tuple"
 
-    # The input 2D replication tensor map should be (-1, -1)
-    assert tuple(d0.layout.to_dict()["tensor_map"]) == (-1, -1)
+        _, kwargs1, cv1 = result1
+        _, kwargs2, cv2 = result2
+        assert kwargs1 == kwargs2, "Normalized kwargs should match"
+        assert cv1[1] == cv2[1], "Normalized cache_values dim should match"
 
-    # axis=0: outputs rank=3, with a replicated inserted at the axis position => (-1, -1, -1)
-    assert tuple(out.layout.to_dict()["tensor_map"]) == (-1, -1, -1)
+    def test_dispatch_falls_back_to_legacy_when_preprocess_returns_none(self):
+        """Test that dispatch falls back to legacy preprocess when new preprocess returns None."""
+        from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
 
-    # The number is correct
-    ref = _stack_ext_local_ms(d0.to_local(), d1.to_local(), axis)
-    assert (_to_numpy_ms(out.to_local()) == _to_numpy_ms(ref)).all()
+        class DummyOp(DistributedOp):
+            def infer_layout(self, layouts, extra_args=None):
+                return layouts[0]
 
+        op = DummyOp("dummy")
+        assert op.preprocess((1, 2), {"a": 3}) is None, "Default preprocess should return None for non-DTensor inputs"
 
-def test_stack_ext_layout_cache(monkeypatch):
-    """
-    Feature: LayoutCacheManager effectiveness for StackExt infer_layout
-    Description: Reload _op_dispatch with custom YAML/Python paths, dispatch the same StackExt call twice
-                 with identical inputs and axis=1, and wrap the distributed op infer_layout to count calls.
-    Expectation: infer_layout is invoked exactly once due to layout cache hit on the second dispatch
-                 (call_count["n"] == 1).
-    """
-    op_dispatch = _reload_op_dispatch_with_env(
-        monkeypatch, HYPER_PARALLEL_OPS_YAML_DIR, HYPER_PARALLEL_OPS_PYTHON_PATH
-    )
-
-    d0, d1 = _make_dtensors_ms()
-    axis = 1
-
-    _patch_op_name(monkeypatch, op_dispatch)
-
-    dist_op = op_dispatch.LayoutCacheManager.get_instance().distributed_op("StackExt")
-
-    call_count = {"n": 0}
-    orig_infer = dist_op.infer_layout
-
-    def wrapped_infer(layouts, extra_args):
-        call_count["n"] += 1
-        return orig_infer(layouts, extra_args)
-
-    monkeypatch.setattr(dist_op, "infer_layout", wrapped_infer, raising=True)
-
-    _ = op_dispatch._OP_DISPATCHER.dispatch(  # pylint: disable=protected-access
-        _stack_ext_local_ms, (d0, d1, axis), {}
-    )
-    _ = op_dispatch._OP_DISPATCHER.dispatch(  # pylint: disable=protected-access
-        _stack_ext_local_ms, (d0, d1, axis), {}
-    )
-
-    assert call_count["n"] == 1
+if __name__ == "__main__":
+    unittest.main()

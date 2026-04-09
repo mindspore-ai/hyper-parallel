@@ -23,7 +23,7 @@ from .parallel_ops import DistributedOp
 class MultinomialDistributedOp(DistributedOp):
     """Distributed implementation for Multinomial operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for Multinomial operator.
 

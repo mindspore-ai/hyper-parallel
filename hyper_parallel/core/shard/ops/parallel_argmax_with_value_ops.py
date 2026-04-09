@@ -22,7 +22,7 @@ from .parallel_ops import DistributedOp
 class ArgMaxWithValueDistributedOp(DistributedOp):
     """Distributed implementation for ArgMaxWithValue operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for ArgMaxWithValue operator.
         Args:

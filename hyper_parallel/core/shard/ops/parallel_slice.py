@@ -54,7 +54,7 @@ class SliceDistributedOp(DistributedOp):
                     f"the begin is {begin}, the end is {end}, the shape is {shape}, layout is {layout.to_dict()}")
         return shard_dim
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for slice operator. The shard dim must be fully fetched.
 

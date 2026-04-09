@@ -43,7 +43,7 @@ class ReduceExtDistributedOpBase(DistributedOp):
             partial_type = ["sum"]
         self.partial_type = partial_type
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout for reduce operator.
 
@@ -264,7 +264,7 @@ class MaxDistributedOp(ReduceExtDistributedOpBase):
     def __init__(self, op_name="max"):
         super().__init__(op_name, partial_type=["max"])
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for torch.max.
         """

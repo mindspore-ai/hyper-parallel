@@ -23,7 +23,7 @@ from .parallel_ops import DistributedOp
 class SplitWithSizeDistributedOp(DistributedOp):
     """Distributed implementation for SplitWithSize operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for Split operator.
 
@@ -54,7 +54,7 @@ class SplitWithSizeDistributedOp(DistributedOp):
 class SplitWithSizeViewDistributedOp(DistributedOp):
     """Distributed implementation for SplitWithSizeView operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for SplitWithSizeView operator.
 
@@ -85,7 +85,7 @@ class SplitWithSizeViewDistributedOp(DistributedOp):
 class SplitDistributedOp(DistributedOp):
     """Distributed implementation for Split operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for Split operator.
 
@@ -143,7 +143,7 @@ class SplitDistributedOp(DistributedOp):
 class SplitTensorDistributedOp(DistributedOp):
     """Distributed implementation for SplitTensor operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for Split operator.
 
@@ -178,7 +178,7 @@ class SplitTensorDistributedOp(DistributedOp):
 class SplitTensorViewDistributedOp(DistributedOp):
     """Distributed implementation for SplitTensorView operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for SplitTensorView operator.
 
@@ -213,7 +213,7 @@ class SplitTensorViewDistributedOp(DistributedOp):
 class TensorSplitDistributedOp(DistributedOp):
     """Distributed implementation for tensor_split operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for tensor_split operator.
 
