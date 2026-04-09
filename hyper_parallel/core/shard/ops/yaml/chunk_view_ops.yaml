@@ -1,0 +1,5 @@
+ChunkView:
+  dist_op_name: _chunk_view_dist_op
+  distributed_op_class: ChunkViewDistributedOp
+  distributed_op_file: parallel_chunk_view
+  infer_layout_suffix: WithShape

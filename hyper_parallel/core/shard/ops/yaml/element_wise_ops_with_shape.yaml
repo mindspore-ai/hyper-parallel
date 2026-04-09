@@ -59,3 +59,6 @@ isnan:
 
 isinf:
   dist_op_name: _torch_isinf_dist_op
+
+MaskedFillScalar:
+  dist_op_name: _masked_fill_scalar_dist_op

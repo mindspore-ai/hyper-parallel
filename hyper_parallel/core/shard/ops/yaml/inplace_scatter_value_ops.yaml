@@ -1,0 +1,4 @@
+InplaceScatterValue:
+  dist_op_name: _inplace_scatter_value_dist_op
+  distributed_op_class: InplaceScatterValueDistributedOp
+  distributed_op_file: parallel_inplace_scatter_value

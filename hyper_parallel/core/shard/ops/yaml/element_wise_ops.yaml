@@ -18,6 +18,9 @@ AddScalar:
 SubScalar:
   dist_op_name: _sub_scalar_dist_op
 
+Muls:
+  dist_op_name: _muls_dist_op
+
 Sigmoid:
   dist_op_name: _sigmoid_dist_op
 
