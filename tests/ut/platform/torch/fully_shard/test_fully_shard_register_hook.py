@@ -20,12 +20,15 @@ after passing through PostBackwardFunction.apply.
 """
 import os
 import unittest
+from unittest.mock import MagicMock
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import torch
 
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
+from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState
 from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
 
 
@@ -293,6 +296,57 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
             f"Value mismatch for no-grad float: "
             f"expected {no_grad_float.data}, got {out_args[2].data}"
         )
+
+
+class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
+    """Unit tests for forward-prefetch suppression during activation recompute."""
+
+    def tearDown(self):
+        HSDPSchedulerV2.root_bp_state = False
+        TorchHSDPSchedulerV2._root_module = None
+
+    def test_forward_pre_hook_disables_prefetch_during_recompute(self):
+        """forward pre hook clears prefetch targets while root backward recompute is active."""
+        scheduler = _make_scheduler_stub()
+        scheduler.scheduler_state = FSDPSchedulerState.FORWARD
+        scheduler.cell = MagicMock(name="cell")
+        scheduler.forward_prefetch_cells = [MagicMock(name="next_module")]
+        scheduler._backup_forward_fetch = None
+        scheduler._is_root = False
+        scheduler.hsdp_state = MagicMock(module_name="mod")
+        scheduler._hsdp_forward_pre_hook = MagicMock(return_value=(("arg",), {"k": "v"}))
+        scheduler._register_post_backward_hook = MagicMock(return_value=("wrapped_args", "wrapped_kwargs"))
+
+        HSDPSchedulerV2.root_bp_state = True
+
+        result = scheduler._forward_pre_hook(MagicMock(), ("arg",), {"k": "v"})
+
+        self.assertEqual(scheduler.forward_prefetch_cells, [])
+        self.assertEqual(len(scheduler._backup_forward_fetch), 1)
+        scheduler._hsdp_forward_pre_hook.assert_called_once()
+        scheduler._register_post_backward_hook.assert_called_once_with(("arg",), {"k": "v"})
+        self.assertEqual(result, ("wrapped_args", "wrapped_kwargs"))
+
+    def test_forward_hook_restores_prefetch_after_recompute(self):
+        """forward hook restores prefetch targets and skips post-forward logic during recompute."""
+        scheduler = _make_scheduler_stub()
+        scheduler.scheduler_state = FSDPSchedulerState.PRE_FORWARD
+        scheduler.forward_prefetch_cells = []
+        restored_prefetch = [MagicMock(name="next_module")]
+        scheduler._backup_forward_fetch = restored_prefetch.copy()
+        outputs = MagicMock(name="outputs")
+        scheduler._register_backward_pre_hook = MagicMock()
+        scheduler._hsdp_forward_hook = MagicMock()
+
+        HSDPSchedulerV2.root_bp_state = True
+
+        result = scheduler._forward_hook(MagicMock(), MagicMock(), outputs)
+
+        scheduler._register_backward_pre_hook.assert_called_once_with(outputs)
+        scheduler._hsdp_forward_hook.assert_not_called()
+        self.assertIsNone(result)
+        self.assertEqual(scheduler.forward_prefetch_cells, restored_prefetch)
+        self.assertIsNone(scheduler._backup_forward_fetch)
 
 
 if __name__ == "__main__":
