@@ -83,6 +83,10 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _forward_pre_hook(self, cell, args, kwargs):
         """Execute forward pre hook and set up backward hook."""
+        if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
+            return args, kwargs
+        if HSDPSchedulerV2.root_bp_state:
+            self._disable_forward_prefetch_for_recompute()
         args, kwargs = self._hsdp_forward_pre_hook(cell, args, kwargs)
         return self._register_post_backward_hook(args, kwargs)
 
@@ -96,19 +100,30 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _forward_hook(self, cell, inputs, outputs):
         """Execute forward hook."""
-        self._register_backward_pre_hook(outputs)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
+            return
+        self._register_backward_pre_hook(outputs)
+        if HSDPSchedulerV2.root_bp_state:
+            self._restore_forward_prefetch_after_recompute()
             return
         return self._hsdp_forward_hook(cell, inputs, outputs)
 
     # pylint: disable=W0212
     def _backward_pre_hook(self, grad):
         """Execute backward pre hook."""
-        _pynative_executor.queue_backward_final_callback(self._backward_hook)
+        _pynative_executor.queue_backward_final_callback(self._root_backward_hook)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return grad
+        HSDPSchedulerV2.root_bp_state = True
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
+
+    def _root_backward_hook(self):
+        """Root backward hook: finalize the outermost backward and clear recompute state."""
+        apply_final_reduce = self.scheduler_state != FSDPSchedulerState.BACKWARD
+        self._backward_hook()
+        if apply_final_reduce:
+            HSDPSchedulerV2.root_bp_state = False
 
     def _backward_hook(self):
         """Execute backward hook."""
