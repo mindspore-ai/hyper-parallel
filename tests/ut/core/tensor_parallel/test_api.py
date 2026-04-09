@@ -318,6 +318,47 @@ class TestParallelizeModule(unittest.TestCase):
             parallelize_module(mod, mesh, "not-a-style")  # type: ignore[arg-type]
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_dict_value_none_raises_type_error(self, mock_platform):
+        """
+        Feature: parallelize_module validation for dict plan values
+        Description: pass dict plan whose value is None for an existing submodule path
+        Expectation: throw TypeError indicating dict values must be ParallelStyle
+        """
+        mesh = self._make_1d_mesh(mock_platform)
+        mod = nn.Sequential(nn.Identity())
+        with self.assertRaises(TypeError):
+            parallelize_module(mod, mesh, {"0": None})  # type: ignore[arg-type]
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_dict_empty_path_raises_value_error(self, mock_platform):
+        """
+        Feature: parallelize_module validation for empty module path
+        Description: pass empty module path key in dict plan
+        Expectation: throw ValueError with invalid path message
+        """
+        mesh = self._make_1d_mesh(mock_platform)
+        mod = nn.Identity()
+        style = RecordingParallelStyle()
+        with self.assertRaises(ValueError):
+            parallelize_module(mod, mesh, {"": style})
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_dict_path_no_match_warns_and_skips(self, mock_platform):
+        """
+        Feature: parallelize_module observability for unmatched dict path
+        Description: pass a dict path atom that does not exist in named_children
+        Expectation: one warning about skipped path and no style apply call
+        """
+        mesh = self._make_1d_mesh(mock_platform)
+        mod = nn.Sequential(nn.Identity())
+        style = RecordingParallelStyle()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            parallelize_module(mod, mesh, {"missing.child": style})
+        self.assertEqual(len(style.apply_log), 0)
+        self.assertTrue(any("has no matches" in str(item.message) for item in caught))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_implicit_mesh_internal_context(self, mock_platform):
         """
         Feature: parallelize_module with implicit mesh via _tensor_parallel_mesh_context
