@@ -145,23 +145,20 @@ HyperParallel depends on a deep learning framework. Before using HyperParallel, 
 
 ## Usage Instructions
 
-1. Use hsdp for data parallelism or zero sharding optimisation
+1. Use fully_shard for data-parallel parameter sharding
 
 ```python
-from hyper_parallel import hsdp
+from hyper_parallel import fully_shard, init_device_mesh
 
-# Configure data parallelism
-model = hsdp(model, shard_size=1)
-
-# Or configure zero sharding
-model = hsdp(model, shard_size=dp_size, optimizer_level="level1")
+mesh = init_device_mesh(device_type="npu", mesh_shape=(dp_size,), mesh_dim_names=("dp",))
+model = fully_shard(model, mesh=mesh)
 ```
 
 2. Use shard for tensor parallelism
 
 ```python
 from mindspore.nn.utils import no_init_parameters
-from hyper_parallel import DTensor, Layout, hsdp, init_parameters, shard
+from hyper_parallel import DTensor, Layout, fully_shard, init_device_mesh, init_parameters, shard_module
 
 # Define tensor layout
 layout = Layout((dp, mp), ("dp", "mp"))
@@ -176,10 +173,11 @@ with no_init_parameters():
 # Configure sharding for network input/output/weights
 sharding_plan = { "forward": { "input": (x_layout,), "output": (out_layout,)},
                 "parameter": {"weight": w_layout}}
-model = shard(model, sharding_plan)
+model = shard_module(model, sharding_plan)
 
-# Can further configure hsdp
-model = hsdp(model, shard_size=hsdp_shard_size, threshold=0)
+# Can further configure fully_shard
+mesh = init_device_mesh(device_type="npu", mesh_shape=(dp, 1), mesh_dim_names=("dp", "tp"))
+model = fully_shard(model, mesh=mesh["dp"])
 
 # Sharded weight initialisation
 model = init_parameters(model)

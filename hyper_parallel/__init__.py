@@ -14,7 +14,7 @@
 # ============================================================================
 """hyper parallel interface"""
 
-__all__ = ["get_platform", "hsdp", "hsdp_sync_stream", "HSDPCell", "DTensor",
+__all__ = ["get_platform", "fully_shard", "hsdp_sync_stream", "HSDPModule", "DTensor",
            "Layout", "DeviceMesh", "init_device_mesh", "get_current_mesh", "distribute_module",
            "init_parameters", "init_empty_weights", "init_on_device",
            "shard_module", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch",
@@ -25,7 +25,6 @@ __all__ = ["get_platform", "hsdp", "hsdp_sync_stream", "HSDPCell", "DTensor",
            "ParallelStyle", "parallelize_module"]
 
 from hyper_parallel.platform import get_platform
-from hyper_parallel.core.hsdp.api import hsdp, hsdp_sync_stream, HSDPCell
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _mesh_resources, init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch, distribute_module
@@ -40,5 +39,6 @@ from hyper_parallel.collectives.cc import (init_process_group, destroy_process_g
                                            get_backend, split_group, get_group_local_rank, mark_created_groups)
 from hyper_parallel.core.context_parallel import ContextParallel, AsyncContextParallel
 from hyper_parallel.core.tensor_parallel import ParallelStyle, parallelize_module
+from hyper_parallel.core.fully_shard.api import fully_shard, hsdp_sync_stream, HSDPModule
 
 get_current_mesh = _mesh_resources.get_current_mesh

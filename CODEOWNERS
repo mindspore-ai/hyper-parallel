@@ -32,7 +32,6 @@
 # The maintainers of hyper_parallel/platform.
 /hyper_parallel/platform/ @yangzhenzhang
 /hyper_parallel/platform/mindspore/ @yangzhenzhang
-/hyper_parallel/platform/mindspore/custom_pass/ @yuanqi1104
 /hyper_parallel/platform/mindspore/hsdp/ @kisnwang
 /hyper_parallel/platform/mindspore/pipeline_parallel/ @lichen666
 /hyper_parallel/platform/mindspore/fully_shard/ @DavidFFFan
@@ -47,7 +46,6 @@
 # The maintainers of tests.
 /tests/ @fengyixing
 /tests/mindspore/ @yangzhenzhang
-/tests/mindspore/st/hsdp/ @kisnwang
 /tests/mindspore/st/pipeline_parallel/ @yangzhenzhang
 /tests/mindspore/st/shard/ @yangzhenzhang
 /tests/mindspore/st/checkpoint/ @zhangbuxue
@@ -60,7 +58,6 @@
 /tests/torch/activation_checkpoint/ @DavidFFFan
 /tests/torch/checkpoint/ @zhangbuxue
 /tests/torch/fully_shard/ @Meng107
-/tests/torch/hsdp/ @kisnwang
 /tests/torch/pipeline_parallel/ @lichen666
 /tests/torch/process_group/ @changzherui1
 /tests/torch/shard/ @yangzhenzhang

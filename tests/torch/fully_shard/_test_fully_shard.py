@@ -26,7 +26,7 @@ from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.common_net import FullyShardTestNet, DenseNet, BufferTestNet, MetaInitNet
 from tests.torch.utils import init_dist
-from tests.torch.hsdp.hsdp_test_common import train
+from tests.torch.fully_shard.test_common import train
 
 
 def test_fully_shard_01():

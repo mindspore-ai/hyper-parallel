@@ -3,12 +3,6 @@ include README.md
 include README.en.md
 include LICENSE
 
-# Ensure source distribution includes C++ sources and build scripts
-include hyper_parallel/platform/mindspore/custom_pass/build_plugin.py
-include hyper_parallel/platform/mindspore/custom_pass/CMakeLists.txt
-include hyper_parallel/platform/mindspore/custom_pass/__init__.py
-recursive-include hyper_parallel/platform/mindspore/custom_pass/passes *.h *.cc *.cpp *.hpp
-
 prune build
 prune dist
 prune *.egg-info
@@ -16,8 +10,6 @@ prune .git
 prune __pycache__
 prune .pytest_cache
 prune .mypy_cache
-prune hyper_parallel/platform/mindspore/custom_pass/build  # Exclude build artifacts
-
 global-exclude __pycache__
 global-exclude *.py[co]
 global-exclude .DS_Store

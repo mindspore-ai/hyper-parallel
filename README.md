@@ -145,23 +145,20 @@ HyperParallel 依赖深度学习框架，在使用HyperParallel前，你需要�
 
 ## 使用说明
 
-1. 使用hsdp进行数据并行或zero切分优化
+1. 使用fully_shard进行数据并行参数切分
 
 ```python
-from hyper_parallel import hsdp
+from hyper_parallel import fully_shard, init_device_mesh
 
-# 配置数据并行
-model = hsdp(model, shard_size=1)
-
-# 或者配置zero切分
-model = hsdp(model, shard_size=dp_size, optimizer_level="level1")
+mesh = init_device_mesh(device_type="npu", mesh_shape=(dp_size,), mesh_dim_names=("dp",))
+model = fully_shard(model, mesh=mesh)
 ```
 
 2. 使用shard进行张量并行
 
 ```python
 from mindspore.nn.utils import no_init_parameters
-from hyper_parallel import DTensor, Layout, hsdp, init_parameters, shard
+from hyper_parallel import DTensor, Layout, fully_shard, init_device_mesh, init_parameters, shard_module
 
 # 定义张量排布
 layout = Layout((dp, mp), ("dp", "mp"))
@@ -176,10 +173,11 @@ with no_init_parameters():
 # 对网络输入/输出/权重做切分配置
 sharding_plan = { "forward": { "input": (x_layout,), "output": (out_layout,)},
                 "parameter": {"weight": w_layout}}
-model = shard(model, sharding_plan)
+model = shard_module(model, sharding_plan)
 
-# 可以进一步配置hsdp
-model = hsdp(model, shard_size=hsdp_shard_size, threshold=0)
+# 可以进一步配置fully_shard
+mesh = init_device_mesh(device_type="npu", mesh_shape=(dp, 1), mesh_dim_names=("dp", "tp"))
+model = fully_shard(model, mesh=mesh["dp"])
 
 # 权重分片初始化
 model = init_parameters(model)

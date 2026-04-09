@@ -107,7 +107,7 @@ class PipelineStageBase:
         if not self._has_backward:
             return
         recv_args = []
-        if last_backward and isinstance(self.submodule, hyper_parallel.HSDPCell):
+        if last_backward and isinstance(self.submodule, hyper_parallel.HSDPModule):
             self.submodule.set_requires_grad_sync(True)
         if micro_index in self.grad_recv_info:
             recv_args = [recv_info.buffer for recv_info in self.grad_recv_info[micro_index]]
