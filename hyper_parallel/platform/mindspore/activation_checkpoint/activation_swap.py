@@ -17,7 +17,6 @@
 # adapted for MindSpore Cell API.
 # ============================================================================
 """Activation Swap Wrapper implementation for MindSpore."""
-import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from typing import Optional, Callable, Any, Union
@@ -207,94 +206,6 @@ def _normalize_device(device: str) -> str:
     return device
 
 
-class MindSporeSwapTensor(SwapTensor):
-    """
-    MindSpore swap tensor that offloads via ``Tensor.to`` instead of storage mutation.
-
-    The base ``SwapTensor`` implementation mutates the original tensor storage in-place
-    to release device memory. That is acceptable on PyTorch, but it violates
-    MindSpore's ``saved_tensors_hooks`` contract. This subclass stores a detached CPU
-    copy and recreates the device tensor with ``to(device)`` during load.
-    """
-
-    def __init__(self, val: Any) -> None: #pylint: disable=W0231
-        self.val = val
-        if isinstance(val, Tensor) and str(val.device).lower() != 'cpu':
-            self.device = _normalize_device(str(val.device))
-            self.val_cpu = None
-            self._state = self.STATE_DEVICE
-        else:
-            self.device = None
-            self.val_cpu = val
-            self._state = self.STATE_NON_TENSOR
-
-    def get_val(self) -> Any:
-        if self._state == self.STATE_NON_TENSOR:
-            return self.val
-        if self._state != self.STATE_DEVICE:
-            raise RuntimeError(
-                f"Cannot call get_val(): tensor is in '{self._state}' state. "
-                f"Must be in 'device' state."
-            )
-        return self.val
-
-    def async_load(self):
-        """Materialize the swapped tensor back to the original device."""
-        if self._state == self.STATE_NON_TENSOR:
-            return
-        if self._state == self.STATE_DEVICE:
-            return
-        if self._state != self.STATE_HOST:
-            warnings.warn(
-                f"[MindSporeSwapTensor.async_load] Invalid state: current={self._state}, "
-                f"expected 'host'. Operation skipped."
-            )
-            return
-        assert self.val_cpu is not None
-        self.val = self.val_cpu.to(self.device)
-        self._state = self.STATE_H2D
-
-    def wait_load(self):
-        if self._state == self.STATE_NON_TENSOR:
-            return
-        if self._state == self.STATE_DEVICE:
-            return
-        if self._state != self.STATE_H2D:
-            warnings.warn(
-                f"[MindSporeSwapTensor.wait_load] Called in invalid state: {self._state}. "
-                f"Expected 'h2d'. Skipped."
-            )
-            return
-        self._state = self.STATE_DEVICE
-
-    def async_offload(self):
-        """Create a CPU copy without mutating the original tensor storage."""
-        if self._state == self.STATE_NON_TENSOR:
-            return
-        if self._state != self.STATE_DEVICE:
-            warnings.warn(
-                f"[MindSporeSwapTensor.async_offload] Invalid state: current={self._state}, "
-                f"expected 'device'. Operation skipped."
-            )
-            return
-        self.val_cpu = self.val.to('CPU')
-        self._state = self.STATE_D2H
-
-    def wait_offload(self):
-        if self._state == self.STATE_NON_TENSOR:
-            return
-        if self._state == self.STATE_HOST:
-            return
-        if self._state != self.STATE_D2H:
-            warnings.warn(
-                f"[MindSporeSwapTensor.wait_offload] Called in invalid state: {self._state}. "
-                f"Expected 'd2h'. Skipped."
-            )
-            return
-        self.val = None
-        self._state = self.STATE_HOST
-
-
 class AsyncSaveOnCpu(ms.saved_tensors_hooks):
     """
     Context manager to offload tensors to CPU during forward pass.
@@ -319,7 +230,7 @@ class AsyncSaveOnCpu(ms.saved_tensors_hooks):
                 group_name = SwapManager().get_current_group_name()
                 SwapManager().add_storage(group_name, self.storage)
                 self.add_to_storage = True
-            self.storage.swap_storage[self.count_idx].append(MindSporeSwapTensor(tensor))
+            self.storage.swap_storage[self.count_idx].append(SwapTensor(tensor))
             idx = self.count_idx
             self.count_idx += 1
             self.pack_count += 1

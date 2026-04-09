@@ -926,6 +926,11 @@ class TorchPlatform(Platform):
         return AsyncSaveOnCpu(policy_fn)
 
     @staticmethod
+    def get_element_size(tensor):
+        """Get Tensor Element Size"""
+        return tensor.element_size()
+
+    @staticmethod
     def tensor_to_numpy(tensor) -> np.ndarray:
         """Convert PyTorch tensor to numpy array."""
         return tensor.cpu().numpy()
