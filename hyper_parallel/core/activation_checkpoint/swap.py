@@ -217,6 +217,10 @@ class SwapGroup:
 
     def wait_offload(self):
         """Wait for offload to complete for all storages in the group."""
+        if self._offload_event is None:
+            raise RuntimeError(
+                f"SwapGroup '{self.group_name}' wait_offload() called before launch_offload()."
+            )
         compute_stream = platform.get_current_stream()
         stream_context = platform.get_stream_context()
         with platform.no_grad(), stream_context(compute_stream):
@@ -239,6 +243,10 @@ class SwapGroup:
 
     def wait_load(self):
         """Wait for load to complete for all storages in the group."""
+        if self._load_event is None:
+            raise RuntimeError(
+                f"SwapGroup '{self.group_name}' wait_load() called before launch_load()."
+            )
         compute_stream = platform.get_current_stream()
         stream_context = platform.get_stream_context()
         with platform.no_grad(), stream_context(compute_stream):

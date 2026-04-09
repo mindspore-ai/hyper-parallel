@@ -14,12 +14,14 @@
 # ============================================================================
 """Activation Swap memory comparison: None vs Swap"""
 import copy
+import pytest
 import torch
 
 from tests.torch.common_net import SimpleTransformer
 from tests.torch.activation_checkpoint.utils import prepare_data, train_one_mode, seed_memory_time_context
 from hyper_parallel.core.activation_checkpoint import SwapManager, swap_wrapper
 from hyper_parallel.core.activation_checkpoint.activation_checkpoint import CheckpointPolicy, swap
+from hyper_parallel.core.activation_checkpoint.swap import SwapGroup
 
 
 def apply_swap(model, mode):
@@ -318,3 +320,23 @@ def test_swap_wrapper_accepts_func():
             f"Loss mismatch at step {step}: "
             f"ref={ref_loss.item():.8f}, swap={swap_loss.item():.8f}, diff={diff:.2e}"
         )
+
+
+@pytest.mark.parametrize("wait_fn, launch_keyword", [
+    ("wait_offload", "launch_offload"),
+    ("wait_load", "launch_load"),
+])
+def test_swap_group_wait_requires_launch(wait_fn: str, launch_keyword: str):
+    """
+    Feature: SwapGroup state guard — wait before launch
+    Description: calling wait_offload/wait_load before the corresponding launch
+                 on a new SwapGroup must raise RuntimeError
+    Expectation: raise RuntimeError mentioning the required launch call
+
+    Args:
+        wait_fn: Name of the wait method to invoke ("wait_offload" or "wait_load").
+        launch_keyword: Substring expected in the RuntimeError message.
+    """
+    group = SwapGroup("test_group")
+    with pytest.raises(RuntimeError, match=launch_keyword):
+        getattr(group, wait_fn)()
