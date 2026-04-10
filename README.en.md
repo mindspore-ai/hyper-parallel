@@ -86,7 +86,7 @@ Key design principles:
     - Multi-Core Parallelism
         - [ ] Multi-Core Parallelism - O0: Through framework-level host CPU scheduling, supports cube, vector, and one-sided communication operator execution across cores;
         - [ ] Multi-Core Parallelism - O1: Scheduling offloaded to AICore, supports cube, vector, and one-sided communication operator execution across cores, further improving performance;
-        - [ ] MoE Compute-Communication Overlap Optimisation Based on Multi-Core Parallelism
+        - [x] MoE Compute-Communication Overlap Optimisation Based on Multi-Core Parallelism
         - [ ] PP 1B1F Compute-Communication Overlap Optimisation Based on Multi-Core Parallelism
 
 - HyperOffload
@@ -195,7 +195,7 @@ run_model(x, model)
 from hyper_parallel import PipelineStage, Schedule1F1B
 
 # Wrap the partitioned module into PipelineStage
-stage = PipelineStage(splited_model, stage_index, stage_num=4)
+stage = PipelineStage(split_model, stage_index, stage_num=4)
 
 # Select pipeline parallel scheduling
 schedule = Schedule1F1B(stage, micro_batch_num=8)
@@ -204,6 +204,10 @@ schedule = Schedule1F1B(stage, micro_batch_num=8)
 x = DTensor.from_local(local_x, x_layout)
 schedule.run(x)
 ```
+
+4. Use MoE Compute-Communication Overlap Optimisation Based on Multi-Core Parallelism
+
+For details, see the [MOE-FFN Documentation](./hyper_parallel/core/multicore/doc/README.md).
 
 ## Contributing
 

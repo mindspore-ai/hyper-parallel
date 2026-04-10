@@ -121,7 +121,7 @@ class BuildPy(build_py):
         hyper_parallel_lib_dir = os.path.join(
             os.path.dirname(__file__), 'build', 'lib', 'hyper_parallel')
         shutil.rmtree(hyper_parallel_lib_dir, ignore_errors=True)
-        self._run_shell_script("scripts/build_symmetric_memory.sh")
+        self._run_shell_script_optional("scripts/build_symmetric_memory.sh")
         self._run_shell_script_optional("scripts/build_multicore.sh")
         super().run()
         update_permissions(hyper_parallel_lib_dir)

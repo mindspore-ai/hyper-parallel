@@ -10,6 +10,42 @@ if(DEFINED ENV{MINDSPORE_PATH})
     set(MS_PATH $ENV{MINDSPORE_PATH})
     message(STATUS "Using MINDSPORE_PATH environment variable: ${MS_PATH}")
 else()
+    execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import mindspore"
+    RESULT_VARIABLE TEST_MINDSPORE
+    OUTPUT_QUIET
+    ERROR_QUIET
+    )
+    if(TEST_MINDSPORE GREATER 0)
+        message(WARNING "MindSpore not found. Installing automatically...")
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} -m pip install mindspore==2.8.0
+            RESULT_VARIABLE PIP_INSTALL_RESULT
+        )
+        if(NOT PIP_INSTALL_RESULT EQUAL 0)
+            message(FATAL_ERROR "Failed to install MindSpore.")
+        endif()
+    else()
+        execute_process(
+            COMMAND ${Python3_EXECUTABLE} -c "import mindspore; print(mindspore.__version__)"
+            OUTPUT_VARIABLE MS_VERSION_RAW
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        message(STATUS "Detected MindSpore version: ${MS_VERSION_RAW}")
+
+        if(MS_VERSION_RAW VERSION_LESS "2.8.0")
+            message(WARNING "MindSpore version ${MS_VERSION_RAW} is too old. Installing required version 2.8.0...")
+            execute_process(
+                COMMAND ${Python3_EXECUTABLE} -m pip install mindspore==2.8.0
+                RESULT_VARIABLE PIP_INSTALL_RESULT
+            )
+            if(NOT PIP_INSTALL_RESULT EQUAL 0)
+                message(FATAL_ERROR "Failed to upgrade to MindSpore 2.8.0.")
+            endif()
+        else()
+            message(STATUS "MindSpore version meets the requirement (≥2.8.0)")
+        endif()
+    endif()
     # Get MindSpore installation path using Python - get the last line of output
     execute_process(
         COMMAND ${Python3_EXECUTABLE} -c "import mindspore as ms; print(ms.__file__)"
@@ -38,17 +74,15 @@ else()
     message(STATUS "Number of output lines: ${NUM_LINES}")
     message(STATUS "Extracted MindSpore path: ${MS_MODULE_PATH}")
 
-    # Validate the result
-    if(NOT PYTHON_RESULT EQUAL 0)
-        message(FATAL_ERROR "Failed to find MindSpore installation: ${PYTHON_ERROR}")
-    endif()
 
     if(NOT MS_MODULE_PATH MATCHES ".*mindspore.*")
+        execute_process(COMMAND ${CMAKE_COMMAND} -E echo "")
         message(FATAL_ERROR "Invalid MindSpore path detected: ${MS_MODULE_PATH}")
     endif()
 
     if(NOT PYTHON_RESULT EQUAL 0)
-        message(FATAL_ERROR "Failed to find MindSpore installation."
+        execute_process(COMMAND ${CMAKE_COMMAND} -E echo "")
+        message(FATAL_ERROR "Failed to find MindSpore installation: ${PYTHON_ERROR}."
         "Please ensure MindSpore is installed or set MINDSPORE_PATH environment variable.")
     endif()
 

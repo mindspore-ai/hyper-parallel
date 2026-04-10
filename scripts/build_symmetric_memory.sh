@@ -49,9 +49,11 @@ MANUAL_GCC_ROOT=${MANUAL_GCC_ROOT:-""}
 
 function is_bisheng_header_le_730() {
     bisheng -v -E -x c++ 2>&1 /dev/null | \
-        grep -E "^ /.*include/c\+\+/[0-9.]+" | head -1 | \
-        grep -oE "[0-9]+\.[0-9]+\.?[0-9]*" | \
-        awk -F '.' '{v=$1*10000+$2*100+($3? $3 : 0); exit(v<70300? 0 : 1)}'
+    grep -E "^ /.*/include/c\+\+/[0-9]+(\.[0-9]+)*(/|$)" | head -1 | \
+    sed -nE 's/.*c\+\+\/([0-9]+(\.[0-9]+)*).*/\1/p' | \
+    awk -F '.' '{
+        v = $1 * 10000 + ($2 ? $2 * 100 : 0) + ($3 ? $3 : 0); exit(v < 70300 ? 0 : 1);
+}'
 }
 
 function detect_gcc_path() {
@@ -242,7 +244,7 @@ function build_shmem() {
 
 function build_aclshmem_ops() {
     echo "build aclshmem ops start"
-    cd "$PROJECT_ROOT"/hyper_parallel/ccsrc/symmetric_memory/ops || exit
+    cd "$PROJECT_ROOT"/hyper_parallel/core/symmetric_memory/ops || exit
     OPS_BUILD_DIR=$BUILD_DIR/symmetric_memory/ops
     rm -rf $OPS_BUILD_DIR
     mkdir -p $OPS_BUILD_DIR
@@ -257,7 +259,7 @@ function build_aclshmem_ops() {
 
 function build_torch_library() {
     echo "build torch library start"
-    cd "$PROJECT_ROOT"/hyper_parallel/ccsrc/symmetric_memory/platform/torch || exit
+    cd "$PROJECT_ROOT"/hyper_parallel/core/symmetric_memory/platform/torch || exit
     TORCH_BUILD_DIR=$BUILD_DIR/symmetric_memory/torch
     rm -rf $TORCH_BUILD_DIR
     mkdir -p $TORCH_BUILD_DIR
@@ -271,8 +273,7 @@ function build_torch_library() {
 
 function build_ms_library() {
     echo "build mindspore library start"
-    pip install mindspore==2.8.0
-    cd "$PROJECT_ROOT"/hyper_parallel/ccsrc/symmetric_memory/platform/mindspore || exit
+    cd "$PROJECT_ROOT"/hyper_parallel/core/symmetric_memory/platform/mindspore || exit
     MS_BUILD_DIR="$BUILD_DIR"/symmetric_memory/mindspore
     rm -rf $MS_BUILD_DIR
     mkdir -p $MS_BUILD_DIR

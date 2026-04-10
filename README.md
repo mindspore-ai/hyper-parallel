@@ -5,7 +5,7 @@
 HyperParallel提供昇腾超节点亲和的分布式并行加速能力，在保障易用性的前提下，针对昇腾超节点资源池化、对等架构、网路拓扑分层多样、FP8低精格式等架构特点，实现了集群的分布式并行到芯片内多核并行，支持CPU DRAM和NPU HBM的池化统一管理，支持拓扑感知调度和通信路径规划，支持FP8混合精度训练等昇腾超节点亲和的加速能力。  
 关键设计思路:  
 **模型和系统优化解耦**：随着LLM和多模态算法新架构的不断演进，性能优化技术也随之向前持续创新，传统的算法和系统优化融合架构给算法迭代和系统长期维护带来了困难。我们希望通过HyperParallel，支持编程模型从系统优化内嵌到模型脚本演进到模型和系统优化解耦，隐式注入并行、重计算、offload等系统优化；支持并行范式从SPMD演进到MPMD，进一步支持集群MPMD和多核MPMD协同优化；支持存算关系从Stateful演进到Stateless计算状态分离。支持大语言模型、多模态大模型训练及强化学习等能力。  
-**全流程确定性**：为了进一步保障训练稳定性和精度可复现性，HyperPrallel支持了全流程的确定性，包括高性能确定性计算、通信、数据预处理、以及随机数的确定性，支持浮点bitwise对齐，所有支持的模型均会用确定性进行验证。虽然有部分的性能劣化，但出于对训练精度可复现性、SDC的快速发现、bug识别，我们仍然建议训练开启确定性。  
+**全流程确定性**：为了进一步保障训练稳定性和精度可复现性，HyperParallel支持了全流程的确定性，包括高性能确定性计算、通信、数据预处理、以及随机数的确定性，支持浮点bitwise对齐，所有支持的模型均会用确定性进行验证。虽然有部分的性能劣化，但出于对训练精度可复现性、SDC的快速发现、bug识别，我们仍然建议训练开启确定性。  
 **训推一体**：随着Reasoning RL和Agentic RL任务越来越复杂，训推不一致问题导致强化学习训练难以收敛的问题愈发突出。HyperParallel会探索训推一体架构，通过一套加速框架同时实现训练和推理的性能优化，加强训推一致性，保障RL收敛。  
 **动静混合**：基于静态图的优化是进一步提升性能的重要手段，比如基于静态图的通算并发、内存分析、执行序编排等能力可以有效优化性能，在动态图模式下并不容易实现。但动转静的编译支持难度非常大，目前还不能实现完全的动转静。HyperParallel会通过一些语法的约束，支持局部的动转静，使用MindSpore高阶图优化能力，进一步提升性能。
 
@@ -47,7 +47,7 @@ HyperParallel提供昇腾超节点亲和的分布式并行加速能力，在保�
         - [ ] DTensor centric communication
         - [ ] Cross Mesh DTensor redistribution
     - HSDP
-        - [x] Parameter&Opitmizer切分
+        - [x] Parameter&Optimizer切分
         - [x] Parameter&Optimizer&Gradient切分
         - [x] Overlap
         - [ ] 动转静
@@ -86,7 +86,7 @@ HyperParallel提供昇腾超节点亲和的分布式并行加速能力，在保�
     - 多核并行
         - [ ] 多核并行 - O0：通过框架层host cpu侧的调度，支持cube、vector、单边通信算子分核执行；
         - [ ] 多核并行 - O1：调度下沉到AICore，支持cube、vector、单边通信算子分核执行，进一步提升性能；
-        - [ ] 基于多核并行优化MoE通算掩盖
+        - [x] 基于多核并行优化MoE通算掩盖
         - [ ] 基于多核并行优化PP 1B1F通算掩盖
 
 - HyperOffload
@@ -195,7 +195,7 @@ run_model(x, model)
 from hyper_parallel import PipelineStage, Schedule1F1B
 
 # 将切分后的module封装成PipelineStage
-stage = PipelineStage(splited_model, stage_index, stage_num=4)
+stage = PipelineStage(split_model, stage_index, stage_num=4)
 
 # 选择流水线并行的调度
 schedule = Schedule1F1B（stage, micro_batch_num=8）
@@ -204,6 +204,10 @@ schedule = Schedule1F1B（stage, micro_batch_num=8）
 x = DTensor.from_local(local_x, x_layout)
 schedule.run(x)
 ```
+
+4. 使用基于多核并行的MOE通算掩盖算子
+
+详见[MOE-FFN说明](./hyper_parallel/core/multicore/doc/README.md)。
 
 ## 参与贡献
 
