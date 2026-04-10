@@ -209,6 +209,16 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement tensor_type_cast")
 
     @staticmethod
+    def is_tensor(obj: Any) -> bool:
+        """Return True if ``obj`` is this framework's tensor type."""
+        raise NotImplementedError("Platform subclasses must implement is_tensor")
+
+    @staticmethod
+    def get_tensor_storage_size(tensor: Any) -> int:
+        """Return serialized byte size (numel * element size) for this framework's tensor."""
+        raise NotImplementedError("Platform subclasses must implement get_tensor_storage_size")
+
+    @staticmethod
     def differentiable_all_reduce(data, op, group):
         """Perform differentiable all-reduce operation.
 
@@ -1222,3 +1232,27 @@ class Platform:
             A context manager for device-specific initialization.
         """
         raise NotImplementedError("Platform subclasses must implement init_on_device")
+
+    def str_to_dtype(self, dtype_str: str) -> Any:
+        """
+        Map a framework-style dtype string (e.g. ``torch.float32``) to the backend dtype object.
+
+        Args:
+            dtype_str (str): Serialized dtype identifier produced by checkpoint metadata.
+
+        Returns:
+            Framework dtype object (e.g. ``torch.dtype`` or MindSpore dtype).
+        """
+        raise NotImplementedError("Platform subclasses must implement str_to_dtype")
+
+    def list_to_size(self, size_list: list[int]) -> Any:
+        """
+        Convert a shape list from checkpoint metadata to the framework's size type (e.g. ``torch.Size``).
+
+        Args:
+            size_list (list[int]): Tensor global shape as a list of ints.
+
+        Returns:
+            Framework-specific size object.
+        """
+        raise NotImplementedError("Platform subclasses must implement list_to_size")

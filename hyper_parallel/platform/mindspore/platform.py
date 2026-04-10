@@ -14,7 +14,7 @@
 # ============================================================================
 """MindSpore platform api"""
 from datetime import timedelta
-from typing import Optional
+from typing import Any, Optional
 import dataclasses
 from collections import OrderedDict
 
@@ -443,6 +443,20 @@ class MindSporePlatform(Platform):
         return type_size_in_bytes(param.dtype)
 
     @staticmethod
+    def is_tensor(obj: Any) -> bool:
+        """Return True if ``obj`` is a ``mindspore.Tensor``."""
+        return isinstance(obj, Tensor)
+
+    @staticmethod
+    def get_tensor_storage_size(tensor: Any) -> int:
+        """Return serialized byte size (numel * itemsize) for a MindSpore tensor."""
+        if not MindSporePlatform.is_tensor(tensor):
+            raise TypeError(
+                f"MindSporePlatform.get_tensor_storage_size expects mindspore.Tensor, got {type(tensor)!r}"
+            )
+        return int(tensor.numel()) * int(tensor.itemsize)
+
+    @staticmethod
     def new_zero_parameter(param_shape, param_type, requires_grad, device):
         param = Parameter(initializer("zeros", param_shape, param_type), requires_grad=requires_grad)
         if device in ("GPU", "Ascend"):
@@ -564,8 +578,18 @@ class MindSporePlatform(Platform):
         )
 
     @staticmethod
-    def save_checkpoint(cell: Cell, file_path: str, ckpt_format: str = "safetensors") -> None:
-        save_dict = cell._params
+    def save_checkpoint(cell: Cell | dict, file_path: str, ckpt_format: str = "safetensors") -> None:
+        if isinstance(cell, dict):
+            save_dict = {}
+            for k, v in cell.items():
+                if isinstance(v, Parameter):
+                    save_dict[k] = v
+                elif isinstance(v, Tensor):
+                    save_dict[k] = Parameter(v, name=k)
+                else:
+                    save_dict[k] = v
+        else:
+            save_dict = cell._params
         ms.save_checkpoint(save_obj=save_dict, ckpt_file_name=file_path, format=ckpt_format)
 
     @staticmethod
@@ -875,3 +899,19 @@ class MindSporePlatform(Platform):
     def profiler_record(name):
         """Profiler context manager for recording operations using mindspore.profiler."""
         return contextlib.nullcontext()
+
+    def str_to_dtype(self, dtype_str: str) -> Any:
+        """Resolve checkpoint dtype strings (``mindspore.*`` or short ``str(Tensor.dtype)`` e.g. ``Float32``)."""
+        if "." in dtype_str:
+            prefix, name = dtype_str.split(".", 1)
+            if prefix == "mindspore":
+                return getattr(ms, name)
+        dtype = getattr(ms, dtype_str.lower(), None)
+        if dtype is not None:
+            return dtype
+        raise ValueError(
+            f"Expected dtype string like 'mindspore.float32' or 'Float32', got {dtype_str!r}."
+        )
+
+    def list_to_size(self, size_list: list[int]) -> tuple[int, ...]:
+        return tuple(size_list)

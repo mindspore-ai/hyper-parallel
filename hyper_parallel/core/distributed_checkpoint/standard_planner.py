@@ -31,6 +31,8 @@ from hyper_parallel.core.distributed_checkpoint.util import (
     chunk_to_area,
     create_chunk_list_for_tensor,
     remove_redundant_plans,
+    flatten_state_dict,
+    set_element,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor, Layout
 from hyper_parallel.platform import get_platform
@@ -49,6 +51,7 @@ class StandardSavePlanner(SavePlanner):
         self.remove_redundancy: bool = True
         self.save_to_minimum_rank: bool = True
         self._tensor_cache: dict[MetadataIndex, Any] = {}  # Cache for tensor data
+        self.flatten_state_dict: bool = True
 
     def configure_planner(self, state_dict: dict[str, Any], **kwargs) -> None:
         """
@@ -64,6 +67,10 @@ class StandardSavePlanner(SavePlanner):
         self.rank = kwargs.get("rank", 0)
         self.remove_redundancy = kwargs.get("remove_redundancy", True)
         self.save_to_minimum_rank = kwargs.get("save_to_minimum_rank", True)
+        self.flatten_state_dict = kwargs.get("flatten_state_dict", True)
+        if self.flatten_state_dict:
+            state_dict, self.name_mapping = flatten_state_dict(state_dict)
+        self.state_dict = state_dict
 
     def build_local_plan(self) -> SavePlan:
         """
@@ -184,7 +191,10 @@ class StandardSavePlanner(SavePlanner):
                 )
                 items.append(write_item)
 
-        return SavePlan(items=items)
+        plan = SavePlan(items=items)
+        if self.flatten_state_dict:
+            plan.planner_data = self.name_mapping
+        return plan
 
     def build_global_plan(self, all_plans: list[SavePlan]) -> tuple[list[SavePlan], Metadata]:
         """
@@ -251,6 +261,11 @@ class StandardSavePlanner(SavePlanner):
             )
 
         metadata = Metadata(state_dict_metadata=state_dict_metadata)
+        if self.flatten_state_dict:
+            merged_mapping = {}
+            for p in all_plans:
+                merged_mapping.update(p.planner_data)
+            metadata.planner_data = merged_mapping
         return final_global_plans, metadata
 
     def _update_tensor_cache(self, plan: SavePlan) -> None:
@@ -388,6 +403,7 @@ class StandardLoadPlanner(LoadPlanner):
         self.is_coordinator: bool = False
         self.rank: int = 0
         self.allow_partial_load = allow_partial_load
+        self.flatten_state_dict: bool = True
 
     def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs) -> None:
         """
@@ -402,6 +418,11 @@ class StandardLoadPlanner(LoadPlanner):
         self.metadata = metadata
         self.is_coordinator = kwargs.get("is_coordinator", False)
         self.rank = kwargs.get("rank", 0)
+        self.flatten_state_dict = kwargs.get("flatten_state_dict", True)
+        self.original_state_dict = state_dict
+        if self.flatten_state_dict:
+            state_dict, self.name_mapping = flatten_state_dict(state_dict)
+        self.state_dict = state_dict
 
     def build_local_plan(self) -> LoadPlan:
         """
@@ -546,3 +567,42 @@ class StandardLoadPlanner(LoadPlanner):
         # Deserialize bytes
         obj = pickle.loads(value)
         self.state_dict[fqn] = obj
+        if self.flatten_state_dict:
+            set_element(self.original_state_dict, self.name_mapping[fqn], obj)
+
+
+
+class _DcpMergeLoadPlanner(StandardLoadPlanner):
+    """Load planner that builds distributed checkpoint from dcp into fully ``state_dict`` (in-place)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def configure_planner(self, state_dict: dict[str, Any], metadata: Metadata, **kwargs) -> None:
+        if len(state_dict) > 0:
+            raise ValueError(
+                "state_dict must be empty for _DcpMergeLoadPlanner; "
+                "it is populated in-place from checkpoint metadata."
+            )
+
+        if metadata is None:
+            raise ValueError("metadata must not be None for _DcpMergeLoadPlanner.")
+
+        self.is_coordinator = kwargs.get("is_coordinator", False)
+        for k, v in metadata.state_dict_metadata.items():
+            if isinstance(v, TensorStorageMetadata):
+                v = platform.empty(
+                    platform.list_to_size(v.size),
+                    dtype=platform.str_to_dtype(v.properties.dtype),
+                )
+
+            state_dict[k] = v
+            if metadata.planner_data is not None and k in metadata.planner_data:
+                set_element(state_dict, metadata.planner_data[k], v)
+
+        super().configure_planner(
+            state_dict,
+            metadata,
+            is_coordinator=self.is_coordinator,
+            flatten_state_dict=True,
+        )
