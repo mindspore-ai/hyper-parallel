@@ -41,6 +41,7 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 import mindspore as ms
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState, ShardedState
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.fully_shard.scheduler import MindSporeHSDPSchedulerV2
@@ -590,8 +591,82 @@ class TestParameterRebinding(unittest.TestCase):
         self.assertEqual(param.sharded_state, ShardedState.SHARDED)
 
 
+class TestPrefetchStateMachine(unittest.TestCase):
+    """Test the shared per-parameter unshard/prefetch state machine."""
+
+    def _make_param(self):
+        """Create a lightweight fully_shard param object with mocked hooks."""
+        param = object.__new__(MindSporeHSDPParamV2)
+        param.sharded_state = ShardedState.SHARDED
+        param.prefetch_handle = None
+        param._assert_in_states = MagicMock()
+        param._get_unsharded_param_data = MagicMock()
+        param.init_unsharded_param = MagicMock()
+        param.to_unsharded = MagicMock()
+        param.to_sharded = MagicMock()
+        return param
+
+    def test_async_unshard_uses_prefetch_handle_as_pending_state(self):
+        """
+        Feature: per-parameter prefetch
+        Description: async unshard should record the backend handle as the pending state
+        Expectation: the handle is stored and used by wait_for_unshard
+        """
+        param = self._make_param()
+        mock_handle = MagicMock()
+        param._get_unsharded_param_data.return_value = (MagicMock(name="output"), mock_handle)
+
+        param.unshard(async_op=True)
+
+        param._get_unsharded_param_data.assert_called_once_with(async_op=True)
+        self.assertIs(param.prefetch_handle, mock_handle)
+
+    def test_sync_unshard_is_noop_when_pending_prefetch_exists(self):
+        """
+        Feature: per-parameter prefetch
+        Description: sync unshard should not reissue communication or eagerly consume a pending prefetch
+        Expectation: pending handle remains until wait_for_unshard() explicitly finishes the transition
+        """
+        param = self._make_param()
+        mock_handle = MagicMock()
+        param._get_unsharded_param_data.return_value = (MagicMock(name="output"), mock_handle)
+
+        param.unshard(async_op=True)
+        param.unshard(async_op=False)
+
+        param._get_unsharded_param_data.assert_called_once_with(async_op=True)
+        mock_handle.wait.assert_not_called()
+        param.init_unsharded_param.assert_not_called()
+        param.to_unsharded.assert_not_called()
+        self.assertIs(param.prefetch_handle, mock_handle)
+
+    def test_sync_unshard_records_handle_and_wait_for_unshard_finishes_transition(self):
+        """
+        Feature: per-parameter prefetch
+        Description: sync unshard should match torch semantics by issuing communication and deferring the transition
+        Expectation: the handle is recorded first, then wait_for_unshard completes the transition
+        """
+        param = self._make_param()
+        mock_handle = MagicMock()
+        param._get_unsharded_param_data.return_value = (MagicMock(name="output"), mock_handle)
+
+        param.unshard(async_op=False)
+        self.assertIs(param.prefetch_handle, mock_handle)
+
+        param.wait_for_unshard()
+
+        param._get_unsharded_param_data.assert_called_once_with(async_op=False)
+        mock_handle.wait.assert_called_once_with()
+        param.init_unsharded_param.assert_called_once_with()
+        param.to_unsharded.assert_called_once_with()
+        self.assertIsNone(param.prefetch_handle)
+
+
 class TestSchedulerBackwardCompatFlow(unittest.TestCase):
     """Test MindSpore scheduler behavior added by the backward-compat refactor."""
+
+    def tearDown(self):
+        HSDPSchedulerV2.root_bp_state = False
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.scheduler._pynative_executor")
     def test_backward_pre_hook_queues_final_callback_before_pre_backward(self, mock_executor):
@@ -604,13 +679,14 @@ class TestSchedulerBackwardCompatFlow(unittest.TestCase):
         scheduler.scheduler_state = FSDPSchedulerState.PRE_FORWARD
         scheduler.cell = MagicMock()
         scheduler._hsdp_backward_pre_hook = MagicMock()
-        scheduler._backward_hook = MagicMock()
+        scheduler._root_backward_hook = MagicMock()
         grad = MagicMock()
 
         result = scheduler._backward_pre_hook(grad)
 
-        mock_executor.queue_backward_final_callback.assert_called_once_with(scheduler._backward_hook)
+        mock_executor.queue_backward_final_callback.assert_called_once_with(scheduler._root_backward_hook)
         scheduler._hsdp_backward_pre_hook.assert_called_once_with(scheduler.cell, None)
+        self.assertTrue(HSDPSchedulerV2.root_bp_state)
         self.assertIs(result, grad)
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.scheduler._pynative_executor")
@@ -624,14 +700,97 @@ class TestSchedulerBackwardCompatFlow(unittest.TestCase):
         scheduler.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
         scheduler.cell = MagicMock()
         scheduler._hsdp_backward_pre_hook = MagicMock()
-        scheduler._backward_hook = MagicMock()
+        scheduler._root_backward_hook = MagicMock()
         grad = MagicMock()
 
         result = scheduler._backward_pre_hook(grad)
 
-        mock_executor.queue_backward_final_callback.assert_called_once_with(scheduler._backward_hook)
+        mock_executor.queue_backward_final_callback.assert_called_once_with(scheduler._root_backward_hook)
         scheduler._hsdp_backward_pre_hook.assert_not_called()
         self.assertIs(result, grad)
+
+    def test_forward_pre_hook_disables_prefetch_during_recompute(self):
+        """
+        Feature: recompute forward guard
+        Description: During activation recompute, forward pre hook should suppress prefetch issuance
+        Expectation: forward_prefetch_cells is cleared before entering the shared pre-forward path
+        """
+        scheduler = object.__new__(MindSporeHSDPSchedulerV2)
+        scheduler.scheduler_state = FSDPSchedulerState.FORWARD
+        scheduler.forward_prefetch_cells = [MagicMock(name="next_cell")]
+        scheduler._backup_forward_fetch = None
+        scheduler._hsdp_forward_pre_hook = MagicMock(return_value=(("arg",), {"k": "v"}))
+        scheduler._register_post_backward_hook = MagicMock(return_value=("wrapped_args", "wrapped_kwargs"))
+
+        HSDPSchedulerV2.root_bp_state = True
+
+        result = scheduler._forward_pre_hook(MagicMock(), ("arg",), {"k": "v"})
+
+        self.assertEqual(scheduler.forward_prefetch_cells, [])
+        self.assertEqual(len(scheduler._backup_forward_fetch), 1)
+        scheduler._hsdp_forward_pre_hook.assert_called_once()
+        scheduler._register_post_backward_hook.assert_called_once_with(("arg",), {"k": "v"})
+        self.assertEqual(result, ("wrapped_args", "wrapped_kwargs"))
+
+    def test_forward_hook_restores_prefetch_after_recompute(self):
+        """
+        Feature: recompute forward guard
+        Description: During activation recompute, forward hook should restore prefetched
+                     targets and skip post-forward logic
+        Expectation: forward prefetch list is restored after registering backward hooks
+        """
+        scheduler = object.__new__(MindSporeHSDPSchedulerV2)
+        scheduler.scheduler_state = FSDPSchedulerState.PRE_FORWARD
+        scheduler.forward_prefetch_cells = []
+        restored_prefetch = [MagicMock(name="next_cell")]
+        scheduler._backup_forward_fetch = restored_prefetch.copy()
+        scheduler._register_backward_pre_hook = MagicMock()
+        scheduler._hsdp_forward_hook = MagicMock()
+        outputs = MagicMock(name="outputs")
+
+        HSDPSchedulerV2.root_bp_state = True
+
+        result = scheduler._forward_hook(MagicMock(), MagicMock(), outputs)
+
+        scheduler._register_backward_pre_hook.assert_called_once_with(outputs)
+        scheduler._hsdp_forward_hook.assert_not_called()
+        self.assertIsNone(result)
+        self.assertEqual(scheduler.forward_prefetch_cells, restored_prefetch)
+        self.assertIsNone(scheduler._backup_forward_fetch)
+
+    def test_root_backward_hook_resets_root_backward_state(self):
+        """
+        Feature: recompute forward guard
+        Description: Final root backward hook should clear the shared recompute state
+        Expectation: root_bp_state is reset after the outermost post-backward finishes
+        """
+        scheduler = object.__new__(MindSporeHSDPSchedulerV2)
+        scheduler.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
+        scheduler._backward_hook = MagicMock()
+
+        HSDPSchedulerV2.root_bp_state = True
+
+        scheduler._root_backward_hook()
+
+        scheduler._backward_hook.assert_called_once_with()
+        self.assertFalse(HSDPSchedulerV2.root_bp_state)
+
+    def test_root_backward_hook_keeps_root_state_for_non_root_callback(self):
+        """
+        Feature: recompute forward guard
+        Description: Non-root final callbacks should not clear the shared recompute state
+        Expectation: root_bp_state remains set until the outermost callback runs
+        """
+        scheduler = object.__new__(MindSporeHSDPSchedulerV2)
+        scheduler.scheduler_state = FSDPSchedulerState.BACKWARD
+        scheduler._backward_hook = MagicMock()
+
+        HSDPSchedulerV2.root_bp_state = True
+
+        scheduler._root_backward_hook()
+
+        scheduler._backward_hook.assert_called_once_with()
+        self.assertTrue(HSDPSchedulerV2.root_bp_state)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,8 @@ class HSDPSchedulerContext:
 
 class HSDPSchedulerV2:
     """HSDPScheduler is used to scheduler hsdp"""
+    root_bp_state = False
+
     def __init__(self, cell: Union[platform.Module, Tuple[platform.Module, ...]], mesh,
                  reshard_after_forward, shard_placement_fn,
                  mp_policy, offload_policy, ignored_params, replicate_params, device, comm_fusion):
@@ -58,6 +60,7 @@ class HSDPSchedulerV2:
         self.scheduler_state = None
         self.forward_prefetch_cells = []
         self.backward_prefetch_cells = []
+        self._backup_forward_fetch = None
         self.scheduler_ctx = HSDPSchedulerContext()
         # When ``fully_shard`` is given multiple root modules, forward pre/post hooks coordinate
         # so unshard / PostBackward / reshard run once per forward (aligned with PyTorch FSDP2).
@@ -142,14 +145,12 @@ class HSDPSchedulerV2:
     # pylint: disable=W0613
     def _hsdp_forward_pre_hook(self, cell, args, kwargs):
         """Forward pre hook to unsharded parameter for forward process."""
-        if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
-            return args, kwargs
         self.scheduler_state = FSDPSchedulerState.PRE_FORWARD
+        self.hsdp_state.lazy_init()
         if self.mp_policy.cast_forward_inputs and self.mp_policy.param_dtype:
             cast_fn = functools.partial(self.platform.cast_fp_tensor, self.mp_policy.param_dtype)
             args = self.platform.apply_to_tensors(cast_fn, args)
             kwargs = self.platform.apply_to_tensors(cast_fn, kwargs)
-        self.hsdp_state.lazy_init()
         with self.platform.profiler_record(f"pre_forward unshard:{self.hsdp_state.module_name}"):
             self.hsdp_state.unshard()
         for prefetch_cell in self.forward_prefetch_cells:
@@ -250,3 +251,16 @@ class HSDPSchedulerV2:
             hsdp_cell_list: HSDP cells to prefetch ahead of backward.
         """
         self.backward_prefetch_cells = hsdp_cell_list
+
+    def _disable_forward_prefetch_for_recompute(self) -> None:
+        """Temporarily disable forward prefetch during activation recompute."""
+        self._backup_forward_fetch = self.forward_prefetch_cells
+        self.forward_prefetch_cells = []
+
+    def _restore_forward_prefetch_after_recompute(self) -> bool:
+        """Restore forward prefetch list after a recompute forward hook finishes."""
+        if self._backup_forward_fetch is None:
+            return False
+        self.forward_prefetch_cells = self._backup_forward_fetch
+        self._backup_forward_fetch = None
+        return True
