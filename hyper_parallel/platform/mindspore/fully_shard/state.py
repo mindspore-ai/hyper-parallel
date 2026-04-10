@@ -39,8 +39,6 @@ def _to_dtype_if_needed(
 
 class MindSporeHSDPStateV2(HSDPState):
     """MindSpore HSDP cell state"""
-    pre_reduce_scatter_params = []
-    pre_all_reduce_params = []
 
     def __init__(self, cell, mesh_info, config, platform, device=None):
         super().__init__(cell, mesh_info, config, platform, device)
@@ -277,22 +275,6 @@ class MindSporeHSDPStateV2(HSDPState):
 
         self._ignored_allreduce_works.clear()
 
-    def reduce_params(self):
-        """Drain pending sharded parameter reductions and materialize sharded grads."""
-        while MindSporeHSDPStateV2.pre_reduce_scatter_params:
-            hsdp_param = MindSporeHSDPStateV2.pre_reduce_scatter_params.pop(0)
-            reduced_grad = hsdp_param.reduce_scatter_output()
-            self._div_if_needed(reduced_grad, hsdp_param.shard_world_size)
-            hsdp_param.clear_reduce_scatter_output()
-            self._apply_reduced_grad(hsdp_param, reduced_grad)
-
-        while MindSporeHSDPStateV2.pre_all_reduce_params:
-            hsdp_param = MindSporeHSDPStateV2.pre_all_reduce_params.pop(0)
-            reduced_grad = hsdp_param.all_reduce_output()
-            self._div_if_needed(reduced_grad, hsdp_param.replicate_world_size)
-            hsdp_param.clear_all_reduce_output()
-            self._apply_reduced_grad(hsdp_param, reduced_grad)
-
     def post_backward(self, *_):
         for hsdp_param in self.hsdp_params:
             hsdp_param.accumulate_unsharded_grad_if_needed()
@@ -306,7 +288,6 @@ class MindSporeHSDPStateV2(HSDPState):
             for replicate_param in self.replicate_params:
                 replicate_param.to_accumulated_grad_if_needed()
             return
-        self.reduce_params()
         self._allreduce_replicate_params()
         for hsdp_param in self.hsdp_params:
             if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
@@ -321,36 +302,20 @@ class MindSporeHSDPStateV2(HSDPState):
                     # forward — all ranks skip consistently.
                     continue
                 reduced_grad, _ = hsdp_param.reduce_scatter_grad(
-                    async_op=True,
                     dtype=self._reduce_dtype,
                     reduce_op=self.reduce_op_type
                 )
-                MindSporeHSDPStateV2.pre_reduce_scatter_params.append(hsdp_param)
-            else:
-                if hsdp_param.unsharded_param.grad is None:
-                    continue
-                reduced_grad = hsdp_param.unsharded_grad_data
+                self._div_if_needed(reduced_grad, hsdp_param.shard_world_size)
             if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
                 if not isinstance(hsdp_param.mesh_info, HSDPMeshInfo):
                     raise TypeError("hsdp_param.mesh_info must be HSDPMeshInfo")
-                if hsdp_param.shard_world_size > 1:
-                    reduced_grad = hsdp_param.reduce_scatter_output()
-                    if (
-                        MindSporeHSDPStateV2.pre_reduce_scatter_params
-                        and MindSporeHSDPStateV2.pre_reduce_scatter_params[-1] == hsdp_param
-                    ):
-                        MindSporeHSDPStateV2.pre_reduce_scatter_params.pop()
-                    hsdp_param.clear_reduce_scatter_output()
-                    self._div_if_needed(reduced_grad, hsdp_param.shard_world_size)
                 reduced_grad, _ = hsdp_param.all_reduce_grad(
                     grad=reduced_grad,
-                    async_op=True,
                     reduce_op=self.reduce_op_type,
                 )
-                MindSporeHSDPStateV2.pre_all_reduce_params.append(hsdp_param)
-                continue
-            if hsdp_param.shard_world_size <= 1:
-                self._apply_reduced_grad(hsdp_param, reduced_grad)
+                self._div_if_needed(reduced_grad, hsdp_param.replicate_world_size)
+            # Bind the reduced gradient to hsdp_param.sharded_param
+            self._apply_reduced_grad(hsdp_param, reduced_grad)
         self._finish_ignored_allreduce()
         if self.reshard_after_backward:
             self.shard()

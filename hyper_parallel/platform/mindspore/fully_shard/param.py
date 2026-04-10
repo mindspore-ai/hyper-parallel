@@ -38,20 +38,6 @@ from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo
 
 
-def _pack_for_reduce_scatter(local_tensor: ms.Tensor, shard_dim: int, world_size: int) -> ms.Tensor:
-    """Pack one local gradient into the row-major reduce-scatter layout.
-
-    MindSpore currently aligns with the torch non-comm-fusion V1 path:
-
-    - shard on dim 0: identity flatten
-    - shard on non-dim0: chunk on shard dim, then concatenate on dim 0
-    """
-    if world_size <= 1 or shard_dim == 0:
-        return local_tensor
-    chunks = ms.mint.chunk(local_tensor, world_size, dim=shard_dim)
-    return ms.mint.cat(chunks, dim=0).contiguous()
-
-
 def make_contiguous_strides_for(shape, row_major=True):
     """
     Compute strides for a contiguous tensor of the given shape.
@@ -147,10 +133,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._param_fqn: Optional[str] = None
         # Communication attributes for prefetch pattern
         self.prefetch_handle: Optional[CommHandle] = None
-        self._reduce_scatter_output = None
-        self.reduce_scatter_handle: Optional[CommHandle] = None
-        self._all_reduce_output = None
-        self.all_reduce_handle: Optional[CommHandle] = None
         self._post_load_hook_handle = (
             module_info.module.register_load_state_dict_post_hook(
                 lambda *args, **kwargs: self.reset_sharded_param()
@@ -558,20 +540,9 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._assert_in_states(ShardedState.UNSHARDED)
         self.to_sharded()
 
-    def reduce_scatter_output(self):
-        """Return cached reduce-scatter output after waiting pending async work."""
-        if self.reduce_scatter_handle is not None:
-            self.reduce_scatter_handle.wait()
-            self.reduce_scatter_handle = None
-        return self._reduce_scatter_output
-
-    def clear_reduce_scatter_output(self):
-        """Clear cached reduce-scatter output."""
-        self._reduce_scatter_output = None
-
     def reduce_scatter_grad(
         self,
-        async_op: bool = True,
+        async_op: bool = False,
         dtype: Optional[ms.Type] = None,
         reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.SUM
     ) -> Tuple[ms.Tensor, Optional[CommHandle]]:
@@ -595,17 +566,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             grad = self.unsharded_grad_data
         reduce_dtype = dtype or grad.dtype
         grad = grad.to(reduce_dtype)
-        plan_world_size = (
-            self.shard_world_size
-            if self.is_sharded
-            and isinstance(self.mesh_info, FSDPMeshInfo)
-            and self.mesh_info.shard_process_group is not None
-            and self.shard_world_size > 1
-            else 1
-        )
-        grad_flat = _pack_for_reduce_scatter(
-            grad, self.hsdp_placement.dim, plan_world_size
-        ).view(-1)
+        grad_flat = grad.view(-1)
 
         # If parameter is not sharded (below threshold), no reduce-scatter needed
         if not self.is_sharded:
@@ -620,20 +581,18 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
         # Calculate output size
         output_numel = grad_flat.numel() // self.shard_world_size
-        self._reduce_scatter_output = ms.mint.empty(
-            output_numel, dtype=reduce_dtype, device=grad.device.split(':')[0]
-        )
+        output = ms.mint.empty(output_numel, dtype=reduce_dtype, device=grad.device.split(':')[0])
 
         # Execute reduce_scatter_tensor
-        self.reduce_scatter_handle = dist.reduce_scatter_tensor(
-            self._reduce_scatter_output,
+        handle = dist.reduce_scatter_tensor(
+            output,
             grad_flat,
             op=reduce_op,
             group=shard_group,
             async_op=async_op,
         )
 
-        return self._reduce_scatter_output, self.reduce_scatter_handle
+        return output, handle
 
     def zero_grad(self):
         self.sharded_param.grad = None
@@ -641,8 +600,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
     def all_reduce_grad(
         self,
         grad: Optional[ms.Tensor] = None,
-        dtype: Optional[ms.Type] = None,
-        async_op: bool = True,
+        async_op: bool = False,
         reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.SUM
     ) -> Tuple[ms.Tensor, Optional[CommHandle]]:
         """
@@ -664,9 +622,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             else:
                 grad = self.unsharded_grad_data
 
-        if dtype is not None and dtype != grad.dtype:
-            grad = grad.to(dtype)
-
         if not isinstance(self.mesh_info, HSDPMeshInfo):
             # Not HSDP mode, no all-reduce needed
             return grad, None
@@ -675,25 +630,13 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         if replicate_group is None or self.replicate_world_size <= 1:
             return grad, None
 
-        self._all_reduce_output = grad
-        self.all_reduce_handle = dist.all_reduce(
+        handle = dist.all_reduce(
             grad,
             op=reduce_op,
             group=replicate_group,
             async_op=async_op
         )
-        return self._all_reduce_output, self.all_reduce_handle
-
-    def all_reduce_output(self):
-        """Return cached all-reduce output after waiting pending async work."""
-        if self.all_reduce_handle is not None:
-            self.all_reduce_handle.wait()
-            self.all_reduce_handle = None
-        return self._all_reduce_output
-
-    def clear_all_reduce_output(self):
-        """Clear cached all-reduce output."""
-        self._all_reduce_output = None
+        return grad, handle
 
 
 def set_requires_grad_if_needed(

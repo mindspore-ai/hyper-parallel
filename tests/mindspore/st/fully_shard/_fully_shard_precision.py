@@ -20,7 +20,6 @@ import mindspore as ms
 import mindspore.dataset as ds
 import numpy as np
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
-from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 from hyper_parallel.core.fully_shard.api import fully_shard
@@ -85,28 +84,6 @@ def get_forward_fn(net):
         loss = loss_fn(logits, label)
         return loss, logits
     return forward_fn
-
-
-def setup_prefetch(net):
-    """Configure one-hop forward/backward prefetch for wrapped child modules."""
-    wrapped_modules = [
-        net.dense_relu_sequential[0],
-        net.dense_relu_sequential[2],
-        net.dense_relu_sequential[4],
-    ]
-
-    for i, layer in enumerate(wrapped_modules[:-1]):
-        layer.set_modules_to_forward_prefetch([wrapped_modules[i + 1]])
-
-    wrapped_modules.reverse()
-    for i, layer in enumerate(wrapped_modules[:-1]):
-        layer.set_modules_to_backward_prefetch([wrapped_modules[i + 1]])
-
-
-def apply_recompute(net):
-    """Wrap fully_shard-target child modules with activation recompute."""
-    for idx in (0, 2, 4):
-        net.dense_relu_sequential[idx] = checkpoint_wrapper(net.dense_relu_sequential[idx])
 
 
 def get_backward_grads(net, expected_dtype=None):
@@ -237,9 +214,7 @@ def generate_baseline_artifacts():
 def run_fully_shard_multi_card(
     ckpt_path,
     mesh,
-    accumulate_grad=False,
-    enable_prefetch=False,
-    enable_recompute=False,
+    accumulate_grad=False
 ):
     """Run fully_shard multi-card training."""
     dp_size = get_group_size()
@@ -266,11 +241,6 @@ def run_fully_shard_multi_card(
     fully_shard(net.dense_relu_sequential[2], mesh=mesh, mp_policy=mp_policy)
     fully_shard(net.dense_relu_sequential[4], mesh=mesh, mp_policy=mp_policy)
     fully_shard(net, mesh=mesh, mp_policy=mp_policy)
-    if enable_prefetch:
-        setup_prefetch(net)
-
-    if enable_recompute:
-        apply_recompute(net)
 
     assert_sharded_param_layout(net, origin_shapes, shard_dim_size)
 
@@ -429,7 +399,7 @@ def run_fully_shard_multi_card_ignored(ckpt_path, mesh):
     return losses
 
 
-def run_fully_shard(mesh, use_empty_weight=False, enable_prefetch=False, enable_recompute=False):
+def run_fully_shard(mesh, use_empty_weight=False):
     """Run fully_shard with different mesh"""
     init()
 
@@ -441,9 +411,7 @@ def run_fully_shard(mesh, use_empty_weight=False, enable_prefetch=False, enable_
     if use_empty_weight:
         losses, _ = run_fully_shard_multi_card_with_empty_init(ckpt_path, mesh)
     else:
-        losses, _ = run_fully_shard_multi_card(
-            ckpt_path, mesh, enable_prefetch=enable_prefetch, enable_recompute=enable_recompute
-        )
+        losses, _ = run_fully_shard_multi_card(ckpt_path, mesh)
 
     if rank_id == 0:
         losses_file = os.path.join(TEMP_DIR, "fully_shard_losses.npy")
@@ -517,28 +485,6 @@ def test_ms_zero3_fully_shard():
     """
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     run_fully_shard(mesh)
-
-
-def test_ms_zero3_fully_shard_prefetch():
-    """
-    Feature: Compare fully_shard prefetch precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training with child-module prefetch enabled,
-                 then compare reduced losses on rank 0 only
-    Expectation: Losses should match within tolerance
-    """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard(mesh, enable_prefetch=True)
-
-
-def test_ms_zero3_fully_shard_prefetch_recompute():
-    """
-    Feature: Compare fully_shard prefetch + recompute precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training with child-module prefetch
-                 and activation recompute enabled, then compare reduced losses on rank 0 only
-    Expectation: Losses should match within tolerance
-    """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard(mesh, enable_prefetch=True, enable_recompute=True)
 
 
 def test_ms_zero3_fully_shard_empty_weight():

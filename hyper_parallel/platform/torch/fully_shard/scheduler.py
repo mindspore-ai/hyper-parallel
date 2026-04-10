@@ -29,11 +29,13 @@ from hyper_parallel.platform import get_platform
 
 class TorchHSDPSchedulerV2(HSDPSchedulerV2):
     """TorchHSDPScheduler is used to implement optimizer level."""
+    root_bp_state = False
     _root_module = None
 
     def __init__(self, *args, **kwargs):
         """Initialize TorchHSDPSchedulerV2 and register forward/backward hooks."""
         super().__init__(*args, **kwargs)
+        self._backup_forward_fetch = None
         self._is_root = False
 
     def _register_hooks(self):
@@ -107,10 +109,9 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _forward_pre_hook(self, cell, args, kwargs):
         """Execute forward pre hook and set up backward hook."""
-        if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
-            return args, kwargs
-        if HSDPSchedulerV2.root_bp_state:
-            self._disable_forward_prefetch_for_recompute()
+        if TorchHSDPSchedulerV2.root_bp_state:
+            self._backup_forward_fetch = self.forward_prefetch_cells
+            self.forward_prefetch_cells = []
         if TorchHSDPSchedulerV2._root_module is None:
             TorchHSDPSchedulerV2._root_module = self.cell
             self._is_root = True
@@ -132,12 +133,14 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _forward_hook(self, cell, inputs, outputs):  # pylint: disable=R1710
         """Execute forward hook."""
-        if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
-            return
         self._register_backward_pre_hook(outputs)
-        if HSDPSchedulerV2.root_bp_state:
-            self._restore_forward_prefetch_after_recompute()
-            return
+        if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
+            return None
+        if TorchHSDPSchedulerV2.root_bp_state:
+            if self._backup_forward_fetch:
+                self.forward_prefetch_cells = self._backup_forward_fetch
+                self._backup_forward_fetch = []
+            return None
         return self._hsdp_forward_hook(cell, inputs, outputs)
 
     # pylint: disable=W0212
@@ -146,7 +149,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         Variable._execution_engine.queue_callback(self._root_backward_hook)
         if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
             return grad
-        HSDPSchedulerV2.root_bp_state = True
+        TorchHSDPSchedulerV2.root_bp_state = True
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
 
@@ -160,7 +163,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         apply_final_reduce = self.scheduler_state != FSDPSchedulerState.BACKWARD
         self._backward_hook()
         if apply_final_reduce:
-            HSDPSchedulerV2.root_bp_state = False
+            TorchHSDPSchedulerV2.root_bp_state = False
             with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
                 # Drain any pending async fused reduction from the last module's backward
                 comm_ctx = get_comm_ctx()

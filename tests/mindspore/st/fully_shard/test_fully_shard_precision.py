@@ -85,29 +85,6 @@ def test_ms_zero3_fully_shard():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_fully_shard_prefetch():
-    """
-    Feature: Compare fully_shard prefetch precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training with prefetch enabled,
-                 then compare losses on rank 0
-    Expectation: Losses should match within tolerance
-    """
-    run_case(case_name=f"{inspect.stack()[0].function}")
-
-
-@pytest.mark.skip(reason="recompute currently not supported in MindSpore fully_shard; will re-enable once supported")
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_fully_shard_prefetch_recompute():
-    """
-    Feature: Compare fully_shard prefetch + recompute precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training with prefetch and activation
-                 recompute enabled, then compare losses on rank 0
-    Expectation: Losses should match within tolerance
-    """
-    run_case(case_name=f"{inspect.stack()[0].function}")
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_zero3_partial_shard():
     """
     Feature: Compare partial_shard precision with standalone baseline
