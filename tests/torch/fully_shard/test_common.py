@@ -12,17 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""hsdp test common"""
+"""fully_shard test common helpers"""
 import time
+
 import torch
 from torch import optim
+
 from hyper_parallel import hsdp_sync_stream
 
 
 def train(model, data, comm_async=True, train_steps=10):
-    """train net with data"""
-    train_steps = max(train_steps, 1)
-    train_steps = train_steps + 1
+    """Train a model for a few steps and optionally wait async fully_shard comm."""
+    train_steps = max(train_steps, 1) + 1
 
     model = model.npu()
     optimizer = optim.SGD(model.parameters(), lr=0.01)
@@ -36,7 +37,7 @@ def train(model, data, comm_async=True, train_steps=10):
             hsdp_sync_stream()
         if i != 0:
             end_time = time.time()
-            cost_time = end_time - start_time + cost_time
+            cost_time += end_time - start_time
         optimizer.step()
         optimizer.zero_grad()
     return cost_time
