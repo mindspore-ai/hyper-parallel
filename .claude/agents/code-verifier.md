@@ -157,7 +157,7 @@ After auto-fix, remind user:
 | Issue | Solution |
 | ----- | -------- |
 | Missing Apache header | `code_style_guard.py --fix` auto-adds it |
-| pylint `C0415` on lazy import | Already expected — add `# pylint: disable=C0415` |
+| pylint `C0415` (import inside function) | In `platform/torch/` and `platform/mindspore/`, lazy imports with `# pylint: disable=C0415` are expected. Elsewhere, move imports to module top per `code-style.md` unless a documented exception applies |
 | Line too long (>120) | Break line at logical boundary |
 | Missing type hints | Add return type and parameter types to public functions |
 

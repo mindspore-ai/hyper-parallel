@@ -106,8 +106,8 @@ When a change introduces new API patterns, evaluate broader implications:
 - [ ] **Naming** — Classes `PascalCase`, functions/vars `snake_case`, private `_leading_underscore`
 - [ ] **Docstrings** — Google-style with `Args:`, `Returns:`, `Raises:`, `Example:` sections on public APIs
 - [ ] **Type hints** — Present on all public function signatures
-- [ ] **Lazy imports** — Inside methods use `# pylint: disable=C0415`
-- [ ] **Pylint compliance** — Run `pylint` on changed `.py` files; add violations to `.jenkins/check/config/filter_pylint.txt` for unified suppression (do not use inline `# pylint: disable=` in code)
+- [ ] **Imports** — **Non-platform code:** module-level imports only; flag imports inside methods unless documented exceptions (`TYPE_CHECKING`, optional dependency, circular import). **`platform/torch/` and `platform/mindspore/`:** lazy framework imports inside methods with `# pylint: disable=C0415` are expected
+- [ ] **Pylint compliance** — Run `pylint` on changed `.py` files; add violations to `.jenkins/check/config/filter_pylint.txt` for unified suppression (do not use inline `# pylint: disable=` except `C0415` on lazy backend imports in `platform/torch/` and `platform/mindspore/` per `code-style.md`)
 
 ### Common Issues to Flag
 

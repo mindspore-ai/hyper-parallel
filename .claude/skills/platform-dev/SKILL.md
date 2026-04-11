@@ -30,8 +30,7 @@ platform/
 │   ├── group_utils.py             # Process group creation
 │   ├── clip_grad.py               # Distributed gradient clipping
 │   ├── activation_checkpoint/     # SAC + Activation Swap
-│   ├── fully_shard/               # FSDP (state, param, scheduler, hooks)
-│   ├── hsdp/                      # HSDP (state, param, scheduler, grad hooks)
+│   ├── fully_shard/               # FSDP + HSDP (state, param, scheduler, hooks; core hsdp_*.py)
 │   └── pipeline_parallel/         # Pipeline stages + micro-batch
 └── mindspore/                     # MindSpore backend
     ├── platform.py                # MindSporePlatform(Platform)
@@ -40,8 +39,7 @@ platform/
     ├── parameter_init.py          # Parameter initialization with slice_index
     ├── platform_graph.py          # Graph construction utilities
     ├── custom_pass/               # Custom graph passes
-    ├── fully_shard/               # FSDP (state, param, scheduler, hooks)
-    ├── hsdp/                      # HSDP (state, param, scheduler, grad hooks)
+    ├── fully_shard/               # FSDP + HSDP (state, param, scheduler, hooks; core hsdp_*.py)
     └── pipeline_parallel/         # Pipeline stages + micro-batch
 ```
 
@@ -147,7 +145,7 @@ See [references/architecture.md](references/architecture.md) for:
 2. **New Platform APIs must be added to base class first** (`platform/platform.py`)
 3. **Both backends must be considered** — implement or raise `NotImplementedError`
 4. **Cross-platform type differences** — torch uses `torch.device` vs mindspore uses `str`; torch uses `ProcessGroup` vs mindspore uses `str` group names
-5. **Lazy imports** — use `# pylint: disable=C0415` inside methods
+5. **Lazy backend imports** — in `platform/torch/` and `platform/mindspore/`, use lazy imports inside methods for framework modules; add `# pylint: disable=C0415`. Non-platform code uses module-top imports (see `code-style.md`)
 6. **handle.wait()** before reading async collective output
 7. **event.record(src) → event.wait(dst)** for cross-stream dependencies
 8. **resize_(0)** to free device memory, never access freed storage

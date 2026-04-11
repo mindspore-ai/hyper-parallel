@@ -4,16 +4,14 @@ paths:
   - hyper_parallel/core/**
   - hyper_parallel/collectives/**
   - hyper_parallel/platform/torch/fully_shard/**
-  - hyper_parallel/platform/torch/hsdp/**
   - hyper_parallel/platform/mindspore/fully_shard/**
-  - hyper_parallel/platform/mindspore/hsdp/**
 ---
 
 ## DTensor
 
 - `is_partial()` is a **method**, not a property — always call with parentheses
 - Call `reduce_partial` before `redistribute()` if layout is in partial state
-- ReduceScatter must be ordered before AllReduce (see `tensor_redistribution.py`)
+- ReduceScatter must be ordered before AllReduce (see `core/dtensor/tensor_redistribution.py`)
 - Use `SkipDTensorDispatch` context manager when operating on raw local tensors inside gradient hooks
 - Distributed ops are registered via YAML in `core/shard/ops/yaml/`; implementations in `core/shard/ops/parallel_*.py`
 

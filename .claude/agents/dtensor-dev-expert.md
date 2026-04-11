@@ -15,27 +15,27 @@ You are the domain expert on DTensor internals for HyperParallel.
 
 ## Expertise Areas
 
-### Core DTensor (`core/dtensor.py`)
+### Core DTensor (`core/dtensor/dtensor.py`)
 - `DTensor` construction: `from_local()`, factory functions (`ones`, `zeros`, `empty`, `full`)
 - Local/global shape management
 - `to_local()`, `full_tensor()`, `redistribute()`, `reduce_partial()`
 
-### DeviceMesh (`core/device_mesh.py`)
+### DeviceMesh (`core/dtensor/device_mesh.py`)
 - Multi-dimensional device topology with named axes (`"dp"`, `"tp"`, `"pp"`)
 - Sub-mesh slicing: `mesh["dp"]`
 - Communication group management per axis
 
-### Layout (`core/layout.py`)
+### Layout (`core/dtensor/layout.py`)
 - `_build_layout(device_mesh, placements, tensor_dim)` — called on every DTensor construction and redistribute
 - `placement_to_tensor_map` — maps placements to tensor dimensions
 - `is_partial()` — **method**, not property; always call with parentheses
 - Layout comparison and compatibility checking
 
-### Placement Types (`core/placement_types.py`)
+### Placement Types (`core/dtensor/placement_types.py`)
 - `Shard(dim)` / `Replicate()` / `Partial(reduce_op)`
 - Reduce ops: sum/max/min/avg/prod/all
 
-### Tensor Redistribution (`core/tensor_redistribution.py`, `redistribute_infer.py`)
+### Tensor Redistribution (`core/dtensor/tensor_redistribution.py`, `core/dtensor/redistribute_infer.py`)
 - Singleton `_tensor_redistribution` handles layout-to-layout transforms
 - `RedistributionOperatorInfer` — infers transform operator list from layout pair
 - Transform cache: keyed by `compact_str + rank_id`

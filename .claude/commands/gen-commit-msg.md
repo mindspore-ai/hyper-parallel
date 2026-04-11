@@ -46,8 +46,7 @@ Infer scope from changed file paths:
 | `hyper_parallel/core/dtensor/` | `dtensor` |
 | `hyper_parallel/core/shard/` | `shard` |
 | `hyper_parallel/core/shard/ops/` | `ops` |
-| `hyper_parallel/core/fully_shard/` | `fsdp` |
-| `hyper_parallel/core/hsdp/` | `hsdp` |
+| `hyper_parallel/core/fully_shard/` | `fsdp` (includes shared `hsdp_*.py` / HSDP scheduler state) |
 | `hyper_parallel/core/pipeline_parallel/` | `pipeline` |
 | `hyper_parallel/core/activation_checkpoint/` | `activation` |
 | `hyper_parallel/core/checkpoint/` | `checkpoint` |

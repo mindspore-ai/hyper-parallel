@@ -27,8 +27,8 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 | **Platform** | `platform/` (`platform.py`, `torch/`, `mindspore/`) | Abstraction layer — use `get_platform()`, never import torch/mindspore directly |
 | **DTensor** | `core/dtensor/` (`dtensor.py`, `device_mesh.py`, `layout.py`, `placement_types.py`, `tensor_redistribution.py`, `redistribute_infer.py`, `random.py`, `init_weights.py`, `parameter_init.py`) | Distributed tensor (local shard + DeviceMesh + Placements); DeviceMesh defines multi-dim device topology; Layout maps tensor-to-mesh; redistribution cached by `compact_str + rank_id` |
 | **Shard** | `core/shard/` (`api.py`, `custom_shard.py`, `_op_dispatch.py`, `ops/`) | `shard_module()` / `custom_shard()` entry points; YAML registry (`ops/yaml/`) + Python impl (`ops/parallel_*.py`) |
-| **FSDP** | `core/fully_shard/`, `platform/*/fully_shard/` | Parameter sharding/unsharding lifecycle |
-| **HSDP** | `core/hsdp/`, `platform/*/hsdp/` | Hybrid shard data parallel (legacy + new scheduler) |
+| **Tensor parallel (declarative)** | `core/tensor_parallel/` (`api.py`, `style.py`) | `parallelize_module()`, `ParallelStyle`; uses 1-D `DeviceMesh` slice + mesh context (`with mesh:`) |
+| **FSDP / HSDP** | `core/fully_shard/` (`api.py`, `hsdp_*.py`, …), `platform/*/fully_shard/` | Parameter sharding/unsharding; hybrid sharded DP (HSDP) shares this tree — core `hsdp_*.py` + platform schedulers/state, not a separate `platform/*/hsdp/` package |
 | **Pipeline** | `core/pipeline_parallel/`, `platform/*/pipeline_parallel/` | Stage scheduling, micro-batch, cross-stage comm |
 | **Activation** | `core/activation_checkpoint/`, `platform/torch/activation_checkpoint/` | Selective activation checkpoint (SAC) + activation swap (offload to CPU, prefetch on backward) |
 | **Checkpoint** | `core/distributed_checkpoint/` | Distributed checkpoint save/load (planner, storage, reshard) |
@@ -47,7 +47,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 - **Docstrings**: Google-style (`Args:`, `Returns:`, `Raises:`, `Example:`)
 - **Type hints**: Required on all public function signatures
 - **Errors**: `ValueError` with descriptive messages; validate at boundaries
-- **Lazy imports**: `# pylint: disable=C0415` inside methods
+- **Imports**: Most code (`core/`, `collectives/`, `tests/`, `platform/platform.py`, etc.) — put `import` / `from … import` at **module top**; avoid imports inside methods except documented cases (`TYPE_CHECKING`, optional deps, circular imports). **Platform backends** (`platform/torch/**`, `platform/mindspore/**`) — **lazy import** `torch` / `mindspore` (and related modules) **inside methods** with `# pylint: disable=C0415`.
 - **Enforcement**: load `code-style.md` before code generation, code modification, commit, and review; auto-fix violations before proceeding; if a user request conflicts with the rule, explain the conflict and provide a compliant alternative
 
 ---
@@ -64,7 +64,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 
 ## Key Implementation Notes
 
-> Full rules for DTensor, memory lifecycle, and stream synchronization are in `.claude/rules/distributed.md` (auto-applied when editing `core/`, `collectives/`, `fully_shard/`, `hsdp/`). The code-review skill's `distributed-guidelines.md` and `review-checklist.md` contain complete patterns with code examples.
+> Full rules for DTensor, memory lifecycle, and stream synchronization are in `.claude/rules/distributed.md` (auto-applied when editing `core/`, `collectives/`, `platform/*/fully_shard/`). The code-review skill's `distributed-guidelines.md` and `review-checklist.md` contain complete patterns with code examples.
 
 **Quick reference — three highest-risk areas:**
 
@@ -113,6 +113,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 | **simple-code-reviewer** | sonnet | Read, Grep, Glob | Lightweight quick quality check — platform patterns, DTensor invariants, common mistakes |
 | **code-reviewer** | sonnet | Read, Grep, Glob, Bash | Comprehensive post-change code review (distributed-first, stream sync, memory safety) |
 | **dtensor-dev-expert** | opus | Read, Grep, Glob, Bash | DTensor, Layout, redistribution, op dispatch |
+| **tensor-dev-expert** | opus | Read, Grep, Glob, Bash | Declarative module parallelism — `parallelize_module`, `ParallelStyle`, mesh context |
 | **fsdp-dev-expert** | opus | Read, Grep, Glob, Bash | FSDP/HSDP, parameter sharding, gradient reduction |
 | **pipeline-dev-expert** | opus | Read, Grep, Glob, Bash | Pipeline parallelism, micro-batch, activation swap |
 
@@ -122,7 +123,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 | ---- | ----- |
 | **project-overview** | Global — project identity, architecture invariants, top safety concerns |
 | **code-style** | Global — conventions, naming, patterns |
-| **distributed** | `core/**`, `collectives/**`, `**/fully_shard/**`, `**/hsdp/**` — stream sync, memory, DTensor |
+| **distributed** | `core/**`, `collectives/**`, `**/fully_shard/**` — stream sync, memory, DTensor (HSDP code lives under `core/fully_shard/` and `platform/*/fully_shard/`) |
 | **platform** | `platform/**` — cross-platform abstraction |
 | **multi-platform-features** | `core/**`, `platform/**` — multi-backend and list/collection API consistency |
 | **testing** | `tests/**` — test patterns, markers, distributed test helpers |

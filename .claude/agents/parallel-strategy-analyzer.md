@@ -467,9 +467,9 @@ for layer in model.layers:
     fully_shard(layer, mesh=fsdp_mesh)
 fully_shard(model, mesh=fsdp_mesh)
 
-# HSDP (legacy, for MindSpore graph mode)
-from hyper_parallel import hsdp
-model = hsdp(model, optimizer_level="level3", comm_async=True)
+# HSDP — same public entry as FSDP: `fully_shard` with a hybrid (e.g. 2-D) mesh; see `core/fully_shard/api.py`
+from hyper_parallel import fully_shard
+fully_shard(model, mesh=hybrid_mesh)
 
 # Tensor Parallel
 from hyper_parallel import shard_module

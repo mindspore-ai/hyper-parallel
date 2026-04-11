@@ -35,8 +35,7 @@ For feature-specific changes, also read the relevant submodule:
 
 | Feature | Torch Files | MindSpore Files |
 |---------|-------------|-----------------|
-| FSDP | `platform/torch/fully_shard/*.py` | `platform/mindspore/fully_shard/*.py` |
-| HSDP | `platform/torch/hsdp/*.py` | `platform/mindspore/hsdp/*.py` |
+| FSDP / HSDP | `platform/torch/fully_shard/*.py` + `core/fully_shard/hsdp_*.py` | `platform/mindspore/fully_shard/*.py` + same `core/fully_shard/` |
 | Pipeline | `platform/torch/pipeline_parallel/*.py` | `platform/mindspore/pipeline_parallel/*.py` |
 | Activation | `platform/torch/activation_checkpoint/*.py` | N/A (not yet implemented) |
 | DTensor | `platform/torch/dtensor.py` | `platform/mindspore/dtensor.py` |

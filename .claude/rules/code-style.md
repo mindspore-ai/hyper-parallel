@@ -38,7 +38,16 @@ Use these rules as the default coding style and convention set for HyperParallel
 
 - Order imports clearly: standard library, third-party, then first-party.
 - Keep import placement consistent with module export structure such as `__all__`.
-- When using lazy imports inside methods, add `# pylint: disable=C0415`.
+
+### Import placement (non-platform vs platform backends)
+
+- **Default (most of the repo):** Put runtime `import` / `from … import` at **module top** (after the license header and any module docstring). Do **not** put imports inside functions, methods, or nested class bodies except the narrow exceptions under “Other exceptions” below. Applies to e.g. `core/`, `collectives/`, `tests/`, and **platform-agnostic** files such as `platform/platform.py`.
+- **Platform backend implementations** (`hyper_parallel/platform/torch/**`, `hyper_parallel/platform/mindspore/**`): Use **lazy imports inside methods** (lazy import / lazy init) for `torch`, `mindspore`, and their submodules as needed. This avoids pulling in the wrong framework at module import time, reduces import-order/cycle issues, and keeps the other backend unloadable when not in use. Add `# pylint: disable=C0415` on those lines.
+- **Other exceptions** (outside platform backends; each should include a brief comment explaining why):
+  - Import-time circular dependency that cannot be fixed by restructuring.
+  - Optional dependencies that may be missing at runtime.
+  - Type-only symbols: prefer `from typing import TYPE_CHECKING` and an `if TYPE_CHECKING:` block at module scope instead of importing inside methods.
+- Outside `platform/torch/` and `platform/mindspore/`, do not use local imports for convenience; do not blanket-suppress `C0415` unless the case matches an exception above.
 - Validate inputs at boundaries.
 - Raise `ValueError` with descriptive messages for invalid values.
 - Do not rely on `assert` for runtime input validation or business logic checks.
