@@ -171,6 +171,16 @@ class TorchPlatform(Platform):
     dtype = torch.dtype
 
     @staticmethod
+    def is_linear_module(module) -> bool:
+        """Check whether *module* is a ``torch.nn.Linear`` instance."""
+        return isinstance(module, nn.Linear)
+
+    @staticmethod
+    def is_embedding_module(module) -> bool:
+        """Check whether *module* is a ``torch.nn.Embedding`` instance."""
+        return isinstance(module, nn.Embedding)
+
+    @staticmethod
     def device_count(device_handle):
         """
         Get the number of available devices.

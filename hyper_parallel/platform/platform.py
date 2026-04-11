@@ -992,6 +992,30 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement tree_map")
 
     @staticmethod
+    def is_linear_module(module) -> bool:
+        """Check whether *module* is a linear/dense layer for the current framework.
+
+        Args:
+            module: The module instance to check.
+
+        Returns:
+            True if *module* is the framework's linear layer type.
+        """
+        raise NotImplementedError("Platform subclasses must implement is_linear_module")
+
+    @staticmethod
+    def is_embedding_module(module) -> bool:
+        """Check whether *module* is an embedding layer for the current framework.
+
+        Args:
+            module: The module instance to check.
+
+        Returns:
+            True if *module* is the framework's embedding layer type.
+        """
+        raise NotImplementedError("Platform subclasses must implement is_embedding_module")
+
+    @staticmethod
     def register_forward_pre_hook(module, hook, prepend=False, with_kwargs=False):
         """Register a forward pre-hook on a module.
 

@@ -64,6 +64,16 @@ class MindSporePlatform(Platform):
     tensor_dtype = mstype
     dtype = ms.Type
 
+    @staticmethod
+    def is_linear_module(module) -> bool:
+        """Check whether *module* is a MindSpore ``Dense`` (linear) or ``mint.nn.Linear`` layer."""
+        return isinstance(module, (ms.nn.Dense, mint.nn.Linear))
+
+    @staticmethod
+    def is_embedding_module(module) -> bool:
+        """Check whether *module* is a MindSpore ``Embedding`` layer."""
+        return isinstance(module, ms.nn.Embedding)
+
     def device_count(self, device_handle):
         """
         Get the number of available devices.
