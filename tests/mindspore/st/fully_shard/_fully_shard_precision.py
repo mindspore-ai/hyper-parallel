@@ -432,6 +432,7 @@ def run_fully_shard_multi_card_with_empty_init(
 
     with init_empty_weights():
         net = SlimLeNet16()
+    with ms.DeviceCtx("meta"):
         fully_shard(net.dense_relu_sequential[0], mesh=mesh, mp_policy=mp_policy)
         fully_shard(net.dense_relu_sequential[2], mesh=mesh, mp_policy=mp_policy)
         fully_shard(net.dense_relu_sequential[4], mesh=mesh, mp_policy=mp_policy)

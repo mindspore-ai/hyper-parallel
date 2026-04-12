@@ -243,6 +243,7 @@ def _build_empty_init_tp_fully_shard_model(
     """Create a TP + fully_shard model through init_empty_weights and then load the full state."""
     with init_empty_weights():
         model = TPFullyShardNet(state_dict_np)
+    with ms.DeviceCtx("meta"):
         model, x_placements = _wrap_tp_fully_shard_model(model, tp_mesh, mesh=mesh)
     model.load_state_dict(
         {name: Tensor(weight, ms.float32) for name, weight in state_dict_np.items()},

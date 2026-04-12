@@ -249,9 +249,8 @@ class OpDispatcher:
         # Only mint random op support
         # MindSpore use the actual kernel name.
         self._random_ms_ops = {
-            "BernoulliExt", "MultinomialExt", "RandpermExt",
-            "NormalTensorTensor", "NormalTensorFloat", "NormalFloatTensor", "NormalFloatFloat",
-            "Randn", "RandLikeExt", "RandnLike", "RandInt", "RandIntLike", "RandExt",
+            "BernoulliExt", "MultinomialExt", "InplaceNormal", "InplaceUniform",
+            "RandpermExt", "Randn", "RandLikeExt", "RandnLike", "RandInt", "RandIntLike", "RandExt",
             "FuncDropoutExt"
         }
         self._rng_tracker: Optional[OffsetBasedRNGTracker] = None

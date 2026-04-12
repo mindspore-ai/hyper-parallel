@@ -14,6 +14,14 @@
 # ============================================================================
 """Tests for init_empty_weights -> fully_shard -> init weight consistency (MindSpore)."""
 
+import os
+
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+
+# pylint: disable=C0413
+import pytest
+
+from hyper_parallel.core.dtensor.init_weights import init_on_device
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import MindSporeCase, parallel_run
 
@@ -22,7 +30,7 @@ _TEST_INIT_WEIGHTS = "_test_init_weights.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_init_weights_group1():
+def test_init_weights():
     """
     Feature: parallel run case in init_weights (MindSpore)
     Description:
@@ -33,3 +41,11 @@ def test_init_weights_group1():
     parallel_run([
         MindSporeCase(_TEST_INIT_WEIGHTS, "test_init_weights_with_randn_like", 12351, 2, 2),
     ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_init_on_device_include_buffers_true_raises() -> None:
+    """MindSpore backend should reject include_buffers=True."""
+    with pytest.raises(ValueError, match="does not support include_buffers=True"):
+        with init_on_device("meta", include_buffers=True):
+            pass

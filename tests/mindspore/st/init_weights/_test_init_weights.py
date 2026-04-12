@@ -75,6 +75,8 @@ def _create_sharded_model():
 
     with init_empty_weights():
         model = SimpleNet(32)
+
+    with ms.DeviceCtx("meta"):
         model = fully_shard(model, mesh=mesh, reshard_after_forward=True, mp_policy=mp_policy)
 
     for p in model.trainable_params():
