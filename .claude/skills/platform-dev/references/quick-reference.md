@@ -9,10 +9,8 @@
 | MindSpore platform | `hyper_parallel/platform/mindspore/platform.py` | `MindSporePlatform(Platform)` |
 | Torch DTensorBase | `hyper_parallel/platform/torch/dtensor.py` | Subclass of `torch.Tensor` |
 | MindSpore DTensorBase | `hyper_parallel/platform/mindspore/dtensor.py` | Subclass of `ms.Tensor` |
-| Torch FSDP | `hyper_parallel/platform/torch/fully_shard/` | state, param, scheduler, hooks |
-| MindSpore FSDP | `hyper_parallel/platform/mindspore/fully_shard/` | state, param, scheduler, hooks |
-| Torch HSDP | `hyper_parallel/platform/torch/hsdp/` | state, param, scheduler, grad hooks |
-| MindSpore HSDP | `hyper_parallel/platform/mindspore/hsdp/` | state, param, scheduler, grad hooks |
+| Torch FSDP / HSDP | `hyper_parallel/platform/torch/fully_shard/` | state, param, scheduler, hooks (HSDP shares this tree; core logic in `core/fully_shard/hsdp_*.py`) |
+| MindSpore FSDP / HSDP | `hyper_parallel/platform/mindspore/fully_shard/` | state, param, scheduler, hooks (same layout as Torch) |
 | Torch Pipeline | `hyper_parallel/platform/torch/pipeline_parallel/` | stage, micro-batch utils |
 | MindSpore Pipeline | `hyper_parallel/platform/mindspore/pipeline_parallel/` | stage, micro-batch utils |
 | Torch Activation Ckpt | `hyper_parallel/platform/torch/activation_checkpoint/` | SAC + activation swap |
@@ -144,17 +142,19 @@ class Platform:
     def new_api(self, arg1, arg2):
         raise NotImplementedError
 
-# 2. platform/torch/platform.py — implement
+# 2. platform/torch/platform.py — implement (lazy import in methods)
 class TorchPlatform(Platform):
     def new_api(self, arg1, arg2):
         import torch  # pylint: disable=C0415
         # torch-specific implementation
+        ...
 
 # 3. platform/mindspore/platform.py — implement (or NotImplementedError)
 class MindSporePlatform(Platform):
     def new_api(self, arg1, arg2):
-        import mindspore  # pylint: disable=C0415
+        import mindspore as ms  # pylint: disable=C0415
         # mindspore-specific implementation
+        ...
 ```
 
 ### Async Collective with Handle
@@ -195,7 +195,9 @@ tensor.resize_(0)
 param.grad = None
 ```
 
-### Lazy Import Pattern
+### Lazy import in platform backends
+
+In `platform/torch/` and `platform/mindspore/`, framework imports belong **inside methods** with `# pylint: disable=C0415`. In **non-platform** code, prefer module-level imports; local imports there are only for documented exceptions (see `.claude/rules/code-style.md`).
 
 ```python
 def some_method(self):
@@ -216,5 +218,6 @@ def some_method(self):
 | `non_blocking=True` without stream sync | Ensure stream sync before reading |
 | Add Platform API without base class method | Define in `platform/platform.py` first |
 | Modify torch/ without checking mindspore/ | Always verify cross-platform parity |
-| Module-level framework imports in platform code | Use lazy imports with `# pylint: disable=C0415` |
+| Module-top `import torch` / `import mindspore` in `platform/torch/` or `platform/mindspore/` | Prefer lazy import inside methods with `C0415` per `code-style.md` |
+| Imports inside methods in **non-platform** code | Move to module top unless a documented exception applies |
 | `.item()` or `.numpy()` in hot paths | Causes GPU-CPU sync, avoid in training loops |

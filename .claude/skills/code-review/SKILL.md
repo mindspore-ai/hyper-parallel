@@ -77,9 +77,9 @@ Group changed files by risk level:
 
 | Risk | File Patterns | Reason |
 |------|--------------|--------|
-| CRITICAL | `**/fully_shard/**`, `**/hsdp/**`, stream/sync code | Memory stomping, stale data |
+| CRITICAL | `**/fully_shard/**`, stream/sync code | Memory stomping, stale data (HSDP lives under `fully_shard/` + `hsdp_*.py` in core) |
 | CRITICAL | Async collectives, `non_blocking`, cross-stream code | Stream sync bugs |
-| HIGH | `core/dtensor.py`, `core/layout.py`, `core/tensor_redistribution.py` | DTensor correctness |
+| HIGH | `core/dtensor/**` (e.g. `dtensor.py`, `layout.py`, `tensor_redistribution.py`) | DTensor correctness |
 | HIGH | `platform/torch/**`, `platform/mindspore/**` | Cross-platform consistency |
 | HIGH | `core/pipeline_parallel/**` | Pipeline deadlocks, buffer leaks |
 | MEDIUM | `core/shard/ops/**` | Op dispatch, YAML registration |
@@ -178,7 +178,7 @@ Only include this section if the user requests "detailed" review. Do not repeat 
 
 ```markdown
 ### Specific Comments
-- `core/layout.py:42` - is_partial() called without parentheses — this is a method, not a property
+- `core/dtensor/layout.py:42` - is_partial() called without parentheses — this is a method, not a property
 - `platform/torch/fully_shard/param.py:100-105` - Missing resize_(0) after consuming all-gather output
 ```
 

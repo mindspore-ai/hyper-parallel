@@ -25,7 +25,7 @@ The review covers:
 - **Code quality** — conventions, patterns, design
 - **Style compliance** — mandatory enforcement of `.claude/rules/code-style.md`
 - **Testing** — coverage, distributed test patterns
-- **Pylint (review-PR stage)** — Run `autogit pylint-review` on changed Python files and include the report in the Code Quality section; add violations to `.jenkins/check/config/filter_pylint.txt` for unified suppression (do not use inline `# pylint: disable=` in code)
+- **Pylint (review-PR stage)** — Run `autogit pylint-review` on changed Python files and include the report in the Code Quality section; add violations to `.jenkins/check/config/filter_pylint.txt` for unified suppression (do not use inline `# pylint: disable=` except `C0415` for lazy backend imports under `platform/torch/` and `platform/mindspore/` per `code-style.md`)
 
 When the review finds a `code-style.md` violation, the output must:
 

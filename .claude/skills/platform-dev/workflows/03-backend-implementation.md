@@ -11,7 +11,7 @@ Implement concrete methods in `platform/torch/` and `platform/mindspore/` for th
 **File:** `hyper_parallel/platform/torch/platform.py` (or submodule files)
 
 **Conventions:**
-- Lazy imports: `import torch  # pylint: disable=C0415`
+- **Lazy import in methods:** import `torch`, `torch.distributed`, etc. **inside** each method that needs them, with `# pylint: disable=C0415` (see `.claude/rules/code-style.md`).
 - Use `torch.distributed` for collective operations
 - Use `device_handle` for stream/event management (supports both CUDA and NPU)
 - Return `(output, handle)` tuple for async collective ops
@@ -32,7 +32,7 @@ class TorchPlatform(Platform):
 **File:** `hyper_parallel/platform/mindspore/platform.py` (or submodule files)
 
 **Conventions:**
-- Lazy imports: `import mindspore as ms  # pylint: disable=C0415`
+- **Lazy import in methods:** import `mindspore` / `mindspore.mint.distributed`, etc. **inside** each method that needs them, with `# pylint: disable=C0415` (see `.claude/rules/code-style.md`).
 - Use `mindspore.mint.distributed` for collective operations
 - Process groups are `str` names (not objects)
 - Device is `str` (not `torch.device`)
