@@ -58,8 +58,6 @@ def save(
         planner: Optional[SavePlanner] = None,
         no_dist: bool = False,
         use_collectives: bool = True,
-        remove_redundancy: bool = True,
-        save_to_minimum_rank: bool = False,
 ) -> Metadata:
     """
     Save a distributed checkpoint in SPMD style.
@@ -79,8 +77,6 @@ def save(
         use_collectives (bool): If True, use collective communication for coordination.
             If False, each rank saves its own shard data and rank-local metadata (.metadata_rank{rank}),
             with no cross-rank interaction. Default True.
-        remove_redundancy (bool): If True, deduplicate tensors across ranks. Default True.
-        save_to_minimum_rank (bool): If True, deduplicated items are saved on the minimum rank. Default False.
 
     Returns:
         Metadata: Metadata object for the saved checkpoint.
@@ -92,10 +88,6 @@ def save(
 
     # Determine if we're in distributed mode
     use_collectives = False if no_dist else use_collectives
-
-    # When use_collectives=False: each rank saves its own shard, no cross-rank interaction
-    if not use_collectives:
-        remove_redundancy = False
 
     # Set up storage writer
     if storage_writer is None:
@@ -114,13 +106,12 @@ def save(
     world_size = platform.get_world_size()
     is_coordinator = rank == 0
 
-    # Configure planner (remove_redundancy=False when use_collectives=False)
+    # Configure planner
     planner.configure_planner(
         state_dict=state_dict,
         is_coordinator=is_coordinator,
         rank=rank,
-        remove_redundancy=remove_redundancy,
-        save_to_minimum_rank=save_to_minimum_rank
+        use_collectives=use_collectives
     )
 
     # Configure storage writer (use_collectives for rank-local metadata when False)
@@ -130,25 +121,31 @@ def save(
         use_collectives=use_collectives
     )
 
-    # Build local plan
-    local_plan = planner.build_local_plan()
-    local_plan = storage_writer.optimize_local_plan(local_plan)
-
-    # Gather all local plans and build global plan
-    all_local_plans = _gather_from_all_ranks(platform, local_plan, world_size, use_collectives)
-    global_plans, metadata = planner.build_global_plan(all_local_plans)
-    global_plans = storage_writer.optimize_global_plan(global_plans)
-
-    # Select central plan for current rank
-    if use_collectives and world_size > 1 and global_plans:
-        central_plan = global_plans[rank]
-    elif global_plans:
-        central_plan = global_plans[0]
+    cached = planner.get_cached_result() if isinstance(planner, StandardSavePlanner) else None
+    if cached is not None:
+        final_plan, metadata = cached
     else:
-        central_plan = local_plan
+        # Build local plan
+        local_plan = planner.build_local_plan()
+        local_plan = storage_writer.optimize_local_plan(local_plan)
 
-    # Finalize plan
-    final_plan = planner.finalize_plan(central_plan)
+        # Gather all local plans and build global plan
+        all_local_plans = _gather_from_all_ranks(platform, local_plan, world_size, use_collectives)
+        global_plans, metadata = planner.build_global_plan(all_local_plans)
+        global_plans = storage_writer.optimize_global_plan(global_plans)
+
+        # Select central plan for current rank
+        if use_collectives and world_size > 1 and global_plans:
+            central_plan = global_plans[rank]
+        elif global_plans:
+            central_plan = global_plans[0]
+        else:
+            central_plan = local_plan
+
+        # Finalize and cache plan
+        final_plan = planner.finalize_plan(central_plan)
+        if isinstance(planner, StandardSavePlanner):
+            planner.cache_result(final_plan, metadata)
 
     # Write data
     write_results = storage_writer.execute_write(final_plan, planner)

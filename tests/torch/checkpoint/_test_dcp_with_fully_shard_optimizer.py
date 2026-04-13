@@ -173,7 +173,7 @@ def test_dcp_with_fully_shard_optimizer():
         "optimizer": optimizer.state_dict(),
     }
 
-    save(save_state, checkpoint_id=checkpoint_path, use_collectives=True, remove_redundancy=True)
+    save(save_state, checkpoint_id=checkpoint_path, use_collectives=True)
     dist.barrier()
 
     wrong_lr_g0, wrong_lr_g1 = 5e-2, 8e-2
@@ -211,7 +211,7 @@ def test_dcp_with_fully_shard_optimizer():
     if rank == 0:
         shutil.rmtree(checkpoint_path)
 
-    # model was not trained after save; same checkpoint as model2 after load — paired steps should match loss.
+    # model was not trained after save; same checkpoint as model2 after load 鈥?paired steps should match loss.
     for _ in range(COMPARE_STEPS_AFTER_LOAD):
         loss_m = _train_step(model, x, optimizer)
         loss_m2 = _train_step(model2, x, optimizer2)

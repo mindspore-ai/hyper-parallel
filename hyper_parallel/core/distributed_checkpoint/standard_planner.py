@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """Standard planner implementations for checkpoint save and load."""
+from dataclasses import dataclass
 import dataclasses
 import pickle
 from typing import Any, Optional, Union
@@ -41,17 +42,33 @@ platform = get_platform()
 Tensor = platform.Tensor
 
 
+@dataclass(frozen=True)
+class CachedSaveResult:
+    """Cached finalized save result keyed by planner cache namespace."""
+
+    final_plan: SavePlan
+    metadata: Metadata
+
+
 class StandardSavePlanner(SavePlanner):
     """Standard implementation of SavePlanner for distributed checkpoint saving."""
 
-    def __init__(self):
+    _cached_save_result: dict[str, CachedSaveResult] = {}
+
+    def __init__(
+            self,
+            enable_plan_caching: bool = True,
+            remove_redundancy: bool = True,
+            save_to_minimum_rank: bool = False,
+    ):
         self.state_dict: Optional[dict[str, Any]] = None
         self.is_coordinator: bool = False
         self.rank: int = 0
-        self.remove_redundancy: bool = True
-        self.save_to_minimum_rank: bool = True
-        self._tensor_cache: dict[MetadataIndex, Any] = {}  # Cache for tensor data
+        self.remove_redundancy: bool = remove_redundancy
+        self.save_to_minimum_rank: bool = save_to_minimum_rank
         self.flatten_state_dict: bool = True
+        self._enable_plan_caching: bool = enable_plan_caching
+        self._cached_plans_key: str = self.__class__.__name__
 
     def configure_planner(self, state_dict: dict[str, Any], **kwargs) -> None:
         """
@@ -62,15 +79,27 @@ class StandardSavePlanner(SavePlanner):
             **kwargs: Additional keyword arguments (e.g., is_coordinator, rank, remove_redundancy,
                 save_to_minimum_rank).
         """
-        self.state_dict = state_dict
         self.is_coordinator = kwargs.get("is_coordinator", False)
         self.rank = kwargs.get("rank", 0)
-        self.remove_redundancy = kwargs.get("remove_redundancy", True)
-        self.save_to_minimum_rank = kwargs.get("save_to_minimum_rank", True)
+        self.remove_redundancy = kwargs.get("remove_redundancy", self.remove_redundancy)
+        self.save_to_minimum_rank = kwargs.get("save_to_minimum_rank", self.save_to_minimum_rank)
         self.flatten_state_dict = kwargs.get("flatten_state_dict", True)
+
+        use_collectives = bool(kwargs.get("use_collectives", True))
+        if not use_collectives:
+            self.remove_redundancy = False
+            self._enable_plan_caching = False
+        elif "enable_plan_caching" in kwargs:
+            self._enable_plan_caching = bool(kwargs["enable_plan_caching"])
+
         if self.flatten_state_dict:
             state_dict, self.name_mapping = flatten_state_dict(state_dict)
         self.state_dict = state_dict
+        self._cached_plans_key = self._build_cache_key(state_dict)
+
+    def _build_cache_key(self, state_dict: dict[str, Any]) -> str:
+        """Build a stable cache namespace from sorted state_dict keys."""
+        return f"{self.__class__.__name__}:{'||'.join(state_dict.keys())}"
 
     def build_local_plan(self) -> SavePlan:
         """
@@ -111,7 +140,6 @@ class StandardSavePlanner(SavePlanner):
                     f"Current rank {current_rank} not found in layout's rank_list {dtensor_layout.rank_list}")
 
             inner_rank_id = dtensor_layout.rank_list.index(current_rank)
-
             # Calculate slice area using infer_slice_area_by_rank
             slice_area = infer_slice_area_by_rank(
                 mesh_shape=dtensor_layout.mesh_shape,
@@ -119,7 +147,6 @@ class StandardSavePlanner(SavePlanner):
                 rank_id=inner_rank_id,
                 full_shape=global_shape
             )
-
             # Extract offsets (start values) from slice_area
             return tuple(start for start, _ in slice_area)
 
@@ -139,15 +166,11 @@ class StandardSavePlanner(SavePlanner):
 
                 sizes = local_tensor.shape
                 chunk = ChunkStorageMetadata(offsets=offsets, sizes=sizes)
-
                 # Get tensor properties
                 dtype_str = str(local_tensor.dtype) if hasattr(local_tensor, 'dtype') else 'unknown'
                 properties = TensorProperties(dtype=dtype_str)
-
                 # Create write item for this tensor
                 index = MetadataIndex(fqn=fqn, offset=offsets, index=None)
-                # Store tensor in cache instead of tensor_data
-                self._tensor_cache[index] = local_tensor
                 write_item = WriteItem(
                     index=index,
                     type=WriteItemType.TENSOR,
@@ -162,15 +185,12 @@ class StandardSavePlanner(SavePlanner):
                 # Create write item for platform.Tensor: build single chunk with tensor's own size
                 dtype_str = str(obj.dtype) if hasattr(obj, 'dtype') else 'unknown'
                 properties = TensorProperties(dtype=dtype_str)
-
                 # Single chunk covering the whole tensor (offsets=0, sizes=shape)
                 chunk = ChunkStorageMetadata(
                     offsets=(0,) * len(obj.shape),
                     sizes=obj.shape,
                 )
-
                 index = MetadataIndex(fqn=fqn, offset=(0,) * len(obj.shape), index=None)
-                self._tensor_cache[index] = obj
                 write_item = WriteItem(
                     index=index,
                     type=WriteItemType.TENSOR,
@@ -187,7 +207,7 @@ class StandardSavePlanner(SavePlanner):
                 write_item = WriteItem(
                     index=index,
                     type=WriteItemType.BYTE_IO,
-                    bytes_io_data=obj
+                    bytes_io_data=None
                 )
                 items.append(write_item)
 
@@ -268,73 +288,61 @@ class StandardSavePlanner(SavePlanner):
             metadata.planner_data = merged_mapping
         return final_global_plans, metadata
 
-    def _update_tensor_cache(self, plan: SavePlan) -> None:
-        """
-        Update tensor cache keys to match the finalized plan's MetadataIndex values.
-
-        Updates cache keys for tensors that are in the plan, and removes tensors
-        that are not in the plan. The plan's items have been modified by build_global_plan
-        (index field added), so we need to update the cache keys accordingly.
-
-        Args:
-            plan (SavePlan): Plan with updated MetadataIndex values.
-        """
-        # Build mapping from (fqn, offset) to updated MetadataIndex from plan
-        plan_tensor_map: dict[tuple[str, tuple], MetadataIndex] = {}
-        for item in plan.items:
-            if item.type == WriteItemType.TENSOR and item.tensor_data:
-                key_pair = (item.index.fqn, item.index.offset)
-                plan_tensor_map[key_pair] = item.index
-
-        # Update tensor cache keys and remove tensors not in plan
-        keys_to_remove = []
-        for cached_key in list(self._tensor_cache.keys()):
-            key_pair = (cached_key.fqn, cached_key.offset)
-
-            if key_pair in plan_tensor_map:
-                # Update cache key if index changed
-                new_index = plan_tensor_map[key_pair]
-                if cached_key != new_index:
-                    tensor = self._tensor_cache.pop(cached_key)
-                    self._tensor_cache[new_index] = tensor
-            else:
-                # Mark for removal if not in plan
-                keys_to_remove.append(cached_key)
-
-        # Remove tensors not in plan
-        for key in keys_to_remove:
-            self._tensor_cache.pop(key, None)
-
     def finalize_plan(self, plan: SavePlan) -> SavePlan:
         """
-        Finalize the plan and update tensor cache keys.
-
-        Updates tensor cache keys to match the finalized plan's MetadataIndex values.
-        The plan's items have been modified by build_global_plan (index field added),
-        so we need to update the cache keys accordingly.
-        Also removes tensors from cache that are not in the finalized plan.
+        Finalize the plan.
 
         Args:
-            plan (SavePlan): Plan to finalize (with updated MetadataIndex values).
+            plan (SavePlan): Plan to finalize.
 
         Returns:
             SavePlan: Finalized plan.
         """
-        self._update_tensor_cache(plan)
         return plan
 
-    def get_tensor(self, index: MetadataIndex) -> Any:
+    def get_cached_result(self) -> Optional[tuple[SavePlan, Metadata]]:
+        """Return cached finalized plan and metadata when plan caching is enabled."""
+        if not self._enable_plan_caching:
+            return None
+        cached_result = StandardSavePlanner._cached_save_result.get(self._cached_plans_key)
+        if cached_result is None:
+            return None
+        return cached_result.final_plan, cached_result.metadata
+
+    def cache_result(self, final_plan: SavePlan, metadata: Metadata) -> None:
+        """Store finalized plan and metadata in the class-level planner cache."""
+        if not self._enable_plan_caching:
+            return
+        StandardSavePlanner._cached_save_result[self._cached_plans_key] = CachedSaveResult(
+            final_plan=final_plan,
+            metadata=metadata,
+        )
+
+    def get_data(self, item: WriteItem) -> Any:
         """
-        Get tensor data for a given MetadataIndex from the cache.
+        Get current runtime data from state_dict for a write item.
 
         Args:
-            index (MetadataIndex): Metadata index identifying the tensor.
+            item (WriteItem): Write item describing what to write.
 
         Returns:
-            Any: Tensor data (tensor-like object) or None if not found.
+            Any: Runtime object to be written.
         """
-        return self._tensor_cache.get(index)
-
+        if self.state_dict is None:
+            raise RuntimeError("Planner not set up")
+        fqn = item.index.fqn
+        if fqn not in self.state_dict:
+            raise KeyError(f"Key {fqn} not found in state_dict")
+        obj = self.state_dict[fqn]
+        if item.type == WriteItemType.TENSOR:
+            if isinstance(obj, DTensor):
+                return obj.to_local()
+            if isinstance(obj, Tensor):
+                return obj
+            raise TypeError(f"Write item {fqn} expected tensor-like object, got {type(obj)}")
+        if item.type == WriteItemType.BYTE_IO:
+            return obj
+        raise TypeError(f"Unsupported write item type: {item.type}")
 
 def create_read_items_for_chunk_list(
     fqn: str,

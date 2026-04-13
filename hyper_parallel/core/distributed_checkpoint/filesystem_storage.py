@@ -101,12 +101,13 @@ class FileSystemWriter(StorageWriter):
         """
         return plans
 
-    def _write_bytes_item(self, item: WriteItem) -> WriteResult:
+    def _write_bytes_item(self, item: WriteItem, planner: SavePlanner) -> WriteResult:
         """
         Write a single bytes item to storage.
 
         Args:
             item (WriteItem): WriteItem containing bytes data.
+            planner (SavePlanner): Save planner used to get current runtime data.
 
         Returns:
             WriteResult: Write result with storage metadata.
@@ -114,11 +115,12 @@ class FileSystemWriter(StorageWriter):
         fqn = item.index.fqn
         file_name = f"{fqn}_rank{self.rank}.bytes"
         file_path = self.checkpoint_dir / file_name
+        data = planner.get_data(item)
         with open(file_path, "wb") as f:
-            if isinstance(item.bytes_io_data, bytes):
-                f.write(item.bytes_io_data)
+            if isinstance(data, bytes):
+                f.write(data)
             else:
-                pickle.dump(item.bytes_io_data, f)
+                pickle.dump(data, f)
             try:
                 length = f.tell()
             except (OSError, IOError):
@@ -135,7 +137,7 @@ class FileSystemWriter(StorageWriter):
 
     def _collect_tensors(self, plan: SavePlan, planner: SavePlanner) -> dict[str, Any]:
         """
-        Collect tensor data from planner cache.
+        Collect tensor data from planner runtime lookup.
 
         Args:
             plan (SavePlan): Save plan containing WriteItems.
@@ -145,16 +147,15 @@ class FileSystemWriter(StorageWriter):
             dict[str, Any]: Dictionary mapping FQN to tensor data.
 
         Raises:
-            RuntimeError: If tensor data not found in planner cache.
+            RuntimeError: If tensor data cannot be resolved for an item.
         """
         tensor_dict: dict[str, Any] = {}
         for item in plan.items:
             if item.type.value == "tensor" and item.tensor_data:
-                # Get tensor from planner cache instead of tensor_data
-                tensor = planner.get_tensor(item.index)
+                tensor = planner.get_data(item)
                 if tensor is None:
                     raise RuntimeError(
-                        f"Tensor data not found in planner cache for index {item.index}. "
+                        f"Tensor data could not be resolved for index {item.index}. "
                         f"FQN: {item.index.fqn}"
                     )
                 fqn = item.index.fqn
@@ -216,7 +217,7 @@ class FileSystemWriter(StorageWriter):
         # Collect tensors and write bytes objects
         for item in plan.items:
             if item.type.value == "byte_io":
-                results.append(self._write_bytes_item(item))
+                results.append(self._write_bytes_item(item, planner))
 
         # Collect and write tensors
         tensor_dict = self._collect_tensors(plan, planner)
