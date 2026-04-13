@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,13 +16,15 @@
 Distributed implementation for MatMul operator.
 """
 
+from typing import Callable, Optional, Tuple
+
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
 
 
 class MatMulExtDistributedOp(DistributedOp):
     """Distributed implementation for MatMul operator."""
-    def infer_layout(self, layouts, extra_args=None):
+    def infer_layout(self, layouts: tuple, extra_args: Optional[tuple] = None) -> tuple:
         """
         Infer output layout for MatMul operator.
 
@@ -82,7 +84,7 @@ class MatMulExtDistributedOp(DistributedOp):
 
 class MatMulDistributedOp(DistributedOp):
     """Distributed implementation for MatMul operator."""
-    def infer_layout(self, layouts, extra_args=None):
+    def infer_layout(self, layouts: tuple, extra_args: Optional[tuple] = None) -> tuple:
         """
         Infer output layout for MatMul operator.
 
@@ -217,7 +219,7 @@ class BaseBatchMatMulDistributedOp(DistributedOp):
 class BatchMatMulExtDistributedOp(BaseBatchMatMulDistributedOp):
     """Distributed implementation for BatchMatMulExt operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def infer_layout(self, layouts: tuple, extra_args: Optional[tuple] = None) -> tuple:
         """
         Infer output layout for BatchMatMulExt operator. Inputs shape are x=[b, n, m] and w=[b, m, p].
 
@@ -273,7 +275,7 @@ class BatchMatMulExtDistributedOp(BaseBatchMatMulDistributedOp):
 class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
     """Distributed implementation for BatchMatMul operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def infer_layout(self, layouts: tuple, extra_args: Optional[tuple] = None) -> tuple:
         """
         Infer output layout for BatchMatMul operator. Inputs shape are x=[b, n, m] and w=[b, m, p].
 
@@ -342,86 +344,120 @@ class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
 
 
 def _normalize_linear_args(x, weight, bias=None):
-    return (x, weight), {'bias': bias}
+    return (x, weight, bias), {}
 
 
 class LinearDistributedOp(DistributedOp):
     """Distributed implementation for Linear operator."""
-    def preprocess(self, args, kwargs):
+
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
         Preprocess arguments for Linear operator.
 
         Args:
-            args (tuple): Input arguments (x, w)
-            kwargs (dict): Keyword arguments (bias)
+            args (tuple): Input arguments containing x and weight tensors.
+            kwargs (dict): Keyword arguments, may contain bias.
 
         Returns:
-            tuple: Preprocessed arguments (x_local, w_local), local kwargs, cache values
+            tuple: (local_args, local_kwargs, cache_values) where local_args contains
+                local tensors for x, weight, and bias; local_kwargs is empty; and
+                cache_values contains layouts and None-sentinel for absent bias.
         """
         args, kwargs = _normalize_linear_args(*args, **kwargs)
-        x_tensor = args[0]
-        w_tensor = args[1]
-        bias = kwargs['bias']
-        local_args = (x_tensor.to_local(), w_tensor.to_local())
-        local_kwargs = {'bias': bias.to_local() if hasattr(bias, '_layout') else bias}
-        cache_values = [x_tensor.layout, w_tensor.layout,
-                       bias.layout if hasattr(bias, '_layout') else None]
+        x_tensor, w_tensor, bias = args[0], args[1], args[2]
+        local_args = (
+            x_tensor.to_local(),
+            w_tensor.to_local(),
+            bias.to_local() if hasattr(bias, '_layout') else bias,
+        )
+        local_kwargs = {}
+        cache_values = [
+            x_tensor.layout,
+            w_tensor.layout,
+            bias.layout if hasattr(bias, '_layout') else None,
+        ]
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, cache_values):
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
-        Infer output layout for MatMul operator.
-
-        Linear: output = x @ w
+        Infer output layout for Linear operator (output = x @ weight.T + bias).
 
         Rules:
-        1. Batch dimensions should have same layout
-        2. Contracting dimensions should have same layout
-        3. Output dimensions inherit layouts from non-contracting dimensions
+            1. x and weight must share the same mesh_shape.
+            2. weight must be 2D [out_features, in_features].
+            3. Contracting dimensions (in_features) must have the same layout.
+            4. Output batch dimensions inherit from x; output feature dim inherits from weight dim 0.
+            5. Partial state is set on the output when the contracting dimension is sharded.
 
         Args:
-            x_layout (Layout): Layout of input x
-            w_layout (Layout): Layout of input w
-            bias_layout (Layout): Layout of input bias
+            cache_values (list): [x_layout, w_layout, bias_layout] where bias_layout may be None.
 
         Returns:
-            tuple: Layout for output tensor
+            tuple: ((out_layout,), None)
+
+        Raises:
+            ValueError: If cache_values length is not 3, layouts are invalid, mesh shapes differ,
+                weight is not 2D, contracting dims mismatch, or bias sharding is inconsistent.
         """
         if len(cache_values) != 3:
-            raise ValueError(f"Linear cache_values length is not 3, but {len(cache_values)}")
+            raise ValueError(
+                f"For {self.op_name}, cache_values length should be 3, but got {len(cache_values)}"
+            )
         x_layout = cache_values[0]
         w_layout = cache_values[1]
         bias_layout = cache_values[2]
+
         if not x_layout or not w_layout:
             raise ValueError(f"x_layout : {x_layout}, w_layout : {w_layout}")
+
+        self._check_partial_inputs([x_layout, w_layout])
+
         x_mesh_shape = x_layout.mesh_shape
         w_mesh_shape = w_layout.mesh_shape
         if x_mesh_shape != w_mesh_shape:
-            raise ValueError("Linear inputs must have same mesh_shape")
+            raise ValueError(
+                f"For {self.op_name}, x and weight must have the same mesh_shape, "
+                f"but got x: {x_mesh_shape} and weight: {w_mesh_shape}"
+            )
         if bias_layout and bias_layout.mesh_shape != x_mesh_shape:
-            raise ValueError("Linear bias and x must have same mesh_shape")
+            raise ValueError(
+                f"For {self.op_name}, bias and x must have the same mesh_shape, "
+                f"but got bias: {bias_layout.mesh_shape} and x: {x_mesh_shape}"
+            )
+
         x_map = x_layout.alias_tensor_map
         w_map = w_layout.alias_tensor_map
+
+        if len(w_map) != 2:
+            raise ValueError(
+                f"For {self.op_name}, weight should be 2D [out_features, in_features], "
+                f"but got {len(w_map)}D"
+            )
+
         x_contract_dim = len(x_map) - 1
         w_contract_dim = len(w_map) - 1
         if x_map[x_contract_dim] != w_map[w_contract_dim]:
-            raise ValueError(f"Contracting dimensions must have same layout. "
-                             f"Got {x_map[x_contract_dim]} and {w_map[w_contract_dim]}")
+            raise ValueError(
+                f"For {self.op_name}, contracting dimensions must have the same layout, "
+                f"but got x: {x_map[x_contract_dim]} and weight: {w_map[w_contract_dim]}"
+            )
 
         output_dim = 0
         output_map = x_map[:-1] + (w_map[output_dim],)
         if bias_layout and bias_layout.alias_tensor_map[0] != w_map[output_dim]:
-            raise ValueError(f"Output dimensions must have same sharding. "
-                             f"Got weight output dim sharding size: {w_map[output_dim]}"
-                             f" and bias output dim sharding size : {bias_layout.alias_tensor_map[0]}")
+            raise ValueError(
+                f"For {self.op_name}, bias output dim sharding must match weight output dim sharding, "
+                f"but got weight: {w_map[output_dim]} and bias: {bias_layout.alias_tensor_map[0]}"
+            )
+
         output_layout = Layout(
             mesh_shape=x_layout.mesh_shape,
             alias_name=x_layout.alias_name,
-            rank_list=x_layout.rank_list
+            rank_list=x_layout.rank_list,
         )
         out_layout = output_layout(*output_map)
 
-        # Set partial status
+        # Set partial status when contracting dimension is sharded
         if x_map[x_contract_dim] != "None":
             if isinstance(x_map[x_contract_dim], tuple):
                 for axis in x_map[x_contract_dim]:
@@ -431,29 +467,52 @@ class LinearDistributedOp(DistributedOp):
 
         return ((out_layout,), None)
 
-    def get_expand_impl(self, func, infer_result, cache_values):
+    def get_expand_impl(self, func: Callable, infer_result: tuple,
+                        cache_values: list) -> Optional[Callable]:
         """
-        Get expand implementation for the operator
+        Return a custom expand implementation when bias scaling is needed.
+
+        When the contracting dimension is sharded each rank computes a partial sum
+        (x_shard @ w_shard.T + bias).  After AllReduce the bias would accumulate
+        scaling_factor times.  The returned closure pre-divides bias by scaling_factor
+        to keep the result numerically correct.
+
+        Args:
+            func: Original operator callable.
+            infer_result (tuple): ((out_layout,), None) from infer_layout.
+            cache_values (list): [x_layout, w_layout, bias_layout].
+
+        Returns:
+            callable | None: expand_impl closure when scaling is required, else None.
         """
-        output_layouts, _ = infer_result
-        output_layout = output_layouts[0]
         x_layout = cache_values[0]
         bias_layout = cache_values[2]
         x_map = x_layout.alias_tensor_map
         x_contract_dim = len(x_map) - 1
+
+        # Guard: scaling only needed when contract dim is sharded AND bias is present
+        if x_map[x_contract_dim] == "None" or not bias_layout:
+            return None
+
+        output_layout = infer_result[0][0]
         scaling_factor = 1
+        if isinstance(x_map[x_contract_dim], tuple):
+            for axis in x_map[x_contract_dim]:
+                scaling_factor *= output_layout.mesh.get_device_num_along_axis(axis)
+        else:
+            scaling_factor *= output_layout.mesh.get_device_num_along_axis(x_map[x_contract_dim])
 
-        if x_map[x_contract_dim] != "None":
-            if isinstance(x_map[x_contract_dim], tuple):
-                for axis in x_map[x_contract_dim]:
-                    scaling_factor *= output_layout.mesh.get_device_num_along_axis(axis)
-            else:
-                scaling_factor *= output_layout.mesh.get_device_num_along_axis(x_map[x_contract_dim])
+        def expand_impl(x: object, w: object, bias: object) -> object:
+            """Pre-scale bias to counteract the AllReduce accumulation over shards.
 
-        def expand_impl(x, w, bias):
-            linear_out = func(x, w, bias / scaling_factor)
-            return linear_out
+            Args:
+                x (object): Local input activation tensor.
+                w (object): Local weight tensor.
+                bias (object): Local bias tensor to be pre-scaled.
 
-        if x_map[x_contract_dim] != "None" and bias_layout:
-            return expand_impl
-        return None
+            Returns:
+                object: Result of the linear operation with pre-scaled bias.
+            """
+            return func(x, w, bias / scaling_factor)
+
+        return expand_impl
