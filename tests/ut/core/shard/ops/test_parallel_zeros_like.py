@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_elementwise import ElementWiseDistributedOp
 from hyper_parallel.platform import get_platform
@@ -41,6 +41,7 @@ class TestParallelZerosLike(unittest.TestCase):
         """Clear global caches and initialise platform before each test."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
         self.platform = get_platform()
         self.op = ElementWiseDistributedOp("zeros_like")
 
@@ -48,6 +49,7 @@ class TestParallelZerosLike(unittest.TestCase):
         """Restore global state after each test."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure minimal mock-platform attributes needed by init_device_mesh.

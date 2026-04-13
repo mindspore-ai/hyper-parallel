@@ -29,12 +29,10 @@ from hyper_parallel.platform import get_platform
 
 class TorchHSDPSchedulerV2(HSDPSchedulerV2):
     """TorchHSDPScheduler is used to implement optimizer level."""
-    _root_module = None
 
     def __init__(self, *args, **kwargs):
         """Initialize TorchHSDPSchedulerV2 and register forward/backward hooks."""
         super().__init__(*args, **kwargs)
-        self._is_root = False
 
     def _register_hooks(self):
         """Register hooks."""
@@ -107,18 +105,6 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _forward_pre_hook(self, cell, args, kwargs):
         """Execute forward pre hook and set up backward hook."""
-        if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
-            return args, kwargs
-        if HSDPSchedulerV2.root_bp_state:
-            self._disable_forward_prefetch_for_recompute()
-        if TorchHSDPSchedulerV2._root_module is None:
-            TorchHSDPSchedulerV2._root_module = self.cell
-            self._is_root = True
-        if not self._is_root and not self.hsdp_state.module_name:
-            for module_name, module in TorchHSDPSchedulerV2._root_module.named_modules():
-                if module == self.cell:
-                    self.hsdp_state.module_name = module_name
-                    break
         args, kwargs = self._hsdp_forward_pre_hook(cell, args, kwargs)
         return self._register_post_backward_hook(args, kwargs)
 

@@ -320,3 +320,12 @@ def get_split_rank_lists_for_axes(
         selected = mesh_tensor[tuple(mesh_slice)]
         split_rank_lists.append([int(item) for item in np.array(selected).reshape(-1).tolist()])
     return split_rank_lists
+
+def get_hsdp_state(module):
+    """Return the HSDPState for a fully_shard-managed module, or None."""
+    from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
+    if isinstance(module, HSDPModule):
+        scheduler = getattr(module, "hsdp_scheduler", None)
+        if scheduler is not None:
+            return scheduler.hsdp_state
+    return None

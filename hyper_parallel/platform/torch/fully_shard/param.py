@@ -695,27 +695,17 @@ class TorchHSDPParamV2(HSDPParamV2):
                     f"Expects swap_tensors to preserve object but got {new_param} "
                     f"instead of {self.sharded_param}"
                 )
-            self.sharded_param = new_param
+            if isinstance(new_param, DTensor):
+                self.sharded_param = new_param
+                if not getattr(self.sharded_param, "_hsdp_param_initialized", None):
+                    # reset _hsdp_param_initialized flag.
+                    self.sharded_param._hsdp_param_initialized = True
+            elif isinstance(new_param, torch.Tensor):
+                # if new_param is Tensor, don't change 'self.sharded_param' ref
+                # just update self.sharded_param._local_tensor and self.sharded_param_data.
+                pass
 
-        # Handle materialization from meta device via model.to_empty(device=...).
-        # to_empty() → _apply → compute_should_use_set_data → _has_compatible_shallow_copy_type
-        # (now whitelisted) → strips DTensor → returns False for meta vs npu types →
-        # PyTorch replaces the DTensor parameter with a plain Parameter(plain_npu_tensor).
-        # This plain Parameter has no _local_tensor attribute, so we detect it by hasattr
-        # and re-wrap it back into a DTensor to restore the HSDP parameter lifecycle.
-        if not hasattr(new_param, '_local_tensor'):
-            local_tensor = new_param.data
-            new_dtensor_param = nn.Parameter(
-                DTensor.from_local(local_tensor, self._spmd_mesh, self._spmd_placements)
-            )
-            new_dtensor_param.requires_grad_(new_param.requires_grad)
-            self.sharded_param = new_dtensor_param
-            self._sharded_param_data = local_tensor.view(-1)
-            self._sharding_spec = cast(DTensor, self.sharded_param).layout
-            self._setattr_on_modules(self.sharded_param)
-            return
-
-        local_tensor = new_param._local_tensor
+        local_tensor = new_param._local_tensor if isinstance(new_param, DTensor) else new_param
         if local_tensor.is_meta:
             return
         updated_local_tensor = False
@@ -738,10 +728,12 @@ class TorchHSDPParamV2(HSDPParamV2):
         sharded_size = self.sharded_size
         shard_dim = self.hsdp_placement.dim
         length = local_tensor.size(shard_dim) if local_tensor.numel() > 0 else 0
-        if local_tensor.size() != sharded_size and not same_local_tensor:
-            raise AssertionError(
-                f"Expected sharded_size to be {sharded_size}, got {local_tensor.size()}"
-            )
+        if not same_local_tensor:
+            if local_tensor.size() != sharded_size:
+                raise AssertionError(
+                    f"Expected sharded_size to be {sharded_size}, got {local_tensor.size()}"
+                )
+            updated_local_tensor = True
         if self.pin_memory and not local_tensor.is_pinned():
             local_tensor = local_tensor.cpu().pin_memory()
             updated_local_tensor = True

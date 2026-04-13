@@ -18,16 +18,17 @@ Verifies that when forward inputs contain a mix of requires_grad=True and
 requires_grad=False tensors, the requires_grad attribute is preserved correctly
 after passing through PostBackwardFunction.apply.
 """
+# pylint: disable=W0212
 import os
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 # pylint: disable=C0413
 import torch
-
-from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
+from torch import nn
+from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerContext, HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState
 from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
 
@@ -35,6 +36,7 @@ from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedul
 def _make_scheduler_stub() -> TorchHSDPSchedulerV2:
     """Create a minimal TorchHSDPSchedulerV2 stub that can call _register_post_backward_hook."""
     scheduler = object.__new__(TorchHSDPSchedulerV2)
+    scheduler.scheduler_ctx = HSDPSchedulerContext()
     return scheduler
 
 
@@ -303,18 +305,39 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
 
     def tearDown(self):
         HSDPSchedulerV2.root_bp_state = False
-        TorchHSDPSchedulerV2._root_module = None
 
     def test_forward_pre_hook_disables_prefetch_during_recompute(self):
-        """forward pre hook clears prefetch targets while root backward recompute is active."""
+        """_hsdp_forward_pre_hook clears prefetch targets when root_bp_state is True.
+
+        Description:
+            The prefetch-clearing logic lives in _hsdp_forward_pre_hook
+            (_disable_forward_prefetch_for_recompute), so _hsdp_forward_pre_hook
+            must NOT be mocked — its internal dependencies are mocked instead.
+        Expectation: forward_prefetch_cells is empty and _backup_forward_fetch
+            holds the original list; _register_post_backward_hook is called with
+            the args/kwargs returned by _hsdp_forward_pre_hook.
+        """
         scheduler = _make_scheduler_stub()
         scheduler.scheduler_state = FSDPSchedulerState.FORWARD
         scheduler.cell = MagicMock(name="cell")
-        scheduler.forward_prefetch_cells = [MagicMock(name="next_module")]
+        scheduler.scheduler_ctx.root_module = MagicMock(name="root_module")
+        original_prefetch = [MagicMock(name="next_module")]
+        scheduler.forward_prefetch_cells = list(original_prefetch)
         scheduler._backup_forward_fetch = None
         scheduler._is_root = False
+        # module_name non-empty so get_cells_and_names lookup is skipped
         scheduler.hsdp_state = MagicMock(module_name="mod")
-        scheduler._hsdp_forward_pre_hook = MagicMock(return_value=(("arg",), {"k": "v"}))
+        # Mock internal dependencies of _hsdp_forward_pre_hook
+        mock_mp_policy = MagicMock()
+        mock_mp_policy.cast_forward_inputs = False
+        scheduler.mp_policy = mock_mp_policy
+        scheduler.platform = MagicMock()
+        scheduler.platform.profiler_record.return_value = MagicMock(
+            __enter__=MagicMock(return_value=None),
+            __exit__=MagicMock(return_value=False),
+        )
+        scheduler._init_params_fqn = MagicMock()
+        scheduler._lazy_init_all_states = MagicMock()
         scheduler._register_post_backward_hook = MagicMock(return_value=("wrapped_args", "wrapped_kwargs"))
 
         HSDPSchedulerV2.root_bp_state = True
@@ -322,8 +345,7 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
         result = scheduler._forward_pre_hook(MagicMock(), ("arg",), {"k": "v"})
 
         self.assertEqual(scheduler.forward_prefetch_cells, [])
-        self.assertEqual(len(scheduler._backup_forward_fetch), 1)
-        scheduler._hsdp_forward_pre_hook.assert_called_once()
+        self.assertEqual(scheduler._backup_forward_fetch, original_prefetch)
         scheduler._register_post_backward_hook.assert_called_once_with(("arg",), {"k": "v"})
         self.assertEqual(result, ("wrapped_args", "wrapped_kwargs"))
 
@@ -347,6 +369,95 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(scheduler.forward_prefetch_cells, restored_prefetch)
         self.assertIsNone(scheduler._backup_forward_fetch)
+
+    def test_forward_pre_hook_with_param_fqn_init(self):
+        """_init_params_fqn assigns correct FQNs for a multi-layer nested model.
+
+        Description:
+            Build a two-level nested model (root → layer1 → sub).  Each
+            submodule that has local parameters contributes mock hsdp_params
+            whose sharded_param tensors are the real nn.Parameter objects.
+            After calling _init_params_fqn the _param_fqn attribute on each
+            wrapper must equal the FQN returned by named_parameters().
+        Expectation: Success — every hsdp_param._param_fqn matches the FQN
+            produced by model.named_parameters().
+        """
+        # Two-level nested model: root has its own param, layer1 is a Linear,
+        # layer1.sub is a nested Linear — all registered via nn.Module.
+        class _Sub(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(4, 4, bias=False)
+
+        class _Layer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(4, 4))
+                self.sub = _Sub()
+
+        class _Root(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bias = nn.Parameter(torch.randn(4))
+                self.layer1 = _Layer()
+
+        model = _Root()
+
+        # Ground-truth FQNs from named_parameters() before scheduler setup.
+        expected_fqns = {param: name for name, param in model.named_parameters()}
+
+        # Use a plain object instead of MagicMock so that attribute writes on
+        # _param_fqn and sharded_param behave like normal Python attributes.
+        # MagicMock intercepts single-underscore names and _iter_managed_params
+        # .return_value would silently produce a new Mock instead of our list.
+        class _FakeHSDPParam:
+            def __init__(self, real_param):
+                self.sharded_param = real_param
+                self._param_fqn = None
+
+        class _FakeHSDPState:
+            def __init__(self, hsdp_params):
+                self._hsdp_params = hsdp_params
+
+            def _iter_managed_params(self):
+                return self._hsdp_params
+
+        submodule_hsdp_params = {}
+        for module in model.modules():
+            local_params = [p for p in module._parameters.values() if p is not None]
+            if local_params:
+                submodule_hsdp_params[module] = [_FakeHSDPParam(p) for p in local_params]
+
+        def _fake_get_hsdp_state(module):
+            if module not in submodule_hsdp_params:
+                return None
+            return _FakeHSDPState(submodule_hsdp_params[module])
+
+        scheduler = _make_scheduler_stub()
+        scheduler._is_root = True
+        scheduler.scheduler_ctx.root_module = model
+
+        with patch(
+            "hyper_parallel.core.fully_shard.hsdp_scheduler.get_hsdp_state",
+            side_effect=_fake_get_hsdp_state,
+        ):
+            # pylint: disable=protected-access
+            scheduler._init_params_fqn()
+        # Every hsdp_param must have received the correct FQN.
+        all_fqns = [
+            (hp._param_fqn, expected_fqns.get(hp.sharded_param))
+            for hsdp_params in submodule_hsdp_params.values()
+            for hp in hsdp_params
+        ]
+        print("\n[_param_fqn check]")
+        for got, expected in all_fqns:
+            print(f"  got={got!r:40s}  expected={expected!r}")
+        for module, hsdp_params in submodule_hsdp_params.items():
+            for hp in hsdp_params:
+                expected = expected_fqns.get(hp.sharded_param)
+                assert hp._param_fqn == expected, (
+                    f"_param_fqn mismatch: expected={expected!r}, got={hp._param_fqn!r}"
+                )
 
 
 if __name__ == "__main__":

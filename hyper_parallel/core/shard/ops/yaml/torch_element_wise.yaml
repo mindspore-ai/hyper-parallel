@@ -65,3 +65,6 @@ square:
 
 zeros_like:
   dist_op_name: _torch_zeros_like_dist_op
+
+empty_like:
+  dist_op_name: _torch_empty_like_dist_op

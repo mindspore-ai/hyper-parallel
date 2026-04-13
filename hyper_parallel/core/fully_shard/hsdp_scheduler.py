@@ -22,6 +22,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     FSDPSchedulerState,
     HSDPConfigV2,
     get_managed_modules_parameters,
+    get_hsdp_state
 )
 
 platform = get_platform()
@@ -33,12 +34,13 @@ class HSDPSchedulerContext:
     def __init__(self) -> None:
         # Currently only record is_last_backward flag for scheduler context.
         self.is_last_backward: bool = True
+        # flag to identify "root_module"
+        self.root_module = None
 
 
 class HSDPSchedulerV2:
     """HSDPScheduler is used to scheduler hsdp"""
     root_bp_state = False
-
     def __init__(self, cell: Union[platform.Module, Tuple[platform.Module, ...]], mesh,
                  reshard_after_forward, shard_placement_fn,
                  mp_policy, offload_policy, ignored_params, replicate_params, device, comm_fusion):
@@ -61,6 +63,9 @@ class HSDPSchedulerV2:
         self.forward_prefetch_cells = []
         self.backward_prefetch_cells = []
         self._backup_forward_fetch = None
+        # Flag to identify root module.
+        self._is_root = False
+        # module and its all sub-modules share one same 'HSDPSchedulerContext'
         self.scheduler_ctx = HSDPSchedulerContext()
         # When ``fully_shard`` is given multiple root modules, forward pre/post hooks coordinate
         # so unshard / PostBackward / reshard run once per forward (aligned with PyTorch FSDP2).
@@ -145,8 +150,28 @@ class HSDPSchedulerV2:
     # pylint: disable=W0613
     def _hsdp_forward_pre_hook(self, cell, args, kwargs):
         """Forward pre hook to unsharded parameter for forward process."""
+        if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
+            return args, kwargs
+        if HSDPSchedulerV2.root_bp_state:
+            self._disable_forward_prefetch_for_recompute()
+        if self.scheduler_ctx.root_module is None:
+            self.scheduler_ctx.root_module = self.cell
+            self._is_root = True
+            for _, module in platform.get_cells_and_names(self.scheduler_ctx.root_module):
+                from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
+                if isinstance(module, HSDPModule):
+                    submod_scheduler = getattr(module, "hsdp_scheduler", None)
+                    if submod_scheduler and submod_scheduler.scheduler_ctx is not self.scheduler_ctx:
+                        submod_scheduler.scheduler_ctx = self.scheduler_ctx
+    
+        if not self._is_root and not self.hsdp_state.module_name:
+            for module_name, module in platform.get_cells_and_names(self.scheduler_ctx.root_module):
+                if module == self.cell:
+                    self.hsdp_state.module_name = module_name
+                    break
         self.scheduler_state = FSDPSchedulerState.PRE_FORWARD
-        self.hsdp_state.lazy_init()
+        self._init_params_fqn()
+        self._lazy_init_all_states()
         if self.mp_policy.cast_forward_inputs and self.mp_policy.param_dtype:
             cast_fn = functools.partial(self.platform.cast_fp_tensor, self.mp_policy.param_dtype)
             args = self.platform.apply_to_tensors(cast_fn, args)
@@ -158,6 +183,41 @@ class HSDPSchedulerV2:
                                                f"{prefetch_cell.hsdp_scheduler.hsdp_state.module_name}"):
                 prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()
         return args, kwargs
+
+    def _lazy_init_all_states(self):
+        if self._is_root and self.scheduler_ctx.root_module is not None:
+            for _, module in platform.get_cells_and_names(self.scheduler_ctx.root_module):
+                hsdp_state = get_hsdp_state(module)
+                if hsdp_state:
+                    hsdp_state.lazy_init()
+
+    def _init_params_fqn(self):  # pylint: disable=W0212
+        if not self._is_root or self.scheduler_ctx.root_module is None:
+            return
+        # Build a map from original (sharded) parameter tensor → hsdp_param wrapper,
+        # covering both sharded hsdp_params and replicate_params.
+        param_to_hsdp_param = {}
+        for _, module in platform.get_cells_and_names(self.scheduler_ctx.root_module):
+            hsdp_state = get_hsdp_state(module)
+            if hsdp_state is None:
+                continue
+            for hsdp_param in hsdp_state._iter_managed_params():  # pylint: disable=W0212
+                orig_param = hsdp_param.sharded_param
+                # Shared parameters: keep only the first mapping to preserve the
+                # first-seen FQN (consistent with the deduplication in _init_hsdp_params).
+                if orig_param not in param_to_hsdp_param:
+                    param_to_hsdp_param[orig_param] = hsdp_param
+
+        # Walk the full parameter tree and assign FQNs; skip params already seen
+        # (shared-parameter deduplication: first name wins).
+        visited_params = set()
+        for param_name, parameter in platform.parameters_dict(self.scheduler_ctx.root_module):
+            if parameter in visited_params:
+                continue
+            visited_params.add(parameter)
+            hsdp_param = param_to_hsdp_param.get(parameter)
+            if hsdp_param is not None:
+                hsdp_param._param_fqn = param_name  # pylint: disable=W0212
 
     # pylint: disable=W0613, R1710
     def _hsdp_forward_hook(self, cell, inputs, outputs):

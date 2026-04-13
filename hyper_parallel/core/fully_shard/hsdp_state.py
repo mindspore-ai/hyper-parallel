@@ -114,3 +114,7 @@ class HSDPState:
             for param in self.sharded_hsdp_params:
                 param.wait_for_unshard()
         self.is_shard = False
+
+    def _iter_managed_params(self):
+        """Return all fully_shard-managed parameters, including replicate_params."""
+        return [*self.hsdp_params, *self.replicate_params]

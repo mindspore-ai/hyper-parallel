@@ -92,10 +92,6 @@ class TorchHSDPStateV2(HSDPState):
         self._reset_sharded_params = False
         self._init_param_group()
 
-    def _iter_managed_params(self):
-        """Return all fully_shard-managed parameters, including replicate_params."""
-        return [*self.hsdp_params, *self.replicate_params]
-
     @staticmethod
     def _comm_fusion_unsupported_reason(hsdp_param) -> Optional[str]:
         """Return the reason why ``hsdp_param`` cannot participate in comm_fusion."""
