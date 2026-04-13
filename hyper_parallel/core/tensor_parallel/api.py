@@ -104,36 +104,50 @@ def parallelize_module(  # type: ignore[return]
         parallelize_plan.src_data_rank = src_data_rank
         return parallelize_plan.apply(module, device_mesh)
     if isinstance(parallelize_plan, dict):
-        for module_path, parallelize_style in parallelize_plan.items():
-            path_splits = module_path.split(".")
-            if len(path_splits) == 0:
-                raise ValueError(
-                    "Expect module path to be non-empty, but got empty string!"
+
+        def _apply_path(
+            current_module: Module,
+            atoms: list[str],
+            style: ParallelStyle,
+            src_rank: Optional[int],
+        ) -> bool:
+            atom = atoms[0]
+            matched_children = list(
+                filter(
+                    lambda t, pattern=atom: fnmatch(t[0], pattern),
+                    current_module.named_children(),
                 )
-            while path_splits:
-                atom = path_splits.pop(0)
-                matched_children = list(
-                    filter(
-                        lambda t, pattern=atom: fnmatch(t[0], pattern),
-                        module.named_children(),
+            )
+            applied = False
+            for _, submodule in matched_children:
+                if len(atoms) == 1:
+                    parallelize_module(
+                        submodule,
+                        device_mesh,
+                        style,
+                        src_data_rank=src_rank,
                     )
+                    applied = True
+                else:
+                    applied = _apply_path(submodule, atoms[1:], style, src_rank) or applied
+            return applied
+
+        for module_path, parallelize_style in parallelize_plan.items():
+            if not isinstance(parallelize_style, ParallelStyle):
+                raise TypeError(
+                    "Expect ParallelStyle values in parallelize_plan dict, but got "
+                    f"{type(parallelize_style)} for path '{module_path}'."
                 )
-                for _, submodule in matched_children:
-                    if path_splits:
-                        leaf_path = ".".join(path_splits)
-                        parallelize_module(
-                            submodule,
-                            device_mesh,
-                            {leaf_path: parallelize_style},
-                            src_data_rank=src_data_rank,
-                        )
-                    else:
-                        parallelize_module(
-                            submodule,
-                            device_mesh,
-                            parallelize_style,
-                            src_data_rank=src_data_rank,
-                        )
+            path_splits = module_path.split(".")
+            if module_path == "" or any(path == "" for path in path_splits):
+                raise ValueError(
+                    f"Expect module path to be non-empty dot-separated atoms, but got '{module_path}'."
+                )
+            if not _apply_path(module, path_splits, parallelize_style, src_data_rank):
+                warnings.warn(
+                    f"parallelize_plan path '{module_path}' has no matches, so this path is skipped.",
+                    stacklevel=2,
+                )
         return module
     raise TypeError(
         "Expect Union[ParallelStyle, Dict[str, ParallelStyle]] for"
