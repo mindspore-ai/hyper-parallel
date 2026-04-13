@@ -20,7 +20,7 @@ import mindspore as ms
 import mindspore.dataset as ds
 import numpy as np
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
-from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
+from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper, swap_wrapper, CheckpointPolicy, SwapManager
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 from hyper_parallel.core.fully_shard.api import fully_shard
@@ -105,8 +105,18 @@ def setup_prefetch(net):
 
 def apply_recompute(net):
     """Wrap fully_shard-target child modules with activation recompute."""
-    for idx in (0, 2, 4):
-        net.dense_relu_sequential[idx] = checkpoint_wrapper(net.dense_relu_sequential[idx])
+    def recomp_policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613,W0621
+        return CheckpointPolicy.MUST_RECOMPUTE
+    def swap_policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613,W0621
+        return CheckpointPolicy.MUST_SWAP
+    net.dense_relu_sequential[0] = swap_wrapper(net.dense_relu_sequential[0])
+    net.dense_relu_sequential[1] = checkpoint_wrapper(net.dense_relu_sequential[1], policy_fn=recomp_policy_fn)
+    net.dense_relu_sequential[2] = checkpoint_wrapper(net.dense_relu_sequential[2], policy_fn=swap_policy_fn)
+    net.dense_relu_sequential[3] = checkpoint_wrapper(net.dense_relu_sequential[3])
+
+    for i in range(len(net.dense_relu_sequential) - 1):
+        SwapManager().set_forward_prefetch_layer(net.dense_relu_sequential[i], net.dense_relu_sequential[i+1])
+
 
 
 def get_backward_grads(net, expected_dtype=None):
@@ -269,6 +279,9 @@ def run_fully_shard_multi_card(
     shard_dim_size = mesh.shape[-1]
     replicate_params = set(net.trainable_params()) if replicate_all_params else None
 
+    if enable_recompute:
+        apply_recompute(net)
+
     fully_shard(
         net.dense_relu_sequential[0], mesh=mesh, mp_policy=mp_policy, replicate_params=replicate_params
     )
@@ -281,9 +294,6 @@ def run_fully_shard_multi_card(
     fully_shard(net, mesh=mesh, mp_policy=mp_policy, replicate_params=replicate_params)
     if enable_prefetch:
         setup_prefetch(net)
-
-    if enable_recompute:
-        apply_recompute(net)
 
     if not replicate_all_params:
         assert_sharded_param_layout(net, origin_shapes, shard_dim_size)
@@ -504,7 +514,7 @@ def run_fully_shard_ignored(mesh):
         print("Precision comparison with replicate_params passed!")
 
 
-def run_fully_shard_with_grad_accum(mesh):
+def run_fully_shard_with_grad_accum(mesh, enable_prefetch=False, enable_recompute=False):
     """Run fully_shard gradient accumulation and compare with large-batch baseline."""
     init()
 
@@ -513,7 +523,13 @@ def run_fully_shard_with_grad_accum(mesh):
     ckpt_path = os.path.join(TEMP_DIR, "init_baseline.ckpt")
     assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please generate baseline artifacts first"
 
-    losses, _ = run_fully_shard_multi_card(ckpt_path, mesh, accumulate_grad=True)
+    losses, _ = run_fully_shard_multi_card(
+        ckpt_path,
+        mesh,
+        accumulate_grad=True,
+        enable_prefetch=enable_prefetch,
+        enable_recompute=enable_recompute,
+    )
 
     if rank_id == 0:
         baseline_losses_file = os.path.join(TEMP_DIR, "baseline_losses.npy")
@@ -605,6 +621,17 @@ def test_ms_zero3_partial_shard():
     run_fully_shard(mesh)
 
 
+def test_ms_zero3_partial_shard_prefetch_recompute():
+    """
+    Feature: Compare partial_shard prefetch + recompute precision with standalone baseline
+    Description: Run standalone baseline and partial_shard multi-card training with child-module
+                 prefetch and activation recompute enabled, then compare reduced losses on rank 0 only
+    Expectation: Losses should match within tolerance
+    """
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "op"))
+    run_fully_shard(mesh, enable_prefetch=True, enable_recompute=True)
+
+
 def test_ms_zero3_fully_shard_replicate_params():
     """
     Feature: Compare fully_shard(replicate_params) precision with standalone baseline
@@ -625,6 +652,19 @@ def test_ms_zero3_fully_shard_grad_accum():
     """
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     run_fully_shard_with_grad_accum(mesh)
+
+
+def test_ms_zero3_fully_shard_prefetch_recompute_grad_accum():
+    """
+    Feature: Compare fully_shard prefetch + recompute + gradient accumulation precision
+             with large-batch standalone baseline
+    Description: Run fully_shard multi-card training with child-module prefetch, activation
+                 recompute, and per-micro-step gradient accumulation, then compare reduced
+                 losses against the large-batch baseline on rank 0 only
+    Expectation: Losses should match the large-batch baseline within tolerance
+    """
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    run_fully_shard_with_grad_accum(mesh, enable_prefetch=True, enable_recompute=True)
 
 
 def test_ms_zero1_fully_shard_grad_accum():

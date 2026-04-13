@@ -24,6 +24,7 @@ from mindspore import Tensor, mint, nn
 from mindspore.communication import get_rank, get_group_size, init
 
 from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
+from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, checkpoint_wrapper
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
@@ -101,6 +102,28 @@ def _get_dense1_grad_shard(net) -> Tensor:
     raise AssertionError("block.dense1.weight grad not found")
 
 
+def _setup_list_prefetch(net) -> None:
+    """Configure one-hop prefetch edges for the nested list-unit topology."""
+    net.pre.set_modules_to_forward_prefetch([net.block.dense1])
+    net.block.dense1.set_modules_to_forward_prefetch([net.block.dense2])
+
+    net.block.dense2.set_modules_to_backward_prefetch([net.block.dense1])
+    net.block.dense1.set_modules_to_backward_prefetch([net.pre])
+
+
+def _apply_list_recompute(net) -> None:
+    """Wrap list-unit modules with selective activation recompute policies."""
+    def recomp_policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613
+        return CheckpointPolicy.MUST_RECOMPUTE
+
+    def save_policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613
+        return CheckpointPolicy.MUST_SAVE
+
+    net.pre = checkpoint_wrapper(net.pre)
+    net.block.dense1 = checkpoint_wrapper(net.block.dense1, policy_fn=recomp_policy_fn)
+    net.block.dense2 = checkpoint_wrapper(net.block.dense2, policy_fn=save_policy_fn)
+
+
 def _train_reference():
     """Single full-replica training (no fully_shard) for numerical target."""
     # Match ``fully_shard()``: PyNative loss.backward() needs torch-style tensor API.
@@ -127,7 +150,7 @@ def _train_reference():
     return last_loss, last_g1
 
 
-def _train_fully_shard_list(mesh):
+def _train_fully_shard_list(mesh, enable_prefetch=False, enable_recompute=False):
     """Nested fully_shard + list unit (exercises grouped hooks)."""
     ms.set_seed(42)
     x = _fixed_input()
@@ -142,6 +165,12 @@ def _train_fully_shard_list(mesh):
     )
     fully_shard(net, **fsdp_kw)
     assert net.block.dense1.hsdp_scheduler is net.block.dense2.hsdp_scheduler
+
+    if enable_prefetch:
+        _setup_list_prefetch(net)
+
+    if enable_recompute:
+        _apply_list_recompute(net)
 
     opt = nn.SGD(net.trainable_params(), learning_rate=LR)
     last_loss = None
@@ -177,6 +206,38 @@ def test_ms_fully_shard_list_unit_precision():
 
     ref_loss, ref_g1 = _train_reference()
     dist_loss, dist_local = _train_fully_shard_list(mesh)
+
+    assert np.allclose(ref_loss, dist_loss, rtol=1e-3, atol=1e-3), (ref_loss, dist_loss)
+
+    stride = HIDDEN // shard
+    off = (rank % shard) * stride
+    expected = ref_g1[off : off + stride, :]
+    assert np.allclose(expected, dist_local, rtol=1e-3, atol=1e-3), (
+        rank,
+        expected.shape,
+        dist_local.shape,
+    )
+
+
+def test_ms_fully_shard_list_unit_prefetch_recompute_precision():
+    """
+    Feature: fully_shard(list) prefetch + recompute precision vs standalone MindSpore training.
+    Description: Nested ``fully_shard([d1,d2], reshard_after_forward=False)`` list unit with
+        prefetch and activation recompute; compare final loss and ``dense1`` grad slice to
+        a non-sharded reference.
+    Expectation: Run success on all ranks.
+    """
+    ms.set_context(mode=ms.PYNATIVE_MODE)
+    init()
+    rank = get_rank()
+    ws = get_group_size()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(ws,), mesh_dim_names=("dp",))
+    shard = ws
+
+    ref_loss, ref_g1 = _train_reference()
+    dist_loss, dist_local = _train_fully_shard_list(
+        mesh, enable_prefetch=True, enable_recompute=True
+    )
 
     assert np.allclose(ref_loss, dist_loss, rtol=1e-3, atol=1e-3), (ref_loss, dist_loss)
 

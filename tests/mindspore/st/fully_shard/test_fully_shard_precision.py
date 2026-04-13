@@ -117,6 +117,18 @@ def test_ms_zero3_partial_shard():
     run_case(case_name=f"{inspect.stack()[0].function}")
 
 
+@pytest.mark.skip(reason="recompute currently not supported in MindSpore fully_shard; will re-enable once supported")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_ms_zero3_partial_shard_prefetch_recompute():
+    """
+    Feature: Compare partial_shard prefetch + recompute precision with standalone baseline
+    Description: Run standalone baseline and partial_shard multi-card training with prefetch and activation
+                 recompute enabled, then compare losses on rank 0
+    Expectation: Losses should match within tolerance
+    """
+    run_case(case_name=f"{inspect.stack()[0].function}")
+
+
 @pytest.mark.skip(reason="Case failed after upgrading mindspore version")
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_ms_zero3_fully_shard_replicate_params():
@@ -134,6 +146,18 @@ def test_ms_zero3_fully_shard_grad_accum():
     Feature: Compare fully_shard gradient accumulation precision with standalone baseline
     Description: Run standalone baseline and fully_shard multi-card training with gradient accumulation,
                  then compare losses on rank 0
+    Expectation: Losses should match within tolerance
+    """
+    run_case(case_name=f"{inspect.stack()[0].function}")
+
+
+@pytest.mark.skip(reason="recompute currently not supported in MindSpore fully_shard; will re-enable once supported")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_ms_zero3_fully_shard_prefetch_recompute_grad_accum():
+    """
+    Feature: Compare fully_shard prefetch + recompute + gradient accumulation precision with standalone baseline
+    Description: Run standalone baseline and fully_shard multi-card training with prefetch, activation
+                 recompute, and gradient accumulation, then compare losses on rank 0
     Expectation: Losses should match within tolerance
     """
     run_case(case_name=f"{inspect.stack()[0].function}")
@@ -159,6 +183,19 @@ def test_ms_fully_shard_list_unit_precision():
     Feature: fully_shard(list) numerical parity vs standalone (MindSpore).
     Description: Nested fully_shard with ``fully_shard([dense1, dense2], reshard_after_forward=False)``;
         compare final loss and dense1 grad shard to non-sharded training (same seed).
+    Expectation: Run success (grouped hooks aligned with PyTorch FSDP2 list semantics).
+    """
+    run_list_precision_case(case_name=f"{inspect.stack()[0].function}")
+
+
+@pytest.mark.skip(reason="recompute currently not supported in MindSpore fully_shard; will re-enable once supported")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_ms_fully_shard_list_unit_prefetch_recompute_precision():
+    """
+    Feature: fully_shard(list) numerical parity vs standalone with prefetch and recompute (MindSpore).
+    Description: Nested fully_shard with ``fully_shard([dense1, dense2], reshard_after_forward=False)``
+        plus prefetch and activation recompute; compare final loss and dense1 grad shard to
+        non-sharded training (same seed).
     Expectation: Run success (grouped hooks aligned with PyTorch FSDP2 list semantics).
     """
     run_list_precision_case(case_name=f"{inspect.stack()[0].function}")
