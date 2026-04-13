@@ -27,6 +27,7 @@ from mindspore.mint.distributed import TCPStore
 from mindspore.nn import Cell
 from mindspore import mint
 from mindspore.common.api import _no_grad
+from mindspore.common._grad_function import _Function
 from mindspore.common.dtype import type_size_in_bytes
 from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
@@ -35,6 +36,7 @@ from mindspore.common.recompute import null_context_fn
 from mindspore.communication import get_group_size
 from mindspore.communication import create_group as new_group
 from mindspore.communication import get_rank as get_rank_id
+from mindspore.ops import communication as ops_comm
 from mindspore.ops.function import comm_func
 from mindspore._c_expression import TensorTransform
 import mindspore.mint.distributed as dist
@@ -50,6 +52,78 @@ _tensor_transform = TensorTransform.get_instance()
 
 
 # pylint: disable=C0103
+
+
+def _a2a_reconstruct_ms(out_perm: Tensor, concat_dim: int) -> Tensor:
+    """Reconstruct A2A result from raw out_perm buffer."""
+    new_ndim = out_perm.dim()
+    chunk_in_perm = concat_dim + 1
+    recon_perm = list(range(1, chunk_in_perm)) + [0] + list(range(chunk_in_perm, new_ndim))
+    x_recon = out_perm.permute(recon_perm).contiguous()
+    shape = list(x_recon.shape)
+    merged = shape[concat_dim] * shape[concat_dim + 1]
+    return x_recon.reshape(shape[:concat_dim] + [merged] + shape[concat_dim + 2:])
+
+
+def _normalize_all_to_all_single_result(result, output: Tensor) -> tuple[Tensor, object]:
+    """Normalize MindSpore all_to_all_single return values to ``(output, handle)``."""
+    if isinstance(result, tuple):
+        if len(result) != 2:
+            raise ValueError(
+                "mindspore all_to_all_single returned an unexpected tuple "
+                f"with length {len(result)}"
+            )
+        return result
+    return output, result
+
+
+def _mindspore_all_to_all_single(input_tensor: Tensor, output_shape, group, async_op=False) -> tuple[Tensor, object]:
+    """Launch MindSpore all_to_all_single and normalize return values."""
+    output = mint.empty(tuple(output_shape), dtype=input_tensor.dtype)
+    result = ops_comm.all_to_all_single(output, input_tensor, group=group, async_op=async_op)
+    normalized_output, handle = _normalize_all_to_all_single_result(result, output)
+    if not async_op:
+        return normalized_output, None
+    return normalized_output, handle
+
+
+class _MSAsyncA2AFunction(_Function):
+    """Differentiable wrapper for pre-launched async all-to-all."""
+
+    @staticmethod
+    def forward(ctx, x, work, out_perm, group, world_size, concat_dim, split_dim, handle_box):  # pylint: disable=arguments-differ
+        """Wait for pre-launched async A2A and return reconstructed output."""
+        ctx.group = group
+        ctx.world_size = world_size
+        ctx.concat_dim = concat_dim
+        ctx.split_dim = split_dim
+        ctx.handle_box = handle_box
+        ctx.x_shape = tuple(x.shape)
+        work.wait()
+        return _a2a_reconstruct_ms(out_perm, concat_dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Launch async head->seq A2A for backward overlap, or return zero grad."""
+        if ctx.handle_box is not None:
+            g = grad_output.contiguous()
+            shape = list(g.shape)
+            seq_dim = ctx.concat_dim
+            s_full = shape[seq_dim]
+            ndim = len(shape) + 1
+            x_perm = g.reshape(
+                shape[:seq_dim] + [ctx.world_size, s_full // ctx.world_size] + shape[seq_dim + 1:]
+            ).permute(
+                [seq_dim] + list(range(seq_dim)) + list(range(seq_dim + 1, ndim))
+            ).contiguous()
+            out_perm, work = _mindspore_all_to_all_single(
+                x_perm,
+                list(x_perm.shape),
+                ctx.group,
+                async_op=True,
+            )
+            ctx.handle_box.append((work, out_perm))
+        return mint.zeros(ctx.x_shape, dtype=grad_output.dtype), None, None, None, None, None, None, None
 
 
 class MindSporePlatform(Platform):
@@ -524,19 +598,13 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def all_to_all_single(input_tensor, output_shape, group, async_op=False):
-        return comm_func.all_to_all_single_with_output_shape(
-            output_shape=output_shape,
-            tensor=input_tensor,
-            group=group,
-            async_op=async_op,
-        )
+        return _mindspore_all_to_all_single(input_tensor, output_shape, group, async_op=async_op)
 
     @staticmethod
     def differentiable_async_a2a_wait(x, work, out_perm, group, world_size, concat_dim, split_dim,  # pylint: disable=unused-argument
                                       handle_box=None):
-        raise NotImplementedError(
-            "differentiable_async_a2a_wait is not yet supported "
-            "on the MindSpore platform."
+        return _MSAsyncA2AFunction.apply(
+            x, work, out_perm, group, world_size, concat_dim, split_dim, handle_box
         )
 
     @staticmethod
