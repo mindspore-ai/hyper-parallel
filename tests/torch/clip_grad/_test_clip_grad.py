@@ -30,7 +30,7 @@ from hyper_parallel.core.fully_shard.utils import (  # pylint: disable=C0413
     MixedPrecisionPolicy,
 )
 
-from tests.torch.common_net import DenseNet  # pylint: disable=C0413
+from tests.torch.common_net import DenseNet, DenseMutiLayerNet  # pylint: disable=C0413
 from tests.torch.utils import init_dist  # pylint: disable=C0413
 
 
@@ -164,30 +164,6 @@ def _zero_grads(model):
         p.grad = None
 
 
-def _local_norm(model, norm_type=2.0):
-    """Compute local combined norm from this rank's grad shards.
-
-    Matches the return value of clip_grad_norm_ for finite p-norms,
-    which returns the local combined norm (pre-eps, pre-reduce)
-    to match FSDP2's _NormPartial._local_tensor behavior.
-    """
-    norms = []
-    for p in model.parameters():
-        grad = getattr(p, "main_grad", None)
-        if grad is None:
-            grad = p.grad
-        if grad is None:
-            continue
-        local_g = (
-            grad._local_tensor  # pylint: disable=W0212
-            if isinstance(grad, DTensor) else grad
-        )
-        norms.append(torch.linalg.vector_norm(local_g, norm_type))
-    if not norms:
-        return torch.tensor(0.0)
-    return torch.linalg.vector_norm(torch.stack(norms), norm_type)
-
-
 # ===================================================================
 # Test A – 5-step training loop: FSDP2-aligned clipped grads
 # ===================================================================
@@ -228,17 +204,24 @@ def test_clip_grad_norm_training_5step():  # pylint: disable=R0914
             loss = out.sum()
             loss.backward(torch.tensor(1.0 / world_size).npu())
 
-        # -- Reference: clip full grads via nn.utils --
+        # -- Reference: clip full grads via nn.utils (= FSDP1 path) --
         saved = _save_grads(model)
         full_grads = _gather_full(model, "grad")
-        _, ref_clipped = _ref_clip(full_grads, _MAX_NORM, 2.0)
+        ref_norm, ref_clipped = _ref_clip(full_grads, _MAX_NORM, 2.0)
 
         # -- Our clip on sharded grads --
         _restore_grads(model, saved)
         with SkipDTensorDispatch():
-            clip_grad_norm_(model, _MAX_NORM, norm_type=2.0)
+            our_norm = clip_grad_norm_(model, _MAX_NORM, norm_type=2.0)
 
-        # -- Precision check: clipped grads must match --
+        # -- Check 1: return value == global norm (torchtitan-aligned) --
+        assert _close(our_norm, ref_norm), (
+            f"Step {step} return norm mismatch vs torch reference: "
+            f"got={our_norm.item():.6e}, "
+            f"ref={ref_norm.item():.6e}"
+        )
+
+        # -- Check 2: clipped grads match torch reference --
         our_clipped = _gather_full(model, "grad")
         for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped)):
             assert _close(og, rg), (
@@ -294,10 +277,17 @@ def test_clip_grad_norm_main_grad():  # pylint: disable=R0914
     # Our clip — should read main_grad
     max_norm = 0.01
     with SkipDTensorDispatch():
-        clip_grad_norm_(model, max_norm, norm_type=2.0)
+        our_norm = clip_grad_norm_(model, max_norm, norm_type=2.0)
 
     # Reference clip on full grads
-    _, ref_clipped = _ref_clip(full_grads, max_norm, 2.0)
+    ref_norm, ref_clipped = _ref_clip(full_grads, max_norm, 2.0)
+
+    # Check 1: return value == global norm (torchtitan-aligned)
+    assert _close(our_norm, ref_norm), (
+        f"main_grad return norm mismatch: "
+        f"got={our_norm.item():.6e}, "
+        f"ref={ref_norm.item():.6e}"
+    )
 
     # Verify clipped main_grad values match reference
     for p in model.parameters():
@@ -353,12 +343,19 @@ def test_clip_grad_norm_frozen_params():
 
     max_norm = 0.01
     with SkipDTensorDispatch():
-        clip_grad_norm_(model, max_norm, norm_type=2.0)
+        our_norm = clip_grad_norm_(model, max_norm, norm_type=2.0)
 
     # Reference: clip only unfrozen grads
-    _, ref_clipped = _ref_clip(unfrozen_full_grads, max_norm, 2.0)
+    ref_norm, ref_clipped = _ref_clip(unfrozen_full_grads, max_norm, 2.0)
 
-    # Verify clipped unfrozen grads match
+    # Check 1: return value == global norm (torchtitan-aligned)
+    assert _close(our_norm, ref_norm), (
+        f"frozen return norm mismatch: "
+        f"got={our_norm.item():.6e}, "
+        f"ref={ref_norm.item():.6e}"
+    )
+
+    # Check 2: clipped grads match torch reference
     our_clipped = _gather_full(model, "grad")
     for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped)):
         assert _close(og, rg), f"Frozen: clipped grad[{i}] mismatch"
@@ -366,3 +363,73 @@ def test_clip_grad_norm_frozen_params():
     # Restore
     params[0].requires_grad_(True)
     params[0].grad = saved_grad
+
+
+# ===================================================================
+# Test D – Multi-grad-group parameter ordering
+# ===================================================================
+
+def test_clip_grad_norm_multi_group():  # pylint: disable=R0914
+    """Verify stack order stability across multiple grad groups.
+
+    Regression guard for param / grad_group iteration order: when
+    parameters span multiple fully_shard units (multiple grad_groups),
+    norm stacking must follow original parameter order, not
+    grad_group iteration order. Float32 addition is non-associative,
+    so different orders can produce 1-ULP diffs on non-rank-0 ranks.
+
+    Check on all ranks explicitly — the regression does not manifest
+    on rank 0 in general.
+    """
+    init_dist()
+
+    mesh = init_device_mesh(
+        device_type="npu", mesh_shape=(4, 2),
+        mesh_dim_names=("dp", "op"),
+    )
+    fsdp_kwargs = _get_fsdp_kwargs(mesh)
+    world_size = len(mesh.rank_list)
+
+    torch.manual_seed(_SEED)
+
+    # Multi-layer net (8 layers × weight+bias = 16 params) creates
+    # multiple grad_groups, exercising the param-order regression path.
+    # Randomize per-param weights so per-param norms differ across layers.
+    model = DenseMutiLayerNet(64, layer_num=8, has_bias=True)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.copy_(torch.randn_like(p) * 0.1)
+    for layer in model.layers:
+        fully_shard(layer, **fsdp_kwargs)
+    model = fully_shard(model, **fsdp_kwargs)
+    model.set_reduce_op_type("sum")
+
+    x = torch.rand(4, 64).npu()
+    with SkipDTensorDispatch():
+        out = model(x)
+        loss = out
+        loss.backward(torch.tensor(1.0 / world_size).npu())
+
+    saved = _save_grads(model)
+    full_grads = _gather_full(model, "grad")
+    ref_norm, ref_clipped = _ref_clip(full_grads, _MAX_NORM, 2.0)
+
+    _restore_grads(model, saved)
+    with SkipDTensorDispatch():
+        our_norm = clip_grad_norm_(model, _MAX_NORM, norm_type=2.0)
+
+    rank = dist.get_rank()
+
+    # Check 1: return value == torch reference (FSDP2-aligned global norm)
+    assert _close(our_norm, ref_norm), (
+        f"[rank={rank}] multi-group norm mismatch: "
+        f"got={our_norm.item():.6e}, ref={ref_norm.item():.6e}"
+    )
+
+    # Check 2: clipped grads match torch reference on ALL ranks
+    our_clipped = _gather_full(model, "grad")
+    for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped)):
+        assert _close(og, rg), (
+            f"[rank={rank}] multi-group grad[{i}] mismatch: "
+            f"max_diff={torch.max(torch.abs(og - rg)).item():.2e}"
+        )

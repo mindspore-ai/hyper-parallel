@@ -356,35 +356,30 @@ def _get_total_norm(
     mesh_cache: Dict[int, object],
     device: torch.device,
     all_grads: Optional[List[torch.Tensor]] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Compute total gradient norm with per-group all-reduce.
-
-    Returns ``(total_norm, local_combined)`` where *local_combined* is
-    set for finite p-norms (FSDP2-aligned path) and ``None`` for others.
-    """
+) -> torch.Tensor:
+    """Compute total gradient norm with per-group all-reduce."""
     if norm_type == math.inf:
         return _total_norm_inf(
             grad_groups, norm_type, mesh_cache, device,
             dist.ReduceOp.MAX,
-        ), None
+        )
 
     if norm_type == -math.inf:
         return _total_norm_inf(
             grad_groups, norm_type, mesh_cache, device,
             dist.ReduceOp.MIN,
-        ), None
+        )
 
     if norm_type == 0:
         return _total_norm_sum(
             grad_groups, norm_type, mesh_cache, device,
-        ), None
+        )
 
-    # Finite p-norm: FSDP2-aligned sequence with eps on local combined norm.
-    total_p, local_combined = _total_norm_fsdp2_aligned(
+    # Finite p-norm: FSDP2-aligned sequence.
+    total_p = _total_norm_fsdp2_aligned(
         grad_groups, norm_type, mesh_cache, device, all_grads,
     )
-    total_norm = total_p ** (1.0 / norm_type)
-    return total_norm, local_combined
+    return total_p ** (1.0 / norm_type)
 
 
 def _total_norm_inf(  # pylint: disable=R0913,R0917
@@ -439,9 +434,7 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
     different results on non-rank-0 ranks, causing the all_reduce sum
     to differ.
 
-    Returns ``(total_p, local_combined)`` where *total_p* is the global
-    sum of p-th powers (caller takes p-th root), and *local_combined*
-    is the overall local norm (for return value alignment).
+    Returns the global sum of p-th powers (caller takes p-th root).
     """
     # --- Phase 1: find the reduce group ---
     reduce_mesh = None
@@ -460,20 +453,13 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
     else:
         all_norms = []
 
-    # --- Phase 2: ONE vector_norm + eps on local (passive path) ---
+    # --- Phase 2: ONE vector_norm on local norms ---
     if not all_norms:
-        local_combined = torch.tensor(0.0, device=device, dtype=torch.float32)
         partial_sq = torch.tensor(0.0, device=device, dtype=torch.float32)
     else:
         combined = torch.linalg.vector_norm(
             torch.stack(all_norms), norm_type,
         )
-        local_combined = combined
-        # Match FSDP2 passive path: eps added to ONE local combined norm
-        # BEFORE squaring and all_reduce. This replicates the _NormPartial
-        # linearity preservation behavior (aten.add.Tensor linearity=True
-        # preserves _NormPartial, so +1e-6 stays on local).
-        combined = combined + 1e-6
         partial_sq = combined ** norm_type
 
     # --- Phase 3: ONE all_reduce ---
@@ -482,7 +468,7 @@ def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
             dist.all_reduce(partial_sq, op=dist.ReduceOp.SUM,
                             group=reduce_mesh.get_group(dim))
 
-    return partial_sq, local_combined
+    return partial_sq
 
 
 def _build_coalesce_buffer(
@@ -699,18 +685,9 @@ def _clip_grads_with_norm_(
     max_norm: float,
     total_norm: torch.Tensor,
     foreach: Optional[bool] = None,
-    eps_in_norm: bool = False,
 ) -> None:
-    """Scale gradients in-place so the total norm <= *max_norm*.
-
-    When *eps_in_norm* is True, the 1e-6 epsilon is already baked into
-    *total_norm* (FSDP2-aligned passive path for finite p-norms).
-    Otherwise eps is added here to prevent division by zero.
-    """
-    if eps_in_norm:
-        clip_coef = max_norm / total_norm
-    else:
-        clip_coef = max_norm / (total_norm + 1e-6)
+    """Scale gradients in-place so the total norm <= *max_norm*."""
+    clip_coef = max_norm / (total_norm + 1e-6)
     clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
 
     if _group_tensors_by_device_and_dtype is not None:
@@ -813,10 +790,9 @@ def clip_grad_norm_(
     # -- Norm + clip (all ranks participate) --------------------------------
     # _compute_local_norm returns identity elements for empty groups,
     # so the subsequent all-reduce is safe and semantically neutral.
-    total_norm, local_norm = _get_total_norm(
+    total_norm = _get_total_norm(
         grad_groups, norm_type, mesh_cache, device, all_grads,
     )
-    eps_in_norm = local_norm is not None  # finite p-norm has eps baked in
 
     if error_if_nonfinite and torch.logical_or(
         total_norm.isnan(), total_norm.isinf()
@@ -834,7 +810,6 @@ def clip_grad_norm_(
         effective_foreach = False if has_dtensor_grad and foreach is None else foreach
         _clip_grads_with_norm_(
             all_grads, max_norm, total_norm, effective_foreach,
-            eps_in_norm=eps_in_norm,
         )
 
     # Promote return dtype to match gradient dtypes (FSDP1 convention).
@@ -853,8 +828,6 @@ def clip_grad_norm_(
         torch.promote_types,
         [g.dtype for g in all_grads],
     )
-    # Return the global all-reduced norm so that all ranks see the same
-    # value and callers can use it for logging or adaptive clipping.
-    # For finite p-norms total_norm includes a 1e-6 epsilon (matching the
-    # clip denominator); for inf/-inf/0 norms it is the exact global norm.
+    # Return global all-reduced norm, consistent with torchtitan's
+    # full_tensor() approach — .item() returns the correct global value.
     return total_norm.to(total_norm_dtype)

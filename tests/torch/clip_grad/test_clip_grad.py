@@ -58,3 +58,19 @@ def test_clip_grad_norm_frozen_params():
     parallel_run([
         TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_frozen_params", 12365, 8)
     ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_clip_grad_norm_multi_group():
+    """
+    Feature: multi-grad-group parameter ordering stability
+    Description:
+        8-layer model wrapped per-layer with fully_shard creates multiple
+        grad_groups. Verify norm stacking uses original parameter order
+        (not grad_group iteration order) to avoid float32 non-associative
+        ULP diffs on non-rank-0 ranks.
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_multi_group", 12366, 8)
+    ])
