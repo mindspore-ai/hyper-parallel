@@ -22,7 +22,6 @@ from safetensors import safe_open
 
 from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, MetadataIndex
 from hyper_parallel.core.distributed_checkpoint.planner import (
-    LoadItemType,
     LoadPlan,
     LoadPlanner,
     ReadItem,
@@ -104,39 +103,54 @@ class FileSystemWriter(StorageWriter):
         """
         return plans
 
-    def _write_bytes_item(self, item: WriteItem, planner: SavePlanner) -> WriteResult:
+
+    def _serialize_bytes_item(self, item: WriteItem, planner: SavePlanner) -> bytes:
+        """Serialize a BYTE_IO item payload while preserving current behavior."""
+        data = planner.get_data(item)
+        if isinstance(data, bytes):
+            return data
+        return pickle.dumps(data)
+
+
+    def _write_bytes_items(self, plan: SavePlan, planner: SavePlanner) -> list[WriteResult]:
         """
-        Write a single bytes item to storage.
+        Write all BYTE_IO items into one per-rank bytes file.
 
         Args:
-            item (WriteItem): WriteItem containing bytes data.
-            planner (SavePlanner): Save planner used to get current runtime data.
+            plan (SavePlan): Save plan containing WriteItems.
+            planner (SavePlanner): Save planner used to resolve runtime data.
 
         Returns:
-            WriteResult: Write result with storage metadata.
+            list[WriteResult]: Write results for BYTE_IO items.
         """
-        fqn = item.index.fqn
-        file_name = f"{fqn}_rank{self.rank}.bytes"
+        byte_items = [item for item in plan.items if item.type.value == "byte_io"]
+        if not byte_items:
+            return []
+
+        file_name = f"_rank{self.rank}_.bytes"
         file_path = self.checkpoint_dir / file_name
-        data = planner.get_data(item)
+
+        results: list[WriteResult] = []
+
         with open(file_path, "wb") as f:
-            if isinstance(data, bytes):
-                f.write(data)
-            else:
-                pickle.dump(data, f)
-            try:
-                length = f.tell()
-            except (OSError, IOError):
-                length = 0
-        storage_info = StorageInfo(
-            relative_path=file_name,
-            offset=0,
-            length=length,
-        )
-        return WriteResult(
-            index=item.index,
-            storage_data=storage_info,
-        )
+            for item in byte_items:
+                payload = self._serialize_bytes_item(item, planner)
+                offset = f.tell()
+                f.write(payload)
+                length = len(payload)
+                storage_info = StorageInfo(
+                    relative_path=file_name,
+                    offset=offset,
+                    length=length,
+                )
+                results.append(
+                    WriteResult(
+                        index=item.index,
+                        storage_data=storage_info,
+                    )
+                )
+
+        return results
 
     def _collect_tensors(self, plan: SavePlan, planner: SavePlanner) -> dict[str, Any]:
         """
@@ -217,10 +231,8 @@ class FileSystemWriter(StorageWriter):
         """
         results: list[WriteResult] = []
 
-        # Collect tensors and write bytes objects
-        for item in plan.items:
-            if item.type.value == "byte_io":
-                results.append(self._write_bytes_item(item, planner))
+        # Write all BYTE_IO items into one file per rank
+        results.extend(self._write_bytes_items(plan, planner))
 
         # Collect and write tensors
         tensor_dict = self._collect_tensors(plan, planner)
@@ -279,7 +291,12 @@ def _copy_tensor_to_target(
         planner.apply_tensor(req, tensor)
 
 
-def _load_bytes_file(path: str, reqs: list[ReadItem], planner: LoadPlanner) -> None:
+def _load_bytes_file(
+        path: str,
+        reqs: list[ReadItem],
+        planner: LoadPlanner,
+        storage_data: dict[MetadataIndex, StorageInfo],
+) -> None:
     """
     Load bytes from a file.
 
@@ -288,10 +305,16 @@ def _load_bytes_file(path: str, reqs: list[ReadItem], planner: LoadPlanner) -> N
         reqs (list[ReadItem]): List of ReadItems for this file.
         planner (LoadPlanner): Load planner for loading bytes.
     """
-    for req in reqs:
-        with open(path, "rb") as f:
-            value = f.read()
-        planner.apply_bytes(req, value)
+    with open(path, "rb") as f:
+        for req in reqs:
+            storage_info = storage_data.get(req.storage_index)
+            if storage_info is None:
+                raise KeyError(
+                    f"StorageInfo not found for index {req.storage_index}"
+                )
+            f.seek(storage_info.offset)
+            value = f.read(storage_info.length)
+            planner.apply_bytes(req, value)
 
 
 def _get_tensor_size(tensor: Any) -> Optional[tuple]:
@@ -482,20 +505,12 @@ class FileSystemReader(StorageReader):
         Returns:
             str: Absolute path to the storage file.
         """
-        storage_data = self.storage_data
-
-        if storage_data is not None:
-            storage_info = storage_data.get(read_item.storage_index)
-            if storage_info is None:
-                raise KeyError(f"StorageInfo not found for index {read_item.storage_index}")
-            return str(self.checkpoint_dir / storage_info.relative_path)
-        # Fallback: derive path from rank & fqn (legacy format without storage_data)
-        if read_item.type == LoadItemType.TENSOR:
-            rank = read_item.storage_index.index or self.rank
-            return str(self.checkpoint_dir / f"_rank{rank}_.safetensors")
-        fqn = read_item.storage_index.fqn
-        rank = read_item.storage_index.index or self.rank
-        return str(self.checkpoint_dir / f"{fqn}_rank{rank}.bytes")
+        if self.storage_data is None:
+            raise KeyError("Checkpoint metadata.storage_data is required for filesystem read")
+        storage_info = self.storage_data.get(read_item.storage_index)
+        if storage_info is None:
+            raise KeyError(f"StorageInfo not found for index {read_item.storage_index}")
+        return str(self.checkpoint_dir / storage_info.relative_path)
 
     def _group_items_by_file(self, plan: LoadPlan) -> dict[str, list]:
         """
@@ -534,8 +549,8 @@ class FileSystemReader(StorageReader):
                 raise FileNotFoundError(f"Checkpoint file not found: {path}")
 
             if path.endswith(".bytes"):
-                # BYTE_IO: one file per (fqn, rank)
-                _load_bytes_file(path, reqs, planner)
+                # BYTE_IO: one bytes file per rank with per-item offsets.
+                _load_bytes_file(path, reqs, planner, self.storage_data)
             else:
                 # TENSOR: one safetensors file per rank
                 _load_tensor_file(path, reqs, planner)
