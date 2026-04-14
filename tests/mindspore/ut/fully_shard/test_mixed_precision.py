@@ -42,6 +42,7 @@ import mindspore as ms
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
+from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState, ShardedState
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.fully_shard.scheduler import MindSporeHSDPSchedulerV2
@@ -49,7 +50,10 @@ from hyper_parallel.platform.mindspore.fully_shard.state import (
     MindSporeHSDPStateV2,
     _to_dtype_if_needed,
 )
-from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
+from hyper_parallel.platform.mindspore.fully_shard.param import (
+    MindSporeHSDPParamV2,
+    _pack_for_reduce_scatter,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -323,28 +327,18 @@ class TestLazyInitDtypeRefresh(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 5. _apply_reduced_grad dtype restoration and gradient assignment
+# 5. apply_reduced_grad dtype restoration and gradient assignment
 # ---------------------------------------------------------------------------
 
 class TestApplyReducedGrad(unittest.TestCase):
-    """Test dtype conversion and gradient assignment behavior in _apply_reduced_grad."""
-
-    def _make_state_for_apply(self, orig_dtype):
-        """Create a state for _apply_reduced_grad tests."""
-        policy = MixedPrecisionPolicy(param_dtype=ms.float16, reduce_dtype=ms.float32)
-        state = _make_state(policy, [])
-        state._orig_dtype = orig_dtype
-        return state
+    """Test dtype conversion and gradient assignment behavior in apply_reduced_grad."""
 
     def test_grad_cast_to_orig_dtype(self):
         """
-        Feature: _apply_reduced_grad
+        Feature: apply_reduced_grad
         Description: Cast to _orig_dtype when reduced_grad.dtype differs from _orig_dtype
         Expectation: _to_dtype_if_needed is called with _orig_dtype
         """
-        state = self._make_state_for_apply(ms.float32)
-
-        # Mock hsdp_param
         hsdp_param = MagicMock()
         hsdp_param.sharded_size = (8, 8)
         hsdp_param.offload_to_cpu = False
@@ -353,40 +347,29 @@ class TestApplyReducedGrad(unittest.TestCase):
         sharded_grad_dtensor = MagicMock(spec=DTensor)
         hsdp_param.to_sharded_dtensor.return_value = sharded_grad_dtensor
 
-        # Mock reduced_grad
         reduced_grad = MagicMock()
         viewed_grad = MagicMock()
-        viewed_grad.dtype = ms.float16  # Different from _orig_dtype
+        viewed_grad.dtype = ms.float16
         casted_grad = MagicMock()
         casted_grad.dtype = ms.float32
         viewed_grad.to.return_value = casted_grad
         reduced_grad.view.return_value = viewed_grad
 
-        with patch(
-            'hyper_parallel.platform.mindspore.fully_shard.state._to_dtype_if_needed',
-            side_effect=lambda t, d: t.to(d) if (d is not None and t.dtype != d) else t
-        ):
-            state._apply_reduced_grad(hsdp_param, reduced_grad)
+        MindSporeHSDPParamV2.apply_reduced_grad(hsdp_param, reduced_grad, ms.float32)
 
-        # Verify that view is called
         reduced_grad.view.assert_called_once_with((8, 8))
-        # Verify the cast to orig_dtype
         viewed_grad.to.assert_called_once_with(ms.float32)
-        # Verify that sharded_param.grad receives the result first,
-        # then becomes the optimizer-visible DTensor grad
         hsdp_param.to_sharded_dtensor.assert_called_once_with(casted_grad)
         self.assertIs(hsdp_param.sharded_param.grad, sharded_grad_dtensor)
         self.assertIsNone(hsdp_param.unsharded_param.grad)
 
     def test_grad_accumulated_when_existing(self):
         """
-        Feature: _apply_reduced_grad
+        Feature: apply_reduced_grad
         Description: When sharded_param.grad already exists,
         the new gradient should be accumulated instead of overwritten
         Expectation: hsdp_param.sharded_param.grad._local_tensor += reduced_grad is executed
         """
-        state = self._make_state_for_apply(ms.float32)
-
         existing_grad = MagicMock(spec=DTensor)
         local_tensor = MagicMock()
         existing_grad._local_tensor = local_tensor
@@ -398,28 +381,21 @@ class TestApplyReducedGrad(unittest.TestCase):
 
         reduced_grad = MagicMock()
         viewed_grad = MagicMock()
-        viewed_grad.dtype = ms.float32  # Matches _orig_dtype, so no cast is needed
+        viewed_grad.dtype = ms.float32
         reduced_grad.view.return_value = viewed_grad
 
-        with patch(
-            'hyper_parallel.platform.mindspore.fully_shard.state._to_dtype_if_needed',
-            return_value=viewed_grad
-        ):
-            state._apply_reduced_grad(hsdp_param, reduced_grad)
+        MindSporeHSDPParamV2.apply_reduced_grad(hsdp_param, reduced_grad, ms.float32)
 
-        # Verify that the gradient is accumulated into the underlying local tensor
         local_tensor.__iadd__.assert_called_once_with(viewed_grad)
 
     def test_unsharded_grad_cleared_after_apply(self):
         """
-        Feature: _apply_reduced_grad
+        Feature: apply_reduced_grad
         Description: After gradient assignment,
         the temporary unsharded grad should be cleared
         Expectation: the reduced DTensor grad is attached to sharded_param.grad
         and the transient full-grad reference is cleared.
         """
-        state = self._make_state_for_apply(ms.float32)
-
         hsdp_param = MagicMock()
         hsdp_param.sharded_size = (4,)
         hsdp_param.offload_to_cpu = False
@@ -430,17 +406,43 @@ class TestApplyReducedGrad(unittest.TestCase):
 
         reduced_grad = MagicMock()
         casted_grad = MagicMock()
+        casted_grad.dtype = ms.float32
         reduced_grad.view.return_value = casted_grad
 
-        with patch(
-            'hyper_parallel.platform.mindspore.fully_shard.state._to_dtype_if_needed',
-            return_value=casted_grad
-        ):
-            state._apply_reduced_grad(hsdp_param, reduced_grad)
+        MindSporeHSDPParamV2.apply_reduced_grad(hsdp_param, reduced_grad, ms.float32)
 
         hsdp_param.to_sharded_dtensor.assert_called_once_with(casted_grad)
         self.assertIs(hsdp_param.sharded_param.grad, sharded_grad_dtensor)
         self.assertIsNone(hsdp_param.unsharded_param.grad)
+
+    def test_cpu_offload_requests_synchronize(self):
+        """
+        Feature: apply_reduced_grad
+        Description: Return True when CPU offload uses a non-blocking device-to-host copy
+        Expectation: callers can synchronize the current stream after gradient materialization
+        """
+        hsdp_param = MagicMock()
+        hsdp_param.sharded_size = (4,)
+        hsdp_param.offload_to_cpu = True
+        hsdp_param.pin_memory = True
+        hsdp_param.sharded_param.grad = None
+        hsdp_param.unsharded_accumulated_grad_data = None
+        sharded_grad_dtensor = MagicMock(spec=DTensor)
+        hsdp_param.to_sharded_dtensor.return_value = sharded_grad_dtensor
+
+        reduced_grad = MagicMock()
+        viewed_grad = MagicMock()
+        viewed_grad.dtype = ms.float32
+        cpu_grad = MagicMock()
+        viewed_grad.to.return_value = cpu_grad
+        reduced_grad.view.return_value = viewed_grad
+
+        need_synchronize = MindSporeHSDPParamV2.apply_reduced_grad(
+            hsdp_param, reduced_grad, ms.float32
+        )
+
+        viewed_grad.to.assert_called_once_with("cpu", non_blocking=True)
+        self.assertTrue(need_synchronize)
 
 
 class TestReplicateParamGradHandling(unittest.TestCase):
@@ -483,9 +485,6 @@ class TestReplicateParamGradHandling(unittest.TestCase):
         reduced_grad = MagicMock()
         reduced_grad.dtype = ms.float32
         reduced_grad.to.return_value = reduced_grad
-        flat_mesh = MagicMock()
-        flat_mesh.rank_list = [0, 1]
-
         local_grad = MagicMock()
         sharded_grad_dtensor = MagicMock(spec=DTensor)
         sharded_grad_dtensor.to_local.return_value = local_grad
@@ -493,23 +492,18 @@ class TestReplicateParamGradHandling(unittest.TestCase):
         param = MagicMock()
         param.all_reduce_handle = MagicMock()
         param.offload_to_cpu = False
+        param.sharded_size = (4,)
         param.sharded_param.grad = None
         param.to_sharded_dtensor.return_value = sharded_grad_dtensor
         param.unsharded_accumulated_grad_data = None
 
-        state._ignored_allreduce_works = [(param, reduced_grad, flat_mesh)]
+        state._ignored_allreduce_works = [(param, reduced_grad, 2)]
 
-        with patch(
-            'hyper_parallel.platform.mindspore.fully_shard.state._to_dtype_if_needed',
-            return_value=reduced_grad
-        ):
-            state._finish_ignored_allreduce()
+        state._finish_ignored_allreduce()
 
         param.all_reduce_handle.wait.assert_called_once_with()
-        reduced_grad.view.assert_not_called()
-        param.to_sharded_dtensor.assert_called_once_with(reduced_grad)
-        self.assertIs(param.sharded_param.grad, sharded_grad_dtensor)
-        self.assertIsNone(param.unsharded_param.grad)
+        reduced_grad.div_.assert_called_once_with(2.0)
+        param.apply_reduced_grad.assert_called_once_with(reduced_grad, ms.float32)
         self.assertEqual(state._ignored_allreduce_works, [])
 
 
@@ -659,6 +653,418 @@ class TestPrefetchStateMachine(unittest.TestCase):
         self.assertIsNone(param.prefetch_handle)
 
 
+class TestAsyncReduceStateMachine(unittest.TestCase):
+    """Test per-parameter async reduce/all-reduce pending state."""
+
+    def _make_param(self):
+        """Create a lightweight param mock for async reduce API tests."""
+        param = MagicMock()
+        param.unsharded_accumulated_grad = None
+        param._reduce_scatter_output = None
+        param.reduce_scatter_handle = None
+        param._all_reduce_output = None
+        param.all_reduce_handle = None
+        param._assert_in_states = MagicMock()
+        param.unsharded_param = MagicMock()
+        param.is_sharded = True
+        param.shard_world_size = 2
+        param.shard_size = 2
+        param.replicate_world_size = 2
+        param.dp_size = 2
+        param.sharded_group_info = MagicMock()
+        param.sharded_group_info.group = MagicMock()
+        param.sharded_group_info.rank_size = 2
+        param.unsharded_group_info = MagicMock()
+        param.unsharded_group_info.group = MagicMock()
+        param.unsharded_group_info.rank_size = 2
+        param._to_local_unsharded_grad.side_effect = lambda grad: grad
+        return param
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.pack_for_reduce_scatter")
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.build_rs_plan")
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.ms.mint.empty")
+    def test_reduce_scatter_grad_records_output_and_handle(
+        self, mock_empty, mock_reduce_scatter, mock_build_plan, mock_pack
+    ):
+        """
+        Feature: async reduce-scatter
+        Description: Launch reduce-scatter and cache output/handle on the param wrapper
+        Expectation: output and handle are returned and stored for deferred wait
+        """
+        param = self._make_param()
+        grad = MagicMock()
+        grad.dtype = ms.float32
+        grad.device = "Ascend:0"
+        grad_flat = MagicMock()
+        grad.view.return_value = grad_flat
+        grad_flat.numel.return_value = 8
+        grad.to.return_value = grad
+        param.unsharded_grad_data = grad
+        param.hsdp_placement = MagicMock()
+        param.hsdp_placement.dim = 0
+        output = MagicMock(name="reduce_scatter_output")
+        handle = MagicMock(name="reduce_scatter_handle")
+        plan = MagicMock()
+        mock_build_plan.return_value = plan
+        mock_pack.return_value = grad_flat
+        mock_empty.return_value = output
+        mock_reduce_scatter.return_value = handle
+        fake_mesh_info = type("FakeFSDPMeshInfo", (), {})
+        param.mesh_info = fake_mesh_info()
+        param.mesh_info.shard_process_group = MagicMock()
+
+        with patch(
+            "hyper_parallel.platform.mindspore.fully_shard.param.FSDPMeshInfo",
+            new=fake_mesh_info,
+        ):
+            reduced_grad, returned_handle = MindSporeHSDPParamV2.reduce_scatter_grad(
+                param, async_op=True
+            )
+
+        self.assertIs(reduced_grad, output)
+        self.assertIs(returned_handle, handle)
+        self.assertIs(param._reduce_scatter_output, output)
+        self.assertIs(param.reduce_scatter_handle, handle)
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.pack_for_reduce_scatter")
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.build_rs_plan")
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.reduce_scatter_tensor")
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.ms.mint.empty")
+    def test_reduce_scatter_grad_uses_packed_gradient_layout(
+        self, mock_empty, mock_reduce_scatter, mock_build_plan, mock_pack
+    ):
+        """
+        Feature: reduce-scatter packing
+        Description: Pack the unsharded gradient before passing it to reduce_scatter_tensor
+        Expectation: the packed tensor is used as the communication input
+        """
+        param = self._make_param()
+        grad = MagicMock()
+        grad.dtype = ms.float32
+        grad.device = "Ascend:0"
+        packed_grad = MagicMock()
+        packed_grad.reshape.return_value = packed_grad
+        packed_grad.numel.return_value = 8
+        grad.to.return_value = grad
+        param.unsharded_grad_data = grad
+        param.hsdp_placement = MagicMock()
+        param.hsdp_placement.dim = 1
+        output = MagicMock()
+        handle = MagicMock()
+        plan = MagicMock()
+        mock_build_plan.return_value = plan
+        mock_pack.return_value = packed_grad
+        mock_empty.return_value = output
+        mock_reduce_scatter.return_value = handle
+        MindSporeHSDPParamV2.reduce_scatter_grad(param, async_op=True)
+
+        mock_build_plan.assert_called_once_with(param, grad, 2)
+        mock_pack.assert_called_once_with(grad, plan)
+        self.assertIs(mock_reduce_scatter.call_args.args[1], packed_grad)
+
+    def test_reduce_scatter_output_waits_and_clears_handle(self):
+        """
+        Feature: async reduce-scatter
+        Description: Consume a pending reduce-scatter result through reduce_scatter_output
+        Expectation: the handle is waited once and then cleared
+        """
+        param = MagicMock()
+        handle = MagicMock()
+        output = MagicMock()
+        param.reduce_scatter_handle = handle
+        param._reduce_scatter_output = output
+
+        result = MindSporeHSDPParamV2.reduce_scatter_output(param)
+
+        handle.wait.assert_called_once_with()
+        self.assertIs(result, output)
+        self.assertIsNone(param.reduce_scatter_handle)
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.all_reduce")
+    def test_all_reduce_grad_records_output_and_handle(self, mock_all_reduce):
+        """
+        Feature: async all-reduce
+        Description: Launch all-reduce and cache output/handle on the param wrapper
+        Expectation: output and handle are returned and stored for deferred wait
+        """
+        param = self._make_param()
+        grad = MagicMock()
+        handle = MagicMock()
+        mock_all_reduce.return_value = handle
+        reduced_grad, returned_handle = MindSporeHSDPParamV2.all_reduce_grad(
+            param, grad=grad, async_op=True
+        )
+
+        self.assertIs(reduced_grad, grad)
+        self.assertIs(returned_handle, handle)
+        self.assertIs(param._all_reduce_output, grad)
+        self.assertIs(param.all_reduce_handle, handle)
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.all_reduce")
+    def test_all_reduce_grad_casts_to_requested_dtype(self, mock_all_reduce):
+        """
+        Feature: async all-reduce
+        Description: Cast the all-reduce gradient to the requested reduce dtype
+        Expectation: the casted tensor is cached and returned
+        """
+        param = self._make_param()
+        grad = MagicMock()
+        grad.dtype = ms.float16
+        cast_grad = MagicMock()
+        grad.to.return_value = cast_grad
+        handle = MagicMock()
+        mock_all_reduce.return_value = handle
+        reduced_grad, _ = MindSporeHSDPParamV2.all_reduce_grad(
+            param, grad=grad, dtype=ms.float32, async_op=True
+        )
+
+        grad.to.assert_called_once_with(ms.float32)
+        self.assertIs(reduced_grad, cast_grad)
+        self.assertIs(param._all_reduce_output, cast_grad)
+
+    def test_all_reduce_output_waits_and_clears_handle(self):
+        """
+        Feature: async all-reduce
+        Description: Consume a pending all-reduce result through all_reduce_output
+        Expectation: the handle is waited once and then cleared
+        """
+        param = MagicMock()
+        handle = MagicMock()
+        output = MagicMock()
+        param.all_reduce_handle = handle
+        param._all_reduce_output = output
+
+        result = MindSporeHSDPParamV2.all_reduce_output(param)
+
+        handle.wait.assert_called_once_with()
+        self.assertIs(result, output)
+        self.assertIsNone(param.all_reduce_handle)
+
+
+class TestAsyncReduceDrain(unittest.TestCase):
+    """Test state-level draining of pending sharded reductions."""
+
+    def tearDown(self):
+        HSDPState.pre_reduce_scatter_params = []
+        HSDPState.pre_all_reduce_params = []
+
+    def test_reduce_params_drains_reduce_scatter_queue(self):
+        """
+        Feature: async reduce drain
+        Description: Drain a pending reduce-scatter entry from the shared HSDPState queue
+        Expectation: reduced grad is waited, divided, cleared, and applied with dtype context
+        """
+        state = object.__new__(MindSporeHSDPStateV2)
+        state._div_if_needed = MagicMock()
+
+        param = MagicMock()
+        reduced_grad = MagicMock()
+        param.reduce_scatter_output.return_value = reduced_grad
+        param.shard_world_size = 2
+        param.apply_reduced_grad.return_value = False
+        HSDPState.pre_reduce_scatter_params.append((param, ms.float32))
+
+        state.reduce_params()
+
+        param.reduce_scatter_output.assert_called_once_with()
+        state._div_if_needed.assert_called_once_with(reduced_grad, 2)
+        param.clear_reduce_scatter_output.assert_called_once_with()
+        param.apply_reduced_grad.assert_called_once_with(reduced_grad, ms.float32)
+        self.assertEqual(HSDPState.pre_reduce_scatter_params, [])
+
+    def test_reduce_params_drains_all_reduce_queue(self):
+        """
+        Feature: async reduce drain
+        Description: Drain a pending all-reduce entry from the shared HSDPState queue
+        Expectation: reduced grad is waited, divided, cleared, and applied with dtype context
+        """
+        state = object.__new__(MindSporeHSDPStateV2)
+        state._div_if_needed = MagicMock()
+
+        param = MagicMock()
+        reduced_grad = MagicMock()
+        param.all_reduce_output.return_value = reduced_grad
+        param.replicate_world_size = 4
+        param.apply_reduced_grad.return_value = False
+        HSDPState.pre_all_reduce_params.append((param, ms.float32))
+
+        state.reduce_params()
+
+        param.all_reduce_output.assert_called_once_with()
+        state._div_if_needed.assert_called_once_with(reduced_grad, 4)
+        param.clear_all_reduce_output.assert_called_once_with()
+        param.apply_reduced_grad.assert_called_once_with(reduced_grad, ms.float32)
+        self.assertEqual(HSDPState.pre_all_reduce_params, [])
+
+    def test_reduce_params_drains_pending_created_by_other_state_instance(self):
+        """
+        Feature: async reduce drain
+        Description: Drain pending reduce work created by another fully_shard state instance
+        Expectation: the shared base-state queue allows cross-state pending work consumption
+        """
+        state_a = object.__new__(MindSporeHSDPStateV2)
+        state_b = object.__new__(MindSporeHSDPStateV2)
+        state_a._div_if_needed = MagicMock()
+        state_b._div_if_needed = MagicMock()
+
+        param = MagicMock()
+        reduced_grad = MagicMock()
+        param.reduce_scatter_output.return_value = reduced_grad
+        param.shard_world_size = 2
+        param.apply_reduced_grad.return_value = False
+        HSDPState.pre_reduce_scatter_params.append((param, ms.float32))
+
+        state_b.reduce_params()
+
+        param.reduce_scatter_output.assert_called_once_with()
+        state_b._div_if_needed.assert_called_once_with(reduced_grad, 2)
+        param.apply_reduced_grad.assert_called_once_with(reduced_grad, ms.float32)
+        self.assertEqual(HSDPState.pre_reduce_scatter_params, [])
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.state.ms.runtime.current_stream")
+    def test_reduce_params_synchronizes_after_cpu_offload(self, mock_current_stream):
+        """
+        Feature: async reduce drain
+        Description: Synchronize the current stream after apply_reduced_grad requests it
+        Expectation: non-blocking CPU offload is made visible before later consumers use the grad
+        """
+        state = object.__new__(MindSporeHSDPStateV2)
+        state._div_if_needed = MagicMock()
+
+        stream = MagicMock()
+        mock_current_stream.return_value = stream
+
+        param = MagicMock()
+        reduced_grad = MagicMock()
+        param.reduce_scatter_output.return_value = reduced_grad
+        param.shard_world_size = 2
+        param.apply_reduced_grad.return_value = True
+        HSDPState.pre_reduce_scatter_params.append((param, ms.float32))
+
+        state.reduce_params()
+
+        stream.synchronize.assert_called_once_with()
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.state.ms.runtime.current_stream")
+    def test_reduce_params_synchronizes_once_for_multiple_offloaded_grads(self, mock_current_stream):
+        """
+        Feature: async reduce drain
+        Description: Aggregate synchronize requests across all queued gradients
+        Expectation: the current stream is synchronized once after the whole drain, matching torch
+        """
+        state = object.__new__(MindSporeHSDPStateV2)
+        state._div_if_needed = MagicMock()
+
+        stream = MagicMock()
+        mock_current_stream.return_value = stream
+
+        param_a = MagicMock()
+        reduced_grad_a = MagicMock()
+        param_a.reduce_scatter_output.return_value = reduced_grad_a
+        param_a.shard_world_size = 2
+        param_a.apply_reduced_grad.return_value = True
+
+        param_b = MagicMock()
+        reduced_grad_b = MagicMock()
+        param_b.all_reduce_output.return_value = reduced_grad_b
+        param_b.replicate_world_size = 4
+        param_b.apply_reduced_grad.return_value = True
+
+        HSDPState.pre_reduce_scatter_params.append((param_a, ms.float32))
+        HSDPState.pre_all_reduce_params.append((param_b, ms.float32))
+
+        state.reduce_params()
+
+        stream.synchronize.assert_called_once_with()
+
+
+class TestAsyncReducePostBackwardHelpers(unittest.TestCase):
+    """Test state-level post-backward helper alignment with torch behavior."""
+
+    def tearDown(self):
+        HSDPState.pre_reduce_scatter_params = []
+        HSDPState.pre_all_reduce_params = []
+
+    def test_has_pending_unsharded_grad_accepts_accumulated_grad(self):
+        """
+        Feature: async reduce post-backward
+        Description: Detect pending accumulated unsharded grad even when .grad is empty
+        Expectation: the parameter is considered ready for gradient reduction
+        """
+        state = object.__new__(MindSporeHSDPStateV2)
+        param = MagicMock()
+        param.sharded_param.requires_grad = True
+        param.unsharded_accumulated_grad = MagicMock()
+        param.unsharded_param.grad = None
+
+        self.assertTrue(state._has_pending_unsharded_grad(param))
+
+    def test_queue_compat_all_reduce_passes_reduce_dtype(self):
+        """
+        Feature: async reduce post-backward
+        Description: Launch compat all-reduce with the state's reduce dtype
+        Expectation: all_reduce_grad receives dtype so local-only shard paths still cast consistently
+        """
+        state = object.__new__(MindSporeHSDPStateV2)
+        state._reduce_dtype = ms.float16
+        state._orig_dtype = ms.float32
+        state.reduce_op_type = "reduce_op"
+        state.requires_all_reduce = True
+        pending_grad = MagicMock()
+        state._get_pending_unsharded_grad = MagicMock(return_value=pending_grad)
+        param = MagicMock()
+        param.dp_size = 2
+
+        state._queue_compat_all_reduce(param)
+
+        param.all_reduce_grad.assert_called_once_with(
+            grad=pending_grad,
+            dtype=ms.float16,
+            async_op=True,
+            reduce_op="reduce_op",
+        )
+        self.assertEqual(HSDPState.pre_all_reduce_params, [(param, ms.float32)])
+
+
+class TestReduceScatterPackHelpers(unittest.TestCase):
+    """Test MindSpore reduce-scatter packing helper alignment with torch semantics."""
+
+    def test_pack_for_reduce_scatter_keeps_dim0_layout(self):
+        """
+        Feature: reduce-scatter packing
+        Description: Keep dim0-sharded gradients in their original row-major layout
+        Expectation: the helper returns the original tensor object
+        """
+        tensor = MagicMock()
+        result = _pack_for_reduce_scatter(tensor, shard_dim=0, world_size=2)
+        self.assertIs(result, tensor)
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.ms.mint.cat")
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.ms.mint.chunk")
+    def test_pack_for_reduce_scatter_reorders_non_dim0_shards(self, mock_chunk, mock_cat):
+        """
+        Feature: reduce-scatter packing
+        Description: Reorder non-dim0 shards into rank-major reduce-scatter layout
+        Expectation: chunk on shard dim, concatenate on dim 0, and return contiguous output
+        """
+        tensor = MagicMock()
+        chunk_0 = MagicMock()
+        chunk_1 = MagicMock()
+        packed = MagicMock()
+        contiguous = MagicMock()
+        mock_chunk.return_value = (chunk_0, chunk_1)
+        mock_cat.return_value = packed
+        packed.contiguous.return_value = contiguous
+
+        result = _pack_for_reduce_scatter(tensor, shard_dim=1, world_size=2)
+
+        mock_chunk.assert_called_once_with(tensor, 2, dim=1)
+        mock_cat.assert_called_once_with((chunk_0, chunk_1), dim=0)
+        packed.contiguous.assert_called_once_with()
+        self.assertIs(result, contiguous)
+
+
 class TestSchedulerBackwardCompatFlow(unittest.TestCase):
     """Test MindSpore scheduler behavior added by the backward-compat refactor."""
 
@@ -713,7 +1119,7 @@ class TestSchedulerBackwardCompatFlow(unittest.TestCase):
         Expectation: forward_prefetch_cells is cleared before entering the shared pre-forward path
         """
         scheduler = object.__new__(MindSporeHSDPSchedulerV2)
-        scheduler.scheduler_state = FSDPSchedulerState.FORWARD
+        scheduler.scheduler_state = FSDPSchedulerState.PRE_FORWARD
         scheduler.forward_prefetch_cells = [MagicMock(name="next_cell")]
         scheduler._backup_forward_fetch = None
         scheduler._hsdp_forward_pre_hook = MagicMock(return_value=(("arg",), {"k": "v"}))
@@ -764,12 +1170,15 @@ class TestSchedulerBackwardCompatFlow(unittest.TestCase):
         scheduler = object.__new__(MindSporeHSDPSchedulerV2)
         scheduler.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
         scheduler._backward_hook = MagicMock()
+        scheduler.hsdp_state = MagicMock()
 
         HSDPSchedulerV2.root_bp_state = True
 
         scheduler._root_backward_hook()
 
         scheduler._backward_hook.assert_called_once_with()
+        scheduler.hsdp_state.reduce_params.assert_called_once_with()
+        scheduler.hsdp_state._finish_ignored_allreduce.assert_called_once_with()
         self.assertFalse(HSDPSchedulerV2.root_bp_state)
 
     def test_root_backward_hook_keeps_root_state_for_non_root_callback(self):
@@ -781,12 +1190,15 @@ class TestSchedulerBackwardCompatFlow(unittest.TestCase):
         scheduler = object.__new__(MindSporeHSDPSchedulerV2)
         scheduler.scheduler_state = FSDPSchedulerState.BACKWARD
         scheduler._backward_hook = MagicMock()
+        scheduler.hsdp_state = MagicMock()
 
         HSDPSchedulerV2.root_bp_state = True
 
         scheduler._root_backward_hook()
 
         scheduler._backward_hook.assert_called_once_with()
+        scheduler.hsdp_state.reduce_params.assert_not_called()
+        scheduler.hsdp_state._finish_ignored_allreduce.assert_not_called()
         self.assertTrue(HSDPSchedulerV2.root_bp_state)
 
 

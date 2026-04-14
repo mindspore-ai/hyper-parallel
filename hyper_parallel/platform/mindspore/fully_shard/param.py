@@ -45,6 +45,29 @@ from hyper_parallel.platform.mindspore.fully_shard.pack_utils import (
 )
 
 
+def _pack_for_reduce_scatter(local_tensor: ms.Tensor, shard_dim: int, world_size: int) -> ms.Tensor:
+    """Pack one local gradient into the row-major reduce-scatter layout.
+
+    MindSpore currently aligns with the torch non-comm-fusion V1 path:
+
+    - shard on dim 0: identity flatten
+    - shard on non-dim0: chunk on shard dim, then concatenate on dim 0
+    """
+    if world_size <= 1 or shard_dim == 0:
+        return local_tensor
+    chunks = ms.mint.chunk(local_tensor, world_size, dim=shard_dim)
+    return ms.mint.cat(chunks, dim=0).contiguous()
+
+
+def _to_dtype_if_needed(
+    tensor: ms.Tensor, dtype: Optional[ms.Type]
+) -> ms.Tensor:
+    """Cast tensor to the given dtype if it differs from current dtype."""
+    if dtype is not None and tensor.dtype != dtype:
+        return tensor.to(dtype)
+    return tensor
+
+
 def make_contiguous_strides_for(shape, row_major=True):
     """
     Compute strides for a contiguous tensor of the given shape.
@@ -507,7 +530,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
                 f"Expected sharded_size to be {sharded_size}, got {local_tensor.shape}"
             )
         if self.pin_memory and not local_tensor.is_pinned():
-            local_tensor = local_tensor.cpu().pin_memory()
+            local_tensor = local_tensor.to("cpu").pin_memory()
             updated_local_tensor = True
         if not same_local_tensor:
             self._sharded_param_data = local_tensor.view(-1)
@@ -739,6 +762,41 @@ class MindSporeHSDPParamV2(HSDPParamV2):
     def clear_all_reduce_output(self):
         """Clear cached all-reduce output."""
         self._all_reduce_output = None
+
+    def apply_reduced_grad(self, reduced_grad, param_type):
+        """
+        Apply reduced gradient to the sharded parameter.
+
+        Reshapes ``reduced_grad`` to match the local shard, optionally
+        offloads to CPU, then accumulates or assigns onto
+        ``self.sharded_param.grad``.
+
+        Args:
+            reduced_grad (ms.Tensor): Gradient after reduce-scatter
+                and/or all-reduce.
+            param_type (Optional[ms.Type]): Target dtype for the gradient.
+        """
+        sharded_grad = self.sharded_param.grad
+        reduced_grad = reduced_grad.view(self.sharded_size)
+        reduced_grad = _to_dtype_if_needed(reduced_grad, param_type)
+        to_accumulate_grad = sharded_grad is not None
+        need_synchronize = False
+        if self.offload_to_cpu:
+            non_blocking = self.pin_memory and not to_accumulate_grad
+            reduced_grad = reduced_grad.to(
+                "cpu", non_blocking=non_blocking
+            )
+            need_synchronize = True
+        if sharded_grad is None:
+            self.sharded_param.grad = self.to_sharded_dtensor(reduced_grad)
+        else:
+            self.sharded_param.grad._local_tensor += reduced_grad
+
+        if self.unsharded_accumulated_grad_data is not None:
+            self.unsharded_accumulated_grad = None
+        elif self.unsharded_param.grad is not None:
+            self.unsharded_param.grad = None
+        return need_synchronize
 
 
 def set_requires_grad_if_needed(
