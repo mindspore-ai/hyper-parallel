@@ -18,9 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, Union
 
-from hyper_parallel.core.distributed_checkpoint.metadata import (
-    Metadata, MetadataIndex
-)
+from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, MetadataIndex
 
 
 class WriteItemType(Enum):
@@ -152,7 +150,6 @@ class LoadPlan:
     storage_data: Optional[dict[MetadataIndex, Any]] = None  # Storage-specific data mapping
     planner_data: Any = None  # Planner-specific data (can be any type)
 
-
 class SavePlanner(abc.ABC):
     """Abstract base class for save planners."""
 
@@ -211,19 +208,15 @@ class SavePlanner(abc.ABC):
         """
 
     @abc.abstractmethod
-    def get_tensor(self, index: MetadataIndex) -> Any:
+    def get_data(self, item: WriteItem) -> Any:
         """
-        Get tensor data for a given MetadataIndex.
-
-        This method allows storage writers to retrieve tensor data when needed,
-        avoiding the need to store tensors in WriteItem.tensor_data (which would
-        be transmitted during all_gather operations).
+        Get runtime data for a write item from the current state_dict.
 
         Args:
-            index (MetadataIndex): Metadata index identifying the tensor.
+            item (WriteItem): The write item to get data for.
 
         Returns:
-            Any: Tensor data (tensor-like object) or None if not found.
+            Any: Runtime object to be written for this item.
         """
 
 
