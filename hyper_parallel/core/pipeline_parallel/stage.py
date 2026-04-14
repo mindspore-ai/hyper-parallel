@@ -13,9 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """pipeline stage"""
+from typing import Optional
 from types import SimpleNamespace
 
 from hyper_parallel import DTensor
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.platform import get_platform
 from .utils import _RecvInfo  # pylint: disable=E0402
 
@@ -77,13 +79,22 @@ class PipelineStage(PipelineStageBase):
         dyn_shape (bool, optional): Specify whether this stage has dynamic shape. Default ``False``
         has_backward (bool, optional): Specify whether this stage has backward. Default ``True``.
         shared_parameters (SharedParameterInfo, optional): Specify shared parameter information. Default ``None``.
+        mesh (DeviceMesh, optional): A **1-D PP sub-mesh**, e.g. ``full_mesh["pp"]``.
+            Its ``rank_list`` contains the global ranks along the pipeline
+            dimension for the current process.  When provided it is used to
+            derive the PP communication group (``_init_pp_group``) and
+            within-stage rank list (``_update_layout``), replacing the
+            global-rank arithmetic that assumes PP is the only parallelism.
+            Default ``None``.
     """
     def __init__(self, submodule, stage_index: int, stage_num: int, device=None, group=None,
-                 src_stage=None, dst_stage=None, dyn_shape=False, has_backward=True, shared_parameters=None):
+                 src_stage=None, dst_stage=None, dyn_shape=False, has_backward=True,
+                 shared_parameters=None, mesh: Optional[DeviceMesh] = None):
         super().__init__(submodule, stage_index, stage_num, group, has_backward)
         self.submodule = submodule
         self.pp_group = self._check_pp_group(group)
         self.device = device
+        self.mesh = mesh
         self._has_backward = has_backward
         self._recv_info = []
         self._send_info = []
@@ -105,8 +116,17 @@ class PipelineStage(PipelineStageBase):
         self._sync_shared_parameters()
 
     def _init_pp_group(self):
-        """init pipeline parallel communication group."""
-        if self.pp_group is None:
+        """init pipeline parallel communication group.
+
+        When ``self.mesh`` (a 1-D PP sub-mesh) is provided, its sole dimension
+        already represents the PP axis, so the group is obtained directly via
+        ``mesh.get_group()``.  Otherwise falls back to global-rank arithmetic.
+        """
+        if self.pp_group is not None:
+            return
+        if self.mesh is not None:
+            self.pp_group = self.mesh.get_group()
+        else:
             rank_id = platform.get_rank()
             device_num = platform.get_world_size()
             real_stage_num = self.stage_num // self._virtual_chunk_num
@@ -152,6 +172,9 @@ class PipelineStage(PipelineStageBase):
     def _global_rank(self, stage_index):
         real_stage_num = self.stage_num // self._virtual_chunk_num
         real_stage_index = stage_index % real_stage_num
+        if self.mesh is not None:
+            # mesh is a 1-D PP sub-mesh; rank_list[i] is the global rank of stage i.
+            return self.mesh.rank_list[real_stage_index]
         return platform.get_global_rank(self.pp_group, real_stage_index)
 
     def _init_shared_parameter_group(self, shared_stage):
@@ -198,15 +221,48 @@ class PipelineStage(PipelineStageBase):
         raise TypeError(f"Argument dst_stage must be of type None, int, but got {type(dst_stage)}.")
 
     def _update_layout(self, layout):
-        """update the received layout."""
-        device_num = platform.get_world_size()
-        real_stage_num = self.stage_num // self._virtual_chunk_num
-        device_num_per_stage = device_num // real_stage_num
-        index = self.stage_index % real_stage_num
-        rank_list = tuple(range(index * device_num_per_stage, (index + 1) * device_num_per_stage))
+        """update the received layout.
+
+        When ``self.mesh`` is set, within-stage ranks are derived from the
+        root mesh's non-PP dimensions.  Otherwise falls back to global-rank
+        arithmetic.
+        """
+        if self.mesh is not None:
+            rank_list = self._get_within_stage_ranks()
+        else:
+            device_num = platform.get_world_size()
+            real_stage_num = self.stage_num // self._virtual_chunk_num
+            device_num_per_stage = device_num // real_stage_num
+            index = self.stage_index % real_stage_num
+            rank_list = tuple(range(index * device_num_per_stage, (index + 1) * device_num_per_stage))
         layout.rank_list = rank_list
         layout.update_mesh()
         layout.update_compact_str()
+
+    def _get_within_stage_ranks(self) -> tuple:
+        """Return the global ranks that belong to the current pipeline stage.
+
+        ``self.mesh`` is a 1-D PP sub-mesh (e.g. ``full_mesh["pp"]``).
+        If its ``root_mesh`` exists, the non-PP dimensions of the root mesh
+        give the within-stage rank list.  When there is no root mesh (the PP
+        mesh is the full mesh) each stage has a single rank.
+        """
+        root = self.mesh.root_mesh
+        if root is None or root.ndim <= 1:
+            # PP-only topology: one rank per stage
+            return (platform.get_rank(),)
+        # Identify the PP dimension name(s) inside the root mesh
+        pp_dim_names = set(self.mesh.mesh_dim_names or ())
+        non_pp_names = tuple(
+            name for name in root.mesh_dim_names if name not in pp_dim_names
+        )
+        if not non_pp_names:
+            return (platform.get_rank(),)
+        if len(non_pp_names) == 1:
+            within_stage_mesh = root[non_pp_names[0]]
+        else:
+            within_stage_mesh = root[non_pp_names]
+        return tuple(within_stage_mesh.rank_list)
 
     def get_last_stage_sens(self, last_stage_outputs):
         """Get last stage sens"""

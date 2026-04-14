@@ -14,6 +14,7 @@
 # ============================================================================
 """mindspore pipeline stage"""
 from mindspore import ops
+import hyper_parallel
 
 
 class PipelineStageBase:
@@ -107,7 +108,7 @@ class PipelineStageBase:
             return None
         fwd_args, fwd_kwargs = self.fwd_inputs_cache.pop(micro_index)
         recv_args = []
-        if last_backward:
+        if last_backward and isinstance(self.submodule, hyper_parallel.HSDPCell):
             self.submodule.set_requires_grad_sync(True)
         if micro_index in self.grad_recv_info:
             recv_args = [recv_info.buffer for recv_info in self.grad_recv_info[micro_index]]

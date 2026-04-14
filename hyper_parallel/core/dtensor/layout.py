@@ -470,7 +470,7 @@ class Layout:
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        self.update_mesh()
+        self.update_mesh(init_backend=False)
 
     @property
     def mesh(self):
@@ -482,9 +482,17 @@ class Layout:
         """
         return self._mesh
 
-    def update_mesh(self):
+    def update_mesh(self, init_backend: bool = True):
+        """Recreate the internal DeviceMesh from current layout properties.
+
+        Args:
+            init_backend (bool): Whether to initialize communication backend
+                (process groups). Set to ``False`` during deserialization to
+                avoid creating process groups with a stale rank_list from the
+                sender side. Default ``True``.
+        """
         self._mesh = _create_device_mesh("npu", self.mesh_shape, mesh_dim_names=self.alias_name,
-                                         rank_list=self.rank_list)
+                                         rank_list=self.rank_list, init_backend=init_backend)
 
     @property
     def rank_list(self):
