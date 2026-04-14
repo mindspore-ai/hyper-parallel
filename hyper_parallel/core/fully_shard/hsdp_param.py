@@ -14,6 +14,50 @@
 # ============================================================================
 """HSDP parameter"""
 
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Replicate
+from hyper_parallel.core.fully_shard.hsdp_utils import (
+    FullyShardParamMode,
+    GroupInfo,
+    get_rank_list_for_axes,
+    get_split_rank_lists_for_axes,
+)
+from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo
+from hyper_parallel.platform import get_platform
+
+platform = get_platform()
+_GROUP_INFO_CACHE = {}
+
+
+def _build_group_info_from_rank_list(group_name: str, rank_list) -> GroupInfo:
+    """Create group metadata from an explicit rank list."""
+    normalized_rank_list = tuple(sorted(int(rank) for rank in rank_list))
+    if len(normalized_rank_list) <= 1:
+        return GroupInfo(f"{group_name}_invalid", None, 1)
+    if normalized_rank_list in _GROUP_INFO_CACHE:
+        cached_group = _GROUP_INFO_CACHE[normalized_rank_list]
+        return GroupInfo(str(normalized_rank_list), cached_group, len(normalized_rank_list))
+    try:
+        group = platform.create_group(list(normalized_rank_list))
+    except (RuntimeError, ValueError):  # pragma: no cover - UT may run without dist init
+        group = None
+    _GROUP_INFO_CACHE[normalized_rank_list] = group
+    return GroupInfo(str(normalized_rank_list), group, len(normalized_rank_list))
+
+
+def _build_group_info_from_process_group(
+    group_name: str,
+    process_group,
+    rank_size: int,
+    *,
+    resolved_group_name: str | None = None,
+) -> GroupInfo:
+    """Create group metadata from an existing process group."""
+    if process_group is None or rank_size <= 1:
+        return GroupInfo(f"{group_name}_invalid", None, 1)
+    return GroupInfo(resolved_group_name or group_name, process_group, rank_size)
+
 
 class HSDPParamV2:
     """
@@ -141,3 +185,166 @@ class HSDPParamV2:
     def all_reduce_grad(self):
         """Perform all-reduce on gradient across the replicate dimension (HSDP mode only)."""
         raise NotImplementedError("HSDP param subclasses must implement all_reduce_grad")
+
+    def _resolve_process_group_name(self, group_name: str, process_group) -> str:
+        """Resolve the name recorded in GroupInfo for an existing process group."""
+        del process_group
+        return group_name
+
+    def _get_base_spmd_placements(self) -> tuple:
+        """Return placements before explicit data-parallel semantics are applied."""
+        if (
+            getattr(self, "param_mode", None) == FullyShardParamMode.DTENSOR_UNIFIED
+            and getattr(self, "_orig_param_is_dtensor", False)
+        ):
+            self._spmd_mesh = DeviceMesh.concatenate([self.mesh_info.mesh, self._orig_dtensor_mesh])
+            dp_prefix_placements = tuple(Replicate() for _ in range(self.mesh_info.mesh.ndim))
+            return dp_prefix_placements + tuple(self._orig_dtensor_placements)
+
+        if (
+            getattr(self, "param_mode", None) == FullyShardParamMode.DTENSOR_COMPAT
+            and getattr(self, "_orig_param_is_dtensor", False)
+        ):
+            self._spmd_mesh = self._orig_dtensor_mesh
+            return tuple(self._orig_dtensor_placements)
+
+        self._spmd_mesh = self.mesh_info.mesh
+        return tuple(Replicate() for _ in range(self._spmd_mesh.ndim))
+
+    def _get_data_parallel_shard_placement(self, placements: list, shard_placement):
+        """Return the placement to apply on the explicit fully_shard dimension."""
+        del placements
+        return shard_placement
+
+    def _apply_data_parallel_placements(self, placements: list, shard_placement) -> tuple:
+        """Apply explicit DDP/FSDP placements on top of the base SPMD layout."""
+        if len(placements) != self._spmd_mesh.ndim:
+            raise AssertionError(
+                f"Expected {self._spmd_mesh.ndim} unified placements, got {len(placements)}: {placements}"
+            )
+
+        spmd_replicate_mesh_dim = getattr(self, "_spmd_replicate_mesh_dim", None)
+        if (
+            isinstance(self.mesh_info, DDPMeshInfo)
+            and spmd_replicate_mesh_dim is not None
+            and not getattr(self, "_orig_param_is_dtensor", False)
+        ):
+            placements[spmd_replicate_mesh_dim] = Replicate()
+
+        spmd_shard_mesh_dim = getattr(self, "_spmd_shard_mesh_dim", None)
+        if (
+            getattr(self, "uses_param_shard", False)
+            and isinstance(self.mesh_info, FSDPMeshInfo)
+            and spmd_shard_mesh_dim is not None
+        ):
+            placements[spmd_shard_mesh_dim] = self._get_data_parallel_shard_placement(
+                placements, shard_placement
+            )
+        return tuple(placements)
+
+    def _init_group_infos(self) -> None:
+        """Initialize sharded/unsharded communication groups from the current layout."""
+        if (
+            getattr(self, "uses_param_shard", False)
+            and getattr(self, "is_sharded", False)
+            and isinstance(self.mesh_info, FSDPMeshInfo)
+        ):
+            resolved_group_name = self._resolve_process_group_name(
+                "fully_shard_sharded_group",
+                self.mesh_info.shard_process_group,
+            )
+            self.sharded_group_info = _build_group_info_from_process_group(
+                "fully_shard_sharded_group",
+                self.mesh_info.shard_process_group,
+                self.mesh_info.shard_mesh_size,
+                resolved_group_name=resolved_group_name,
+            )
+        else:
+            self.sharded_group_info = GroupInfo("fully_shard_sharded_group_invalid", None, 1)
+
+        self.unsharded_group_info = self._build_layout_driven_group_info()
+        self.shard_size = self.sharded_group_info.rank_size
+        self.dp_size = self.unsharded_group_info.rank_size
+        self.rank_size = max(1, self.shard_size * self.dp_size)
+
+    def _build_layout_driven_group_info(self) -> GroupInfo:
+        """Build the group that should all-reduce an unsharded gradient from the final layout."""
+        group_axes = [
+            axis
+            for axis, placement in enumerate(self._spmd_placements)
+            if placement.is_replicate()
+        ]
+        spmd_shard_mesh_dim = getattr(self, "_spmd_shard_mesh_dim", None)
+        if getattr(self, "uses_param_shard", False) and spmd_shard_mesh_dim is not None:
+            group_axes = [axis for axis in group_axes if axis != spmd_shard_mesh_dim]
+        if not group_axes:
+            return GroupInfo("fully_shard_unsharded_group_invalid", None, 1)
+
+        group_dim_names = getattr(self._spmd_mesh, "mesh_dim_names", None)
+        if group_dim_names:
+            try:
+                mesh_axis_names = tuple(group_dim_names[axis] for axis in group_axes)
+                if len(mesh_axis_names) == 1:
+                    axis_name = mesh_axis_names[0]
+                    process_group = self._spmd_mesh.get_group(axis_name)
+                    if process_group is not None:
+                        rank_size = self._spmd_mesh.mesh_shape[group_dim_names.index(axis_name)]
+                        resolved_group_name = self._resolve_process_group_name(
+                            "fully_shard_unsharded_group",
+                            process_group,
+                        )
+                        return _build_group_info_from_process_group(
+                            "fully_shard_unsharded_group",
+                            process_group,
+                            rank_size,
+                            resolved_group_name=resolved_group_name,
+                        )
+
+                split_rank_lists = get_split_rank_lists_for_axes(self._spmd_mesh, group_axes)
+                process_group = platform.split_group(split_ranks=split_rank_lists)
+                if process_group is not None:
+                    rank_size = 1
+                    for axis in group_axes:
+                        rank_size *= self._spmd_mesh.mesh_shape[axis]
+                    resolved_group_name = self._resolve_process_group_name(
+                        "fully_shard_unsharded_group",
+                        process_group,
+                    )
+                    return _build_group_info_from_process_group(
+                        "fully_shard_unsharded_group",
+                        process_group,
+                        rank_size,
+                        resolved_group_name=resolved_group_name,
+                    )
+            except (
+                AssertionError,
+                AttributeError,
+                KeyError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ):
+                pass
+
+        rank_list = get_rank_list_for_axes(self._spmd_mesh, group_axes)
+        return _build_group_info_from_rank_list("fully_shard_unsharded_group", rank_list)
+
+    def _normalize_unsharded_grad_to_local(self, grad, *, reduce_partial_dtensor: bool = True):
+        """Normalize a pending gradient to the local tensor expected by fully_shard collectives."""
+        if not isinstance(grad, DTensor):
+            return grad
+
+        if reduce_partial_dtensor and any(placement.is_partial() for placement in grad.placements):
+            grad = grad.reduce_partial()
+
+        orig_dtensor_mesh = getattr(self, "_orig_dtensor_mesh", None)
+        orig_dtensor_placements = getattr(self, "_orig_dtensor_placements", None)
+        if (
+            orig_dtensor_mesh is not None
+            and grad.device_mesh.to_hash() != orig_dtensor_mesh.to_hash()
+        ) or (
+            orig_dtensor_placements is not None
+            and tuple(grad.placements) != tuple(orig_dtensor_placements)
+        ):
+            grad = grad.redistribute(orig_dtensor_mesh, orig_dtensor_placements)
+        return grad.to_local()

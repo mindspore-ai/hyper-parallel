@@ -18,9 +18,13 @@ import mindspore as ms
 from mindspore import ops
 import mindspore.mint.distributed as dist
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
-from hyper_parallel.core.fully_shard.hsdp_utils import _get_param_module_infos
+from hyper_parallel.core.fully_shard.hsdp_utils import (
+    _get_param_module_infos,
+    FullyShardParamMode,
+    infer_fully_shard_param_mode,
+)
 from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
-from hyper_parallel.core.fully_shard.utils import HSDPMeshInfo, DDPMeshInfo, CPUOffloadPolicy
+from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 
 
 def _to_dtype_if_needed(
@@ -40,6 +44,9 @@ def _to_dtype_if_needed(
 class MindSporeHSDPStateV2(HSDPState):
     """MindSpore HSDP cell state"""
 
+    def _iter_managed_params(self):
+        return [*self.hsdp_params, *self.replicate_params]
+
     def __init__(self, cell, mesh_info, config, platform, device=None):
         super().__init__(cell, mesh_info, config, platform, device)
         # Do ReduceScatter/AllReduce for grad
@@ -50,9 +57,14 @@ class MindSporeHSDPStateV2(HSDPState):
         self.reshard_after_backward = True
         # Requires AllReduce for grad When HSDP
         self.requires_all_reduce = True
-        # Reduce Op type for gradient reduction, default to AVG.
+        # Keep historical AVG behavior for local parameters while DTensor-aware
+        # paths default to SUM semantics without extra division.
         self.reduce_op_type = ops.ReduceOp.SUM
-        self._need_div = True
+        self._need_div = not any(
+            getattr(param, "param_mode", FullyShardParamMode.LOCAL_PARAM)
+            != FullyShardParamMode.LOCAL_PARAM
+            for param in self._iter_managed_params()
+        )
         self._ignored_allreduce_works = []
         self._reset_sharded_params = False
 
@@ -88,11 +100,14 @@ class MindSporeHSDPStateV2(HSDPState):
         """init hsdp parameters for cell and replicate parameters for cell."""
         # all parameters in the module tree(s), deduplicated
         visited_params = set()
-        replicate_params = self.config.replicate_params
+        replicate_params = set(self.config.replicate_params or ())
+        ignored_params = set(self.config.ignored_params or ())
         filtered_params = []
         for mod in self.modules:
             for _, param in mod.parameters_and_names():
                 if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
+                    continue
+                if param in ignored_params:
                     continue
                 if param in visited_params:
                     continue
@@ -101,15 +116,19 @@ class MindSporeHSDPStateV2(HSDPState):
 
         module_infos = _get_param_module_infos(filtered_params, tuple(self.modules))
         for param, module_info in zip(filtered_params, module_infos):
-            ddp_mesh_info = DDPMeshInfo(mesh=self.mesh_info.mesh, replicate_mesh_dim=0)
-            mesh_info = ddp_mesh_info if param in replicate_params else self.mesh_info
-            hsdp_param = MindSporeHSDPParamV2(param,
-                                              module_info,
-                                              mesh_info,
-                                              mp_policy=self.mp_policy,
-                                              offload_policy=self.offload_policy,
-                                              device=self.device,
-                                              )
+            param_mode = infer_fully_shard_param_mode(self.config.mesh, [param])
+            enable_fsdp_shard = param not in replicate_params
+            hsdp_param = MindSporeHSDPParamV2(
+                param,
+                module_info,
+                self.mesh_info,
+                shard_placement_fn=self.config.shard_placement_fn,
+                mp_policy=self.mp_policy,
+                offload_policy=self.offload_policy,
+                device=self.device,
+                param_mode=param_mode,
+                enable_fsdp_shard=enable_fsdp_shard,
+            )
             if param in replicate_params:
                 self.replicate_params.append(hsdp_param)
             else:
@@ -124,7 +143,7 @@ class MindSporeHSDPStateV2(HSDPState):
         for replicate_param in self.replicate_params:
             replicate_param.init_dtype_attrs(self.mp_policy)
         trainable_params: list[MindSporeHSDPParamV2] = [
-            p for p in self.hsdp_params if p.sharded_param.requires_grad
+            p for p in self._iter_managed_params() if p.sharded_param.requires_grad
         ]
         orig_dtypes = {p.orig_dtype for p in trainable_params}
         reduce_dtypes = {p.reduce_dtype for p in trainable_params}
@@ -156,7 +175,7 @@ class MindSporeHSDPStateV2(HSDPState):
             return
         hsdp_params_not_on_cpu = [
             hsdp_param
-            for hsdp_param in self.hsdp_params
+            for hsdp_param in self._iter_managed_params()
             if not str(hsdp_param.sharded_param.device).lower().startswith("cpu")
         ]
         if hsdp_params_not_on_cpu:
@@ -171,7 +190,7 @@ class MindSporeHSDPStateV2(HSDPState):
         """Validate that all parameters have been materialized from meta device."""
         param_names_on_meta = [
             hsdp_param._param_fqn
-            for hsdp_param in self.hsdp_params
+            for hsdp_param in self._iter_managed_params()
             if hsdp_param.sharded_param.device == "meta"
         ]
         if param_names_on_meta:
@@ -217,24 +236,31 @@ class MindSporeHSDPStateV2(HSDPState):
         """
         DDP-style all-reduce for parameters in config.replicate_params.
 
-        Do one all-reduce over the flattened 2D mesh so the final
-        gradient is reduced over the full mesh.
+        Use the parameter's layout-driven unsharded group so DTensor-aware
+        compatibility and unified modes reduce over the correct axes.
         """
         for param in self.replicate_params:
             if not hasattr(param, "_unsharded_param") or param.unsharded_param is None:
                 continue
+            if (
+                param.unsharded_accumulated_grad is None
+                and param.unsharded_param.grad is None
+            ):
+                continue
 
-            reduced_grad = _to_dtype_if_needed(param.unsharded_param.grad, self._reduce_dtype)
-            flat_name = "reduce_all"
+            reduced_grad = param.unsharded_accumulated_grad_data
+            if reduced_grad is None:
+                reduced_grad = param.unsharded_grad_data
+            reduced_grad = _to_dtype_if_needed(reduced_grad, self._reduce_dtype)
+            reduce_group_info = getattr(param, "unsharded_group_info", None)
+            reduce_group = reduce_group_info.group if reduce_group_info is not None else None
+            reduce_group_size = reduce_group_info.rank_size if reduce_group_info is not None else 1
 
-            flat_mesh = self.mesh_info.mesh.flatten(mesh_dim_name=flat_name)
-            reduce_group = flat_mesh.get_group(flat_name)
-
-            if reduce_group is not None and len(flat_mesh.rank_list) > 1:
+            if reduce_group is not None and reduce_group_size > 1:
                 param.all_reduce_handle = dist.all_reduce(
                     reduced_grad, group=reduce_group, op=self.reduce_op_type, async_op=async_op
                 )
-            self._ignored_allreduce_works.append((param, reduced_grad, flat_mesh))
+            self._ignored_allreduce_works.append((param, reduced_grad, reduce_group_size))
 
     def _finish_ignored_allreduce(self) -> None:
         """
@@ -248,10 +274,10 @@ class MindSporeHSDPStateV2(HSDPState):
         if not self._ignored_allreduce_works:
             return
 
-        for param, reduced_grad, flat_mesh in self._ignored_allreduce_works:
+        for param, reduced_grad, reduce_group_size in self._ignored_allreduce_works:
             if param.all_reduce_handle:
                 param.all_reduce_handle.wait()
-            group_size = float(len(flat_mesh.rank_list))
+            group_size = float(reduce_group_size)
             self._div_if_needed(reduced_grad, group_size)
 
             if self._orig_dtype is not None and reduced_grad.dtype != self._orig_dtype:
@@ -288,7 +314,9 @@ class MindSporeHSDPStateV2(HSDPState):
             for replicate_param in self.replicate_params:
                 replicate_param.to_accumulated_grad_if_needed()
             return
-        self._allreduce_replicate_params()
+        # post_backward() consumes reduced tensors immediately, so the current
+        # MindSpore path must use synchronous communication here.
+        self._allreduce_replicate_params(async_op=False)
         for hsdp_param in self.hsdp_params:
             if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
                 continue
@@ -296,24 +324,31 @@ class MindSporeHSDPStateV2(HSDPState):
             # gradient — skip all reduce-scatter / all-reduce work.
             if not hsdp_param.sharded_param.requires_grad:
                 continue
-            if hsdp_param.shard_world_size > 1:
-                if hsdp_param.unsharded_param.grad is None:
-                    # Parameter requires grad but was not used in
-                    # forward — all ranks skip consistently.
-                    continue
+            if (
+                hsdp_param.unsharded_accumulated_grad is None
+                and hsdp_param.unsharded_param.grad is None
+            ):
+                # Parameter requires grad but was not used in forward.
+                continue
+
+            reduced_grad = hsdp_param.unsharded_accumulated_grad_data
+            if reduced_grad is None:
+                reduced_grad = hsdp_param.unsharded_grad_data
+
+            if hsdp_param.shard_size > 1:
                 reduced_grad, _ = hsdp_param.reduce_scatter_grad(
+                    async_op=False,
                     dtype=self._reduce_dtype,
                     reduce_op=self.reduce_op_type
                 )
-                self._div_if_needed(reduced_grad, hsdp_param.shard_world_size)
-            if self.requires_all_reduce and hsdp_param.replicate_world_size > 1:
-                if not isinstance(hsdp_param.mesh_info, HSDPMeshInfo):
-                    raise TypeError("hsdp_param.mesh_info must be HSDPMeshInfo")
+                self._div_if_needed(reduced_grad, hsdp_param.shard_size)
+            if self.requires_all_reduce and hsdp_param.dp_size > 1:
                 reduced_grad, _ = hsdp_param.all_reduce_grad(
                     grad=reduced_grad,
+                    async_op=False,
                     reduce_op=self.reduce_op_type,
                 )
-                self._div_if_needed(reduced_grad, hsdp_param.replicate_world_size)
+                self._div_if_needed(reduced_grad, hsdp_param.dp_size)
             # Bind the reduced gradient to hsdp_param.sharded_param
             self._apply_reduced_grad(hsdp_param, reduced_grad)
         self._finish_ignored_allreduce()
