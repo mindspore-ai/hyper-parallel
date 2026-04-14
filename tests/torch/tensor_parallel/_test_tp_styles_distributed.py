@@ -279,39 +279,45 @@ def test_mlp_colwise_rowwise_forward_precision_npu():
         f"in_features {in_f} must be divisible by world_size {world_size}"
     )
 
-    w1 = torch.randn(hidden_f, in_f, dtype=torch.float32)
-    b1 = torch.randn(hidden_f, dtype=torch.float32)
-    w2 = torch.randn(out_f, hidden_f, dtype=torch.float32)
-    b2 = torch.randn(out_f, dtype=torch.float32)
+    # Reference weight/bias data for CPU reference computation
+    w1_data = torch.randn(hidden_f, in_f, dtype=torch.float32)
+    b1_data = torch.randn(hidden_f, dtype=torch.float32)
+    w2_data = torch.randn(out_f, hidden_f, dtype=torch.float32)
+    b2_data = torch.randn(out_f, dtype=torch.float32)
     x = torch.randn(batch, in_f, dtype=torch.float32)
 
-    # CPU reference: w1 -> relu -> w2
-    h_ref = F.linear(x, w1, b1)
+    # CPU reference: linear1 -> relu -> linear2
+    h_ref = F.linear(x, w1_data, b1_data)
     h_ref = F.relu(h_ref)
-    y_ref = F.linear(h_ref, w2, b2)
+    y_ref = F.linear(h_ref, w2_data, b2_data)
 
+    # MLP model where `linear1` and `linear2` are nn.Linear **modules**.
+    # ColwiseParallel / RowwiseParallel operate at the **module/layer level** —
+    # they automatically shard all parameters (weight, bias) of the module.
     class MLP(nn.Module):
         def __init__(self):
             super().__init__()
-            self.w1 = nn.Linear(in_f, hidden_f, bias=True)
-            self.w2 = nn.Linear(hidden_f, out_f, bias=True)
+            self.linear1 = nn.Linear(in_f, hidden_f, bias=True)
+            self.linear2 = nn.Linear(hidden_f, out_f, bias=True)
 
         def forward(self, x):
-            return self.w2(F.relu(self.w1(x)))
+            return self.linear2(F.relu(self.linear1(x)))
 
     model = MLP().npu()
     with torch.no_grad():
-        model.w1.weight.copy_(w1.npu())
-        model.w1.bias.copy_(b1.npu())
-        model.w2.weight.copy_(w2.npu())
-        model.w2.bias.copy_(b2.npu())
+        model.linear1.weight.copy_(w1_data.npu())
+        model.linear1.bias.copy_(b1_data.npu())
+        model.linear2.weight.copy_(w2_data.npu())
+        model.linear2.bias.copy_(b2_data.npu())
     x_npu = x.npu()
 
-    # w1: colwise (output shard(0)), w2: rowwise (weight shard(1), all-reduce output)
+    # parallelize_module applies styles at module (layer) granularity:
+    #   "linear1" → ColwiseParallel() shards model.linear1 (nn.Linear) column-wise
+    #   "linear2" → RowwiseParallel() shards model.linear2 (nn.Linear) row-wise
     # For composition: colwise output is Shard(-1), rowwise expects Shard(-1) input — matches
     parallelize_module(
         model, mesh,
-        {"w1": ColwiseParallel(), "w2": RowwiseParallel()},
+        {"linear1": ColwiseParallel(), "linear2": RowwiseParallel()},
     )
     with torch.no_grad():
         y_hp = model(x_npu)

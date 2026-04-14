@@ -33,8 +33,10 @@ from torch import nn
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_parallel.core.tensor_parallel.style import RowwiseParallel
+from hyper_parallel.core.tensor_parallel.api import parallelize_module
+from hyper_parallel.core.tensor_parallel.style import ParallelStyle, RowwiseParallel, ColwiseParallel
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
 
 
@@ -87,7 +89,6 @@ class TestRowwiseParallelInit(unittest.TestCase):
         Description: check RowwiseParallel is a ParallelStyle
         Expectation: isinstance check passes
         """
-        from hyper_parallel.core.tensor_parallel.style import ParallelStyle
         style = RowwiseParallel()
         self.assertIsInstance(style, ParallelStyle)
 
@@ -112,8 +113,9 @@ class TestRowwiseParallelApply(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    def _setup_mock_platform(self, mock_platform, world_size=4):
-        mock_platform.platform_type = PlatformType.PYTORCH
+    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=4):
+        if platform_type is not None:
+            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (
@@ -208,8 +210,9 @@ class TestRowwiseParallelPartition(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    def _setup_mock_platform(self, mock_platform, world_size=4):
-        mock_platform.platform_type = PlatformType.PYTORCH
+    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=4):
+        if platform_type is not None:
+            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (
@@ -309,8 +312,6 @@ class TestRowwiseParallelIO(unittest.TestCase):
         Description: pass plain torch.Tensor as input[0]
         Expectation: DTensor.from_local is called with correct device_mesh and input_layouts
         """
-        from hyper_parallel.core.dtensor.dtensor import DTensor
-
         input_layouts = (Shard(-1),)
         desired_layouts = (Shard(-1),)
         mesh = MagicMock()
@@ -333,8 +334,6 @@ class TestRowwiseParallelIO(unittest.TestCase):
         Description: input_layouts=(Replicate(),), desired=(Shard(-1),)
         Expectation: redistribute is called
         """
-        from hyper_parallel.core.dtensor.dtensor import DTensor
-
         input_layouts = (Replicate(),)
         desired_layouts = (Shard(-1),)
         mesh = MagicMock()
@@ -414,8 +413,9 @@ class TestColRowComposition(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    def _setup_mock_platform(self, mock_platform, world_size=4):
-        mock_platform.platform_type = PlatformType.PYTORCH
+    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=4):
+        if platform_type is not None:
+            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (
@@ -436,12 +436,9 @@ class TestColRowComposition(unittest.TestCase):
     def test_mlp_colwise_rowwise_composition(self, mock_style_platform, mock_mesh_platform):
         """
         Feature: ColwiseParallel + RowwiseParallel composition on MLP
-        Description: parallelize_module with w1=ColwiseParallel, w2=RowwiseParallel
+        Description: parallelize_module with linear1=ColwiseParallel, linear2=RowwiseParallel
         Expectation: distribute_module called twice (once per submodule)
         """
-        from hyper_parallel.core.tensor_parallel.api import parallelize_module
-        from hyper_parallel.core.tensor_parallel.style import ColwiseParallel
-
         mesh = self._make_1d_mesh(mock_mesh_platform)
         mock_style_platform.is_linear_module.return_value = True
         mock_style_platform.is_embedding_module.return_value = False
@@ -450,8 +447,8 @@ class TestColRowComposition(unittest.TestCase):
         class MLP(nn.Module):
             def __init__(self):
                 super().__init__()
-                self.w1 = nn.Linear(8, 16)
-                self.w2 = nn.Linear(16, 8)
+                self.linear1 = nn.Linear(8, 16)
+                self.linear2 = nn.Linear(16, 8)
 
         model = MLP()
 
@@ -459,7 +456,7 @@ class TestColRowComposition(unittest.TestCase):
             mock_dist.side_effect = lambda m, *args, **kwargs: m
             parallelize_module(
                 model, mesh,
-                {"w1": ColwiseParallel(), "w2": RowwiseParallel()},
+                {"linear1": ColwiseParallel(), "linear2": RowwiseParallel()},
             )
             self.assertEqual(mock_dist.call_count, 2)
 

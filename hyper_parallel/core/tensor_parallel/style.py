@@ -93,10 +93,11 @@ class ColwiseParallel(ParallelStyle):
         A :class:`ParallelStyle` that applies column-wise sharding.
 
     Example::
+
         >>> from hyper_parallel import parallelize_module, ColwiseParallel, init_device_mesh
         >>> m = Model(...)
         >>> tp_mesh = init_device_mesh("npu", (8,), mesh_dim_names=("tp",))
-        >>> sharded_mod = parallelize_module(m, tp_mesh, {"w1": ColwiseParallel()})
+        >>> parallelize_module(m, tp_mesh, {"linear1": ColwiseParallel()})
     """
 
     def __init__(
@@ -250,7 +251,7 @@ class RowwiseParallel(ParallelStyle):
         >>> from hyper_parallel import parallelize_module, RowwiseParallel, init_device_mesh
         >>> m = Model(...)
         >>> tp_mesh = init_device_mesh("npu", (8,), mesh_dim_names=("tp",))
-        >>> sharded_mod = parallelize_module(m, tp_mesh, {"w2": RowwiseParallel()})
+        >>> parallelize_module(m, tp_mesh, {"linear2": RowwiseParallel()})
     """
 
     def __init__(

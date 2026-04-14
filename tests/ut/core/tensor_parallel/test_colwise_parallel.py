@@ -32,8 +32,9 @@ from torch import nn
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from hyper_parallel.core.tensor_parallel.style import ColwiseParallel
+from hyper_parallel.core.tensor_parallel.style import ColwiseParallel, ParallelStyle
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
 
 
@@ -87,7 +88,6 @@ class TestColwiseParallelInit(unittest.TestCase):
         Description: check ColwiseParallel is a ParallelStyle
         Expectation: isinstance check passes
         """
-        from hyper_parallel.core.tensor_parallel.style import ParallelStyle
         style = ColwiseParallel()
         self.assertIsInstance(style, ParallelStyle)
 
@@ -112,8 +112,9 @@ class TestColwiseParallelApply(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    def _setup_mock_platform(self, mock_platform, world_size=4):
-        mock_platform.platform_type = PlatformType.PYTORCH
+    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=4):
+        if platform_type is not None:
+            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (
@@ -209,8 +210,9 @@ class TestColwiseParallelPartition(unittest.TestCase):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
 
-    def _setup_mock_platform(self, mock_platform, world_size=4):
-        mock_platform.platform_type = PlatformType.PYTORCH
+    def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=4):
+        if platform_type is not None:
+            mock_platform.platform_type = platform_type
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
         mock_platform.tensor_to_numpy.side_effect = (
@@ -285,8 +287,6 @@ class TestColwiseParallelIO(unittest.TestCase):
         Description: pass plain torch.Tensor as input[0]
         Expectation: DTensor.from_local is called with correct device_mesh and input_layouts
         """
-        from hyper_parallel.core.dtensor.dtensor import DTensor
-
         input_layouts = (Replicate(),)
         desired_layouts = (Replicate(),)
         mesh = MagicMock()
@@ -309,8 +309,6 @@ class TestColwiseParallelIO(unittest.TestCase):
         Description: pass DTensor as input[0] with matching layouts
         Expectation: DTensor.from_local is NOT called
         """
-        from hyper_parallel.core.dtensor.dtensor import DTensor
-
         input_layouts = (Replicate(),)
         desired_layouts = (Replicate(),)
         mesh = MagicMock()
@@ -330,8 +328,6 @@ class TestColwiseParallelIO(unittest.TestCase):
         Description: input_layouts=(Shard(0),), desired=(Replicate(),)
         Expectation: redistribute is called on the DTensor
         """
-        from hyper_parallel.core.dtensor.dtensor import DTensor
-
         input_layouts = (Shard(0),)
         desired_layouts = (Replicate(),)
         mesh = MagicMock()
