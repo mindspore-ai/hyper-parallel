@@ -1105,6 +1105,11 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement async_save_on_cpu")
 
     @staticmethod
+    def get_element_size(tensor):
+        """Get Tensor Element Size"""
+        raise NotImplementedError("Platform subclasses must implement get_element_size")
+
+    @staticmethod
     def tensor_to_numpy(tensor) -> np.ndarray:
         """Convert a framework tensor to a NumPy array.
 

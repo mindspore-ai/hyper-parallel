@@ -834,6 +834,11 @@ class MindSporePlatform(Platform):
         return AsyncSaveOnCpu(policy_fn=policy_fn)
 
     @staticmethod
+    def get_element_size(tensor):
+        """Get Tensor Element Size"""
+        return tensor.itemsize
+
+    @staticmethod
     def tensor_to_numpy(tensor) -> np.ndarray:
         """Convert MindSpore tensor to numpy array."""
         return tensor.asnumpy()
