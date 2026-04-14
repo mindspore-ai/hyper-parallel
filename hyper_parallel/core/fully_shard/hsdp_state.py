@@ -24,6 +24,12 @@ platform = get_platform()
 
 class HSDPState:
     """HSDP state for cell"""
+    # Record pending per-parameter reduce-scatter/all-reduce work across
+    # fully_shard states so later backward hooks/root drains can materialize
+    # gradients launched by earlier states.
+    pre_reduce_scatter_params = []
+    pre_all_reduce_params = []
+
     def __init__(self, cell: Union[platform.Module, Tuple[platform.Module, ...]], mesh_info,
                  config: HSDPConfigV2, platform_impl, device=None):
         """

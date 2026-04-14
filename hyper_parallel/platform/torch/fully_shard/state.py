@@ -47,12 +47,6 @@ def _to_dtype_if_needed(
 
 class TorchHSDPStateV2(HSDPState):
     """Torch HSDP cell state"""
-    # Record grad reduce-scatter handles across states to preserve the
-    # existing cross-module backward staging / prefetch pipeline.
-    pre_reduce_scatter_params = []
-    # Record grad all-reduce handles (only for HSDP) across states.
-    pre_all_reduce_params = []
-
     @staticmethod
     def _get_pending_unsharded_grad(hsdp_param):
         """Return the pending unsharded gradient tensor for all-reduce-based paths."""
@@ -335,21 +329,21 @@ class TorchHSDPStateV2(HSDPState):
             dtype=self._reduce_dtype,
             reduce_op=reduce_op,
         )
-        TorchHSDPStateV2.pre_reduce_scatter_params.append((hsdp_param, self._orig_dtype))
+        HSDPState.pre_reduce_scatter_params.append((hsdp_param, self._orig_dtype))
         if not self._should_run_all_reduce(hsdp_param):
             return
         reduced_grad = hsdp_param.reduce_scatter_output()
         if (
-            TorchHSDPStateV2.pre_reduce_scatter_params
-            and TorchHSDPStateV2.pre_reduce_scatter_params[-1][0] == hsdp_param
+            HSDPState.pre_reduce_scatter_params
+            and HSDPState.pre_reduce_scatter_params[-1][0] == hsdp_param
         ):
-            TorchHSDPStateV2.pre_reduce_scatter_params.pop()
+            HSDPState.pre_reduce_scatter_params.pop()
         hsdp_param.all_reduce_grad(
             grad=reduced_grad,
             dtype=self._reduce_dtype,
             reduce_op=reduce_op,
         )
-        TorchHSDPStateV2.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
+        HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
 
     def _queue_compat_all_reduce(self, hsdp_param, reduce_op):
         """Queue the compatibility all-reduce path without FSDP sharding."""
@@ -360,7 +354,7 @@ class TorchHSDPStateV2(HSDPState):
             dtype=self._reduce_dtype,
             reduce_op=reduce_op,
         )
-        TorchHSDPStateV2.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
+        HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
 
     def post_backward(self, *unused):  # pylint: disable=unused-argument
         """Reduce gradients and reshard parameters after backward."""
@@ -413,14 +407,14 @@ class TorchHSDPStateV2(HSDPState):
             4. Assigning or accumulating the gradient to `sharded_param.grad`
         """
         need_synchronize = False
-        while TorchHSDPStateV2.pre_reduce_scatter_params:
-            pre_hsdp_param, pre_orig_dtype = TorchHSDPStateV2.pre_reduce_scatter_params.pop(0)
+        while HSDPState.pre_reduce_scatter_params:
+            pre_hsdp_param, pre_orig_dtype = HSDPState.pre_reduce_scatter_params.pop(0)
             reduced_grad = pre_hsdp_param.reduce_scatter_output()
             pre_hsdp_param.clear_reduce_scatter_output()
             need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype) or need_synchronize
 
-        while TorchHSDPStateV2.pre_all_reduce_params:
-            pre_hsdp_param, pre_orig_dtype = TorchHSDPStateV2.pre_all_reduce_params.pop(0)
+        while HSDPState.pre_all_reduce_params:
+            pre_hsdp_param, pre_orig_dtype = HSDPState.pre_all_reduce_params.pop(0)
             reduced_grad = pre_hsdp_param.all_reduce_output()
             pre_hsdp_param.clear_all_reduce_output()
             need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype) or need_synchronize

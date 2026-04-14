@@ -63,6 +63,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     get_rank_list_for_axes,
 )
 from hyper_parallel.core.fully_shard.api import fully_shard
+from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
 from hyper_parallel.platform.torch.fully_shard.state import TorchHSDPStateV2
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, get_torch_platform
@@ -1243,8 +1244,8 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         state.reduce_grads = True
         state.reshard_after_backward = False
         state.requires_all_reduce = True
-        state.pre_reduce_scatter_params = []
-        state.pre_all_reduce_params = []
+        HSDPState.pre_reduce_scatter_params = []
+        HSDPState.pre_all_reduce_params = []
         state.reduce_params = MagicMock()
         state._queue_compat_all_reduce = MagicMock()
         state._queue_reduce_scatter_then_all_reduce = MagicMock()
@@ -1415,8 +1416,8 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         state.reduce_grads = True
         state.reshard_after_backward = False
         state.requires_all_reduce = True
-        state.pre_reduce_scatter_params = []
-        state.pre_all_reduce_params = []
+        HSDPState.pre_reduce_scatter_params = []
+        HSDPState.pre_all_reduce_params = []
         state._user_reduce_op_type = None
         state.reduce_params = MagicMock()
         state._queue_compat_all_reduce = MagicMock()
@@ -1450,8 +1451,8 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         state.reduce_grads = True
         state.reshard_after_backward = False
         state.requires_all_reduce = True
-        state.pre_reduce_scatter_params = []
-        state.pre_all_reduce_params = []
+        HSDPState.pre_reduce_scatter_params = []
+        HSDPState.pre_all_reduce_params = []
         state._user_reduce_op_type = None
         state.reduce_params = MagicMock()
         state._queue_compat_all_reduce = MagicMock()
@@ -1490,8 +1491,8 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         state.reduce_grads = True
         state.reshard_after_backward = False
         state.requires_all_reduce = False
-        state.pre_reduce_scatter_params = []
-        state.pre_all_reduce_params = []
+        HSDPState.pre_reduce_scatter_params = []
+        HSDPState.pre_all_reduce_params = []
         state.reduce_params = MagicMock()
         state._queue_compat_all_reduce = MagicMock()
         state._queue_reduce_scatter_then_all_reduce = MagicMock()

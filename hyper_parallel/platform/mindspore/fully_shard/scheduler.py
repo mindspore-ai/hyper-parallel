@@ -146,6 +146,8 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         apply_final_reduce = self.scheduler_state != FSDPSchedulerState.BACKWARD
         self._backward_hook()
         if apply_final_reduce:
+            self.hsdp_state.reduce_params()
+            self.hsdp_state._finish_ignored_allreduce()
             HSDPSchedulerV2.root_bp_state = False
 
     def _backward_hook(self):
