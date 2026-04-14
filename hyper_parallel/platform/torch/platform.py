@@ -104,6 +104,168 @@ class _TorchAsyncA2AFunction(torch.autograd.Function):
         return grad_output.new_zeros(ctx.x_shape), None, None, None, None, None, None, None
 
 
+class _AsyncA2ALazyBwd(torch.autograd.Function):
+    """All-to-all whose forward AND backward return ``AsyncCollectiveTensor``.
+
+    PyTorch's stock ``all_to_all_single_autograd`` calls ``wait_tensor`` in
+    its backward eagerly, and the autograd engine binds backward stream
+    context to the forward stream — so even if the BWD thread is wrapped
+    in a side-stream context, that wait still lands on the FWD main
+    stream and blocks Attention launches.
+
+    This Function bypasses the engine's binding by calling the
+    non-autograd functional op in both directions and returning ACT.
+    The wait is deferred to the next consumer's first non-view access
+    (e.g. the indexing backward of ``_unpermute``), giving the FWD
+    thread a small Python window to enqueue its Attention kernels onto
+    the main stream **before** the wait lands there.
+    """
+
+    @staticmethod
+    def forward(ctx, input_tensor, output_splits, input_splits, group):  # pylint: disable=arguments-differ
+        ctx.input_splits = input_splits
+        ctx.output_splits = output_splits
+        ctx.group = group
+        # pylint: disable=C0415
+        from torch.distributed._functional_collectives import all_to_all_single
+        return all_to_all_single(
+            input_tensor, output_splits, input_splits, group,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # pylint: disable=C0415
+        from torch.distributed._functional_collectives import all_to_all_single
+        grad_input = all_to_all_single(
+            grad_output, ctx.input_splits, ctx.output_splits, ctx.group,
+        )
+        return grad_input, None, None, None
+
+
+class _TorchSyncHookFunction(torch.autograd.Function):
+    """Autograd identity that fires HookCoordinator rendezvous on fwd/bwd.
+
+    Uses a **4-hook** design (``A``, ``B``, ``C``, ``D``) with pure
+    COMM / COMPUTE roles — no NONE role.  Every rendezvous is a strict
+    COMM + COMPUTE pair, guaranteeing NCCL-first dispatch ordering at
+    **all** points including layer boundaries.
+
+    Hook placement per MoE layer::
+
+        [A] → dispatch → [B] → module → [C] → combine → [D] → (Attention) → [A_next]
+
+    At layer boundaries (D / A hooks), the Attention that runs between
+    layers is treated as COMPUTE, and the combine / combine.bwd is treated
+    as COMM, so the coordinator enforces comm-first ordering even across
+    layer transitions.
+    """
+
+    # 4-hook role tables: (prev_role_idx, next_role_idx).
+    # Index encoding: 1 = COMM, 2 = COMPUTE.
+    _FWD_ROLES = {
+        #         (prev, next)      prev op          next op
+        "A": (2, 1),   # COMPUTE, COMM     Attention   | dispatch
+        "B": (1, 2),   # COMM, COMPUTE     dispatch    | module
+        "C": (2, 1),   # COMPUTE, COMM     module      | combine
+        "D": (1, 2),   # COMM, COMPUTE     combine     | Attention
+    }
+    _BWD_ROLES = {
+        "D": (2, 1),   # COMPUTE, COMM     Attn.bwd    | combine.bwd
+        "C": (1, 2),   # COMM, COMPUTE     combine.bwd | module.bwd
+        "B": (2, 1),   # COMPUTE, COMM     module.bwd  | dispatch.bwd
+        "A": (1, 2),   # COMM, COMPUTE     dispatch.bwd| Attn.bwd
+    }
+
+    _ROLE_CACHE = None
+
+    @staticmethod
+    def _role_enum(idx: int):
+        if _TorchSyncHookFunction._ROLE_CACHE is None:
+            from hyper_parallel.core.pipeline_parallel.hook_coordinator import HookRole  # pylint: disable=C0415
+            _TorchSyncHookFunction._ROLE_CACHE = (None, HookRole.COMM, HookRole.COMPUTE)
+        return _TorchSyncHookFunction._ROLE_CACHE[idx]
+
+    @staticmethod
+    def forward(ctx, x, hook_name, coordinator):  # pylint: disable=arguments-differ
+        """Identity forward that fires a HookCoordinator rendezvous.
+
+        Notifies the previous op's role and rendezvouses for the next op's
+        role per the ``_FWD_ROLES`` table.  ``"D_LAST"`` is a sentinel
+        meaning "skip this rendezvous" (last layer's closing D — no
+        Attention follows).
+
+        Args:
+            ctx:         Autograd context, stores ``hook_name`` and
+                         ``coordinator`` for the backward pass.
+            x:           Input tensor, returned unchanged.
+            hook_name:   One of ``"A"``, ``"B"``, ``"C"``, ``"D"``,
+                         ``"D_LAST"``.
+            coordinator: The :class:`HookCoordinator` driving the rendezvous.
+
+        Returns:
+            ``x`` unchanged.
+        """
+        ctx.hook_name = hook_name
+        ctx.coordinator = coordinator
+
+        if not coordinator.is_enabled():
+            return x
+
+        # ``D_LAST`` marks the last layer's D hook.  The "next op" after
+        # this hook is the chunk's output (no Attention follows), so the
+        # rendezvous is meaningless — skip it.  In backward this same
+        # hook is the very first BWD hook to fire, where ``combine.bwd``
+        # has already free-run before any rendezvous is possible — also
+        # skip.  Tagging at wrap time replaces the old runtime
+        # ``increment_cycle`` / ``bwd_d_should_skip`` mechanisms.
+        if hook_name == "D_LAST":
+            return x
+
+        prev_idx, next_idx = _TorchSyncHookFunction._FWD_ROLES[hook_name]
+        role_of = _TorchSyncHookFunction._role_enum
+        coordinator.notify_dispatched(role_of(prev_idx))
+        coordinator.rendezvous(role_of(next_idx))
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Identity backward that fires a HookCoordinator rendezvous.
+
+        Mirror of :meth:`forward` using the ``_BWD_ROLES`` table.
+        ``"D_LAST"`` skips the rendezvous because this is the first BWD
+        hook to fire and ``combine.bwd`` has already dispatched freely
+        before any rendezvous can happen.
+
+        Args:
+            ctx:         Autograd context with ``hook_name`` and
+                         ``coordinator`` saved during forward.
+            grad_output: Gradient w.r.t. the forward output, returned
+                         unchanged.
+
+        Returns:
+            ``(grad_output, None, None)`` — gradients only flow back to
+            the tensor input, ``hook_name`` and ``coordinator`` are
+            non-tensor inputs.
+        """
+        hook_name = ctx.hook_name
+        coordinator = ctx.coordinator
+
+        if not coordinator.is_enabled():
+            return grad_output, None, None
+
+        # Same ``D_LAST`` semantics as forward: this is the first BWD
+        # hook to fire and combine.bwd has already dispatched freely
+        # before any rendezvous can happen, so skip the rendezvous.
+        if hook_name == "D_LAST":
+            return grad_output, None, None
+
+        prev_idx, next_idx = _TorchSyncHookFunction._BWD_ROLES[hook_name]
+        role_of = _TorchSyncHookFunction._role_enum
+        coordinator.notify_dispatched(role_of(prev_idx))
+        coordinator.rendezvous(role_of(next_idx))
+        return grad_output, None, None
+
+
 class _TorchP2PExchangeFunction(torch.autograd.Function):
     """Symmetric bidirectional P2P: send local tensor to peer, receive peer's tensor."""
 
@@ -715,6 +877,39 @@ class TorchPlatform(Platform):
         return output
 
     @staticmethod
+    def differentiable_all_to_all_single_async(input_tensor, input_splits, output_splits, group):
+        """Truly-async variant of :meth:`differentiable_all_to_all_single`.
+
+        Both forward AND backward return :class:`AsyncCollectiveTensor`,
+        so the ``wait_tensor`` op is queued lazily — only when a downstream
+        kernel actually reads the result.
+
+        Why both directions need lazy wait:
+
+        * FWD: ACT lazy wait lets host return immediately and the paired
+          BWD thread's compute kernel slip into the queue before the wait.
+        * BWD: PyTorch's stock backward issues ``wait_tensor`` eagerly,
+          and the autograd engine binds backward stream to the forward
+          stream — so even running BWD inside a ``with torch.npu.stream
+          (side_stream)`` context does not move that wait off the main
+          stream.  Returning ACT from backward defers the wait to the
+          next backward op's first consumption, opening a small window
+          during which FWD's Attention kernels can be queued onto the
+          main stream **before** the wait lands.
+
+        Args:
+            input_tensor:  Input tensor, split along dim 0 by ``input_splits``.
+            input_splits:  ``list[int]`` — rows sent to each rank.
+            output_splits: ``list[int]`` — rows received from each rank.
+            group:         Process group.
+
+        Returns:
+            ``AsyncCollectiveTensor`` of shape
+            ``[sum(output_splits), *input_tensor.shape[1:]]``.
+        """
+        return _AsyncA2ALazyBwd.apply(input_tensor, output_splits, input_splits, group)
+
+    @staticmethod
     def arange(start, end=None, step=1, dtype=None, device=None):
         """Create a 1-D tensor with evenly spaced values."""
         if end is None:
@@ -739,6 +934,26 @@ class TorchPlatform(Platform):
         return _TorchAsyncA2AFunction.apply(
             x, work, out_perm, group, world_size, concat_dim, split_dim, handle_box
         )
+
+    @staticmethod
+    def differentiable_sync_hook(x, hook_name: str, coordinator):
+        """Identity op that fires coordinator rendezvous on forward and backward.
+
+        Always goes through ``_TorchSyncHookFunction.apply`` so that the
+        autograd graph **records a SyncHook node regardless of whether the
+        coordinator is currently enabled**.  Skipping ``apply`` when
+        disabled would leave warmup-forwarded graphs without the hook
+        nodes, and a later ``overlap.run`` — whose BWD thread back-props
+        such a graph — would then traverse zero hooks while the paired FWD
+        thread (whose current forward DOES record hooks) waits at a
+        barrier for a partner that never arrives.
+
+        Args:
+            x:           Input tensor.
+            hook_name:   One of ``"A"``, ``"B"``, ``"C"``, ``"D"``.
+            coordinator: A :class:`HookCoordinator` instance.
+        """
+        return _TorchSyncHookFunction.apply(x, hook_name, coordinator)
 
     @staticmethod
     def get_tensor_transform():

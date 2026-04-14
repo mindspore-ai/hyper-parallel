@@ -14,6 +14,11 @@
 # ============================================================================
 """pipeline parallel interface"""
 from hyper_parallel.core.pipeline_parallel.stage import PipelineStage
-from hyper_parallel.core.pipeline_parallel.scheduler import ScheduleInterleaved1F1B, MetaStep, MetaStepType
+from hyper_parallel.core.pipeline_parallel.scheduler import (
+    ScheduleInterleaved1F1B, MetaStep, MetaStepType, PipelineContext,
+)
 from hyper_parallel.core.pipeline_parallel.scheduler import ScheduleGPipe, Schedule1F1B
+from hyper_parallel.core.pipeline_parallel.scheduler import auto_align_and_add_send_recv
 from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
+from hyper_parallel.core.pipeline_parallel.hook_coordinator import HookCoordinator, HookRole
+from hyper_parallel.core.pipeline_parallel.comm_compute_overlap import CommComputeOverlap

@@ -34,6 +34,8 @@ class MetaStepType(Enum):
     FWD_SEND = auto()
     BWD_RECV = auto()
     BWD_SEND = auto()
+    OVERLAP_F_B = auto()
+    OVERLAP_B_F = auto()
 
 
 class MetaStep:
@@ -43,14 +45,22 @@ class MetaStep:
     and fed into the PipelineSchedule for execution.
 
     Args:
-        micro_index (int): The index of micro-batch.
+        micro_index (int | None): The index of micro-batch.  ``None`` for
+            composite types (``OVERLAP_F_B`` / ``OVERLAP_B_F``) whose real
+            micro index lives in each ``sub_steps`` entry.
         type (MetaStepType): Specify the type of current step.
-        stage_index (int): Specify the stage index of current step.
+        stage_index (int | None): Stage index of current step.  ``None``
+            for composite types; use ``sub_steps`` to get each direction's
+            stage.
+        sub_steps (tuple[MetaStep, MetaStep] | None): For composite types
+            only: ``(fwd, bwd)`` for ``OVERLAP_F_B``, ``(bwd, fwd)`` for
+            ``OVERLAP_B_F``.
     """
-    def __init__(self, micro_index, meta_type, stage_index):
+    def __init__(self, micro_index, meta_type, stage_index, sub_steps=None):
         self._type = meta_type
         self._micro_index = micro_index
         self._stage_index = stage_index
+        self._sub_steps = sub_steps
 
     @property
     def micro_index(self):
@@ -63,6 +73,12 @@ class MetaStep:
     @property
     def type(self):
         return self._type
+
+    @property
+    def sub_steps(self):
+        """Sub-steps for composite types: ``(fwd, bwd)`` for OVERLAP_F_B,
+        ``(bwd, fwd)`` for OVERLAP_B_F, or ``None``."""
+        return self._sub_steps
 
     def __eq__(self, value):
         if not isinstance(value, MetaStep):
@@ -92,11 +108,47 @@ class MetaStep:
         pass
 
 
+class PipelineContext:
+    """Context passed to custom execution functions registered via
+    :meth:`PipelineScheduleRuntime.register_custom_function`.
+
+    Provides access to the schedule's internal state so that custom
+    handlers (e.g. OVERLAP_F_B callbacks) can perform P2P communication,
+    invoke ``forward_one_chunk`` / ``backward_one_chunk``, record losses,
+    etc.
+
+    Attributes:
+        schedule: The :class:`PipelineScheduleRuntime` instance.
+        arg_mbs: Per-micro-batch positional args.
+        kwarg_mbs: Per-micro-batch keyword args.
+        losses: Mutable list for loss collection.
+        fwd_recv_ops: ``{(stage_index, micro_index): [handle, ...]}``
+            cached forward recv handles (when ``overlap_p2p=True``).
+        bwd_recv_ops: Same for backward recv handles.
+        send_handles: Mutable list of outstanding send handles.
+    """
+
+    def __init__(self, schedule, arg_mbs, kwarg_mbs, losses, send_handles):
+        self.schedule = schedule
+        self.arg_mbs = arg_mbs
+        self.kwarg_mbs = kwarg_mbs
+        self.losses = losses
+        self.fwd_recv_ops = schedule.fwd_handle_cache
+        self.bwd_recv_ops = schedule.bwd_handle_cache
+        self.send_handles = send_handles
+
+
 class PipelineScheduleRuntime(ABC):
     """
     Base class for pipeline schedule.
     Implements the `split_microbatches` and `run_microbatches` method.
     Derived classes should implement `run_microbatches` method and `run` method.
+
+    Supports registering **custom execution functions** for any
+    :class:`MetaStepType` via :meth:`register_custom_function`.  When
+    ``run_microbatches`` encounters a step whose type has a registered
+    handler, it creates a :class:`PipelineContext` and delegates execution
+    to the handler instead of using the built-in logic.
 
     Args:
         stages (list[PipelineStage], PipelineStage):  PipelineStage used to run_microbatches.
@@ -129,6 +181,26 @@ class PipelineScheduleRuntime(ABC):
         self._init_stages()
         self.fwd_handle_cache = {}
         self.bwd_handle_cache = {}
+        self._custom_fn_map = {}
+
+    def register_custom_function(self, step_type: MetaStepType, fn) -> None:
+        """Register a custom execution function for the given step type.
+
+        When :meth:`run_microbatches` encounters a :class:`MetaStep` whose
+        ``type`` matches ``step_type``, it calls ``fn(step, ctx)`` instead
+        of the built-in logic.
+
+        Args:
+            step_type: The :class:`MetaStepType` to intercept.
+            fn: A callable with signature ``(step: MetaStep, ctx: PipelineContext) -> None``.
+
+        Example:
+            >>> def my_overlap_callback(step, ctx):
+            ...     fwd_step, bwd_step = step.sub_steps
+            ...     # custom parallel execution logic
+            >>> schedule.register_custom_function(MetaStepType.OVERLAP_F_B, my_overlap_callback)
+        """
+        self._custom_fn_map[step_type] = fn
 
     def convert_stages_dict(self):
         """convert stages to dict."""
@@ -184,163 +256,507 @@ class PipelineScheduleRuntime(ABC):
             if handle is not None:
                 handle.wait()
 
+    def _exec_step(self, cur_step, arg_mbs, kwarg_mbs, losses, send_handles):
+        """Execute a single built-in step (FWD/BWD/SEND/RECV)."""
+        stage = self._stage_dict[cur_step.stage_index]
+        stage_index = cur_step.stage_index
+        micro_index = cur_step.micro_index
+
+        if cur_step.type == MetaStepType.FWD_RECV:
+            comm_handle = stage.exec_fwd_recv_ops(micro_index)
+            if not self._overlap_p2p:
+                self._wait_p2p(comm_handle)
+            else:
+                self.fwd_handle_cache[(stage_index, micro_index)] = comm_handle
+
+        elif cur_step.type == MetaStepType.FWD:
+            key = (stage_index, micro_index)
+            if self._overlap_p2p and key in self.fwd_handle_cache:
+                self._wait_p2p(self.fwd_handle_cache.pop(key))
+            out = stage.forward_one_chunk(micro_index, arg_mbs[micro_index], kwarg_mbs[micro_index])
+            self.update_losses(stage, out, losses)
+
+        elif cur_step.type == MetaStepType.FWD_SEND:
+            comm_handle = stage.exec_fwd_send_ops(micro_index)
+            if not self._overlap_p2p:
+                self._wait_p2p(comm_handle)
+            else:
+                send_handles.append(comm_handle)
+
+        elif cur_step.type == MetaStepType.BWD_RECV:
+            comm_handle = stage.exec_bwd_recv_ops(micro_index)
+            if not self._overlap_p2p:
+                self._wait_p2p(comm_handle)
+            else:
+                self.bwd_handle_cache[(stage_index, micro_index)] = comm_handle
+
+        elif cur_step.type == MetaStepType.BWD:
+            key = (stage_index, micro_index)
+            if self._overlap_p2p and key in self.bwd_handle_cache:
+                self._wait_p2p(self.bwd_handle_cache.pop(key))
+            last_bwd = micro_index == self.micro_batch_num - 1
+            stage.backward_one_chunk(micro_index, last_bwd)
+
+        elif cur_step.type == MetaStepType.BWD_SEND:
+            comm_handle = stage.exec_bwd_send_ops(micro_index)
+            if not self._overlap_p2p:
+                self._wait_p2p(comm_handle)
+            else:
+                send_handles.append(comm_handle)
+
     def run_microbatches(self, arg_mbs, kwarg_mbs, losses):
-        """run_microbatches."""
+        """Execute the schedule step by step.
+
+        Steps whose :attr:`MetaStep.type` has a registered custom function
+        are delegated to that function with a :class:`PipelineContext`.
+        Composite ``OVERLAP_F_B`` / ``OVERLAP_B_F`` steps without a
+        registered handler fall back to executing their ``sub_steps``
+        sequentially via :meth:`_exec_step` — correct but without
+        comm/compute overlap.  All other steps are executed by
+        :meth:`_exec_step`.
+        """
         real_stage_index = self.stages[0].stage_index % self.real_stage_num
-        send_handle = []
+        send_handles = []
+        ctx = None  # lazily created
+
         for cur_step in self.exec_order[real_stage_index]:
             if cur_step is None:
                 continue
-            stage = self._stage_dict[cur_step.stage_index]
-            stage_index = cur_step.stage_index
-            micro_index = cur_step.micro_index
-            if cur_step.type == MetaStepType.FWD_RECV:
-                comm_handle = stage.exec_fwd_recv_ops(micro_index)
-                if not self._overlap_p2p:
-                    self._wait_p2p(comm_handle)
-                else:
-                    key = (stage_index, micro_index)
-                    self.fwd_handle_cache[key] = comm_handle
-            if cur_step.type == MetaStepType.FWD:
-                key = (stage_index, micro_index)
-                if self._overlap_p2p and key in self.fwd_handle_cache:
-                    comm_handle = self.fwd_handle_cache.pop(key)
-                    self._wait_p2p(comm_handle)
-                out = stage.forward_one_chunk(micro_index, arg_mbs[micro_index], kwarg_mbs[micro_index])
-                self.update_losses(stage, out, losses)
-            if cur_step.type == MetaStepType.FWD_SEND:
-                comm_handle = stage.exec_fwd_send_ops(micro_index)
-                if not self._overlap_p2p:
-                    self._wait_p2p(comm_handle)
-                else:
-                    send_handle.append(comm_handle)
-            if cur_step.type == MetaStepType.BWD_RECV:
-                comm_handle = stage.exec_bwd_recv_ops(micro_index)
-                if not self._overlap_p2p:
-                    self._wait_p2p(comm_handle)
-                else:
-                    key = (stage_index, micro_index)
-                    self.bwd_handle_cache[key] = comm_handle
-            if cur_step.type == MetaStepType.BWD:
-                key = (stage_index, micro_index)
-                if self._overlap_p2p and key in self.bwd_handle_cache:
-                    comm_handle = self.bwd_handle_cache.pop(key)
-                    self._wait_p2p(comm_handle)
-                if micro_index == self.micro_batch_num - 1:
-                    stage.backward_one_chunk(micro_index, True)
-                else:
-                    stage.backward_one_chunk(micro_index)
-            if cur_step.type == MetaStepType.BWD_SEND:
-                comm_handle = stage.exec_bwd_send_ops(micro_index)
-                if not self._overlap_p2p:
-                    self._wait_p2p(comm_handle)
-                else:
-                    send_handle.append(comm_handle)
+
+            # Check for registered custom function
+            custom_fn = self._custom_fn_map.get(cur_step.type)
+            if custom_fn is not None:
+                if ctx is None:
+                    ctx = PipelineContext(self, arg_mbs, kwarg_mbs, losses, send_handles)
+                custom_fn(cur_step, ctx)
+                continue
+
+            # Default for composite OVERLAP steps: run sub_steps sequentially.
+            # P2P send/recv around these steps are already laid out in two
+            # virtual slots by ``add_send_recv``, so sequential execution is
+            # semantically equivalent to non-overlapped 1F1B.
+            if (cur_step.type in (MetaStepType.OVERLAP_F_B, MetaStepType.OVERLAP_B_F)
+                    and cur_step.sub_steps):
+                for sub in cur_step.sub_steps:
+                    self._exec_step(sub, arg_mbs, kwarg_mbs, losses, send_handles)
+                continue
+
+            self._exec_step(cur_step, arg_mbs, kwarg_mbs, losses, send_handles)
+
         self.sync_shared_parameters_grad()
-        while send_handle:
-            self._wait_p2p(send_handle.pop())
+        while send_handles:
+            self._wait_p2p(send_handles.pop())
+
+
+class _OverlapPhantom:
+    """Internal marker used by :func:`add_send_recv` to expand an
+    ``OVERLAP_F_B`` or ``OVERLAP_B_F`` step into two virtual time slots.
+
+    An overlap step composes two sub-steps (``B + F`` or ``F + B``) that
+    execute concurrently on the GPU but occupy **two** logical time slots
+    in the column-scan sender timeline — the sender can only finish
+    emitting the second sub-step's output after the first sub-step has
+    completed.  Treating an overlap step as a single slot places the RECV
+    triggered by the second sub-step too early on the receiver.
+
+    Each overlap step is expanded into two phantoms:
+      * ``is_first_half=True`` — represents the first sub-step's emission
+        slot; the original overlap step is emitted into the output
+        schedule here (only once).
+      * ``is_first_half=False`` — represents the second sub-step's emission
+        slot; only its send/recv comms are inserted.
+    """
+
+    __slots__ = ('obf_step', 'sub_step', 'is_first_half')
+
+    def __init__(self, obf_step, sub_step, is_first_half: bool):
+        self.obf_step = obf_step
+        self.sub_step = sub_step
+        self.is_first_half = is_first_half
+
+
+def _expand_overlap_slots(scheduler, real_stage_num):
+    """Expand OVERLAP steps in a per-rank schedule into 2 virtual time slots.
+
+    Returns a new ``{rank: [MetaStep | _OverlapPhantom | None, ...]}`` dict
+    where each OVERLAP step is replaced by a pair of phantoms.  Non-OVERLAP
+    entries pass through unchanged.
+    """
+    expanded = {}
+    for rank in range(real_stage_num):
+        order = scheduler[rank]
+        exp = []
+        for op in order:
+            if (op is not None
+                    and op.type in (MetaStepType.OVERLAP_F_B, MetaStepType.OVERLAP_B_F)
+                    and op.sub_steps):
+                exp.append(_OverlapPhantom(op, op.sub_steps[0], is_first_half=True))
+                exp.append(_OverlapPhantom(op, op.sub_steps[1], is_first_half=False))
+            else:
+                exp.append(op)
+        expanded[rank] = exp
+    return expanded
+
+
+def _process_rank_items(real_stage_num, current_items, insert_step_comms, new_schedule):
+    """Run ``insert_step_comms`` for each rank's current item, even ranks first.
+
+    Even-before-odd ordering avoids P2P deadlocks between adjacent ranks.
+    """
+    for rank in range(0, real_stage_num, 2):
+        item = current_items.get(rank)
+        if item is not None:
+            sub = item.sub_step if isinstance(item, _OverlapPhantom) else item
+            insert_step_comms(sub, rank, new_schedule)
+    for rank in range(1, real_stage_num, 2):
+        item = current_items.get(rank)
+        if item is not None:
+            sub = item.sub_step if isinstance(item, _OverlapPhantom) else item
+            insert_step_comms(sub, rank, new_schedule)
+
+
+def _column_scan_insert_comms(expanded, real_stage_num, insert_step_comms):
+    """Column-scan over an OVERLAP-expanded schedule to insert SEND/RECV.
+
+    Processes ``expanded`` one time slot at a time.  Emits the original
+    overlap step into ``new_schedule`` only once (at the first-half
+    phantom).  Delegates comm insertion to ``insert_step_comms`` for each
+    plain step or phantom's underlying sub-step.
+
+    Even ranks are processed before odd ranks at each time step to avoid
+    P2P deadlocks between adjacent ranks.
+
+    Args:
+        expanded: Result of :func:`_expand_overlap_slots`.
+        real_stage_num: Number of physical ranks.
+        insert_step_comms: Callable ``(step, rank, new_schedule) -> None``
+            that inserts SEND/RECV for a single FWD/BWD step.
+
+    Returns:
+        ``{rank: [MetaStep, ...]}`` final schedule.
+    """
+    max_length = max(len(order) for order in expanded.values())
+    new_schedule = {rank: [] for rank in range(real_stage_num)}
+
+    for time_step in range(max_length):
+        current_items = {}
+        for rank in range(real_stage_num):
+            if time_step < len(expanded[rank]):
+                item = expanded[rank][time_step]
+                current_items[rank] = item
+                if item is None:
+                    # Preserve bubble slots to keep per-rank time-step
+                    # indexing aligned with the column scan.  The runtime
+                    # loop skips ``None`` entries, so this is execution-
+                    # semantics-neutral.
+                    new_schedule[rank].append(None)
+                    continue
+                if isinstance(item, _OverlapPhantom):
+                    # Emit the overlap step only once, at the first-half slot.
+                    if item.is_first_half:
+                        new_schedule[rank].append(item.obf_step)
+                else:
+                    new_schedule[rank].append(item)
+            else:
+                current_items[rank] = None
+
+        _process_rank_items(
+            real_stage_num, current_items, insert_step_comms, new_schedule,
+        )
+
+    return new_schedule
 
 
 def add_send_recv(scheduler, stage_num, real_stage_num, style='loop'):
-    """
-    Create schedule for each rank and automatically add communication operations
+    """Insert P2P send/recv operations into a per-rank compute schedule.
+
+    For each FWD or BWD step that requires cross-rank communication, a
+    ``FWD_SEND`` / ``BWD_SEND`` is appended to the sender's schedule and a
+    ``FWD_RECV`` / ``BWD_RECV`` is appended to the receiver's schedule.
+
+    ``OVERLAP_F_B`` / ``OVERLAP_B_F`` composite steps are expanded into
+    **two** virtual time slots during the column scan so that the RECV
+    triggered by the **second** sub-step lands in the receiver's schedule
+    one slot later — matching the fact that the sender can only finish
+    emitting the second sub-step's output after the first completes.
+
+    Even ranks are processed before odd ranks at each time step to avoid
+    P2P deadlocks between adjacent ranks.
 
     Args:
-        scheduler: Compute schedule table with None
-        stage_num: Total number of pipeline stages
-        real_stage_num: Number of actual physical stages/ranks
-        style: Communication style ('loop' or 'v')
+        scheduler: ``{rank: [MetaStep | None, ...]}`` — compute schedule
+            with ``None`` for bubble slots.
+        stage_num: Total number of virtual pipeline stages.
+        real_stage_num: Number of physical ranks.
+        style: Topology mapping — ``'loop'`` or ``'v'``.
 
     Returns:
-        Complete schedule table for each rank (including communication operations)
+        ``{rank: [MetaStep, ...]}`` — schedule with communication ops inserted.
     """
 
-    def _need_com(action, style, stage_num):
-        """Determine if communication is needed"""
-        if action.type == MetaStepType.FWD:
-            if action.stage_index == stage_num - 1:
-                return False  # Last stage doesn't need forward communication
-            next_stage_rank = stage_to_rank(action.stage_index + 1, style, stage_num, real_stage_num)
-            current_rank = stage_to_rank(action.stage_index, style, stage_num, real_stage_num)
-            return next_stage_rank != current_rank
-        if action.type == MetaStepType.BWD:
-            if action.stage_index == 0:
-                return False  # First stage doesn't need backward communication
-            prev_stage_rank = stage_to_rank(action.stage_index - 1, style, stage_num, real_stage_num)
-            current_rank = stage_to_rank(action.stage_index, style, stage_num, real_stage_num)
-            return prev_stage_rank != current_rank
-        return False
-
-    def stage_to_rank(stage_index, style, stage_num, real_stage_num):
-        """Map stage index to rank"""
+    def stage_to_rank(stage_index: int) -> int:
+        """Map a virtual stage index to its physical rank."""
         if style == 'loop':
             return stage_index % real_stage_num
         if style == 'v':
             if stage_index < real_stage_num:
                 return stage_index
             return stage_num - 1 - stage_index
-        raise ValueError("Invalid style")
+        raise ValueError(f"Argument 'style' must be 'loop' or 'v', but got {style!r}.")
 
-    def process_rank_communication(rank, operation, new_schedule, style, stage_num, real_stage_num):
-        """Process communication operations for single rank"""
-        if operation is None:
+    def _fwd_peer(stage_index: int):
+        """Return the rank that receives this stage's forward output, or None."""
+        if stage_index >= stage_num - 1:
+            return None
+        peer = stage_to_rank(stage_index + 1)
+        return peer if peer != stage_to_rank(stage_index) else None
+
+    def _bwd_peer(stage_index: int):
+        """Return the rank that receives this stage's backward gradient, or None."""
+        if stage_index <= 0:
+            return None
+        peer = stage_to_rank(stage_index - 1)
+        return peer if peer != stage_to_rank(stage_index) else None
+
+    def _insert_comms_for_step(step, rank, new_schedule):
+        """Insert send/recv for a single FWD, BWD, or composite OVERLAP step."""
+        if step is None:
             return
 
-        stage_index = operation.stage_index
-        pre_rank = stage_to_rank(stage_index - 1, style, stage_num, real_stage_num) if stage_index > 0 else 0
-        nxt_rank = stage_to_rank(stage_index + 1, style, stage_num, real_stage_num) if stage_index < stage_num else None
+        if step.type == MetaStepType.FWD:
+            peer = _fwd_peer(step.stage_index)
+            if peer is not None:
+                new_schedule[rank].append(
+                    MetaStep(step.micro_index, MetaStepType.FWD_SEND, step.stage_index))
+                new_schedule[peer].append(
+                    MetaStep(step.micro_index, MetaStepType.FWD_RECV, step.stage_index + 1))
 
-        if (operation.type == MetaStepType.FWD and
-                _need_com(operation, style, stage_num) and nxt_rank is not None):
-            new_schedule[rank].append(MetaStep(
-                micro_index=operation.micro_index,
-                meta_type=MetaStepType.FWD_SEND,  # Note: use FWD_SEND
-                stage_index=stage_index
-            ))
-            new_schedule[nxt_rank].append(MetaStep(
-                micro_index=operation.micro_index,
-                meta_type=MetaStepType.FWD_RECV,  # Note: use FWD_RECV
-                stage_index=stage_index + 1
-            ))
-        elif (operation.type == MetaStepType.BWD and
-              _need_com(operation, style, stage_num) and pre_rank is not None):
-            new_schedule[rank].append(MetaStep(
-                micro_index=operation.micro_index,
-                meta_type=MetaStepType.BWD_SEND,  # Note: use BWD_SEND
-                stage_index=stage_index
-            ))
-            new_schedule[pre_rank].append(MetaStep(
-                micro_index=operation.micro_index,
-                meta_type=MetaStepType.BWD_RECV,  # Note: use BWD_RECV
-                stage_index=stage_index - 1
-            ))
+        elif step.type == MetaStepType.BWD:
+            peer = _bwd_peer(step.stage_index)
+            if peer is not None:
+                new_schedule[rank].append(
+                    MetaStep(step.micro_index, MetaStepType.BWD_SEND, step.stage_index))
+                new_schedule[peer].append(
+                    MetaStep(step.micro_index, MetaStepType.BWD_RECV, step.stage_index - 1))
 
-    # Main logic
-    max_length = max(len(schedule) for schedule in scheduler.values())
-    new_schedule = {rank: [] for rank in range(real_stage_num)}
+        elif step.type in (MetaStepType.OVERLAP_F_B, MetaStepType.OVERLAP_B_F) and step.sub_steps:
+            for sub in step.sub_steps:
+                _insert_comms_for_step(sub, rank, new_schedule)
 
-    for time_step in range(max_length):
-        current_operations = {}
+    # --- Main logic: expand OVERLAP steps into 2 virtual slots, then scan ---
+    expanded = _expand_overlap_slots(scheduler, real_stage_num)
+    return _column_scan_insert_comms(expanded, real_stage_num, _insert_comms_for_step)
+
+
+_ALIGN_PAD = object()
+"""Sentinel marking a forced 1F1B-boundary bubble produced during alignment."""
+
+
+def _step_dep_ready(step, rank, t, done, stage_num, stage_to_rank):
+    """Cross-rank data dependency check used by the alignment simulator.
+
+    A FWD step at stage ``s`` depends on FWD at stage ``s-1`` (on a
+    different rank); BWD at stage ``s`` depends on BWD at stage ``s+1``.
+    Steps at boundaries or whose producer lives on the same rank are
+    always ready.
+    """
+    si, mi = step.stage_index, step.micro_index
+    if step.type == MetaStepType.FWD:
+        if si == 0 or stage_to_rank(si - 1) == rank:
+            return True
+        key = (MetaStepType.FWD, si - 1, mi)
+        return key in done and done[key] < t
+    if step.type == MetaStepType.BWD:
+        if si == stage_num - 1 or stage_to_rank(si + 1) == rank:
+            return True
+        key = (MetaStepType.BWD, si + 1, mi)
+        return key in done and done[key] < t
+    return True
+
+
+def _simulate_aligned_schedule(padded, stage_num, real_stage_num, stage_to_rank):
+    """Simulate execution time-step by time-step, inserting bubbles where
+    a step is not yet ready (cross-rank dep) or where the cooldown
+    rhythm requires it.
+
+    Args:
+        padded:          ``{rank: [step | _ALIGN_PAD | None, ...]}`` after
+                         1F1B-boundary padding.
+        stage_num:       Total number of virtual pipeline stages.
+        real_stage_num:  Number of physical ranks.
+        stage_to_rank:   Topology mapping from stage to rank.
+
+    Returns:
+        ``{rank: [step | None, ...]}`` ready for the column-scan SEND/RECV
+        insertion phase.
+    """
+    remaining_fwd = {
+        rank: sum(
+            1 for s in padded[rank]
+            if s is not _ALIGN_PAD and s is not None and s.type == MetaStepType.FWD
+        )
+        for rank in range(real_stage_num)
+    }
+    cursors = {r: 0 for r in range(real_stage_num)}
+    aligned = {r: [] for r in range(real_stage_num)}
+    done = {}
+    last_was_cooldown_bwd = {r: False for r in range(real_stage_num)}
+    max_t = sum(len(v) for v in padded.values()) + real_stage_num * 20
+
+    def _emit_bubble(rank):
+        aligned[rank].append(None)
+        last_was_cooldown_bwd[rank] = False
+
+    def _emit_step(rank, step, t, in_cooldown):
+        aligned[rank].append(step)
+        done[(step.type, step.stage_index, step.micro_index)] = t
+        cursors[rank] += 1
+        if step.type == MetaStepType.FWD:
+            remaining_fwd[rank] -= 1
+        last_was_cooldown_bwd[rank] = in_cooldown and step.type == MetaStepType.BWD
+
+    def _step_rank_at(t, rank):
+        if cursors[rank] >= len(padded[rank]):
+            return
+        item = padded[rank][cursors[rank]]
+        if item is _ALIGN_PAD:
+            _emit_bubble(rank)
+            cursors[rank] += 1
+            return
+        in_cooldown = remaining_fwd[rank] == 0
+        # Cooldown rhythm: alternate None / BWD in pure-BWD phase.
+        cooldown_skip = (
+            in_cooldown
+            and item.type == MetaStepType.BWD
+            and last_was_cooldown_bwd[rank]
+        )
+        if cooldown_skip:
+            _emit_bubble(rank)
+            return
+        if not _step_dep_ready(item, rank, t, done, stage_num, stage_to_rank):
+            _emit_bubble(rank)
+            return
+        _emit_step(rank, item, t, in_cooldown)
+
+    for t in range(max_t):
+        if all(cursors[r] >= len(padded[r]) for r in range(real_stage_num)):
+            break
         for rank in range(real_stage_num):
-            if time_step < len(scheduler[rank]):
-                operation = scheduler[rank][time_step]
-                current_operations[rank] = operation
-                if operation is not None:
-                    new_schedule[rank].append(operation)
-            else:
-                current_operations[rank] = None
+            _step_rank_at(t, rank)
+    return aligned
 
-        # Process even rank communication
-        for rank in range(0, real_stage_num, 2):
-            process_rank_communication(rank, current_operations[rank], new_schedule,
-                                       style, stage_num, real_stage_num)
 
-        # Process odd rank communication
-        for rank in range(1, real_stage_num, 2):
-            process_rank_communication(rank, current_operations[rank], new_schedule,
-                                       style, stage_num, real_stage_num)
+def auto_align_and_add_send_recv(scheduler, stage_num, real_stage_num, style='loop'):
+    """Auto-insert bubble alignment and P2P send/recv into a pure-compute schedule.
 
-    return new_schedule
+    Unlike :func:`add_send_recv` which requires the caller to pre-insert
+    ``None`` bubble slots for time-step alignment, this function accepts a
+    **pure compute order** (``FWD`` / ``BWD`` only, no ``None`` needed) and
+    automatically determines bubble placement via execution simulation.
+
+    Three constraints are enforced:
+
+    1. **Data dependency** — a ``FWD(stage_k)`` cannot execute until
+       ``FWD(stage_{k-1})`` on its source rank has completed (and
+       analogously for ``BWD``).
+    2. **1F1B transition alignment** — ``real_stage_num - 1 - rank`` padding
+       slots are inserted at the warmup → 1F1B boundary (detected as the
+       first ``FWD`` immediately followed by a ``BWD`` in the compute order)
+       so that all ranks enter the 1F1B steady state in lockstep.
+    3. **Cooldown rhythm** — once a rank exhausts its ``FWD`` ops and enters
+       pure-``BWD`` cooldown, consecutive ``BWD`` steps are separated by a
+       ``None`` slot, maintaining the column-phase-sync property (no rank
+       does ``BWD`` while another does ``FWD`` at the same time step).
+
+    After alignment, a column-scan pass inserts ``FWD_SEND`` / ``FWD_RECV``
+    and ``BWD_SEND`` / ``BWD_RECV`` with the same prefetch semantics as
+    :func:`add_send_recv`.
+
+    Args:
+        scheduler: ``{rank: [MetaStep, ...]}`` — pure compute schedule.
+            ``None`` entries are silently stripped before processing.
+        stage_num: Total number of virtual pipeline stages.
+        real_stage_num: Number of physical ranks.
+        style: Topology mapping — ``'loop'`` or ``'v'``.
+
+    Returns:
+        ``{rank: [MetaStep, ...]}`` — fully aligned schedule with bubbles
+        and communication ops inserted.
+    """
+
+    # ---- topology helpers (shared with column-scan phase) ----
+
+    def stage_to_rank(stage_index: int) -> int:
+        if style == 'loop':
+            return stage_index % real_stage_num
+        if style == 'v':
+            if stage_index < real_stage_num:
+                return stage_index
+            return stage_num - 1 - stage_index
+        raise ValueError(f"Argument 'style' must be 'loop' or 'v', but got {style!r}.")
+
+    def _fwd_peer(stage_index: int):
+        if stage_index >= stage_num - 1:
+            return None
+        peer = stage_to_rank(stage_index + 1)
+        return peer if peer != stage_to_rank(stage_index) else None
+
+    def _bwd_peer(stage_index: int):
+        if stage_index <= 0:
+            return None
+        peer = stage_to_rank(stage_index - 1)
+        return peer if peer != stage_to_rank(stage_index) else None
+
+    # ---- Phase 1: strip None, detect 1F1B boundary, insert transition padding ----
+
+    def _find_1f1b_boundary(order):
+        """Index of the first FWD followed by BWD; ``len(order)`` if absent."""
+        for i in range(len(order) - 1):
+            if (order[i].type == MetaStepType.FWD
+                    and order[i + 1].type == MetaStepType.BWD):
+                return i
+        return len(order)
+
+    padded = {}
+    for rank in range(real_stage_num):
+        order = [s for s in scheduler[rank] if s is not None]
+        boundary = _find_1f1b_boundary(order)
+        pad_count = real_stage_num - 1 - rank
+        padded[rank] = order[:boundary] + [_ALIGN_PAD] * pad_count + order[boundary:]
+
+    # ---- Phase 2: simulate execution with data deps + cooldown rhythm ----
+
+    aligned = _simulate_aligned_schedule(padded, stage_num, real_stage_num, stage_to_rank)
+
+    # ---- Phase 3: column-scan SEND/RECV insertion (same as add_send_recv) ----
+
+    def _insert_comms_for_step(step, rank, new_schedule):
+        if step is None:
+            return
+        if step.type == MetaStepType.FWD:
+            peer = _fwd_peer(step.stage_index)
+            if peer is not None:
+                new_schedule[rank].append(
+                    MetaStep(step.micro_index, MetaStepType.FWD_SEND, step.stage_index))
+                new_schedule[peer].append(
+                    MetaStep(step.micro_index, MetaStepType.FWD_RECV, step.stage_index + 1))
+        elif step.type == MetaStepType.BWD:
+            peer = _bwd_peer(step.stage_index)
+            if peer is not None:
+                new_schedule[rank].append(
+                    MetaStep(step.micro_index, MetaStepType.BWD_SEND, step.stage_index))
+                new_schedule[peer].append(
+                    MetaStep(step.micro_index, MetaStepType.BWD_RECV, step.stage_index - 1))
+        elif step.type in (MetaStepType.OVERLAP_F_B, MetaStepType.OVERLAP_B_F) and step.sub_steps:
+            for sub in step.sub_steps:
+                _insert_comms_for_step(sub, rank, new_schedule)
+
+    # Expand OVERLAP steps into 2 virtual slots before the column scan so
+    # the RECV triggered by an overlap's second sub-step lands one slot
+    # later on the receiver — matching the fact that the sender can only
+    # finish emitting the second sub-step after the first completes.
+    expanded = _expand_overlap_slots(aligned, real_stage_num)
+    return _column_scan_insert_comms(expanded, real_stage_num, _insert_comms_for_step)
 
 
 class ScheduleGPipe(PipelineScheduleRuntime):
@@ -454,25 +870,51 @@ class Schedule1F1B(PipelineScheduleRuntime):
 
 
 class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
-    """
-    The Interleaved 1F1B schedule.
-    Support multiple stages per rank. It will perform one forward and one backward
-    on the micro batches in steady state.
-    We support cases where num_microbatch is less than or equal, or greater than the
-    stage num, as well as cases where num_microbatch can't be evenly divided by the
-    stage num.
+    """The Interleaved 1F1B schedule.
+
+    Supports multiple stages per rank.  In steady state, performs one
+    forward followed by one backward on each micro-batch.  Handles the
+    cases where ``micro_batch_num`` is less than, equal to, or greater
+    than the stage count, including non-evenly-divisible micro counts.
+
+    Two orthogonal overlap modes can be enabled via constructor flags:
+
+    * ``overlap_p2p=True``: defer P2P recv ``handle.wait()`` until the
+      consuming FWD/BWD step (or the OVERLAP_B_F callback when
+      ``overlap_b_f=True``), letting recv overlap with prior compute.
+    * ``overlap_b_f=True``: in the 1F1B steady state, pair consecutive
+      ``(B_i, F_{i+1})`` steps into ``OVERLAP_B_F`` composite steps so
+      a registered callback can drive comm/compute overlap (typically
+      via :class:`CommComputeOverlap` for MoE EP A2A).  Users register
+      the callback through :meth:`register_custom_function`.
+
+    The two flags are independent and can be combined.
+
+    Example:
+        >>> # Plain interleaved 1F1B
+        >>> sched = ScheduleInterleaved1F1B(stages, 8)
+        >>> # With B/F overlap (dual-pipe-style comm/compute overlap)
+        >>> sched = ScheduleInterleaved1F1B(stages, 8, overlap_b_f=True)
+        >>> sched.register_custom_function(MetaStepType.OVERLAP_B_F, callback)
     """
     def __init__(self,
                  stages,
                  micro_batch_num,
                  args_batch_dim=None,
                  kwargs_batch_dim=None,
-                 output_concat_dim=None):
+                 output_concat_dim=None,
+                 overlap_p2p=False,
+                 overlap_b_f=False):
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
                          kwargs_batch_dim=kwargs_batch_dim,
-                         output_concat_dim=output_concat_dim)
+                         output_concat_dim=output_concat_dim,
+                         overlap_p2p=overlap_p2p)
+        # _overlap_b_f selects between plain F/B emission and OVERLAP_B_F
+        # pairing in the 1F1B steady-state phase.  Must be set before
+        # ``construct_stage_exec_order`` is called below.
+        self._overlap_b_f = overlap_b_f
         self.n_rounds = max(1, self.micro_batch_num // self.real_stage_num)
         if self.micro_batch_num < self.real_stage_num:
             base = self.micro_batch_num - self.real_stage_num
@@ -512,59 +954,182 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
         local_index = self.n_local_stages - 1 - local_index
         return (local_index * self.real_stage_num) + stage_index
 
-    def construct_stage_exec_order(self, stage_index):
-        """construct the execution order of specified stage_index."""
-        warmup_ops = self.warmup_ops(stage_index)
-        fwd_bwd_ops = self.n_local_stages * self.micro_batch_num - warmup_ops
-        cooldown_ops = warmup_ops
-        total_ops = warmup_ops + fwd_bwd_ops + cooldown_ops
-        # Pre-padding bubbles, stage starts with no-ops based on the warmup.
-        order_list = [None for _ in range(stage_index)]
-        fwd_stage_micro_index = defaultdict(int)
-        bwd_stage_micro_index = defaultdict(int)
-        # WarmUp Phase
+    def _short_micro(self) -> bool:
+        """True when ``micro_batch_num < real_stage_num`` (extra-bubble regime)."""
+        return self.micro_batch_num < self.real_stage_num
+
+    def _trailing_bubble(self) -> int:
+        """Bubble count appended after a BWD with ``micro == micro_batch_num - 1``
+        in the short-micro regime.
+        """
+        return self.real_stage_num - self.micro_batch_num
+
+    def _emit_warmup_ops(self, stage_index, warmup_ops, fwd_stage_micro_index):
+        """Emit pure-FWD warmup ops with optional short-micro bubble padding."""
+        ops = []
+        short = self._short_micro()
+        last_micro = self.micro_batch_num - 1
+        last_stage = self.real_stage_num - 1
+        bubble = self._trailing_bubble()
         for op_idx in range(warmup_ops):
             fwd_stage_idx = self.forward_stage_index(op_idx, stage_index)
             fwd_micro_idx = fwd_stage_micro_index[fwd_stage_idx]
-            order_list.append(MetaStep(fwd_micro_idx, MetaStepType.FWD, fwd_stage_idx))
-            # If micro is less than stage num, there will be additional bubbles during warmup phase.
-            if self.micro_batch_num < self.real_stage_num and fwd_micro_idx == self.micro_batch_num - 1:
-                if op_idx != warmup_ops - 1 or stage_index == self.real_stage_num - 1:
-                    order_list.extend([None] * (self.real_stage_num - self.micro_batch_num))
+            ops.append(MetaStep(fwd_micro_idx, MetaStepType.FWD, fwd_stage_idx))
+            need_pad = (
+                short
+                and fwd_micro_idx == last_micro
+                and (op_idx != warmup_ops - 1 or stage_index == last_stage)
+            )
+            if need_pad:
+                ops.extend([None] * bubble)
             fwd_stage_micro_index[fwd_stage_idx] += 1
-        # If micro is less than 2 * (self.real_stage_num - stage_index - 1),
-        # there will be additional bubbles during warmup phase.
-        if self.micro_batch_num < 2 * (self.real_stage_num - stage_index - 1):
-            order_list.extend([None] * (2 * (self.real_stage_num - stage_index - 1) - self.micro_batch_num))
-        # Bubble from the end of warmup to the start of backward.
-        order_list.extend([None] * (self.real_stage_num - 1 - stage_index))
+        return ops
 
-        # 1f1b phase
-        for op_idx in range(warmup_ops, warmup_ops+fwd_bwd_ops):
+    def _emit_cooldown_ops(self, stage_index, warmup_ops, fwd_bwd_ops, total_ops,
+                           bwd_stage_micro_index):
+        """Emit pure-BWD cooldown ops (each preceded by a bubble) with
+        optional short-micro trailing padding.
+        """
+        ops = []
+        short = self._short_micro()
+        last_micro = self.micro_batch_num - 1
+        bubble = self._trailing_bubble()
+        for op_idx in range(warmup_ops + fwd_bwd_ops, total_ops):
+            ops.append(None)
+            bwd_stage_idx = self.backward_stage_index(op_idx - warmup_ops, stage_index)
+            bwd_micro_idx = bwd_stage_micro_index[bwd_stage_idx]
+            ops.append(MetaStep(bwd_micro_idx, MetaStepType.BWD, bwd_stage_idx))
+            if short and bwd_micro_idx == last_micro:
+                ops.extend([None] * bubble)
+            bwd_stage_micro_index[bwd_stage_idx] += 1
+        return ops
+
+    def _emit_1f1b_ops(self, stage_index, warmup_ops, fwd_bwd_ops,
+                       fwd_stage_micro_index, bwd_stage_micro_index):
+        """Emit interleaved (FWD, BWD) pairs for the 1F1B steady-state phase."""
+        ops = []
+        short = self._short_micro()
+        last_micro = self.micro_batch_num - 1
+        last_stage = self.real_stage_num - 1
+        bubble = self._trailing_bubble()
+        for op_idx in range(warmup_ops, warmup_ops + fwd_bwd_ops):
             fwd_stage_idx = self.forward_stage_index(op_idx, stage_index)
             fwd_micro_idx = fwd_stage_micro_index[fwd_stage_idx]
-            order_list.append(MetaStep(fwd_micro_idx, MetaStepType.FWD, fwd_stage_idx))
+            ops.append(MetaStep(fwd_micro_idx, MetaStepType.FWD, fwd_stage_idx))
             fwd_stage_micro_index[fwd_stage_idx] += 1
             bwd_stage_idx = self.backward_stage_index(op_idx - warmup_ops, stage_index)
             bwd_micro_idx = bwd_stage_micro_index[bwd_stage_idx]
-            order_list.append(MetaStep(bwd_micro_idx, MetaStepType.BWD, bwd_stage_idx))
-            # If micro is less than 2 * (self.real_stage_num - stage_index - 1),
-            # there will be additional bubbles after 1f1b phase in last stage.
-            if self.micro_batch_num < self.real_stage_num and bwd_micro_idx == self.micro_batch_num - 1:
-                if stage_index == self.real_stage_num - 1:
-                    order_list.extend([None] * (self.real_stage_num - self.micro_batch_num))
+            ops.append(MetaStep(bwd_micro_idx, MetaStepType.BWD, bwd_stage_idx))
+            need_pad = (
+                short
+                and bwd_micro_idx == last_micro
+                and stage_index == last_stage
+            )
+            if need_pad:
+                ops.extend([None] * bubble)
             bwd_stage_micro_index[bwd_stage_idx] += 1
-        # cooldown phase
-        for op_idx in range(warmup_ops+fwd_bwd_ops, total_ops):
-            order_list.append(None)
-            bwd_stage_idx = self.backward_stage_index(op_idx - warmup_ops, stage_index)
-            bwd_micro_idx = bwd_stage_micro_index[bwd_stage_idx]
-            order_list.append(MetaStep(bwd_micro_idx, MetaStepType.BWD, bwd_stage_idx))
-            # If micro is less than 2 * (self.real_stage_num - stage_index - 1),
-            # there will be additional bubbles during cooldown phase.
-            if self.micro_batch_num < self.real_stage_num and bwd_micro_idx == self.micro_batch_num - 1:
-                order_list.extend([None] * (self.real_stage_num - self.micro_batch_num))
-            bwd_stage_micro_index[bwd_stage_idx] += 1
+        return ops
+
+    @staticmethod
+    def _collect_fwd_bwd_steps(emit_fwd, emit_bwd, fwd_bwd_ops, warmup_ops):
+        """Walk the 1F1B range collecting parallel ``fwd_steps`` / ``bwd_steps``.
+
+        ``emit_fwd(op_idx)`` and ``emit_bwd(op_idx)`` build a single
+        :class:`MetaStep` and advance their respective per-stage micro
+        counters as a side effect.
+        """
+        fwd_steps = []
+        bwd_steps = []
+        for op_idx in range(warmup_ops, warmup_ops + fwd_bwd_ops):
+            fwd_steps.append(emit_fwd(op_idx))
+            bwd_steps.append(emit_bwd(op_idx))
+        return fwd_steps, bwd_steps
+
+    @staticmethod
+    def _pair_into_overlap_b_f(fwd_steps, bwd_steps):
+        """Build ``F₁, [B_i, F_{i+1}], B_n`` ordering with OVERLAP_B_F pairs.
+
+        ``sub_steps`` carry the ``(bwd, fwd)`` tuple — callbacks access
+        them via ``step.sub_steps`` to recover per-direction stage /
+        micro info.
+        """
+        ops = []
+        if fwd_steps:
+            ops.append(fwd_steps[0])  # F₁ runs alone
+        for i in range(len(bwd_steps) - 1):
+            ops.append(MetaStep(
+                None, MetaStepType.OVERLAP_B_F, None,
+                sub_steps=(bwd_steps[i], fwd_steps[i + 1]),
+            ))
+        if bwd_steps:
+            ops.append(bwd_steps[-1])  # B_n runs alone
+        return ops
+
+    def _emit_1f1b_overlap_ops(self, stage_index, warmup_ops, fwd_bwd_ops,
+                               fwd_stage_micro_index, bwd_stage_micro_index):
+        """Emit ``F₁, [B_i, F_{i+1}], B_n`` for the 1F1B phase under
+        ``overlap_b_f=True``.  Each ``[B_i, F_{i+1}]`` becomes an
+        ``OVERLAP_B_F`` composite step; a registered callback drives the
+        actual concurrent execution.  Short-micro extra-bubble padding
+        on the last rank is appended after ``B_n``.
+        """
+        def emit_fwd(op_idx):
+            fwd_si = self.forward_stage_index(op_idx, stage_index)
+            fwd_mi = fwd_stage_micro_index[fwd_si]
+            fwd_stage_micro_index[fwd_si] += 1
+            return MetaStep(fwd_mi, MetaStepType.FWD, fwd_si)
+
+        def emit_bwd(op_idx):
+            bwd_si = self.backward_stage_index(op_idx - warmup_ops, stage_index)
+            bwd_mi = bwd_stage_micro_index[bwd_si]
+            bwd_stage_micro_index[bwd_si] += 1
+            return MetaStep(bwd_mi, MetaStepType.BWD, bwd_si)
+
+        fwd_steps, bwd_steps = self._collect_fwd_bwd_steps(
+            emit_fwd, emit_bwd, fwd_bwd_ops, warmup_ops,
+        )
+        ops = self._pair_into_overlap_b_f(fwd_steps, bwd_steps)
+
+        last_stage = self.real_stage_num - 1
+        if self._short_micro() and stage_index == last_stage and bwd_steps:
+            if bwd_steps[-1].micro_index == self.micro_batch_num - 1:
+                ops.extend([None] * self._trailing_bubble())
+        return ops
+
+    def construct_stage_exec_order(self, stage_index):
+        """Construct the execution order for ``stage_index``.
+
+        Builds: warmup → bubbles → 1F1B steady state → cooldown.  The
+        1F1B segment switches between :meth:`_emit_1f1b_ops` (plain) and
+        :meth:`_emit_1f1b_overlap_ops` (OVERLAP_B_F pairing) based on
+        the ``overlap_b_f`` constructor flag.
+        """
+        warmup_ops = self.warmup_ops(stage_index)
+        fwd_bwd_ops = self.n_local_stages * self.micro_batch_num - warmup_ops
+        total_ops = 2 * warmup_ops + fwd_bwd_ops
+        order_list = [None for _ in range(stage_index)]
+        fwd_stage_micro_index = defaultdict(int)
+        bwd_stage_micro_index = defaultdict(int)
+        order_list.extend(self._emit_warmup_ops(stage_index, warmup_ops, fwd_stage_micro_index))
+        bubbles_before_1f1b = max(
+            0,
+            2 * (self.real_stage_num - stage_index - 1) - self.micro_batch_num,
+        )
+        order_list.extend([None] * bubbles_before_1f1b)
+        order_list.extend([None] * (self.real_stage_num - 1 - stage_index))
+        if self._overlap_b_f:
+            order_list.extend(self._emit_1f1b_overlap_ops(
+                stage_index, warmup_ops, fwd_bwd_ops,
+                fwd_stage_micro_index, bwd_stage_micro_index,
+            ))
+        else:
+            order_list.extend(self._emit_1f1b_ops(
+                stage_index, warmup_ops, fwd_bwd_ops,
+                fwd_stage_micro_index, bwd_stage_micro_index,
+            ))
+        order_list.extend(self._emit_cooldown_ops(
+            stage_index, warmup_ops, fwd_bwd_ops, total_ops, bwd_stage_micro_index,
+        ))
         return order_list
 
 
