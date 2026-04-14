@@ -38,9 +38,10 @@ def init_on_device(device, include_buffers=False):
             orig_param = module._parameters[name]
             param_cls = type(orig_param)
             kwargs = orig_param.__dict__
-            kwargs["requires_grad"] = param.requires_grad
-            module._parameters[name] = (param if param.device == device
-                                        else param_cls(orig_param.to(device), **kwargs))
+            new_param = (param if param.device == device
+                         else param_cls(orig_param.to(device), **kwargs))
+            new_param.requires_grad = param.requires_grad
+            module._parameters[name] = new_param
 
     # pylint: disable=W0212
     def _register_buffer(module, name, buffer, persistent=True):
