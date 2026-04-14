@@ -143,10 +143,17 @@ class DTensorBase(Tensor):
         return device_info.split(':', 1)[0]
 
     # pylint: disable=W0212
-    def set_data(self, data):
+    def set_data(self, data, slice_shape=False):
         """
         Set shape/dtype/storage for dtensor and local tensor.
+
+        Args:
+            data (Tensor): New tensor payload.
+            slice_shape (bool): Kept for MindSpore `Parameter.set_data` API
+                compatibility. Static-graph slicing semantics are not used by
+                hyper_parallel, so this flag is accepted but ignored.
         """
+        _ = slice_shape
         if not isinstance(data, Tensor):
             raise ValueError(f"The data type {type(data)} is not Tensor")
         if data.has_init:
