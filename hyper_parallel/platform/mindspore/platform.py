@@ -14,7 +14,7 @@
 # ============================================================================
 """MindSpore platform api"""
 from datetime import timedelta
-from typing import Any, Optional
+from typing import Any, Optional, Union
 import dataclasses
 from collections import OrderedDict
 
@@ -578,7 +578,7 @@ class MindSporePlatform(Platform):
         )
 
     @staticmethod
-    def save_checkpoint(cell: Cell | dict, file_path: str, ckpt_format: str = "safetensors") -> None:
+    def save_checkpoint(cell: Union[Cell, dict], file_path: str, ckpt_format: str = "safetensors") -> None:
         if isinstance(cell, dict):
             save_dict = {}
             for k, v in cell.items():

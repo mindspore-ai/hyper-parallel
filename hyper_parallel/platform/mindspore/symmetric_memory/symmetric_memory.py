@@ -105,6 +105,10 @@ class MSSymmetricMemoryHandler:
     @staticmethod
     def shmem_put_with_signal(target, target_offset, src, src_offset,
                               size, signal, signal_offset, signal_value, signal_op, target_rank):
+        """shmem_put_with_signal operator"""
+        world_size = get_platform().get_world_size()
+        if target_rank < 0 or target_rank >= world_size:
+            raise ValueError(f"target_rank must be in range [0, {world_size - 1}], but get {target_rank}")
         aclshmem_ms.put_mem_signal(target, target_offset, src, src_offset,
                                    size, signal, signal_offset, signal_value, signal_op, target_rank)
 
