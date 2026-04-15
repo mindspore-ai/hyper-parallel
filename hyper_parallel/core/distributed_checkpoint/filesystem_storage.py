@@ -18,6 +18,8 @@ import pickle
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from safetensors import safe_open
+
 from hyper_parallel.core.distributed_checkpoint.metadata import Metadata, MetadataIndex
 from hyper_parallel.core.distributed_checkpoint.planner import (
     LoadItemType,
@@ -37,6 +39,7 @@ from hyper_parallel.core.distributed_checkpoint.storage import (
 )
 from hyper_parallel.core.distributed_checkpoint.util import narrow_tensor_by_index
 from hyper_parallel.platform import get_platform
+from hyper_parallel.platform.platform import PlatformType
 
 
 class FileSystemWriter(StorageWriter):
@@ -318,20 +321,56 @@ def _load_tensor_file(
         planner (LoadPlanner): Load planner for resolving and committing tensors.
     """
     platform = get_platform()
-    param_dict = platform.load_checkpoint(path)
 
+    if platform.platform_type == PlatformType.PYTORCH:
+        with safe_open(path, framework="pt", device="cpu") as tensor_file:
+            for req in reqs:
+                fqn = req.storage_index.fqn
+                if fqn not in tensor_file.keys():
+                    raise KeyError(f"Key {fqn} not found in checkpoint file {path}")
+                tensor_slices = tuple(
+                    slice(int(off), int(off) + int(length))
+                    for off, length in zip(req.storage_offsets, req.lengths)
+                )
+                if tensor_slices:
+                    tensor = tensor_file.get_slice(fqn)[tensor_slices]
+                else:
+                    tensor = narrow_tensor_by_index(
+                        tensor_file.get_tensor(fqn),
+                        req.storage_offsets,
+                        req.lengths,
+                    )
+
+                target_tensor = planner.acquire_tensor(req)
+                if hasattr(target_tensor, "detach"):
+                    target_tensor = target_tensor.detach()
+
+                # Size check (torch-aligned AssertionError)
+                target_size = _get_tensor_size(target_tensor)
+                tensor_size = _get_tensor_size(tensor)
+                if target_size is not None and tensor_size is not None:
+                    if target_size != tensor_size:
+                        raise AssertionError(
+                            f"req {req.storage_index} mismatch sizes "
+                            f"{target_size} vs {tensor_size}"
+                        )
+
+                # Copy data to target
+                _copy_tensor_to_target(req, tensor, target_tensor, planner)
+        return
+
+    param_dict = platform.load_checkpoint(path)
     for req in reqs:
         fqn = req.storage_index.fqn
         if fqn not in param_dict:
             raise KeyError(f"Key {fqn} not found in checkpoint file {path}")
-
         full_tensor = param_dict[fqn]
-        # Narrow by storage_offsets/lengths (resharding)
         tensor = narrow_tensor_by_index(
             full_tensor,
             req.storage_offsets,
             req.lengths,
         )
+
         target_tensor = planner.acquire_tensor(req)
         if hasattr(target_tensor, "detach"):
             target_tensor = target_tensor.detach()
