@@ -72,6 +72,15 @@ foreach(INC_DIR_ITEM ${INCLUDE_DIRS})
     endif()
 endforeach()
 
+set(MS_LOG_FILE "${MS_PATH}/include/mindspore/core/include/utils/log_adapter.h")
+get_filename_component(PROJECT_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.." ABSOLUTE)
+string(LENGTH "${MS_LOG_FILE}" LEN_LOG_FILE)
+string(LENGTH "${PROJECT_ROOT_DIR}/" LEN_PROJECT_ROOT_DIR)
+math(EXPR LEN_REQUIRED "${LEN_LOG_FILE} - ${LEN_PROJECT_ROOT_DIR}")
+if(LEN_REQUIRED GREATER 0)
+    string(RANDOM LENGTH ${LEN_REQUIRED} ALPHABET "a" LOG_HDR_VALUE)
+    set(CFLAGS_INCLUDES "${CFLAGS_INCLUDES} -DLOG_HDR_FILE_REL_PATH=\\\"${LOG_HDR_VALUE}\\\"")
+endif()
 message(STATUS "CFLAGS_INCLUDES: ${CFLAGS_INCLUDES}")
 
 
@@ -143,7 +152,7 @@ ms.ops.CustomOpBuilder(
     op_def=${DEF_YAML_STRING},
     op_doc=${DOC_YAML_STRING},
     backend='Ascend',
-    cflags='${CFLAGS_INCLUDES}',
+    cflags=r'${CFLAGS_INCLUDES}',
     ldflags=f'{rpath_flag} ${LDLAGS_LIB_DIRS} ${LDLAGS_LIBS}',
     build_dir='${BUILD_EXTENSION_DIR}',
     debug_mode=${ENABLE_DEBUG}
