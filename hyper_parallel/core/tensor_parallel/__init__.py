@@ -14,6 +14,15 @@
 # ============================================================================
 """Tensor parallel declarative APIs (parallel styles and module parallelization)."""
 from hyper_parallel.core.tensor_parallel.api import parallelize_module
-from hyper_parallel.core.tensor_parallel.style import ParallelStyle
+from hyper_parallel.core.tensor_parallel.style import (
+    ColwiseParallel,
+    ParallelStyle,
+    RowwiseParallel,
+)
 
-__all__ = ["ParallelStyle", "parallelize_module"]
+__all__ = [
+    "ColwiseParallel",
+    "ParallelStyle",
+    "RowwiseParallel",
+    "parallelize_module",
+]
