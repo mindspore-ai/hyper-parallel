@@ -169,10 +169,40 @@ class TestMindSporeParam(unittest.TestCase):
         MindSporeHSDPParamV2.init_unsharded_param(hsdp_param)
 
         mock_parameter.assert_not_called()
-        wrapped_parameter.requires_grad_.assert_called_once_with(True)
         wrapped_parameter.set_data.assert_called_once_with("next-dtensor-unsharded")
         self.assertIsNone(wrapped_parameter.grad)
 
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.Parameter")
+    @patch(
+        "hyper_parallel.platform.mindspore.fully_shard.param."
+        "MindSporeHSDPParamV2._get_unsharded_param_from_all_gather_output"
+    )
+    def test_init_unsharded_param_preserves_frozen_requires_grad_on_creation(
+        self,
+        mock_get_unsharded_param,
+        mock_parameter,
+    ):
+        """Frozen local params should pass requires_grad=False when creating the unsharded Parameter."""
+        hsdp_param = object.__new__(MindSporeHSDPParamV2)
+        hsdp_param._orig_param_is_dtensor = False
+        hsdp_param._unsharded_param = None
+        hsdp_param.sharded_param = SimpleNamespace(name="frozen_weight", requires_grad=False)
+        mock_get_unsharded_param.return_value = "frozen-local"
+        created_parameter = MagicMock(name="created-parameter")
+        mock_parameter.return_value = created_parameter
+
+        MindSporeHSDPParamV2.init_unsharded_param(hsdp_param)
+
+        mock_get_unsharded_param.assert_called_once_with()
+        mock_parameter.assert_called_once_with(
+            [],
+            name="frozen_weight",
+            requires_grad=False,
+        )
+        self.assertIs(hsdp_param._unsharded_param, created_parameter)
+        self.assertEqual(created_parameter.data, "frozen-local")
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param.set_requires_grad_if_needed")
     @patch(
         "hyper_parallel.platform.mindspore.fully_shard.param."
         "MindSporeHSDPParamV2._get_unsharded_param_from_all_gather_output"
@@ -180,6 +210,7 @@ class TestMindSporeParam(unittest.TestCase):
     def test_init_unsharded_param_refreshes_existing_local_parameter_data(
         self,
         mock_get_unsharded_param,
+        mock_set_requires_grad_if_needed,
     ):
         """Existing local Parameters should be refreshed in place with the latest unpacked tensor."""
         hsdp_param = object.__new__(MindSporeHSDPParamV2)
@@ -193,7 +224,7 @@ class TestMindSporeParam(unittest.TestCase):
         MindSporeHSDPParamV2.init_unsharded_param(hsdp_param)
 
         mock_get_unsharded_param.assert_called_once_with()
-        existing_param.requires_grad_.assert_called_once_with(True)
+        mock_set_requires_grad_if_needed.assert_called_once_with(hsdp_param.sharded_param, existing_param)
         self.assertEqual(existing_param.data, "new-local")
         self.assertIsNone(existing_param.grad)
 

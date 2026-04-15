@@ -267,7 +267,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
         shard_dtensor = DTensor.from_local(sharded_param, self._spmd_mesh, self._spmd_placements)
         self.sharded_param = Parameter(shard_dtensor, name=param.name)
-        self.sharded_param.requires_grad_(param.requires_grad)
+        set_requires_grad_if_needed(param, self.sharded_param)
         self.sharded_param.grad = None
 
         self._setattr_on_modules(self.sharded_param)
@@ -312,14 +312,14 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             # Keep the Parameter identity stable across forward-reshard-backward
             # cycles so backward hooks continue to read gradients from the same
             # object that participated in the forward graph.
-            if getattr(self, "_orig_param_is_dtensor", False):
+            if self._orig_param_is_dtensor:
                 self._unsharded_param.set_data(unsharded_param)
             else:
                 self._unsharded_param.data = unsharded_param
-            self._unsharded_param.requires_grad_(self.sharded_param.requires_grad)
+            set_requires_grad_if_needed(self.sharded_param, self._unsharded_param)
             self._unsharded_param.grad = None
             return
-        if getattr(self, "_orig_param_is_dtensor", False):
+        if self._orig_param_is_dtensor:
             self._unsharded_param = Parameter(
                 unsharded_param,
                 name=self.sharded_param.name,
