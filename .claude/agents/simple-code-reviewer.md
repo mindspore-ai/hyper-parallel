@@ -48,12 +48,11 @@ the most common mistakes fast.
 
 ### 3. Memory & Stream Patterns
 
-| Pattern | Check |
-| ------- | ----- |
-| Async collective | `handle.wait()` before reading result tensor |
-| `non_blocking=True` | Stream sync needed before reading destination tensor |
-| Storage free | `resize_(0)` after tensor is consumed |
-| Grad cleanup | `param.grad = None` after gradient consumed |
+Load `.claude/rules/distributed.md` and verify against its **Stream Synchronization** and **Memory Management** sections. Key items to check:
+
+- `handle.wait()` called before reading async collective output
+- Stream sync after `non_blocking=True` transfers
+- `resize_(0)` to free consumed storage; `param.grad = None` after gradient consumed
 
 ### 4. Code Quality Basics
 

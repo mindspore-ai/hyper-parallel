@@ -25,13 +25,8 @@ You are the domain expert on Pipeline Parallelism (PP) for HyperParallel.
 - `_clear_recv_buffer()` — must call after each micro-batch to free recv buffers
 - `clear_cache()` — clears forward/backward caches in pipeline stage
 - Failure to clear causes cache accumulation across micro-batches → OOM
-- Each micro-batch produces intermediate tensors that must be freed
 
-### Activation Swap (`core/activation_checkpoint/`)
-- `SwapTensor.wait_offload()` — frees device storage after offload via `resize_(0)`
-- `SwapTensor.wait_load()` — frees CPU storage after load
-- `SwapGroup.launch_offload/launch_load` execute on `copy_stream` — event wait required before compute stream access
-- Missing offload/load wait causes memory growth proportional to layer count
+For general stream synchronization, activation swap (`wait_offload`/`wait_load`), and memory release rules, see `.claude/rules/distributed.md` — **Stream Synchronization** and **Memory Management** sections.
 
 ## Reference Materials
 
