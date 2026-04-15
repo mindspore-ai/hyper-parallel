@@ -399,15 +399,16 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         return self._normalize_unsharded_grad_to_local(grad, reduce_partial_dtensor=False)
 
     def to_accumulated_grad_if_needed(self) -> None:
-        if (
-            self._unsharded_param.grad is not None
-            and self.reduce_dtype is not None
-        ):
-            unsharded_grad = self._to_local_unsharded_grad(self._unsharded_param.grad)
-            self._unsharded_param.grad = None
-            if unsharded_grad.dtype != self.reduce_dtype:
-                unsharded_grad = unsharded_grad.to(self.reduce_dtype)
+        if self._unsharded_param.grad is None:
+            return
+        unsharded_grad = self._unsharded_param.grad
+        self._unsharded_param.grad = None
+        if self.reduce_dtype is not None and unsharded_grad.dtype != self.reduce_dtype:
+            unsharded_grad = unsharded_grad.to(self.reduce_dtype)
+        if self.unsharded_accumulated_grad is None:
             self.unsharded_accumulated_grad = unsharded_grad
+        else:
+            self.unsharded_accumulated_grad += unsharded_grad
 
     def accumulate_unsharded_grad_if_needed(self) -> None:
         if (

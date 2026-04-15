@@ -159,7 +159,7 @@ def assert_sharded_param_layout(
     return param_type_names
 
 
-def run_accumulated_step(data, label, forward_fn, net):
+def run_accumulated_step(data, label, forward_fn, net, sync_grad_on_last_micro_step=False):
     """Run one fully_shard step with per-micro-step gradient accumulation."""
     micro_step = 4
     micro_size = data.shape[0] // micro_step
@@ -170,9 +170,13 @@ def run_accumulated_step(data, label, forward_fn, net):
     )
     total_loss = 0
     for micro_idx in range(micro_step):
+        if sync_grad_on_last_micro_step:
+            net.set_requires_gradient_sync(micro_idx == micro_step - 1)
         loss, _ = forward_fn(data_list[micro_idx], label_list[micro_idx])
         loss.backward()
         total_loss = total_loss + loss
+    if sync_grad_on_last_micro_step:
+        net.set_requires_gradient_sync(True)
     grads = get_backward_grads(net)
     return total_loss, grads, micro_step
 
@@ -238,6 +242,8 @@ def run_fully_shard_multi_card(
     ckpt_path,
     mesh,
     accumulate_grad=False,
+    sync_grad_on_last_micro_step=False,
+    replicate_all_params=False,
     enable_prefetch=False,
     enable_recompute=False,
 ):
@@ -261,18 +267,26 @@ def run_fully_shard_multi_card(
 
     origin_shapes = [p.shape for p in net.trainable_params()]
     shard_dim_size = mesh.shape[-1]
+    replicate_params = set(net.trainable_params()) if replicate_all_params else None
 
-    fully_shard(net.dense_relu_sequential[0], mesh=mesh, mp_policy=mp_policy)
-    fully_shard(net.dense_relu_sequential[2], mesh=mesh, mp_policy=mp_policy)
-    fully_shard(net.dense_relu_sequential[4], mesh=mesh, mp_policy=mp_policy)
-    fully_shard(net, mesh=mesh, mp_policy=mp_policy)
+    fully_shard(
+        net.dense_relu_sequential[0], mesh=mesh, mp_policy=mp_policy, replicate_params=replicate_params
+    )
+    fully_shard(
+        net.dense_relu_sequential[2], mesh=mesh, mp_policy=mp_policy, replicate_params=replicate_params
+    )
+    fully_shard(
+        net.dense_relu_sequential[4], mesh=mesh, mp_policy=mp_policy, replicate_params=replicate_params
+    )
+    fully_shard(net, mesh=mesh, mp_policy=mp_policy, replicate_params=replicate_params)
     if enable_prefetch:
         setup_prefetch(net)
 
     if enable_recompute:
         apply_recompute(net)
 
-    assert_sharded_param_layout(net, origin_shapes, shard_dim_size)
+    if not replicate_all_params:
+        assert_sharded_param_layout(net, origin_shapes, shard_dim_size)
 
     forward_fn = get_forward_fn(net)
     optimizer = nn.Adam(net.trainable_params(), learning_rate=learning_rate)
@@ -285,7 +299,8 @@ def run_fully_shard_multi_card(
         net.zero_grad()
         if accumulate_grad:
             total_loss, grads, micro_step = run_accumulated_step(
-                data, label, forward_fn, net
+                data, label, forward_fn, net,
+                sync_grad_on_last_micro_step=sync_grad_on_last_micro_step
             )
             with SkipDTensorDispatch():
                 for grad in grads:
@@ -301,7 +316,8 @@ def run_fully_shard_multi_card(
                 optimizer(grads)
             reduced_loss = loss_sync_allreduce(loss)
             final_loss = reduced_loss / dp_size
-        final_param_type_names = assert_sharded_param_layout(net)
+        if not replicate_all_params:
+            final_param_type_names = assert_sharded_param_layout(net)
         if rank_id == 0:
             losses.append(float(final_loss.asnumpy()))
             print(f"rank: {rank_id} step: {i}, loss: {final_loss}")
@@ -508,6 +524,32 @@ def run_fully_shard_with_grad_accum(mesh):
         print("Precision comparison with gradient accumulation passed!")
 
 
+def run_fully_shard_zero1_with_manual_grad_sync(mesh):
+    """Run zero1-style gradient accumulation with manual final-step sync."""
+    init()
+
+    rank_id = get_rank()
+
+    ckpt_path = os.path.join(TEMP_DIR, "init_baseline.ckpt")
+    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please generate baseline artifacts first"
+
+    losses, _ = run_fully_shard_multi_card(
+        ckpt_path,
+        mesh,
+        accumulate_grad=True,
+        sync_grad_on_last_micro_step=True,
+        replicate_all_params=True,
+    )
+
+    if rank_id == 0:
+        baseline_losses_file = os.path.join(TEMP_DIR, "baseline_losses.npy")
+        assert os.path.exists(baseline_losses_file), f"Baseline losses not found: {baseline_losses_file}"
+
+        baseline_losses = list(np.load(baseline_losses_file))
+        compare_losses(baseline_losses, losses, rtol=1e-5, atol=1e-5)
+        print("Precision comparison with zero1 manual grad sync passed!")
+
+
 def test_ms_zero3_fully_shard():
     """
     Feature: Compare fully_shard precision with standalone baseline
@@ -583,6 +625,17 @@ def test_ms_zero3_fully_shard_grad_accum():
     """
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     run_fully_shard_with_grad_accum(mesh)
+
+
+def test_ms_zero1_fully_shard_grad_accum():
+    """
+    Feature: Compare zero1-style fully_shard gradient accumulation precision with large-batch standalone baseline
+    Description: Run fully_shard on replicated parameters (zero1-style) and disable gradient synchronization for
+                 early micro steps via set_requires_gradient_sync(False), then synchronize on the final micro step
+    Expectation: Losses should match the large-batch baseline within tolerance
+    """
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    run_fully_shard_zero1_with_manual_grad_sync(mesh)
 
 
 def _parse_args():
