@@ -139,6 +139,20 @@ def test_ms_zero3_fully_shard_grad_accum():
     run_case(case_name=f"{inspect.stack()[0].function}")
 
 
+@pytest.mark.skip(reason="The Mindspore framework has a bug that causes a core dump when the process exits.")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_ms_zero1_fully_shard_grad_accum():
+    """
+    Feature: Compare zero1-style fully_shard gradient accumulation precision with standalone baseline
+    Description: Run standalone baseline and fully_shard multi-card training
+                 on replicated parameters with gradient accumulation,
+                 disable grad sync on intermediate micro steps via set_requires_gradient_sync(False),
+                 and synchronize only when accumulation reaches the optimizer step
+    Expectation: Losses should match within tolerance
+    """
+    run_case(case_name=f"{inspect.stack()[0].function}")
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_ms_fully_shard_list_unit_precision():
     """

@@ -415,6 +415,32 @@ class TestApplyReducedGrad(unittest.TestCase):
         self.assertIs(hsdp_param.sharded_param.grad, sharded_grad_dtensor)
         self.assertIsNone(hsdp_param.unsharded_param.grad)
 
+    def test_unsharded_accumulated_grad_cleared_after_apply(self):
+        """
+        Feature: apply_reduced_grad
+        Description: After gradient assignment, the no-sync accumulated grad cache should be cleared
+        Expectation: unsharded_accumulated_grad is reset to None after materializing sharded_param.grad
+        """
+        hsdp_param = MagicMock()
+        hsdp_param.sharded_size = (4,)
+        hsdp_param.offload_to_cpu = False
+        hsdp_param.sharded_param.grad = None
+        hsdp_param.unsharded_accumulated_grad = MagicMock(name="accumulated_grad")
+        hsdp_param.unsharded_param.grad = MagicMock(name="live_unsharded_grad")
+        sharded_grad_dtensor = MagicMock(spec=DTensor)
+        hsdp_param.to_sharded_dtensor.return_value = sharded_grad_dtensor
+
+        reduced_grad = MagicMock()
+        casted_grad = MagicMock()
+        casted_grad.dtype = ms.float32
+        reduced_grad.view.return_value = casted_grad
+
+        MindSporeHSDPParamV2.apply_reduced_grad(hsdp_param, reduced_grad, ms.float32)
+
+        self.assertIs(hsdp_param.sharded_param.grad, sharded_grad_dtensor)
+        self.assertIsNone(hsdp_param.unsharded_accumulated_grad)
+        self.assertIsNotNone(hsdp_param.unsharded_param.grad)
+
     def test_cpu_offload_requests_synchronize(self):
         """
         Feature: apply_reduced_grad
@@ -443,6 +469,51 @@ class TestApplyReducedGrad(unittest.TestCase):
 
         viewed_grad.to.assert_called_once_with("cpu", non_blocking=True)
         self.assertTrue(need_synchronize)
+
+
+class TestNoSyncAccumulatedGrad(unittest.TestCase):
+    """Test no-sync gradient accumulation bookkeeping matches Torch semantics."""
+
+    def test_to_accumulated_grad_keeps_grad_when_reduce_dtype_is_none(self):
+        """
+        Feature: to_accumulated_grad_if_needed
+        Description: no-sync should stash the unsharded grad even when reduce_dtype is None
+        Expectation: unsharded_accumulated_grad stores the moved grad and clears unsharded_param.grad
+        """
+        hsdp_param = object.__new__(MindSporeHSDPParamV2)
+        grad = MagicMock(name="micro_grad")
+        hsdp_param._unsharded_param = MagicMock()
+        hsdp_param._unsharded_param.grad = grad
+        hsdp_param.reduce_dtype = None
+        hsdp_param.unsharded_accumulated_grad = None
+        hsdp_param._to_local_unsharded_grad = MagicMock(return_value=grad)
+
+        MindSporeHSDPParamV2.to_accumulated_grad_if_needed(hsdp_param)
+
+        hsdp_param._to_local_unsharded_grad.assert_called_once_with(grad)
+        self.assertIsNone(hsdp_param._unsharded_param.grad)
+        self.assertIs(hsdp_param.unsharded_accumulated_grad, grad)
+
+    def test_to_accumulated_grad_accumulates_instead_of_overwriting(self):
+        """
+        Feature: to_accumulated_grad_if_needed
+        Description: repeated no-sync micro steps should accumulate onto the existing cached grad
+        Expectation: existing accumulated grad receives an in-place add from the new micro grad
+        """
+        hsdp_param = object.__new__(MindSporeHSDPParamV2)
+        incoming_grad = MagicMock(name="incoming_grad")
+        accumulated_grad = MagicMock(name="accumulated_grad")
+        hsdp_param._unsharded_param = MagicMock()
+        hsdp_param._unsharded_param.grad = incoming_grad
+        hsdp_param.reduce_dtype = None
+        hsdp_param.unsharded_accumulated_grad = accumulated_grad
+        hsdp_param._to_local_unsharded_grad = MagicMock(return_value=incoming_grad)
+
+        MindSporeHSDPParamV2.to_accumulated_grad_if_needed(hsdp_param)
+
+        hsdp_param._to_local_unsharded_grad.assert_called_once_with(incoming_grad)
+        accumulated_grad.__iadd__.assert_called_once_with(incoming_grad)
+        self.assertIsNone(hsdp_param._unsharded_param.grad)
 
 
 class TestReplicateParamGradHandling(unittest.TestCase):
