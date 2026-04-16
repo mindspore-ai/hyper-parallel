@@ -52,8 +52,8 @@
 /tests/mindspore/ut/parallel_ops_infer/ @yangzhenzhang
 /tests/mindspore/st/fully_shard/ @DavidFFFan
 /tests/mindspore/ut/fully_shard/ @DavidFFFan
-/tests/mindspore/ut/checkpoint/ @zhangbuxue
-/tests/ut/checkpoint/ @zhangbuxue
+/tests/mindspore/ut/core/distributed_checkpoint/ @zhangbuxue
+/tests/ut/core/distributed_checkpoint/ @zhangbuxue
 
 /tests/torch/ @yangzhenzhang
 /tests/torch/activation_checkpoint/ @DavidFFFan

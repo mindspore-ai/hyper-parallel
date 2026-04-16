@@ -14,7 +14,7 @@
 # ============================================================================
 """ST (PyTorch): offline checkpoint — HF safetensors, ``convert_full_checkpoint_to_dcp``, .pt → DCP.
 
-DCP full-weights ↔ disk round-trip without HF/file loaders is covered in ``tests/ut/checkpoint/``.
+DCP full-weights ↔ disk round-trip without HF/file loaders is covered in ``tests/ut/core/distributed_checkpoint/``.
 
 Module basename is distinct from the MindSpore ST file so pytest can collect both in one session.
 """

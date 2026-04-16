@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,16 +14,18 @@
 # ============================================================================
 """Layout I/O utilities for saving, loading and gathering layout information."""
 import json
+import logging
 import os
 from pathlib import Path
-from typing import Union
+from typing import Any, Union
 
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
+logger = logging.getLogger(__name__)
 
 
-def get_current_layout(cell):
+def get_current_layout(cell: Any) -> dict:
     """
     Get current layout from cell
     Args:
@@ -37,14 +39,27 @@ def get_current_layout(cell):
     current_rank = str(platform.get_rank())
     layout_dict = {current_rank: {}}
 
+    params_without_layout_attr = []
     param_dict = platform.parameters_dict(cell)
     for name, param in param_dict:
         if name in layout_dict:
             raise RuntimeError("param in cell can not have same name")
+        if not hasattr(param, "layout"):
+            params_without_layout_attr.append(name)
+            continue
         if param.layout:
-            layout_dict[current_rank][param.name] = param.layout.to_dict()
+            layout_info = dict(param.layout.to_dict())
+            if "mesh_shape" in layout_info:
+                layout_info["device_matrix"] = layout_info.pop("mesh_shape")
+            layout_dict[current_rank][param.name] = layout_info
             layout_dict[current_rank][param.name]["type"] = str(param.dtype)
             layout_dict[current_rank][param.name]["full_shape"] = param.shape
+
+    if params_without_layout_attr:
+        logger.info(
+            "The following parameters have no layout attribute and were skipped: %s",
+            params_without_layout_attr,
+        )
 
     return layout_dict
 
@@ -102,7 +117,7 @@ def combine_layout(directory: Union[Path, str]) -> dict:
     return layout_dict
 
 
-def get_global_layout(cell) -> dict:
+def get_global_layout(cell: Any) -> dict:
     """
     Get global layout information from all ranks, and gather them into a dict.
 
