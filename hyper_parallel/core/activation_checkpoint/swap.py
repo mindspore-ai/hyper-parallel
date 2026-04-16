@@ -37,6 +37,8 @@ class SwapTensor:
 
     def __init__(self, val: Any) -> None:
         self.val = val
+        self.ver = val._version
+        self.size = val.untyped_storage().size()
         if isinstance(val, platform.Tensor) and str(val.device).lower() != 'cpu':
             self._state = self.STATE_DEVICE
             self.is_slice_tensor = val.untyped_storage().size() != val.numel() * platform.get_element_size(val)
@@ -105,6 +107,12 @@ class SwapTensor:
                 f"expected 'device'. Operation skipped."
             )
             return
+
+        if self.size != self.val.untyped_storage().size() or self.ver != self.val._version:
+            raise RuntimeError(
+                "There is a tensor(s) cannot be SWAPPED! In-place modification happened or "
+                "its storage has been resized."
+            )
 
         if self.is_slice_tensor:
             self.val_cpu.copy_(self.val, non_blocking=True)
