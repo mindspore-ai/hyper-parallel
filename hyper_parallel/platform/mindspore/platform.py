@@ -145,8 +145,8 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def is_embedding_module(module) -> bool:
-        """Check whether *module* is a MindSpore ``Embedding`` layer."""
-        return isinstance(module, ms.nn.Embedding)
+        """Check whether *module* is a MindSpore ``Embedding`` or ``mint.nn.Embedding`` layer."""
+        return isinstance(module, (ms.nn.Embedding, mint.nn.Embedding))
 
     def device_count(self, device_handle):
         """

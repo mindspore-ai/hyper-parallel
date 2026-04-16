@@ -19,7 +19,6 @@ Provides :class:`ParallelStyle` (ABC) and concrete implementations
 ``torch.distributed.tensor.parallel.style``.
 """
 from abc import ABC, abstractmethod
-from functools import partial
 from typing import Any, Optional, Tuple
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
@@ -125,12 +124,10 @@ class ColwiseParallel(ParallelStyle):
     def _prepare_input_fn(
         input_layouts: Tuple[Placement, ...],
         desired_input_layouts: Tuple[Placement, ...],
-        module: Any,
         inputs: Any,
         device_mesh: DeviceMesh,
     ) -> Any:
         """Annotate or redistribute the first positional input."""
-        del module
         input_tensor = inputs[0]
         if not isinstance(input_tensor, DTensor):
             input_tensor = DTensor.from_local(
@@ -143,11 +140,8 @@ class ColwiseParallel(ParallelStyle):
             )
         return input_tensor
 
-    def _partition_linear_fn(
-        self, module_name: str, module: Any, device_mesh: DeviceMesh
-    ) -> None:
+    def _partition_linear_fn(self, module: Any, device_mesh: DeviceMesh) -> None:
         """Shard Linear weight/bias along ``Shard(0)`` (column-wise)."""
-        del module_name
         for key, param in _distribute_module_iter_params(module):
             if param is None:
                 continue
@@ -157,11 +151,8 @@ class ColwiseParallel(ParallelStyle):
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
 
-    def _partition_embedding_fn(
-        self, module_name: str, module: Any, device_mesh: DeviceMesh
-    ) -> None:
+    def _partition_embedding_fn(self, module: Any, device_mesh: DeviceMesh) -> None:
         """Shard Embedding weight along ``Shard(1)`` (column-wise)."""
-        del module_name
         for key, param in _distribute_module_iter_params(module):
             if param is None:
                 continue
@@ -175,12 +166,10 @@ class ColwiseParallel(ParallelStyle):
     def _prepare_output_fn(
         output_layouts: Tuple[Placement, ...],
         use_local_output: bool,
-        module: Any,
         outputs: Any,
         device_mesh: DeviceMesh,
     ) -> Any:
         """Redistribute output to desired layout and optionally convert to local."""
-        del module
         if outputs.placements != output_layouts:
             outputs = outputs.redistribute(device_mesh, output_layouts)
         if use_local_output:
@@ -201,28 +190,42 @@ class ColwiseParallel(ParallelStyle):
             NotImplementedError: If *module* is not a supported type.
         """
         if platform.is_linear_module(module):
-            partition_fn = self._partition_linear_fn
+
+            def partition_fn(submodule_path, submodule, device_mesh):
+                self._partition_linear_fn(submodule, device_mesh)
+
         elif platform.is_embedding_module(module):
-            partition_fn = self._partition_embedding_fn
+
+            def partition_fn(submodule_path, submodule, device_mesh):
+                self._partition_embedding_fn(submodule, device_mesh)
+
         else:
             raise NotImplementedError(
                 "ColwiseParallel currently only supports Linear and Embedding modules!"
+            )
+
+        def input_fn(forward_module, forward_inputs, device_mesh):
+            return self._prepare_input_fn(
+                self.input_layouts,
+                self.desired_input_layouts,
+                forward_inputs,
+                device_mesh,
+            )
+
+        def output_fn(forward_module, forward_outputs, device_mesh):
+            return self._prepare_output_fn(
+                self.output_layouts,
+                self.use_local_output,
+                forward_outputs,
+                device_mesh,
             )
 
         return distribute_module(
             module,
             device_mesh,
             partition_fn,
-            partial(
-                self._prepare_input_fn,
-                self.input_layouts,
-                self.desired_input_layouts,
-            ),
-            partial(
-                self._prepare_output_fn,
-                self.output_layouts,
-                self.use_local_output,
-            ),
+            input_fn,
+            output_fn,
         )
 
 
@@ -279,12 +282,10 @@ class RowwiseParallel(ParallelStyle):
     def _prepare_input_fn(
         input_layouts: Tuple[Placement, ...],
         desired_input_layouts: Tuple[Placement, ...],
-        module: Any,
         inputs: Any,
         device_mesh: DeviceMesh,
     ) -> Any:
         """Annotate or redistribute the first positional input."""
-        del module
         input_tensor = inputs[0]
         if not isinstance(input_tensor, DTensor):
             input_tensor = DTensor.from_local(
@@ -297,11 +298,8 @@ class RowwiseParallel(ParallelStyle):
             )
         return input_tensor
 
-    def _partition_linear_fn(
-        self, module_name: str, module: Any, device_mesh: DeviceMesh
-    ) -> None:
+    def _partition_linear_fn(self, module: Any, device_mesh: DeviceMesh) -> None:
         """Shard Linear weight along ``Shard(1)`` (row-wise); bias to ``Replicate()``."""
-        del module_name
         for key, param in _distribute_module_iter_params(module):
             if param is None:
                 continue
@@ -312,11 +310,8 @@ class RowwiseParallel(ParallelStyle):
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
 
-    def _partition_embedding_fn(
-        self, module_name: str, module: Any, device_mesh: DeviceMesh
-    ) -> None:
+    def _partition_embedding_fn(self, module: Any, device_mesh: DeviceMesh) -> None:
         """Shard Embedding weight along ``Shard(0)`` (row-wise)."""
-        del module_name
         for key, param in _distribute_module_iter_params(module):
             if param is None:
                 continue
@@ -330,12 +325,10 @@ class RowwiseParallel(ParallelStyle):
     def _prepare_output_fn(
         output_layouts: Tuple[Placement, ...],
         use_local_output: bool,
-        module: Any,
         outputs: Any,
         device_mesh: DeviceMesh,
     ) -> Any:
         """Redistribute partial output and optionally convert to local."""
-        del module
         if outputs.placements != output_layouts:
             outputs = outputs.redistribute(device_mesh, output_layouts)
         if use_local_output:
@@ -356,28 +349,42 @@ class RowwiseParallel(ParallelStyle):
             NotImplementedError: If *module* is not a supported type.
         """
         if platform.is_linear_module(module):
-            partition_fn = self._partition_linear_fn
+
+            def partition_fn(submodule_path, submodule, device_mesh):
+                self._partition_linear_fn(submodule, device_mesh)
+
             self.desired_input_layouts = (Shard(-1),)
         elif platform.is_embedding_module(module):
-            partition_fn = self._partition_embedding_fn
+
+            def partition_fn(submodule_path, submodule, device_mesh):
+                self._partition_embedding_fn(submodule, device_mesh)
+
             self.desired_input_layouts = (Replicate(),)
         else:
             raise NotImplementedError(
                 "RowwiseParallel currently only supports Linear and Embedding modules!"
             )
 
+        def input_fn(forward_module, forward_inputs, device_mesh):
+            return self._prepare_input_fn(
+                self.input_layouts,
+                self.desired_input_layouts,
+                forward_inputs,
+                device_mesh,
+            )
+
+        def output_fn(forward_module, forward_outputs, device_mesh):
+            return self._prepare_output_fn(
+                self.output_layouts,
+                self.use_local_output,
+                forward_outputs,
+                device_mesh,
+            )
+
         return distribute_module(
             module,
             device_mesh,
             partition_fn,
-            partial(
-                self._prepare_input_fn,
-                self.input_layouts,
-                self.desired_input_layouts,
-            ),
-            partial(
-                self._prepare_output_fn,
-                self.output_layouts,
-                self.use_local_output,
-            ),
+            input_fn,
+            output_fn,
         )

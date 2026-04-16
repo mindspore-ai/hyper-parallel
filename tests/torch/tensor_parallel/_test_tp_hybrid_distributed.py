@@ -12,17 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Distributed NPU worker tests for TP + FSDP / TP + CP hybrid parallelism.
+"""Distributed NPU worker tests for TP + FSDP hybrid parallelism.
 
 Uses the real ``ColwiseParallel`` / ``RowwiseParallel`` from
-``hyper_parallel.core.tensor_parallel.style`` combined with ``fully_shard``
-and ``ContextParallel``.
+``hyper_parallel.core.tensor_parallel.style`` combined with ``fully_shard``.
 
 All tests compare distributed NPU output against single-device CPU reference.
 
 Port allocation (launched from ``test_tp_hybrid_distributed.py``):
   10600–10601  4-card TP+FSDP
-  10602–10603  8-card TP+CP
 """
 import torch
 import torch.distributed as dist
@@ -33,7 +31,6 @@ import torch_npu  # noqa: F401  -- Ascend NPU
 
 from hyper_parallel import (
     ColwiseParallel,
-    ContextParallel,
     RowwiseParallel,
     init_device_mesh,
     parallelize_module,
@@ -228,136 +225,3 @@ def test_tp_fsdp_mlp_backward_gradient_npu():
     full_grad = torch.cat(gathered_tp, dim=0).cpu() / dp_size
 
     _npu_precision_close(full_grad, ref_w1_grad)
-
-
-# ---------------------------------------------------------------------------
-# TP + ContextParallel
-# ---------------------------------------------------------------------------
-
-
-class SimpleAttention(nn.Module):
-    """Minimal single-head attention for CP testing.
-
-    Uses ``F.scaled_dot_product_attention`` style computation but
-    implemented explicitly so we can compare with CPU reference.
-    """
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.out_proj = nn.Linear(dim, dim, bias=False)
-        self.scale = dim ** -0.5
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute single-head attention.
-
-        Args:
-            x: Input tensor of shape (batch, seq_len, dim).
-
-        Returns:
-            Output tensor of same shape.
-        """
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-        # (B, S, D) -> (B, S, D)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)
-        return self.out_proj(out)
-
-
-class TransformerBlock(nn.Module):
-    """One transformer block: attention + MLP for TP+CP composition test."""
-
-    def __init__(self, dim: int, hidden_dim: int):
-        super().__init__()
-        self.attn = SimpleAttention(dim)
-        self.mlp = MLP(dim, hidden_dim, dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward with residual connection."""
-        h = self.attn(x) + x
-        return self.mlp(h) + h
-
-
-def test_tp_cp_transformer_forward_precision_npu():
-    """
-    Feature: TP + CP on TransformerBlock matches CPU reference
-    Description:
-        1. Create 2D mesh (cp=2, tp=2), total 4 ranks (or 8 with cp=2, tp=4)
-        2. TP: MLP w1=ColwiseParallel, w2=RowwiseParallel on tp_mesh
-        3. CP: ContextParallel on attn module using cp_mesh
-        4. Compare output with CPU single-device reference
-    Expectation: NPU output close to CPU reference
-    """
-    init_dist()
-    world_size = dist.get_world_size()
-    if world_size < 4 or world_size % 2 != 0:
-        print(f"Skip: need at least 4 ranks, got {world_size}")
-        return
-
-    tp_size = 2
-    cp_size = world_size // tp_size
-    root_mesh = init_device_mesh(
-        device_type="npu",
-        mesh_shape=(cp_size, tp_size),
-        mesh_dim_names=("cp", "tp"),
-    )
-    cp_mesh = root_mesh["cp"]
-    tp_mesh = root_mesh["tp"]
-
-    torch.manual_seed(50)
-    torch.npu.manual_seed(50)
-
-    dim, hidden_dim, batch, seq_len = 32, 64, 2, 16
-    assert hidden_dim % tp_size == 0, (
-        f"hidden_dim {hidden_dim} must be divisible by tp_size {tp_size}"
-    )
-    assert dim % tp_size == 0, (
-        f"dim {dim} must be divisible by tp_size {tp_size}"
-    )
-    assert seq_len % cp_size == 0, (
-        f"seq_len {seq_len} must be divisible by cp_size {cp_size}"
-    )
-
-    # CPU reference model
-    torch.manual_seed(300)
-    ref_block = TransformerBlock(dim, hidden_dim)
-    x = torch.randn(batch, seq_len, dim, dtype=torch.float32)
-    y_ref = ref_block(x)
-
-    # NPU distributed model
-    torch.manual_seed(300)
-    dist_block = TransformerBlock(dim, hidden_dim).npu()
-
-    # Step 1: Apply TP on MLP submodules
-    parallelize_module(
-        dist_block.mlp,
-        tp_mesh,
-        {"w1": ColwiseParallel(), "w2": RowwiseParallel()},
-    )
-
-    # Step 2: Apply CP on attention module
-    parallelize_module(
-        dist_block.attn,
-        cp_mesh,
-        {"": ContextParallel(seq_dim=1)},
-    )
-
-    # Split input along sequence dimension for CP
-    cp_idx = root_mesh.get_coordinate()[0]
-    local_seq = seq_len // cp_size
-    x_local = x[:, cp_idx * local_seq : (cp_idx + 1) * local_seq, :].npu()
-
-    with torch.no_grad():
-        y_local = dist_block(x_local)
-
-    # Gather outputs from all CP ranks along sequence dimension
-    gathered = [torch.empty_like(y_local) for _ in range(cp_size)]
-    dist.all_gather(gathered, y_local)
-    y_full = torch.cat(gathered, dim=1)  # gather along seq_dim=1
-
-    _npu_precision_close(y_full, y_ref)

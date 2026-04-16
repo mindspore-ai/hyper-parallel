@@ -12,18 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Pytest launchers for TP + FSDP / TP + CP hybrid parallelism NPU distributed tests.
+"""Pytest launchers for TP + FSDP hybrid parallelism NPU distributed tests.
 
-Uses the real ``ColwiseParallel`` / ``RowwiseParallel`` combined with ``fully_shard``
-and ``ContextParallel`` to verify hybrid parallel composition on NPU hardware.
+Uses the real ``ColwiseParallel`` / ``RowwiseParallel`` with ``fully_shard`` on NPU.
 
 Port allocation:
   10600–10601  4-card TP+FSDP (forward + backward)
-  10602–10603  8-card TP+CP (forward + backward)
 """
 from pathlib import Path
-
-import pytest
 
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
@@ -52,29 +48,4 @@ def test_tp_fsdp_hybrid_4card():
     _run_group(
         ("test_tp_fsdp_mlp_forward_precision_npu", 10600, 4),
         ("test_tp_fsdp_mlp_backward_gradient_npu", 10601, 4),
-    )
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_tp_cp_hybrid_4card():
-    """
-    Feature: parallel_run launcher for 4-card TP + CP hybrid tests
-    Description:
-        1. test_tp_cp_transformer_forward_precision_npu
-    Expectation: Run success.
-
-    Skip reason: ContextParallel Ulysses mode assumes the attention module
-    receives separate Q, K, V as positional args (qkv_indices=(0,1,2)),
-    but SimpleAttention.forward(self, x) takes a single input and computes
-    Q/K/V internally.  Additionally, ``parallelize_module(..., {"": style})``
-    does not match any child module (fnmatch(name, "") is always False).
-    Tracked in design issue docs/tensor_parallel_cp_design_issue.md.
-    """
-    pytest.skip(
-        "ContextParallel Ulysses mode incompatible with SimpleAttention structure; "
-        "see docs/tensor_parallel_cp_design_issue.md"
-    )
-    _run_group(
-        ("test_tp_cp_transformer_forward_precision_npu", 10602, 4),
     )

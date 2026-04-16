@@ -119,7 +119,9 @@
 # 13. test_style.py — abstract-class-instantiated is intentional (testing abstract class behavior)
 "hyper-parallel/tests/ut/core/tensor_parallel/test_style.py"           "abstract-class-instantiated"
 
-# 14. Tensor Parallel style.py — calls private distribute_module helpers (internal API contract)
+# 14. Tensor Parallel style.py — calls private distribute_module helpers (internal API contract);
+#     distribute_module callbacks require full signatures; some parameters are intentionally unused.
 "hyper-parallel/hyper_parallel/core/tensor_parallel/style.py"           "protected-access"
 "hyper-parallel/hyper_parallel/core/tensor_parallel/style.py"           "missing-public-docstring"
 "hyper-parallel/hyper_parallel/core/tensor_parallel/style.py"           "missing-public-type-hints"
+"hyper-parallel/hyper_parallel/core/tensor_parallel/style.py"           "unused-argument"
