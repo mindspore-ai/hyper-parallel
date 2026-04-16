@@ -18,7 +18,7 @@ import unittest
 from unittest.mock import patch
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, Partial
 from hyper_parallel.core.shard.ops.parallel_scatter import ScatterDistributedOp
@@ -41,12 +41,14 @@ class TestParallelScatter(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
         self.platform = get_platform()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.

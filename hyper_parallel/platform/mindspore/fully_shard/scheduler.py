@@ -106,10 +106,6 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _forward_pre_hook(self, cell, args, kwargs):
         """Execute forward pre hook and set up backward hook."""
-        if self.scheduler_state == FSDPSchedulerState.PRE_BACKWARD:
-            return args, kwargs
-        if HSDPSchedulerV2.root_bp_state:
-            self._disable_forward_prefetch_for_recompute()
         args, kwargs = self._hsdp_forward_pre_hook(cell, args, kwargs)
         return self._register_post_backward_hook(args, kwargs)
 

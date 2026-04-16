@@ -501,9 +501,17 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         module_info = self._module_info
         new_param = getattr(module_info.module, module_info.param_name)
         if new_param is not self.sharded_param:
-            self.sharded_param = new_param
+            if isinstance(new_param, DTensor):
+                self.sharded_param = new_param
+                if not getattr(self.sharded_param, "_hsdp_param_initialized", None):
+                    # reset _hsdp_param_initialized flag.
+                    self.sharded_param._hsdp_param_initialized = True
+            elif isinstance(new_param, ms.Tensor):
+                # if new_param is Tensor, don't re-ref 'self.sharded_param'
+                # just update self.sharded_param._local_tensor and self.sharded_param_data.
+                pass
 
-        local_tensor = new_param._local_tensor
+        local_tensor = new_param._local_tensor if isinstance(new_param, DTensor) else new_param
         if local_tensor.is_meta:
             return
         updated_local_tensor = False
@@ -526,10 +534,12 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         sharded_size = self.sharded_size
         shard_dim = self.hsdp_placement.dim
         length = local_tensor.shape[shard_dim] if local_tensor.numel() > 0 else 0
-        if local_tensor.shape != sharded_size and not same_local_tensor:
-            raise AssertionError(
-                f"Expected sharded_size to be {sharded_size}, got {local_tensor.shape}"
-            )
+        if not same_local_tensor:
+            if local_tensor.shape != sharded_size :
+                raise AssertionError(
+                    f"Expected sharded_size to be {sharded_size}, got {local_tensor.size()}"
+                )
+            updated_local_tensor = True
         if self.pin_memory and not local_tensor.is_pinned():
             local_tensor = local_tensor.to("cpu").pin_memory()
             updated_local_tensor = True
