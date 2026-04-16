@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -220,7 +220,8 @@ class AsyncContextParallel(ContextParallel):
                 partial(self._proj_post_hook, key=key, group=group, world_size=world_size,
                         fwd_slots=fwd_slots)
             )
-            proj.register_full_backward_pre_hook(
+            platform.register_full_backward_pre_hook(
+                proj,
                 partial(self._proj_bwd_pre_hook, bwd_slot=bwd_slots[key])
             )
 
