@@ -142,6 +142,18 @@ class DTensorBase(Tensor):
         device_info = self._local_tensor.device
         return device_info.split(':', 1)[0]
 
+    @property
+    # pylint: disable=C2801
+    def data(self):
+        return Tensor.data.__get__(self, type(self))
+
+    @data.setter
+    # pylint: disable=C2801
+    def data(self, value):
+        local_value = value.to_local() if isinstance(value, DTensorBase) else value
+        Tensor.data.__set__(self, local_value)
+        Tensor.data.__set__(self._local_tensor, local_value)
+
     # pylint: disable=W0212
     def set_data(self, data, slice_shape=False):
         """

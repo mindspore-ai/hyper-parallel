@@ -37,6 +37,7 @@ venv/
 *.shp
 *.pkl
 *.pb
+*.log
 .clangd
 
 # Dynamic libraries

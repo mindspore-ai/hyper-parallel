@@ -249,6 +249,18 @@ class DTensorBase(Tensor):
         return self._local_tensor.device
 
     @property
+    # pylint: disable=C2801
+    def data(self):
+        return Tensor.data.__get__(self, type(self))
+
+    @data.setter
+    # pylint: disable=C2801
+    def data(self, value):
+        local_value = value.to_local() if isinstance(value, DTensorBase) else value
+        Tensor.data.__set__(self, local_value)
+        Tensor.data.__set__(self._local_tensor, local_value)
+
+    @property
     def dtype(self) -> torch.dtype:
         """
         Get the data type of this tensor.

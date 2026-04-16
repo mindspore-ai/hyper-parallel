@@ -38,7 +38,8 @@ class HSDPConfigV2:
         offload_policy,
         ignored_params=None,
         replicate_params=None,
-        comm_fusion=False
+        comm_fusion=False,
+        comm_fusion_zero_copy=False,
     ):
         self.mesh = mesh
         self.reshard_after_forward = reshard_after_forward
@@ -49,6 +50,7 @@ class HSDPConfigV2:
         self.replicate_params = replicate_params
         self.reduce_dtype = self.mp_policy.reduce_dtype if self.mp_policy else None
         self.comm_fusion = comm_fusion
+        self.comm_fusion_zero_copy = comm_fusion_zero_copy
 
 
 class ShardedState(Enum):

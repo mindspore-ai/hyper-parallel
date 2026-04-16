@@ -153,6 +153,7 @@ class TorchHSDPStateV2(HSDPState):
                     self.mesh_info,
                     self.device,
                     self.mp_policy,
+                    self.config.comm_fusion_zero_copy,
                 )
 
     def _move_states_to_device(self):

@@ -33,3 +33,23 @@ MindSpore reduce-like collectives do not provide native `AVG`, so `fully_shard` 
 
 - `SUM`
 - then explicit division by group size
+
+## 4. Version-Preserving Buffer Updates
+
+Tensor `_version` participates in consistency checks for autograd, selective
+recomputation, and similar flows. `fully_shard` should stay transparent to those
+mechanisms and must not introduce extra `_version` bumps on its own.
+
+Torch can handle this directly with
+`torch.autograd._unsafe_preserve_version_counter(...)`.
+
+MindSpore does not provide an equivalent API, but it can return a new tensor via
+`.data` that shares the same storage as the original one. Updating that new tensor
+with `copy_` or other in-place writes lets `fully_shard` refresh the underlying
+contents without bumping the original tensor version. That is why all-gather
+copy-out style buffer refreshes use `tensor.data.copy_(src)`.
+
+This should still be distinguished from `Parameter` / DTensor rebasing, which
+must continue to use `set_data(...)`. DTensor-backed parameters may maintain
+multiple synchronized storages internally, and `.data = ...` only updates one of
+them, while `set_data(...)` updates the full parameter state correctly.

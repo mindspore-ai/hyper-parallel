@@ -89,7 +89,7 @@ class HSDPState:
         if unshard_replicate:
             for param in self.replicate_params:
                 param.unshard(async_op)
-        if self.config.comm_fusion:
+        if self.config.comm_fusion and self.param_group is not None:
             self.param_group.unshard(async_op)
         else:
             for param in self.sharded_hsdp_params:
@@ -108,7 +108,7 @@ class HSDPState:
         if wait_for_replicate:
             for param in self.replicate_params:
                 param.wait_for_unshard()
-        if self.config.comm_fusion:
+        if self.config.comm_fusion and self.param_group is not None:
             self.param_group.wait_for_unshard()
         else:
             for param in self.sharded_hsdp_params:

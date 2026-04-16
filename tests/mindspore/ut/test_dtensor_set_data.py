@@ -15,7 +15,7 @@
 """Unit tests for MindSpore DTensor set_data compatibility."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import mindspore as ms
 
@@ -37,3 +37,44 @@ def test_dtensor_set_data_accepts_slice_shape_for_compatibility():
 
     local_update_data.assert_called_once_with(data)
     dtensor_update_data.assert_called_once_with(data)
+
+
+def test_dtensor_data_setter_updates_wrapper_and_local_tensor():
+    """Assigning ``dtensor.data = x`` should synchronize both wrapper and local tensor payloads."""
+    base_setter = Mock()
+    local_setter = Mock()
+    fake_dtensor = SimpleNamespace(
+        _set_base_data=base_setter,
+        _set_local_tensor_data=local_setter,
+    )
+    data = ms.Tensor([1, 2, 3], ms.float32)
+
+    DTensorBase.data.fset(fake_dtensor, data)
+
+    base_setter.assert_called_once_with(data)
+    local_setter.assert_called_once_with(data)
+
+
+def test_dtensor_data_setter_uses_local_tensor_for_dtensor_input():
+    """Assigning another DTensor should propagate its local shard payload."""
+    base_setter = Mock()
+    local_setter = Mock()
+    input_dtensor = SimpleNamespace(to_local=Mock(return_value="local-shard"))
+    fake_dtensor = SimpleNamespace(
+        _set_base_data=base_setter,
+        _set_local_tensor_data=local_setter,
+    )
+
+    original_isinstance = isinstance
+
+    def fake_isinstance(obj, cls):
+        if cls is DTensorBase:
+            return obj is input_dtensor
+        return original_isinstance(obj, cls)
+
+    with patch("builtins.isinstance", side_effect=fake_isinstance):
+        DTensorBase.data.fset(fake_dtensor, input_dtensor)
+
+    input_dtensor.to_local.assert_called_once_with()
+    base_setter.assert_called_once_with("local-shard")
+    local_setter.assert_called_once_with("local-shard")

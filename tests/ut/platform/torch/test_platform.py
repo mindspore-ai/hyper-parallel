@@ -21,7 +21,8 @@ communication primitives, parameter handling, and tensor operations.
 import os
 import unittest
 from unittest import mock
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -45,6 +46,63 @@ class TestTorchPlatformCore(unittest.TestCase):
         """
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.platform = TorchPlatform()
+
+    def test_dtensor_data_setter_updates_wrapper_and_local_tensor(self):
+        """Assigning ``dtensor.data = x`` should synchronize wrapper and local tensor payloads."""
+        class FakeDataDescriptor:
+            def __init__(self):
+                self.set_calls = []
+
+            def __get__(self, obj, objtype=None):
+                return "fake-data"
+
+            def __set__(self, obj, value):
+                self.set_calls.append((obj, value))
+
+        fake_descriptor = FakeDataDescriptor()
+        fake_tensor_cls = SimpleNamespace(data=fake_descriptor)
+        fake_dtensor = SimpleNamespace(_local_tensor=object())
+
+        with patch("hyper_parallel.platform.torch.dtensor.Tensor", fake_tensor_cls):
+            DTensorBase.data.fset(fake_dtensor, "payload")
+
+        self.assertEqual(
+            fake_descriptor.set_calls,
+            [(fake_dtensor, "payload"), (fake_dtensor._local_tensor, "payload")],
+        )
+
+    def test_dtensor_data_setter_uses_local_tensor_for_dtensor_input(self):
+        """Assigning another DTensor should propagate its local shard payload."""
+        class FakeDataDescriptor:
+            def __init__(self):
+                self.set_calls = []
+
+            def __get__(self, obj, objtype=None):
+                return "fake-data"
+
+            def __set__(self, obj, value):
+                self.set_calls.append((obj, value))
+
+        class FakeInputDTensor:
+            def __init__(self):
+                self._local_tensor = "local-shard"
+
+            def to_local(self):
+                return self._local_tensor
+
+        fake_descriptor = FakeDataDescriptor()
+        fake_tensor_cls = SimpleNamespace(data=fake_descriptor)
+        fake_dtensor = SimpleNamespace(_local_tensor=object())
+        input_dtensor = FakeInputDTensor()
+
+        with patch("hyper_parallel.platform.torch.dtensor.Tensor", fake_tensor_cls):
+            with patch("hyper_parallel.platform.torch.dtensor.DTensorBase", FakeInputDTensor):
+                DTensorBase.data.fset(fake_dtensor, input_dtensor)
+
+        self.assertEqual(
+            fake_descriptor.set_calls,
+            [(fake_dtensor, "local-shard"), (fake_dtensor._local_tensor, "local-shard")],
+        )
 
     @mock.patch('hyper_parallel.platform.torch.platform.TorchPlatform.get_device_handle')
     def test_device_type(self, mock_get_device_handle):

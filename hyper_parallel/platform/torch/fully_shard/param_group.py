@@ -311,7 +311,8 @@ class HSDPParamGroup:
         hsdp_params,
         mesh_info: FSDPMeshInfo,
         device: Optional[torch.device] = None,
-        mp_policy: Optional[MixedPrecisionPolicy] = None
+        mp_policy: Optional[MixedPrecisionPolicy] = None,
+        enable_zero_copy: bool = True,
     ):
         self.mesh_info = mesh_info
         self.device = device
@@ -333,6 +334,7 @@ class HSDPParamGroup:
         self.ag_output = None  # Fused all-gather output buffer, lazily allocated
         self.metadata_cache = None
         self.mp_policy = mp_policy
+        self.enable_zero_copy = enable_zero_copy
         self._result = None  # Pending AllGatherResult from async all-gather
         self._reduce_output = None  # Fused reduce-scatter output, consumed by apply_fusion_reduced_grad
         self._reduce_op = None  # Reduce op saved from foreach_reduce for use in apply_fusion_reduced_grad
@@ -344,7 +346,8 @@ class HSDPParamGroup:
         self._init_mp_dtypes()
         self._flat_param_buffer = None  # Contiguous buffer holding all params' sharded data
         self._flat_cast_buffer = None  # Cast buffer for mixed precision (param_dtype)
-        self._init_flat_param_buffer()
+        if self.enable_zero_copy:
+            self._init_flat_param_buffer()
 
     def _infer_layout_replicate_group(self):
         """Infer a compatibility all-reduce group from params' final DTensor layout when mesh_info has none.
@@ -614,9 +617,9 @@ class HSDPParamGroup:
         else:
             self.alloc_all_gather_output(total_output_numel)
 
-        if not self._is_flat_buffer_valid():
+        if self.enable_zero_copy and not self._is_flat_buffer_valid():
             self._init_flat_param_buffer()
-        use_flat_buffer = self._flat_param_buffer is not None
+        use_flat_buffer = self.enable_zero_copy and self._flat_param_buffer is not None
         if use_flat_buffer:
             # Zero-copy path: flat buffer already holds contiguous shard data
             if self._flat_cast_buffer is not None:

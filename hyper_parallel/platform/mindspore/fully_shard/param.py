@@ -38,6 +38,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
 )
 from hyper_parallel.core.dtensor.placement_types import Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo
+from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_without_bumping_version
 from hyper_parallel.platform.mindspore.fully_shard.pack_utils import (
     build_rs_plan,
     pack_for_reduce_scatter,
@@ -573,7 +574,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
                 device=all_gather_input.device.split(':')[0],
             )
             self.alloc_all_gather_outputs()
-            self.all_gather_outputs[0].copy_(all_gather_input)
+            copy_without_bumping_version(self.all_gather_outputs[0], all_gather_input)
             return self.all_gather_outputs[0], None
 
         # Initialize output buffer
@@ -590,7 +591,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
         if shard_group is None or self.shard_world_size <= 1:
             # No communication needed, just copy
-            self.all_gather_outputs[0].copy_(all_gather_input)
+            copy_without_bumping_version(self.all_gather_outputs[0], all_gather_input)
             return self.all_gather_outputs[0], None
 
         # Execute all_gather_into_tensor
