@@ -50,6 +50,34 @@ def test_fully_shard_precision_group2():
     ])
 
 
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_fully_shard_precision_group3():
+    """
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_zero3_fully_shard_prefetch_recompute
+        2.test_zero3_partial_shard_prefetch_recompute
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_fully_shard_prefetch_recompute", 12351, 4),
+        TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_partial_shard_prefetch_recompute", 12352, 4),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_fully_shard_precision_group4():
+    """
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_zero3_fully_shard_prefetch_recompute_grad_accum
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(_TEST_FULLY_SHARD_PRECISION, "test_zero3_fully_shard_prefetch_recompute_grad_accum", 12353, 4),
+    ])
+
+
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_fully_shard_precision_list_unit():
     """
