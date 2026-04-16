@@ -17,11 +17,21 @@
 Uses the real ``ColwiseParallel`` / ``RowwiseParallel`` styles from
 ``hyper_parallel.core.tensor_parallel.style`` (not custom substitutes).
 
-Port allocation:
-  10500–10501  2-card functional (unsupported module rejection)
-  10502–10505  4-card precision (colwise/rowwise linear forward + backward)
-  10506        4-card precision (MLP colwise+rowwise composition)
-  10507        4-card precision (colwise embedding)
+This file exposes **three** top-level pytest tests; each triggers one ``parallel_run``
+(so three subprocess waves to torchrun/pytest). Worker cases live in
+``_test_tp_styles_distributed.py`` and use ``dist.get_world_size()`` so the same
+test body runs on 2- or 4-rank meshes as configured here.
+
+Port allocation (unique per concurrent case within a wave; ``sum(num_proc) <= 8`` per wave):
+
+  Wave 1 (``test_tp_styles_two_card_wave_one``): 10500–10503, four cases × 2 ranks
+  Wave 2 (``test_tp_styles_two_card_wave_two``): 10510–10513, four cases × 2 ranks
+  Wave 3 (``test_tp_styles_four_card_wave``):    10520–10521, two cases × 4 ranks
+
+Coverage:
+
+  * **Eight** worker scenarios run once on **2** NPUs (split 4+4 across the first two waves).
+  * **Two** worker scenarios run again on **4** NPUs (linear col/row forward only, wider TP mesh).
 """
 from pathlib import Path
 
@@ -41,66 +51,55 @@ def _run_group(*cases):
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
-def test_tp_styles_functional_2card():
+def test_tp_styles_two_card_wave_one():
     """
-    Feature: parallel_run launcher for 2-card functional coverage
+    Feature: first parallel_run — four 2-card worker cases (sum ranks = 8)
     Description:
         1. test_colwise_unsupported_module_raises_npu
         2. test_rowwise_unsupported_module_raises_npu
+        3. test_colwise_linear_forward_precision_npu
+        4. test_colwise_linear_backward_gradient_npu
     Expectation: Run success.
     """
     _run_group(
         ("test_colwise_unsupported_module_raises_npu", 10500, 2),
         ("test_rowwise_unsupported_module_raises_npu", 10501, 2),
+        ("test_colwise_linear_forward_precision_npu", 10502, 2),
+        ("test_colwise_linear_backward_gradient_npu", 10503, 2),
     )
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
-def test_tp_styles_linear_precision_4card():
+def test_tp_styles_two_card_wave_two():
     """
-    Feature: parallel_run launcher for 4-card Linear precision vs CPU reference
+    Feature: second parallel_run — four 2-card worker cases (sum ranks = 8)
     Description:
-        1. test_colwise_linear_forward_precision_npu
-        2. test_colwise_linear_backward_gradient_npu
-        3. test_rowwise_linear_forward_precision_npu
-        4. test_rowwise_linear_backward_gradient_npu
+        1. test_rowwise_linear_forward_precision_npu
+        2. test_rowwise_linear_backward_gradient_npu
+        3. test_mlp_colwise_rowwise_forward_precision_npu
+        4. test_colwise_embedding_forward_precision_npu
     Expectation: Run success.
     """
-    # Split into two groups to keep total processes ≤ 8 cards per group
     _run_group(
-        ("test_colwise_linear_forward_precision_npu", 10502, 4),
-        ("test_colwise_linear_backward_gradient_npu", 10503, 4),
-    )
-    _run_group(
-        ("test_rowwise_linear_forward_precision_npu", 10504, 4),
-        ("test_rowwise_linear_backward_gradient_npu", 10505, 4),
+        ("test_rowwise_linear_forward_precision_npu", 10510, 2),
+        ("test_rowwise_linear_backward_gradient_npu", 10511, 2),
+        ("test_mlp_colwise_rowwise_forward_precision_npu", 10512, 2),
+        ("test_colwise_embedding_forward_precision_npu", 10513, 2),
     )
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
-def test_tp_styles_mlp_composition_4card():
+def test_tp_styles_four_card_wave():
     """
-    Feature: parallel_run launcher for 4-card MLP composition (colwise + rowwise)
+    Feature: third parallel_run — two 4-card worker cases (sum ranks = 8)
     Description:
-        1. test_mlp_colwise_rowwise_forward_precision_npu
+        1. test_colwise_linear_forward_precision_npu (wider TP mesh)
+        2. test_rowwise_linear_forward_precision_npu (wider TP mesh)
     Expectation: Run success.
     """
     _run_group(
-        ("test_mlp_colwise_rowwise_forward_precision_npu", 10506, 4),
-    )
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-          card_mark="allcards", essential_mark="essential")
-def test_tp_styles_embedding_precision_4card():
-    """
-    Feature: parallel_run launcher for 4-card Embedding precision vs CPU reference
-    Description:
-        1. test_colwise_embedding_forward_precision_npu
-    Expectation: Run success.
-    """
-    _run_group(
-        ("test_colwise_embedding_forward_precision_npu", 10507, 4),
+        ("test_colwise_linear_forward_precision_npu", 10520, 4),
+        ("test_rowwise_linear_forward_precision_npu", 10521, 4),
     )

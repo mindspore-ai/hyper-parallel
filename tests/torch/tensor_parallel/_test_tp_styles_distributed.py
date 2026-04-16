@@ -14,12 +14,20 @@
 # ============================================================================
 """Distributed NPU worker tests for ``ColwiseParallel`` / ``RowwiseParallel``.
 
-Launched from ``test_tp_styles_distributed.py`` via ``parallel_run``.
+Launched from ``test_tp_styles_distributed.py`` via ``parallel_run`` in **three**
+launcher waves: eight scenarios on **2** ranks (two waves of four cases), plus
+**Colwise/Rowwise linear forward** again on **4** ranks for a wider TP mesh.
+
+Each worker test uses ``dist.get_world_size()`` for divisibility checks; tensor
+shapes are chosen so the same case passes for both 2- and 4-rank runs where a
+case is scheduled twice (linear forward only on 4 ranks).
+
 Each test instantiates the real ``ColwiseParallel`` / ``RowwiseParallel`` style
 from ``hyper_parallel.core.tensor_parallel.style``, shards a module through
 ``parallelize_module``, runs a forward (and optionally backward) pass on NPU,
 and compares results against a single-device CPU reference.
 """
+import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -260,8 +268,8 @@ def test_mlp_colwise_rowwise_forward_precision_npu():
     """
     Feature: ColwiseParallel + RowwiseParallel MLP composition matches CPU reference
     Description:
-        1. Two-layer MLP: w1 (in->hidden) colwise, w2 (hidden->out) rowwise
-        2. parallelize_module with plan {"w1": ColwiseParallel, "w2": RowwiseParallel}
+        1. Two-layer MLP: linear1 (in->hidden) colwise, linear2 (hidden->out) rowwise
+        2. parallelize_module with plan {"linear1": ColwiseParallel, "linear2": RowwiseParallel}
         3. Compare end-to-end output with CPU MLP reference
     Expectation: NPU MLP output close to CPU reference
     """
@@ -387,11 +395,8 @@ def test_colwise_unsupported_module_raises_npu():
     style = ColwiseParallel()
     module = nn.LayerNorm(8).npu()
 
-    try:
+    with pytest.raises(NotImplementedError):
         style.apply(module, mesh)
-        assert False, "Expected NotImplementedError for unsupported module type"
-    except NotImplementedError:
-        pass
 
 
 def test_rowwise_unsupported_module_raises_npu():
@@ -406,8 +411,5 @@ def test_rowwise_unsupported_module_raises_npu():
     style = RowwiseParallel()
     module = nn.LayerNorm(8).npu()
 
-    try:
+    with pytest.raises(NotImplementedError):
         style.apply(module, mesh)
-        assert False, "Expected NotImplementedError for unsupported module type"
-    except NotImplementedError:
-        pass

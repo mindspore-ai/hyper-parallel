@@ -248,7 +248,7 @@ class TestColwiseParallelPartition(unittest.TestCase):
             mock_dt.return_value = mock_dt_result
             mock_new.return_value = nn.Parameter(torch.empty(1))
 
-            style._partition_linear_fn("linear", module, mesh)
+            style._partition_linear_fn(module, mesh)
 
             for call in mock_dt.call_args_list:
                 self.assertEqual(call[0][2], [Shard(0)])
@@ -272,7 +272,7 @@ class TestColwiseParallelPartition(unittest.TestCase):
             mock_dt.return_value = MagicMock()
             mock_new.return_value = nn.Parameter(torch.empty(1))
 
-            style._partition_embedding_fn("embedding", module, mesh)
+            style._partition_embedding_fn(module, mesh)
 
             for call in mock_dt.call_args_list:
                 self.assertEqual(call[0][2], [Shard(1)])
@@ -290,7 +290,6 @@ class TestColwiseParallelIO(unittest.TestCase):
         input_layouts = (Replicate(),)
         desired_layouts = (Replicate(),)
         mesh = MagicMock()
-        mod = MagicMock()
         local_tensor = torch.randn(4, 8)
         inputs = (local_tensor,)
 
@@ -299,7 +298,7 @@ class TestColwiseParallelIO(unittest.TestCase):
             mock_from_local.return_value = mock_dtensor
 
             ColwiseParallel._prepare_input_fn(
-                input_layouts, desired_layouts, mod, inputs, mesh
+                input_layouts, desired_layouts, inputs, mesh
             )
             mock_from_local.assert_called_once_with(local_tensor, mesh, input_layouts)
 
@@ -312,13 +311,12 @@ class TestColwiseParallelIO(unittest.TestCase):
         input_layouts = (Replicate(),)
         desired_layouts = (Replicate(),)
         mesh = MagicMock()
-        mod = MagicMock()
         mock_dtensor = MagicMock(spec=DTensor)
         inputs = (mock_dtensor,)
 
         with patch.object(DTensor, "from_local") as mock_from_local:
             ColwiseParallel._prepare_input_fn(
-                input_layouts, desired_layouts, mod, inputs, mesh
+                input_layouts, desired_layouts, inputs, mesh
             )
             mock_from_local.assert_not_called()
 
@@ -331,13 +329,12 @@ class TestColwiseParallelIO(unittest.TestCase):
         input_layouts = (Shard(0),)
         desired_layouts = (Replicate(),)
         mesh = MagicMock()
-        mod = MagicMock()
         mock_dtensor = MagicMock(spec=DTensor)
         mock_from_local = MagicMock(return_value=mock_dtensor)
 
         with patch.object(DTensor, "from_local", mock_from_local):
             ColwiseParallel._prepare_input_fn(
-                input_layouts, desired_layouts, mod, (torch.randn(4, 8),), mesh
+                input_layouts, desired_layouts, (torch.randn(4, 8),), mesh
             )
             mock_dtensor.redistribute.assert_called_once_with(mesh, desired_layouts)
 
@@ -354,7 +351,7 @@ class TestColwiseParallelIO(unittest.TestCase):
         mesh = MagicMock()
 
         result = ColwiseParallel._prepare_output_fn(
-            output_layouts, True, MagicMock(), mock_outputs, mesh
+            output_layouts, True, mock_outputs, mesh
         )
         mock_outputs.to_local.assert_called_once()
         self.assertIsInstance(result, torch.Tensor)
@@ -371,7 +368,7 @@ class TestColwiseParallelIO(unittest.TestCase):
         mesh = MagicMock()
 
         result = ColwiseParallel._prepare_output_fn(
-            output_layouts, False, MagicMock(), mock_outputs, mesh
+            output_layouts, False, mock_outputs, mesh
         )
         mock_outputs.to_local.assert_not_called()
         self.assertIs(result, mock_outputs)
@@ -392,7 +389,7 @@ class TestColwiseParallelIO(unittest.TestCase):
         mesh = MagicMock()
 
         ColwiseParallel._prepare_output_fn(
-            output_layouts, True, MagicMock(), mock_outputs, mesh
+            output_layouts, True, mock_outputs, mesh
         )
         mock_outputs.redistribute.assert_called_once_with(mesh, output_layouts)
 
