@@ -17,8 +17,9 @@
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Tuple
 
 import numpy as np
 
@@ -29,7 +30,7 @@ import torch.distributed as dist
 import torch_npu  # pylint: disable=W0611
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
-from hyper_parallel.core.distributed_checkpoint import load, save
+from hyper_parallel.core.distributed_checkpoint import load, save, async_save
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_module, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
@@ -315,17 +316,35 @@ def _assert_sd_tensors_close(a, b, rtol=1e-5, atol=1e-5):
     assert a == b, f"mismatch {type(a)} {a!r} vs {type(b)} {b!r}"
 
 
-def test_dcp_with_optimizer_tp_dp():
-    """fully_shard + AdamW + DCP save/load + flatten_state_dict + bytes."""
+@dataclass
+class _DcpOptTpDpPrepared:
+    """State after pretrain DCP layout check and one train step, ready for checkpoint save."""
+
+    rank: int
+    world: int
+    root_mesh: Any
+    model: FullyShardTestNet
+    optimizer: torch.optim.AdamW
+    x: torch.Tensor
+    tp_reduce_size: int
+    save_state: dict
+    path_name: str
+    unsharded_ckpt_path: Path
+    sharded_pretrain_ckpt_path: Path
+    shared_betas: Tuple[float, float]
+    shared_wd: float
+
+
+def _prepare_dcp_optimizer_tp_dp_save_state(*, run_name: str) -> _DcpOptTpDpPrepared:
+    """Init dist, pretrain DCP verify, one train step; return ``save_state`` for sync/async save tests."""
     init_dist()
     world = dist.get_world_size()
     rank = dist.get_rank()
     assert world == 4, f"test_dcp_with_fully_shard_optimizer requires world_size=4, but got {world}"
 
-    path_name = "dcp_with_fully_shard_optimizer"
-    checkpoint_path = Path(path_name)
-    unsharded_ckpt_path = Path("dcp_with_fully_shard_optimizer_unsharded.pt")
-    sharded_pretrain_ckpt_path = Path("dcp_with_fully_shard_optimizer_pretrain_dcp")
+    path_name = run_name
+    unsharded_ckpt_path = Path(f"{run_name}_unsharded.pt")
+    sharded_pretrain_ckpt_path = Path(f"{run_name}_pretrain_dcp")
 
     if rank == 0:
         os.makedirs(path_name, exist_ok=True)
@@ -382,6 +401,39 @@ def test_dcp_with_optimizer_tp_dp():
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
     }
+    return _DcpOptTpDpPrepared(
+        rank=rank,
+        world=world,
+        root_mesh=root_mesh,
+        model=model,
+        optimizer=optimizer,
+        x=x,
+        tp_reduce_size=tp_reduce_size,
+        save_state=save_state,
+        path_name=path_name,
+        unsharded_ckpt_path=unsharded_ckpt_path,
+        sharded_pretrain_ckpt_path=sharded_pretrain_ckpt_path,
+        shared_betas=shared_betas,
+        shared_wd=shared_wd,
+    )
+
+
+def test_dcp_with_optimizer_tp_dp():
+    """fully_shard + AdamW + DCP save/load + flatten_state_dict + bytes."""
+    p = _prepare_dcp_optimizer_tp_dp_save_state(run_name="dcp_with_fully_shard_optimizer")
+    rank = p.rank
+    world = p.world
+    model = p.model
+    optimizer = p.optimizer
+    x = p.x
+    tp_reduce_size = p.tp_reduce_size
+    save_state = p.save_state
+    path_name = p.path_name
+    checkpoint_path = Path(path_name)
+    unsharded_ckpt_path = p.unsharded_ckpt_path
+    sharded_pretrain_ckpt_path = p.sharded_pretrain_ckpt_path
+    shared_betas = p.shared_betas
+    shared_wd = p.shared_wd
 
     save(save_state, checkpoint_id=checkpoint_path, use_collectives=True)
     dist.barrier()
@@ -432,3 +484,56 @@ def test_dcp_with_optimizer_tp_dp():
         assert np.isclose(loss_m, loss_m2, rtol=0.0, atol=1e-4), (
             f"loss mismatch after load (paired train step): {loss_m} vs {loss_m2}"
         )
+
+
+def test_dcp_async_save_with_optimizer_tp_dp():
+    """fully_shard + AdamW + DCP ``async_save`` + ``load`` (optimizer + model), TP/DP layout."""
+    p = _prepare_dcp_optimizer_tp_dp_save_state(run_name="dcp_async_save_optimizer_tp_dp")
+    rank = p.rank
+    world = p.world
+    x = p.x
+    tp_reduce_size = p.tp_reduce_size
+    save_state = p.save_state
+    path_name = p.path_name
+    unsharded_ckpt_path = p.unsharded_ckpt_path
+    sharded_pretrain_ckpt_path = p.sharded_pretrain_ckpt_path
+    shared_betas = p.shared_betas
+    shared_wd = p.shared_wd
+
+    checkpoint_path_async = Path(f"{path_name}_async")
+    if rank == 0:
+        os.makedirs(str(checkpoint_path_async), exist_ok=True)
+    dist.barrier()
+    async_resp = async_save(save_state, checkpoint_id=checkpoint_path_async, use_collectives=False)
+    async_resp.persist_completion.result()
+    dist.barrier()
+
+    wrong_lr_g0, wrong_lr_g1 = 5e-2, 8e-2
+    wrong_eps = 1e-2
+    model2, optimizer2 = _build_model_and_adamw(
+        world,
+        lr_g0=wrong_lr_g0,
+        lr_g1=wrong_lr_g1,
+        eps=wrong_eps,
+        betas=shared_betas,
+        weight_decay=shared_wd,
+    )
+
+    steps_load_wrong = 2
+    _train_step(model2, x, optimizer2, steps_load_wrong, tp_reduce_size=tp_reduce_size)
+
+    load_state_async = {
+        "model": model2.state_dict(),
+        "optimizer": optimizer2.state_dict(),
+    }
+    load(load_state_async, checkpoint_id=checkpoint_path_async, use_collectives=True)
+    dist.barrier()
+    _assert_sd_tensors_close(save_state["model"], load_state_async["model"])
+    _assert_sd_tensors_close(save_state["optimizer"], load_state_async["optimizer"])
+
+    dist.barrier()
+    if rank == 0:
+        shutil.rmtree(checkpoint_path_async)
+        shutil.rmtree(Path(path_name))
+        shutil.rmtree(sharded_pretrain_ckpt_path)
+        unsharded_ckpt_path.unlink(missing_ok=True)

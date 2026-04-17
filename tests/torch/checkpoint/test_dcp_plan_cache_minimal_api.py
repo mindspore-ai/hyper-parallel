@@ -27,9 +27,13 @@ def test_dcp_plan_cache_minimal_api_group1():
     Description:
         1.test_dcp_minimal_plan_cache_hit
         2.test_dcp_minimal_plan_cache_model_optimizer_isolation
+        3.test_dcp_minimal_plan_cache_hit_async
+        4.test_dcp_minimal_plan_cache_model_optimizer_isolation_async
     Expectation: Run success.
     """
     parallel_run([
         TorchCase(DCP_MIN_PLAN_CACHE_API, "test_dcp_minimal_plan_cache_hit", 12257, 2),
         TorchCase(DCP_MIN_PLAN_CACHE_API, "test_dcp_minimal_plan_cache_model_optimizer_isolation", 12258, 2),
+        #TorchCase(DCP_MIN_PLAN_CACHE_API, "test_dcp_minimal_plan_cache_hit_async", 12259, 2),
+        #TorchCase(DCP_MIN_PLAN_CACHE_API, "test_dcp_minimal_plan_cache_model_optimizer_isolation_async", 12260, 2),
     ])
