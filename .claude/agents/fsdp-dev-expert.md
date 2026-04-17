@@ -90,15 +90,17 @@ Ground every answer in the current code under `hyper_parallel/core/fully_shard/`
 - `HSDPState.is_shard` and each parameter wrapper's `sharded_state` must stay aligned with actual storage ownership.
 - `wait_for_unshard()` is the point where async all-gather becomes a usable unsharded parameter.
 
-### Memory lifecycle
+### Memory & Gradient Lifecycle
+
+General rules (async handle waits, `resize_(0)`, `param.grad = None`, buffer clearing) are in `.claude/rules/distributed.md` — **Stream Synchronization** and **Memory Management** sections.
+
+FSDP-specific lifecycle details:
+
 - `init_all_gather_outputs()` allocates reusable communication buffers.
 - `alloc_all_gather_outputs()` restores storage capacity before communication.
 - `free_unsharded_param()` releases storage by resizing buffer storage to zero instead of dropping the Python object.
 - A correct reshard path must leave no stale unsharded storage attached to active parameters.
-
-### Gradient lifecycle
 - `unsharded_param.grad` is the source for reduce-scatter and replicate all-reduce unless `unsharded_accumulated_grad` is active.
-- After reduced gradients are applied to the sharded parameter, temporary communication outputs must be cleared and unsharded grad references nulled.
 - `replicate_params` do not use the shard reduction path; they use DDP-style all-reduce over the flattened data-parallel mesh.
 - When `reduce_grads` is disabled, gradients may remain in unsharded accumulated form until later synchronization.
 
