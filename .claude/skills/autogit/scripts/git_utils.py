@@ -250,10 +250,7 @@ def update_copyright_years(filepaths: List[str]) -> List[str]:
             if current_year in (end_year, start_year):
                 break
 
-            if end_year:
-                new_text = f"{m.group(1)}{start_year}-{current_year}{m.group(4)}"
-            else:
-                new_text = f"{m.group(1)}{start_year}-{current_year}{m.group(4)}"
+            new_text = f"{m.group(1)}{start_year}-{current_year}{m.group(4)}"
 
             lines[i] = lines[i][:m.start()] + new_text + lines[i][m.end():]
             changed = True
