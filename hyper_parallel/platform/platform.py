@@ -618,6 +618,68 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement differentiable_async_a2a_wait")
 
     @staticmethod
+    def differentiable_all_to_all_single(input_tensor, input_splits, output_splits, group):
+        """Variable-split all-to-all single that supports gradient flow.
+
+        Unlike ``all_to_all_single`` (which is not differentiable), this method
+        wraps the collective in an autograd function so gradients are correctly
+        routed back through the reverse all-to-all in the backward pass.
+        Intended for Expert Parallelism token dispatch / combine.
+
+        Args:
+            input_tensor: Input tensor to scatter. Shape ``[sum(input_splits), *feature_dims]``.
+            input_splits: Per-rank sizes of data sent from this rank (list of ints,
+                          length equal to ep_degree).
+            output_splits: Per-rank sizes of data received by this rank (list of ints,
+                           length equal to ep_degree).
+            group: Process group (ProcessGroup for torch, group name str for mindspore).
+
+        Returns:
+            Output tensor of shape ``[sum(output_splits), *feature_dims]``.
+
+        Raises:
+            NotImplementedError: Must be implemented by platform subclasses.
+        """
+        raise NotImplementedError("Platform subclasses must implement differentiable_all_to_all_single")
+
+    @staticmethod
+    def arange(start, end=None, step=1, dtype=None, device=None):
+        """Create a 1-D tensor with evenly spaced values.
+
+        Args:
+            start: Start of interval (inclusive).  If *end* is ``None``,
+                treated as the stop value and *start* defaults to 0.
+            end: End of interval (exclusive).  Defaults to ``None``.
+            step: Step size.  Defaults to ``1``.
+            dtype: Data type.  ``None`` uses the framework default (int64).
+            device: Target device.
+
+        Returns:
+            1-D tensor ``[start, start+step, ..., end)``.
+
+        Raises:
+            NotImplementedError: Must be implemented by platform subclasses.
+        """
+        raise NotImplementedError("Platform subclasses must implement arange")
+
+    @staticmethod
+    def zeros(size, dtype=None, device=None):
+        """Create a zero-filled tensor of the given shape.
+
+        Args:
+            size: Shape of the tensor (a single tuple/list).
+            dtype: Desired data type.  ``None`` uses the framework default (float32).
+            device: Target device.  ``None`` uses the framework default.
+
+        Returns:
+            Zero-filled tensor of the specified shape.
+
+        Raises:
+            NotImplementedError: Must be implemented by platform subclasses.
+        """
+        raise NotImplementedError("Platform subclasses must implement zeros")
+
+    @staticmethod
     def parameters_dict(cell):
         """Get the parameters dictionary of a cell/module.
 

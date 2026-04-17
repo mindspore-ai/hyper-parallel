@@ -125,3 +125,6 @@
 "hyper-parallel/hyper_parallel/core/tensor_parallel/style.py"           "missing-public-docstring"
 "hyper-parallel/hyper_parallel/core/tensor_parallel/style.py"           "missing-public-type-hints"
 "hyper-parallel/hyper_parallel/core/tensor_parallel/style.py"           "unused-argument"
+
+# 15. Expert Parallel tests — torch and torch_npu imports are conditionally used in distributed tests
+"hyper-parallel/tests/torch/expert_parallel/"                           "unused-import"

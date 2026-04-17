@@ -282,18 +282,19 @@ class TorchPlatform(Platform):
         return torch.ones(size, dtype=dtype)
 
     @staticmethod
-    def zeros(size, dtype=None):
+    def zeros(size, dtype=None, device=None):
         """
         Create a tensor filled with zeros.
 
         Args:
             size (tuple): The shape of the output tensor.
             dtype (Optional[torch.dtype]): The desired data type.
+            device (Optional[torch.device]): The device to create the tensor on.
 
         Returns:
             Tensor: A tensor filled with zeros.
         """
-        return torch.zeros(size, dtype=dtype)
+        return torch.zeros(size, dtype=dtype, device=device)
 
     @staticmethod
     def full(size, fill_value, dtype=None):
@@ -695,6 +696,29 @@ class TorchPlatform(Platform):
         output = torch.empty(output_shape, device=input_tensor.device, dtype=input_tensor.dtype)
         work = dist.all_to_all_single(output, input_tensor, group=group, async_op=async_op)
         return output, work
+
+    @staticmethod
+    def differentiable_all_to_all_single(input_tensor, input_splits, output_splits, group):
+        """Variable-split all-to-all with autograd support for EP token dispatch/combine."""
+        out_total = sum(output_splits)
+        output = torch.empty(
+            out_total, *input_tensor.shape[1:],
+            dtype=input_tensor.dtype, device=input_tensor.device,
+        )
+        output = dist_func.all_to_all_single(
+            output, input_tensor,
+            output_split_sizes=output_splits,
+            input_split_sizes=input_splits,
+            group=group,
+        )
+        return output
+
+    @staticmethod
+    def arange(start, end=None, step=1, dtype=None, device=None):
+        """Create a 1-D tensor with evenly spaced values."""
+        if end is None:
+            return torch.arange(start, dtype=dtype, device=device)
+        return torch.arange(start, end, step, dtype=dtype, device=device)
 
     @staticmethod
     def differentiable_async_a2a_wait(x, work, out_perm, group, world_size, concat_dim, split_dim,

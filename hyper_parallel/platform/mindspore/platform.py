@@ -257,18 +257,22 @@ class MindSporePlatform(Platform):
         return mint.ones(size, dtype=dtype)
 
     @staticmethod
-    def zeros(size, dtype=None):
+    def zeros(size, dtype=None, device=None):
         """
         Create a tensor filled with zeros.
 
         Args:
             size (tuple): The shape of the output tensor.
             dtype (Optional[ms.Type]): The desired data type.
+            device (Optional[ms.device]): The device to create the tensor on.
 
         Returns:
             Tensor: A tensor filled with zeros.
         """
-        return mint.zeros(size, dtype=dtype)
+        tensor = mint.zeros(size, dtype=dtype)
+        if device in ("GPU", "Ascend"):
+            return tensor.to(device)
+        return tensor
 
     @staticmethod
     def full(size, fill_value, dtype=None):
