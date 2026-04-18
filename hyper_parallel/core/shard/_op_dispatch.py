@@ -1014,6 +1014,11 @@ class OpDispatcher:
         if op_name in self._random_ops or op_name in self._random_ms_ops:
             return self._dispatch_random_op(op_name, op_call, args, kwargs)
 
+        # Auto-register ops that were registered programmatically via DistributedOp
+        # (e.g. through DFunction) without a corresponding YAML entry.
+        if op_name not in self.layout_infer_ops and get_distributed_op(op_name) is not None:
+            self.layout_infer_ops[op_name] = {}
+
         return self._dispatch_layout_infer(op_name, op_call, args, kwargs)
 
 _OP_DISPATCHER = OpDispatcher()

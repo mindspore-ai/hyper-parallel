@@ -140,6 +140,7 @@ class MindSporePlatform(Platform):
     platform_type = PlatformType.MINDSPORE
     tensor_dtype = mstype
     dtype = ms.Type
+    Function = _Function
 
     def __init__(self):
         # Ensure MindSpore ``nn.Cell.to_empty`` is patched as soon as the

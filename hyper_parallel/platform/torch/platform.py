@@ -169,6 +169,7 @@ class TorchPlatform(Platform):
     platform_type = PlatformType.PYTORCH
     tensor_dtype = torch
     dtype = torch.dtype
+    Function = torch.autograd.Function
 
     @staticmethod
     def is_linear_module(module) -> bool:
