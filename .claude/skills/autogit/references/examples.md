@@ -51,7 +51,7 @@ Day 3:  squash #205                             (1 commit, ready to merge)
 
 ## Scenario 2: Hotfix on Production Bug
 
-> Goal: Fix a critical bug quickly, skip lint in emergency, create PR immediately.
+> Goal: Fix a critical bug quickly, create PR immediately.
 
 ```bash
 # 1. Branch from latest master
@@ -59,10 +59,10 @@ git checkout master
 git pull upstream master
 git checkout -b fix/tensor-shape-crash
 
-# 2. Fix the bug — skip lint for speed (emergency only!)
-/autogit commit -m "fix: handle empty tensor shape in reshape op" --no-check
+# 2. Fix the bug (lint runs via pre-commit hook automatically)
+/autogit commit -m "fix: handle empty tensor shape in reshape op"
 
-# 3. Create PR immediately
+# 3. Create PR immediately (UT/ST defaults: changed/skip; user accepts via prompt)
 /autogit pr --base master --reviewer zhangsan
 
 # 4. After PR is merged, run lint retroactively
@@ -192,3 +192,97 @@ Need to append to PR?
 #   审核人: lisi, wangwu
 #   🔗 https://gitcode.com/org/repo/pull/160
 ```
+
+---
+
+## Scenario 8: AI Agent — End-to-end commit → PR with tri-state UT/ST
+
+> Goal: Show the full chat-driven flow when Claude Code (or any agent)
+> drives `autogit` from "implement a feature" to "PR open and described".
+> Demonstrates: per-step UT/ST prompts, content previews, non-tty errors as
+> teaching messages.
+
+```text
+USER: 我新加了 core/foo.py + tests/torch/ut/test_foo.py，帮我提交并开 PR
+
+AGENT: I'll commit then open the PR. First the commit.
+       Generating commit message from `git diff --cached` …
+
+       ┌────────────────── Proposed commit message ──────────────────┐
+       │ feat(core): add foo distributed op                          │
+       │                                                              │
+       │ Adds Foo op covering case X; UT in tests/torch/ut/test_foo  │
+       └──────────────────────────────────────────────────────────────┘
+       OK / edit / cancel?
+
+USER: OK
+
+AGENT: $ autogit commit -m "feat(core): add foo distributed op …"
+       [WARN] pre-commit hook not installed — this commit will skip lint.
+              Install: bash scripts/pre-commit/install.sh
+       Created commit a1b2c3d4
+       Pushed to origin/feat/foo
+
+       Now opening PR. Running gates one at a time.
+
+       UT? c=changed (本 PR 涉及的 UT 测试) / f=full (全量 tests/ut) / n=skip
+           default c
+
+USER: c
+
+AGENT: ST? c=changed / f=full / n=skip — default n (需多卡环境)
+
+USER: n
+
+AGENT: $ autogit pr --analyze-only --ut skip --st skip   # for content gen
+       [analysis JSON returned]
+
+       Generating PR title + body from diff + .gitcode template …
+
+       ┌─────────────────────── PR title ────────────────────────────┐
+       │ feat(core): 新增 Foo 分布式算子（覆盖场景 X）               │
+       └──────────────────────────────────────────────────────────────┘
+
+       ┌─────────────────────── PR body (excerpt) ───────────────────┐
+       │ /kind feature                                                │
+       │                                                              │
+       │ **What does this PR do**                                     │
+       │ 新增 Foo 算子 …                                              │
+       │ ...                                                          │
+       └──────────────────────────────────────────────────────────────┘
+       OK / edit / cancel?
+
+USER: OK
+
+AGENT: $ autogit pr --ut changed --st skip \
+            --title "..." --body "..."
+       Updating remote info...
+       UT gate (changed, 1 files):
+         tests/torch/ut/test_foo.py
+       ........  [100%]
+       1 passed in 4.12s
+       UT gate passed.
+       Submitting 1 commits to org/hyper-parallel
+       Creating PR...
+       PR created successfully!
+          https://gitcode.com/org/hyper-parallel/pull/567
+```
+
+**Key things this scenario shows:**
+
+- AI **never** passes `-m / --title / --body` without first showing the user.
+- AI asks **one gate at a time** (UT then ST), not a single bundled menu.
+- `--ut changed` runs only the test files in the PR diff (here 1 file),
+  not the whole `tests/ut` suite.
+- ST default is `skip` because most envs are single-card; user can opt up to
+  `c` or `f` when running on 8-card.
+- The pre-commit hook warning is non-blocking — the commit still goes
+  through, the user is told how to install the hook.
+
+**What the AI must NOT do:**
+
+- Self-generate a commit message and pass `-m "..."` without preview.
+- Catch the non-tty `AutoGitError` listing UT/ST flags and silently retry
+  with `--ut skip --st skip`.
+- Chain `commit` → `pr` in one turn without surfacing both the commit
+  message and the PR title/body in chat.

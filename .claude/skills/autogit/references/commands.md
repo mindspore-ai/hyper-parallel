@@ -4,36 +4,32 @@ Complete parameter docs, execution flows, and setup instructions.
 
 ---
 
-## 1. commit — Stage, Check, Commit, Push
+## 1. commit — Stage, Preview Message, Commit, Push
 
 ```bash
-autogit commit                      # auto-generate commit message (with lint checks)
-autogit commit -m "feat: new thing" # specify commit message
-autogit commit --no-check           # skip lint checks (emergency only)
+autogit commit                      # generate + preview commit message, then commit
+autogit commit -m "feat: new thing" # specify commit message (skips preview)
 ```
 
 ### Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `-m`, `--message` | Commit message | Auto-generated from file names |
-| `--no-check` | Skip pre-commit lint checks | Off (checks run) |
+| `-m`, `--message` | Commit message | Auto-generated; previewed on tty, required on non-tty |
 
 ### Execution Flow
 
 ```text
-Load `.claude/rules/code-style.md` → Check for changes → git add -A
-  → code-style auto-fix/check → commit-stage lint checks
-  → git commit → git push origin <branch>
+Check for changes → stage (filter cosmetic-only edits) → warn if pre-commit
+  hook missing → preview commit message (tty) / require -m (non-tty)
+  → git commit (pre-commit hook auto-runs lint) → git push origin <branch>
 ```
 
-### Lint Checks
+### Lint Ownership
 
-- Runs the `code-style.md` guard first and auto-fixes mechanical issues before continuing.
-- Runs commit-stage lint checks before commit.
-- Fails: unstages all changes, prompts for fix.
-- Use `--no-check` to skip all checks (emergency only).
-- Project-level `filter_pylint.txt` supported for known-issue filtering.
+- Lint (pylint + markdownlint) is owned by the project's **pre-commit git hook**, installed via `bash scripts/pre-commit/install.sh`. The hook fires on every `git commit` automatically — autogit does not duplicate it.
+- If the hook is not installed, `autogit commit` prints a one-line install reminder and continues (non-blocking).
+- For an explicit no-commit precheck, use `autogit check` (see §2).
 
 ### Commit Message Convention
 
@@ -98,7 +94,8 @@ autogit pr                        # create PR (keep multiple commits)
 autogit pr --squash               # create PR (squash into 1 commit)
 autogit pr --base develop         # target branch
 autogit pr --reviewer zhangsan    # assign reviewer
-autogit pr --no-test              # skip pytest gate before PR
+autogit pr --ut skip --st skip    # skip both gates (only if user opted in)
+autogit pr --ut full              # run full UT suite instead of changed-scope
 ```
 
 ### Parameters
@@ -108,7 +105,8 @@ autogit pr --no-test              # skip pytest gate before PR
 | `--base <branch>` | PR target branch | upstream default branch (master) |
 | `--reviewer <users>` | Reviewers (comma-separated) | None |
 | `--squash` | Squash all commits into one | Off |
-| `--no-test` | Skip `autogit test` before PR flow | Off (test runs) |
+| `--ut {skip,changed,full}` | UT gate: skip / changed (PR-diff scope) / full | Ask on tty (Enter→`changed`); error on non-tty |
+| `--st {skip,changed,full}` | ST gate: skip / changed (PR-diff scope) / full | Ask on tty (Enter→`skip`); error on non-tty |
 
 ### Smart Branch Strategy
 
@@ -120,15 +118,17 @@ autogit pr --no-test              # skip pytest gate before PR
 ### Execution Flow
 
 ```text
-1. Run `autogit test` by default
-2. Check env (token, remotes, uncommitted changes)
-   ⚠️ Refuse if uncommitted changes exist — commit first
-3. Determine branch type
+1. Check env (token, remotes, uncommitted changes)
+   ⚠ Refuse if uncommitted changes exist — commit first
+2. Resolve UT/ST gates (ask one-at-a-time on tty; error on non-tty if undecided)
+3. Run UT gate (changed: only PR-diff test files; full: tests/ut)
+4. Run ST gate when scope != skip (changed: PR-diff ST files; full: tests/{torch,mindspore}/st)
+5. Determine branch type
    • feature branch → use directly
    • master/main → create new branch + cherry-pick
-4. Push to origin (prompt on conflict, never force)
-5. Analyze diff, auto-generate PR description
-6. Call API to create PR, output URL
+6. Push to origin (prompt on conflict, never force)
+7. Analyze diff, preview/accept PR title+body
+8. Call API to create PR, output URL
 ```
 
 ### Auto-generated PR Description
@@ -148,7 +148,7 @@ autogit pr --no-test              # skip pytest gate before PR
 autogit pr --to #160              # append new commit (default: rebase first)
 autogit pr --to #160 --amend     # amend into last commit
 autogit pr --to #160 --no-rebase # skip rebase, append directly
-autogit pr --to #160 --no-test   # skip pytest gate before append
+autogit pr --to #160 --ut skip   # skip UT gate (only if user opted in)
 ```
 
 ### Parameters
@@ -158,7 +158,7 @@ autogit pr --to #160 --no-test   # skip pytest gate before append
 | `--to <#N>` | PR number to append to | Required |
 | `--amend` | Merge into last commit instead of new | Off |
 | `--no-rebase` | Skip rebase before appending | Off (rebase on) |
-| `--no-test` | Skip `autogit test` before append flow | Off (test runs) |
+| `--ut {skip,changed,full}` | UT gate: changed scope reads working-tree (staged + unstaged); ST is not asked for append | Ask on tty (Enter→`changed`); error on non-tty |
 | `-m`, `--message` | Commit message for new commit | Auto-generated |
 
 ### Three Modes Compared

@@ -11,6 +11,7 @@ Use these rules as the default coding style and convention set for HyperParallel
 ## File And Formatting Rules
 
 - All `.py` files must start with the Apache 2.0 license header at lines 1-16.
+- **Copyright year**: for a **new file**, write `Copyright <current_year>` (the calendar year at creation — read the date from the environment). For an **existing file** whose header year differs from the current year, the header becomes `Copyright <existing_year>-<current_year>` (e.g. `2025-2026`). `autogit` extends this range automatically on commit; do not hand-edit to a past year on a new file.
 - Keep Python lines to about 120 characters, following PEP 8 where practical.
 - Keep C++ lines to 120 characters, following the project `.clang-format` and Google style expectations.
 - Keep module-level function and class definitions separated by two blank lines.
@@ -157,6 +158,14 @@ import torch.distributed as dist
 
 result = dist.all_reduce(tensor)
 ```
+
+## Fix Over Evade (pylint / UT / ST)
+
+When a check fails (pylint finding, UT failure, ST failure), **default to a positive fix**. Before reaching for a suppression, a skip, or an environment workaround:
+
+1. Search the repo for similar code / tests / ops and see how the same situation is handled there — follow the established pattern rather than inventing a new one.
+2. Fix the root cause (refactor the code, install the correct backend version, correct the test expectation).
+3. Only evade when evasion is genuinely the only path (e.g. an inline `# pylint: disable=C0415` on a backend lazy import is the precedent-established pattern; a test needs a real hardware gate like multi-card NPU). In that case **say so explicitly** in the PR description — do not silently disable, `try/except`, `@skipif`, or swap environment variables.
 
 ## Commit Convention
 

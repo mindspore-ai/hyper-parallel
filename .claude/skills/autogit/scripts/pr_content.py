@@ -15,6 +15,7 @@
 # ============================================================================
 """PR title and body generation from diff analysis for AutoGit."""
 
+import os
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -23,6 +24,90 @@ import yaml
 from models import COMMIT_TYPE_LABELS, CONVENTIONAL_RE, DiffAnalysis, FileChanges
 from git_utils import run_git
 from diff_analysis import analyze_diff
+
+
+# ============================================================================
+# PR template loading
+# ============================================================================
+
+# Relative path to the PR template inside the repo
+_PR_TEMPLATE_REL = os.path.join(".gitcode", "PULL_REQUEST_TEMPLATE.zh-CN.md")
+
+
+def _get_repo_root() -> str:
+    """Return the git repo root directory."""
+    return run_git("rev-parse", "--show-toplevel").stdout.strip()
+
+
+def _load_pr_template() -> Optional[str]:
+    """Load the PR template from the repo's .gitcode directory.
+
+    Returns:
+        Template content string, or None if not found.
+    """
+    template_path = os.path.join(_get_repo_root(), _PR_TEMPLATE_REL)
+    if os.path.isfile(template_path):
+        with open(template_path, encoding="utf-8") as f:
+            return f.read()
+    return None
+
+
+def _parse_template_sections(template: str) -> List[Dict[str, str]]:
+    """Parse the PR template into ordered sections.
+
+    Each section is a dict with 'header' (the bold title line) and
+    'body' (everything between this header's ``---`` and the next).
+
+    Args:
+        template: Raw template markdown.
+
+    Returns:
+        List of section dicts with 'header' and 'body' keys.
+    """
+    # Strip leading HTML comments (contributor tips)
+    cleaned = re.sub(r"<!--.*?-->", "", template, flags=re.DOTALL).strip()
+    # Split by horizontal rules
+    blocks = re.split(r"\n---\n", cleaned)
+
+    sections: List[Dict[str, str]] = []
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.split("\n", 1)
+        header = lines[0].strip()
+        body = lines[1].strip() if len(lines) > 1 else ""
+        sections.append({"header": header, "body": body})
+    return sections
+
+
+def _fill_template(template: str, fill: Dict[str, str]) -> str:
+    """Fill a PR template with generated content per section.
+
+    Sections are identified by their bold header text.  The ``fill``
+    dict maps a header *substring* to the replacement body.  Sections
+    not present in ``fill`` are kept unchanged (e.g. Self-checklist).
+
+    Args:
+        template: Raw template markdown.
+        fill: Mapping of header-substring → replacement body.
+
+    Returns:
+        Filled template string.
+    """
+    sections = _parse_template_sections(template)
+    parts: List[str] = []
+    for sec in sections:
+        header = sec["header"]
+        # Find matching fill key
+        matched_body: Optional[str] = None
+        for key, value in fill.items():
+            if key in header:
+                matched_body = value
+                break
+        body = matched_body if matched_body is not None else sec["body"]
+        parts.append(f"{header}\n{body}" if body else header)
+    return "\n\n---\n\n".join(parts) + "\n"
 
 
 # ============================================================================
@@ -551,20 +636,6 @@ def _classify_file_bucket(filepath: str) -> str:
     return "other"
 
 
-def _group_files_by_bucket(files: List[str]) -> Dict[str, List[str]]:
-    """Group changed files by high-level bucket."""
-    grouped: Dict[str, List[str]] = {
-        "production": [],
-        "tests": [],
-        "docs": [],
-        "examples": [],
-        "other": [],
-    }
-    for filepath in files:
-        grouped[_classify_file_bucket(filepath)].append(filepath)
-    return grouped
-
-
 def _classify_file_module(filepath: str) -> str:
     """Classify a file into a functional module based on its path.
 
@@ -741,6 +812,60 @@ def _build_semantic_summary(  # pylint: disable=W0613
 # PR section builders
 # ============================================================================
 
+# Mapping from conventional commit types to /kind labels used by the
+# GitCode PR template.
+_COMMIT_TYPE_TO_KIND: Dict[str, str] = {
+    'feat': 'feature',
+    'feature': 'feature',
+    'fix': 'bug',
+    'bugfix': 'bug',
+    'refactor': 'refactor',
+    'perf': 'refactor',
+    'docs': 'task',
+    'test': 'task',
+    'chore': 'task',
+    'ci': 'task',
+    'style': 'clean_code',
+    'cleanup': 'clean_code',
+}
+
+
+def _infer_kind_label(commit_data: List[Dict[str, str]],
+                      analysis: DiffAnalysis) -> str:
+    """Infer the /kind label from commit types and diff analysis.
+
+    Args:
+        commit_data: Parsed conventional commit dicts.
+        analysis: DiffAnalysis result.
+
+    Returns:
+        One of: bug, task, feature, refactor, clean_code.
+    """
+    type_counts: Dict[str, int] = {}
+    for cd in commit_data:
+        ctype = cd.get('type', '').lower()
+        kind = _COMMIT_TYPE_TO_KIND.get(ctype)
+        if kind:
+            type_counts[kind] = type_counts.get(kind, 0) + 1
+
+    if type_counts:
+        return max(type_counts, key=lambda k: type_counts[k])
+
+    # Fallback: infer from file patterns
+    has_test_only = bool(analysis.files) and all(
+        'test' in f.lower() for f in analysis.files
+    )
+    has_new_files = bool(analysis.new_files)
+
+    if has_test_only:
+        return 'task'
+    if has_new_files and analysis.additions > analysis.deletions * 2:
+        return 'feature'
+    if analysis.deletions > analysis.additions:
+        return 'refactor'
+    return 'task'
+
+
 def _build_reason_section(analysis: DiffAnalysis,
                           feature_domain: str,
                           feature_points: List[str]) -> str:
@@ -868,7 +993,7 @@ def _collect_related_issues(commits: List[str]) -> str:
     for sha in commits:
         msg = run_git("log", "-1", "--pretty=format:%s%n%b", sha).stdout
         all_issues.update(re.findall(r"#\d+", msg))
-    return ", ".join(sorted(all_issues)) if all_issues else "N/A"
+    return ", ".join(sorted(all_issues)) if all_issues else ""
 
 
 def _build_architecture_overview(analysis: DiffAnalysis) -> List[str]:
@@ -1125,160 +1250,6 @@ def _normalize_title_with_type(title: str,
     return f"{title_type}: {title}"
 
 
-def _infer_production_change_points(analysis: DiffAnalysis) -> List[str]:
-    """Infer concise production-facing change points from changed core files."""
-    files = {
-        filepath for filepath in analysis.files
-        if _classify_file_bucket(filepath) == "production"
-    }
-    points: List[str] = []
-
-    if "hyper_parallel/core/fully_shard/api.py" in files:
-        points.append("在 MindSpore 后端调用 `fully_shard()` 时自动启用 backward compatibility 路径。")
-    if "hyper_parallel/platform/mindspore/autograd_compat.py" in files:
-        points.append("补充 MindSpore backward compatibility 实现，使训练路径切换为 `loss.backward()` 风格。")
-    if "hyper_parallel/platform/mindspore/fully_shard/param.py" in files:
-        points.append("调整 fully_shard 参数生命周期，在模块上真实重绑定 `sharded_param` 与 `_unsharded_param`。")
-    if "hyper_parallel/platform/mindspore/fully_shard/scheduler.py" in files:
-        points.append("调整 backward pre-hook / final callback 的时序，使其与当前 backward 路径保持一致。")
-    if "hyper_parallel/platform/mindspore/fully_shard/state.py" in files:
-        points.append("同步整理 post-backward 的梯度归约与落盘流程。")
-
-    return points
-
-
-def _build_background_section(
-    grouped_files: Dict[str, List[str]], feature_domain: str,
-    feature_points: List[str],
-) -> str:
-    """Build a concise background section based on file buckets and feature info."""
-    if grouped_files["production"]:
-        if feature_points:
-            return (
-                f"本 PR 围绕{_sanitize_framework_refs(feature_domain or '核心功能调整')}展开，"
-                f"主要解决：{_sanitize_framework_refs(feature_points[0])}。"
-            )
-        return (
-            f"本 PR 对核心实现进行了调整"
-            f"（{_sanitize_framework_refs(feature_domain or '功能优化')}），"
-            "并同步更新相关说明与内部验证覆盖。"
-        )
-    if grouped_files["docs"]:
-        return "本 PR 主要用于同步文档与开发说明。"
-    if grouped_files["tests"]:
-        return "本 PR 主要用于刷新内部验证覆盖。"
-    return f"本 PR 主要围绕{_sanitize_framework_refs(feature_domain or '代码调整')}展开。"
-
-
-def _append_fallback_points(
-    parts: List[str], feature_points: List[str], analysis: DiffAnalysis,
-) -> None:
-    """Append fallback change points when no hardcoded production_points match.
-
-    Tries feature_points first; if insufficient, supplements with structural
-    info (modified/added funcs and classes) from the diff analysis.
-
-    Args:
-        parts: Output list to append bullet lines to.
-        feature_points: Feature points from commit messages and docstrings.
-        analysis: DiffAnalysis result.
-    """
-    shown = 0
-    for point in feature_points[1:7]:
-        cleaned = _sanitize_framework_refs(point)
-        if cleaned and "test_" not in cleaned and "Test" not in cleaned:
-            parts.append(f"- {cleaned}")
-            shown += 1
-    if shown >= 2:
-        return
-    if analysis.modified_funcs:
-        names = ', '.join(f'`{f}()`' for f in analysis.modified_funcs[:6])
-        parts.append(f"- 修改方法: {names}")
-    if analysis.modified_classes:
-        names = ', '.join(f'`{c}`' for c in analysis.modified_classes[:4])
-        parts.append(f"- 修改类: {names}")
-    if analysis.added_funcs:
-        names = ', '.join(f'`{f}()`' for f in analysis.added_funcs[:6])
-        parts.append(f"- 新增方法: {names}")
-    if analysis.added_classes:
-        names = ', '.join(f'`{c}`' for c in analysis.added_classes[:4])
-        parts.append(f"- 新增类: {names}")
-
-
-def _build_key_changes_section(
-    analysis: DiffAnalysis,
-    grouped_files: Dict[str, List[str]],
-    feature_points: List[str],
-) -> List[str]:
-    """Build concise key change lines grouped by intent instead of file stats."""
-    parts: List[str] = []
-    section_num = 0
-
-    if grouped_files["production"]:
-        section_num += 1
-        parts.append(f"### {section_num}. 核心实现")
-        production_points = _infer_production_change_points(analysis)
-        if production_points:
-            for point in production_points:
-                parts.append(f"- {point}")
-        else:
-            _append_fallback_points(parts, feature_points, analysis)
-
-    if grouped_files["docs"] or grouped_files["examples"]:
-        if parts:
-            parts.append("")
-        section_num += 1
-        parts.append(f"### {section_num}. 配套同步")
-        if grouped_files["docs"]:
-            parts.append("- 更新相关文档与开发说明，使其与当前实现保持一致。")
-        if grouped_files["examples"]:
-            parts.append("- 更新示例代码，使示例写法与当前实现路径保持一致。")
-
-    if grouped_files["tests"]:
-        if parts:
-            parts.append("")
-        section_num += 1
-        parts.append(f"### {section_num}. 内部验证")
-        parts.append("- 更新内部验证用例，使断言与当前实现保持一致。")
-        parts.append("- 清理已失效的测试写法，并补充重构后关键路径的覆盖。")
-
-    return parts
-
-
-def _build_impact_section(grouped_files: Dict[str, List[str]]) -> str:
-    """Build a concise impact section."""
-    if grouped_files["production"]:
-        return (
-            "本次变更不引入新的对外接口，主要是后端内部实现与内部验证方式的调整。\n"
-            "测试、示例和说明文件中的改动仅用于配套验证与同步说明，不构成外部接口变更。"
-        )
-    if grouped_files["tests"]:
-        return "- 本次变更仅涉及内部验证覆盖更新，不构成外部接口变更。"
-    return "- 本次变更不涉及外部接口变更。"
-
-
-def _build_validation_section(grouped_files: Dict[str, List[str]]) -> str:
-    """Build a concise validation section."""
-    if grouped_files["tests"]:
-        return (
-            "已验证：\n\n"
-            "- `conda run -n py310 python -m pytest -q tests/mindspore/ut/fully_shard`\n"
-            "  - `37 passed`"
-        )
-    return "N/A"
-
-
-def _build_description_section(analysis: DiffAnalysis,
-                               grouped_files: Dict[str, List[str]],
-                               feature_points: List[str]) -> str:
-    """Build the PR description section with change summary and impact."""
-    changes = _build_key_changes_section(analysis, grouped_files, feature_points)
-    impact = _build_impact_section(grouped_files)
-
-    parts = [*changes, "", "### 影响范围", impact]
-    return "\n".join(parts)
-
-
 # ============================================================================
 # Main PR content generation
 # ============================================================================
@@ -1311,7 +1282,8 @@ def generate_pr_content(diff: str, commits: List[str],
         commit_data,
         analysis,
     )
-    related_issue = _collect_related_issues(commits) if commits else "N/A"
+    related_issue = _collect_related_issues(commits) if commits else ""
+    kind_label = _infer_kind_label(commit_data, analysis)
     reason = _build_reason_section(analysis, feature_domain, feature_points)
 
     desc_parts = _build_architecture_overview(analysis)
@@ -1328,21 +1300,41 @@ def generate_pr_content(diff: str, commits: List[str],
     test_cases = _build_test_section(analysis)
     affected_str = _build_affected_section(analysis)
 
-    body = _sanitize_framework_refs(f"""## 相关的Issue
-{related_issue}
+    # Build "What does this PR do / why do we need it" by combining
+    # reason, description, and affected-functionality sections.
+    what_parts: List[str] = []
+    if reason and reason != "- 代码优化与维护":
+        what_parts.append(reason)
+    if description:
+        what_parts.append("")
+        what_parts.append(description)
+    if affected_str and affected_str != "无明显影响（新增代码或内部重构）":
+        what_parts.append("")
+        what_parts.append("**可能影响的功能**:")
+        what_parts.append(affected_str)
+    what_section = "\n".join(what_parts) if what_parts else "代码优化"
 
-## 原因（目的、解决的问题等）
-{reason}
+    fixes_line = f"Fixes {related_issue}" if related_issue else ""
 
-## 描述（做了什么，变更了什么）
-{description}
+    # Fill template sections — keys are substrings matched against headers
+    fill: Dict[str, str] = {
+        "What type of PR is this": f"/kind {kind_label}",
+        "What does this PR do": what_section,
+        "Which issue": fixes_line,
+        "Test Plan": test_cases,
+    }
 
-## 测试用例（新增、改动、可能影响的功能）
-{test_cases}
-
-## 可能影响的功能
-{affected_str}
-""")
+    template = _load_pr_template()
+    if template:
+        body = _sanitize_framework_refs(_fill_template(template, fill))
+    else:
+        # Fallback: inline template when .gitcode/ template is missing
+        body = _sanitize_framework_refs(
+            f"**What type of PR is this?**\n/kind {kind_label}\n\n---\n\n"
+            f"**What does this PR do / why do we need it**:\n{what_section}\n\n---\n\n"
+            f"**Which issue(s) this PR fixes**:\n{fixes_line}\n\n---\n\n"
+            f"**Test Plan and Test result**：\n{test_cases}\n"
+        )
     return title, body
 
 
