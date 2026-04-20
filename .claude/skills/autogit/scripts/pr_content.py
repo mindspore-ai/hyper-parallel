@@ -52,62 +52,85 @@ def _load_pr_template() -> Optional[str]:
     return None
 
 
-def _parse_template_sections(template: str) -> List[Dict[str, str]]:
-    """Parse the PR template into ordered sections.
-
-    Each section is a dict with 'header' (the bold title line) and
-    'body' (everything between this header's ``---`` and the next).
-
-    Args:
-        template: Raw template markdown.
-
-    Returns:
-        List of section dicts with 'header' and 'body' keys.
-    """
-    # Strip leading HTML comments (contributor tips)
-    cleaned = re.sub(r"<!--.*?-->", "", template, flags=re.DOTALL).strip()
-    # Split by horizontal rules
-    blocks = re.split(r"\n---\n", cleaned)
-
-    sections: List[Dict[str, str]] = []
-    for block in blocks:
-        block = block.strip()
-        if not block:
-            continue
-        lines = block.split("\n", 1)
-        header = lines[0].strip()
-        body = lines[1].strip() if len(lines) > 1 else ""
-        sections.append({"header": header, "body": body})
-    return sections
+# HR line: a line containing only 3+ hyphens, tolerating leading/trailing
+# horizontal whitespace. Matches CommonMark's thematic-break rule so both
+# `---` and `----` (the repo template's style) parse correctly.
+_HR_LINE_RE = re.compile(r"^[ \t]*-{3,}[ \t]*$", re.MULTILINE)
 
 
 def _fill_template(template: str, fill: Dict[str, str]) -> str:
-    """Fill a PR template with generated content per section.
+    """Fill the PR template in-place, preserving its original structure.
 
-    Sections are identified by their bold header text.  The ``fill``
-    dict maps a header *substring* to the replacement body.  Sections
-    not present in ``fill`` are kept unchanged (e.g. Self-checklist).
+    The template file at ``.gitcode/PULL_REQUEST_TEMPLATE.zh-CN.md`` is
+    the single source of truth. This function does **targeted string
+    replacement** on the raw template — it never rebuilds the body from
+    scratch. Concretely, for each ``(header_substring, replacement)``
+    pair:
+
+      1. Find the bold header line containing ``header_substring``
+         (e.g. ``**What does this PR do / why do we need it**:``).
+      2. Locate the body region: everything after the header line up to
+         the next HR (``\\n-{3,}\\n``) or end of file.
+      3. Extract any HTML comments inside that body region and preserve
+         them (they carry contributor instructions like the ``/kind``
+         label options).
+      4. Replace the body region with: preserved comments + the new
+         content.
+
+    Consequences:
+
+      - Sections *not* in ``fill`` (e.g. the Self-checklist) are left
+        byte-identical to the template.
+      - HTML comments are kept so the rendered PR keeps the hints.
+      - Fill keys whose headers aren't found are silently skipped —
+        the rest of the template still ships. Worst case (no key
+        matches anything) the raw template is returned verbatim, which
+        is exactly what GitCode shows in the PR web editor anyway.
 
     Args:
-        template: Raw template markdown.
-        fill: Mapping of header-substring → replacement body.
+        template: Raw template markdown (contents of the .gitcode file).
+        fill: Mapping of header-substring → replacement body text.
 
     Returns:
-        Filled template string.
+        Filled template string with the template's original structure,
+        comments, HRs, and Self-checklist preserved.
     """
-    sections = _parse_template_sections(template)
-    parts: List[str] = []
-    for sec in sections:
-        header = sec["header"]
-        # Find matching fill key
-        matched_body: Optional[str] = None
-        for key, value in fill.items():
-            if key in header:
-                matched_body = value
-                break
-        body = matched_body if matched_body is not None else sec["body"]
-        parts.append(f"{header}\n{body}" if body else header)
-    return "\n\n---\n\n".join(parts) + "\n"
+    # Normalize line endings so the HR regex matches regardless of editor
+    result = template.replace("\r\n", "\n").replace("\r", "\n")
+
+    for header_sub, new_body in fill.items():
+        header_re = re.compile(
+            rf"^(\*\*[^\n]*{re.escape(header_sub)}[^\n]*\*\*[^\n]*)$",
+            re.MULTILINE,
+        )
+        m = header_re.search(result)
+        if not m:
+            # Header not in template; skip this fill key and keep going
+            continue
+
+        body_start = m.end()
+        # Body ends at the next HR line (relative search in the tail)
+        hr_match = _HR_LINE_RE.search(result, pos=body_start)
+        body_end = hr_match.start() if hr_match else len(result)
+
+        body_region = result[body_start:body_end]
+        preserved_comments = re.findall(
+            r"<!--.*?-->", body_region, flags=re.DOTALL,
+        )
+
+        # Rebuild just this body region: preserved comments, then the
+        # new content, sandwiched by newlines so spacing stays clean.
+        parts_region: List[str] = ["\n"]
+        for comment in preserved_comments:
+            parts_region.append(comment + "\n")
+        if new_body:
+            parts_region.append(new_body + "\n")
+        parts_region.append("\n")
+        new_region = "".join(parts_region)
+
+        result = result[:body_start] + new_region + result[body_end:]
+
+    return result
 
 
 # ============================================================================
@@ -1256,67 +1279,70 @@ def _normalize_title_with_type(title: str,
 
 def generate_pr_content(diff: str, commits: List[str],
                         pr_info: Optional[Dict] = None) -> Tuple[str, str]:
-    """Generate detailed PR title and description based on diff.
+    """Produce a FACTUAL draft (title, body) from git metadata only.
+
+    Autogit's contract with callers in an AI agent (Claude Code / Codex /
+    ...) is: Python supplies mechanical facts, the AI supplies the
+    narrative. This function therefore does NOT try to synthesize a
+    "why we need this PR" paragraph, summarize architecture, classify
+    changes into "Skill 创作规范", or build a file-stats table.
+    Everything it emits is traceable to a concrete git fact:
+
+      - ``/kind <label>``: inferred from the conventional-commit type
+        of the first commit subject.
+      - "What does this PR do": the **commit message body of the first
+        commit, verbatim**. No truncation, no bullet extraction. If the
+        commit message is one-line, this stays empty — the AI fills it
+        via ``--body``.
+      - ``Fixes #<n>``: extracted from explicit "Fixes #N" references
+        in commit messages.
+      - "Test Plan": list of test files touched in the diff, or
+        "N/A" when no test files changed.
+
+    The AI-provided ``--body`` always wins — this function's output is
+    only used to seed interactive review in a TTY. In non-interactive
+    (AI agent) mode, callers are required to pass ``--body`` explicitly
+    and this function's body output is discarded.
 
     Args:
         diff: Raw unified diff text.
         commits: List of commit SHA strings.
-        pr_info: Optional existing PR info dict.
+        pr_info: Optional existing PR info dict (for title continuity).
 
     Returns:
         Tuple of (title, body).
     """
     analysis = analyze_diff(diff)
-
-    fallback_domain, fallback_points = infer_feature_purpose(analysis)
-    # Reverse commits so oldest is first — primary intent should lead
+    # Reverse so oldest is first — primary intent leads
     ordered_commits = list(reversed(commits)) if commits else []
     commit_data = _parse_conventional_commits(ordered_commits) if ordered_commits else []
-    docstrings = _extract_docstrings_from_diff(diff)
-    feature_domain, feature_points = _synthesize_pr_purpose(
-        commit_data, docstrings, analysis, fallback_domain, fallback_points
-    )
 
     title = _normalize_title_with_type(
         _sanitize_framework_refs(_generate_pr_title(analysis, ordered_commits, pr_info)),
         commit_data,
         analysis,
     )
-    related_issue = _collect_related_issues(commits) if commits else ""
     kind_label = _infer_kind_label(commit_data, analysis)
-    reason = _build_reason_section(analysis, feature_domain, feature_points)
-
-    desc_parts = _build_architecture_overview(analysis)
-
-    desc_parts.extend(_build_api_section(docstrings))
-
-    skill_files = [f for f in analysis.files if 'skills/' in f]
-    if skill_files:
-        desc_parts.extend(_build_skill_section(skill_files))
-
-    desc_parts.extend(_build_file_stats_section(analysis))
-    description = "\n".join(desc_parts) if desc_parts else "代码优化"
-
-    test_cases = _build_test_section(analysis)
-    affected_str = _build_affected_section(analysis)
-
-    # Build "What does this PR do / why do we need it" by combining
-    # reason, description, and affected-functionality sections.
-    what_parts: List[str] = []
-    if reason and reason != "- 代码优化与维护":
-        what_parts.append(reason)
-    if description:
-        what_parts.append("")
-        what_parts.append(description)
-    if affected_str and affected_str != "无明显影响（新增代码或内部重构）":
-        what_parts.append("")
-        what_parts.append("**可能影响的功能**:")
-        what_parts.append(affected_str)
-    what_section = "\n".join(what_parts) if what_parts else "代码优化"
-
+    related_issue = _collect_related_issues(commits) if commits else ""
     fixes_line = f"Fixes {related_issue}" if related_issue else ""
 
-    # Fill template sections — keys are substrings matched against headers
+    # "What does this PR do / why do we need it" is intentionally left
+    # empty here. Commit message and PR description serve different
+    # audiences — commit = code history for engineers reading `git log`,
+    # PR description = reviewer-facing narrative — so copying the
+    # commit body into this slot would produce a PR that just duplicates
+    # the commit (low-signal, lazy-looking).
+    #
+    # In the intended AI-first workflow the caller always passes
+    # `--body` with an AI-composed, reviewer-focused description, and
+    # this empty placeholder is overwritten before the PR ships.
+    # If `--body` is omitted (interactive TTY preview, or AI forgot to
+    # pass it), an empty section is a clear signal that the reviewer
+    # narrative is still pending — better than a stale commit-body dup.
+    what_section = ""
+
+    test_cases = _build_test_section(analysis)
+
     fill: Dict[str, str] = {
         "What type of PR is this": f"/kind {kind_label}",
         "What does this PR do": what_section,
@@ -1325,15 +1351,18 @@ def generate_pr_content(diff: str, commits: List[str],
     }
 
     template = _load_pr_template()
-    if template:
+    if template is not None:
         body = _sanitize_framework_refs(_fill_template(template, fill))
     else:
-        # Fallback: inline template when .gitcode/ template is missing
+        # Template file missing — don't paper over with a Python-side
+        # copy (that would drift). Show the raw fills with a warning.
         body = _sanitize_framework_refs(
-            f"**What type of PR is this?**\n/kind {kind_label}\n\n---\n\n"
-            f"**What does this PR do / why do we need it**:\n{what_section}\n\n---\n\n"
-            f"**Which issue(s) this PR fixes**:\n{fixes_line}\n\n---\n\n"
-            f"**Test Plan and Test result**：\n{test_cases}\n"
+            f"<!-- WARNING: {_PR_TEMPLATE_REL} not found in repo; "
+            f"please add it and regenerate this description. -->\n\n"
+            f"/kind {kind_label}\n\n"
+            f"{what_section}\n\n"
+            f"{fixes_line}\n\n"
+            f"{test_cases}\n"
         )
     return title, body
 
