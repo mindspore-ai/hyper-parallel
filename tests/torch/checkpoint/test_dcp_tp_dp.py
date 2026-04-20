@@ -16,24 +16,11 @@
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-_TEST_DCP_WITH_FULLY_SHARD_OPTIMIZER = "_test_dcp_with_fully_shard_optimizer.py"
+_TEST_DCP_TP_DP = "_test_dcp_tp_dp.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_dcp_with_fully_shard_optimizer_single():
-    """
-    Feature: fully_shard + distributed checkpoint + flatten_state_dict + bytes (single process, num_proc=1).
-    Description:
-        1. test_dcp_with_fully_shard_optimizer
-    Expectation: Run success.
-    """
-    parallel_run([
-        TorchCase(_TEST_DCP_WITH_FULLY_SHARD_OPTIMIZER, "test_dcp_with_fully_shard_optimizer", 12501, 1),
-    ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_dcp_with_fully_shard_optimizer_multi():
+def test_dcp_with_optimizer_tp_dp():
     """
     Feature: fully_shard + DCP + flatten_state_dict + bytes (multi-GPU).
 
@@ -43,5 +30,5 @@ def test_dcp_with_fully_shard_optimizer_multi():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(_TEST_DCP_WITH_FULLY_SHARD_OPTIMIZER, "test_dcp_with_fully_shard_optimizer", 12502, 4),
+        TorchCase(_TEST_DCP_TP_DP, "test_dcp_with_optimizer_tp_dp", 12502, 4),
     ])

@@ -32,10 +32,14 @@ class SimpleModel(nn.Module):
 
 class DenseNet(nn.Module):
     """Dense model"""
-    def __init__(self, in_channels, hidden_size, has_bias=True):
+    def __init__(self, in_channels, hidden_size, has_bias=True, weight_init=None):
         super().__init__()
         self.has_bias = has_bias
-        self.weight = nn.Parameter(torch.ones(in_channels, hidden_size).npu())
+        init_fn = torch.ones if weight_init is None else weight_init
+        if not callable(init_fn):
+            raise ValueError(f"weight_init must be None or callable, but got {type(weight_init)}")
+        weight = init_fn(in_channels, hidden_size)
+        self.weight = nn.Parameter(weight.npu())
         if self.has_bias:
             self.bias = nn.Parameter(torch.zeros(hidden_size).npu())
 
@@ -48,12 +52,12 @@ class DenseNet(nn.Module):
 
 class DenseMutiLayerNet(nn.Module):
     """dense net with configurable layer number"""
-    def __init__(self, hidden_size, layer_num, has_bias=True):
+    def __init__(self, hidden_size, layer_num, has_bias=True, weight_init=None):
         super().__init__()
         self.layer_num = layer_num
         self.layers = nn.Sequential()
         for i in range(self.layer_num):
-            layer = DenseNet(hidden_size, hidden_size, has_bias)
+            layer = DenseNet(hidden_size, hidden_size, has_bias, weight_init=weight_init)
             self.layers.add_module(f"layer{i}", layer)
 
     def forward(self, x):
@@ -106,10 +110,15 @@ class SimpleTransformer(nn.Module):
 
 class FullyShardTestNet(nn.Module):
     """net for fully_shard test"""
-    def __init__(self, dense_hidden, dense_layer_num, has_bias=True):
+    def __init__(self, dense_hidden, dense_layer_num, has_bias=True, dense_weight_init=None):
         super().__init__()
         self.w1 = nn.Parameter(torch.rand(dense_hidden, dense_hidden).npu())
-        self.dense_layers = DenseMutiLayerNet(dense_hidden, dense_layer_num, has_bias)
+        self.dense_layers = DenseMutiLayerNet(
+            dense_hidden,
+            dense_layer_num,
+            has_bias,
+            weight_init=dense_weight_init,
+        )
 
     def forward(self, x):
         w1_out = torch.matmul(x, self.w1)
