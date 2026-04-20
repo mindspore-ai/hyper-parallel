@@ -50,7 +50,7 @@ class SelectiveCheckpointContext:
     def __init__(self, *, is_recompute):
         self.is_recompute = is_recompute
 
-SAC_IGNORED_OPS = {"StopGradient", "Reshape", "SelectExtView", "TransposeExtView", "Transpose", "LayerNormExt"}
+SAC_IGNORED_OPS = {"StopGradient"}
 
 
 class _CachingMindSporeDispatchMode(MsDispatchMode):

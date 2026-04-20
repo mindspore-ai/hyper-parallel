@@ -38,7 +38,7 @@ class SwapTensor:
     def __init__(self, val: Any) -> None:
         self.val = val
         self.ver = val._version
-        self.size = val.untyped_storage().size()
+        self._keep_on_device = False
         if isinstance(val, platform.Tensor) and str(val.device).lower() != 'cpu':
             self._state = self.STATE_DEVICE
             self.is_slice_tensor = val.untyped_storage().size() != val.numel() * platform.get_element_size(val)
@@ -49,6 +49,20 @@ class SwapTensor:
         else:
             self._state = self.STATE_NON_TENSOR
             self.val_cpu = None
+
+    def protect_if_aliases(self, output_tensors: List[Any]) -> None:
+        """Keep tensors that alias the wrapped module output on device."""
+        if self._state == self.STATE_NON_TENSOR:
+            return
+        self_storage_ptr = self.val.untyped_storage().data_ptr()
+        for out in output_tensors:
+            if not isinstance(out, platform.Tensor):
+                continue
+            if str(out.device).lower() == "cpu":
+                continue
+            if out.untyped_storage().data_ptr() == self_storage_ptr:
+                self._keep_on_device = True
+                return
 
     def get_val(self) -> Any:
         if self._state == self.STATE_NON_TENSOR:
@@ -62,7 +76,7 @@ class SwapTensor:
 
     def async_load(self):
         """async load tensor from host to device"""
-        if self._state == self.STATE_NON_TENSOR:
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device:
             return
 
         if self._state != self.STATE_HOST:
@@ -83,7 +97,7 @@ class SwapTensor:
 
     def wait_load(self):
         """change state to device after async load is done"""
-        if self._state == self.STATE_NON_TENSOR:
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device:
             return
 
         if self._state == self.STATE_DEVICE:
@@ -98,7 +112,7 @@ class SwapTensor:
 
     def async_offload(self):
         """async offload tensor from device to host"""
-        if self._state == self.STATE_NON_TENSOR:
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device:
             return
 
         if self._state != self.STATE_DEVICE:
@@ -108,7 +122,7 @@ class SwapTensor:
             )
             return
 
-        if self.size != self.val.untyped_storage().size() or self.ver != self.val._version:
+        if self.storage_size != self.val.untyped_storage().size() or self.ver != self.val._version:
             raise RuntimeError(
                 "There is a tensor(s) cannot be SWAPPED! In-place modification happened or "
                 "its storage has been resized."
@@ -122,7 +136,7 @@ class SwapTensor:
 
     def wait_offload(self):
         """wait offload to host and free device memory"""
-        if self._state == self.STATE_NON_TENSOR:
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device:
             return
 
         if self._state == self.STATE_HOST:
@@ -152,6 +166,28 @@ class Storage:
     def __init__(self):
         self.save_storage: Dict[Any, List[Any]] = defaultdict(list)
         self.swap_storage: Dict[Any, List[Any]] = defaultdict(list)
+
+    def protect_output_tensors(self, outputs: Any):
+        """Avoid offloading tensors that alias the wrapped module outputs."""
+        output_tensors = []
+
+        def _collect_outputs(x):
+            if isinstance(x, platform.Tensor):
+                output_tensors.append(x)
+            return x
+
+        platform.tree_map(_collect_outputs, outputs)
+        if not output_tensors:
+            return
+
+        def _protect_tensor(x):
+            if isinstance(x, SwapTensor):
+                x.protect_if_aliases(output_tensors)
+            return x
+
+        for storage_list in self.swap_storage.values():
+            for item in storage_list:
+                platform.tree_map(_protect_tensor, item)
 
     def launch_load(self):
         """launch async load for all tensors in swap storage"""
@@ -210,6 +246,11 @@ class SwapGroup:
     def add(self, storage):
         """Add a storage to the swap group."""
         self._storages.add(storage)
+
+    def protect_output_tensors(self, outputs: Any):
+        """Protect current module outputs from premature offload."""
+        for storage in self._storages:
+            storage.protect_output_tensors(outputs)
 
     def launch_offload(self, copy_stream):
         """Launch async offload for all storages in the group."""
@@ -299,6 +340,13 @@ class SwapManager:
         if copy_stream is None:
             copy_stream = self._get_copy_stream()
         group.launch_offload(copy_stream)
+
+    def protect_output_tensors(self, group_name: str, outputs: Any):
+        """Keep tensors that alias the module output on device."""
+        group = self._groups.get(group_name)
+        if group is None:
+            raise RuntimeError(f"Group {group_name} does not exist.")
+        group.protect_output_tensors(outputs)
 
     def wait_offload(self, group_name: str):
         """Wait for offload to complete for a specified swap group."""
@@ -405,6 +453,7 @@ class SwapManager:
                 return
             next_name = module._swap_group_order.get('next', None)
             if next_name:
+                SwapManager().protect_output_tensors(group_name, output)
                 SwapManager().launch_offload(group_name)
             prev_name = module._swap_group_order.get('prev', None)
             if prev_name:

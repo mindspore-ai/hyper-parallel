@@ -233,7 +233,12 @@ def apply_recompute(model, mode):
 
 
     elif mode == "swap":
+        no_swap_ops = {
+            "LayerNormExt"
+        }
         def policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613
+            if op.name in no_swap_ops:
+                return CheckpointPolicy.MUST_RECOMPUTE
             return CheckpointPolicy.MUST_SWAP
         for i, layer in enumerate(model.layers):
             model.layers[i] = checkpoint_wrapper(layer, policy_fn=policy_fn, swap_inputs=True)
@@ -318,7 +323,7 @@ def test_ac_memory_comparison():
     tol = 1e-4
     for step in range(train_steps):
         base_val = base_losses[step]
-        for mode in ["recompute", "funcrecompute", "save", "funcsave", "funcswap"]: # skip swap
+        for mode in ["recompute", "funcrecompute", "save", "funcsave", "swap", "funcswap"]:
             val = results[mode]["losses"][step]
             diff = abs(val - base_val)
             assert diff < tol, (
