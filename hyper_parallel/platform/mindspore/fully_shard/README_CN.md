@@ -33,3 +33,21 @@ MindSpore 的 reduce 类通信算子没有原生 `AVG`，所以 `fully_shard` �
 
 - 先做 `SUM`
 - 再手动除以 group size
+
+## 4. 保持 Version 不变的 Buffer 更新方式
+
+tensor 的 `_version` 会在自动微分、选择重计算等场景中参与一致性校验。
+`fully_shard` 对 tensor 的处理应该尽量保持透明，不能额外引入 `_version` 变化，
+否则会影响这些校验语义。
+
+torch 在这类路径上可以直接使用
+`torch.autograd._unsafe_preserve_version_counter(...)` 来抑制 version 递增。
+
+MindSpore 没有对应接口，但可以通过 `.data` 取到一个和原始 tensor 共享内存的新
+tensor，再对这个新 tensor 做 `copy_` 等修改，从而实现对原始 tensor version
+递增的抑制。因此 `fully_shard` 在 all-gather copy-out 这类 buffer 刷新路径上，
+会使用 `tensor.data.copy_(src)`。
+
+需要区分的是，`Parameter` / DTensor rebasing 仍然要继续使用 `set_data(...)`。
+因为 DTensor 参数内部可能维护多份需要同步的存储，`.data = ...` 只会更新其中一份，
+而 `set_data(...)` 才能正确更新整个参数状态。

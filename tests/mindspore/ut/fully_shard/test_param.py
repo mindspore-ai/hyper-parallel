@@ -32,6 +32,7 @@ import mindspore as ms
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_utils import FullyShardParamMode, GroupInfo, ShardedState
 from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo
+from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_without_bumping_version
 from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
 
 
@@ -263,9 +264,20 @@ class TestMindSporeParam(unittest.TestCase):
             device="npu",
         )
         hsdp_param.alloc_all_gather_outputs.assert_called_once()
-        output.copy_.assert_called_once_with(cast_input)
+        output.copy_.assert_not_called()
+        output.data.copy_.assert_called_once_with(cast_input)
         self.assertIs(gathered, output)
         self.assertIsNone(handle)
+
+    def test_copy_without_bumping_version_prefers_data_alias(self):
+        """Shared helper should write through ``dst.data``."""
+        dst = MagicMock(name="dst")
+        src = MagicMock(name="src")
+
+        copy_without_bumping_version(dst, src)
+
+        dst.copy_.assert_not_called()
+        dst.data.copy_.assert_called_once_with(src)
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.reduce_scatter_tensor")
     def test_reduce_scatter_grad_supports_same_dim_strided_non_dim0_layout(self, mock_reduce_scatter):

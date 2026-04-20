@@ -18,6 +18,7 @@ Covers parameter sharding init, unshard/wait, state transitions, reduce_scatter_
 all_reduce_grad, reset_sharded_param, and _get_unsharded_param_data. All tests mock
 DTensor/Layout and distributed calls; no NPU required.
 """
+from contextlib import nullcontext
 import copy
 import os
 from types import SimpleNamespace
@@ -34,6 +35,7 @@ from hyper_parallel.platform.torch.fully_shard.param import (
     TorchHSDPParamV2,
     _build_group_info_from_rank_list,
     _GROUP_INFO_CACHE,
+    _copy_without_bumping_version,
 )
 from hyper_parallel.platform.torch.fully_shard.pack_utils import (
     build_rs_plan,
@@ -481,6 +483,21 @@ class TestTorchHSDPParamV2(unittest.TestCase):
             mock_alloc_outputs.assert_called_once()
             mock_all_gather.assert_called_once()
             self.assertEqual(handle, mock_handle)
+
+    def test_copy_without_bumping_version_uses_unsafe_preserve(self):
+        """No-comm all-gather copies should preserve tensor version counters."""
+        dst = MagicMock()
+        src = MagicMock()
+
+        with patch(
+            "hyper_parallel.platform.torch.fully_shard.param."
+            "torch.autograd._unsafe_preserve_version_counter",
+            return_value=nullcontext(),
+        ) as mock_preserve:
+            _copy_without_bumping_version(dst, src)
+
+        mock_preserve.assert_called_once_with(dst)
+        dst.copy_.assert_called_once_with(src)
 
     @patch.object(TorchHSDPParamV2, "_sharded_local_tensor")
     @patch.object(DTensor, "from_local")

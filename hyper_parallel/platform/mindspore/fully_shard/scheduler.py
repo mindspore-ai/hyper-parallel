@@ -19,6 +19,7 @@ from mindspore.utils._pytree import tree_flatten, tree_unflatten
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2, FSDPSchedulerState
 from hyper_parallel.core.fully_shard.hsdp_utils import get_dtensor_managed_mesh
 from hyper_parallel.platform.mindspore.fully_shard.hook_function import PostBackwardFunction
+from hyper_parallel.platform.mindspore.fully_shard.param_group import get_comm_ctx
 from hyper_parallel.platform.mindspore.fully_shard.state import MindSporeHSDPStateV2
 from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, HSDPMeshInfo, DDPMeshInfo
 from hyper_parallel.platform import get_platform
@@ -142,6 +143,13 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         apply_final_reduce = self.scheduler_state != FSDPSchedulerState.BACKWARD
         self._backward_hook()
         if apply_final_reduce:
+            comm_ctx = get_comm_ctx()
+            if comm_ctx.all_reduce_param_group is not None:
+                comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
+                comm_ctx.all_reduce_param_group = None
+            if comm_ctx.pre_param_group is not None:
+                comm_ctx.pre_param_group.apply_fusion_reduced_grad()
+                comm_ctx.pre_param_group = None
             self.hsdp_state.reduce_params()
             self.hsdp_state._finish_ignored_allreduce()
             HSDPSchedulerV2.root_bp_state = False

@@ -23,7 +23,9 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     FullyShardParamMode,
     infer_fully_shard_param_mode,
 )
+from hyper_parallel.platform.mindspore.fully_shard.pack_utils import build_rs_plan
 from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
+from hyper_parallel.platform.mindspore.fully_shard.param_group import HSDPParamGroup, get_comm_ctx
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 
 
@@ -69,6 +71,7 @@ class MindSporeHSDPStateV2(HSDPState):
 
     def __init__(self, cell, mesh_info, config, platform, device=None):
         super().__init__(cell, mesh_info, config, platform, device)
+        self.comm_fusion = config.comm_fusion
         # Do ReduceScatter/AllReduce for grad
         self.mp_policy = config.mp_policy
         self.offload_policy = config.offload_policy
@@ -87,10 +90,62 @@ class MindSporeHSDPStateV2(HSDPState):
         )
         self._ignored_allreduce_works = []
         self._reset_sharded_params = False
+        self._init_param_group()
 
     def _iter_managed_params(self):
         """Return all fully_shard-managed parameters, including replicate_params."""
         return [*self.hsdp_params, *self.replicate_params]
+
+    @staticmethod
+    def _comm_fusion_unsupported_reason(hsdp_param) -> Optional[str]:
+        """Return the reason why ``hsdp_param`` cannot participate in comm_fusion."""
+        if not hsdp_param.enable_fsdp_shard:
+            return "non-sharded parameters such as replicate_params are not supported"
+        if hsdp_param.param_mode not in (
+            FullyShardParamMode.LOCAL_PARAM,
+            FullyShardParamMode.DTENSOR_UNIFIED,
+        ):
+            return f"param_mode {hsdp_param.param_mode} is not supported"
+        local_shard = getattr(hsdp_param, "_sharded_local_tensor", None)
+        if local_shard is None:
+            return "missing local shard tensor for comm_fusion plan validation"
+        plan_world_size = getattr(hsdp_param, "shard_world_size", None)
+        if plan_world_size is None:
+            plan_world_size = getattr(hsdp_param, "shard_size", 1)
+        try:
+            build_rs_plan(hsdp_param, local_shard, plan_world_size)
+        except NotImplementedError as exc:
+            return str(exc)
+        except (AssertionError, ValueError) as exc:
+            return f"cannot build comm_fusion pack plan: {exc}"
+        return None
+
+    def _init_param_group(self):
+        """Initialize fused parameter group when comm_fusion is enabled."""
+        if self.config.comm_fusion:
+            unsupported_param = next(
+                (
+                    hsdp_param
+                    for hsdp_param in self.hsdp_params
+                    if self._comm_fusion_unsupported_reason(hsdp_param) is not None
+                ),
+                None,
+            )
+            if unsupported_param is not None:
+                param_fqn = getattr(unsupported_param, "_param_fqn", "<unknown>")
+                reason = self._comm_fusion_unsupported_reason(unsupported_param)
+                raise NotImplementedError(
+                    f"comm_fusion does not support parameter {param_fqn}: {reason}."
+                )
+            self.param_group = None
+            if self.hsdp_params:
+                self.param_group = HSDPParamGroup(
+                    self.hsdp_params,
+                    self.mesh_info,
+                    self.device,
+                    self.mp_policy,
+                    self.config.comm_fusion_zero_copy,
+                )
 
     def zero_grad(self):
         """zero grad"""
@@ -304,6 +359,23 @@ class MindSporeHSDPStateV2(HSDPState):
             )
         self._synchronize_current_stream_if_needed(need_synchronize)
 
+    def post_backward_for_comm_fusion(self):
+        """Drive the fused gradient-reduction pipeline for sharded params."""
+        self.reduce_params()
+        comm_ctx = get_comm_ctx()
+        if comm_ctx.all_reduce_param_group is not None:
+            comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
+            comm_ctx.all_reduce_param_group = None
+        if comm_ctx.pre_param_group is not None:
+            comm_ctx.pre_param_group.wait_reduce_scatter_and_issue_all_reduce()
+            comm_ctx.pre_param_group = None
+        if self.param_group is not None:
+            self.param_group.foreach_reduce(
+                reduce_scatter_reduce_op=self.reduce_op_type,
+                needs_avg_div=self._need_div,
+            )
+        self._allreduce_replicate_params()
+
     def _post_backward_without_reduce(self):
         """Finish backward when gradient communication is disabled."""
         if self.reshard_after_backward:
@@ -359,26 +431,29 @@ class MindSporeHSDPStateV2(HSDPState):
         if not self.reduce_grads:
             self._post_backward_without_reduce()
             return
-        self.reduce_params()
-        self._allreduce_replicate_params()
-        for hsdp_param in self.hsdp_params:
-            if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
-                continue
-            if not hsdp_param.sharded_param.requires_grad:
-                continue
-            if not self._has_pending_unsharded_grad(hsdp_param):
-                continue
-            if hsdp_param.shard_size > 1:
-                self._queue_reduce_scatter_then_all_reduce(hsdp_param)
-            elif self._should_run_all_reduce(hsdp_param):
-                self._queue_compat_all_reduce(hsdp_param)
-            else:
-                need_synchronize = hsdp_param.apply_reduced_grad(
-                    self._get_pending_unsharded_grad(hsdp_param),
-                    self._orig_dtype,
-                )
-                self._synchronize_current_stream_if_needed(need_synchronize)
-        self._finish_ignored_allreduce()
+        if not self.comm_fusion:
+            self.reduce_params()
+            self._allreduce_replicate_params()
+            for hsdp_param in self.hsdp_params:
+                if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
+                    continue
+                if not hsdp_param.sharded_param.requires_grad:
+                    continue
+                if not self._has_pending_unsharded_grad(hsdp_param):
+                    continue
+                if hsdp_param.shard_size > 1:
+                    self._queue_reduce_scatter_then_all_reduce(hsdp_param)
+                elif self._should_run_all_reduce(hsdp_param):
+                    self._queue_compat_all_reduce(hsdp_param)
+                else:
+                    need_synchronize = hsdp_param.apply_reduced_grad(
+                        self._get_pending_unsharded_grad(hsdp_param),
+                        self._orig_dtype,
+                    )
+                    self._synchronize_current_stream_if_needed(need_synchronize)
+            self._finish_ignored_allreduce()
+        else:
+            self.post_backward_for_comm_fusion()
         if self.reshard_after_backward:
             self.shard()
 

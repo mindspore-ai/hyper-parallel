@@ -19,6 +19,10 @@ import os
 import mindspore as ms
 import mindspore.dataset as ds
 import numpy as np
+from mindspore import nn, ops
+from mindspore.common.api import _no_grad
+from mindspore.communication import get_group_size, get_rank, init
+
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper, swap_wrapper, CheckpointPolicy, SwapManager
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -26,8 +30,6 @@ from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
-from mindspore import nn, ops
-from mindspore.communication import get_group_size, get_rank, init
 from tests.mindspore.st.common_net import SlimLeNet16
 
 # Shared temp directory for generated baseline artifacts
@@ -117,6 +119,49 @@ def apply_recompute(net):
     for i in range(len(net.dense_relu_sequential) - 1):
         SwapManager().set_forward_prefetch_layer(net.dense_relu_sequential[i], net.dense_relu_sequential[i+1])
 
+
+
+def assert_comm_fusion_state(net, enabled: bool, expect_zero_copy_flat_buffer: bool = False):
+    """Validate that fully_shard states are wired to the expected comm_fusion path."""
+    wrapped_modules = [
+        net,
+        net.dense_relu_sequential[0],
+        net.dense_relu_sequential[2],
+        net.dense_relu_sequential[4],
+    ]
+    found_fused_group = False
+    for mod in wrapped_modules:
+        scheduler = getattr(mod, "hsdp_scheduler", None)
+        assert scheduler is not None, f"{type(mod).__name__} is expected to have hsdp_scheduler"
+        state = getattr(scheduler, "hsdp_state", None)
+        assert state is not None, f"{type(mod).__name__} is expected to have hsdp_state"
+        assert state.config.comm_fusion == enabled, (
+            f"{type(mod).__name__} comm_fusion mismatch: "
+            f"expected {enabled}, got {state.config.comm_fusion}"
+        )
+        param_group = getattr(state, "param_group", None)
+        if not enabled:
+            assert param_group is None
+            continue
+        if state.hsdp_params:
+            assert param_group is not None, (
+                f"{type(mod).__name__} has sharded params but no fused param_group"
+            )
+            if expect_zero_copy_flat_buffer:
+                flat_buffer = getattr(param_group, "_flat_param_buffer", None)
+                assert flat_buffer is not None, (
+                    f"{type(mod).__name__} expected zero-copy flat buffer but found none"
+                )
+                assert param_group._is_flat_buffer_valid(), (  # pylint: disable=W0212
+                    f"{type(mod).__name__} flat buffer is not backing sharded param data"
+                )
+            found_fused_group = True
+        else:
+            assert param_group is None, (
+                f"{type(mod).__name__} should not allocate param_group without hsdp_params"
+            )
+    if enabled:
+        assert found_fused_group, "Expected at least one fused param_group when comm_fusion=True"
 
 
 def get_backward_grads(net, expected_dtype=None):
@@ -226,7 +271,8 @@ def run_baseline_standalone(ckpt_path: str):
         loss, _ = get_forward_fn(net)(data, label)
         loss.backward()
         grads = tuple(param.grad for param in params)
-        optimizer(grads)
+        with _no_grad():
+            optimizer(grads)
         losses.append(float(loss.asnumpy()))
         print(f"step: {i}, loss: {loss}")
         i += 1
@@ -256,6 +302,8 @@ def run_fully_shard_multi_card(
     replicate_all_params=False,
     enable_prefetch=False,
     enable_recompute=False,
+    enable_comm_fusion=False,
+    enable_comm_fusion_zero_copy=None,
 ):
     """Run fully_shard multi-card training."""
     dp_size = get_group_size()
@@ -283,15 +331,42 @@ def run_fully_shard_multi_card(
         apply_recompute(net)
 
     fully_shard(
-        net.dense_relu_sequential[0], mesh=mesh, mp_policy=mp_policy, replicate_params=replicate_params
+        net.dense_relu_sequential[0],
+        mesh=mesh,
+        mp_policy=mp_policy,
+        replicate_params=replicate_params,
+        comm_fusion=enable_comm_fusion,
+        comm_fusion_zero_copy=enable_comm_fusion_zero_copy,
     )
     fully_shard(
-        net.dense_relu_sequential[2], mesh=mesh, mp_policy=mp_policy, replicate_params=replicate_params
+        net.dense_relu_sequential[2],
+        mesh=mesh,
+        mp_policy=mp_policy,
+        replicate_params=replicate_params,
+        comm_fusion=enable_comm_fusion,
+        comm_fusion_zero_copy=enable_comm_fusion_zero_copy,
     )
     fully_shard(
-        net.dense_relu_sequential[4], mesh=mesh, mp_policy=mp_policy, replicate_params=replicate_params
+        net.dense_relu_sequential[4],
+        mesh=mesh,
+        mp_policy=mp_policy,
+        replicate_params=replicate_params,
+        comm_fusion=enable_comm_fusion,
+        comm_fusion_zero_copy=enable_comm_fusion_zero_copy,
     )
-    fully_shard(net, mesh=mesh, mp_policy=mp_policy, replicate_params=replicate_params)
+    fully_shard(
+        net,
+        mesh=mesh,
+        mp_policy=mp_policy,
+        replicate_params=replicate_params,
+        comm_fusion=enable_comm_fusion,
+        comm_fusion_zero_copy=enable_comm_fusion_zero_copy,
+    )
+    assert_comm_fusion_state(
+        net,
+        enable_comm_fusion,
+        expect_zero_copy_flat_buffer=bool(enable_comm_fusion_zero_copy),
+    )
     if enable_prefetch:
         setup_prefetch(net)
 
@@ -312,7 +387,7 @@ def run_fully_shard_multi_card(
                 data, label, forward_fn, net,
                 sync_grad_on_last_micro_step=sync_grad_on_last_micro_step
             )
-            with SkipDTensorDispatch():
+            with SkipDTensorDispatch(), _no_grad():
                 for grad in grads:
                     grad /= micro_step
                 optimizer(grads)
@@ -322,7 +397,7 @@ def run_fully_shard_multi_card(
             loss, _ = forward_fn(data, label)
             loss.backward()
             grads = get_backward_grads(net)
-            with SkipDTensorDispatch():
+            with SkipDTensorDispatch(), _no_grad():
                 optimizer(grads)
             reduced_loss = loss_sync_allreduce(loss)
             final_loss = reduced_loss / dp_size
@@ -381,7 +456,7 @@ def run_fully_shard_multi_card_with_empty_init(
             total_loss, grads, micro_step = run_accumulated_step(
                 data, label, forward_fn, net
             )
-            with SkipDTensorDispatch():
+            with SkipDTensorDispatch(), _no_grad():
                 for grad in grads:
                     grad /= micro_step
                 optimizer(grads)
@@ -391,7 +466,7 @@ def run_fully_shard_multi_card_with_empty_init(
             loss, _ = forward_fn(data, label)
             loss.backward()
             grads = get_backward_grads(net)
-            with SkipDTensorDispatch():
+            with SkipDTensorDispatch(), _no_grad():
                 optimizer(grads)
             reduced_loss = loss_sync_allreduce(loss)
             final_loss = reduced_loss / dp_size
@@ -441,7 +516,7 @@ def run_fully_shard_multi_card_ignored(ckpt_path, mesh):
         loss, _ = forward_fn(data, label)
         loss.backward()
         grads = get_backward_grads(net)
-        with SkipDTensorDispatch():
+        with SkipDTensorDispatch(), _no_grad():
             optimizer(grads)
         reduced_loss = loss_sync_allreduce(loss)
         final_loss = reduced_loss / dp_size
@@ -455,7 +530,14 @@ def run_fully_shard_multi_card_ignored(ckpt_path, mesh):
     return losses
 
 
-def run_fully_shard(mesh, use_empty_weight=False, enable_prefetch=False, enable_recompute=False):
+def run_fully_shard(
+    mesh,
+    use_empty_weight=False,
+    enable_prefetch=False,
+    enable_recompute=False,
+    enable_comm_fusion=False,
+    enable_comm_fusion_zero_copy=None,
+):
     """Run fully_shard with different mesh"""
     init()
 
@@ -468,7 +550,12 @@ def run_fully_shard(mesh, use_empty_weight=False, enable_prefetch=False, enable_
         losses, _ = run_fully_shard_multi_card_with_empty_init(ckpt_path, mesh)
     else:
         losses, _ = run_fully_shard_multi_card(
-            ckpt_path, mesh, enable_prefetch=enable_prefetch, enable_recompute=enable_recompute
+            ckpt_path,
+            mesh,
+            enable_prefetch=enable_prefetch,
+            enable_recompute=enable_recompute,
+            enable_comm_fusion=enable_comm_fusion,
+            enable_comm_fusion_zero_copy=enable_comm_fusion_zero_copy,
         )
 
     if rank_id == 0:
@@ -566,6 +653,56 @@ def run_fully_shard_zero1_with_manual_grad_sync(mesh):
         print("Precision comparison with zero1 manual grad sync passed!")
 
 
+def run_fully_shard_with_grad_accum_comm_fusion(mesh):
+    """Run fully_shard gradient accumulation with comm_fusion and compare with large-batch baseline."""
+    init()
+
+    rank_id = get_rank()
+
+    ckpt_path = os.path.join(TEMP_DIR, "init_baseline.ckpt")
+    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please generate baseline artifacts first"
+
+    losses, _ = run_fully_shard_multi_card(
+        ckpt_path,
+        mesh,
+        accumulate_grad=True,
+        enable_comm_fusion=True,
+    )
+
+    if rank_id == 0:
+        baseline_losses_file = os.path.join(TEMP_DIR, "baseline_losses.npy")
+        assert os.path.exists(baseline_losses_file), f"Baseline losses not found: {baseline_losses_file}"
+
+        baseline_losses = list(np.load(baseline_losses_file))
+        compare_losses(baseline_losses, losses, rtol=1e-5, atol=1e-5)
+        print("Precision comparison with gradient accumulation + comm_fusion passed!")
+
+
+def run_fully_shard_zero_copy_comm_fusion(mesh):
+    """Run fully_shard with comm_fusion and the experimental zero-copy path."""
+    init()
+
+    rank_id = get_rank()
+
+    ckpt_path = os.path.join(TEMP_DIR, "init_baseline.ckpt")
+    assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}, please generate baseline artifacts first"
+
+    losses, _ = run_fully_shard_multi_card(
+        ckpt_path,
+        mesh,
+        enable_comm_fusion=True,
+        enable_comm_fusion_zero_copy=True,
+    )
+
+    if rank_id == 0:
+        baseline_losses_file = os.path.join(TEMP_DIR, "baseline_losses.npy")
+        assert os.path.exists(baseline_losses_file), f"Baseline losses not found: {baseline_losses_file}"
+
+        baseline_losses = list(np.load(baseline_losses_file))
+        compare_losses(baseline_losses, losses, rtol=1e-5, atol=1e-5)
+        print("Precision comparison with comm_fusion zero-copy passed!")
+
+
 def test_ms_zero3_fully_shard():
     """
     Feature: Compare fully_shard precision with standalone baseline
@@ -586,6 +723,28 @@ def test_ms_zero3_fully_shard_prefetch():
     """
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     run_fully_shard(mesh, enable_prefetch=True)
+
+
+def test_ms_zero3_fully_shard_comm_fusion():
+    """
+    Feature: Compare fully_shard comm_fusion precision with standalone baseline
+    Description: Run standalone baseline and fully_shard multi-card training with comm_fusion enabled,
+                 then compare reduced losses on rank 0 only
+    Expectation: Losses should match within tolerance
+    """
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    run_fully_shard(mesh, enable_comm_fusion=True)
+
+
+def test_ms_zero3_fully_shard_comm_fusion_prefetch():
+    """
+    Feature: Compare fully_shard comm_fusion + prefetch precision with standalone baseline
+    Description: Run standalone baseline and fully_shard multi-card training with comm_fusion and
+                 child-module prefetch enabled, then compare reduced losses on rank 0 only
+    Expectation: Losses should match within tolerance
+    """
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    run_fully_shard(mesh, enable_prefetch=True, enable_comm_fusion=True)
 
 
 def test_ms_zero3_fully_shard_prefetch_recompute():
@@ -676,6 +835,17 @@ def test_ms_zero1_fully_shard_grad_accum():
     """
     mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
     run_fully_shard_zero1_with_manual_grad_sync(mesh)
+
+
+def test_ms_zero3_fully_shard_grad_accum_comm_fusion():
+    """
+    Feature: Compare fully_shard gradient accumulation + comm_fusion precision with large-batch baseline
+    Description: Run fully_shard multi-card training with per-micro-step gradient accumulation and
+                 comm_fusion enabled, then compare reduced losses against the large-batch baseline on rank 0 only
+    Expectation: Losses should match the large-batch baseline within tolerance
+    """
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
+    run_fully_shard_with_grad_accum_comm_fusion(mesh)
 
 
 def _parse_args():

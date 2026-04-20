@@ -17,7 +17,7 @@ from tests.common.mark_utils import arg_mark
 from tests.mindspore.st.utils import msrun_case
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_moe_ffn_fwd_tp2ep2():
     """
     Feature: MoE-FFN forward mega kernel with MindSpore (TP=2, EP=2).
@@ -33,7 +33,7 @@ def test_moe_ffn_fwd_tp2ep2():
     msrun_case(glog_v, file_name, case_name, master_port, worker_num, worker_num)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_moe_ffn_bwd_tp2ep2():
     """
     Feature: MoE-FFN backward mega kernel with MindSpore (TP=2, EP=2).

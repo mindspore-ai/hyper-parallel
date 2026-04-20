@@ -33,6 +33,23 @@ platform = get_platform()
 origin_class_to_extend_class = {}
 
 
+def _resolve_comm_fusion_zero_copy_default(
+    platform_type: PlatformType,
+    comm_fusion: bool,
+    comm_fusion_zero_copy: Optional[bool],
+) -> bool:
+    """Resolve backend-specific default for the comm_fusion zero-copy path."""
+    if comm_fusion_zero_copy is not None:
+        return comm_fusion_zero_copy
+    if not comm_fusion:
+        return False
+    if platform_type == PlatformType.PYTORCH:
+        return True
+    if platform_type == PlatformType.MINDSPORE:
+        return False
+    return False
+
+
 def _check_strict_keys(
     module: platform.Module, state_dict: Mapping[str, Any],
 ) -> None:
@@ -114,16 +131,22 @@ class HSDPModule:
 
     # pylint: disable=C0415
     def hsdp_init(self, platform_type, module, mesh, reshard_after_forward,
-                  shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device, comm_fusion):
+                  shard_placement_fn, mp_policy, offload_policy, ignored_params, replicate_params, device,
+                  comm_fusion, comm_fusion_zero_copy: Optional[bool] = None):
         """init hsdp2 scheduler."""
         scheduler_class = None
         if platform_type == PlatformType.MINDSPORE:
             from hyper_parallel.platform.mindspore.fully_shard.scheduler import MindSporeHSDPSchedulerV2
             scheduler_class = MindSporeHSDPSchedulerV2
-            comm_fusion = False
         else:
             from hyper_parallel.platform.torch.fully_shard.scheduler import TorchHSDPSchedulerV2
             scheduler_class = TorchHSDPSchedulerV2
+
+        resolved_comm_fusion_zero_copy = _resolve_comm_fusion_zero_copy_default(
+            platform_type,
+            comm_fusion,
+            comm_fusion_zero_copy,
+        )
 
         self.hsdp_scheduler = scheduler_class(module,
                                               mesh,
@@ -134,7 +157,8 @@ class HSDPModule:
                                               ignored_params,
                                               replicate_params,
                                               device,
-                                              comm_fusion
+                                              comm_fusion,
+                                              resolved_comm_fusion_zero_copy,
                                               )
 
     def set_requires_gradient_sync(self, requires_grad_sync):
@@ -506,7 +530,8 @@ def fully_shard(
         offload_policy: OffloadPolicy = OffloadPolicy(),
         ignored_params: Optional[set[platform.Parameter]] = None,
         replicate_params: Optional[set[platform.Parameter]] = None,
-        comm_fusion: bool = False
+        comm_fusion: bool = False,
+        comm_fusion_zero_copy: Optional[bool] = None,
 ) -> Union[platform.Module, List[platform.Module]]:
 
     """
@@ -566,6 +591,17 @@ def fully_shard(
             which skips fully_shard management and gradient synchronization
             entirely for the selected parameters.
 
+        comm_fusion_zero_copy (Optional[bool], default=None):
+            Whether allow the experimental zero-copy path for
+            ``comm_fusion``. When set to ``None``, fully_shard uses a backend-specific
+            default:
+            - PyTorch: enabled automatically when ``comm_fusion=True``
+            - MindSpore: disabled automatically even when ``comm_fusion=True``
+            When enabled, fully_shard may rebase sharded local parameter storage
+            into one shared flat buffer so fused all-gather can read directly from
+            contiguous memory. This path depends on optimizer compatibility with
+            view-backed parameters.
+
     Returns:
         nn.Module or List[nn.Module]: The input module(s) with HSDP capabilities added.
     """
@@ -614,7 +650,8 @@ def fully_shard(
         ignored_params,
         replicate_params,
         device,
-        comm_fusion
+        comm_fusion,
+        comm_fusion_zero_copy,
     )
     # Share the same scheduler handle with other roots so mods[i].unshard()/prefetch work
     if len(modules) > 1:

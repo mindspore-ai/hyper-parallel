@@ -56,6 +56,13 @@ _GROUP_INFO_CACHE = {}
 platform = get_platform()
 
 
+def _copy_without_bumping_version(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Copy into ``dst`` while preserving its autograd version counter."""
+    # pylint: disable=W0212
+    with torch.autograd._unsafe_preserve_version_counter(dst):
+        dst.copy_(src)
+
+
 def _build_group_info_from_rank_list(
     group_name: str,
     rank_list,
@@ -772,7 +779,7 @@ class TorchHSDPParamV2(HSDPParamV2):
                 device=self.device,
             )
             self.alloc_all_gather_outputs()
-            self.all_gather_outputs[0].copy_(all_gather_input)
+            _copy_without_bumping_version(self.all_gather_outputs[0], all_gather_input)
             return self.all_gather_outputs[0], None
 
         # Get input data
@@ -789,7 +796,7 @@ class TorchHSDPParamV2(HSDPParamV2):
 
         if self.sharded_group_info.group is None or self.shard_world_size <= 1:
             # No communication needed, just copy
-            self.all_gather_outputs[0].copy_(all_gather_input)
+            _copy_without_bumping_version(self.all_gather_outputs[0], all_gather_input)
             return self.all_gather_outputs[0], None
 
         # Execute all_gather_into_tensor
