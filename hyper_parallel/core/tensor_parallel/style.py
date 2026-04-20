@@ -15,8 +15,8 @@
 """Parallel styles for declarative tensor-parallel module sharding.
 
 Provides :class:`ParallelStyle` (ABC) and concrete implementations
-:class:`ColwiseParallel` / :class:`RowwiseParallel` aligned with
-``torch.distributed.tensor.parallel.style``.
+:class:`ColwiseParallel`, :class:`RowwiseParallel`, and :class:`SequenceParallel`
+aligned with ``torch.distributed.tensor.parallel.style``.
 """
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Tuple
@@ -41,6 +41,7 @@ __all__ = [
     "ParallelStyle",
     "ColwiseParallel",
     "RowwiseParallel",
+    "SequenceParallel",
 ]
 
 
@@ -380,6 +381,113 @@ class RowwiseParallel(ParallelStyle):
                 forward_outputs,
                 device_mesh,
             )
+
+        return distribute_module(
+            module,
+            device_mesh,
+            partition_fn,
+            input_fn,
+            output_fn,
+        )
+
+
+class SequenceParallel(ParallelStyle):
+    """Replicate module parameters and run forward with the sequence axis sharded.
+
+    Matches ``torch.distributed.tensor.parallel.SequenceParallel``: activations are
+    sharded on the sequence dimension while weights stay fully replicated. Typical
+    targets are normalization and dropout layers used after row-wise / scatter
+    projections in tensor-parallel transformers (`Reducing Activation Recomputation
+    in Large Transformer Models <https://arxiv.org/abs/2205.05198>`__).
+
+    If the first positional input is a plain tensor, it is treated as the local
+    shard along ``sequence_dim`` and wrapped as a :class:`DTensor`. If it is already
+    a :class:`DTensor` but not sharded on that dimension, it is redistributed.
+
+    Keyword Args:
+        sequence_dim (int, optional):
+            Tensor dimension index for the sequence axis (e.g. ``1`` for ``(B, S, H)``).
+            Default: ``1``.
+        use_local_output (bool, optional):
+            If ``True``, return a local tensor via ``to_local()``; otherwise keep a
+            :class:`DTensor`. Default: ``False`` (PyTorch default).
+
+    Note:
+        Like PyTorch, this assumes sensible defaults for norm weights (e.g. ones).
+        Custom initializations should be broadcast so every rank agrees before or
+        after parallelization.
+
+    Example::
+
+        >>> from hyper_parallel import parallelize_module, SequenceParallel, init_device_mesh
+        >>> m = Model(...)
+        >>> tp_mesh = init_device_mesh("npu", (8,), mesh_dim_names=("tp",))
+        >>> parallelize_module(m, tp_mesh, {"norm": SequenceParallel()})
+    """
+
+    def __init__(self, *, sequence_dim: int = 1, use_local_output: bool = False) -> None:
+        super().__init__()
+        self.sequence_sharding: Tuple[Placement, ...] = (Shard(sequence_dim),)
+        self.use_local_output = use_local_output
+
+    def __repr__(self) -> str:
+        dim = self.sequence_sharding[0].dim
+        return (
+            f"{self.__class__.__name__}("
+            f"sequence_dim={dim}, "
+            f"use_local_output={self.use_local_output})"
+        )
+
+    @staticmethod
+    def _prepare_input_fn(
+        sequence_sharding: Tuple[Placement, ...],
+        mod: Module,
+        inputs: Any,
+        device_mesh: DeviceMesh,
+    ) -> Any:
+        """Ensure the first input is a :class:`DTensor` sharded on the sequence dim."""
+        input_tensor = inputs[0]
+        if isinstance(input_tensor, DTensor):
+            if tuple(input_tensor.placements) != tuple(sequence_sharding):
+                input_tensor = input_tensor.redistribute(device_mesh, sequence_sharding)
+            return input_tensor
+        if platform.is_tensor(input_tensor):
+            return DTensor.from_local(input_tensor, device_mesh, sequence_sharding)
+        raise ValueError(
+            f"expecting input of {mod} to be a tensor or DTensor, but got {type(input_tensor)}"
+        )
+
+    @staticmethod
+    def _prepare_output_fn(use_local_output: bool, outputs: Any) -> Any:
+        if use_local_output:
+            return outputs.to_local()
+        return outputs
+
+    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+        """Apply sequence-parallel hooks and replicate parameters via ``distribute_module``.
+
+        Args:
+            module: Submodule to parallelize (for example ``LayerNorm`` or ``Dropout``).
+            device_mesh: One-dimensional tensor-parallel device mesh.
+
+        Returns:
+            The same ``module`` instance with forward hooks attached and parameters
+            converted to replicated DTensors where applicable.
+        """
+
+        def partition_fn(_submodule_path, _submodule, _mesh):
+            return None
+
+        def input_fn(forward_module, forward_inputs, mesh):
+            return self._prepare_input_fn(
+                self.sequence_sharding,
+                forward_module,
+                forward_inputs,
+                mesh,
+            )
+
+        def output_fn(_forward_module, forward_outputs, _mesh):
+            return self._prepare_output_fn(self.use_local_output, forward_outputs)
 
         return distribute_module(
             module,

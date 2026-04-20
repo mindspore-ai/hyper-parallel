@@ -18,11 +18,13 @@ from hyper_parallel.core.tensor_parallel.style import (
     ColwiseParallel,
     ParallelStyle,
     RowwiseParallel,
+    SequenceParallel,
 )
 
 __all__ = [
     "ColwiseParallel",
     "ParallelStyle",
     "RowwiseParallel",
+    "SequenceParallel",
     "parallelize_module",
 ]

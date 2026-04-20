@@ -22,7 +22,7 @@ __all__ = ["get_platform", "fully_shard", "hsdp_sync_stream", "HSDPModule", "DTe
            "init_process_group", "destroy_process_group", "get_process_group_ranks", "get_backend", "split_group",
            "get_group_local_rank", "mark_created_groups",
            "ContextParallel", "AsyncContextParallel",
-           "ColwiseParallel", "RowwiseParallel",
+           "ColwiseParallel", "RowwiseParallel", "SequenceParallel",
            "ParallelStyle", "parallelize_module"]
 
 from hyper_parallel.platform import get_platform
@@ -40,7 +40,7 @@ from hyper_parallel.collectives.cc import (init_process_group, destroy_process_g
                                            get_backend, split_group, get_group_local_rank, mark_created_groups)
 from hyper_parallel.core.context_parallel import ContextParallel, AsyncContextParallel
 from hyper_parallel.core.tensor_parallel import (
-    ColwiseParallel, RowwiseParallel, ParallelStyle, parallelize_module,
+    ColwiseParallel, RowwiseParallel, SequenceParallel, ParallelStyle, parallelize_module,
 )
 from hyper_parallel.core.fully_shard.api import fully_shard, hsdp_sync_stream, HSDPModule
 
