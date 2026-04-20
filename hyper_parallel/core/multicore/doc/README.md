@@ -13,6 +13,17 @@ AllToAll-Dispatch → GMM1(up_proj) → SwiGLU → GMM2(down_proj) → AllToAll-
 每个算子是独立的 NPU kernel，算子之间存在大量 HBM 读写（激活值中间结果落盘再读回）。
 在 Expert Parallel（EP）场景下，AllToAll 通信与 GMM 计算通常串行执行，造成大量空闲等待。
 
+实测数据（昇腾 910C，DeepSeek-V3 规模 MoE 负载）：
+
+| 指标 | 测量值 |
+|---|---|
+| Cube 核平均 MAC 利用率 | ~54%（离理论峰值差距显著）|
+| 关键路径 Vector 核执行时间 | ~18%（SwiGLU 等，此时 Cube 全闲）|
+| AllToAll 通信占端到端时间 | ~17%（其中 61% 被 GEMM 掩盖，39% 暴露）|
+| Cube/Vector 相互空闲 | 两类核轮流空转，任一时刻只有一类核工作 |
+
+根因分析：GroupedGEMM 只使用 Cube 核，Vector 核在 GMM 执行期间全部空闲；SwiGLU 由 Vector 核执行时 25 个 Cube 同时空转；AllToAll 由 HOST 驱动，通信空窗期设备内 AIC 和 AIV 也无法计算。
+
 ### 1.2 融合方案
 
 Mega Kernel 将上述五个算子**融合为一个 kernel**，由 AIC（AI Cube）和 AIV（AI Vector）核同时执行：
@@ -26,6 +37,10 @@ Mega Kernel 将上述五个算子**融合为一个 kernel**，由 AIC（AI Cube�
 - 消除 AllToAll 与 GMM 之间的 HBM 中间激活读写
 - 通信与计算深度重叠，提升硬件利用率
 - 正向、反向均适用，支持端到端训练
+
+### 1.3 RATR：Rank-Aware Tile Reordering
+
+在多卡 AllToAll 场景下，各 Rank 同时向同一目标 Rank 发送数据会造成网络拥塞，导致尾延迟暴露。RATR 通过调整 AllToAll Tile 的执行顺序，使发往不同 Rank 的通信流量在时间轴上均匀分散，避免多源 Rank 同时涌向同一目标。RATR 不修改任何计算逻辑，仅对 `vector_task_indexs` 中 AllToAll tile 重排，与 SSC 静态调度配置一起在 RuntimeConfig 中离线生成，运行时零开销。
 
 反向计算流程（同理融合）：
 
@@ -645,3 +660,13 @@ hyper_parallel/core/multicore/
 └── doc/
     └── README.md                   # 本文档
 ```
+
+### C++ CANN 算子源码（vendor 包）
+
+```text
+hyper_parallel/core/multicore/ops/
+├── multicore_moe_ffn/       # 正向算子 CANN 源码（op_host / op_kernel / op_graph）
+└── multicore_moe_ffn_grad/  # 反向算子 CANN 源码（含 swi_glu_grad/）
+```
+
+预编译产物打包为 `prebuild/multicore_moe_ffn.tar.gz`，`import` 时自动解压；如需从源码重新编译 CANN vendor 包，参见 [ISSUE_MULTICORE_DESIGN.md](../../../../ISSUE_MULTICORE_DESIGN.md)。
