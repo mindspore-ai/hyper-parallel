@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -98,7 +98,7 @@ def remove_no_skip_ops(op_names: Set[str]) -> None:
     _no_skip_ops = _no_skip_ops - op_names
 
 
-def enable_dtensor_dispatch():
+def enable_dtensor_dispatch() -> None:
     """
     Enable DTensor dispatch for distributed tensor operations.
 
@@ -109,7 +109,7 @@ def enable_dtensor_dispatch():
     _dtensor_dispatch = True
 
 
-def disable_dtensor_dispatch():
+def disable_dtensor_dispatch() -> None:
     """
     Disable DTensor dispatch for distributed tensor operations.
 
@@ -120,7 +120,7 @@ def disable_dtensor_dispatch():
     _dtensor_dispatch = False
 
 
-def get_dtensor_dispatch():
+def get_dtensor_dispatch() -> bool:
     """
     Get the current DTensor dispatch status.
 
@@ -139,7 +139,15 @@ class LayoutCacheKey:
         self._hash = hash(self._tuple)
 
     @classmethod
-    def from_cache_values(cls, cache_values):
+    def from_cache_values(cls, cache_values: list) -> "LayoutCacheKey":
+        """Build a LayoutCacheKey from a cache_values list.
+
+        Args:
+            cache_values (list): Mixed list of Layout objects (with compact_str) and raw scalars.
+
+        Returns:
+            LayoutCacheKey: Immutable key derived from the string representation of each value.
+        """
         key_values = []
         for v in cache_values:
             if hasattr(v, 'compact_str'):
@@ -174,7 +182,7 @@ class LayoutCacheManager:
         atexit.register(self.clear_cache)
 
     @classmethod
-    def get_instance(cls):
+    def get_instance(cls) -> "LayoutCacheManager":
         """
         Get the singleton instance of LayoutCacheManager.
 
@@ -208,7 +216,7 @@ class LayoutCacheManager:
         op = get_distributed_op(op_name)
         return op
 
-    def clear_cache(self):
+    def clear_cache(self) -> None:
         """
         Clear all cached layouts.
 
@@ -785,9 +793,12 @@ class OpDispatcher:
 
         return merged
 
-    def safe_load_yaml_from_dir(self):
+    def safe_load_yaml_from_dir(self) -> dict:
         """
         Load yaml dictionary from directory.
+
+        Returns:
+            dict: Merged dictionary of all operator configurations loaded from YAML files.
         """
         yaml_dict = {}
         yaml_path = os.path.join(self.work_dir, self.yaml_dir) if self.work_dir else self.yaml_dir
@@ -877,7 +888,15 @@ class OpDispatcher:
         Returns:
             List of args with DTensor replaced by their local tensors.
         """
-        def unwrap(arg):
+        def unwrap(arg: object) -> object:
+            """Replace DTensor with its local tensor; pass scalars and plain tensors through.
+
+            Args:
+                arg (object): An element of the operator's argument list.
+
+            Returns:
+                object: The local tensor if arg is a DTensor, otherwise arg unchanged.
+            """
             if isinstance(arg, DTensor):
                 return arg.to_local()
             if isinstance(arg, tuple):
@@ -917,7 +936,7 @@ class OpDispatcher:
             RuntimeError: If op_name is not registered or has an unknown suffix.
         """
         if op_name not in self.layout_infer_ops:
-            raise RuntimeError(f"Operator {op_name} dose not contain parallel layout infer func.")
+            raise RuntimeError(f"Operator {op_name} does not contain parallel layout infer func.")
 
         cache_manager = LayoutCacheManager.get_instance()
         distribute_op = cache_manager.distributed_op(op_name)
@@ -972,16 +991,12 @@ class OpDispatcher:
             infer_result = distribute_op.infer_layout(cache_values)
             op_impl = distribute_op.get_expand_impl(func, infer_result, cache_values)
             op_layout_cache[cache_key] = (infer_result, op_impl)
-        output_layouts, extra_info = infer_result
-        if op_impl is None:
-            op_impl = func
-        if extra_info is not None:
-            py_output = op_impl(*local_args, *extra_info, **local_kwargs)
-        else:
-            py_output = op_impl(*local_args, **local_kwargs)
+        output_layouts, _ = infer_result
+        op_impl = func if op_impl is None else op_impl
+        py_output = op_impl(*local_args, **local_kwargs)
         return self._wrap_output(py_output, output_layouts)
 
-    def dispatch(self, op_call: callable, args: tuple[object, ...], kwargs: dict[str, object]):
+    def dispatch(self, op_call: callable, args: tuple, kwargs: dict) -> object:
         """Route an op call through the appropriate DTensor dispatch path.
 
         Args:

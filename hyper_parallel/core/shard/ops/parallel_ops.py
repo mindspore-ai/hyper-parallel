@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
 """
 Distributed operator implementation.
 """
+
+from typing import Optional
 
 from .parallel_ops_register import register_distributed_op
 
@@ -56,11 +58,15 @@ class DistributedOp:
                 )
 
     # pylint: disable=W0613
-    def preprocess(self, args: tuple, kwargs: dict):
+    def preprocess(self, args: tuple, kwargs: dict) -> Optional[tuple]:
         """
         Unified preprocessing: parameter parsing + to_local + cache_values construction.
 
         Subclasses override this to participate in the new dispatch flow.
+
+        Args:
+            args (tuple): Positional arguments passed to the operator call.
+            kwargs (dict): Keyword arguments passed to the operator call.
 
         Returns:
             None: Fall back to legacy dispatch (default).
@@ -73,7 +79,7 @@ class DistributedOp:
         return None
 
     # pylint: disable=W0613
-    def infer_layout(self, layouts, extra_args=None):
+    def infer_layout(self, layouts: tuple, extra_args: Optional[tuple] = None) -> Optional[tuple]:
         """
         Infer output layouts based on input layouts.
 
@@ -82,7 +88,7 @@ class DistributedOp:
 
         Args:
             layouts (tuple): Layouts of input tensor.
-            extra_args (dict): Additional arguments (dim, keepdim).
+            extra_args (list): Additional arguments (dim, keepdim, etc.).
 
         Returns:
             tuple: Layouts for output tensors.
@@ -96,8 +102,19 @@ class DistributedOp:
         return None
 
     # pylint: disable=W0613
-    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
+    def get_expand_impl(self, func: Optional[callable], infer_result: tuple, layouts: tuple,
+                        extra_args: Optional[tuple] = None) -> Optional[callable]:
         """
-        Get expand implementation for the operator
+        Get expand implementation for the operator.
+
+        Args:
+            func (Optional[callable]): The underlying operator function.
+            infer_result (tuple): Result returned by infer_layout (output_layouts, extra_info).
+            layouts (tuple): Input layouts passed to layout inference.
+            extra_args (Optional[tuple]): Additional arguments for layout inference.
+
+        Returns:
+            Optional[callable]: A closure that wraps the operator call with extra logic,
+                or None if no expansion is needed.
         """
         return None

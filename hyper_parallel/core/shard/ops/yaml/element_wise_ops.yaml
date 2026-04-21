@@ -20,6 +20,11 @@ SubScalar:
 
 Muls:
   dist_op_name: _muls_dist_op
+  distributed_op_class: ElementWiseWithPartialDistributedOp
+
+Divs:
+  dist_op_name: _divs_dist_op
+  distributed_op_class: ElementWiseWithPartialDistributedOp
 
 Sigmoid:
   dist_op_name: _sigmoid_dist_op
@@ -47,6 +52,7 @@ NotEqual:
 
 Cast:
   dist_op_name: _cast_dist_op
+  distributed_op_class: ElementWiseWithPartialDistributedOp
 
 Contiguous:
   dist_op_name: _contiguous_dist_op
@@ -68,6 +74,12 @@ Tile:
 
 OnesLikeExt:
   dist_op_name: _ones_like_ext_dist_op
+
+ZerosLikeExt:
+  dist_op_name: _zeros_like_ext_dist_op
+
+EmptyLike:
+  dist_op_name: _empty_like_dist_op
 
 dropout:
   dist_op_name: _torch_dropout_dist_op
