@@ -15,11 +15,12 @@
 """Parallel styles for declarative tensor-parallel module sharding.
 
 Provides :class:`ParallelStyle` (ABC) and concrete implementations
-:class:`ColwiseParallel`, :class:`RowwiseParallel`, and :class:`SequenceParallel`
-aligned with ``torch.distributed.tensor.parallel.style``.
+:class:`ColwiseParallel`, :class:`RowwiseParallel`, :class:`SequenceParallel`,
+:class:`PrepareModuleInput`, :class:`PrepareModuleInputOutput`, and
+:class:`PrepareModuleOutput` aligned with ``torch.distributed.tensor.parallel.style``.
 """
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
@@ -42,6 +43,9 @@ __all__ = [
     "ColwiseParallel",
     "RowwiseParallel",
     "SequenceParallel",
+    "PrepareModuleInput",
+    "PrepareModuleInputOutput",
+    "PrepareModuleOutput",
 ]
 
 
@@ -495,4 +499,281 @@ class SequenceParallel(ParallelStyle):
             partition_fn,
             input_fn,
             output_fn,
+        )
+
+
+class PrepareModuleInput(ParallelStyle):
+    """Prepare module forward *args* (and optional *kwargs*) as :class:`DTensor` layouts.
+
+    At forward time, converts each annotated positional (or keyword) tensor from local
+    to :class:`DTensor` using ``input_layouts``, then redistributes to
+    ``desired_input_layouts`` when they differ. ``None`` in a layout tuple means
+    “leave this input unchanged”.
+
+    Mirrors ``torch.distributed.tensor.parallel.style.PrepareModuleInput``.
+
+    Keyword Args:
+        input_layouts: Placements per positional arg, or a single :class:`Placement`
+            wrapped as a one-tuple. ``None`` entries skip conversion for that arg.
+        desired_input_layouts: Target placements; must match ``input_layouts`` length.
+        input_kwarg_layouts: Optional mapping kwarg name → placement for conversion.
+        desired_input_kwarg_layouts: Target placements for those kwargs (same keys).
+        use_local_output: If ``True``, convert prepared inputs back to local tensors
+            before the module runs (PyTorch names this flag ``use_local_output`` on
+            :class:`PrepareModuleInput`).
+    """
+
+    def __init__(
+        self,
+        *,
+        input_layouts: Optional[Union[Placement, Tuple[Optional[Placement], ...]]] = None,
+        desired_input_layouts: Optional[
+            Union[Placement, Tuple[Optional[Placement], ...]]
+        ] = None,
+        input_kwarg_layouts: Optional[Dict[str, Placement]] = None,
+        desired_input_kwarg_layouts: Optional[Dict[str, Placement]] = None,
+        use_local_output: bool = False,
+    ) -> None:
+        super().__init__()
+        self.input_layouts = (
+            (input_layouts,) if isinstance(input_layouts, Placement) else input_layouts
+        )
+        self.desired_input_layouts = (
+            (desired_input_layouts,)
+            if isinstance(desired_input_layouts, Placement)
+            else desired_input_layouts
+        )
+        self.use_local_output = use_local_output
+        if self.input_layouts is not None:
+            if self.desired_input_layouts is None:
+                raise AssertionError("desired module inputs should not be None!")
+            if len(self.input_layouts) != len(self.desired_input_layouts):
+                raise AssertionError(
+                    "input_layouts and desired_input_layouts should have same length!"
+                )
+        self.with_kwargs = input_kwarg_layouts is not None
+        self.input_kwarg_layouts = input_kwarg_layouts or {}
+        self.desired_input_kwarg_layouts = desired_input_kwarg_layouts or {}
+        if self.with_kwargs:
+            if len(self.input_kwarg_layouts) != len(self.desired_input_kwarg_layouts):
+                raise AssertionError(
+                    "input_kwarg_layouts and desired_input_kwarg_layouts should have "
+                    "same length!"
+                )
+
+    def _prepare_input_arg(
+        self,
+        input_obj: Any,
+        mesh: DeviceMesh,
+        input_layout: Optional[Placement],
+        desired_layout: Optional[Placement],
+    ) -> Any:
+        """Convert one input to DTensor, redistribute if needed, optionally to_local."""
+        if input_layout is not None:
+            if isinstance(input_obj, DTensor):
+                dt_inp = input_obj
+            else:
+                if not platform.is_tensor(input_obj):
+                    raise AssertionError("expecting input to be a framework tensor!")
+                dt_inp = DTensor.from_local(input_obj, mesh, (input_layout,))
+
+            if desired_layout is not None and input_layout != desired_layout:
+                dt_inp = dt_inp.redistribute(mesh, (desired_layout,))
+
+            return dt_inp.to_local() if self.use_local_output else dt_inp
+        return input_obj
+
+    def _prepare_input_fn(self, inputs: Any, device_mesh: DeviceMesh) -> Any:
+        """Prepare positional ``inputs`` tuple per ``input_layouts`` / ``desired_input_layouts``."""
+        if self.input_layouts is None:
+            return inputs
+        if not isinstance(inputs, tuple):
+            inputs = (inputs,)
+        if len(inputs) != len(self.input_layouts):
+            raise ValueError("module inputs and input_layouts should have same length!")
+        if self.desired_input_layouts is None:
+            raise AssertionError("desired module inputs should not be None!")
+        prepared_inputs = [
+            self._prepare_input_arg(inp, device_mesh, il, dl)
+            for inp, il, dl in zip(inputs, self.input_layouts, self.desired_input_layouts)
+        ]
+        return tuple(prepared_inputs)
+
+    def _prepare_input_kwarg_fn(
+        self,
+        inputs: Any,
+        kwarg_inputs: Dict[str, Any],
+        device_mesh: DeviceMesh,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Prepare positional and keyword tensor inputs; returns ``(args, kwargs)`` for the hook."""
+        prepared_arg_inputs = self._prepare_input_fn(inputs, device_mesh)
+        prepared_kwarg_inputs: Dict[str, Any] = {}
+        for kwarg_key in kwarg_inputs:
+            kwarg_val = kwarg_inputs[kwarg_key]
+            input_layout = self.input_kwarg_layouts.get(kwarg_key)
+            desired_input_layout = self.desired_input_kwarg_layouts.get(kwarg_key)
+            prepared_kwarg_inputs[kwarg_key] = self._prepare_input_arg(
+                kwarg_val, device_mesh, input_layout, desired_input_layout
+            )
+        return (prepared_arg_inputs, prepared_kwarg_inputs)
+
+    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+        if self.with_kwargs:
+
+            def _pre_hook(_mod, inputs, kwargs):
+                return self._prepare_input_kwarg_fn(inputs, kwargs, device_mesh)
+
+            platform.register_forward_pre_hook(
+                module, _pre_hook, prepend=False, with_kwargs=True,
+            )
+        else:
+
+            def _pre_hook(_mod, inputs):
+                return self._prepare_input_fn(inputs, device_mesh)
+
+            platform.register_forward_pre_hook(module, _pre_hook, prepend=False)
+        return module
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"input_layouts={self.input_layouts}, "
+            f"desired_input_layouts={self.desired_input_layouts}, "
+            f"input_kwarg_layouts={self.input_kwarg_layouts}, "
+            f"desired_input_kwarg_layouts={self.desired_input_kwarg_layouts}, "
+            f"use_local_output={self.use_local_output})"
+        )
+
+
+class PrepareModuleOutput(ParallelStyle):
+    """Prepare module forward outputs as :class:`DTensor` and redistribute layouts.
+
+    Registers a forward hook that treats each return value like
+    ``torch.distributed.tensor.parallel.style.PrepareModuleOutput``: optional
+    ``None`` slots in ``output_layouts`` pass that output through unchanged.
+
+    Keyword Args:
+        output_layouts: Current or assumed placement per output tensor.
+        desired_output_layouts: Target placements; length must match ``output_layouts``.
+        use_local_output: If ``True`` (default), return local shards after redistribution.
+    """
+
+    def __init__(
+        self,
+        *,
+        output_layouts: Union[Placement, Tuple[Optional[Placement], ...]],
+        desired_output_layouts: Union[Placement, Tuple[Optional[Placement], ...]],
+        use_local_output: bool = True,
+    ) -> None:
+        super().__init__()
+        self.output_layouts = (
+            (output_layouts,) if isinstance(output_layouts, Placement) else output_layouts
+        )
+        self.desired_output_layouts = (
+            (desired_output_layouts,)
+            if isinstance(desired_output_layouts, Placement)
+            else desired_output_layouts
+        )
+        self.use_local_output = use_local_output
+        if len(self.output_layouts) != len(self.desired_output_layouts):
+            raise AssertionError(
+                "output_layouts and desired_output_layouts should have same length!"
+            )
+
+    def _prepare_out_fn(self, outputs: Any, device_mesh: DeviceMesh) -> Any:
+        """Redistribute each output tensor per ``output_layouts`` / ``desired_output_layouts``."""
+        prepared_outputs: list = []
+        if not isinstance(outputs, tuple):
+            outputs = (outputs,)
+        if len(outputs) != len(self.output_layouts):
+            raise ValueError("module outputs and output_layouts should have same length!")
+        for out, out_layout, desired_out_layout in zip(
+            outputs, self.output_layouts, self.desired_output_layouts,
+        ):
+            if out_layout is not None:
+                if isinstance(out, DTensor):
+                    dt_out = out
+                else:
+                    dt_out = DTensor.from_local(out, device_mesh, (out_layout,))
+                if out_layout != desired_out_layout:
+                    dt_out = dt_out.redistribute(device_mesh, (desired_out_layout,))
+                prepared_outputs.append(
+                    dt_out.to_local() if self.use_local_output else dt_out
+                )
+            else:
+                prepared_outputs.append(out)
+        if len(prepared_outputs) == 1:
+            return prepared_outputs[0]
+        return tuple(prepared_outputs)
+
+    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+
+        def _hook(_mod, _inputs, outputs):
+            return self._prepare_out_fn(outputs, device_mesh)
+
+        module.register_forward_hook(_hook)
+        return module
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"output_layouts={self.output_layouts}, "
+            f"desired_output_layouts={self.desired_output_layouts}, "
+            f"use_local_output={self.use_local_output})"
+        )
+
+
+class PrepareModuleInputOutput(ParallelStyle):
+    """Combine :class:`PrepareModuleInput` and :class:`PrepareModuleOutput` on one module.
+
+    Same keyword arguments as the two styles, with ``use_local_input`` mapping to
+    ``PrepareModuleInput(..., use_local_output=use_local_input)`` for PyTorch parity.
+    """
+
+    def __init__(
+        self,
+        *,
+        input_layouts: Optional[Union[Placement, Tuple[Optional[Placement], ...]]] = None,
+        desired_input_layouts: Optional[
+            Union[Placement, Tuple[Optional[Placement], ...]]
+        ] = None,
+        input_kwarg_layouts: Optional[Dict[str, Placement]] = None,
+        desired_input_kwarg_layouts: Optional[Dict[str, Placement]] = None,
+        use_local_input: bool = False,
+        output_layouts: Union[Placement, Tuple[Optional[Placement], ...]],
+        desired_output_layouts: Union[Placement, Tuple[Optional[Placement], ...]],
+        use_local_output: bool = True,
+    ) -> None:
+        super().__init__()
+        self.prepare_module_input = PrepareModuleInput(
+            input_layouts=input_layouts,
+            desired_input_layouts=desired_input_layouts,
+            input_kwarg_layouts=input_kwarg_layouts,
+            desired_input_kwarg_layouts=desired_input_kwarg_layouts,
+            use_local_output=use_local_input,
+        )
+        self.prepare_module_output = PrepareModuleOutput(
+            output_layouts=output_layouts,
+            desired_output_layouts=desired_output_layouts,
+            use_local_output=use_local_output,
+        )
+
+    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+        self.prepare_module_input.apply(module, device_mesh)
+        self.prepare_module_output.apply(module, device_mesh)
+        return module
+
+    def __repr__(self) -> str:
+        p_in = self.prepare_module_input
+        p_out = self.prepare_module_output
+        return (
+            f"{self.__class__.__name__}("
+            f"input_layouts={p_in.input_layouts}, "
+            f"desired_input_layouts={p_in.desired_input_layouts}, "
+            f"input_kwarg_layouts={p_in.input_kwarg_layouts}, "
+            f"desired_input_kwarg_layouts={p_in.desired_input_kwarg_layouts}, "
+            f"use_local_input={p_in.use_local_output}, "
+            f"output_layouts={p_out.output_layouts}, "
+            f"desired_output_layouts={p_out.desired_output_layouts}, "
+            f"use_local_output={p_out.use_local_output})"
         )

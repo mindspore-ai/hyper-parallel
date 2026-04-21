@@ -19,10 +19,15 @@ Tests for :class:`ParallelStyle` abstract base class and its contract:
 - Subclasses must implement ``apply`` method
 - ``src_data_rank`` default value and mutability
 - ``apply`` method signature and return value contract
+
+:class:`PrepareModuleInput` / :class:`PrepareModuleOutput` /
+:class:`PrepareModuleInputOutput` cases mirror PyTorch
+``test/distributed/tensor/parallel/test_parallelize_api.py`` (``TensorParallelAPITests``)
+where applicable; mesh size is 1 with ``init_backend=False`` for CPU-only UT.
 """
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from torch import nn
@@ -30,8 +35,30 @@ from torch import nn
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
-from hyper_parallel.core.tensor_parallel.style import ParallelStyle
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+from hyper_parallel.core.tensor_parallel.api import parallelize_module
+from hyper_parallel.core.tensor_parallel.style import (
+    ParallelStyle,
+    PrepareModuleInput,
+    PrepareModuleInputOutput,
+    PrepareModuleOutput,
+)
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
+
+
+def _patch_platform_rank_for_dtensor_redistribute(world_size: int = 1):
+    """Patch ``torch.distributed`` rank helpers so ``tensor_redistribution`` runs without ``init_process_group``.
+
+    Instance-level patches to ``platform.get_rank`` do not reliably override
+    ``TorchPlatform``'s ``@staticmethod`` implementations; patching ``torch.distributed``
+    APIs directly keeps behavior correct when running the full ``tests/ut`` suite.
+    """
+    return patch.multiple(
+        "torch.distributed",
+        get_rank=MagicMock(return_value=0),
+        get_world_size=MagicMock(return_value=world_size),
+    )
 
 
 class ConcreteParallelStyle(ParallelStyle):
@@ -271,6 +298,355 @@ class TestParallelStyleWithMockMesh(unittest.TestCase):
 
             self.assertIs(result, module)
             self.assertIs(style.last_device_mesh, mesh)
+
+
+class _DummyIdentityModule(nn.Module):
+    """Identity module (same idea as PyTorch ``DummyModule`` in ``test_parallelize_api``)."""
+
+    def forward(self, x):
+        return x
+
+
+class _DupOutModule(nn.Module):
+    """Returns two values for multi-output layout tests."""
+
+    def forward(self, x):
+        return x, torch.tensor(1.0, dtype=x.dtype, device=x.device)
+
+
+class TestPrepareModuleInput(unittest.TestCase):
+    """Tests aligned with PyTorch ``TensorParallelAPITests.test_prepare_module_input``."""
+
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def _setup_mock_platform(self, mock_platform, world_size: int = 1):
+        mock_platform.platform_type = PlatformType.PYTORCH
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else __import__("numpy").array(t)
+        )
+
+    def _make_1d_mesh(self, mock_platform, size: int = 1):
+        self._setup_mock_platform(mock_platform, world_size=size)
+        return init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(size,),
+            mesh_dim_names=("tp",),
+            init_backend=False,
+        )
+
+    def test_is_subclass_of_parallel_style(self):
+        """PrepareModuleInput is a ParallelStyle."""
+        self.assertIsInstance(PrepareModuleInput(), ParallelStyle)
+
+    def test_constructor_wraps_single_placement_as_tuple(self):
+        """Single Placement for input_layouts is normalized to a one-tuple."""
+        style = PrepareModuleInput(
+            input_layouts=Shard(0),
+            desired_input_layouts=Replicate(),
+        )
+        self.assertEqual(style.input_layouts, (Shard(0),))
+        self.assertEqual(style.desired_input_layouts, (Replicate(),))
+
+    def test_constructor_raises_when_desired_none_but_input_given(self):
+        """PyTorch parity: input_layouts set implies desired_input_layouts must be set."""
+        with self.assertRaises(AssertionError):
+            PrepareModuleInput(
+                input_layouts=(Replicate(),),
+                desired_input_layouts=None,
+            )
+
+    def test_constructor_raises_on_layout_length_mismatch(self):
+        with self.assertRaises(AssertionError):
+            PrepareModuleInput(
+                input_layouts=(Replicate(), Replicate()),
+                desired_input_layouts=(Replicate(),),
+            )
+
+    def test_constructor_raises_on_kwarg_layout_length_mismatch(self):
+        with self.assertRaises(AssertionError):
+            PrepareModuleInput(
+                input_kwarg_layouts={"a": Replicate()},
+                desired_input_kwarg_layouts={},
+            )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_forward_matches_pytorch_prepare_module_input_case(self, mock_platform):
+        """Same layout contract as PyTorch ``test_prepare_module_input`` (rank-agnostic check)."""
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+        module = _DummyIdentityModule()
+        PrepareModuleInput(
+            input_layouts=Shard(0),
+            desired_input_layouts=Replicate(),
+            use_local_output=False,
+        ).apply(module, mesh)
+        inp = torch.rand(5, 7)
+        with _patch_platform_rank_for_dtensor_redistribute(world_size=1):
+            output = module(inp)
+            self.assertIsInstance(output, DTensor)
+            restored = output.redistribute(mesh, [Shard(0)]).to_local()
+        self.assertTrue(torch.allclose(inp, restored))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_parallelize_module_single_style_like_pytorch(self, mock_platform):
+        """``parallelize_module(m, mesh, PrepareModuleInput(...))`` applies hooks on root."""
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+        module = _DummyIdentityModule()
+        parallelize_module(
+            module,
+            mesh,
+            PrepareModuleInput(
+                input_layouts=Shard(0),
+                desired_input_layouts=Replicate(),
+                use_local_output=False,
+            ),
+        )
+        inp = torch.rand(4, 6)
+        with _patch_platform_rank_for_dtensor_redistribute(world_size=1):
+            out = module(inp)
+            restored = out.redistribute(mesh, [Shard(0)]).to_local()
+        self.assertTrue(torch.allclose(inp, restored))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_use_local_output_true_passes_local_tensor_to_forward(self, mock_platform):
+        """With ``use_local_output=True``, forward receives plain tensors, not DTensor."""
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+        module = _DummyIdentityModule()
+        PrepareModuleInput(
+            input_layouts=Replicate(),
+            desired_input_layouts=Replicate(),
+            use_local_output=True,
+        ).apply(module, mesh)
+        inp = torch.ones(2, 3)
+        out = module(inp)
+        self.assertIsInstance(out, torch.Tensor)
+        self.assertTrue(torch.allclose(inp, out))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_value_error_when_forward_arity_mismatches_input_layouts(self, mock_platform):
+        """Raise ``ValueError`` when the number of forward args does not match ``input_layouts``."""
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+
+        class TwoIn(nn.Module):
+            def forward(self, x, y):
+                return x + y
+
+        module = TwoIn()
+        PrepareModuleInput(
+            input_layouts=(Replicate(),),
+            desired_input_layouts=(Replicate(),),
+        ).apply(module, mesh)
+        with self.assertRaises(ValueError):
+            module(torch.randn(2, 2), torch.randn(2, 2))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_none_placeholder_leaves_input_unchanged(self, mock_platform):
+        """A ``None`` slot in layout tuples skips preparing that positional argument."""
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+
+        class PickSecond(nn.Module):
+            def forward(self, x, y):
+                return y
+
+        module = PickSecond()
+        PrepareModuleInput(
+            input_layouts=(None, Replicate()),
+            desired_input_layouts=(None, Replicate()),
+            use_local_output=True,
+        ).apply(module, mesh)
+        x = torch.randn(2, 2)
+        y = torch.randn(2, 2)
+        out = module(x, y)
+        self.assertTrue(torch.all(torch.eq(out, y)))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_with_kwargs_prepares_kwarg_tensor(self, mock_platform):
+        """``input_kwarg_layouts`` prepares keyword tensor arguments like positional ones."""
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+
+        class M(nn.Module):
+            def forward(self, x, scale=None):
+                return (x, scale)
+
+        m = M()
+        PrepareModuleInput(
+            input_layouts=(Replicate(),),
+            desired_input_layouts=(Replicate(),),
+            input_kwarg_layouts={"scale": Replicate()},
+            desired_input_kwarg_layouts={"scale": Replicate()},
+            use_local_output=True,
+        ).apply(m, mesh)
+        x = torch.ones(2, 3)
+        s = torch.tensor(2.0)
+        out_x, out_s = m(x, scale=s)
+        self.assertIsInstance(out_x, torch.Tensor)
+        self.assertIsInstance(out_s, torch.Tensor)
+
+    def test_repr_contains_key_fields(self):
+        style = PrepareModuleInput(
+            input_layouts=Shard(0),
+            desired_input_layouts=Replicate(),
+            use_local_output=False,
+        )
+        r = repr(style)
+        self.assertIn("PrepareModuleInput", r)
+        self.assertIn("use_local_output=False", r)
+
+
+class TestPrepareModuleOutput(unittest.TestCase):
+    """Tests aligned with PyTorch ``TensorParallelAPITests.test_prepare_module_output``."""
+
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def _setup_mock_platform(self, mock_platform, world_size: int = 1):
+        mock_platform.platform_type = PlatformType.PYTORCH
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else __import__("numpy").array(t)
+        )
+
+    def _make_1d_mesh(self, mock_platform, size: int = 1):
+        self._setup_mock_platform(mock_platform, world_size=size)
+        return init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(size,),
+            mesh_dim_names=("tp",),
+            init_backend=False,
+        )
+
+    def test_constructor_raises_on_layout_length_mismatch(self):
+        with self.assertRaises(AssertionError):
+            PrepareModuleOutput(
+                output_layouts=(Replicate(), Replicate()),
+                desired_output_layouts=(Shard(0),),
+            )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_forward_matches_pytorch_prepare_module_output_case(self, mock_platform):
+        """Same as PyTorch ``test_prepare_module_output`` (Replicate -> Shard(0) on hook)."""
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+        module = _DummyIdentityModule()
+        PrepareModuleOutput(
+            output_layouts=Replicate(),
+            desired_output_layouts=Shard(0),
+            use_local_output=True,
+        ).apply(module, mesh)
+        torch.manual_seed(15)
+        inp = torch.rand(16, 7)
+        dtensor = DTensor.from_local(inp, mesh, [Replicate()])
+        with _patch_platform_rank_for_dtensor_redistribute(world_size=1):
+            output = module(dtensor)
+            expected = dtensor.redistribute(mesh, [Shard(0)]).to_local()
+        self.assertTrue(torch.allclose(expected, output))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_none_placeholder_skips_second_output(self, mock_platform):
+        """``None`` in ``output_layouts`` leaves the matching return value untouched."""
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+        module = _DupOutModule()
+        PrepareModuleOutput(
+            output_layouts=(Replicate(), None),
+            desired_output_layouts=(Shard(0), None),
+            use_local_output=True,
+        ).apply(module, mesh)
+        with _patch_platform_rank_for_dtensor_redistribute(world_size=1):
+            a, b = module(torch.randn(3, 4))
+        self.assertIsInstance(a, torch.Tensor)
+        self.assertIsInstance(b, torch.Tensor)
+        self.assertEqual(b.item(), 1.0)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_use_local_output_false_returns_dtensor(self, mock_platform):
+        """With ``use_local_output=False``, the hook leaves outputs as :class:`DTensor`."""
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+        module = _DummyIdentityModule()
+        PrepareModuleOutput(
+            output_layouts=Replicate(),
+            desired_output_layouts=Replicate(),
+            use_local_output=False,
+        ).apply(module, mesh)
+        inp = torch.ones(2, 2)
+        out = module(inp)
+        self.assertIsInstance(out, DTensor)
+
+
+class TestPrepareModuleInputOutput(unittest.TestCase):
+    """Tests aligned with PyTorch ``TensorParallelAPITests.test_prepare_module_input_output``."""
+
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def _setup_mock_platform(self, mock_platform, world_size: int = 1):
+        mock_platform.platform_type = PlatformType.PYTORCH
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else __import__("numpy").array(t)
+        )
+
+    def _make_1d_mesh(self, mock_platform, size: int = 1):
+        self._setup_mock_platform(mock_platform, world_size=size)
+        return init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(size,),
+            mesh_dim_names=("tp",),
+            init_backend=False,
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_forward_matches_pytorch_prepare_module_input_output_case(self, mock_platform):
+        """Same end-to-end tensor equality as PyTorch ``test_prepare_module_input_output``."""
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+        module = _DummyIdentityModule()
+        PrepareModuleInputOutput(
+            input_layouts=Shard(0),
+            desired_input_layouts=Replicate(),
+            output_layouts=Replicate(),
+            desired_output_layouts=Shard(1),
+        ).apply(module, mesh)
+        inp = torch.rand(5, 7)
+        with _patch_platform_rank_for_dtensor_redistribute(world_size=1):
+            output = module(inp)
+            expected = (
+                DTensor.from_local(inp, mesh, [Shard(0)])
+                .redistribute(mesh, [Shard(1)])
+                .to_local()
+            )
+        self.assertTrue(torch.allclose(expected, output))
+
+    def test_delegates_to_prepare_substyles_in_repr(self):
+        """``repr`` exposes nested PrepareModuleInput / PrepareModuleOutput settings."""
+        style = PrepareModuleInputOutput(
+            input_layouts=Replicate(),
+            desired_input_layouts=Shard(0),
+            output_layouts=Shard(0),
+            desired_output_layouts=Replicate(),
+            use_local_input=True,
+            use_local_output=False,
+        )
+        r = repr(style)
+        self.assertIn("PrepareModuleInputOutput", r)
+        self.assertIn("use_local_input=True", r)
+        self.assertIn("use_local_output=False", r)
 
 
 if __name__ == "__main__":
