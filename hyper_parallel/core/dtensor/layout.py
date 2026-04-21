@@ -411,7 +411,7 @@ class Layout:
         has_names = mesh_dim_names is not None
 
         def _map_dim(dim):
-            """covert dimension index to dimension name."""
+            """convert dimension index to dimension name."""
             if dim == -1:
                 return "None"
             if not has_names:
@@ -615,6 +615,70 @@ class Layout:
     def is_partial(self):
         """Return true if any dim in mesh_shape is partial"""
         return any(self.partial)
+
+    def get_dim_split_num(self, tensor_dim: int) -> int:
+        """Return the total shard count for ``tensor_dim`` via alias_tensor_map.
+
+        Args:
+            tensor_dim: Tensor dimension index to check.
+
+        Returns:
+            Number of shards (1 if not sharded or no alias_tensor_map set).
+        """
+        alias_tm = self.alias_tensor_map
+        if alias_tm is None or tensor_dim >= len(alias_tm):
+            return 1
+        dim_entry = alias_tm[tensor_dim]
+        if dim_entry == 'None':
+            return 1
+        if isinstance(dim_entry, str):
+            return self.mesh.get_device_num_along_axis(dim_entry)
+        if isinstance(dim_entry, tuple):
+            total = 1
+            for axis in dim_entry:
+                if axis != 'None':
+                    total *= self.mesh.get_device_num_along_axis(axis)
+            return total
+        return 1
+
+    def get_split_id(self, tensor_dim: int) -> int:
+        """Return this rank's global position among all shards of ``tensor_dim``.
+
+        For a single sharding axis, returns the rank's position within that axis group.
+        For multiple sharding axes (e.g. dp+cp both sharding T1), computes the combined
+        global position as a mixed-radix number ordered by the axis tuple:
+            global_id = ax0_pos * ax1_size * ... + ax1_pos * ax2_size * ... + axN_pos
+        This matches MindFormers' ``offset_id = dp_rank * (cp*tp) + cp_rank * tp + tp_rank``
+        for combined sequence-parallel sharding across dp, cp, and tp dimensions.
+
+        Args:
+            tensor_dim: Tensor dimension index to query.
+
+        Returns:
+            Split index for this rank (0 if not sharded or rank not in rank list).
+        """
+        alias_tm = self.alias_tensor_map
+        if alias_tm is None or tensor_dim >= len(alias_tm):
+            return 0
+        dim_entry = alias_tm[tensor_dim]
+        if dim_entry == 'None':
+            return 0
+        rank = platform.get_rank()
+        if isinstance(dim_entry, tuple):
+            non_none = [ax for ax in dim_entry if ax != 'None']
+            if not non_none:
+                return 0
+            global_id = 0
+            for ax in non_none:
+                rank_list = self.mesh.get_rank_list_along_axis(ax)
+                local_id = rank_list.index(rank) if rank in rank_list else 0
+                ax_size = self.mesh.get_device_num_along_axis(ax)
+                global_id = global_id * ax_size + local_id
+            return global_id
+        if isinstance(dim_entry, str):
+            rank_list = self.mesh.get_rank_list_along_axis(dim_entry)
+            return rank_list.index(rank) if rank in rank_list else 0
+        return 0
 
     def get_global_shape(self, slice_shape):
         """get global shape"""

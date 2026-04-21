@@ -1,0 +1,4 @@
+npu_dense_lightning_indexer_softmax_lse:
+  dist_op_name: _npu_dense_lightning_indexer_softmax_lse_dist_op
+  distributed_op_class: NpuDenseLightningIndexerSoftmaxLseDistributedOp
+  distributed_op_file: parallel_npu_dense_lightning_indexer_softmax_lse

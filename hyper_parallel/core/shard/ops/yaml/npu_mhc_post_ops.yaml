@@ -1,0 +1,4 @@
+npu_mhc_post:
+  dist_op_name: _npu_mhc_post_dist_op
+  distributed_op_class: NpuMhcPostDistributedOp
+  distributed_op_file: parallel_mhc_post

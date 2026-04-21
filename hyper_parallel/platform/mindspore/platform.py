@@ -143,6 +143,26 @@ class MindSporePlatform(Platform):
     dtype = ms.Type
     Function = _Function
 
+    _custom_ops_cls = None
+
+    @property
+    def custom_ops(self):
+        """Return the MindSpore platform custom ops instance.
+
+        .. warning::
+            This is an experimental API that subject to change or deletion.
+
+        Returns:
+            MindSporeCustomOps: Custom ops class that delegates to DFunction
+            implementations wrapping Ascend NPU custom C++ kernels.
+        """
+        if self._custom_ops_cls is None:
+            from hyper_parallel.platform.mindspore.custom_ops.custom_ops import (  # pylint: disable=import-outside-toplevel
+                MindSporeCustomOps,
+            )
+            self._custom_ops_cls = MindSporeCustomOps
+        return self._custom_ops_cls
+
     def __init__(self):
         # Ensure MindSpore ``nn.Cell.to_empty`` is patched as soon as the
         # MindSpore platform instance is created.
@@ -869,6 +889,10 @@ class MindSporePlatform(Platform):
     @staticmethod
     def no_grad():
         return _no_grad()
+
+    @staticmethod
+    def relu(tensor):
+        return mint.nn.functional.relu(tensor)
 
     @staticmethod
     def cat(tensors, dim=0):

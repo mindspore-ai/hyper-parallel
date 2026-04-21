@@ -1,0 +1,4 @@
+npu_mhc_pre_sinkhorn:
+  dist_op_name: _npu_mhc_pre_sinkhorn_dist_op
+  distributed_op_class: NpuMhcPreSinkhornDistributedOp
+  distributed_op_file: parallel_mhc_pre_sinkhorn
