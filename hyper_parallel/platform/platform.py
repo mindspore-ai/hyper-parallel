@@ -890,6 +890,24 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement all_gather_object")
 
     @staticmethod
+    def barrier(group=None, async_op: bool = False, device_ids=None) -> Any:
+        """Synchronize all processes in the given process group.
+
+        Each rank blocks until every rank in the group enters this collective (when ``async_op``
+        is False), or returns an async handle that must be completed before proceeding.
+
+        Args:
+            group: The process group or communication group. ``None`` uses the default group.
+            async_op (bool): If True, returns a backend-specific async work handle. Default: False.
+            device_ids: Optional device id list; semantics depend on the backend.
+
+        Returns:
+            Async work handle when ``async_op`` is True; otherwise ``None`` (unless the rank
+            is not in the group, in which case the backend may return ``None``).
+        """
+        raise NotImplementedError("Platform subclasses must implement barrier")
+
+    @staticmethod
     def init_process_group(
             backend: Optional[str] = None,
             *,

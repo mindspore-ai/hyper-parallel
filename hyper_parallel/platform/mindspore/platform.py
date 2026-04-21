@@ -722,6 +722,22 @@ class MindSporePlatform(Platform):
         dist.all_gather_object(object_list, obj, group)
 
     @staticmethod
+    def barrier(group=None, async_op: bool = False, device_ids=None) -> Any:
+        """
+        Synchronize all processes in the given communication group.
+
+        Args:
+            group (str, optional): The communication group to work on. Default is ``None``,
+                meaning the default world group.
+            async_op (bool, optional): Whether this op should be asynchronous. Default: ``False``.
+            device_ids (list[int], optional): Reserved parameter on Ascend. Default: ``None``.
+
+        Returns:
+            CommHandle if ``async_op`` is True; otherwise ``None``.
+        """
+        return dist.barrier(group, async_op, device_ids)
+
+    @staticmethod
     def init_process_group(
             backend: str = None,
             *,

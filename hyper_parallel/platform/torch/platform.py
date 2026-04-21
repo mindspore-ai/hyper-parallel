@@ -791,6 +791,23 @@ class TorchPlatform(Platform):
         dist.all_gather_object(object_list, obj, group)
 
     @staticmethod
+    def barrier(group=None, async_op: bool = False, device_ids=None) -> Any:
+        """
+        Synchronize all processes in the given process group.
+
+        Args:
+            group (ProcessGroup, optional): The process group to work on. Default is ``None``,
+                meaning the default process group.
+            async_op (bool, optional): Whether this op should be asynchronous. Default: ``False``.
+            device_ids (list[int], optional): Device ids for backends that require a device for
+                barrier (e.g. NCCL). Default: ``None``.
+
+        Returns:
+            Async work handle if ``async_op`` is True; otherwise ``None``.
+        """
+        return dist.barrier(group, async_op, device_ids)
+
+    @staticmethod
     def init_process_group(
             backend: Optional[str] = None,
             *,

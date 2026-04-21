@@ -22,6 +22,8 @@ including support for tensor sharding, resharding, and layout management.
 __all__ = [
     # Main API
     "save",
+    "async_save",
+    "AsyncSaveResponse",
     "load",
     # Metadata
     "Metadata",
@@ -64,7 +66,12 @@ __all__ = [
 ]
 
 # Main API
-from hyper_parallel.core.distributed_checkpoint.api import load, save
+from hyper_parallel.core.distributed_checkpoint.api import (
+    AsyncSaveResponse,
+    async_save,
+    load,
+    save,
+)
 
 # Metadata structures
 from hyper_parallel.core.distributed_checkpoint.metadata import (

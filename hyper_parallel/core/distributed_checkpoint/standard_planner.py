@@ -336,9 +336,9 @@ class StandardSavePlanner(SavePlanner):
         obj = self.state_dict[fqn]
         if item.type == WriteItemType.TENSOR:
             if isinstance(obj, DTensor):
-                return obj.to_local()
+                return obj.to_local().detach().cpu()
             if isinstance(obj, Tensor):
-                return obj
+                return obj.detach().cpu()
             raise TypeError(f"Write item {fqn} expected tensor-like object, got {type(obj)}")
         if item.type == WriteItemType.BYTE_IO:
             return obj
@@ -530,7 +530,7 @@ class StandardLoadPlanner(LoadPlanner):
             raise KeyError(f"Key {fqn} not found in state_dict")
 
         target = self.state_dict[fqn]
-        local_tensor = target.to_local() if isinstance(target, DTensor) else target
+        local_tensor = target.to_local().detach() if isinstance(target, DTensor) else target.detach()
         return narrow_tensor_by_index(
             local_tensor,
             read_item.dest_offsets,
