@@ -45,7 +45,10 @@ from hyper_parallel.platform.platform import Platform, PlatformType, EXISTING_CO
 from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 from hyper_parallel.platform.mindspore.pipeline_parallel.stage import PipelineStageBase
 from hyper_parallel.platform.mindspore.parameter_init import init_parameters as _init_parameters
-from hyper_parallel.platform.mindspore.init_weights import init_on_device as _init_on_device
+from hyper_parallel.platform.mindspore.init_weights import (
+    init_on_device as _init_on_device,
+    _install_cell_to_empty_patch,
+)
 
 comm_func.set_comm_ops_inplace(False)
 _tensor_transform = TensorTransform.get_instance()
@@ -137,6 +140,11 @@ class MindSporePlatform(Platform):
     platform_type = PlatformType.MINDSPORE
     tensor_dtype = mstype
     dtype = ms.Type
+
+    def __init__(self):
+        # Ensure MindSpore ``nn.Cell.to_empty`` is patched as soon as the
+        # MindSpore platform instance is created.
+        _install_cell_to_empty_patch()
 
     @staticmethod
     def is_linear_module(module) -> bool:
