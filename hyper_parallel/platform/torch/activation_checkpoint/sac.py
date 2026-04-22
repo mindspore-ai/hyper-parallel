@@ -145,12 +145,13 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
             storage = self.storage.save_storage[func]  # patch code
             storage.append(tree_map(lambda x: _VersionWrapper(_maybe_detach(x, any_ret_has_alias_info)), out))
         elif policy == CheckpointPolicy.MUST_SWAP:  # patch code
+            group_name = SwapManager().get_current_group_name()
             if not self.add_to_storage:
-                group_name = SwapManager().get_current_group_name()
                 SwapManager().add_storage(group_name, self.storage)
                 self.add_to_storage = True
             storage = self.storage.swap_storage[func]
-            storage.append(tree_map(lambda x: SwapTensor(_maybe_detach(x, any_ret_has_alias_info)), out))
+            funcname = f"{group_name}::{func}"
+            storage.append(tree_map(lambda x: SwapTensor(_maybe_detach(x, any_ret_has_alias_info), funcname), out))
         return out
 
 

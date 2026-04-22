@@ -21,7 +21,7 @@ from typing import Optional, Callable, Union
 
 from mindspore.nn import Cell
 
-from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import ActivationWrapper, FuncCell
+from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import ActivationWrapper
 
 
 class CheckpointWrapper(ActivationWrapper):
@@ -63,11 +63,6 @@ class CheckpointWrapper(ActivationWrapper):
         super().__init__(mod)
         self.checkpoint_fn = checkpoint_fn
         self.checkpoint_fn_kwargs = checkpoint_fn_kwargs
-        if checkpoint_fn is None and not isinstance(self._ckpt_wrapped_module, FuncCell):
-            # Use MindSpore's native recompute mechanism (effective in graph /
-            # semi-auto parallel mode).  FuncCell wrappers have no meaningful
-            # recompute graph, so skip the call for plain-function inputs.
-            self._ckpt_wrapped_module.recompute()
 
     def construct(self, *args, **kwargs):
         if self.checkpoint_fn is not None:

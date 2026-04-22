@@ -72,12 +72,13 @@ class _CachingMindSporeDispatchMode(MsDispatchMode):
             storage = self.storage.save_storage[func.name]
             storage.append(platform.tree_map(lambda x: _VersionWrapper(_maybe_detach(x)), out))
         elif policy == CheckpointPolicy.MUST_SWAP:
+            group_name = SwapManager().get_current_group_name()
             if not self.add_to_storage:
-                group_name = SwapManager().get_current_group_name()
                 SwapManager().add_storage(group_name, self.storage)
                 self.add_to_storage = True
             storage = self.storage.swap_storage[func.name]
-            storage.append(platform.tree_map(lambda x: SwapTensor(_maybe_detach(x)), out))
+            funcname = f"{group_name}::{func.name}"
+            storage.append(platform.tree_map(lambda x: SwapTensor(_maybe_detach(x), funcname), out))
         return out
 
 
