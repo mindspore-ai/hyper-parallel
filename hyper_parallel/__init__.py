@@ -14,7 +14,7 @@
 # ============================================================================
 """hyper parallel interface"""
 
-__all__ = ["get_platform", "fully_shard", "hsdp_sync_stream", "HSDPModule", "DTensor",
+__all__ = ["get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDPModule", "DTensor",
            "Layout", "DeviceMesh", "init_device_mesh", "get_current_mesh", "distribute_module",
            "init_parameters", "init_empty_weights", "init_on_device",
            "shard_module", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch",
@@ -27,6 +27,7 @@ __all__ = ["get_platform", "fully_shard", "hsdp_sync_stream", "HSDPModule", "DTe
            "ParallelStyle", "parallelize_module"]
 
 from hyper_parallel.platform import get_platform
+from hyper_parallel.core.shard.dfunction import DFunction
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _mesh_resources, init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch, distribute_module
