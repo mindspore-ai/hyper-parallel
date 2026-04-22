@@ -148,6 +148,15 @@ class MindSporePlatform(Platform):
         _install_cell_to_empty_patch()
 
     @staticmethod
+    def apply_runtime_patches_if_needed():
+        """Apply MindSpore-specific runtime patches."""
+        from hyper_parallel.platform.mindspore.parameter_param_info_patch import (  # pylint: disable=import-outside-toplevel
+            patch_mindspore_parameter_param_info_cycle_if_needed,
+        )
+
+        patch_mindspore_parameter_param_info_cycle_if_needed()
+
+    @staticmethod
     def is_linear_module(module) -> bool:
         """Check whether *module* is a MindSpore ``Dense`` (linear) or ``mint.nn.Linear`` layer."""
         return isinstance(module, (ms.nn.Dense, mint.nn.Linear))
