@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """
-Polymorphic fill configs for mega-kernel task scheduling.
+Polymorphic fill configs for Multicore MoE-FFN task scheduling.
 
 Each operator type has a FillConfig subclass that encapsulates both the
 config data and the fill logic (fill method).  OperatorNode.fill_config

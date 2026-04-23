@@ -18,7 +18,7 @@ Backward pass: generate RuntimeConfig binary files and tiling binary files.
 Usage:
     python gen_runtime_data.py [--tp 4] [--ep 4] [--seq_size 8192]
                                [--all_expert_num 32] [--top_k 8]
-                               [--output_dir mega_kernel_gmm_grad_tp4_ep4_910b]
+                               [--output_dir multicore_moe_ffn_grad_tp4_ep4_910b]
 
 Outputs (rank-independent):
     <output_dir>/act_grad_tiling.bin         (act_grad, pos 20)
@@ -71,7 +71,7 @@ def parse_args():
     p.add_argument('--num_cube_cores',    type=int, default=24,
                    help='Number of AI Cube cores on target hardware (910B=24)')
     p.add_argument('--output_dir',        type=str,
-                   default='mega_kernel_gmm_grad_tp4_ep4_910b')
+                   default='multicore_moe_ffn_grad_tp4_ep4_910b')
     return p.parse_args()
 
 

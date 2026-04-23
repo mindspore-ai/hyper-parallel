@@ -296,7 +296,7 @@ if [[ "${PREBUILD_SHMEM}" == "true" ]]; then
     echo -e "\n[1/4] Checking for prebuilt files..."
     # Check if tarball and hash file exist
     if [[ ! -f "${TAR_FILE}" || ! -f "${SHA256_FILE}" ]]; then
-        echo "ERROR: Prebuilt files missing, switching to compile mode"
+        echo "WARNING: Prebuilt files missing, switching to compile mode"
         PREBUILD_SHMEM="false"
     else
         echo "[2/4] Verifying SHA256 checksum..."

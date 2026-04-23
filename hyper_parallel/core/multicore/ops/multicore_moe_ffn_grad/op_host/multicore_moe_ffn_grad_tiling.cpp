@@ -23,78 +23,61 @@
 namespace optiling {
 const uint64_t BLOCK_SIZE = 32;
 const uint64_t BUFFER_NUM = 2;
-static ge::graphStatus TilingFunc(gert::TilingContext* context)
-{
-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    auto coreNum = ascendcPlatform.GetCoreNumAic();
-    context->SetBlockDim(coreNum);
-    // OP_LOGE(context->GetNodeName(), "coreNum:%d", coreNum);
+static ge::graphStatus TilingFunc(gert::TilingContext *context) {
+  auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+  auto coreNum = ascendcPlatform.GetCoreNumAic();
+  context->SetBlockDim(coreNum);
+  // OP_LOGE(context->GetNodeName(), "coreNum:%d", coreNum);
 
-    auto input0Desc = context->GetInputDesc(0);
-    OP_CHECK_NULL_WITH_CONTEXT(context, input0Desc);
-    ge::DataType input0DType = input0Desc->GetDataType();
-    if (input0DType == ge::DT_FLOAT16) {
-        uint64_t tilingKey_ = GET_TPL_TILING_KEY(static_cast<uint32_t>(1),
-                                                static_cast<uint32_t>(1),
-                                                static_cast<uint32_t>(1),
-                                                0UL,
-                                                0UL,
-                                                static_cast<uint32_t>(0),
-                                                static_cast<uint32_t>(0),
-                                                static_cast<uint32_t>(0),
-                                                static_cast<uint32_t>(0),
-                                                static_cast<uint32_t>(0));
-        context->SetTilingKey(tilingKey_);
-    } else if (input0DType == ge::DT_BF16) {
-        uint64_t tilingKey_ = GET_TPL_TILING_KEY(static_cast<uint32_t>(27),
-                                                static_cast<uint32_t>(27),
-                                                static_cast<uint32_t>(27),
-                                                0UL,
-                                                0UL,
-                                                static_cast<uint32_t>(0),
-                                                static_cast<uint32_t>(0),
-                                                static_cast<uint32_t>(0),
-                                                static_cast<uint32_t>(0),
-                                                static_cast<uint32_t>(0));
-        context->SetTilingKey(tilingKey_);
-    } else {
-        OP_LOGE(context->GetNodeName(), "Input0[gradients]:%s is only support float16, bfloat16",
+  auto input0Desc = context->GetInputDesc(0);
+  OP_CHECK_NULL_WITH_CONTEXT(context, input0Desc);
+  ge::DataType input0DType = input0Desc->GetDataType();
+  if (input0DType == ge::DT_FLOAT16) {
+    uint64_t tilingKey_ = GET_TPL_TILING_KEY(
+      static_cast<uint32_t>(1), static_cast<uint32_t>(1), static_cast<uint32_t>(1), 0UL, 0UL, static_cast<uint32_t>(0),
+      static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0));
+    context->SetTilingKey(tilingKey_);
+  } else if (input0DType == ge::DT_BF16) {
+    uint64_t tilingKey_ =
+      GET_TPL_TILING_KEY(static_cast<uint32_t>(27), static_cast<uint32_t>(27), static_cast<uint32_t>(27), 0UL, 0UL,
+                         static_cast<uint32_t>(0), static_cast<uint32_t>(0), static_cast<uint32_t>(0),
+                         static_cast<uint32_t>(0), static_cast<uint32_t>(0));
+    context->SetTilingKey(tilingKey_);
+  } else {
+    OP_LOGE(context->GetNodeName(), "Input0[dispatch_target]:%s is only support float16, bfloat16",
             Ops::Base::ToString(static_cast<ge::DataType>(input0DType)).c_str());
-        return ge::GRAPH_FAILED;
-    }
+    return ge::GRAPH_FAILED;
+  }
 
-    MulticoreMoeFfnGradTilingData tiling;
-    auto attr = context->GetAttrs();
-    if (attr != nullptr) {
-        tiling.set_rankId((*(attr->GetAttrPointer<int64_t>(0))));
-        tiling.set_ep((*(attr->GetAttrPointer<int64_t>(1))));
-        tiling.set_expertNum((*(attr->GetAttrPointer<int64_t>(2))));
-        tiling.set_hiddenSize((*(attr->GetAttrPointer<int64_t>(3))));
-        tiling.set_seqSize((*(attr->GetAttrPointer<int64_t>(4))));
-        tiling.set_coreNum(static_cast<int64_t>(coreNum));
-    }
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
-    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+  MulticoreMoeFfnGradTilingData tiling;
+  auto attr = context->GetAttrs();
+  if (attr != nullptr) {
+    tiling.set_rankId((*(attr->GetAttrPointer<int64_t>(0))));
+    tiling.set_ep((*(attr->GetAttrPointer<int64_t>(1))));
+    tiling.set_expertNum((*(attr->GetAttrPointer<int64_t>(2))));
+    tiling.set_hiddenSize((*(attr->GetAttrPointer<int64_t>(3))));
+    tiling.set_seqSize((*(attr->GetAttrPointer<int64_t>(4))));
+    tiling.set_coreNum(static_cast<int64_t>(coreNum));
+  }
+  tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+  context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
 
-    size_t *currentWorkspace = context->GetWorkspaceSizes(1);
-    currentWorkspace[0] = 99615232;
-    return ge::GRAPH_SUCCESS;
+  size_t *currentWorkspace = context->GetWorkspaceSizes(1);
+  currentWorkspace[0] = 99615232;
+  return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus TilingPrepareTilingFunc(gert::TilingParseContext* context)
-{
-    if (context == nullptr) {
-        return ge::GRAPH_FAILED;
-    }
-    return ge::GRAPH_SUCCESS;
+ge::graphStatus TilingPrepareTilingFunc(gert::TilingParseContext *context) {
+  if (context == nullptr) {
+    return ge::GRAPH_FAILED;
+  }
+  return ge::GRAPH_SUCCESS;
 }
 
-struct MulticoreMoeFfnGradCompileInfo {
-};
+struct MulticoreMoeFfnGradCompileInfo {};
 
 IMPL_OP_OPTILING(MulticoreMoeFfnGrad)
-    .Tiling(TilingFunc)
-    .TilingParse<MulticoreMoeFfnGradCompileInfo>(TilingPrepareTilingFunc);
+  .Tiling(TilingFunc)
+  .TilingParse<MulticoreMoeFfnGradCompileInfo>(TilingPrepareTilingFunc);
 
-}
-
+}  // namespace optiling

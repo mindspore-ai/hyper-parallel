@@ -24,7 +24,7 @@ Reference ops used (all run on Ascend):
   - silu(gate) * up                                     (SwiGLU forward, silu = x * sigmoid(x))
   - ms.ops.auto_generate.gen_ops_prim.SwigluGrad        (SwiGLU backward)
 
-Note: glist tensors passed to the mega kernel must be cumulative sums.
+Note: glist tensors passed to the multicore Moe-FFn must be cumulative sums.
 The _ref_gmm helpers accept per-group counts and accumulate internally.
 
 Forward precision test (test_moe_ffn_fwd_tp2ep2):

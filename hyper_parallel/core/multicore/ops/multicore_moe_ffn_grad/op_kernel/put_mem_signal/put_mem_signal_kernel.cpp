@@ -20,8 +20,8 @@
 using namespace AscendC;
 
 template <typename T>
-__aicore__ inline void CopyGmSingleValueToUb(GM_ADDR gm_addr, T* result) {
-  __ubuf__ T *ubAddr = (__ubuf__ T*)(32);
+__aicore__ inline void CopyGmSingleValueToUb(GM_ADDR gm_addr, T *result) {
+  __ubuf__ T *ubAddr = (__ubuf__ T *)(32);
   smem_shm_copy_gm2ub(ubAddr, (__gm__ T *)gm_addr, sizeof(T));
   AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
   AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
@@ -32,12 +32,10 @@ template <typename T>
 class PutMemSignalKernel {
  public:
   __aicore__ inline PutMemSignalKernel() {}
-  __aicore__ inline void Init(GM_ADDR target, int64_t target_offset, GM_ADDR src,
-                              int64_t src_offset, int64_t size, GM_ADDR signal,
-                              int64_t signal_offset, int32_t signal_value, int64_t signal_op,
+  __aicore__ inline void Init(GM_ADDR target, int64_t target_offset, GM_ADDR src, int64_t src_offset, int64_t size,
+                              GM_ADDR signal, int64_t signal_offset, int32_t signal_value, int64_t signal_op,
                               int64_t target_pe, bool non_blocking, GM_ADDR workspace) {
     // Initialize pointers and parameters
-    int32_t size_temp = 0;
     target_ = reinterpret_cast<__gm__ T *>(target);
     src_ = reinterpret_cast<__gm__ T *>(src);
     signal_ = reinterpret_cast<__gm__ int32_t *>(signal);
@@ -55,8 +53,8 @@ class PutMemSignalKernel {
     aiv_idx_ = 0;
     aiv_num_ = 1;
 
-    syncGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspace), 256);
-    pipe.InitBuffer(localwork,1,sizeof(int32_t)*aiv_num_);
+    syncGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(workspace), 256);
+    pipe.InitBuffer(localwork, 1, sizeof(int32_t) * aiv_num_);
   }
 
   __aicore__ inline void Process() {
@@ -72,10 +70,10 @@ class PutMemSignalKernel {
     uint64_t copy_ub = device_state->mte_config.aclshmem_ub;
     uint64_t copy_ub_size = device_state->mte_config.ub_size;
     __ubuf__ T *ping_buff = reinterpret_cast<__ubuf__ T *>(copy_ub);
-    __ubuf__ T *pong_buff = reinterpret_cast<__ubuf__ T *>(copy_ub+copy_ub_size/2);
+    __ubuf__ T *pong_buff = reinterpret_cast<__ubuf__ T *>(copy_ub + copy_ub_size / 2);
     auto ptr = aclshmem_ptr(target_ptr, target_pe_);
-    __gm__ T* remote_ptr = reinterpret_cast<__gm__ T*>(ptr);
-    uint64_t block_size = copy_ub_size/2/ sizeof(T)* sizeof(T);
+    __gm__ T *remote_ptr = reinterpret_cast<__gm__ T *>(ptr);
+    uint64_t block_size = copy_ub_size / 2 / sizeof(T) * sizeof(T);
     uint64_t remain = (size_per_core * sizeof(T)) % block_size;
 
     uint64_t repeat_times = (size_per_core * sizeof(T)) / block_size;
@@ -83,8 +81,8 @@ class PutMemSignalKernel {
     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
     AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
     for (uint64_t i = 0; i < repeat_times; i++) {
-      AscendC::TEventID EVENT_ID = i & 1 ? EVENT_ID0 : EVENT_ID1;
-      __ubuf__ T *buf= i & 1 ? ping_buff : pong_buff;
+      AscendC::TEventID EVENT_ID = (i & 1) ? EVENT_ID0 : EVENT_ID1;
+      __ubuf__ T *buf = (i & 1) ? ping_buff : pong_buff;
       AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
       aclshmemi_copy_gm2ub(buf, src_ptr + i * repeat_elem, block_size);
       AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID);
@@ -93,8 +91,8 @@ class PutMemSignalKernel {
       AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
     }
     if (remain > 0) {
-      AscendC::TEventID EVENT_ID = repeat_times & 1 ? EVENT_ID0 : EVENT_ID1;
-      __ubuf__ T *buf= repeat_times & 1 ? ping_buff : pong_buff;
+      AscendC::TEventID EVENT_ID = (repeat_times & 1) ? EVENT_ID0 : EVENT_ID1;
+      __ubuf__ T *buf = (repeat_times & 1) ? ping_buff : pong_buff;
       AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID);
       aclshmemi_copy_gm2ub(buf, src_ptr + repeat_times * repeat_elem, remain);
       AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID);
@@ -115,12 +113,13 @@ class PutMemSignalKernel {
     // Sync ensure corresponding tasks are done
     if (aiv_num_ > 1) {
       AscendC::LocalTensor<int32_t> workLocal = localwork.AllocTensor<int32_t>();
-      AscendC::SyncAll(syncGlobal,workLocal,aiv_num_);
+      AscendC::SyncAll(syncGlobal, workLocal, aiv_num_);
       localwork.FreeTensor(workLocal);
     }
 
     if (aiv_idx_ == 0) {
-      aclshmemx_signal_op(signal_ptr, signal_value_, signal_op_ == 1 ? ACLSHMEM_SIGNAL_ADD : ACLSHMEM_SIGNAL_SET, target_pe_);
+      aclshmemx_signal_op(signal_ptr, signal_value_, signal_op_ == 1 ? ACLSHMEM_SIGNAL_ADD : ACLSHMEM_SIGNAL_SET,
+                          target_pe_);
     }
   }
 
@@ -130,28 +129,27 @@ class PutMemSignalKernel {
   __gm__ int32_t *signal_;
   AscendC::TPipe pipe;
 
-  int64_t target_offset_;
-  int64_t src_offset_;
-  int64_t size_;
-  int64_t signal_offset_;
-  int32_t signal_value_;
-  int64_t signal_op_;
-  int64_t target_pe_;
-  bool non_blocking_;
+  int64_t target_offset_ = 0;
+  int64_t src_offset_ = 0;
+  int64_t size_ = 0;
+  int64_t signal_offset_ = 0;
+  int32_t signal_value_ = 0;
+  int64_t signal_op_ = 0;
+  int64_t target_pe_ = 0;
+  bool non_blocking_ = true;
   AscendC::GlobalTensor<int32_t> syncGlobal;
   AscendC::TQue<AscendC::TPosition::VECIN, 1> localwork;
   // ub
-  uint32_t aiv_idx_;
-  uint32_t aiv_num_;
+  uint32_t aiv_idx_ = 0;
+  uint32_t aiv_num_ = 0;
 };
 
-extern "C" inline __aicore__ void put_mem_signal_kernel(GM_ADDR target, int64_t target_offset,
-                                                              GM_ADDR src, int64_t src_offset,
-                                                              int64_t size, GM_ADDR signal,
-                                                              int64_t signal_offset, int64_t signal_value, GM_ADDR workspace,
-                                                              int64_t signal_op, int64_t target_pe,
-                                                              bool non_blocking) {
+extern "C" inline __aicore__ void put_mem_signal_kernel(GM_ADDR target, int64_t target_offset, GM_ADDR src,
+                                                        int64_t src_offset, int64_t size, GM_ADDR signal,
+                                                        int64_t signal_offset, int64_t signal_value, GM_ADDR workspace,
+                                                        int64_t signal_op, int64_t target_pe, bool non_blocking) {
   PutMemSignalKernel<DTYPE_DY> op;
-  op.Init(target, target_offset, src, src_offset, size, signal, signal_offset, signal_value, signal_op, target_pe, non_blocking, workspace);
+  op.Init(target, target_offset, src, src_offset, size, signal, signal_offset, signal_value, signal_op, target_pe,
+          non_blocking, workspace);
   op.Process();
 }

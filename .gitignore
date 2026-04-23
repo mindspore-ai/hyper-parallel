@@ -9,7 +9,7 @@ kernel_meta/
 somas_meta/
 trace_code_graph_*
 3rdparty/shmem
-multicore_moe_ffn
+vendors/
 
 # Protocol buffers
 *_pb2.py

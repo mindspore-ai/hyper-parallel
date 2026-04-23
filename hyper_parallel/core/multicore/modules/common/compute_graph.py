@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """
-ComputeGraph, OperatorNode, TensorSpec, SplitSpec, and TaskSplitValue for Mega-Kernel scheduling.
+ComputeGraph, OperatorNode, TensorSpec, SplitSpec, and TaskSplitValue for Multicore MoE-FFN scheduling.
 """
 from dataclasses import dataclass, field
 from enum import Enum

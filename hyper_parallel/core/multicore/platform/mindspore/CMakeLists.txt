@@ -14,7 +14,7 @@ set(_PREBUILD_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../prebuild")
 set(_PREBUILD_DIR  "${_PREBUILD_ROOT}/multicore_moe_ffn")
 set(_TARBALL       "${_PREBUILD_DIR}.tar.gz")
 
-if(NOT DEFINED ENV{HP_THIRD_PARTY_DIR}
+if(NOT DEFINED ENV{HP_MULTICORE_DIR}
   AND NOT DEFINED ENV{CANN_VENDOR_FWD_LIBDIR}
   AND NOT DEFINED ENV{CANN_VENDOR_BWD_LIBDIR}
   AND NOT DEFINED ENV{CANN_VENDOR_LIBDIR})
@@ -31,26 +31,26 @@ if(NOT DEFINED ENV{HP_THIRD_PARTY_DIR}
     endif()
 
     if(IS_DIRECTORY "${_PREBUILD_DIR}/vendors")
-        set(ENV{HP_THIRD_PARTY_DIR} "${_PREBUILD_DIR}/vendors")
-        message(STATUS "Auto-detected HP_THIRD_PARTY_DIR: ${_PREBUILD_DIR}/vendors")
+        set(ENV{HP_MULTICORE_DIR} "${_PREBUILD_DIR}/vendors")
+        message(STATUS "Auto-detected HP_MULTICORE_DIR: ${_PREBUILD_DIR}/vendors")
     endif()
 endif()
 
 # =============================================================================
 # CANN Vendor Library Paths
-# Priority: CANN_VENDOR_FWD/BWD_LIBDIR > HP_THIRD_PARTY_DIR > CANN_VENDOR_LIBDIR
+# Priority: CANN_VENDOR_FWD/BWD_LIBDIR > HP_MULTICORE_DIR > CANN_VENDOR_LIBDIR
 # =============================================================================
 
-if(DEFINED ENV{HP_THIRD_PARTY_DIR})
+if(DEFINED ENV{HP_MULTICORE_DIR})
     if(DEFINED ENV{CANN_VENDOR_FWD_LIBDIR})
         set(CANN_VENDOR_FWD_LIBDIR "$ENV{CANN_VENDOR_FWD_LIBDIR}")
     else()
-        set(CANN_VENDOR_FWD_LIBDIR "$ENV{HP_THIRD_PARTY_DIR}/mega_kernel_gmm_nn/op_api/lib")
+        set(CANN_VENDOR_FWD_LIBDIR "$ENV{HP_MULTICORE_DIR}/multicore_moe_ffn_nn/op_api/lib")
     endif()
     if(DEFINED ENV{CANN_VENDOR_BWD_LIBDIR})
         set(CANN_VENDOR_BWD_LIBDIR "$ENV{CANN_VENDOR_BWD_LIBDIR}")
     else()
-        set(CANN_VENDOR_BWD_LIBDIR "$ENV{HP_THIRD_PARTY_DIR}/mega_kernel_gmm_grad_nn/op_api/lib")
+        set(CANN_VENDOR_BWD_LIBDIR "$ENV{HP_MULTICORE_DIR}/multicore_moe_ffn_grad_nn/op_api/lib")
     endif()
 elseif(DEFINED ENV{CANN_VENDOR_LIBDIR})
     set(CANN_VENDOR_FWD_LIBDIR "$ENV{CANN_VENDOR_LIBDIR}")
@@ -58,7 +58,7 @@ elseif(DEFINED ENV{CANN_VENDOR_LIBDIR})
 else()
     message(FATAL_ERROR
         "Cannot locate cust_opapi libraries. Set one of:\n"
-        "  HP_THIRD_PARTY_DIR  (vendors root; fwd/bwd paths derived automatically)\n"
+        "  HP_MULTICORE_DIR  (vendors root; fwd/bwd paths derived automatically)\n"
         "  CANN_VENDOR_FWD_LIBDIR + CANN_VENDOR_BWD_LIBDIR  (explicit overrides)\n"
         "  CANN_VENDOR_LIBDIR  (legacy single-lib fallback)\n"
         "  Or place prebuild/multicore_moe_ffn.tar.gz and re-run cmake.")

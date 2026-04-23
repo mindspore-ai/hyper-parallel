@@ -20,7 +20,7 @@ from tests.mindspore.st.utils import msrun_case
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_moe_ffn_fwd_tp2ep2():
     """
-    Feature: MoE-FFN forward mega kernel with MindSpore (TP=2, EP=2).
+    Feature: MoE-FFN forward operator with MindSpore (TP=2, EP=2).
     Description: Test moe_ffn_fwd operator: dispatch -> GMM1 -> SwiGLU -> GMM2 -> combine.
                  Verifies down_proj_y against a reference implementation.
     Expectation: Run success and precision within rtol=atol=2e-3.
@@ -36,7 +36,7 @@ def test_moe_ffn_fwd_tp2ep2():
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_moe_ffn_bwd_tp2ep2():
     """
-    Feature: MoE-FFN backward mega kernel with MindSpore (TP=2, EP=2).
+    Feature: MoE-FFN backward operator with MindSpore (TP=2, EP=2).
     Description: Test moe_ffn_bwd operator: act_grad GMM -> SwiGLU_bwd -> gate_grad GMM.
                  Verifies act_grad_y, grad_gate, and gate_dx against reference implementations.
     Expectation: Run success and precision within rtol=atol=2e-3.

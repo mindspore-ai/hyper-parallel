@@ -1,4 +1,4 @@
-# MoE-FFN Multicore Mega Kernel
+# MoE-FFN Multicore Operator
 
 ## 1. 背景与融合思路
 
@@ -13,20 +13,20 @@ AllToAll-Dispatch → GMM1(up_proj) → SwiGLU → GMM2(down_proj) → AllToAll-
 每个算子是独立的 NPU kernel，算子之间存在大量 HBM 读写（激活值中间结果落盘再读回）。
 在 Expert Parallel（EP）场景下，AllToAll 通信与 GMM 计算通常串行执行，造成大量空闲等待。
 
-实测数据（昇腾 910C，DeepSeek-V3 规模 MoE 负载）：
+实测数据（昇腾 A3，DeepSeek-V3 规模 MoE 负载）：
 
 | 指标 | 测量值 |
 |---|---|
-| Cube 核平均 MAC 利用率 | ~54%（离理论峰值差距显著）|
-| 关键路径 Vector 核执行时间 | ~18%（SwiGLU 等，此时 Cube 全闲）|
-| AllToAll 通信占端到端时间 | ~17%（其中 61% 被 GEMM 掩盖，39% 暴露）|
+| Cube 核平均 MAC 利用率 | ~54%（离理论峰值差距显著） |
+| 关键路径 Vector 核执行时间 | ~18%（SwiGLU 等，此时 Cube 全闲） |
+| AllToAll 通信占端到端时间 | ~17%（其中 61% 被 GEMM 掩盖，39% 暴露） |
 | Cube/Vector 相互空闲 | 两类核轮流空转，任一时刻只有一类核工作 |
 
 根因分析：GroupedGEMM 只使用 Cube 核，Vector 核在 GMM 执行期间全部空闲；SwiGLU 由 Vector 核执行时 25 个 Cube 同时空转；AllToAll 由 HOST 驱动，通信空窗期设备内 AIC 和 AIV 也无法计算。
 
 ### 1.2 融合方案
 
-Mega Kernel 将上述五个算子**融合为一个 kernel**，由 AIC（AI Cube）和 AIV（AI Vector）核同时执行：
+Multicore MoE-FFN 将上述五个算子**融合为一个 kernel**，由 AIC（AI Cube）和 AIV（AI Vector）核同时执行：
 
 - **AIV 核**负责 AllToAll 通信（dispatch / combine）和 SwiGLU
 - **AIC 核**负责 GMM1、GMM2（矩阵乘）
@@ -40,7 +40,7 @@ Mega Kernel 将上述五个算子**融合为一个 kernel**，由 AIC（AI Cube�
 
 ### 1.3 RATR：Rank-Aware Tile Reordering
 
-在多卡 AllToAll 场景下，各 Rank 同时向同一目标 Rank 发送数据会造成网络拥塞，导致尾延迟暴露。RATR 通过调整 AllToAll Tile 的执行顺序，使发往不同 Rank 的通信流量在时间轴上均匀分散，避免多源 Rank 同时涌向同一目标。RATR 不修改任何计算逻辑，仅对 `vector_task_indexs` 中 AllToAll tile 重排，与 SSC 静态调度配置一起在 RuntimeConfig 中离线生成，运行时零开销。
+在多卡 AllToAll 场景下，各 Rank 同时向同一目标 Rank 发送数据会造成网络拥塞，导致尾延迟暴露。RATR 通过调整 AllToAll Tile 的执行顺序，使发往不同 Rank 的通信流量在时间轴上均匀分散，避免多源 Rank 同时涌向同一目标。RATR 不修改任何计算逻辑，仅对 `vector_task_indexs` 中 AllToAll Tile 重排，与 SSC 静态调度配置一起在 RuntimeConfig 中离线生成，运行时零开销。
 
 反向计算流程（同理融合）：
 
@@ -205,7 +205,7 @@ w1_grad: split_inputs=[(0, 0)]   # task_num 始终 = 1
 
 ### 4.4 Event 驱动协调
 
-Mega Kernel 中各核通过事件信号量（event）同步，关键配置：
+Multicore MoE-FFN 中各核通过事件信号量（event）同步，关键配置：
 
 **AllToAll dispatch**：per-expert 触发
 
@@ -236,7 +236,7 @@ trigger_event = all_event_num  (全局唯一 event)
 
 ## 5. RuntimeConfig 生成
 
-`RuntimeConfig` 是 Mega Kernel 的调度配置二进制，包含每个 task 的依赖 event、触发 event、tensor 地址偏移等信息，**按 rank 独立生成**。
+`RuntimeConfig` 是 Multicore MoE-FFN 的调度配置二进制，包含每个 task 的依赖 event、触发 event、tensor 地址偏移等信息，**按 rank 独立生成**。
 
 ### 5.1 正向
 
@@ -319,22 +319,22 @@ python -m hyper_parallel.core.multicore.modules.moe_ffn.backward.gen_runtime_dat
 
 ### 6.1 环境变量
 
-Mega Kernel 依赖两个预编译 CANN vendor 包：
+Multicore MoE-FFN 依赖两个预编译 CANN vendor 包：
 
 | 包 | 导出符号 | 说明 |
 |---|---|---|
-| `mega_kernel_gmm_nn` | `aclnnMegaKernelGmm*` | 正向 kernel |
-| `mega_kernel_gmm_grad_nn` | `aclnnMegaKernelGmmGrad*` | 反向 kernel |
+| `multicore_moe_ffn_nn` | `aclnnMulticoreMoeFfn*` | 正向 kernel |
+| `multicore_moe_ffn_grad_nn` | `aclnnMulticoreMoeFfnGrad*` | 反向 kernel |
 
 库路径解析优先级（从高到低）：
 
 ```bash
 # 方式 1：显式指定每个包的 lib 目录（最高优先级）
-export CANN_VENDOR_FWD_LIBDIR=/path/to/mega_kernel_gmm_nn/op_api/lib
-export CANN_VENDOR_BWD_LIBDIR=/path/to/mega_kernel_gmm_grad_nn/op_api/lib
+export CANN_VENDOR_FWD_LIBDIR=/path/to/multicore_moe_ffn_nn/op_api/lib
+export CANN_VENDOR_BWD_LIBDIR=/path/to/multicore_moe_ffn_grad_nn/op_api/lib
 
 # 方式 2：指定 vendors 根目录（fwd/bwd 路径自动推导）
-export HP_THIRD_PARTY_DIR=/path/to/vendors_root
+export HP_MULTICORE_DIR=/path/to/vendors_root
 
 # 方式 3：遗留单库模式（fwd 和 bwd 共用同一 lib 目录）
 export CANN_VENDOR_LIBDIR=/path/to/opp_vendor_root/op_api/lib
@@ -410,7 +410,7 @@ cmake --build build -j$(nproc)
 
 MindSpore 自定义算子需通过 `ms.ops.CustomOpBuilder` 编译，cmake 的职责是准备编译参数并驱动 Python 脚本完成实际编译：
 
-1. **vendor 库路径解析**：与 PyTorch 路径逻辑相同，cmake 按优先级解析 `CANN_VENDOR_FWD/BWD_LIBDIR` → `HP_THIRD_PARTY_DIR` → `CANN_VENDOR_LIBDIR` → prebuild tarball，确定 `libcust_opapi.so` 的位置。若四者均未配置且 tarball 不存在，cmake 报错退出。
+1. **vendor 库路径解析**：与 PyTorch 路径逻辑相同，cmake 按优先级解析 `CANN_VENDOR_FWD/BWD_LIBDIR` → `HP_MULTICORE_DIR` → `CANN_VENDOR_LIBDIR` → prebuild tarball，确定 `libcust_opapi.so` 的位置。若四者均未配置且 tarball 不存在，cmake 报错退出。
 
 2. **代码生成**：cmake 将 vendor 路径、头文件路径、链接参数等写入 `build/build_custom_with_ms.py`，该脚本调用：
 
@@ -669,4 +669,4 @@ hyper_parallel/core/multicore/ops/
 └── multicore_moe_ffn_grad/  # 反向算子 CANN 源码（含 swi_glu_grad/）
 ```
 
-预编译产物打包为 `prebuild/multicore_moe_ffn.tar.gz`，`import` 时自动解压；如需从源码重新编译 CANN vendor 包，参见 [ISSUE_MULTICORE_DESIGN.md](../../../../ISSUE_MULTICORE_DESIGN.md)。
+预编译产物打包为 `prebuild/multicore_moe_ffn.tar.gz`，`import` 时自动解压；如需从源码重新编译 CANN vendor 包，将`SOC_VALUE`填入`hyper-parallel\scripts\build_multicore_local.sh`结尾并取消注释，然后在根目录运行`bash scripts\build_multicore_local.sh`即可。

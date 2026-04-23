@@ -16,7 +16,7 @@
 
 
 class MSMulticoreHandler:
-    """MindSpore platform handler for MoE-FFN multicore mega kernels."""
+    """MindSpore platform handler for MoE-FFN multicore operators."""
 
     def __init__(self):
         # Eagerly import platform/mindspore/__init__.py so that its module-level
@@ -41,7 +41,7 @@ class MSMulticoreHandler:
         rank_id: int, ep: int, expert_num: int,
         hidden_size: int, seq_size: int,
     ):
-        """MoE-FFN forward mega kernel (MindSpore backend)."""
+        """MoE-FFN forward operator (MindSpore backend)."""
         # pylint: disable=C0415
         from hyper_parallel.core.multicore.platform.mindspore import moe_ffn_fwd
         return moe_ffn_fwd(
@@ -70,7 +70,7 @@ class MSMulticoreHandler:
         rank_id: int, ep: int, expert_num: int,
         hidden_size: int, seq_size: int,
     ):
-        """MoE-FFN backward mega kernel (MindSpore backend)."""
+        """MoE-FFN backward operator (MindSpore backend)."""
         # pylint: disable=C0415
         from hyper_parallel.core.multicore.platform.mindspore import moe_ffn_bwd
         return moe_ffn_bwd(

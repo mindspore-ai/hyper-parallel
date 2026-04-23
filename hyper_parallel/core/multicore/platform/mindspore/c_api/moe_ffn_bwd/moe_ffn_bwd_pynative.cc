@@ -19,7 +19,7 @@
 //
 // Uses AclnnOpRunner + LAUNCH_ACLNN_FUNC so that GetWorkspaceSize, executor
 // caching, and workspace allocation are handled transparently by the MindSpore
-// framework.  The function name "aclnnMegaKernelGmmGrad" is resolved at
+// framework.  The function name "aclnnMulticoreMoeFfnGrad" is resolved at
 // runtime from the loaded libcust_opapi.so — no compile-time declaration needed.
 //
 // This op is INPLACE with 7 declared returns:
@@ -101,7 +101,7 @@ std::vector<ms::Tensor> npu_moe_ffn_bwd(
     int64_t hidden_size, int64_t seq_size) {
   auto runner = std::make_shared<ms::pynative::AclnnOpRunner>("MoeFfnBwd");
   MS_EXCEPTION_IF_NULL(runner);
-  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnMegaKernelGmmGrad,
+  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnMulticoreMoeFfnGrad,
       dispatch_target, dispatch_target_off,
       dy, dispatch_src_off, dispatch_size,
       hidden, hidden_dw,

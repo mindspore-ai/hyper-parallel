@@ -15,7 +15,7 @@
 """
 hyper_parallel.core.multicore.platform.mindspore
 ==================================================
-MindSpore platform adapter for MoE-FFN multicore mega kernels.
+MindSpore platform adapter for MoE-FFN multicore operators.
 
 Exposes ``moe_ffn_fwd`` and ``moe_ffn_bwd`` backed by the
 ``hyper_parallel_multicore_moe_ffn_ms`` pybind11 extension.
@@ -33,7 +33,7 @@ Exposes ``moe_ffn_fwd`` and ``moe_ffn_bwd`` backed by the
 Vendor library resolution order (highest priority first):
 
   1. ``CANN_VENDOR_FWD_LIBDIR`` / ``CANN_VENDOR_BWD_LIBDIR``
-  2. ``HP_THIRD_PARTY_DIR``  (vendors root; fwd/bwd derived automatically)
+  2. ``HP_MULTICORE_DIR``  (vendors root; fwd/bwd derived automatically)
   3. ``CANN_VENDOR_LIBDIR``  (legacy single-lib fallback)
   4. Auto-detect from ``prebuild/multicore_moe_ffn/vendors/``
 """
@@ -49,12 +49,12 @@ _CANN_VENDOR_FWD_LIBDIR = os.environ.get("CANN_VENDOR_FWD_LIBDIR", "")
 _CANN_VENDOR_BWD_LIBDIR = os.environ.get("CANN_VENDOR_BWD_LIBDIR", "")
 
 if not (_CANN_VENDOR_FWD_LIBDIR or _CANN_VENDOR_BWD_LIBDIR):
-    _HP_THIRD_PARTY_DIR = os.environ.get("HP_THIRD_PARTY_DIR", "")
-    if _HP_THIRD_PARTY_DIR:
+    _HP_MULTICORE_DIR = os.environ.get("HP_MULTICORE_DIR", "")
+    if _HP_MULTICORE_DIR:
         _CANN_VENDOR_FWD_LIBDIR = os.path.join(
-            _HP_THIRD_PARTY_DIR, "mega_kernel_gmm_nn", "op_api", "lib")
+            _HP_MULTICORE_DIR, "multicore_moe_ffn_nn", "op_api", "lib")
         _CANN_VENDOR_BWD_LIBDIR = os.path.join(
-            _HP_THIRD_PARTY_DIR, "mega_kernel_gmm_grad_nn", "op_api", "lib")
+            _HP_MULTICORE_DIR, "multicore_moe_ffn_grad_nn", "op_api", "lib")
     elif os.environ.get("CANN_VENDOR_LIBDIR", ""):
         _CANN_VENDOR_FWD_LIBDIR = os.environ["CANN_VENDOR_LIBDIR"]
         _CANN_VENDOR_BWD_LIBDIR = os.environ["CANN_VENDOR_LIBDIR"]
@@ -63,8 +63,8 @@ if not (_CANN_VENDOR_FWD_LIBDIR or _CANN_VENDOR_BWD_LIBDIR):
             os.path.join(os.path.dirname(__file__), "../../prebuild/multicore_moe_ffn"))
         if os.path.isdir(_PREBUILD_DIR):
             _vendors = os.path.join(_PREBUILD_DIR, "vendors")
-            _fwd = os.path.join(_vendors, "mega_kernel_gmm_nn", "op_api", "lib")
-            _bwd = os.path.join(_vendors, "mega_kernel_gmm_grad_nn", "op_api", "lib")
+            _fwd = os.path.join(_vendors, "multicore_moe_ffn_nn", "op_api", "lib")
+            _bwd = os.path.join(_vendors, "multicore_moe_ffn_grad_nn", "op_api", "lib")
             if os.path.isdir(_fwd):
                 _CANN_VENDOR_FWD_LIBDIR = _fwd
             if os.path.isdir(_bwd):
@@ -103,7 +103,7 @@ if os.path.exists(_opapi_path):
     ctypes.CDLL(_opapi_path, mode=ctypes.RTLD_GLOBAL)
 
 # Pre-load both libcust_opapi.so with RTLD_GLOBAL so LAUNCH_ACLNN_FUNC can
-# resolve aclnnMegaKernelGmm* / aclnnMegaKernelGmmGrad* from either package.
+# resolve aclnnMulticoreMoeFfn* / aclnnMulticoreMoeFfnGrad* from either package.
 for _vendor_libdir in (_CANN_VENDOR_FWD_LIBDIR, _CANN_VENDOR_BWD_LIBDIR):
     if _vendor_libdir:
         _cust_opapi = os.path.join(_vendor_libdir, "libcust_opapi.so")
@@ -158,7 +158,7 @@ def moe_ffn_fwd(
     rank_id: int, ep: int, expert_num: int,
     hidden_size: int, seq_size: int,
 ):
-    """MoE-FFN forward mega kernel (MindSpore).
+    """MoE-FFN forward operator (MindSpore).
 
     .. note:: Only PyNative mode is supported. Raises ``RuntimeError`` if
         called in Graph mode or inside an ``@ms.jit`` function.
@@ -190,7 +190,7 @@ def moe_ffn_bwd(
     rank_id: int, ep: int, expert_num: int,
     hidden_size: int, seq_size: int,
 ):
-    """MoE-FFN backward mega kernel (MindSpore).
+    """MoE-FFN backward operator (MindSpore).
 
     .. note:: Only PyNative mode is supported. Raises ``RuntimeError`` if
         called in Graph mode or inside an ``@ms.jit`` function.

@@ -1,0 +1,286 @@
+diff --git a/activation/swi_glu/op_kernel/glu_tiling_kernel.hpp b/activation/swi_glu/op_kernel/glu_tiling_kernel.hpp
+index f0d3a2c95..20e21ca7e 100644
+--- a/activation/swi_glu/op_kernel/glu_tiling_kernel.hpp
++++ b/activation/swi_glu/op_kernel/glu_tiling_kernel.hpp
+@@ -76,7 +76,7 @@ struct SwigluSingleTilingKernel {
+ 
+   // calc tiling data
+   __aicore__ void GetTilingAndOffset(GM_ADDR tiling_gm, uint32_t inputDTypeLen) {
+-    GET_TILING_DATA(tempTilingGm, tiling_gm);
++    GET_TILING_DATA_WITH_STRUCT(SwiGluTilingData, tempTilingGm, tiling_gm);
+ 
+     is32BAligned = tempTilingGm.is32BAligned;
+     rowLen = tempTilingGm.rowLen;
+@@ -202,8 +202,8 @@ do {                                \
+ } while (0)
+ #define SWIGLU_SINGLE_PROCESS(kernelTiling) \
+ do {                                       \
+-    uint64_t blockNum = GetBlockNum();       \
+-	  for(uint64_t tileIdx = AscendC::GetBlockIdx(); tileIdx < (kernelTiling).totalTileNum; tileIdx += blockNum) { \
++    uint64_t blockNum = 1;       \
++	  for(uint64_t tileIdx = 0; tileIdx < (kernelTiling).totalTileNum; tileIdx += blockNum) { \
+         (kernelTiling).CaclOneTileParam(tileIdx); \
+         SWIGLU_SINGLE_PROCESS_TILE((kernelTiling).offsetParam, *((kernelTiling).curTileCopyParam), (kernelTiling).curCalLen); \
+ 	} \
+@@ -216,8 +216,8 @@ do {                                              \
+ } while(0)
+ #define SWIGLU_SINGLE_PROCESS_NON32BALIGNED(kernelTiling) \
+ do {                                       \
+-    uint64_t blockNum = GetBlockNum();       \
+-	  for(uint64_t tileIdx = AscendC::GetBlockIdx(); tileIdx < (kernelTiling).totalTileNum; tileIdx += blockNum) { \
++    uint64_t blockNum = 1;       \
++	  for(uint64_t tileIdx = 0; tileIdx < (kernelTiling).totalTileNum; tileIdx += blockNum) { \
+         (kernelTiling).CaclOneTileParam(tileIdx); \
+         SWIGLU_SINGLE_PROCESS_TILE_NON32BALIGNED((kernelTiling).offsetParam, *((kernelTiling).curTileCopyParam), (kernelTiling).curCalLen); \
+ 	} \
+diff --git a/activation/swi_glu/op_kernel/swi_glu.cpp b/activation/swi_glu/op_kernel/swi_glu.cpp
+index 0450bfbf0..8bd8369ec 100644
+--- a/activation/swi_glu/op_kernel/swi_glu.cpp
++++ b/activation/swi_glu/op_kernel/swi_glu.cpp
+@@ -12,54 +12,38 @@
+  * \file swi_glu.cpp
+  * \brief
+  */
++#ifndef OPP_MULTICORE_MOE_SWI_GLU_CPP
++#define OPP_MULTICORE_MOE_SWI_GLU_CPP
+ #include "swi_glu_impl.hpp"
+ #include "swi_glu_bf16.hpp"
+ #include "swi_glu_single.hpp"
+ 
+ using namespace AscendC;
+-extern "C" __global__ __aicore__ void swi_glu(GM_ADDR input_gm, GM_ADDR output_gm,
++extern "C" inline __aicore__ void swi_glu(GM_ADDR input_gm, GM_ADDR output_gm,
+                                               GM_ADDR workspace, GM_ADDR tiling) {
+-  // ascend910B的Relu不支持int16
+-  // ascend910B的Relu/Mul不支持double
+-  // ascend910B的Relu/Mul不支持int64
+ 
+-  // DT_FLOAT = 0,            // float type
+-  // DT_FLOAT16 = 1,          // fp16 type
+-  // DT_BF16 = 27,            // bf16 type
+-  GET_TILING_DATA(tempTilingGm, tiling);
+-  if (tempTilingGm.isDoubleBuffer == 1) {
+-    if (TILING_KEY_IS(1)) {
+-      SwigluSingle<SwigluVectorBF16<half, float, half, 2>, half, half> op;
+-      op.Init(input_gm, nullptr, output_gm, tiling);
+-      op.Process();
+-    } else if (TILING_KEY_IS(0)) {
+-      SwigluSingle<SwigluVector<float, float, 2>, float, float> op;
++  GET_TILING_DATA_WITH_STRUCT(SwiGluTilingData, tempTilingGm, tiling);
++
++  if constexpr (std::is_same_v<DTYPE_X, bfloat16_t>) {
++    if (tempTilingGm.isDoubleBuffer == 1) {
++      SwigluSingle<SwigluVectorBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;
+       op.Init(input_gm, nullptr, output_gm, tiling);
+       op.Process();
+-    }
+-#if defined(__CCE_AICORE__) && __CCE_AICORE__  == 220
+-    else if (TILING_KEY_IS(27)) {
++    } else {
+       SwigluSingle<SwigluVectorBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;
+       op.Init(input_gm, nullptr, output_gm, tiling);
+       op.Process();
+     }
+-#endif
+   } else {
+-    if (TILING_KEY_IS(1)) {
+-      SwigluSingle<SwigluVectorBF16<half, float, half, 1>, half, half> op;
+-      op.Init(input_gm, nullptr, output_gm, tiling);
+-      op.Process();
+-    } else if (TILING_KEY_IS(0)) {
+-      SwigluSingle<SwigluVector<float, float, 1>, float, float> op;
++    if (tempTilingGm.isDoubleBuffer == 1) {
++      SwigluSingle<SwigluVectorBF16<half, float, half, 2>, half, half> op;
+       op.Init(input_gm, nullptr, output_gm, tiling);
+       op.Process();
+-    }
+-#if defined(__CCE_AICORE__) && __CCE_AICORE__  == 220
+-    else if (TILING_KEY_IS(27)) {
+-      SwigluSingle<SwigluVectorBF16<bfloat16_t, float, bfloat16_t, 1>, bfloat16_t, bfloat16_t> op;
++    } else {
++      SwigluSingle<SwigluVectorBF16<half, float, half, 1>, half, half> op;
+       op.Init(input_gm, nullptr, output_gm, tiling);
+       op.Process();
+     }
+-#endif
+   }
+-}
+\ No newline at end of file
++}
++#endif  // OPP_MULTICORE_MOE_SWI_GLU_CPP
+\ No newline at end of file
+diff --git a/activation/swi_glu_grad/op_kernel/glu_tiling_kernel.hpp b/activation/swi_glu_grad/op_kernel/glu_tiling_kernel.hpp
+index f0d3a2c95..9b99d815e 100644
+--- a/activation/swi_glu_grad/op_kernel/glu_tiling_kernel.hpp
++++ b/activation/swi_glu_grad/op_kernel/glu_tiling_kernel.hpp
+@@ -76,7 +76,8 @@ struct SwigluSingleTilingKernel {
+ 
+   // calc tiling data
+   __aicore__ void GetTilingAndOffset(GM_ADDR tiling_gm, uint32_t inputDTypeLen) {
+-    GET_TILING_DATA(tempTilingGm, tiling_gm);
++    // GET_TILING_DATA(tempTilingGm, tiling_gm);
++    GET_TILING_DATA_WITH_STRUCT(SwiGluTilingData, tempTilingGm, tiling_gm);
+ 
+     is32BAligned = tempTilingGm.is32BAligned;
+     rowLen = tempTilingGm.rowLen;
+@@ -202,8 +203,8 @@ do {                                \
+ } while (0)
+ #define SWIGLU_SINGLE_PROCESS(kernelTiling) \
+ do {                                       \
+-    uint64_t blockNum = GetBlockNum();       \
+-	  for(uint64_t tileIdx = AscendC::GetBlockIdx(); tileIdx < (kernelTiling).totalTileNum; tileIdx += blockNum) { \
++    uint64_t blockNum = 1;       \
++	  for(uint64_t tileIdx = 0; tileIdx < (kernelTiling).totalTileNum; tileIdx += blockNum) { \
+         (kernelTiling).CaclOneTileParam(tileIdx); \
+         SWIGLU_SINGLE_PROCESS_TILE((kernelTiling).offsetParam, *((kernelTiling).curTileCopyParam), (kernelTiling).curCalLen); \
+ 	} \
+@@ -216,8 +217,8 @@ do {                                              \
+ } while(0)
+ #define SWIGLU_SINGLE_PROCESS_NON32BALIGNED(kernelTiling) \
+ do {                                       \
+-    uint64_t blockNum = GetBlockNum();       \
+-	  for(uint64_t tileIdx = AscendC::GetBlockIdx(); tileIdx < (kernelTiling).totalTileNum; tileIdx += blockNum) { \
++    uint64_t blockNum = 1;       \
++	  for(uint64_t tileIdx = 0; tileIdx < (kernelTiling).totalTileNum; tileIdx += blockNum) { \
+         (kernelTiling).CaclOneTileParam(tileIdx); \
+         SWIGLU_SINGLE_PROCESS_TILE_NON32BALIGNED((kernelTiling).offsetParam, *((kernelTiling).curTileCopyParam), (kernelTiling).curCalLen); \
+ 	} \
+diff --git a/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp b/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp
+index 2e3864024..f8a72d947 100644
+--- a/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp
++++ b/activation/swi_glu_grad/op_kernel/swi_glu_grad.cpp
+@@ -17,45 +17,31 @@
+ #include "swi_glu_grad_single.hpp"
+ 
+ using namespace AscendC;
+-extern "C" __global__ __aicore__ void swi_glu_grad(GM_ADDR gradout_gm, GM_ADDR input_gm, GM_ADDR output_gm,
++extern "C" inline __aicore__ void swi_glu_grad(GM_ADDR gradout_gm, GM_ADDR input_gm, GM_ADDR output_gm,
+                                                    GM_ADDR workspace, GM_ADDR tiling) {
+     // DT_FLOAT = 0,            // float type
+     // DT_FLOAT16 = 1,          // fp16 type
+     // DT_BF16 = 27,            // bf16 type
+-    GET_TILING_DATA(tempTilingGm, tiling);
+-    if (tempTilingGm.isDoubleBuffer == 1) {
+-      if (TILING_KEY_IS(1)) {
+-        SwiGluGradSingle <SwiGluGradBF16<half, float, half, 2>, half, half> op;
+-        op.Init(gradout_gm, input_gm, output_gm, tiling);
+-        op.Process();
+-      } else if (TILING_KEY_IS(0)) {
+-        SwiGluGradSingle<SwiGluGradVector<float, float, float, float, float, 2>, float, float> op;
++    GET_TILING_DATA_WITH_STRUCT(SwiGluTilingData, tempTilingGm, tiling);
++    if constexpr (std::is_same_v<DTYPE_DY, bfloat16_t>) {
++      if (tempTilingGm.isDoubleBuffer == 1) {
++        SwiGluGradSingle <SwiGluGradBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;
+         op.Init(gradout_gm, input_gm, output_gm, tiling);
+         op.Process();
+-      }
+-#if defined(__CCE_AICORE__) && __CCE_AICORE__  == 220
+-      else if (TILING_KEY_IS(27)) {
+-        SwiGluGradSingle <SwiGluGradBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;
++      } else {
++        SwiGluGradSingle <SwiGluGradBF16<bfloat16_t, float, bfloat16_t, 1>, bfloat16_t, bfloat16_t> op;
+         op.Init(gradout_gm, input_gm, output_gm, tiling);
+         op.Process();
+       }
+-#endif
+     } else {
+-      if (TILING_KEY_IS(1)) {
+-        SwiGluGradSingle <SwiGluGradBF16<half, float, half, 1>, half, half> op;
+-        op.Init(gradout_gm, input_gm, output_gm, tiling);
+-        op.Process();
+-      } else if (TILING_KEY_IS(0)) {
+-        SwiGluGradSingle<SwiGluGradVector<float, float, float, float, float, 1>, float, float> op;
++      if (tempTilingGm.isDoubleBuffer == 1) {
++        SwiGluGradSingle <SwiGluGradBF16<half, float, half, 2>, half, half> op;
+         op.Init(gradout_gm, input_gm, output_gm, tiling);
+         op.Process();
+-      }
+-#if defined(__CCE_AICORE__) && __CCE_AICORE__  == 220
+-      else if (TILING_KEY_IS(27)) {
+-        SwiGluGradSingle <SwiGluGradBF16<bfloat16_t, float, bfloat16_t, 1>, bfloat16_t, bfloat16_t> op;
++      } else {
++        SwiGluGradSingle <SwiGluGradBF16<half, float, half, 1>, half, half> op;
+         op.Init(gradout_gm, input_gm, output_gm, tiling);
+         op.Process();
+       }
+-#endif
+-  }
++    }
+ }
+diff --git a/cmake/variables.cmake b/cmake/variables.cmake
+index 2eb3634d2..f8f3c5147 100644
+--- a/cmake/variables.cmake
++++ b/cmake/variables.cmake
+@@ -9,7 +9,7 @@
+ # ----------------------------------------------------------------------------
+ 
+ # 算子类别清单
+-set(OP_CATEGORY_LIST "matmul" "conv" "reliability" "activation" "foreach" "hash" "vfusion" "index" "loss" "norm" "optim" "pooling" "quant" "rnn" "control")
++set(OP_CATEGORY_LIST "multicore_moe")
+ 
+ set(COMMON_NAME common_${PKG_NAME})
+ set(OPHOST_NAME ophost_${PKG_NAME})
+diff --git a/scripts/kernel/binary_script/build_env.sh b/scripts/kernel/binary_script/build_env.sh
+index fbd8479ef..4f730ed1c 100644
+--- a/scripts/kernel/binary_script/build_env.sh
++++ b/scripts/kernel/binary_script/build_env.sh
+@@ -22,7 +22,7 @@ SOC_MAP=([Ascend310P]="Ascend310P3"
+ 
+ OPC_TASK_NAME="opc_cmd.sh"
+ OUT_TASK_NAME="out_cmd.sh"
+-OP_CATEGORY_LIST="matmul conv activation foreach vfusion index loss norm optim pooling quant rnn control"
++OP_CATEGORY_LIST="multicore_moe"
+ 
+ function trans_soc() {
+   local _soc_input=$1
+diff --git a/scripts/util/ascendc_impl_build.py b/scripts/util/ascendc_impl_build.py
+index 8d93d9eec..dacb99cb0 100644
+--- a/scripts/util/ascendc_impl_build.py
++++ b/scripts/util/ascendc_impl_build.py
+@@ -166,6 +166,11 @@ def {}({}, kernel_name="{}", impl_mode=""):
+     __inputs__, __outputs__, __attrs__ = _build_args({})
+     options = get_dtype_fmt_options(__inputs__, __outputs__)
+     options += ["-x", "cce"]
++    ascend_shmem_path = os.environ.get('ASCEND_SHMEM_HOME_PATH')
++    if ascend_shmem_path != None:
++        ascend_shmem_path = os.path.realpath(ascend_shmem_path)
++    else:
++        print("please export ASCEND_SHMEM_HOME_PATH")
+     bisheng = os.environ.get('BISHENG_REAL_PATH')
+     if bisheng is None:
+         bisheng = shutil.which("bisheng")
+@@ -183,6 +188,15 @@ def {}({}, kernel_name="{}", impl_mode=""):
+         "..", "..", "..", "latest", os.uname().machine+"-linux", "asc", "atcos"))
+     options.append("-I" + os.path.join(PYF_PATH, "..", "ascendc", "common"))
+ 
++    options.append("-I" + os.path.join(ascend_shmem_path, "shmem"))
++    options.append("-I" + os.path.join(ascend_shmem_path, "shmem", "src"))
++    options.append("-I" + os.path.join(ascend_shmem_path, "shmem", "src", "device"))
++    options.append("-I" + os.path.join(ascend_shmem_path, "shmem", "src", "host_device"))
++    options.append("-I" + os.path.join(ascend_shmem_path, "shmem", "include"))
++    options.append("-I" + os.path.join(ascend_shmem_path, "shmem", "include", "device"))
++    options.append("-I" + os.path.join(ascend_shmem_path, "shmem", "include", "host_device"))
++    options.append("-I" + os.path.join(ascend_shmem_path, "shmem", "include", "host"))
++
+     ascend_home_path = os.environ.get('ASCEND_HOME_PATH')
+     if ascend_home_path is None:
+         ascend_home_path = os.path.realpath("/usr/local/Ascend/cann")
+@@ -225,9 +239,17 @@ REPLAY_OP_API = '''
+     else:
+         op_replay_path = os.path.join(PYF_PATH, "..", "op_replay")
+     replayapi_so_path = os.path.join(op_replay_path, "libreplay_{}_" + soc_short + ".so")
++    shmem_so_path = os.path.join(ascend_shmem_path, "shmem", "lib", "libshmem.so")
++    libshmem_utils = os.path.join(ascend_shmem_path, "shmem", "lib", "libshmem_utils.so")
++    libshmem_bootstrap_uid = os.path.join(ascend_shmem_path, "shmem", "lib", "libshmem_bootstrap_uid.so")
++    libshmem_bootstrap_config_store = os.path.join(ascend_shmem_path, "shmem", "lib", "libshmem_bootstrap_config_store.so")
+     load_dso(codegen_so_path)
+     load_dso(replaystub_so_path)
+     load_dso(replayapi_so_path)
++    load_dso(shmem_so_path)
++    load_dso(libshmem_utils)
++    load_dso(libshmem_bootstrap_uid)
++    load_dso(libshmem_bootstrap_config_store)
+     op_type = "{}"
+     entry_obj = os.path.join(op_replay_path, "{}_entry_" + soc_short + ".o")
+     code_channel = get_code_channel(src, kernel_name, op_type, options)
+

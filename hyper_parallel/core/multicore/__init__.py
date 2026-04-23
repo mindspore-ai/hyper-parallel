@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""MoE-FFN multicore mega kernel entry point with platform dispatch."""
+"""MoE-FFN multicore operator entry point with platform dispatch."""
 from hyper_parallel.platform import get_platform
 
 _platform = get_platform()
@@ -31,7 +31,7 @@ def moe_ffn_fwd(
     rank_id: int, ep: int, expert_num: int,
     hidden_size: int, seq_size: int,
 ):
-    """MoE-FFN forward mega kernel (platform-dispatched)."""
+    """MoE-FFN forward operator (platform-dispatched)."""
     return _multicore_handler.moe_ffn_fwd(
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
@@ -58,7 +58,7 @@ def moe_ffn_bwd(
     rank_id: int, ep: int, expert_num: int,
     hidden_size: int, seq_size: int,
 ):
-    """MoE-FFN backward mega kernel (platform-dispatched)."""
+    """MoE-FFN backward operator (platform-dispatched)."""
     return _multicore_handler.moe_ffn_bwd(
         dispatch_target, dispatch_target_off,
         dy, dispatch_src_off, dispatch_size,

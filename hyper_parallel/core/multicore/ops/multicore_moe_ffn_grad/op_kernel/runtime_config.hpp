@@ -1,3 +1,13 @@
+/**
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ * This file is a part of the CANN Open Software.
+ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
 #ifndef MULTICORE_MOE_FFN_GRAD_RUNTIME_HEAD_TEST_KERNEL_CODE
 #define MULTICORE_MOE_FFN_GRAD_RUNTIME_HEAD_TEST_KERNEL_CODE
 
@@ -5,12 +15,12 @@ constexpr uint32_t MAX_TENSOR_DIMS = 4;
 constexpr uint32_t MAX_INPUTS_PER_TASK = 4;
 constexpr uint32_t MAX_OUTPUTS_PER_TASK = 4;
 
-constexpr uint32_t MAX_TASK_NUM = 256*100;
+constexpr uint32_t MAX_TASK_NUM = 256 * 100;
 constexpr uint32_t MAX_EVENT_NUM = 1024;
 constexpr uint32_t NUM_WORKERS_VECTOR = 48;
 constexpr uint32_t NUM_WORKERS_CUBE = 24;
 constexpr uint32_t QUEUE_CAPACITY = 100;
-constexpr uint32_t TASK_TYPE_INDEX_NUM = 256*100;
+constexpr uint32_t TASK_TYPE_INDEX_NUM = 256 * 100;
 constexpr uint32_t MAX_GROUP_LIST = 512;
 constexpr uint32_t ATOMIC_ADD_VALUE_LEN = 8;
 
@@ -51,7 +61,7 @@ enum EventType : uint32_t {
   EVENT_LAUNCH_MASSIVE_TASKS = 902,
   EVENT_LAUNCH_DEPENDENT_TASKS = 903,
   EVENT_END_OF_TASK_GRAPH = 910,
-  EVENT_TERMINATION = 911, // TASK_TERMINATE
+  EVENT_TERMINATION = 911,  // TASK_TERMINATE
   EVENT_INVALID = 999,
 };
 
@@ -112,50 +122,41 @@ struct RuntimeConfig {
   uint32_t queue_capacity;
   uint32_t config_extra_value;
 
-  int32_t* all_event_num_triggers;
+  int32_t *all_event_num_triggers;
 
-  TaskDesc* all_tasks;
-  EventDesc* all_events;
+  TaskDesc *all_tasks;
+  EventDesc *all_events;
 
-  int32_t* task_index_num; // 3
-  int32_t* cube_task_indexs; // TASK_TYPE_INDEX_NUM
-  int32_t* vector_task_indexs; // TASK_TYPE_INDEX_NUM
-  int32_t* mix_task_indexs; // TASK_TYPE_INDEX_NUM
+  int32_t *task_index_num;      // 3
+  int32_t *cube_task_indexs;    // TASK_TYPE_INDEX_NUM
+  int32_t *vector_task_indexs;  // TASK_TYPE_INDEX_NUM
+  int32_t *mix_task_indexs;     // TASK_TYPE_INDEX_NUM
 
   DynamicData dynamic_data;
-  int64_t* grouped_matmul_group_list;
-  int32_t* atomic_add_values;
+  int64_t *grouped_matmul_group_list;
+  int32_t *atomic_add_values;
 };
 
-__aicore__ inline uint32_t getTaskNum(__gm__ uint8_t *tiling)
-{
-  return (*(__gm__ uint32_t *)(tiling));
-}
+__aicore__ inline uint32_t getTaskNum(__gm__ uint8_t *tiling) { return (*(__gm__ uint32_t *)(tiling)); }
 
-__aicore__ inline uint32_t getAllEventNumTriggersOffset()
-{
-  return UINT32_T_SIZE * 4;
-}
+__aicore__ inline uint32_t getAllEventNumTriggersOffset() { return UINT32_T_SIZE * 4; }
 
-__aicore__ inline uint32_t getAllTasksOffset()
-{
-  return UINT32_T_SIZE * 4 + INT32_T_SIZE * MAX_EVENT_NUM;
-}
+__aicore__ inline uint32_t getAllTasksOffset() { return UINT32_T_SIZE * 4 + INT32_T_SIZE * MAX_EVENT_NUM; }
 
-__aicore__ inline uint32_t getAllEventsOffset()
-{
+__aicore__ inline uint32_t getAllEventsOffset() {
   uint32_t start_size = getAllTasksOffset();
 
   uint32_t tensor_desc_size = UINT32_T_SIZE * 8 + UINT32_T_SIZE * MAX_TENSOR_DIMS * 2;
-  uint32_t task_desc_size = UINT32_T_SIZE * 6 + MAX_INPUTS_PER_TASK * tensor_desc_size + MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
+  uint32_t task_desc_size = UINT32_T_SIZE * 6 + MAX_INPUTS_PER_TASK * tensor_desc_size +
+                            MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
 
   return start_size + task_desc_size * MAX_TASK_NUM;
 }
 
-__aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData, uint32_t index_size)
-{
+__aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData, uint32_t index_size) {
   uint32_t tensor_desc_size = UINT32_T_SIZE * 8 + UINT32_T_SIZE * MAX_TENSOR_DIMS * 2;
-  uint32_t task_desc_size = UINT32_T_SIZE * 6 + MAX_INPUTS_PER_TASK * tensor_desc_size + MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
+  uint32_t task_desc_size = UINT32_T_SIZE * 6 + MAX_INPUTS_PER_TASK * tensor_desc_size +
+                            MAX_OUTPUTS_PER_TASK * tensor_desc_size + UINT32_T_SIZE * 10;
   uint32_t size = getAllTasksOffset() + index_size * task_desc_size;
 
   tilingData->task_type = (*(__gm__ TaskType *)(tiling + size));
@@ -228,8 +229,7 @@ __aicore__ inline void getTaskDesc(__gm__ uint8_t *tiling, TaskDesc *tilingData,
   tilingData->task_split_value = (*(__gm__ uint32_t *)(tiling + start_size));
 }
 
-__aicore__ inline void getEventDesc(__gm__ uint8_t *tiling, EventDesc *tilingData, uint32_t index_size)
-{
+__aicore__ inline void getEventDesc(__gm__ uint8_t *tiling, EventDesc *tilingData, uint32_t index_size) {
   uint32_t size = getAllEventsOffset() + index_size * 4 * UINT32_T_SIZE;
 
   tilingData->event_type = (*(__gm__ EventType *)(tiling + size));
@@ -238,13 +238,9 @@ __aicore__ inline void getEventDesc(__gm__ uint8_t *tiling, EventDesc *tilingDat
   tilingData->last_task_id = (*(__gm__ uint32_t *)(tiling + size + UINT32_T_SIZE * 3));
 }
 
-__aicore__ inline uint32_t getTaskIndexNumOffset()
-{
-  return getAllEventsOffset() + MAX_EVENT_NUM * 4 * UINT32_T_SIZE;
-}
+__aicore__ inline uint32_t getTaskIndexNumOffset() { return getAllEventsOffset() + MAX_EVENT_NUM * 4 * UINT32_T_SIZE; }
 
-__aicore__ inline int32_t getTaskIndexNumByTaskType(__gm__ uint8_t *tiling, TaskAiCoreType task_aicore_type)
-{
+__aicore__ inline int32_t getTaskIndexNumByTaskType(__gm__ uint8_t *tiling, TaskAiCoreType task_aicore_type) {
   uint32_t size = getAllEventsOffset() + MAX_EVENT_NUM * 4 * UINT32_T_SIZE;
   if (task_aicore_type == TaskAiCoreType::TASK_AICORE_VECTOR) {
     return (*(__gm__ int32_t *)(tiling + size + INT32_T_SIZE));
@@ -255,28 +251,21 @@ __aicore__ inline int32_t getTaskIndexNumByTaskType(__gm__ uint8_t *tiling, Task
   }
 }
 
-__aicore__ inline uint32_t getCubeTaskIndexsOffset()
-{
-  return getTaskIndexNumOffset() + 4 * INT32_T_SIZE;
-}
+__aicore__ inline uint32_t getCubeTaskIndexsOffset() { return getTaskIndexNumOffset() + 4 * INT32_T_SIZE; }
 
-__aicore__ inline uint32_t getVectorTaskIndexsOffset()
-{
+__aicore__ inline uint32_t getVectorTaskIndexsOffset() {
   return getCubeTaskIndexsOffset() + TASK_TYPE_INDEX_NUM * INT32_T_SIZE;
 }
 
-__aicore__ inline uint32_t getMixTaskIndexsOffset()
-{
+__aicore__ inline uint32_t getMixTaskIndexsOffset() {
   return getVectorTaskIndexsOffset() + TASK_TYPE_INDEX_NUM * INT32_T_SIZE;
 }
 
-__aicore__ inline uint32_t getDynamicDataOffset()
-{
+__aicore__ inline uint32_t getDynamicDataOffset() {
   return getMixTaskIndexsOffset() + TASK_TYPE_INDEX_NUM * INT32_T_SIZE;
 }
 
-__aicore__ inline void getDynamicData(__gm__ uint8_t *tiling, DynamicData *tilingData)
-{
+__aicore__ inline void getDynamicData(__gm__ uint8_t *tiling, DynamicData *tilingData) {
   uint32_t size = getDynamicDataOffset();
   tilingData->dynamic_type = (*(__gm__ DynamicType *)(tiling + size));
   tilingData->dynamic_input_position = (*(__gm__ uint32_t *)(tiling + size + UINT32_T_SIZE));
@@ -284,31 +273,25 @@ __aicore__ inline void getDynamicData(__gm__ uint8_t *tiling, DynamicData *tilin
   tilingData->dynamic_max_seq_len = (*(__gm__ uint32_t *)(tiling + size + UINT32_T_SIZE * 3));
 }
 
-__aicore__ inline uint32_t getGroupedMatmulGroupListOffset()
-{
-  return getDynamicDataOffset() + 4 * UINT32_T_SIZE;
-}
+__aicore__ inline uint32_t getGroupedMatmulGroupListOffset() { return getDynamicDataOffset() + 4 * UINT32_T_SIZE; }
 
-__aicore__ inline uint32_t getGroupedMatmulGroupListOffsetById(__gm__ uint8_t *tiling, uint32_t block_idx)
-{
+__aicore__ inline uint32_t getGroupedMatmulGroupListOffsetById(__gm__ uint8_t *tiling, uint32_t block_idx) {
   return getGroupedMatmulGroupListOffset() + 8 * INT64_T_SIZE * block_idx;
 }
 
-__aicore__ inline uint32_t getAtomicAddValuesOffset()
-{
+__aicore__ inline uint32_t getAtomicAddValuesOffset() {
   return getGroupedMatmulGroupListOffset() + MAX_GROUP_LIST * INT64_T_SIZE;
 }
 
-__aicore__ inline int64_t getExtraValueFromTiling(__gm__ uint8_t *tiling, uint32_t index)
-{
+__aicore__ inline int64_t getExtraValueFromTiling(__gm__ uint8_t *tiling, uint32_t index) {
   return (*(__gm__ int64_t *)(tiling + index * INT64_T_SIZE));
 }
 
-template<AscendC::HardEvent event>
+template <AscendC::HardEvent event>
 __aicore__ inline void SyncFunc() {
-    uint32_t eventID = static_cast<uint32_t>(GetTPipePtr()->FetchEventID(event));
-    AscendC::SetFlag<event>(eventID);
-    AscendC::WaitFlag<event>(eventID);
+  uint32_t eventID = static_cast<uint32_t>(GetTPipePtr()->FetchEventID(event));
+  AscendC::SetFlag<event>(eventID);
+  AscendC::WaitFlag<event>(eventID);
 }
 
-#endif // MULTICORE_MOE_FFN_GRAD_RUNTIME_HEAD_TEST_KERNEL_CODE
+#endif  // MULTICORE_MOE_FFN_GRAD_RUNTIME_HEAD_TEST_KERNEL_CODE
