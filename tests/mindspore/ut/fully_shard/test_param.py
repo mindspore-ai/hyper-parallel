@@ -279,6 +279,48 @@ class TestMindSporeParam(unittest.TestCase):
         dst.copy_.assert_not_called()
         dst.data.copy_.assert_called_once_with(src)
 
+    def test_release_full_param_storage_if_safe_shrinks_plain_tensor_storage(self):
+        """Plain full params should release their original storage after sharded replacement."""
+        hsdp_param = object.__new__(MindSporeHSDPParamV2)
+        hsdp_param._orig_param_is_dtensor = False
+        storage = MagicMock()
+        storage.size.return_value = 128
+        param_data = MagicMock()
+        param_data.is_meta = False
+        param_data.untyped_storage.return_value = storage
+
+        MindSporeHSDPParamV2._release_full_param_storage_if_safe(hsdp_param, param_data)
+
+        storage.resize_.assert_called_once_with(0)
+
+    def test_release_full_param_storage_if_safe_shrinks_dtensor_local_storage(self):
+        """DTensor local tensors should also release their original storage after sharding."""
+        hsdp_param = object.__new__(MindSporeHSDPParamV2)
+        hsdp_param._orig_param_is_dtensor = True
+        storage = MagicMock()
+        storage.size.return_value = 128
+        param_data = MagicMock()
+        param_data.is_meta = False
+        param_data.untyped_storage.return_value = storage
+
+        MindSporeHSDPParamV2._release_full_param_storage_if_safe(hsdp_param, param_data)
+
+        storage.resize_.assert_called_once_with(0)
+
+    def test_release_full_param_storage_if_safe_skips_meta_inputs(self):
+        """Meta tensors should keep their storage untouched."""
+        hsdp_param = object.__new__(MindSporeHSDPParamV2)
+        hsdp_param._orig_param_is_dtensor = False
+        storage = MagicMock()
+        storage.size.return_value = 128
+        param_data = MagicMock()
+        param_data.is_meta = True
+        param_data.untyped_storage.return_value = storage
+
+        MindSporeHSDPParamV2._release_full_param_storage_if_safe(hsdp_param, param_data)
+
+        storage.resize_.assert_not_called()
+
     @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.reduce_scatter_tensor")
     def test_reduce_scatter_grad_supports_same_dim_strided_non_dim0_layout(self, mock_reduce_scatter):
         """same-dim StridedShard(dim!=0) should reuse the non-dim0 chunk-cat packing path."""

@@ -211,6 +211,19 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             return StridedShard(shard_placement.dim, split_factor=split_factor)
         return shard_placement
 
+    def _release_full_param_storage_if_safe(self, param_data: ms.Tensor) -> None:
+        """Release the temporary full-parameter storage once the sharded param is installed.
+
+        Skip storage reclamation only for meta tensors. Both plain Tensor inputs and DTensor local
+        tensors should drop their original storage after the sharded Parameter has been installed
+        onto the owning modules.
+        """
+        if param_data.is_meta:
+            return
+        storage = param_data.untyped_storage()
+        if storage.size() != 0:
+            storage.resize_(0)
+
     @_no_grad()
     def _init_sharded_param(
         self,
@@ -272,6 +285,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self.sharded_param.grad = None
 
         self._setattr_on_modules(self.sharded_param)
+        self._release_full_param_storage_if_safe(param_data)
         self.sharded_param._hsdp_param_initialized = True
         self.sharded_state = ShardedState.SHARDED
         self.param_dtype = None
