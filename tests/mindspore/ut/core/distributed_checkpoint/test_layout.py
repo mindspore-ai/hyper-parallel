@@ -49,6 +49,18 @@ def _make_param(name, layout, dtype="float32", shape=(2, 4)):
 class TestLayout(unittest.TestCase):
     """Test the layout module."""
 
+    def setUp(self):
+        # MindSpore uses parameters_and_names(); Torch uses named_parameters(). Mocks only define
+        # parameters_and_names, so delegate parameters_dict to that for stable get_current_layout tests.
+        self._params_dict_patcher = patch(
+            "hyper_parallel.core.distributed_checkpoint.layout.platform.parameters_dict",
+            side_effect=lambda cell: cell.parameters_and_names(),
+        )
+        self._params_dict_patcher.start()
+
+    def tearDown(self):
+        self._params_dict_patcher.stop()
+
     @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
     @arg_mark(
         plat_marks=["platform_ascend910b"],
@@ -125,11 +137,11 @@ class TestLayout(unittest.TestCase):
         card_mark="onecard",
         essential_mark="unessential",
     )
-    def test_get_current_layout_skips_falsy_layout(self, mock_rank):
+    def test_get_current_layout_falsy_layout_recorded_as_none(self, mock_rank):
         """
-        Feature: Skip parameters without a usable layout.
+        Feature: Serialize parameters with absent usable layout as null entries.
         Description: One parameter has a truthy layout and another has layout set to None.
-        Expectation: Only the parameter with a truthy layout appears in the result.
+        Expectation: Both names appear under the rank; the falsy-layout parameter maps to None.
         """
         mock_cell = MagicMock()
         mock_cell.parameters_and_names.return_value = [
@@ -137,7 +149,10 @@ class TestLayout(unittest.TestCase):
             ("ignored", _make_param("ignored", None)),
         ]
         layout_dict = get_current_layout(mock_cell)
-        self.assertEqual(set(layout_dict["0"].keys()), {"weight"})
+        rank_layout = layout_dict["0"]
+        self.assertEqual(set(rank_layout.keys()), {"weight", "ignored"})
+        self.assertIsNotNone(rank_layout["weight"])
+        self.assertIsNone(rank_layout["ignored"])
         mock_rank.assert_called_once()
 
     @patch("hyper_parallel.core.distributed_checkpoint.layout.logger")
@@ -152,7 +167,7 @@ class TestLayout(unittest.TestCase):
         """
         Feature: Observability for parameters missing a layout attribute.
         Description: A parameter object without a layout attribute is included alongside normal params.
-        Expectation: logger.info runs once with the skipped parameter names.
+        Expectation: logger.info runs once with the parameter names; rank layout stores None for that param.
         """
         no_layout_attr = SimpleNamespace(name="buf", dtype="float32", shape=())
         mock_cell = MagicMock()
@@ -160,11 +175,38 @@ class TestLayout(unittest.TestCase):
             ("weight", _make_param("weight", _layout_mock_with_to_dict({"mesh_shape": (2,)}))),
             ("buf", no_layout_attr),
         ]
-        get_current_layout(mock_cell)
+        layout_dict = get_current_layout(mock_cell)
+        self.assertIsNone(layout_dict["0"]["buf"])
+        self.assertIsNotNone(layout_dict["0"]["weight"])
         mock_logger.info.assert_called_once()
         msg, names = mock_logger.info.call_args[0]
         self.assertIn("layout attribute", msg)
         self.assertEqual(names, ["buf"])
+        mock_rank.assert_called_once()
+
+    @patch("hyper_parallel.core.distributed_checkpoint.layout.logger")
+    @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
+    @arg_mark(
+        plat_marks=["platform_ascend910b"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="unessential",
+    )
+    def test_get_current_layout_only_missing_layout_attr_all_none(self, mock_rank, mock_logger):
+        """
+        Feature: Rank layout map when every parameter lacks a layout attribute.
+        Description: Two SimpleNamespace params without ``layout`` are enumerated from the cell.
+        Expectation: Each param name maps to None and logger.info lists both names once.
+        """
+        p1 = SimpleNamespace(name="a", dtype="float32", shape=(1,))
+        p2 = SimpleNamespace(name="b", dtype="float32", shape=(2,))
+        mock_cell = MagicMock()
+        mock_cell.parameters_and_names.return_value = [("a", p1), ("b", p2)]
+        layout_dict = get_current_layout(mock_cell)["0"]
+        self.assertEqual(layout_dict, {"a": None, "b": None})
+        mock_logger.info.assert_called_once()
+        names = mock_logger.info.call_args[0][1]
+        self.assertEqual(set(names), {"a", "b"})
         mock_rank.assert_called_once()
 
     @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
@@ -299,6 +341,31 @@ class TestLayout(unittest.TestCase):
         with self.assertRaises(FileNotFoundError) as ctx:
             load_layout(missing)
         self.assertIn(str(missing), str(ctx.exception))
+
+    @arg_mark(
+        plat_marks=["platform_ascend910b"],
+        level_mark="level0",
+        card_mark="onecard",
+        essential_mark="unessential",
+    )
+    def test_save_load_layout_roundtrip_preserves_null_entries(self):
+        """
+        Feature: JSON persistence of rank layout maps containing null parameter entries.
+        Description: save_layout writes a dict whose per-rank values include explicit JSON nulls.
+        Expectation: load_layout returns the same structure with Python None for those entries.
+        """
+        layout_dict = {
+            "0": {
+                "weight": {"device_matrix": [2, 2], "type": "float32", "full_shape": [4, 8]},
+                "bias": None,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "roundtrip.layout.json"
+            save_layout(layout_dict, path)
+            loaded = load_layout(path)
+        self.assertEqual(loaded, layout_dict)
+        self.assertIsNone(loaded["0"]["bias"])
 
 
 if __name__ == "__main__":
