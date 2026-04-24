@@ -46,18 +46,20 @@ def get_current_layout(cell: Any) -> dict:
             raise RuntimeError("param in cell can not have same name")
         if not hasattr(param, "layout"):
             params_without_layout_attr.append(name)
-            continue
-        if param.layout:
-            layout_info = dict(param.layout.to_dict())
+        layout = getattr(param, "layout", None)
+        if layout:
+            layout_info = dict(layout.to_dict())
             if "mesh_shape" in layout_info:
                 layout_info["device_matrix"] = layout_info.pop("mesh_shape")
             layout_dict[current_rank][param.name] = layout_info
             layout_dict[current_rank][param.name]["type"] = str(param.dtype)
             layout_dict[current_rank][param.name]["full_shape"] = param.shape
+        else:
+            layout_dict[current_rank][param.name] = None
 
     if params_without_layout_attr:
         logger.info(
-            "The following parameters have no layout attribute and were skipped: %s",
+            "The following parameters have no layout attribute (layout entry is None): %s",
             params_without_layout_attr,
         )
 
