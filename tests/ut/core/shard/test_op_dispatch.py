@@ -93,6 +93,9 @@ class TestStackExtDispatch(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = np.prod(mesh_shape)
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
         return init_device_mesh(
             device_type="npu",
             mesh_shape=mesh_shape,
@@ -192,6 +195,9 @@ class TestNewDispatchFlow(unittest.TestCase):
         _DEVICE_MESH_MAP.clear()
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = np.prod(mesh_shape)
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
         return init_device_mesh(
                 device_type="npu",
                 mesh_shape=mesh_shape,

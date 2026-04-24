@@ -46,9 +46,16 @@ class TestParallelStack(unittest.TestCase):
         """Mock a 2x4 device mesh."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
         mock_platform.platform_type = MagicMock()
-        return init_device_mesh(device_type="cpu", mesh_shape=(2, 4),
-                                mesh_dim_names=("dp", "mp"), init_backend=False)
+        return init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(2, 4),
+            mesh_dim_names=("dp", "mp"),
+            init_backend=False
+        )
 
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -180,6 +187,9 @@ class TestParallelStack(unittest.TestCase):
         """Mock a 2x2x2 device mesh for complex tests."""
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = 8
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
         mock_platform.platform_type = MagicMock()
         return init_device_mesh(device_type="cpu", mesh_shape=(2, 2, 2),
                                 mesh_dim_names=("dp", "tp", "mp"), init_backend=False)
