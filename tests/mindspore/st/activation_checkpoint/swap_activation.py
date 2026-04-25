@@ -26,7 +26,9 @@ import mindspore as ms
 import numpy as np
 from hyper_parallel.core.activation_checkpoint import SwapManager, swap_wrapper
 from hyper_parallel.core.activation_checkpoint.activation_checkpoint import CheckpointPolicy, swap
+from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 from mindspore import Tensor, mint, nn
+enable_mindspore_backward_compat()
 
 
 class SelfAttention(nn.Cell):
@@ -137,17 +139,22 @@ def train_one_mode(net, data_list, train_steps=3):
     optimizer = nn.Adam(net.trainable_params(), learning_rate=1e-4)
     loss_fn = nn.CrossEntropyLoss()
 
-    def forward_fn(x, y):
-        logits = net(x)
-        return loss_fn(logits.view(-1, vocab_size), y.view(-1))
+    def get_forward_fn(net):
+        def forward_fn(x, y):
+            logits = net(x)
+            return loss_fn(logits.view(-1, vocab_size), y.view(-1))
+        return forward_fn
 
-    grad_fn = ms.value_and_grad(forward_fn, None, optimizer.parameters)
-
+    params = tuple(net.trainable_params())
     losses = []
     for step, (x, y) in enumerate(data_list):
         if step >= train_steps:
             break
-        loss, grads = grad_fn(x, y)
+        for param in params:
+            param.grad = None
+        loss = get_forward_fn(net)(x, y)
+        loss.backward()
+        grads = tuple(param.grad for param in params)
         optimizer(grads)
         losses.append(float(loss.asnumpy()))
     return losses
@@ -160,13 +167,10 @@ def apply_swap(model, mode):
 
     if mode == "swap":
         for i, layer in enumerate(model.layers):
-            model.layers[i].attn = swap_wrapper(layer.attn)
-        model.layers[0].ffn[0].matmul = swap_wrapper(model.layers[0].ffn[0].matmul)
-        model.layers[1].ffn[2].matmul = swap_wrapper(model.layers[1].ffn[2].matmul)
-        model.layers[2].ffn[0].reshape = swap_wrapper(model.layers[2].ffn[0].reshape)
+            model.layers[i] = swap_wrapper(layer)
 
     elif mode == "swap_with_policy":
-        policy_threshold = 32 * 512 * 512
+        policy_threshold = 2048
 
         def policy_fn(x):
             if x.size <= policy_threshold:
@@ -174,10 +178,7 @@ def apply_swap(model, mode):
             return CheckpointPolicy.MUST_SWAP
 
         for i, layer in enumerate(model.layers):
-            model.layers[i].attn = swap_wrapper(layer.attn, policy_fn)
-        model.layers[0].ffn[0].matmul = swap_wrapper(model.layers[0].ffn[0].matmul)
-        model.layers[1].ffn[2].matmul = swap_wrapper(model.layers[1].ffn[2].matmul)
-        model.layers[3].ffn[0].reshape = swap_wrapper(model.layers[3].ffn[0].reshape)
+            model.layers[i] = swap_wrapper(layer, policy_fn)
 
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -194,7 +195,7 @@ def run_one_mode(mode, train_steps=3, seed=42):
     data_list = prepare_data()
     try:
         with seed_memory_time_context(seed=seed) as stats:
-            base_model = SimpleTransformer(vocab_size=32000, dim=2048, depth=6)
+            base_model = SimpleTransformer(vocab_size=32000, dim=512, depth=16)
             model = apply_swap(base_model, mode)
             losses = train_one_mode(model, data_list, train_steps)
         return {
@@ -293,19 +294,19 @@ def test_act_swap_memory_comparison():
             )
     print(f"\nAll {train_steps} steps: losses are consistent across modes (tol={tol}).")
 
-    # mem_none = results["none"]["peak_mem_gb"]
-    # mem_swap = results["swap"]["peak_mem_gb"]
-    # mem_swap_with_policy = results["swap_with_policy"]["peak_mem_gb"]
+    mem_none = results["none"]["peak_mem_gb"]
+    mem_swap = results["swap"]["peak_mem_gb"]
+    mem_swap_with_policy = results["swap_with_policy"]["peak_mem_gb"]
 
-    # assert mem_none > mem_swap_with_policy, (
-    #     f"Expected NONE ({mem_none:.5f}) > SWAP_WITH_POLICY ({mem_swap_with_policy:.5f})"
-    # )
-    # print(f"Verified: NONE ({mem_none:.5f}) > SWAP_WITH_POLICY ({mem_swap_with_policy:.5f})")
+    assert mem_none > mem_swap_with_policy, (
+        f"Expected NONE ({mem_none:.5f}) > SWAP_WITH_POLICY ({mem_swap_with_policy:.5f})"
+    )
+    print(f"Verified: NONE ({mem_none:.5f}) > SWAP_WITH_POLICY ({mem_swap_with_policy:.5f})")
 
-    # assert mem_swap_with_policy > mem_swap, (
-    #     f"Expected SWAP_WITH_POLICY ({mem_swap_with_policy:.5f}) > SWAP ({mem_swap:.5f})"
-    # )
-    # print(f"Verified: SWAP_WITH_POLICY ({mem_swap_with_policy:.5f}) > SWAP ({mem_swap:.5f})")
+    assert mem_swap_with_policy > mem_swap, (
+        f"Expected SWAP_WITH_POLICY ({mem_swap_with_policy:.5f}) > SWAP ({mem_swap:.5f})"
+    )
+    print(f"Verified: SWAP_WITH_POLICY ({mem_swap_with_policy:.5f}) > SWAP ({mem_swap:.5f})")
 
 
 

@@ -91,11 +91,12 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
             if (policy_fn is not None) and (policy_fn(tensor)==CheckpointPolicy.MUST_SAVE):
                 return tensor
 
+            group_name = SwapManager().get_current_group_name()
             if not self.add_to_storage:
-                group_name = SwapManager().get_current_group_name()
                 SwapManager().add_storage(group_name, self.storage)
                 self.add_to_storage = True
-            self.storage.swap_storage[self.count_idx].append(SwapTensor(tensor))
+            funcname = f"{group_name}::{tensor.shape}"
+            self.storage.swap_storage[self.count_idx].append(SwapTensor(tensor, funcname))
             idx = self.count_idx
             self.count_idx += 1
             self.pack_count += 1

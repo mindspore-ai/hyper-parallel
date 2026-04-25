@@ -25,6 +25,8 @@ import numpy as np
 import mindspore as ms
 from mindspore import nn, Tensor, mint
 from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, checkpoint_wrapper
+from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
+enable_mindspore_backward_compat()
 
 
 # ---------------------------------------------------------------------------
@@ -135,17 +137,22 @@ def train_one_mode(net, data_list, train_steps=3):
     optimizer = nn.Adam(net.trainable_params(), learning_rate=1e-4)
     loss_fn = nn.CrossEntropyLoss()
 
-    def forward_fn(x, y):
-        logits = net(x)
-        return loss_fn(logits.view(-1, vocab_size), y.view(-1))
+    def get_forward_fn(net):
+        def forward_fn(x, y):
+            logits = net(x)
+            return loss_fn(logits.view(-1, vocab_size), y.view(-1))
+        return forward_fn
 
-    grad_fn = ms.value_and_grad(forward_fn, None, optimizer.parameters)
-
+    params = tuple(net.trainable_params())
     losses = []
     for step, (x, y) in enumerate(data_list):
         if step >= train_steps:
             break
-        loss, grads = grad_fn(x, y)
+        for param in params:
+            param.grad = None
+        loss = get_forward_fn(net)(x, y)
+        loss.backward()
+        grads = tuple(param.grad for param in params)
         optimizer(grads)
         losses.append(float(loss.asnumpy()))
     return losses
@@ -332,21 +339,16 @@ def test_ac_memory_comparison():
             )
     print(f"\nAll {train_steps} steps: losses are consistent across modes (tol={tol}).")
 
-    # # memory hierarchy assertion: none > save > recompute ≈ swap
-    # mem_none = results["none"]["peak_mem_gb"]
-    # mem_save = results["save"]["peak_mem_gb"]
-    # mem_recompute = results["recompute"]["peak_mem_gb"]
-    # mem_swap = results["swap"]["peak_mem_gb"]
+    # memory hierarchy assertion: none > recompute ≈ swap
+    mem_none = results["none"]["peak_mem_gb"]
+    mem_recompute = results["recompute"]["peak_mem_gb"]
+    mem_swap = results["swap"]["peak_mem_gb"]
 
-    # assert mem_none > mem_save, \
-    #     f"Expected NONE ({mem_none:.5f} GB) > SAVE ({mem_save:.5f} GB)"
-    # print(f"Verified: NONE ({mem_none:.5f}) > SAVE ({mem_save:.5f})")
+    assert mem_none > mem_recompute, \
+        f"Expected SAVE ({mem_none:.5f} GB) > RECOMPUTE ({mem_recompute:.5f} GB)"
+    print(f"Verified: SAVE ({mem_none:.5f}) > RECOMPUTE ({mem_recompute:.5f})")
 
-    # assert mem_save > mem_recompute, \
-    #     f"Expected SAVE ({mem_save:.5f} GB) > RECOMPUTE ({mem_recompute:.5f} GB)"
-    # print(f"Verified: SAVE ({mem_save:.5f}) > RECOMPUTE ({mem_recompute:.5f})")
-
-    # tol_mem = 0.15
-    # assert abs(mem_recompute - mem_swap) < tol_mem, \
-    #     f"Expected RECOMPUTE ({mem_recompute:.5f} GB) ≈ SWAP ({mem_swap:.5f} GB)"
-    # print(f"Verified: RECOMPUTE ({mem_recompute:.5f}) ≈ SWAP ({mem_swap:.5f}) within {tol_mem:.2f} GB")
+    tol_mem = 0.15
+    assert abs(mem_recompute - mem_swap) < tol_mem, \
+        f"Expected RECOMPUTE ({mem_recompute:.5f} GB) ≈ SWAP ({mem_swap:.5f} GB)"
+    print(f"Verified: RECOMPUTE ({mem_recompute:.5f}) ≈ SWAP ({mem_swap:.5f}) within {tol_mem:.2f} GB")

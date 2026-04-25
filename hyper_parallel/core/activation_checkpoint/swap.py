@@ -35,9 +35,10 @@ class SwapTensor:
     STATE_H2D = "h2d"
     STATE_NON_TENSOR = "non_tensor"
 
-    def __init__(self, val: Any) -> None:
+    def __init__(self, val: Any, funcname: Any) -> None:
         self.val = val
         self.ver = val._version
+        self.funcname = funcname
         self._keep_on_device = False
         if isinstance(val, platform.Tensor) and str(val.device).lower() != 'cpu':
             self._state = self.STATE_DEVICE
@@ -74,6 +75,18 @@ class SwapTensor:
             )
         return self.val
 
+    def resize_device_storage(self):
+        """Reallocate device memory on compute stream."""
+        if self._state == self.STATE_NON_TENSOR:
+            return
+
+        if self._state != self.STATE_HOST:
+            return
+        storage = self.val.untyped_storage()
+        if storage.size() == self.storage_size:
+            return
+        storage.resize_(self.storage_size)
+
     def async_load(self):
         """async load tensor from host to device"""
         if self._state == self.STATE_NON_TENSOR or self._keep_on_device:
@@ -88,7 +101,6 @@ class SwapTensor:
 
         if self.val_cpu is None:
             raise ValueError("val_cpu must not be None during async_load")
-        self.val.untyped_storage().resize_(self.storage_size)
         if self.is_slice_tensor:
             self.val.data.copy_(self.val_cpu, non_blocking=True)
         else:
@@ -122,10 +134,15 @@ class SwapTensor:
             )
             return
 
-        if self.storage_size != self.val.untyped_storage().size() or self.ver != self.val._version:
+        if self.storage_size != self.val.untyped_storage().size():
             raise RuntimeError(
-                "There is a tensor(s) cannot be SWAPPED! In-place modification happened or "
-                "its storage has been resized."
+                f"There is a tensor from {self.funcname} cannot be SWAPPED! Its storage has been resized "
+                f"presize:{self.storage_size}, current size:{self.val.untyped_storage().size()}"
+            )
+        if self.ver != self.val._version:
+            raise RuntimeError(
+                f"There is a tensor from {self.funcname} cannot be SWAPPED! In-place modification happened "
+                f"preversion:{self.ver}, current version:{self.val._version}"
             )
 
         if self.is_slice_tensor:
@@ -147,7 +164,9 @@ class SwapTensor:
                 f"Expected 'd2h'. Skipped."
             )
             return
-        self.val.untyped_storage().resize_(0)
+        storage = self.val.untyped_storage()
+        if storage.size() != 0:
+            storage.resize_(0)
         self._state = self.STATE_HOST
 
     @property
@@ -199,6 +218,16 @@ class Storage:
         for storage_list in self.swap_storage.values():
             for item in storage_list:
                 platform.tree_map(_async_load, item)
+
+    def resize_device_storage(self):
+        """Resize device storage for all swap tensors (runs on compute stream)."""
+        def _resize(x):
+            if isinstance(x, SwapTensor):
+                x.resize_device_storage()
+            return x
+        for storage_list in self.swap_storage.values():
+            for item in storage_list:
+                platform.tree_map(_resize, item)
 
     def wait_load(self):
         """wait load for all tensors in swap storage"""
@@ -279,7 +308,11 @@ class SwapGroup:
                 storage.wait_offload()
 
     def launch_load(self, copy_stream):
-        """Launch async load for all storages in the group."""
+        """Prepare storage and launch async load for all storages in the group."""
+        with platform.no_grad():
+            for storage in self._storages:
+                storage.resize_device_storage()
+
         compute_event = platform.new_event()
         compute_event.record(platform.get_current_stream())
         self._load_event = platform.new_event()
@@ -287,7 +320,7 @@ class SwapGroup:
         with platform.no_grad(), stream_context(copy_stream):
             compute_event.wait(copy_stream)
             for storage in self._storages:
-                storage.launch_load()
+                storage.launch_load()    # Only copy, no resize
             self._load_event.record(copy_stream)
 
     def wait_load(self):
