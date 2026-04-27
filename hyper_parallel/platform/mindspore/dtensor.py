@@ -76,6 +76,18 @@ class DTensorBase(Tensor):
     def __str__(self):
         return str(self._local_tensor)
 
+    def to(self, *args, **kwargs):
+        """Move the DTensor to a different device or dtype.
+
+        Args:
+            *args (tuple): Arguments passed to the underlying tensor's ``to`` method.
+            **kwargs (dict): Keyword arguments for the tensor conversion.
+        """
+        src_local = self._local_tensor
+        new_local = src_local.to(*args, **kwargs)
+        alias_p = self._layout.alias_placements if hasattr(self, '_layout') and self._layout else self._placements
+        return self.__class__(new_local, device_mesh=self._device_mesh, placements=alias_p)
+
     def __copy__(self):
         """
         Create a shallow copy of the DTensorBase instance.
