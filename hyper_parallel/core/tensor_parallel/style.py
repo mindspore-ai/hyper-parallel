@@ -32,7 +32,7 @@ from hyper_parallel.core.dtensor.dtensor import (
     _distribute_module_param_source,
     _distribute_module_set_param,
 )
-from hyper_parallel.core.dtensor.placement_types import Placement, Replicate, Shard
+from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Replicate, Shard
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -332,9 +332,20 @@ class RowwiseParallel(ParallelStyle):
         use_local_output: bool,
         outputs: Any,
         device_mesh: DeviceMesh,
+        module: Optional[Module] = None,
     ) -> Any:
         """Redistribute partial output and optionally convert to local."""
-        if outputs.placements != output_layouts:
+        if not isinstance(outputs, DTensor):
+            # ``nn.Embedding.forward`` returns a plain tensor even when weight is sharded;
+            # treat the local values as partial along the TP mesh (sum) before redistributing.
+            if module is not None and platform.is_embedding_module(module):
+                outputs = DTensor.from_local(outputs, device_mesh, [Partial("sum")])
+            else:
+                raise TypeError(
+                    "RowwiseParallel expects a DTensor from Linear outputs; "
+                    f"got {type(outputs)}. If this is an unsupported module, extend I/O hooks."
+                )
+        if tuple(outputs.placements) != tuple(output_layouts):
             outputs = outputs.redistribute(device_mesh, output_layouts)
         if use_local_output:
             return outputs.to_local()
@@ -384,6 +395,7 @@ class RowwiseParallel(ParallelStyle):
                 self.use_local_output,
                 forward_outputs,
                 device_mesh,
+                forward_module,
             )
 
         return distribute_module(

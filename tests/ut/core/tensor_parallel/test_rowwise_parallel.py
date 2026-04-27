@@ -25,7 +25,7 @@ Tests cover:
 """
 import os
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 from torch import nn
@@ -38,6 +38,15 @@ from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.tensor_parallel.api import parallelize_module
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle, RowwiseParallel, ColwiseParallel
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
+
+
+def _patch_dist_rank_for_ut(world_size: int = 1):
+    """Patch ``torch.distributed`` rank helpers for CPU-only DTensor redistribute (see ``test_style``)."""
+    return patch.multiple(
+        "torch.distributed",
+        get_rank=MagicMock(return_value=0),
+        get_world_size=MagicMock(return_value=world_size),
+    )
 
 
 class TestRowwiseParallelInit(unittest.TestCase):
@@ -306,6 +315,31 @@ class TestRowwiseParallelPartition(unittest.TestCase):
 class TestRowwiseParallelIO(unittest.TestCase):
     """Tests for RowwiseParallel input/output preparation functions."""
 
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def _setup_mock_platform(self, mock_platform, world_size: int = 1):
+        mock_platform.platform_type = PlatformType.PYTORCH
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else __import__("numpy").array(t)
+        )
+
+    def _make_1d_mesh(self, mock_platform, size: int = 1):
+        self._setup_mock_platform(mock_platform, world_size=size)
+        return init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(size,),
+            mesh_dim_names=("tp",),
+            init_backend=False,
+        )
+
     def test_prepare_input_fn_wraps_plain_tensor(self):
         """
         Feature: _prepare_input_fn wraps local tensor
@@ -344,60 +378,54 @@ class TestRowwiseParallelIO(unittest.TestCase):
             )
             mock_dtensor.redistribute.assert_called_once_with(mesh, desired_layouts)
 
-    def test_prepare_output_fn_to_local(self):
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_prepare_output_fn_to_local(self, mock_platform):
         """
         Feature: _prepare_output_fn converts to local tensor
-        Description: use_local_output=True, matching placements
-        Expectation: to_local() is called on outputs
+        Description: use_local_output=True, matching placements on a real DTensor
+        Expectation: returns local torch.Tensor
         """
-        output_layouts = (Replicate(),)
-        mock_outputs = MagicMock()
-        mock_outputs.placements = output_layouts
-        mock_outputs.to_local.return_value = torch.randn(4, 8)
-        mesh = MagicMock()
-
-        result = RowwiseParallel._prepare_output_fn(
-            output_layouts, True, mock_outputs, mesh
-        )
-        mock_outputs.to_local.assert_called_once()
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+        local = torch.randn(4, 8)
+        dt_out = DTensor.from_local(local, mesh, [Replicate()])
+        with _patch_dist_rank_for_ut(world_size=1):
+            result = RowwiseParallel._prepare_output_fn(
+                (Replicate(),), True, dt_out, mesh
+            )
         self.assertIsInstance(result, torch.Tensor)
+        self.assertTrue(torch.allclose(result, local))
 
-    def test_prepare_output_fn_keeps_dtensor(self):
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_prepare_output_fn_keeps_dtensor(self, mock_platform):
         """
         Feature: _prepare_output_fn keeps DTensor when use_local_output=False
         Description: use_local_output=False, matching placements
-        Expectation: to_local() is NOT called
+        Expectation: same DTensor instance is returned
         """
-        output_layouts = (Replicate(),)
-        mock_outputs = MagicMock()
-        mock_outputs.placements = output_layouts
-        mesh = MagicMock()
-
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+        dt_out = DTensor.from_local(torch.randn(4, 8), mesh, [Replicate()])
         result = RowwiseParallel._prepare_output_fn(
-            output_layouts, False, mock_outputs, mesh
+            (Replicate(),), False, dt_out, mesh
         )
-        mock_outputs.to_local.assert_not_called()
-        self.assertIs(result, mock_outputs)
+        self.assertIs(result, dt_out)
 
-    def test_prepare_output_fn_redistributes_if_needed(self):
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_prepare_output_fn_redistributes_if_needed(self, mock_platform):
         """
         Feature: _prepare_output_fn redistributes when placements differ
-        Description: output has partial/Shard(-1) but desired is Replicate()
-        Expectation: redistribute is called with desired output_layouts
+        Description: DTensor has Shard(-1); desired output_layouts is Replicate()
+        Expectation: result equals redistribute(..., Replicate()).to_local()
         """
-        output_layouts = (Replicate(),)
-        mock_outputs = MagicMock()
-        mock_outputs.placements = (Shard(-1),)
-        redistributed = MagicMock()
-        redistributed.to_local.return_value = torch.randn(4, 8)
-        redistributed.placements = output_layouts
-        mock_outputs.redistribute.return_value = redistributed
-        mesh = MagicMock()
-
-        RowwiseParallel._prepare_output_fn(
-            output_layouts, True, mock_outputs, mesh
-        )
-        mock_outputs.redistribute.assert_called_once_with(mesh, output_layouts)
+        mesh = self._make_1d_mesh(mock_platform, size=1)
+        local = torch.randn(4, 8)
+        dt_sharded = DTensor.from_local(local, mesh, [Shard(-1)])
+        with _patch_dist_rank_for_ut(world_size=1):
+            expected = dt_sharded.redistribute(mesh, [Replicate()]).to_local()
+            result = RowwiseParallel._prepare_output_fn(
+                (Replicate(),), True, dt_sharded, mesh
+            )
+        self.assertIsInstance(result, torch.Tensor)
+        self.assertTrue(torch.allclose(result, expected))
 
 
 class TestColRowComposition(unittest.TestCase):
