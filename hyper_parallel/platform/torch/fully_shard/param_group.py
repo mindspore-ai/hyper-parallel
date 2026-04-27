@@ -269,6 +269,7 @@ def reduce_scatter_copy_in(
     col_offset = 0
     with torch.no_grad():
         for hsdp_param, grad in zip(hsdp_params, unsharded_grads):
+            grad = grad.contiguous()
             plan = build_rs_plan(hsdp_param, grad, world_size)
             packed_grad = pack_for_reduce_scatter(grad, plan)
             next_col_offset = col_offset + packed_grad.size(1)

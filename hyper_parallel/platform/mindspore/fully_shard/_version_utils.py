@@ -15,8 +15,9 @@
 """Helpers for storage-preserving tensor updates in MindSpore fully_shard."""
 
 import mindspore as ms
+from mindspore.common.api import _no_grad
 
-
+@_no_grad()
 def copy_without_bumping_version(dst: ms.Tensor, src: ms.Tensor) -> None:
     """Copy through ``dst.data`` so the destination tensor version is preserved."""
     dst.data.copy_(src)
