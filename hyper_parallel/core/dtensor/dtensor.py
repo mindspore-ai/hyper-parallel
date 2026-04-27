@@ -241,6 +241,41 @@ class DTensor(DTensorBase):
         """
         return DTensor(local_tensor, device_mesh, placements)
 
+    def _alias_placements(self) -> Sequence[Placement]:
+        """Return alias_placements from layout, falling back to _placements."""
+        if hasattr(self, '_layout') and self._layout:
+            return self._layout.alias_placements
+        return self._placements
+
+    def to(self, *args, **kwargs):
+        """Move the DTensor to a different device or dtype.
+
+        Delegates to the underlying local tensor's ``to`` method and
+        reconstructs a DTensor preserving device_mesh and placements.
+
+        Args:
+            *args (tuple): Arguments passed to the underlying tensor's ``to``
+                method (e.g., device or dtype).
+            **kwargs (dict): Keyword arguments for the tensor conversion
+                (e.g., dtype, device, non_blocking).
+
+        Returns:
+            DTensor: A new DTensor with the converted local tensor.
+        """
+        new_local = self._local_tensor.to(*args, **kwargs)
+        return self.__class__(new_local, device_mesh=self._device_mesh,
+                              placements=self._alias_placements())
+
+    def float(self):
+        """Convert the DTensor to float dtype.
+
+        Returns:
+            DTensor: A new DTensor with float32 local tensor.
+        """
+        new_local = self._local_tensor.float()
+        return self.__class__(new_local, device_mesh=self._device_mesh,
+                              placements=self._alias_placements())
+
     def to_local(self) -> Tensor:
         """
         Convert DTensor to local tensor.
