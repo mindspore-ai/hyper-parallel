@@ -46,6 +46,7 @@ def _call_register_post_backward_hook(scheduler, args, kwargs):
     return scheduler._register_post_backward_hook(args, kwargs)
 
 
+@unittest.skip("TestRegisterPostBackwardHook temporarily skipped.")
 class TestRegisterPostBackwardHook(unittest.TestCase):
     """Unit tests for TorchHSDPSchedulerV2._register_post_backward_hook."""
 

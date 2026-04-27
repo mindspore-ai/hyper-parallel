@@ -543,6 +543,61 @@ def _warn_if_pre_commit_hook_missing() -> None:
     print()
 
 
+def _undecided_pr_gate_keys(ut: Optional[str], st: Optional[str]) -> List[str]:
+    """Return gate keys that still need a tty or explicit-flag decision."""
+    return [key for key, val in (("ut", ut), ("st", st)) if val is None]
+
+
+def _raise_pr_gates_non_interactive_error(undecided_keys: List[str]) -> None:
+    """Explain ``--ut`` / ``--st`` and raise (non-tty with undecided gates)."""
+    lines = [
+        "PR quality gates need an explicit choice (non-interactive context).",
+        "",
+        "AutoGit is designed to run inside an AI coding agent",
+        "(Claude Code / Codex / Copilot / ...). Ask the user one gate at",
+        "a time in chat, then re-invoke autogit with all flags in a",
+        "single call.",
+        "",
+        "Each gate accepts: skip | changed | full",
+        "  changed  test files appearing in this PR's diff (fast default)",
+        "  full     entire suite (regression coverage)",
+        "  skip     do not run",
+        "",
+        "Undecided gates:",
+    ]
+    for key in undecided_keys:
+        lines.append(f"  --{key} {{skip,changed,full}}    default: {_GATE_DEFAULTS[key]}")
+        lines.append(f"      {_GATE_LABELS[key]}")
+    lines += ["", "Re-invoke example:", "  autogit pr --ut changed --st skip"]
+    raise AutoGitError("\n".join(lines))
+
+
+def _read_one_pr_gate_from_tty(key: str) -> str:
+    """Prompt until the user enters a valid choice for one gate key."""
+    default = _GATE_DEFAULTS[key]
+    prompt_letters = "/".join(
+        letter.upper() if letter == default[0] else letter
+        for letter in ("c", "f", "n")
+    )
+    prompt = f"  {_GATE_LABELS[key]} ? [{prompt_letters}] "
+    while True:
+        try:
+            raw = input(prompt).strip().lower()
+        except EOFError as exc:
+            raise AutoGitError(
+                f"EOF reading {key} gate. Pass --{key} {{skip,changed,full}} explicitly."
+            ) from exc
+        if not raw:
+            return default
+        if raw in ("c", "changed"):
+            return "changed"
+        if raw in ("f", "full"):
+            return "full"
+        if raw in ("n", "no", "skip"):
+            return "skip"
+        print(f"    invalid '{raw}', expected c / f / n / Enter")
+
+
 def _collect_pr_gate_choices(ut: Optional[str],
                              st: Optional[str]) -> Tuple[str, str]:
     """Resolve PR-time UT/ST gates to one of ``skip`` | ``changed`` | ``full``.
@@ -574,78 +629,19 @@ def _collect_pr_gate_choices(ut: Optional[str],
     Raises:
         AutoGitError: On non-tty with undecided gates, or invalid tty input.
     """
-    undecided = [
-        (key, value) for key, value in (("ut", ut), ("st", st))
-        if value is None
-    ]
-    if not undecided:
+    keys = _undecided_pr_gate_keys(ut, st)
+    if not keys:
         return ut, st
-
     if not sys.stdin.isatty():
-        lines = [
-            "PR quality gates need an explicit choice (non-interactive context).",
-            "",
-            "AutoGit is designed to run inside an AI coding agent",
-            "(Claude Code / Codex / Copilot / ...). Ask the user one gate at",
-            "a time in chat, then re-invoke autogit with all flags in a",
-            "single call.",
-            "",
-            "Each gate accepts: skip | changed | full",
-            "  changed  test files appearing in this PR's diff (fast default)",
-            "  full     entire suite (regression coverage)",
-            "  skip     do not run",
-            "",
-            "Undecided gates:",
-        ]
-        for key, _ in undecided:
-            lines.append(
-                f"  --{key} {{skip,changed,full}}    default: {_GATE_DEFAULTS[key]}"
-            )
-            lines.append(f"      {_GATE_LABELS[key]}")
-        lines += [
-            "",
-            "Re-invoke example:",
-            "  autogit pr --ut changed --st skip",
-        ]
-        raise AutoGitError("\n".join(lines))
-
+        _raise_pr_gates_non_interactive_error(keys)
     print()
     print("PR quality gates — answering one at a time")
     print("(Enter for default; c=changed, f=full, n=skip)")
-    answers: Dict[str, str] = {}
-    for key, _ in undecided:
-        default = _GATE_DEFAULTS[key]
-        labels = ["c", "f", "n"]
-        prompt_letters = "/".join(
-            letter.upper() if letter == default[0] else letter for letter in labels
-        )
-        prompt = f"  {_GATE_LABELS[key]} ? [{prompt_letters}] "
-        while True:
-            try:
-                raw = input(prompt).strip().lower()
-            except EOFError as exc:
-                raise AutoGitError(
-                    f"EOF reading {key} gate. "
-                    f"Pass --{key} {{skip,changed,full}} explicitly."
-                ) from exc
-            if not raw:
-                answers[key] = default
-                break
-            if raw in ("c", "changed"):
-                answers[key] = "changed"
-                break
-            if raw in ("f", "full"):
-                answers[key] = "full"
-                break
-            if raw in ("n", "no", "skip"):
-                answers[key] = "skip"
-                break
-            print(f"    invalid '{raw}', expected c / f / n / Enter")
-
+    resolved = {key: _read_one_pr_gate_from_tty(key) for key in keys}
     if ut is None:
-        ut = answers["ut"]
+        ut = resolved["ut"]
     if st is None:
-        st = answers["st"]
+        st = resolved["st"]
     return ut, st
 
 
@@ -736,7 +732,7 @@ def _diff_test_files(diff_range: Optional[str], kind: str) -> List[str]:
 
     Filters:
       * Only files under ``tests/`` whose path contains the ``kind`` segment
-        (e.g. ``tests/torch/ut/test_x.py`` for ``'ut'``).
+        (e.g. ``tests/ut/core/.../test_x.py`` for ``'ut'``).
       * Only files named ``test_*.py`` — excludes ``conftest.py``,
         ``__init__.py``, fixtures, helpers, etc.
       * Deleted files are excluded via ``--diff-filter=ACMR`` (Added /
@@ -858,6 +854,130 @@ def _run_pr_st_gate(scope: str, diff_range: Optional[str]) -> None:
     print("ST gate passed.")
 
 
+def _cmd_pr_resolve_env_and_refs(
+    base: Optional[str],
+) -> Tuple[EnvConfig, str, str, str]:
+    """Load env config, target base name, ``upstream/<base>`` ref, and current branch."""
+    env = check_env()
+    actual_base = base or env.default_branch
+    base_ref = f"upstream/{actual_base}"
+    current_branch = get_current_branch()
+    return env, actual_base, base_ref, current_branch
+
+
+def _cmd_pr_refresh_remotes(actual_base: str) -> None:
+    """Fetch upstream target branch and origin (PR push target)."""
+    run_git("fetch", "upstream", actual_base, check=False)
+    run_git("fetch", "origin", check=False)
+
+
+def _cmd_pr_run_quality_gates(
+    analyze_only: bool,
+    ut: Optional[str],
+    st: Optional[str],
+    diff_range: str,
+) -> None:
+    """Run UT/ST gates according to ``analyze_only`` and user choices."""
+    if analyze_only:
+        return
+    ut_decision, st_decision = _collect_pr_gate_choices(ut, st)
+    if ut_decision != "skip":
+        _run_pr_ut_gate(ut_decision, diff_range)
+    if st_decision != "skip":
+        _run_pr_st_gate(st_decision, diff_range)
+
+
+def _cmd_pr_require_unpushed_commits(base_ref: str, actual_base: str) -> List[str]:
+    """Return SHAs not yet on upstream; raise if there is nothing to open a PR for."""
+    commits = get_unpushed_commits(base_ref)
+    if not commits:
+        raise AutoGitError(
+            f"No new commits relative to upstream/{actual_base}\n"
+            "Please develop and commit on the current branch first"
+        )
+    return commits
+
+
+def _cmd_pr_print_submit_banner(env: EnvConfig, commits: List[str]) -> None:
+    """Log how many commits will be submitted to the upstream repo."""
+    print(f"Submitting {len(commits)} commits to {env.upstream_owner}/{env.upstream_repo}")
+    for i, sha in enumerate(commits, 1):
+        msg = run_git("log", "-1", "--pretty=format:%s", sha).stdout.strip()
+        print(f"   {i}. {sha[:8]} {msg[:50]}")
+
+
+def _cmd_pr_invoke_create_pr(
+    env: EnvConfig,
+    title: str,
+    body: str,
+    pr_branch: str,
+    actual_base: str,
+) -> Tuple[int, Any]:
+    """Call GitCode API to create the pull request."""
+    head = f"{env.origin_owner}:{pr_branch}"
+    return create_pr(
+        env.upstream_owner, env.upstream_repo, env.token,
+        title, body, head, actual_base,
+        env.origin_owner, env.origin_repo,
+    )
+
+
+def _cmd_pr_raise_on_create_failure(status: int, result: Any, env: EnvConfig) -> None:
+    """Raise a clear error when PR creation does not return success."""
+    if status in (200, 201):
+        return
+    if "already exists" in str(result).lower() or status == 422:
+        raise AutoGitError(
+            f"PR creation failed (may already exist): {result}\n"
+            f"Please check: https://gitcode.com/{env.upstream_owner}/{env.upstream_repo}/pulls"
+        )
+    raise AutoGitError(f"PR creation failed: {result}")
+
+
+def _cmd_pr_maybe_add_reviewers(
+    env: EnvConfig,
+    reviewer: Optional[str],
+    result: Any,
+) -> None:
+    """Assign reviewers when ``--reviewer`` is set and the PR number is known."""
+    pr_number = result.get("number") or result.get("iid")
+    if not (reviewer and pr_number):
+        return
+    reviewer_list = [r.strip() for r in reviewer.split(",")]
+    print(f"Adding reviewers: {', '.join(reviewer_list)}")
+    add_reviewers(env.upstream_owner, env.upstream_repo, pr_number, env.token, reviewer_list)
+
+
+def _cmd_pr_maybe_checkout_original(
+    need_new_branch: bool,
+    current_branch: str,
+) -> None:
+    """Return to the user's original branch when autogit created a throwaway PR branch."""
+    if need_new_branch:
+        run_git("checkout", current_branch)
+        print(f"Switched back to {current_branch}")
+
+
+def _cmd_pr_success_payload(
+    result: Any,
+    pr_branch: str,
+    final_commits: List[str],
+    env: EnvConfig,
+) -> Dict[str, Any]:
+    """Build the return dict after a successful ``create_pr`` call."""
+    pr_number = result.get("number") or result.get("iid")
+    pr_url = (
+        result.get("html_url")
+        or f"https://gitcode.com/{env.upstream_owner}/{env.upstream_repo}/pull/{pr_number}"
+    )
+    return {
+        "url": pr_url,
+        "branch": pr_branch,
+        "commits": final_commits,
+        "pr_number": pr_number,
+    }
+
+
 def cmd_pr(base: Optional[str] = None, reviewer: Optional[str] = None,
            squash: bool = False, ut: Optional[str] = None,
            st: Optional[str] = None,
@@ -884,11 +1004,7 @@ def cmd_pr(base: Optional[str] = None, reviewer: Optional[str] = None,
     Returns:
         Dict with keys: url, branch, commits, pr_number.
     """
-    env = check_env()
-
-    actual_base = base or env.default_branch
-    base_ref = f"upstream/{actual_base}"
-    current_branch = get_current_branch()
+    env, actual_base, base_ref, current_branch = _cmd_pr_resolve_env_and_refs(base)
 
     if has_uncommitted_changes():
         raise AutoGitError(
@@ -898,32 +1014,13 @@ def cmd_pr(base: Optional[str] = None, reviewer: Optional[str] = None,
         )
 
     print("Updating remote info...")
-    run_git("fetch", "upstream", actual_base, check=False)
-    run_git("fetch", "origin", check=False)
-
-    if analyze_only:
-        ut_decision, st_decision = "skip", "skip"
-    else:
-        ut_decision, st_decision = _collect_pr_gate_choices(ut, st)
+    _cmd_pr_refresh_remotes(actual_base)
 
     diff_range = f"{base_ref}...HEAD"
-    if ut_decision != "skip":
-        _run_pr_ut_gate(ut_decision, diff_range)
+    _cmd_pr_run_quality_gates(analyze_only, ut, st, diff_range)
 
-    if st_decision != "skip":
-        _run_pr_st_gate(st_decision, diff_range)
-
-    commits = get_unpushed_commits(base_ref)
-    if not commits:
-        raise AutoGitError(
-            f"No new commits relative to upstream/{actual_base}\n"
-            f"Please develop and commit on the current branch first"
-        )
-
-    print(f"Submitting {len(commits)} commits to {env.upstream_owner}/{env.upstream_repo}")
-    for i, sha in enumerate(commits, 1):
-        msg = run_git("log", "-1", "--pretty=format:%s", sha).stdout.strip()
-        print(f"   {i}. {sha[:8]} {msg[:50]}")
+    commits = _cmd_pr_require_unpushed_commits(base_ref, actual_base)
+    _cmd_pr_print_submit_banner(env, commits)
 
     pr_branch, need_new_branch, final_commits = _prepare_pr_branch(
         current_branch, base_ref, commits, squash
@@ -956,42 +1053,12 @@ def cmd_pr(base: Optional[str] = None, reviewer: Optional[str] = None,
         )
 
     print("Creating PR...")
-    head = f"{env.origin_owner}:{pr_branch}"
-    status, result = create_pr(
-        env.upstream_owner, env.upstream_repo, env.token,
-        title, body, head, actual_base,
-        env.origin_owner, env.origin_repo
-    )
+    status, result = _cmd_pr_invoke_create_pr(env, title, body, pr_branch, actual_base)
+    _cmd_pr_raise_on_create_failure(status, result, env)
+    _cmd_pr_maybe_add_reviewers(env, reviewer, result)
+    _cmd_pr_maybe_checkout_original(need_new_branch, current_branch)
 
-    if status not in [200, 201]:
-        if "already exists" in str(result).lower() or status == 422:
-            raise AutoGitError(
-                f"PR creation failed (may already exist): {result}\n"
-                f"Please check: https://gitcode.com/{env.upstream_owner}/{env.upstream_repo}/pulls"
-            )
-        raise AutoGitError(f"PR creation failed: {result}")
-
-    pr_number = result.get("number") or result.get("iid")
-    pr_url = (
-        result.get("html_url")
-        or f"https://gitcode.com/{env.upstream_owner}/{env.upstream_repo}/pull/{pr_number}"
-    )
-
-    if reviewer and pr_number:
-        reviewer_list = [r.strip() for r in reviewer.split(",")]
-        print(f"Adding reviewers: {', '.join(reviewer_list)}")
-        add_reviewers(env.upstream_owner, env.upstream_repo, pr_number, env.token, reviewer_list)
-
-    if need_new_branch:
-        run_git("checkout", current_branch)
-        print(f"Switched back to {current_branch}")
-
-    return {
-        "url": pr_url,
-        "branch": pr_branch,
-        "commits": final_commits,
-        "pr_number": pr_number
-    }
+    return _cmd_pr_success_payload(result, pr_branch, final_commits, env)
 
 
 # ============================================================================

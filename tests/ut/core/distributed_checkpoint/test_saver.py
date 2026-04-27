@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Saver and loader ut test."""
+"""UT for :mod:`hyper_parallel.core.distributed_checkpoint.saver` (MindSpore backend)."""
 # pylint: disable=wrong-import-position
 import importlib
 import os
@@ -40,15 +40,15 @@ importlib.reload(saver_mod)
 importlib.reload(loader_mod)
 
 
-def setUpModule() -> None:  # pylint: disable=invalid-name  # unittest module hook (name is fixed by API)
-    """Ensure MindSpore platform backs saver/loader after other tests may have cached torch."""
+def setUpModule() -> None:  # pylint: disable=invalid-name
+    """Ensure MindSpore platform backs saver after other tests may have cached torch."""
     os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
     _platform_mod.platform = None
     importlib.reload(saver_mod)
     importlib.reload(loader_mod)
 
 
-def tearDownModule() -> None:  # pylint: disable=invalid-name  # unittest module hook (name is fixed by API)
+def tearDownModule() -> None:  # pylint: disable=invalid-name
     """Remove dirs and files created by path-based save tests."""
     for name in ("str", "path"):
         p = Path(name)
@@ -63,11 +63,10 @@ def _unlink_file(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-class TestSaverLoader(unittest.TestCase):
-    """Ut test for Saver and Loader."""
+class TestSaver(unittest.TestCase):
+    """Tests for :func:`hyper_parallel.core.distributed_checkpoint.saver.save_checkpoint`."""
 
     def setUp(self) -> None:
-        """Set up test case."""
         self.weight = ms.Parameter(
             Tensor(np.ones([32, 2]), ms.float32), name="weight", requires_grad=True
         )
@@ -108,26 +107,6 @@ class TestSaverLoader(unittest.TestCase):
         with self.assertRaises(ValueError) as exception:
             saver_mod.save_checkpoint(self.save_obj, file_path)
         self.assertIn("Saver file_path should contains valid filename", str(exception.exception))
-
-    def test_load_checkpoint_success_use_str_file_name(self):
-        file_path = "test_load_checkpoint_success_use_str_file_name.safetensors"
-        saver_mod.save_checkpoint(self.save_obj, file_path)
-        param_dict = loader_mod.load_checkpoint(file_path)
-        self.assertIsInstance(param_dict, dict)
-        _unlink_file(Path(file_path))
-
-    def test_load_checkpoint_success_use_path_file_path(self):
-        file_path = Path("path/path/test_load_checkpoint_success_use_path_file_path.safetensors")
-        saver_mod.save_checkpoint(self.save_obj, file_path)
-        param_dict = loader_mod.load_checkpoint(file_path)
-        self.assertIsInstance(param_dict, dict)
-        _unlink_file(file_path)
-
-    def test_load_checkpoint_raise_value_error_use_path_file_path(self):
-        file_path = Path("path/path/")
-        with self.assertRaises(ValueError) as exception:
-            loader_mod.load_checkpoint(file_path)
-        self.assertIn("Loader file_path should contains valid filename", str(exception.exception))
 
 
 if __name__ == "__main__":

@@ -49,11 +49,11 @@
 /tests/mindspore/st/pipeline_parallel/ @yangzhenzhang
 /tests/mindspore/st/shard/ @yangzhenzhang
 /tests/mindspore/st/checkpoint/ @zhangbuxue
-/tests/mindspore/ut/parallel_ops_infer/ @yangzhenzhang
 /tests/mindspore/st/fully_shard/ @DavidFFFan
-/tests/mindspore/ut/fully_shard/ @DavidFFFan
-/tests/mindspore/ut/core/distributed_checkpoint/ @zhangbuxue
 /tests/ut/core/distributed_checkpoint/ @zhangbuxue
+/tests/ut/platform/mindspore/ @yangzhenzhang
+/tests/ut/platform/mindspore/fully_shard/ @DavidFFFan
+/tests/ut/core/context_parallel/ @yangzhenzhang
 
 /tests/torch/ @yangzhenzhang
 /tests/torch/activation_checkpoint/ @DavidFFFan

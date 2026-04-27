@@ -57,7 +57,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 > Full details in `.claude/rules/testing.md` (auto-applied for `tests/**`).
 
 - **Framework**: pytest with custom markers (`@arg_mark` in `tests/common/mark_utils.py`)
-- **Unit tests**: `tests/torch/ut/`, `tests/mindspore/ut/` — no distributed setup needed
+- **Unit tests**: `tests/ut/` (`tests/ut/core/`, `tests/ut/platform/torch/`, `tests/ut/platform/mindspore/`, …) — no distributed setup needed
 - **Distributed tests**: `torchrun_case()` for PyTorch, `msrun_case()` for MindSpore (8-card)
 
 ---
