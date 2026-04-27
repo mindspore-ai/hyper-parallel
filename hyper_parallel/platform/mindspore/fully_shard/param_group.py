@@ -197,6 +197,7 @@ def reduce_scatter_copy_in(
     packed_rows = reduce_scatter_input.view(world_size, -1)
     col_offset = 0
     for hsdp_param, grad in zip(hsdp_params, unsharded_grads):
+        grad = grad.contiguous()
         plan = build_rs_plan(hsdp_param, grad, world_size)
         packed_grad = pack_for_reduce_scatter(grad, plan)
         next_col_offset = col_offset + packed_grad.shape[1]
