@@ -13,4 +13,4 @@
 # limitations under the License.
 # ============================================================================
 """Activation checkpointing related interfaces"""
-from .activation_swap import swap_wrapper
+from .activation_swap import swap_wrapper, swap_tensor_wrapper

@@ -980,6 +980,12 @@ class TorchPlatform(Platform):
         from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import swap_wrapper
         return swap_wrapper(module, policy_fn=policy_fn)
 
+    @staticmethod
+    def swap_tensor_wrapper(target, tag=None):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import swap_tensor_wrapper
+        return swap_tensor_wrapper(target, tag=tag)
+
     @property
     def noop_context_fn(self):
         return noop_context_fn
