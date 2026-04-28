@@ -12,7 +12,7 @@
 #include <numeric>
 #include <string>
 #include <vector>
-
+#include "acl/acl.h"
 #include "torch/script.h"
 #include "torch/torch.h"
 #include "torch_npu/csrc/aten/common/from_blob.h"
