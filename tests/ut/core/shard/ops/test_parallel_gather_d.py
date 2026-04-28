@@ -20,6 +20,7 @@ import numpy as np
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_gather import GatherDDistributedOp
 from hyper_parallel.platform import get_platform
@@ -40,6 +41,7 @@ class TestParallelGatherD(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
         self.platform = get_platform()
         self.op = GatherDDistributedOp("GatherD")
 
@@ -47,6 +49,7 @@ class TestParallelGatherD(unittest.TestCase):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -67,12 +70,22 @@ class TestParallelGatherD(unittest.TestCase):
     def _make_2x4_mesh(self, mock_platform):
         """Set up mock and return a standard 2x4 (dp, mp) mesh via init_device_mesh."""
         self._setup_mock_platform(mock_platform, world_size=8)
-        return init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp"))
+        return init_device_mesh(
+            device_type="npu",
+            mesh_shape=(2, 4),
+            mesh_dim_names=("dp", "mp"),
+            init_backend=False
+        )
 
     def _make_2x2x2_mesh(self, mock_platform, mesh_dim_names=("dp", "tp", "cp")):
         """Set up mock and return a standard 2x2x2 mesh via init_device_mesh."""
         self._setup_mock_platform(mock_platform, world_size=8)
-        return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=mesh_dim_names)
+        return init_device_mesh(
+            device_type="npu",
+            mesh_shape=(2, 2, 2),
+            mesh_dim_names=mesh_dim_names,
+            init_backend=False
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_gatherd_data_parallel_dim0(self, mock_platform):

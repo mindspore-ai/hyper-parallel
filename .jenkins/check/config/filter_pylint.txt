@@ -17,6 +17,7 @@
 "hyper-parallel/hyper_parallel/core/fully_shard/"                     "useless-parent-delegation"
 "hyper-parallel/hyper_parallel/core/fully_shard/"                     "import-outside-toplevel"
 "hyper-parallel/hyper_parallel/core/fully_shard/"                     "wrong-import-position"
+"hyper-parallel/hyper_parallel/core/dtensor/"                         "protected-access"
 
 # 2. Platform Implementation: hyper_parallel/platform/torch/fully_shard/
 "hyper-parallel/hyper_parallel/platform/torch/fully_shard/"           "consider-using-from-import"

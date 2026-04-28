@@ -16,6 +16,7 @@
 import os
 import unittest
 from unittest.mock import patch
+import numpy as np
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
@@ -60,6 +61,9 @@ class TestParallelZerosLike(unittest.TestCase):
         """
         mock_platform.get_rank.return_value = 0
         mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
 
     def _make_2x4_mesh(self, mock_platform):
         """Return a 2x4 (dp, mp) mesh with mocked backend.
