@@ -77,25 +77,6 @@ class DTensorBase(Tensor):
         out = _OP_DISPATCHER.dispatch(func, args, kwargs)
         return out
 
-    def to(self, *args, **kwargs):
-        """Move the DTensor to a different device or dtype.
-
-        Args:
-            *args (tuple): Arguments passed to the underlying tensor's ``to`` method (e.g., device or dtype).
-            **kwargs (dict): Keyword arguments for the tensor conversion (e.g., dtype, device, non_blocking).
-        """
-        src_local = self._local_tensor
-        new_local = src_local.to(*args, **kwargs)
-        alias_p = self._layout.alias_placements if hasattr(self, '_layout') and self._layout else self._placements
-        return self.__class__(new_local, device_mesh=self._device_mesh, placements=alias_p)
-
-    def float(self):
-        """convert tensor to float dtype"""
-        local_tensor = self._local_tensor
-        new_local = local_tensor.float()
-        alias_p = self._layout.alias_placements if hasattr(self, '_layout') and self._layout else self._placements
-        return self.__class__(new_local, device_mesh=self._device_mesh, placements=alias_p)
-
     @property
     def grad(self) -> Optional[Tensor]:
         """
