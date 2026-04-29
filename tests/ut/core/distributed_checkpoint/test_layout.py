@@ -137,11 +137,12 @@ class TestLayout(unittest.TestCase):
         card_mark="onecard",
         essential_mark="unessential",
     )
-    def test_get_current_layout_falsy_layout_recorded_as_none(self, mock_rank):
+    def test_get_current_layout_falsy_layout_records_type_and_full_shape(self, mock_rank):
         """
-        Feature: Serialize parameters with absent usable layout as null entries.
+        Feature: Parameters with no usable layout still record dtype and global shape.
         Description: One parameter has a truthy layout and another has layout set to None.
-        Expectation: Both names appear under the rank; the falsy-layout parameter maps to None.
+        Expectation: Both names appear under the rank; the falsy-layout parameter maps to a dict
+            with only type and full_shape (no shard metadata).
         """
         mock_cell = MagicMock()
         mock_cell.parameters_and_names.return_value = [
@@ -152,7 +153,10 @@ class TestLayout(unittest.TestCase):
         rank_layout = layout_dict["0"]
         self.assertEqual(set(rank_layout.keys()), {"weight", "ignored"})
         self.assertIsNotNone(rank_layout["weight"])
-        self.assertIsNone(rank_layout["ignored"])
+        self.assertEqual(
+            rank_layout["ignored"],
+            {"type": "float32", "full_shape": (2, 4)},
+        )
         mock_rank.assert_called_once()
 
     @patch("hyper_parallel.core.distributed_checkpoint.layout.logger")
@@ -167,7 +171,8 @@ class TestLayout(unittest.TestCase):
         """
         Feature: Observability for parameters missing a layout attribute.
         Description: A parameter object without a layout attribute is included alongside normal params.
-        Expectation: logger.info runs once with the parameter names; rank layout stores None for that param.
+        Expectation: logger.info runs once with the parameter names; rank layout stores type/full_shape
+            for that param (no layout shard keys).
         """
         no_layout_attr = SimpleNamespace(name="buf", dtype="float32", shape=())
         mock_cell = MagicMock()
@@ -176,7 +181,7 @@ class TestLayout(unittest.TestCase):
             ("buf", no_layout_attr),
         ]
         layout_dict = get_current_layout(mock_cell)
-        self.assertIsNone(layout_dict["0"]["buf"])
+        self.assertEqual(layout_dict["0"]["buf"], {"type": "float32", "full_shape": ()})
         self.assertIsNotNone(layout_dict["0"]["weight"])
         mock_logger.info.assert_called_once()
         msg, names = mock_logger.info.call_args[0]
@@ -192,18 +197,24 @@ class TestLayout(unittest.TestCase):
         card_mark="onecard",
         essential_mark="unessential",
     )
-    def test_get_current_layout_only_missing_layout_attr_all_none(self, mock_rank, mock_logger):
+    def test_get_current_layout_only_missing_layout_attr_type_and_full_shape(self, mock_rank, mock_logger):
         """
         Feature: Rank layout map when every parameter lacks a layout attribute.
         Description: Two SimpleNamespace params without ``layout`` are enumerated from the cell.
-        Expectation: Each param name maps to None and logger.info lists both names once.
+        Expectation: Each param name maps to type/full_shape only; logger.info lists both names once.
         """
         p1 = SimpleNamespace(name="a", dtype="float32", shape=(1,))
         p2 = SimpleNamespace(name="b", dtype="float32", shape=(2,))
         mock_cell = MagicMock()
         mock_cell.parameters_and_names.return_value = [("a", p1), ("b", p2)]
         layout_dict = get_current_layout(mock_cell)["0"]
-        self.assertEqual(layout_dict, {"a": None, "b": None})
+        self.assertEqual(
+            layout_dict,
+            {
+                "a": {"type": "float32", "full_shape": (1,)},
+                "b": {"type": "float32", "full_shape": (2,)},
+            },
+        )
         mock_logger.info.assert_called_once()
         names = mock_logger.info.call_args[0][1]
         self.assertEqual(set(names), {"a", "b"})
