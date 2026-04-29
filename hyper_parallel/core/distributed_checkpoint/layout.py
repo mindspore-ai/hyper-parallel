@@ -55,7 +55,9 @@ def get_current_layout(cell: Any) -> dict:
             layout_dict[current_rank][param.name]["type"] = str(param.dtype)
             layout_dict[current_rank][param.name]["full_shape"] = param.shape
         else:
-            layout_dict[current_rank][param.name] = None
+            layout_dict[current_rank][param.name] = {}
+            layout_dict[current_rank][param.name]["type"] = str(param.dtype)
+            layout_dict[current_rank][param.name]["full_shape"] = param.shape
 
     if params_without_layout_attr:
         logger.info(
