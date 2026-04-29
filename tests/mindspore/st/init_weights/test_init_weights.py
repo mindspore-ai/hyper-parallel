@@ -49,3 +49,11 @@ def test_init_on_device_include_buffers_true_raises() -> None:
     with pytest.raises(ValueError, match="does not support include_buffers=True"):
         with init_on_device("meta", include_buffers=True):
             pass
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+def test_init_on_device_invalid_device_raises() -> None:
+    """MindSpore backend should reject unsupported external device values."""
+    with pytest.raises(ValueError, match='only "npu", "cpu", and "meta" are allowed'):
+        with init_on_device("Ascend:0"):
+            pass

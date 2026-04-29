@@ -26,6 +26,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
 from hyper_parallel.platform.mindspore.fully_shard.pack_utils import build_rs_plan
 from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
 from hyper_parallel.platform.mindspore.fully_shard.param_group import HSDPParamGroup, get_comm_ctx
+from hyper_parallel.platform.mindspore.utils import normalize_runtime_device
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 
 
@@ -167,7 +168,8 @@ class MindSporeHSDPStateV2(HSDPState):
             for param in mod.get_parameters():
                 if hasattr(param, "_hsdp_param_initialized") and param._hsdp_param_initialized:
                     continue
-                if param.device.startswith("Ascend") and self.device == "npu" or param.device == "meta":
+                param_device = normalize_runtime_device(param.device)
+                if param_device in (self.device, "meta"):
                     continue
                 param.data = param.to(self.device)
             for buffer in mod.buffers():
