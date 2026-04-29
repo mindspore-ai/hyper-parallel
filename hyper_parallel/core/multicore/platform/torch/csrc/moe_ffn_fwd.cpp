@@ -3,11 +3,11 @@
  *
  * PyTorch TORCH_LIBRARY_IMPL for hyper_parallel::moe_ffn_fwd.
  *
- * NPU implementation calls aclnnMegaKernelGmm via EXEC_NPU_CMD macro
+ * NPU implementation calls aclnnMulticoreMoeFfn via EXEC_NPU_CMD macro
  * (from op_plugin/utils/op_api_common.h), which handles:
  *   1. at::Tensor -> aclTensor conversion
- *   2. aclnnMegaKernelGmmGetWorkspaceSize() call + workspace alloc
- *   3. aclnnMegaKernelGmm(workspace, size, executor, stream) call
+ *   2. aclnnMulticoreMoeFfnGetWorkspaceSize() call + workspace alloc
+ *   3. aclnnMulticoreMoeFfn(workspace, size, executor, stream) call
  *
  * Meta implementation is a no-op (all output tensors are pre-allocated by caller).
  */
@@ -49,7 +49,7 @@ moe_ffn_fwd_npu(
     int64_t expert_num,
     int64_t hidden_size,
     int64_t seq_size) {
-    EXEC_NPU_CMD_EXT(aclnnMegaKernelGmm,
+    EXEC_NPU_CMD_EXT(aclnnMulticoreMoeFfn,
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
         up_proj_weight, up_proj_glist,

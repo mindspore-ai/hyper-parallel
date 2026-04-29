@@ -16,7 +16,7 @@
 
 
 class TorchMulticoreHandler:
-    """PyTorch platform handler for MoE-FFN multicore mega kernels."""
+    """PyTorch platform handler for MoE-FFN multicore operators."""
 
     def __init__(self):
         # Eagerly import platform/torch/__init__.py so that its module-level code
@@ -37,7 +37,7 @@ class TorchMulticoreHandler:
         rank_id: int, ep: int, expert_num: int,
         hidden_size: int, seq_size: int,
     ):
-        """MoE-FFN forward mega kernel (PyTorch backend)."""
+        """MoE-FFN forward operator (PyTorch backend)."""
         # pylint: disable=C0415
         from hyper_parallel.core.multicore.platform.torch import moe_ffn_fwd
         return moe_ffn_fwd(
@@ -66,7 +66,7 @@ class TorchMulticoreHandler:
         rank_id: int, ep: int, expert_num: int,
         hidden_size: int, seq_size: int,
     ):
-        """MoE-FFN backward mega kernel (PyTorch backend)."""
+        """MoE-FFN backward operator (PyTorch backend)."""
         # pylint: disable=C0415
         from hyper_parallel.core.multicore.platform.torch import moe_ffn_bwd
         return moe_ffn_bwd(

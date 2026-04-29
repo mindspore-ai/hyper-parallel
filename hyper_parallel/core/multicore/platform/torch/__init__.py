@@ -15,7 +15,7 @@
 """
 hyper_parallel.core.multicore.platform.torch
 =============================================
-Out-of-tree PyTorch operator registration for MoE-FFN mega kernels.
+Out-of-tree PyTorch operator registration for MoE-FFN operators.
 
 Registers into the ``hyper_parallel`` PyTorch namespace — does NOT modify
 op-plugin or any PyTorch source. The operators are accessible via:
@@ -36,15 +36,15 @@ exists alongside this package.  The tarball is auto-extracted and the correct
 Alternatively, set one of the following environment variables before importing:
 
     # Preferred: per-op explicit paths
-    export CANN_VENDOR_FWD_LIBDIR=/path/to/mega_kernel_gmm_nn/op_api/lib
-    export CANN_VENDOR_BWD_LIBDIR=/path/to/mega_kernel_gmm_grad_nn/op_api/lib
+    export CANN_VENDOR_FWD_LIBDIR=/path/to/multicore_moe_ffn_nn/op_api/lib
+    export CANN_VENDOR_BWD_LIBDIR=/path/to/multicore_moe_ffn_grad_nn/op_api/lib
 
     # Or: legacy single-lib (used for both fwd and bwd)
-    export CANN_VENDOR_LIBDIR=/path/to/mega_kernel_gmm_nn/op_api/lib
+    export CANN_VENDOR_LIBDIR=/path/to/multicore_moe_ffn_nn/op_api/lib
 
 Symbol lookup (new op-plugin API)
 ----------------------------------
-GetOpApiFuncAddr (in op_api_common.cpp) resolves aclnnMegaKernelGmm* at
+GetOpApiFuncAddr (in op_api_common.cpp) resolves aclnnMulticoreMoeFfn* at
 runtime via dlopen.  It searches each entry in ``g_custom_lib_path`` (a C++
 file-scope ``const`` global in libopapi.so) for
 ``op_api/lib/libcust_opapi.so``.  ``g_custom_lib_path`` is initialised
@@ -74,8 +74,8 @@ import re as _re
 # Step 0: locate both CANN vendor lib dirs (forward + backward packages).
 #
 # Two vendor packages provide separate libcust_opapi.so files:
-#   Forward : mega_kernel_gmm_nn      → aclnnMegaKernelGmm*
-#   Backward: mega_kernel_gmm_grad_nn → aclnnMegaKernelGmmGrad*
+#   Forward : multicore_moe_ffn_nn      → aclnnMulticoreMoeFfn*
+#   Backward: multicore_moe_ffn_grad_nn → aclnnMulticoreMoeFfnGrad*
 #
 # Resolution order (highest priority first):
 #   1. CANN_VENDOR_FWD_LIBDIR / CANN_VENDOR_BWD_LIBDIR  (explicit per-op)
@@ -107,8 +107,8 @@ if not (_CANN_VENDOR_FWD_LIBDIR or _CANN_VENDOR_BWD_LIBDIR):
                 _tf.extractall(os.path.dirname(_PREBUILD_DIR))
         if os.path.isdir(_PREBUILD_DIR):
             _vendors = os.path.join(_PREBUILD_DIR, "vendors")
-            _fwd = os.path.join(_vendors, "mega_kernel_gmm_nn", "op_api", "lib")
-            _bwd = os.path.join(_vendors, "mega_kernel_gmm_grad_nn", "op_api", "lib")
+            _fwd = os.path.join(_vendors, "multicore_moe_ffn_nn", "op_api", "lib")
+            _bwd = os.path.join(_vendors, "multicore_moe_ffn_grad_nn", "op_api", "lib")
             if os.path.isdir(_fwd):
                 _CANN_VENDOR_FWD_LIBDIR = _fwd
             if os.path.isdir(_bwd):
@@ -118,7 +118,7 @@ if not (_CANN_VENDOR_FWD_LIBDIR or _CANN_VENDOR_BWD_LIBDIR):
 # Step 1: set ASCEND_CUSTOM_OPP_PATH from the detected vendor lib dirs.
 #
 # GetOpApiFuncAddr searches each entry in ASCEND_CUSTOM_OPP_PATH for
-# op_api/lib/libcust_opapi.so to resolve aclnnMegaKernelGmm* symbols.
+# op_api/lib/libcust_opapi.so to resolve aclnnMulticoreMoeFfn* symbols.
 # g_custom_lib_path (a C++ static-duration global in op_api_common.cpp) is
 # populated from ASCEND_CUSTOM_OPP_PATH once — when the .so that contains
 # op_api_common.cpp is first loaded into the process.  Depending on the
@@ -163,8 +163,8 @@ if os.path.exists(_opapi_path):
 # ---------------------------------------------------------------------------
 # Step 3: pre-load both libcust_opapi.so files with RTLD_GLOBAL.
 #
-# Forward  (mega_kernel_gmm_nn)      exports: aclnnMegaKernelGmm*
-# Backward (mega_kernel_gmm_grad_nn) exports: aclnnMegaKernelGmmGrad*
+# Forward  (multicore_moe_ffn_nn)      exports: aclnnMulticoreMoeFfn*
+# Backward (multicore_moe_ffn_grad_nn) exports: aclnnMulticoreMoeFfnGrad*
 # Pre-loading with RTLD_GLOBAL ensures symbols from both are globally visible
 # so GetOpApiFuncAddr can resolve either operator at runtime.
 # ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ def moe_ffn_fwd(
     hidden_size: int, seq_size: int,
 ):
     """
-    MoE-FFN forward mega kernel.
+    MoE-FFN forward operator.
 
     Writes in-place to: dispatch_target, up_proj_y, swiglu_out, down_proj_y,
                         combine_target.
@@ -255,7 +255,7 @@ def moe_ffn_bwd(
     hidden_size: int, seq_size: int,
 ):
     """
-    MoE-FFN backward mega kernel.
+    MoE-FFN backward operator.
 
     Writes in-place to: dispatch_target, hidden_dw, act_grad_y, grad_gate,
                         gate_dx, grad_x, permute_out, gate_dw.

@@ -1,7 +1,7 @@
 /**
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  *
- * PyTorch out-of-tree operator registration for MoE-FFN mega kernels.
+ * PyTorch out-of-tree operator registration for MoE-FFN operators.
  * Registers into the 'hyper_parallel' namespace — does NOT modify aten:: or op-plugin.
  *
  * After building (setup.py build_ext --inplace), import with:
@@ -15,7 +15,7 @@
 
 TORCH_LIBRARY(hyper_parallel, m) {
     // -------------------------------------------------------------------------
-    // moe_ffn_fwd: MoE-FFN forward mega kernel (wraps aclnnMegaKernelGmm)
+    // moe_ffn_fwd: MoE-FFN forward operator (wraps aclnnMulticoreMoeFfn)
     //
     // Output buffers written in-place:
     //   dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target.
@@ -54,7 +54,7 @@ TORCH_LIBRARY(hyper_parallel, m) {
 
 
     // -------------------------------------------------------------------------
-    // moe_ffn_bwd: MoE-FFN backward mega kernel (wraps aclnnMegaKernelGmmGrad)
+    // moe_ffn_bwd: MoE-FFN backward operator (wraps aclnnMulticoreMoeFfnGrad)
     //
     // Output buffers written in-place:
     //   dispatch_target, hidden_dw, act_grad_y, grad_gate,

@@ -53,8 +53,8 @@ def _find_prebuild_vendor_libdirs():
         with tarfile.open(tarball) as tf:
             tf.extractall(os.path.dirname(prebuild_dir))
     vendors = os.path.join(prebuild_dir, "vendors")
-    fwd = fwd or os.path.join(vendors, "mega_kernel_gmm_nn", "op_api", "lib")
-    bwd = bwd or os.path.join(vendors, "mega_kernel_gmm_grad_nn", "op_api", "lib")
+    fwd = fwd or os.path.join(vendors, "multicore_moe_ffn_nn", "op_api", "lib")
+    bwd = bwd or os.path.join(vendors, "multicore_moe_ffn_grad_nn", "op_api", "lib")
     return fwd, bwd
 
 

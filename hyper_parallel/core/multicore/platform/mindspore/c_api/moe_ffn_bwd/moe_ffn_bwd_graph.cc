@@ -21,7 +21,7 @@
 #include <vector>
 #include "framework/module.h"
 
-// moe_ffn_bwd has 7 declared returns (following mega_kernel_gmm_grad_op.yaml):
+// moe_ffn_bwd has 7 declared returns (following multicore_moe_ffn_grad_op.yaml):
 //   target, hidden_dw, y, grad_gate, gate_dx, grad_x, gate_dw
 // (permute_out is written in-place but not declared as a return)
 static const mindspore::ShapeArray kBwdFakeOutShapes{

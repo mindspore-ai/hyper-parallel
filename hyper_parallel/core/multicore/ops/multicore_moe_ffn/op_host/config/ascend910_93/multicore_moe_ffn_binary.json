@@ -1,0 +1,340 @@
+{
+  "op_type": "MulticoreMoeFfn",
+  "optional_input_mode": "gen_placeholder",
+  "dynamicParamMode": "folded_with_desc",
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "op_list": [
+    {
+      "bin_filename": "MulticoreMoeFfn_op_565d4safdsfd5_high_performance",
+      "inputs": [
+        {
+          "name": "dispatch_target",
+          "index": 0,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "dispatch_target_off",
+          "index": 1,
+          "dtype": "int64",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "dispatch_src",
+          "index": 2,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "dispatch_src_off",
+          "index": 3,
+          "dtype": "int64",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "dispatch_size",
+          "index": 4,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "weight",
+          "index": 5,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "up_proj_glist",
+          "index": 6,
+          "dtype": "int64",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "y",
+          "index": 7,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "swiglu_out",
+          "index": 8,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "down_proj_weight",
+          "index": 9,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "down_proj_glist",
+          "index": 10,
+          "dtype": "int64",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "down_proj_y",
+          "index": 11,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "combine_target",
+          "index": 12,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "combine_target_off",
+          "index": 13,
+          "dtype": "int64",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "combine_src_off",
+          "index": 14,
+          "dtype": "int64",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "combine_size",
+          "index": 15,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "gmm_workspace",
+          "index": 16,
+          "dtype": "uint8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "up_proj_tiling",
+          "index": 17,
+          "dtype": "uint8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "swiglu_tiling",
+          "index": 18,
+          "dtype": "uint8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "down_proj_tiling",
+          "index": 19,
+          "dtype": "uint8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "runtime_config",
+          "index": 20,
+          "dtype": "uint8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "all_event_counters",
+          "index": 21,
+          "dtype": "uint8",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "dispatch_target",
+          "index": 0,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "y",
+          "index": 1,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "swiglu_out",
+          "index": 2,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "down_proj_y",
+          "index": 3,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        },
+        {
+          "name": "combine_target",
+          "index": 4,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatDefault"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "rank_id",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "ep",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "expert_num",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "hidden_size",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "seq_size",
+          "dtype": "int",
+          "value": 0
+        }
+      ]
+    }
+  ]
+}
