@@ -19,6 +19,8 @@ from contextlib import contextmanager
 import mindspore as ms
 from mindspore import mint, nn
 
+from hyper_parallel.platform.mindspore.utils import normalize_runtime_device
+
 
 def _cell_to_empty(self, device=None, recurse=True):
     """Patch for ``nn.Cell.to_empty`` (init.md): ``param.set_data(mint.empty_like(...))``.
@@ -52,6 +54,12 @@ def _install_cell_to_empty_patch():
     nn.Cell._hyper_parallel_to_empty_installed = True # pylint: disable=W0212
 
 
+def _check_valid_init_device(device: str):
+    """Validate user-provided init device for MindSpore init_on_device."""
+    if device not in {"npu", "cpu", "meta"}:
+        raise ValueError(f'Unsupported device "{device}", only "npu", "cpu", and "meta" are allowed.')
+
+
 @contextmanager
 def init_on_device(device, include_buffers=False):
     """Context manager that initializes model parameters (and optionally
@@ -64,6 +72,7 @@ def init_on_device(device, include_buffers=False):
     """
     if include_buffers:
         raise ValueError("MindSpore platform does not support include_buffers=True.")
+    _check_valid_init_device(device)
     orig_insert_param = nn.Cell.insert_param_to_cell
 
     # pylint: disable=W0212
@@ -82,8 +91,9 @@ def init_on_device(device, include_buffers=False):
             kwargs["name"] = param.name
             kwargs["requires_grad"] = param.requires_grad
             param_cls = type(orig_param)
-            module._params[param_name] = (param if param.device == device
-                                            else param_cls(orig_param.to(device=device), **kwargs))
+            param_device = normalize_runtime_device(param.device)
+            module._params[param_name] = (param if param_device == device
+                                          else param_cls(orig_param.to(device=device), **kwargs))
 
     try:
         nn.Cell.insert_param_to_cell = _insert_param_to_cell

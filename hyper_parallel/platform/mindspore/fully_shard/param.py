@@ -39,6 +39,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
 from hyper_parallel.core.dtensor.placement_types import Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_utils import ParamModuleInfo
 from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_without_bumping_version
+from hyper_parallel.platform.mindspore.utils import normalize_runtime_device
 from hyper_parallel.platform.mindspore.fully_shard.pack_utils import (
     build_rs_plan,
     pack_for_reduce_scatter,
@@ -230,7 +231,8 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         param: Parameter,
         shard_placement_fn: Optional[Callable],
     ) -> None:
-        if param.device != "meta" and not (param.device.startswith("Ascend") and self.device == "npu"):
+        param_device = normalize_runtime_device(param.device)
+        if param_device not in ("meta", self.device):
             raise AssertionError(
                 f"Expects the parameter to already be moved to device {self.device} but got {param.device}"
             )
