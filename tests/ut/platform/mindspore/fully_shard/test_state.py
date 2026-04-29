@@ -173,6 +173,15 @@ class TestStateParamBookkeeping(unittest.TestCase):
 
         self.assertEqual(state._iter_managed_params(), [hsdp_param, replicate_param])
 
+    def test_prefetch_forwards_unshard_replicate_flag(self):
+        """prefetch should forward the replicate-policy bit to unshard."""
+        state = _make_state()
+        state.unshard = MagicMock()
+
+        state.prefetch(unshard_replicate=False)
+
+        state.unshard.assert_called_once_with(async_op=True, unshard_replicate=False)
+
     @patch("hyper_parallel.platform.mindspore.fully_shard.state.dist.all_reduce")
     def test_allreduce_replicate_params_uses_layout_group_info(self, mock_all_reduce):
         """Replicate params should reduce over the layout-driven unsharded group instead of flattening the root mesh."""

@@ -372,6 +372,13 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         return unsharded_param
 
     def to_sharded(self) -> None:
+        if not self.uses_param_shard and self._unsharded_param is not None:
+            # Replicate params keep the same local shape across shard/unshard,
+            # so persist forward-time state updates before switching objects.
+            src = self._unsharded_param.to_local() if isinstance(self._unsharded_param, DTensor) \
+                else self._unsharded_param
+            dst = self.sharded_param.to_local() if isinstance(self.sharded_param, DTensor) else self.sharded_param
+            copy_without_bumping_version(dst, src)
         self._setattr_on_modules(self.sharded_param)
         self.free_unsharded_param()
         self.sharded_state = ShardedState.SHARDED
@@ -630,7 +637,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
     def unshard(self, async_op: bool = False) -> None:
         if self.prefetch_handle is not None:
-            # 已经被prefetch 触发过了，直接return
+            # Already triggered by HSDPState.prefetch(), so return directly.
             return  # no-op
 
         _, handle = self._get_unsharded_param_data(async_op=async_op)

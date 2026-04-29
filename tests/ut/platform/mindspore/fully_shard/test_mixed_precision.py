@@ -65,6 +65,7 @@ def _new_hsdp_param_v2() -> MindSporeHSDPParamV2:
     """Bare :class:`MindSporeHSDPParamV2` with ``all_gather_outputs`` initialized."""
     obj = object.__new__(MindSporeHSDPParamV2)
     obj.all_gather_outputs = []
+    obj.enable_fsdp_shard = True
     return obj
 
 
@@ -731,7 +732,6 @@ class TestPrefetchStateMachine(unittest.TestCase):
         param.init_unsharded_param.assert_called_once_with()
         param.to_unsharded.assert_called_once_with()
         self.assertIsNone(param.prefetch_handle)
-
 
 class TestAsyncReduceStateMachine(unittest.TestCase):
     """Test per-parameter async reduce/all-reduce pending state."""
