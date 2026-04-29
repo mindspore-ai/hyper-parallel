@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Test the layout module."""
+"""UT for :mod:`hyper_parallel.core.distributed_checkpoint.layout`."""
 import json
 import os
 import tempfile
@@ -47,11 +47,11 @@ def _make_param(name, layout, dtype="float32", shape=(2, 4)):
 
 
 class TestLayout(unittest.TestCase):
-    """Test the layout module."""
+    """Tests for :mod:`hyper_parallel.core.distributed_checkpoint.layout`."""
 
     def setUp(self):
-        # MindSpore uses parameters_and_names(); Torch uses named_parameters(). Mocks only define
-        # parameters_and_names, so delegate parameters_dict to that for stable get_current_layout tests.
+        # ``parameters_dict`` may map to ``named_parameters`` (Torch) or ``parameters_and_names`` (MS);
+        # mocks only define ``parameters_and_names``, so delegate for stable ``get_current_layout`` tests.
         self._params_dict_patcher = patch(
             "hyper_parallel.core.distributed_checkpoint.layout.platform.parameters_dict",
             side_effect=lambda cell: cell.parameters_and_names(),

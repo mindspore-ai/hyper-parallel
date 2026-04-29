@@ -9,7 +9,7 @@ Add unit tests (UT) and system/distributed tests (ST) covering the platform chan
 ### 5.1 Unit Tests (UT)
 
 **Location:**
-- PyTorch: `tests/torch/ut/`
+- PyTorch (unit): `tests/ut/` (e.g. `tests/ut/core/`, `tests/ut/platform/torch/`)
 - MindSpore: `tests/mindspore/ut/`
 
 **Conventions:**
@@ -91,7 +91,7 @@ def _test_feature_impl():
 /test
 
 # Or manually
-pytest tests/torch/ut/path/to/test.py -v
+pytest tests/ut/path/to/test.py -v
 pytest tests/mindspore/ut/path/to/test.py -v
 ```
 

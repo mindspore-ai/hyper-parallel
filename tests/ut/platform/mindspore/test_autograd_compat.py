@@ -28,6 +28,12 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise unittest.SkipTest("mindspore is required for autograd compat tests") from exc
 
+from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E402
+    ensure_mindspore_platform_default,
+)
+
+ensure_mindspore_platform_default()
+
 from hyper_parallel.platform.mindspore import autograd_compat
 
 

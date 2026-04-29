@@ -203,7 +203,7 @@ Need to append to PR?
 > teaching messages.
 
 ```text
-USER: 我新加了 core/foo.py + tests/torch/ut/test_foo.py，帮我提交并开 PR
+USER: 我新加了 core/foo.py + tests/ut/core/foo/test_foo.py，帮我提交并开 PR
 
 AGENT: I'll commit then open the PR. First the commit.
        Generating commit message from `git diff --cached` …
@@ -211,7 +211,7 @@ AGENT: I'll commit then open the PR. First the commit.
        ┌────────────────── Proposed commit message ──────────────────┐
        │ feat(core): add foo distributed op                          │
        │                                                              │
-       │ Adds Foo op covering case X; UT in tests/torch/ut/test_foo  │
+       │ Adds Foo op covering case X; UT in tests/ut/core/foo/test_foo │
        └──────────────────────────────────────────────────────────────┘
        OK / edit / cancel?
 
@@ -258,7 +258,7 @@ AGENT: $ autogit pr --ut changed --st skip \
             --title "..." --body "..."
        Updating remote info...
        UT gate (changed, 1 files):
-         tests/torch/ut/test_foo.py
+         tests/ut/core/foo/test_foo.py
        ........  [100%]
        1 passed in 4.12s
        UT gate passed.

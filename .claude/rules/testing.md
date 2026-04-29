@@ -23,7 +23,7 @@ pytest with custom markers defined in `tests/common/mark_utils.py`.
 
 ## Test Types
 
-- **Unit tests** (`tests/torch/ut/`, `tests/mindspore/ut/`): Run without distributed setup, no GPU required for logic tests
+- **Unit tests** (`tests/ut/`): Run without distributed setup, no GPU required for logic tests
 - **System tests** (`tests/mindspore/st/`): Distributed, require `msrun` launcher
 - **Torch distributed tests**: Use `torchrun` via `tests/torch/utils.torchrun_case()`
 

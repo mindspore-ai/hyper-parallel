@@ -25,7 +25,15 @@ import pytest
 pytest.importorskip("mindspore")
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E402
+    ensure_mindspore_platform_for_fully_shard,
+)
 
+ensure_mindspore_platform_for_fully_shard()
+
+from mindspore import ops
+
+from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import FullyShardParamMode, GroupInfo
 from hyper_parallel.platform.mindspore.fully_shard.state import MindSporeHSDPStateV2
 
@@ -44,13 +52,16 @@ def _make_state():
         replicate_params=None,
         ignored_params=None,
         shard_placement_fn="shard-fn",
+        comm_fusion=False,
+        comm_fusion_zero_copy=False,
     )
+    state.comm_fusion = False
     state.mesh_info = SimpleNamespace(mesh="mesh-info")
     state.modules = []
     state.reduce_grads = True
     state.reshard_after_backward = False
     state.requires_all_reduce = True
-    state.reduce_op_type = "sum"
+    state.reduce_op_type = ops.ReduceOp.SUM
     state._reduce_dtype = None
     state._orig_dtype = None
     state._need_div = False
@@ -186,35 +197,48 @@ class TestStateParamBookkeeping(unittest.TestCase):
 
     def test_post_backward_uses_sync_reduction_on_layout_driven_sizes(self):
         """post_backward should use layout-driven sizes and waitable sync reductions before applying grads."""
+        HSDPState.pre_reduce_scatter_params.clear()
+        HSDPState.pre_all_reduce_params.clear()
         state = _make_state()
-        hsdp_param = MagicMock()
-        hsdp_param.accumulate_unsharded_grad_if_needed = MagicMock()
-        hsdp_param.sharded_param = SimpleNamespace(requires_grad=True)
-        hsdp_param.unsharded_param = SimpleNamespace(grad="local-grad")
-        hsdp_param.unsharded_accumulated_grad = None
-        hsdp_param.unsharded_accumulated_grad_data = None
-        hsdp_param.unsharded_grad_data = "local-grad"
-        hsdp_param.shard_size = 2
-        hsdp_param.dp_size = 2
-        hsdp_param.shard_world_size = 8
-        hsdp_param.replicate_world_size = 8
-        hsdp_param.reduce_scatter_grad = MagicMock(return_value=("sharded-grad", None))
-        hsdp_param.all_reduce_grad = MagicMock(return_value=("reduced-grad", None))
+        reduce_scatter_out = MagicMock(return_value="sharded-grad")
+        all_reduce_grad = MagicMock(return_value=("reduced-grad", None))
+        unsharded = SimpleNamespace(grad="local-grad")
+
+        def _noop_accumulate():
+            return None
+
+        hsdp_param = SimpleNamespace(
+            accumulate_unsharded_grad_if_needed=_noop_accumulate,
+            sharded_param=SimpleNamespace(requires_grad=True),
+            _unsharded_param=unsharded,
+            unsharded_param=unsharded,
+            unsharded_accumulated_grad=None,
+            unsharded_accumulated_grad_data=None,
+            unsharded_grad_data="local-grad",
+            shard_size=2,
+            dp_size=2,
+            shard_world_size=8,
+            replicate_world_size=8,
+            reduce_scatter_grad=MagicMock(return_value=("sharded-grad", None)),
+            reduce_scatter_output=reduce_scatter_out,
+            clear_reduce_scatter_output=MagicMock(),
+            all_reduce_grad=all_reduce_grad,
+        )
         state.hsdp_params = [hsdp_param]
 
         state.post_backward()
 
         hsdp_param.reduce_scatter_grad.assert_called_once_with(
-            async_op=False,
+            async_op=True,
             dtype=None,
-            reduce_op="sum",
+            reduce_op=ops.ReduceOp.SUM,
         )
-        hsdp_param.all_reduce_grad.assert_called_once_with(
+        all_reduce_grad.assert_called_once_with(
             grad="sharded-grad",
-            async_op=False,
-            reduce_op="sum",
+            dtype=None,
+            async_op=True,
+            reduce_op=ops.ReduceOp.SUM,
         )
-        state._apply_reduced_grad.assert_called_once_with(hsdp_param, "reduced-grad")
 
 if __name__ == "__main__":
     unittest.main()

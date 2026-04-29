@@ -176,7 +176,7 @@ When a change introduces new API patterns, evaluate broader implications:
 ### Test Existence
 
 - [ ] **Tests exist** — New functionality has corresponding tests
-- [ ] **Right test location** — `tests/torch/ut/` for PyTorch unit tests, `tests/mindspore/ut/` for MindSpore unit tests
+- [ ] **Right test location** — `tests/ut/core/`, `tests/ut/platform/torch/` for PyTorch-focused UTs; MindSpore under `tests/ut/platform/mindspore/` or `*_mindspore.py`
 
 ### Test Patterns
 

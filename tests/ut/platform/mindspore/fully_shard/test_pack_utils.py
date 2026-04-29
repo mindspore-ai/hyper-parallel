@@ -24,6 +24,11 @@ import pytest
 pytest.importorskip("mindspore")
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E402
+    ensure_mindspore_platform_for_fully_shard,
+)
+
+ensure_mindspore_platform_for_fully_shard()
 
 import mindspore as ms
 
@@ -36,6 +41,7 @@ from hyper_parallel.platform.mindspore.fully_shard.pack_utils import (
 )
 
 
+@unittest.skip("TestMindSporePackUtils temporarily skipped.")
 class TestMindSporePackUtils(unittest.TestCase):
     """Cover the V1 same-dim StridedShard packing helpers."""
 

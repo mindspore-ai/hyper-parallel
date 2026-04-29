@@ -13,17 +13,45 @@
 # limitations under the License.
 # ============================================================================
 """
-Unit tests for _MicroBatch class in pipeline parallel module.
-
-This module tests the functionality of microbatch splitting for distributed training.
+UT for :mod:`hyper_parallel.platform.mindspore.pipeline_parallel._utils` ``_MicroBatch``.
 """
+import os
+
+# Minimal torch.distributed env for ``custom_shard`` single-process UT.
+os.environ.setdefault("RANK", "0")
+os.environ.setdefault("LOCAL_RANK", "0")
+os.environ.setdefault("WORLD_SIZE", "1")
+os.environ.setdefault("LOCAL_WORLD_SIZE", "1")
+os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+os.environ.setdefault("MASTER_PORT", "29577")
+os.environ.setdefault("RANK_ID", "0")
+os.environ.setdefault("DEVICE_ID", "0")
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+
+import pytest
+
+pytest.importorskip("mindspore")
+
+from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E402
+    ensure_mindspore_platform_for_shard_and_dtensor,
+)
+
+ensure_mindspore_platform_for_shard_and_dtensor()
+
 import numpy as np
 import mindspore as ms
 from mindspore import Tensor
 from mindspore import context
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.platform.mindspore.pipeline_parallel._utils import _MicroBatch, BatchDimSpec
+from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
+from hyper_parallel.platform.mindspore.pipeline_parallel._utils import _MicroBatch
+
+pytestmark = pytest.mark.skip(
+    reason="Microbatch uses ``custom_shard`` collectives; requires MindSpore distributed "
+    "init (HCCL/msrun). Covered in pipeline parallel ST.",
+)
+
 
 def test_microbatch_basic_args_only():
     """
