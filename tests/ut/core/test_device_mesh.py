@@ -102,6 +102,26 @@ class TestDeviceMesh(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=4)
         return DeviceMesh("npu", mesh=[[0, 1], [2, 3]], mesh_dim_names=mesh_dim_names, _init_backend=False)
 
+    def _build_torchtitan_like_meshes_8card_cp2(self, mock_platform):
+        """Build TorchTitan-like meshes for an 8-card cp=2 topology."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        world_mesh = init_device_mesh("npu", (8,), mesh_dim_names=("world",))
+
+        dataloading_mesh = world_mesh._unflatten(
+            0,
+            (1, 4, 2, 1),
+            ("pp", "batch", "cp", "tp"),
+            backend_override={"pp": "fake", "tp": "fake"},
+        )
+        loss_mesh = dataloading_mesh["batch", "cp"]._flatten("loss_mesh")
+        dense_mesh = world_mesh._unflatten(
+            0,
+            (1, 1, 8, 1),
+            ("pp", "dp_replicate", "fsdp", "tp"),
+            backend_override={"pp": "fake", "tp": "fake"},
+        )
+        return world_mesh, dataloading_mesh, loss_mesh, dense_mesh
+
     # ------------------------------------------------------------------
     # Construction tests
     # ------------------------------------------------------------------
@@ -293,6 +313,28 @@ class TestDeviceMesh(unittest.TestCase):
             _ = mesh[("cp", "dp")]  # Wrong order, should be ("dp", "cp")
         self.assertIn("must follow the order", str(context.exception))
 
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_getitem_supports_contiguous_flatten_and_original_dim(self, mock_platform):
+        """Test root mesh slicing can mix a contiguous flattened dim with an original dim."""
+        mesh = self._make_2x2x2_mesh(mock_platform)
+
+        flat_dp_cp = mesh[("dp", "cp")].flatten()
+        mixed_mesh = mesh[("dp_cp", "tp")]
+
+        self.assertIs(mesh["dp_cp"], flat_dp_cp)
+        self.assertEqual(mixed_mesh.mesh_shape, (4, 2))
+        self.assertEqual(mixed_mesh.mesh_dim_names, ("dp_cp", "tp"))
+        self.assertEqual(mixed_mesh.rank_list, (0, 1, 2, 3, 4, 5, 6, 7))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_getitem_rejects_non_contiguous_flatten_mix(self, mock_platform):
+        """Test root mesh slicing still rejects non-contiguous flattened dims mixed with originals."""
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        _ = mesh[("dp", "tp")].flatten()
+
+        with self.assertRaisesRegex(NotImplementedError, "contiguous flattened dim"):
+            _ = mesh[("dp_tp", "cp")]
+
     # ------------------------------------------------------------------
     # concatenate tests
     # ------------------------------------------------------------------
@@ -371,6 +413,19 @@ class TestDeviceMesh(unittest.TestCase):
             DeviceMesh.concatenate([dp_mesh, tp_mesh])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_concatenate_supports_contiguous_flattened_dim(self, mock_platform):
+        """Test concatenate can stitch a contiguous flattened dim with an original dim."""
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        flat_dp_cp = mesh[("dp", "cp")].flatten()
+        tp_mesh = mesh["tp"]
+
+        unified_mesh = DeviceMesh.concatenate([flat_dp_cp, tp_mesh])
+
+        self.assertEqual(unified_mesh.mesh_dim_names, ("dp_cp", "tp"))
+        self.assertEqual(unified_mesh.mesh_shape, (4, 2))
+        self.assertEqual(unified_mesh.rank_list, (0, 1, 2, 3, 4, 5, 6, 7))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_concatenate_preserves_root_mesh_after_layout_deepcopy(self, mock_platform):
         """Test concatenate still works after deepcopying a layout built from a submesh."""
         mesh = self._make_2x2_mesh_no_backend(mock_platform)
@@ -383,6 +438,171 @@ class TestDeviceMesh(unittest.TestCase):
         self.assertEqual(copied_layout.mesh._get_root_mesh().to_hash(), mesh.to_hash())  # pylint: disable=W0212
         self.assertEqual(unified_mesh.mesh_dim_names, ("dp", "tp"))
         self.assertEqual(unified_mesh.to_hash(), mesh.to_hash())
+
+    # ------------------------------------------------------------------
+    # TorchTitan compatibility tests
+    # ------------------------------------------------------------------
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_supports_torchtitan_build_mesh_primitives(self, mock_platform):
+        """Test world->_unflatten->slice->_flatten matches TorchTitan's common mesh construction flow."""
+        self._setup_mock_platform(mock_platform, world_size=16)
+        world_mesh = init_device_mesh("npu", (16,), mesh_dim_names=("world",))
+
+        dataloading_mesh = world_mesh._unflatten(
+            0,
+            (1, 4, 2, 2),
+            ("pp", "batch", "cp", "tp"),
+            backend_override={"pp": "fake", "batch": "fake"},
+        )
+        loss_mesh = dataloading_mesh["batch", "cp"]._flatten("loss_mesh")
+        dense_mesh = world_mesh._unflatten(
+            0,
+            (1, 2, 4, 2),
+            ("pp", "dp_replicate", "fsdp", "tp"),
+            backend_override={"pp": "fake"},
+        )
+        sparse_mesh = world_mesh._unflatten(
+            0,
+            (1, 2, 4, 2, 1),
+            ("pp", "dp_replicate", "efsdp", "ep", "etp"),
+            backend_override={"pp": "fake", "etp": "fake"},
+        )
+
+        self.assertEqual(dataloading_mesh.mesh_shape, (1, 4, 2, 2))
+        self.assertEqual(dataloading_mesh.mesh_dim_names, ("pp", "batch", "cp", "tp"))
+        self.assertEqual(dataloading_mesh._dim_group_backends, ("fake", "fake", None, None))  # pylint: disable=W0212
+        self.assertEqual(dataloading_mesh["batch"].rank_list, (0, 4, 8, 12))
+        self.assertEqual(dataloading_mesh["batch"]._dim_group_backends, ("fake",))  # pylint: disable=W0212
+        self.assertEqual(dataloading_mesh["batch", "cp"].rank_list, (0, 2, 4, 6, 8, 10, 12, 14))
+
+        self.assertEqual(loss_mesh.mesh_dim_names, ("loss_mesh",))
+        self.assertEqual(loss_mesh.mesh_shape, (8,))
+        self.assertEqual(loss_mesh.rank_list, (0, 2, 4, 6, 8, 10, 12, 14))
+        self.assertEqual(loss_mesh._dim_group_backends, (None,))  # pylint: disable=W0212
+        self.assertIs(world_mesh["loss_mesh"], loss_mesh)
+
+        self.assertEqual(dense_mesh["tp"].rank_list, (0, 1))
+        self.assertEqual(dense_mesh["fsdp"].size(), 4)
+        self.assertEqual(dense_mesh[("dp_replicate", "fsdp")].mesh_shape, (2, 4))
+
+        self.assertEqual(sparse_mesh["ep"].size(), 2)
+        self.assertEqual(sparse_mesh["etp"].size(), 1)
+        self.assertEqual(sparse_mesh["etp"]._dim_group_backends, ("fake",))  # pylint: disable=W0212
+        self.assertEqual(sparse_mesh[("ep", "etp")].mesh_shape, (2, 1))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_supports_torchtitan_8card_cp2_fsdp_semantics(self, mock_platform):
+        """Test TorchTitan-like 8-card cp=2 keeps batch sharding and fsdp sharding semantics separate."""
+        world_mesh, dataloading_mesh, loss_mesh, dense_mesh = self._build_torchtitan_like_meshes_8card_cp2(
+            mock_platform
+        )
+
+        self.assertEqual(dataloading_mesh["batch"].size(), 4)
+        self.assertEqual(dataloading_mesh["batch"].rank_list, (0, 2, 4, 6))
+        self.assertEqual(dataloading_mesh["cp"].size(), 2)
+        self.assertEqual(dataloading_mesh["cp"].rank_list, (0, 1))
+
+        self.assertEqual(loss_mesh.size(), 8)
+        self.assertEqual(loss_mesh.rank_list, (0, 1, 2, 3, 4, 5, 6, 7))
+        self.assertEqual(dense_mesh["fsdp"].size(), 8)
+        self.assertEqual(dense_mesh["fsdp"].rank_list, (0, 1, 2, 3, 4, 5, 6, 7))
+
+        self.assertIs(world_mesh["loss_mesh"], loss_mesh)
+        self.assertEqual(loss_mesh.rank_list, dense_mesh["fsdp"].rank_list)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_supports_torchtitan_8card_cp2_concatenate_views(self, mock_platform):
+        """Test concatenate rebuilds TorchTitan-like batch/cp and fsdp views on 8 cards."""
+        _, dataloading_mesh, _, dense_mesh = self._build_torchtitan_like_meshes_8card_cp2(mock_platform)
+
+        batch_cp_mesh = DeviceMesh.concatenate([dataloading_mesh["batch"], dataloading_mesh["cp"]])
+        fsdp_tp_mesh = DeviceMesh.concatenate([dense_mesh["fsdp"], dense_mesh["tp"]])
+
+        self.assertEqual(batch_cp_mesh.mesh_dim_names, ("batch", "cp"))
+        self.assertEqual(batch_cp_mesh.mesh_shape, (4, 2))
+        self.assertEqual(batch_cp_mesh.rank_list, dataloading_mesh["batch", "cp"].rank_list)
+
+        self.assertEqual(fsdp_tp_mesh.mesh_dim_names, ("fsdp", "tp"))
+        self.assertEqual(fsdp_tp_mesh.mesh_shape, (8, 1))
+        self.assertEqual(fsdp_tp_mesh.rank_list, dense_mesh["fsdp", "tp"].rank_list)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_supports_torchtitan_8card_cp2_axis_queries(self, mock_platform):
+        """Test axis helpers return the expected TorchTitan-like ranks on 8-card cp=2 meshes."""
+        _, dataloading_mesh, _, dense_mesh = self._build_torchtitan_like_meshes_8card_cp2(mock_platform)
+
+        self.assertEqual(dataloading_mesh.get_rank_list_along_axis("batch"), [0, 2, 4, 6])
+        self.assertEqual(dataloading_mesh.get_rank_list_along_axis("cp"), [0, 1])
+        self.assertEqual(dense_mesh.get_rank_list_along_axis("fsdp"), [0, 1, 2, 3, 4, 5, 6, 7])
+
+        with patch.object(dataloading_mesh, "_rank", 5):
+            self.assertEqual(dataloading_mesh.get_local_rank("batch"), 2)
+            self.assertEqual(dataloading_mesh.get_local_rank("cp"), 1)
+
+        with patch.object(dense_mesh, "_rank", 5):
+            self.assertEqual(dense_mesh.get_local_rank("fsdp"), 5)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_unflatten_rejects_invalid_backend_override_keys(self, mock_platform):
+        """Test _unflatten validates backend_override keys like Torch."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        world_mesh = init_device_mesh("npu", (8,), mesh_dim_names=("world",))
+
+        with self.assertRaisesRegex(RuntimeError, "invalid keys"):
+            world_mesh._unflatten(
+                "world",
+                (2, 4),
+                ("dp", "tp"),
+                backend_override={"invalid": "fake"},
+            )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_size_one_dims_skip_eager_group_creation(self, mock_platform):
+        """Test singleton mesh dimensions do not eagerly create communication groups."""
+        self._setup_mock_platform(mock_platform, world_size=1)
+        mock_group = MagicMock()
+        mock_platform.split_group.return_value = mock_group
+
+        mesh = init_device_mesh("npu", (1, 1, 1), mesh_dim_names=("pp", "dp", "tp"))
+
+        mock_platform.split_group.assert_not_called()
+        self.assertEqual(mesh._dim_group_names, [None, None, None])  # pylint: disable=W0212
+
+        group = mesh.get_group("pp")
+
+        self.assertIs(group, mock_group)
+        mock_platform.split_group.assert_called_once_with(split_ranks=[[0]])
+
+        group_again = mesh.get_group("pp")
+        self.assertIs(group_again, mock_group)
+        mock_platform.split_group.assert_called_once()
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_device_mesh_fake_backend_dims_materialize_groups_lazily(self, mock_platform):
+        """Test fake backend dimensions skip eager group init and only create groups on demand."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mock_group = MagicMock()
+        mock_platform.split_group.return_value = mock_group
+
+        world_mesh = init_device_mesh("npu", (8,), mesh_dim_names=("world",))
+        mock_platform.split_group.reset_mock()
+
+        mesh = world_mesh._unflatten(
+            0,
+            (2, 2, 2),
+            ("dp", "cp", "tp"),
+            backend_override={"dp": "fake"},
+        )
+
+        self.assertEqual(mock_platform.split_group.call_count, 2)
+        self.assertEqual(mesh._dim_group_names[0], None)  # pylint: disable=W0212
+        self.assertEqual(mesh._dim_group_backends[0], "fake")  # pylint: disable=W0212
+
+        dp_group = mesh["dp"].get_group()
+
+        self.assertIs(dp_group, mock_group)
+        self.assertEqual(mock_platform.split_group.call_count, 3)
 
     # ------------------------------------------------------------------
     # Properties and methods
