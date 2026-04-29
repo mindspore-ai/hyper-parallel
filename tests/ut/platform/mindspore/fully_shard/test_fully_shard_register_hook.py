@@ -263,6 +263,30 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
         self.assertEqual(scheduler.forward_prefetch_cells, restored_prefetch)
         self.assertIsNone(scheduler._backup_forward_fetch)
 
+    def test_backward_pre_hook_prefetches_without_replicate_params(self):
+        """backward prefetch should skip replicate_params when reshard_after_forward is enabled."""
+        scheduler = _make_scheduler_stub()
+        scheduler.scheduler_state = FSDPSchedulerState.FORWARD
+        scheduler.cell = MagicMock(name="cell")
+        scheduler.reshard_after_forward = True
+        scheduler.hsdp_state = MagicMock(module_name="mod")
+        scheduler.hsdp_state.unshard = MagicMock()
+        prefetch_state = MagicMock(module_name="next_mod")
+        prefetch_state.prefetch = MagicMock()
+        prefetch_cell = MagicMock()
+        prefetch_cell.hsdp_scheduler.hsdp_state = prefetch_state
+        scheduler.backward_prefetch_cells = [prefetch_cell]
+        scheduler.platform = MagicMock()
+        scheduler.platform.profiler_record.return_value = MagicMock(
+            __enter__=MagicMock(return_value=None),
+            __exit__=MagicMock(return_value=False),
+        )
+
+        scheduler._hsdp_backward_pre_hook(scheduler.cell, None)
+
+        scheduler.hsdp_state.unshard.assert_called_once_with(unshard_replicate=False)
+        prefetch_state.prefetch.assert_called_once_with(unshard_replicate=False)
+
     def test_forward_pre_hook_with_param_fqn_init(self):
         """_init_params_fqn assigns correct FQNs for a multi-layer nested model.
 

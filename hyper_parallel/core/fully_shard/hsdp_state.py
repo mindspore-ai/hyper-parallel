@@ -97,9 +97,9 @@ class HSDPState:
         if not async_op:
             self.wait_for_unshard(unshard_replicate)
 
-    def prefetch(self):
+    def prefetch(self, unshard_replicate: bool = True):
         """prefetch unsharded parameters"""
-        self.unshard(async_op=True)
+        self.unshard(async_op=True, unshard_replicate=unshard_replicate)
 
     def wait_for_unshard(self, wait_for_replicate: bool = True):
         """wait for all unshard parameters"""

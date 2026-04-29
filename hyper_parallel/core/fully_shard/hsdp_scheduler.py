@@ -244,7 +244,7 @@ class HSDPSchedulerV2:
         for prefetch_cell in self.backward_prefetch_cells:
             with self.platform.profiler_record(f"pre_backward prefetch:"
                                                f"{prefetch_cell.hsdp_scheduler.hsdp_state.module_name}"):
-                prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()
+                prefetch_cell.hsdp_scheduler.hsdp_state.prefetch(unshard_replicate=False)
         if self.reshard_after_forward:
             with self.platform.profiler_record(f"pre_backward unshard:{self.hsdp_state.module_name}"):
                 self.hsdp_state.unshard(unshard_replicate=False)
