@@ -99,11 +99,6 @@ def get_platform():
         return get_torch_platform()
 
 
-def apply_runtime_patches_if_needed():
-    """Apply backend-specific runtime patches for the resolved platform."""
-    return get_platform().apply_runtime_patches_if_needed()
-
-
 EXISTING_COMM_GROUPS = {}
 
 
@@ -112,11 +107,6 @@ class Platform:
     current_grad_handle = None
     post_grad_handle_process = None
     grad_sync_stream = None
-
-    @staticmethod
-    def apply_runtime_patches_if_needed():
-        """Apply backend-specific runtime patches if this platform needs any."""
-        return None
 
     @staticmethod
     def get_rank():
