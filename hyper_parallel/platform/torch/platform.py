@@ -172,11 +172,6 @@ class TorchPlatform(Platform):
     Function = torch.autograd.Function
 
     @staticmethod
-    def apply_runtime_patches_if_needed():
-        """Torch currently does not require extra runtime patches."""
-        return None
-
-    @staticmethod
     def is_linear_module(module) -> bool:
         """Check whether *module* is a ``torch.nn.Linear`` instance."""
         return isinstance(module, nn.Linear)

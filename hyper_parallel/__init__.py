@@ -28,7 +28,6 @@ __all__ = ["get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDP
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.shard.dfunction import DFunction
-from hyper_parallel.platform.platform import apply_runtime_patches_if_needed
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _mesh_resources, init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch, distribute_module
@@ -53,7 +52,5 @@ from hyper_parallel.core.tensor_parallel import (
     parallelize_module,
 )
 from hyper_parallel.core.fully_shard.api import fully_shard, hsdp_sync_stream, HSDPModule
-
-apply_runtime_patches_if_needed()
 
 get_current_mesh = _mesh_resources.get_current_mesh
