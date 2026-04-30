@@ -164,7 +164,7 @@ def test_device_mesh_invalid_different_mesh_dim_names():
         init_device_mesh(device_type="npu", mesh_shape=(2,), mesh_dim_names=("dp", "tp"))
     except ValueError as e:
         result = str(e)
-    assert "mesh_dim_names length" in result
+    assert "same length" in result
 
     try:
         init_device_mesh(device_type="npu", mesh_shape=(2, 1), mesh_dim_names=("dp", "dp"))

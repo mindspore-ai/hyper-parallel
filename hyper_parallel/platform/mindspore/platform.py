@@ -33,6 +33,7 @@ from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
 from mindspore.common.initializer import initializer
 from mindspore.common.recompute import null_context_fn
+from mindspore.communication import GlobalComm
 from mindspore.communication import get_group_size
 from mindspore.communication import create_group as new_group
 from mindspore.communication import get_rank as get_rank_id
@@ -614,6 +615,10 @@ class MindSporePlatform(Platform):
         input_tensor.requires_grad_()
 
     def _create_group(self, rank_list):
+        world_group = self._maybe_reuse_world_group(rank_list)
+        if world_group is not None:
+            return world_group
+
         group_name = str(tuple(sorted(rank_list)))
         new_group(rank_ids=rank_list, group=group_name)
         EXISTING_COMM_GROUPS[group_name] = group_name
@@ -852,6 +857,9 @@ class MindSporePlatform(Platform):
         rank_id = MindSporePlatform.get_rank()
         for split_rank in split_ranks:
             if rank_id in split_rank:
+                world_group = MindSporePlatform._maybe_reuse_world_group(split_rank)
+                if world_group is not None:
+                    return world_group
                 split_group = MindSporePlatform.get_created_group(split_rank)
                 if split_group:
                     return split_group
@@ -1036,3 +1044,14 @@ class MindSporePlatform(Platform):
 
     def list_to_size(self, size_list: list[int]) -> tuple[int, ...]:
         return tuple(size_list)
+
+    @staticmethod
+    def _maybe_reuse_world_group(rank_list):
+        """Reuse the default world group for full-world rank lists."""
+        normalized = tuple(sorted(rank_list))
+        world_ranks = tuple(range(MindSporePlatform.get_world_size()))
+        if normalized != world_ranks:
+            return None
+
+        EXISTING_COMM_GROUPS[str(normalized)] = GlobalComm.WORLD_COMM_GROUP
+        return GlobalComm.WORLD_COMM_GROUP
