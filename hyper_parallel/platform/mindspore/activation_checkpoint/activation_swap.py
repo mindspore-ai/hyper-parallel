@@ -31,7 +31,11 @@ from hyper_parallel.core.activation_checkpoint.swap import Storage, SwapManager,
 
 
 _CKPT_WRAPPED_MODULE = "_ckpt_wrapped_module"
-_CKPT_PREFIX = _CKPT_WRAPPED_MODULE + "."
+
+
+def _strip_ckpt_wrapped_module_prefix(name: str) -> str:
+    """Remove the wrapper cell segment from a dotted MindSpore cell name."""
+    return ".".join(part for part in name.split(".") if part != _CKPT_WRAPPED_MODULE)
 
 
 class FuncCell(Cell):
@@ -120,6 +124,19 @@ class ActivationWrapper(Cell, ABC):
         """Forward indexing calls in case the wrapped cell is a SequentialCell."""
         return self._ckpt_wrapped_module.__getitem__(key)  # type: ignore[operator]
 
+    def cells_and_names(self, cells=None, name_prefix=''):
+        """
+        Return wrapped cells without exposing the wrapper storage prefix.
+
+        MindSpore registers ``_ckpt_wrapped_module`` as a real child cell, so
+        the default :meth:`Cell.cells_and_names` would expose names such as
+        ``layer._ckpt_wrapped_module.attn``.  Strip that implementation detail
+        so downstream code sees the same names as it would for the unwrapped
+        model.
+        """
+        for cell_name, cell in super().cells_and_names(cells, name_prefix):
+            yield _strip_ckpt_wrapped_module_prefix(cell_name), cell
+
     def parameters_and_names(
         self,
         name_prefix: str = '',
@@ -141,7 +158,7 @@ class ActivationWrapper(Cell, ABC):
             wrapper prefix removed.
         """
         for param_name, param in super().parameters_and_names(name_prefix, expand):
-            yield param_name.replace(_CKPT_PREFIX, ""), param
+            yield _strip_ckpt_wrapped_module_prefix(param_name), param
 
     def update_parameters_name(self, prefix='', recurse=True):
         """
