@@ -18,6 +18,9 @@ ne:
 LogicalOr:
   dist_op_name: _logical_or_dist_op
 
+Maximum:
+  dist_op_name: _maximum_dist_op
+
 Minimum:
   dist_op_name: _minimum_dist_op
 
