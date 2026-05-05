@@ -86,6 +86,40 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     )
 
 
+def repeat_kv_bshd(x_bshd: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Expand KV heads in **BSHD** layout (``[B, S, n_kv, D]`` → ``[B, S, n_heads, D]``)."""
+    if n_rep == 1:
+        return x_bshd
+    x_bh = x_bshd.transpose(1, 2)
+    x_bh = repeat_kv(x_bh, n_rep)
+    return x_bh.transpose(1, 2)
+
+
+class Llama3BshdSdpaCore(nn.Module):
+    """Causal scaled dot-product attention with **BSHD** tensors ``[B, S, H, D]``.
+
+    Exposed as a submodule so :class:`~hyper_parallel.ContextParallel` can register hooks on
+    ``forward(q, k, v)`` (Colossal / Ulysses modes expect this call shape).
+    """
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Run SDPA on Q/K/V in BSHD layout and return BSHD output.
+
+        Args:
+            q: Query ``[B, S, H, D]``.
+            k: Key ``[B, S, H, D]``.
+            v: Value ``[B, S, H, D]``.
+
+        Returns:
+            Attention output ``[B, S, H, D]``.
+        """
+        qh = q.transpose(1, 2)
+        kh = k.transpose(1, 2)
+        vh = v.transpose(1, 2)
+        out = torch.nn.functional.scaled_dot_product_attention(qh, kh, vh, is_causal=True)
+        return out.transpose(1, 2)
+
+
 class Llama3RMSNorm(nn.Module):
     """Root mean square normalization (Llama-style)."""
 
@@ -136,6 +170,7 @@ class Llama3Attention(nn.Module):
         self.wk = nn.Linear(cfg.dim, cfg.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(cfg.dim, cfg.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(cfg.n_heads * self.head_dim, cfg.dim, bias=False)
+        self.sdpa_core = Llama3BshdSdpaCore()
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         """Attention forward with optional TP local head counts (``tp_mesh_size`` set by TP plan).
@@ -162,15 +197,11 @@ class Llama3Attention(nn.Module):
 
         ql, kl = apply_rotary_emb(ql, kl, freqs_cis)
 
-        ql = ql.transpose(1, 2)
-        kl = kl.transpose(1, 2)
-        vl = vl.transpose(1, 2)
+        kl = repeat_kv_bshd(kl, self.n_rep)
+        vl = repeat_kv_bshd(vl, self.n_rep)
 
-        kl = repeat_kv(kl, self.n_rep)
-        vl = repeat_kv(vl, self.n_rep)
-
-        out_l = F.scaled_dot_product_attention(ql, kl, vl, is_causal=True)
-        out_l = out_l.transpose(1, 2).contiguous().reshape(b, s, n_h * self.head_dim)
+        out_bshd = self.sdpa_core(ql, kl, vl)
+        out_l = out_bshd.reshape(b, s, n_h * self.head_dim)
         if mesh is not None:
             out_l = DTensor.from_local(out_l, mesh, [PlShard(-1)])
         return self.wo(out_l)
@@ -200,6 +231,12 @@ class Llama3TransformerBlock(nn.Module):
         self.feed_forward = Llama3FeedForward(cfg.dim, hidden_dim)
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        """Decoder block forward.
+
+        Args:
+            x: Hidden states.
+            freqs_cis: RoPE table slice matching ``x``'s sequence length (may be a global-position slice).
+        """
         h = x + self.attention(self.attention_norm(x), freqs_cis)
         return h + self.feed_forward(self.ffn_norm(h))
 
@@ -223,11 +260,34 @@ class Llama3Model(nn.Module):
         freqs = precompute_freqs_cis(cfg.dim // cfg.n_heads, cfg.max_seq_len, cfg.rope_theta)
         self.register_buffer("freqs_cis", freqs, persistent=False)
 
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        _, seq_len = token_ids.shape
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        freqs_cis: Optional[torch.Tensor] = None,
+        *,
+        rope_seq_start: int = 0,
+    ) -> torch.Tensor:
+        """Token ids forward pass.
+
+        Args:
+            token_ids: ``[batch, seq_len]`` token indices (local sequence per rank when using CP/TP).
+            freqs_cis: Optional RoPE slice with leading dimension equal to the **local** sequence length
+                after ``tok_embeddings`` (i.e. ``h.shape[1]``). When ``None``, slices
+                ``self.freqs_cis[rope_seq_start : rope_seq_start + h.shape[1]]`` so global positions
+                align with the caller's CP window start ``rope_seq_start``.
+            rope_seq_start: Global index of the first token position represented by ``token_ids`` on
+                this rank (used only when ``freqs_cis`` is ``None``).
+
+        Returns:
+            Logits ``[batch, seq_len, vocab_size]`` (layout follows TP plan on ``output``).
+        """
         h = self.tok_embeddings(token_ids)
-        freqs_cis = self.freqs_cis[:seq_len]
+        seq_loc = h.shape[1]
+        if freqs_cis is None:
+            freqs = self.freqs_cis[rope_seq_start : rope_seq_start + seq_loc]
+        else:
+            freqs = freqs_cis
         for layer in self.layers:
-            h = layer(h, freqs_cis)
+            h = layer(h, freqs)
         h = self.norm(h)
         return self.output(h)
