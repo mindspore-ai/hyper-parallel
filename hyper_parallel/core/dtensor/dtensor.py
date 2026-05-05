@@ -491,21 +491,39 @@ def _distribute_module_iter_buffers(module: Any) -> list:
     return []
 
 
-def _replicate_submodule_params_buffers(sub_mod: Any, mesh: DeviceMesh) -> None:
+def _distribute_module_named_modules(module: Any):
+    """``nn.Module.named_modules`` or MindSpore ``Cell.cells_and_names`` (submodule FQNs)."""
+    if hasattr(module, "named_modules"):
+        return module.named_modules()
+    if hasattr(module, "cells_and_names"):
+        return module.cells_and_names()
+    raise TypeError(
+        f"distribute_module expects module-like objects with named_modules or cells_and_names; "
+        f"got {type(module)}."
+    )
+
+
+def _replicate_submodule_params_buffers(
+    sub_mod: Any,
+    device_mesh: DeviceMesh,
+    *,
+    module_prefix: str = "",
+) -> None:
     """Convert plain params/buffers on *sub_mod* to fully replicated :class:`DTensor`."""
-    full_replicate = [Replicate()] * mesh.ndim
+    full_replicate = [Replicate()] * device_mesh.ndim
     for key, param in _distribute_module_iter_params(sub_mod):
         if param is None or isinstance(param, DTensorBase):
             continue
         src = _distribute_module_param_source(param)
         requires_grad = bool(getattr(param, "requires_grad", True))
-        dt = distribute_tensor(src, mesh, full_replicate)
-        new_param = _distribute_module_new_parameter(key, dt, requires_grad)
+        dt = distribute_tensor(src, device_mesh, full_replicate)
+        param_name = f"{module_prefix}.{key}" if module_prefix else key
+        new_param = _distribute_module_new_parameter(param_name, dt, requires_grad)
         _distribute_module_set_param(sub_mod, key, new_param)
     for key, buffer in _distribute_module_iter_buffers(sub_mod):
         if buffer is None or isinstance(buffer, DTensorBase):
             continue
-        sub_mod._buffers[key] = distribute_tensor(buffer, mesh, full_replicate)
+        sub_mod._buffers[key] = distribute_tensor(buffer, device_mesh, full_replicate)
 
 
 def _distribute_module_run_partition_and_replicate(
@@ -515,12 +533,12 @@ def _distribute_module_run_partition_and_replicate(
 ) -> None:
     """Call optional ``partition_fn`` per ``named_modules`` and replicate remaining tensors."""
     if partition_fn is None:
-        for submod in module.modules():
-            _replicate_submodule_params_buffers(submod, device_mesh)
+        for mod_name, submod in _distribute_module_named_modules(module):
+            _replicate_submodule_params_buffers(submod, device_mesh, module_prefix=mod_name)
         return
-    for name, submod in module.named_modules():
-        partition_fn(name, submod, device_mesh)
-        _replicate_submodule_params_buffers(submod, device_mesh)
+    for mod_name, submod in _distribute_module_named_modules(module):
+        partition_fn(mod_name, submod, device_mesh)
+        _replicate_submodule_params_buffers(submod, device_mesh, module_prefix=mod_name)
 
 
 def _distribute_module_register_input_fn(

@@ -30,6 +30,13 @@ Module = platform.Module
 __all__ = ["parallelize_module"]
 
 
+def _named_children(module: Module):
+    """Immediate child modules: PyTorch ``nn.Module.named_children`` or MindSpore ``Cell.name_cells``."""
+    if hasattr(module, "named_children"):
+        return module.named_children()
+    return module.name_cells().items()
+
+
 @contextmanager
 def _tensor_parallel_mesh_context(device_mesh: DeviceMesh) -> Iterator[DeviceMesh]:
     """Internal: same thread-local stack as ``with device_mesh:`` for ``parallelize_module(..., None)``.
@@ -115,7 +122,7 @@ def parallelize_module(  # type: ignore[return]
             matched_children = list(
                 filter(
                     lambda t, pattern=atom: fnmatch(t[0], pattern),
-                    current_module.named_children(),
+                    _named_children(current_module),
                 )
             )
             applied = False
