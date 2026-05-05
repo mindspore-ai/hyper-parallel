@@ -155,8 +155,15 @@ class MindSporeHSDPStateV2(HSDPState):
         for hsdp_param in self.replicate_params:
             hsdp_param.zero_grad()
 
-    def _div_if_needed(self, x, divisor):
-        if not self._need_div:
+    @staticmethod
+    def _div_if_needed(x, divisor, need_div: bool):
+        """Apply gradient averaging only when the caller-provided policy requires it.
+
+        ``need_div`` may come from the current state or from metadata captured when
+        async reduce work was queued, so this helper is safe for both immediate and
+        deferred gradient materialization paths.
+        """
+        if not need_div:
             return
         if divisor == 1:
             return
@@ -327,8 +334,7 @@ class MindSporeHSDPStateV2(HSDPState):
         for param, reduced_grad, reduce_group_size in self._ignored_allreduce_works:
             if param.all_reduce_handle:
                 param.all_reduce_handle.wait()
-            group_size = float(reduce_group_size)
-            self._div_if_needed(reduced_grad, group_size)
+            self._div_if_needed(reduced_grad, reduce_group_size, self._need_div)
             need_synchronize = (
                 param.apply_reduced_grad(reduced_grad, self._orig_dtype)
                 or need_synchronize
@@ -341,9 +347,9 @@ class MindSporeHSDPStateV2(HSDPState):
         """Drain pending sharded parameter reductions and materialize sharded grads."""
         need_synchronize = False
         while HSDPState.pre_reduce_scatter_params:
-            hsdp_param, pre_orig_dtype = HSDPState.pre_reduce_scatter_params.pop(0)
+            hsdp_param, pre_orig_dtype, need_div = HSDPState.pre_reduce_scatter_params.pop(0)
             reduced_grad = hsdp_param.reduce_scatter_output()
-            self._div_if_needed(reduced_grad, hsdp_param.shard_world_size)
+            self._div_if_needed(reduced_grad, hsdp_param.shard_world_size, need_div)
             hsdp_param.clear_reduce_scatter_output()
             need_synchronize = (
                 hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype)
@@ -351,9 +357,9 @@ class MindSporeHSDPStateV2(HSDPState):
             )
 
         while HSDPState.pre_all_reduce_params:
-            hsdp_param, pre_orig_dtype = HSDPState.pre_all_reduce_params.pop(0)
+            hsdp_param, pre_orig_dtype, need_div = HSDPState.pre_all_reduce_params.pop(0)
             reduced_grad = hsdp_param.all_reduce_output()
-            self._div_if_needed(reduced_grad, hsdp_param.replicate_world_size)
+            self._div_if_needed(reduced_grad, hsdp_param.replicate_world_size, need_div)
             hsdp_param.clear_all_reduce_output()
             need_synchronize = (
                 hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype)
@@ -396,7 +402,7 @@ class MindSporeHSDPStateV2(HSDPState):
             dtype=self._reduce_dtype,
             reduce_op=self.reduce_op_type
         )
-        HSDPState.pre_reduce_scatter_params.append((hsdp_param, self._orig_dtype))
+        HSDPState.pre_reduce_scatter_params.append((hsdp_param, self._orig_dtype, self._need_div))
         if not self._should_run_all_reduce(hsdp_param):
             return
         reduced_grad = hsdp_param.reduce_scatter_output()
@@ -406,14 +412,14 @@ class MindSporeHSDPStateV2(HSDPState):
         ):
             HSDPState.pre_reduce_scatter_params.pop()
         hsdp_param.clear_reduce_scatter_output()
-        self._div_if_needed(reduced_grad, hsdp_param.shard_size)
+        self._div_if_needed(reduced_grad, hsdp_param.shard_size, self._need_div)
         hsdp_param.all_reduce_grad(
             grad=reduced_grad,
             dtype=self._reduce_dtype,
             async_op=True,
             reduce_op=self.reduce_op_type,
         )
-        HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
+        HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype, self._need_div))
 
     def _queue_compat_all_reduce(self, hsdp_param):
         """Queue the compatibility all-reduce path without FSDP sharding."""
@@ -425,7 +431,7 @@ class MindSporeHSDPStateV2(HSDPState):
             async_op=True,
             reduce_op=self.reduce_op_type,
         )
-        HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
+        HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype, self._need_div))
 
     def post_backward(self, *_):
         for hsdp_param in self._iter_managed_params():
