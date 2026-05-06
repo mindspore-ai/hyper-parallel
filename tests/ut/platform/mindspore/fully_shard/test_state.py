@@ -208,6 +208,7 @@ class TestStateParamBookkeeping(unittest.TestCase):
         """post_backward should use layout-driven sizes and waitable sync reductions before applying grads."""
         HSDPState.pre_reduce_scatter_params.clear()
         HSDPState.pre_all_reduce_params.clear()
+        MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
         state = _make_state()
         reduce_scatter_out = MagicMock(return_value="sharded-grad")
         all_reduce_grad = MagicMock(return_value=("reduced-grad", None))
@@ -248,6 +249,61 @@ class TestStateParamBookkeeping(unittest.TestCase):
             async_op=True,
             reduce_op=ops.ReduceOp.SUM,
         )
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.state.dist.all_reduce")
+    def test_post_backward_reduces_direct_dtensor_compat_sharded_grad(self, mock_all_reduce):
+        """Pure-TP DTENSOR_COMPAT params should reduce grads stored on sharded_param.grad."""
+        HSDPState.pre_reduce_scatter_params.clear()
+        HSDPState.pre_all_reduce_params.clear()
+        MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
+        state = _make_state()
+        mock_all_reduce.return_value = "work"
+
+        hsdp_param = SimpleNamespace(
+            accumulate_unsharded_grad_if_needed=lambda: None,
+            param_mode=FullyShardParamMode.DTENSOR_COMPAT,
+            enable_fsdp_shard=True,
+            is_sharded=False,
+            shard_size=1,
+            dp_size=4,
+            sharded_param=SimpleNamespace(requires_grad=True, grad="grad"),
+            unsharded_group_info=GroupInfo("group", "layout-group", 4),
+        )
+        state.hsdp_params = [hsdp_param]
+
+        state.post_backward()
+
+        mock_all_reduce.assert_called_once_with(
+            "grad",
+            group="layout-group",
+            op=ops.ReduceOp.SUM,
+            async_op=True,
+        )
+        self.assertEqual(
+            MindSporeHSDPStateV2.pre_direct_all_reduce_grads,
+            [("work", "grad", "grad", 4, state._need_div)],
+        )
+        MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
+
+    def test_reduce_params_drains_direct_dtensor_compat_all_reduce(self):
+        """The direct compat queue should wait async work and copy cast buffers back."""
+        HSDPState.pre_reduce_scatter_params.clear()
+        HSDPState.pre_all_reduce_params.clear()
+        state = _make_state()
+        handle = MagicMock()
+        reduced_grad = MagicMock()
+        target_grad = MagicMock()
+        reduced_grad.dtype = "float32"
+        target_grad.dtype = "float32"
+        MindSporeHSDPStateV2.pre_direct_all_reduce_grads = [
+            (handle, reduced_grad, target_grad, 4, state._need_div)
+        ]
+
+        state.reduce_params()
+
+        handle.wait.assert_called_once_with()
+        target_grad.data.copy_.assert_called_once_with(reduced_grad)
+        self.assertEqual(MindSporeHSDPStateV2.pre_direct_all_reduce_grads, [])
 
 if __name__ == "__main__":
     unittest.main()

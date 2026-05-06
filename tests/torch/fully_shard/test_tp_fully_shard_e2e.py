@@ -57,6 +57,23 @@ def test_tp_fully_shard_typical_networks():
     card_mark="allcards",
     essential_mark="essential",
 )
+def test_pure_tp_replicate_grad_managed_by_fully_shard_matches_standalone():
+    """
+    Feature: fully_shard manages pure-TP replicated DTensor parameter gradients.
+    Description: Run a 1D TP-only case with fully_shard(mesh=None) and compare loss/grad with standalone.
+    Expectation: Distributed loss and gradients match standalone, without passing replicate_params.
+    """
+    master_port = 12375
+    case_name = "test_pure_tp_replicate_grad_managed_by_fully_shard_matches_standalone"
+    torchrun_case(_TEST_TP_FULLY_SHARD_E2E, case_name, master_port, num_proc=4)
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
 def test_hsdp_tp_comm_fusion_replicate_group_guards():
     """
     Feature: representative HSDP + TP + comm_fusion coverage for mixed replicate groups.

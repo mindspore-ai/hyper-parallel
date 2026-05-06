@@ -25,6 +25,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
 )
 from hyper_parallel.platform.mindspore.fully_shard.pack_utils import build_rs_plan
 from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
+from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_without_bumping_version
 from hyper_parallel.platform.mindspore.fully_shard.param_group import HSDPParamGroup, get_comm_ctx
 from hyper_parallel.platform.mindspore.utils import normalize_runtime_device
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
@@ -46,6 +47,11 @@ def _to_dtype_if_needed(
 
 class MindSporeHSDPStateV2(HSDPState):
     """MindSpore HSDP cell state"""
+    # DTensor compat parameters in pure-TP mode can accumulate gradients
+    # directly on ``sharded_param.grad`` without materializing an
+    # ``_unsharded_param``. Track those async all-reduces separately from the
+    # standard unsharded-gradient queues.
+    pre_direct_all_reduce_grads = []
 
     @staticmethod
     def _get_pending_unsharded_grad(hsdp_param):
@@ -62,6 +68,17 @@ class MindSporeHSDPStateV2(HSDPState):
         if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
             return False
         return hsdp_param.unsharded_param.grad is not None
+
+    @staticmethod
+    def _get_local_sharded_grad(hsdp_param):
+        """Return the local gradient tensor currently stored on ``sharded_param``."""
+        grad = hsdp_param.sharded_param.grad
+        if grad is None:
+            return None
+        to_local = getattr(grad, "to_local", None)
+        if callable(to_local):
+            return to_local()
+        return grad
 
     @staticmethod
     def _synchronize_current_stream_if_needed(need_synchronize: bool) -> None:
@@ -365,6 +382,17 @@ class MindSporeHSDPStateV2(HSDPState):
                 hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype)
                 or need_synchronize
             )
+        while MindSporeHSDPStateV2.pre_direct_all_reduce_grads:
+            handle, reduced_grad, target_grad, reduce_group_size, need_div = (
+                MindSporeHSDPStateV2.pre_direct_all_reduce_grads.pop(0)
+            )
+            if handle is not None:
+                handle.wait()
+            self._div_if_needed(reduced_grad, reduce_group_size, need_div)
+            if reduced_grad is not target_grad:
+                if reduced_grad.dtype != target_grad.dtype:
+                    reduced_grad = reduced_grad.to(target_grad.dtype)
+                copy_without_bumping_version(target_grad, reduced_grad)
         self._synchronize_current_stream_if_needed(need_synchronize)
 
     def post_backward_for_comm_fusion(self):
@@ -433,6 +461,41 @@ class MindSporeHSDPStateV2(HSDPState):
         )
         HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype, self._need_div))
 
+    def _can_direct_all_reduce_compat_grad(self, hsdp_param) -> bool:
+        """Whether ``hsdp_param`` should reduce its existing ``sharded_param.grad`` directly."""
+        return (
+            hsdp_param.param_mode == FullyShardParamMode.DTENSOR_COMPAT
+            and hsdp_param.enable_fsdp_shard
+            and not hsdp_param.is_sharded
+            and hsdp_param.shard_size == 1
+            and hsdp_param.sharded_param.requires_grad
+            and self._should_run_all_reduce(hsdp_param)
+            and self._get_local_sharded_grad(hsdp_param) is not None
+        )
+
+    def _queue_direct_compat_all_reduce(self, hsdp_param):
+        """Queue all-reduce for DTENSOR_COMPAT params whose grad stays on ``sharded_param``."""
+        grad = self._get_local_sharded_grad(hsdp_param)
+        if grad is None:
+            return
+        reduced_grad = _to_dtype_if_needed(grad, self._reduce_dtype)
+        reduce_group_info = getattr(hsdp_param, "unsharded_group_info", None)
+        reduce_group = reduce_group_info.group if reduce_group_info is not None else None
+        reduce_group_size = reduce_group_info.rank_size if reduce_group_info is not None else 1
+        handle = None
+        if reduce_group_size > 1:
+            if reduce_group is None:
+                raise RuntimeError("Expected a valid unsharded all-reduce group when rank_size > 1")
+            handle = dist.all_reduce(
+                reduced_grad,
+                group=reduce_group,
+                op=self.reduce_op_type,
+                async_op=True,
+            )
+        MindSporeHSDPStateV2.pre_direct_all_reduce_grads.append(
+            (handle, reduced_grad, grad, reduce_group_size, self._need_div)
+        )
+
     def post_backward(self, *_):
         for hsdp_param in self._iter_managed_params():
             hsdp_param.accumulate_unsharded_grad_if_needed()
@@ -444,6 +507,8 @@ class MindSporeHSDPStateV2(HSDPState):
             self._allreduce_replicate_params()
             for hsdp_param in self.hsdp_params:
                 if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
+                    if self._can_direct_all_reduce_compat_grad(hsdp_param):
+                        self._queue_direct_compat_all_reduce(hsdp_param)
                     continue
                 if not hsdp_param.sharded_param.requires_grad:
                     continue
