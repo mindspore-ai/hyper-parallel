@@ -1,0 +1,164 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Llama3 demo: tensor parallelism + fully_shard (FSDP2-style) on the Torch backend.
+
+Layout follows ``tests/torch/fully_shard/_test_tp_fully_shard_e2e.py``: a 2-D device mesh
+``(dp, tp)`` where ``parallelize_llama3`` uses the 1-D ``mesh["tp"]`` slice and
+``fully_shard`` uses the 1-D ``mesh["dp"]`` slice (FSDP shards parameters across DP ranks;
+TP keeps Colwise/Rowwise/sequence-parallel plans on the TP submesh).
+
+Run (from repo root or this directory), e.g. 4 ranks with ``tp=2``, ``dp=2``::
+
+    torchrun --nproc_per_node=4 fsdp_tp_example.py
+
+Optional environment variables:
+
+* ``LLAMA3_TP_SIZE`` — TP degree (default ``2``). ``world_size`` must be divisible by it.
+* ``LLAMA3_DEVICE_TYPE`` — ``npu`` or ``cuda`` (default ``npu``).
+
+Requirements:
+    * ``n_heads`` and ``n_kv_heads`` divisible by ``LLAMA3_TP_SIZE``.
+    * Sequence length divisible by TP size (sequence parallel).
+"""
+# pylint: disable=C0413
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+from hyper_parallel import SkipDTensorDispatch, fully_shard, init_device_mesh
+
+from model import Llama3DemoConfig, Llama3Model
+from parallelize import broadcast_state_dict_from_rank0, parallelize_llama3
+
+
+def _tp_size_from_env(world: int) -> int:
+    """Read tensor-parallel width from ``LLAMA3_TP_SIZE`` and validate against ``world``.
+
+    Args:
+        world: Current distributed world size (``torch.distributed.get_world_size()``).
+
+    Returns:
+        Positive TP degree such that ``world`` is divisible by it.
+
+    Raises:
+        ValueError: If the env var is not a positive integer, or if it does not divide ``world``.
+    """
+    raw = os.environ.get("LLAMA3_TP_SIZE", "2").strip()
+    try:
+        tp = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"LLAMA3_TP_SIZE must be an integer, got {raw!r}") from exc
+    if tp < 1:
+        raise ValueError("LLAMA3_TP_SIZE must be >= 1.")
+    if world % tp != 0:
+        raise ValueError(f"world_size ({world}) must be divisible by LLAMA3_TP_SIZE ({tp}).")
+    return tp
+
+
+def init_dist() -> tuple[int, int, str]:
+    """Initialize process group and bind one device per rank."""
+    if not dist.is_initialized():
+        dist.init_process_group()
+    rank = dist.get_rank()
+    world = dist.get_world_size()
+    device_type = os.environ.get("LLAMA3_DEVICE_TYPE", "npu").strip().lower()
+    if device_type == "npu":
+        torch.npu.set_device(rank)
+    elif device_type == "cuda":
+        torch.cuda.set_device(rank)
+    else:
+        raise ValueError(f"Unsupported LLAMA3_DEVICE_TYPE={device_type!r} (use npu or cuda).")
+    return rank, world, device_type
+
+
+def main() -> None:
+    rank, world, device_type = init_dist()
+    device = torch.device(device_type, rank)
+    tp_size = _tp_size_from_env(world)
+    dp_size = world // tp_size
+
+    mesh = init_device_mesh(
+        device_type=device_type,
+        mesh_shape=(dp_size, tp_size),
+        mesh_dim_names=("dp", "tp"),
+    )
+    tp_mesh = mesh["tp"]
+    dp_mesh = mesh["dp"]
+
+    cfg = Llama3DemoConfig(
+        dim=256,
+        n_layers=2,
+        n_heads=8,
+        n_kv_heads=4,
+        vocab_size=1024,
+        max_seq_len=128,
+    )
+    if cfg.n_heads % tp_size != 0 or cfg.n_kv_heads % tp_size != 0:
+        raise ValueError("n_heads and n_kv_heads must be divisible by TP size.")
+
+    torch.manual_seed(42 + rank)
+    model = Llama3Model(cfg).to(device=device)
+    broadcast_state_dict_from_rank0(model)
+    parallelize_llama3(model, tp_mesh)
+
+    for layer in model.layers:
+        fully_shard(layer, mesh=dp_mesh)
+    fully_shard(model, mesh=dp_mesh)
+    model.set_reduce_op_type("sum")
+
+    batch_size = 2
+    seq_len = 16
+    if seq_len % tp_size != 0:
+        raise ValueError("seq_len must be divisible by TP size for sequence parallel.")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    # Same minibatch on every rank (smoke test; DP uses identical data like ``fsdp_demo.py``).
+    torch.manual_seed(2026)
+    tokens = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
+    targets = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
+
+    for step in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(tokens)
+        loss = F.cross_entropy(
+            logits.float().reshape(-1, cfg.vocab_size),
+            targets.reshape(-1),
+        )
+        with SkipDTensorDispatch():
+            loss.backward()
+            optimizer.step()
+
+        if rank == 0:
+            print(
+                f"[fsdp_tp step {step}] loss={loss.item():.4f} "
+                f"(dp={dp_size}, tp={tp_size}, world={world})"
+            )
+
+
+if __name__ == "__main__":
+    main()
