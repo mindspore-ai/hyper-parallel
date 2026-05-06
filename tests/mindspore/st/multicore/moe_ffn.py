@@ -16,7 +16,7 @@
 
 The GMM and SwiGLU computations can be verified in isolation against
 MindSpore reference implementations.  Each checked output must satisfy
-  |kernel − ref| ≤ atol + rtol × |ref|   (rtol = atol = 1e-3, i.e. 0.1 %)
+  |kernel − ref| ≤ atol + rtol × |ref|   (rtol = atol = 1e-3, i.e., 0.1 %)
 on every element.
 
 Reference ops used (all run on Ascend):
@@ -84,7 +84,7 @@ _TOP_K             = 8
 _HIDDEN_SIZE       = 5120
 _INTERMEDIATE_SIZE = 2048   # post-SwiGLU half dimension; up_proj output width = intermediate_size * 2
 
-_NUM_CUBE_CORES              = 20
+_NUM_CUBE_CORES              = ms.runtime.get_device_limit(get_rank())["cube_core_num"]
 _GMM_WORKSPACE_BYTES         = 32 * 1024 * 1024
 _SWIGLU_GRAD_WORKSPACE_BYTES = 16 * 1024 * 1024
 

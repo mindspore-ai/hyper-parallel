@@ -633,7 +633,7 @@ pytest tests/mindspore/st/multicore/test_moe_ffn.py -v
 
 ```text
 hyper_parallel/core/multicore/
-├── models/
+├── modules/
 │   ├── common/
 │   │   ├── compute_graph.py        # TaskSplitValue / TensorSpec / SplitSpec / OperatorNode
 │   │   └── runtime_structs.py      # RuntimeConfigC / TaskDescC / TensorDescC（ctypes）
