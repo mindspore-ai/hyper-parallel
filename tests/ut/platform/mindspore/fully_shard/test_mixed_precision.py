@@ -583,7 +583,7 @@ class TestReplicateParamGradHandling(unittest.TestCase):
         state._finish_ignored_allreduce()
 
         param.all_reduce_handle.wait.assert_called_once_with()
-        reduced_grad.div_.assert_called_once_with(2.0)
+        reduced_grad.div_.assert_called_once_with(2)
         param.apply_reduced_grad.assert_called_once_with(reduced_grad, ms.float32)
         self.assertEqual(state._ignored_allreduce_works, [])
 
@@ -943,12 +943,12 @@ class TestAsyncReduceDrain(unittest.TestCase):
         param.reduce_scatter_output.return_value = reduced_grad
         param.shard_world_size = 2
         param.apply_reduced_grad.return_value = False
-        HSDPState.pre_reduce_scatter_params.append((param, ms.float32))
+        HSDPState.pre_reduce_scatter_params.append((param, ms.float32, True))
 
         state.reduce_params()
 
         param.reduce_scatter_output.assert_called_once_with()
-        state._div_if_needed.assert_called_once_with(reduced_grad, 2)
+        state._div_if_needed.assert_called_once_with(reduced_grad, 2, True)
         param.clear_reduce_scatter_output.assert_called_once_with()
         param.apply_reduced_grad.assert_called_once_with(reduced_grad, ms.float32)
         self.assertEqual(HSDPState.pre_reduce_scatter_params, [])
@@ -967,12 +967,12 @@ class TestAsyncReduceDrain(unittest.TestCase):
         param.all_reduce_output.return_value = reduced_grad
         param.replicate_world_size = 4
         param.apply_reduced_grad.return_value = False
-        HSDPState.pre_all_reduce_params.append((param, ms.float32))
+        HSDPState.pre_all_reduce_params.append((param, ms.float32, True))
 
         state.reduce_params()
 
         param.all_reduce_output.assert_called_once_with()
-        state._div_if_needed.assert_called_once_with(reduced_grad, 4)
+        state._div_if_needed.assert_called_once_with(reduced_grad, 4, True)
         param.clear_all_reduce_output.assert_called_once_with()
         param.apply_reduced_grad.assert_called_once_with(reduced_grad, ms.float32)
         self.assertEqual(HSDPState.pre_all_reduce_params, [])
@@ -985,7 +985,8 @@ class TestAsyncReduceDrain(unittest.TestCase):
         """
         state_a = object.__new__(MindSporeHSDPStateV2)
         state_b = object.__new__(MindSporeHSDPStateV2)
-        state_a._div_if_needed = MagicMock()
+        state_a._need_div = True
+        state_b._need_div = False
         state_b._div_if_needed = MagicMock()
 
         param = MagicMock()
@@ -993,14 +994,27 @@ class TestAsyncReduceDrain(unittest.TestCase):
         param.reduce_scatter_output.return_value = reduced_grad
         param.shard_world_size = 2
         param.apply_reduced_grad.return_value = False
-        HSDPState.pre_reduce_scatter_params.append((param, ms.float32))
+        HSDPState.pre_reduce_scatter_params.append((param, ms.float32, state_a._need_div))
 
         state_b.reduce_params()
 
         param.reduce_scatter_output.assert_called_once_with()
-        state_b._div_if_needed.assert_called_once_with(reduced_grad, 2)
+        state_b._div_if_needed.assert_called_once_with(reduced_grad, 2, True)
         param.apply_reduced_grad.assert_called_once_with(reduced_grad, ms.float32)
         self.assertEqual(HSDPState.pre_reduce_scatter_params, [])
+
+    def test_reduce_params_rejects_legacy_pending_tuple(self):
+        """
+        Feature: async reduce drain
+        Description: Reject legacy pending reduce metadata that does not include need_div
+        Expectation: reduce_params raises ValueError during 3-tuple unpack instead of silently inferring queue policy
+        """
+        state = object.__new__(MindSporeHSDPStateV2)
+        param = MagicMock()
+        HSDPState.pre_reduce_scatter_params.append((param, ms.float32))
+
+        with self.assertRaisesRegex(ValueError, r"not enough values to unpack"):
+            state.reduce_params()
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.state.ms.runtime.current_stream")
     def test_reduce_params_synchronizes_after_cpu_offload(self, mock_current_stream):
@@ -1020,7 +1034,7 @@ class TestAsyncReduceDrain(unittest.TestCase):
         param.reduce_scatter_output.return_value = reduced_grad
         param.shard_world_size = 2
         param.apply_reduced_grad.return_value = True
-        HSDPState.pre_reduce_scatter_params.append((param, ms.float32))
+        HSDPState.pre_reduce_scatter_params.append((param, ms.float32, True))
 
         state.reduce_params()
 
@@ -1051,8 +1065,8 @@ class TestAsyncReduceDrain(unittest.TestCase):
         param_b.replicate_world_size = 4
         param_b.apply_reduced_grad.return_value = True
 
-        HSDPState.pre_reduce_scatter_params.append((param_a, ms.float32))
-        HSDPState.pre_all_reduce_params.append((param_b, ms.float32))
+        HSDPState.pre_reduce_scatter_params.append((param_a, ms.float32, True))
+        HSDPState.pre_all_reduce_params.append((param_b, ms.float32, True))
 
         state.reduce_params()
 
@@ -1091,6 +1105,7 @@ class TestAsyncReducePostBackwardHelpers(unittest.TestCase):
         state._orig_dtype = ms.float32
         state.reduce_op_type = "reduce_op"
         state.requires_all_reduce = True
+        state._need_div = False
         pending_grad = MagicMock()
         state._get_pending_unsharded_grad = MagicMock(return_value=pending_grad)
         param = MagicMock()
@@ -1104,7 +1119,7 @@ class TestAsyncReducePostBackwardHelpers(unittest.TestCase):
             async_op=True,
             reduce_op="reduce_op",
         )
-        self.assertEqual(HSDPState.pre_all_reduce_params, [(param, ms.float32)])
+        self.assertEqual(HSDPState.pre_all_reduce_params, [(param, ms.float32, False)])
 
 
 class TestReduceScatterPackHelpers(unittest.TestCase):
