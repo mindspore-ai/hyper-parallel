@@ -3,3 +3,9 @@ squeeze:
   distributed_op_class: SqueezeDistributedOp
   distributed_op_file: parallel_squeeze
   infer_layout_suffix: WithShape
+
+Squeeze:
+  dist_op_name: _squeeze_dist_op
+  distributed_op_class: SqueezeDistributedOp
+  distributed_op_file: parallel_squeeze
+  infer_layout_suffix: WithShape
