@@ -26,6 +26,7 @@ import torch_npu
 
 from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.fully_shard.api import fully_shard
+from hyper_parallel.core.fully_shard.hsdp_utils import FullyShardParamMode
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.core.shard.api import shard_module
@@ -98,6 +99,25 @@ def _build_mesh(world_size: int, tp_size: int = 2):
         mesh_dim_names=("dp", "tp"),
     )
     return root_mesh, root_mesh["dp"], root_mesh["tp"], dp_size
+
+
+def _build_tp_only_mesh(world_size: int):
+    """
+    Build a pure-TP 1D mesh.
+
+    Input:
+        world_size: total process count from torchrun.
+    Expected output:
+        A 1D ``tp`` mesh that uses all ranks and does not add an explicit DP/FSDP dimension.
+    """
+    if world_size < 2:
+        return None, None
+    tp_mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(world_size,),
+        mesh_dim_names=("tp",),
+    )
+    return tp_mesh, world_size
 
 
 def _build_hsdp_tp_mesh(
@@ -742,6 +762,98 @@ def _assert_complex_replicate_param_comm_fusion_match_hsdp_tp_root_mesh(
     )
 
 
+def _assert_pure_tp_replicate_grad_managed_by_fully_shard(
+    *,
+    case_name: str,
+    steps: int,
+    batch_size: int,
+    input_size: int,
+    output_size: int,
+    input_seed: int,
+    label_seed: int,
+    init_seed: int,
+):
+    """
+    Run one pure-TP replicate case and compare standalone vs fully_shard(mesh=None).
+
+    Input:
+        Weight and input placements are both ``Replicate()`` on a 1D TP mesh.
+    Expected output:
+        1. Each training step produces the same loss as standalone.
+        2. Each rank's reduced gradient matches the standalone full gradient.
+        3. The parameter stays in hsdp_params and is not promoted to replicate_params.
+    """
+    rank, _ = init_dist()
+    world_size = torch.distributed.get_world_size()
+    tp_mesh, tp_size = _build_tp_only_mesh(world_size)
+    if tp_mesh is None:
+        print(f"[Rank {rank}] Skip {case_name} because world_size={world_size} is not multi-card.")
+        return
+
+    torch.manual_seed(1)
+    np.random.seed(1)
+
+    torch.manual_seed(input_seed)
+    input_data = torch.randn(batch_size, input_size).npu()
+    torch.manual_seed(label_seed)
+    label_data = torch.randn(batch_size, output_size).npu()
+
+    torch.manual_seed(init_seed)
+    standalone_model = TPFullyShardNet(input_size, output_size)
+    torch.manual_seed(init_seed)
+    dist_model = TPFullyShardNet(input_size, output_size)
+
+    standalone_grads, standalone_losses = _run_standalone_training(
+        standalone_model,
+        input_data,
+        label_data,
+        steps,
+        1,
+        0,
+    )
+    dist_losses, dist_grads = _run_pure_tp_fully_shard_training(
+        dist_model,
+        tp_mesh,
+        input_data,
+        label_data,
+        steps,
+    )
+
+    managed_param = dist_model.hsdp_scheduler.hsdp_state.hsdp_params[0]
+    assert dist_model.hsdp_scheduler.hsdp_state.replicate_params == []
+    assert managed_param.param_mode == FullyShardParamMode.DTENSOR_COMPAT
+    assert managed_param.enable_fsdp_shard is True
+    assert managed_param.is_sharded is False
+    assert managed_param.shard_size == 1
+    assert managed_param.dp_size == tp_size
+    assert [repr(placement) for placement in managed_param._spmd_placements] == ["Replicate()"]
+
+    for step_idx in range(steps):
+        assert np.allclose(
+            standalone_losses[step_idx].numpy(),
+            dist_losses[step_idx].numpy(),
+            rtol=1e-3,
+            atol=1e-3,
+        ), (
+            f"{case_name}, rank {rank}, step {step_idx}: expected loss "
+            f"{standalone_losses[step_idx].item()}, got {dist_losses[step_idx].item()}"
+        )
+        assert np.allclose(
+            standalone_grads[step_idx].numpy(),
+            dist_grads[step_idx].numpy(),
+            rtol=1e-3,
+            atol=1e-3,
+        ), (
+            f"{case_name}, rank {rank}, step {step_idx}: expected full grad shape "
+            f"{tuple(standalone_grads[step_idx].shape)}, got {tuple(dist_grads[step_idx].shape)}"
+        )
+
+    print(
+        f"[Rank {rank}] {case_name} passed with tp_mesh={tp_mesh.mesh_shape}, "
+        f"steps={steps}, grad_shape={tuple(dist_grads[-1].shape)}"
+    )
+
+
 def _run_standalone_training(model, x, y, steps, dp_size, dp_idx):
     """
     Run standalone training.
@@ -767,6 +879,65 @@ def _run_standalone_training(model, x, y, steps, dp_size, dp_idx):
             optimizer.step()
             optimizer.zero_grad()
     return grads, local_losses
+
+
+def _run_pure_tp_fully_shard_training(
+    model,
+    tp_mesh,
+    x,
+    y,
+    steps,
+):
+    """
+    Run pure-TP training with fully_shard(mesh=None) managing replicated DTensor gradients.
+
+    Input:
+        Weight and input are both replicated on the TP mesh.
+    Expected output:
+        Per-step losses and full gradients that match standalone after compat all-reduce.
+    """
+    x_placements = tuple(Replicate() for _ in range(tp_mesh.ndim))
+    w_placements = tuple(Replicate() for _ in range(tp_mesh.ndim))
+
+    sharding_plan = ShardingPlan(
+        plan={"weight": w_placements},
+        input_plan={"input": x_placements},
+        output_plan={"output": w_placements},
+    )
+    model = shard_module(model, device_mesh=tp_mesh, sharding_plan=sharding_plan)
+    model = fully_shard(
+        model,
+        mesh=None,
+        reshard_after_forward=True,
+        mp_policy=MixedPrecisionPolicy(
+            param_dtype=torch.float32,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+            cast_forward_inputs=True,
+        ),
+    )
+    model.set_reduce_op_type("sum")
+
+    optimizer = optim.SGD(model.parameters(), lr=0.01)
+    dist_x = DTensor.from_local(x, tp_mesh, x_placements)
+    dist_y = DTensor.from_local(y, tp_mesh, x_placements)
+    losses = []
+    grads = []
+    for _ in range(steps):
+        y_pred = model(dist_x)
+        loss = mse_loss_sum(y_pred, dist_y)
+        loss.backward(torch.tensor(1.0 / tp_mesh.size(), device=x.device))
+
+        local_loss = loss.to_local() if isinstance(loss, DTensor) else loss
+        grad = model.weight.grad
+        local_grad = grad.to_local() if isinstance(grad, DTensor) else grad
+        losses.append(local_loss.detach().cpu())
+        grads.append(local_grad.detach().cpu().clone())
+
+        with SkipDTensorDispatch():
+            optimizer.step()
+            optimizer.zero_grad()
+    return losses, grads
 
 
 def _run_standalone_training_with_replicated_scale(model, x, y, steps, dp_size, dp_idx):
@@ -1282,6 +1453,31 @@ def test_tp_plus_fully_shard_loss_and_grad_match_standalone():
         label_seed=3,
         init_seed=4,
         tp_size=2,
+    )
+
+
+def test_pure_tp_replicate_grad_managed_by_fully_shard_matches_standalone():
+    """
+    Feature: pure TP replicate parameters with fully_shard backward management.
+    Description:
+        1. Build a 1D TP mesh only, without an explicit DP/FSDP mesh.
+        2. Keep the weight replicated on the TP mesh and wrap the model with
+           ``fully_shard(mesh=None)``.
+        3. Compare per-step loss and reduced gradients with standalone.
+    Expectation:
+        1. Distributed loss equals standalone loss at each step.
+        2. Each rank's gradient equals the standalone full gradient.
+        3. The parameter stays in ``hsdp_params`` and uses the compat all-reduce route.
+    """
+    _assert_pure_tp_replicate_grad_managed_by_fully_shard(
+        case_name="pure_tp_replicate_fully_shard_case",
+        steps=2,
+        batch_size=16,
+        input_size=8,
+        output_size=8,
+        input_seed=72,
+        label_seed=73,
+        init_seed=74,
     )
 
 

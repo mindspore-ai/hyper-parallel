@@ -47,6 +47,12 @@ def _to_dtype_if_needed(
 
 class TorchHSDPStateV2(HSDPState):
     """Torch HSDP cell state"""
+    # DTensor compat parameters in pure-TP mode can accumulate gradients
+    # directly on ``sharded_param.grad`` without ever materializing an
+    # ``_unsharded_param``. Track their async all-reduce work separately from
+    # the standard unsharded-grad queues.
+    pre_direct_all_reduce_grads = []
+
     @staticmethod
     def _get_pending_unsharded_grad(hsdp_param):
         """Return the pending unsharded gradient tensor for all-reduce-based paths."""
@@ -62,6 +68,17 @@ class TorchHSDPStateV2(HSDPState):
         if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
             return False
         return hsdp_param.unsharded_param.grad is not None
+
+    @staticmethod
+    def _get_local_sharded_grad(hsdp_param):
+        """Return the local gradient tensor currently stored on ``sharded_param``."""
+        grad = hsdp_param.sharded_param.grad
+        if grad is None:
+            return None
+        to_local = getattr(grad, "to_local", None)
+        if callable(to_local):
+            return to_local()
+        return grad
 
     def __init__(self, cell, mesh_info, config, platform, device):
         """
@@ -353,6 +370,36 @@ class TorchHSDPStateV2(HSDPState):
         )
         HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
 
+    def _can_direct_all_reduce_compat_grad(self, hsdp_param) -> bool:
+        """Whether ``hsdp_param`` should reduce its existing ``sharded_param.grad`` directly."""
+        return (
+            hsdp_param.param_mode == FullyShardParamMode.DTENSOR_COMPAT
+            and hsdp_param.enable_fsdp_shard
+            and not hsdp_param.is_sharded
+            and hsdp_param.shard_size == 1
+            and hsdp_param.sharded_param.requires_grad
+            and self._should_run_all_reduce(hsdp_param)
+            and self._get_local_sharded_grad(hsdp_param) is not None
+        )
+
+    def _queue_direct_compat_all_reduce(self, hsdp_param, reduce_op):
+        """Queue all-reduce for DTENSOR_COMPAT params whose grad stays on ``sharded_param``."""
+        grad = self._get_local_sharded_grad(hsdp_param)
+        if grad is None:
+            return
+        reduced_grad = grad
+        if self._reduce_dtype is not None and reduced_grad.dtype != self._reduce_dtype:
+            reduced_grad = reduced_grad.to(self._reduce_dtype)
+        handle = None
+        if hsdp_param.unsharded_group_info.group is not None and hsdp_param.dp_size > 1:
+            handle = torch.distributed.all_reduce(
+                reduced_grad,
+                op=reduce_op,
+                group=hsdp_param.unsharded_group_info.group,
+                async_op=True,
+            )
+        TorchHSDPStateV2.pre_direct_all_reduce_grads.append((handle, reduced_grad, grad))
+
     def post_backward(self, *unused):  # pylint: disable=unused-argument
         """Reduce gradients and reshard parameters after backward."""
         for hsdp_param in self._iter_managed_params():
@@ -367,6 +414,9 @@ class TorchHSDPStateV2(HSDPState):
             self.reduce_params()
             for hsdp_param in self._iter_managed_params():
                 if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
+                    if self._can_direct_all_reduce_compat_grad(hsdp_param):
+                        reduce_op = self._resolve_reduce_op(hsdp_param)
+                        self._queue_direct_compat_all_reduce(hsdp_param, reduce_op)
                     continue
                 # Frozen parameters produce no gradient, so there is nothing to reduce.
                 if not hsdp_param.sharded_param.requires_grad:
@@ -415,6 +465,15 @@ class TorchHSDPStateV2(HSDPState):
             reduced_grad = pre_hsdp_param.all_reduce_output()
             pre_hsdp_param.clear_all_reduce_output()
             need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype) or need_synchronize
+
+        while TorchHSDPStateV2.pre_direct_all_reduce_grads:
+            handle, reduced_grad, target_grad = TorchHSDPStateV2.pre_direct_all_reduce_grads.pop(0)
+            if handle is not None:
+                handle.wait()
+            if reduced_grad is not target_grad:
+                if reduced_grad.dtype != target_grad.dtype:
+                    reduced_grad = reduced_grad.to(target_grad.dtype)
+                target_grad.copy_(reduced_grad)
         if need_synchronize:
             if self.device.type == "npu":
                 torch.npu.current_stream().synchronize()

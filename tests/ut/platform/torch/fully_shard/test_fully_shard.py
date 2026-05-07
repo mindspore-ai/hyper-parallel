@@ -1498,6 +1498,58 @@ class TestFullyShardMeshUtils(unittest.TestCase):
             torch.distributed.ReduceOp.SUM,
         )
 
+    def test_state_post_backward_reduces_direct_dtensor_compat_sharded_grad(self):
+        """Verify pure-TP DTENSOR_COMPAT params reduce grads that stay on sharded_param.grad."""
+        state = object.__new__(TorchHSDPStateV2)
+        state.hsdp_params = []
+        state.replicate_params = []
+        state.reduce_grads = True
+        state.reshard_after_backward = False
+        state.requires_all_reduce = True
+        HSDPState.pre_reduce_scatter_params = []
+        HSDPState.pre_all_reduce_params = []
+        TorchHSDPStateV2.pre_direct_all_reduce_grads = []
+        state._user_reduce_op_type = None
+        state._reduce_dtype = torch.float32
+        state._orig_dtype = torch.float32
+        state.reduce_params = MagicMock()
+        state._queue_compat_all_reduce = MagicMock()
+        state._queue_reduce_scatter_then_all_reduce = MagicMock()
+        state.comm_fusion = False
+        state.reduce_op_type = torch.distributed.ReduceOp.SUM
+
+        hsdp_param = MagicMock()
+        hsdp_param.accumulate_unsharded_grad_if_needed = MagicMock()
+        if hasattr(hsdp_param, "_unsharded_param"):
+            del hsdp_param._unsharded_param
+        hsdp_param.param_mode = FullyShardParamMode.DTENSOR_COMPAT
+        hsdp_param.enable_fsdp_shard = True
+        hsdp_param.is_sharded = False
+        hsdp_param.shard_size = 1
+        hsdp_param.dp_size = 4
+        hsdp_param.sharded_param.requires_grad = True
+        hsdp_param.sharded_param.grad = torch.ones(2, 2)
+        hsdp_param.unsharded_group_info.group = MagicMock()
+        state.hsdp_params.append(hsdp_param)
+
+        with patch("hyper_parallel.platform.torch.fully_shard.state.torch.distributed.all_reduce") as mock_all_reduce:
+            mock_all_reduce.return_value = "work"
+            TorchHSDPStateV2.post_backward(state)
+
+        state.reduce_params.assert_called_once()
+        state._queue_compat_all_reduce.assert_not_called()
+        state._queue_reduce_scatter_then_all_reduce.assert_not_called()
+        mock_all_reduce.assert_called_once_with(
+            hsdp_param.sharded_param.grad,
+            op=torch.distributed.ReduceOp.SUM,
+            group=hsdp_param.unsharded_group_info.group,
+            async_op=True,
+        )
+        self.assertEqual(TorchHSDPStateV2.pre_direct_all_reduce_grads, [
+            ("work", hsdp_param.sharded_param.grad, hsdp_param.sharded_param.grad)
+        ])
+        TorchHSDPStateV2.pre_direct_all_reduce_grads = []
+
     def test_state_post_backward_skips_all_reduce_when_disabled_for_replicate_params(self):
         """Verify requires_all_reduce=False suppresses compat all-reduce for replicate_params."""
         state = object.__new__(TorchHSDPStateV2)
