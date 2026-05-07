@@ -96,30 +96,35 @@ def _generate_permute_indices(
     counts_2d = counts.view(num_ranks, experts_per_rank)  # [R, E]
     num_tokens_per_expert = counts_2d.sum(dim=0)          # [E]
 
+    # ``total`` must be a host int because ``arange`` needs a scalar size.
+    # That single D2H drain is unavoidable.  Everything else stays on
+    # device — no per-block ``.item()`` in a loop.
     total = int(num_tokens_per_expert.sum())
     if total == 0:
         return counts.new_zeros(0, dtype=counts.dtype), num_tokens_per_expert
 
-    # Cumulative start position of each (rank, expert) block in the
-    # rank-major received buffer.
-    offsets = counts.new_zeros(num_ranks * experts_per_rank + 1)
-    offsets[1:] = counts.cumsum(0)
+    # ---- Vectorized expert-major permutation, no host stalls -----------
+    # Source offsets in the rank-major receive buffer for each (r, e) block.
+    src_offsets_rm = counts.cumsum(0) - counts            # [R*E], starts of each block
+    # Reorder src offsets to expert-major iteration order: block (e, r).
+    src_offsets_em = (
+        src_offsets_rm.view(num_ranks, experts_per_rank).T.contiguous().view(-1)
+    )                                                     # [E*R]
+    # Counts in expert-major iteration order.
+    counts_em = counts_2d.T.contiguous().view(-1)         # [E*R]
 
-    # Build permuted_indices by iterating expert-major order.
-    device = counts.device
-    permuted_indices = platform.arange(0, total, device=device)
-    dst = 0
-    for e in range(experts_per_rank):
-        for r in range(num_ranks):
-            n = int(counts_2d[r, e])
-            if n == 0:
-                continue
-            src_start = int(offsets[r * experts_per_rank + e])
-            permuted_indices[dst:dst + n] = platform.arange(
-                src_start, src_start + n, device=device
-            )
-            dst += n
+    # ``repeat_interleave`` expands each block's src start to one entry per
+    # token in that block — gives the source position of each output token.
+    block_src_starts = src_offsets_em.repeat_interleave(counts_em)   # [total]
 
+    # Destination block starts in expert-major order, then expanded.  The
+    # ``arange(total) - dst_block_starts_per_token`` produces 0..n-1 within
+    # each block, i.e. the intra-block offset.
+    dst_block_starts = counts_em.cumsum(0) - counts_em               # [E*R]
+    dst_block_starts_per_token = dst_block_starts.repeat_interleave(counts_em)
+    intra = platform.arange(0, total, device=counts.device) - dst_block_starts_per_token
+
+    permuted_indices = (block_src_starts + intra).long()
     return permuted_indices, num_tokens_per_expert
 
 
@@ -148,8 +153,10 @@ def _permute(x, tokens_per_expert_group, ep_degree: int, num_local_experts: int)
     permuted_indices, num_tokens_per_expert = _generate_permute_indices(
         tokens_per_expert_group, num_local_experts, ep_degree
     )
-    if permuted_indices.numel() == 0:
-        return original_shape, x.new_zeros(0, *x.shape[1:]), permuted_indices, num_tokens_per_expert
+    # ``x[permuted_indices]`` works for empty indices too (returns a
+    # shape-0 tensor with a real grad_fn).  Avoid the early-return with
+    # ``new_zeros`` which would produce a leaf tensor without grad_fn and
+    # silently break autograd for ranks that happen to receive zero tokens.
     permuted_x = x[permuted_indices]
     return original_shape, permuted_x, permuted_indices, num_tokens_per_expert
 
@@ -167,8 +174,12 @@ def _unpermute(out, original_shape, permuted_indices):
         Token tensor restored to the rank-major layout received after
         all-to-all, with shape ``original_shape``.
     """
-    if permuted_indices.numel() == 0:
-        return out.new_zeros(*original_shape)
+    # ``result[permuted_indices] = out`` is a differentiable scatter that
+    # also handles the empty-index case (no-op assignment, but autograd
+    # still connects ``result`` back to ``out``).  Do NOT short-circuit
+    # with a bare ``new_zeros`` — that returns a leaf tensor without
+    # grad_fn and the downstream combine a2a loses its backward path,
+    # which manifests as "element 0 of tensors does not require grad".
     result = out.new_zeros(*original_shape)
     result[permuted_indices] = out
     return result
@@ -325,26 +336,31 @@ class ExpertParallel(BaseExpertParallel):
 
         # --- Step 1: exchange token counts (no gradient needed) ---
         # Each rank needs to know how many tokens it will receive from every
-        # other rank (for each local expert).
-        counts_out, _ = platform.all_to_all_single(
+        # other rank (for each local expert).  Uses ``async_op=True`` + an
+        # explicit ``handle.wait()`` rather than ``async_op=False`` because
+        # the implicit cross-stream sync is NCCL-only; on HCCL the compute
+        # stream may read ``counts_out`` before the collective write is
+        # visible, producing garbage values that blow up the downstream
+        # ``torch.empty(sum(output_splits), ...)`` allocation.
+        counts_out, handle = platform.all_to_all_single(
             num_tokens_per_expert,
             output_shape=[num_tokens_per_expert.shape[0]],
             group=ep_group,
+            async_op=True,
         )
+        if handle is not None:
+            handle.wait()
         # counts_out shape: [ep_size * num_local_experts]
         # counts_out[r * num_local_experts + e] = tokens from rank r for expert e
 
         # --- Step 2: compute input / output splits ---
         # input_splits[r] = tokens this rank sends to rank r
-        input_splits = [
-            int(num_tokens_per_expert[r * num_local_experts:(r + 1) * num_local_experts].sum())
-            for r in range(ep_size)
-        ]
         # output_splits[r] = tokens this rank receives from rank r
-        output_splits = [
-            int(counts_out[r * num_local_experts:(r + 1) * num_local_experts].sum())
-            for r in range(ep_size)
-        ]
+        # Reshape to [ep_size, num_local_experts] and sum per rank on device;
+        # a single ``tolist()`` drains the rank-sum vector to host, replacing
+        # ``2 * ep_size`` scalar ``int()`` D2H syncs with 2.
+        input_splits = num_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1).tolist()
+        output_splits = counts_out.view(ep_size, num_local_experts).sum(dim=1).tolist()
         self._input_splits = input_splits
         self._output_splits = output_splits
 

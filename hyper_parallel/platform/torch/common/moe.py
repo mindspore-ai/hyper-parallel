@@ -66,17 +66,32 @@ def _run_experts_for_loop(
     Returns:
         Expert output of shape ``[total_routed_tokens, dim]``.
     """
-    output = torch.zeros_like(x)
+    # Use ``torch.cat`` instead of ``zeros_like + in-place slice assign``.
+    # On some backends (notably torch_npu) in-place slice assignment onto a
+    # ``requires_grad=False`` leaf tensor does not reliably upgrade it to a
+    # non-leaf with a ``grad_fn`` — the forward result may end up with
+    # ``grad_fn=None`` and downstream ``backward()`` fails with
+    # "element 0 of tensors does not require grad and does not have a grad_fn".
+    #
+    # Drain ``num_tokens_per_expert`` to host **once** via ``.tolist()``
+    # rather than calling ``int(n)`` per loop iteration — a single D2H
+    # copy instead of ``num_local_experts`` separate ones.  Per-iter
+    # ``.item()`` would stall the host between expert kernels and shrink
+    # the dual-pipe overlap window.
+    counts_list = num_tokens_per_expert.tolist()
+    parts = []
     offset = 0
-    for e, n in enumerate(num_tokens_per_expert):
-        n = int(n)
+    for e, n in enumerate(counts_list):
         if n == 0:
             continue
         x_e = x[offset:offset + n]
         h = F.silu(x_e @ w1[e].T) * (x_e @ w3[e].T)
-        output[offset:offset + n] = h @ w2[e].T
+        parts.append(h @ w2[e].T)
         offset += n
-    return output
+    if not parts:
+        # No routed tokens: return a grad-connected zero (not ``zeros_like``).
+        return x * 0.0
+    return torch.cat(parts, dim=0)
 
 
 def _run_experts_grouped_mm_gpu(
@@ -584,8 +599,13 @@ class MoE(nn.Module):
             expert_out = expert_out * top_scores_sorted.unsqueeze(1)
 
         # --- Scatter expert outputs back to token order ---
-        out = x_flat.new_zeros(num_tokens, dim)
-        out.scatter_add_(
+        # Use out-of-place ``scatter_add`` so autograd correctly records
+        # ``ScatterAddBackward``; ``new_zeros + scatter_add_`` on some
+        # backends (torch_npu) leaves the leaf un-upgraded and the result
+        # without a ``grad_fn``.
+        out = torch.zeros(
+            num_tokens, dim, dtype=x_flat.dtype, device=x_flat.device,
+        ).scatter_add(
             0,
             token_indices.unsqueeze(1).expand(-1, dim),
             expert_out,

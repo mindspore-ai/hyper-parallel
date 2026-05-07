@@ -618,6 +618,30 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement differentiable_async_a2a_wait")
 
     @staticmethod
+    def differentiable_sync_hook(x, hook_name: str, coordinator):
+        """Identity operation that intercepts both forward and backward to call
+        coordinator rendezvous, enabling deterministic comm/compute overlap.
+
+        This is the differentiable building block for dual-pipe schedules.
+        In the forward pass the coordinator is invoked with the forward-side
+        roles for ``hook_name``; in the backward pass it is invoked with the
+        backward-side roles.  The tensor value and gradient flow through
+        unchanged.
+
+        Args:
+            x:           Input tensor.  Returned as-is; gradients flow through.
+            hook_name:   One of ``"A"``, ``"B"``, ``"C"``, ``"D"`` identifying
+                         the position relative to MoE dispatch/combine.
+            coordinator: A :class:`HookCoordinator` instance shared between the
+                         forward and backward threads.
+
+        Returns:
+            The same tensor *x*, attached to the autograd graph so that the
+            backward hook will fire.
+        """
+        raise NotImplementedError("Platform subclasses must implement differentiable_sync_hook")
+
+    @staticmethod
     def differentiable_all_to_all_single(input_tensor, input_splits, output_splits, group):
         """Variable-split all-to-all single that supports gradient flow.
 
@@ -641,6 +665,33 @@ class Platform:
             NotImplementedError: Must be implemented by platform subclasses.
         """
         raise NotImplementedError("Platform subclasses must implement differentiable_all_to_all_single")
+
+    @staticmethod
+    def differentiable_all_to_all_single_async(input_tensor, input_splits, output_splits, group):
+        """Async variant of :meth:`differentiable_all_to_all_single`.
+
+        Same semantics but launches the collective with ``async_op=True`` and
+        only performs a stream-level ``wait`` — the host returns immediately
+        after dispatching the kernel.  Intended for dual-pipe comm/compute
+        overlap paths where the paired COMPUTE side's rendezvous notify must
+        fire right after kernel launch (not after the collective actually
+        completes on device).
+
+        Args:
+            input_tensor: Input tensor to scatter. Shape ``[sum(input_splits), *feature_dims]``.
+            input_splits: Per-rank sizes of data sent from this rank.
+            output_splits: Per-rank sizes of data received by this rank.
+            group: Process group.
+
+        Returns:
+            Output tensor of shape ``[sum(output_splits), *feature_dims]``.
+
+        Raises:
+            NotImplementedError: Must be implemented by platform subclasses.
+        """
+        raise NotImplementedError(
+            "Platform subclasses must implement differentiable_all_to_all_single_async"
+        )
 
     @staticmethod
     def arange(start, end=None, step=1, dtype=None, device=None):
