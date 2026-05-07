@@ -118,3 +118,35 @@ class DistributedOp:
                 or None if no expansion is needed.
         """
         return None
+
+    def wrap_output(self, py_output, output_layouts):
+        """Wrap local outputs into DTensors according to inferred layouts.
+
+        Subclasses may override this when a specific operator needs custom
+        packing semantics for certain output slots.
+        """
+        # pylint: disable=C0415
+        from hyper_parallel.core.dtensor.dtensor import DTensor
+
+        if isinstance(py_output, (tuple, list)):
+            if len(py_output) != len(output_layouts):
+                raise RuntimeError(
+                    f"Output tuple size ({len(py_output)}) "
+                    f"does not match layout tuple size ({len(output_layouts)})")
+            return tuple(
+                DTensor.from_local(item, layout.mesh, layout.alias_placements)
+                for item, layout in zip(py_output, output_layouts)
+            )
+
+        if isinstance(output_layouts, (tuple, list)):
+            if len(output_layouts) != 1:
+                raise RuntimeError(
+                    f"Scalar output expects a single layout, but got {len(output_layouts)} layouts"
+                )
+            output_layout = output_layouts[0]
+        else:
+            output_layout = output_layouts
+
+        return DTensor.from_local(
+            py_output, output_layout.mesh, output_layout.alias_placements
+        )

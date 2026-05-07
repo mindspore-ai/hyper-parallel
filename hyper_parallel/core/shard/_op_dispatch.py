@@ -544,8 +544,7 @@ class OpDispatcher:
             op_impl = func
 
         py_output = op_impl(*input_args, **input_kwargs)
-
-        return self._pack_infer_output(py_output, output_layout)
+        return distribute_op.wrap_output(py_output, output_layout)
 
     @staticmethod
     def _with_layout_infer_reshape(func: callable, *args) -> Tensor:
@@ -953,18 +952,6 @@ class OpDispatcher:
             raise RuntimeError(f"Operator {op_name} specified wrong suffix in parallel yaml.")
         return getattr(self, handler_name)(op_call, *args, **kwargs)
 
-    def _wrap_output(self, py_output, output_layouts) -> Tensor:
-        if isinstance(py_output, (tuple, list)):
-            if len(py_output) != len(output_layouts):
-                raise RuntimeError(
-                    f"Output tuple size ({len(py_output)}) "
-                    f"does not match layout tuple size ({len(output_layouts)})")
-            return tuple(
-                DTensor.from_local(item, layout.mesh, layout.alias_placements)
-                for item, layout in zip(py_output, output_layouts))
-        return DTensor.from_local(
-            py_output, output_layouts[0].mesh, output_layouts[0].alias_placements)
-
     def _dispatch_new(self, func, distribute_op, result) -> Tensor:
         """New dispatch flow using preprocess result.
 
@@ -993,7 +980,7 @@ class OpDispatcher:
         output_layouts, _ = infer_result
         op_impl = func if op_impl is None else op_impl
         py_output = op_impl(*local_args, **local_kwargs)
-        return self._wrap_output(py_output, output_layouts)
+        return distribute_op.wrap_output(py_output, output_layouts)
 
     def dispatch(self, op_call: callable, args: tuple, kwargs: dict) -> object:
         """Route an op call through the appropriate DTensor dispatch path.
