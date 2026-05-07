@@ -340,6 +340,7 @@ class TestDistributeModule(unittest.TestCase):
         root = self._leaf_module({})
         bad = _BadLeaf()
         root._modules_list = [root, bad]
+        root._named_list = [("", root), ("bad", bad)]
         mesh = self._mock_mesh(1)
 
         with patch("hyper_parallel.core.dtensor.dtensor.distribute_tensor", return_value=MagicMock(spec=DTensorBase)):
