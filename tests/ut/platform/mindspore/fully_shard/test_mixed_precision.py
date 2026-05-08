@@ -596,13 +596,13 @@ class TestParameterRebinding(unittest.TestCase):
         "hyper_parallel.platform.mindspore.fully_shard.param."
         "MindSporeHSDPParamV2._get_unsharded_param_from_all_gather_output"
     )
-    def test_init_unsharded_param_uses_parameter_empty_then_data_assign(
+    def test_init_unsharded_param_delays_requires_grad_until_after_data_assign(
         self, mock_get_unsharded_param, mock_parameter
     ):
         """
         Feature: init_unsharded_param
-        Description: Build _unsharded_param from Parameter([]) and then assign .data
-        Expectation: Parameter is constructed with [] and its data points to the unpacked tensor view
+        Description: Build _unsharded_param from Parameter([]), bind shared storage, then restore gradients
+        Expectation: Parameter is constructed frozen first so shape metadata is recorded after the real data lands
         """
         param = _new_hsdp_param_v2()
         param._orig_param_is_dtensor = False
@@ -614,6 +614,7 @@ class TestParameterRebinding(unittest.TestCase):
         unsharded_tensor = MagicMock(name="unsharded_tensor")
         mock_get_unsharded_param.return_value = unsharded_tensor
         unsharded_param = MagicMock(name="unsharded_param")
+        unsharded_param.requires_grad = False
         mock_parameter.return_value = unsharded_param
 
         param.init_unsharded_param()
@@ -621,11 +622,12 @@ class TestParameterRebinding(unittest.TestCase):
         mock_parameter.assert_called_once_with(
             [],
             name="weight",
-            requires_grad=True,
+            requires_grad=False,
         )
         mock_get_unsharded_param.assert_called_once_with()
         self.assertIs(param._unsharded_param, unsharded_param)
         self.assertIs(unsharded_param.data, unsharded_tensor)
+        self.assertIs(unsharded_param.requires_grad, True)
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.param.set_requires_grad_if_needed")
     def test_to_unsharded_rebinds_module_param(self, mock_set_requires_grad):
