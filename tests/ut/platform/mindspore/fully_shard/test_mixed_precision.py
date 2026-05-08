@@ -953,6 +953,7 @@ class TestAsyncReduceDrain(unittest.TestCase):
         """
         state = object.__new__(MindSporeHSDPStateV2)
         state._div_if_needed = MagicMock()
+        state.gradient_scaling_factor = None
 
         param = MagicMock()
         reduced_grad = MagicMock()
@@ -977,6 +978,7 @@ class TestAsyncReduceDrain(unittest.TestCase):
         """
         state = object.__new__(MindSporeHSDPStateV2)
         state._div_if_needed = MagicMock()
+        state.gradient_scaling_factor = None
 
         param = MagicMock()
         reduced_grad = MagicMock()
@@ -1004,6 +1006,7 @@ class TestAsyncReduceDrain(unittest.TestCase):
         state_a._need_div = True
         state_b._need_div = False
         state_b._div_if_needed = MagicMock()
+        state_b.gradient_scaling_factor = None
 
         param = MagicMock()
         reduced_grad = MagicMock()
@@ -1041,6 +1044,7 @@ class TestAsyncReduceDrain(unittest.TestCase):
         """
         state = object.__new__(MindSporeHSDPStateV2)
         state._div_if_needed = MagicMock()
+        state.gradient_scaling_factor = None
 
         stream = MagicMock()
         mock_current_stream.return_value = stream
@@ -1065,6 +1069,7 @@ class TestAsyncReduceDrain(unittest.TestCase):
         """
         state = object.__new__(MindSporeHSDPStateV2)
         state._div_if_needed = MagicMock()
+        state.gradient_scaling_factor = None
 
         stream = MagicMock()
         mock_current_stream.return_value = stream
@@ -1129,8 +1134,9 @@ class TestAsyncReducePostBackwardHelpers(unittest.TestCase):
 
         state._queue_compat_all_reduce(param)
 
+        # Pure all-reduce path passes grad=None so all_reduce_grad fetches the
+        # unsharded grad itself and owns the scaling (mirrors the torch side).
         param.all_reduce_grad.assert_called_once_with(
-            grad=pending_grad,
             dtype=ms.float16,
             async_op=True,
             reduce_op="reduce_op",

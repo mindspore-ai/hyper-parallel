@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """HSDP cell state"""
-from typing import List, Tuple, Union
+from typing import Any, List, Tuple, Union
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
@@ -137,6 +137,20 @@ class HSDPState:
                 for param in self.sharded_hsdp_params:
                     param.wait_for_unshard()
             self.is_shard = False
+
+    def set_gradient_scaling_factor(self, factor):
+        """Propagate the gradient scaling factor to the layer that applies it.
+
+        The factor is consumed on the reduce input: ``param_group.foreach_reduce``
+        for the fused (comm_fusion) path, or per-parameter ``reduce_scatter_grad``
+        / ``all_reduce_grad`` otherwise. The state does not hold a copy.
+        """
+        param_group = getattr(self, "param_group", None)
+        if param_group is not None:
+            param_group.gradient_scaling_factor = factor
+        else:
+            for hsdp_param in self._iter_managed_params():
+                hsdp_param.gradient_scaling_factor = factor
 
     def _iter_managed_params(self):
         """Return all fully_shard-managed parameters, including replicate_params."""

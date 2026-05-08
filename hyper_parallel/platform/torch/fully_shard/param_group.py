@@ -36,6 +36,7 @@ from contextlib import ExitStack
 import torch
 import torch.distributed as dist
 from torch.distributed import Work
+from hyper_parallel.core.fully_shard.hsdp_utils import apply_gradient_scaling_factor
 from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
     FSDPMeshInfo,
@@ -349,6 +350,7 @@ class HSDPParamGroup:
         self._flat_cast_buffer = None  # Cast buffer for mixed precision (param_dtype)
         if self.enable_zero_copy:
             self._init_flat_param_buffer()
+        self.gradient_scaling_factor = None
 
     def _infer_layout_replicate_group(self):
         """Infer a compatibility all-reduce group from params' final DTensor layout when mesh_info has none.
@@ -692,7 +694,7 @@ class HSDPParamGroup:
     def foreach_reduce(
         self,
         reduce_scatter_reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG,
-        async_op: bool = True
+        async_op: bool = True,
     ) -> Optional[torch.Tensor]:
         """Perform fused gradient reduction (reduce-scatter + optional all-reduce).
 
@@ -738,6 +740,8 @@ class HSDPParamGroup:
         reduce_scatter_input = torch.empty((reduce_scatter_input_numel,), dtype=reduce_dtype, device=device)
         reduce_scatter_copy_in(hsdp_params, unsharded_grads, reduce_scatter_input, world_size)
         unsharded_grads.clear()  # Release references to full gradients
+        # Captured here, consumed once in _apply_reduced_grad after all collectives
+        # complete. Async paths cross method boundaries, so the field is unavoidable.
         reduce_output = reduce_scatter_input.new_empty((reduce_scatter_output_numel,))
         self._needs_avg_div = reduce_scatter_reduce_op == dist.ReduceOp.AVG
         comm_op = dist.ReduceOp.SUM if self._needs_avg_div else reduce_scatter_reduce_op
@@ -751,6 +755,7 @@ class HSDPParamGroup:
         self._active_replicate_buckets = self._build_active_replicate_buckets(hsdp_params)
         self._allocate_bucket_buffers_if_needed(reduce_output.device, reduce_output.dtype)
         self._pending_all_reduce_handles = []
+        apply_gradient_scaling_factor(reduce_scatter_input, self.gradient_scaling_factor)
         rs_handle = dist.reduce_scatter_tensor(
             output=reduce_output,
             input=reduce_scatter_input,
@@ -860,6 +865,8 @@ class HSDPParamGroup:
         flat_grad_offset = 0
         if self._reduce_hsdp_params is None:
             return
+        # All collectives have completed; scale once on the fused buffer right
+        # before slicing it into per-parameter sharded grads.
         for hsdp_param in self._reduce_hsdp_params:
             # Determine target gradient tensor (regular .grad or fp32 main_grad)
             sharded_grad = None

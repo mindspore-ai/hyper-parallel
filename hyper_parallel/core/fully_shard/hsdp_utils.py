@@ -330,4 +330,17 @@ def get_hsdp_state(module):
         scheduler = getattr(module, "hsdp_scheduler", None)
         if scheduler is not None:
             return scheduler.hsdp_state
+
+
+def apply_gradient_scaling_factor(reduced_grad: Any, factor: Any) -> None:
+    """In-place scale ``reduced_grad`` by ``factor`` (no-op when ``factor`` is ``None``).
+
+    Tensor factors are cast to ``reduced_grad``'s dtype so the multiply stays
+    in the reduction precision (e.g. fp32 accumulation, bf16 reduce).
+    """
+    if factor is None:
+        return
+    if isinstance(factor, platform.Tensor) and factor.dtype != reduced_grad.dtype:
+        factor = factor.to(reduced_grad.dtype)
+    reduced_grad.mul_(factor)
     return None

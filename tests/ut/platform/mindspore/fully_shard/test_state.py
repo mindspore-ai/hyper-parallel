@@ -293,6 +293,7 @@ class TestStateParamBookkeeping(unittest.TestCase):
             dp_size=4,
             sharded_param=SimpleNamespace(requires_grad=True, grad=grad),
             unsharded_group_info=GroupInfo("group", "layout-group", 4),
+            gradient_scaling_factor=None,
         )
         state.hsdp_params = [hsdp_param]
 
@@ -552,6 +553,7 @@ class TestStateParamBookkeeping(unittest.TestCase):
             unsharded_grad_data=normalized_grad,
             unsharded_group_info=GroupInfo("group", "layout-group", 4),
             all_reduce_handle=None,
+            gradient_scaling_factor=None,
             apply_reduced_grad=MagicMock(return_value=False),
             accumulate_unsharded_grad_if_needed=MagicMock(),
         )
@@ -617,6 +619,7 @@ class TestStateParamBookkeeping(unittest.TestCase):
             unsharded_grad_data=grad,
             shard_size=1,
             dp_size=1,
+            gradient_scaling_factor=None,
             apply_reduced_grad=MagicMock(return_value=False),
         )
         state = _make_state()

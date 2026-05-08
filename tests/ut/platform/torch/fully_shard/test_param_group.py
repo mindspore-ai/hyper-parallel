@@ -144,6 +144,7 @@ def _new_param_group(params, *, world_size=2, enable_zero_copy=False):
     group._reduce_dtype = torch.float32
     group._flat_param_buffer = None
     group._flat_cast_buffer = None
+    group.gradient_scaling_factor = None
     return group
 
 

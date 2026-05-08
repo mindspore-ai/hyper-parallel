@@ -26,6 +26,7 @@ from mindspore.common.api import _no_grad
 import mindspore.mint.distributed as dist
 from mindspore.ops.function.comm_func import CommHandle
 
+from hyper_parallel.core.fully_shard.hsdp_utils import apply_gradient_scaling_factor
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, HSDPMeshInfo, MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_without_bumping_version
 from hyper_parallel.platform.mindspore.fully_shard.pack_utils import build_rs_plan, pack_for_reduce_scatter
@@ -256,6 +257,7 @@ class HSDPParamGroup:
         self._init_mp_dtypes()
         if self.enable_zero_copy_param_buffer:
             self._init_flat_param_buffer()
+        self.gradient_scaling_factor = None
 
     def _infer_layout_replicate_group(self):
         replicate_groups = []
@@ -561,6 +563,8 @@ class HSDPParamGroup:
         device = _normalize_device(unsharded_grads[0].device)
         reduce_scatter_input = ms.mint.empty((reduce_scatter_input_numel,), dtype=reduce_dtype, device=device)
         reduce_scatter_copy_in(hsdp_params, unsharded_grads, reduce_scatter_input, world_size)
+        # Captured here, consumed once in _apply_reduced_grad after all collectives
+        # complete. Async paths cross method boundaries, so the field is unavoidable.
         reduce_output = ms.mint.empty((reduce_scatter_output_numel,), dtype=reduce_dtype, device=device)
         self._needs_avg_div = needs_avg_div
         self._reduce_op = reduce_scatter_reduce_op
@@ -581,6 +585,7 @@ class HSDPParamGroup:
             else:
                 self.apply_fusion_reduced_grad()
             return self._reduce_output
+        apply_gradient_scaling_factor(reduce_scatter_input, self.gradient_scaling_factor)
         rs_handle = dist.reduce_scatter_tensor(
             output=reduce_output,
             input=reduce_scatter_input,
@@ -656,6 +661,8 @@ class HSDPParamGroup:
         flat_grad_offset = 0
         if self._reduce_hsdp_params is None or self._reduce_output is None:
             return
+        # All collectives have completed; scale once on the fused buffer right
+        # before slicing it into per-parameter sharded grads.
         for hsdp_param in self._reduce_hsdp_params:
             shard_numel = _shape_numel(hsdp_param.sharded_size)
             new_sharded_grad = self._reduce_output.narrow(0, flat_grad_offset, shard_numel)

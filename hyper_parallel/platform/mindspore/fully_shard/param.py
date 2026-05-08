@@ -34,6 +34,7 @@ from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     ShardedState,
     FullyShardParamMode,
+    apply_gradient_scaling_factor,
     unwrap_dtensor_param,
 )
 from hyper_parallel.core.dtensor.placement_types import Shard, StridedShard
@@ -192,6 +193,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
                 lambda *args, **kwargs: self.reset_sharded_param()
             )
         )
+        self.gradient_scaling_factor = None
 
     @property
     def uses_param_shard(self) -> bool:
@@ -767,7 +769,8 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         )
         plan = build_rs_plan(self, grad, plan_world_size)
         grad_flat = pack_for_reduce_scatter(grad, plan).reshape(-1)
-
+        # apply gradient_scaling_factor (reduce-scatter leg)
+        apply_gradient_scaling_factor(grad_flat, self.gradient_scaling_factor)
         # If parameter is not sharded (below threshold), no reduce-scatter needed
         if not self.is_sharded:
             return grad_flat, None
@@ -808,21 +811,28 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         grad: Optional[ms.Tensor] = None,
         dtype: Optional[ms.Type] = None,
         async_op: bool = True,
-        reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.SUM
+        reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.SUM,
     ) -> Tuple[ms.Tensor, Optional[CommHandle]]:
         """
         Perform all-reduce on gradient (across replicate dimension in HSDP mode).
 
         Args:
-            grad: Gradient tensor to reduce. If None, will use unsharded_param.grad
-                or unsharded_accumulated_grad based on use_accumulated_grad flag.
+            grad: Gradient tensor to reduce. If None, this is a pure all-reduce
+                path (no preceding reduce-scatter): the unsharded grad is fetched
+                here and ``gradient_scaling_factor`` is applied in this leg. If a
+                grad is passed in, it is the already-scaled output of
+                ``reduce_scatter_grad`` (chained HSDP all-reduce) and is not
+                scaled again. Whether the grad is fetched here is therefore the
+                signal for which leg owns the scaling -- no extra flag needed.
             async_op: Whether to execute asynchronously.
             reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.SUM.
 
         Returns:
             (reduced_grad, handle): Reduced gradient and communication handle.
         """
-        # If grad is not provided, get from parameter
+        # grad is None => pure all-reduce path: fetch the unsharded grad and own
+        # the scaling here, since it never went through reduce_scatter_grad.
+        scale_here = grad is None
         if grad is None:
             if self.unsharded_accumulated_grad is not None:
                 grad = self.unsharded_accumulated_grad_data
@@ -833,6 +843,10 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
         if dtype is not None and dtype != grad.dtype:
             grad = grad.to(dtype)
+        if scale_here:
+            # all-reduce below is in-place on grad, so scaling in-place here keeps
+            # the same semantics: reduce(g_i * factor) == factor * reduce(g_i).
+            apply_gradient_scaling_factor(grad, self.gradient_scaling_factor)
         reduce_group_info = self.unsharded_group_info
         if reduce_group_info.rank_size <= 1:
             return grad, None
@@ -876,7 +890,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         Reshapes ``reduced_grad`` to match the local shard, optionally
         offloads to CPU, then accumulates or assigns onto
         ``self.sharded_param.grad``.
-
         Args:
             reduced_grad (ms.Tensor): Gradient after reduce-scatter
                 and/or all-reduce.
