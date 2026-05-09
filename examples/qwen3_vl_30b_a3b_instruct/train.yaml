@@ -1,0 +1,62 @@
+# Alignment-regression config: validated 1c↔FSDP4 ≤0.005 step-loss diff (≤1 bf16 ULP at small-loss reporting precision); text num_hidden_layers=4 + frozen visual tower, vl_dummy synthetic batches.
+model:
+  name: qwen3_vl_moe
+  weights_path: /path/to/Qwen3-VL-30B-A3B-Instruct
+  tokenizer_path: /path/to/Qwen3-VL-30B-A3B-Instruct
+  freeze_modules:
+    - model.visual
+  config_overrides:
+    vl: true
+    text_config:
+      num_hidden_layers: 4
+
+data:
+  type: vl_dummy
+  max_seq_len: 64
+  vl_grid_t: 2
+  vl_grid_h: 2
+  vl_grid_w: 2
+
+train:
+  max_steps: 20
+  num_train_epochs: 1
+  global_batch_size: 4
+  micro_batch_size: 1
+  seed: 1234
+  backend: torch
+  init_device: meta
+
+  accelerator:
+    dp_shard: 4
+    comm_fusion: true
+
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 0.0
+    lr_decay_style: cosine
+    lr_warmup_ratio: 0.1
+    max_grad_norm: 1.0e9
+    weight_decay: 0.0
+    loss_aggregation: rank_average
+
+  mixed_precision:
+    enabled: true
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    output_dtype: bfloat16
+
+  gradient_checkpointing:
+    activation_checkpoint: full
+
+  checkpoint:
+    output_dir: outputs/qwen3_vl_moe
+    save_steps: 0
+    save_hf_weights: false
+
+  logging:
+    log_steps: 1
+    report_throughput: false
+
+  debug:
+    deterministic: true

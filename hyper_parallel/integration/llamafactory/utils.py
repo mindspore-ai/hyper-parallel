@@ -323,13 +323,49 @@ def _is_fsdp2_wrapped_model(model: nn.Module) -> bool:
     )
 
 
+def _resolve_shard_size(mesh) -> int:
+    """Return the FSDP shard-dim size for a 1D FSDP or 2D HSDP mesh.
+
+    HP ``fully_shard`` builds ``FSDPMeshInfo(shard_mesh_dim=0)`` for a 1D mesh
+    and ``HSDPMeshInfo(shard_mesh_dim=1, replicate_mesh_dim=0)`` for a 2D mesh
+    (see ``platform/*/fully_shard/scheduler.py``). In both cases the shard
+    dim is the last mesh dim, so ``mesh.mesh_shape[-1]`` gives the actual
+    per-param shard count regardless of HSDP layout.
+    """
+    if mesh is None:
+        return get_platform().get_world_size()
+    shape = getattr(mesh, "mesh_shape", None)
+    if shape:
+        return int(shape[-1])
+    return mesh.size() if hasattr(mesh, "size") else get_platform().get_world_size()
+
+
+def _collect_replicate_params(model: nn.Module, shard_size: int) -> set:
+    """Collect params whose dim-0 isn't divisible by ``shard_size``.
+
+    HP ``fully_shard`` raises ``Uneven sharding on dim 0`` for such params
+    (e.g. ``shared_expert_gate.weight`` of shape ``(1, hidden)`` on
+    ``shard_size > 1``). Routing them through ``replicate_params`` makes
+    them DDP-replicated along the shard dim instead.
+    """
+    replicate = set()
+    if shard_size <= 1:
+        return replicate
+    for _, param in model.named_parameters():
+        if param.dim() == 0:
+            continue
+        if param.size(0) % shard_size != 0:
+            replicate.add(param)
+    return replicate
+
+
 def _build_fsdp2_kwargs(accelerator, model: nn.Module, hp_args, fsdp2_plugin) -> dict:
     """Build fully_shard kwargs from accelerator and plugin settings."""
     mesh = _build_device_mesh(accelerator, hp_args)
     reshard_after_forward = fsdp2_plugin.reshard_after_forward
     if hp_args.reshard_after_forward is not None:
         reshard_after_forward = hp_args.reshard_after_forward
-    return {
+    kwargs = {
         "reshard_after_forward": reshard_after_forward,
         "offload_policy": _resolve_offload_policy(fsdp2_plugin),
         "mp_policy": _resolve_mp_policy(fsdp2_plugin, hp_args),
@@ -337,6 +373,10 @@ def _build_fsdp2_kwargs(accelerator, model: nn.Module, hp_args, fsdp2_plugin) ->
         "ignored_params": get_parameters_from_modules(fsdp2_plugin.ignored_modules, model, accelerator.device),
         "comm_fusion": True,
     }
+    replicate_params = _collect_replicate_params(model, _resolve_shard_size(mesh))
+    if replicate_params:
+        kwargs["replicate_params"] = replicate_params
+    return kwargs
 
 
 def _model_has_4bit_params(model: nn.Module) -> bool:
