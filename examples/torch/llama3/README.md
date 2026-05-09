@@ -15,6 +15,7 @@
 | `tensor_parallel_example.py` | **仅 TP：**一维 `DeviceMesh`，`world_size` 等于 TP 宽度；短训练循环。 |
 | `fsdp_tp_example.py` | **TP + `fully_shard`：**二维 mesh `(dp, tp)`，TP 用 `mesh["tp"]`，FSDP 用 `mesh["dp"]`；对子层与根模块嵌套 `fully_shard`。 |
 | `tp_cp_example.py` | **TP + CP：**构建 `Llama3Model`（`n_layers=2`），`parallelize_llama3(..., mesh["tp"])`，再对**每一层**的 `layer.attention.sdpa_core` 在 `mesh["cp"]` 上应用 `ContextParallel`。各 CP rank 处理长度为 `seq_len / cp` 的 token 窗口；通过 `rope_seq_start` 使 RoPE 与 embedding 后的 CP 窗口对齐。 |
+| `dp_tp_cp_sp_fsdp_example.py` | **8 卡综合：DP + TP + CP + SP + FSDP2。**4-D mesh `(dp, fsdp, cp, tp)`，TP+SP 用 `mesh["tp"]`，CP 用 `mesh["cp"]`，FSDP2/HSDP 用 `mesh[("dp", "fsdp")]`（参数在 `fsdp` 内分片、在 `dp` 上复制；`dp=1` 时退化为纯 FSDP2）。 |
 | `__init__.py` | 再导出主要符号；示例脚本会把本目录加入 `sys.path`。 |
 
 ---
@@ -98,6 +99,55 @@ torchrun --nnodes=1 --nproc_per_node=4 tp_cp_example.py
 约束：**`seq_len % cp == 0`**，**`(seq_len / cp) % tp == 0`**（保证 Rowwise embedding 的序列分片均匀），且 **`n_heads` / `n_kv_heads` 能被 `tp` 整除**。
 
 脚本会设置 `HYPER_PARALLEL_PLATFORM=torch`。
+
+---
+
+## 运行四：8 卡综合（DP + TP + CP + SP + FSDP2）
+
+`dp_tp_cp_sp_fsdp_example.py` 在 4-D `DeviceMesh` `(dp, fsdp, cp, tp)` 上同时启用：
+
+| 维度 | 组件 | 说明 |
+|------|------|------|
+| `mesh["tp"]` | **TP + SP** | `parallelize_llama3` 的 TorchTitan 风格方案：`Colwise/Rowwise` 线性 + `SequenceParallel` 范数 + `Shard(1)` 序列维激活。 |
+| `mesh["cp"]` | **CP** | `ContextParallel(seq_dim=1, head_dim=2, ulysses_degree=1)` 挂在每个 `layer.attention.sdpa_core`（Colossal CP，BSHD Q/K/V）。 |
+| `mesh[("dp", "fsdp")]` | **FSDP2 + DP** | `fully_shard` 用 2-D HSDP 切片：参数在 `fsdp` 组内分片、在 `dp` 组上复制；`dp=1` 即纯 FSDP2，`dp>=2` 即 HSDP。 |
+
+需满足 **`world_size == dp * fsdp * cp * tp`**。默认 `(dp, fsdp, cp, tp) = (1, 2, 2, 2)`，即 8 卡。
+
+```bash
+cd examples/torch/llama3
+torchrun --nnodes=1 --nproc_per_node=8 dp_tp_cp_sp_fsdp_example.py
+```
+
+也可在仓库根目录执行：
+
+```bash
+torchrun --nnodes=1 --nproc_per_node=8 examples/torch/llama3/dp_tp_cp_sp_fsdp_example.py
+```
+
+可选环境变量（默认见括号）：
+
+| 变量 | 含义 | 默认 |
+|------|------|------|
+| `LLAMA3_DP_SIZE` | 外层（HSDP 复制）DP 宽度 | `1` |
+| `LLAMA3_FSDP_SIZE` | FSDP2 分片宽度 | `2` |
+| `LLAMA3_CP_SIZE` | 上下文并行宽度 | `2` |
+| `LLAMA3_TP_SIZE` | 张量并行宽度（含 SP） | `2` |
+| `LLAMA3_DEVICE_TYPE` | `npu` 或 `cuda` | `npu` |
+
+约束：**`n_heads` / `n_kv_heads` 能被 `tp` 整除**；**`seq_len % cp == 0`**；**`(seq_len / cp) % tp == 0`**（保证每个 CP 窗口内的 SP 序列分片均匀）。
+
+8 卡常见组合（`dp * fsdp * cp * tp = 8`）：
+
+| `dp` | `fsdp` | `cp` | `tp` | 说明 |
+|------|--------|------|------|------|
+| 1 | 2 | 2 | 2 | 默认；纯 FSDP2 + CP + TP/SP。 |
+| 2 | 2 | 1 | 2 | HSDP（DP 复制 × FSDP 分片）+ TP/SP，关闭 CP。 |
+| 1 | 4 | 1 | 2 | 大 FSDP 分片 + TP/SP。 |
+
+> **注意：当 `fully_shard` 把 TP-DTensor 权重提升到 ≥3-D mesh 且活动 `(tp,)` 输入仍为 1-D 时（如 `dp=2, fsdp=1, cp=2, tp=2`），库内 layout-infer 路径还不支持权重 mesh 是输入 mesh 超集的情况：先在 `parallel_embedding.infer_layout` 触发 `int - tuple` 类型错误，进一步还会卡在 `parallel_matmul` 的 `x_mesh_shape != w_mesh_shape` 检查上。**如需"纯 DP（不分片参数）+ TP/SP/CP"，建议改用 `(dp=1, fsdp=2, cp=2, tp=2)`（默认）或上面的 HSDP 组合，等库内修复后再启用 `fsdp=1`。
+
+脚本会设置 `HYPER_PARALLEL_PLATFORM=torch`，并在所有 rank 上对 `tokens` / `targets` 做一次广播确保同样输入（冒烟用法，与 `fsdp_tp_example.py` 一致；不是严格的单卡数值基准）。
 
 ---
 
