@@ -348,9 +348,11 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._unsharded_param = Parameter(
             [],
             name=self.sharded_param.name,
-            requires_grad=self.sharded_param.requires_grad,
+            requires_grad=False,
         )
         self._unsharded_param.data = unsharded_param
+        if self.sharded_param.requires_grad:
+            self._unsharded_param.requires_grad = True
 
     def _get_unsharded_param_from_all_gather_output(self):
         """Reconstruct the full local parameter view from the packed all-gather output."""

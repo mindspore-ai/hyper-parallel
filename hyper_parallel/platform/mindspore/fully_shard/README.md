@@ -20,10 +20,12 @@ Torch can swap in an unsharded parameter view without worrying about `Parameter(
 
 MindSpore cannot rely on `Parameter(tensor)` here, because that may materialize a new tensor instead of reusing the all-gather buffer. For this reason, `fully_shard` creates the full parameter as:
 
-- `Parameter([])`
+- first `Parameter([], requires_grad=False)`
 - then `unsharded_param.data = unsharded_tensor`
+- finally restore `requires_grad` if the sharded parameter needs gradients
 
-This keeps `unsharded_param` sharing the all-gather storage.
+This keeps `unsharded_param` sharing the all-gather storage while avoiding MindSpore
+recording backward metadata from the temporary empty shape.
 
 ## 3. Reduce Semantics
 

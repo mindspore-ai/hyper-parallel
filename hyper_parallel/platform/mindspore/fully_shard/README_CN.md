@@ -20,10 +20,12 @@ torch 在切换到 unsharded 参数时，可以直接依赖后端已有的参数
 
 MindSpore 这里不能直接用 `Parameter(tensor)`，因为这一步可能重新创建底层 Tensor，导致无法复用 all-gather 出来的存储。所以 `fully_shard` 现在用下面的方式构造完整参数：
 
-- 先创建 `Parameter([])`
+- 先创建 `Parameter([], requires_grad=False)`
 - 再执行 `unsharded_param.data = unsharded_tensor`
+- 最后按需恢复 `requires_grad`
 
-这样 `unsharded_param` 才能和 all-gather buffer 共享底层存储。
+这样 `unsharded_param` 才能和 all-gather buffer 共享底层存储，同时避免 MindSpore
+在临时空 shape 上记录错误的反向元信息。
 
 ## 3. Reduce 语义
 
