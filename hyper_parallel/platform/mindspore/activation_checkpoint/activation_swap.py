@@ -120,6 +120,11 @@ class ActivationWrapper(Cell, ABC):
             return getattr(wrapped, name)
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
+    @property
+    def unwrap_cell(self) -> Cell:
+        """Recursively return the innermost wrapped cell."""
+        return self._ckpt_wrapped_module
+
     def __getitem__(self, key: int) -> Any:
         """Forward indexing calls in case the wrapped cell is a SequentialCell."""
         return self._ckpt_wrapped_module.__getitem__(key)  # type: ignore[operator]
