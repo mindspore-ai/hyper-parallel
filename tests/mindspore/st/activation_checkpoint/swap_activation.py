@@ -174,6 +174,10 @@ def apply_swap(model, mode):
         for i, layer in enumerate(model.layers):
             model.layers[i] = swap_wrapper(layer)
 
+    elif mode == "group_swap":
+        for i, layer in enumerate(model.layers):
+            model.layers[i] = swap_wrapper(layer, group_swap=True)
+
     elif mode == "swap_with_policy":
         policy_threshold = 2048
 
@@ -263,7 +267,7 @@ def test_act_swap_memory_comparison():
     print("Starting memory and time comparison: none vs swap vs swap_with_policy")
     train_steps = 3
 
-    modes = ["none", "swap", "swap_with_policy"]
+    modes = ["none", "swap", "swap_with_policy", "group_swap"]
     results = {}
 
     for mode in modes:
@@ -290,7 +294,7 @@ def test_act_swap_memory_comparison():
     tol = 1e-4
     for step in range(train_steps):
         base_val = base_losses[step]
-        for mode in ["swap", "swap_with_policy"]:
+        for mode in ["swap", "group_swap", "swap_with_policy"]:
             val = results[mode]["losses"][step]
             diff = abs(val - base_val)
             assert diff < tol, (
@@ -301,12 +305,18 @@ def test_act_swap_memory_comparison():
 
     mem_none = results["none"]["peak_mem_gb"]
     mem_swap = results["swap"]["peak_mem_gb"]
+    mem_group_swap = results["group_swap"]["peak_mem_gb"]
     mem_swap_with_policy = results["swap_with_policy"]["peak_mem_gb"]
 
     assert mem_none > mem_swap_with_policy, (
         f"Expected NONE ({mem_none:.5f}) > SWAP_WITH_POLICY ({mem_swap_with_policy:.5f})"
     )
     print(f"Verified: NONE ({mem_none:.5f}) > SWAP_WITH_POLICY ({mem_swap_with_policy:.5f})")
+
+    assert mem_none > mem_group_swap, (
+        f"Expected NONE ({mem_none:.5f}) > GROUP_SWAP ({mem_group_swap:.5f})"
+    )
+    print(f"Verified: NONE ({mem_none:.5f}) > GROUP_SWAP ({mem_group_swap:.5f})")
 
     assert mem_swap_with_policy > mem_swap, (
         f"Expected SWAP_WITH_POLICY ({mem_swap_with_policy:.5f}) > SWAP ({mem_swap:.5f})"

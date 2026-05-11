@@ -20,8 +20,10 @@ def test_sac_group():
     Feature: parallel run case in ckpt_activation
     Description:
         1. test_ac_memory_comparison
+        2. test_group_swap_correctness_and_memory
     Expectation: Run success.
     """
     parallel_run([
-        MindSporeCase(BASE_SHARD, "test_ac_memory_comparison", 11637, 1)
+        MindSporeCase(BASE_SHARD, "test_ac_memory_comparison", 11637, 1),
+        MindSporeCase(BASE_SHARD, "test_group_swap_correctness_and_memory", 11638, 1)
     ])

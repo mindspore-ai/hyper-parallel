@@ -45,6 +45,17 @@ def apply_recompute(model, mode):
 
         for i in range(len(model.layers) - 1):
             SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
+    elif mode == "group_swap":
+        def policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613
+            if op in op_non_recompute:
+                return CheckpointPolicy.MUST_SWAP
+            return CheckpointPolicy.MUST_RECOMPUTE
+
+        for i, layer in enumerate(model.layers):
+            model.layers[i] = checkpoint_wrapper(layer, policy_fn=policy_fn, swap_inputs=True, group_swap=True)
+
+        for i in range(len(model.layers) - 1):
+            SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
     elif mode == 'save':
         def policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613
             if op in op_non_recompute:
@@ -74,7 +85,7 @@ def test_ac_memory_comparison():
     dataloader = prepare_data()
     train_steps = 3
 
-    modes = ["none", "recompute", "save", "swap"]
+    modes = ["none", "recompute", "save", "swap", "group_swap"]
     results = {}
 
     for mode in modes:
@@ -118,12 +129,16 @@ def test_ac_memory_comparison():
     mem_none = results["none"]["peak_mem_gb"]
     mem_save = results["save"]["peak_mem_gb"]
     mem_recompute = results["recompute"]["peak_mem_gb"]
+    mem_group_swap = results["group_swap"]["peak_mem_gb"]
     mem_swap = results["swap"]["peak_mem_gb"]
 
     # none > save > recompute ≈ swap
     # none > save
     assert mem_none > mem_save, f"Expected NONE ({mem_none:.5f}) > SAVE ({mem_save:.5f})"
     print(f"✅ Verified: NONE ({mem_none:.5f}) > SAVE ({mem_save:.5f})")
+    # none > swap_group
+    assert mem_none > mem_group_swap, f"Expected NONE ({mem_none:.5f}) > SWAP_GROUP ({mem_group_swap:.5f})"
+    print(f"✅ Verified: NONE ({mem_none:.5f}) > SWAP_GROUP ({mem_group_swap:.5f})")
     # save > recompute
     assert mem_save > mem_recompute, f"Expected SAVE ({mem_save:.5f}) > RECOMPUTE ({mem_recompute:.5f})"
     print(f"✅ Verified: SAVE ({mem_save:.5f}) > RECOMPUTE ({mem_recompute:.5f})")

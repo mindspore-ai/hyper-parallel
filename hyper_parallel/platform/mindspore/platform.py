@@ -1512,39 +1512,66 @@ class MindSporePlatform(Platform):
         return ms.recompute
 
     @staticmethod
-    def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
-        # pylint: disable=C0415
-        from hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_wrapper import checkpoint_wrapper
-        return checkpoint_wrapper(module, checkpoint_fn=checkpoint_fn, **checkpoint_fn_kwargs)
-
-    @staticmethod
-    def swap_wrapper(module, policy_fn=None):
+    def swap_wrapper(module, policy_fn=None, group_swap=False):
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import swap_wrapper
-        return swap_wrapper(module, policy_fn=policy_fn)
+        return swap_wrapper(module, policy_fn=policy_fn, group_swap=group_swap)
 
     @staticmethod
-    def swap_tensor_wrapper(target, tag=None):
+    def swap_tensor_wrapper(target, tag=None, group_swap=False):
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import swap_tensor_wrapper
-        return swap_tensor_wrapper(target, tag=tag)
+        return swap_tensor_wrapper(target, tag=tag, group_swap=group_swap)
+
+    @staticmethod
+    def get_class_activation_wrapper():
+        # pylint: disable=C0415
+        from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import ActivationWrapper
+        return ActivationWrapper
 
     @property
     def noop_context_fn(self):
         return null_context_fn
 
     @staticmethod
-    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
+    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False):
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.activation_checkpoint.sac import create_selective_checkpoint_contexts
         return create_selective_checkpoint_contexts(policy_fn_or_list,
-                                                    allow_cache_entry_mutation=allow_cache_entry_mutation)
+                                                    allow_cache_entry_mutation=allow_cache_entry_mutation,
+                                                    group_swap=group_swap)
 
     @staticmethod
     def async_save_on_cpu(policy_fn=None):
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import AsyncSaveOnCpu
         return AsyncSaveOnCpu(policy_fn=policy_fn)
+
+    _MS_DEVICE_MAP = {
+        "npu": "Ascend",
+        "ascend": "Ascend",
+        "gpu": "GPU",
+        "cpu": "cpu",
+        "": "cpu",
+    }
+
+    @staticmethod
+    def alloc_tensor_buffer(numel: int, dtype, device, pin_memory: bool = False):
+        """Allocate an uninitialized 1-D tensor buffer."""
+        if pin_memory:
+            return mint.empty((numel,), dtype=dtype, device="cpu", pin_memory=True)
+        if device is None:
+            return mint.empty((numel,), dtype=dtype)
+        device_type = str(device).split(":", maxsplit=1)[0].lower()
+        ms_device = MindSporePlatform._MS_DEVICE_MAP.get(device_type)
+        if ms_device is None:
+            raise ValueError(
+                f"Unsupported device type '{device_type}' for MindSpore; "
+                f"supported: {sorted(MindSporePlatform._MS_DEVICE_MAP)}"
+            )
+        if ms_device == "cpu":
+            return mint.empty((numel,), dtype=dtype, device="cpu")
+        return mint.empty((numel,), dtype=dtype, device=ms_device)
 
     @staticmethod
     def get_element_size(tensor):

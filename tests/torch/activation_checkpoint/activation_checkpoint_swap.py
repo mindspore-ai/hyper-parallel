@@ -36,6 +36,12 @@ def apply_swap(model, mode):
 
         for i in range(len(model.layers) - 1):
             SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
+    elif mode == "group_swap":
+        for i, layer in enumerate(model.layers):
+            model.layers[i].attn = swap_wrapper(layer.attn, group_swap=True)
+
+        for i in range(len(model.layers) - 1):
+            SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
     elif mode == "swap_with_policy":
         policy_threshold = 32 * 512 * 512
         def policy_fn(x):
@@ -69,7 +75,7 @@ def test_act_swap_memory_comparison():
     dataloader = prepare_data()
     train_steps = 3
 
-    modes = ["none", "swap", "swap_with_policy"]
+    modes = ["none", "swap", "swap_with_policy", "group_swap"]
     results = {}
 
     for mode in modes:
@@ -112,6 +118,7 @@ def test_act_swap_memory_comparison():
     # memory assert
     mem_none = results["none"]["peak_mem_gb"]
     mem_swap = results["swap"]["peak_mem_gb"]
+    mem_group_swap = results["group_swap"]["peak_mem_gb"]
     mem_swap_with_policy = results["swap_with_policy"]["peak_mem_gb"]
 
     # mem_none > mem_swap_with_policy
@@ -122,6 +129,10 @@ def test_act_swap_memory_comparison():
     assert mem_swap_with_policy > mem_swap, \
         f"Expected SWAP_WITH_POLICY ({mem_swap_with_policy:.5f}) > SWAP ({mem_swap:.5f})"
     print(f"✅ Verified: SWAP_WITH_POLICY ({mem_swap_with_policy:.5f}) > SWAP ({mem_swap:.5f})")
+    # mem_none > mem_group_swap
+    assert mem_none > mem_group_swap, \
+        f"Expected NONE ({mem_none:.5f}) > GROUP_SWAP ({mem_group_swap:.5f})"
+    print(f"✅ Verified: NONE ({mem_none:.5f}) > GROUP_SWAP ({mem_group_swap:.5f})")
 
 
 class _SwapFnTransformer(SimpleTransformer):

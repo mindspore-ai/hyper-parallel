@@ -32,7 +32,7 @@ ensure_mindspore_platform_default()
 import mindspore as ms  # noqa: E402
 from mindspore import nn  # noqa: E402
 
-from hyper_parallel.platform.mindspore.activation_checkpoint import checkpoint_wrapper  # noqa: E402
+from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper  # noqa: E402
 
 
 class TestActivationWrapper(unittest.TestCase):

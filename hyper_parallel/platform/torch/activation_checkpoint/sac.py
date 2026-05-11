@@ -62,9 +62,9 @@ class _VersionWrapper:
 class _SwapCacheEntry:
     """Pair the recompute cache and swap record around the same tensor object."""
 
-    def __init__(self, val, funcname):
+    def __init__(self, val, funcname, group_swap=False):
         self.save = _VersionWrapper(val)
-        self.swap = SwapTensor(val, funcname)
+        self.swap = SwapTensor(val, funcname, group_swap=group_swap)
 
 
 def _maybe_detach(x, any_ret_has_alias_info):
@@ -129,11 +129,15 @@ SAC_IGNORED_OPS = {
 
 class _CachingTorchDispatchMode(TorchDispatchMode):
     # Used together with _CachedTorchDispatchMode to implement SAC.
-    def __init__(self, policy_fn, swap_storage, storage):
+    def __init__(self, policy_fn, swap_storage, storage, group_swap=False):
         self.policy_fn = policy_fn
         self.swap_storage = swap_storage
         self.storage = storage
         self.add_to_storage = False
+        self.group_swap = group_swap
+        # Cache context and singleton to avoid per-dispatch allocation / lookup.
+        self._swap_manager = SwapManager()
+        self._group_prefix = ""
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if func in SAC_IGNORED_OPS:
@@ -160,13 +164,15 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
                 tree_map(lambda x: _VersionWrapper(_maybe_detach(x, any_ret_has_alias_info)), out)
             )
         elif policy == CheckpointPolicy.MUST_SWAP:  # patch code
-            group_name = SwapManager().get_current_group_name()
             if not self.add_to_storage:
-                SwapManager().add_storage(group_name, self.swap_storage)
+                group_name = self._swap_manager.get_current_group_name()
+                self._group_prefix = f"{group_name}::"
+                self._swap_manager.add_storage(group_name, self.swap_storage)
                 self.add_to_storage = True
-            funcname = f"{group_name}::{func}"
+            funcname = f"{self._group_prefix}{func}"
+            group_swap = self.group_swap
             entries = tree_map(
-                lambda x: _SwapCacheEntry(_maybe_detach(x, any_ret_has_alias_info), funcname),
+                lambda x: _SwapCacheEntry(_maybe_detach(x, any_ret_has_alias_info), funcname, group_swap=group_swap),
                 out,
             )
             self.storage[func].append(tree_map(lambda x: x.save, entries))
@@ -175,7 +181,7 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
 
 
 class _CachedTorchDispatchMode(TorchDispatchMode):
-    # Used together with _CachedTorchDispatchMode to implement SAC.
+    # Used together with _CachingTorchDispatchMode to implement SAC.
     def __init__(self, policy_fn, swap_storage, storage, allow_cache_entry_mutation):
         self.policy_fn = policy_fn
         self.swap_storage = swap_storage
@@ -199,18 +205,10 @@ class _CachedTorchDispatchMode(TorchDispatchMode):
             self.swap_storage.clear()
             self._swap_cleared = True
 
-        if policy in (CheckpointPolicy.MUST_SAVE, CheckpointPolicy.PREFER_SAVE) or is_compiling:
+        # MUST_SAVE, PREFER_SAVE, and MUST_SWAP all restore from storage identically.
+        if (policy in (CheckpointPolicy.MUST_SAVE, CheckpointPolicy.PREFER_SAVE, CheckpointPolicy.MUST_SWAP)
+           or is_compiling):
             storage = self.storage.get(func)  # patch code
-            if storage is None:
-                raise RuntimeError(f"{func} encountered during backward, but not found in storage")
-            if len(storage) == 0:
-                raise RuntimeError(
-                    "Trying to backward an extra time. You are only allowed to backward once "
-                    "on any region computed under selective activation checkpoint."
-                )
-            out = tree_map(lambda x: x.get_val(self.allow_cache_entry_mutation), storage.pop(0))
-        elif policy == CheckpointPolicy.MUST_SWAP:  # patch code
-            storage = self.storage.get(func)
             if storage is None:
                 raise RuntimeError(f"{func} encountered during backward, but not found in storage")
             if len(storage) == 0:
@@ -224,7 +222,7 @@ class _CachedTorchDispatchMode(TorchDispatchMode):
         return out
 
 
-def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
+def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False):
     """
     Helper to avoid recomputing certain ops during activation checkpointing.
 
@@ -281,7 +279,10 @@ def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mu
     """
     # NB: If grad_mode is disabled, checkpoint would not run forward under
     #     context_fn anyway, so proceed as usual.
-    if isinstance(policy_fn_or_list, list):
+    if policy_fn_or_list is None:
+        def policy_fn(_ctx, _op, *_args, **_kwargs):
+            return CheckpointPolicy.PREFER_RECOMPUTE
+    elif isinstance(policy_fn_or_list, list):
         for op in policy_fn_or_list:
             if not isinstance(op, torch._ops.OpOverload):
                 _extra_msg = (
@@ -306,6 +307,6 @@ def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mu
     swap_storage = Storage()  # patch code
     storage: Dict[Any, List[Any]] = defaultdict(list)
     return (
-        _CachingTorchDispatchMode(policy_fn, swap_storage, storage),
+        _CachingTorchDispatchMode(policy_fn, swap_storage, storage, group_swap=group_swap),
         _CachedTorchDispatchMode(policy_fn, swap_storage, storage, allow_cache_entry_mutation),
     )
