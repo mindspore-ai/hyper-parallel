@@ -144,6 +144,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.pin_memory = (
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
         )
+        self._orig_param_hooks: List[Callable] = []
         self.grad_offload_event: Optional[torch.Event] = None
         self._orig_param_is_dtensor = isinstance(param, DTensor)
         self._orig_dtensor_mesh = param.device_mesh if self._orig_param_is_dtensor else None
@@ -166,6 +167,9 @@ class TorchHSDPParamV2(HSDPParamV2):
         self.reduce_scatter_handle = None
         self._all_reduce_output = None
         self.all_reduce_handle = None
+        self._save_backward_hooks(param)
+        self._grad = None
+        self._accumulated_allreduced_grad = True
 
     @property
     def uses_param_shard(self) -> bool:
@@ -312,6 +316,46 @@ class TorchHSDPParamV2(HSDPParamV2):
             grad = grad.redistribute(self._orig_dtensor_mesh, self._orig_dtensor_placements)
         return grad.to_local()
 
+    @property
+    def accumulated_allreduced_grad(self) -> bool:
+        """Whether the parameter has accumulated all-reduced gradient."""
+        return self._accumulated_allreduced_grad
+ 
+    @accumulated_allreduced_grad.setter
+    def accumulated_allreduced_grad(self, value: bool) -> None:
+        self._accumulated_allreduced_grad = value
+
+    def _save_backward_hooks(self, param: nn.Parameter) -> None:
+        """Save the backward hooks of the original parameter"""
+        if not hasattr(param, '_backward_hooks') or param._backward_hooks is None:
+            return
+
+        # Get the set of saved hook function IDs for deduplication
+        if not hasattr(self, '_saved_hook_ids'):
+            object.__setattr__(self, '_saved_hook_ids', set())
+
+        for _, hook_func in param._backward_hooks.items():
+            # Use the id of hook_func to avoid adding the same function object repeatedly
+            hook_func_id = id(hook_func)
+            if hook_func_id not in self._saved_hook_ids:
+                self._orig_param_hooks.append(hook_func)
+                self._saved_hook_ids.add(hook_func_id)
+
+    def _migrate_backward_hooks(self, new_param: nn.Parameter) -> None:
+        """Migrate backward hooks from the original parameter to the new parameter"""
+        if not self._orig_param_hooks or hasattr(new_param, "migrate_backward_hooks_run_once"):
+            return
+
+        # Properly register each hook using the register_hook method
+        for hook_func in self._orig_param_hooks:
+            try:
+                if new_param.requires_grad:
+                    new_param.register_hook(hook_func)
+            except RuntimeError:
+                # Skip hook registration if the parameter does not require gradients
+                pass
+        new_param.migrate_backward_hooks_run_once = True
+
     def reduce_scatter_output(self):
         """
         Get the reduce-scatter output tensor and wait for asynchronous operation to complete.
@@ -321,6 +365,8 @@ class TorchHSDPParamV2(HSDPParamV2):
         """
         if self.reduce_scatter_handle is not None:
             self.reduce_scatter_handle.wait()
+            self._grad.untyped_storage().resize_(0)
+            self._grad = None
             self.reduce_scatter_handle = None
         return self._reduce_scatter_output
 
@@ -579,7 +625,8 @@ class TorchHSDPParamV2(HSDPParamV2):
         else:
             # slow path
             setattr(self._module_info.module, self._module_info.param_name, param)
-
+        self._save_backward_hooks(self.sharded_param)
+        self._migrate_backward_hooks(param)
         # Iterate through all modules that share this parameter to prevent pointer desync.
         for shared_module, shared_param_name in zip(
             self._module_info.shared_modules, self._module_info.shared_param_names
@@ -845,7 +892,8 @@ class TorchHSDPParamV2(HSDPParamV2):
         self,
         async_op: bool = True,
         dtype: Optional[torch.dtype] = None,
-        reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG
+        reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG,
+        output_buffer: Optional[torch.Tensor] = None,
     ) -> Union[None, Tuple[torch.Tensor, Optional[dist.Work]]]:
         """
         Perform reduce-scatter on gradient to reduce and shard the full gradient.
@@ -854,6 +902,10 @@ class TorchHSDPParamV2(HSDPParamV2):
             async_op: Whether to execute asynchronously.
             dtype: reduce dtype.
             reduce_op: do reduce-scatter avg or sum.
+            output_buffer: Optional pre-allocated output buffer for fused all-reduce.
+                          When provided, reduce_scatter writes directly into this buffer,
+                          enabling zero-copy fusion with subsequent all_reduce operations.
+                          The buffer must have the correct size (sharded_size.numel()) and dtype.
 
         Returns:
             (sharded_grad, handle): Sharded gradient and communication handle.
@@ -866,7 +918,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         else:
             grad = self.unsharded_grad_data
         reduce_dtype = dtype or grad.dtype
-        grad = grad.to(reduce_dtype)
+        self._grad = grad.to(reduce_dtype)
         plan_world_size = (
             self.shard_world_size
             if self.is_sharded
@@ -874,20 +926,44 @@ class TorchHSDPParamV2(HSDPParamV2):
             and self.shard_world_size > 1
             else 1
         )
-        plan = build_rs_plan(self, grad, plan_world_size)
-        grad_flat = pack_for_reduce_scatter(grad, plan).reshape(-1)
+        plan = build_rs_plan(self, self._grad, plan_world_size)
+        grad_flat = pack_for_reduce_scatter(self._grad, plan).reshape(-1)
 
         # If parameter is not sharded (below threshold), no reduce-scatter needed
         if not self.is_sharded:
+            if output_buffer is not None:
+                output_buffer.copy_(grad_flat)
+                self._reduce_scatter_output = output_buffer
+            else:
+                self._reduce_scatter_output = grad_flat
+            self.reduce_scatter_handle = None
             return grad_flat, None
 
         if self.sharded_group_info.group is None or self.shard_world_size <= 1:
+            if output_buffer is not None:
+                output_buffer.copy_(grad_flat)
+                self._reduce_scatter_output = output_buffer
+            else:
+                self._reduce_scatter_output = grad_flat
+            self.reduce_scatter_handle = None
             # No communication needed
             return grad_flat, None
 
         # Calculate output size
         output_numel = grad_flat.numel() // self.shard_world_size
-        self._reduce_scatter_output = torch.empty(output_numel, dtype=reduce_dtype, device=grad.device)
+        # Use provided output buffer or allocate a new one
+        if output_buffer is not None:
+            if output_buffer.numel() != output_numel:
+                raise ValueError(
+                    f"output_buffer size mismatch: expected {output_numel}, got {output_buffer.numel()}"
+                )
+            if output_buffer.dtype != reduce_dtype:
+                raise ValueError(
+                    f"output_buffer dtype mismatch: expected {reduce_dtype}, got {output_buffer.dtype}"
+                )
+            self._reduce_scatter_output = output_buffer
+        else:
+            self._reduce_scatter_output = torch.empty(output_numel, dtype=reduce_dtype, device=self._grad.device)
 
         # Execute reduce_scatter_tensor
         self.reduce_scatter_handle = dist.reduce_scatter_tensor(

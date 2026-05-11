@@ -322,5 +322,199 @@ class TestNewDispatchFlow(unittest.TestCase):
         op = DummyOp("dummy")
         assert op.preprocess((1, 2), {"a": 3}) is None, "Default preprocess should return None for non-DTensor inputs"
 
+class TestUnwrapArgsAndKwargs(unittest.TestCase):
+    """
+    Feature: OpDispatcher._unwrap_value / _unwrap_args / _unwrap_kwargs
+    Description: Test that DTensor wrappers are correctly stripped from args
+                 and kwargs while preserving tuple/list container structure.
+    Expectation: DTensor instances are replaced by their local tensors;
+                 plain tensors, scalars, and nested containers are preserved.
+    """
+
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def test_unwrap_value_plain_scalar(self):
+        """Test _unwrap_value passes plain scalars through unchanged."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        assert OpDispatcher._unwrap_value(42) == 42, \
+            (f"Expected 42, "
+             f"got {OpDispatcher._unwrap_value(42)}")
+        assert OpDispatcher._unwrap_value("hello") == "hello", \
+            (f"Expected 'hello', "
+             f"got {OpDispatcher._unwrap_value('hello')}")
+        assert OpDispatcher._unwrap_value(None) is None, \
+            "Expected None"
+
+    def test_unwrap_value_plain_tensor(self):
+        """Test _unwrap_value passes plain (non-DTensor) tensors through unchanged."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        t = np.array([1.0, 2.0])
+        result = OpDispatcher._unwrap_value(t)
+        assert result is t, \
+            (f"Expected same object, "
+             f"got {result}")
+
+    def test_unwrap_value_dtensor(self):
+        """Test _unwrap_value replaces DTensor with its local tensor."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        local = np.array([1.0, 2.0])
+        dt = MagicMock(spec=DTensor)
+        dt.to_local.return_value = local
+
+        result = OpDispatcher._unwrap_value(dt)
+        dt.to_local.assert_called_once()
+        assert result is local, \
+            (f"Expected local tensor, "
+             f"got {result}")
+
+    def test_unwrap_value_tuple_with_dtensor(self):
+        """Test _unwrap_value recursively unwraps DTensors inside tuples."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        local0 = np.array([1.0])
+        local1 = np.array([2.0])
+        dt0 = MagicMock(spec=DTensor)
+        dt0.to_local.return_value = local0
+        dt1 = MagicMock(spec=DTensor)
+        dt1.to_local.return_value = local1
+
+        result = OpDispatcher._unwrap_value((dt0, 3, dt1))
+        assert isinstance(result, tuple), \
+            (f"Expected tuple, "
+             f"got {type(result)}")
+        assert len(result) == 3, \
+            (f"Expected length 3, "
+             f"got {len(result)}")
+        assert result[0] is local0, \
+            "First element should be local0"
+        assert result[1] == 3, \
+            "Second element should be scalar 3"
+        assert result[2] is local1, \
+            "Third element should be local1"
+
+    def test_unwrap_value_list_with_dtensor(self):
+        """Test _unwrap_value recursively unwraps DTensors inside lists."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        local = np.array([3.0])
+        dt = MagicMock(spec=DTensor)
+        dt.to_local.return_value = local
+
+        result = OpDispatcher._unwrap_value([dt, "abc"])
+        assert isinstance(result, list), \
+            (f"Expected list, "
+             f"got {type(result)}")
+        assert len(result) == 2, \
+            (f"Expected length 2, "
+             f"got {len(result)}")
+        assert result[0] is local, \
+            "First element should be local"
+        assert result[1] == "abc", \
+            "Second element should be 'abc'"
+
+    def test_unwrap_args_mixed(self):
+        """Test _unwrap_args with mixed DTensor, scalar, and tuple args."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        local = np.array([1.0])
+        dt = MagicMock(spec=DTensor)
+        dt.to_local.return_value = local
+
+        result = OpDispatcher._unwrap_args((dt, 5, (dt, 2)))
+        assert len(result) == 3, \
+            (f"Expected 3 args, "
+             f"got {len(result)}")
+        assert result[0] is local, \
+            "First arg should be local tensor"
+        assert result[1] == 5, \
+            "Second arg should be scalar 5"
+        assert isinstance(result[2], tuple), \
+            (f"Third arg should be tuple, "
+             f"got {type(result[2])}")
+        assert result[2][0] is local, \
+            "Nested tuple first element should be local tensor"
+        assert result[2][1] == 2, \
+            "Nested tuple second element should be 2"
+
+    def test_unwrap_kwargs_mixed(self):
+        """Test _unwrap_kwargs with mixed DTensor, scalar, and list kwargs."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        local = np.array([1.0])
+        dt = MagicMock(spec=DTensor)
+        dt.to_local.return_value = local
+
+        kwargs = {"input": dt, "dim": -1, "extra": [dt, True]}
+        result = OpDispatcher._unwrap_kwargs(kwargs)
+        assert result["input"] is local, \
+            "kwargs 'input' should be local tensor"
+        assert result["dim"] == -1, \
+            (f"kwargs 'dim' should be -1, "
+             f"got {result['dim']}")
+        assert isinstance(result["extra"], list), \
+            (f"kwargs 'extra' should be list, "
+             f"got {type(result['extra'])}")
+        assert result["extra"][0] is local, \
+            "kwargs 'extra'[0] should be local tensor"
+        assert result["extra"][1] is True, \
+            "kwargs 'extra'[1] should be True"
+
+    def test_unwrap_kwargs_does_not_mutate_original(self):
+        """Test _unwrap_kwargs returns a new dict without modifying the original."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        local = np.array([1.0])
+        dt = MagicMock(spec=DTensor)
+        dt.to_local.return_value = local
+
+        original = {"x": dt, "y": 10}
+        result = OpDispatcher._unwrap_kwargs(original)
+        assert result is not original, \
+            "Returned dict should be a new object"
+        assert isinstance(original["x"], MagicMock), \
+            "Original dict should not be mutated"
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_dispatch_bypass_unwraps_kwargs(self, mock_platform):
+        """Test dispatch bypass path unwraps kwargs containing DTensors."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        local = np.array([1.0, 2.0])
+        dt = MagicMock(spec=DTensor)
+        dt.to_local.return_value = local
+
+        captured_args = {}
+        def fake_op(*args, **kwargs):
+            captured_args["args"] = args
+            captured_args["kwargs"] = kwargs
+            return np.array([3.0])
+
+        dispatcher = OpDispatcher.__new__(OpDispatcher)
+        dispatcher.whitelist = ["fake_op"]
+        dispatcher._random_ops = set()
+        dispatcher._random_ms_ops = set()
+        dispatcher.layout_infer_ops = {}
+
+        result = dispatcher.dispatch(fake_op, (dt,), {"bias": dt, "alpha": 0.5})
+        assert captured_args["args"] == (local,), \
+            (f"Expected args={(local,)}, "
+             f"got {captured_args['args']}")
+        assert captured_args["kwargs"]["bias"] is local, \
+            (f"Expected kwargs['bias']=local, "
+             f"got {captured_args['kwargs']['bias']}")
+        assert captured_args["kwargs"]["alpha"] == 0.5, \
+            (f"Expected kwargs['alpha']=0.5, "
+             f"got {captured_args['kwargs']['alpha']}")
+
+
 if __name__ == "__main__":
     unittest.main()

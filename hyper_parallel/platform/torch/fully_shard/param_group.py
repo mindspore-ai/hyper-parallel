@@ -920,3 +920,226 @@ class HSDPParamGroup:
         self._active_param_flat_offsets = []
         self._active_replicate_buckets = {}
         self._pending_all_reduce_handles = []
+
+class AllReduceParamGroup:
+    """Groups HSDP parameters by replicate group for fused async all-reduce.
+
+    This class enables zero-copy fused all-reduce by:
+    1. Pre-allocating a contiguous buffer with 512-byte alignment
+    2. Having reduce_scatter write directly into aligned views of this buffer
+    3. Performing a single all_reduce on the entire buffer
+    4. Applying gradients directly from buffer views (with manual averaging)
+
+    Key design decisions for numerical correctness:
+    - Uses SUM instead of AVG for all_reduce to avoid padding zeros affecting the average
+    - Manually divides by replicate_world_size when applying gradients
+    - Padding regions are initialized to zero and don't affect SUM results
+
+    Attributes:
+        replicate_group: Process group for the replicate dimension.
+        hsdp_params: List of HSDP parameters in this group.
+        orig_dtypes: Original dtype for each parameter (for grad casting).
+        reduce_dtype: Uniform dtype for the fused buffer.
+        reduce_op: Original reduce op (AVG or SUM), used to determine final scaling.
+        replicate_world_size: Size of the replicate group.
+        fused_buffer: Pre-allocated contiguous buffer for all params.
+        param_offsets: Element offset for each param in the fused buffer.
+        param_numels: Number of elements for each param (excluding padding).
+        all_reduce_handle: Async work handle for the in-flight all_reduce.
+    """
+
+    ALIGNMENT_BYTES = 512  # 512-byte alignment requirement
+
+    def __init__(
+        self,
+        replicate_group: dist.ProcessGroup,
+        hsdp_params: List["TorchHSDPParamV2"],
+        orig_dtypes: List[torch.dtype],
+        reduce_dtype: torch.dtype,
+        reduce_op: dist.ReduceOp,
+        mp_policy: Optional["MixedPrecisionPolicy"] = None,
+    ):
+        self.replicate_group = replicate_group
+        self.hsdp_params = hsdp_params
+        self.orig_dtypes = orig_dtypes
+        self.reduce_dtype = reduce_dtype
+        self.reduce_op = reduce_op
+        self.mp_policy = mp_policy
+        self.replicate_world_size = replicate_group.size() if replicate_group else 1
+
+        # Fused buffer (lazily allocated)
+        self.fused_buffer: Optional[torch.Tensor] = None
+        # Element offsets in fused_buffer (accounting for padding)
+        self.param_offsets: List[int] = []
+        # Number of elements per param (without padding)
+        self.param_numels: List[int] = []
+
+        # Async communication handle
+        self.all_reduce_handle: Optional[dist.Work] = None
+
+    def compute_aligned_layout(self) -> int:
+        """Compute buffer layout with 512-byte alignment for total buffer size only.
+
+        Parameters are packed contiguously without per-param alignment.
+        Padding is added only at the end of the buffer to make total size
+        512-byte aligned.
+
+        Returns:
+            Total number of elements needed for the fused buffer.
+        """
+        self.param_offsets = []
+        self.param_numels = []
+
+        element_size = torch.tensor([], dtype=self.reduce_dtype).element_size()
+        current_offset = 0
+
+        for hsdp_param in self.hsdp_params:
+            # Number of elements for this param's sharded gradient
+            numel = hsdp_param.sharded_size.numel()
+            self.param_numels.append(numel)
+            self.param_offsets.append(current_offset)
+            current_offset += numel
+
+        # Total buffer size in bytes (packed, no per-param padding)
+        total_bytes = current_offset * element_size
+
+        # Align total buffer size to 512 bytes (padding at end only)
+        aligned_total_bytes = (
+            (total_bytes + self.ALIGNMENT_BYTES - 1) // self.ALIGNMENT_BYTES
+        ) * self.ALIGNMENT_BYTES
+        total_numel = aligned_total_bytes // element_size
+
+        return total_numel
+
+    def allocate_fused_buffer(self, device: torch.device) -> None:
+        """Allocate the fused buffer with computed layout."""
+        total_numel = self.compute_aligned_layout()
+        self.fused_buffer = torch.empty(total_numel, dtype=self.reduce_dtype, device=device)
+        # Initialize to zero (important for SUM correctness with padding)
+        self.fused_buffer.zero_()
+
+    def get_param_buffer_view(self, idx: int) -> torch.Tensor:
+        """Get a view into the fused buffer for parameter at index idx.
+
+        This view can be used as the output buffer for reduce_scatter,
+        enabling zero-copy fusion.
+
+        Args:
+            idx: Index of the parameter in hsdp_params.
+
+        Returns:
+            A 1D tensor view of size param_numels[idx].
+        """
+        if self.fused_buffer is None:
+            raise RuntimeError("Fused buffer not allocated. Call allocate_fused_buffer first.")
+
+        offset = self.param_offsets[idx]
+        numel = self.param_numels[idx]
+        return self.fused_buffer.narrow(0, offset, numel)
+
+    def get_param_grad_view(self, idx: int, target_shape: torch.Size) -> torch.Tensor:
+        """Get a reshaped view of the reduced gradient for applying to parameter.
+
+        Args:
+            idx: Index of the parameter.
+            target_shape: Target shape (sharded_size).
+
+        Returns:
+            A view of the reduced gradient with target_shape.
+        """
+        flat_view = self.get_param_buffer_view(idx)
+        return flat_view.view(target_shape)
+
+    def accumulate_existing_grads_to_buffer(self) -> None:
+        """Accumulate existing sharded_param.grad/main_grad to fused_buffer.
+
+        This is called before allreduce in gradient accumulation scenario,
+        to ensure the previously accumulated gradients (from n-1 mini steps)
+        are included in the allreduce operation.
+
+        Handles:
+            - Mixed-precision: uses reduce_dtype for consistency
+            - main_grad vs grad: respects mp_policy.apply_grad_on_fp32_main_grad
+        """
+        if self.fused_buffer is None:
+            return
+
+        for idx, hsdp_param in enumerate(self.hsdp_params):
+            # Get existing sharded grad
+            existing_grad = None
+            if self.mp_policy is not None and self.mp_policy.apply_grad_on_fp32_main_grad:
+                if hasattr(hsdp_param.sharded_param, "main_grad"):
+                    existing_grad = hsdp_param.sharded_param.main_grad
+            else:
+                existing_grad = hsdp_param.sharded_param.grad
+
+            if existing_grad is not None and not hsdp_param.accumulated_allreduced_grad:
+                # Get DTensor's local_tensor
+                from hyper_parallel.core.dtensor import DTensor
+                if isinstance(existing_grad, DTensor):
+                    existing_grad_local = existing_grad._local_tensor
+                else:
+                    existing_grad_local = existing_grad
+
+                # Get the corresponding view in fused_buffer
+                buffer_view = self.get_param_buffer_view(idx)
+
+                # Ensure dtype consistency (convert to reduce_dtype)
+                if existing_grad_local.dtype != self.reduce_dtype:
+                    existing_grad_local = existing_grad_local.to(self.reduce_dtype)
+
+                # Accumulate to fused_buffer
+                buffer_view.add_(existing_grad_local.view_as(buffer_view))
+                if self.mp_policy is not None and self.mp_policy.apply_grad_on_fp32_main_grad:
+                    if hasattr(hsdp_param.sharded_param, "main_grad"):
+                        hsdp_param.sharded_param.main_grad = None
+                else:
+                    hsdp_param.sharded_param.grad = None
+
+    def issue_async_allreduce(self) -> None:
+        """Issue async all_reduce on the fused buffer.
+
+        Uses SUM operation for numerical correctness with padding.
+        If original op was AVG, scaling is done when applying gradients.
+        """
+        if self.fused_buffer is None:
+            raise RuntimeError("Fused buffer not allocated.")
+
+        # Always use SUM for correctness with padding regions
+        # If original op was AVG, we divide by world_size when applying
+        self.all_reduce_handle = dist.all_reduce(
+            self.fused_buffer,
+            op=dist.ReduceOp.SUM,
+            group=self.replicate_group,
+            async_op=True,
+        )
+
+    def wait_and_apply_grads(self) -> bool:
+        """Wait for all_reduce to complete and apply gradients to parameters.
+
+        Returns:
+            True if CPU synchronization is needed (for offload params).
+        """
+        if self.all_reduce_handle is not None:
+            self.all_reduce_handle.wait()
+            self.all_reduce_handle = None
+
+        need_synchronize = False
+
+        for idx, hsdp_param in enumerate(self.hsdp_params):
+            # Get the reduced gradient from fused buffer
+            reduced_grad = self.get_param_grad_view(idx, hsdp_param.sharded_size)
+
+            # Apply manual averaging if original op was AVG
+            if self.reduce_op == dist.ReduceOp.AVG and self.replicate_world_size > 1:
+                reduced_grad = reduced_grad / self.replicate_world_size
+            # Apply to parameter (handles dtype cast, CPU offload, accumulation)
+            need_synchronize = hsdp_param.apply_reduced_grad(
+                reduced_grad, self.orig_dtypes[idx]
+            ) or need_synchronize
+            hsdp_param.accumulated_allreduced_grad = True
+
+        # Release fused buffer
+        self.fused_buffer = None
+
+        return need_synchronize

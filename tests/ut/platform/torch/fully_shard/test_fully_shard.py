@@ -1251,33 +1251,41 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "uniform original parameter dtype"):
             TorchHSDPStateV2._init_mp_dtypes(state)
 
-    def test_state_post_backward_routes_replicate_params_through_compat_queue(self):
+    @patch("hyper_parallel.platform.torch.fully_shard.state.get_comm_ctx")
+    def test_state_post_backward_routes_replicate_params_through_compat_queue(self, mock_get_comm_ctx):
         """Verify replicate_params use the unified compat all-reduce route when shard_size == 1."""
         state = object.__new__(TorchHSDPStateV2)
         state._user_reduce_op_type = None
         state._reduce_dtype = None
-        state.hsdp_params = []
-        state.replicate_params = []
+        state.reduce_op_type = torch.distributed.ReduceOp.AVG
+        state.requires_all_reduce = True
         state.reduce_grads = True
         state.reshard_after_backward = False
-        state.requires_all_reduce = True
-        HSDPState.pre_reduce_scatter_params = []
-        HSDPState.pre_all_reduce_params = []
+        state.hsdp_params = []
+        state.replicate_params = []
         state.reduce_params = MagicMock()
         state._queue_compat_all_reduce = MagicMock()
         state._queue_reduce_scatter_then_all_reduce = MagicMock()
-        state.comm_fusion = False
-        state.reduce_op_type = torch.distributed.ReduceOp.AVG
+        state.param_group = MagicMock()
+        state.comm_fusion = True
+        HSDPState.pre_reduce_scatter_params = []
+        HSDPState.pre_all_reduce_params = []
+        mock_get_comm_ctx.return_value = SimpleNamespace(
+            all_reduce_param_group=None,
+            pre_param_group=None,
+        )
 
         replicate_param = MagicMock()
         replicate_param.accumulate_unsharded_grad_if_needed = MagicMock()
         replicate_param.unsharded_accumulated_grad = None
+        replicate_param.unsharded_accumulated_grad_data = None
         replicate_param._unsharded_param = MagicMock()
         replicate_param.unsharded_param = replicate_param._unsharded_param
         replicate_param.unsharded_param.grad = torch.ones(2, 2)
         replicate_param.sharded_param.requires_grad = True
         replicate_param.shard_size = 1
         replicate_param.dp_size = 2
+        replicate_param.replicate_world_size = 2
         replicate_param.param_mode = FullyShardParamMode.LOCAL_PARAM
         state.replicate_params.append(replicate_param)
 
@@ -1435,7 +1443,12 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         state.requires_all_reduce = True
         HSDPState.pre_reduce_scatter_params = []
         HSDPState.pre_all_reduce_params = []
+        TorchHSDPStateV2.pre_all_reduce_groups = []
         state._user_reduce_op_type = None
+        state._orig_dtype = torch.float32
+        state._reduce_dtype = torch.float32
+        state.mp_policy = MixedPrecisionPolicy()
+        state.device = torch.device("cpu")
         state.reduce_params = MagicMock()
         state._queue_compat_all_reduce = MagicMock()
         state._queue_reduce_scatter_then_all_reduce = MagicMock()
@@ -1445,12 +1458,14 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         hsdp_param = MagicMock()
         hsdp_param.accumulate_unsharded_grad_if_needed = MagicMock()
         hsdp_param.unsharded_accumulated_grad = None
+        hsdp_param.unsharded_accumulated_grad_data = None
         hsdp_param._unsharded_param = MagicMock()
         hsdp_param.unsharded_param = hsdp_param._unsharded_param
         hsdp_param.unsharded_param.grad = None
         hsdp_param.sharded_param.requires_grad = True
         hsdp_param.shard_size = 1
         hsdp_param.dp_size = 1
+        hsdp_param.replicate_world_size = 1
         hsdp_param.param_mode = FullyShardParamMode.LOCAL_PARAM
         state.hsdp_params.append(hsdp_param)
 
@@ -1460,7 +1475,8 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         state._queue_compat_all_reduce.assert_not_called()
         state._queue_reduce_scatter_then_all_reduce.assert_not_called()
 
-    def test_state_post_backward_routes_sharded_params_through_reduce_scatter_path(self):
+    @patch("hyper_parallel.platform.torch.fully_shard.state.AllReduceParamGroup")
+    def test_state_post_backward_routes_sharded_params_through_reduce_scatter_path(self, mock_ar_group_cls):
         """Verify sharded params use the unified reduce-scatter path when shard_size > 1."""
         state = object.__new__(TorchHSDPStateV2)
         state.hsdp_params = []
@@ -1470,7 +1486,12 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         state.requires_all_reduce = True
         HSDPState.pre_reduce_scatter_params = []
         HSDPState.pre_all_reduce_params = []
+        TorchHSDPStateV2.pre_all_reduce_groups = []
         state._user_reduce_op_type = None
+        state._orig_dtype = torch.float32
+        state._reduce_dtype = torch.float32
+        state.mp_policy = MixedPrecisionPolicy()
+        state.device = torch.device("cpu")
         state.reduce_params = MagicMock()
         state._queue_compat_all_reduce = MagicMock()
         state._queue_reduce_scatter_then_all_reduce = MagicMock()
@@ -1480,23 +1501,29 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         hsdp_param = MagicMock()
         hsdp_param.accumulate_unsharded_grad_if_needed = MagicMock()
         hsdp_param.unsharded_accumulated_grad = None
+        hsdp_param.unsharded_accumulated_grad_data = None
         hsdp_param._unsharded_param = MagicMock()
         hsdp_param.unsharded_param = hsdp_param._unsharded_param
         hsdp_param.unsharded_param.grad = torch.ones(2, 2)
         hsdp_param.sharded_param.requires_grad = True
         hsdp_param.shard_size = 2
         hsdp_param.dp_size = 2
+        hsdp_param.replicate_world_size = 2
         hsdp_param.param_mode = FullyShardParamMode.DTENSOR_UNIFIED
+        hsdp_param.mesh_info = MagicMock()
+        hsdp_param.mesh_info.replicate_process_group = MagicMock()
         state.hsdp_params.append(hsdp_param)
+
+        mock_ar_group = MagicMock()
+        mock_ar_group_cls.return_value = mock_ar_group
 
         TorchHSDPStateV2.post_backward(state)
 
         state.reduce_params.assert_called_once()
         state._queue_compat_all_reduce.assert_not_called()
-        state._queue_reduce_scatter_then_all_reduce.assert_called_once_with(
-            hsdp_param,
-            torch.distributed.ReduceOp.SUM,
-        )
+        mock_ar_group_cls.assert_called_once()
+        mock_ar_group.allocate_fused_buffer.assert_called_once_with(state.device)
+        TorchHSDPStateV2.pre_all_reduce_groups = []
 
     def test_state_post_backward_reduces_direct_dtensor_compat_sharded_grad(self):
         """Verify pure-TP DTENSOR_COMPAT params reduce grads that stay on sharded_param.grad."""
@@ -1509,9 +1536,12 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         HSDPState.pre_reduce_scatter_params = []
         HSDPState.pre_all_reduce_params = []
         TorchHSDPStateV2.pre_direct_all_reduce_grads = []
+        TorchHSDPStateV2.pre_all_reduce_groups = []
         state._user_reduce_op_type = None
         state._reduce_dtype = torch.float32
         state._orig_dtype = torch.float32
+        state.mp_policy = MixedPrecisionPolicy()
+        state.device = torch.device("cpu")
         state.reduce_params = MagicMock()
         state._queue_compat_all_reduce = MagicMock()
         state._queue_reduce_scatter_then_all_reduce = MagicMock()
@@ -1554,7 +1584,10 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         """Verify requires_all_reduce=False suppresses compat all-reduce for replicate_params."""
         state = object.__new__(TorchHSDPStateV2)
         state._user_reduce_op_type = None
-        state._reduce_dtype = None
+        state._reduce_dtype = torch.float32
+        state._orig_dtype = torch.float32
+        state.mp_policy = MixedPrecisionPolicy()
+        state.device = torch.device("cpu")
         state.hsdp_params = []
         state.replicate_params = []
         state.reduce_grads = True
@@ -1562,6 +1595,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         state.requires_all_reduce = False
         HSDPState.pre_reduce_scatter_params = []
         HSDPState.pre_all_reduce_params = []
+        TorchHSDPStateV2.pre_all_reduce_groups = []
         state.reduce_params = MagicMock()
         state._queue_compat_all_reduce = MagicMock()
         state._queue_reduce_scatter_then_all_reduce = MagicMock()
@@ -1571,13 +1605,18 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         replicate_param = MagicMock()
         replicate_param.accumulate_unsharded_grad_if_needed = MagicMock()
         replicate_param.unsharded_accumulated_grad = None
+        replicate_param.unsharded_accumulated_grad_data = None
         replicate_param._unsharded_param = MagicMock()
         replicate_param.unsharded_param = replicate_param._unsharded_param
         replicate_param.unsharded_param.grad = torch.ones(2, 2)
         replicate_param.sharded_param.requires_grad = True
         replicate_param.shard_size = 1
         replicate_param.dp_size = 2
+        replicate_param.replicate_world_size = 1
         replicate_param.param_mode = FullyShardParamMode.LOCAL_PARAM
+        replicate_param.mesh_info = MagicMock()
+        replicate_param.mesh_info.replicate_process_group = MagicMock()
+        replicate_param.apply_reduced_grad = MagicMock(return_value=False)
         state.replicate_params.append(replicate_param)
 
         TorchHSDPStateV2.post_backward(state)
