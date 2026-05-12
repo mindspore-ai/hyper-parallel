@@ -1225,6 +1225,19 @@ class Platform:
         """
         raise NotImplementedError("Platform subclasses must implement swap_wrapper")
 
+    @staticmethod
+    def swap_tensor_wrapper(target, tag=None):
+        """Register target tensors into the current swap group.
+
+        Args:
+            target: A tensor or nested container of tensors to register.
+            tag: Optional debug tag associated with the wrapped tensors.
+
+        Returns:
+            The original target structure, unchanged semantically.
+        """
+        raise NotImplementedError("Platform subclasses must implement swap_tensor_wrapper")
+
     @property
     def noop_context_fn(self):
         """Get a no-op context function for checkpointing.

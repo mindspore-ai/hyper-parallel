@@ -24,7 +24,7 @@ from typing import Callable, Optional
 
 import mindspore as ms
 import numpy as np
-from hyper_parallel.core.activation_checkpoint import SwapManager, swap_wrapper
+from hyper_parallel.core.activation_checkpoint import SwapManager, swap_wrapper, swap_tensor_wrapper
 from hyper_parallel.core.activation_checkpoint.activation_checkpoint import CheckpointPolicy, swap
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 from mindspore import Tensor, mint, nn
@@ -133,7 +133,7 @@ def prepare_data(batch_size=4, seq_len=256, num_samples=32):
     ]
 
 
-def train_one_mode(net, data_list, train_steps=3):
+def train_one_mode(net, data_list, train_steps=3, record_forward_loss_peak=False):
     """Run training for one mode and return per-step losses."""
     vocab_size = net.head.out_channels
     optimizer = nn.Adam(net.trainable_params(), learning_rate=1e-4)
@@ -147,16 +147,21 @@ def train_one_mode(net, data_list, train_steps=3):
 
     params = tuple(net.trainable_params())
     losses = []
+    forward_loss_peak = None
     for step, (x, y) in enumerate(data_list):
         if step >= train_steps:
             break
         for param in params:
             param.grad = None
         loss = get_forward_fn(net)(x, y)
+        if record_forward_loss_peak and forward_loss_peak is None:
+            forward_loss_peak = ms.runtime.max_memory_allocated() / (1024 ** 3)
         loss.backward()
         grads = tuple(param.grad for param in params)
         optimizer(grads)
         losses.append(float(loss.asnumpy()))
+    if record_forward_loss_peak:
+        return losses, forward_loss_peak
     return losses
 
 
@@ -496,3 +501,183 @@ def test_act_swap_function_mode():
                 f"none={base_val:.8f}, {mode}={val:.8f}, diff={diff:.2e}"
             )
     print(f"\nAll {train_steps} steps: losses are consistent across modes (tol={tol}).")
+
+
+class _SwapTensorTransformerBlock(nn.Cell):
+    """Transformer block variant that optionally swaps selected activations."""
+
+    def __init__(self, dim=256, num_heads=4, swap_tensor_on=False):
+        super().__init__()
+        self.swap_tensor_on = swap_tensor_on
+        self.attn = SelfAttention(dim, num_heads)
+        self.norm1 = nn.LayerNorm((dim,))
+        self.norm2 = nn.LayerNorm((dim,))
+        self.ffn = nn.SequentialCell(
+            nn.Dense(dim, dim * 4, has_bias=True),
+            nn.ReLU(),
+            nn.Dense(dim * 4, dim, has_bias=True),
+        )
+
+    def construct(self, x):
+        """TransformerBlock construct"""
+        attn_out = self.attn(x)
+        if self.swap_tensor_on:
+            attn_out = swap_tensor_wrapper(attn_out, tag="attn_out")
+        x = x + attn_out
+        x = self.norm1(x)
+        if self.swap_tensor_on:
+            x = swap_tensor_wrapper(x, tag="norm1_out")
+        x = x + self.ffn(x)
+        x = self.norm2(x)
+        if self.swap_tensor_on:
+            x = swap_tensor_wrapper(x, tag="norm2_out")
+        return x
+
+
+class _SwapTensorTransformer(nn.Cell):
+    """SimpleTransformer variant that uses swap_tensor_wrapper() in each block."""
+
+    def __init__(self, vocab_size=32000, dim=2048, depth=16, swap_tensor_on=False):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.layers = nn.CellList(
+            [_SwapTensorTransformerBlock(dim, swap_tensor_on=swap_tensor_on) for _ in range(depth)]
+        )
+        self.norm = nn.LayerNorm((dim,))
+        self.head = nn.Dense(dim, vocab_size, has_bias=False)
+
+    def construct(self, x):
+        x = self.embed(x)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        return self.head(x)
+
+
+def run_one_swap_tensor_mode(mode: str, train_steps: int = 3, seed: int = 42) -> dict:
+    """Build a fresh swap-tensor model and run training for one mode."""
+    ms.set_context(mode=ms.PYNATIVE_MODE)
+    set_seed(seed)
+    data_list = prepare_data()
+    try:
+        with seed_memory_time_context(seed=seed) as stats:
+            vocab_size, dim, depth = 32000, 2048, 6
+
+            if mode == "none":
+                model = _SwapTensorTransformer(vocab_size=vocab_size, dim=dim, depth=depth)
+            elif mode == "swap_tensor":
+                model = _SwapTensorTransformer(
+                    vocab_size=vocab_size, dim=dim, depth=depth, swap_tensor_on=True
+                )
+                for i in range(len(model.layers) - 1):
+                    SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
+            else:
+                raise ValueError(f"Unknown mode: {mode!r}")
+
+            losses, forward_loss_peak = train_one_mode(
+                model,
+                data_list,
+                train_steps,
+                record_forward_loss_peak=True,
+            )
+        return {
+            "mode": mode,
+            "losses": losses,
+            "peak_mem_gb": forward_loss_peak,
+            "time_sec": stats["exec_time"],
+        }
+    finally:
+        gc.collect()
+        ms.runtime.empty_cache()
+
+
+def run_one_swap_tensor_mode_in_subprocess(mode: str, train_steps: int = 3, seed: int = 42) -> dict:
+    """Run a single swap-tensor mode in an isolated subprocess."""
+    project_root = Path(__file__).resolve().parents[4]
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import json; "
+            "from tests.mindspore.st.activation_checkpoint.swap_activation import "
+            "run_one_swap_tensor_mode; "
+            f"result = run_one_swap_tensor_mode({mode!r}, train_steps={train_steps}, seed={seed}); "
+            "print('__ACT_SWAP_TENSOR_RESULT__' + json.dumps(result, sort_keys=True))"
+        ),
+    ]
+
+    completed = subprocess.run(
+        command,
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    marker = "__ACT_SWAP_TENSOR_RESULT__"
+    for line in reversed(completed.stdout.splitlines()):
+        if marker in line:
+            return json.loads(line[line.find(marker) + len(marker):])
+
+    raise RuntimeError(
+        f"Mode {mode!r} did not produce a result marker.\n"
+        f"STDOUT:\n{completed.stdout}\n"
+        f"STDERR:\n{completed.stderr}"
+    )
+
+
+def test_act_swap_tensor_function_mode():
+    """
+    Feature: swap_tensor_wrapper() Function Interface
+    Description: Compare peak memory usage across two modes:
+                 'none' (baseline) and 'swap_tensor' (manually offload selected
+                 block outputs via swap_tensor_wrapper()).
+                 Validate that losses are numerically identical at every training
+                 step and that swap_tensor reduces peak memory usage.
+    Expectation: NONE > SWAP_TENSOR in peak memory usage, and both modes
+                 produce consistent losses without OOM.
+    """
+    print("Starting swap_tensor_wrapper() comparison: none vs swap_tensor")
+    train_steps = 3
+
+    modes = ["none", "swap_tensor"]
+    results = {}
+
+    for mode in modes:
+        print(f"\n--- Running mode: {mode.upper()} ---")
+        results[mode] = run_one_swap_tensor_mode_in_subprocess(mode, train_steps=train_steps)
+        peak_mem = results[mode]["peak_mem_gb"]
+        duration = results[mode]["time_sec"]
+        losses = results[mode]["losses"]
+        print(f"{mode}: Loss={losses[-1]:.4f}, Peak Mem={peak_mem:.5f} GB, Time={duration:.5f}s")
+
+    print("\n" + "=" * 70)
+    print("FINAL COMPARISON")
+    print("=" * 70)
+    print(f"{'Mode':<25} | {'Peak Mem (GB)':<15} | {'Time (s)':<10} | {'Final Loss':<12}")
+    print("-" * 70)
+    for mode in modes:
+        result = results[mode]
+        print(
+            f"{mode.upper():<25} | {result['peak_mem_gb']:<15.5f} | "
+            f"{result['time_sec']:<10.5f} | {result['losses'][-1]:<12.4f}"
+        )
+
+    base_losses = results["none"]["losses"]
+    tol = 1e-4
+    for step in range(train_steps):
+        base_val = base_losses[step]
+        val = results["swap_tensor"]["losses"][step]
+        diff = abs(val - base_val)
+        assert diff < tol, (
+            f"Loss mismatch at step {step} in mode 'swap_tensor': "
+            f"none={base_val:.8f}, swap_tensor={val:.8f}, diff={diff:.2e}"
+        )
+    print(f"\nAll {train_steps} steps: losses are consistent across modes (tol={tol}).")
+
+    mem_none = results["none"]["peak_mem_gb"]
+    mem_swap_tensor = results["swap_tensor"]["peak_mem_gb"]
+    assert mem_none > mem_swap_tensor, (
+        f"Expected NONE ({mem_none:.5f}) > SWAP_TENSOR ({mem_swap_tensor:.5f})"
+    )
+    print(f"Verified: NONE ({mem_none:.5f}) > SWAP_TENSOR ({mem_swap_tensor:.5f})")

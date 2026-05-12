@@ -21,6 +21,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from typing import Optional, Callable, Any, Union
+import warnings
 import torch
 from torch import nn
 from torch.distributed.utils import _replace_by_prefix
@@ -213,3 +214,42 @@ class SwapWrapper(ActivationWrapper):
 
 def swap_wrapper(module: Union[nn.Module, Callable], policy_fn: Optional[Callable] = None) -> SwapWrapper:
     return SwapWrapper(module, policy_fn)
+
+
+def swap_tensor_wrapper(target, tag: Optional[str] = None):
+    """Register selected tensors into the current swap group.
+
+    This helper is intended to be used inside a forward path that already
+    participates in the existing swap scheduling managed by ``SwapManager``.
+    It preserves the input structure and returns the original tensors.
+    """
+    group_name = SwapManager().get_current_group_name()
+    if not group_name:
+        warnings.warn(
+            f"Tensor {tag} cannot be swapped, for its group is unregistered."
+        )
+        return target
+    if SwapManager().is_last_group(group_name):
+        return target
+
+    storage = Storage()
+    count_idx = 0
+
+    def _register_tensor(tensor):
+        nonlocal count_idx
+        if not base_check_fn(tensor):
+            return tensor
+
+        tensor_tag = tag or f"{group_name}_swap_tensor"
+        funcname = f"{tensor_tag}::{tuple(tensor.shape)}"
+        storage.swap_storage[count_idx].append(SwapTensor(tensor, funcname))
+        count_idx += 1
+        return tensor
+
+    wrapped = torch.utils._pytree.tree_map(  # pylint: disable=protected-access
+        lambda x: _register_tensor(x) if isinstance(x, torch.Tensor) else x,
+        target,
+    )
+    if count_idx > 0:
+        SwapManager().add_storage(group_name, storage)
+    return wrapped

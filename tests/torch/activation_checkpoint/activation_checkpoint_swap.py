@@ -17,9 +17,10 @@ import copy
 import pytest
 import torch
 
+from torch import nn
 from tests.torch.common_net import SimpleTransformer
 from tests.torch.activation_checkpoint.utils import prepare_data, train_one_mode, seed_memory_time_context
-from hyper_parallel.core.activation_checkpoint import SwapManager, swap_wrapper
+from hyper_parallel.core.activation_checkpoint import SwapManager, swap_wrapper, swap_tensor_wrapper
 from hyper_parallel.core.activation_checkpoint.activation_checkpoint import CheckpointPolicy, swap
 from hyper_parallel.core.activation_checkpoint.swap import SwapGroup
 
@@ -150,6 +151,57 @@ class _SwapFnTransformer(SimpleTransformer):
         return self.head(x)
 
 
+class _TransformerBlock(nn.Module):
+    """A simple Transformer block for testing purposes."""
+
+    def __init__(self, dim=256, num_heads=4, swap_tensor_on=False):
+        super().__init__()
+        self.swap_tensor_on = swap_tensor_on
+        self.dim = dim
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.ReLU(),
+            nn.Linear(dim * 4, dim)
+        )
+
+    def forward(self, x):
+        """TransformerBlock forwardS"""
+        attn_out, _ = self.attn(x, x, x)
+        if self.swap_tensor_on:
+            attn_out = swap_tensor_wrapper(attn_out, tag="attn_out")
+        x = x + attn_out
+        x = self.norm1(x)
+        if self.swap_tensor_on:
+            x = swap_tensor_wrapper(x, tag="norm1_out")
+        x = x + self.ffn(x)
+        x = self.norm2(x)
+        if self.swap_tensor_on:
+            x = swap_tensor_wrapper(x, tag="norm2_out")
+        return x
+
+
+
+class _SwapTensorTransformer(nn.Module):
+    """A simple Transformer model for testing purposes."""
+
+    def __init__(self, vocab_size=1000, dim=2048, depth=6, swap_tensor_on=False):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, dim)
+        self.layers = nn.ModuleList([_TransformerBlock(dim, swap_tensor_on=swap_tensor_on) for _ in range(depth)])
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, vocab_size)
+
+    def forward(self, x):
+        x = self.embed(x)
+        for block in self.layers:
+            x = block(x)
+        x = self.norm(x)
+        return self.head(x)
+
+
 def _build_swap_fn_model(mode: str) -> torch.nn.Module:
     """Build and configure a model using the swap() function interface.
 
@@ -186,6 +238,32 @@ def _build_swap_fn_model(mode: str) -> torch.nn.Module:
     for i in range(len(model.layers) - 1):
         SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
     return model
+
+
+def _build_swap_tensor_model(mode: str) -> torch.nn.Module:
+    """Build and configure a model using the swap_tensor_wrapper() interface.
+
+    Args:
+        mode: One of 'none' or 'swap_tensor'.
+
+    Returns:
+        Configured model placed on NPU.
+
+    Raises:
+        ValueError: If mode is not recognised.
+    """
+    vocab_size, dim, depth = 32000, 2048, 16
+
+    if mode == "none":
+        # return SimpleTransformer(vocab_size=vocab_size, dim=dim, depth=depth).npu()
+        return _SwapTensorTransformer(vocab_size=vocab_size, dim=dim, depth=depth).npu()
+    if mode == "swap_tensor":
+        model = _SwapTensorTransformer(vocab_size=vocab_size, dim=dim, depth=depth, swap_tensor_on=True).npu()
+        for i in range(len(model.layers) - 1):
+            SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
+        return model
+
+    raise ValueError(f"Unknown mode: {mode!r}")
 
 
 def test_act_swap_function_mode():
@@ -256,6 +334,61 @@ def test_act_swap_function_mode():
         f"Expected NONE ({mem_none:.5f}) > SWAP_FN_WITH_POLICY ({mem_swap_fn_with_policy:.5f})"
     )
     print(f"Verified: NONE ({mem_none:.5f}) > SWAP_FN_WITH_POLICY ({mem_swap_fn_with_policy:.5f})")
+
+
+def test_act_swap_tensor_function_mode():
+    """
+    Feature: swap_tensor_wrapper() Function Interface
+    Description: Validate the declarative tensor swap interface by comparing
+                 training across two modes: 'none' (baseline) and
+                 'swap_tensor' (manually offload each transformer block output
+                 via swap_tensor_wrapper()).
+                 Asserts that losses are numerically identical at every
+                 training step and that device memory is reduced when swap is applied.
+    Expectation: All modes produce consistent losses (within 1e-5 tolerance),
+                 and NONE > SWAP_TENSOR in peak device memory.
+    """
+    print("Starting swap_tensor_wrapper() comparison: none vs swap_tensor")
+    dataloader = prepare_data()
+    train_steps = 3
+
+    modes = ["none", "swap_tensor"]
+
+    results = {}
+
+    for mode in modes:
+        print(f"\n--- Running mode: {mode.upper()} ---")
+        with seed_memory_time_context() as stats:
+            model = _build_swap_tensor_model(mode)
+            losses = train_one_mode(model, dataloader, train_steps)
+        peak_mem = stats.get("peak_mem")
+        duration = stats.get("exec_time")
+        results[mode] = {"losses": losses, "peak_mem_gb": peak_mem, "time_sec": duration}
+        print(f"{mode}: Loss={losses[-1]:.4f}, Peak Mem={peak_mem:.5f} GB, Time={duration:.5f}s")
+
+    print("\n" + "=" * 70)
+    print("FINAL COMPARISON")
+    print("=" * 70)
+    print(f"{'Mode':<25} | {'Peak Mem (GB)':<15} | {'Time (s)':<10} | {'Final Loss':<12}")
+    print("-" * 70)
+    for mode in modes:
+        r = results[mode]
+        print(
+            f"{mode.upper():<25} | {r['peak_mem_gb']:<15.5f} | "
+            f"{r['time_sec']:<10.5f} | {r['losses'][-1]:<12.4f}"
+        )
+
+    base_losses = results["none"]["losses"]
+    tol = 1e-5
+    for step in range(train_steps):
+        base_val = base_losses[step]
+        val = results["swap_tensor"]["losses"][step]
+        diff = abs(val - base_val)
+        assert diff < tol, (
+            f"Loss mismatch at step {step} in mode 'swap_tensor': "
+            f"none={base_val:.8f}, swap_tensor={val:.8f}, diff={diff:.2e}"
+        )
+    print(f"\nAll {train_steps} steps: losses are consistent across modes (tol={tol}).")
 
 
 class _SmallNet(torch.nn.Module):

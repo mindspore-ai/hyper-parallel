@@ -23,6 +23,7 @@ from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap imp
     SwapWrapper,
     base_check_fn,
     swap_wrapper,
+    swap_tensor_wrapper,
 )
 from hyper_parallel.platform.mindspore.activation_checkpoint.sac import (
     create_selective_checkpoint_contexts
@@ -36,5 +37,6 @@ __all__ = [
     "SwapWrapper",
     "base_check_fn",
     "swap_wrapper",
+    "swap_tensor_wrapper",
     "create_selective_checkpoint_contexts",
 ]

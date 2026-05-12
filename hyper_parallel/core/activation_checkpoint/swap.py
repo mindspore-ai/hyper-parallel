@@ -18,7 +18,7 @@
 import functools
 import threading
 import warnings
-import weakref
+
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +40,7 @@ class SwapTensor:
         self.ver = val._version
         self.funcname = funcname
         self._keep_on_device = False
+        self._duplicate_swap = False
         if isinstance(val, platform.Tensor) and str(val.device).lower() != 'cpu':
             self._state = self.STATE_DEVICE
             self.is_slice_tensor = val.untyped_storage().size() != val.numel() * platform.get_element_size(val)
@@ -50,6 +51,22 @@ class SwapTensor:
         else:
             self._state = self.STATE_NON_TENSOR
             self.val_cpu = None
+
+    def dedup_key(self):
+        """Return a stable identity key for duplicate-swap detection."""
+        if self._state == self.STATE_NON_TENSOR:
+            return None
+        return (
+            str(self.val.device),
+            self.val.untyped_storage().data_ptr(),
+            self.val.storage_offset(),
+            self.val.untyped_storage().size(),
+            tuple(self.val.stride()),
+        )
+
+    def mark_duplicate_swap(self) -> None:
+        """Mark this wrapper as a duplicate registration in the same swap group."""
+        self._duplicate_swap = True
 
     def protect_if_aliases(self, output_tensors: List[Any]) -> None:
         """Keep tensors that alias the wrapped module output on device."""
@@ -77,7 +94,7 @@ class SwapTensor:
 
     def resize_device_storage(self):
         """Reallocate device memory on compute stream."""
-        if self._state == self.STATE_NON_TENSOR:
+        if self._state == self.STATE_NON_TENSOR or self._duplicate_swap:
             return
 
         if self._state != self.STATE_HOST:
@@ -89,7 +106,7 @@ class SwapTensor:
 
     def async_load(self):
         """async load tensor from host to device"""
-        if self._state == self.STATE_NON_TENSOR or self._keep_on_device:
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
             return
 
         if self._state != self.STATE_HOST:
@@ -109,7 +126,7 @@ class SwapTensor:
 
     def wait_load(self):
         """change state to device after async load is done"""
-        if self._state == self.STATE_NON_TENSOR or self._keep_on_device:
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
             return
 
         if self._state == self.STATE_DEVICE:
@@ -124,7 +141,7 @@ class SwapTensor:
 
     def async_offload(self):
         """async offload tensor from device to host"""
-        if self._state == self.STATE_NON_TENSOR or self._keep_on_device:
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
             return
 
         if self._state != self.STATE_DEVICE:
@@ -153,7 +170,7 @@ class SwapTensor:
 
     def wait_offload(self):
         """wait offload to host and free device memory"""
-        if self._state == self.STATE_NON_TENSOR or self._keep_on_device:
+        if self._state == self.STATE_NON_TENSOR or self._keep_on_device or self._duplicate_swap:
             return
 
         if self._state == self.STATE_HOST:
@@ -176,7 +193,10 @@ class SwapTensor:
     def __repr__(self):
         if self._state == self.STATE_NON_TENSOR:
             return f"<SwapTensor state=non_tensor, val_type={type(self.val).__name__}>"
-        return f"<SwapTensor state={self._state}, device_val={'exists' if self.val is not None else 'None'}>"
+        return (
+            f"<SwapTensor state={self._state}, duplicate={self._duplicate_swap}, "
+            f"device_val={'exists' if self.val is not None else 'None'}>"
+        )
 
 
 class Storage:
@@ -185,6 +205,34 @@ class Storage:
     def __init__(self):
         self.save_storage: Dict[Any, List[Any]] = defaultdict(list)
         self.swap_storage: Dict[Any, List[Any]] = defaultdict(list)
+
+    def iter_swap_tensors(self):
+        """Iterate all SwapTensor objects stored in this storage."""
+        collected = []
+
+        def _collect(x):
+            if isinstance(x, SwapTensor):
+                collected.append(x)
+            return x
+
+        for storage_list in self.swap_storage.values():
+            for item in storage_list:
+                platform.tree_map(_collect, item)
+        return collected
+
+    def mark_duplicate_swaps(self, seen_keys) -> int:
+        """Mark tensors already registered in the same swap group as duplicates."""
+        duplicate_count = 0
+        for swap_tensor in self.iter_swap_tensors():
+            dedup_key = swap_tensor.dedup_key()
+            if dedup_key is None:
+                continue
+            if dedup_key in seen_keys:
+                swap_tensor.mark_duplicate_swap()
+                duplicate_count += 1
+                continue
+            seen_keys.add(dedup_key)
+        return duplicate_count
 
     def protect_output_tensors(self, outputs: Any):
         """Avoid offloading tensors that alias the wrapped module outputs."""
@@ -268,17 +316,29 @@ class SwapGroup:
 
     def __init__(self, group_name: str):
         self.group_name = group_name
-        self._storages = weakref.WeakSet()
+        self.is_last_group = False
+        self._live_storages = []
         self._load_event = None
         self._offload_event = None
 
     def add(self, storage):
         """Add a storage to the swap group."""
-        self._storages.add(storage)
+        seen_keys = set()
+        for existing_storage in self._live_storages:
+            for swap_tensor in existing_storage.iter_swap_tensors():
+                dedup_key = swap_tensor.dedup_key()
+                if dedup_key is not None:
+                    seen_keys.add(dedup_key)
+        duplicate_count = storage.mark_duplicate_swaps(seen_keys)
+        if duplicate_count > 0:
+            warnings.warn(
+                f"SwapGroup '{self.group_name}' skipped {duplicate_count} duplicate tensor swap registration(s)."
+            )
+        self._live_storages.append(storage)
 
     def protect_output_tensors(self, outputs: Any):
         """Protect current module outputs from premature offload."""
-        for storage in self._storages:
+        for storage in self._live_storages:
             storage.protect_output_tensors(outputs)
 
     def launch_offload(self, copy_stream):
@@ -289,7 +349,7 @@ class SwapGroup:
         stream_context = platform.get_stream_context()
         with platform.no_grad(), stream_context(copy_stream):
             compute_event.wait(copy_stream)
-            for storage in self._storages:
+            for storage in self._live_storages:
                 storage.launch_offload()
             self._offload_event.record(copy_stream)
 
@@ -304,13 +364,13 @@ class SwapGroup:
         with platform.no_grad(), stream_context(compute_stream):
             self._offload_event.wait(compute_stream)
             self._offload_event = None
-            for storage in self._storages:
+            for storage in self._live_storages:
                 storage.wait_offload()
 
     def launch_load(self, copy_stream):
         """Prepare storage and launch async load for all storages in the group."""
         with platform.no_grad():
-            for storage in self._storages:
+            for storage in self._live_storages:
                 storage.resize_device_storage()
 
         compute_event = platform.new_event()
@@ -319,7 +379,7 @@ class SwapGroup:
         stream_context = platform.get_stream_context()
         with platform.no_grad(), stream_context(copy_stream):
             compute_event.wait(copy_stream)
-            for storage in self._storages:
+            for storage in self._live_storages:
                 storage.launch_load()    # Only copy, no resize
             self._load_event.record(copy_stream)
 
@@ -329,13 +389,16 @@ class SwapGroup:
             raise RuntimeError(
                 f"SwapGroup '{self.group_name}' wait_load() called before launch_load()."
             )
-        compute_stream = platform.get_current_stream()
-        stream_context = platform.get_stream_context()
-        with platform.no_grad(), stream_context(compute_stream):
-            self._load_event.wait(compute_stream)
-            self._load_event = None
-            for storage in self._storages:
-                storage.wait_load()
+        try:
+            compute_stream = platform.get_current_stream()
+            stream_context = platform.get_stream_context()
+            with platform.no_grad(), stream_context(compute_stream):
+                self._load_event.wait(compute_stream)
+                self._load_event = None
+                for storage in self._live_storages:
+                    storage.wait_load()
+        finally:
+            self._live_storages.clear()
 
 
 class SwapManager:
@@ -404,11 +467,30 @@ class SwapManager:
             raise RuntimeError(f"Group {group_name} does not exist.")
         group.wait_load()
 
+    def release_group_storage(self, group_name: str) -> None:
+        """Release live storage references held by the swap group.
+
+        Called at the end of backward to free Storage objects that were never
+        released via wait_load (e.g. the last layer, which has no next layer
+        and therefore never goes through the offload-load cycle).
+        """
+        group = self._groups.get(group_name)
+        if group is not None:
+            group._live_storages.clear()
+
     def get_current_group_name(self):
         return self._current_group_name
 
     def set_current_group_name(self, group_name):
         self._current_group_name = group_name
+
+    def is_last_group(self, group_name: Optional[str] = None) -> bool:
+        """Return whether the specified swap group is the terminal group in the chain."""
+        group_name = self._current_group_name if group_name is None else group_name
+        group = self._groups.get(group_name)
+        if group is None:
+            return False
+        return group.is_last_group
 
     def set_forward_prefetch_layer(self, first_layer, second_layer):
         """
@@ -441,6 +523,9 @@ class SwapManager:
             first_layer._swap_group_order["next"] = second_name
         if second_layer._swap_group_order["prev"] is None:
             second_layer._swap_group_order["prev"] = first_name
+
+        self._groups[first_name].is_last_group = first_layer._swap_group_order["next"] is None
+        self._groups[second_name].is_last_group = second_layer._swap_group_order["next"] is None
 
         def _forward_pre_hook(group_name, module, _):  # pylint: disable=W0613
             if getattr(module, "_swap_state", None) == "pre_backward":
@@ -538,6 +623,7 @@ class SwapManager:
 
         def _backward_hook(group_name, module, grad_input, grad_output):  # pylint: disable=W0613
             module._swap_state = "backward"
+            SwapManager().release_group_storage(group_name)
 
         def _register_hooks_once(module, group_name):
             hooks = [

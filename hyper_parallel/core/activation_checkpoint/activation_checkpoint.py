@@ -106,3 +106,4 @@ def swap(function, *args, policy_fn=None, **kwargs):
 
 checkpoint_wrapper = partial(plat.ckpt_wrapper, checkpoint_fn=checkpoint)
 swap_wrapper = plat.swap_wrapper
+swap_tensor_wrapper = plat.swap_tensor_wrapper
