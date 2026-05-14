@@ -26,6 +26,13 @@ Divs:
   dist_op_name: _divs_dist_op
   distributed_op_class: ElementWiseWithPartialDistributedOp
 
+InplaceZero:
+  dist_op_name: _inplace_zero_dist_op
+
+InplaceMuls:
+  dist_op_name: _inplace_muls_dist_op
+  distributed_op_class: ElementWiseWithPartialDistributedOp
+
 Sigmoid:
   dist_op_name: _sigmoid_dist_op
 

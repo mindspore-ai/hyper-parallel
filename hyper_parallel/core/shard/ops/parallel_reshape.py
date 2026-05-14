@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -107,6 +107,10 @@ class ReshapeDistributedOp(DistributedOp):
         """
         Merge those axes that are not sharded to the high dimension which is shared.
         shape[4, 2, 6, 8], tensor map[-1, -1, 0, -1] -> merged shape[8, 48]
+
+        Returns:
+            tuple: (merged_shape, merge_tensor_map).
+                merge_tensor_map may contain -1 for merged unsharded axis groups.
         """
         merged_size = 1
         merged_shape = []
@@ -223,9 +227,12 @@ class ReshapeDistributedOp(DistributedOp):
             cur_size = cur_size // shape
 
             if cur_size == 1:
-                map_val = self._handle_sharded_axis(
-                    merge_tensor_map, cur_axis, x_mesh_shape, shape, dynamic_can_shard, input_shape, x_map, dst_shape
-                )
+                map_val = merge_tensor_map[cur_axis]
+                if map_val != -1:
+                    self._validate_reshape_shard(
+                        map_val, x_mesh_shape, shape,
+                        dynamic_can_shard, input_shape, x_map, dst_shape
+                    )
                 output_tensor_map.insert(0, map_val)
                 cur_axis -= 1
                 cur_size = merged_shape[cur_axis]
@@ -234,11 +241,9 @@ class ReshapeDistributedOp(DistributedOp):
 
         return output_tensor_map
 
-    def _handle_sharded_axis(self, merge_tensor_map, cur_axis, x_mesh_shape, shape, dynamic_can_shard,
-                              input_shape, x_map, dst_shape):
-        """Handle sharded axis in tensor_map computation."""
-        map_val = merge_tensor_map[cur_axis]
-
+    def _validate_reshape_shard(self, map_val, x_mesh_shape, shape,
+                                 dynamic_can_shard, input_shape, x_map, dst_shape):
+        """Validate that a sharded axis can be reshaped to the target shape dimension."""
         if isinstance(map_val, tuple):
             shard_size = 1
             for axis in map_val:
@@ -251,8 +256,6 @@ class ReshapeDistributedOp(DistributedOp):
                 raise ValueError(f"Can not reshape {input_shape} to {dst_shape} with tensor map {x_map}")
         elif shard_size > shape or shape % shard_size != 0:
             raise ValueError(f"Can not reshape {input_shape} to {dst_shape} with tensor map {x_map}")
-
-        return map_val
 
     def _apply_partial_status(self, x_layout, out_layout):
         """Apply partial status from input to output layout."""

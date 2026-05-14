@@ -16,7 +16,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 
@@ -177,7 +177,7 @@ class _MeshLayout:
     def from_sizes_strides(
             cls,
             sizes: tuple[int, ...],
-            strides: tuple[int, ...] | None = None,
+            strides: Optional[tuple[int, ...]] = None,
     ) -> "_MeshLayout":
         if strides is None:
             strides = _contiguous_strides(sizes)
