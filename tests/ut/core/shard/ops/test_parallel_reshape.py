@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -76,6 +76,11 @@ class TestParallelReshape(unittest.TestCase):
         """Set up mock and return a standard 2x2x2 (dp, mp, cp) mesh via init_device_mesh."""
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "mp", "cp"))
+
+    def _make_8_mesh(self, mock_platform, mesh_dim_name="dp"):
+        """Set up mock and return a standard 8-element 1D mesh."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        return init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=(mesh_dim_name,))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_reshape_layout_not_change_sharded_axis(self, mock_platform):
@@ -562,6 +567,30 @@ class TestParallelReshape(unittest.TestCase):
 
         assert output_layout.is_partial(), "Output layout should preserve partial status"
         assert output_layout.get_partial_by_dev_id("dp") == "sum"
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_reshape_replicate_1d_mesh8_to_self(self, mock_platform):
+        """
+        Feature: Reshape with Replicate placement on 1D tensor via 8-element 1D mesh
+        Description: x.reshape((-1,)) on (2,) tensor with Replicate placement on (8,) mesh
+        Expectation: Success or distributed logic error reported
+        """
+        mesh = self._make_8_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(),), 1)
+        src_shape = (2,)
+        dst_shape = (-1,)
+
+        output_layout, local_dst_shape = op_torch.infer_layout((x_layout,), (dst_shape, src_shape))
+        expected_map = (-1,)
+        assert output_layout.tensor_map == expected_map, (
+            f"Replicate 1D reshape to self failed. Expected {expected_map}, "
+            f"got {output_layout.tensor_map}"
+        )
+        expected_local_dst_shape = [2]
+        assert local_dst_shape == expected_local_dst_shape, (
+            f"Replicate 1D reshape to self failed. Expected {expected_local_dst_shape}, "
+            f"got {local_dst_shape}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_view_with_partial(self, mock_platform):
