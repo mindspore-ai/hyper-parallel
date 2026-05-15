@@ -330,6 +330,12 @@ class MindSporeHSDPStateV2(HSDPState):
             reduce_group_size = reduce_group_info.rank_size if reduce_group_info is not None else 1
 
             if reduce_group is not None and reduce_group_size > 1:
+                # Ascend HCCL DistCommAllReduce rejects non-contiguous tensors;
+                # reduced_grad here may still be a view from the no-reduce path
+                # of ``unsharded_grad_data`` / ``_to_local_unsharded_grad``.
+                # ``Tensor.contiguous()`` is a no-op when storage is already
+                # contiguous, so the unconditional call is safe.
+                reduced_grad = reduced_grad.contiguous()
                 param.all_reduce_handle = dist.all_reduce(
                     reduced_grad, group=reduce_group, op=self.reduce_op_type, async_op=async_op
                 )

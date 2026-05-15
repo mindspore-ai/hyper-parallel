@@ -235,12 +235,31 @@ class DeviceMesh:
 
     def _refresh_mesh_view(self) -> None:
         """Materialize the visible mesh tensor and the derived shape/rank metadata."""
-        full_mesh_np = self._layout.remap_to_numpy(platform.tensor_to_numpy(self._rank_map))
-        full_mesh = Tensor(full_mesh_np).int()
-        self.mesh = self._get_mesh_tensor_from_full_mesh(full_mesh, current_rank=self._rank)
-        self._mesh_shape = tuple(self.mesh.shape)
-        self._rank_list = tuple(platform.tensor_to_numpy(self.mesh).reshape(-1).tolist())
-        self._flatten_rank_map = tuple(platform.tensor_to_numpy(self._rank_map).reshape(-1).tolist())
+        # Compute everything in numpy first so the intermediate ops don't need
+        # a real device. Otherwise the call would fail (or SIGSEGV on Ascend)
+        # when DeviceMesh is constructed inside a ``ms.DeviceCtx("meta")``
+        # block — e.g., from ``DeviceMesh.concatenate`` invoked under
+        # ``fully_shard``, which forces fresh ``Tensor()`` constructions onto
+        # the meta device and any subsequent op (asnumpy, nonzero, …) crashes.
+        rank_map_np = platform.tensor_to_numpy(self._rank_map).reshape(-1)
+        full_mesh_np = self._layout.remap_to_numpy(rank_map_np)
+        if full_mesh_np.shape[0] == 1:
+            per_rank_mesh_np = full_mesh_np[0]
+        else:
+            coords = np.argwhere(full_mesh_np == self._rank)
+            if coords.shape[0] == 0:
+                raise RuntimeError(
+                    "In order to get the mesh tensor of a DeviceMesh it needs to "
+                    "either have all its original dimensions or contain the local rank."
+                )
+            per_rank_mesh_np = full_mesh_np[coords[0, 0]]
+        # Cache the numpy view so ``_compute_coordinate_on_dim`` doesn't need
+        # to operate on ``self.mesh`` (which may be on the meta device).
+        self._per_rank_mesh_np = per_rank_mesh_np
+        self.mesh = Tensor(per_rank_mesh_np.astype(np.int32)).int()
+        self._mesh_shape = tuple(per_rank_mesh_np.shape)
+        self._rank_list = tuple(per_rank_mesh_np.reshape(-1).tolist())
+        self._flatten_rank_map = tuple(rank_map_np.tolist())
         self._dev_num = np.prod(np.array(self._mesh_shape))
         self._dev_rank = len(self._mesh_shape)
 
@@ -299,10 +318,22 @@ class DeviceMesh:
 
     @staticmethod
     def _convert_rank_map_to_tensor(rank_map: Tensor) -> Tensor:
+        """Normalize a rank-map input into the flat int32 Tensor stored on the mesh.
+
+        Tensor input is returned as-is to preserve its original device; list /
+        tuple / numpy input is built into a fresh flat int32 Tensor.
+        """
         if isinstance(rank_map, Tensor):
-            rank_map_np = platform.tensor_to_numpy(rank_map)
-        else:
-            rank_map_np = np.array(rank_map)
+            # Reuse the existing tensor as-is so we preserve its real device.
+            # Going through ``Tensor(np_array)`` would re-create on whatever
+            # device context is active (e.g. ``ms.DeviceCtx("meta")`` while
+            # ``DeviceMesh.concatenate`` runs under ``fully_shard``), which then
+            # breaks the immediate ``asnumpy()`` in ``_refresh_mesh_view``.
+            # All in-tree callers that pass a Tensor pass an existing
+            # ``DeviceMesh._rank_map`` — already a flat int32 tensor, so no
+            # reshape/cast is needed.
+            return rank_map
+        rank_map_np = np.array(rank_map)
         return Tensor(rank_map_np.reshape(-1).astype(np.int32)).int()
 
     @staticmethod
@@ -324,6 +355,19 @@ class DeviceMesh:
 
     def _compute_coordinate_on_dim(self):
         """Compute the current rank coordinates inside this mesh view."""
+        # Use the cached numpy view rather than ``self.mesh`` so this works
+        # even when the mesh tensor lives on the meta device (DeviceMesh
+        # constructed under ``ms.DeviceCtx("meta")`` via ``fully_shard``).
+        per_rank_mesh_np = getattr(self, "_per_rank_mesh_np", None)
+        if per_rank_mesh_np is not None:
+            rank_coords = np.argwhere(per_rank_mesh_np == self._rank)
+            if rank_coords.shape[0] not in (0, 1):
+                raise AssertionError(
+                    f"rank_coords.shape[0] must be 0 or 1, got {rank_coords.shape[0]}"
+                )
+            if rank_coords.shape[0] == 0:
+                return None
+            return tuple(int(x) for x in rank_coords[0])
         return self._compute_coordinates_from_mesh(self.mesh, self._rank)
 
     @staticmethod

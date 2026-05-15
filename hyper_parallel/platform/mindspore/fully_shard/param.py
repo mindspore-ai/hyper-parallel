@@ -729,6 +729,13 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             output_numel, dtype=reduce_dtype, device=grad.device.split(':')[0]
         )
 
+        # Ascend HCCL DistCommReduceScatter rejects non-contiguous tensors.
+        # ``pack_for_reduce_scatter`` on a shard-dim-0 path returns the input
+        # tensor as-is (potentially a view from to_local() / redistribute()),
+        # and the trailing ``.reshape(-1)`` may yield a view. Force contiguous
+        # storage here (no-op when already contig).
+        grad_flat = grad_flat.contiguous()
+
         # Execute reduce_scatter_tensor
         self.reduce_scatter_handle = dist.reduce_scatter_tensor(
             self._reduce_scatter_output,
@@ -779,6 +786,15 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         reduce_group = reduce_group_info.group
         if reduce_group is None:
             raise RuntimeError("Expected a valid unsharded all-reduce group when rank_size > 1")
+
+        # Ascend HCCL DistCommAllReduce rejects non-contiguous tensors.
+        # ``grad`` here may be a view returned by ``_to_local_unsharded_grad``
+        # (DTensor.to_local() / redistribute().to_local()) or by autograd.
+        # ``Tensor.contiguous()`` is itself a no-op when storage is already
+        # contiguous, so the unconditional call is safe and avoids the
+        # ``is_contiguous()`` query (which has been observed to under-detect
+        # non-contig views from DTensor on this MS version).
+        grad = grad.contiguous()
 
         self._all_reduce_output = grad
         self.all_reduce_handle = dist.all_reduce(
