@@ -1,0 +1,4 @@
+MatmulReduceScatter:
+  dist_op_name: _matmul_reduce_scatter_dist_op
+  distributed_op_class: MatmulReduceScatterDistributedOp
+  distributed_op_file: parallel_matmul_reduce_scatter

@@ -1,0 +1,4 @@
+AllGatherMatmul:
+  dist_op_name: _all_gather_matmul_dist_op
+  distributed_op_class: AllGatherMatmulDistributedOp
+  distributed_op_file: parallel_all_gather_matmul
