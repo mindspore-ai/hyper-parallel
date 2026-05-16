@@ -828,6 +828,11 @@ class TestAsyncReduceStateMachine(unittest.TestCase):
         packed_grad = MagicMock()
         packed_grad.reshape.return_value = packed_grad
         packed_grad.numel.return_value = 8
+        # ``reduce_scatter_grad`` calls ``.contiguous()`` on the packed flat
+        # tensor right before ``dist.reduce_scatter_tensor`` to satisfy Ascend
+        # HCCL's contig requirement; route the mock back to ``packed_grad`` so
+        # the identity assertion below still passes.
+        packed_grad.contiguous.return_value = packed_grad
         grad.to.return_value = grad
         param.unsharded_grad_data = grad
         param.hsdp_placement = MagicMock()
@@ -872,6 +877,10 @@ class TestAsyncReduceStateMachine(unittest.TestCase):
         """
         param = self._make_param()
         grad = MagicMock()
+        # ``all_reduce_grad`` calls ``.contiguous()`` right before
+        # ``dist.all_reduce`` to satisfy Ascend HCCL; route the mock back to
+        # ``grad`` so the identity assertions below still pass.
+        grad.contiguous.return_value = grad
         handle = MagicMock()
         mock_all_reduce.return_value = handle
         reduced_grad, returned_handle = MindSporeHSDPParamV2.all_reduce_grad(
@@ -894,6 +903,10 @@ class TestAsyncReduceStateMachine(unittest.TestCase):
         grad = MagicMock()
         grad.dtype = ms.float16
         cast_grad = MagicMock()
+        # The dtype-cast result is what reaches the dist op; ``all_reduce_grad``
+        # then calls ``.contiguous()`` on it for Ascend HCCL. Route the mock
+        # back to ``cast_grad`` so the identity assertions still pass.
+        cast_grad.contiguous.return_value = cast_grad
         grad.to.return_value = cast_grad
         handle = MagicMock()
         mock_all_reduce.return_value = handle

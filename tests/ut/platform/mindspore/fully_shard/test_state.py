@@ -190,19 +190,25 @@ class TestStateParamBookkeeping(unittest.TestCase):
         replicate_param.unsharded_accumulated_grad = None
         replicate_param.unsharded_accumulated_grad_data = None
         replicate_param.unsharded_param = SimpleNamespace(grad="grad")
-        replicate_param.unsharded_grad_data = "normalized-grad"
+        # ``_allreduce_replicate_params`` calls ``.contiguous()`` on the grad
+        # right before ``dist.all_reduce`` to satisfy Ascend HCCL. Use a Mock
+        # whose ``.contiguous()`` returns itself so the existing identity
+        # assertions on the AllReduce input still hold.
+        normalized_grad = MagicMock(name="normalized_grad")
+        normalized_grad.contiguous.return_value = normalized_grad
+        replicate_param.unsharded_grad_data = normalized_grad
         replicate_param.unsharded_group_info = GroupInfo("group", "layout-group", 4)
         state.replicate_params = [replicate_param]
 
         state._allreduce_replicate_params(async_op=True)
 
         mock_all_reduce.assert_called_once_with(
-            "normalized-grad",
+            normalized_grad,
             group="layout-group",
             op="sum",
             async_op=True,
         )
-        self.assertEqual(state._ignored_allreduce_works, [(replicate_param, "normalized-grad", 4)])
+        self.assertEqual(state._ignored_allreduce_works, [(replicate_param, normalized_grad, 4)])
 
     def test_post_backward_uses_sync_reduction_on_layout_driven_sizes(self):
         """post_backward should use layout-driven sizes and waitable sync reductions before applying grads."""
