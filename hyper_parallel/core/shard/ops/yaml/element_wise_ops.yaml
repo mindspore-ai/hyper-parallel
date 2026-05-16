@@ -33,6 +33,12 @@ InplaceMuls:
   dist_op_name: _inplace_muls_dist_op
   distributed_op_class: ElementWiseWithPartialDistributedOp
 
+InplaceFillScalar:
+  dist_op_name: _inplace_fill_scalar_dist_op
+
+InplaceFillTensor:
+  dist_op_name: _inplace_fill_tensor_dist_op
+
 Sigmoid:
   dist_op_name: _sigmoid_dist_op
 
