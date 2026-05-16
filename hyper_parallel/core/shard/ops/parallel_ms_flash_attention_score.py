@@ -24,7 +24,7 @@ from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import (  
     _get_lb_override,
 )
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
 from hyper_parallel.platform import get_platform
 
@@ -111,34 +111,6 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
         if isinstance(value, Tensor):
             return value.item()
         return value
-
-    @staticmethod
-    def _tensor_map_to_placements(base_layout: Layout, tensor_map: tuple) -> tuple:
-        """Convert tensor_map to placements."""
-        mesh_ndim = len(base_layout.mesh_shape)
-        placements = []
-
-        for mesh_dim_idx in range(mesh_ndim):
-            is_sharded = False
-
-            for tensor_dim_idx, tensor_dim_map in enumerate(tensor_map):
-                if tensor_dim_map == -1:
-                    continue
-
-                if isinstance(tensor_dim_map, tuple):
-                    if mesh_dim_idx in tensor_dim_map:
-                        placements.append(Shard(tensor_dim_idx))
-                        is_sharded = True
-                        break
-                elif tensor_dim_map == mesh_dim_idx:
-                    placements.append(Shard(tensor_dim_idx))
-                    is_sharded = True
-                    break
-
-            if not is_sharded:
-                placements.append(Replicate())
-
-        return tuple(placements)
 
     def _is_dynamic_shape(self, tensor: Tensor, dim: int) -> bool:
         """Check if tensor has dynamic shape at given dimension."""
@@ -407,10 +379,7 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
 
         attention_out_layout = copy.deepcopy(query_layout)
         if attention_out_layout.placements is None and attention_out_layout.tensor_map is not None:
-            attention_out_placements = FlashAttentionScoreDistributedOp._tensor_map_to_placements(
-                attention_out_layout, attention_out_layout.tensor_map
-            )
-            attention_out_layout.set_placements(attention_out_placements)
+            attention_out_layout.tensor_map_to_placement()
 
         if input_layout_str in self._layout_dims:
             softmax_layout = self._infer_softmax_layout_by_input_layout(
@@ -423,10 +392,7 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
         softmax_sum_layout = copy.deepcopy(softmax_layout)
         softmax_out_layout = self._create_replicated_scalar_layout(query_layout)
         if softmax_out_layout.placements is None and softmax_out_layout.tensor_map is not None:
-            softmax_out_placements = FlashAttentionScoreDistributedOp._tensor_map_to_placements(
-                softmax_out_layout, softmax_out_layout.tensor_map
-            )
-            softmax_out_layout.set_placements(softmax_out_placements)
+            softmax_out_layout.tensor_map_to_placement()
 
         # Output order must match C++ kernel: softmax_max, softmax_sum,
         # softmax_out, attention_out.
@@ -462,10 +428,7 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
             )
 
         softmax_layout.set_tensor_map(softmax_tensor_map)
-        softmax_placements = FlashAttentionScoreDistributedOp._tensor_map_to_placements(
-            softmax_layout, softmax_tensor_map
-        )
-        softmax_layout.set_placements(softmax_placements)
+        softmax_layout.tensor_map_to_placement()
 
         return softmax_layout
 
@@ -481,10 +444,7 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
 
         softmax_layout = Layout.from_device_mesh(query_layout.mesh)
         softmax_layout.set_tensor_map(softmax_tensor_map)
-        softmax_placements = FlashAttentionScoreDistributedOp._tensor_map_to_placements(
-            softmax_layout, softmax_tensor_map
-        )
-        softmax_layout.set_placements(softmax_placements)
+        softmax_layout.tensor_map_to_placement()
 
         return softmax_layout
 

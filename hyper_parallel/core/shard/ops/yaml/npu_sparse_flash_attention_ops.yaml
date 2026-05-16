@@ -1,0 +1,9 @@
+npu_sparse_flash_attention:
+  dist_op_name: _npu_sparse_flash_attention_dist_op
+  distributed_op_class: SparseFlashAttentionDistributedOp
+  distributed_op_file: parallel_npu_sparse_flash_attention
+
+SparseFlashAttention:
+  dist_op_name: _npu_sparse_flash_attention_dist_op
+  distributed_op_class: SparseFlashAttentionDistributedOp
+  distributed_op_file: parallel_npu_sparse_flash_attention

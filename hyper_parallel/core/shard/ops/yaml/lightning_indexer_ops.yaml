@@ -1,0 +1,4 @@
+LightningIndexer:
+  dist_op_name: _lightning_indexer_dist_op
+  distributed_op_class: LightningIndexerDistributedOp
+  distributed_op_file: parallel_lightning_indexer

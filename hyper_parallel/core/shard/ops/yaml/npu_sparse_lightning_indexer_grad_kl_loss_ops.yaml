@@ -1,0 +1,4 @@
+npu_sparse_lightning_indexer_grad_kl_loss:
+  dist_op_name: _npu_sparse_lightning_indexer_grad_kl_loss_dist_op
+  distributed_op_class: NpuSparseLightningIndexerGradKlLossDistributedOp
+  distributed_op_file: parallel_npu_sparse_lightning_indexer_grad_kl_loss

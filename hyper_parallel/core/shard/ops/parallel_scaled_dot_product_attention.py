@@ -24,7 +24,6 @@ from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import (  
     _get_lb_override,
 )
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
 from hyper_parallel.platform import get_platform
 
@@ -44,34 +43,6 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
       - SP: Shard Q sequence dimension, KV replicated
       - Combinations: DP+MP, SP+MP, DP+SP+MP
     """
-
-    @staticmethod
-    def _tensor_map_to_placements(base_layout: Layout, tensor_map: tuple) -> tuple:
-        """Convert tensor_map to placements."""
-        mesh_ndim = len(base_layout.mesh_shape)
-        placements = []
-
-        for mesh_dim_idx in range(mesh_ndim):
-            is_sharded = False
-
-            for tensor_dim_idx, tensor_dim_map in enumerate(tensor_map):
-                if tensor_dim_map == -1:
-                    continue
-
-                if isinstance(tensor_dim_map, tuple):
-                    if mesh_dim_idx in tensor_dim_map:
-                        placements.append(Shard(tensor_dim_idx))
-                        is_sharded = True
-                        break
-                elif tensor_dim_map == mesh_dim_idx:
-                    placements.append(Shard(tensor_dim_idx))
-                    is_sharded = True
-                    break
-
-            if not is_sharded:
-                placements.append(Replicate())
-
-        return tuple(placements)
 
     @staticmethod
     def _normalize_dim_map(dim_map):
@@ -286,10 +257,7 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
 
         attention_out_layout = copy.deepcopy(query_layout)
         if attention_out_layout.placements is None and attention_out_layout.tensor_map is not None:
-            placements = ScaledDotProductAttentionDistributedOp._tensor_map_to_placements(
-                attention_out_layout, attention_out_layout.tensor_map
-            )
-            attention_out_layout.set_placements(placements)
+            attention_out_layout.tensor_map_to_placement()
 
         return attention_out_layout
 

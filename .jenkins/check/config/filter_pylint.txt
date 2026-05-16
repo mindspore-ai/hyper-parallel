@@ -134,3 +134,6 @@
 
 # 15. Expert Parallel tests — torch and torch_npu imports are conditionally used in distributed tests
 "hyper-parallel/tests/torch/expert_parallel/"                           "unused-import"
+
+# 16. Code static analysis fixes - custom_ops
+"hyper-parallel/hyper_parallel/platform/mindspore/custom_ops/"          "arguments-differ"

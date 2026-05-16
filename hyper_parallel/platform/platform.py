@@ -108,6 +108,20 @@ class Platform:
     post_grad_handle_process = None
     grad_sync_stream = None
 
+    @property
+    def custom_ops(self):
+        """Return the platform-specific custom ops interface.
+
+        Subclasses MUST override this property to return an object that
+        exposes the platform-specific custom operator implementations.
+
+        Returns:
+            object: Platform-specific custom ops class instance.
+        """
+        raise NotImplementedError(
+            "Platform subclasses must implement custom_ops"
+        )
+
     @staticmethod
     def get_rank():
         """Get the rank of the current process in the default process group.
@@ -1073,6 +1087,18 @@ class Platform:
             A context manager that disables gradient tracking.
         """
         raise NotImplementedError("Platform subclasses must implement no_grad")
+
+    @staticmethod
+    def relu(tensor):
+        """Apply ReLU activation element-wise.
+
+        Args:
+            tensor: Input tensor.
+
+        Returns:
+            Tensor with ReLU applied (max(0, x)).
+        """
+        raise NotImplementedError("Platform subclasses must implement relu")
 
     @staticmethod
     def cat(tensors, dim=0):

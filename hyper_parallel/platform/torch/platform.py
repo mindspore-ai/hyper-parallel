@@ -333,6 +333,24 @@ class TorchPlatform(Platform):
     dtype = torch.dtype
     Function = torch.autograd.Function
 
+    _custom_ops_cls = None
+
+    @property
+    def custom_ops(self):
+        """Return the Torch platform custom ops instance.
+
+        .. warning::
+            This is an experimental API that subject to change or deletion.
+
+        Returns:
+            TorchCustomOps: Custom ops class that raises NotImplementedError
+            for all operators (MindSpore-only at this time).
+        """
+        if self._custom_ops_cls is None:
+            from hyper_parallel.platform.torch.custom_ops import TorchCustomOps  # pylint: disable=import-outside-toplevel
+            self._custom_ops_cls = TorchCustomOps
+        return self._custom_ops_cls
+
     @staticmethod
     def is_linear_module(module) -> bool:
         """Check whether *module* is a ``torch.nn.Linear`` instance."""
@@ -1152,6 +1170,10 @@ class TorchPlatform(Platform):
     @staticmethod
     def no_grad():
         return torch.no_grad()
+
+    @staticmethod
+    def relu(tensor):
+        return torch.relu(tensor)
 
     @staticmethod
     def cat(tensors, dim=0):

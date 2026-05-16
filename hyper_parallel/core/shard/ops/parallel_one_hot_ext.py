@@ -18,7 +18,6 @@ Distributed implementation for OneHotExt operator.
 
 # pylint: disable=import-outside-toplevel
 from hyper_parallel.core.dtensor.layout import Layout
-from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
 
@@ -67,8 +66,7 @@ class OneHotExtDistributedOp(DistributedOp):
         out_tensor_map = self._infer_output_tensor_map(in_tensor_map, axis)
         out_layout = self._create_layout_from_tensor_map(indices_layout, out_tensor_map)
 
-        out_placements = OneHotExtDistributedOp._tensor_map_to_placements(indices_layout, out_tensor_map)
-        out_layout.set_placements(out_placements)
+        out_layout.tensor_map_to_placement()
 
         return out_layout
 
@@ -279,40 +277,3 @@ class OneHotExtDistributedOp(DistributedOp):
             alias_tensor_map.append(alias_name[len(alias_name) - 1 - dim])
 
         return tuple(alias_tensor_map)
-
-    @staticmethod
-    def _tensor_map_to_placements(base_layout, tensor_map):
-        """
-        Convert tensor_map to placements.
-        
-        Args:
-            base_layout: Base layout to get mesh dimension info
-            tensor_map: Tensor map to convert
-            
-        Returns:
-            tuple: Placements tuple (Shard/Replicate for each mesh dimension)
-        """
-        mesh_ndim = len(base_layout.mesh_shape)
-        placements = []
-
-        for mesh_dim_idx in range(mesh_ndim):
-            is_sharded = False
-
-            for tensor_dim_idx, tensor_dim_map in enumerate(tensor_map):
-                if tensor_dim_map == -1:
-                    continue
-
-                if isinstance(tensor_dim_map, tuple):
-                    if mesh_dim_idx in tensor_dim_map:
-                        placements.append(Shard(tensor_dim_idx))
-                        is_sharded = True
-                        break
-                elif tensor_dim_map == mesh_dim_idx:
-                    placements.append(Shard(tensor_dim_idx))
-                    is_sharded = True
-                    break
-
-            if not is_sharded:
-                placements.append(Replicate())
-
-        return tuple(placements)
