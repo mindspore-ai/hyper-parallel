@@ -10,8 +10,8 @@
 
 "hyper-parallel/hyper_parallel/core/multicore/ops"                                      "build/include_subdir"
 "hyper-parallel/hyper_parallel/core/multicore/ops"                                      "build/include"
-"hyper-parallel/hyper_parallel/core/multicore/ops/multicore_moe_ffn/op_kernel"          "build/namespaces"
-"hyper-parallel/hyper_parallel/core/multicore/ops/multicore_moe_ffn_grad/op_kernel"     "build/namespaces"
+"hyper-parallel/hyper_parallel/core/multicore/ops/mega_moe/op_kernel"          "build/namespaces"
+"hyper-parallel/hyper_parallel/core/multicore/ops/mega_moe_grad/op_kernel"     "build/namespaces"
 
 # Hyper-Parallel mindspore custom_ops Rules
 

@@ -9,8 +9,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # Build multicore op extensions:
-#   - MindSpore custom op (hyper_parallel_multicore_moe_ffn_ms) — always built
-#   - PyTorch NpuExtension (hyper_parallel_multicore_moe_ffn_pta) — opt-in, set below
+#   - MindSpore custom op (hyper_parallel_mega_moe_ms) — always built
+#   - PyTorch NpuExtension (hyper_parallel_mega_moe_pta) — opt-in, set below
 #
 # To enable the PyTorch extension build, change the variable below to "true":
 #   BUILD_TORCH_EXTENSION=true
@@ -41,8 +41,8 @@ PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
 
 # ── Extract prebuild vendors tarball ──────────────────────────────────────────
 PREBUILD_DIR="$PROJECT_ROOT/hyper_parallel/core/multicore/prebuild"
-TARBALL="$PREBUILD_DIR/multicore_moe_ffn.tar.gz"
-if [ -f "$TARBALL" ] && [ ! -d "$PREBUILD_DIR/multicore_moe_ffn" ]; then
+TARBALL="$PREBUILD_DIR/mega_moe.tar.gz"
+if [ -f "$TARBALL" ] && [ ! -d "$PREBUILD_DIR/mega_moe" ]; then
     echo "Extracting prebuild vendors: $TARBALL"
     tar -xzf "$TARBALL" -C "$PREBUILD_DIR"
 fi
@@ -79,8 +79,8 @@ cmake --build "$MULTICORE_MS_BUILD_DIR" -j
 # ── Copy prebuild vendor libs into the build output dir ───────────────────────
 # Place vendor packages alongside the compiled extension so that all multicore
 # runtime assets are co-located under build/lib/ and picked up by package_data.
-VENDORS_SRC="$PREBUILD_DIR/multicore_moe_ffn/vendors"
-VENDORS_DST="$PROJECT_ROOT/build/lib/hyper_parallel/core/multicore/prebuild/multicore_moe_ffn"
+VENDORS_SRC="$PREBUILD_DIR/mega_moe/vendors"
+VENDORS_DST="$PROJECT_ROOT/build/lib/hyper_parallel/core/multicore/prebuild/mega_moe"
 if [ -d "$VENDORS_SRC" ]; then
     rm -rf "$VENDORS_DST"
 fi

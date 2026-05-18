@@ -17,8 +17,8 @@ hyper_parallel.core.multicore.platform.mindspore
 ==================================================
 MindSpore platform adapter for MoE-FFN multicore operators.
 
-Exposes ``moe_ffn_fwd`` and ``moe_ffn_bwd`` backed by the
-``hyper_parallel_multicore_moe_ffn_ms`` pybind11 extension.
+Exposes ``mega_moe`` and ``mega_moe_grad`` backed by the
+``hyper_parallel_mega_moe_ms`` pybind11 extension.
 
 .. note::
     **Only MindSpore PyNative mode is supported.**
@@ -35,7 +35,7 @@ Vendor library resolution order (highest priority first):
   1. ``CANN_VENDOR_FWD_LIBDIR`` / ``CANN_VENDOR_BWD_LIBDIR``
   2. ``HP_MULTICORE_DIR``  (vendors root; fwd/bwd derived automatically)
   3. ``CANN_VENDOR_LIBDIR``  (legacy single-lib fallback)
-  4. Auto-detect from ``prebuild/multicore_moe_ffn/vendors/``
+  4. Auto-detect from ``prebuild/mega_moe/vendors/``
 """
 import ctypes
 import os
@@ -52,19 +52,19 @@ if not (_CANN_VENDOR_FWD_LIBDIR or _CANN_VENDOR_BWD_LIBDIR):
     _HP_MULTICORE_DIR = os.environ.get("HP_MULTICORE_DIR", "")
     if _HP_MULTICORE_DIR:
         _CANN_VENDOR_FWD_LIBDIR = os.path.join(
-            _HP_MULTICORE_DIR, "multicore_moe_ffn_nn", "op_api", "lib")
+            _HP_MULTICORE_DIR, "mega_moe_nn", "op_api", "lib")
         _CANN_VENDOR_BWD_LIBDIR = os.path.join(
-            _HP_MULTICORE_DIR, "multicore_moe_ffn_grad_nn", "op_api", "lib")
+            _HP_MULTICORE_DIR, "mega_moe_grad_nn", "op_api", "lib")
     elif os.environ.get("CANN_VENDOR_LIBDIR", ""):
         _CANN_VENDOR_FWD_LIBDIR = os.environ["CANN_VENDOR_LIBDIR"]
         _CANN_VENDOR_BWD_LIBDIR = os.environ["CANN_VENDOR_LIBDIR"]
     else:
         _PREBUILD_DIR = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "../../prebuild/multicore_moe_ffn"))
+            os.path.join(os.path.dirname(__file__), "../../prebuild/mega_moe"))
         if os.path.isdir(_PREBUILD_DIR):
             _vendors = os.path.join(_PREBUILD_DIR, "vendors")
-            _fwd = os.path.join(_vendors, "multicore_moe_ffn_nn", "op_api", "lib")
-            _bwd = os.path.join(_vendors, "multicore_moe_ffn_grad_nn", "op_api", "lib")
+            _fwd = os.path.join(_vendors, "mega_moe_nn", "op_api", "lib")
+            _bwd = os.path.join(_vendors, "mega_moe_grad_nn", "op_api", "lib")
             if os.path.isdir(_fwd):
                 _CANN_VENDOR_FWD_LIBDIR = _fwd
             if os.path.isdir(_bwd):
@@ -103,7 +103,7 @@ if os.path.exists(_opapi_path):
     ctypes.CDLL(_opapi_path, mode=ctypes.RTLD_GLOBAL)
 
 # Pre-load both libcust_opapi.so with RTLD_GLOBAL so LAUNCH_ACLNN_FUNC can
-# resolve aclnnMulticoreMoeFfn* / aclnnMulticoreMoeFfnGrad* from either package.
+# resolve aclnnMegaMoe* / aclnnMegaMoeGrad* from either package.
 for _vendor_libdir in (_CANN_VENDOR_FWD_LIBDIR, _CANN_VENDOR_BWD_LIBDIR):
     if _vendor_libdir:
         _cust_opapi = os.path.join(_vendor_libdir, "libcust_opapi.so")
@@ -141,12 +141,12 @@ def _get_ms_ops():
         build_lib = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "lib")
         if build_lib not in sys.path:
             sys.path.insert(0, build_lib)
-        import hyper_parallel_multicore_moe_ffn_ms as _m  # noqa: E402  # pylint: disable=import-outside-toplevel
+        import hyper_parallel_mega_moe_ms as _m  # noqa: E402  # pylint: disable=import-outside-toplevel
         _ms_ops = _m
     return _ms_ops
 
 
-def moe_ffn_fwd(
+def mega_moe(
     dispatch_target, dispatch_target_off,
     dispatch_src, dispatch_src_off, dispatch_size,
     up_proj_weight, up_proj_glist,
@@ -163,8 +163,8 @@ def moe_ffn_fwd(
     .. note:: Only PyNative mode is supported. Raises ``RuntimeError`` if
         called in Graph mode or inside an ``@ms.jit`` function.
     """
-    _check_pynative_mode("moe_ffn_fwd")
-    _get_ms_ops().moe_ffn_fwd(
+    _check_pynative_mode("mega_moe")
+    _get_ms_ops().mega_moe(
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
         up_proj_weight, up_proj_glist,
@@ -177,7 +177,7 @@ def moe_ffn_fwd(
     )
 
 
-def moe_ffn_bwd(
+def mega_moe_grad(
     dispatch_target, dispatch_target_off,
     dy, dispatch_src_off, dispatch_size,
     hidden, hidden_dw,
@@ -195,8 +195,8 @@ def moe_ffn_bwd(
     .. note:: Only PyNative mode is supported. Raises ``RuntimeError`` if
         called in Graph mode or inside an ``@ms.jit`` function.
     """
-    _check_pynative_mode("moe_ffn_bwd")
-    _get_ms_ops().moe_ffn_bwd(
+    _check_pynative_mode("mega_moe_grad")
+    _get_ms_ops().mega_moe_grad(
         dispatch_target, dispatch_target_off,
         dy, dispatch_src_off, dispatch_size,
         hidden, hidden_dw,
@@ -210,4 +210,4 @@ def moe_ffn_bwd(
     )
 
 
-__all__ = ["moe_ffn_fwd", "moe_ffn_bwd"]
+__all__ = ["mega_moe", "mega_moe_grad"]

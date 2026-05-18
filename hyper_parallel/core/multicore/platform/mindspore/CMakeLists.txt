@@ -1,17 +1,17 @@
 cmake_minimum_required(VERSION 3.18)
 project(multicore_ms)
 
-set(MS_EXTENSION_NAME "hyper_parallel_multicore_moe_ffn_ms")
+set(MS_EXTENSION_NAME "hyper_parallel_mega_moe_ms")
 set(BUILD_EXTENSION_DIR "${CMAKE_BINARY_DIR}/lib")
 
 # =============================================================================
 # Prebuild Auto-Extract
-# If no vendor env var is set, extract prebuild/multicore_moe_ffn.tar.gz
+# If no vendor env var is set, extract prebuild/mega_moe.tar.gz
 # (vendors/ inside contains pre-built vendor libs).
 # =============================================================================
 
 set(_PREBUILD_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../prebuild")
-set(_PREBUILD_DIR  "${_PREBUILD_ROOT}/multicore_moe_ffn")
+set(_PREBUILD_DIR  "${_PREBUILD_ROOT}/mega_moe")
 set(_TARBALL       "${_PREBUILD_DIR}.tar.gz")
 
 if(NOT DEFINED ENV{HP_MULTICORE_DIR}
@@ -45,12 +45,12 @@ if(DEFINED ENV{HP_MULTICORE_DIR})
     if(DEFINED ENV{CANN_VENDOR_FWD_LIBDIR})
         set(CANN_VENDOR_FWD_LIBDIR "$ENV{CANN_VENDOR_FWD_LIBDIR}")
     else()
-        set(CANN_VENDOR_FWD_LIBDIR "$ENV{HP_MULTICORE_DIR}/multicore_moe_ffn_nn/op_api/lib")
+        set(CANN_VENDOR_FWD_LIBDIR "$ENV{HP_MULTICORE_DIR}/mega_moe_nn/op_api/lib")
     endif()
     if(DEFINED ENV{CANN_VENDOR_BWD_LIBDIR})
         set(CANN_VENDOR_BWD_LIBDIR "$ENV{CANN_VENDOR_BWD_LIBDIR}")
     else()
-        set(CANN_VENDOR_BWD_LIBDIR "$ENV{HP_MULTICORE_DIR}/multicore_moe_ffn_grad_nn/op_api/lib")
+        set(CANN_VENDOR_BWD_LIBDIR "$ENV{HP_MULTICORE_DIR}/mega_moe_grad_nn/op_api/lib")
     endif()
 elseif(DEFINED ENV{CANN_VENDOR_LIBDIR})
     set(CANN_VENDOR_FWD_LIBDIR "$ENV{CANN_VENDOR_LIBDIR}")
@@ -61,7 +61,7 @@ else()
         "  HP_MULTICORE_DIR  (vendors root; fwd/bwd paths derived automatically)\n"
         "  CANN_VENDOR_FWD_LIBDIR + CANN_VENDOR_BWD_LIBDIR  (explicit overrides)\n"
         "  CANN_VENDOR_LIBDIR  (legacy single-lib fallback)\n"
-        "  Or place prebuild/multicore_moe_ffn.tar.gz and re-run cmake.")
+        "  Or place prebuild/mega_moe.tar.gz and re-run cmake.")
 endif()
 
 string(REGEX REPLACE "/op_api/lib/?$" "" CANN_VENDOR_HOME "${CANN_VENDOR_FWD_LIBDIR}")
@@ -195,7 +195,7 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_custom_target(
     BuildCustomOp ALL
     COMMAND cd ${CMAKE_BINARY_DIR} && ${Python3_EXECUTABLE} ${PYTHON_SCRIPT_PATH}
-    COMMENT "Building hyper_parallel_multicore_moe_ffn_ms custom operator with MindSpore"
+    COMMENT "Building hyper_parallel_mega_moe_ms custom operator with MindSpore"
 )
 
 # =============================================================================

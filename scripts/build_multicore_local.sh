@@ -14,10 +14,12 @@ rm -rf build
 rm -rf ops-nn
 rm -rf ops-transformer
 mkdir build
-mkdir build/multicore_moe
-cp --parents -r multicore_moe_ffn multicore_moe_ffn_grad build/multicore_moe
-mkdir build/multicore_moe/{multicore_moe_ffn,multicore_moe_ffn_grad}/op_kernel/{swi_glu,grouped_matmul}
-mkdir build/multicore_moe/multicore_moe_ffn_grad/op_kernel/swi_glu_grad
+mkdir build/mega_moe
+cp --parents -r mega_moe mega_moe_grad build/mega_moe
+cp -r runtime build/mega_moe/mega_moe/op_kernel/
+cp -r runtime build/mega_moe/mega_moe_grad/op_kernel/
+mkdir build/mega_moe/{mega_moe,mega_moe_grad}/op_kernel/{swi_glu,grouped_matmul}
+mkdir build/mega_moe/mega_moe_grad/op_kernel/swi_glu_grad
 git clone --no-checkout --depth 1 https://gitcode.com/cann/ops-nn.git -b v9.0.0-beta.1
 cd ops-nn
 git sparse-checkout init --cone
@@ -25,9 +27,9 @@ git sparse-checkout set cmake common control scripts conv/common/op_kernel matmu
 git checkout
 git apply ../ops-nn.patch
 cp --parents -r cmake common control scripts conv/common/op_kernel matmul/common/cmct build.sh CMakeLists.txt install_deps.sh ../build
-cp -r activation/swi_glu/op_kernel/. ../build/multicore_moe/multicore_moe_ffn/op_kernel/swi_glu/
-cp -r activation/swi_glu/op_kernel/. ../build/multicore_moe/multicore_moe_ffn_grad/op_kernel/swi_glu/
-cp -r activation/swi_glu_grad/op_kernel/. ../build/multicore_moe/multicore_moe_ffn_grad/op_kernel/swi_glu_grad/
+cp -r activation/swi_glu/op_kernel/. ../build/mega_moe/mega_moe/op_kernel/swi_glu/
+cp -r activation/swi_glu/op_kernel/. ../build/mega_moe/mega_moe_grad/op_kernel/swi_glu/
+cp -r activation/swi_glu_grad/op_kernel/. ../build/mega_moe/mega_moe_grad/op_kernel/swi_glu_grad/
 cd ..
 rm -rf ops-nn
 git clone --no-checkout --depth 1 https://gitcode.com/cann/ops-transformer.git -b v8.5.0
@@ -36,11 +38,11 @@ git sparse-checkout init --cone
 git sparse-checkout set gmm/grouped_matmul/op_kernel
 git checkout
 git apply ../ops-transformer.patch
-cp -r gmm/grouped_matmul/op_kernel/. ../build/multicore_moe/multicore_moe_ffn_grad/op_kernel/grouped_matmul/
-cp -r gmm/grouped_matmul/op_kernel/, ../build/multicore_moe/multicore_moe_ffn/op_kernel/grouped_matmul/
+cp -r gmm/grouped_matmul/op_kernel/. ../build/mega_moe/mega_moe_grad/op_kernel/grouped_matmul/
+cp -r gmm/grouped_matmul/op_kernel/. ../build/mega_moe/mega_moe/op_kernel/grouped_matmul/
 cd ..
 rm -rf ops-transformer
 # 之后在hyper-parallel/hyper_parallel/core/multicore/ops/build目录下进行编译，SOC_VALUE改为对应硬件版本
 # cd build
-# bash build.sh --pkg --soc=$SOC_VALUE --ops=multicore_moe_ffn --vendor_name=multicore_moe_ffn
-# bash build.sh --pkg --soc=$SOC_VALUE --ops=multicore_moe_ffn_grad --vendor_name=multicore_moe_ffn_grad
+# bash build.sh --pkg --soc=$SOC_VALUE --ops=mega_moe --vendor_name=mega_moe
+# bash build.sh --pkg --soc=$SOC_VALUE --ops=mega_moe_grad --vendor_name=mega_moe_grad

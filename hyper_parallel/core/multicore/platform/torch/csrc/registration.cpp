@@ -7,22 +7,22 @@
  * After building (setup.py build_ext --inplace), import with:
  *   import hyper_parallel.core.multicore.platform.torch  # loads this .so
  * Or call directly after import:
- *   torch.ops.hyper_parallel.moe_ffn_fwd(...)
- *   torch.ops.hyper_parallel.moe_ffn_bwd(...)
+ *   torch.ops.hyper_parallel.mega_moe(...)
+ *   torch.ops.hyper_parallel.mega_moe_grad(...)
  */
 #include <torch/library.h>
 #include <torch/extension.h>
 
 TORCH_LIBRARY(hyper_parallel, m) {
     // -------------------------------------------------------------------------
-    // moe_ffn_fwd: MoE-FFN forward operator (wraps aclnnMulticoreMoeFfn)
+    // mega_moe: MoE-FFN forward operator (wraps aclnnMegaMoe)
     //
     // Output buffers written in-place:
     //   dispatch_target, up_proj_y, swiglu_out, down_proj_y, combine_target.
     // All buffers must be pre-allocated by the caller.
     // -------------------------------------------------------------------------
     m.def(
-        "moe_ffn_fwd("
+        "mega_moe("
         "  Tensor(a!) dispatch_target,"
         "  Tensor dispatch_target_off,"
         "  Tensor dispatch_src,"
@@ -54,7 +54,7 @@ TORCH_LIBRARY(hyper_parallel, m) {
 
 
     // -------------------------------------------------------------------------
-    // moe_ffn_bwd: MoE-FFN backward operator (wraps aclnnMulticoreMoeFfnGrad)
+    // mega_moe_grad: MoE-FFN backward operator (wraps aclnnMegaMoeGrad)
     //
     // Output buffers written in-place:
     //   dispatch_target, hidden_dw, act_grad_y, grad_gate,
@@ -62,7 +62,7 @@ TORCH_LIBRARY(hyper_parallel, m) {
     // All buffers must be pre-allocated by the caller.
     // -------------------------------------------------------------------------
     m.def(
-        "moe_ffn_bwd("
+        "mega_moe_grad("
         "  Tensor(a!) dispatch_target,"
         "  Tensor dispatch_target_off,"
         "  Tensor dy,"
@@ -100,10 +100,10 @@ TORCH_LIBRARY(hyper_parallel, m) {
         ") -> (Tensor(a!), Tensor(b!), Tensor(c!), Tensor(d!), Tensor(e!), Tensor(f!), Tensor(g!), Tensor(h!))");
 }
 
-// Python module entry point — required for `import hyper_parallel_multicore_moe_ffn_pta`.
+// Python module entry point — required for `import hyper_parallel_mega_moe_pta`.
 // Use an explicit name rather than TORCH_EXTENSION_NAME to avoid depending on
 // the build system injecting -DTORCH_EXTENSION_NAME (not all NpuExtension
 // versions guarantee this macro is defined).
-// TORCH_LIBRARY_IMPL registrations in moe_ffn_fwd.cpp / moe_ffn_bwd.cpp fire
+// TORCH_LIBRARY_IMPL registrations in mega_moe.cpp / mega_moe_grad.cpp fire
 // via static initializers when the .so is loaded.
-PYBIND11_MODULE(hyper_parallel_multicore_moe_ffn_pta, m) {}
+PYBIND11_MODULE(hyper_parallel_mega_moe_pta, m) {}

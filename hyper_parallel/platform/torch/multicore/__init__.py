@@ -25,7 +25,7 @@ class TorchMulticoreHandler:
         import hyper_parallel.core.multicore.platform.torch  # noqa: F401  # pylint: disable=C0415,W0611
 
     @staticmethod
-    def moe_ffn_fwd(
+    def mega_moe(
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
         up_proj_weight, up_proj_glist,
@@ -39,8 +39,8 @@ class TorchMulticoreHandler:
     ):
         """MoE-FFN forward operator (PyTorch backend)."""
         # pylint: disable=C0415
-        from hyper_parallel.core.multicore.platform.torch import moe_ffn_fwd
-        return moe_ffn_fwd(
+        from hyper_parallel.core.multicore.platform.torch import mega_moe
+        return mega_moe(
             dispatch_target, dispatch_target_off,
             dispatch_src, dispatch_src_off, dispatch_size,
             up_proj_weight, up_proj_glist,
@@ -53,7 +53,7 @@ class TorchMulticoreHandler:
         )
 
     @staticmethod
-    def moe_ffn_bwd(
+    def mega_moe_grad(
         dispatch_target, dispatch_target_off,
         dy, dispatch_src_off, dispatch_size,
         hidden, hidden_dw,
@@ -68,8 +68,8 @@ class TorchMulticoreHandler:
     ):
         """MoE-FFN backward operator (PyTorch backend)."""
         # pylint: disable=C0415
-        from hyper_parallel.core.multicore.platform.torch import moe_ffn_bwd
-        return moe_ffn_bwd(
+        from hyper_parallel.core.multicore.platform.torch import mega_moe_grad
+        return mega_moe_grad(
             dispatch_target, dispatch_target_off,
             dy, dispatch_src_off, dispatch_size,
             hidden, hidden_dw,

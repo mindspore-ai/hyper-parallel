@@ -480,3 +480,58 @@ index f903e8fb..b6a10293 100644
      #if defined(GMM_ANTI_QUANT)
          mm.template IterateAll<false>(yGm[outOffset], 0, false, true);
 
+diff --git a/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp b/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
+index 39f152c..302409d 100644
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.cpp
+@@ -63,12 +63,12 @@ static constexpr VecAntiQuantConfig VEC_ANTIQUANT_CONFIG_5 = {3, 384};
+ #endif
+ #else
+ #include "arch35/non_quant/grouped_matmul_basic_kernel.h"
+-#include "arch35/non_quant/grouped_matmul_tiling_key.h"
++//#include "arch35/non_quant/grouped_matmul_tiling_key.h"
+ #endif
+ #else
+ #include "grouped_matmul_antiquant.h"
+ #include "grouped_matmul_vector.h"
+-#include "grouped_matmul_tiling_key.h"
++//#include "grouped_matmul_tiling_key.h"
+ #include "grouped_matmul.h"
+ #endif
+ 
+diff --git a/gmm/grouped_matmul/op_kernel/grouped_matmul.h b/gmm/grouped_matmul/op_kernel/grouped_matmul.h
+index f903e8f..f9b3e2b 100644
+--- a/gmm/grouped_matmul/op_kernel/grouped_matmul.h
++++ b/gmm/grouped_matmul/op_kernel/grouped_matmul.h
+@@ -397,7 +397,7 @@ class GMMCompute {
+     GlobalTensor<DTYPE_Y> yGm;
+ #if defined(GMM_QUANT_INT8)
+     GM_ADDR scaleTensorPtr;
+-    GlobalTensor<DTYPE_SCALE> scaleGm;
++    GlobalTensor<DTYPE_Y> scaleGm;
+ #endif
+     uint32_t ubBaseN;
+     uint32_t ubBaseK;
+@@ -458,8 +458,8 @@ __aicore__ inline void GMMCompute<mmType, sync>::SetGlobalBufferBias(uint32_t gr
+         }
+ #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+         constexpr bool isBiasEpilogue_ =
+-            AscendC::IsSameType<DTYPE_BIAS, bfloat16_t>::value &&
+-            (AscendC::IsSameType<DTYPE_SCALE, bfloat16_t>::value || AscendC::IsSameType<DTYPE_SCALE, float>::value);
++            AscendC::IsSameType<DTYPE_Y, bfloat16_t>::value &&
++            (AscendC::IsSameType<DTYPE_Y, bfloat16_t>::value || AscendC::IsSameType<DTYPE_Y, float>::value);
+         if constexpr (!isBiasEpilogue_) {
+             mm.SetBias(biasGm[tailN]);
+         }
+@@ -535,9 +535,9 @@ __aicore__ inline void GMMCompute<mmType, sync>::MMCompute(uint32_t groupIdx, MN
+     mm.SetTensorB(weightGmLocal, transposeW);
+ #if defined(GMM_QUANT_INT8)
+     if (singleWeight == 0) {
+-        scaleGm.SetGlobalBuffer(GetTensorAddr<DTYPE_SCALE>(groupIdx, scaleTensorPtr));
++        scaleGm.SetGlobalBuffer(GetTensorAddr<DTYPE_Y>(groupIdx, scaleTensorPtr));
+     } else {
+-        scaleGm.SetGlobalBuffer(GetTensorAddr<DTYPE_SCALE>(0, scaleTensorPtr) + mnConfig.nAxisBaseOffset);
++        scaleGm.SetGlobalBuffer(GetTensorAddr<DTYPE_Y>(0, scaleTensorPtr) + mnConfig.nAxisBaseOffset);
+     }
+     mm.SetQuantVector(scaleGm[tailN]);
+ #endif

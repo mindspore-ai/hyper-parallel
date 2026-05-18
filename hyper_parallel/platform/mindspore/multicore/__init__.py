@@ -22,14 +22,14 @@ class MSMulticoreHandler:
         # Eagerly import platform/mindspore/__init__.py so that its module-level
         # code runs now (sets ASCEND_CUSTOM_OPP_PATH, preloads ctypes libs, adds
         # build/lib to sys.path).  This MUST happen before any `import mindspore`
-        # elsewhere in the process; deferring to the first moe_ffn_fwd/bwd call
+        # elsewhere in the process; deferring to the first moe_fwd/bwd call
         # is too late when symmetric_memory or other modules import mindspore first.
         # Note: platform/mindspore/__init__.py itself does NOT import mindspore at
         # module level, so this import is safe to call early.
         import hyper_parallel.core.multicore.platform.mindspore  # noqa: F401  # pylint: disable=C0415,W0611
 
     @staticmethod
-    def moe_ffn_fwd(
+    def mega_moe(
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
         up_proj_weight, up_proj_glist,
@@ -43,8 +43,8 @@ class MSMulticoreHandler:
     ):
         """MoE-FFN forward operator (MindSpore backend)."""
         # pylint: disable=C0415
-        from hyper_parallel.core.multicore.platform.mindspore import moe_ffn_fwd
-        return moe_ffn_fwd(
+        from hyper_parallel.core.multicore.platform.mindspore import mega_moe
+        return mega_moe(
             dispatch_target, dispatch_target_off,
             dispatch_src, dispatch_src_off, dispatch_size,
             up_proj_weight, up_proj_glist,
@@ -57,7 +57,7 @@ class MSMulticoreHandler:
         )
 
     @staticmethod
-    def moe_ffn_bwd(
+    def mega_moe_grad(
         dispatch_target, dispatch_target_off,
         dy, dispatch_src_off, dispatch_size,
         hidden, hidden_dw,
@@ -72,8 +72,8 @@ class MSMulticoreHandler:
     ):
         """MoE-FFN backward operator (MindSpore backend)."""
         # pylint: disable=C0415
-        from hyper_parallel.core.multicore.platform.mindspore import moe_ffn_bwd
-        return moe_ffn_bwd(
+        from hyper_parallel.core.multicore.platform.mindspore import mega_moe_grad
+        return mega_moe_grad(
             dispatch_target, dispatch_target_off,
             dy, dispatch_src_off, dispatch_size,
             hidden, hidden_dw,
