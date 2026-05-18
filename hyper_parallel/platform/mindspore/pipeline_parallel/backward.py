@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""parallel grad helper (dx/dw split)"""    
+"""parallel grad helper (dx/dw split)"""
 from __future__ import absolute_import
 from collections import deque, defaultdict
 import warnings
@@ -68,6 +68,20 @@ def _get_grad_node(tensor):
 def _get_node_id(node):
     """Return stable integer id for BackwardNode (C++ `_unique_id`)."""
     return int(node._unique_id())  # pylint: disable=protected-access
+
+
+def _accumulate_grads(target_tensors, grads):
+    """Accumulate returned grads onto leaf tensors' internal grad storage."""
+    if grads is None:
+        return
+    for tensor, grad in zip(target_tensors, grads):
+        if tensor is None or grad is None:
+            continue
+        current_grad = getattr(tensor, "_grad", None)
+        if current_grad is None:
+            tensor._grad = grad  # pylint: disable=protected-access
+        else:
+            current_grad += grad
 
 
 def _compute_nodes_out_degree(output_grad_fns):
@@ -215,7 +229,7 @@ class GradFunction:
     """
     A wrapper class used to build forward output and gradient functions.
     This class supports separate computation of input gradients (dx) and weight gradients (dw),
-    which is essential for pipeline parallelism. 
+    which is essential for pipeline parallelism.
 
     Args:
         output (Any): Forward output value of the network.
@@ -350,6 +364,7 @@ class GradFunction:
             keep_graph, keep_graph,
             tuple(group_weights), allow_unreachable=True, accumulate_grad=False
         )
+        _accumulate_grads(group_weights, weight_grads)
         if not keep_graph:
             del weight_group['grads']
 
@@ -428,6 +443,11 @@ class GradFunction:
             output_tensors, sens, keep_graph, keep_graph,
             input_tensors, allow_unreachable=True, accumulate_grad=False
         )
+        if input_size > 0:
+            _accumulate_grads(input_tensors[:input_size], grads[:input_size])
+        weight_tensors = self._collect_weight_tensors()
+        if weight_tensors:
+            _accumulate_grads(weight_tensors, grads[input_size:])
         if not keep_graph:
             self._clear_res()
         if input_size == 0:
@@ -466,7 +486,7 @@ class GradFunction:
         Returns:
             Gradients with respect to inputs. Returns single tensor if one input,
             tuple of tensors if multiple inputs.
-            
+
             When grad_position=-1 (default), the return type matches the input structure,
             supporting complex input types (tuple, dict, etc.). The gradients are automatically
             unflattened to preserve the original input structure.
@@ -496,6 +516,7 @@ class GradFunction:
             output_tensors, sens, True, True,
             tuple(input_tensors), allow_unreachable=True, accumulate_grad=False
         )
+        _accumulate_grads(input_tensors, input_grads)
 
         for handle in hook_handles:
             handle.remove()
@@ -596,12 +617,12 @@ def forward_and_gradfn(fn, *inputs, weights=None, has_aux=False, grad_position=-
 
     Returns:
         Tuple of (output, grad_fn):
-        
+
         - output: The output value of function `fn`.
         - grad_fn: A :class:`GradFunction` instance used to compute gradients.
-        
+
         The :class:`GradFunction` class provides methods for gradient computation:
-        
+
         - :meth:`__call__`: Compute gradients with respect to both inputs and weights at once.
         - :meth:`compute_input_grad`: Compute gradients with respect to inputs only (dx).
           This is the first stage of dx/dw split computation, which captures intermediate
@@ -614,7 +635,7 @@ def forward_and_gradfn(fn, *inputs, weights=None, has_aux=False, grad_position=-
     Examples:
         When grad_position=-1 (default), the gradient return type matches the input structure,
         supporting complex input types (tuple, dict, etc.):
-        
+
         >>> def fn(x, tuple_input, scale=None):
         ...     a, b = tuple_input
         ...     return x * a + x * b + scale * x

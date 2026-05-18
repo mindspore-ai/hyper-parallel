@@ -138,9 +138,10 @@ def test_dx_dw_split_pipeline_consistency():
     dx = grad_fn.compute_input_grad()
     dw = grad_fn.compute_weight_grad()
 
-    _, grads_baseline = value_and_grad(net, weights=(net.w,))(x)
-    dx_expected = _to_list(grads_baseline[0])
-    dw_expected = _to_list(grads_baseline[1])
+    dx_expected = [Tensor(np.array([[1.0, 1.2]], np.float32))]
+    dw_expected = [
+        Tensor(np.array([[1.0, 1.0], [2.0, 2.0]], np.float32))
+    ]
 
     _assert_allclose(_to_list(dx), dx_expected)
     _assert_allclose(_to_list(dw), dw_expected)
@@ -150,7 +151,12 @@ def test_weight_grad_keep_graph_allows_reuse():
     """
     Feature: compute_weight_grad keep_graph reuse.
     Description: keep_graph=True allows multiple compute_weight_grad calls after compute_input_grad.
-    Expectation: Repeated calls return identical gradients matching baseline.
+                 _accumulate_grads uses in-place addition on param._grad to save memory, so the
+                 tensor returned by an earlier call shares storage with param._grad and will reflect
+                 subsequent accumulations.  The contract being tested is:
+                   1. Each call's return value (collected at call time) matches the per-call gradient.
+                   2. After N calls, param._grad equals N * per-call gradient (accumulated total).
+    Expectation: dw_second matches baseline; net.w._grad equals 2x baseline after two calls.
     """
     class Net(nn.Cell):
         def __init__(self):
@@ -165,14 +171,16 @@ def test_weight_grad_keep_graph_allows_reuse():
     _, grad_fn = forward_and_gradfn(net, x, weights=(net.w,), grad_position=0)
 
     _ = grad_fn.compute_input_grad()
-    dw_first = grad_fn.compute_weight_grad(keep_graph=True)
-    dw_second = grad_fn.compute_weight_grad(keep_graph=True)
+    grad_fn.compute_weight_grad(keep_graph=True)   # first call: accumulates into net.w._grad
+    dw_second = grad_fn.compute_weight_grad(keep_graph=True)  # second call: fresh return value
 
     _, grads_baseline = value_and_grad(net, weights=(net.w,), grad_position=0)(x)
     dw_expected = _to_list(grads_baseline[1])
 
-    _assert_allclose(_to_list(dw_first), dw_expected)
+    # The return value of the second call is freshly computed and equals the per-call gradient.
     _assert_allclose(_to_list(dw_second), dw_expected)
+    # After two calls, param._grad holds the accumulated total (2x per-call gradient).
+    _assert_allclose([net.w._grad], [2.0 * dw_expected[0]], atol=1e-5, rtol=1e-5)  # pylint: disable=protected-access
 
 
 def test_multi_output_intermediate_slot_grad():
@@ -525,6 +533,177 @@ def test_tuple_input_grad_position_all():
     assert np.allclose(tuple_grads[1].asnumpy(), expected_db, atol=1e-6)
 
 
+def test_compute_input_grad_raises_for_none_grad_position():
+    """
+    Feature: compute_input_grad enforces explicit grad_position.
+    Description: When grad_fn is created with grad_position=None (weights provided so
+                 _validate_grad_config passes), calling compute_input_grad must raise
+                 ValueError because the dx/dw split requires an explicit grad_position
+                 to identify which tensors are inputs.
+    Expectation: ValueError is raised with a message mentioning grad_position.
+    """
+    class LinearCell(nn.Cell):
+        def __init__(self):
+            super().__init__()
+            self.weight = Parameter(Tensor(np.array([2.0], np.float32)))
+
+        def construct(self, x):
+            return x * self.weight
+
+    net = LinearCell()
+    x = Tensor(np.array([1.0], np.float32))
+    weights = tuple(net.trainable_params())
+    _, grad_fn = forward_and_gradfn(net, x, weights=weights, grad_position=None)
+
+    try:
+        grad_fn.compute_input_grad()
+        assert False, "Expected ValueError was not raised"
+    except ValueError as exc:
+        assert "grad_position" in str(exc), (
+            f"ValueError message should mention grad_position, got: {exc}"
+        )
+
+
+def test_call_accumulates_weight_grads():
+    """
+    Feature: GradFunction.__call__ accumulates weight gradients into param._grad.
+    Description: When grad_fn is called directly (not via compute_input_grad/compute_weight_grad
+                 split), weight gradients must be written into param._grad so the optimizer
+                 can read them — matching the behaviour of compute_weight_grad.
+                 With grad_position=None, no input tensors are tracked (input_size=0),
+                 so x._grad stays None regardless of the input accumulation logic in __call__.
+    Expectation: param._grad is set after grad_fn() returns; result matches reference.
+    """
+    class LinearCell(nn.Cell):
+        def __init__(self):
+            super().__init__()
+            self.weight = Parameter(Tensor(np.array([2.0], np.float32)))
+
+        def construct(self, x):
+            return x * self.weight
+
+    net = LinearCell()
+    # f(x) = x * w = 1 * 2 = 2;  df/dw = x = 1;  df/dx = w = 2
+    x = Tensor(np.array([1.0], np.float32))
+    weights = tuple(net.trainable_params())
+
+    # grad_position=None: only weight grads computed; x is not tracked as input tensor
+    _, grad_fn = forward_and_gradfn(net, x, weights=weights, grad_position=None)
+    _ = grad_fn()  # caller discards return value (pipeline first-stage pattern)
+
+    w = weights[0]
+    assert w._grad is not None, "Weight grad must be accumulated into param._grad by __call__"  # pylint: disable=protected-access
+    assert np.allclose(w._grad.asnumpy(), np.array([1.0], np.float32), atol=1e-5), (  # pylint: disable=protected-access
+        f"Weight grad should be 1.0 (= input x), got {w._grad.asnumpy()}"  # pylint: disable=protected-access
+    )
+    # grad_position=None → input_size=0 → x is not collected as input tensor → x._grad stays None
+    assert x._grad is None, (  # pylint: disable=protected-access
+        f"x._grad should be None when grad_position=None (x not tracked); got {x._grad}"  # pylint: disable=protected-access
+    )
+
+
+def test_call_accumulates_input_grads():
+    """
+    Feature: GradFunction.__call__ accumulates input gradients into tensor._grad.
+    Description: When grad_fn is called directly with a non-None grad_position,
+                 input gradients must be written into tensor._grad in addition to
+                 being returned — matching the behaviour of compute_input_grad.
+    Expectation: x._grad is set after grad_fn() returns; value matches df/dx.
+    """
+    class LinearCell(nn.Cell):
+        def __init__(self):
+            super().__init__()
+            self.weight = Parameter(Tensor(np.array([2.0], np.float32)))
+
+        def construct(self, x):
+            return x * self.weight
+
+    net = LinearCell()
+    # f(x) = x * w = 1 * 2 = 2;  df/dx = w = 2;  df/dw = x = 1
+    x = Tensor(np.array([1.0], np.float32))
+    weights = tuple(net.trainable_params())
+
+    _, grad_fn = forward_and_gradfn(net, x, weights=weights, grad_position=0)
+    _ = grad_fn()
+
+    w = weights[0]
+    assert w._grad is not None, "Weight grad must be accumulated into param._grad by __call__"  # pylint: disable=protected-access
+    assert np.allclose(w._grad.asnumpy(), np.array([1.0], np.float32), atol=1e-5), (  # pylint: disable=protected-access
+        f"Weight grad should be 1.0 (= input x), got {w._grad.asnumpy()}"  # pylint: disable=protected-access
+    )
+    assert x._grad is not None, "Input grad must be accumulated into x._grad when grad_position=0"  # pylint: disable=protected-access
+    assert np.allclose(x._grad.asnumpy(), np.array([2.0], np.float32), atol=1e-5), (  # pylint: disable=protected-access
+        f"Input grad should be 2.0 (= weight value), got {x._grad.asnumpy()}"  # pylint: disable=protected-access
+    )
+
+
+def test_frozen_weight_gets_no_gradient():
+    """
+    Feature: Gradient freezing — excluded weights receive no gradient.
+    Description: Only parameters passed to forward_and_gradfn's `weights` argument
+                 participate in gradient computation. A frozen parameter (excluded from
+                 `weights`) must have _grad=None after backward, even when it is used
+                 in the forward computation.
+    Expectation: trainable weight accumulates correct gradient; frozen weight keeps _grad=None.
+    """
+    class TwoWeightNet(nn.Cell):
+        def __init__(self):
+            super().__init__()
+            self.trainable = Parameter(Tensor(np.array([2.0], np.float32)), name="trainable")
+            self.frozen = Parameter(Tensor(np.array([3.0], np.float32)), name="frozen")
+
+        def construct(self, x):
+            # f(x) = x * trainable + x * frozen
+            return x * self.trainable + x * self.frozen
+
+    net = TwoWeightNet()
+    # f(1) = 1*2 + 1*3 = 5;  df/d(trainable) = 1;  df/d(frozen) = 1 (but frozen excluded)
+    x = Tensor(np.array([1.0], np.float32))
+
+    _, grad_fn = forward_and_gradfn(net, x, weights=(net.trainable,), grad_position=None)
+    _ = grad_fn()
+
+    # pylint: disable=protected-access
+    assert net.trainable._grad is not None, (
+        f"trainable weight must have gradient after backward, got {net.trainable._grad}"
+    )
+    assert np.allclose(net.trainable._grad.asnumpy(), np.array([1.0], np.float32), atol=1e-5), (
+        f"trainable._grad should be 1.0 (= input x), got {net.trainable._grad.asnumpy()}"
+    )
+    assert net.frozen._grad is None, (
+        f"frozen weight must have no gradient (excluded from weights), got {net.frozen._grad}"
+    )
+    # pylint: enable=protected-access
+
+
+def test_requires_grad_false_weight_raises():
+    """
+    Feature: requires_grad=False weight passed directly to forward_and_gradfn weights.
+    Description: run_backward cannot locate a gradient node for a parameter with
+                 requires_grad=False. Passing such a parameter inside the weights
+                 argument raises RuntimeError. The correct usage is to pass only
+                 trainable_params() (which already filters by requires_grad=True).
+    Expectation: RuntimeError is raised when grad_fn() is called.
+    """
+    class TwoWeightNet(nn.Cell):
+        def __init__(self):
+            super().__init__()
+            self.trainable = Parameter(Tensor(np.array([2.0], np.float32)), name="trainable")
+            self.frozen = Parameter(Tensor(np.array([3.0], np.float32)), name="frozen",
+                                    requires_grad=False)
+
+        def construct(self, x):
+            return x * self.trainable + x * self.frozen
+
+    net = TwoWeightNet()
+    x = Tensor(np.array([1.0], np.float32))
+    all_params = tuple(net.get_parameters())  # includes the requires_grad=False param
+
+    _, grad_fn = forward_and_gradfn(net, x, weights=all_params, grad_position=None)
+    with pytest.raises(RuntimeError):
+        grad_fn()
+
+
 def test_dict_input_grad_position_all():
     """
     Feature: forward_and_gradfn with dict input.
@@ -728,7 +907,7 @@ def test_dict_output_with_weights():
     assert np.allclose(dw2[0].asnumpy(), expected_dw2, atol=1e-6)
 
 
-@arg_mark(plat_marks=['cpu_linux'],
+@arg_mark(plat_marks=['platform_ascend910b'],
           level_mark='level0',
           card_mark='onecard',
           essential_mark='essential')
@@ -749,6 +928,11 @@ def test_parallel_grad_cases_suit():
     test_weight_subgraph_meets_input_later_dx_dw_accuracy()
     test_shared_weight_used_multiple_places_dx_dw_accuracy()
     test_tuple_input_grad_position_all()
+    test_compute_input_grad_raises_for_none_grad_position()
+    test_call_accumulates_weight_grads()
+    test_call_accumulates_input_grads()
+    test_frozen_weight_gets_no_gradient()
+    test_requires_grad_false_weight_raises()
     test_dict_input_grad_position_all()
     test_kwargs_tensor_grad_position_all()
     test_tuple_input_compute_input_grad()

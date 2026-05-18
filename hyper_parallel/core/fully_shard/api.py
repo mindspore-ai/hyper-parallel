@@ -319,8 +319,7 @@ class HSDPModule:
                 "need support module_param mapping."
             )
         self_module = cast(platform.Module, self)
-        modules = list(self_module.modules()) if recurse else [self_module]
-        for module in modules:
+        for _, module in platform.get_cells_and_names(self_module):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_requires_all_reduce(requires_all_reduce)
 
@@ -336,8 +335,7 @@ class HSDPModule:
                 "need support module_param mapping."
             )
         self_module = cast(platform.Module, self)
-        modules = list(self_module.modules()) if recurse else [self_module]
-        for module in modules:
+        for _, module in platform.get_cells_and_names(self_module):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_forward(reshard_after_forward)
 
@@ -353,8 +351,7 @@ class HSDPModule:
                 "need support module_param mapping."
             )
         self_module = cast(platform.Module, self)
-        modules = list(self_module.modules()) if recurse else [self_module]
-        for module in modules:
+        for _, module in platform.get_cells_and_names(self_module):
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_backward(reshard_after_backward)
 

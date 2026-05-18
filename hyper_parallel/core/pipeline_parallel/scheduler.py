@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """pipeline schedule"""
-from abc import ABC
+from abc import ABC, abstractmethod
 from enum import Enum, auto
 from collections import defaultdict
 import itertools
@@ -22,6 +22,7 @@ import logging
 import re
 import hyper_parallel
 from hyper_parallel.platform import get_platform
+from hyper_parallel.core.fully_shard.api import HSDPModule
 platform = get_platform()
 logger = logging.getLogger(__name__)
 
@@ -30,12 +31,17 @@ class MetaStepType(Enum):
     """Specify the enumeration type for MetaStep."""
     FWD = auto()
     BWD = auto()
+    BWD_INPUT = auto()
+    BWD_WEIGHT = auto()
     FWD_RECV = auto()
     FWD_SEND = auto()
     BWD_RECV = auto()
     BWD_SEND = auto()
     OVERLAP_F_B = auto()
     OVERLAP_B_F = auto()
+    FSDP_UNSHARD = auto()
+    FSDP_RESHARD = auto()
+    FSDP_REDUCE_GRAD = auto()
 
 
 class MetaStep:
@@ -83,30 +89,75 @@ class MetaStep:
     def __eq__(self, value):
         if not isinstance(value, MetaStep):
             return NotImplemented
-        return self.type == value.type and \
-            self.micro_index == value.micro_index and \
-            self.stage_index == value.stage_index
+        return (self.type == value.type
+                and self.micro_index == value.micro_index
+                and self.stage_index == value.stage_index
+                and self.sub_steps == value.sub_steps)
 
     def __ne__(self, value):
         if not isinstance(value, MetaStep):
             return NotImplemented
-        return self.type != value.type or \
-            self.micro_index != value.micro_index or \
-            self.stage_index != value.stage_index
+        return not self.__eq__(value)
 
     def __hash__(self):
         return hash((self.type, self.micro_index, self.stage_index))
 
     def __str__(self):
+        if self.sub_steps:
+            sub = ", ".join(str(s) for s in self.sub_steps)
+            return (f"MetaStep(type={self.type}, micro_index={self.micro_index}, "
+                    f"stage_index={self.stage_index}, sub_steps=[{sub}])")
         return f"MetaStep(type={self.type}, micro_index={self.micro_index}, stage_index={self.stage_index})"
 
     def __repr__(self):
-        return f"MetaStep(type={self.type}, micro_index={self.micro_index}, stage_index={self.stage_index})"
+        return self.__str__()
 
     @staticmethod
     def from_str(step_str):
         pass
 
+def generate_stage_to_rank_mapping(real_stage_num, stage_num, style='loop'):
+    """Generate stage to rank mapping for loop or V schedules."""
+    if style == 'loop':
+        return {stage_index: stage_index % real_stage_num for stage_index in range(stage_num)}
+    if style == 'v':
+        if stage_num % real_stage_num != 0:
+            raise ValueError(
+                f"stage_num {stage_num} must be evenly divisible by real_stage_num {real_stage_num} for V schedules."
+            )
+        mapping = {}
+        rank_index = 0
+        for stage_index in range(stage_num):
+            mapping[stage_index] = rank_index
+            if (stage_index + 1) % real_stage_num == 0:
+                continue
+            if (stage_index // real_stage_num) % 2 == 0:
+                rank_index += 1
+            else:
+                rank_index -= 1
+        return mapping
+    raise ValueError(f"Unsupported stage rank mapping style: {style}")
+
+
+def generate_rank_to_stage_mapping(real_stage_num, stage_num, style='loop'):
+    """Invert the stage to rank mapping."""
+    stage_to_rank = generate_stage_to_rank_mapping(real_stage_num, stage_num, style)
+    rank_to_stages = defaultdict(list)
+    for stage_index, rank in stage_to_rank.items():
+        rank_to_stages[rank].append(stage_index)
+    for stages in rank_to_stages.values():
+        stages.sort()
+    return dict(rank_to_stages)
+
+def iter_leaf_meta_steps(step):
+    """Yield leaf MetaSteps, recursively expanding OVERLAP_F_B containers."""
+    if step is None:
+        return
+    if step.type == MetaStepType.OVERLAP_F_B:
+        for sub_step in step.sub_steps:
+            yield from iter_leaf_meta_steps(sub_step)
+        return
+    yield step
 
 class PipelineContext:
     """Context passed to custom execution functions registered via
@@ -176,9 +227,11 @@ class PipelineScheduleRuntime(ABC):
         self._stage_dict = self.convert_stages_dict()
         self.real_stage_num = self.stages[0].stage_num // self.n_local_stages
         self._stage_num = self.stages[0].stage_num
+        self._stage_to_rank_index = None
         self._overlap_p2p = overlap_p2p
         self.exec_order = {}
         self._init_stages()
+        self._build_stage_to_rank_index()
         self.fwd_handle_cache = {}
         self.bwd_handle_cache = {}
         self._custom_fn_map = {}
@@ -201,6 +254,44 @@ class PipelineScheduleRuntime(ABC):
             >>> schedule.register_custom_function(MetaStepType.OVERLAP_F_B, my_overlap_callback)
         """
         self._custom_fn_map[step_type] = fn
+
+    def _inject_local_fsdp_actions(self):
+        """Annotate the local rank schedule with optional FSDP control actions."""
+        current_rank = self._stage_to_rank_index[self.stages[0].stage_index]
+        managed_stage_indices = {
+            stage.stage_index
+            for stage in self.stages
+            if isinstance(stage.submodule, HSDPModule)
+        }
+        if not managed_stage_indices:
+            return
+        if len(managed_stage_indices) != len(self.stages):
+            raise RuntimeError(
+                "When injecting fsdp_action, expect all stages to be HSDPModule. "
+                "Check whether all separated modules are wrapped with 'fully_shard'."
+            )
+        rank_actions = add_fsdp_unshard_reshard(self.exec_order[current_rank], managed_stage_indices)
+        self.exec_order[current_rank] = add_fsdp_reduce_grad(
+            rank_actions,
+            managed_stage_indices,
+            self.micro_batch_num,
+        )
+
+    @abstractmethod
+    def _build_stage_to_rank_index(self) -> None:
+        """
+        Build attribute of  _stage_to_rank_index.
+        Each subclass constructs it according to its own schedule style.
+        """
+
+    @abstractmethod
+    def construct_exec_order(self) -> None:
+        """Build exec order, PP cmopute and PP comms(Send/Recv)"""
+
+    def build_exec_order(self) -> None:
+        """Build the execution order and inject FSDP actions."""
+        self.construct_exec_order()
+        self._inject_local_fsdp_actions()
 
     def convert_stages_dict(self):
         """convert stages to dict."""
@@ -256,6 +347,17 @@ class PipelineScheduleRuntime(ABC):
             if handle is not None:
                 handle.wait()
 
+    def _assert_in_unshard_if_needed(self, stage, check_step):
+        if not isinstance(stage.submodule, HSDPModule):
+            return
+        submodule_hsdp_scheduler = stage.submodule.hsdp_scheduler
+        scheduler_state = submodule_hsdp_scheduler.hsdp_state
+        if scheduler_state.is_shard:
+            raise RuntimeError(
+                f"Executing MetaStep: {check_step}, expected HSDPModule parameters in unsharded "
+                f"state, but got sharded parameters."
+            )
+
     def _exec_step(self, cur_step, arg_mbs, kwarg_mbs, losses, send_handles):
         """Execute a single built-in step (FWD/BWD/SEND/RECV)."""
         stage = self._stage_dict[cur_step.stage_index]
@@ -270,6 +372,7 @@ class PipelineScheduleRuntime(ABC):
                 self.fwd_handle_cache[(stage_index, micro_index)] = comm_handle
 
         elif cur_step.type == MetaStepType.FWD:
+            self._assert_in_unshard_if_needed(stage, cur_step)
             key = (stage_index, micro_index)
             if self._overlap_p2p and key in self.fwd_handle_cache:
                 self._wait_p2p(self.fwd_handle_cache.pop(key))
@@ -291,11 +394,12 @@ class PipelineScheduleRuntime(ABC):
                 self.bwd_handle_cache[(stage_index, micro_index)] = comm_handle
 
         elif cur_step.type == MetaStepType.BWD:
+            self._assert_in_unshard_if_needed(stage, cur_step)
             key = (stage_index, micro_index)
             if self._overlap_p2p and key in self.bwd_handle_cache:
                 self._wait_p2p(self.bwd_handle_cache.pop(key))
-            last_bwd = micro_index == self.micro_batch_num - 1
-            stage.backward_one_chunk(micro_index, last_bwd)
+            is_last_microbatch = micro_index == self.micro_batch_num - 1
+            stage.backward_one_chunk(micro_index, is_last_microbatch)
 
         elif cur_step.type == MetaStepType.BWD_SEND:
             comm_handle = stage.exec_bwd_send_ops(micro_index)
@@ -303,6 +407,26 @@ class PipelineScheduleRuntime(ABC):
                 self._wait_p2p(comm_handle)
             else:
                 send_handles.append(comm_handle)
+
+        elif cur_step.type in (
+            MetaStepType.FSDP_UNSHARD,
+            MetaStepType.FSDP_RESHARD,
+            MetaStepType.FSDP_REDUCE_GRAD,
+        ):
+            self._exec_fsdp_step(cur_step, stage)
+
+    def _exec_fsdp_step(self, cur_step, stage):
+        """Execute an FSDP control step (unshard, reshard, or reduce-grad)."""
+        if cur_step.type == MetaStepType.FSDP_UNSHARD:
+            for _, module in platform.get_cells_and_names(stage.submodule):
+                if isinstance(module, HSDPModule):
+                    module.unshard()
+        elif cur_step.type == MetaStepType.FSDP_RESHARD:
+            for _, module in platform.get_cells_and_names(stage.submodule):
+                if isinstance(module, HSDPModule):
+                    module.reshard()
+        elif cur_step.type == MetaStepType.FSDP_REDUCE_GRAD:
+            stage.execute_reduce_grad()
 
     def run_microbatches(self, arg_mbs, kwarg_mbs, losses):
         """Execute the schedule step by step.
@@ -775,7 +899,12 @@ class ScheduleGPipe(PipelineScheduleRuntime):
                          args_batch_dim=args_batch_dim,
                          kwargs_batch_dim=kwargs_batch_dim,
                          output_concat_dim=output_concat_dim)
-        self.construct_exec_order()
+        self.build_exec_order()
+
+    def _build_stage_to_rank_index(self) -> None:
+        self._stage_to_rank_index = generate_stage_to_rank_mapping(
+            self.real_stage_num, self._stage_num, style='loop'
+        )
 
     def construct_exec_order(self):
         """construct_exec_order of Gpipe."""
@@ -812,7 +941,12 @@ class Schedule1F1B(PipelineScheduleRuntime):
                          args_batch_dim=args_batch_dim,
                          kwargs_batch_dim=kwargs_batch_dim,
                          output_concat_dim=output_concat_dim)
-        self.construct_exec_order()
+        self.build_exec_order()
+
+    def _build_stage_to_rank_index(self) -> None:
+        self._stage_to_rank_index = generate_stage_to_rank_mapping(
+            self.real_stage_num, self._stage_num, style='loop'
+        )
 
     def construct_exec_order(self):
         """construct_exec_order of 1F1B."""
@@ -929,9 +1063,17 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
         self.n_microbatch_per_round_accu = \
             [x * self.n_local_stages for x in itertools.accumulate(self.n_microbatch_per_round)]
         self.n_microbatch_per_round_accu.insert(0, 0)
+        self.build_exec_order()
+
+    def construct_exec_order(self):
         for stage_index in range(self.real_stage_num):
             self.exec_order[stage_index] = self.construct_stage_exec_order(stage_index)
         self.exec_order = add_send_recv(self.exec_order, self._stage_num, self.real_stage_num, style = 'loop')
+
+    def _build_stage_to_rank_index(self) -> None:
+        self._stage_to_rank_index = generate_stage_to_rank_mapping(
+            self.real_stage_num, self._stage_num, style='loop'
+        )
 
     def warmup_ops(self, stage_index):
         """warmup phase."""
@@ -1411,3 +1553,82 @@ def validate_pipeline_execution(order_list: dict[int, list[MetaStep]],
         'has_cycle': bool(cycle_path)
     }
     return result
+
+
+_COMPUTE_META_STEP_TYPES = frozenset({
+    MetaStepType.FWD,
+    MetaStepType.BWD,
+    MetaStepType.BWD_INPUT,
+    MetaStepType.BWD_WEIGHT,
+})
+
+
+def _next_active_stage_indices(actions, start_index, max_active_stages, managed_stage_indices):
+    """Find the next distinct managed stages that will execute compute work.
+
+    Send/recv and previously injected FSDP control steps are skipped so that the
+    lookahead window only counts real compute, otherwise communication-only
+    actions would consume the budget and shrink the effective prefetch depth.
+    """
+    stage_indices = []
+    seen = set()
+    for action in actions[start_index:]:
+        for leaf_step in iter_leaf_meta_steps(action):
+            if leaf_step.type not in _COMPUTE_META_STEP_TYPES:
+                continue
+            if leaf_step.stage_index not in managed_stage_indices or leaf_step.stage_index in seen:
+                continue
+            seen.add(leaf_step.stage_index)
+            stage_indices.append(leaf_step.stage_index)
+            if len(stage_indices) == max_active_stages:
+                return stage_indices
+    return stage_indices
+
+
+def add_fsdp_unshard_reshard(actions, managed_stage_indices, max_active_stages=3):
+    """Insert FSDP unshard/reshard actions for locally managed stages."""
+    if not managed_stage_indices:
+        return actions
+
+    fsdp_actions = []
+    active_stages = []
+    for index, action in enumerate(actions):
+        next_stage_indices = _next_active_stage_indices(
+            actions, index, max_active_stages, managed_stage_indices
+        )
+        evicted_stages = [stage_index for stage_index in active_stages if stage_index not in next_stage_indices]
+        fetched_stages = [stage_index for stage_index in next_stage_indices if stage_index not in active_stages]
+        for stage_index in evicted_stages:
+            fsdp_actions.append(MetaStep(None, MetaStepType.FSDP_RESHARD, stage_index))
+            active_stages.remove(stage_index)
+        for stage_index in fetched_stages:
+            fsdp_actions.append(MetaStep(None, MetaStepType.FSDP_UNSHARD, stage_index))
+            active_stages.append(stage_index)
+        fsdp_actions.append(action)
+
+    while active_stages:
+        fsdp_actions.append(MetaStep(None, MetaStepType.FSDP_RESHARD, active_stages.pop(0)))
+    return fsdp_actions
+
+
+def add_fsdp_reduce_grad(actions, managed_stage_indices, micro_batch_num):
+    """Insert FSDP reduce-grad actions after the last backward-like action of each stage."""
+    if not managed_stage_indices:
+        return actions
+
+    fsdp_actions = []
+    for action in actions:
+        fsdp_actions.append(action)
+        reduced_stage_indices = []
+        for leaf_step in iter_leaf_meta_steps(action):
+            if leaf_step.stage_index not in managed_stage_indices:
+                continue
+            if leaf_step.type not in (MetaStepType.BWD, MetaStepType.BWD_WEIGHT):
+                continue
+            if leaf_step.micro_index != micro_batch_num - 1:
+                continue
+            if leaf_step.stage_index not in reduced_stage_indices:
+                reduced_stage_indices.append(leaf_step.stage_index)
+        for stage_index in reduced_stage_indices:
+            fsdp_actions.append(MetaStep(None, MetaStepType.FSDP_REDUCE_GRAD, stage_index))
+    return fsdp_actions

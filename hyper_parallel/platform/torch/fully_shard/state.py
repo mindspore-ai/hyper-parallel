@@ -262,7 +262,7 @@ class TorchHSDPStateV2(HSDPState):
             )
 
     def lazy_init(self):
-        if not self._reset_sharded_params:
+        if self.is_shard and not self._reset_sharded_params:
             for hsdp_param in self.hsdp_params:
                 if hsdp_param.is_sharded:
                     hsdp_param.reset_sharded_param()

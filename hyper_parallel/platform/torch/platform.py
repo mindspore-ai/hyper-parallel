@@ -652,6 +652,10 @@ class TorchPlatform(Platform):
         return cell.named_modules()
 
     @staticmethod
+    def get_modules(module):
+        return module.modules()
+
+    @staticmethod
     def search_parameter_by_name(cell, param_name: str):
         """
         Find the parent Module of the parameter, the parameter's name in the parent Module, and the parameter.

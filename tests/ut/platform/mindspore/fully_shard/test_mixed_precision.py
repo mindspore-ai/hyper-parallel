@@ -82,6 +82,7 @@ def _make_state(mp_policy, hsdp_params):
     state.replicate_params = []
     state._ignored_allreduce_works = []
     state._reset_sharded_params = True   # Skip the reset_sharded_param branch
+    state.is_shard = True                # Match HSDPState.__init__ default
     return state
 
 
