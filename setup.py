@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # encoding: utf-8
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -120,6 +120,7 @@ class BuildPy(build_py):
         shutil.rmtree(hyper_parallel_lib_dir, ignore_errors=True)
         self._run_shell_script_optional("scripts/build_symmetric_memory.sh")
         self._run_shell_script_optional("scripts/build_multicore.sh")
+        self._run_shell_script_optional("scripts/build_custom_ops.sh")
         super().run()
         update_permissions(hyper_parallel_lib_dir)
 
@@ -199,6 +200,9 @@ if __name__ == '__main__':
             'hyper_parallel.core.shard.ops': ['yaml/*.yaml'],
             'hyper_parallel.platform.torch.symmetric_memory': ['*.so'],
             'hyper_parallel.platform.mindspore.symmetric_memory': ['aclshmem_ms/*.so'],
+            'hyper_parallel.platform.mindspore.custom_ops': [
+                'build/lib/*.so',
+            ],
             'hyper_parallel.core.multicore.platform.mindspore': [
                 'build/lib/*.so',
                 'build/lib/*_auto_generate/*.py',
