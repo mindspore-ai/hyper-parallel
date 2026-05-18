@@ -15,20 +15,63 @@
 """test vpp"""
 import numpy as np
 import torch
+import torch.distributed as dist
 # pylint: disable=W0611
 import torch_npu  # Ascend NPU core adapter
-from hyper_parallel import PipelineStage
-from hyper_parallel import ScheduleInterleaved1F1B
-from .simple_mlp import SimpleMLP, model_split_manual, run_standalone, init_hccl, get_stage_index
+from hyper_parallel import DTensor, PipelineStage, ScheduleInterleaved1F1B, init_device_mesh, manual_seed
+from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.core.dtensor.random import is_rng_supported_mesh
+from .simple_mlp import (
+    SimpleMLP,
+    model_split_manual,
+    run_standalone,
+    init_hccl,
+    get_stage_index,
+    get_rank_list,
+)
+
+
+def _pp_domain_dtensor_rng_smoke() -> None:
+    """Per PP-domain ``DeviceMesh``: ``manual_seed`` then one sharded ``randn_like`` on ``DTensor``.
+
+    Uses two domains of two ranks each (ranks ``{0,1}`` and ``{2,3}``) when ``world_size==4``,
+    mirroring different parallel seeds per domain (PyTorch DTensor PP guidance).
+    """
+    world_size = dist.get_world_size()
+    if world_size != 4:
+        return
+    num_pp_domains = 2
+    stage_ranks = tuple(get_rank_list(num_pp_domains))
+    domain_mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(len(stage_ranks),),
+        mesh_dim_names=("pp_domain",),
+        rank_list=stage_ranks,
+        init_backend=False,
+    )
+    if not is_rng_supported_mesh(domain_mesh):
+        return
+    pp_domain_id = get_stage_index(num_pp_domains)
+    parallel_seed = 31_415 + pp_domain_id * 271_828
+    manual_seed(parallel_seed, domain_mesh)
+
+    local = torch.zeros((1, 8), dtype=torch.float32, device="npu")
+    dt = DTensor.from_local(local, domain_mesh, [Shard(0)])
+    out = torch.randn_like(dt)
+    assert isinstance(out, DTensor), f"expected DTensor, got {type(out)}"
+    assert tuple(out.shape) == (1 * len(stage_ranks), 8)
+    assert torch.isfinite(out.to_local()).all()
 
 
 def run_parallel(micro_batch_num):
     """
     Feature: PipelineParallel.
-    Description: Test simple mlp net.
+    Description: Test simple mlp net; before PP run, smoke-test per-domain ``manual_seed`` and
+        ``torch.randn_like`` on a sharded ``DTensor`` (two PP domains when world size is 4).
     Expectation: Run success.
     """
     init_hccl()
+    _pp_domain_dtensor_rng_smoke()
 
     # pp config
     num_stages = 4

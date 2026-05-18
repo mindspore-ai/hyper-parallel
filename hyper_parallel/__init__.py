@@ -24,7 +24,7 @@ __all__ = ["get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDP
            "ContextParallel", "AsyncContextParallel",
            "ColwiseParallel", "RowwiseParallel", "SequenceParallel",
            "PrepareModuleInput", "PrepareModuleInputOutput", "PrepareModuleOutput",
-           "ParallelStyle", "parallelize_module"]
+           "ParallelStyle", "parallelize_module", "manual_seed"]
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.shard.dfunction import DFunction
@@ -51,6 +51,7 @@ from hyper_parallel.core.tensor_parallel import (
     SequenceParallel,
     parallelize_module,
 )
+from hyper_parallel.core.dtensor.random import manual_seed
 from hyper_parallel.core.fully_shard.api import fully_shard, hsdp_sync_stream, HSDPModule
 
 get_current_mesh = _mesh_resources.get_current_mesh
