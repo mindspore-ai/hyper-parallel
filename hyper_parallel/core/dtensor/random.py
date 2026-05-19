@@ -1,4 +1,17 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
 """RNG state management for distributed tensor operations.
 
 Provides utilities for tracking and synchronizing random number generator states
@@ -7,10 +20,12 @@ across multiple devices in distributed training scenarios.
 
 __all__ = [
     "is_rng_supported_mesh",
+    "manual_seed",
     "OffsetBasedRNGTracker",
 ]
 
 import contextlib
+import warnings
 from logging import getLogger
 import typing
 from typing import Optional
@@ -18,6 +33,7 @@ import functools
 import operator
 
 from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -26,23 +42,37 @@ Tensor = platform.tensor
 
 logger = getLogger(__name__)
 
-_rng_tracker: Optional["_RNGStateTracker"] = None
 
-
-def is_rng_supported_mesh() -> bool:
+def is_rng_supported_mesh(device_mesh: Optional[DeviceMesh] = None) -> bool:
     """Check if the device mesh supports DTensor random operations.
 
     Currently, DTensor random operations are only supported on CUDA and CUDA-like
     devices. Users should call this function before using DTensor random APIs to
     verify compatibility.
 
+    Args:
+        device_mesh: Optional :class:`DeviceMesh` to check (same semantics as PyTorch
+            ``torch.distributed.tensor``). If omitted, checks the active platform device
+            handle only.
+
     Returns:
         bool: ``True`` if the device mesh supports DTensor random operations,
             ``False`` otherwise.
     """
+    if device_mesh is not None and device_mesh.device_type == "cpu":
+        warnings.warn(
+            f"DTensor random operators may not have complete support on {device_mesh.device_type} device mesh",
+            stacklevel=2,
+        )
+        return False
     device_handle = platform.get_device_handle()
     if device_handle and hasattr(device_handle, "set_rng_state"):
         return True
+    if device_mesh is not None:
+        warnings.warn(
+            f"DTensor random operators may not have complete support on {device_mesh.device_type} device mesh",
+            stacklevel=2,
+        )
     return False
 
 
@@ -142,11 +172,16 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
                 logger.warning(
                     "DTensor is synchronizing RNG states of every rank with the state from rank 0. "
                     "This behavior is deprecated. "
-                    "Please call `manual_seed()` on every rank that participates in SPMD DTensor Operations with "
-                    "the same seed. If using Pipeline Parallelism, each pipelining state would use a different seed, "
-                    "but all ranks belonging to one pipeline stage would use the same seed."
+                    "Please call ``manual_seed(seed, device_mesh)`` from "
+                    "``hyper_parallel.core.dtensor.random`` on every rank that participates in SPMD DTensor "
+                    "operations with the same seed. If using Pipeline Parallelism, each pipelining state would use "
+                    "a different seed, but all ranks belonging to one pipeline stage would use the same seed."
                 )
             self._set_device_state(rng_state)
+
+    def _manual_seed(self, parallel_seed: int) -> None:
+        """Set default RNG seed (``platform.manual_seed``); same idea as PyTorch DTensor."""
+        platform.manual_seed(parallel_seed)
 
     def _get_device_state(self):
         rng_state = self._device_handle.get_rng_state().to(self._device)
@@ -389,6 +424,49 @@ def _resolve_device():
         return platform.device(device_idx)
 
     return get_device(device_idx)
+
+
+def manual_seed(seed: int, device_mesh: DeviceMesh) -> None:
+    """Set the seed for generating random numbers on the calling rank (PyTorch DTensor parity).
+
+    Ensures the global RNG used by DTensor random ops is initialized consistently. Lazily
+    creates the :class:`OffsetBasedRNGTracker` used by shard dispatch with
+    ``run_state_sync=False`` so ranks are not synchronized from rank 0's prior RNG state.
+
+    Args:
+        seed: Desired RNG seed (must be agreed across ranks in the mesh for SPMD).
+        device_mesh: Mesh that must include the current process rank.
+
+    Raises:
+        RuntimeError: If the current rank is not part of ``device_mesh`` (undefined DTensor
+            RNG behavior in that case).
+
+    Warning:
+        Does not validate that ``seed`` matches across ranks; callers must ensure SPMD
+        consistency. Pipeline parallel: use one seed per pipeline stage group as in PyTorch.
+    """
+    if not is_rng_supported_mesh(device_mesh):
+        warnings.warn(
+            "DTensor manual_seed() may not have complete support "
+            f"on {device_mesh.device_type} device mesh",
+            stacklevel=2,
+        )
+        return
+
+    # Local import avoids import cycle: _op_dispatch imports this module at load time.
+    from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER  # pylint: disable=C0415
+
+    if _OP_DISPATCHER._rng_tracker is None:
+        _OP_DISPATCHER._rng_tracker = OffsetBasedRNGTracker(run_state_sync=False)
+
+    if device_mesh.get_coordinate() is None:
+        raise RuntimeError(
+            "manual_seed requires the current rank to be a part of the device mesh "
+            "otherwise DTensor RNG state on the rank will not be initialized and "
+            "the behavior of DTensor random ops is undefined."
+        )
+
+    platform.manual_seed(seed)
 
 
 def local_shard_size_and_offset(

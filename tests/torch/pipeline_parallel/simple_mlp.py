@@ -26,12 +26,18 @@ class MLP(nn.Module):
     def __init__(self, in_size, out_size):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(in_size, out_size, dtype=torch.float32).npu())
+        # ``p=0`` keeps the graph as a random-op module without consuming RNG or changing values,
+        # so PP vs standalone ``allclose`` in ``test_vpp`` still holds. Non-zero dropout needs
+        # per-rank aligned ``torch.manual_seed`` / device seed; it still may not match standalone
+        # partition-wise without a redesigned reference.
+        self.dropout = nn.Dropout(p=0.0)
         self.relu = nn.ReLU()
 
     def forward(self, x):
         x = torch.matmul(x, self.weight)
         if isinstance(x, DTensor):
             x = x.reduce_partial()
+        x = self.dropout(x)
         x = self.relu(x)
         return x
 
