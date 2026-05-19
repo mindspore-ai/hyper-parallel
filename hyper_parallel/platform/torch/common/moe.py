@@ -439,7 +439,14 @@ def _compute_load_balance_loss(
 ) -> torch.Tensor:
     """Compute load-balance auxiliary loss.
 
-    Standard formulation: ``loss = num_experts * Σ fraction_i * mean_score_i``
+    Standard formulation: ``loss = num_experts * Σ (expert_fraction_i * expert_prob_i)``
+
+    Where:
+        - expert_fraction_i = tokens routed to expert i / total routed tokens
+        - expert_prob_i = sum of routing scores for expert i / total tokens
+
+    When routing is perfectly balanced, loss ≈ 1.0.
+    When routing is imbalanced, loss > 1.0.
 
     Args:
         top_scores: Routing weights, shape ``[num_tokens, top_k]``.
@@ -447,25 +454,30 @@ def _compute_load_balance_loss(
         num_experts: Total number of experts.
 
     Returns:
-        Scalar loss tensor.
+        Scalar loss tensor. Returns 0.0 for empty input.
     """
     num_tokens, top_k = top_scores.shape
-    flat_experts = selected_experts.flatten()  # [num_tokens * top_k]
 
-    # Fraction of tokens sent to each expert (soft, uses routing probabilities).
-    one_hot = torch.zeros(
-        num_tokens * top_k, num_experts,
-        dtype=top_scores.dtype, device=top_scores.device,
-    ).scatter_(1, flat_experts.unsqueeze(1), 1.0)
-    # [num_tokens, top_k, num_experts] → mean per expert
-    expert_fraction = one_hot.view(num_tokens, top_k, num_experts).float().mean(dim=(0, 1))
+    if num_tokens == 0:
+        return torch.tensor(0.0, dtype=top_scores.dtype, device=top_scores.device)
 
-    # Mean routing probability per expert.
-    prob = F.softmax(top_scores.float(), dim=-1)  # [num_tokens, top_k]
-    mean_score = prob.mean(dim=0)  # [top_k]
+    flat_experts = selected_experts.flatten()
+    flat_scores = top_scores.flatten()
 
-    # Scalar: num_experts * dot(mean_score, expert_fraction.T)
-    loss = num_experts * (mean_score.unsqueeze(-1) * expert_fraction.unsqueeze(0)).sum()
+    expert_fraction = torch.zeros(
+        num_experts, dtype=top_scores.dtype, device=top_scores.device
+    )
+    expert_fraction.scatter_add_(0, flat_experts, torch.ones_like(flat_scores))
+    expert_fraction = expert_fraction / (num_tokens * top_k)
+
+    expert_prob = torch.zeros(
+        num_experts, dtype=top_scores.dtype, device=top_scores.device
+    )
+    expert_prob.scatter_add_(0, flat_experts, flat_scores)
+    expert_prob = expert_prob / num_tokens
+
+    loss = num_experts * (expert_fraction * expert_prob).sum()
+
     return loss
 
 
@@ -630,22 +642,44 @@ class MoE(nn.Module):
 # Expert bias update for auxiliary-loss-free load balancing
 # ---------------------------------------------------------------------------
 
-def update_expert_bias(moe: MoE, lr: float = 1e-3) -> None:
+def update_expert_bias(
+    moe: "MoE",
+    lr: float = 1e-3,
+    num_recomputations: int = 1,
+) -> None:
     """Update expert bias for auxiliary-loss-free load balancing.
 
-    Should be called once per training step after the optimiser step.
+    Should be called once per training step after the optimizer step.
     Adjusts ``moe.expert_bias`` to push token load towards the mean, then
     resets the ``tokens_per_expert`` accumulator.
+
+    The update delta is centered to have zero mean, preventing systematic
+    drift of all bias values over time.
+
+    When activation checkpoint is enabled, forward is re-executed during
+    backward, causing ``tokens_per_expert`` to accumulate twice (or more).
+    Use ``num_recomputations`` to correct for this double-counting.
 
     Args:
         moe: The :class:`MoE` module whose bias should be updated.
         lr: Step size for the bias update.  Defaults to ``1e-3``.
+        num_recomputations: Number of times forward is executed per optimizer
+            step. Default ``1`` (normal training). Set to ``2`` when activation
+            checkpoint is enabled (forward + recompute during backward). For
+            nested checkpoint strategies, set to the actual execution count.
 
     Example::
-        >>> # After optimizer.step():
+        >>> # Single-card scenario without activation checkpoint:
         >>> update_expert_bias(moe_layer, lr=1e-3)
+        >>>
+        >>> # With activation checkpoint (forward executed twice):
+        >>> update_expert_bias(moe_layer, lr=1e-3, num_recomputations=2)
     """
     with torch.no_grad():
+        if num_recomputations > 1:
+            moe.tokens_per_expert.div_(num_recomputations)
         avg = moe.tokens_per_expert.float().mean()
-        moe.expert_bias.data += lr * (avg - moe.tokens_per_expert.float()).sign()
+        delta = lr * (avg - moe.tokens_per_expert.float()).sign()
+        delta = delta - delta.mean()
+        moe.expert_bias.data += delta
         moe.tokens_per_expert.zero_()

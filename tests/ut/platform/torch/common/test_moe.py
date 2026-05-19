@@ -23,11 +23,10 @@ from copy import deepcopy
 from unittest.mock import MagicMock, patch
 
 import torch
-from torch import nn
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
-from hyper_parallel.platform.torch.common.moe import (  # noqa: E402
+from hyper_parallel.platform.torch.common.moe import (  # pylint: disable=C0413
     FeedForward,
     GroupedExperts,
     MoE,
@@ -469,6 +468,10 @@ class TestMoE(unittest.TestCase):
             "expert_bias unchanged after update_expert_bias"
         )
 
+
+# ---------------------------------------------------------------------------
+# TestRegisterExpertBiasUpdater
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     unittest.main()
