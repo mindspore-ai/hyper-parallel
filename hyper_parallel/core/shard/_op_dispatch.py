@@ -877,6 +877,24 @@ class OpDispatcher:
         return local_results
 
     @staticmethod
+    def _unwrap_value(value: object) -> object:
+        """Replace DTensor with its local tensor; pass scalars and plain tensors through.
+
+        Args:
+            value (object): A single argument value from an op call.
+
+        Returns:
+            object: The local tensor if value is a DTensor, otherwise value unchanged.
+        """
+        if isinstance(value, DTensor):
+            return value.to_local()
+        if isinstance(value, tuple):
+            return tuple(OpDispatcher._unwrap_value(e) for e in value)
+        if isinstance(value, list):
+            return [OpDispatcher._unwrap_value(e) for e in value]
+        return value
+
+    @staticmethod
     def _unwrap_args(args: tuple) -> list:
         """Strip DTensor wrappers from args, preserving tuple/list container structure.
 
@@ -886,23 +904,19 @@ class OpDispatcher:
         Returns:
             List of args with DTensor replaced by their local tensors.
         """
-        def unwrap(arg: object) -> object:
-            """Replace DTensor with its local tensor; pass scalars and plain tensors through.
+        return [OpDispatcher._unwrap_value(arg) for arg in args]
 
-            Args:
-                arg (object): An element of the operator's argument list.
+    @staticmethod
+    def _unwrap_kwargs(kwargs: dict) -> dict:
+        """Strip DTensor wrappers from kwargs values, preserving tuple/list container structure.
 
-            Returns:
-                object: The local tensor if arg is a DTensor, otherwise arg unchanged.
-            """
-            if isinstance(arg, DTensor):
-                return arg.to_local()
-            if isinstance(arg, tuple):
-                return tuple(e.to_local() if isinstance(e, DTensor) else e for e in arg)
-            if isinstance(arg, list):
-                return [e.to_local() if isinstance(e, DTensor) else e for e in arg]
-            return arg
-        return [unwrap(arg) for arg in args]
+        Args:
+            kwargs: Op call keyword arguments, values may contain DTensor instances.
+
+        Returns:
+            Dict of kwargs with DTensor values replaced by their local tensors.
+        """
+        return {k: OpDispatcher._unwrap_value(v) for k, v in kwargs.items()}
 
     def _should_bypass_dispatch(self, op_name: str) -> bool:
         """Return True if the op should bypass DTensor dispatch and run locally.
@@ -996,7 +1010,7 @@ class OpDispatcher:
         op_name = platform.get_op_name(op_call)
 
         if self._should_bypass_dispatch(op_name):
-            return op_call(*self._unwrap_args(args), **kwargs)
+            return op_call(*self._unwrap_args(args), **self._unwrap_kwargs(kwargs))
 
         if op_name in self._random_ops or op_name in self._random_ms_ops:
             return self._dispatch_random_op(op_name, op_call, args, kwargs)
