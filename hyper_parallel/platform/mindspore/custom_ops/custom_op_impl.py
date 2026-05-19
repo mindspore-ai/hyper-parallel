@@ -14,28 +14,38 @@
 # ============================================================================
 """MindSpore custom kernel implementations and DFunction wrappers."""
 import os
+import sys
 
-import mindspore as ms  # pylint: disable=C0415
+import mindspore as ms # pylint: disable=C0415
 
 from hyper_parallel.core.shard.dfunction import DFunction
 
 
 _CC_DIR = os.path.dirname(os.path.abspath(__file__))
+_MS_EXTENSION_NAME = "hyper_parallel_custom_ops_ms"
+_BUILD_LIB = os.path.join(_CC_DIR, "build", "lib")
 
-_custom_ops = ms.ops.CustomOpBuilder(
-    "custom_ops",
-    [
-        os.path.join(_CC_DIR, "module.cc"),
-        os.path.join(_CC_DIR, "dense_lightning_indexer_grad_kl_loss.cc"),
-        os.path.join(_CC_DIR, "dense_lightning_indexer_softmax_lse.cc"),
-        os.path.join(_CC_DIR, "sparse_lightning_indexer_grad_kl_loss.cc"),
-        os.path.join(_CC_DIR, "mhc_post.cc"),
-        os.path.join(_CC_DIR, "mhc_post_backward.cc"),
-        os.path.join(_CC_DIR, "mhc_pre_sinkhorn.cc"),
-        os.path.join(_CC_DIR, "mhc_pre_sinkhorn_backward.cc"),
-    ],
-    backend="Ascend",
-).load()
+if _BUILD_LIB not in sys.path:
+    sys.path.insert(0, _BUILD_LIB)
+
+try:
+    _custom_ops = __import__(_MS_EXTENSION_NAME)
+except ImportError:
+    # Source-tree development: .so not pre-built; JIT-compile from local .cc files.
+    _custom_ops = ms.ops.CustomOpBuilder(
+        _MS_EXTENSION_NAME,
+        [
+            os.path.join(_CC_DIR, "module.cc"),
+            os.path.join(_CC_DIR, "dense_lightning_indexer_grad_kl_loss.cc"),
+            os.path.join(_CC_DIR, "dense_lightning_indexer_softmax_lse.cc"),
+            os.path.join(_CC_DIR, "sparse_lightning_indexer_grad_kl_loss.cc"),
+            os.path.join(_CC_DIR, "mhc_post.cc"),
+            os.path.join(_CC_DIR, "mhc_post_backward.cc"),
+            os.path.join(_CC_DIR, "mhc_pre_sinkhorn.cc"),
+            os.path.join(_CC_DIR, "mhc_pre_sinkhorn_backward.cc"),
+        ],
+        backend="Ascend",
+    ).load()
 
 
 def _ensure_contiguous(*tensors):

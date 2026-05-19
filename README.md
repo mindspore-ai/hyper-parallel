@@ -135,7 +135,8 @@ HyperParallel提供昇腾超节点亲和的分布式并行加速能力，在保�
 ```bash
 git clone https://gitcode.com/mindspore/hyper-parallel.git
 cd hyper-parallel
-pip install .
+python setup.py bdist_wheel
+pip install dist/hyper_parallel-*-py3-none-any.whl
 ```
 
 HyperParallel 依赖深度学习框架，在使用HyperParallel前，你需要：<br>
