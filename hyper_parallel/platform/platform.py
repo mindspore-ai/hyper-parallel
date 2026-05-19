@@ -306,6 +306,10 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement get_cells_and_names")
 
     @staticmethod
+    def get_modules(module):
+        raise NotImplementedError("Platform subclasses must implement get_modules")
+
+    @staticmethod
     def search_parameter_by_name(cell, param_name: str):
         """Search for a parameter by name within a cell/module.
 

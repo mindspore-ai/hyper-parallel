@@ -40,7 +40,10 @@ def run_parallel(micro_batch_num):
     stage_index = get_stage_index(num_stages)
 
     # Create DeviceMesh
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(1, 2), mesh_dim_names=("dp", "tp"), rank_list=rank_list)
+    mesh = init_device_mesh(
+        device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("pp", "dp", "tp"), rank_list=rank_list
+    )
+    # mesh = init_device_mesh(device_type="npu", mesh_shape=(1, 2), mesh_dim_names=("dp", "tp"), rank_list=rank_list)
 
     # Define placements using Placement format
     w_tp_none = (Replicate(), Shard(0))  # tp shard on dim 0

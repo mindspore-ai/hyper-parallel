@@ -13,8 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """mindspore pipeline stage"""
-from mindspore import ops
-import hyper_parallel
+from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
+from hyper_parallel.platform.mindspore.pipeline_parallel.backward import forward_and_gradfn
 
 
 class PipelineStageBase:
@@ -45,15 +45,15 @@ class PipelineStageBase:
         if has_backward:
             self.submodule.set_grad(True)
             self._construct_backward_func()
-        self.fwd_inputs_cache = {}
         self.fwd_outputs_cache = {}
+        self.fwd_grad_fn_cache = {}
         self.bwd_cache = {}
         self.last_stage_outputs = None  # Initialized in forward_one_chunk()
 
     def clear_cache(self):
         """clear cache."""
-        self.fwd_inputs_cache.clear()
         self.fwd_outputs_cache.clear()
+        self.fwd_grad_fn_cache.clear()
         self.bwd_cache.clear()
 
     @staticmethod
@@ -72,6 +72,26 @@ class PipelineStageBase:
             return
         for info in recv_info[micro_index]:
             info.buffer = None
+
+    @staticmethod
+    def _grad_position_from_requires_grad(composite_args):
+        """Derive grad_position from composite_args' requires_grad attributes.
+
+        Returns -1 if all tensor args require grad, a tuple of indices if some do,
+        and an empty list if none do.
+        """
+        # pylint: disable=C0415
+        from mindspore import Tensor
+        tensor_indices = [i for i, a in enumerate(composite_args) if isinstance(a, Tensor)]
+        requires_grad_indices = [
+            i for i in tensor_indices
+            if composite_args[i]._requires_grad  # pylint: disable=protected-access
+        ]
+        if not requires_grad_indices:
+            return []
+        if len(requires_grad_indices) == len(tensor_indices):
+            return -1
+        return tuple(requires_grad_indices)
 
     @property
     def is_first_stage(self):
@@ -94,31 +114,51 @@ class PipelineStageBase:
                 raise RuntimeError(f"The exec order is wrong. The corresponding forward calculation \
                                     is executed before the Receive operation. micro is {micro_index}.")
         composite_kwargs = kwargs or {}
-        out = self.submodule(*composite_args, **composite_kwargs)
+        if self._has_backward:
+            grad_position = self._grad_position_from_requires_grad(composite_args)
+            weights = tuple(self.submodule.trainable_params())
+            out, grad_fn = forward_and_gradfn(
+                self.submodule,
+                *composite_args,
+                weights=weights,
+                grad_position=grad_position,
+                **composite_kwargs,
+            )
+            self.fwd_grad_fn_cache[micro_index] = grad_fn
+        else:
+            out = self.submodule(*composite_args, **composite_kwargs)
         out_tuple = out if isinstance(out, tuple) else (out,)
-        self.fwd_inputs_cache[micro_index] = (composite_args, composite_kwargs)
         self.fwd_outputs_cache[micro_index] = out_tuple
         if self.is_last_stage:
             self.last_stage_outputs = out
         return out
 
-    def backward_one_chunk(self, micro_index, last_backward=False):
+    def backward_one_chunk(self, micro_index, last_backward=False):  # pylint: disable=unused-argument
         """Execution a backward function."""
+        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
         if not self._has_backward:
             return None
-        fwd_args, fwd_kwargs = self.fwd_inputs_cache.pop(micro_index)
         recv_args = []
-        if last_backward and isinstance(self.submodule, hyper_parallel.HSDPCell):
-            self.submodule.set_requires_grad_sync(True)
+        for _, mod in self.submodule.cells_and_names():
+            if not isinstance(mod, HSDPModule):
+                continue
+            mod.set_reshard_after_backward(False)
+            mod.set_requires_gradient_sync(False)
         if micro_index in self.grad_recv_info:
             recv_args = [recv_info.buffer for recv_info in self.grad_recv_info[micro_index]]
+
+        grad_fn = self.fwd_grad_fn_cache.pop(micro_index)
         if self.is_first_stage:
-            grad_out = self._backward_func(*fwd_args, **fwd_kwargs, sens=recv_args)
-        elif self.is_last_stage:
-            sens = self.get_last_stage_sens(self.last_stage_outputs)
-            grad_out = self._backward_func(*fwd_args, **fwd_kwargs, sens=sens)
+            _ = grad_fn(sens=recv_args)
+            grad_out = None
         else:
-            grad_out = self._backward_func(*fwd_args, **fwd_kwargs, sens=recv_args)
+            if self.is_last_stage:
+                sens = self.get_last_stage_sens(self.last_stage_outputs)
+            else:
+                sens = recv_args
+            input_grads = grad_fn.compute_input_grad(sens=sens)
+            weight_grads = grad_fn.compute_weight_grad()
+            grad_out = (input_grads, weight_grads)
         self._clear_recv_buffer(self.grad_recv_info, micro_index)
         self._clear_recv_buffer(self.args_recv_info, micro_index)
         if not self.is_first_stage:
@@ -130,13 +170,5 @@ class PipelineStageBase:
 
     def _construct_backward_func(self):
         """construct backward func."""
+        enable_mindspore_backward_compat()
         self._backward_func = None
-        if self.is_first_stage:
-            self._backward_func = ops.GradOperation(get_by_list=True, sens_param=True)(
-                self.submodule, self.submodule.trainable_params())
-        elif self.is_last_stage:
-            self._backward_func = ops.GradOperation(get_by_list=True, get_all=True, sens_param=True)(
-                self.submodule, self.submodule.trainable_params())
-        else:
-            self._backward_func = ops.GradOperation(get_by_list=True, get_all=True, sens_param=True)(
-                self.submodule, self.submodule.trainable_params())

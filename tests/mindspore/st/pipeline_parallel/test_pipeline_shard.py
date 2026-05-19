@@ -12,24 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test fully_shard module api"""
+"""msrun entry for MindSpore pipeline_parallel/pipeline_shard."""
 import os
-from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import parallel_run, TorchCase
 
-_TEST_FULLY_SHARD_MODULE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_module.py")
+from tests.common.mark_utils import arg_mark
+from tests.mindspore.st.utils import msrun_case
+
+_FILE_NAME = os.path.join(os.path.dirname(__file__), "_pipeline_shard.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_fully_shard_module_group1():
+def test_ms_pipeline_shard():
     """
-    Feature: parallel run cases in fully_shard module
-    Description:
-        1.test_fully_shard_module_01 — HSDPModule interface methods
-        2.test_fully_shard_module_02 — set_reshard_after_backward/forward recurse on nested model
+    Feature: PipelineParallel + shard.
+    Description: Run the MindSpore interleaved pipeline + shard case and compare with standalone.
     Expectation: Run success.
     """
-    parallel_run([
-        TorchCase(_TEST_FULLY_SHARD_MODULE, "test_fully_shard_module_01", 12343, 4),
-        TorchCase(_TEST_FULLY_SHARD_MODULE, "test_fully_shard_module_02", 12344, 4),
-    ])
+    msrun_case(2, _FILE_NAME, "test_pipeline_shard", 18611, worker_num=4, local_worker_num=4)

@@ -12,24 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test fully_shard module api"""
+"""msrun launcher for fully_shard module interface tests (MindSpore)."""
 import os
-from tests.common.mark_utils import arg_mark
-from tests.common.parallel_case import parallel_run, TorchCase
 
-_TEST_FULLY_SHARD_MODULE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_module.py")
+from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import MindSporeCase, parallel_run
+
+_TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_module.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_fully_shard_module_group1():
+def test_ms_fully_shard_module_suite():
     """
-    Feature: parallel run cases in fully_shard module
+    Feature: parallel run cases in fully_shard module (MindSpore)
     Description:
-        1.test_fully_shard_module_01 — HSDPModule interface methods
+        1.test_ms_fully_shard_module_01 — HSDPModule interface methods
         2.test_fully_shard_module_02 — set_reshard_after_backward/forward recurse on nested model
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(_TEST_FULLY_SHARD_MODULE, "test_fully_shard_module_01", 12343, 4),
-        TorchCase(_TEST_FULLY_SHARD_MODULE, "test_fully_shard_module_02", 12344, 4),
+        MindSporeCase(_TEST_FILE, "test_ms_fully_shard_module_01", 18510, 4, 4),
+        MindSporeCase(_TEST_FILE, "test_fully_shard_module_02", 18511, 4, 4),
     ])

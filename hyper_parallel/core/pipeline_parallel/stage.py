@@ -18,6 +18,7 @@ from types import SimpleNamespace
 
 from hyper_parallel import DTensor
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
+from hyper_parallel.core.fully_shard.api import HSDPModule
 from hyper_parallel.platform import get_platform
 from .utils import _RecvInfo  # pylint: disable=E0402
 
@@ -405,3 +406,22 @@ class PipelineStage(PipelineStageBase):
             handle = platform.isend(cur_out, global_rank)
             comm_handle.append(handle)
         return comm_handle
+
+    def execute_reduce_grad(self):
+        """Trigger FSDP post-backward gradient reduction and root hook for the stage submodule."""
+        if not isinstance(self.submodule, HSDPModule):
+            return
+        fsdp_module = self.submodule
+        fsdp_module.set_is_last_backward(True)
+        fsdp_module.set_reshard_after_backward(True)
+        fsdp_module.set_requires_gradient_sync(True)
+
+        for _, submod in platform.get_cells_and_names(fsdp_module):
+            if not isinstance(submod, HSDPModule):
+                continue
+            sub_mod_state = submod.hsdp_scheduler.hsdp_state
+            sub_mod_state.post_backward()
+            sub_mod_state.reduce_params()
+
+        # No public API exposes the root backward finalization; call the platform hook directly.
+        fsdp_module.hsdp_scheduler._root_backward_hook()  # pylint: disable=protected-access

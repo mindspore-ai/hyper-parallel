@@ -173,3 +173,74 @@ def test_fully_shard_module_01():
     model1.reshard()
     model1.reshard()
     assert hsdp_state.is_shard is True
+
+
+class StageModel(torch.nn.Module):
+    """Wraps a contiguous sequence of fully_shard-managed layers as one pipeline stage."""
+
+    def __init__(self, layers):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(list(layers))
+
+    def forward(self, hidden_states):
+        for layer in self.layers:
+            hidden_states = layer(hidden_states)
+        return hidden_states
+
+
+def test_fully_shard_module_02():
+    """
+    Feature: Test set_reshard_after_backward / set_reshard_after_forward recurse on nested model
+    Description: Verify that calling set_reshard_after_backward / set_reshard_after_forward on
+        a StageModel whose child layers are individually wrapped with fully_shard correctly
+        propagates to all child HSDPModule instances (tests the recurse=True deep traversal).
+    Expectation: run successfully
+    """
+    init_dist()
+    world_size = dist.get_world_size()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("dp",))
+
+    mp_policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32,
+                                     output_dtype=torch.float32, cast_forward_inputs=True)
+
+    inner_layers = [DenseNet(32, 32, has_bias=False) for _ in range(3)]
+    for layer in inner_layers:
+        fully_shard(layer, mesh=mesh, reshard_after_forward=True, mp_policy=mp_policy)
+
+    stage = StageModel(inner_layers)
+    fully_shard(stage, mesh=mesh, reshard_after_forward=True, mp_policy=mp_policy)
+
+    child_hsdp_modules = [m for m in stage.modules() if isinstance(m, HSDPModule) and m is not stage]
+    assert len(child_hsdp_modules) == len(inner_layers), (
+        f"Expected {len(inner_layers)} child HSDPModules, got {len(child_hsdp_modules)}"
+    )
+
+    # set_reshard_after_backward(False) must reach all nested HSDPModule children
+    stage.set_reshard_after_backward(False)
+    for child in child_hsdp_modules:
+        assert child.hsdp_scheduler.hsdp_state.reshard_after_backward is False, (
+            f"Expected reshard_after_backward=False on child {child}, "
+            f"got {child.hsdp_scheduler.hsdp_state.reshard_after_backward}"
+        )
+
+    stage.set_reshard_after_backward(True)
+    for child in child_hsdp_modules:
+        assert child.hsdp_scheduler.hsdp_state.reshard_after_backward is True, (
+            f"Expected reshard_after_backward=True on child {child}, "
+            f"got {child.hsdp_scheduler.hsdp_state.reshard_after_backward}"
+        )
+
+    # set_reshard_after_forward(False) must reach all nested HSDPModule children
+    stage.set_reshard_after_forward(False)
+    for child in child_hsdp_modules:
+        assert child.hsdp_scheduler.reshard_after_forward is False, (
+            f"Expected reshard_after_forward=False on child {child}, "
+            f"got {child.hsdp_scheduler.reshard_after_forward}"
+        )
+
+    stage.set_reshard_after_forward(True)
+    for child in child_hsdp_modules:
+        assert child.hsdp_scheduler.reshard_after_forward is True, (
+            f"Expected reshard_after_forward=True on child {child}, "
+            f"got {child.hsdp_scheduler.reshard_after_forward}"
+        )
