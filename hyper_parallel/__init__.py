@@ -21,7 +21,8 @@ __all__ = ["get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDP
            "MetaStep", "MetaStepType", "BatchDimSpec", "PipelineStage", "ScheduleInterleaved1F1B",
            "init_process_group", "destroy_process_group", "get_process_group_ranks", "get_backend", "split_group",
            "get_group_local_rank", "mark_created_groups",
-           "ContextParallel", "AsyncContextParallel",
+           "ContextParallel", "AsyncContextParallel", "DSAContextParallel",
+           "DSAIndexerContextParallel", "DSAIndexerLossContextParallel", "DSASparseAttentionContextParallel",
            "ColwiseParallel", "RowwiseParallel", "SequenceParallel",
            "PrepareModuleInput", "PrepareModuleInputOutput", "PrepareModuleOutput",
            "ParallelStyle", "parallelize_module", "manual_seed"]
@@ -40,7 +41,14 @@ from hyper_parallel.core.pipeline_parallel import (PipelineStage, ScheduleInterl
                                                    BatchDimSpec)
 from hyper_parallel.collectives.cc import (init_process_group, destroy_process_group, get_process_group_ranks,
                                            get_backend, split_group, get_group_local_rank, mark_created_groups)
-from hyper_parallel.core.context_parallel import ContextParallel, AsyncContextParallel
+from hyper_parallel.core.context_parallel import (
+    ContextParallel,
+    AsyncContextParallel,
+    DSAContextParallel,
+    DSAIndexerContextParallel,
+    DSAIndexerLossContextParallel,
+    DSASparseAttentionContextParallel,
+)
 from hyper_parallel.core.tensor_parallel import (
     ColwiseParallel,
     ParallelStyle,
