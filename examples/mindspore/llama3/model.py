@@ -96,11 +96,18 @@ class Llama3RMSNorm(nn.Cell):
         self.weight = ms.Parameter(mint.ones((dim,), dtype=ms.float32))
 
     def construct(self, x: Tensor) -> Tensor:
-        dtype = x.dtype
-        x_fp = ops.cast(x, ms.float32)
-        norm = mint.rsqrt(mint.mean(mint.square(x_fp), dim=-1, keepdim=True) + self.eps)
-        out = x_fp * norm * self.weight
-        return ops.cast(out, dtype)
+        """Apply RMSNorm on the last dimension (local ops under ``SkipDTensorDispatch``)."""
+        with SkipDTensorDispatch():
+            dtype = x.dtype
+            x_fp = ops.cast(x, ms.float32)
+            if hasattr(x_fp, "to_local"):
+                x_fp = x_fp.to_local()
+            weight = self.weight
+            if hasattr(weight, "to_local"):
+                weight = weight.to_local()
+            norm = mint.rsqrt(mint.mean(mint.square(x_fp), dim=-1, keepdim=True) + self.eps)
+            out = x_fp * norm * weight
+            return ops.cast(out, dtype)
 
 
 @dataclass
@@ -172,6 +179,58 @@ class Llama3Attention(nn.Cell):
         return self.wo(out_l)
 
 
+class Llama3LocalEmbedding(nn.Embedding):
+    """Row-parallel token embedding without DTensor ``Gather`` dispatch.
+
+    MindSpore ``nn.Embedding`` calls ``Gather``, which HyperParallel does not yet
+    register for layout inference. Subclassing keeps ``RowwiseParallel`` support
+    (``is_embedding_module``); forward runs under :class:`SkipDTensorDispatch` with
+    local ``ops.gather`` and the same index shift / mask rules as row-parallel
+    embedding in the library.
+    """
+
+    @staticmethod
+    def _as_local(tensor: Tensor) -> Tensor:
+        return tensor.to_local() if hasattr(tensor, "to_local") else tensor
+
+    @staticmethod
+    def _embedding_dtensor(weight_ref: Tensor) -> Tensor | None:
+        if hasattr(weight_ref, "device_mesh"):
+            return weight_ref
+        inner = getattr(weight_ref, "data", None)
+        if inner is not None and hasattr(inner, "device_mesh"):
+            return inner
+        return None
+
+    def _row_parallel_lookup(self, token_ids: Tensor, weight: Tensor) -> Tensor:
+        """Gather embedding rows with row-parallel vocab sharding (local ``ops.gather``)."""
+        ids = self._as_local(token_ids)
+        table = self._as_local(weight)
+        dtensor = self._embedding_dtensor(self.embedding_table)
+        if dtensor is None:
+            return ops.gather(table, ids, 0)
+
+        mesh = dtensor.device_mesh
+        mesh_dim_idx = len(mesh.mesh_shape) - 1
+        vocab_coord = mesh.get_local_rank(mesh_dim_idx)
+        vocab_per = int(table.shape[0])
+        vocab_start = int(vocab_coord * vocab_per)
+        vocab_end = vocab_start + vocab_per
+
+        mask = (ids >= vocab_start) & (ids < vocab_end)
+        mask_int = ops.cast(mask, ids.dtype)
+        local_ids = (ids - vocab_start) * mask_int
+        out = ops.gather(table, local_ids, 0)
+        mask_f = ops.cast(mask, table.dtype)
+        while mask_f.ndim < out.ndim:
+            mask_f = ops.expand_dims(mask_f, -1)
+        return out * mask_f
+
+    def construct(self, token_ids: Tensor) -> Tensor:
+        with SkipDTensorDispatch():
+            return self._row_parallel_lookup(token_ids, self.embedding_table)
+
+
 class Llama3FeedForward(nn.Cell):
     """SwiGLU feed-forward (w1 / w3 up, w2 down)."""
 
@@ -209,7 +268,7 @@ class Llama3Model(nn.Cell):
         hidden_dim = _compute_ffn_hidden_dim(
             cfg.dim, multiple_of=cfg.multiple_of, ffn_dim_multiplier=cfg.ffn_dim_multiplier
         )
-        self.tok_embeddings = nn.Embedding(cfg.vocab_size, cfg.dim)
+        self.tok_embeddings = Llama3LocalEmbedding(cfg.vocab_size, cfg.dim)
         self.layers = nn.CellList(
             [Llama3TransformerBlock(cfg, hidden_dim) for _ in range(cfg.n_layers)]
         )
