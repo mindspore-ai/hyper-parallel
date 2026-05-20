@@ -15,8 +15,18 @@
 """Context Parallel implementations for HyperParallel."""
 from hyper_parallel.core.context_parallel.context_parallel import ContextParallel
 from hyper_parallel.core.context_parallel.async_context_parallel import AsyncContextParallel
+from hyper_parallel.core.context_parallel.dsa_context_parallel import (
+    DSAContextParallel,
+    DSAIndexerContextParallel,
+    DSAIndexerLossContextParallel,
+    DSASparseAttentionContextParallel,
+)
 
 __all__ = [
     "ContextParallel",
     "AsyncContextParallel",
+    "DSAContextParallel",
+    "DSAIndexerContextParallel",
+    "DSAIndexerLossContextParallel",
+    "DSASparseAttentionContextParallel",
 ]
