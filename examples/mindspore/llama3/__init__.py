@@ -17,12 +17,18 @@
 Import from the ``examples/mindspore/llama3`` directory (see ``tensor_parallel_example.py``).
 """
 from model import Llama3DemoConfig, Llama3Model
-from parallelize import broadcast_state_dict_from_rank0, build_tp_mesh, parallelize_llama3
+from parallelize import (
+    broadcast_state_dict_from_rank0,
+    build_dp_tp_mesh,
+    build_tp_mesh,
+    parallelize_llama3,
+)
 
 __all__ = [
     "Llama3DemoConfig",
     "Llama3Model",
     "broadcast_state_dict_from_rank0",
+    "build_dp_tp_mesh",
     "build_tp_mesh",
     "parallelize_llama3",
 ]

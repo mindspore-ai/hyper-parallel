@@ -12,9 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Minimal Llama3 tensor-parallel demo on MindSpore + Ascend (HyperParallel).
+"""Llama3 demo: tensor parallelism + fully_shard (FSDP2-style) on MindSpore + Ascend.
 
-Run (see README for ``msrun`` launcher flags; world size must match TP degree).
+Layout mirrors ``examples/torch/llama3/fsdp_tp_example.py``: a 2-D device mesh ``(dp, tp)``
+where ``parallelize_llama3`` uses the 1-D ``mesh["tp"]`` slice and ``fully_shard`` uses the
+1-D ``mesh["dp"]`` slice.
+
+Run (4 ranks, ``tp=2``, ``dp=2`` by default)::
+
+    msrun --worker_num=4 --local_worker_num=4 --log_dir=./msrun_log --join=True fsdp_tp_example.py
+
+Optional environment variables:
+
+* ``LLAMA3_TP_SIZE`` — TP degree (default ``2``). ``world_size`` must be divisible by it.
 """
 # pylint: disable=C0413
 from __future__ import annotations
@@ -35,26 +45,35 @@ from mindspore import mint, nn, ops
 from mindspore._c_expression import NoFallbackGuard
 from mindspore.communication import get_group_size, get_rank
 
-from hyper_parallel import SkipDTensorDispatch
+from hyper_parallel import SkipDTensorDispatch, fully_shard
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 
 from model import Llama3DemoConfig, Llama3Model
+from parallelize import (
+    broadcast_state_dict_from_rank0,
+    build_dp_tp_mesh,
+    parallelize_llama3,
+)
 
 enable_mindspore_backward_compat()
-from parallelize import broadcast_state_dict_from_rank0, build_tp_mesh, parallelize_llama3
 
 
-def _zero_grad(cell: nn.Cell) -> None:
-    for p in cell.trainable_params():
-        p.grad = None
+def _tp_size_from_env(world: int) -> int:
+    """Read tensor-parallel width from ``LLAMA3_TP_SIZE`` and validate against ``world``."""
+    raw = os.environ.get("LLAMA3_TP_SIZE", "2").strip()
+    try:
+        tp = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"LLAMA3_TP_SIZE must be an integer, got {raw!r}") from exc
+    if tp < 1:
+        raise ValueError("LLAMA3_TP_SIZE must be >= 1.")
+    if world % tp != 0:
+        raise ValueError(f"world_size ({world}) must be divisible by LLAMA3_TP_SIZE ({tp}).")
+    return tp
 
 
 def _sync_parameter_names_from_fqn(cell: nn.Cell) -> None:
-    """``nn.Adam`` builds a :class:`~mindspore.common.parameter.ParameterTuple` that requires unique
-    ``Parameter.name`` values. After tensor-parallel ``distribute_module`` / styles, some shards may
-    still report short names (e.g. ``weight``); sync each parameter's ``name`` to its FQN from
-    :meth:`~mindspore.nn.Cell.parameters_and_names`.
-    """
+    """Sync ``Parameter.name`` to FQN so ``nn.Adam`` can build a unique ``ParameterTuple``."""
     for fqn, p in cell.parameters_and_names(expand=True):
         if p is None or not fqn:
             continue
@@ -65,6 +84,11 @@ def _sync_parameter_names_from_fqn(cell: nn.Cell) -> None:
 def main() -> None:
     dist.init()
     rank = get_rank()
+    world = get_group_size()
+    tp_size = _tp_size_from_env(world)
+    dp_size = world // tp_size
+
+    tp_mesh, dp_mesh = build_dp_tp_mesh(tp_size=tp_size, device_type="npu")[1:]
 
     cfg = Llama3DemoConfig(
         dim=256,
@@ -74,31 +98,35 @@ def main() -> None:
         vocab_size=1024,
         max_seq_len=128,
     )
-    world = get_group_size()
-    if cfg.n_heads % world != 0 or cfg.n_kv_heads % world != 0:
-        raise ValueError("n_heads and n_kv_heads must be divisible by world_size.")
+    if cfg.n_heads % tp_size != 0 or cfg.n_kv_heads % tp_size != 0:
+        raise ValueError("n_heads and n_kv_heads must be divisible by TP size.")
 
     ms.set_seed(42 + rank)
     model = Llama3Model(cfg)
 
     broadcast_state_dict_from_rank0(model)
-
-    tp_mesh = build_tp_mesh(device_type="npu")
     parallelize_llama3(model, tp_mesh)
+
+    for layer in model.layers:
+        fully_shard(layer, mesh=dp_mesh)
+    fully_shard(model, mesh=dp_mesh)
+    model.set_reduce_op_type("sum")
     _sync_parameter_names_from_fqn(model)
 
     batch_size = 2
     seq_len = 16
-    if seq_len % world != 0:
-        raise ValueError("seq_len must be divisible by TP world_size for sequence parallel.")
+    if seq_len % tp_size != 0:
+        raise ValueError("seq_len must be divisible by TP size for sequence parallel.")
 
     optimizer = nn.Adam(model.trainable_params(), learning_rate=1e-4)
 
-    for step in range(2):
-        _zero_grad(model)
-        tokens = mint.randint(0, cfg.vocab_size, (batch_size, seq_len), dtype=ms.int32)
-        targets = mint.randint(0, cfg.vocab_size, (batch_size, seq_len), dtype=ms.int32)
+    # Same minibatch on every rank (smoke test; identical data on all DP ranks).
+    ms.set_seed(2026)
+    tokens = mint.randint(0, cfg.vocab_size, (batch_size, seq_len), dtype=ms.int32)
+    targets = mint.randint(0, cfg.vocab_size, (batch_size, seq_len), dtype=ms.int32)
 
+    for step in range(2):
+        model.zero_grad()
         logits = model(tokens)
         loss = mint.nn.functional.cross_entropy(
             ops.cast(logits, ms.float32).reshape(-1, cfg.vocab_size),
@@ -111,7 +139,10 @@ def main() -> None:
                 optimizer(grads)
 
         if rank == 0:
-            print(f"[step {step}] loss = {loss.item():.4f}")
+            print(
+                f"[fsdp_tp step {step}] loss = {loss.item():.4f} "
+                f"(dp={dp_size}, tp={tp_size}, world={world})"
+            )
 
 
 if __name__ == "__main__":

@@ -116,12 +116,45 @@ def parallelize_llama3(
 def build_tp_mesh(device_type: str = "npu") -> DeviceMesh:
     """Build a 1-D TP mesh covering all ranks in the current process group."""
     world = get_group_size()
+    # After ``dist.init()``, still pass ``init_backend=True`` so the mesh creates TP
+    # process groups required by ``RowwiseParallel`` embedding output redistribution.
     return init_device_mesh(
         device_type=device_type,
         mesh_shape=(world,),
         mesh_dim_names=("tp",),
-        init_backend=False,
+        init_backend=True,
     )
+
+
+def build_dp_tp_mesh(
+    tp_size: int,
+    device_type: str = "npu",
+) -> tuple[DeviceMesh, DeviceMesh, DeviceMesh]:
+    """Build a 2-D ``(dp, tp)`` mesh and return ``(root_mesh, tp_mesh, dp_mesh)``.
+
+    Args:
+        tp_size: Tensor-parallel degree (must divide ``get_group_size()``).
+        device_type: Device type passed to :func:`init_device_mesh`.
+
+    Returns:
+        Tuple of root mesh, 1-D TP submesh, and 1-D DP/FSDP submesh.
+
+    Raises:
+        ValueError: If ``tp_size`` is invalid or does not divide the world size.
+    """
+    world = get_group_size()
+    if tp_size < 1:
+        raise ValueError("tp_size must be >= 1.")
+    if world % tp_size != 0:
+        raise ValueError(f"world_size ({world}) must be divisible by tp_size ({tp_size}).")
+    dp_size = world // tp_size
+    root_mesh = init_device_mesh(
+        device_type=device_type,
+        mesh_shape=(dp_size, tp_size),
+        mesh_dim_names=("dp", "tp"),
+        init_backend=True,
+    )
+    return root_mesh, root_mesh["tp"], root_mesh["dp"]
 
 
 def broadcast_state_dict_from_rank0(model: nn.Cell) -> None:
