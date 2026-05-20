@@ -34,10 +34,13 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 
+from hyper_parallel.core.dtensor.layout import Layout
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.dtensor.tensor_redistribution import (
     TensorRedistribution,
     _construct_layout_tuple_for_transform_operator_list,
 )
+from hyper_parallel.core.dtensor.redistribute_infer import RedistributionOperatorInfer
 
 
 class TestTensorRedistributionConstructOps(unittest.TestCase):
@@ -168,6 +171,73 @@ class TestTensorRedistributionConstructOps(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self.redistribution._construct_all_to_all(x, *args)
         self.assertIn("cannot be evenly split", str(ctx.exception))
+
+    def test_infer_ops_list_decomposes_strided_shard_concat(self):
+        """StridedShard -> Replicate should decompose into standard concat groups."""
+        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+            cases = [
+                (
+                    (2, 2),
+                    ("dp", "tp"),
+                    [StridedShard(0, split_factor=2), Shard(0)],
+                    2,
+                    [0, 1, 2, 3],
+                    [
+                        ("all_concat", (0, 2, [0, 2])),
+                        ("all_concat", (0, 2, [0, 1])),
+                    ],
+                ),
+                (
+                    (2, 2, 2),
+                    ("dp", "cp", "tp"),
+                    [StridedShard(0, split_factor=4), StridedShard(0, split_factor=2), Shard(0)],
+                    2,
+                    list(range(8)),
+                    [
+                        ("all_concat", (0, 2, [0, 4])),
+                        ("all_concat", (0, 2, [0, 2])),
+                        ("all_concat", (0, 2, [0, 1])),
+                    ],
+                ),
+            ]
+            for mesh_shape, mesh_dim_names, placements, tensor_dim, rank_list, expected_ops in cases:
+                src_layout = Layout(mesh_shape, mesh_dim_names, init_backend=False)
+                src_layout.set_placements(placements)
+                src_layout.placement_to_tensor_map(dim=tensor_dim)
+
+                dst_layout = Layout(mesh_shape, mesh_dim_names, init_backend=False)
+                dst_layout.set_placements([Replicate()] * len(mesh_shape))
+                dst_layout.placement_to_tensor_map(dim=tensor_dim)
+
+                infer = RedistributionOperatorInfer(
+                    dev_mat=list(src_layout.mesh_shape),
+                    in_tensor_map=list(src_layout.tensor_map),
+                    out_tensor_map=list(dst_layout.tensor_map),
+                )
+                ops = infer.infer_ops_list(rank=0, rank_list=rank_list)
+
+                self.assertEqual(ops, expected_ops)
+
+    def test_infer_ops_list_keeps_plain_tuple_concat_combined(self):
+        """Plain same-dim Shard -> Replicate should keep the original combined concat."""
+        with patch("hyper_parallel.core.dtensor.device_mesh.platform.get_rank", return_value=0):
+            src_layout = Layout((2, 2), ("dp", "tp"), init_backend=False)
+            src_layout.set_placements([Shard(0), Shard(0)])
+            src_layout.placement_to_tensor_map(dim=2)
+            self.assertEqual(src_layout.tensor_map, ((1, 0), -1))
+
+            dst_layout = Layout((2, 2), ("dp", "tp"), init_backend=False)
+            dst_layout.set_placements([Replicate(), Replicate()])
+            dst_layout.placement_to_tensor_map(dim=2)
+
+            infer = RedistributionOperatorInfer(
+                dev_mat=list(src_layout.mesh_shape),
+                in_tensor_map=list(src_layout.tensor_map),
+                out_tensor_map=list(dst_layout.tensor_map),
+            )
+            ops = infer.infer_ops_list(rank=0, rank_list=[0, 1, 2, 3])
+
+            self.assertEqual(ops, [("all_concat", (0, 4, [0, 1, 2, 3]))])
 
 
 class TestTensorRedistributionAllReduce(unittest.TestCase):
