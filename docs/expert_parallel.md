@@ -118,8 +118,24 @@ x [bs, slen, dim]
   tensor for auxiliary loss computation.
 
 ```python
-def update_expert_bias(moe: MoE, lr: float = 1e-3) -> None:
-    """Update expert bias using sign of load deviation from mean."""
+def update_expert_bias(
+    moe: MoE,
+    lr: float = 1e-3,
+    num_recomputations: int = 1,
+) -> None:
+    """Update expert bias for auxiliary-loss-free load balancing.
+
+    Should be called once per training step after the optimizer step.
+    Adjusts expert_bias to push token load towards the mean, then resets
+    the tokens_per_expert accumulator.
+
+    Args:
+        moe: The MoE module whose bias should be updated.
+        lr: Step size for the bias update. Defaults to 1e-3.
+        num_recomputations: Number of times forward is executed per optimizer step.
+            Default 1 (normal training). Set to 2 when activation checkpoint is
+            enabled (forward + recompute during backward).
+    """
 ```
 
 ---
