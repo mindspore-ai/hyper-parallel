@@ -14,6 +14,7 @@
 # ============================================================================
 """MindSpore HSDP scheduler"""
 import mindspore as ms
+from mindspore._c_expression import _DisableMsDispatchMode
 from mindspore.common.api import _pynative_executor
 from mindspore.utils._pytree import tree_flatten, tree_unflatten
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2, FSDPSchedulerState
@@ -160,13 +161,29 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
             return
         self._hsdp_backward_hook(self.cell, None, None)
 
+    @staticmethod
+    def _without_ms_dispatch_mode(hook):
+        """Run HSDP hook internals outside any outer MsDispatchMode."""
+        def wrapped_hook(*args, **kwargs):
+            with _DisableMsDispatchMode():
+                return hook(*args, **kwargs)
+        return wrapped_hook
+
     def _register_forward_backward_hooks(self):
         """Register module forward and backward hook on all managed modules."""
         if self._fsdp_group_post_pending is None:
             for mod in self.modules:
-                mod.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
-                mod.register_forward_hook(self._forward_hook)
+                mod.register_forward_pre_hook(
+                    self._without_ms_dispatch_mode(self._forward_pre_hook),
+                    with_kwargs=True,
+                )
+                mod.register_forward_hook(self._without_ms_dispatch_mode(self._forward_hook))
             return
         for mod in self.modules:
-            mod.register_forward_pre_hook(self._grouped_forward_pre_hook, with_kwargs=True)
-            mod.register_forward_hook(self._make_grouped_forward_post_hook(mod))
+            mod.register_forward_pre_hook(
+                self._without_ms_dispatch_mode(self._grouped_forward_pre_hook),
+                with_kwargs=True,
+            )
+            mod.register_forward_hook(
+                self._without_ms_dispatch_mode(self._make_grouped_forward_post_hook(mod))
+            )
