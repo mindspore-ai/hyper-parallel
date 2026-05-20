@@ -15,127 +15,105 @@
 """test torch dtensor with distributed split"""
 import numpy as np
 import torch
-from hyper_parallel import DTensor, Layout
-from tests.torch.utils import init_dist
-from tests.torch.shard.utils import global_to_local, local_to_global
+from hyper_parallel import DTensor, init_device_mesh
+from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from tests.torch.utils import init_backend, to_device
+from tests.torch.shard.utils import local_to_global
 
-# Generate input data using numpy at file header
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
+
 np.random.seed(42)
 standalone_input_np = np.random.randn(16, 20).astype(np.float32)
 
-def test_distributed_split_layout_inference_default_dim():
-    """
-    Feature: dtensor + torch.split layout inference
-    Description:
-        - Test layout inference for torch.split in distributed setting.
-        - Ensure that:
-            a) Output layouts match input layout when splitting on unsharded dim.
-            b) Results are consistent with standalone execution.
-    Expectation: Success.
-    """
-    init_dist()
+
+def test_split_layout_inference_default_dim() -> None:
+    """Test torch.split layout inference (default dim)."""
+    init_backend(_DEVICE_TYPE)
     split_size = 4
 
-    # Standalone
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     standalone_outputs = torch.split(standalone_input, split_size)
-    assert len(standalone_outputs) == 4  # 16 / 4 = 4 chunks
+    assert len(standalone_outputs) == 4
 
-    # Distributed setup
-    layout = Layout((2, 2), ("dp", "tp"))
-    # Shard only on dim=0
-    x_layout = layout("None", "dp")
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    x_placements = (Replicate(), Shard(1))
 
-    dist_input = global_to_local(standalone_input, x_layout)
-
-    # Perform split
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_outputs = torch.split(dist_input, split_size)
 
+    expected_layout = _build_layout(mesh, x_placements, 2)
     assert isinstance(dist_outputs, tuple)
     assert len(dist_outputs) == 4
     for out in dist_outputs:
-        assert isinstance(out, DTensor)
-        assert out.layout == x_layout, f"Output layout {out.layout} != input layout {x_layout}"
+        assert isinstance(out, DTensor), f"Expected DTensor, got {type(out)}"
+        assert out.layout == expected_layout, (
+            f"Output layout {out.layout} != expected {expected_layout}"
+        )
 
     for i, (ref, dist_out) in enumerate(zip(standalone_outputs, dist_outputs)):
         gathered = local_to_global(dist_out)
         assert torch.allclose(ref, gathered, atol=1e-5), f"Chunk {i} mismatch"
 
 
-def test_distributed_split_layout_inference():
-    """
-    Feature: dtensor + torch.split layout inference
-    Description:
-        - Test layout inference for torch.split in distributed setting.
-        - Ensure that:
-            a) Output layouts match input layout when splitting on unsharded dim.
-            b) Results are consistent with standalone execution.
-    Expectation: Success.
-    """
-    init_dist()
+def test_split_layout_inference() -> None:
+    """Test torch.split layout inference with explicit dim."""
+    init_backend(_DEVICE_TYPE)
     split_size = 4
-    axis = 1  # split along axis 1
+    axis = 1
 
-    # Standalone
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     standalone_outputs = torch.split(standalone_input, split_size, dim=axis)
-    assert len(standalone_outputs) == 5  # 20 / 4 = 5 chunks
+    assert len(standalone_outputs) == 5
 
-    # Distributed setup
-    layout = Layout((2, 2), ("dp", "tp"))
-    # Shard only on dim=0
-    x_layout = layout("dp", "None")
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    x_placements = (Shard(0), Replicate())
 
-    dist_input = global_to_local(standalone_input, x_layout)
-
-    # Perform split
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_outputs = torch.split(dist_input, split_size, dim=axis)
 
+    expected_layout = _build_layout(mesh, x_placements, 2)
     assert isinstance(dist_outputs, tuple)
     assert len(dist_outputs) == 5
     for out in dist_outputs:
-        assert isinstance(out, DTensor)
-        assert out.layout == x_layout, f"Output layout {out.layout} != input layout {x_layout}"
+        assert isinstance(out, DTensor), f"Expected DTensor, got {type(out)}"
+        assert out.layout == expected_layout, (
+            f"Output layout {out.layout} != expected {expected_layout}"
+        )
 
     for i, (ref, dist_out) in enumerate(zip(standalone_outputs, dist_outputs)):
         gathered = local_to_global(dist_out)
         assert torch.allclose(ref, gathered, atol=1e-5), f"Chunk {i} mismatch"
 
 
-def test_distributed_split_layout_inference_split_list():
-    """
-    Feature: dtensor + torch.split layout inference
-    Description:
-        - Test layout inference for torch.split in distributed setting.
-        - Ensure that:
-            a) Output layouts match input layout when splitting on unsharded dim.
-            b) Results are consistent with standalone execution.
-    Expectation: Success.
-    """
-    init_dist()
+def test_split_layout_inference_split_list() -> None:
+    """Test torch.split layout inference with list of split sizes."""
+    init_backend(_DEVICE_TYPE)
     split_size = (8, 12)
-    axis = 1  # split along axis 1
+    axis = 1
 
-    # Standalone
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     standalone_outputs = torch.split(standalone_input, split_size, dim=axis)
     assert len(standalone_outputs) == 2
 
-    # Distributed setup
-    layout = Layout((2, 2), ("dp", "tp"))
-    # Shard only on dim=0
-    x_layout = layout("dp", "None")
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    x_placements = (Shard(0), Replicate())
 
-    dist_input = global_to_local(standalone_input, x_layout)
-
-    # Perform split
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_outputs = torch.split(dist_input, split_size, dim=axis)
 
+    expected_layout = _build_layout(mesh, x_placements, 2)
     assert isinstance(dist_outputs, tuple)
     assert len(dist_outputs) == 2
     for out in dist_outputs:
-        assert isinstance(out, DTensor)
-        assert out.layout == x_layout, f"Output layout {out.layout} != input layout {x_layout}"
+        assert isinstance(out, DTensor), f"Expected DTensor, got {type(out)}"
+        assert out.layout == expected_layout, (
+            f"Output layout {out.layout} != expected {expected_layout}"
+        )
 
     for i, (ref, dist_out) in enumerate(zip(standalone_outputs, dist_outputs)):
         gathered = local_to_global(dist_out)

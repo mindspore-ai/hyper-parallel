@@ -18,32 +18,56 @@ from tests.common.parallel_case import parallel_run, TorchCase
 
 PARALLEL_OP_STACK = "parallel_op_stack.py"
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_stack_group1():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_stack_basic_dim0
-        2.test_distributed_stack_dim1
+        1.test_stack_basic_dim0
+        2.test_stack_dim1
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_STACK, "test_distributed_stack_basic_dim0", 10400, 4),
-        TorchCase(PARALLEL_OP_STACK, "test_distributed_stack_dim1", 10401, 4),
+        TorchCase(PARALLEL_OP_STACK, "test_stack_basic_dim0", num_proc=4),
+        TorchCase(PARALLEL_OP_STACK, "test_stack_dim1", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_stack_group1_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_stack_basic_dim0
+        2.test_stack_dim1
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_STACK, "test_stack_basic_dim0", num_proc=4),
+        TorchCase(PARALLEL_OP_STACK, "test_stack_dim1", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_stack_group2():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_stack_negative_dim
+        1.test_stack_negative_dim
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_STACK, "test_distributed_stack_negative_dim", 10402, 4),
+        TorchCase(PARALLEL_OP_STACK, "test_stack_negative_dim", num_proc=4),
+    ])
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_stack_group2_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_stack_negative_dim
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_STACK, "test_stack_negative_dim", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -51,26 +75,53 @@ def test_parallel_op_stack_group3():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_stack_multiple_tensors
-        2.test_distributed_stack_3d_tensors
+        1.test_stack_multiple_tensors
+        2.test_stack_3d_tensors
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_STACK, "test_distributed_stack_multiple_tensors", 10404, 4),
-        TorchCase(PARALLEL_OP_STACK, "test_distributed_stack_3d_tensors", 10405, 4),
+        TorchCase(PARALLEL_OP_STACK, "test_stack_multiple_tensors", num_proc=4),
+        TorchCase(PARALLEL_OP_STACK, "test_stack_3d_tensors", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_stack_group3_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_stack_multiple_tensors
+        2.test_stack_3d_tensors
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_STACK, "test_stack_multiple_tensors", num_proc=4),
+        TorchCase(PARALLEL_OP_STACK, "test_stack_3d_tensors", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_stack_group4():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_stack_scalars
-        2.test_distributed_stack_fully_replicated
+        1.test_stack_scalars
+        2.test_stack_fully_replicated
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_STACK, "test_distributed_stack_scalars", 10406, 4),
-        TorchCase(PARALLEL_OP_STACK, "test_distributed_stack_fully_replicated", 10407, 4),
+        TorchCase(PARALLEL_OP_STACK, "test_stack_scalars", num_proc=4),
+        TorchCase(PARALLEL_OP_STACK, "test_stack_fully_replicated", num_proc=4),
+    ])
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_stack_group4_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_stack_scalars
+        2.test_stack_fully_replicated
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_STACK, "test_stack_scalars", num_proc=4),
+        TorchCase(PARALLEL_OP_STACK, "test_stack_fully_replicated", num_proc=4),
     ])

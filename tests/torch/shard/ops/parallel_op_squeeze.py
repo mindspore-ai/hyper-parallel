@@ -19,68 +19,55 @@ import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global
+
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
 
 np.random.seed(42)
 
-def test_distributed_squeeze_basic():
-    """
-    Feature: dtensor + torch.Tensor.squeeze basic
-    Description:
-    - Squeeze an unsharded singleton dimension.
-    - Input: shape (8, 1) sharded on dim=0, squeeze dim=1.
-    - Output: shape (8,) sharded on dim=0.
-    Expectation: Success with correct layout and numerical equivalence.
-    """
-    init_dist()
-    # Standalone reference
+
+def test_squeeze_basic() -> None:
+    """Test squeeze an unsharded singleton dimension."""
+    init_backend(_DEVICE_TYPE)
+
     input_np = np.random.randn(8, 1).astype(np.float32)
-    standalone_input = torch.from_numpy(input_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
     standalone_output = standalone_input.squeeze(1)
 
-    # Distributed setup: shard dim=0 ("dp"), dim=1 is unsharded (Replicate)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.squeeze(1)
 
-    # Layout validation: dim0 preserved (sharded on dp), dim1 removed
-    # Output dim 0 corresponds to Input dim 0, so it should still be sharded on Mesh 0
     expected_layout = _build_layout(mesh, (Shard(0), Replicate()), 1)
     assert dist_output.layout == expected_layout, \
         f"Squeeze output layout mismatch: expected {expected_layout}, got {dist_output.layout}"
 
-    # Numerical validation
     gathered_output = local_to_global(dist_output)
     assert torch.equal(standalone_output, gathered_output), \
         "Squeeze output mismatch between standalone and distributed execution"
 
-def test_distributed_squeeze_no_args_all_dims():
-    """
-    Feature: dtensor + torch.Tensor.squeeze with no args (squeeze all)
-    Description:
-    - Squeeze all singleton dimensions.
-    - Input: shape (1, 4, 1, 8) sharded on dim=1 and dim=3.
-    - Output: shape (4, 8) sharded on dim=0 and dim=1.
-    Expectation: Success with correct layout propagation.
-    """
-    init_dist()
+
+def test_squeeze_no_args_all_dims() -> None:
+    """Test squeeze with no args (squeeze all singleton dimensions)."""
+    init_backend(_DEVICE_TYPE)
+
     input_np = np.random.randn(1, 4, 1, 8).astype(np.float32)
-    standalone_input = torch.from_numpy(input_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
     standalone_output = standalone_input.squeeze()
 
-    # Mesh (2, 2). Map: Tensor dim 1 -> "dp" (Mesh 0), Tensor dim 3 -> "tp" (Mesh 1)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(1), Shard(3))
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.squeeze()
 
-    # Layout validation:
-    # Input T1 (sharded on Mesh 0) becomes Output T0.
-    # Input T3 (sharded on Mesh 1) becomes Output T1.
     expected_layout = _build_layout(mesh, (Shard(0), Shard(1)), 2)
     assert dist_output.layout == expected_layout, \
         f"Squeeze all dims layout mismatch: expected {expected_layout}, got {dist_output.layout}"
@@ -89,30 +76,21 @@ def test_distributed_squeeze_no_args_all_dims():
     assert torch.equal(standalone_output, gathered_output), \
         "Squeeze all dims output mismatch"
 
-def test_distributed_squeeze_specific_axis_negative():
-    """
-    Feature: dtensor + torch.Tensor.squeeze with negative axis
-    Description:
-    - Squeeze specific dimension using negative index.
-    - Input: shape (4, 1, 8) sharded on dim=0 and dim=2. Squeeze dim=-2 (dim 1).
-    - Output: shape (4, 8).
-    Expectation: Success with correct layout.
-    """
-    init_dist()
+
+def test_squeeze_specific_axis_negative() -> None:
+    """Test squeeze specific dimension using negative index."""
+    init_backend(_DEVICE_TYPE)
+
     input_np = np.random.randn(4, 1, 8).astype(np.float32)
-    standalone_input = torch.from_numpy(input_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
     standalone_output = standalone_input.squeeze(-2)
 
-    # Mesh (2, 2). Map: Tensor dim 0 -> Mesh 0, Tensor dim 2 -> Mesh 1
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(2))
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.squeeze(-2)
 
-    # Layout validation:
-    # Input T0 (Mesh 0) -> Output T0
-    # Input T2 (Mesh 1) -> Output T1
     expected_layout = _build_layout(mesh, (Shard(0), Shard(1)), 2)
     assert dist_output.layout == expected_layout, \
         f"Squeeze negative axis layout mismatch: expected {expected_layout}, got {dist_output.layout}"
@@ -122,25 +100,20 @@ def test_distributed_squeeze_specific_axis_negative():
         "Squeeze negative axis output mismatch"
 
 
-def test_distributed_squeeze_scalar_like():
-    """
-    Feature: dtensor + torch.Tensor.squeeze on scalar-like tensor
-    Description:
-    - Squeeze (1, 1) tensor to ().
-    Expectation: Success.
-    """
-    init_dist()
+def test_squeeze_scalar_like() -> None:
+    """Test squeeze (1, 1) tensor to scalar."""
+    init_backend(_DEVICE_TYPE)
+
     input_np = np.array([[3.14]], dtype=np.float32)
-    standalone_input = torch.from_numpy(input_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
     standalone_output = standalone_input.squeeze()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.squeeze()
 
-    # Layout validation: 0-dim tensor, fully replicated
     expected_layout = _build_layout(mesh, (Replicate(), Replicate()), 0)
     assert dist_output.layout == expected_layout, \
         f"Squeeze scalar layout mismatch: expected {expected_layout}, got {dist_output.layout}"

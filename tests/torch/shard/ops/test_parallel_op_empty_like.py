@@ -18,17 +18,30 @@ from tests.common.parallel_case import parallel_run, TorchCase
 
 PARALLEL_OP_EMPTY_LIKE = "parallel_op_empty_like.py"
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_empty_like_group1():
     """
     Feature: parallel run case in empty_like shard
     Description:
-        1.test_distributed_empty_like_data_parallel
-        2.test_distributed_empty_like_model_parallel
+        1.test_empty_like_data_parallel
+        2.test_empty_like_model_parallel
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_EMPTY_LIKE, "test_distributed_empty_like_data_parallel", 10359, 4),
-        TorchCase(PARALLEL_OP_EMPTY_LIKE, "test_distributed_empty_like_model_parallel", 10360, 4),
+        TorchCase(PARALLEL_OP_EMPTY_LIKE, "test_empty_like_data_parallel", num_proc=4),
+        TorchCase(PARALLEL_OP_EMPTY_LIKE, "test_empty_like_model_parallel", num_proc=4),
+    ])
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_empty_like_group1_gloo():
+    """
+    Feature: parallel run case in empty_like shard (gloo cpu)
+    Description:
+        1.test_empty_like_data_parallel
+        2.test_empty_like_model_parallel
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_EMPTY_LIKE, "test_empty_like_data_parallel", num_proc=4),
+        TorchCase(PARALLEL_OP_EMPTY_LIKE, "test_empty_like_model_parallel", num_proc=4),
     ])

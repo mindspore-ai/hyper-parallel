@@ -19,50 +19,41 @@ import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global
 
-# Set seed for reproducibility across ranks
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
+
 np.random.seed(42)
 torch.manual_seed(42)
 
-# Generate random data
 standalone_input_2d_np = np.random.randn(8, 16).astype(np.float32)
 standalone_input_3d_np = np.random.randn(4, 8, 6).astype(np.float32)
 
 
-def test_distributed_sort_basic():
-    """
-    Feature: dtensor + torch.sort basic execution
-    Description:
-        - Sort along an unsharded dimension (last dim).
-        - Input: shape (8, 16) sharded on dim=0, sort dim=1.
-    Expectation:
-        - Output values and indices match standalone torch.sort result.
-        - Output layout preserves input sharding.
-    """
-    init_dist()
+def test_sort_basic() -> None:
+    """Test sort along an unsharded dimension (last dim)."""
+    init_backend(_DEVICE_TYPE)
 
-    # Standalone reference
-    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
-    # sort returns (values, indices)
+    standalone_input = to_device(torch.from_numpy(standalone_input_2d_np), _DEVICE_TYPE)
     s_values, s_indices = torch.sort(standalone_input, dim=1, descending=False)
 
-    # Distributed setup: Shard dim 0 ("dp"), Replicate dim 1 (sort dim)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     d_values, d_indices = dist_input.sort(dim=1, descending=False)
 
-    # Layout validation
     expected_layout = _build_layout(mesh, x_placements, 2)
     assert d_values.layout == expected_layout, \
         f"Values layout mismatch: expected {expected_layout}, got {d_values.layout}"
     assert d_indices.layout == expected_layout, \
         f"Indices layout mismatch: expected {expected_layout}, got {d_indices.layout}"
 
-    # Numerical validation
     g_values = local_to_global(d_values)
     g_indices = local_to_global(d_indices)
 
@@ -70,20 +61,14 @@ def test_distributed_sort_basic():
     assert torch.equal(s_indices, g_indices), "Sort indices mismatch"
 
 
-def test_distributed_sort_descending():
-    """
-    Feature: dtensor + torch.sort with descending=True
-    Description:
-        - Sort along unsharded dimension with descending order.
-        - Input: shape (8, 16) sharded on dim=0.
-    Expectation: Results match standalone execution.
-    """
-    init_dist()
+def test_sort_descending() -> None:
+    """Test sort along unsharded dimension with descending=True."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_2d_np), _DEVICE_TYPE)
     s_values, s_indices = torch.sort(standalone_input, dim=1, descending=True)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
@@ -96,33 +81,23 @@ def test_distributed_sort_descending():
     assert torch.equal(s_indices, g_indices), "Sort descending indices mismatch"
 
 
-def test_distributed_sort_middle_dim():
-    """
-    Feature: dtensor + torch.sort on middle dimension
-    Description:
-        - Input shape (4, 8, 6).
-        - Shard dim=0 and dim=2. Sort along dim=1 (unsharded).
-    Expectation: Correct sorting of the middle dimension while preserving sharding on others.
-    """
-    init_dist()
+def test_sort_middle_dim() -> None:
+    """Test sort on middle dimension with 3D tensor."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_input = torch.from_numpy(standalone_input_3d_np).npu()
-    # Sort along dim 1
+    standalone_input = to_device(torch.from_numpy(standalone_input_3d_np), _DEVICE_TYPE)
     s_values, s_indices = torch.sort(standalone_input, dim=1)
 
-    # Mesh: (dp=4, tp=2). Input layout: (Shard(0), Replicate(), Shard(1))
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate(), Shard(1))
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     d_values, d_indices = dist_input.sort(dim=1)
 
-    # Layout validation
     expected_layout = _build_layout(mesh, x_placements, 3)
     assert d_values.layout == expected_layout
     assert d_indices.layout == expected_layout
 
-    # Numerical validation
     g_values = local_to_global(d_values)
     g_indices = local_to_global(d_indices)
 
@@ -130,20 +105,14 @@ def test_distributed_sort_middle_dim():
     assert torch.equal(s_indices, g_indices), "3D Sort indices mismatch"
 
 
-def test_distributed_sort_negative_dim():
-    """
-    Feature: dtensor + torch.sort with negative dimension index
-    Description:
-        - Input shape (8, 16). Sharded on dim 0.
-        - Sort using dim=-1 (which maps to unsharded dim 1).
-    Expectation: Correctly infers the dimension and executes sort.
-    """
-    init_dist()
+def test_sort_negative_dim() -> None:
+    """Test sort with negative dimension index."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_2d_np), _DEVICE_TYPE)
     s_values, s_indices = torch.sort(standalone_input, dim=-1)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)

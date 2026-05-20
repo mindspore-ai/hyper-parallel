@@ -19,39 +19,35 @@ import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, Partial
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, init_dist, to_device
 from tests.torch.shard.utils import local_to_global
 
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
+
 np.random.seed(42)
-# Base input arrays
 input_a_2d_np = np.random.randn(8, 4).astype(np.float32)
 input_b_2d_np = np.random.randn(8, 4).astype(np.float32)
 
 # Make some elements exactly equal to test 'ne' (not equal) properly
 input_b_2d_np[0:4, :] = input_a_2d_np[0:4, :]
 
-# Broadcasting arrays
 input_c_2d_np = np.random.randn(8, 1).astype(np.float32)
 input_d_2d_np = np.random.randn(1, 4).astype(np.float32)
 
 
-def test_distributed_ne_basic():
-    """
-    Feature: dtensor + torch.ne basic element-wise comparison.
-    Description:
-        - Compare two tensors with the exact same shape and sharding layout.
-        - Input: shape (8, 4) sharded on dim=0.
-    Expectation: Success with correct layout and numerical equivalence.
-    """
-    init_dist()
+def test_ne_basic() -> None:
+    """Test torch.ne basic element-wise comparison."""
+    init_backend(_DEVICE_TYPE)
 
-    # Standalone reference
-    standalone_a = torch.from_numpy(input_a_2d_np).npu()
-    standalone_b = torch.from_numpy(input_b_2d_np).npu()
+    standalone_a = to_device(torch.from_numpy(input_a_2d_np), _DEVICE_TYPE)
+    standalone_b = to_device(torch.from_numpy(input_b_2d_np), _DEVICE_TYPE)
     standalone_output = torch.ne(standalone_a, standalone_b)
 
-    # Distributed setup: shard dim=0 ("dp")
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     placements = (Shard(0), Replicate())
 
     dist_a = distribute_tensor(standalone_a, mesh, placements)
@@ -59,58 +55,47 @@ def test_distributed_ne_basic():
 
     dist_output = torch.ne(dist_a, dist_b)
 
-    # Layout validation
     expected_layout = _build_layout(mesh, placements, 2)
-    assert dist_output.layout == expected_layout, \
-        f"Ne output layout mismatch: expected {expected_layout}, got {dist_output.layout}"
+    assert dist_output.layout == expected_layout, (
+        f"Ne output layout mismatch: expected={expected_layout}, got={dist_output.layout}"
+    )
 
-    # Numerical validation via gathering
     gathered_output = local_to_global(dist_output)
-    assert torch.equal(
-        standalone_output, gathered_output
-    ), "Ne output mismatch between standalone and distributed execution"
+    assert torch.equal(standalone_output, gathered_output), (
+        f"Ne output mismatch: standalone shape={standalone_output.shape}, "
+        f"gathered shape={gathered_output.shape}"
+    )
 
 
-def test_distributed_ne_scalar():
-    """
-    Feature: dtensor + torch.ne scalar comparison.
-    Description:
-        - Compare a sharded tensor with a scalar value.
-    Expectation: Success with layout inheriting the tensor's sharding and correct boolean results.
-    """
-    init_dist()
+def test_ne_scalar() -> None:
+    """Test torch.ne scalar comparison."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_a = torch.from_numpy(input_a_2d_np).npu()
-    scalar_val = input_a_2d_np[0, 0].item() # Pick a specific value from the array
+    standalone_a = to_device(torch.from_numpy(input_a_2d_np), _DEVICE_TYPE)
+    scalar_val = input_a_2d_np[0, 0].item()
     standalone_output = torch.ne(standalone_a, scalar_val)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     placements = (Shard(0), Shard(1))
 
     dist_a = distribute_tensor(standalone_a, mesh, placements)
 
-    # Compare DTensor with scalar
     dist_output = torch.ne(dist_a, scalar_val)
 
-    # Layout validation: Should inherit the layout of dist_a
     expected_layout = _build_layout(mesh, placements, 2)
-    assert dist_output.layout == expected_layout, \
-        f"Ne scalar layout mismatch: expected {expected_layout}, got {dist_output.layout}"
+    assert dist_output.layout == expected_layout, (
+        f"Ne scalar layout mismatch: expected={expected_layout}, got={dist_output.layout}"
+    )
 
     gathered_output = local_to_global(dist_output)
-    assert torch.equal(
-        standalone_output, gathered_output
-    ), "Ne scalar comparison output mismatch"
+    assert torch.equal(standalone_output, gathered_output), (
+        f"Ne scalar comparison output mismatch: "
+        f"standalone shape={standalone_output.shape}, gathered shape={gathered_output.shape}"
+    )
 
 
-def test_distributed_ne_partial_error(): # TODO
-    """
-    Feature: dtensor + torch.ne Partial input handling.
-    Description:
-        - Attempt to perform 'ne' operation on a tensor with Partial status.
-        - Logical operators return booleans and do not support partial accumulations.
-    Expectation: Raise ValueError.
-    """
+def test_distributed_ne_partial_error() -> None:
+    """Test torch.ne raises ValueError on Partial input (NPU only)."""
     init_dist()
 
     standalone_a = torch.from_numpy(input_a_2d_np).npu()
@@ -118,7 +103,6 @@ def test_distributed_ne_partial_error(): # TODO
 
     mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
 
-    # Assign Partial placement
     a_placements = (Partial("sum"), Replicate())
     b_placements = (Partial("sum"), Replicate())
 
@@ -129,5 +113,6 @@ def test_distributed_ne_partial_error(): # TODO
         torch.ne(dist_a, dist_b)
         assert False, "Expected ValueError when passing Partial tensor to 'ne' operator"
     except ValueError as e:
-        assert "Partial status which is not allowed" in str(e), \
+        assert "Partial status which is not allowed" in str(e), (
             f"Unexpected error message: {str(e)}"
+        )

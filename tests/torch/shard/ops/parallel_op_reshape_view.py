@@ -15,114 +15,104 @@
 """test torch dtensor with distributed reshape and view"""
 import numpy as np
 import torch
-from hyper_parallel import Layout
-from tests.torch.utils import init_dist
+from hyper_parallel import Layout, init_device_mesh
+from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from tests.torch.utils import init_backend, init_dist, to_device
 from tests.torch.shard.utils import local_to_global, global_to_local
+
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
 
 # Generate input data using numpy at file header
 np.random.seed(42)
 # Shape: [Batch=8, Channel=4, Height=4, Width=4] -> Total 512 elements
 standalone_input_np = np.random.randn(8, 4, 4, 4).astype(np.float32)
 
-def test_distributed_reshape_layout_inference():
+
+def test_reshape_layout_inference() -> None:
     """
-    Feature: dtensor + torch.reshape layout inference
+    Test torch.reshape layout inference.
+
     Description:
         1. Test 'flatten' scenario: [B, C, H, W] -> [B, C*H*W]
         2. Test 'expand' scenario: [B, C*H*W] -> [B, C, H, W]
         3. Verify layout consistency and value correctness.
-    Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    # Setup Standalone
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
 
     # --- Case 1: Flatten dimensions (preserving sharded dim) ---
-    # Target shape: [8, 64]
     standalone_output_flat = standalone_input.reshape(8, 64)
 
-    # Distributed Setup
-    # Mesh: (2, 4), dp splits dim 0, tp is unused (None)
-    layout = Layout((2, 2), ("dp", "tp"))
-    x_layout = layout("dp", "None", "None", "None") # Shard Batch dim
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    x_placements = (Shard(0), Replicate(), Replicate(), Replicate())
 
-    dist_input = global_to_local(standalone_input, x_layout)
-
-    # Perform Reshape
-    # FIX: Pass shape as a tuple explicitly to bypass OpDispatcher bug
-    # dist_input.reshape(8, 64) -> dist_input.reshape((8, 64))
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output_flat = dist_input.reshape((8, 64))
 
-    # Check Layout
-    # Expectation: Dim 0 is still sharded ("dp"), Dim 1 is replicate ("None")
-    expected_flat_layout = layout("dp", "None")
-    assert dist_output_flat.layout == expected_flat_layout, \
-        f"Reshape flat layout mismatch. Got {dist_output_flat.layout}, expected {expected_flat_layout}"
+    expected_flat_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+    assert dist_output_flat.layout == expected_flat_layout, (
+        f"Reshape flat layout mismatch: "
+        f"expected={expected_flat_layout}, got={dist_output_flat.layout}"
+    )
 
-    # Check Values
     gathered_flat = local_to_global(dist_output_flat)
-    assert torch.allclose(standalone_output_flat, gathered_flat, atol=1e-5), \
+    assert torch.allclose(standalone_output_flat, gathered_flat, atol=1e-5), (
         "Reshape values mismatch between standalone and distributed"
+    )
 
     # --- Case 2: Expand dimensions (using -1 inference) ---
-    # Input is the flattened distributed tensor from Case 1
-    # Target shape: [8, 4, 4, 4]
-    # FIX: Pass shape as a tuple explicitly
     dist_output_expand = dist_output_flat.reshape((8, 4, 4, -1))
 
-    # Check Layout
-    # Expectation: Dim 0 sharded ("dp"), others replicate
-    expected_expand_layout = x_layout
-    assert dist_output_expand.layout == expected_expand_layout, \
-        "Reshape expand layout mismatch"
+    expected_expand_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate(), Replicate()), 4)
+    assert dist_output_expand.layout == expected_expand_layout, (
+        f"Reshape expand layout mismatch: "
+        f"expected={expected_expand_layout}, got={dist_output_expand.layout}"
+    )
 
-    # Check Values
     gathered_expand = local_to_global(dist_output_expand)
-    assert torch.allclose(standalone_input, gathered_expand, atol=1e-5), \
+    assert torch.allclose(standalone_input, gathered_expand, atol=1e-5), (
         "Reshape expand values mismatch"
+    )
 
 
-def test_distributed_view_layout_inference():
+def test_view_layout_inference() -> None:
     """
-    Feature: dtensor + torch.view layout inference
+    Test torch.view layout inference.
+
     Description:
         1. Test view with tuple argument input style.
         2. Test view on a tensor where sharded dimension is preserved but reshaped
            (as long as total size / shards is integer).
-    Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    # Setup Standalone
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
 
-    # Scenario: Input [8, 4, 4, 4], Layout: Shard dim 1 (Channel)
-    layout = Layout((2, 2), ("dp", "tp"))
-    x_layout = layout("None", "tp", "None", "None") # Shard Channel
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    x_placements = (Replicate(), Shard(1), Replicate(), Replicate())
 
-    dist_input = global_to_local(standalone_input, x_layout)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
-    # --- Operation: View ---
-    # Merge last two dims: [8, 4, 4, 4] -> [8, 4, 16]
     target_shape = (8, 4, 16)
-
-    # Perform View (PyTorch style: tuple arg)
     dist_view = dist_input.view(target_shape)
-
-    # Standalone reference
     standalone_view = standalone_input.view(target_shape)
 
-    # Check Layout
-    expected_view_layout = layout("None", "tp", "None")
+    expected_view_layout = _build_layout(mesh, (Replicate(), Shard(1), Replicate()), 3)
+    assert dist_view.layout == expected_view_layout, (
+        f"View layout mismatch: "
+        f"expected={expected_view_layout}, got={dist_view.layout}"
+    )
 
-    assert dist_view.layout == expected_view_layout, \
-        f"View layout mismatch. Got {dist_view.layout}, expected {expected_view_layout}"
-
-    # Check Values
     gathered_view = local_to_global(dist_view)
-    assert torch.allclose(standalone_view, gathered_view, atol=1e-5), \
+    assert torch.allclose(standalone_view, gathered_view, atol=1e-5), (
         "View values mismatch between standalone and distributed"
+    )
 
 
 def test_distributed_reshape_fail_mismatch():
@@ -136,7 +126,7 @@ def test_distributed_reshape_fail_mismatch():
     init_dist()
 
     layout = Layout((2, 2), ("dp", "tp"))
-    x_layout = layout("dp", "None") # [8, 64] -> split 8
+    x_layout = layout("dp", "None")  # [8, 64] -> split 8
 
     input_np = np.random.randn(8, 64).astype(np.float32)
     standalone_input = torch.from_numpy(input_np).npu()
@@ -144,7 +134,6 @@ def test_distributed_reshape_fail_mismatch():
 
     # Invalid total element count
     try:
-        # Pass as tuple to ensuring we are testing element mismatch, not argument drop bug
         dist_input.reshape((8, 32))
         assert False, "Should raise ValueError for element count mismatch"
     except ValueError:

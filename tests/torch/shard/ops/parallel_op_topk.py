@@ -16,51 +16,51 @@
 
 import numpy as np
 import torch
-from hyper_parallel import Layout
-from tests.torch.utils import init_dist
-from tests.torch.shard.utils import local_to_global, global_to_local
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from tests.torch.utils import init_backend, to_device
+from tests.torch.shard.utils import local_to_global
+
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
 
 # Generate input data using numpy at file header
 np.random.seed(42)
 standalone_input_np = np.random.randn(8, 16).astype(np.float32)
 
-def test_distributed_topk_layout_inference():
-    """
-    Feature: dtensor + torch.topk layout inference
-    Description:
-        - Test layout inference for torch.topk in distributed setting.
-        - Ensure that:
-            a) The output layouts (values, indices) match input layout.
-            b) Results are consistent between standalone and distributed.
-    Expectation: Success.
-    """
-    init_dist()
+def test_topk_layout_inference() -> None:
+    """Test torch.topk layout inference."""
+    init_backend(_DEVICE_TYPE)
     k = 5
-    dim = -1  # last dimension
+    dim = -1
 
-    # Standalone (single-device)
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     standalone_values, standalone_indices = torch.topk(standalone_input, k, dim=dim)
 
-    # Distributed setup
-    layout = Layout((2, 2), ("dp", "tp"))
-    x_layout = layout("dp", "None") # shard on dim=0 (dp), keep dim=1 unsharded
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    x_placements = (Shard(0), Replicate())
 
-    dist_input = global_to_local(standalone_input, x_layout)
+    dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_values, dist_indices = torch.topk(dist_input, k, dim=dim)
 
-    # Layout correctness check
-    assert dist_values.layout == x_layout, "Torch TopK: output values layout mismatch input"
-    assert dist_indices.layout == x_layout, "Torch TopK: output indices layout mismatch input"
+    expected_layout = _build_layout(mesh, x_placements, 2)
+    assert dist_values.layout == expected_layout, (
+        f"TopK values layout mismatch: expected={expected_layout}, got={dist_values.layout}"
+    )
+    assert dist_indices.layout == expected_layout, (
+        f"TopK indices layout mismatch: expected={expected_layout}, got={dist_indices.layout}"
+    )
 
-    # Gather distributed results back to global view
     gathered_values = local_to_global(dist_values)
     gathered_indices = local_to_global(dist_indices)
 
-    assert torch.allclose(
-        standalone_values, gathered_values, atol=1e-5
-    ), "Topk values mismatch between standalone and distributed"
-
-    assert torch.equal(
-        standalone_indices, gathered_indices
-    ), "Topk indices mismatch between standalone and distributed"
+    assert torch.allclose(standalone_values, gathered_values, atol=1e-5), (
+        "Topk values mismatch between standalone and distributed"
+    )
+    assert torch.equal(standalone_indices, gathered_indices), (
+        "Topk indices mismatch between standalone and distributed"
+    )

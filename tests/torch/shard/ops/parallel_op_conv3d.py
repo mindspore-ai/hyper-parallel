@@ -20,8 +20,14 @@ import torch.nn.functional as F
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global
+
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
 
 np.random.seed(42)
 
@@ -33,15 +39,15 @@ def test_distributed_conv3d_data_parallel():
         - Verify result matches standalone convolution.
     Expectation: Success with numerical equivalence.
     """
-    init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    init_backend(_DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     # Input (8, 2, 4, 4, 4), Weight (4, 2, 2, 2, 2)
     input_np = np.random.randn(8, 2, 4, 4, 4).astype(np.float32)
     weight_np = np.random.randn(4, 2, 2, 2, 2).astype(np.float32)
 
-    standalone_input = torch.from_numpy(input_np).npu()
-    standalone_weight = torch.from_numpy(weight_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
+    standalone_weight = to_device(torch.from_numpy(weight_np), _DEVICE_TYPE)
     standalone_output = F.conv3d(standalone_input, standalone_weight)
 
     # Distributed: Input sharded on batch (dp), Weight replicated
@@ -65,14 +71,14 @@ def test_distributed_conv3d_column_parallel():
         - Weight is sharded on output channel dimension (C_out).
     Expectation: Success with numerical equivalence.
     """
-    init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    init_backend(_DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     input_np = np.random.randn(4, 2, 4, 4, 4).astype(np.float32)
     weight_np = np.random.randn(4, 2, 2, 2, 2).astype(np.float32)
 
-    standalone_input = torch.from_numpy(input_np).npu()
-    standalone_weight = torch.from_numpy(weight_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
+    standalone_weight = to_device(torch.from_numpy(weight_np), _DEVICE_TYPE)
     standalone_output = F.conv3d(standalone_input, standalone_weight)
 
     # Distributed: Weight sharded on C_out (0)
@@ -95,16 +101,16 @@ def test_distributed_conv3d_spatial_parallel():
         - Verify that sharding on spatial axes is preserved through convolution.
     Expectation: Success with numerical equivalence.
     """
-    init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    init_backend(_DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     # Input (4, 2, 8, 4, 4), Weight (4, 2, 2, 2, 2)
     # Shard Input on Depth dim=2
     input_np = np.random.randn(4, 2, 8, 4, 4).astype(np.float32)
     weight_np = np.random.randn(4, 2, 2, 2, 2).astype(np.float32)
 
-    standalone_input = torch.from_numpy(input_np).npu()
-    standalone_weight = torch.from_numpy(weight_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
+    standalone_weight = to_device(torch.from_numpy(weight_np), _DEVICE_TYPE)
     standalone_output = F.conv3d(standalone_input, standalone_weight)
 
     # Distributed: Input sharded on depth (Shard dim=2)
@@ -127,16 +133,16 @@ def test_distributed_conv3d_with_bias():
         - Verify Conv3d with bias term when output channels are sharded.
     Expectation: Success, bias should be aligned and correctly added.
     """
-    init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    init_backend(_DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     input_np = np.random.randn(4, 2, 4, 4, 4).astype(np.float32)
     weight_np = np.random.randn(4, 2, 2, 2, 2).astype(np.float32)
     bias_np = np.random.randn(4).astype(np.float32)
 
-    standalone_input = torch.from_numpy(input_np).npu()
-    standalone_weight = torch.from_numpy(weight_np).npu()
-    standalone_bias = torch.from_numpy(bias_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
+    standalone_weight = to_device(torch.from_numpy(weight_np), _DEVICE_TYPE)
+    standalone_bias = to_device(torch.from_numpy(bias_np), _DEVICE_TYPE)
     standalone_output = F.conv3d(standalone_input, standalone_weight, bias=standalone_bias)
 
     # Distributed: Shard Weight and Bias on C_out (0)
@@ -162,15 +168,15 @@ def test_distributed_conv3d_row_parallel():
         - Generates Partial sums which are automatically reduced by the framework.
     Expectation: Success with numerical equivalence.
     """
-    init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    init_backend(_DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     # Input (2, 4, 4, 4, 4), Weight (4, 4, 2, 2, 2)
     input_np = np.random.randn(2, 4, 4, 4, 4).astype(np.float32)
     weight_np = np.random.randn(4, 4, 2, 2, 2).astype(np.float32)
 
-    standalone_input = torch.from_numpy(input_np).npu()
-    standalone_weight = torch.from_numpy(weight_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
+    standalone_weight = to_device(torch.from_numpy(weight_np), _DEVICE_TYPE)
     standalone_output = F.conv3d(standalone_input, standalone_weight)
 
     # Distributed: Shard Input and Weight on C_in (dim=1) along the 'tp' mesh dimension
@@ -195,14 +201,14 @@ def test_distributed_conv3d_dp_cp():
         - Weight is sharded on Output Channel (C_out) along 'tp'.
     Expectation: Success with numerical equivalence.
     """
-    init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    init_backend(_DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     input_np = np.random.randn(4, 2, 4, 4, 4).astype(np.float32)
     weight_np = np.random.randn(4, 2, 2, 2, 2).astype(np.float32)
 
-    standalone_input = torch.from_numpy(input_np).npu()
-    standalone_weight = torch.from_numpy(weight_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
+    standalone_weight = to_device(torch.from_numpy(weight_np), _DEVICE_TYPE)
     standalone_output = F.conv3d(standalone_input, standalone_weight)
 
     # Distributed: Input sharded on N (dp), Weight sharded on C_out (tp)
@@ -227,14 +233,14 @@ def test_distributed_conv3d_dp_rp():
         - Weight is sharded on Input Channel (C_in) along 'tp'.
     Expectation: Success with numerical equivalence.
     """
-    init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    init_backend(_DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     input_np = np.random.randn(4, 4, 4, 4, 4).astype(np.float32)
     weight_np = np.random.randn(2, 4, 2, 2, 2).astype(np.float32)
 
-    standalone_input = torch.from_numpy(input_np).npu()
-    standalone_weight = torch.from_numpy(weight_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
+    standalone_weight = to_device(torch.from_numpy(weight_np), _DEVICE_TYPE)
     standalone_output = F.conv3d(standalone_input, standalone_weight)
 
     # Distributed: Input sharded on N (dp) and C_in (tp)
@@ -259,15 +265,15 @@ def test_distributed_conv3d_spatial_h():
         - Kernel size is 1x1x1 to ensure mathematical equivalence without halo exchange.
     Expectation: Success with numerical equivalence.
     """
-    init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    init_backend(_DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     # Shard Input on Height dim=3
     input_np = np.random.randn(2, 2, 4, 8, 4).astype(np.float32)
     weight_np = np.random.randn(4, 2, 1, 1, 1).astype(np.float32)
 
-    standalone_input = torch.from_numpy(input_np).npu()
-    standalone_weight = torch.from_numpy(weight_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
+    standalone_weight = to_device(torch.from_numpy(weight_np), _DEVICE_TYPE)
     standalone_output = F.conv3d(standalone_input, standalone_weight)
 
     # Distributed: Input sharded on height (Shard dim=3) along 'tp'
@@ -292,15 +298,15 @@ def test_distributed_conv3d_spatial_w():
         - Kernel size is 1x1x1 to ensure mathematical equivalence without halo exchange.
     Expectation: Success with numerical equivalence.
     """
-    init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    init_backend(_DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     # Shard Input on Width dim=4
     input_np = np.random.randn(2, 2, 4, 4, 8).astype(np.float32)
     weight_np = np.random.randn(4, 2, 1, 1, 1).astype(np.float32)
 
-    standalone_input = torch.from_numpy(input_np).npu()
-    standalone_weight = torch.from_numpy(weight_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
+    standalone_weight = to_device(torch.from_numpy(weight_np), _DEVICE_TYPE)
     standalone_output = F.conv3d(standalone_input, standalone_weight)
 
     # Distributed: Input sharded on width (Shard dim=4) along 'tp'
@@ -325,15 +331,15 @@ def test_distributed_conv3d_groups_dp():
         - Convolution uses groups=2.
     Expectation: Success with numerical equivalence.
     """
-    init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    init_backend(_DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     input_np = np.random.randn(4, 4, 4, 4, 4).astype(np.float32)
     # C_out=4, C_in/groups=2
     weight_np = np.random.randn(4, 2, 2, 2, 2).astype(np.float32)
 
-    standalone_input = torch.from_numpy(input_np).npu()
-    standalone_weight = torch.from_numpy(weight_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
+    standalone_weight = to_device(torch.from_numpy(weight_np), _DEVICE_TYPE)
     standalone_output = F.conv3d(standalone_input, standalone_weight, groups=2)
 
     in_placements = (Shard(0), Replicate())
@@ -357,15 +363,15 @@ def test_distributed_conv3d_groups_cp():
         - Convolution uses groups=2.
     Expectation: Success with numerical equivalence.
     """
-    init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    init_backend(_DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     input_np = np.random.randn(2, 4, 4, 4, 4).astype(np.float32)
     # C_out=4, C_in/groups=2
     weight_np = np.random.randn(4, 2, 2, 2, 2).astype(np.float32)
 
-    standalone_input = torch.from_numpy(input_np).npu()
-    standalone_weight = torch.from_numpy(weight_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
+    standalone_weight = to_device(torch.from_numpy(weight_np), _DEVICE_TYPE)
     standalone_output = F.conv3d(standalone_input, standalone_weight, groups=2)
 
     in_placements = (Replicate(), Replicate())
@@ -389,17 +395,17 @@ def test_distributed_conv3d_groups_cp_with_bias():
         - Convolution uses groups=2.
     Expectation: Success with numerical equivalence.
     """
-    init_dist()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    init_backend(_DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     input_np = np.random.randn(2, 4, 4, 4, 4).astype(np.float32)
     # C_out=4, C_in/groups=2
     weight_np = np.random.randn(4, 2, 2, 2, 2).astype(np.float32)
     bias_np = np.random.randn(4).astype(np.float32)
 
-    standalone_input = torch.from_numpy(input_np).npu()
-    standalone_weight = torch.from_numpy(weight_np).npu()
-    standalone_bias = torch.from_numpy(bias_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_np), _DEVICE_TYPE)
+    standalone_weight = to_device(torch.from_numpy(weight_np), _DEVICE_TYPE)
+    standalone_bias = to_device(torch.from_numpy(bias_np), _DEVICE_TYPE)
     standalone_output = F.conv3d(standalone_input, standalone_weight, bias=standalone_bias, groups=2)
 
     in_placements = (Replicate(), Replicate())

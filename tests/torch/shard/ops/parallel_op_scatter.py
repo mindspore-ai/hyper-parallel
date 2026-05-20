@@ -19,99 +19,71 @@ import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global
+
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
 
 # Fixed numpy random seed
 np.random.seed(42)
 
-def test_distributed_scatter_basic():
-    """
-    Feature: dtensor + torch.Tensor.scatter
-    Description:
-        - Verify scatter works correctly when the scatter dimension is NOT sharded.
-        - Input: sharded on dim 0, scatter along dim 1.
-        - Index/Src: must have same layout as input.
-    Expectation: Distributed result matches local execution.
-    """
-    init_dist()
-    # FIX: Ensure deterministic random generation across all ranks
+def test_scatter_basic() -> None:
+    """Test torch.Tensor.scatter."""
+    init_backend(_DEVICE_TYPE)
     torch.manual_seed(1234)
 
-    # 1. Standalone Execution
-    # Shape: (8, 8)
-    # Scatter along dim 1
     input_shape = (8, 8)
-    standalone_input = torch.zeros(input_shape).npu()
-
-    # Construct index and src
-    # Scatter some random values into random indices along dim 1
-    # For dim 1 (size 8), indices must be in [0, 8)
-    standalone_src = torch.randn(input_shape).npu()
-    standalone_index = torch.randint(0, 8, input_shape).npu()
+    standalone_input = to_device(torch.zeros(input_shape), _DEVICE_TYPE)
+    standalone_src = to_device(torch.randn(input_shape), _DEVICE_TYPE)
+    standalone_index = to_device(torch.randint(0, 8, input_shape), _DEVICE_TYPE)
 
     standalone_output = standalone_input.scatter(1, standalone_index, standalone_src)
 
-    # 2. Distributed Execution
-    # Mesh: (2, 4) -> "dp", "tp"
-    # Shard input on dim 0 ("dp"), Replicate on dim 1
-    # Scatter dimension is 1 (Replicated), so this is allowed.
-    mesh = init_device_mesh(device_type="npu",mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-
-    # All tensors (input, index, src) must share the same layout for consistency
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, placements)
     dist_index = distribute_tensor(standalone_index, mesh, placements)
     dist_src = distribute_tensor(standalone_src, mesh, placements)
 
-    # Perform distributed scatter
     dist_output = dist_input.scatter(1, dist_index, dist_src)
 
-    # 3. Validation
-    # Layout Check: Output layout should match input layout
     expected_layout = _build_layout(mesh, placements, 2)
-    assert dist_output.layout == expected_layout, \
+    assert dist_output.layout == expected_layout, (
         f"Scatter output layout mismatch: expected {expected_layout}, got {dist_output.layout}"
+    )
 
-    # Numerical Check
     gathered_output = local_to_global(dist_output)
-    assert torch.equal(standalone_output, gathered_output), \
+    assert torch.equal(standalone_output, gathered_output), (
         "Distributed scatter output does not match standalone output"
+    )
 
 
-def test_distributed_scatter_scalar_src():
-    """
-    Feature: dtensor + torch.Tensor.scatter with scalar src
-    Description:
-        - Verify scatter works with a scalar 'value' instead of a src tensor.
-    Expectation: Success with correct values filled.
-    """
-    init_dist()
-    # FIX: Ensure deterministic random generation across all ranks
+def test_scatter_scalar_src() -> None:
+    """Test torch.Tensor.scatter with scalar src."""
+    init_backend(_DEVICE_TYPE)
     torch.manual_seed(2345)
 
-    # 1. Standalone
     input_shape = (8, 8)
-    standalone_input = torch.zeros(input_shape).npu()
-    standalone_index = torch.randint(0, 8, (8, 4)).npu() # Index can be smaller on other dims
+    standalone_input = to_device(torch.zeros(input_shape), _DEVICE_TYPE)
+    standalone_index = to_device(torch.randint(0, 8, (8, 4)), _DEVICE_TYPE)
     scalar_val = 3.14159
 
     standalone_output = standalone_input.scatter(1, standalone_index, scalar_val)
 
-    # 2. Distributed
-    mesh = init_device_mesh(device_type="npu",mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, placements)
     dist_index = distribute_tensor(standalone_index, mesh, placements)
 
-    # Perform distributed scatter with scalar value
     dist_output = dist_input.scatter(1, dist_index, scalar_val)
 
-    # 3. Validation
     gathered_output = local_to_global(dist_output)
-
-    # Allow small float error due to distributed gathering potential precision diffs (unlikely here but safe)
-    assert torch.allclose(standalone_output, gathered_output), \
+    assert torch.allclose(standalone_output, gathered_output), (
         "Distributed scatter with scalar src output mismatch"
+    )

@@ -18,32 +18,58 @@ from tests.common.parallel_case import parallel_run, TorchCase
 
 PARALLEL_OP_SQUEEZE = "parallel_op_squeeze.py"
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_squeeze_group1():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_squeeze_basic
-        2.test_distributed_squeeze_no_args_all_dims
+        1.test_squeeze_basic
+        2.test_squeeze_no_args_all_dims
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_SQUEEZE, "test_distributed_squeeze_basic", 10359, 4),
-        TorchCase(PARALLEL_OP_SQUEEZE, "test_distributed_squeeze_no_args_all_dims", 10360, 4),
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_squeeze_basic", num_proc=4),
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_squeeze_no_args_all_dims", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_squeeze_group1_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_squeeze_basic
+        2.test_squeeze_no_args_all_dims
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_squeeze_basic", num_proc=4),
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_squeeze_no_args_all_dims", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_squeeze_group2():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_squeeze_specific_axis_negative
-        2.test_distributed_squeeze_scalar_like
+        1.test_squeeze_specific_axis_negative
+        2.test_squeeze_scalar_like
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_SQUEEZE, "test_distributed_squeeze_specific_axis_negative", 10361, 4),
-        TorchCase(PARALLEL_OP_SQUEEZE, "test_distributed_squeeze_scalar_like", 10362, 4),
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_squeeze_specific_axis_negative", num_proc=4),
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_squeeze_scalar_like", num_proc=4),
+    ])
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_squeeze_group2_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_squeeze_specific_axis_negative
+        2.test_squeeze_scalar_like
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_squeeze_specific_axis_negative", num_proc=4),
+        TorchCase(PARALLEL_OP_SQUEEZE, "test_squeeze_scalar_like", num_proc=4),
     ])

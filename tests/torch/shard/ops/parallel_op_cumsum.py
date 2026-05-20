@@ -19,34 +19,29 @@ import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global
+
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
 
 # Generate input data using numpy at file header
 np.random.seed(42)
 standalone_input_np = np.random.randn(8, 16).astype(np.float32)
 
-def test_distributed_cumsum_layout_inference():
-    """
-    Feature: dtensor + torch.cumsum layout inference
-    Description:
-        - Test layout inference for cumsum in distributed setting.
-        - Ensure that:
-            a) Output layout matches input layout when operation dimension is unsharded.
-            b) Results are numerically consistent between standalone and distributed execution.
-            c) Non-operation dimensions may be arbitrarily sharded.
-    Expectation: Success.
-    """
-    init_dist()
-    cumsum_dim = 1  # Perform cumsum along dimension 1 (must be unsharded)
+def test_cumsum_layout_inference() -> None:
+    """Test torch.cumsum layout inference."""
+    init_backend(_DEVICE_TYPE)
+    cumsum_dim = 1
 
-    # Single-device
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     standalone_output = torch.cumsum(standalone_input, dim=cumsum_dim)
 
-    # Distributed setup: shard on dim=0 ("dp"), keep dim=1 unsharded for cumsum
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    x_placements = (Shard(0), Replicate())  # dim=0 sharded, dim=1 unsharded → VALID for cumsum(dim=1)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = torch.cumsum(dist_input, dim=cumsum_dim)
@@ -61,24 +56,16 @@ def test_distributed_cumsum_layout_inference():
     ), "Cumsum output mismatch between standalone and distributed execution"
 
 
-def test_distributed_cumsum_negative_dim_support():
-    """
-    Feature: dtensor + torch.cumsum with negative dimension indexing
-    Description:
-        - Test that negative dimension indexing (PyTorch convention) works correctly.
-        - cumsum(dim=-1) on a 2D tensor should operate on last dimension (dim=1).
-        - Last dimension must be unsharded for correctness.
-    Expectation: Success with proper layout validation.
-    """
-    init_dist()
-    cumsum_dim = -1  # Equivalent to dim=1 for 2D tensor
+def test_cumsum_negative_dim() -> None:
+    """Test torch.cumsum with negative dimension indexing."""
+    init_backend(_DEVICE_TYPE)
+    cumsum_dim = -1
 
-    # Standalone
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     standalone_output = torch.cumsum(standalone_input, dim=cumsum_dim)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    x_placements = (Shard(0), Replicate())  # dim=0 sharded
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = torch.cumsum(dist_input, dim=cumsum_dim)

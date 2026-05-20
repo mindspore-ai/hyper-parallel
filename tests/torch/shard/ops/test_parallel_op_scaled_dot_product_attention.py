@@ -18,7 +18,6 @@ from tests.common.parallel_case import parallel_run, TorchCase
 
 PARALLEL_OP_SDPA = "parallel_op_scaled_dot_product_attention.py"
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_parallel_op_scaled_dot_product_attention_group1():
     """
@@ -28,9 +27,20 @@ def test_parallel_op_scaled_dot_product_attention_group1():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_replicate", 11100, 4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_replicate", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_scaled_dot_product_attention_group1_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_sdpa_replicate
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_replicate", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_scaled_dot_product_attention_group2():
@@ -42,10 +52,23 @@ def test_parallel_op_scaled_dot_product_attention_group2():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_dp", 11101, 4),
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_mp", 11102, 4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_dp", num_proc=4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_mp", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_scaled_dot_product_attention_group2_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_sdpa_dp
+        2.test_sdpa_mp
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_dp", num_proc=4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_mp", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_scaled_dot_product_attention_group3():
@@ -57,10 +80,23 @@ def test_parallel_op_scaled_dot_product_attention_group3():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp", 11103, 4),
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_dp_mp_2d", 11104, 4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp", num_proc=4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_dp_mp_2d", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_scaled_dot_product_attention_group3_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_sdpa_sp
+        2.test_sdpa_dp_mp_2d
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp", num_proc=4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_dp_mp_2d", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_scaled_dot_product_attention_group4():
@@ -72,10 +108,23 @@ def test_parallel_op_scaled_dot_product_attention_group4():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp_mp_2d", 11105, 4),
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp_causal", 11106, 4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp_mp_2d", num_proc=4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp_causal", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_scaled_dot_product_attention_group4_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_sdpa_sp_mp_2d
+        2.test_sdpa_sp_causal
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp_mp_2d", num_proc=4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp_causal", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_scaled_dot_product_attention_group5():
@@ -87,10 +136,21 @@ def test_parallel_op_scaled_dot_product_attention_group5():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp_explicit_mask", 11107, 4),
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_error_kv_strategy_mismatch", 11108, 4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp_explicit_mask", num_proc=4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_error_kv_strategy_mismatch", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_scaled_dot_product_attention_group5_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_sdpa_sp_explicit_mask
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp_explicit_mask", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_parallel_op_scaled_dot_product_attention_group6():
@@ -102,10 +162,23 @@ def test_parallel_op_scaled_dot_product_attention_group6():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_custom_scale", 11110, 4),
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_dropout", 11111, 4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_custom_scale", num_proc=4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_dropout", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_scaled_dot_product_attention_group6_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_sdpa_custom_scale
+        2.test_sdpa_dropout
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_custom_scale", num_proc=4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_dropout", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="unessential")
 def test_parallel_op_scaled_dot_product_attention_group7():
@@ -117,10 +190,23 @@ def test_parallel_op_scaled_dot_product_attention_group7():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_enable_gqa", 11112, 4),
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp_correctness", 11113, 4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_enable_gqa", num_proc=4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp_correctness", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_scaled_dot_product_attention_group7_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_sdpa_enable_gqa
+        2.test_sdpa_sp_correctness
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_enable_gqa", num_proc=4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_sp_correctness", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_scaled_dot_product_attention_group8():
@@ -131,5 +217,5 @@ def test_parallel_op_scaled_dot_product_attention_group8():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_error_kv_seq_sharding", 11109, 4),
+        TorchCase(PARALLEL_OP_SDPA, "test_sdpa_error_kv_seq_sharding", num_proc=4),
     ])
