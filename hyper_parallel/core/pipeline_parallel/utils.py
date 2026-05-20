@@ -51,11 +51,17 @@ class BatchDimSpec:
 class _RecvInfo:
     """
     Used for construct forward Receive operation and backward Send operation.
+
+    ``requires_grad`` mirrors the forward tensor's ``requires_grad`` so
+    pipeline code can skip backward send/recv for tensors that have no
+    gradient, keeping the bwd-send count consistent with the peer's
+    bwd-recv count.
     """
 
-    def __init__(self, global_rank, buffer=None):
+    def __init__(self, global_rank, buffer=None, requires_grad: bool = True):
         self._global_rank = global_rank
         self._buffer = buffer
+        self._requires_grad = bool(requires_grad)
 
     @property
     def global_rank(self):
@@ -68,3 +74,11 @@ class _RecvInfo:
     @buffer.setter
     def buffer(self, val):
         self._buffer = val
+
+    @property
+    def requires_grad(self) -> bool:
+        return self._requires_grad
+
+    @requires_grad.setter
+    def requires_grad(self, val: bool) -> None:
+        self._requires_grad = bool(val)

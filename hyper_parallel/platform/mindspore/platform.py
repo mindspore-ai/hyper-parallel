@@ -91,6 +91,342 @@ def _mindspore_all_to_all_single(input_tensor: Tensor, output_shape, group, asyn
     return normalized_output, handle
 
 
+class AsyncCollectiveTensor(Tensor):
+    """MindSpore Tensor subclass that defers ``CommHandle.wait()`` to
+    the first op that reads it.
+
+    Mimics PyTorch's ``AsyncCollectiveTensor`` using MindSpore's
+    per-tensor ``__ms_dispatch__`` mechanism.  Constructed by calling
+    ``AsyncCollectiveTensor(inner_tensor, work)`` — :meth:`__new__`
+    invokes ``Tensor._make_subclass`` which (per MindSpore C++ side)
+    sets ``has_ms_dispatch=true`` on the new tensor because this class
+    defines ``__ms_dispatch__``.  All subsequent ops involving this
+    tensor are routed through that callback.
+
+    Stream-side ``CommHandle.wait()`` (host non-blocking) means the
+    overlap window between the async a2a issue and the first consumer
+    op is preserved: the wait is only inserted on the consumer stream
+    at the consumer dispatch site, not at the a2a issue site.
+
+    Note:
+        Currently every op (including view ops like reshape /
+        transpose / permute) triggers ``work.wait()`` + unwrap.
+        Once MindSpore exposes schema alias annotations on
+        :class:`OpFunc` (planned per discussion with the MS team),
+        this class can mirror PyTorch's ``_is_view_op`` to keep
+        view chains lazy and stretch the overlap window further.
+
+    Attributes:
+        elem:           The underlying regular Tensor (PyTorch's
+                        ``AsyncCollectiveTensor.elem``).  Returned by
+                        :meth:`_wait_and_unwrap` after the wait fires
+                        so downstream ops see a plain Tensor type.
+        completed:      Whether ``work.wait()`` has already been
+                        triggered (idempotency guard).
+        _pending_work:  The async ``CommHandle`` returned by MindSpore.
+                        PyTorch's equivalent class doesn't carry this
+                        because PyTorch tracks tensor→work via the
+                        global ``wait_tensor()`` aten op + c10d
+                        registry.  MindSpore has no such infra, so we
+                        have to stash the handle on the wrapper itself.
+    """
+
+    __slots__ = ("elem", "completed", "_pending_work")
+
+    @staticmethod
+    def __new__(cls, inner: Tensor, work):  # pylint: disable=W0613
+        """Construct a wrapper tensor sharing storage with ``inner``.
+
+        ``Tensor._make_subclass`` returns a tensor of class ``cls``
+        that shares storage with ``inner``.  MindSpore C++ side then
+        sets ``has_ms_dispatch=true`` because ``cls`` defines
+        ``__ms_dispatch__``.  Per-instance state is set in
+        :meth:`__init__`.
+        """
+        return Tensor._make_subclass(cls, inner)  # pylint: disable=W0212
+
+    def __init__(self, inner: Tensor, work):  # pylint: disable=W0231
+        """Initialize wrapper state (does NOT call ``super().__init__``).
+
+        Skipping ``Tensor.__init__`` is intentional: the parent
+        constructor would re-interpret ``inner`` as raw input data
+        and ``work`` as a dtype, corrupting the tensor that
+        :meth:`__new__` already built via ``Tensor._make_subclass``.
+        """
+        self.elem = inner
+        self.completed = work is None
+        self._pending_work = work
+
+    def _wait_and_unwrap(self) -> Tensor:
+        """Trigger ``work.wait()`` (idempotent) and return ``elem``.
+
+        Mirrors PyTorch's ``trigger_wait``: returns the underlying
+        regular Tensor so downstream ops see a plain ``Tensor``
+        instance, not an ``AsyncCollectiveTensor`` (avoids re-entering
+        ``__ms_dispatch__`` on every subsequent op).
+        """
+        if not self.completed:
+            work = self._pending_work
+            if work is not None:
+                work.wait()  # stream-side: inserts streamWaitEvent on current stream
+            self.completed = True
+        return self.elem
+
+    @classmethod
+    def __ms_dispatch__(cls, func, args, kwargs=None):
+        """Per-tensor dispatch callback invoked for every op touching a
+        :class:`AsyncCollectiveTensor` instance.
+
+        Must be a ``@classmethod`` so MindSpore's C++-side invocation
+        (``tensor_py_reg.cc`` retrieves the attribute from the class
+        and calls it as ``handler(op_func, packed_args, kwargs)`` —
+        three positional args, no ``self`` binding) lines up with the
+        signature ``(cls, func, args, kwargs)``.  Mirrors PyTorch's
+        ``__torch_dispatch__`` decoration on ``AsyncCollectiveTensor``.
+
+        Currently every op triggers wait + unwrap on any
+        ``AsyncCollectiveTensor`` arg, then runs the op on the
+        underlying inner tensors.  This is the conservative
+        correctness-first behavior: it always defers the wait at
+        least until the first op consumes the tensor (which is later
+        than calling ``work.wait()`` immediately at a2a issue site,
+        so the overlap window is preserved across the
+        ``sync_hook("B")`` window).
+
+        TODO: when MindSpore exposes schema alias annotations on
+        ``func`` (the ``OpFunc`` parameter), add a fast path that
+        keeps view ops (reshape / transpose / permute / etc.) lazy
+        and only triggers wait on real data-touching ops, mirroring
+        PyTorch's ``_is_view_op`` in
+        ``torch/distributed/_functional_collectives.py``.  Until that
+        annotation is available, treating views as real ops just
+        shortens the overlap window for view-heavy paths — it does
+        not affect correctness.
+        """
+        args = args if args is not None else ()
+        kwargs = kwargs if kwargs is not None else {}
+        unwrapped_args = tuple(
+            a._wait_and_unwrap() if isinstance(a, cls) else a  # pylint: disable=W0212
+            for a in args
+        )
+        unwrapped_kwargs = {
+            k: (v._wait_and_unwrap() if isinstance(v, cls) else v)  # pylint: disable=W0212
+            for k, v in kwargs.items()
+        }
+        return func(*unwrapped_args, **unwrapped_kwargs)
+
+    # ------------------------------------------------------------------
+    # Data-export overrides
+    # ------------------------------------------------------------------
+    # The methods below all read raw tensor data (or print it) and
+    # bypass ``__ms_dispatch__`` because they are Python-level methods
+    # on ``Tensor``, not MindSpore ops.  Without these overrides they
+    # would access ``self``'s data buffer before the pending async a2a
+    # has finished, returning stale / uninitialized values.  Each
+    # override forces a stream-side wait via ``_wait_and_unwrap`` and
+    # delegates to the same method on the underlying inner tensor.
+    #
+    # Methods deliberately NOT overridden:
+    #   ``__len__``       — metadata only (returns shape[0]); no data read.
+    #   ``__hash__``      — id-based on MindSpore Tensor; no data read.
+    #   ``__contains__``  — uses ``(elem == self).any().item()`` which
+    #                       dispatches through ``==`` so wait fires
+    #                       transitively before the chain reaches data.
+    #   ``__getitem__``   — slicing dispatches through ``__ms_dispatch__``.
+    #   ``__format__``    — calls ``__repr__`` which we override.
+
+    def asnumpy(self):
+        """Convert to numpy ndarray; waits the pending a2a first."""
+        return self._wait_and_unwrap().asnumpy()
+
+    def numpy(self):
+        """Alias of :meth:`asnumpy` — same wait + unwrap path."""
+        return self._wait_and_unwrap().numpy()
+
+    def __array__(self, dtype=None):
+        """``np.array(t)`` protocol; waits + delegates to inner tensor."""
+        return self._wait_and_unwrap().__array__(dtype)
+
+    def get_bytes(self):
+        """Raw byte serialization; must wait before reading the buffer."""
+        return self._wait_and_unwrap().get_bytes()
+
+    def tolist(self):
+        """Convert to nested Python list; waits first."""
+        return self._wait_and_unwrap().tolist()
+
+    def item(self):
+        """Extract scalar value (0-d tensor); waits first."""
+        return self._wait_and_unwrap().item()
+
+    def __bool__(self):
+        """``bool(t)`` / ``if t:``; reads scalar value, must wait."""
+        return bool(self._wait_and_unwrap())
+
+    def __int__(self):
+        """``int(t)``; reads scalar value, must wait."""
+        return int(self._wait_and_unwrap())
+
+    def __float__(self):
+        """``float(t)``; reads scalar value, must wait."""
+        return float(self._wait_and_unwrap())
+
+    def __index__(self):
+        """Python index protocol; uses scalar value, must wait."""
+        return self._wait_and_unwrap().__index__()
+
+    def __repr__(self):
+        """Eager debug print; force wait so the printout reflects real data.
+
+        Mirrors PyTorch's ``AsyncCollectiveTensor.__repr__`` style by
+        labelling the wrapper so a stray ``print(t)`` doesn't silently
+        hide the lazy nature of the value.
+        """
+        return f"AsyncCollectiveTensor({self._wait_and_unwrap()})"
+
+    def __str__(self):
+        """``str(t)`` / format printing; falls through to :meth:`__repr__`."""
+        return self.__repr__()
+
+    def __iter__(self):
+        """Iterate over dim-0 slices; one wait, then iterate inner."""
+        return iter(self._wait_and_unwrap())
+
+
+class _MSAsyncA2ALazyBwd(_Function):
+    """Async all-to-all whose forward and backward both return
+    :class:`AsyncCollectiveTensor`, deferring ``CommHandle.wait()``
+    to the first consumer op via ``__ms_dispatch__``.
+
+    Mirrors the Torch ``_AsyncA2ALazyBwd`` semantics: the kernel is
+    queued on the HCCL group's stream, host returns immediately, and
+    the wait fires lazily on the consumer's stream — giving the
+    paired thread a window to dispatch its compute concurrently.
+    """
+
+    @staticmethod
+    def forward(ctx, input_tensor, output_splits, input_splits, group):  # pylint: disable=arguments-differ
+        """Launch async a2a; return :class:`AsyncCollectiveTensor`."""
+        ctx.input_splits = input_splits
+        ctx.output_splits = output_splits
+        ctx.group = group
+        output_size = int(sum(output_splits))
+        output_shape = list(input_tensor.shape)
+        output_shape[0] = output_size
+        output = mint.empty(tuple(output_shape), dtype=input_tensor.dtype)
+        # ``comm_func.all_to_all_single`` is out-of-place by default (the
+        # ``output`` arg is ignored and a fresh tensor is returned in a
+        # tuple together with the handle).  We must wrap the returned
+        # tensor, not the pre-allocated ``output`` buffer — otherwise the
+        # AsyncCollectiveTensor would wrap an uninitialized buffer and
+        # the consumer would read garbage even after ``work.wait()``.
+        # See ``mindspore/ops/function/comm_func.py:3066-3079`` and the
+        # ``is_inplace_func("all_to_all_single")`` default of ``False``.
+        result = comm_func.all_to_all_single(
+            output, input_tensor,
+            output_split_sizes=list(output_splits),
+            input_split_sizes=list(input_splits),
+            group=group,
+            async_op=True,
+        )
+        actual_output, work = _normalize_all_to_all_single_result(result, output)
+        return AsyncCollectiveTensor(actual_output, work)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Symmetric reverse a2a; returns :class:`AsyncCollectiveTensor`."""
+        # If grad_output is still lazy, force unwrap before issuing the
+        # reverse a2a (which is itself a "real" op on the data).
+        if isinstance(grad_output, AsyncCollectiveTensor):
+            grad_output = grad_output._wait_and_unwrap()  # pylint: disable=W0212
+        grad_output_size = int(sum(ctx.input_splits))
+        grad_input_shape = list(grad_output.shape)
+        grad_input_shape[0] = grad_output_size
+        grad_input = mint.empty(tuple(grad_input_shape), dtype=grad_output.dtype)
+        result = comm_func.all_to_all_single(
+            grad_input, grad_output,
+            output_split_sizes=list(ctx.input_splits),
+            input_split_sizes=list(ctx.output_splits),
+            group=ctx.group,
+            async_op=True,
+        )
+        # See forward: must use the returned tensor, not ``grad_input``,
+        # because the call is out-of-place by default.
+        actual_grad, work = _normalize_all_to_all_single_result(result, grad_input)
+        lazy_grad = AsyncCollectiveTensor(actual_grad, work)
+        return lazy_grad, None, None, None
+
+
+class _MSSyncHookFunction(_Function):
+    """Identity autograd op that fires HookCoordinator rendezvous on
+    forward and backward, mirroring the Torch ``_TorchSyncHookFunction``.
+
+    The role tables are intentionally identical to the Torch backend so
+    the dual-thread protocol (COMM-first dispatch ordering) is the same
+    on MindSpore.  The ``"D_LAST"`` sentinel skips the rendezvous in
+    both directions — used to mark the closing D hook of the last MoE
+    layer in a chunk.
+    """
+
+    # Index encoding: 1 = COMM, 2 = COMPUTE.
+    _FWD_ROLES = {
+        "A": (2, 1),   # prev=Attention COMPUTE | next=dispatch COMM
+        "B": (1, 2),   # prev=dispatch COMM     | next=module COMPUTE
+        "C": (2, 1),   # prev=module COMPUTE    | next=combine COMM
+        "D": (1, 2),   # prev=combine COMM      | next=Attention COMPUTE
+    }
+    _BWD_ROLES = {
+        "D": (2, 1),   # prev=Attn.bwd COMPUTE      | next=combine.bwd COMM
+        "C": (1, 2),   # prev=combine.bwd COMM      | next=module.bwd COMPUTE
+        "B": (2, 1),   # prev=module.bwd COMPUTE    | next=dispatch.bwd COMM
+        "A": (1, 2),   # prev=dispatch.bwd COMM     | next=Attn.bwd COMPUTE
+    }
+    _ROLE_CACHE = None
+
+    @staticmethod
+    def _role_enum(idx: int):
+        """Lazy import of HookRole to avoid a circular import at module load."""
+        if _MSSyncHookFunction._ROLE_CACHE is None:
+            # pylint: disable=C0415
+            from hyper_parallel.core.pipeline_parallel.hook_coordinator import HookRole
+            _MSSyncHookFunction._ROLE_CACHE = (None, HookRole.COMM, HookRole.COMPUTE)
+        return _MSSyncHookFunction._ROLE_CACHE[idx]
+
+    @staticmethod
+    def forward(ctx, x, hook_name, coordinator):  # pylint: disable=arguments-differ
+        """Fire forward-direction rendezvous and return ``x`` unchanged."""
+        ctx.hook_name = hook_name
+        ctx.coordinator = coordinator
+        if not coordinator.is_enabled():
+            return x
+        if hook_name == "D_LAST":
+            # Last MoE layer's closing D — no Attention follows in
+            # forward; rendezvous would be against a non-existent op.
+            return x
+        prev_idx, next_idx = _MSSyncHookFunction._FWD_ROLES[hook_name]
+        role_of = _MSSyncHookFunction._role_enum
+        coordinator.notify_dispatched(role_of(prev_idx))
+        coordinator.rendezvous(role_of(next_idx))
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Mirror of :meth:`forward` using ``_BWD_ROLES``."""
+        hook_name = ctx.hook_name
+        coordinator = ctx.coordinator
+        if not coordinator.is_enabled():
+            return grad_output, None, None
+        if hook_name == "D_LAST":
+            # First BWD hook to fire; combine.bwd has already dispatched
+            # freely before any rendezvous can happen.
+            return grad_output, None, None
+        prev_idx, next_idx = _MSSyncHookFunction._BWD_ROLES[hook_name]
+        role_of = _MSSyncHookFunction._role_enum
+        coordinator.notify_dispatched(role_of(prev_idx))
+        coordinator.rendezvous(role_of(next_idx))
+        return grad_output, None, None
+
+
 class _MSAsyncA2AFunction(_Function):
     """Differentiable wrapper for pre-launched async all-to-all."""
 
@@ -672,6 +1008,48 @@ class MindSporePlatform(Platform):
         return _MSAsyncA2AFunction.apply(
             x, work, out_perm, group, world_size, concat_dim, split_dim, handle_box
         )
+
+    @staticmethod
+    def differentiable_all_to_all_single_async(input_tensor, input_splits, output_splits, group):
+        """Launch an asynchronous, differentiable all-to-all-single.
+
+        Token a2a entry point used by ``CommComputeOverlap``-driven MoE
+        wrappers.  The kernel is queued on the HCCL group's stream and
+        the host returns immediately, so the calling thread can proceed
+        to the next sync hook (notify + rendezvous) before the
+        collective finishes — this is what enables the comm/compute
+        overlap window on the paired thread.
+
+        Returns an :class:`AsyncCollectiveTensor` that defers
+        ``CommHandle.wait()`` to the first consumer op via
+        ``__ms_dispatch__``.
+        """
+        return _MSAsyncA2ALazyBwd.apply(input_tensor, output_splits, input_splits, group)
+
+    @staticmethod
+    def differentiable_sync_hook(x, hook_name: str, coordinator):
+        """Fire a HookCoordinator rendezvous on forward and backward.
+
+        Args:
+            x:           Input tensor — returned unchanged.
+            hook_name:   One of ``"A"``, ``"B"``, ``"C"``, ``"D"``,
+                         or ``"D_LAST"`` (last layer's closing D —
+                         skipped on both forward and backward).
+            coordinator: The :class:`HookCoordinator` driving the
+                         rendezvous protocol.
+
+        Returns:
+            ``x`` unchanged.
+
+        Note:
+            Two-thread compatibility on MindSpore PyNative is not yet
+            fully verified.  The HookCoordinator + ``_Function``
+            primitives are individually thread-safe, but the
+            interaction with MindSpore's autograd execution model
+            under ``threading.Thread`` should be PoC-tested before
+            production use.
+        """
+        return _MSSyncHookFunction.apply(x, hook_name, coordinator)
 
     @staticmethod
     def parameters_dict(cell: Cell):

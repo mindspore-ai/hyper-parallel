@@ -133,36 +133,38 @@ class PipelineStageBase:
             self.last_stage_outputs = out
         return out
 
-    def backward_one_chunk(self, micro_index, last_backward=False):  # pylint: disable=unused-argument
+    def backward_one_chunk(self, micro_index):
         """Execution a backward function."""
         from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
         if not self._has_backward:
             return None
-        recv_args = []
         for _, mod in self.submodule.cells_and_names():
             if not isinstance(mod, HSDPModule):
                 continue
             mod.set_reshard_after_backward(False)
             mod.set_requires_gradient_sync(False)
-        if micro_index in self.grad_recv_info:
-            recv_args = [recv_info.buffer for recv_info in self.grad_recv_info[micro_index]]
 
         grad_fn = self.fwd_grad_fn_cache.pop(micro_index)
         if self.is_first_stage:
-            _ = grad_fn(sens=recv_args)
+            sens = self._build_padded_sens(micro_index)
+            _ = grad_fn(sens=sens)
             grad_out = None
         else:
             if self.is_last_stage:
                 sens = self.get_last_stage_sens(self.last_stage_outputs)
             else:
-                sens = recv_args
+                sens = self._build_padded_sens(micro_index)
             input_grads = grad_fn.compute_input_grad(sens=sens)
             weight_grads = grad_fn.compute_weight_grad()
             grad_out = (input_grads, weight_grads)
         self._clear_recv_buffer(self.grad_recv_info, micro_index)
-        self._clear_recv_buffer(self.args_recv_info, micro_index)
         if not self.is_first_stage:
-            self.bwd_cache[micro_index] = grad_out[0][:self._recv_num]
+            # grad_out[0] holds grads for all inputs; keep rg=True slots so bwd_cache aligns
+            # 1:1 with the peer's grad_recv_info.
+            grads_all = grad_out[0][:self._recv_num]
+            rg_indices = [i for i, ri in enumerate(self.args_recv_info[micro_index]) if ri.requires_grad]
+            self.bwd_cache[micro_index] = [grads_all[i] for i in rg_indices]
+        self._clear_recv_buffer(self.args_recv_info, micro_index)
         # return grads for parameters
         if self.is_first_stage:
             return grad_out

@@ -105,6 +105,10 @@ class PipelineStage(PipelineStageBase):
         self.last_stage_outputs = None
         self.args_recv_info = {}
         self.grad_recv_info = {}
+        # micro_index -> list of metas (matching ``_extract_meta_from_tensor``).  Captured at fwd-send
+        # time so backward can read each output's ``requires_grad`` flag after ``fwd_outputs_cache``
+        # is popped — needed to zero-pad sens on the MS GradOperation path.
+        self._fwd_output_meta = {}
         self._meta_been_send = False
         self._meta_been_recv = False
         self._dyn_shape = dyn_shape
@@ -140,6 +144,7 @@ class PipelineStage(PipelineStageBase):
         """clear fwd and bwd recv_info list."""
         self.args_recv_info.clear()
         self.grad_recv_info.clear()
+        self._fwd_output_meta.clear()
 
     def _check_shared_parameters(self, shared_parameters):
         """check type for shared_parameters."""
@@ -224,12 +229,15 @@ class PipelineStage(PipelineStageBase):
     def _update_layout(self, layout):
         """update the received layout.
 
-        When ``self.mesh`` is set, within-stage ranks are derived from the
-        root mesh's non-PP dimensions.  Otherwise falls back to global-rank
-        arithmetic.
+        When ``self.mesh`` is set, resolve ``rank_list`` from the **layout's
+        own** ``alias_name`` against the root mesh, so a layout that only
+        spans part of the within-stage tile (e.g. ``("ep",)`` within a root
+        whose non-PP dims are ``("dp", "ep")``) gets just its submesh ranks
+        rather than the whole stage's ranks.  Otherwise falls back to
+        global-rank arithmetic.
         """
         if self.mesh is not None:
-            rank_list = self._get_within_stage_ranks()
+            rank_list = self._get_layout_rank_list(layout)
         else:
             device_num = platform.get_world_size()
             real_stage_num = self.stage_num // self._virtual_chunk_num
@@ -240,30 +248,30 @@ class PipelineStage(PipelineStageBase):
         layout.update_mesh()
         layout.update_compact_str()
 
-    def _get_within_stage_ranks(self) -> tuple:
-        """Return the global ranks that belong to the current pipeline stage.
+    def _get_layout_rank_list(self, layout) -> tuple:
+        """Return the global ranks the given layout spans for this process.
 
-        ``self.mesh`` is a 1-D PP sub-mesh (e.g. ``full_mesh["pp"]``).
-        If its ``root_mesh`` exists, the non-PP dimensions of the root mesh
-        give the within-stage rank list.  When there is no root mesh (the PP
-        mesh is the full mesh) each stage has a single rank.
+        The serialised ``layout.alias_name`` records exactly the mesh dims
+        the sender used.  Resolving ranks for **that** submesh (rather than
+        the whole within-stage tile) keeps the receiver's group identical
+        to the sender's — necessary when a tensor lives on, say, only the
+        EP sub-axis of a (dp, ep) within-stage root.
         """
         root = self.mesh.root_mesh
         if root is None or root.ndim <= 1:
             # PP-only topology: one rank per stage
             return (platform.get_rank(),)
-        # Identify the PP dimension name(s) inside the root mesh
         pp_dim_names = set(self.mesh.mesh_dim_names or ())
-        non_pp_names = tuple(
-            name for name in root.mesh_dim_names if name not in pp_dim_names
+        layout_dim_names = tuple(
+            name for name in (layout.alias_name or ()) if name not in pp_dim_names
         )
-        if not non_pp_names:
+        if not layout_dim_names:
             return (platform.get_rank(),)
-        if len(non_pp_names) == 1:
-            within_stage_mesh = root[non_pp_names[0]]
+        if len(layout_dim_names) == 1:
+            submesh = root[layout_dim_names[0]]
         else:
-            within_stage_mesh = root[non_pp_names]
-        return tuple(within_stage_mesh.rank_list)
+            submesh = root[layout_dim_names]
+        return tuple(submesh.rank_list)
 
     def get_last_stage_sens(self, last_stage_outputs):
         """Get last stage sens"""
@@ -287,20 +295,28 @@ class PipelineStage(PipelineStageBase):
         return p_sens
 
     def _construct_forward_recv_info(self, micro_index, idx, global_rank, meta):
-        """construct forward recv info."""
-        # shape, type, layout
-        if len(meta) == 3:
+        """construct forward recv info.
+
+        ``meta`` layout — trailing element is always the sender tensor's
+        ``requires_grad`` flag, so the recv buffer mirrors it and the
+        backward send path can skip non-grad slots:
+          * DTensor:  ``[local_shape, dtype, layout, requires_grad]``  (len 4)
+          * regular:  ``[shape, dtype, requires_grad]``                (len 3)
+        """
+        requires_grad = bool(meta[-1])
+        if len(meta) == 4:
             self._update_layout(meta[2])
             buffer = DTensor.from_local(platform.new_tensor(meta[0], meta[1],
                                                             device=self.device), meta[2].mesh, meta[2].alias_placements)
         else:
             buffer = platform.new_tensor(meta[0], meta[1], device=self.device)
-        buffer.requires_grad = True
+        buffer.requires_grad = requires_grad
         if micro_index in self.args_recv_info:
             recv_info = self.args_recv_info[micro_index][idx]
             recv_info.buffer = buffer
+            recv_info.requires_grad = requires_grad
             return recv_info
-        return _RecvInfo(global_rank, buffer)
+        return _RecvInfo(global_rank, buffer, requires_grad=requires_grad)
 
     def _communicate_meta(self, global_rank, meta_send=None):
         """communicate meta."""
@@ -356,27 +372,50 @@ class PipelineStage(PipelineStageBase):
             tensor: Input tensor, can be DTensor or regular tensor
 
         Returns:
-            list: Metadata containing shape, dtype and layout
+            list: Metadata for the receiver.  The trailing element is
+                always the tensor's ``requires_grad`` flag so the peer can
+                mirror it on the recv buffer and skip backward send/recv
+                for non-differentiable forward tensors.
+                  * DTensor:  ``[local_shape, dtype, layout, requires_grad]``
+                  * regular:  ``[shape, dtype, requires_grad]``
         """
+        requires_grad = bool(tensor.requires_grad)
         if isinstance(tensor, DTensor):
-            return [tensor.local_shape, tensor.dtype, tensor.layout]
-        return [tensor.shape, tensor.dtype]
+            return [tensor.local_shape, tensor.dtype, tensor.layout, requires_grad]
+        return [tensor.shape, tensor.dtype, requires_grad]
 
     def exec_fwd_send_ops(self, micro_index):
-        """Execute the forward send operation."""
+        """Execute the forward send operation.
+
+        Only outputs with ``requires_grad=True`` reserve a slot in
+        ``grad_recv_info`` — otherwise the peer would send back N grads
+        while this side waits for fewer, and the irecv count would
+        diverge.  ``bwd_idx`` tracks the position **within
+        ``grad_recv_info[micro_index]``** (which skips non-grad outputs),
+        so the buffer-reuse path in ``_construct_backward_recv_info``
+        keeps aligned across micro-batches.
+
+        The full output meta list is also stashed in ``_fwd_output_meta``
+        so ``backward_one_chunk`` (esp. on MindSpore) can rebuild a
+        zero-padded sens matching the wrapped forward's output structure.
+        """
         comm_handle = []
         if self.is_last_stage:
             return comm_handle
         out = self.fwd_outputs_cache.pop(micro_index)
         bwd_recv_infos = []
         output_meta = [self._extract_meta_from_tensor(each_out) for each_out in out]
+        # Keep meta alive for backward — fwd_outputs_cache has just been popped.
+        self._fwd_output_meta[micro_index] = output_meta
         global_rank = self._global_rank(self.dst_stage)
         self._communicate_meta(global_rank, output_meta)
+        bwd_idx = 0
         for idx, cur_out in enumerate(out):
-            if self._has_backward:
-                recv_info = self._construct_backward_recv_info(micro_index, idx, global_rank, cur_out)
+            if self._has_backward and bool(getattr(cur_out, "requires_grad", False)):
+                recv_info = self._construct_backward_recv_info(micro_index, bwd_idx, global_rank, cur_out)
                 if recv_info is not None:
                     bwd_recv_infos.append(recv_info)
+                bwd_idx += 1
             handle = platform.isend(out[idx], global_rank)
             comm_handle.append(handle)
         if bwd_recv_infos:
@@ -395,15 +434,21 @@ class PipelineStage(PipelineStageBase):
         return comm_handle
 
     def exec_bwd_send_ops(self, micro_index):
-        """Execute the backward send operation."""
+        """Execute the backward send operation.
+
+        ``backward_one_chunk`` filters ``bwd_cache[mi]`` to only contain
+        grads for rg=True inputs, so it aligns 1:1 with the rg=True
+        slots of ``args_recv_info[mi]`` (and 1:1 with the peer's
+        ``grad_recv_info``).  Pairing via ``zip`` keeps send count and
+        peer irecv count consistent.
+        """
         comm_handle = []
         if micro_index not in self.args_recv_info:
             return comm_handle
         out = self.bwd_cache.pop(micro_index)
-        for idx, cur_out in enumerate(out):
-            info = self.args_recv_info[micro_index][idx]
-            global_rank = info.global_rank
-            handle = platform.isend(cur_out, global_rank)
+        rg_infos = [info for info in self.args_recv_info[micro_index] if info.requires_grad]
+        for cur_out, info in zip(out, rg_infos):
+            handle = platform.isend(cur_out, info.global_rank)
             comm_handle.append(handle)
         return comm_handle
 
@@ -425,3 +470,42 @@ class PipelineStage(PipelineStageBase):
 
         # No public API exposes the root backward finalization; call the platform hook directly.
         fsdp_module.hsdp_scheduler._root_backward_hook()  # pylint: disable=protected-access
+
+    def _build_padded_sens(self, micro_index):
+        """Build an N-length sens list aligned with the forward output structure.
+
+        MindSpore's GradOperation requires sens to match the wrapped forward's
+        output signature.  ``grad_recv_info[mi]`` only holds K = rg-true slots,
+        so the remaining N - K slots are filled with zero placeholders sized
+        from the recorded meta.
+
+        Returns:
+            list: sens tensors, length equal to the forward output count.
+                Empty if no meta is recorded (e.g. last stage or unknown mi).
+        """
+        metas = self._fwd_output_meta.get(micro_index)
+        if not metas:
+            return []
+        grad_recv = self.grad_recv_info.get(micro_index, [])
+        sens = []
+        grad_idx = 0
+        for meta in metas:
+            if bool(meta[-1]):
+                sens.append(grad_recv[grad_idx].buffer)
+                grad_idx += 1
+            else:
+                # meta is [shape, dtype, rg] or [local_shape, dtype, layout, rg]
+                sens.append(platform.zeros(meta[0], dtype=meta[1], device=self.device))
+        return sens
+
+    def _output_requires_grad_mask(self, micro_index):
+        """Return the requires_grad mask for forward outputs at ``micro_index``.
+
+        For non-last stages the mask is read from ``_fwd_output_meta`` (recorded
+        during ``exec_fwd_send_ops``).  For the last stage no fwd-send runs, so
+        the caller should derive the mask from ``last_stage_outputs`` instead.
+        """
+        metas = self._fwd_output_meta.get(micro_index)
+        if not metas:
+            return None
+        return [bool(meta[-1]) for meta in metas]

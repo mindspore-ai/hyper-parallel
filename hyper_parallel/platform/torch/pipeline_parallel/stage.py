@@ -102,33 +102,68 @@ class PipelineStageBase:
             self.last_stage_outputs = out
         return out
 
+    @staticmethod
+    def _filter_grad_outputs(fwd_output):
+        """Return outputs with ``requires_grad`` (DTensor → local) for autograd."""
+        local_output = []
+        for each_out in fwd_output:
+            local_tensor = each_out.to_local() if isinstance(each_out, hyper_parallel.DTensor) else each_out
+            if local_tensor.requires_grad:
+                local_output.append(local_tensor)
+        return local_output
+
+    def _build_last_stage_sens(self):
+        """Sens tensors for the last stage, aligned 1:1 with rg=True outputs."""
+        sens_all = self.get_last_stage_sens(self.last_stage_outputs)
+        if not isinstance(sens_all, list):
+            return sens_all
+        outputs_iter = (self.last_stage_outputs
+                        if isinstance(self.last_stage_outputs, (list, tuple))
+                        else [self.last_stage_outputs])
+        sens = []
+        for s, o in zip(sens_all, outputs_iter):
+            o_local = o.to_local() if isinstance(o, hyper_parallel.DTensor) else o
+            if o_local.requires_grad:
+                sens.append(s)
+        return sens
+
+    def _populate_bwd_cache(self, micro_index):
+        """Stash rg=True input grads so they align with peer's grad_recv_info."""
+        input_grads = [recv_info.buffer.grad
+                       for recv_info in self.args_recv_info[micro_index]
+                       if recv_info.requires_grad]
+        self.bwd_cache[micro_index] = input_grads
+
     def backward_one_chunk(self, micro_index, last_backward=False):
-        """Execution a backward function."""
+        """Execution a backward function.
+
+        ``grad_recv_info`` is filtered to rg=True forward outputs (see
+        ``exec_fwd_send_ops``), so ``local_output`` and the matching sens list
+        must be filtered the same way — torch.autograd.backward rejects tensors
+        without ``grad_fn``.  ``bwd_cache`` is then populated with grads for
+        rg=True inputs only, aligning 1:1 with the peer's ``grad_recv_info``.
+        """
         if not self._has_backward:
             return
-        recv_args = []
         if last_backward and isinstance(self.submodule, hyper_parallel.HSDPModule):
             self.submodule.set_requires_grad_sync(True)
+        recv_args = []
         if micro_index in self.grad_recv_info:
             recv_args = [recv_info.buffer for recv_info in self.grad_recv_info[micro_index]]
 
         fwd_output = self.fwd_cache.pop(micro_index)
-        local_output = []
-        # need local_tensor to get gradient.
-        for each_out in fwd_output:
-            if isinstance(each_out, hyper_parallel.DTensor):
-                local_output.append(each_out.to_local())
-            else:
-                local_output.append(each_out)
-        if self.is_first_stage:
-            torch.autograd.backward(local_output, grad_tensors=recv_args)
-        elif self.is_last_stage:
-            sens = self.get_last_stage_sens(self.last_stage_outputs)
-            torch.autograd.backward(local_output, grad_tensors=sens)
-        else:
-            torch.autograd.backward(local_output, grad_tensors=recv_args)
+        local_output = self._filter_grad_outputs(fwd_output)
+
+        if not local_output:
+            # Nothing to backprop through (e.g. all forward outputs detached).
+            self._clear_recv_buffer(self.grad_recv_info, micro_index)
+            self._clear_recv_buffer(self.args_recv_info, micro_index)
+            return
+
+        grad_tensors = self._build_last_stage_sens() if self.is_last_stage else recv_args
+        torch.autograd.backward(local_output, grad_tensors=grad_tensors)
+
         if not self.is_first_stage:
-            input_grads = [recv_info.buffer.grad for recv_info in self.args_recv_info[micro_index]]
-            self.bwd_cache[micro_index] = input_grads
+            self._populate_bwd_cache(micro_index)
         self._clear_recv_buffer(self.grad_recv_info, micro_index)
         self._clear_recv_buffer(self.args_recv_info, micro_index)
