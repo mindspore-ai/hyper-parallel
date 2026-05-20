@@ -17,7 +17,7 @@ import os
 from tests.common.mark_utils import arg_mark
 from tests.mindspore.st.utils import msrun_case
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_symmetric_memory_put_mem():
     """
     Feature: symmetric memory put mem.
@@ -33,7 +33,7 @@ def test_ms_symmetric_memory_put_mem():
     os.environ['SHMEM_LOG_TO_STDOUT'] = "1"
     msrun_case(glog_v, file_name, case_name, master_port, worker_num, worker_num)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_symmetric_memory_shmem_put_with_signal():
     """
     Feature: symmetric memory put mem with signal.
@@ -49,7 +49,7 @@ def test_ms_symmetric_memory_shmem_put_with_signal():
     os.environ['SHMEM_LOG_TO_STDOUT'] = "1"
     msrun_case(glog_v, file_name, case_name, master_port, worker_num, worker_num)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_symmetric_memory_shmem_allgather():
     """
     Feature: symmetric memory allgather.
@@ -65,7 +65,7 @@ def test_ms_symmetric_memory_shmem_allgather():
     os.environ['SHMEM_LOG_TO_STDOUT'] = "1"
     msrun_case(glog_v, file_name, case_name, master_port, worker_num, worker_num)
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_symmetric_memory_shmem_wait_for_signal():
     """
     Feature: symmetric memory wait for signal.

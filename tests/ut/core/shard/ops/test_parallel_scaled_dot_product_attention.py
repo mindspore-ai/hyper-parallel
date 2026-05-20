@@ -366,5 +366,333 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Query layout cannot be None"):
             op.infer_layout((None, k_layout, v_layout), [])
 
+
+class TestSdpaHelperMethods(unittest.TestCase):
+    """
+    Feature: ScaledDotProductAttentionDistributedOp helper methods
+    Description: Test _normalize_dim_map, _get_dims, _get_dim_split_num,
+                 _get_split_info, _validate_sharding_consistency, and get_expand_impl.
+    Expectation: Correct values and exceptions for each path.
+    """
+
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def _setup_mock_platform(self, mock_platform, world_size=8):
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
+
+    def _make_2x4_mesh(self, mock_platform):
+        self._setup_mock_platform(mock_platform, world_size=8)
+        return init_device_mesh(
+            device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp")
+        )
+
+    def test_normalize_dim_map_none_returns_string_none(self):
+        """_normalize_dim_map(None) returns the string 'None'."""
+        result = ScaledDotProductAttentionDistributedOp._normalize_dim_map(None)
+        self.assertEqual(result, "None")
+
+    def test_normalize_dim_map_non_none_returns_value(self):
+        """_normalize_dim_map with non-None value returns the value unchanged."""
+        self.assertEqual(
+            ScaledDotProductAttentionDistributedOp._normalize_dim_map("dp"), "dp"
+        )
+        self.assertEqual(
+            ScaledDotProductAttentionDistributedOp._normalize_dim_map(0), 0
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_dims_3d_tensor(self, mock_platform):
+        """_get_dims returns {head:0, seq:1, dim:2} for a 3D layout."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(8,), mesh_dim_names=("mp",)
+        )
+        layout = _build_layout(mesh, (Replicate(),), 3)
+        dims = op._get_dims(layout)
+        self.assertEqual(dims["head"], 0)
+        self.assertEqual(dims["seq"], 1)
+        self.assertEqual(dims["dim"], 2)
+        self.assertNotIn("batch", dims)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_dims_4d_tensor(self, mock_platform):
+        """_get_dims returns {batch:0, head:1, seq:2, dim:3} for a 4D layout."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(8,), mesh_dim_names=("mp",)
+        )
+        layout = _build_layout(mesh, (Replicate(),), 4)
+        dims = op._get_dims(layout)
+        self.assertEqual(dims["batch"], 0)
+        self.assertEqual(dims["head"], 1)
+        self.assertEqual(dims["seq"], 2)
+        self.assertEqual(dims["dim"], 3)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_dim_split_num_no_alias_tensor_map(self, mock_platform):
+        """_get_dim_split_num returns 1 when layout has no alias_tensor_map."""
+        from unittest.mock import MagicMock
+        mock_layout = MagicMock()
+        del mock_layout.alias_tensor_map
+        result = op._get_dim_split_num(mock_layout, 0)
+        self.assertEqual(result, 1)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_dim_split_num_dim_out_of_range_returns_one(self, mock_platform):
+        """_get_dim_split_num returns 1 when dim_idx >= len(alias_tensor_map)."""
+        from unittest.mock import MagicMock
+        mock_layout = MagicMock()
+        mock_layout.alias_tensor_map = ("dp",)
+        result = op._get_dim_split_num(mock_layout, 5)
+        self.assertEqual(result, 1)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_dim_split_num_none_mapping_returns_one(self, mock_platform):
+        """_get_dim_split_num returns 1 for a 'None' mapped dimension."""
+        from unittest.mock import MagicMock
+        mock_layout = MagicMock()
+        mock_layout.alias_tensor_map = ("None", "dp")
+        result = op._get_dim_split_num(mock_layout, 0)
+        self.assertEqual(result, 1)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_dim_split_num_string_mapping_returns_device_count(self, mock_platform):
+        """_get_dim_split_num returns device count for a string-mapped dimension."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp")
+        )
+        layout = _build_layout(mesh, (Shard(0), Replicate()), 4)
+        result = op._get_dim_split_num(layout, 0)
+        self.assertEqual(result, 2)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_split_info_all_replicated(self, mock_platform):
+        """_get_split_info returns 1 for all dims when layout is fully replicated."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp")
+        )
+        layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        dims = {"batch": 0, "head": 1, "seq": 2}
+        split_info = op._get_split_info(layout, dims)
+        self.assertEqual(split_info["batch"], 1)
+        self.assertEqual(split_info["head"], 1)
+        self.assertEqual(split_info["seq"], 1)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_validate_sharding_consistency_none_key_returns(self, mock_platform):
+        """_validate_sharding_consistency does nothing when key_layout is None."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp")
+        )
+        q_layout = _build_layout(mesh, (Shard(0), Replicate()), 4)
+        op._validate_sharding_consistency(q_layout, None, {"batch": 0, "head": 1, "dim": 3})
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_validate_sharding_consistency_mismatch_raises(self, mock_platform):
+        """_validate_sharding_consistency raises ValueError for batch mismatch."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp")
+        )
+        q_layout = _build_layout(mesh, (Shard(0), Replicate()), 4)
+        k_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        dims = {"batch": 0, "head": 1, "seq": 2, "dim": 3}
+        with self.assertRaisesRegex(ValueError, "identical batch sharding"):
+            op._validate_sharding_consistency(q_layout, k_layout, dims)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_expand_impl_none_query_returns_none(self, mock_platform):
+        """get_expand_impl with None query layout returns None."""
+        result = op.get_expand_impl(None, None, (None,), {})
+        self.assertIsNone(result)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_expand_impl_key_value_mismatch_raises(self, mock_platform):
+        """get_expand_impl raises ValueError when Key and Value have different tensor_maps."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp")
+        )
+        q_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        k_layout = _build_layout(mesh, (Shard(0), Replicate()), 4)
+        v_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        with self.assertRaisesRegex(ValueError, "Key and Value must have identical"):
+            op.get_expand_impl(None, None, (q_layout, k_layout, v_layout), {})
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_expand_impl_returns_callable(self, mock_platform):
+        """get_expand_impl with valid layouts returns a callable expanded_impl."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp")
+        )
+        q_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        k_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        v_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        impl = op.get_expand_impl(lambda *a, **k: "result", None, (q_layout, k_layout, v_layout), {})
+        self.assertTrue(callable(impl))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_expand_impl_callable_no_sp_calls_func(self, mock_platform):
+        """expanded_impl with no sequence parallelism calls func directly."""
+        from unittest.mock import MagicMock
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp")
+        )
+        q_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        k_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        v_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+
+        func_calls = []
+
+        def mock_func(*args, **kwargs):
+            func_calls.append(kwargs)
+            return "attention_output"
+
+        impl = op.get_expand_impl(mock_func, None, (q_layout, k_layout, v_layout), {})
+        query_mock = MagicMock()
+        key_mock = MagicMock()
+        value_mock = MagicMock()
+        result = impl(query_mock, key_mock, value_mock)
+        self.assertEqual(result, "attention_output")
+        self.assertEqual(len(func_calls), 1)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_expand_impl_callable_q_k_mismatch_in_impl_raises(self, mock_platform):
+        """expanded_impl raises ValueError when Q/K layouts mismatch on non-seq dims."""
+        from unittest.mock import MagicMock
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp")
+        )
+        q_layout = _build_layout(mesh, (Shard(0), Replicate()), 4)
+        k_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        v_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+
+        impl = op.get_expand_impl(
+            lambda *a, **k: "result", None, (q_layout, k_layout, v_layout), {}
+        )
+        with self.assertRaises(ValueError):
+            impl(MagicMock(), MagicMock(), MagicMock())
+
+    def test_get_split_info_no_alias_tensor_map_returns_defaults(self):
+        """_get_split_info returns all-1 defaults when alias_tensor_map is None."""
+        from unittest.mock import MagicMock
+        mock_layout = MagicMock()
+        mock_layout.alias_tensor_map = None
+        dims = {"batch": 0, "head": 1, "seq": 2}
+        result = op._get_split_info(mock_layout, dims)
+        self.assertEqual(result, {"batch": 1, "head": 1, "seq": 1})
+
+    def test_build_causal_mask_for_chunk_shape_and_values(self):
+        """_build_causal_mask_for_chunk returns correct shape and causal pattern."""
+        import torch
+        result = ScaledDotProductAttentionDistributedOp._build_causal_mask_for_chunk(
+            local_q_len=4, kv_len=8, split_id=1, device=torch.device("cpu")
+        )
+        self.assertEqual(result.shape, (4, 8))
+        self.assertTrue(result[0, 3])
+        self.assertFalse(result[0, 5])
+
+    def test_adjust_attn_mask_causal_split_id_zero_preserves_causal(self):
+        """_adjust_attn_mask_for_sp with is_causal=True and split_id=0 keeps is_causal=True."""
+        import torch
+        key = torch.randn(2, 4, 8, 64)
+        value = torch.randn(2, 4, 8, 64)
+        adj_mask, adj_causal, adj_key, adj_value = op._adjust_attn_mask_for_sp(
+            None, True, key, value, 0, 4, 2, 8, 2, torch.device("cpu")
+        )
+        self.assertIsNone(adj_mask)
+        self.assertTrue(adj_causal)
+        self.assertEqual(adj_key.shape[2], 4)
+
+    def test_adjust_attn_mask_causal_split_id_nonzero_builds_mask(self):
+        """_adjust_attn_mask_for_sp with is_causal=True and split_id=1 builds causal mask."""
+        import torch
+        key = torch.randn(2, 4, 8, 64)
+        value = torch.randn(2, 4, 8, 64)
+        adj_mask, adj_causal, adj_key, adj_value = op._adjust_attn_mask_for_sp(
+            None, True, key, value, 1, 4, 2, 8, 2, torch.device("cpu")
+        )
+        self.assertIsNotNone(adj_mask)
+        self.assertFalse(adj_causal)
+
+    def test_adjust_attn_mask_explicit_mask_2d_sliced(self):
+        """_adjust_attn_mask_for_sp with explicit 2D attn_mask slices local Q range."""
+        import torch
+        key = torch.randn(2, 4, 8, 64)
+        value = torch.randn(2, 4, 8, 64)
+        global_q_len = 8
+        local_q_len = 4
+        attn_mask = torch.ones(global_q_len, 8)
+        adj_mask, adj_causal, adj_key, adj_value = op._adjust_attn_mask_for_sp(
+            attn_mask, False, key, value, 0, local_q_len, 2, 8, 2, torch.device("cpu")
+        )
+        self.assertEqual(adj_mask.shape[0], local_q_len)
+
+    def test_adjust_attn_mask_explicit_mask_4d_sliced(self):
+        """_adjust_attn_mask_for_sp with explicit 4D attn_mask slices local Q range."""
+        import torch
+        key = torch.randn(2, 4, 8, 64)
+        value = torch.randn(2, 4, 8, 64)
+        global_q_len = 8
+        local_q_len = 4
+        attn_mask = torch.ones(2, 4, global_q_len, 8)
+        adj_mask, adj_causal, adj_key, adj_value = op._adjust_attn_mask_for_sp(
+            attn_mask, False, key, value, 1, local_q_len, 2, 8, 2, torch.device("cpu")
+        )
+        self.assertEqual(adj_mask.shape[2], local_q_len)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.shard.ops.parallel_scaled_dot_product_attention.platform")
+    def test_expanded_impl_with_sequence_parallelism(self, mock_sdpa_platform, mock_mesh_platform):
+        """expanded_impl with SP active calls _adjust_attn_mask_for_sp and then func."""
+        import torch
+        self._setup_mock_platform(mock_mesh_platform, world_size=8)
+        mock_sdpa_platform.get_rank.return_value = 0
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("sp", "mp")
+        )
+        q_layout = _build_layout(mesh, (Shard(2), Replicate()), 4)
+        k_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        v_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+
+        func_calls = []
+
+        def mock_func(*args, **kwargs):
+            func_calls.append(1)
+            return torch.zeros(2, 4, 2, 64)
+
+        impl = op.get_expand_impl(mock_func, None, (q_layout, k_layout, v_layout), {})
+        query = torch.randn(2, 4, 2, 64)
+        key = torch.randn(2, 4, 8, 64)
+        value = torch.randn(2, 4, 8, 64)
+        impl(query, key, value)
+        self.assertEqual(len(func_calls), 1)
+
+    def test_validate_sharding_consistency_none_tensor_map_returns(self):
+        """_validate_sharding_consistency skips when q_tm or k_tm is None."""
+        from unittest.mock import MagicMock
+        mock_q = MagicMock()
+        mock_q.tensor_map = None
+        mock_k = MagicMock()
+        mock_k.tensor_map = ("something",)
+        op._validate_sharding_consistency(mock_q, mock_k, {"batch": 0})
+
+
 if __name__ == "__main__":
     unittest.main()

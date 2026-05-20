@@ -110,7 +110,7 @@ class TestParallelEmbedding(unittest.TestCase):
             # Expected map: input(1, -1) + weight_embed(0) = (1, -1, 0)
             expected_map = (1, -1, 0)
             self.assertEqual(output_layout.tensor_map, expected_map, f"Op {op.op_name} failed")
-            
+
             # CP requires wrapper to intercept max_norm
             impl = op.get_expand_impl(None, output_layout, (input_layout, weight_layout), None)
             self.assertTrue(callable(impl))
@@ -134,7 +134,7 @@ class TestParallelEmbedding(unittest.TestCase):
             # Expected map: input(1, -1) + weight_embed(-1) = (1, -1, -1)
             self.assertEqual(output_layout.tensor_map, (1, -1, -1))
             self.assertTrue(output_layout.is_partial())
-            
+
             # Partial should be on mp axis (index 1)
             mp_idx = mesh.axis_index("mp")
             self.assertEqual(output_layout.partial[mp_idx], "sum")
@@ -157,7 +157,7 @@ class TestParallelEmbedding(unittest.TestCase):
             # Expected map: input(2, -1) + weight_embed(0) = (2, -1, 0)
             expected_map = (2, -1, 0)
             self.assertEqual(output_layout.tensor_map, expected_map)
-            
+
             vp_idx = mesh.axis_index("vp")
             self.assertEqual(output_layout.partial[vp_idx], "sum")
 
@@ -221,7 +221,7 @@ class TestParallelEmbedding(unittest.TestCase):
         for op in embedding_ops:
             output_layout = op.infer_layout((input_layout, weight_layout))
             impl = op.get_expand_impl(None, output_layout, (input_layout, weight_layout), None)
-            
+
             with self.assertRaisesRegex(ValueError, "Row-Parallel.*does not support `scale_grad_by_freq=True`"):
                 impl(MagicMock(), MagicMock(), scale_grad_by_freq=True)
 
@@ -297,13 +297,109 @@ class TestParallelEmbedding(unittest.TestCase):
         for op in embedding_ops:
             output_layout = op.infer_layout((input_layout, weight_layout))
             impl = op.get_expand_impl(MagicMock(), output_layout, (input_layout, weight_layout), None)
-            
+
             # Should not raise ValueError for scale_grad_by_freq
             try:
                 impl(MagicMock(), MagicMock(), scale_grad_by_freq=True)
             except ValueError as e:
                 if "does not support `scale_grad_by_freq`" in str(e):
                     self.fail("CP Embedding should support scale_grad_by_freq")
+
+class TestEmbeddingRowParallelImpl(unittest.TestCase):
+    """
+    Feature: EmbeddingDistributedOp row-parallel get_expand_impl execution paths
+    Description: Test _handle_rp_input and row-parallel closure behavior.
+    Expectation: Correct index shifting, masking, and error handling.
+    """
+
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_row_parallel_max_norm_raises(self, mock_platform):
+        """RP impl with max_norm raises ValueError."""
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = 4
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(4,), mesh_dim_names=("mp",), init_backend=False
+        )
+        input_layout = _build_layout(mesh, (Replicate(),), 2)
+        weight_layout = _build_layout(mesh, (Shard(0),), 2)
+
+        for embedding_op in embedding_ops:
+            output_layout = embedding_op.infer_layout((input_layout, weight_layout))
+            impl = embedding_op.get_expand_impl(
+                MagicMock(), output_layout, (input_layout, weight_layout), None
+            )
+            with self.assertRaisesRegex(ValueError, "Row-Parallel.*does not support.*max_norm"):
+                impl(MagicMock(), MagicMock(), max_norm=1.0)
+
+    def test_handle_rp_input_no_padding(self):
+        """_handle_rp_input shifts indices and masks out-of-range entries (no padding_idx)."""
+        weight_layout = MagicMock()
+        weight_layout.mesh.mesh_shape = (4,)
+        weight_layout.mesh.get_local_rank.return_value = 0
+
+        weight_tensor = MagicMock()
+        weight_tensor.shape = [100, 64]
+
+        input_tensor = np.array([50, 150, 200], dtype=np.float32)
+        new_args = [input_tensor, weight_tensor]
+
+        op_instance = EmbeddingDistributedOp("embedding_test_rp")
+        mapped_input, mask_int = op_instance._handle_rp_input(
+            input_tensor, weight_tensor, weight_layout, 0, new_args, {}, False, None
+        )
+
+        np.testing.assert_array_almost_equal(mask_int, [1.0, 0.0, 0.0])
+        np.testing.assert_array_almost_equal(mapped_input, [50.0, 0.0, 0.0])
+
+    def test_handle_rp_input_padding_in_range_updates_args(self):
+        """_handle_rp_input with padding_idx in local range maps it to local index."""
+        weight_layout = MagicMock()
+        weight_layout.mesh.mesh_shape = (4,)
+        weight_layout.mesh.get_local_rank.return_value = 0
+
+        weight_tensor = MagicMock()
+        weight_tensor.shape = [100, 64]
+
+        input_tensor = np.array([50], dtype=np.float32)
+        new_args = [input_tensor, weight_tensor]
+        kwargs = {}
+
+        op_instance = EmbeddingDistributedOp("embedding_test_rp2")
+        op_instance._handle_rp_input(
+            input_tensor, weight_tensor, weight_layout, 0, new_args, kwargs, False, 50
+        )
+        self.assertEqual(kwargs.get("padding_idx"), 50)
+
+    def test_handle_rp_input_padding_out_of_range_removes_from_kwargs(self):
+        """_handle_rp_input with padding_idx out of local range removes it from kwargs."""
+        weight_layout = MagicMock()
+        weight_layout.mesh.mesh_shape = (4,)
+        weight_layout.mesh.get_local_rank.return_value = 0
+
+        weight_tensor = MagicMock()
+        weight_tensor.shape = [100, 64]
+
+        input_tensor = np.array([50], dtype=np.float32)
+        new_args = [input_tensor, weight_tensor]
+        kwargs = {"padding_idx": 200}
+
+        op_instance = EmbeddingDistributedOp("embedding_test_rp3")
+        op_instance._handle_rp_input(
+            input_tensor, weight_tensor, weight_layout, 0, new_args, kwargs, False, 200
+        )
+        self.assertNotIn("padding_idx", kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()
