@@ -398,8 +398,7 @@ class PipelineScheduleRuntime(ABC):
             key = (stage_index, micro_index)
             if self._overlap_p2p and key in self.bwd_handle_cache:
                 self._wait_p2p(self.bwd_handle_cache.pop(key))
-            is_last_microbatch = micro_index == self.micro_batch_num - 1
-            stage.backward_one_chunk(micro_index, is_last_microbatch)
+            stage.backward_one_chunk(micro_index)
 
         elif cur_step.type == MetaStepType.BWD_SEND:
             comm_handle = stage.exec_bwd_send_ops(micro_index)

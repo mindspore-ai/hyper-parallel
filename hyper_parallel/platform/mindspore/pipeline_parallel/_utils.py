@@ -1,3 +1,9 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
@@ -143,10 +149,13 @@ def recv_object_list(recv_obj, src=0, group=None):
                           but got 'group' type : {type(group)}.")
     if not isinstance(src, int):
         raise TypeError("For recv_object, the src must be int.")
-    obj_size = Tensor([0], dtype=mstype.int32)
+    obj_size = mint.zeros((1,), dtype=mstype.int32)
     recv(obj_size, src, group)
-    size_val = obj_size.item()
-    obj_tensor = mint.empty([size_val], dtype=mstype.int8)
+    # MindSpore PyNative ``recv`` only does a comm-stream wait; bridge to host
+    # so the subsequent ``.item()`` reads the freshly-received value instead
+    # of the original buffer.
+    size_val = int(obj_size.item())
+    obj_tensor = mint.zeros((size_val,), dtype=mstype.int8)
     recv(obj_tensor, src, group)
     buf = obj_tensor.asnumpy().tobytes()[:size_val]
     recv_obj.clear()
