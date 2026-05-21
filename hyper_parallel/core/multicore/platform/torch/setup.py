@@ -36,7 +36,7 @@ def _find_prebuild_vendor_libdirs():
     Resolution order:
       1. CANN_VENDOR_FWD_LIBDIR / CANN_VENDOR_BWD_LIBDIR  (explicit per-op)
       2. CANN_VENDOR_LIBDIR  (legacy single-lib; used for both)
-      3. prebuild/multicore_moe_ffn/vendors/... (auto-detect + extract)
+      3. prebuild/mega_moe/vendors/... (auto-detect + extract)
     """
     fwd = os.environ.get("CANN_VENDOR_FWD_LIBDIR",
           os.environ.get("CANN_VENDOR_LIBDIR", ""))
@@ -46,15 +46,15 @@ def _find_prebuild_vendor_libdirs():
         return fwd, bwd
     # Auto-detect: prebuild dir is 2 levels up from platform/torch/ (→ multicore/)
     prebuild_dir = os.path.normpath(
-        os.path.join(BASE_DIR, "../../prebuild/multicore_moe_ffn"))
+        os.path.join(BASE_DIR, "../../prebuild/mega_moe"))
     tarball = prebuild_dir + ".tar.gz"
     if not os.path.isdir(prebuild_dir) and os.path.isfile(tarball):
         print(f"[setup] Extracting prebuild: {tarball}")
         with tarfile.open(tarball) as tf:
             tf.extractall(os.path.dirname(prebuild_dir))
     vendors = os.path.join(prebuild_dir, "vendors")
-    fwd = fwd or os.path.join(vendors, "multicore_moe_ffn_nn", "op_api", "lib")
-    bwd = bwd or os.path.join(vendors, "multicore_moe_ffn_grad_nn", "op_api", "lib")
+    fwd = fwd or os.path.join(vendors, "mega_moe_nn", "op_api", "lib")
+    bwd = bwd or os.path.join(vendors, "mega_moe_grad_nn", "op_api", "lib")
     return fwd, bwd
 
 
@@ -133,7 +133,7 @@ for _ldir in dict.fromkeys([_FWD_LIBDIR, _BWD_LIBDIR]):
 
 exts = []
 ext = NpuExtension(
-    name="hyper_parallel_multicore_moe_ffn_pta",
+    name="hyper_parallel_mega_moe_pta",
     sources=source_files,
     extra_compile_args=[
         '-I' + os.path.join(PYTORCH_NPU_INSTALL_PATH, "include/third_party/acl/inc"),
@@ -145,9 +145,9 @@ ext = NpuExtension(
 exts.append(ext)
 
 setup(
-    name="hyper_parallel_multicore_moe_ffn_pta",
+    name="hyper_parallel_mega_moe_pta",
     version='1.0',
-    keywords='hyper_parallel_multicore_moe_ffn_pta',
+    keywords='hyper_parallel_mega_moe_pta',
     ext_modules=exts,
     packages=find_packages(),
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=USE_NINJA)},

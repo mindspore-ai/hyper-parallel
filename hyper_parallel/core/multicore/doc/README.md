@@ -1,5 +1,7 @@
 # MoE-FFN Multicore Operator
 
+---
+
 ## 1. 背景与融合思路
 
 ### 1.1 问题
@@ -22,7 +24,7 @@ AllToAll-Dispatch → GMM1(up_proj) → SwiGLU → GMM2(down_proj) → AllToAll-
 | AllToAll 通信占端到端时间 | ~17%（其中 61% 被 GEMM 掩盖，39% 暴露） |
 | Cube/Vector 相互空闲 | 两类核轮流空转，任一时刻只有一类核工作 |
 
-根因分析：GroupedGEMM 只使用 Cube 核，Vector 核在 GMM 执行期间全部空闲；SwiGLU 由 Vector 核执行时 25 个 Cube 同时空转；AllToAll 由 HOST 驱动，通信空窗期设备内 AIC 和 AIV 也无法计算。
+根因分析：GroupedGEMM 只使用 Cube 核，Vector 核在 GMM 执行期间全部空闲；SwiGLU 由 Vector 核执行时 Cube 全部空转；AllToAll 由 HOST 驱动，通信空窗期设备内 AIC 和 AIV 也无法计算。
 
 ### 1.2 融合方案
 
@@ -40,25 +42,198 @@ Multicore MoE-FFN 将上述五个算子**融合为一个 kernel**，由 AIC（AI
 
 ### 1.3 RATR：Rank-Aware Tile Reordering
 
-在多卡 AllToAll 场景下，各 Rank 同时向同一目标 Rank 发送数据会造成网络拥塞，导致尾延迟暴露。RATR 通过调整 AllToAll Tile 的执行顺序，使发往不同 Rank 的通信流量在时间轴上均匀分散，避免多源 Rank 同时涌向同一目标。RATR 不修改任何计算逻辑，仅对 `vector_task_indexs` 中 AllToAll Tile 重排，与 SSC 静态调度配置一起在 RuntimeConfig 中离线生成，运行时零开销。
+在多卡 AllToAll 场景下，各 Rank 同时向同一目标 Rank 发送数据会造成网络拥塞，导致尾延迟暴露。RATR 通过调整 AllToAll Tile 的执行顺序，使发往不同 Rank 的通信流量在时间轴上均匀分散，避免多源 Rank 同时涌向同一目标。RATR 不修改任何计算逻辑，仅对 `vector_task_indexs` 中 AllToAll Tile 重排，与静态调度配置一起在 RuntimeConfig 中离线生成，运行时零开销。
 
 反向计算流程（同理融合）：
 
 ```text
-AllToAll-Dispatch → ┌─ GMM1(act_grad)  ─────────────────┐
-                    └─ GMM4(w1_grad)                     │
-                                                         ▼
-                                              SwiGLU-grad → GMM2(gate_grad) → ┌─ AllToAll-Combine
-                                                                               └─ GMM3(w2_grad)
+AllToAll-Dispatch → ┌─ GMM1(act_grad) ──────────────────────┐
+                    └─ GMM4(w1_grad)                          │
+                                                              ▼
+                                               SwiGLU-grad → GMM2(gate_grad) → ┌─ AllToAll-Combine
+                                                                                └─ GMM3(w2_grad)
 ```
 
 GMM1 与 GMM4 并行，AllToAll-Combine 与 GMM3 并行，进一步减少空闲等待。
 
 ---
 
-## 2. 正向算子
+## 2. 目录结构
 
-### 2.1 计算流图
+### 2.1 设计原则
+
+本框架针对昇腾 A3/A2 NPU 的 AIC/AIV 双路硬件特点制定如下分层规则：
+
+| 层次 | Python 模块 | C++ 模块 | 职责 | 不包含 |
+|---|---|---|---|---|
+| **图层** | `scheduler/graph.py` | — | 算子拓扑、切分规则、形状推导 | 任何算子特定参数 |
+| **运行时层** | `scheduler/config.py` `scheduler/scheduler.py` | — | TaskDesc 生成、事件图、RATR 优化 | 框架 / 编译细节 |
+| **任务层** | `tasks/` | — | 每类算子的 FillConfig（填充策略） | 调度核心逻辑 |
+| **模块层** | `modules/<op>/` | — | 具体 DAG + CLI 数据生成 | C++ / 框架代码 |
+| **调度器层** | — | `ops/runtime/` | 通用 AIC/AIV 事件同步原语 | 计算核实现 |
+| **算子层** | — | `ops/<op_name>/` | 算子特有计算核 + KernelWorker 调度循环 | 跨算子共享逻辑 |
+| **适配层** | `platform/` | `platform/*/c_api/` | MindSpore/PyTorch 接口 | 图与调度逻辑 |
+
+### 2.2 完整目录树
+
+```text
+multicore/
+├── __init__.py
+│
+├── scheduler/                       # Python 编译器核心（无算子特化）
+│   ├── __init__.py
+│   ├── config.py                    # TaskSplitValue + init_task_split_value
+│   │                                # + 全部 ctypes structs（RuntimeConfigC 等）
+│   ├── graph.py                     # ComputeGraph / OperatorNode / TensorSpec
+│   │                                # SplitSpec / OpType / propagate_splits()
+│   ├── builder.py                   # build_runtime_config(graph, tsv, rank_id)
+│   ├── scheduler.py                 # revise_task_queue() / revise_gmm_task_queue_bwd()
+│   └── allocator.py                 # param_position 自动分配（预留）
+│
+├── tasks/                           # 任务类型注册与填充策略
+│   ├── __init__.py
+│   ├── task_base.py                 # FillConfig (ABC): fill(cfg, op, tsv) 接口
+│   ├── alltoall.py                  # AllToAllFillConfig（dispatch / combine）
+│   ├── gmm.py                       # GmmFillConfig（各变体）
+│   ├── swiglu.py                    # SwiGLUFillConfig + SwiGLUGradFillConfig
+│   ├── utils.py                     # advance_tsv_* / add_terminate / add_dynamic_data
+│   ├── tiling.py                    # 全局 tiling 字节注册表
+│   └── registry.py                  # FILL_CONFIG_REGISTRY 字典
+│
+├── modules/                         # 算子模块层（图定义 + CLI 数据生成）
+│   └── moe/
+│       ├── forward/
+│       │   ├── graph.py             # build_forward_graph(tsv, ...) → ComputeGraph
+│       │   ├── gen_runtime_data.py  # CLI: --tp/--ep/... 生成 *.bin 文件
+│       │   └── tiling_tables.py     # GMM/SwiGLU tiling 参数表
+│       └── backward/
+│           ├── graph.py             # build_backward_graph(tsv, ...) → ComputeGraph
+│           ├── gen_runtime_data.py
+│           └── tiling_tables.py
+│
+├── ops/                             # C++ CANN AscendC 算子实现
+│   ├── runtime/                     # ⭐ 通用共享层（build 时拷入各 op_kernel/runtime/）
+│   │   ├── runtime_config.hpp       # 共享常量 + struct 定义（TaskDesc / EventDesc / TaskType 等）
+│   │   └── worker_kernel.h          # KernelWorkerBase<Derived> CRTP 基类
+│   │
+│   ├── mega_moe/               # MoE FFN 正向算子
+│   │   ├── op_host/                 # 主机侧：infershape / tiling / API
+│   │   └── op_kernel/               # 设备侧
+│   │       ├── mega_moe.cpp        # kernel 入口（include worker_kernel.cpp）
+│   │       ├── mega_moe_tiling_key.h
+│   │       ├── worker_kernel.cpp    # KernelWorker（fwd 特化：tiling@[23], event@[24]）
+│   │       │                        # #include "runtime/worker_kernel.h"
+│   │       ├── swi_glu/             # 编译时从 ops-nn 拷入
+│   │       ├── grouped_matmul/      # 编译时从 ops-transformer 拷入
+│   │       ├── put_mem_signal/
+│   │       │   └── put_mem_signal_kernel.cpp  # 自包含；DTYPE_DISPATCH_TARGET 实例化
+│   │       └── runtime/             # build 时由 build_multicore_local.sh 从 ops/runtime/ 拷入
+│   │           ├── runtime_config.hpp
+│   │           └── worker_kernel.h
+│   │
+│   └── mega_moe_grad/          # MoE FFN 反向算子（结构同上）
+│       ├── op_host/
+│       └── op_kernel/
+│           ├── mega_moe_grad.cpp
+│           ├── mega_moe_grad_tiling_key.h
+│           ├── worker_kernel.cpp    # KernelWorker（bwd 特化：tiling@[30], event@[31]）
+│           ├── swi_glu/
+│           ├── swi_glu_grad/
+│           ├── grouped_matmul/
+│           ├── put_mem_signal/
+│           │   └── put_mem_signal_kernel.cpp  # 自包含；DTYPE_DY 实例化
+│           └── runtime/             # build 时拷入
+│               ├── runtime_config.hpp
+│               └── worker_kernel.h
+│
+├── platform/                        # 框架适配层
+│   ├── mindspore/                   # CMakeLists.txt + c_api/ + framework/
+│   └── torch/                       # setup.py + csrc/
+│
+└── prebuild/                        # 预编译 vendor 包
+    └── mega_moe.tar.gz
+```
+
+### 2.3 核心模块说明
+
+#### scheduler/graph.py — 计算图层
+
+提供三个核心抽象：
+
+- **TensorSpec**：描述一个张量（shape、dtype、param_position、split_dim、is_dynamic、transpose）
+- **SplitSpec**：声明该算子如何切分（split_inputs、task_num_fn、split_output_dims）
+- **ComputeGraph**：DAG 管理器，`propagate_splits(tsv)` 按拓扑序自动计算每个节点的 task_num 和 split_dim
+
+#### scheduler/config.py — 配置与拓扑参数
+
+`TaskSplitValue` 封装拓扑超参数（tp、ep、seq_size、all_expert_num、top_k）和运行时计数器。
+
+`RuntimeConfigC` 是连接 Python 和 C++ 的数据桥梁，与 `ops/runtime/runtime_config.hpp` 中的 struct 定义一一对应（ctypes ↔ AscendC struct）。
+
+#### tasks/ — 任务填充策略层
+
+每个文件对应一类算子任务类型，实现 `FillConfig.fill(cfg, op, tsv)` 接口，向 `RuntimeConfigC` 的 `task_descs[]` 和 `event_descs[]` 写入 TaskDesc / EventDesc。
+
+注册机制（`registry.py`）：
+
+```python
+FILL_CONFIG_REGISTRY: Dict[OpType, Type[FillConfig]] = {
+    OpType.ALLTOALL:    AllToAllFillConfig,
+    OpType.GMM:         GmmFillConfig,
+    OpType.SWIGLU:      SwiGLUFillConfig,
+    OpType.SWIGLU_GRAD: SwiGLUFillConfig,
+}
+```
+
+新增算子只需在此字典中添加一行，无需修改核心调度逻辑。
+
+#### ops/runtime/ — C++ 通用共享层
+
+| 文件 | 职责 |
+|---|---|
+| `runtime_config.hpp` | 共享数据结构：`MAX_TASK_NUM`、`TaskDesc`、`EventDesc`、`TaskType` 枚举、所有 accessor 函数 |
+| `worker_kernel.h` | `KernelWorkerBase<Derived>` CRTP 基类，含 `Process()`、`WaitForDependency()`、`TriggerEvent()` |
+
+**关键**：`ops/runtime/` 不会直接参与编译。`build_multicore_local.sh` 在执行时会将整个 `runtime/` 目录分别拷贝到 `build/mega_moe/mega_moe/op_kernel/runtime/` 和 `build/mega_moe/mega_moe_grad/op_kernel/runtime/`，使各算子 `worker_kernel.cpp` 可以用 `#include "runtime/worker_kernel.h"` 访问共享定义。
+
+#### ops/<op_name>/op_kernel/worker_kernel.cpp — 算子调度循环
+
+每个算子保留自己的 `KernelWorker` 类，原因是 `input_list` 索引硬编码不同：
+
+| | mega_moe（正向）| mega_moe_grad（反向）|
+|---|---|---|
+| tiling 参数 | `input_list[23]` | `input_list[30]` |
+| event 计数器 | `input_list[24]` | `input_list[31]` |
+| GMM workspace | `input_list[11]` | `input_list[25]` |
+| SwiGLU grad workspace | — | `input_list[26]` |
+| 特有计算核 | `TASK_SWI_GLU` | `TASK_SWI_GLU_GRAD` |
+
+### 2.4 数据流总览
+
+```text
+用户 (Python)
+    ↓ build_forward_graph(tsv)
+ComputeGraph [modules/mega_moe/forward/graph.py]
+    ↓ propagate_splits(tsv)
+各 OperatorNode 的 task_num / split_dim 被自动填充
+    ↓ build_runtime_config(graph, tsv, rank_id)
+    ↓  → 多态调用各 FillConfig.fill()
+    ↓  → RATR / GMM 交错优化
+RuntimeConfigC (ctypes) → 序列化为 runtime_config_rank_*.bin
+                                      ↓
+                          C++ worker_kernel 读取
+                                      ↓
+                    KernelWorker::Process() 主调度循环
+                    AIC（偶数 block）→ cube_task_indexs → GMM
+                    AIV（奇数 block）→ vector_task_indexs → SwiGLU/AllToAll
+                    事件同步：WaitForDependency / TriggerEvent
+```
+
+---
+
+## 3. 正向算子
+
+### 3.1 计算流图
 
 ```text
 dispatch ──► up_proj (GMM1) ──► swiglu ──► down_proj (GMM2) ──► combine
@@ -72,7 +247,7 @@ dispatch ──► up_proj (GMM1) ──► swiglu ──► down_proj (GMM2) �
 | down_proj | GroupedMatmul | AIC | `[tokens, intermediate] × [E, intermediate, hidden]` |
 | combine | AllToAll | AIV | 将 expert 结果汇聚回原始 rank |
 
-### 2.2 Task 切分参数
+### 3.2 Task 切分参数
 
 | 算子 | split_value | 执行核 | task_num 计算 |
 |---|---|---|---|
@@ -82,7 +257,7 @@ dispatch ──► up_proj (GMM1) ──► swiglu ──► down_proj (GMM2) �
 | down_proj | 4096 | AIC | `num_cube_cores × single_rank_expert_num` |
 | combine | 128 | AIV | `all_expert_num × (per_expert_seq_to_other // 128)` |
 
-### 2.3 Tiling 文件（正向，各 rank 共用）
+### 3.3 Tiling 文件（正向，各 rank 共用）
 
 | 文件 | 参数位置 | 说明 |
 |---|---|---|
@@ -90,20 +265,20 @@ dispatch ──► up_proj (GMM1) ──► swiglu ──► down_proj (GMM2) �
 | `swiglu_tiling.bin` | pos 18 | SwiGLU tiling，大小 = `(2×num_cube_cores+1) × entry_size` |
 | `down_proj_tiling.bin` | pos 19 | GMM2 tiling |
 
-生成方式见第 5.1 节。
+生成方式见第 6.1 节。
 
 ---
 
-## 3. 反向算子
+## 4. 反向算子
 
-### 3.1 计算流图
+### 4.1 计算流图
 
 ```text
-dispatch ──► act_grad (GMM1)  ──────────────────────────────────────────────────────┐
-         └── w1_grad (GMM4)                                                         │
-                                                                                    ▼
-                                                  swiglu_grad ──► gate_grad (GMM2) ──► combine
-                                                                                   └── w2_grad (GMM3)
+dispatch ──► act_grad (GMM1) ──────────────────────────────────────────────────────────┐
+         └── w1_grad (GMM4)                                                             │
+                                                                                        ▼
+                                                    swiglu_grad ──► gate_grad (GMM2) ──► combine
+                                                                                     └── w2_grad (GMM3)
 ```
 
 | 算子 | 映射 | 输入 | 输出 |
@@ -116,34 +291,34 @@ dispatch ──► act_grad (GMM1)  ──────────────�
 | w2_grad (GMM3) | `gate.T @ grad_gate` | `gate`（正向 up_proj_y）, `grad_gate` | `gate_dw`（W1 权重梯度） |
 | combine | AllToAll | `gate_dx` | `grad_x`（汇聚后梯度） |
 
-### 3.2 并行执行说明
+### 4.2 并行执行说明
 
 - **act_grad（GMM1）与 w1_grad（GMM4）并行**：两者均依赖 dispatch 输出 `target`；GMM1 使用 `advance_mode="cube_only"`（只推进 task 计数，不推进 event），GMM4 使用 `advance_mode="cube_custom"` 统一推进 event，避免重复计数。
 
 - **combine 与 w2_grad（GMM3）并行**：两者均依赖 gate_grad（GMM2）输出；combine 使用 `advance_mode="vector_only"`，GMM3 使用 `cube_custom` 处理 event。
 
-### 3.3 Tiling 文件（反向，各 rank 共用）
+### 4.3 Tiling 文件（反向，各 rank 共用）
 
 | 文件 | 参数名 | 说明 |
 |---|---|---|
-| `act_grad_tiling.bin` | `act_grad_tiling` | GMM1 反向 tiling（act_grad：dispatch_target @ W2.T） |
-| `gate_grad_tiling.bin` | `gate_grad_tiling` | GMM2 反向 tiling（gate_grad：grad_gate @ W1.T） |
+| `act_grad_tiling.bin` | `act_grad_tiling` | GMM1 反向 tiling（dispatch_target @ W2.T） |
+| `gate_grad_tiling.bin` | `gate_grad_tiling` | GMM2 反向 tiling（grad_gate @ W1.T） |
 | `w2_grad_tiling.bin` | `w2_grad_tiling` | GMM3（W2 权重梯度）tiling |
 | `w1_grad_tiling.bin` | `w1_grad_tiling` | GMM4（W1 权重梯度）tiling |
 | `swiglu_grad_tiling.bin` | `swiglu_grad_tiling` | SwiGLU 反向 tiling |
 
-生成方式见第 5.2 节。
+生成方式见第 6.2 节。
 
 ---
 
-## 4. Task 切分设计
+## 5. Task 切分设计
 
-### 4.1 TaskSplitValue
+### 5.1 TaskSplitValue
 
 `TaskSplitValue` 封装硬件拓扑参数和运行时计数器：
 
 ```python
-from hyper_parallel.core.multicore.modules.moe_ffn.common.compute_graph import TaskSplitValue
+from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 
 tsv = TaskSplitValue(
     tp=4,              # Tensor Parallel 度
@@ -162,9 +337,9 @@ tsv = TaskSplitValue(
 | `per_rank_seq` | `seq_size × ep × top_k // tp` | 每个 rank 处理的 token 数 |
 | `per_expert_seq` | `per_rank_seq // top_k` | 每个 expert 的 token 数 |
 | `per_expert_seq_to_other` | `seq_size × top_k // all_expert_num` | AllToAll 每对 rank 的 token 数 |
-| `all_event_num` | 自动计算 | 全局 event 总数（combine 全局触发点） |
+| `all_event_num` | 自动计算 | 全局 event 总数 |
 
-### 4.2 propagate_splits 算法
+### 5.2 propagate_splits 算法
 
 `ComputeGraph.propagate_splits(tsv)` 按拓扑顺序自动计算每个算子的 `task_num`：
 
@@ -191,7 +366,7 @@ down_proj [(0,0)]  → swiglu_out.split_dim == 0 ✓ → gmm2_y.split_dim = 0
 combine   [(1,0)]  → gmm2_y.split_dim == 0 ✓
 ```
 
-### 4.3 split_inputs 选择原则
+### 5.3 split_inputs 选择原则
 
 `split_inputs` 中必须选择**图内有上游生产者的输入**（非外部叶子张量）。叶子张量的 `split_dim` 在每次 `propagate_splits` 时重置为 -1，以叶子为触发条件将导致 `task_num` 始终为 1。
 
@@ -203,9 +378,9 @@ w1_grad: split_inputs=[(1, 0)]   # inputs[1] = target
 w1_grad: split_inputs=[(0, 0)]   # task_num 始终 = 1
 ```
 
-### 4.4 Event 驱动协调
+### 5.4 Event 驱动协调
 
-Multicore MoE-FFN 中各核通过事件信号量（event）同步，关键配置：
+Multicore MoE-FFN 中各核通过事件信号量（event）同步：
 
 **AllToAll dispatch**：per-expert 触发
 
@@ -218,10 +393,8 @@ trigger_event = pre_event_num + (task_index // expert_group_size) + 1
 **AllToAll combine**：global 触发
 
 ```text
-trigger_event = all_event_num  (全局唯一 event)
+trigger_event = all_event_num  （全局唯一 event）
 ```
-
-所有 combine task 触发同一个全局 event，表示本 rank 所有 expert 结果已发送完毕。
 
 **GMM 间 event 协调**（反向）：
 
@@ -232,19 +405,37 @@ trigger_event = all_event_num  (全局唯一 event)
 | combine | `vector_only` | 只推进 task 计数 |
 | w2_grad (GMM3) | `cube_custom` | 统一推进 event |
 
+### 5.5 Task 切分参数设计原则
+
+| 算子类型 | 推荐 split_dim | task_num_fn | 注意事项 |
+|---|---|---|---|
+| GroupedMatMul（GMM）| 0（M 维，expert 并行）| `expert_num × (seq_per_expert // TILE_M)` | TILE_M 必须对齐 GMM block_size |
+| AllToAll（dispatch）| 0（token 维）| `total_tokens // token_tile` | event 范围：per-expert（dispatch）vs 全局（combine）|
+| AllToAll（combine）| 0 | `total_tokens // token_tile` | 依赖所有 down_proj tile 完成（N:1 扇入）|
+| SwiGLU / Add | 0 | = 上游 GMM task_num（1:1）| task_num 必须等于上游，否则事件错位 |
+
+### 5.6 Event 设计规范
+
+| 规则 | 说明 |
+|---|---|
+| **单调性** | event 计数器只增不减，保证无死锁 |
+| **1:1 依赖** | 每个生产者 tile 完成后触发对应消费者 tile |
+| **N:1 扇入** | 多个上游 tile 共同触发一个下游 tile，设置 `trigger_count = N` |
+| **1:N 扇出** | 一个上游触发多个下游，每个下游分配独立 event ID |
+| **ID 不重叠** | dispatch / combine / gmm 事件 ID 段需严格区分 |
+
 ---
 
-## 5. RuntimeConfig 生成
+## 6. RuntimeConfig 生成
 
 `RuntimeConfig` 是 Multicore MoE-FFN 的调度配置二进制，包含每个 task 的依赖 event、触发 event、tensor 地址偏移等信息，**按 rank 独立生成**。
 
-### 5.1 正向
+### 6.1 正向
 
 ```bash
 # 必须从 hyper-parallel 仓库根目录（hyper_parallel/ 包所在目录）运行
-# gen_runtime_data.py 使用相对导入，直接 python gen_runtime_data.py 会报
-# "ImportError: attempted relative import with no known parent package"
-python -m hyper_parallel.core.multicore.modules.moe_ffn.forward.gen_runtime_data \
+# 直接 python gen_runtime_data.py 会报 ImportError（相对导入）
+python -m hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_data \
     --tp 4 --ep 4 \
     --seq_size 8192 \
     --all_expert_num 32 \
@@ -269,12 +460,12 @@ python -m hyper_parallel.core.multicore.modules.moe_ffn.forward.gen_runtime_data
 └── ...
 ```
 
-也可在 Python 代码中直接调用（端到端示例见第 8 节）：
+也可在 Python 代码中直接调用：
 
 ```python
-from hyper_parallel.core.multicore.modules.moe_ffn.forward.gen_runtime_data import build_config_for_rank
-from hyper_parallel.core.multicore.modules.moe_ffn.forward.forward_graph import build_forward_graph
-from hyper_parallel.core.multicore.modules.moe_ffn.common.compute_graph import TaskSplitValue
+from hyper_parallel.core.multicore.modules.mega_moe.forward.gen_runtime_data import build_config_for_rank
+from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
+from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
 
 tsv   = TaskSplitValue(tp=4, ep=4, seq_size=8192, all_expert_num=32, top_k=8)
 graph = build_forward_graph(tsv, dispatch_sv=128, up_proj_sv=4096,
@@ -284,11 +475,10 @@ graph.propagate_splits(tsv)
 cfg = build_config_for_rank(graph, tsv, rank_id=0)   # 返回 RuntimeConfigC
 ```
 
-### 5.2 反向
+### 6.2 反向
 
 ```bash
-# 同上，必须从 hyper-parallel 仓库根目录运行
-python -m hyper_parallel.core.multicore.modules.moe_ffn.backward.gen_runtime_data \
+python -m hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_data \
     --tp 4 --ep 4 \
     --seq_size 8192 \
     --all_expert_num 32 \
@@ -308,30 +498,30 @@ python -m hyper_parallel.core.multicore.modules.moe_ffn.backward.gen_runtime_dat
 ├── w2_grad_tiling.bin              # GMM3（W2 梯度）tiling
 ├── w1_grad_tiling.bin              # GMM4（W1 梯度）tiling
 ├── swiglu_grad_tiling.bin          # SwiGLU 反向 tiling
-├── all_event_counters.bin          # 4096 uint8 zeros，4 KB（各 rank 共用，需 symmetric memory）
+├── all_event_counters.bin          # 4096 uint8 zeros，4 KB（各 rank 共用）
 ├── gmm_workspace.bin
 └── runtime_config_input_rank_<i>.bin
 ```
 
 ---
 
-## 6. 编译与安装
+## 7. 编译与安装
 
-### 6.1 环境变量
+### 7.1 CANN vendor 包
 
 Multicore MoE-FFN 依赖两个预编译 CANN vendor 包：
 
 | 包 | 导出符号 | 说明 |
 |---|---|---|
-| `multicore_moe_ffn_nn` | `aclnnMulticoreMoeFfn*` | 正向 kernel |
-| `multicore_moe_ffn_grad_nn` | `aclnnMulticoreMoeFfnGrad*` | 反向 kernel |
+| `mega_moe_nn` | `aclnnMegaMoe*` | 正向 kernel |
+| `mega_moe_grad_nn` | `aclnnMegaMoeGrad*` | 反向 kernel |
 
 库路径解析优先级（从高到低）：
 
 ```bash
 # 方式 1：显式指定每个包的 lib 目录（最高优先级）
-export CANN_VENDOR_FWD_LIBDIR=/path/to/multicore_moe_ffn_nn/op_api/lib
-export CANN_VENDOR_BWD_LIBDIR=/path/to/multicore_moe_ffn_grad_nn/op_api/lib
+export CANN_VENDOR_FWD_LIBDIR=/path/to/mega_moe_nn/op_api/lib
+export CANN_VENDOR_BWD_LIBDIR=/path/to/mega_moe_grad_nn/op_api/lib
 
 # 方式 2：指定 vendors 根目录（fwd/bwd 路径自动推导）
 export HP_MULTICORE_DIR=/path/to/vendors_root
@@ -339,64 +529,27 @@ export HP_MULTICORE_DIR=/path/to/vendors_root
 # 方式 3：遗留单库模式（fwd 和 bwd 共用同一 lib 目录）
 export CANN_VENDOR_LIBDIR=/path/to/opp_vendor_root/op_api/lib
 
-# 方式 4：无需设置（自动从 prebuild/multicore_moe_ffn.tar.gz 解压）
+# 方式 4：无需设置（自动从 prebuild/mega_moe.tar.gz 解压）
 ```
 
-如使用预编译包（`prebuild/multicore_moe_ffn.tar.gz`），无需手动设置，导入时自动解压并检测路径。
+如使用预编译包（`prebuild/mega_moe.tar.gz`），无需手动设置，导入时自动解压并检测路径。
 
-### 6.2 PyTorch 接入
+### 7.2 从源码重新编译 CANN vendor 包
 
-> **⚠️ 注意**
->
-> PyTorch 扩展**暂不支持自动编译**，默认处于关闭状态（`scripts/build_multicore.sh` 中 `BUILD_TORCH_EXTENSION=false`）。
-> 如需编译，请将该变量改为 `true`：
->
-> ```bash
-> # 编辑 scripts/build_multicore.sh，将第 22 行改为：
-> BUILD_TORCH_EXTENSION=true
-> ```
->
-> 或者直接调用 `setup.py`（见下方）。
-
-**编译步骤（手动）**
+如需从源码重新编译 CANN vendor 包，在 `scripts/build_multicore_local.sh` 末尾将 `SOC_VALUE` 填入对应硬件版本并取消注释，然后在仓库根目录运行：
 
 ```bash
-cd hyper_parallel/core/multicore/platform/torch
-python setup.py build_ext --inplace
+bash scripts/build_multicore_local.sh
 ```
 
-可选：通过环境变量启用 Ninja 加速编译：
+该脚本会：
 
-```bash
-USE_NINJA=1 python setup.py build_ext --inplace
-```
+1. 克隆 `ops-nn`（v9.0.0-beta.1）和 `ops-transformer`（v8.5.0）并 sparse checkout 相关子目录
+2. 应用 `ops-nn.patch` 和 `ops-transformer.patch`
+3. 将 `ops/runtime/` 分别拷入正反向 `op_kernel/runtime/`
+4. 组装 `build/` 目录后调用 `build.sh` 编译
 
-**编译流程说明**
-
-`setup.py` 使用 `torch_npu.utils.cpp_extension.NpuExtension` 将 `csrc/` 下的所有 `.cpp` 源文件编译为 Python C 扩展：
-
-1. **vendor 库路径解析**：按优先级依次查找 `CANN_VENDOR_FWD/BWD_LIBDIR` → `CANN_VENDOR_LIBDIR` → `prebuild/multicore_moe_ffn.tar.gz`（自动解压），确定 `libcust_opapi.so` 的位置。
-2. **头文件**：自动从 `torch_npu` 安装目录提取 `acl/inc` 和 `op-plugin` 头文件路径。
-3. **rpath**：将 vendor 库目录写入编译产物的 rpath，运行时无需依赖 `LD_LIBRARY_PATH`。
-4. **环境变量**：`ASCEND_CUSTOM_OPP_PATH` 和 `LD_LIBRARY_PATH` 由 `__init__.py` 在 import 时自动设置（仅影响当前进程），无需手动修改 `~/.bashrc`。如需跨会话持久化，按编译结束后打印的提示手动添加到 `~/.bashrc`。
-
-**编译产物**
-
-```text
-platform/torch/hyper_parallel_multicore_moe_ffn_pta.cpython-3x-aarch64-linux-gnu.so
-```
-
-**使用方式**
-
-```python
-import hyper_parallel.core.multicore as mc
-mc.moe_ffn_fwd(...)
-mc.moe_ffn_bwd(...)
-```
-
----
-
-### 6.3 MindSpore 接入
+### 7.3 MindSpore 接入
 
 **编译步骤**
 
@@ -408,37 +561,19 @@ cmake --build build -j$(nproc)
 
 **编译流程说明**
 
-MindSpore 自定义算子需通过 `ms.ops.CustomOpBuilder` 编译，cmake 的职责是准备编译参数并驱动 Python 脚本完成实际编译：
-
-1. **vendor 库路径解析**：与 PyTorch 路径逻辑相同，cmake 按优先级解析 `CANN_VENDOR_FWD/BWD_LIBDIR` → `HP_MULTICORE_DIR` → `CANN_VENDOR_LIBDIR` → prebuild tarball，确定 `libcust_opapi.so` 的位置。若四者均未配置且 tarball 不存在，cmake 报错退出。
-
-2. **代码生成**：cmake 将 vendor 路径、头文件路径、链接参数等写入 `build/build_custom_with_ms.py`，该脚本调用：
-
-   ```python
-   ms.ops.CustomOpBuilder(
-       name='hyper_parallel_multicore_moe_ffn_ms',
-       sources=[...],          # c_api/ + framework/ 下的 .cc 源文件
-       op_def=[..._op.yaml],   # moe_ffn_fwd_op.yaml + moe_ffn_bwd_op.yaml
-       ...
-   ).build()
-   ```
-
-   `CustomOpBuilder` 读取 YAML 算子定义，自动生成 Python 绑定文件（`gen_ops_def.py`、`gen_ops_prim.py`），并编译 C++ 源码为 `.so`。
-
-3. **YAML 算子定义**：`c_api/moe_ffn_fwd/moe_ffn_fwd_op.yaml` 和 `c_api/moe_ffn_bwd/moe_ffn_bwd_op.yaml` 声明了算子参数类型、in-place 返回规则及 `side_effect_mem` 标记，MindSpore 框架据此生成正确的 PyBoost 调度入口和 device address 准备逻辑。YAML 中设置了 `function: disable: True` 和 `dispatch: enable: False`，**静态图编译路径被显式禁用**（原因见下方注意事项）。
-
-4. **rpath**：链接时写入 `$$ORIGIN/../../../../lib`、vendor fwd/bwd lib 目录，使产物在 `build/lib/` 就地可用，无需安装。
-
-5. **`ASCEND_CUSTOM_OPP_PATH`**：`__init__.py` 在首次 `import` 时自动从 vendor 路径派生并设置该环境变量，再加载 `.so`，因此**不需要**手动 `source ~/.bashrc`。
+1. **vendor 库路径解析**：cmake 按优先级解析 `CANN_VENDOR_FWD/BWD_LIBDIR` → `HP_MULTICORE_DIR` → `CANN_VENDOR_LIBDIR` → prebuild tarball，确定 `libcust_opapi.so` 的位置。若四者均未配置且 tarball 不存在，cmake 报错退出。
+2. **代码生成**：cmake 将 vendor 路径、头文件路径、链接参数等写入 `build/build_custom_with_ms.py`，该脚本调用 `ms.ops.CustomOpBuilder` 编译 C++ 源码。
+3. **YAML 算子定义**：`c_api/mega_moe/mega_moe_op.yaml` 和 `c_api/mega_moe_grad/mega_moe_grad_op.yaml` 声明算子参数类型及约束。YAML 中设置了 `function: disable: True` 与 `dispatch: enable: False`，**静态图编译路径被显式禁用**（见下方注意事项）。
+4. **`ASCEND_CUSTOM_OPP_PATH`**：`__init__.py` 在首次 `import` 时自动从 vendor 路径派生并设置该环境变量，**不需要**手动 `source ~/.bashrc`。
 
 **编译产物**
 
 ```text
 platform/mindspore/build/lib/
-├── hyper_parallel_multicore_moe_ffn_ms.so              # C++ 扩展主体
-└── hyper_parallel_multicore_moe_ffn_ms_auto_generate/
-    ├── gen_ops_def.py   # 算子定义（MindSpore op registry）
-    └── gen_ops_prim.py  # 算子原语（PyBoost 调用入口）
+├── hyper_parallel_mega_moe_ms.so
+└── hyper_parallel_mega_moe_ms_auto_generate/
+    ├── gen_ops_def.py
+    └── gen_ops_prim.py
 ```
 
 **使用方式**
@@ -448,39 +583,76 @@ import mindspore as ms
 ms.set_context(mode=ms.PYNATIVE_MODE)   # 必须：仅支持 PyNative 模式
 
 import hyper_parallel.core.multicore as mc
-mc.moe_ffn_fwd(...)
-mc.moe_ffn_bwd(...)
+mc.mega_moe(...)
+mc.mega_moe_grad(...)
 ```
 
 > **注意：当前仅支持 PyNative 模式（动态图）**
 >
-> Graph 模式（`ms.GRAPH_MODE`）**暂未实现**。原因：
-> - `moe_ffn_fwd` / `moe_ffn_bwd` 的 YAML 定义中设置了 `function: disable: True` 与 `dispatch: enable: False`，MindSpore 编译器无法对这两个算子进行图级追踪和下沉（lower）；
-> - 算子内部依赖运行时动态 tensor 地址（AllToAll symmetric memory 指针、per-rank RuntimeConfig），不满足静态图的编译期地址静态化要求。
+> Graph 模式（`ms.GRAPH_MODE`）**暂未实现**。YAML 定义中 `function: disable: True` 使 MindSpore 编译器无法对这两个算子进行图级追踪和下沉；算子内部依赖运行时动态 tensor 地址，不满足静态图的编译期地址静态化要求。Graph 模式支持计划在后续版本中实现。
+
+### 7.4 PyTorch 接入
+
+> **⚠️ 注意**
 >
-> 在 Graph 模式或 `@ms.jit` 装饰的函数内调用时，Python 层会在运行时抛出 `RuntimeError`，并提示切换到 PyNative 模式。Graph 模式支持计划在后续版本中实现。
+> **依赖版本要求**：`torch_npu >= 330`（即 PTA 330 及更高版本）。
+>
+> PyTorch 扩展**默认处于关闭状态**（`scripts/build_multicore.sh` 中 `BUILD_TORCH_EXTENSION=false`）。
+> 如需编译，将该变量改为 `true`：
+>
+> ```bash
+> # 编辑 scripts/build_multicore.sh，将：
+> BUILD_TORCH_EXTENSION=false
+> # 改为：
+> BUILD_TORCH_EXTENSION=true
+> ```
+>
+> 或者直接调用 `setup.py`（见下方）。
+
+**编译步骤（手动）**
+
+```bash
+cd hyper_parallel/core/multicore/platform/torch
+python setup.py build_ext --inplace
+# 可选：Ninja 加速
+USE_NINJA=1 python setup.py build_ext --inplace
+```
+
+**编译流程说明**
+
+`setup.py` 使用 `torch_npu.utils.cpp_extension.NpuExtension` 将 `csrc/` 下的所有 `.cpp` 源文件编译为 Python C 扩展：
+
+1. **vendor 库路径解析**：按优先级依次查找 `CANN_VENDOR_FWD/BWD_LIBDIR` → `CANN_VENDOR_LIBDIR` → `prebuild/mega_moe.tar.gz`（自动解压）。
+2. **rpath**：将 vendor 库目录写入编译产物的 rpath，运行时无需依赖 `LD_LIBRARY_PATH`。
+3. **环境变量**：`ASCEND_CUSTOM_OPP_PATH` 和 `LD_LIBRARY_PATH` 由 `__init__.py` 在 import 时自动设置，无需手动修改 `~/.bashrc`。
+
+**编译产物**
+
+```text
+platform/torch/hyper_parallel_mega_moe_pta.cpython-3x-aarch64-linux-gnu.so
+```
 
 ---
 
-## 7. API 接口
+## 8. API 接口
 
-### 7.0 平台切换
+### 8.1 平台切换
 
-通过环境变量 `HYPER_PARALLEL_PLATFORM` 选择后端（默认 `mindspore`），在 import 前设置即可：
+通过环境变量 `HYPER_PARALLEL_PLATFORM` 选择后端（默认 `mindspore`）：
 
 ```python
 import os
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"   # 或 "mindspore"（默认）
 
 import hyper_parallel.core.multicore as mc
-mc.moe_ffn_fwd(...)   # 自动路由到对应平台实现
-mc.moe_ffn_bwd(...)
+mc.mega_moe(...)
+mc.mega_moe_grad(...)
 ```
 
-### 7.1 moe_ffn_fwd（正向）
+### 8.2 mega_moe（正向）
 
 ```python
-mc.moe_ffn_fwd(
+mc.mega_moe(
     # AllToAll dispatch
     dispatch_target,      # [tokens, hidden]          bf16   AllToAll 目标缓冲区，output（in-place）
     dispatch_target_off,  # [all_expert_num]           int64  每 expert 的远端写偏移（目标 PE）
@@ -519,28 +691,28 @@ mc.moe_ffn_fwd(
 
 **返回值**：无（PyTorch）/ 5 个 in-place 张量的元组（MindSpore）
 
-### 7.2 moe_ffn_bwd（反向）
+### 8.3 mega_moe_grad（反向）
 
 ```python
-mc.moe_ffn_bwd(
+mc.mega_moe_grad(
     # AllToAll dispatch（梯度分发）
-    dispatch_target,      # [tokens, hidden]           bf16   AllToAll 目标缓冲区（接收分发后的梯度），output（in-place）
+    dispatch_target,      # [tokens, hidden]           bf16   AllToAll 目标缓冲区，output（in-place）
     dispatch_target_off,  # [all_expert_num]            int64  每 expert 的远端写偏移
     dy,                   # [tokens, hidden]            bf16   输入梯度（AllToAll 发送源）
     dispatch_src_off,     # [all_expert_num]            int64  每 expert 的本地读偏移
     dispatch_size,        # [all_expert_num]            int32  每 expert 发送的元素数
     # act_grad（GMM1 反向：dispatch_target @ W2.T）
-    hidden,               # [tokens, intermediate]      bf16   正向 SwiGLU 输出（缓存），W2 梯度的左矩阵
+    hidden,               # [tokens, intermediate]      bf16   正向 SwiGLU 输出（缓存）
     hidden_dw,            # [E, intermediate, hidden]   bf16   W2 权重梯度，output（in-place）
     w2,                   # [E, intermediate, hidden]   bf16   W2 权重（= 正向 down_proj_weight）
-    act_grad_y,           # [tokens, intermediate]      bf16   GMM1 反向输出（激活梯度），output（in-place）
+    act_grad_y,           # [tokens, intermediate]      bf16   GMM1 反向输出，output（in-place）
     # swiglu_grad
     gate,                 # [tokens, intermediate*2]   bf16   正向 up_proj_y（SwiGLU 输入缓存）
     grad_gate,            # [tokens, intermediate*2]   bf16   SwiGLU 梯度输出，output（in-place）
     # gate_grad（GMM2 反向：grad_gate @ W1.T）
     w1,                   # [E, hidden, intermediate*2] bf16  W1 权重（= 正向 up_proj_weight）
-    gate_dx,              # [tokens, hidden]            bf16   GMM2 反向输出（combine 前），output（in-place）
-    grad_x,               # [tokens, hidden]            bf16   AllToAll combine 输出（最终激活梯度），output（in-place）
+    gate_dx,              # [tokens, hidden]            bf16   GMM2 反向输出，output（in-place）
+    grad_x,               # [tokens, hidden]            bf16   AllToAll combine 输出，output（in-place）
     # AllToAll combine（梯度汇聚）
     combine_target_off,   # [all_expert_num]            int64  每 expert 的远端写偏移
     combine_src_off,      # [all_expert_num]            int64  每 expert 的本地读偏移
@@ -550,7 +722,7 @@ mc.moe_ffn_bwd(
     gate_dw,              # [E, hidden, intermediate*2] bf16  W1 权重梯度，output（in-place）
     group_list,           # [E]                         int64  每 expert token 累积和
     # 配置张量
-    act_grad_tiling,      # uint8                       GMM1 反向 tiling，from gen_runtime_data.py
+    act_grad_tiling,      # uint8                       GMM1 反向 tiling
     gate_grad_tiling,     # uint8                       GMM2 反向 tiling
     w2_grad_tiling,       # uint8                       GMM3（W2 梯度）tiling
     w1_grad_tiling,       # uint8                       GMM4（W1 梯度）tiling
@@ -566,107 +738,216 @@ mc.moe_ffn_bwd(
 
 ---
 
-## 8. 端到端示例
-
-测试文件同时充当端到端示例，可直接运行。
-
-### 正向（PyTorch，2 卡 TP=2 EP=2）
-
-```bash
-torchrun --nproc_per_node=2 --master_addr=localhost --master_port=29500 \
-    tests/torch/multicore/moe_ffn.py
-```
-
-### 反向（PyTorch，2 卡 TP=2 EP=2）
-
-```bash
-torchrun --nproc_per_node=2 --master_addr=localhost --master_port=29500 \
-    tests/torch/multicore/moe_ffn.py
-```
-
-### MindSpore
-
-```bash
-msrun --worker_num=2 tests/mindspore/st/multicore/moe_ffn.py
-```
-
----
-
 ## 9. 测试
-
-### PyTorch
-
-```bash
-# 单机 2 卡（TP=2, EP=2）精度测试
-torchrun --nproc_per_node=2 tests/torch/multicore/moe_ffn.py
-
-# pytest 入口
-pytest tests/torch/multicore/test_moe_ffn.py -v
-```
-
-测试内容（`tests/torch/multicore/moe_ffn.py`）：
-
-- `test_moe_ffn_fwd_tp2ep2`：正向精度测试，跳过 AllToAll，对比 GMM1→SwiGLU→GMM2 参考实现
-- `test_moe_ffn_bwd_tp2ep2`：反向精度测试，校验 act_grad / grad_gate / gate_dx 输出
 
 ### MindSpore
 
 ```bash
 # msrun 2 卡
-msrun --worker_num=2 tests/mindspore/st/multicore/moe_ffn.py
+msrun --worker_num=2 tests/mindspore/st/multicore/moe.py
 
 # pytest 入口
-pytest tests/mindspore/st/multicore/test_moe_ffn.py -v
+pytest tests/mindspore/st/multicore/test_moe.py -v
 ```
+
+### PyTorch
+
+PyTorch 测试用例暂未提供（`tests/torch/multicore/` 目录尚不存在）。
 
 ### 精度容限
 
 所有精度测试使用 bfloat16，容限为：
 
 ```text
-|kernel - ref| ≤ atol + rtol × |ref|    (rtol = atol = 1e-3, 即 0.1%)
+|kernel - ref| ≤ atol + rtol × |ref|    (rtol = atol = 1e-3)
 ```
 
 ---
 
-## 10. 代码结构
+## 10. 扩展指南
 
-```text
-hyper_parallel/core/multicore/
-├── modules/
-│   ├── common/
-│   │   ├── compute_graph.py        # TaskSplitValue / TensorSpec / SplitSpec / OperatorNode
-│   │   └── runtime_structs.py      # RuntimeConfigC / TaskDescC / TensorDescC（ctypes）
-│   └── moe_ffn/
-│       ├── common/
-│       │   ├── compute_graph.py    # MoE-FFN 专用图类 + init_task_split_value
-│       │   ├── runtime_structs.py  # MoE-FFN RuntimeConfig 扩展
-│       │   ├── task_builders.py    # fill_alltoall / fill_gmm / fill_swiglu / add_terminate
-│       │   ├── task_builder_utils.py # advance_tsv_* / revise_task_queue
-│       │   └── tiling_registry.py  # tiling 字节格式注册
-│       ├── forward/
-│       │   ├── forward_graph.py    # build_forward_graph()
-│       │   ├── gen_runtime_data.py # RuntimeConfig 生成入口
-│       │   └── tiling_tables.py    # get_up_proj_tiling_bytes 等
-│       └── backward/
-│           ├── backward_graph.py   # build_backward_graph()
-│           ├── gen_runtime_data.py
-│           └── tiling_tables.py
-├── platform/
-│   ├── torch/                      # PyTorch 接入（setup.py + pybind11）
-│   └── mindspore/                  # MindSpore 接入（CMakeLists.txt + CustomOpBuilder）
-├── prebuild/
-│   └── multicore_moe_ffn.tar.gz   # 预编译 CANN vendor 包
-└── doc/
-    └── README.md                   # 本文档
+### 10.1 添加新算子任务类型（Python 侧）
+
+**Step 1** — 在 `scheduler/graph.py` 扩展 `OpType`：
+
+```python
+class OpType(Enum):
+    ALLTOALL    = "alltoall"
+    GMM         = "gmm"
+    SWIGLU      = "swiglu"
+    SWIGLU_GRAD = "swiglu_grad"
+    RMSNORM     = "rmsnorm"   # ← 新增
 ```
 
-### C++ CANN 算子源码（vendor 包）
+**Step 2** — 在 `tasks/rmsnorm.py` 实现 FillConfig：
 
-```text
-hyper_parallel/core/multicore/ops/
-├── multicore_moe_ffn/       # 正向算子 CANN 源码（op_host / op_kernel / op_graph）
-└── multicore_moe_ffn_grad/  # 反向算子 CANN 源码（含 swi_glu_grad/）
+```python
+from .task_base import FillConfig
+from ..scheduler.config import RuntimeConfigC
+
+class RMSNormFillConfig(FillConfig):
+    def fill(self, cfg: RuntimeConfigC, op, tsv) -> None:
+        for i in range(op.task_num):
+            td = cfg.task_descs[cfg.task_num_all]
+            td.task_type = TaskType.TASK_RMSNORM
+            td.input_addr[0]  = op.inputs[0].param_position
+            td.output_addr[0] = op.outputs[0].param_position
+            td.pre_event_id   = ...
+            td.trigger_event_id = ...
+            cfg.task_num_all += 1
 ```
 
-预编译产物打包为 `prebuild/multicore_moe_ffn.tar.gz`，`import` 时自动解压；如需从源码重新编译 CANN vendor 包，将`SOC_VALUE`填入`hyper-parallel\scripts\build_multicore_local.sh`结尾并取消注释，然后在根目录运行`bash scripts\build_multicore_local.sh`即可。
+**Step 3** — 在 `tasks/registry.py` 注册：
+
+```python
+from .rmsnorm import RMSNormFillConfig
+FILL_CONFIG_REGISTRY[OpType.RMSNORM] = RMSNormFillConfig
+```
+
+**Step 4** — 在 C++ `ops/<op>/op_kernel/worker_kernel.cpp` 的 switch 中添加分支：
+
+```cpp
+case TaskType::TASK_RMSNORM:
+    ExecuteRMSNorm(task_desc);
+    break;
+```
+
+### 10.2 添加新模型（MoE FFN 以外的算子组合）
+
+**Step 1** — 建立目录：
+
+```text
+modules/
+└── attention/
+    ├── forward/
+    │   ├── graph.py
+    │   ├── gen_runtime_data.py
+    │   └── tiling_tables.py
+    └── backward/
+        └── ...
+```
+
+**Step 2** — 在 `graph.py` 构建 DAG：
+
+```python
+from hyper_parallel.core.multicore.scheduler.graph import (
+    ComputeGraph, OperatorNode, TensorSpec, SplitSpec, OpType
+)
+from hyper_parallel.core.multicore.scheduler.config import TaskSplitValue
+
+def build_attention_fwd_graph(tsv: TaskSplitValue, ...) -> ComputeGraph:
+    g = ComputeGraph()
+    x       = TensorSpec("x",       shape=[tsv.seq_size, hidden], param_position=0)
+    qkv_out = TensorSpec("qkv_out", shape=[tsv.seq_size, 3*hidden], param_position=1,
+                         is_dynamic=True)
+    qkv_proj = OperatorNode("qkv_proj", op_type=OpType.GMM,
+                            inputs=[x], outputs=[qkv_out],
+                            split_spec=SplitSpec(
+                                split_inputs=None,
+                                task_num_fn=lambda tsv: tsv.seq_size // TILE_M,
+                                split_output_dims=[0]))
+    g.add_op(qkv_proj)
+    return g
+```
+
+**Step 3** — 实现 CLI（参考 `modules/mega_moe/forward/gen_runtime_data.py`）：
+
+```python
+def main():
+    args = parse_args()
+    tsv = TaskSplitValue(tp=args.tp, ep=args.ep, ...)
+    graph = build_attention_fwd_graph(tsv)
+    graph.propagate_splits(tsv)
+    for rank_id in range(args.tp * args.ep):
+        cfg = build_config_for_rank(graph, tsv, rank_id)
+        write_bin(cfg, f"{args.output_dir}/runtime_config_rank_{rank_id}.bin")
+```
+
+### 10.3 添加新 C++ 计算核（AscendC 侧）
+
+**Step 1** — 建立算子目录：
+
+```text
+ops/
+└── attn_fwd/
+    ├── op_host/
+    │   ├── attn_fwd_def.cpp
+    │   ├── attn_fwd_infershape.cpp
+    │   └── attn_fwd_tiling.cpp/h
+    └── op_kernel/
+        ├── attn_fwd.cpp
+        ├── tiling_key.h
+        ├── worker_kernel.cpp
+        └── put_mem_signal/
+            └── put_mem_signal_kernel.cpp
+```
+
+**Step 2** — 在 `attn_fwd.cpp` 中引用共享 scheduler：
+
+```cpp
+#include "kernel_operator.h"
+#include "worker_kernel.cpp"
+#include "tiling_key.h"
+
+__global__ __aicore__ void multicore_attn_fwd(...) {
+    GM_ADDR input_list[] = { ..., runtime_config, ..., tiling, all_event_counters };
+    uint32_t idx = GetBlockIdx();
+    worker_kernel(idx, runtime_config, input_list);
+}
+```
+
+**Step 3** — 在 `worker_kernel.cpp` 中引用共享 runtime：
+
+```cpp
+#include "kernel_operator.h"
+#include "runtime/worker_kernel.h"  // build 脚本将 ops/runtime/ 拷入 op_kernel/runtime/
+
+class KernelWorker : public KernelWorkerBase<KernelWorker> {
+ public:
+    // input_list 索引由本算子的参数布局决定
+    static constexpr uint32_t TILING_IDX = N;   // 替换为实际索引
+    static constexpr uint32_t EVENT_IDX  = M;
+
+    __aicore__ inline void ExecuteComputeKernel(TaskDesc task_desc) {
+        switch (task_desc.task_type) {
+            // 添加本算子的 case
+        }
+    }
+};
+```
+
+**Step 4** — 在 `put_mem_signal/put_mem_signal_kernel.cpp` 中用本算子的数据类型实例化：
+
+```cpp
+#include "kernel_operator.h"
+#include "shmem.h"
+
+template <typename T>
+class PutMemSignalKernel { /* ... */ };  // 与现有实现相同
+
+extern "C" inline __aicore__ void put_mem_signal_kernel(...) {
+    PutMemSignalKernel<DTYPE_YOUR_TYPE> op;  // 替换为本算子的数据类型宏
+    op.Init(...);
+    op.Process();
+}
+```
+
+**Step 5** — 在 `build_multicore_local.sh` 中添加新算子的 `runtime/` 拷贝：
+
+```bash
+cp -r runtime build/mega_moe/attn_fwd/op_kernel/
+```
+
+---
+
+## 11. 附录：常见错误与排查
+
+| 错误现象 | 可能原因 | 排查步骤 |
+|---|---|---|
+| `TaskDesc` event_id 越界 | all_event_num 计算错误 | 检查 `scheduler/config.py` 中 `all_event_num` 属性公式 |
+| 两 bin 文件 task_num 不一致 | SplitSpec 的 task_num_fn 写错 | 打印 `propagate_splits()` 后每个 op 的 task_num |
+| AIV hang（无限等待）| N:1 扇入 trigger_count 设置偏大 | 检查 FillConfig 的 trigger_count = 实际上游 tile 数 |
+| GMM workspace 越界 | TILE_M/N 设置过大 | 检查 `tiling_tables.py` 中 workspace 预算 |
+| `runtime/worker_kernel.h` 找不到 | build 脚本未执行或路径不对 | 确认 `build_multicore_local.sh` 中有 `cp -r runtime build/.../op_kernel/`，且已执行 |
+| Python `ImportError: scheduler` | 从非包根目录运行 | 从 `hyper-parallel/` 根目录用 `python -m` 方式运行 |
+| MindSpore `RuntimeError`: 切换 PYNATIVE | 在 Graph 模式下调用 | `ms.set_context(mode=ms.PYNATIVE_MODE)` 放在 import 之前 |

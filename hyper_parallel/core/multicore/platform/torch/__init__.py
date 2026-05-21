@@ -20,31 +20,31 @@ Out-of-tree PyTorch operator registration for MoE-FFN operators.
 Registers into the ``hyper_parallel`` PyTorch namespace — does NOT modify
 op-plugin or any PyTorch source. The operators are accessible via:
 
-    torch.ops.hyper_parallel.moe_ffn_fwd(...)
-    torch.ops.hyper_parallel.moe_ffn_bwd(...)
+    torch.ops.hyper_parallel.mega_moe(...)
+    torch.ops.hyper_parallel.mega_moe_grad(...)
 
 Or via the Python wrappers in this module:
 
-    from hyper_parallel.core.multicore.platform.torch import moe_ffn_fwd, moe_ffn_bwd
+    from hyper_parallel.core.multicore.platform.torch import mega_moe, mega_moe_grad
 
 Build prerequisites
 -------------------
-No manual env-var setup is required if ``prebuild/multicore_moe_ffn.tar.gz``
+No manual env-var setup is required if ``prebuild/mega_moe.tar.gz``
 exists alongside this package.  The tarball is auto-extracted and the correct
 ``CANN_VENDOR_*`` paths are derived automatically.
 
 Alternatively, set one of the following environment variables before importing:
 
     # Preferred: per-op explicit paths
-    export CANN_VENDOR_FWD_LIBDIR=/path/to/multicore_moe_ffn_nn/op_api/lib
-    export CANN_VENDOR_BWD_LIBDIR=/path/to/multicore_moe_ffn_grad_nn/op_api/lib
+    export CANN_VENDOR_FWD_LIBDIR=/path/to/mega_moe_nn/op_api/lib
+    export CANN_VENDOR_BWD_LIBDIR=/path/to/mega_moe_grad_nn/op_api/lib
 
     # Or: legacy single-lib (used for both fwd and bwd)
-    export CANN_VENDOR_LIBDIR=/path/to/multicore_moe_ffn_nn/op_api/lib
+    export CANN_VENDOR_LIBDIR=/path/to/mega_moe_nn/op_api/lib
 
 Symbol lookup (new op-plugin API)
 ----------------------------------
-GetOpApiFuncAddr (in op_api_common.cpp) resolves aclnnMulticoreMoeFfn* at
+GetOpApiFuncAddr (in op_api_common.cpp) resolves aclnnMegaMoe* at
 runtime via dlopen.  It searches each entry in ``g_custom_lib_path`` (a C++
 file-scope ``const`` global in libopapi.so) for
 ``op_api/lib/libcust_opapi.so``.  ``g_custom_lib_path`` is initialised
@@ -74,8 +74,8 @@ import re as _re
 # Step 0: locate both CANN vendor lib dirs (forward + backward packages).
 #
 # Two vendor packages provide separate libcust_opapi.so files:
-#   Forward : multicore_moe_ffn_nn      → aclnnMulticoreMoeFfn*
-#   Backward: multicore_moe_ffn_grad_nn → aclnnMulticoreMoeFfnGrad*
+#   Forward : mega_moe_nn      → aclnnMegaMoe*
+#   Backward: mega_moe_grad_nn → aclnnMegaMoeGrad*
 #
 # Resolution order (highest priority first):
 #   1. CANN_VENDOR_FWD_LIBDIR / CANN_VENDOR_BWD_LIBDIR  (explicit per-op)
@@ -99,7 +99,7 @@ if not (_CANN_VENDOR_FWD_LIBDIR or _CANN_VENDOR_BWD_LIBDIR):
     else:
         # Auto-detect: prebuild directory is 2 levels up from platform/torch/
         _PREBUILD_DIR = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "../../prebuild/multicore_moe_ffn"))
+            os.path.join(os.path.dirname(__file__), "../../prebuild/mega_moe"))
         _TARBALL = _PREBUILD_DIR + ".tar.gz"
         if not os.path.isdir(_PREBUILD_DIR) and os.path.isfile(_TARBALL):
             import tarfile as _tarfile
@@ -107,8 +107,8 @@ if not (_CANN_VENDOR_FWD_LIBDIR or _CANN_VENDOR_BWD_LIBDIR):
                 _tf.extractall(os.path.dirname(_PREBUILD_DIR))
         if os.path.isdir(_PREBUILD_DIR):
             _vendors = os.path.join(_PREBUILD_DIR, "vendors")
-            _fwd = os.path.join(_vendors, "multicore_moe_ffn_nn", "op_api", "lib")
-            _bwd = os.path.join(_vendors, "multicore_moe_ffn_grad_nn", "op_api", "lib")
+            _fwd = os.path.join(_vendors, "mega_moe_nn", "op_api", "lib")
+            _bwd = os.path.join(_vendors, "mega_moe_grad_nn", "op_api", "lib")
             if os.path.isdir(_fwd):
                 _CANN_VENDOR_FWD_LIBDIR = _fwd
             if os.path.isdir(_bwd):
@@ -118,7 +118,7 @@ if not (_CANN_VENDOR_FWD_LIBDIR or _CANN_VENDOR_BWD_LIBDIR):
 # Step 1: set ASCEND_CUSTOM_OPP_PATH from the detected vendor lib dirs.
 #
 # GetOpApiFuncAddr searches each entry in ASCEND_CUSTOM_OPP_PATH for
-# op_api/lib/libcust_opapi.so to resolve aclnnMulticoreMoeFfn* symbols.
+# op_api/lib/libcust_opapi.so to resolve aclnnMegaMoe* symbols.
 # g_custom_lib_path (a C++ static-duration global in op_api_common.cpp) is
 # populated from ASCEND_CUSTOM_OPP_PATH once — when the .so that contains
 # op_api_common.cpp is first loaded into the process.  Depending on the
@@ -163,8 +163,8 @@ if os.path.exists(_opapi_path):
 # ---------------------------------------------------------------------------
 # Step 3: pre-load both libcust_opapi.so files with RTLD_GLOBAL.
 #
-# Forward  (multicore_moe_ffn_nn)      exports: aclnnMulticoreMoeFfn*
-# Backward (multicore_moe_ffn_grad_nn) exports: aclnnMulticoreMoeFfnGrad*
+# Forward  (mega_moe_nn)      exports: aclnnMegaMoe*
+# Backward (mega_moe_grad_nn) exports: aclnnMegaMoeGrad*
 # Pre-loading with RTLD_GLOBAL ensures symbols from both are globally visible
 # so GetOpApiFuncAddr can resolve either operator at runtime.
 # ---------------------------------------------------------------------------
@@ -181,13 +181,13 @@ for _vendor_libdir in (_CANN_VENDOR_FWD_LIBDIR, _CANN_VENDOR_BWD_LIBDIR):
 # pre-loaded (Step 3), so g_custom_lib_path will be initialized correctly
 # when the .so's static initializers run.
 # ---------------------------------------------------------------------------
-from . import hyper_parallel_multicore_moe_ffn_pta  # noqa: F401, E402  # pylint: disable=wrong-import-position,import-self
+from . import hyper_parallel_mega_moe_pta  # noqa: F401, E402  # pylint: disable=wrong-import-position,import-self
 
 # ---------------------------------------------------------------------------
 # Python wrappers — thin pass-through to the registered C++ ops
 # ---------------------------------------------------------------------------
 
-def moe_ffn_fwd(
+def mega_moe(
     dispatch_target, dispatch_target_off,
     dispatch_src, dispatch_src_off, dispatch_size,
     up_proj_weight, up_proj_glist,
@@ -228,7 +228,7 @@ def moe_ffn_fwd(
     rank_id, ep, expert_num, hidden_size, seq_size :
         Topology / shape attributes.
     """
-    torch.ops.hyper_parallel.moe_ffn_fwd(
+    torch.ops.hyper_parallel.mega_moe(
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
         up_proj_weight, up_proj_glist,
@@ -241,7 +241,7 @@ def moe_ffn_fwd(
     )
 
 
-def moe_ffn_bwd(
+def mega_moe_grad(
     dispatch_target, dispatch_target_off,
     dy, dispatch_src_off, dispatch_size,
     hidden, hidden_dw,
@@ -304,7 +304,7 @@ def moe_ffn_bwd(
     rank_id, ep, expert_num, hidden_size, seq_size :
         Topology / shape attributes.
     """
-    torch.ops.hyper_parallel.moe_ffn_bwd(
+    torch.ops.hyper_parallel.mega_moe_grad(
         dispatch_target, dispatch_target_off,
         dy, dispatch_src_off, dispatch_size,
         hidden, hidden_dw,
@@ -318,4 +318,4 @@ def moe_ffn_bwd(
     )
 
 
-__all__ = ["moe_ffn_fwd", "moe_ffn_bwd"]
+__all__ = ["mega_moe", "mega_moe_grad"]

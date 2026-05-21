@@ -19,7 +19,7 @@ _platform = get_platform()
 _multicore_handler = _platform.get_multicore_handler()
 
 
-def moe_ffn_fwd(
+def mega_moe(
     dispatch_target, dispatch_target_off,
     dispatch_src, dispatch_src_off, dispatch_size,
     up_proj_weight, up_proj_glist,
@@ -32,7 +32,7 @@ def moe_ffn_fwd(
     hidden_size: int, seq_size: int,
 ):
     """MoE-FFN forward operator (platform-dispatched)."""
-    return _multicore_handler.moe_ffn_fwd(
+    return _multicore_handler.mega_moe(
         dispatch_target, dispatch_target_off,
         dispatch_src, dispatch_src_off, dispatch_size,
         up_proj_weight, up_proj_glist,
@@ -45,7 +45,7 @@ def moe_ffn_fwd(
     )
 
 
-def moe_ffn_bwd(
+def mega_moe_grad(
     dispatch_target, dispatch_target_off,
     dy, dispatch_src_off, dispatch_size,
     hidden, hidden_dw,
@@ -59,7 +59,7 @@ def moe_ffn_bwd(
     hidden_size: int, seq_size: int,
 ):
     """MoE-FFN backward operator (platform-dispatched)."""
-    return _multicore_handler.moe_ffn_bwd(
+    return _multicore_handler.mega_moe_grad(
         dispatch_target, dispatch_target_off,
         dy, dispatch_src_off, dispatch_size,
         hidden, hidden_dw,
@@ -73,4 +73,4 @@ def moe_ffn_bwd(
     )
 
 
-__all__ = ["moe_ffn_fwd", "moe_ffn_bwd"]
+__all__ = ["mega_moe", "mega_moe_grad"]

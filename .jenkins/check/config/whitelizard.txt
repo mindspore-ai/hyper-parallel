@@ -1,2 +1,4 @@
 hyper-parallel/hyper_parallel/core/hsdp/api.py:_check_hsdp_input_valid
 hyper-parallel/hyper_parallel/core/hsdp/api.py:hsdp
+hyper-parallel/hyper_parallel/core/multicore/ops/mega_moe/op_host/mega_moe_def.cpp:ops::MegaMoe::MegaMoe
+hyper-parallel/hyper_parallel/core/multicore/ops/mega_moe_grad/op_host/mega_moe_grad_def.cpp:ops::MegaMoeGrad::MegaMoeGrad

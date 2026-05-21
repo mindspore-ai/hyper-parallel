@@ -41,8 +41,8 @@ index 0450bfbf0..8bd8369ec 100644
   * \file swi_glu.cpp
   * \brief
   */
-+#ifndef OPP_MULTICORE_MOE_SWI_GLU_CPP
-+#define OPP_MULTICORE_MOE_SWI_GLU_CPP
++#ifndef OPP_MEGA_MOE_SWI_GLU_CPP
++#define OPP_MEGA_MOE_SWI_GLU_CPP
  #include "swi_glu_impl.hpp"
  #include "swi_glu_bf16.hpp"
  #include "swi_glu_single.hpp"
@@ -68,7 +68,7 @@ index 0450bfbf0..8bd8369ec 100644
 -      SwigluSingle<SwigluVector<float, float, 2>, float, float> op;
 +  GET_TILING_DATA_WITH_STRUCT(SwiGluTilingData, tempTilingGm, tiling);
 +
-+  if constexpr (std::is_same_v<DTYPE_X, bfloat16_t>) {
++  if constexpr (std::is_same_v<DTYPE_Y, bfloat16_t>) {
 +    if (tempTilingGm.isDoubleBuffer == 1) {
 +      SwigluSingle<SwigluVectorBF16<bfloat16_t, float, bfloat16_t, 2>, bfloat16_t, bfloat16_t> op;
        op.Init(input_gm, nullptr, output_gm, tiling);
@@ -107,7 +107,7 @@ index 0450bfbf0..8bd8369ec 100644
 -}
 \ No newline at end of file
 +}
-+#endif  // OPP_MULTICORE_MOE_SWI_GLU_CPP
++#endif  // OPP_MEGA_MOE_SWI_GLU_CPP
 \ No newline at end of file
 diff --git a/activation/swi_glu_grad/op_kernel/glu_tiling_kernel.hpp b/activation/swi_glu_grad/op_kernel/glu_tiling_kernel.hpp
 index f0d3a2c95..9b99d815e 100644
@@ -216,7 +216,7 @@ index 2eb3634d2..f8f3c5147 100644
  
  # 算子类别清单
 -set(OP_CATEGORY_LIST "matmul" "conv" "reliability" "activation" "foreach" "hash" "vfusion" "index" "loss" "norm" "optim" "pooling" "quant" "rnn" "control")
-+set(OP_CATEGORY_LIST "multicore_moe")
++set(OP_CATEGORY_LIST "mega_moe")
  
  set(COMMON_NAME common_${PKG_NAME})
  set(OPHOST_NAME ophost_${PKG_NAME})
@@ -229,7 +229,7 @@ index fbd8479ef..4f730ed1c 100644
  OPC_TASK_NAME="opc_cmd.sh"
  OUT_TASK_NAME="out_cmd.sh"
 -OP_CATEGORY_LIST="matmul conv activation foreach vfusion index loss norm optim pooling quant rnn control"
-+OP_CATEGORY_LIST="multicore_moe"
++OP_CATEGORY_LIST="mega_moe"
  
  function trans_soc() {
    local _soc_input=$1
