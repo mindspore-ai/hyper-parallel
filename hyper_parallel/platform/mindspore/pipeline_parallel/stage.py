@@ -105,6 +105,11 @@ class PipelineStageBase:
 
     def forward_one_chunk(self, micro_index, args=None, kwargs=None):
         """Execution a forward function."""
+        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
+        for _, mod in self.submodule.cells_and_names():
+            if not isinstance(mod, HSDPModule):
+                continue
+            mod.set_reshard_after_forward(False)
         if self.is_first_stage:
             composite_args = args
         else:
@@ -137,7 +142,7 @@ class PipelineStageBase:
         """Execution a backward function."""
         from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
         if not self._has_backward:
-            return None
+            return
         for _, mod in self.submodule.cells_and_names():
             if not isinstance(mod, HSDPModule):
                 continue
@@ -148,27 +153,18 @@ class PipelineStageBase:
         if self.is_first_stage:
             sens = self._build_padded_sens(micro_index)
             _ = grad_fn(sens=sens)
-            grad_out = None
         else:
             if self.is_last_stage:
                 sens = self.get_last_stage_sens(self.last_stage_outputs)
             else:
                 sens = self._build_padded_sens(micro_index)
-            input_grads = grad_fn.compute_input_grad(sens=sens)
-            weight_grads = grad_fn.compute_weight_grad()
-            grad_out = (input_grads, weight_grads)
-        self._clear_recv_buffer(self.grad_recv_info, micro_index)
+            _ = grad_fn(sens=sens)
         if not self.is_first_stage:
-            # grad_out[0] holds grads for all inputs; keep rg=True slots so bwd_cache aligns
-            # 1:1 with the peer's grad_recv_info.
-            grads_all = grad_out[0][:self._recv_num]
-            rg_indices = [i for i, ri in enumerate(self.args_recv_info[micro_index]) if ri.requires_grad]
-            self.bwd_cache[micro_index] = [grads_all[i] for i in rg_indices]
+            input_grads = [recv_info.buffer.grad for recv_info in self.args_recv_info[micro_index]
+                           if recv_info.requires_grad]
+            self.bwd_cache[micro_index] = input_grads
+        self._clear_recv_buffer(self.grad_recv_info, micro_index)
         self._clear_recv_buffer(self.args_recv_info, micro_index)
-        # return grads for parameters
-        if self.is_first_stage:
-            return grad_out
-        return grad_out[1]
 
     def _construct_backward_func(self):
         """construct backward func."""

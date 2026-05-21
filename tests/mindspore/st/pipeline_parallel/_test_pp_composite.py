@@ -90,10 +90,14 @@ class StageModel(nn.Cell):
         super().__init__()
         self.layers = nn.CellList(list(layers))
 
-    def construct(self, x):
+    def construct(self, x, prev_frozen=None):  # pylint: disable=W0613
+        # prev_frozen: frozen tensor received from previous stage; ignored in computation.
         for layer in self.layers:
             x = layer(x)
-        return x
+        # Emit a pair (activation, frozen) to probe how PP handles requires_grad=False outputs.
+        # frozen is a constant zero tensor with no grad history (acts as requires_grad=False).
+        frozen = mint.zeros([1], dtype=ms.float32)
+        return x, frozen
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +217,6 @@ VPP_SPEC = PipelineSpec(
         stages, micro_batch_num=micro_batch_num,
     ),
 )
-
 
 # ---------------------------------------------------------------------------
 # Reference-path helpers (shared across all specs).
@@ -337,9 +340,9 @@ def _wrap_stage_with_fsdp(stage_model: StageModel, dp_mesh, *, reduce_op: str) -
     mp_policy = _fsdp_mp_policy()
     if len(stage_model.layers) > 1:
         for layer in stage_model.layers:
-            fully_shard(layer, mesh=dp_mesh, reshard_after_forward=False, mp_policy=mp_policy)
+            fully_shard(layer, mesh=dp_mesh, reshard_after_forward=True, mp_policy=mp_policy)
             layer.set_reduce_op_type(reduce_op)
-    fsdp_model = fully_shard(stage_model, mesh=dp_mesh, reshard_after_forward=False, mp_policy=mp_policy)
+    fsdp_model = fully_shard(stage_model, mesh=dp_mesh, reshard_after_forward=True, mp_policy=mp_policy)
     fsdp_model.set_reduce_op_type(reduce_op)
     return fsdp_model
 
@@ -436,7 +439,9 @@ def _assert_pp_fsdp_match_reference(spec: PipelineSpec, num_microbatches: int) -
         if is_loss_owner:
             micro_loss_accu = Tensor([0.0])
             for sub_loss in fsdp_losses:
-                micro_loss_accu += sub_loss.sum()
+                # StageModel returns (activation, label, frozen); extract the activation.
+                activation = sub_loss[0] if isinstance(sub_loss, tuple) else sub_loss
+                micro_loss_accu += activation.sum()
 
             # The loss-owner pp_rank emits per-microbatch losses on its dp shard;
             # all-reduce over the dp group recovers the global summed loss.
