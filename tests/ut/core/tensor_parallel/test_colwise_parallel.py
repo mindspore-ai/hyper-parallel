@@ -100,6 +100,21 @@ class TestColwiseParallelInit(unittest.TestCase):
         style = ColwiseParallel()
         self.assertEqual(style.src_data_rank, 0)
 
+    def test_repr_contains_key_fields(self):
+        """
+        Feature: ColwiseParallel.__repr__
+        Description: instantiate with custom layouts and use_local_output=False
+        Expectation: repr includes class name and layout fields
+        """
+        style = ColwiseParallel(
+            input_layouts=Shard(0),
+            output_layouts=Replicate(),
+            use_local_output=False,
+        )
+        r = repr(style)
+        self.assertIn("ColwiseParallel", r)
+        self.assertIn("use_local_output=False", r)
+
 
 class TestColwiseParallelApply(unittest.TestCase):
     """Tests for ColwiseParallel.apply with mocked distribute_module."""
@@ -157,6 +172,40 @@ class TestColwiseParallelApply(unittest.TestCase):
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     @patch("hyper_parallel.core.tensor_parallel.style.platform")
+    def test_apply_linear_invokes_distribute_module_callbacks(
+        self, mock_style_platform, mock_mesh_platform
+    ):
+        """
+        Feature: ColwiseParallel.apply registers callable hooks on distribute_module
+        Description: capture partition_fn, input_fn, output_fn and invoke them for Linear
+        Expectation: partition_fn runs _partition_linear_fn; I/O fns return without error
+        """
+        mesh = self._make_1d_mesh(mock_mesh_platform)
+        mock_style_platform.is_linear_module.return_value = True
+        mock_style_platform.is_embedding_module.return_value = False
+        mock_style_platform.Module = nn.Module
+
+        style = ColwiseParallel()
+        module = nn.Linear(4, 4)
+
+        with patch("hyper_parallel.core.tensor_parallel.style.distribute_module") as mock_dist, \
+             patch.object(style, "_partition_linear_fn") as mock_partition, \
+             patch.object(ColwiseParallel, "_prepare_input_fn", return_value="inp") as mock_in, \
+             patch.object(ColwiseParallel, "_prepare_output_fn", return_value="out") as mock_out:
+            mock_dist.return_value = module
+            style.apply(module, mesh)
+            partition_fn, input_fn, output_fn = mock_dist.call_args[0][2:5]
+            partition_fn("linear", module, mesh)
+            mock_partition.assert_called_once_with(module, mesh)
+            inp = input_fn(module, (torch.randn(2, 2),), mesh)
+            out = output_fn(module, MagicMock(spec=DTensor), mesh)
+            mock_in.assert_called_once()
+            mock_out.assert_called_once()
+            self.assertEqual(inp, "inp")
+            self.assertEqual(out, "out")
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.tensor_parallel.style.platform")
     def test_apply_embedding_calls_distribute_module(self, mock_style_platform, mock_mesh_platform):
         """
         Feature: ColwiseParallel.apply on Embedding module
@@ -176,6 +225,32 @@ class TestColwiseParallelApply(unittest.TestCase):
             result = style.apply(module, mesh)
             mock_dist.assert_called_once()
             self.assertIs(result, module)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.tensor_parallel.style.platform")
+    def test_apply_embedding_invokes_partition_fn(
+        self, mock_style_platform, mock_mesh_platform
+    ):
+        """
+        Feature: ColwiseParallel.apply partition_fn for Embedding
+        Description: invoke captured partition_fn after apply on Embedding module
+        Expectation: _partition_embedding_fn is called once
+        """
+        mesh = self._make_1d_mesh(mock_mesh_platform)
+        mock_style_platform.is_linear_module.return_value = False
+        mock_style_platform.is_embedding_module.return_value = True
+        mock_style_platform.Module = nn.Module
+
+        style = ColwiseParallel()
+        module = nn.Embedding(8, 4)
+
+        with patch("hyper_parallel.core.tensor_parallel.style.distribute_module") as mock_dist, \
+             patch.object(style, "_partition_embedding_fn") as mock_partition:
+            mock_dist.return_value = module
+            style.apply(module, mesh)
+            partition_fn = mock_dist.call_args[0][2]
+            partition_fn("emb", module, mesh)
+            mock_partition.assert_called_once_with(module, mesh)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     @patch("hyper_parallel.core.tensor_parallel.style.platform")
@@ -276,6 +351,60 @@ class TestColwiseParallelPartition(unittest.TestCase):
 
             for call in mock_dt.call_args_list:
                 self.assertEqual(call[0][2], [Shard(1)])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_partition_linear_fn_skips_none_param(self, mock_platform):
+        """
+        Feature: ColwiseParallel._partition_linear_fn skips None parameters
+        Description: _distribute_module_iter_params yields a None slot (e.g. missing bias)
+        Expectation: distribute_tensor is not called for the None entry
+        """
+        mesh = self._make_1d_mesh(mock_platform)
+        style = ColwiseParallel()
+        module = nn.Linear(4, 4)
+        weight = nn.Parameter(torch.randn(4, 4))
+
+        with patch(
+            "hyper_parallel.core.tensor_parallel.style._distribute_module_iter_params",
+            return_value=[("weight", weight), ("bias", None)],
+        ), patch("hyper_parallel.core.tensor_parallel.style.distribute_tensor") as mock_dt, \
+             patch("hyper_parallel.core.tensor_parallel.style._distribute_module_param_source") as mock_src, \
+             patch("hyper_parallel.core.tensor_parallel.style._distribute_module_new_parameter") as mock_new, \
+             patch("hyper_parallel.core.tensor_parallel.style._distribute_module_set_param"):
+            mock_src.side_effect = lambda p: p.data
+            mock_dt.return_value = MagicMock()
+            mock_new.return_value = nn.Parameter(torch.empty(1))
+
+            style._partition_linear_fn(module, mesh)
+
+            self.assertEqual(mock_dt.call_count, 1)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_partition_embedding_fn_skips_none_param(self, mock_platform):
+        """
+        Feature: ColwiseParallel._partition_embedding_fn skips None parameters
+        Description: _distribute_module_iter_params yields a None parameter slot
+        Expectation: distribute_tensor is not called for the None entry
+        """
+        mesh = self._make_1d_mesh(mock_platform)
+        style = ColwiseParallel()
+        module = nn.Embedding(8, 4)
+        weight = nn.Parameter(torch.randn(8, 4))
+
+        with patch(
+            "hyper_parallel.core.tensor_parallel.style._distribute_module_iter_params",
+            return_value=[("weight", weight), ("unused", None)],
+        ), patch("hyper_parallel.core.tensor_parallel.style.distribute_tensor") as mock_dt, \
+             patch("hyper_parallel.core.tensor_parallel.style._distribute_module_param_source") as mock_src, \
+             patch("hyper_parallel.core.tensor_parallel.style._distribute_module_new_parameter") as mock_new, \
+             patch("hyper_parallel.core.tensor_parallel.style._distribute_module_set_param"):
+            mock_src.side_effect = lambda p: p.data
+            mock_dt.return_value = MagicMock()
+            mock_new.return_value = nn.Parameter(torch.empty(1))
+
+            style._partition_embedding_fn(module, mesh)
+
+            self.assertEqual(mock_dt.call_count, 1)
 
 
 class TestColwiseParallelIO(unittest.TestCase):

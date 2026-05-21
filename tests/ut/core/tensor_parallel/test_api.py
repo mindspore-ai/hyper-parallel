@@ -36,6 +36,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
 )
 from hyper_parallel.core.tensor_parallel.api import (
+    _named_children,
     _tensor_parallel_mesh_context,
     parallelize_module,
 )
@@ -54,6 +55,40 @@ class RecordingParallelStyle(ParallelStyle):
     def apply(self, module, device_mesh):
         self.apply_log.append((id(module), id(device_mesh)))
         return module
+
+
+class TestNamedChildren(unittest.TestCase):
+    """Tests for ``_named_children`` PyTorch / MindSpore dispatch."""
+
+    def test_uses_named_children_when_available(self):
+        """
+        Feature: _named_children on PyTorch-style modules
+        Description: module exposes ``named_children`` like ``nn.Module``
+        Expectation: returns the same pairs as ``named_children()``
+        """
+        parent = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
+        expected = list(parent.named_children())
+        self.assertEqual(list(_named_children(parent)), expected)
+
+    def test_uses_name_cells_when_named_children_missing(self):
+        """
+        Feature: _named_children on MindSpore-style cells
+        Description: module has ``name_cells`` but no ``named_children``
+        Expectation: returns ``name_cells().items()`` pairs
+        """
+
+        class FakeCell:
+            """Minimal MindSpore ``Cell`` stand-in for UT."""
+
+            def name_cells(self):
+                child = nn.Identity()
+                return {"block": child}
+
+        cell = FakeCell()
+        children = list(_named_children(cell))
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0][0], "block")
+        self.assertIsInstance(children[0][1], nn.Identity)
 
 
 class TestParallelizeModule(unittest.TestCase):

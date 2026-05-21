@@ -139,6 +139,36 @@ class TestSequenceParallelApply(unittest.TestCase):
             mock_dist.assert_called_once()
             self.assertIs(result, module)
 
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    @patch("hyper_parallel.core.tensor_parallel.style.platform")
+    def test_apply_invokes_distribute_module_callbacks(
+        self, mock_style_platform, mock_mesh_platform
+    ):
+        """
+        Feature: SequenceParallel.apply registers partition/input/output callbacks
+        Description: invoke callbacks captured from mocked distribute_module
+        Expectation: partition_fn is no-op; input_fn/output_fn delegate to static helpers
+        """
+        mesh = self._make_1d_mesh(mock_mesh_platform)
+        mock_style_platform.Module = nn.Module
+
+        style = SequenceParallel(sequence_dim=1)
+        module = nn.LayerNorm(8)
+
+        with patch("hyper_parallel.core.tensor_parallel.style.distribute_module") as mock_dist, \
+             patch.object(SequenceParallel, "_prepare_input_fn", return_value="inp") as mock_in, \
+             patch.object(SequenceParallel, "_prepare_output_fn", return_value="out") as mock_out:
+            mock_dist.return_value = module
+            style.apply(module, mesh)
+            partition_fn, input_fn, output_fn = mock_dist.call_args[0][2:5]
+            self.assertIsNone(partition_fn("", module, mesh))
+            inp = input_fn(module, (torch.randn(2, 4, 8),), mesh)
+            out = output_fn(module, MagicMock(), mesh)
+            mock_in.assert_called_once()
+            mock_out.assert_called_once()
+            self.assertEqual(inp, "inp")
+            self.assertEqual(out, "out")
+
 
 class TestSequenceParallelIO(unittest.TestCase):
     """Input/output hooks for sequence-sharded activations."""
