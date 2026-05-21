@@ -361,7 +361,7 @@ class GradFunction:
 
         weight_grads = run_backward(
             tuple(grad_edges), tuple(grad_outputs),
-            keep_graph, keep_graph,
+            keep_graph, False,
             tuple(group_weights), allow_unreachable=True, accumulate_grad=False
         )
         _accumulate_grads(group_weights, weight_grads)
@@ -513,7 +513,7 @@ class GradFunction:
             hook_handles = self._setup_intermediate_hooks(output_tensors, input_tensors, weight_tensors)
 
         input_grads = run_backward(
-            output_tensors, sens, True, True,
+            output_tensors, sens, True, False,
             tuple(input_tensors), allow_unreachable=True, accumulate_grad=False
         )
         _accumulate_grads(input_tensors, input_grads)

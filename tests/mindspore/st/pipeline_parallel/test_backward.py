@@ -20,7 +20,9 @@ import pytest
 
 from mindspore import Tensor, Parameter, nn, ops, mint
 from mindspore import value_and_grad
+from mindspore.graph.api import _pynative_executor
 from hyper_parallel.platform.mindspore.pipeline_parallel.backward import forward_and_gradfn
+from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 from tests.common.mark_utils import arg_mark
 
 def _assert_allclose(tensors_a, tensors_b, atol=1e-6, rtol=1e-6):
@@ -435,7 +437,7 @@ def test_shared_weight_used_multiple_places_dx_dw_accuracy():
     _assert_allclose(_to_list(dw), dw_expected)
 
 
-@arg_mark(plat_marks=['cpu_linux'],
+@arg_mark(plat_marks=['platform_ascend910b'],
           level_mark='level0',
           card_mark='onecard',
           essential_mark='essential')
@@ -461,7 +463,7 @@ def test_dw_only_weights():
         _ = grad_fn.compute_weight_grad()
 
 
-@arg_mark(plat_marks=['cpu_linux'],
+@arg_mark(plat_marks=['platform_ascend910b'],
           level_mark='level0',
           card_mark='onecard',
           essential_mark='essential')
@@ -531,6 +533,147 @@ def test_tuple_input_grad_position_all():
     assert np.allclose(dx.asnumpy(), expected_dx, atol=1e-6)
     assert np.allclose(tuple_grads[0].asnumpy(), expected_da, atol=1e-6)
     assert np.allclose(tuple_grads[1].asnumpy(), expected_db, atol=1e-6)
+
+def test_tuple_input_grad_position_partial():
+    """
+    Feature: forward_and_gradfn with partial grad_position, mixed inputs, multi-output fn.
+    Description: fn returns 3 outputs: a differentiable Tensor, a stop_gradient Tensor
+                 (requires_grad=False equivalent), and a non-Tensor int.
+                 The middle *input* is also a non-Tensor int (scalar=3).
+
+                 How to set sens for such a multi-output fn
+                 -----------------------------------------
+                 _prepare_output_and_sens calls tree_leaves(output, tensors_only_leaf=True),
+                 which extracts only Tensor leaves in depth-first order and discards non-Tensors.
+                 For output=(active, frozen, label) the extraction order is [active, frozen].
+                 sens must be a tuple of Tensors matching that order and shape:
+                   sens = (Tensor_for_active, Tensor_for_frozen)
+                 The same tree_leaves is applied to sens itself, so the structure can mirror
+                 the output or be a flat tuple — both work.
+                 The frozen tensor (stop_gradient) is included in sens but its gradient
+                 never flows back, so its value is irrelevant; ones_like is the safe default.
+
+                 Sub-case (a): scalar not in grad_position=(0, 2).
+                 Sub-case (b): grad_position=(0, 1, 2) lists the non-Tensor position;
+                               _collect_input_tensors silently drops it via isinstance guard.
+    Expectation: Both cases return (grad_x, grad_z); sens for frozen output has no effect.
+    """
+    def fn(x, scalar, z):
+        active = x * z + scalar * z                      # differentiable Tensor, shape [1]
+        frozen = Tensor(np.array([7.0], np.float32))     # plain constant Tensor, no grad history
+        label = 7                                        # non-Tensor output
+        return active, label, frozen   # non-Tensor sits between two Tensors
+
+    x = Tensor(np.array([2.0], np.float32))
+    scalar = 3        # non-Tensor input
+    z = Tensor(np.array([5.0], np.float32))
+
+    # sens setup for output=(active, label, frozen):
+    #   tree_leaves extracts Tensors depth-first, skipping non-Tensors as "holes":
+    #     active  -> leaf [0]
+    #     label=7 -> skipped (not a Tensor)
+    #     frozen  -> leaf [1]
+    #   flatten_outputs = [active, frozen], length 2.
+    #   sens must be a 2-Tensor tuple in that same order; the non-Tensor hole is invisible.
+    #   frozen has no grad history so its sens has no effect on input gradients.
+    sens = (Tensor(np.array([2.0], np.float32)),   # for active: scales grad by 2
+            Tensor(np.array([1.0], np.float32)))    # for frozen: no-op placeholder
+
+    # expected: grad_x = sens_active * z = 2*5 = 10
+    #           grad_z = sens_active * (x + scalar) = 2*(2+3) = 10
+    expected_grad_x = np.array([10.0], np.float32)
+    expected_grad_z = np.array([10.0], np.float32)
+
+    # Sub-case (a): non-Tensor scalar is outside grad_position
+    _, grad_fn_a = forward_and_gradfn(fn, x, scalar, z, grad_position=(0, 2))
+    grads_a = grad_fn_a(sens=sens)
+
+    assert isinstance(grads_a, tuple), f"Expected tuple, got {type(grads_a)}"
+    assert len(grads_a) == 2, f"Expected 2 gradients, got {len(grads_a)}"
+    grad_x_a, grad_z_a = grads_a
+    assert np.allclose(grad_x_a.asnumpy(), expected_grad_x, atol=1e-6), (
+        f"(a) grad_x mismatch: expected={expected_grad_x}, got={grad_x_a.asnumpy()}"
+    )
+    assert np.allclose(grad_z_a.asnumpy(), expected_grad_z, atol=1e-6), (
+        f"(a) grad_z mismatch: expected={expected_grad_z}, got={grad_z_a.asnumpy()}"
+    )
+
+    # Sub-case (b): non-Tensor scalar IS in grad_position — _collect_input_tensors drops it
+    x2 = Tensor(np.array([2.0], np.float32))
+    z2 = Tensor(np.array([5.0], np.float32))
+    _, grad_fn_b = forward_and_gradfn(fn, x2, scalar, z2, grad_position=(0, 1, 2))
+    grads_b = grad_fn_b(sens=sens)
+
+    assert isinstance(grads_b, tuple), f"Expected tuple, got {type(grads_b)}"
+    assert len(grads_b) == 2, (
+        f"Non-Tensor at grad_position[1] must be dropped: expected 2 grads, got {len(grads_b)}"
+    )
+    grad_x_b, grad_z_b = grads_b
+    assert np.allclose(grad_x_b.asnumpy(), expected_grad_x, atol=1e-6), (
+        f"(b) grad_x mismatch: expected={expected_grad_x}, got={grad_x_b.asnumpy()}"
+    )
+    assert np.allclose(grad_z_b.asnumpy(), expected_grad_z, atol=1e-6), (
+        f"(b) grad_z mismatch: expected={expected_grad_z}, got={grad_z_b.asnumpy()}"
+    )
+
+
+@arg_mark(plat_marks=['platform_ascend910b'],
+          level_mark='level0',
+          card_mark='onecard',
+          essential_mark='essential')
+def test_tuple_input_grad_position_partial_backward_compat():
+    """
+    Feature: enable_mindspore_backward_compat with non-Tensor input, multi-output fn.
+    Description: fn returns 3 outputs: a differentiable Tensor, a stop_gradient Tensor,
+                 and a non-Tensor int. The middle input is also a non-Tensor int.
+                 grad_fn() is called with a custom sens covering the 2 Tensor outputs.
+
+                 sens setup (same rule as test_tuple_input_grad_position_partial):
+                   tree_leaves extracts [active, frozen] from the output tuple, ignoring
+                   the non-Tensor label. sens must be a tuple of 2 Tensors in that order.
+                   frozen's sens value is irrelevant (stop_gradient blocks the path).
+                   Using sens_active=2.0 scales input gradients by 2.
+
+    Expectation: x.grad = z.grad = sens_active * 5 = 10; scalar has no .grad attribute.
+    """
+    enable_mindspore_backward_compat()
+
+    def fn(x, scalar, z):
+        active = x * z + scalar * z
+        frozen = Tensor(np.array([7.0], np.float32))   # constant Tensor, no grad history
+        label = 7
+        return active, label, frozen
+
+    x = Tensor(np.array([2.0], np.float32))
+    scalar = 3        # non-Tensor input
+    z = Tensor(np.array([5.0], np.float32))
+
+    x.requires_grad = True
+    z.requires_grad = True
+
+    _, grad_fn = forward_and_gradfn(fn, x, scalar, z, grad_position=(0, 2))
+    sens = (Tensor(np.array([2.0], np.float32)),   # for active: scales grad by 2
+            Tensor(np.array([1.0], np.float32)))    # for frozen: no-op
+    grad_fn(sens=sens)
+
+    assert x.grad is not None, "x.grad should not be None"
+    assert z.grad is not None, "z.grad should not be None"
+    assert not hasattr(scalar, "grad"), (
+        f"Plain Python int must not have .grad; got {getattr(scalar, 'grad', 'N/A')}"
+    )
+
+    expected_grad_x = np.array([10.0], np.float32)   # sens_active * z = 2 * 5 = 10
+    expected_grad_z = np.array([10.0], np.float32)   # sens_active * (x + scalar) = 2 * 5 = 10
+    assert np.allclose(x.grad.asnumpy(), expected_grad_x, atol=1e-6), (
+        f"x.grad mismatch: expected={expected_grad_x}, got={x.grad.asnumpy()}"
+    )
+    assert np.allclose(z.grad.asnumpy(), expected_grad_z, atol=1e-6), (
+        f"z.grad mismatch: expected={expected_grad_z}, got={z.grad.asnumpy()}"
+    )
+
+    # Reset PyNative executor state (set_grad_flag etc.) so later same-process tests
+    # using value_and_grad baselines do not hit "Can not find top cell for backward".
+    _pynative_executor.clear_res()
 
 
 def test_compute_input_grad_raises_for_none_grad_position():
@@ -938,3 +1081,4 @@ def test_parallel_grad_cases_suit():
     test_tuple_input_compute_input_grad()
     test_dict_output_with_sens()
     test_dict_output_with_weights()
+    test_tuple_input_grad_position_partial()
