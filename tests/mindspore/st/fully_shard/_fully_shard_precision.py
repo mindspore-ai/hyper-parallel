@@ -327,9 +327,6 @@ def run_fully_shard_multi_card(
     shard_dim_size = mesh.shape[-1]
     replicate_params = set(net.trainable_params()) if replicate_all_params else None
 
-    if enable_recompute:
-        apply_recompute(net)
-
     fully_shard(
         net.dense_relu_sequential[0],
         mesh=mesh,
@@ -369,6 +366,9 @@ def run_fully_shard_multi_card(
     )
     if enable_prefetch:
         setup_prefetch(net)
+
+    if enable_recompute:
+        apply_recompute(net)
 
     if not replicate_all_params:
         assert_sharded_param_layout(net, origin_shapes, shard_dim_size)

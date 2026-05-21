@@ -95,7 +95,6 @@ def test_ms_zero3_fully_shard_prefetch():
     run_case(case_name=f"{inspect.stack()[0].function}")
 
 
-@pytest.mark.skip(reason="recompute currently not supported in MindSpore fully_shard; will re-enable once supported")
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_zero3_fully_shard_prefetch_recompute():
     """
@@ -117,7 +116,6 @@ def test_ms_zero3_partial_shard():
     run_case(case_name=f"{inspect.stack()[0].function}")
 
 
-@pytest.mark.skip(reason="recompute currently not supported in MindSpore fully_shard; will re-enable once supported")
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_zero3_partial_shard_prefetch_recompute():
     """
@@ -151,7 +149,6 @@ def test_ms_zero3_fully_shard_grad_accum():
     run_case(case_name=f"{inspect.stack()[0].function}")
 
 
-@pytest.mark.skip(reason="recompute currently not supported in MindSpore fully_shard; will re-enable once supported")
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_ms_zero3_fully_shard_prefetch_recompute_grad_accum():
     """
@@ -188,7 +185,6 @@ def test_ms_fully_shard_list_unit_precision():
     run_list_precision_case(case_name=f"{inspect.stack()[0].function}")
 
 
-@pytest.mark.skip(reason="recompute currently not supported in MindSpore fully_shard; will re-enable once supported")
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_fully_shard_list_unit_prefetch_recompute_precision():
     """
