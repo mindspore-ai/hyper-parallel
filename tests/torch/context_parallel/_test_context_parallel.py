@@ -1703,12 +1703,256 @@ def _test_async_ulysses_backward_npu():
         _assert_close(param_cp.grad, param_ref.grad, rank, f"A2_bwd_{name}")
 
 
+def _test_torch_async_ag_rs_handles_npu():
+    """A3: Torch backend returns real async handles for AllGather/ReduceScatter."""
+    rank = _init_dist_npu()
+    world_size = dist.get_world_size()
+    if world_size < 2:
+        pytest.skip("Requires at least 2 processes")
+
+    from hyper_parallel.platform.torch.platform import TorchPlatform  # pylint: disable=import-outside-toplevel
+
+    rows, cols = 2, 3
+    local = torch.full((rows, cols), float(rank + 1), dtype=torch.float16, device="npu")
+    gathered, ag_work = TorchPlatform.all_gather_single(
+        local,
+        [rows * world_size, cols],
+        dist.group.WORLD,
+        async_op=True,
+    )
+    assert ag_work is not None and hasattr(ag_work, "wait"), \
+        f"[Rank {rank}] all_gather_single did not return an async waitable handle"
+    ag_work.wait()
+    expected_gather = torch.cat([
+        torch.full((rows, cols), float(i + 1), dtype=torch.float16, device="npu")
+        for i in range(world_size)
+    ], dim=0)
+    _assert_close(gathered, expected_gather, rank, "A3_torch_async_allgather_handle")
+
+    rs_input = torch.full(
+        (rows * world_size, cols),
+        float(rank + 1),
+        dtype=torch.float16,
+        device="npu",
+    )
+    reduced, rs_work = TorchPlatform.reduce_scatter_single(
+        rs_input,
+        [rows, cols],
+        dist.group.WORLD,
+        async_op=True,
+    )
+    assert rs_work is not None and hasattr(rs_work, "wait"), \
+        f"[Rank {rank}] reduce_scatter_single did not return an async waitable handle"
+    rs_work.wait()
+    expected_reduce = torch.full(
+        (rows, cols),
+        float(world_size * (world_size + 1) // 2),
+        dtype=torch.float16,
+        device="npu",
+    )
+    _assert_close(reduced, expected_reduce, rank, "A3_torch_async_reduce_scatter_handle")
+
+
+def _test_async_colossal_forward_npu():
+    """A4: AsyncContextParallel Pure Colossal forward matches single-card baseline on NPU."""
+    rank = _init_dist_npu()
+    cp_size = dist.get_world_size()
+    if cp_size < 2:
+        pytest.skip("Requires at least 2 processes")
+    batch, seq_len, num_heads, head_dim = 1, 8, 4, 8
+    hidden = num_heads * head_dim
+    local_s = seq_len // cp_size
+
+    mesh = init_device_mesh("npu", (cp_size,), mesh_dim_names=("cp",))
+
+    device = "npu"
+    torch.manual_seed(42)
+    full_x = torch.randn(batch, seq_len, hidden, dtype=torch.float16, device=device)
+    local_x = full_x[:, rank * local_s:(rank + 1) * local_s]
+
+    torch.manual_seed(0)
+    model_cp = _AsyncModel(hidden, num_heads, head_dim).to(device=device, dtype=torch.float16)
+    async_cp = AsyncContextParallel(seq_dim=1, head_dim=2, ulysses_degree=1)
+    async_cp.apply(
+        module=model_cp.attn,
+        device_mesh=mesh,
+        q_proj=model_cp.q_proj,
+        k_proj=model_cp.k_proj,
+        v_proj=model_cp.v_proj,
+    )
+
+    with torch.no_grad():
+        cp_out = model_cp(local_x)
+
+    torch.manual_seed(0)
+    model_ref = _AsyncModel(hidden, num_heads, head_dim).to(device=device, dtype=torch.float16)
+    with torch.no_grad():
+        ref_full = model_ref(full_x)
+    ref_local = ref_full[:, rank * local_s:(rank + 1) * local_s]
+
+    assert cp_out.shape == (batch, local_s, num_heads, head_dim)
+    _assert_close(cp_out, ref_local, rank, "A4_async_colossal_forward_npu")
+
+
+def _test_async_colossal_backward_npu():
+    """A5: AsyncContextParallel Pure Colossal backward gradients match single-card baseline."""
+    rank = _init_dist_npu()
+    cp_size = dist.get_world_size()
+    if cp_size < 2:
+        pytest.skip("Requires at least 2 processes")
+    batch, seq_len, num_heads, head_dim = 1, 8, 4, 8
+    hidden = num_heads * head_dim
+    local_s = seq_len // cp_size
+
+    mesh = init_device_mesh("npu", (cp_size,), mesh_dim_names=("cp",))
+
+    device = "npu"
+    torch.manual_seed(42)
+    full_x = torch.randn(batch, seq_len, hidden, dtype=torch.float16, device=device)
+    local_x = full_x[:, rank * local_s:(rank + 1) * local_s].clone()
+
+    torch.manual_seed(0)
+    model_cp = _AsyncModel(hidden, num_heads, head_dim).to(device=device, dtype=torch.float16)
+    async_cp = AsyncContextParallel(seq_dim=1, head_dim=2, ulysses_degree=1)
+    async_cp.apply(
+        module=model_cp.attn,
+        device_mesh=mesh,
+        q_proj=model_cp.q_proj,
+        k_proj=model_cp.k_proj,
+        v_proj=model_cp.v_proj,
+    )
+
+    cp_out = model_cp(local_x)
+    cp_out.sum().backward()
+
+    for name, param in model_cp.named_parameters():
+        assert param.grad is not None, f"[Rank {rank}] A5: {name}.grad is None"
+        assert not torch.isnan(param.grad).any(), f"[Rank {rank}] A5: NaN in {name}.grad"
+        assert not torch.isinf(param.grad).any(), f"[Rank {rank}] A5: Inf in {name}.grad"
+
+    for param in model_cp.parameters():
+        dist.all_reduce(param.grad)
+
+    torch.manual_seed(0)
+    model_ref = _AsyncModel(hidden, num_heads, head_dim).to(device=device, dtype=torch.float16)
+    ref_full_out = model_ref(full_x)
+    ref_full_out.sum().backward()
+
+    for (name, param_cp), (_, param_ref) in zip(
+        model_cp.named_parameters(), model_ref.named_parameters()
+    ):
+        _assert_close(param_cp.grad, param_ref.grad, rank, f"A5_colossal_bwd_{name}")
+
+
+def _all_reduce_parameter_grads(model: nn.Module) -> None:
+    """All-reduce every parameter gradient in-place for CP-vs-single-card comparison."""
+    for param in model.parameters():
+        if param.grad is not None:
+            dist.all_reduce(param.grad)
+
+
+def _assert_model_parameter_grads_close(actual: nn.Module, expected: nn.Module, rank: int, label: str) -> None:
+    """Compare named parameter gradients between two models."""
+    for (name, actual_param), (_, expected_param) in zip(
+        actual.named_parameters(), expected.named_parameters()
+    ):
+        assert actual_param.grad is not None, f"[Rank {rank}] {label}: {name}.grad is None"
+        assert expected_param.grad is not None, f"[Rank {rank}] {label}: {name} ref grad is None"
+        _assert_close(actual_param.grad, expected_param.grad, rank, f"{label}_{name}")
+
+
+def _build_precision_model(
+    hidden: int,
+    num_heads: int,
+    head_dim: int,
+    device: str,
+    mesh,
+    ulysses_degree,
+    async_enabled: bool,
+) -> nn.Module:
+    """Build a deterministic sync or async CP model for precision comparison."""
+    torch.manual_seed(0)
+    model = _AsyncModel(hidden, num_heads, head_dim).to(device=device, dtype=torch.float16)
+    if async_enabled:
+        AsyncContextParallel(seq_dim=1, head_dim=2, ulysses_degree=ulysses_degree).apply(
+            module=model.attn,
+            device_mesh=mesh,
+            q_proj=model.q_proj,
+            k_proj=model.k_proj,
+            v_proj=model.v_proj,
+        )
+    else:
+        ContextParallel(seq_dim=1, head_dim=2, ulysses_degree=ulysses_degree).apply(model.attn, mesh)
+    return model
+
+
+def _run_async_vs_sync_precision_case(case_name: str, ulysses_degree) -> None:
+    """Compare single-card reference, sync CP, and async CP forward/backward precision."""
+    rank = _init_dist_npu()
+    cp_size = dist.get_world_size()
+    if cp_size < 2:
+        pytest.skip("Requires at least 2 processes")
+
+    batch, seq_len, num_heads, head_dim = 1, 8, 4, 8
+    hidden = num_heads * head_dim
+    local_s = seq_len // cp_size
+    seq_slice = slice(rank * local_s, (rank + 1) * local_s)
+    mesh = init_device_mesh("npu", (cp_size,), mesh_dim_names=("cp",))
+    device = "npu"
+
+    torch.manual_seed(42)
+    full_x_seed = torch.randn(batch, seq_len, hidden, dtype=torch.float16, device=device)
+
+    torch.manual_seed(0)
+    ref_model = _AsyncModel(hidden, num_heads, head_dim).to(device=device, dtype=torch.float16)
+    ref_x = full_x_seed.detach().clone().requires_grad_(True)
+    ref_out = ref_model(ref_x)
+    ref_out.sum().backward()
+    ref_local_out = ref_out[:, seq_slice].detach()
+    ref_local_input_grad = ref_x.grad[:, seq_slice].detach()
+
+    sync_model = _build_precision_model(
+        hidden, num_heads, head_dim, device, mesh, ulysses_degree, async_enabled=False
+    )
+    sync_x = full_x_seed[:, seq_slice].detach().clone().requires_grad_(True)
+    sync_out = sync_model(sync_x)
+    sync_out.sum().backward()
+    sync_input_grad = sync_x.grad.detach().clone()
+    _all_reduce_parameter_grads(sync_model)
+
+    _sync_workers()
+
+    async_model = _build_precision_model(
+        hidden, num_heads, head_dim, device, mesh, ulysses_degree, async_enabled=True
+    )
+    async_x = full_x_seed[:, seq_slice].detach().clone().requires_grad_(True)
+    async_out = async_model(async_x)
+    async_out.sum().backward()
+    async_input_grad = async_x.grad.detach().clone()
+    _all_reduce_parameter_grads(async_model)
+
+    assert sync_out.shape == (batch, local_s, num_heads, head_dim)
+    assert async_out.shape == (batch, local_s, num_heads, head_dim)
+
+    _assert_close(sync_out, ref_local_out, rank, f"{case_name}_sync_vs_single_fwd")
+    _assert_close(async_out, ref_local_out, rank, f"{case_name}_async_vs_single_fwd")
+    _assert_close(async_out, sync_out, rank, f"{case_name}_async_vs_sync_fwd")
+
+    _assert_close(sync_input_grad, ref_local_input_grad, rank, f"{case_name}_sync_vs_single_input_grad")
+    _assert_close(async_input_grad, ref_local_input_grad, rank, f"{case_name}_async_vs_single_input_grad")
+    _assert_close(async_input_grad, sync_input_grad, rank, f"{case_name}_async_vs_sync_input_grad")
+
+    _assert_model_parameter_grads_close(sync_model, ref_model, rank, f"{case_name}_sync_vs_single_bwd")
+    _assert_model_parameter_grads_close(async_model, ref_model, rank, f"{case_name}_async_vs_single_bwd")
+    _assert_model_parameter_grads_close(async_model, sync_model, rank, f"{case_name}_async_vs_sync_bwd")
+
+
 @pytest.mark.skipif(
     dist.is_initialized() and dist.get_world_size() < 4,
-    reason="A3 requires world_size=4",
+    reason="A6 requires world_size=4",
 )
 def test_async_hybrid_forward_npu():
-    """A3: AsyncContextParallel Hybrid (cp=4, ds=2, co=2) forward matches single-card on NPU.
+    """A6: AsyncContextParallel Hybrid half-async forward matches single-card on NPU.
 
     Reference: same model (single-card, no CP), full sequence → local slice.
     """
@@ -1752,7 +1996,7 @@ def test_async_hybrid_forward_npu():
     ref_local = ref_full[:, rank * local_s:(rank + 1) * local_s]
 
     assert cp_out.shape == (batch, local_s, num_heads, head_dim)
-    _assert_close(cp_out, ref_local, rank, "A3_async_hybrid_forward_npu")
+    _assert_close(cp_out, ref_local, rank, "A6_async_hybrid_half_async_forward_npu")
 
 
 def test_async_ulysses_suite():
@@ -1764,6 +2008,22 @@ def test_async_ulysses_suite():
     _test_async_ulysses_forward_npu()
     _sync_workers()
     _test_async_ulysses_backward_npu()
+
+
+def test_async_colossal_suite():
+    """Merged Async Pure Colossal suite with backend-handle, forward, and backward checks."""
+    _test_torch_async_ag_rs_handles_npu()
+    _sync_workers()
+    _test_async_colossal_forward_npu()
+    _sync_workers()
+    _test_async_colossal_backward_npu()
+
+
+def test_async_vs_sync_precision_suite():
+    """Compare precision with async disabled/enabled against single-card baseline."""
+    _run_async_vs_sync_precision_case("A7_ulysses_precision", ulysses_degree=None)
+    _sync_workers()
+    _run_async_vs_sync_precision_case("A8_colossal_precision", ulysses_degree=1)
 
 
 # ---------------------------------------------------------------------------

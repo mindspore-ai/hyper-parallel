@@ -62,6 +62,32 @@ def _a2a_reconstruct(out_perm: torch.Tensor, concat_dim: int) -> torch.Tensor:
     return x_recon.reshape(shape[:concat_dim] + [merged] + shape[concat_dim + 2:])
 
 
+def _normalize_dim(dim: int, ndim: int) -> int:
+    """Normalize a possibly negative dimension index."""
+    return dim + ndim if dim < 0 else dim
+
+
+def _move_dim_to_front(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    """Move ``dim`` to the front while keeping the other dimensions ordered."""
+    dim = _normalize_dim(dim, tensor.dim())
+    if dim == 0:
+        return tensor.contiguous()
+    perm = [dim] + [i for i in range(tensor.dim()) if i != dim]
+    return tensor.permute(perm).contiguous()
+
+
+def _move_dim_from_front(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    """Inverse of :func:`_move_dim_to_front`."""
+    dim = _normalize_dim(dim, tensor.dim())
+    if dim == 0:
+        return tensor.contiguous()
+    perm = [dim] + [i for i in range(tensor.dim()) if i != dim]
+    inverse = [0] * len(perm)
+    for idx, value in enumerate(perm):
+        inverse[value] = idx
+    return tensor.permute(inverse).contiguous()
+
+
 class _TorchAsyncA2AFunction(torch.autograd.Function):
     """Differentiable wrapper for pre-launched async all-to-all.
 
@@ -102,6 +128,40 @@ class _TorchAsyncA2AFunction(torch.autograd.Function):
             work = dist.all_to_all_single(out_perm, x_perm, group=ctx.group, async_op=True)
             ctx.handle_box.append((work, out_perm))
         return grad_output.new_zeros(ctx.x_shape), None, None, None, None, None, None, None
+
+
+class _TorchAsyncAllGatherFunction(torch.autograd.Function):
+    """Differentiable wrapper for pre-launched async all-gather."""
+
+    @staticmethod
+    def forward(ctx, x, work, out_perm, group, world_size, gather_dim, handle_box):  # pylint: disable=arguments-differ
+        """Wait for pre-launched all-gather and reconstruct the gathered tensor."""
+        ctx.group = group
+        ctx.world_size = world_size
+        ctx.gather_dim = gather_dim
+        ctx.handle_box = handle_box
+        ctx.x_shape = x.shape
+        work.wait()
+        return _move_dim_from_front(out_perm, gather_dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Launch reverse reduce-scatter for the all-gather."""
+        grad_perm = _move_dim_to_front(grad_output.contiguous(), ctx.gather_dim)
+        output_shape = list(grad_perm.shape)
+        if output_shape[0] % ctx.world_size != 0:
+            raise ValueError(
+                "all_gather backward expected gathered dimension to be divisible by world_size, "
+                f"got {output_shape[0]} and {ctx.world_size}."
+            )
+        output_shape[0] //= ctx.world_size
+        output = torch.empty(output_shape, dtype=grad_perm.dtype, device=grad_perm.device)
+        work = dist.reduce_scatter_tensor(output, grad_perm, group=ctx.group, async_op=True)
+        if ctx.handle_box is not None:
+            ctx.handle_box.append((work, output, ctx.gather_dim))
+            return grad_output.new_zeros(ctx.x_shape), None, None, None, None, None, None
+        work.wait()
+        return _move_dim_from_front(output, ctx.gather_dim), None, None, None, None, None, None
 
 
 class _AsyncA2ALazyBwd(torch.autograd.Function):
@@ -834,6 +894,12 @@ class TorchPlatform(Platform):
         return output, handle
 
     @staticmethod
+    def all_gather_single(input_tensor, output_shape, group, async_op=False):
+        output = torch.empty(output_shape, dtype=input_tensor.dtype, device=input_tensor.device)
+        handle = dist.all_gather_into_tensor(output, input_tensor, group=group, async_op=async_op)
+        return output, handle
+
+    @staticmethod
     def all_reduce(data, group_info, async_op=False):
         if not data.is_contiguous():
             data = data.contiguous()
@@ -874,6 +940,12 @@ class TorchPlatform(Platform):
         output_shape[0] = output_shape[0] // group_info.rank_size
         output = torch.empty(output_shape, dtype=data.dtype, device=data.device)
         handle = dist.reduce_scatter_tensor(output, data, group=group_info.group, async_op=async_op)
+        return output, handle
+
+    @staticmethod
+    def reduce_scatter_single(input_tensor, output_shape, group, async_op=False):
+        output = torch.empty(output_shape, dtype=input_tensor.dtype, device=input_tensor.device)
+        handle = dist.reduce_scatter_tensor(output, input_tensor, group=group, async_op=async_op)
         return output, handle
 
     @staticmethod
@@ -930,6 +1002,14 @@ class TorchPlatform(Platform):
             ``[sum(output_splits), *input_tensor.shape[1:]]``.
         """
         return _AsyncA2ALazyBwd.apply(input_tensor, output_splits, input_splits, group)
+
+    @staticmethod
+    def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,
+                                            handle_box=None):
+        """Wait async all-gather handle and reconstruct result (differentiable)."""
+        return _TorchAsyncAllGatherFunction.apply(
+            x, work, out_perm, group, world_size, gather_dim, handle_box
+        )
 
     @staticmethod
     def arange(start, end=None, step=1, dtype=None, device=None):

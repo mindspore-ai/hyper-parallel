@@ -69,6 +69,32 @@ def _a2a_reconstruct_ms(out_perm: Tensor, concat_dim: int) -> Tensor:
     return x_recon.reshape(shape[:concat_dim] + [merged] + shape[concat_dim + 2:])
 
 
+def _normalize_dim(dim: int, ndim: int) -> int:
+    """Normalize a possibly-negative dimension index."""
+    return dim + ndim if dim < 0 else dim
+
+
+def _move_dim_to_front(tensor: Tensor, dim: int) -> Tensor:
+    """Move ``dim`` to the front while preserving the other dimensions' order."""
+    dim = _normalize_dim(dim, tensor.dim())
+    if dim == 0:
+        return tensor.contiguous()
+    perm = [dim] + [i for i in range(tensor.dim()) if i != dim]
+    return tensor.permute(perm).contiguous()
+
+
+def _move_dim_from_front(tensor: Tensor, dim: int) -> Tensor:
+    """Inverse of :func:`_move_dim_to_front`."""
+    dim = _normalize_dim(dim, tensor.dim())
+    if dim == 0:
+        return tensor.contiguous()
+    perm = [dim] + [i for i in range(tensor.dim()) if i != dim]
+    inverse = [0] * len(perm)
+    for idx, value in enumerate(perm):
+        inverse[value] = idx
+    return tensor.permute(inverse).contiguous()
+
+
 def _normalize_all_to_all_single_result(result, output: Tensor) -> tuple[Tensor, object]:
     """Normalize MindSpore all_to_all_single return values to ``(output, handle)``."""
     if isinstance(result, tuple):
@@ -81,11 +107,57 @@ def _normalize_all_to_all_single_result(result, output: Tensor) -> tuple[Tensor,
     return output, result
 
 
+def _normalize_all_gather_single_result(result, output: Tensor) -> tuple[Tensor, object]:
+    """Normalize MindSpore all_gather_into_tensor return values to ``(output, handle)``."""
+    if isinstance(result, tuple):
+        if len(result) != 2:
+            raise ValueError(
+                "mindspore all_gather_into_tensor returned an unexpected tuple "
+                f"with length {len(result)}"
+            )
+        return result
+    return output, result
+
+
+def _normalize_reduce_scatter_single_result(result, output: Tensor) -> tuple[Tensor, object]:
+    """Normalize MindSpore reduce_scatter_tensor return values to ``(output, handle)``."""
+    if isinstance(result, tuple):
+        if len(result) != 2:
+            raise ValueError(
+                "mindspore reduce_scatter_tensor returned an unexpected tuple "
+                f"with length {len(result)}"
+            )
+        return result
+    return output, result
+
+
 def _mindspore_all_to_all_single(input_tensor: Tensor, output_shape, group, async_op=False) -> tuple[Tensor, object]:
     """Launch MindSpore all_to_all_single and normalize return values."""
     output = mint.empty(tuple(output_shape), dtype=input_tensor.dtype)
     result = ops_comm.all_to_all_single(output, input_tensor, group=group, async_op=async_op)
     normalized_output, handle = _normalize_all_to_all_single_result(result, output)
+    if not async_op:
+        return normalized_output, None
+    return normalized_output, handle
+
+
+def _mindspore_all_gather_single(input_tensor: Tensor, output_shape, group, async_op=False) -> tuple[Tensor, object]:
+    """Launch MindSpore all_gather_into_tensor and normalize return values."""
+    output = mint.empty(tuple(output_shape), dtype=input_tensor.dtype)
+    result = ops_comm.all_gather_into_tensor(output, input_tensor, group=group, async_op=async_op)
+    normalized_output, handle = _normalize_all_gather_single_result(result, output)
+    if not async_op:
+        return normalized_output, None
+    return normalized_output, handle
+
+
+def _mindspore_reduce_scatter_single(
+        input_tensor: Tensor, output_shape, group, async_op=False
+) -> tuple[Tensor, object]:
+    """Launch MindSpore reduce_scatter_tensor and normalize return values."""
+    output = mint.empty(tuple(output_shape), dtype=input_tensor.dtype)
+    result = ops_comm.reduce_scatter_tensor(output, input_tensor, group=group, async_op=async_op)
+    normalized_output, handle = _normalize_reduce_scatter_single_result(result, output)
     if not async_op:
         return normalized_output, None
     return normalized_output, handle
@@ -464,6 +536,44 @@ class _MSAsyncA2AFunction(_Function):
             )
             ctx.handle_box.append((work, out_perm))
         return mint.zeros(ctx.x_shape, dtype=grad_output.dtype), None, None, None, None, None, None, None
+
+
+class _MSAsyncAllGatherFunction(_Function):
+    """Differentiable wrapper for pre-launched async all-gather."""
+
+    @staticmethod
+    def forward(ctx, x, work, out_perm, group, world_size, gather_dim, handle_box):  # pylint: disable=arguments-differ
+        """Wait for pre-launched all-gather and reconstruct the gathered tensor."""
+        ctx.group = group
+        ctx.world_size = world_size
+        ctx.gather_dim = gather_dim
+        ctx.handle_box = handle_box
+        ctx.x_shape = tuple(x.shape)
+        work.wait()
+        return _move_dim_from_front(out_perm, gather_dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Launch reverse reduce-scatter for the all-gather."""
+        grad_perm = _move_dim_to_front(grad_output.contiguous(), ctx.gather_dim)
+        output_shape = list(grad_perm.shape)
+        if output_shape[0] % ctx.world_size != 0:
+            raise ValueError(
+                "all_gather backward expected gathered dimension to be divisible by world_size, "
+                f"got {output_shape[0]} and {ctx.world_size}."
+            )
+        output_shape[0] //= ctx.world_size
+        output, work = _mindspore_reduce_scatter_single(
+            grad_perm,
+            output_shape,
+            ctx.group,
+            async_op=True,
+        )
+        if ctx.handle_box is not None:
+            ctx.handle_box.append((work, output, ctx.gather_dim))
+            return mint.zeros(ctx.x_shape, dtype=grad_output.dtype), None, None, None, None, None, None
+        work.wait()
+        return _move_dim_from_front(output, ctx.gather_dim), None, None, None, None, None, None
 
 
 class MindSporePlatform(Platform):
@@ -977,7 +1087,15 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):
-        return comm_func.all_gather_into_tensor(None, data, group=group_info.group_name, async_op=async_op)
+        group_name = group_info if isinstance(group_info, str) else group_info.group_name
+        rank_size = get_group_size(group_name) if isinstance(group_info, str) else group_info.rank_size
+        output_shape = list(data.shape)
+        output_shape[0] *= rank_size
+        return _mindspore_all_gather_single(data, output_shape, group_name, async_op=async_op)
+
+    @staticmethod
+    def all_gather_single(input_tensor, output_shape, group, async_op=False):
+        return _mindspore_all_gather_single(input_tensor, output_shape, group, async_op=async_op)
 
     @staticmethod
     def all_reduce(data, group_info, async_op=False):
@@ -996,11 +1114,26 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def reduce_scatter_tensor(data, group_info, async_op=False):
-        return comm_func.reduce_scatter_tensor(None, data, group=group_info.group_name, async_op=async_op)
+        group_name = group_info if isinstance(group_info, str) else group_info.group_name
+        rank_size = get_group_size(group_name) if isinstance(group_info, str) else group_info.rank_size
+        output_shape = list(data.shape)
+        output_shape[0] //= rank_size
+        return _mindspore_reduce_scatter_single(data, output_shape, group_name, async_op=async_op)
+
+    @staticmethod
+    def reduce_scatter_single(input_tensor, output_shape, group, async_op=False):
+        return _mindspore_reduce_scatter_single(input_tensor, output_shape, group, async_op=async_op)
 
     @staticmethod
     def all_to_all_single(input_tensor, output_shape, group, async_op=False):
         return _mindspore_all_to_all_single(input_tensor, output_shape, group, async_op=async_op)
+
+    @staticmethod
+    def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,
+                                            handle_box=None):
+        return _MSAsyncAllGatherFunction.apply(
+            x, work, out_perm, group, world_size, gather_dim, handle_box
+        )
 
     @staticmethod
     def differentiable_async_a2a_wait(x, work, out_perm, group, world_size, concat_dim, split_dim,  # pylint: disable=unused-argument

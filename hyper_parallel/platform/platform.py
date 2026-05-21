@@ -576,6 +576,38 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement reduce_scatter_tensor")
 
     @staticmethod
+    def all_gather_single(input_tensor, output_shape, group, async_op=False):
+        """All-gather tensor shards with optional async execution.
+
+        Args:
+            input_tensor: Input tensor whose leading dimension is gathered.
+            output_shape: Shape of the gathered output tensor.
+            group: Process group (ProcessGroup for torch, group name string for mindspore).
+            async_op: If True, returns an async work handle.
+
+        Returns:
+            Tuple ``(output, work)`` where *output* is the gathered tensor and
+            *work* is the async handle (``None`` when ``async_op=False``).
+        """
+        raise NotImplementedError("Platform subclasses must implement all_gather_single")
+
+    @staticmethod
+    def reduce_scatter_single(input_tensor, output_shape, group, async_op=False):
+        """Reduce-scatter a tensor with optional async execution.
+
+        Args:
+            input_tensor: Input tensor whose leading dimension is split across ranks.
+            output_shape: Shape of the local reduced output tensor.
+            group: Process group (ProcessGroup for torch, group name string for mindspore).
+            async_op: If True, returns an async work handle.
+
+        Returns:
+            Tuple ``(output, work)`` where *output* is the local shard and
+            *work* is the async handle (``None`` when ``async_op=False``).
+        """
+        raise NotImplementedError("Platform subclasses must implement reduce_scatter_single")
+
+    @staticmethod
     def all_to_all_single(input_tensor, output_shape, group, async_op=False):
         """All-to-all single collective with optional async execution.
 
@@ -594,6 +626,35 @@ class Platform:
             NotImplementedError: Must be implemented by platform subclasses.
         """
         raise NotImplementedError("Platform subclasses must implement all_to_all_single")
+
+    @staticmethod
+    def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,
+                                            handle_box=None):
+        """Differentiable wrapper that waits for a pre-launched async all-gather.
+
+        Forward waits for the all-gather handle and reconstructs the tensor by
+        moving the gathered leading dimension back to ``gather_dim``.
+
+        Backward launches the reverse reduce-scatter. If ``handle_box`` is a
+        mutable list, the reduce-scatter handle is appended there and a zero
+        gradient is returned to be replaced by the caller's backward pre-hook.
+        If ``handle_box`` is ``None``, the reduce-scatter is waited immediately
+        and its local result is returned, preserving composability with an
+        upstream autograd communication op.
+
+        Args:
+            x: Original input tensor; anchors the op in the autograd graph.
+            work: Async work handle from all-gather.
+            out_perm: Output buffer filled by all-gather.
+            group: Communication group for backward reduce-scatter.
+            world_size: Group size.
+            gather_dim: Dimension gathered in forward.
+            handle_box: Optional mutable list for deferred backward wait.
+
+        Returns:
+            Gathered tensor connected to the autograd graph through *x*.
+        """
+        raise NotImplementedError("Platform subclasses must implement differentiable_async_allgather_wait")
 
     @staticmethod
     def differentiable_async_a2a_wait(x, work, out_perm, group, world_size, concat_dim, split_dim,

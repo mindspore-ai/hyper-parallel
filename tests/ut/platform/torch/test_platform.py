@@ -280,6 +280,122 @@ class TestTorchPlatformCore(unittest.TestCase):
         self.assertTrue(result.is_contiguous())
         mock_all_reduce.assert_called_once()
 
+    @mock.patch('torch.distributed.all_gather_into_tensor')
+    def test_all_gather_single_returns_output_and_handle(self, mock_all_gather):
+        """Test direct all_gather_single wrapper with async handle propagation."""
+        tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        mock_group = MagicMock()
+        fake_handle = MagicMock()
+
+        def fake_all_gather(output, input_tensor, group=None, async_op=False):
+            self.assertIs(group, mock_group)
+            self.assertTrue(async_op)
+            output.copy_(torch.cat([input_tensor, input_tensor], dim=0))
+            return fake_handle
+
+        mock_all_gather.side_effect = fake_all_gather
+
+        output, handle = TorchPlatform.all_gather_single(
+            tensor,
+            [4, 2],
+            mock_group,
+            async_op=True,
+        )
+
+        self.assertIs(handle, fake_handle)
+        self.assertEqual(tuple(output.shape), (4, 2))
+        expected = torch.tensor([[1.0, 2.0], [3.0, 4.0], [1.0, 2.0], [3.0, 4.0]])
+        self.assertTrue(torch.allclose(output, expected))
+
+    @mock.patch('torch.distributed.reduce_scatter_tensor')
+    def test_reduce_scatter_single_returns_output_and_handle(self, mock_reduce_scatter):
+        """Test direct reduce_scatter_single wrapper with async handle propagation."""
+        tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+        mock_group = MagicMock()
+        fake_handle = MagicMock()
+
+        def fake_reduce_scatter(output, input_tensor, group=None, async_op=False):
+            self.assertIs(group, mock_group)
+            self.assertTrue(async_op)
+            output.copy_(input_tensor[: output.shape[0]])
+            return fake_handle
+
+        mock_reduce_scatter.side_effect = fake_reduce_scatter
+
+        output, handle = TorchPlatform.reduce_scatter_single(
+            tensor,
+            [2, 2],
+            mock_group,
+            async_op=True,
+        )
+
+        self.assertIs(handle, fake_handle)
+        self.assertEqual(tuple(output.shape), (2, 2))
+        expected = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        self.assertTrue(torch.allclose(output, expected))
+
+    def test_differentiable_async_allgather_wait_immediate_backward(self):
+        """Async all-gather wait should return a real gradient when handle_box is None."""
+        x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        work = MagicMock()
+        work.wait = MagicMock()
+        out_perm = torch.cat([x.detach(), x.detach()], dim=0)
+        fake_handle = MagicMock()
+
+        def fake_reduce_scatter(output, input_tensor, group=None, async_op=False):
+            self.assertTrue(async_op)
+            output.copy_(input_tensor[: output.shape[0]])
+            return fake_handle
+
+        with mock.patch('torch.distributed.reduce_scatter_tensor', side_effect=fake_reduce_scatter):
+            output = TorchPlatform.differentiable_async_allgather_wait(
+                x,
+                work,
+                out_perm,
+                group=MagicMock(),
+                world_size=2,
+                gather_dim=0,
+                handle_box=None,
+            )
+            output.sum().backward()
+
+        self.assertEqual(work.wait.call_count, 1)
+        self.assertTrue(torch.allclose(x.grad, torch.ones_like(x)))
+
+    def test_differentiable_async_allgather_wait_defers_backward_handle(self):
+        """Async all-gather wait should defer reverse reduce-scatter when handle_box is provided."""
+        x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        work = MagicMock()
+        work.wait = MagicMock()
+        out_perm = torch.cat([x.detach(), x.detach()], dim=0)
+        fake_handle = MagicMock()
+        handle_box = []
+
+        def fake_reduce_scatter(output, input_tensor, group=None, async_op=False):
+            self.assertTrue(async_op)
+            output.copy_(input_tensor[: output.shape[0]])
+            return fake_handle
+
+        with mock.patch('torch.distributed.reduce_scatter_tensor', side_effect=fake_reduce_scatter):
+            output = TorchPlatform.differentiable_async_allgather_wait(
+                x,
+                work,
+                out_perm,
+                group=MagicMock(),
+                world_size=2,
+                gather_dim=0,
+                handle_box=handle_box,
+            )
+            output.sum().backward()
+
+        self.assertEqual(work.wait.call_count, 1)
+        self.assertEqual(len(handle_box), 1)
+        handle, output_buffer, gather_dim = handle_box[0]
+        self.assertIs(handle, fake_handle)
+        self.assertEqual(gather_dim, 0)
+        self.assertTrue(torch.allclose(output_buffer, torch.ones_like(output_buffer)))
+        self.assertTrue(torch.allclose(x.grad, torch.zeros_like(x)))
+
     def test_search_parameter_by_name(self):
         """Test parameter search by name logic.
         

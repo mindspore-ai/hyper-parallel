@@ -26,7 +26,8 @@ to CP-replicated layouts.  Ulysses/head sharding is rejected because the current
 DSA kernels require attention head, index head, head dim and sparse top-k dims to
 stay replicated.
 """
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
 
 from hyper_parallel.core.context_parallel.context_parallel import _ensure_1d, _gather_seq
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
@@ -77,6 +78,22 @@ def _maybe_replace_kwarg(kwargs: dict, name: Optional[str], fn) -> None:
     if name is None or name not in kwargs:
         return
     kwargs[name] = fn(kwargs[name])
+
+
+@dataclass
+class _ParamSpec:
+    """Describe one tensor argument location and transform."""
+
+    index: Optional[int]
+    kwarg_name: Optional[str]
+    fn: Callable[[Any], Any]
+
+
+def _apply_param_specs(args: list, kwargs: dict, specs: list[_ParamSpec]) -> None:
+    """Apply each spec's transform to the matching positional or keyword argument."""
+    for spec in specs:
+        _maybe_replace_arg(args, spec.index, spec.fn)
+        _maybe_replace_kwarg(kwargs, spec.kwarg_name, spec.fn)
 
 
 def _validate_layout_and_mode(style_name: str, layout: str, mode: str) -> tuple[str, int]:
@@ -161,32 +178,38 @@ def _configure_sparse_attention_boundary(  # pylint: disable=too-many-arguments
     style.use_local_output = use_local_output
 
 
-def _apply_sparse_attention_boundary(style, module: Module, device_mesh: DeviceMesh) -> Module:
+def _apply_sparse_attention_boundary(
+        style,
+        module: Module,
+        device_mesh: DeviceMesh,
+        *,
+        async_state: Optional[Any] = None,
+) -> Module:
     """Register low-level DSA sparse-attention boundary hooks for ``style``."""
     cp_mesh = _ensure_1d(device_mesh)
 
-    def _shard_query_side(value: Any) -> Any:
+    def _shard(value: Any) -> Any:
         return _to_sequence_shard(value, cp_mesh, style.seq_dim)
 
-    def _replicate_key_side(value: Any) -> Any:
-        return _to_sequence_replicate(value, cp_mesh, style.seq_dim)
+    def _replicate(slot_name: str):
+        if async_state is not None:
+            return lambda value: async_state.wait(slot_name, value)
+        return lambda value: _to_sequence_replicate(value, cp_mesh, style.seq_dim)
+
+    specs = [
+        _ParamSpec(style.query_index, style.query_kwarg_name, _shard),
+        _ParamSpec(style.key_index, style.key_kwarg_name, _replicate("key")),
+        _ParamSpec(style.value_index, style.value_kwarg_name, _replicate("value")),
+        _ParamSpec(style.topk_index, style.topk_kwarg_name, _shard),
+        _ParamSpec(style.query_rope_index, style.query_rope_kwarg_name, _shard),
+        _ParamSpec(style.key_rope_index, style.key_rope_kwarg_name, _replicate("key_rope")),
+    ]
 
     def _pre_hook(hook_module, args, kwargs):
         del hook_module
         new_args = list(args)
         new_kwargs = dict(kwargs)
-        _maybe_replace_arg(new_args, style.query_index, _shard_query_side)
-        _maybe_replace_arg(new_args, style.key_index, _replicate_key_side)
-        _maybe_replace_arg(new_args, style.value_index, _replicate_key_side)
-        _maybe_replace_arg(new_args, style.topk_index, _shard_query_side)
-        _maybe_replace_arg(new_args, style.query_rope_index, _shard_query_side)
-        _maybe_replace_arg(new_args, style.key_rope_index, _replicate_key_side)
-        _maybe_replace_kwarg(new_kwargs, style.query_kwarg_name, _shard_query_side)
-        _maybe_replace_kwarg(new_kwargs, style.key_kwarg_name, _replicate_key_side)
-        _maybe_replace_kwarg(new_kwargs, style.value_kwarg_name, _replicate_key_side)
-        _maybe_replace_kwarg(new_kwargs, style.topk_kwarg_name, _shard_query_side)
-        _maybe_replace_kwarg(new_kwargs, style.query_rope_kwarg_name, _shard_query_side)
-        _maybe_replace_kwarg(new_kwargs, style.key_rope_kwarg_name, _replicate_key_side)
+        _apply_param_specs(new_args, new_kwargs, specs)
         return tuple(new_args), new_kwargs
 
     _register_boundary_hooks(module, _pre_hook, style.use_local_output)
@@ -242,24 +265,37 @@ class DSAIndexerContextParallel(ParallelStyle):
     def _replicate_key_side(self, value: Any, device_mesh: DeviceMesh) -> Any:
         return _to_sequence_replicate(value, device_mesh, self.seq_dim)
 
-    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
-        """Register DSA indexer CP hooks on ``module`` and return it."""
-        cp_mesh = _ensure_1d(device_mesh)
+    def _build_specs(self, cp_mesh: DeviceMesh, key_fn: Callable[[Any], Any]) -> list[_ParamSpec]:
+        """Build table-driven transforms for the indexer boundary."""
+        def shard(value: Any) -> Any:
+            return self._shard_query_side(value, cp_mesh)
 
+        return [
+            _ParamSpec(self.query_index, self.query_kwarg_name, shard),
+            _ParamSpec(self.key_index, self.key_kwarg_name, key_fn),
+            _ParamSpec(self.weights_index, self.weights_kwarg_name, shard),
+        ]
+
+    def _apply_with_specs(self, module: Module, specs: list[_ParamSpec]) -> Module:
+        """Register indexer hooks driven by parameter specs."""
         def _pre_hook(hook_module, args, kwargs):
             del hook_module
             new_args = list(args)
             new_kwargs = dict(kwargs)
-            _maybe_replace_arg(new_args, self.query_index, lambda t: self._shard_query_side(t, cp_mesh))
-            _maybe_replace_arg(new_args, self.key_index, lambda t: self._replicate_key_side(t, cp_mesh))
-            _maybe_replace_arg(new_args, self.weights_index, lambda t: self._shard_query_side(t, cp_mesh))
-            _maybe_replace_kwarg(new_kwargs, self.query_kwarg_name, lambda t: self._shard_query_side(t, cp_mesh))
-            _maybe_replace_kwarg(new_kwargs, self.key_kwarg_name, lambda t: self._replicate_key_side(t, cp_mesh))
-            _maybe_replace_kwarg(new_kwargs, self.weights_kwarg_name, lambda t: self._shard_query_side(t, cp_mesh))
+            _apply_param_specs(new_args, new_kwargs, specs)
             return tuple(new_args), new_kwargs
 
         _register_boundary_hooks(module, _pre_hook, self.use_local_output)
         return module
+
+    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+        """Register DSA indexer CP hooks on ``module`` and return it."""
+        cp_mesh = _ensure_1d(device_mesh)
+        specs = self._build_specs(
+            cp_mesh,
+            key_fn=lambda value: self._replicate_key_side(value, cp_mesh),
+        )
+        return self._apply_with_specs(module, specs)
 
 
 class DSASparseAttentionContextParallel(ParallelStyle):
@@ -442,112 +478,69 @@ class DSAIndexerLossContextParallel(ParallelStyle):
         processed[3] = _dtensor_to_local_reducing_partial(processed[3])
         return type(outputs)(processed)
 
-    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
-        """Register DSA indexer-loss CP hooks on ``module`` and return it."""
-        cp_mesh = _ensure_1d(device_mesh)
-        rank_list = list(cp_mesh.rank_list)
-        local_idx = rank_list.index(platform.get_rank()) if platform.get_rank() in rank_list else 0
+    def _build_loss_specs(
+            self,
+            cp_mesh: DeviceMesh,
+            replicate_fn_map: dict[str, Callable[[Any], Any]],
+    ) -> list[_ParamSpec]:
+        """Build table-driven transforms for the indexer-loss boundary."""
+        def shard(value: Any) -> Any:
+            return self._shard_query_side(value, cp_mesh)
 
+        return [
+            _ParamSpec(self.query_index, self.query_kwarg_name, shard),
+            _ParamSpec(self.key_index, self.key_kwarg_name, replicate_fn_map["key"]),
+            _ParamSpec(self.query_indexer_index, self.query_indexer_kwarg_name, shard),
+            _ParamSpec(self.key_indexer_index, self.key_indexer_kwarg_name, replicate_fn_map["key_indexer"]),
+            _ParamSpec(self.weights_index, self.weights_kwarg_name, shard),
+            _ParamSpec(self.topk_index, self.topk_kwarg_name, shard),
+            _ParamSpec(self.query_rope_index, self.query_rope_kwarg_name, shard),
+            _ParamSpec(self.key_rope_index, self.key_rope_kwarg_name, replicate_fn_map["key_rope"]),
+        ]
+
+    def _read_key_indexer_shape(self, args: list, kwargs: dict) -> Optional[tuple]:
+        """Read the original local key-indexer shape before hook transforms."""
+        if self.key_indexer_index is not None and self.key_indexer_index < len(args):
+            return self._local_shape(args[self.key_indexer_index])
+        if self.key_indexer_kwarg_name and self.key_indexer_kwarg_name in kwargs:
+            return self._local_shape(kwargs[self.key_indexer_kwarg_name])
+        return None
+
+    @staticmethod
+    def _get_local_idx(cp_mesh: DeviceMesh) -> int:
+        """Return current rank's index in the CP mesh rank list."""
+        rank_list = list(cp_mesh.rank_list)
+        rank = platform.get_rank()
+        return rank_list.index(rank) if rank in rank_list else 0
+
+    def _apply_with_loss_specs(self, module: Module, specs: list[_ParamSpec], local_idx: int) -> Module:
+        """Register indexer-loss hooks driven by parameter specs."""
         def _pre_hook(hook_module, args, kwargs):
             new_args = list(args)
             new_kwargs = dict(kwargs)
-            key_shape = None
-            if self.key_indexer_index is not None and self.key_indexer_index < len(new_args):
-                key_shape = self._local_shape(new_args[self.key_indexer_index])
-            elif self.key_indexer_kwarg_name and self.key_indexer_kwarg_name in new_kwargs:
-                key_shape = self._local_shape(new_kwargs[self.key_indexer_kwarg_name])
+            key_shape = self._read_key_indexer_shape(new_args, new_kwargs)
             setattr(hook_module, "_hp_dsa_loss_key_index_local_shape", key_shape)
             setattr(hook_module, "_hp_dsa_loss_local_idx", local_idx)
-
-            _maybe_replace_arg(new_args, self.query_index, lambda t: self._shard_query_side(t, cp_mesh))
-            _maybe_replace_arg(new_args, self.key_index, lambda t: self._replicate_key_side(t, cp_mesh))
-            _maybe_replace_arg(new_args, self.query_indexer_index, lambda t: self._shard_query_side(t, cp_mesh))
-            _maybe_replace_arg(new_args, self.key_indexer_index, lambda t: self._replicate_key_side(t, cp_mesh))
-            _maybe_replace_arg(new_args, self.weights_index, lambda t: self._shard_query_side(t, cp_mesh))
-            _maybe_replace_arg(new_args, self.topk_index, lambda t: self._shard_query_side(t, cp_mesh))
-            _maybe_replace_arg(new_args, self.query_rope_index, lambda t: self._shard_query_side(t, cp_mesh))
-            _maybe_replace_arg(new_args, self.key_rope_index, lambda t: self._replicate_key_side(t, cp_mesh))
-            _maybe_replace_kwarg(new_kwargs, self.query_kwarg_name, lambda t: self._shard_query_side(t, cp_mesh))
-            _maybe_replace_kwarg(new_kwargs, self.key_kwarg_name, lambda t: self._replicate_key_side(t, cp_mesh))
-            _maybe_replace_kwarg(
-                new_kwargs, self.query_indexer_kwarg_name, lambda t: self._shard_query_side(t, cp_mesh)
-            )
-            _maybe_replace_kwarg(
-                new_kwargs, self.key_indexer_kwarg_name, lambda t: self._replicate_key_side(t, cp_mesh)
-            )
-            _maybe_replace_kwarg(new_kwargs, self.weights_kwarg_name, lambda t: self._shard_query_side(t, cp_mesh))
-            _maybe_replace_kwarg(new_kwargs, self.topk_kwarg_name, lambda t: self._shard_query_side(t, cp_mesh))
-            _maybe_replace_kwarg(
-                new_kwargs, self.query_rope_kwarg_name, lambda t: self._shard_query_side(t, cp_mesh)
-            )
-            _maybe_replace_kwarg(
-                new_kwargs, self.key_rope_kwarg_name, lambda t: self._replicate_key_side(t, cp_mesh)
-            )
+            _apply_param_specs(new_args, new_kwargs, specs)
             return tuple(new_args), new_kwargs
 
         platform.register_forward_pre_hook(module, _pre_hook, with_kwargs=True)
         module.register_forward_hook(lambda _module, _args, outputs: self._process_outputs(_module, outputs))
         return module
 
-
-class DSAContextParallel(ParallelStyle):
-    """Colossal-style CP hook for a low-level DSA attention boundary.
-
-    This compatibility style intentionally handles only a direct boundary whose
-    forward signature is shaped like
-    ``(query, key, value, topk_indices, query_rope, key_rope, ...)``.  Callers
-    that own a higher-level attention module should locate its indexer and
-    sparse-attention submodules themselves and apply
-    :class:`DSAIndexerContextParallel` and
-    :class:`DSASparseAttentionContextParallel` explicitly.
-    """
-
-    def __init__(  # pylint: disable=too-many-arguments
-            self,
-            *,
-            layout: str = "BSND",
-            mode: str = "colossal",
-            query_index: Optional[int] = 0,
-            key_index: Optional[int] = 1,
-            value_index: Optional[int] = 2,
-            topk_index: Optional[int] = 3,
-            query_kwarg_name: Optional[str] = None,
-            key_kwarg_name: Optional[str] = None,
-            value_kwarg_name: Optional[str] = None,
-            topk_kwarg_name: Optional[str] = None,
-            query_rope_index: Optional[int] = 4,
-            key_rope_index: Optional[int] = 5,
-            query_rope_kwarg_name: Optional[str] = "query_rope",
-            key_rope_kwarg_name: Optional[str] = "key_rope",
-            use_local_output: bool = True,
-    ) -> None:
-        super().__init__()
-        _configure_sparse_attention_boundary(
-            self,
-            layout=layout,
-            mode=mode,
-            query_index=query_index,
-            key_index=key_index,
-            value_index=value_index,
-            topk_index=topk_index,
-            query_kwarg_name=query_kwarg_name,
-            key_kwarg_name=key_kwarg_name,
-            value_kwarg_name=value_kwarg_name,
-            topk_kwarg_name=topk_kwarg_name,
-            query_rope_index=query_rope_index,
-            key_rope_index=key_rope_index,
-            query_rope_kwarg_name=query_rope_kwarg_name,
-            key_rope_kwarg_name=key_rope_kwarg_name,
-            use_local_output=use_local_output,
-        )
-
-    def __repr__(self) -> str:
-        return (
-            f"{self.__class__.__name__}("
-            f"layout={self.layout!r}, mode={self.mode!r}, "
-            f"use_local_output={self.use_local_output})"
-        )
-
     def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
-        """Register low-level DSA attention CP hooks on ``module`` and return it."""
-        return _apply_sparse_attention_boundary(self, module, device_mesh)
+        """Register DSA indexer-loss CP hooks on ``module`` and return it."""
+        cp_mesh = _ensure_1d(device_mesh)
+
+        def replicate(value: Any) -> Any:
+            return self._replicate_key_side(value, cp_mesh)
+
+        specs = self._build_loss_specs(
+            cp_mesh,
+            replicate_fn_map={
+                "key": replicate,
+                "key_indexer": replicate,
+                "key_rope": replicate,
+            },
+        )
+        return self._apply_with_loss_specs(module, specs, self._get_local_idx(cp_mesh))
