@@ -539,6 +539,23 @@ class RedistributionOperatorInfer:
         if not isinstance(in_dim, tuple):
             return False
 
+        if out_dim == NONE:
+            if len(in_dim) <= 1:
+                return False
+            # Plain same-dim Shard produces a descending tuple, so the original
+            # combined concat is enough. StridedShard reorders the tuple.
+            if all(in_dim[i] > in_dim[i + 1] for i in range(len(in_dim) - 1)):
+                return False
+            in_dim_rest = in_dim[-1]
+            concat_dev_num = self.dev_mat_.get_dim_by_reverse_idx(in_dim_rest)
+            args = (index, in_dim_rest, concat_dev_num)
+
+            if self.insert_operator(CONCAT_BY_AXIS, args) == Status.FAILED:
+                return False
+
+            self.map_[index] = in_dim[:-1] if len(in_dim) > 2 else in_dim[0]
+            return True
+
         if not ((not isinstance(out_dim, tuple) and out_dim == in_dim[0]) or
                 (isinstance(out_dim, tuple) and out_dim == in_dim[:len(out_dim)])):
             return False
