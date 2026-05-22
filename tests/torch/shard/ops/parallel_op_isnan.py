@@ -19,8 +19,14 @@ import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global
+
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
 
 # Generate mock data with NaN values
 np.random.seed(42)
@@ -37,61 +43,42 @@ input_3d_np[0, 1, 1] = np.nan
 input_3d_np[3, 5, 2] = np.nan
 
 
-def test_distributed_isnan_basic():
-    """
-    Feature: dtensor + torch.isnan basic element-wise check
-    Description:
-        - Check isnan on a 2D tensor sharded on multiple dimensions.
-        - Input: shape (8, 8) sharded on dim=0 and dim=1.
-        - Output layout should strictly preserve the input layout.
-    Expectation: Success with correct layout and numerical equivalence.
-    """
-    init_dist()
+def test_isnan_basic() -> None:
+    """Test torch.isnan basic element-wise check."""
+    init_backend(_DEVICE_TYPE)
 
-    # Standalone reference
-    standalone_input = torch.from_numpy(input_2d_np).npu()  # shape (8, 8)
-    standalone_output = torch.isnan(standalone_input)       # boolean tensor
+    standalone_input = to_device(torch.from_numpy(input_2d_np), _DEVICE_TYPE)
+    standalone_output = torch.isnan(standalone_input)
 
-    # Distributed setup: shard dim=0 ("dp") and dim=1 ("tp")
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(1))
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = torch.isnan(dist_input)
 
-    # Layout validation: output layout must be identical to input layout for element-wise ops
     expected_layout = _build_layout(mesh, x_placements, 2)
     assert dist_output.layout == expected_layout, \
         f"isnan output layout mismatch: expected {expected_layout}, got {dist_output.layout}"
 
-    # Numerical validation via gathering local shards to a global tensor
     gathered_output = local_to_global(dist_output)
     assert torch.equal(
         standalone_output, gathered_output
     ), "isnan output mismatch between standalone and distributed execution"
 
 
-def test_distributed_isnan_replicate():
-    """
-    Feature: dtensor + torch.isnan on replicated tensor
-    Description:
-        - Check isnan on a fully replicated 2D tensor.
-        - Output should also be fully replicated.
-    Expectation: Success with correct layout and numerical equivalence.
-    """
-    init_dist()
+def test_isnan_replicate() -> None:
+    """Test torch.isnan on replicated tensor."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_input = torch.from_numpy(input_2d_np).npu()
+    standalone_input = to_device(torch.from_numpy(input_2d_np), _DEVICE_TYPE)
     standalone_output = torch.isnan(standalone_input)
 
-    # Fully replicated placement
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = torch.isnan(dist_input)
 
-    # Layout validation
     expected_layout = _build_layout(mesh, x_placements, 2)
     assert dist_output.layout == expected_layout, \
         f"isnan replicate layout mismatch: expected {expected_layout}, got {dist_output.layout}"
@@ -102,28 +89,20 @@ def test_distributed_isnan_replicate():
     ), "isnan replicate output mismatch"
 
 
-def test_distributed_isnan_3d():
-    """
-    Feature: dtensor + torch.isnan on 3D tensor
-    Description:
-        - Check isnan on a 3D tensor with a mix of sharded and replicated dimensions.
-        - Input: shape (4, 8, 6), shard dim=0, shard dim=1, replicate dim=2 implicitly.
-    Expectation: Success with correct layout and numerical equivalence.
-    """
-    init_dist()
+def test_isnan_3d() -> None:
+    """Test torch.isnan on 3D tensor."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_input = torch.from_numpy(input_3d_np).npu()  # shape (4, 8, 6)
+    standalone_input = to_device(torch.from_numpy(input_3d_np), _DEVICE_TYPE)
     standalone_output = torch.isnan(standalone_input)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(1))
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
-    # Alternatively, you can test tensor method call
     dist_output = dist_input.isnan()
 
-    # Layout validation
     expected_layout = _build_layout(mesh, x_placements, 3)
     assert dist_output.layout == expected_layout, \
         f"isnan 3D layout mismatch: expected {expected_layout}, got {dist_output.layout}"

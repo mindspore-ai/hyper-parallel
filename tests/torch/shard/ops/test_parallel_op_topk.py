@@ -18,15 +18,26 @@ from tests.common.parallel_case import parallel_run, TorchCase
 
 PARALLEL_OP_TOPK = "parallel_op_topk.py"
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_topk_group1():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_topk_layout_inference
+        1.test_topk_layout_inference
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_TOPK, "test_distributed_topk_layout_inference", 10888, 4)
+        TorchCase(PARALLEL_OP_TOPK, "test_topk_layout_inference", num_proc=4)
+    ])
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_topk_group1_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_topk_layout_inference
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_TOPK, "test_topk_layout_inference", num_proc=4)
     ])

@@ -19,8 +19,14 @@ import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global
+
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
 
 # Set random seed for reproducibility
 SEED = 42
@@ -29,90 +35,61 @@ SEED = 42
 def _set_seed(seed=SEED):
     torch.manual_seed(seed)
     np.random.seed(seed)
-    # Ensure CUDA/NPU determinism if applicable, though manual_seed suffices for logic checks
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
-def test_distributed_multinomial_1d_replicated():
-    """
-    Feature: dtensor + torch.multinomial 1D Input
-    Description:
-        - Input: 1D probability tensor (C,), fully replicated.
-        - Operation: multinomial sampling.
-        - Expectation: Output layout is 1D fully replicated.
-          Results should match standalone if seeded identically (since it's replicated).
-    """
-    init_dist()
+def test_multinomial_1d_replicated() -> None:
+    """Test torch.multinomial 1D replicated."""
+    init_backend(_DEVICE_TYPE)
 
-    # 1. Standalone Execution
     _set_seed()
     weights_np = np.abs(np.random.randn(10)).astype(np.float32)
-    standalone_input = torch.from_numpy(weights_np).npu()
-    # Normalize isn't strictly necessary for multinomial but good practice
+    standalone_input = to_device(torch.from_numpy(weights_np), _DEVICE_TYPE)
     standalone_output = torch.multinomial(standalone_input, num_samples=5, replacement=True)
 
-    # 2. Distributed Execution
-    _set_seed() # Reset seed to ensure same random sequence on all ranks
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    x_placements = (Replicate(),) # 1D Replicated
+    _set_seed()
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    x_placements = (Replicate(),)
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.multinomial(num_samples=5, replacement=True)
 
-    # 3. Layout Validation
-    # Input: (-1,) -> Output: (-1,) ("None")
     expected_layout = _build_layout(mesh, (Replicate(),), 1)
     assert dist_output.layout == expected_layout, (
         f"1D Replicated layout mismatch: expected {expected_layout}, got={dist_output.layout}"
     )
 
-    # 4. Numerical/Shape Validation
     gathered_output = local_to_global(dist_output)
 
     assert torch.equal(standalone_output, gathered_output), (
-        f"1D Replicated output mismatch between standalone and distributed execution"
+        "1D Replicated output mismatch between standalone and distributed execution"
         f"standalone_output: {standalone_output}, "
         f"gathered_output: {gathered_output}"
     )
 
 
-def test_distributed_multinomial_2d_data_parallel():
-    """
-    Feature: dtensor + torch.multinomial 2D Input (Data Parallel)
-    Description:
-        - Input: 2D (N, C) sharded on Data Parallel dimension (dim 0).
-        - Operation: multinomial sampling.
-        - Expectation:
-            - Output layout preserves sharding on dim 0.
-            - New sample dimension (dim 1) is unsharded (Replicated).
-            - Note: Strict equality with standalone is skipped here because splitting
-              batches across ranks causes RNG state divergence compared to sequential execution.
-    """
-    init_dist()
+def test_multinomial_2d_data_parallel() -> None:
+    """Test torch.multinomial 2D data parallel."""
+    init_backend(_DEVICE_TYPE)
 
     n, c = 8, 10
     num_samples = 5
 
     weights_np = np.abs(np.random.randn(n, c)).astype(np.float32)
-    standalone_input = torch.from_numpy(weights_np).npu()
+    standalone_input = to_device(torch.from_numpy(weights_np), _DEVICE_TYPE)
 
-    # Distributed Setup: Shard dim 0 ("dp"), Replicate dim 1
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.multinomial(num_samples=num_samples, replacement=True)
 
-    # 1. Layout Validation
-    # Input: (Shard(0), Replicate()) -> Output: (Shard(0), Replicate())
-    # The new dimension is created locally and is not sharded.
     expected_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
     assert dist_output.layout == expected_layout, (
         f"2D Data Parallel layout mismatch: expected {expected_layout}, got={dist_output.layout}"
     )
 
-    # 2. Shape and Value Sanity Check
     gathered_output = local_to_global(dist_output)
 
     assert gathered_output.shape == (n, num_samples), (
@@ -124,38 +101,30 @@ def test_distributed_multinomial_2d_data_parallel():
     )
 
 
-def test_distributed_multinomial_2d_fully_replicated():
-    """
-    Feature: dtensor + torch.multinomial 2D Input (Fully Replicated)
-    Description:
-        - Input: 2D (N, C) fully replicated.
-        - Operation: multinomial sampling.
-        - Expectation: Output fully replicated. Matches standalone with same seed.
-    """
-    init_dist()
+def test_multinomial_2d_fully_replicated() -> None:
+    """Test torch.multinomial 2D fully replicated."""
+    init_backend(_DEVICE_TYPE)
 
     _set_seed()
     weights_np = np.abs(np.random.randn(4, 5)).astype(np.float32)
-    standalone_input = torch.from_numpy(weights_np).npu()
+    standalone_input = to_device(torch.from_numpy(weights_np), _DEVICE_TYPE)
     standalone_output = torch.multinomial(standalone_input, num_samples=3, replacement=True)
 
-    _set_seed() # Reset seed
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    _set_seed()
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.multinomial(num_samples=3, replacement=True)
 
-    # Layout Validation
     expected_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     assert dist_output.layout == expected_layout, (
         f"2D Fully Replicated layout mismatch: expected {expected_layout}, got={dist_output.layout}"
     )
 
-    # Value Validation
     gathered_output = local_to_global(dist_output)
     assert torch.equal(standalone_output, gathered_output), (
-        f"2D Fully Replicated output mismatch between standalone and distributed execution"
+        "2D Fully Replicated output mismatch between standalone and distributed execution"
         f"standalone_output: {standalone_output}, "
         f"gathered_output: {gathered_output}"
     )

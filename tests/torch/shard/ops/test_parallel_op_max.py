@@ -18,45 +18,82 @@ from tests.common.parallel_case import parallel_run, TorchCase
 
 PARALLEL_OP_MAX = "parallel_op_max.py"
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_max_group1():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_max_element_wise
-        2.test_distributed_max_dim_reduce_sharded
+        1.test_max_element_wise
+        2.test_max_dim_reduce_sharded
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MAX, "test_distributed_max_element_wise", 10359, 4),
-        TorchCase(PARALLEL_OP_MAX, "test_distributed_max_dim_reduce_sharded", 10360, 4),
+        TorchCase(PARALLEL_OP_MAX, "test_max_element_wise", num_proc=4),
+        TorchCase(PARALLEL_OP_MAX, "test_max_dim_reduce_sharded", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_max_group1_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_max_element_wise
+        2.test_max_dim_reduce_sharded
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MAX, "test_max_element_wise", num_proc=4),
+        TorchCase(PARALLEL_OP_MAX, "test_max_dim_reduce_sharded", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_max_group2():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_max_dim_reduce_replicated
-        2.test_distributed_max_global_reduce
+        1.test_max_dim_reduce_replicated
+        2.test_max_global_reduce
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MAX, "test_distributed_max_dim_reduce_replicated", 10361, 4),
-        TorchCase(PARALLEL_OP_MAX, "test_distributed_max_global_reduce", 10362, 4),
+        TorchCase(PARALLEL_OP_MAX, "test_max_dim_reduce_replicated", num_proc=4),
+        TorchCase(PARALLEL_OP_MAX, "test_max_global_reduce", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_max_group2_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_max_dim_reduce_replicated
+        2.test_max_global_reduce
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MAX, "test_max_dim_reduce_replicated", num_proc=4),
+        TorchCase(PARALLEL_OP_MAX, "test_max_global_reduce", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_max_group3():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_max_keepdim
+        1.test_max_keepdim
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MAX, "test_distributed_max_keepdim", 10363, 4),
+        TorchCase(PARALLEL_OP_MAX, "test_max_keepdim", num_proc=4),
+    ])
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_max_group3_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_max_keepdim
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MAX, "test_max_keepdim", num_proc=4),
     ])

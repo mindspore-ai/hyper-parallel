@@ -16,7 +16,6 @@
 from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_cat_basic():
     '''
@@ -24,12 +23,22 @@ def test_distributed_cat_basic():
     Description: basic cat with aligned shards.
     Expectation: Run success.
     '''
-    master_port = 10359
+
     file_name = "parallel_op_cat.py"
-    case_name = "test_distributed_cat_basic"
-    torchrun_case(file_name, case_name, master_port)
+    case_name = "test_cat_basic"
+    torchrun_case(file_name, case_name)
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_cat_basic():
+    '''
+    Feature: test parallel op cat (gloo cpu).
+    Description: basic cat with aligned shards.
+    Expectation: Run success.
+    '''
 
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_basic"
+    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_distributed_cat_3d_complex():
@@ -38,12 +47,22 @@ def test_distributed_cat_3d_complex():
     Description: 3D cat on complex device mesh.
     Expectation: Run success.
     '''
-    master_port = 10359
+
     file_name = "parallel_op_cat.py"
-    case_name = "test_distributed_cat_3d_complex"
-    torchrun_case(file_name, case_name, master_port)
+    case_name = "test_cat_3d_complex"
+    torchrun_case(file_name, case_name)
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_cat_3d_complex():
+    '''
+    Feature: test parallel op cat (gloo cpu).
+    Description: 3D cat on complex device mesh.
+    Expectation: Run success.
+    '''
 
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_3d_complex"
+    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_cat_multiple_tensors():
@@ -52,12 +71,22 @@ def test_distributed_cat_multiple_tensors():
     Description: Concatenate more than 2 tensors at once.
     Expectation: Run success.
     '''
-    master_port = 10361
+
     file_name = "parallel_op_cat.py"
-    case_name = "test_distributed_cat_multiple_tensors"
-    torchrun_case(file_name, case_name, master_port, num_proc=8)
+    case_name = "test_cat_multiple_tensors"
+    torchrun_case(file_name, case_name, num_proc=8)
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_cat_multiple_tensors():
+    '''
+    Feature: test parallel op cat (gloo cpu).
+    Description: Concatenate more than 2 tensors at once.
+    Expectation: Run success.
+    '''
 
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_multiple_tensors"
+    torchrun_case(file_name, case_name, num_proc=8)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_cat_mismatched_shapes():
@@ -66,11 +95,22 @@ def test_distributed_cat_mismatched_shapes():
     Description: Concatenate tensors with differing sizes in the target dimension.
     Expectation: Run success.
     '''
-    master_port = 10363
-    file_name = "parallel_op_cat.py"
-    case_name = "test_distributed_cat_mismatched_shapes"
-    torchrun_case(file_name, case_name, master_port, num_proc=4)
 
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_mismatched_shapes"
+    torchrun_case(file_name, case_name, num_proc=4)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_cat_mismatched_shapes():
+    '''
+    Feature: test parallel op cat (gloo cpu).
+    Description: Concatenate tensors with differing sizes in the target dimension.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_mismatched_shapes"
+    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_cat_with_empty():
@@ -79,11 +119,22 @@ def test_distributed_cat_with_empty():
     Description: Concatenate with a dimension size of zero (empty tensor).
     Expectation: Run success.
     '''
-    master_port = 10365
-    file_name = "parallel_op_cat.py"
-    case_name = "test_distributed_cat_with_empty"
-    torchrun_case(file_name, case_name, master_port, num_proc=4)
 
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_with_empty"
+    torchrun_case(file_name, case_name, num_proc=4)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_cat_with_empty():
+    '''
+    Feature: test parallel op cat (gloo cpu).
+    Description: Concatenate with a dimension size of zero (empty tensor).
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_with_empty"
+    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_cat_4d_tensor():
@@ -92,12 +143,22 @@ def test_distributed_cat_4d_tensor():
     Description: Concatenate 4D tensors on a 2D device mesh.
     Expectation: Run success.
     '''
-    master_port = 10366
+
     file_name = "parallel_op_cat.py"
-    case_name = "test_distributed_cat_4d_tensor"
-    torchrun_case(file_name, case_name, master_port, num_proc=8)
+    case_name = "test_cat_4d_tensor"
+    torchrun_case(file_name, case_name, num_proc=8)
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_cat_4d_tensor():
+    '''
+    Feature: test parallel op cat (gloo cpu).
+    Description: Concatenate 4D tensors on a 2D device mesh.
+    Expectation: Run success.
+    '''
 
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_4d_tensor"
+    torchrun_case(file_name, case_name, num_proc=8)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_cat_5d_mixed_placements():
@@ -106,11 +167,22 @@ def test_distributed_cat_5d_mixed_placements():
     Description: 5D tensors with mixed sharding and replication placements.
     Expectation: Run success.
     '''
-    master_port = 10368
-    file_name = "parallel_op_cat.py"
-    case_name = "test_distributed_cat_5d_mixed_placements"
-    torchrun_case(file_name, case_name, master_port, num_proc=8)
 
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_5d_mixed_placements"
+    torchrun_case(file_name, case_name, num_proc=8)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_cat_5d_mixed_placements():
+    '''
+    Feature: test parallel op cat (gloo cpu).
+    Description: 5D tensors with mixed sharding and replication placements.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_5d_mixed_placements"
+    torchrun_case(file_name, case_name, num_proc=8)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_cat_shard_last_cat_first():
@@ -119,11 +191,22 @@ def test_distributed_cat_shard_last_cat_first():
     Description: Shard on the last dimension but concatenate on the first.
     Expectation: Run success.
     '''
-    master_port = 10369
-    file_name = "parallel_op_cat.py"
-    case_name = "test_distributed_cat_shard_last_cat_first"
-    torchrun_case(file_name, case_name, master_port, num_proc=8)
 
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_shard_last_cat_first"
+    torchrun_case(file_name, case_name, num_proc=8)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_cat_shard_last_cat_first():
+    '''
+    Feature: test parallel op cat (gloo cpu).
+    Description: Shard on the last dimension but concatenate on the first.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_shard_last_cat_first"
+    torchrun_case(file_name, case_name, num_proc=8)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_cat_singleton_dimension():
@@ -132,7 +215,19 @@ def test_distributed_cat_singleton_dimension():
     Description: Concatenate tensors along a singleton dimension.
     Expectation: Run success.
     '''
-    master_port = 10370
+
     file_name = "parallel_op_cat.py"
-    case_name = "test_distributed_cat_singleton_dimension"
-    torchrun_case(file_name, case_name, master_port, num_proc=4)
+    case_name = "test_cat_singleton_dimension"
+    torchrun_case(file_name, case_name, num_proc=4)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_cat_singleton_dimension():
+    '''
+    Feature: test parallel op cat (gloo cpu).
+    Description: Concatenate tensors along a singleton dimension.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_cat.py"
+    case_name = "test_cat_singleton_dimension"
+    torchrun_case(file_name, case_name, num_proc=4)

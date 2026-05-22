@@ -16,7 +16,6 @@
 from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_isinf_replicate():
     '''
@@ -24,11 +23,22 @@ def test_distributed_isinf_replicate():
     Description: test parallel op isinf on a fully replicated tensor.
     Expectation: Run success.
     '''
-    master_port = 10359
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_distributed_isinf_replicate"
-    torchrun_case(file_name, case_name, master_port)
 
+    file_name = "parallel_op_isinf.py"
+    case_name = "test_isinf_replicate"
+    torchrun_case(file_name, case_name)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_isinf_replicate():
+    '''
+    Feature: test parallel op isinf (gloo cpu).
+    Description: test parallel op isinf on a fully replicated tensor.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_isinf.py"
+    case_name = "test_isinf_replicate"
+    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_isinf_1d_shard():
@@ -37,11 +47,22 @@ def test_distributed_isinf_1d_shard():
     Description: test parallel op isinf on a 1D sharded tensor.
     Expectation: Run success.
     '''
-    master_port = 10359
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_distributed_isinf_1d_shard"
-    torchrun_case(file_name, case_name, master_port)
 
+    file_name = "parallel_op_isinf.py"
+    case_name = "test_isinf_1d_shard"
+    torchrun_case(file_name, case_name)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_isinf_1d_shard():
+    '''
+    Feature: test parallel op isinf (gloo cpu).
+    Description: test parallel op isinf on a 1D sharded tensor.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_isinf.py"
+    case_name = "test_isinf_1d_shard"
+    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_isinf_2d_shard_dim0():
@@ -50,11 +71,22 @@ def test_distributed_isinf_2d_shard_dim0():
     Description: test parallel op isinf on a 2D tensor sharded on dim0.
     Expectation: Run success.
     '''
-    master_port = 10359
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_distributed_isinf_2d_shard_dim0"
-    torchrun_case(file_name, case_name, master_port)
 
+    file_name = "parallel_op_isinf.py"
+    case_name = "test_isinf_2d_shard_dim0"
+    torchrun_case(file_name, case_name)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_isinf_2d_shard_dim0():
+    '''
+    Feature: test parallel op isinf (gloo cpu).
+    Description: test parallel op isinf on a 2D tensor sharded on dim0.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_isinf.py"
+    case_name = "test_isinf_2d_shard_dim0"
+    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_isinf_2d_shard_dim1():
@@ -63,11 +95,22 @@ def test_distributed_isinf_2d_shard_dim1():
     Description: test parallel op isinf on a 2D tensor sharded on dim1.
     Expectation: Run success.
     '''
-    master_port = 10359
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_distributed_isinf_2d_shard_dim1"
-    torchrun_case(file_name, case_name, master_port)
 
+    file_name = "parallel_op_isinf.py"
+    case_name = "test_isinf_2d_shard_dim1"
+    torchrun_case(file_name, case_name)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_isinf_2d_shard_dim1():
+    '''
+    Feature: test parallel op isinf (gloo cpu).
+    Description: test parallel op isinf on a 2D tensor sharded on dim1.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_isinf.py"
+    case_name = "test_isinf_2d_shard_dim1"
+    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_isinf_3d_multi_shard():
@@ -76,7 +119,19 @@ def test_distributed_isinf_3d_multi_shard():
     Description: test parallel op isinf on a 3D tensor with multi-dimension sharding.
     Expectation: Run success.
     '''
-    master_port = 10359
+
     file_name = "parallel_op_isinf.py"
-    case_name = "test_distributed_isinf_3d_multi_shard"
-    torchrun_case(file_name, case_name, master_port)
+    case_name = "test_isinf_3d_multi_shard"
+    torchrun_case(file_name, case_name)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_isinf_3d_multi_shard():
+    '''
+    Feature: test parallel op isinf (gloo cpu).
+    Description: test parallel op isinf on a 3D tensor with multi-dimension sharding.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_isinf.py"
+    case_name = "test_isinf_3d_multi_shard"
+    torchrun_case(file_name, case_name)

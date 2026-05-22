@@ -19,34 +19,29 @@ import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global
+
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
 
 np.random.seed(42)
 vec1_np = np.random.randn(8).astype(np.float32)
 vec2_np = np.random.randn(16).astype(np.float32)
-invalid_2d_np = np.random.randn(8, 2).astype(np.float32)
 
 
-def test_distributed_outer_both_replicated():
-    """
-    Feature: dtensor + torch.outer basic computation
-    Description:
-        - Compute outer product of two fully replicated 1-D tensors.
-        - Input 1: shape (8) fully replicated.
-        - Input 2: shape (16) fully replicated.
-        - Output layout should be fully replicated, shape (8, 16).
-    Expectation: Success with correct layout and numerical equivalence.
-    """
-    init_dist()
+def test_outer_both_replicated() -> None:
+    """Test torch.outer with both inputs replicated."""
+    init_backend(_DEVICE_TYPE)
 
-    # Standalone reference
-    standalone_vec1 = torch.from_numpy(vec1_np).npu()
-    standalone_vec2 = torch.from_numpy(vec2_np).npu()
+    standalone_vec1 = to_device(torch.from_numpy(vec1_np), _DEVICE_TYPE)
+    standalone_vec2 = to_device(torch.from_numpy(vec2_np), _DEVICE_TYPE)
     standalone_output = torch.outer(standalone_vec1, standalone_vec2)
 
-    # Distributed setup
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
     placements = (Replicate(), Replicate())
 
     dist_vec1 = distribute_tensor(standalone_vec1, mesh, placements)
@@ -54,39 +49,27 @@ def test_distributed_outer_both_replicated():
 
     dist_output = torch.outer(dist_vec1, dist_vec2)
 
-    # Layout validation
     expected_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     assert dist_output.layout == expected_layout, \
         f"Outer output layout mismatch: expected {expected_layout}, got {dist_output.layout}"
 
-    # Numerical validation via gathering
     gathered_output = local_to_global(dist_output)
     assert torch.equal(
         standalone_output, gathered_output
     ), "Outer output mismatch between standalone and distributed execution"
 
 
-def test_distributed_outer_both_sharded():
-    """
-    Feature: dtensor + torch.outer with orthogonal sharding
-    Description:
-        - Compute outer product where inputs are sharded on different mesh dimensions.
-        - Input 1: shape (8) sharded on dim 0 ("dp").
-        - Input 2: shape (16) sharded on dim 1 ("tp").
-        - Output layout should be sharded on both dimensions: (Shard(0), Shard(1)).
-    Expectation: Success with correct layout and numerical equivalence.
-    """
-    init_dist()
+def test_outer_both_sharded() -> None:
+    """Test torch.outer with both inputs sharded."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_vec1 = torch.from_numpy(vec1_np).npu()
-    standalone_vec2 = torch.from_numpy(vec2_np).npu()
+    standalone_vec1 = to_device(torch.from_numpy(vec1_np), _DEVICE_TYPE)
+    standalone_vec2 = to_device(torch.from_numpy(vec2_np), _DEVICE_TYPE)
     standalone_output = torch.outer(standalone_vec1, standalone_vec2)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
 
-    # vec1 sharded on "dp" (mesh dim 0), replicates on "tp"
     v1_placements = (Shard(0), Replicate())
-    # vec2 replicates on "dp", sharded on "tp" (mesh dim 1)
     v2_placements = (Replicate(), Shard(0))
 
     dist_vec1 = distribute_tensor(standalone_vec1, mesh, v1_placements)
@@ -94,7 +77,6 @@ def test_distributed_outer_both_sharded():
 
     dist_output = torch.outer(dist_vec1, dist_vec2)
 
-    # Output should inherit "dp" for its dim 0, and "tp" for its dim 1
     expected_layout = _build_layout(mesh, (Shard(0), Shard(1)), 2)
     assert dist_output.layout == expected_layout, \
         f"Outer orthogonal sharding layout mismatch: expected {expected_layout}, got {dist_output.layout}"
@@ -105,23 +87,15 @@ def test_distributed_outer_both_sharded():
     ), "Outer orthogonal sharding output mismatch"
 
 
-def test_distributed_outer_first_sharded():
-    """
-    Feature: dtensor + torch.outer with partial sharding
-    Description:
-        - Compute outer product where only the first input is sharded.
-        - Input 1: shape (8) sharded on dim 0 ("dp").
-        - Input 2: shape (16) fully replicated.
-        - Output layout should be sharded on "dp" for dim 0, replicated for dim 1.
-    Expectation: Success with correct layout and numerical equivalence.
-    """
-    init_dist()
+def test_outer_first_sharded() -> None:
+    """Test torch.outer with first input sharded."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_vec1 = torch.from_numpy(vec1_np).npu()
-    standalone_vec2 = torch.from_numpy(vec2_np).npu()
+    standalone_vec1 = to_device(torch.from_numpy(vec1_np), _DEVICE_TYPE)
+    standalone_vec2 = to_device(torch.from_numpy(vec2_np), _DEVICE_TYPE)
     standalone_output = torch.outer(standalone_vec1, standalone_vec2)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
 
     v1_placements = (Shard(0), Replicate())
     v2_placements = (Replicate(), Replicate())

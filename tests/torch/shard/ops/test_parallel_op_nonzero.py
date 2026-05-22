@@ -18,28 +18,50 @@ from tests.common.parallel_case import parallel_run, TorchCase
 
 PARALLEL_OP_NONZERO = "parallel_op_nonzero.py"
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_nonzero_group1():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_nonzero_basic
+        1.test_nonzero_basic
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_NONZERO, "test_distributed_nonzero_basic", 10359, 8),
+        TorchCase(PARALLEL_OP_NONZERO, "test_nonzero_basic", num_proc=8),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_nonzero_group1_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_nonzero_basic
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_NONZERO, "test_nonzero_basic", num_proc=8),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_nonzero_group2():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_nonzero_as_tuple
+        1.test_nonzero_as_tuple
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_NONZERO, "test_distributed_nonzero_as_tuple", 10359, 8),
+        TorchCase(PARALLEL_OP_NONZERO, "test_nonzero_as_tuple", num_proc=8),
+    ])
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_nonzero_group2_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_nonzero_as_tuple
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_NONZERO, "test_nonzero_as_tuple", num_proc=8),
     ])

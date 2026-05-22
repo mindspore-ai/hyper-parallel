@@ -19,33 +19,33 @@ import torch
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global, global_to_local
+
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
 
 np.random.seed(42)
 standalone_input_2d_np = np.random.randn(8, 16).astype(np.float32)
 standalone_input_3d_np = np.random.randn(8, 16, 32).astype(np.float32)
 
 
-def test_layernorm_data_parallel():
-    """
-    Feature: dtensor + torch.nn.functional.layer_norm data parallel
-    Description:
-        - Input: (8, 16) sharded on dim 0 (batch dimension).
-        - LayerNorm on dim 1 (feature dimension, unsharded).
-    Expectation: Success with correct layout and numerical equivalence.
-    """
-    init_dist()
+def test_layernorm_data_parallel() -> None:
+    """Test layer_norm with data parallel."""
+    init_backend(_DEVICE_TYPE)
     normalized_shape = (16,)
 
-    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
-    weight = torch.ones(normalized_shape).npu()
-    bias = torch.zeros(normalized_shape).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_2d_np), _DEVICE_TYPE)
+    weight = to_device(torch.ones(normalized_shape), _DEVICE_TYPE)
+    bias = to_device(torch.zeros(normalized_shape), _DEVICE_TYPE)
     standalone_output = torch.nn.functional.layer_norm(
         standalone_input, normalized_shape, weight, bias
     )
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
 
@@ -70,25 +70,19 @@ def test_layernorm_data_parallel():
     )
 
 
-def test_layernorm_model_parallel():
-    """
-    Feature: dtensor + torch.nn.functional.layer_norm model parallel
-    Description:
-        - Input: (8, 16, 32) sharded on dim 0 and dim 1.
-        - LayerNorm on dim 2 (feature dimension, unsharded).
-    Expectation: Success with correct layout and numerical equivalence.
-    """
-    init_dist()
+def test_layernorm_model_parallel() -> None:
+    """Test layer_norm with model parallel."""
+    init_backend(_DEVICE_TYPE)
     normalized_shape = (32,)
 
-    standalone_input = torch.from_numpy(standalone_input_3d_np).npu()
-    weight = torch.ones(normalized_shape).npu()
-    bias = torch.zeros(normalized_shape).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_3d_np), _DEVICE_TYPE)
+    weight = to_device(torch.ones(normalized_shape), _DEVICE_TYPE)
+    bias = to_device(torch.zeros(normalized_shape), _DEVICE_TYPE)
     standalone_output = torch.nn.functional.layer_norm(
         standalone_input, normalized_shape, weight, bias
     )
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Shard(1), Replicate())
     x_layout = _build_layout(mesh, x_placements, 3)
 
@@ -113,25 +107,19 @@ def test_layernorm_model_parallel():
     )
 
 
-def test_layernorm_hybrid_parallel():
-    """
-    Feature: dtensor + torch.nn.functional.layer_norm hybrid parallel
-    Description:
-        - Input: (8, 16, 32) sharded on dim 0 and dim 1.
-        - LayerNorm on dim 2 (feature dimension, unsharded).
-    Expectation: Success with correct layout and numerical equivalence.
-    """
-    init_dist()
+def test_layernorm_hybrid_parallel() -> None:
+    """Test layer_norm with hybrid parallel."""
+    init_backend(_DEVICE_TYPE)
     normalized_shape = (32,)
 
-    standalone_input = torch.from_numpy(standalone_input_3d_np).npu()
-    weight = torch.ones(normalized_shape).npu()
-    bias = torch.zeros(normalized_shape).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_3d_np), _DEVICE_TYPE)
+    weight = to_device(torch.ones(normalized_shape), _DEVICE_TYPE)
+    bias = to_device(torch.zeros(normalized_shape), _DEVICE_TYPE)
     standalone_output = torch.nn.functional.layer_norm(
         standalone_input, normalized_shape, weight, bias
     )
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(1), Replicate())
     x_layout = _build_layout(mesh, x_placements, 3)
 
@@ -156,25 +144,19 @@ def test_layernorm_hybrid_parallel():
     )
 
 
-def test_layernorm_all_replicated():
-    """
-    Feature: dtensor + torch.nn.functional.layer_norm all replicated
-    Description:
-        - Input: (8, 16) fully replicated.
-        - LayerNorm on dim 1 (feature dimension).
-    Expectation: Success with correct layout and numerical equivalence.
-    """
-    init_dist()
+def test_layernorm_all_replicated() -> None:
+    """Test layer_norm with all replicated."""
+    init_backend(_DEVICE_TYPE)
     normalized_shape = (16,)
 
-    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
-    weight = torch.ones(normalized_shape).npu()
-    bias = torch.zeros(normalized_shape).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_2d_np), _DEVICE_TYPE)
+    weight = to_device(torch.ones(normalized_shape), _DEVICE_TYPE)
+    bias = to_device(torch.zeros(normalized_shape), _DEVICE_TYPE)
     standalone_output = torch.nn.functional.layer_norm(
         standalone_input, normalized_shape, weight, bias
     )
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
     x_layout = _build_layout(mesh, x_placements, 2)
 

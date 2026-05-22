@@ -18,30 +18,54 @@ from tests.common.parallel_case import parallel_run, TorchCase
 
 PARALLEL_OP_ZEROS_LIKE = "parallel_op_zeros_like.py"
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_zeros_like_group1():
     """
     Feature: parallel run case in zeros_like shard
     Description:
-        1.test_distributed_zeros_like_data_parallel
-        2.test_distributed_zeros_like_model_parallel
+        1.test_zeros_like_data_parallel
+        2.test_zeros_like_model_parallel
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_ZEROS_LIKE, "test_distributed_zeros_like_data_parallel", 10359, 4),
-        TorchCase(PARALLEL_OP_ZEROS_LIKE, "test_distributed_zeros_like_model_parallel", 10360, 4),
+        TorchCase(PARALLEL_OP_ZEROS_LIKE, "test_zeros_like_data_parallel", num_proc=4),
+        TorchCase(PARALLEL_OP_ZEROS_LIKE, "test_zeros_like_model_parallel", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_zeros_like_group1_gloo():
+    """
+    Feature: parallel run case in zeros_like shard (gloo cpu)
+    Description:
+        1.test_zeros_like_data_parallel
+        2.test_zeros_like_model_parallel
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_ZEROS_LIKE, "test_zeros_like_data_parallel", num_proc=4),
+        TorchCase(PARALLEL_OP_ZEROS_LIKE, "test_zeros_like_model_parallel", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_zeros_like_group2():
     """
     Feature: parallel run case in zeros_like shard
     Description:
-        1.test_distributed_zeros_like_no_skip
+        1.test_zeros_like_no_skip
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_ZEROS_LIKE, "test_distributed_zeros_like_no_skip", 10359, 4),
+        TorchCase(PARALLEL_OP_ZEROS_LIKE, "test_zeros_like_no_skip", num_proc=4),
+    ])
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_zeros_like_group2_gloo():
+    """
+    Feature: parallel run case in zeros_like shard (gloo cpu)
+    Description:
+        1.test_zeros_like_no_skip
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_ZEROS_LIKE, "test_zeros_like_no_skip", num_proc=4),
     ])

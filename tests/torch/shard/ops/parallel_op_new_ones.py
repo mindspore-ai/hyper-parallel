@@ -19,70 +19,56 @@ import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global
 
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
+
 np.random.seed(42)
-# Input tensor shape and content don't affect new_ones output values,
-# but we need a tensor to call .new_ones() on.
 standalone_input_np = np.random.randn(4, 4).astype(np.float32)
 
 
-def test_distributed_new_ones_tuple_size():
-    """
-    Feature: dtensor + torch.Tensor.new_ones with tuple size
-    Description:
-        - Create a new tensor of ones with specific tuple shape from a distributed tensor.
-        - Input: Sharded tensor.
-        - Output: Should be fully Replicated (all dimensions -1) regardless of input sharding.
-    Expectation: Output layout is Replicated, values match standalone execution.
-    """
-    init_dist()
+def test_new_ones_tuple_size() -> None:
+    """Test torch.Tensor.new_ones with tuple size."""
+    init_backend(_DEVICE_TYPE)
 
-    # Standalone reference
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     size = (3, 5)
     standalone_output = standalone_input.new_ones(size)
 
-    # Distributed setup: Input sharded on dim 0 and 1
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(1))
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.new_ones(size)
 
-    # Layout validation: Output must be fully replicated
-    # size is (3, 5) -> 2D -> Expect (Replicate(), Replicate())
     expected_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
     assert dist_output.layout == expected_layout, \
         f"Tuple size layout mismatch: expected {expected_layout}, got {dist_output.layout}"
 
-    # Numerical validation
     gathered_output = local_to_global(dist_output)
     assert torch.equal(standalone_output, gathered_output), \
         "Tuple size output mismatch between standalone and distributed execution"
 
 
-def test_distributed_new_ones_list_size():
-    """
-    Feature: dtensor + torch.Tensor.new_ones with list size
-    Description:
-        - Call new_ones with a list argument for size.
-    Expectation: Success with Replicated layout.
-    """
-    init_dist()
+def test_new_ones_list_size() -> None:
+    """Test torch.Tensor.new_ones with list size."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     size = [2, 2, 2]
     standalone_output = standalone_input.new_ones(size)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.new_ones(size)
 
-    # Layout validation: 3D Replicated
     expected_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
     assert dist_output.layout == expected_layout, \
         f"List size layout mismatch: expected {expected_layout}, got {dist_output.layout}"
@@ -92,26 +78,20 @@ def test_distributed_new_ones_list_size():
         "List size output mismatch"
 
 
-def test_distributed_new_ones_int_size():
-    """
-    Feature: dtensor + torch.Tensor.new_ones with int size
-    Description:
-        - Call new_ones with a single integer (1D tensor creation).
-    Expectation: Success with 1D Replicated layout.
-    """
-    init_dist()
+def test_new_ones_int_size() -> None:
+    """Test torch.Tensor.new_ones with int size (1D tensor)."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     size = 8
     standalone_output = standalone_input.new_ones(size)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.new_ones(size)
 
-    # Layout validation: 1D Replicated
     expected_layout = _build_layout(mesh, (Replicate(),), 1)
     assert dist_output.layout == expected_layout, \
         f"Int size layout mismatch: expected {expected_layout}, got {dist_output.layout}"
@@ -121,26 +101,20 @@ def test_distributed_new_ones_int_size():
         "Int size output mismatch"
 
 
-def test_distributed_new_ones_scalar():
-    """
-    Feature: dtensor + torch.Tensor.new_ones scalar
-    Description:
-        - Call new_ones with empty tuple to create a scalar tensor.
-    Expectation: Success with scalar Replicated layout.
-    """
-    init_dist()
+def test_new_ones_scalar() -> None:
+    """Test torch.Tensor.new_ones with empty tuple (scalar tensor)."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     size = ()
     standalone_output = standalone_input.new_ones(size)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Replicate(), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.new_ones(size)
 
-    # Layout validation: 0-dim Replicated (empty tuple placements)
     expected_layout = _build_layout(mesh, (), 0)
     assert dist_output.layout == expected_layout, \
         f"Scalar layout mismatch: expected {expected_layout}, got {dist_output.layout}"
@@ -150,31 +124,22 @@ def test_distributed_new_ones_scalar():
         "Scalar output mismatch"
 
 
-def test_distributed_new_ones_input_sharding_ignored():
-    """
-    Feature: dtensor + torch.Tensor.new_ones ignores input sharding
-    Description:
-        - Verify that even if the input tensor is heavily sharded, the new_ones output
-          is created as Replicated.
-    Expectation: Output layout is strictly Replicated.
-    """
-    init_dist()
+def test_new_ones_input_sharding_ignored() -> None:
+    """Test new_ones output being Replicated regardless of input sharding."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     size = (4, 4)
     standalone_output = standalone_input.new_ones(size)
 
-    # Heavily sharded input: dim0 on dp(2), dim1 on tp(4)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(1))
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_output = dist_input.new_ones(size)
 
-    # Expect Replicated, NOT Sharded
     expected_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
-    # Double check it is not sharded
     assert dist_output.layout == expected_layout, \
         f"Sharding ignore check failed: expected {expected_layout}, got {dist_output.layout}"
 

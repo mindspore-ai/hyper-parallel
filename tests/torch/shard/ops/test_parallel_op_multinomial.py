@@ -18,30 +18,54 @@ from tests.common.parallel_case import parallel_run, TorchCase
 
 PARALLEL_OP_MULTINOMIAL = "parallel_op_multinomial.py"
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_multinomial_group1():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_multinomial_1d_replicated
-        2.test_distributed_multinomial_2d_data_parallel
+        1.test_multinomial_1d_replicated
+        2.test_multinomial_2d_data_parallel
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_distributed_multinomial_1d_replicated", 10359, 4),
-        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_distributed_multinomial_2d_data_parallel", 10360, 4),
+        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_multinomial_1d_replicated", num_proc=4),
+        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_multinomial_2d_data_parallel", num_proc=4),
     ])
 
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_multinomial_group1_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_multinomial_1d_replicated
+        2.test_multinomial_2d_data_parallel
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_multinomial_1d_replicated", num_proc=4),
+        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_multinomial_2d_data_parallel", num_proc=4),
+    ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_multinomial_group2():
     """
     Feature: parallel run case in shard
     Description:
-        1.test_distributed_multinomial_2d_fully_replicated
+        1.test_multinomial_2d_fully_replicated
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_distributed_multinomial_2d_fully_replicated", 10361, 4),
+        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_multinomial_2d_fully_replicated", num_proc=4),
+    ])
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_multinomial_group2_gloo():
+    """
+    Feature: parallel run case in shard (gloo cpu)
+    Description:
+        1.test_multinomial_2d_fully_replicated
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_multinomial_2d_fully_replicated", num_proc=4),
     ])

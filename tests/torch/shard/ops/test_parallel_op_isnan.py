@@ -16,7 +16,6 @@
 from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_isnan_basic():
     '''
@@ -24,11 +23,22 @@ def test_distributed_isnan_basic():
     Description: test parallel op isnan basic with sharding.
     Expectation: Run success.
     '''
-    master_port = 10359
-    file_name = "parallel_op_isnan.py"
-    case_name = "test_distributed_isnan_basic"
-    torchrun_case(file_name, case_name, master_port)
 
+    file_name = "parallel_op_isnan.py"
+    case_name = "test_isnan_basic"
+    torchrun_case(file_name, case_name)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_isnan_basic():
+    '''
+    Feature: test parallel op isnan (gloo cpu).
+    Description: test parallel op isnan basic with sharding.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_isnan.py"
+    case_name = "test_isnan_basic"
+    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_isnan_replicate():
@@ -37,11 +47,22 @@ def test_distributed_isnan_replicate():
     Description: test parallel op isnan with fully replicated tensor.
     Expectation: Run success.
     '''
-    master_port = 10359
-    file_name = "parallel_op_isnan.py"
-    case_name = "test_distributed_isnan_replicate"
-    torchrun_case(file_name, case_name, master_port)
 
+    file_name = "parallel_op_isnan.py"
+    case_name = "test_isnan_replicate"
+    torchrun_case(file_name, case_name)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_isnan_replicate():
+    '''
+    Feature: test parallel op isnan (gloo cpu).
+    Description: test parallel op isnan with fully replicated tensor.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_isnan.py"
+    case_name = "test_isnan_replicate"
+    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_isnan_3d():
@@ -50,7 +71,19 @@ def test_distributed_isnan_3d():
     Description: test parallel op isnan on 3D tensor with mixed sharding.
     Expectation: Run success.
     '''
-    master_port = 10359
+
     file_name = "parallel_op_isnan.py"
-    case_name = "test_distributed_isnan_3d"
-    torchrun_case(file_name, case_name, master_port)
+    case_name = "test_isnan_3d"
+    torchrun_case(file_name, case_name)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_isnan_3d():
+    '''
+    Feature: test parallel op isnan (gloo cpu).
+    Description: test parallel op isnan on 3D tensor with mixed sharding.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_isnan.py"
+    case_name = "test_isnan_3d"
+    torchrun_case(file_name, case_name)

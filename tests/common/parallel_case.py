@@ -13,16 +13,43 @@
 # limitations under the License.
 # ============================================================================
 """parallel run case"""
+import fcntl
 import os
 import signal
 import multiprocessing as mp
+import tempfile
 from typing import Union
+
+
+def allocate_port() -> int:
+    """Atomically allocate a unique port from a circular counter.
+
+    Uses :func:`fcntl.flock` to guarantee that no two processes ever receive
+    the same port.  The counter wraps through a fixed range (10000–29999,
+    deliberately below the Linux default ephemeral range of 32768–60999)
+    so that ports are cycled safely without colliding with OS-assigned ports.
+
+    Returns:
+        A TCP port number guaranteed unique among all current callers.
+    """
+    counter_path = os.path.join(tempfile.gettempdir(), f"hp_port_counter_{os.getuid()}")
+    port_base = 10000
+    port_range = 20000
+    with open(counter_path, "a+", encoding="utf-8") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        f.seek(0)
+        content = f.read().strip()
+        counter = int(content) if content else 0
+        f.seek(0)
+        f.truncate()
+        f.write(str(counter + 1))
+    return port_base + (counter % port_range)
 
 
 class TorchCase:
     """torch case messages"""
 
-    def __init__(self, file_name: str, case_name: str, master_port: int, num_proc: int = 1):
+    def __init__(self, file_name: str, case_name: str, master_port: int | None = None, num_proc: int = 1):
         self.file_name = file_name
         self.case_name = case_name
         self.master_port = master_port
@@ -61,6 +88,17 @@ def run_case(visible_devices, case: Union[TorchCase, MindSporeCase]):
         msrun_case(case.glog_v, case.file_name, case.case_name, case.master_port, case.num_proc, case.local_worker_num)
 
 
+def _auto_assign_ports(cases: list) -> None:
+    """Assign unique ports to every case whose :attr:`master_port` is ``None``.
+
+    Ports are allocated in the parent process so that concurrent children
+    never race — each child receives a globally-unique, pre-allocated port.
+    """
+    for case in cases:
+        if case.master_port is None:
+            case.master_port = allocate_port()
+
+
 def parallel_run(cases: Union[list[TorchCase], list[MindSporeCase]], global_num_proc: int = 8):
     """
     parallel run cases
@@ -69,6 +107,11 @@ def parallel_run(cases: Union[list[TorchCase], list[MindSporeCase]], global_num_
         cases (list[Case]): list of case messages to be run parallel
         global_num_proc (int, optional): number of total num of process. Defaults to 8.
     """
+    # auto-assign ports before spawning children (avoids cross-process races)
+    torch_cases = [c for c in cases if isinstance(c, TorchCase) and c.master_port is None]
+    if torch_cases:
+        _auto_assign_ports(torch_cases)
+
     # assign devices
     sum_num_proc = 0
     assignments = []

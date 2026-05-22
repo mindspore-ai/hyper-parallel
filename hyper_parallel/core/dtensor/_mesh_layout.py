@@ -16,7 +16,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Iterator, Optional, Union
 
 import numpy as np
 
@@ -123,22 +123,27 @@ class _FlatLayout:
     shape: tuple[int, ...]
     stride: tuple[int, ...]
 
-    def __init__(self, shape, stride=None) -> None:
+    def __init__(self, shape: IntTuple, stride: Optional[IntTuple] = None) -> None:
+        """Canonicalize *shape* and *stride* into a frozen flat layout."""
         flat_shape, flat_stride = _canonicalize_axis(shape, stride)
         object.__setattr__(self, "shape", flat_shape)
         object.__setattr__(self, "stride", flat_stride)
 
     def numel(self) -> int:
+        """Return the total number of elements in this layout."""
         return math.prod(self.shape) if len(self.shape) > 0 else 1
 
     def cosize(self) -> int:
+        """Return the size of the smallest contiguous block containing all ranks."""
         ranks = self.all_ranks_from_zero()
         return max(ranks) + 1 if ranks else 1
 
     def check_sorted(self) -> bool:
+        """Return True if strides are in descending order."""
         return tuple(sorted(self.stride, reverse=True)) == self.stride
 
     def check_orthogonal(self) -> bool:
+        """Return True if each axis is independent (strides are orthogonal)."""
         if len(self.shape) < 2:
             return True
         stride, shape = zip(*sorted(zip(self.stride, self.shape), reverse=True))
@@ -148,6 +153,7 @@ class _FlatLayout:
         )
 
     def all_ranks_from_zero(self) -> list[int]:
+        """List every rank offset assuming the base is zero."""
         if len(self.shape) == 0:
             return [0]
         return [
@@ -159,7 +165,12 @@ class _FlatLayout:
 class _MeshLayout:
     """Minimal layout helper for DeviceMesh slicing, flattening, and concatenation."""
 
-    def __init__(self, shape_or_axes: Union[IntTuple, list[_FlatLayout], tuple[_FlatLayout, ...]], stride=None):
+    def __init__(
+        self,
+        shape_or_axes: Union[IntTuple, list[_FlatLayout], tuple[_FlatLayout, ...]],
+        stride: Optional[IntTuple] = None,
+    ) -> None:
+        """Build a layout from a nested shape/stride pair or a list of flat axes."""
         if stride is None and isinstance(shape_or_axes, (list, tuple)) and all(
             isinstance(axis, _FlatLayout) for axis in shape_or_axes
         ):
@@ -179,30 +190,37 @@ class _MeshLayout:
             sizes: tuple[int, ...],
             strides: Optional[tuple[int, ...]] = None,
     ) -> "_MeshLayout":
+        """Create a layout from flat sizes and optional strides."""
         if strides is None:
             strides = _contiguous_strides(sizes)
         return cls(sizes, strides)
 
     @property
     def sizes(self) -> IntTuple:
+        """Return the (possibly nested) shape tuple."""
         return self.shape
 
     @property
     def strides(self) -> IntTuple:
+        """Return the (possibly nested) stride tuple."""
         return self.stride
 
     @property
     def axes(self) -> tuple[_FlatLayout, ...]:
+        """Return each top-level dimension as a separate flat layout."""
         return tuple(self[idx].collapse() for idx in range(len(self)))
 
     def __len__(self) -> int:
+        """Return the number of top-level dimensions."""
         return len(self.shape) if isinstance(self.shape, tuple) else 1
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator["_MeshLayout"]:
+        """Yield each top-level dimension as its own layout."""
         for idx in range(len(self)):
             yield self[idx]
 
     def __getitem__(self, idx: int) -> "_MeshLayout":
+        """Select a single top-level dimension by index."""
         if isinstance(self.shape, tuple):
             if idx < -len(self.shape) or idx >= len(self.shape):
                 raise IndexError(
@@ -214,24 +232,30 @@ class _MeshLayout:
         return _MeshLayout(self.shape, self.stride)
 
     def __eq__(self, other: object) -> bool:
+        """Return True if *other* has the same shape and stride."""
         if not isinstance(other, _MeshLayout):
             return False
         return self.shape == other.shape and self.stride == other.stride
 
     def __repr__(self) -> str:
+        """Return a printable representation of this layout."""
         return f"_MeshLayout(shape={self.shape}, stride={self.stride})"
 
     def numel(self) -> int:
+        """Return the total number of elements in this layout."""
         return _numel(self.shape)
 
     @property
     def top_level_sizes(self) -> tuple[int, ...]:
+        """Return the element count of each top-level dimension."""
         return tuple(self[idx].numel() for idx in range(len(self)))
 
     def all_ranks_from_zero(self) -> list[int]:
+        """List every rank offset assuming the base is zero."""
         return _enumerate_offsets(self.shape, self.stride)
 
     def check_non_overlap(self) -> bool:
+        """Return True if no rank appears more than once in this layout."""
         ranks = self.all_ranks_from_zero()
         return len(ranks) == len(set(ranks))
 
@@ -269,6 +293,7 @@ class _MeshLayout:
         return _MeshLayout(tuple(merged_shapes), tuple(merged_strides))
 
     def composition(self, layout: "_MeshLayout") -> "_MeshLayout":
+        """Compose *layout* on top of this axis (unflatten with scaled strides)."""
         if not _is_int(self.stride):
             raise NotImplementedError(
                 "Currently, _unflatten only supports unflattening a mesh dim with scalar stride."
@@ -276,11 +301,13 @@ class _MeshLayout:
         return _MeshLayout(layout.shape, _scale_inttuple(layout.stride, int(self.stride)))
 
     def nest(self) -> "_MeshLayout":
+        """Wrap all dimensions into a single outer dimension."""
         if len(self) == 1:
             return self
         return _MeshLayout((self.shape,), (self.stride,))
 
     def splice(self, start: int, end: int, layout: "_MeshLayout") -> "_MeshLayout":
+        """Replace dimensions [start, end) with the axes of *layout*."""
         sizes = list(_as_tuple(self.shape))
         strides = list(_as_tuple(self.stride))
         sizes[start:end] = list(_as_tuple(layout.shape))
@@ -290,9 +317,10 @@ class _MeshLayout:
         return _MeshLayout(tuple(sizes), tuple(strides))
 
     def collapse(self) -> _FlatLayout:
+        """Flatten this layout into a single canonicalized flat layout."""
         return _FlatLayout(self.shape, self.stride)
 
-    def remap_to_numpy(self, rank_map) -> np.ndarray:
+    def remap_to_numpy(self, rank_map: Any) -> np.ndarray:
         """Materialize this layout as a dense numpy mesh over the provided rank map."""
         rank_map_np = np.asarray(rank_map).reshape(-1)
         base_offsets = self.all_ranks_from_zero()

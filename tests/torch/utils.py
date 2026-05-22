@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,8 +20,10 @@ import sys
 import torch
 import torch.distributed as dist
 
+from tests.common.parallel_case import allocate_port
 
-def init_dist():
+
+def init_dist() -> tuple[int, int]:
     """init dist"""
     if not dist.is_initialized():
         dist.init_process_group()
@@ -32,27 +34,87 @@ def init_dist():
     return rank, device_id
 
 
-def torchrun_case(file_name, case_name, master_port, num_proc=8):
+def init_dist_gloo() -> int:
+    """Init dist with gloo CPU backend (no NPU required)."""
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo")
+    rank = dist.get_rank()
+    return rank
+
+
+def init_backend(device_type: str):
+    """Initialize distributed backend for the given device type.
+
+    Args:
+        device_type: "npu" for Ascend NPU (hccl backend), "cpu" for Gloo CPU backend.
+
+    Returns:
+        Same as init_dist() for NPU or init_dist_gloo() for CPU.
+    """
+    if device_type == "npu":
+        return init_dist()
+    return init_dist_gloo()
+
+
+def to_device(tensor: torch.Tensor, device_type: str) -> torch.Tensor:
+    """Move tensor to the appropriate device based on device_type.
+
+    Args:
+        tensor: Input tensor to move.
+        device_type: "npu" moves to NPU, "cpu" keeps on CPU.
+
+    Returns:
+        Tensor on the target device.
+    """
+    if device_type == "npu":
+        return tensor.npu()
+    return tensor
+
+
+def torchrun_case(file_name: str, case_name: str, master_port: int | None = None, num_proc: int = 8) -> None:
     """Spawn *num_proc* workers via ``python -m torch.distributed.run`` (same as torchrun).
 
     Uses :data:`sys.executable` so conda/env interpreters work when ``torchrun`` is not on ``PATH``.
+
+    Args:
+        file_name: The implementation file to test.
+        case_name: The test function name within *file_name*.
+        master_port: TCP port for torchrun rendezvous.  When ``None`` (default),
+            a globally-unique port is allocated automatically via :func:`allocate_port`.
+        num_proc: Number of worker processes.
     """
     env = os.environ.copy()
     env.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
-    cmd = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        f"--nproc-per-node={num_proc}",
-        f"--log-dir=./logs/{file_name}/{case_name}",
-        "-r",
-        "3",
-        "--master_addr=127.0.0.1",
-        f"--master_port={master_port}",
-        "-m",
-        "pytest",
-        "-s",
-        f"{file_name}::{case_name}",
-    ]
-    ret = subprocess.call(cmd, env=env)
-    assert ret == 0
+    # Resolve file_name relative to CWD so torchrun workers can find it
+    # regardless of the CWD of the calling process.
+    abs_file = os.path.abspath(file_name)
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        if master_port is None or attempt > 0:
+            master_port = allocate_port()
+        cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            f"--nproc-per-node={num_proc}",
+            f"--log-dir=./logs/{file_name}/{case_name}",
+            "-r",
+            "3",
+            "--master_addr=127.0.0.1",
+            f"--master_port={master_port}",
+            "-m",
+            "pytest",
+            "-s",
+            f"{abs_file}::{case_name}",
+        ]
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            return
+        # Retry on port-in-use errors; surface any other failure immediately.
+        combined = result.stdout + result.stderr
+        if "Address already in use" not in combined:
+            print(combined, file=sys.stderr)
+            assert result.returncode == 0, f"torchrun failed with exit code {result.returncode}"
+        if attempt == max_attempts - 1:
+            print(combined, file=sys.stderr)
+            assert False, f"Port {master_port} still in use after {max_attempts} attempts"

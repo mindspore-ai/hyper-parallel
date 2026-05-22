@@ -18,89 +18,75 @@ import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global
 
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
 
 # Generate input data using numpy at file header
 np.random.seed(42)
 standalone_input_np = np.random.randn(8, 16).astype(np.float32)
 standalone_input_np[0][0] = 0.0
 
-def test_distributed_all_unsharded_dim():
-    """
-    Feature: dtensor + torch.all layout inference (unsharded dim)
-    Description:
-        ▪ Test layout inference for torch.all when reducing along an unsharded dimension.
-        ▪ Ensure that:
-            a) The output layout is correctly inferred (rank reduction).
-            b) Results are consistent between standalone and distributed.
-    Expectation: Success.
-    """
-    init_dist()
+def test_all_unsharded_dim() -> None:
+    """Test torch.all with unsharded dim reduction."""
+    init_backend(_DEVICE_TYPE)
     dim = 1
 
-    # Standalone
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     standalone_result = torch.all(standalone_input, dim=dim)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
     dist_result = torch.all(dist_input, dim, keepdim=False)
 
     expected_layout = _build_layout(mesh, (Shard(0),), 1)
-    assert dist_result.layout == expected_layout, \
-        f"Layout mismatch. Got {dist_result.layout}, expected {expected_layout}"
+    assert dist_result.layout == expected_layout, (
+        f"Layout mismatch: expected={expected_layout}, got={dist_result.layout}"
+    )
 
-    # Ensure no partial state since we reduced a replicated dimension
-    assert not dist_result.layout.is_partial(), "Result should not be partial for unsharded dim reduction"
+    assert not dist_result.layout.is_partial(), (
+        "Result should not be partial for unsharded dim reduction"
+    )
 
-    # Gather distributed results back to global view
     gathered_result = local_to_global(dist_result)
 
-    assert (standalone_result == gathered_result).all(), \
+    assert (standalone_result == gathered_result).all(), (
         "All values mismatch between standalone and distributed (unsharded dim)"
+    )
 
 
-def test_distributed_all_sharded_dim():
-    """
-    Feature: dtensor + torch.all layout inference (sharded dim)
-    Description:
-        ▪ Test layout inference for torch.all when reducing along a sharded dimension.
-        ▪ Ensure that:
-            a) The output layout is marked as PARTIAL (with op 'all').
-            b) After resolving partial (reduce_partial), results match standalone.
-    Expectation: Success.
-    """
-    init_dist()
+def test_all_sharded_dim() -> None:
+    """Test torch.all with sharded dim reduction."""
+    init_backend(_DEVICE_TYPE)
     dim = 1
 
-    # Standalone
-    standalone_input = torch.from_numpy(standalone_input_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_np), _DEVICE_TYPE)
     standalone_result = torch.all(standalone_input, dim=dim)
 
-    # Distributed setup
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Shard(1))
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)
 
-    # FIX: Use positional arguments to ensure correct layout inference
     dist_result = torch.all(dist_input, dim, keepdim=False)
 
-    # Layout correctness check
-    # We reduced dim 1 which corresponds to 'tp'.
-    # The result should be partial on 'tp'.
-    assert dist_result.layout.is_partial(), "Result should be partial when reducing sharded dim"
-    assert dist_result.layout.get_partial_by_dev_id("tp") == "all", \
+    assert dist_result.layout.is_partial(), (
+        "Result should be partial when reducing sharded dim"
+    )
+    assert dist_result.layout.get_partial_by_dev_id("tp") == "all", (
         "Partial operator should be 'all' for tp axis"
+    )
 
-    # Resolve partial state (triggers communication/allreduce)
     final_result = dist_result.reduce_partial()
 
-    # Gather distributed results back to global view
     gathered_result = local_to_global(final_result)
 
-    assert (standalone_result == gathered_result).all(), \
+    assert (standalone_result == gathered_result).all(), (
         "All values mismatch between standalone and distributed (sharded dim)"
+    )

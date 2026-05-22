@@ -19,44 +19,35 @@ import torch
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global
+
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
 
 np.random.seed(42)
 standalone_elements_np = np.random.randint(0, 50, size=(8, 16)).astype(np.int32)
 standalone_test_elements_np = np.random.choice(np.arange(50), size=20, replace=False).astype(np.int32)
 
 
-def test_distributed_isin_layout_inference():
-    """
-    Feature: dtensor + torch.isin layout inference
-    Description:
-        - Test layout inference and numerical correctness for isin in distributed setting.
-        - Ensure that:
-            a) Output layout matches elements layout (same shape semantics).
-            b) Results are numerically consistent between standalone and distributed execution.
-            c) test_elements MUST be fully replicated for correctness.
-    Expectation: Success with identical results to standalone execution.
-    """
-    init_dist()
+def test_isin_layout_inference() -> None:
+    """Test torch.isin layout inference."""
+    init_backend(_DEVICE_TYPE)
 
-    # Standalone execution (single device)
-    standalone_elements = torch.from_numpy(standalone_elements_np).npu()
-    standalone_test_elements = torch.from_numpy(standalone_test_elements_np).npu()
+    standalone_elements = to_device(torch.from_numpy(standalone_elements_np), _DEVICE_TYPE)
+    standalone_test_elements = to_device(torch.from_numpy(standalone_test_elements_np), _DEVICE_TYPE)
     standalone_output = torch.isin(standalone_elements, standalone_test_elements)
 
-    # Distributed setup:
-    # elements: sharded on dim0 ("dp")
-    # test_elements: MUST be fully replicated (critical constraint)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    elements_placements = (Shard(0), Replicate()) # tensor_map = (1, -1)
-    test_elements_placements = (Replicate(), Replicate()) # tensor_map = (-1,) - fully replicated 1D tensor
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    elements_placements = (Shard(0), Replicate())
+    test_elements_placements = (Replicate(), Replicate())
 
-    # Convert to distributed tensors
     dist_elements = distribute_tensor(standalone_elements, mesh, elements_placements)
     dist_test_elements = distribute_tensor(standalone_test_elements, mesh, test_elements_placements)
 
-    # Distributed execution
     dist_output = torch.isin(dist_elements, dist_test_elements)
 
     assert dist_output.layout == dist_elements.layout, (
@@ -69,91 +60,63 @@ def test_distributed_isin_layout_inference():
     ), "Isin output mismatch between standalone and distributed execution"
 
 
-def test_distributed_isin_invert_and_assume_unique():
-    """
-    Feature: dtensor + torch.isin with invert/assume_unique parameters
-    Description:
-        - Test that invert=True and assume_unique=True parameters work correctly in distributed setting.
-        - These parameters affect computation but NOT layout derivation.
-        - Validates numerical correctness with special parameters.
-    Expectation: Success with identical results to standalone execution.
-    """
-    init_dist()
+def test_isin_invert_and_assume_unique() -> None:
+    """Test torch.isin with invert/assume_unique parameters."""
+    init_backend(_DEVICE_TYPE)
 
     elements_unique_np = np.arange(128, dtype=np.int32).reshape(8, 16)
     test_elements_unique_np = np.arange(20, dtype=np.int32)
 
-    standalone_elements = torch.from_numpy(elements_unique_np).npu()
-    standalone_test_elements = torch.from_numpy(test_elements_unique_np).npu()
+    standalone_elements = to_device(torch.from_numpy(elements_unique_np), _DEVICE_TYPE)
+    standalone_test_elements = to_device(torch.from_numpy(test_elements_unique_np), _DEVICE_TYPE)
 
-    # Case 1: invert=True (logical NOT of membership)
     standalone_invert = torch.isin(standalone_elements, standalone_test_elements, invert=True)
-
-    # Case 2: assume_unique=True (optimization hint, should not change result)
     standalone_unique = torch.isin(
-        standalone_elements,
-        standalone_test_elements,
-        assume_unique=True
+        standalone_elements, standalone_test_elements, assume_unique=True
     )
 
-    # Distributed setup (same as normal case)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
-    elements_placements = (Shard(0), Replicate()) # tensor_map = (1, -1)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    elements_placements = (Shard(0), Replicate())
     test_elements_placements = (Replicate(), Replicate())
 
     dist_elements = distribute_tensor(standalone_elements, mesh, elements_placements)
     dist_test_elements = distribute_tensor(standalone_test_elements, mesh, test_elements_placements)
 
-    # Distributed execution with parameters
     dist_invert = torch.isin(dist_elements, dist_test_elements, invert=True)
     dist_unique = torch.isin(dist_elements, dist_test_elements, assume_unique=True)
 
-    # Verify invert parameter
     gathered_invert = local_to_global(dist_invert)
     assert torch.equal(
         standalone_invert, gathered_invert
     ), "Isin with invert=True mismatch between standalone and distributed"
 
-    # Verify assume_unique parameter
     gathered_unique = local_to_global(dist_unique)
     assert torch.equal(
         standalone_unique, gathered_unique
     ), "Isin with assume_unique=True mismatch between standalone and distributed"
 
 
-def test_distributed_isin_mixed_parallel_3d():
-    """
-    Feature: dtensor + torch.isin with 3D mixed parallelism
-    Description:
-        - Test isin with 3D elements tensor using mixed parallelism (dp on dim0, mp on dim2).
-        - test_elements remains fully replicated (1D tensor).
-        - Validates layout propagation for higher-dimensional tensors.
-    Expectation: Success with identical results to standalone execution.
-    """
-    init_dist()
+def test_isin_mixed_parallel_3d() -> None:
+    """Test torch.isin with 3D mixed parallelism."""
+    init_backend(_DEVICE_TYPE)
 
-    # 3D standalone inputs
-    np.random.seed(43)  # Different seed for 3D data
-    standalone_elements_3d = torch.from_numpy(
-        np.random.randint(0, 50, size=(4, 6, 8)).astype(np.int32)
-    ).npu()
-    standalone_test_elements = torch.from_numpy(standalone_test_elements_np).npu()
+    np.random.seed(43)
+    standalone_elements_3d = to_device(
+        torch.from_numpy(np.random.randint(0, 50, size=(4, 6, 8)).astype(np.int32)), _DEVICE_TYPE
+    )
+    standalone_test_elements = to_device(torch.from_numpy(standalone_test_elements_np), _DEVICE_TYPE)
     standalone_output = torch.isin(standalone_elements_3d, standalone_test_elements)
 
-    # Distributed setup: mixed parallelism on 3D tensor
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
-    elements_placements = (Shard(0), Shard(2)) # tensor_map = (2, 0)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "mp"))
+    elements_placements = (Shard(0), Shard(2))
     test_elements_placements = (Replicate(), Replicate())
 
-    # Convert and execute
     dist_elements = distribute_tensor(standalone_elements_3d, mesh, elements_placements)
     dist_test_elements = distribute_tensor(standalone_test_elements, mesh, test_elements_placements)
     dist_output = torch.isin(dist_elements, dist_test_elements)
 
-    # Verify layout correctness
     assert dist_output.layout == dist_elements.layout, "3D mixed parallel isin: layout mismatch"
 
-    # Verify numerical correctness
     gathered_output = local_to_global(dist_output)
     assert torch.equal(
         standalone_output, gathered_output

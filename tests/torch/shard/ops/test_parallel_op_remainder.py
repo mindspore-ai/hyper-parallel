@@ -16,7 +16,6 @@
 from tests.torch.utils import torchrun_case
 from tests.common.mark_utils import arg_mark
 
-
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_remainder_basic():
     '''
@@ -24,11 +23,22 @@ def test_distributed_remainder_basic():
     Description: test parallel op remainder with basic identical layout tensors.
     Expectation: Run success.
     '''
-    master_port = 10359
-    file_name = "parallel_op_remainder.py"
-    case_name = "test_distributed_remainder_basic"
-    torchrun_case(file_name, case_name, master_port)
 
+    file_name = "parallel_op_remainder.py"
+    case_name = "test_remainder_basic"
+    torchrun_case(file_name, case_name)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_remainder_basic():
+    '''
+    Feature: test parallel op remainder (gloo cpu).
+    Description: test parallel op remainder with basic identical layout tensors.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_remainder.py"
+    case_name = "test_remainder_basic"
+    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_remainder_scalar():
@@ -37,11 +47,22 @@ def test_distributed_remainder_scalar():
     Description: test parallel op remainder with scalar operand.
     Expectation: Run success.
     '''
-    master_port = 10359
-    file_name = "parallel_op_remainder.py"
-    case_name = "test_distributed_remainder_scalar"
-    torchrun_case(file_name, case_name, master_port)
 
+    file_name = "parallel_op_remainder.py"
+    case_name = "test_remainder_scalar"
+    torchrun_case(file_name, case_name)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_remainder_scalar():
+    '''
+    Feature: test parallel op remainder (gloo cpu).
+    Description: test parallel op remainder with scalar operand.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_remainder.py"
+    case_name = "test_remainder_scalar"
+    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_remainder_broadcast():
@@ -50,11 +71,22 @@ def test_distributed_remainder_broadcast():
     Description: test parallel op remainder with broadcasting shapes.
     Expectation: Run success.
     '''
-    master_port = 10359
-    file_name = "parallel_op_remainder.py"
-    case_name = "test_distributed_remainder_broadcast"
-    torchrun_case(file_name, case_name, master_port)
 
+    file_name = "parallel_op_remainder.py"
+    case_name = "test_remainder_broadcast"
+    torchrun_case(file_name, case_name)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_remainder_broadcast():
+    '''
+    Feature: test parallel op remainder (gloo cpu).
+    Description: test parallel op remainder with broadcasting shapes.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_remainder.py"
+    case_name = "test_remainder_broadcast"
+    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_distributed_remainder_operator_overload():
@@ -63,7 +95,19 @@ def test_distributed_remainder_operator_overload():
     Description: test parallel op modulo (%) overload.
     Expectation: Run success.
     '''
-    master_port = 10359
+
     file_name = "parallel_op_remainder.py"
-    case_name = "test_distributed_remainder_operator_overload"
-    torchrun_case(file_name, case_name, master_port)
+    case_name = "test_remainder_operator_overload"
+    torchrun_case(file_name, case_name)
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_gloo_remainder_operator_overload():
+    '''
+    Feature: test parallel op remainder (gloo cpu).
+    Description: test parallel op modulo (%) overload.
+    Expectation: Run success.
+    '''
+
+    file_name = "parallel_op_remainder.py"
+    case_name = "test_remainder_operator_overload"
+    torchrun_case(file_name, case_name)

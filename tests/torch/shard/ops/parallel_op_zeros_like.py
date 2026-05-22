@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,41 +19,38 @@ import torch
 from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import init_backend, to_device
 from tests.torch.shard.utils import local_to_global
 
+try:
+    import torch_npu  # pylint: disable=W0611
+    _DEVICE_TYPE = "npu"
+except ImportError:
+    _DEVICE_TYPE = "cpu"
+
 np.random.seed(42)
-# Shape (4, 8): dim 0 divisible by dp=2, dim 1 divisible by tp=2
 standalone_input_2d_np = np.random.randn(4, 8).astype(np.float32)
 
 
-def test_distributed_zeros_like_data_parallel():
-    """
-    Feature: dtensor + torch.zeros_like with data parallel
-    Description:
-        - Input: (4, 8) sharded on dim 0 (batch dimension) across 2 dp ranks.
-        - zeros_like preserves the input layout; all output values must be zero.
-    Expectation: Success with correct layout and all-zero numerical output.
-    """
-    init_dist()
+def test_zeros_like_data_parallel() -> None:
+    """Test torch.zeros_like with data parallel."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_2d_np), _DEVICE_TYPE)
     standalone_output = torch.zeros_like(standalone_input)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, placements)
     dist_output = torch.zeros_like(dist_input)
 
-    # Layout validation: output layout must equal input layout
     expected_layout = _build_layout(mesh, placements, 2)
     assert dist_output.layout == expected_layout, (
         f"zeros_like data parallel layout mismatch: "
         f"expected={expected_layout}, got={dist_output.layout}"
     )
 
-    # Numerical validation: all output values must be zero
     gathered_output = local_to_global(dist_output)
     assert torch.equal(standalone_output, gathered_output), (
         f"zeros_like data parallel output mismatch: "
@@ -61,33 +58,25 @@ def test_distributed_zeros_like_data_parallel():
     )
 
 
-def test_distributed_zeros_like_model_parallel():
-    """
-    Feature: dtensor + torch.zeros_like with model parallel
-    Description:
-        - Input: (4, 8) sharded on dim 1 (feature dimension) across 2 tp ranks.
-        - zeros_like preserves the input layout; all output values must be zero.
-    Expectation: Success with correct layout and all-zero numerical output.
-    """
-    init_dist()
+def test_zeros_like_model_parallel() -> None:
+    """Test torch.zeros_like with model parallel."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_2d_np), _DEVICE_TYPE)
     standalone_output = torch.zeros_like(standalone_input)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     placements = (Replicate(), Shard(1))
 
     dist_input = distribute_tensor(standalone_input, mesh, placements)
     dist_output = torch.zeros_like(dist_input)
 
-    # Layout validation: output layout must equal input layout
     expected_layout = _build_layout(mesh, placements, 2)
     assert dist_output.layout == expected_layout, (
         f"zeros_like model parallel layout mismatch: "
         f"expected={expected_layout}, got={dist_output.layout}"
     )
 
-    # Numerical validation: all output values must be zero
     gathered_output = local_to_global(dist_output)
     assert torch.equal(standalone_output, gathered_output), (
         f"zeros_like model parallel output mismatch: "
@@ -95,22 +84,14 @@ def test_distributed_zeros_like_model_parallel():
     )
 
 
-def test_distributed_zeros_like_no_skip():
-    """
-    Feature: dtensor + torch.zeros_like inside SkipDTensorDispatch with no_skip
-    Description:
-        - Wrap execution in SkipDTensorDispatch(no_skip={torch.zeros_like}).
-        - zeros_like is exempt from the skip, so it still dispatches through
-          DTensor and must return a DTensor with the same layout as the input.
-        - All output values must be zero.
-    Expectation: Output is a DTensor with correct layout and all-zero values.
-    """
-    init_dist()
+def test_zeros_like_no_skip() -> None:
+    """Test torch.zeros_like inside SkipDTensorDispatch with no_skip."""
+    init_backend(_DEVICE_TYPE)
 
-    standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
+    standalone_input = to_device(torch.from_numpy(standalone_input_2d_np), _DEVICE_TYPE)
     standalone_output = torch.zeros_like(standalone_input)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, placements)
@@ -118,19 +99,16 @@ def test_distributed_zeros_like_no_skip():
     with SkipDTensorDispatch(no_skip={torch.zeros_like}):
         dist_output = torch.zeros_like(dist_input)
 
-    # zeros_like is in no_skip, so the result must still be a DTensor
     assert isinstance(dist_output, DTensor), (
         f"zeros_like with no_skip should return DTensor, got {type(dist_output)}"
     )
 
-    # Layout validation: layout must match the input layout
     expected_layout = _build_layout(mesh, placements, 2)
     assert dist_output.layout == expected_layout, (
         f"zeros_like no_skip layout mismatch: "
         f"expected={expected_layout}, got={dist_output.layout}"
     )
 
-    # Numerical validation: all output values must be zero
     gathered_output = local_to_global(dist_output)
     assert torch.equal(standalone_output, gathered_output), (
         f"zeros_like no_skip output mismatch: "
