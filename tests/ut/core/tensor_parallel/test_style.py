@@ -499,6 +499,85 @@ class TestPrepareModuleInput(unittest.TestCase):
         self.assertIn("PrepareModuleInput", r)
         self.assertIn("use_local_output=False", r)
 
+    def test_prepare_input_fn_returns_inputs_when_layouts_none(self):
+        """
+        Feature: PrepareModuleInput._prepare_input_fn with no layouts
+        Description: default constructor leaves input_layouts as None
+        Expectation: inputs tuple is returned unchanged
+        """
+        style = PrepareModuleInput()
+        mesh = MagicMock()
+        inputs = (torch.randn(2, 2), torch.randn(2, 2))
+        self.assertIs(style._prepare_input_fn(inputs, mesh), inputs)
+
+    def test_prepare_input_fn_wraps_non_tuple_input(self):
+        """
+        Feature: PrepareModuleInput._prepare_input_fn normalizes scalar args
+        Description: forward passes a single tensor instead of a one-tuple
+        Expectation: tensor is prepared like the sole positional argument
+        """
+        style = PrepareModuleInput(
+            input_layouts=Replicate(),
+            desired_input_layouts=Replicate(),
+            use_local_output=True,
+        )
+        mesh = MagicMock()
+        tensor = torch.ones(2, 3)
+        with patch.object(style, "_prepare_input_arg", return_value=tensor) as mock_arg:
+            out = style._prepare_input_fn(tensor, mesh)
+            mock_arg.assert_called_once_with(tensor, mesh, Replicate(), Replicate())
+            self.assertEqual(out, (tensor,))
+
+    def test_prepare_input_fn_raises_when_desired_layouts_none_at_runtime(self):
+        """
+        Feature: PrepareModuleInput._prepare_input_fn validates desired_input_layouts
+        Description: input_layouts set at runtime while desired_input_layouts is None
+        Expectation: AssertionError from defensive check in _prepare_input_fn
+        """
+        style = PrepareModuleInput()
+        style.input_layouts = (Replicate(),)
+        style.desired_input_layouts = None
+        mesh = MagicMock()
+        with self.assertRaises(AssertionError):
+            style._prepare_input_fn((torch.randn(1, 1),), mesh)
+
+    def test_prepare_input_arg_passes_through_existing_dtensor(self):
+        """
+        Feature: PrepareModuleInput._prepare_input_arg DTensor branch
+        Description: input is already a DTensor with a layout that needs redistribution
+        Expectation: redistribute is called; result is local when use_local_output=True
+        """
+        style = PrepareModuleInput(
+            input_layouts=Replicate(),
+            desired_input_layouts=Shard(0),
+            use_local_output=True,
+        )
+        mesh = MagicMock()
+        mock_dt = MagicMock(spec=DTensor)
+        redistributed = MagicMock(spec=DTensor)
+        mock_dt.redistribute.return_value = redistributed
+        local = torch.randn(2, 2)
+        redistributed.to_local.return_value = local
+
+        result = style._prepare_input_arg(mock_dt, mesh, Replicate(), Shard(0))
+        mock_dt.redistribute.assert_called_once_with(mesh, (Shard(0),))
+        self.assertTrue(torch.allclose(result, local))
+
+    @patch("hyper_parallel.core.tensor_parallel.style.platform")
+    def test_prepare_input_arg_raises_for_non_tensor(self, mock_platform):
+        """
+        Feature: PrepareModuleInput._prepare_input_arg type validation
+        Description: non-tensor, non-DTensor positional value with a layout set
+        Expectation: AssertionError
+        """
+        mock_platform.is_tensor.return_value = False
+        style = PrepareModuleInput(
+            input_layouts=Replicate(),
+            desired_input_layouts=Replicate(),
+        )
+        with self.assertRaises(AssertionError):
+            style._prepare_input_arg(42, MagicMock(), Replicate(), Replicate())
+
 
 class TestPrepareModuleOutput(unittest.TestCase):
     """Tests aligned with PyTorch ``TensorParallelAPITests.test_prepare_module_output``."""
@@ -534,6 +613,32 @@ class TestPrepareModuleOutput(unittest.TestCase):
                 output_layouts=(Replicate(), Replicate()),
                 desired_output_layouts=(Shard(0),),
             )
+
+    def test_repr_contains_key_fields(self):
+        """``repr`` includes class name and layout settings."""
+        style = PrepareModuleOutput(
+            output_layouts=Replicate(),
+            desired_output_layouts=Shard(0),
+            use_local_output=False,
+        )
+        r = repr(style)
+        self.assertIn("PrepareModuleOutput", r)
+        self.assertIn("use_local_output=False", r)
+
+    def test_prepare_out_fn_raises_on_output_length_mismatch(self):
+        """
+        Feature: PrepareModuleOutput._prepare_out_fn arity validation
+        Description: module returns more tensors than output_layouts entries
+        Expectation: ValueError mentioning same length
+        """
+        style = PrepareModuleOutput(
+            output_layouts=(Replicate(),),
+            desired_output_layouts=(Replicate(),),
+        )
+        mesh = MagicMock()
+        with self.assertRaises(ValueError) as ctx:
+            style._prepare_out_fn((torch.randn(1), torch.randn(1)), mesh)
+        self.assertIn("same length", str(ctx.exception))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_forward_matches_pytorch_prepare_module_output_case(self, mock_platform):
