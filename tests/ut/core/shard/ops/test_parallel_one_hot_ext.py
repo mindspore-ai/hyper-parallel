@@ -219,5 +219,98 @@ class TestParallelOneHotExt(unittest.TestCase):
             _ = op.infer_layout((indices_layout,), [-2, None, None, -1])
 
 
+class TestOneHotExtValidationPaths(unittest.TestCase):
+    """
+    Feature: OneHotExtDistributedOp early-validation and helper method coverage
+    Description: Cover infer_layout early-exit paths and helper validation methods.
+    Expectation: Correct return values or exceptions for each validation path.
+    """
+
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    def _setup_mock_platform(self, mock_platform, world_size=8):
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_infer_layout_empty_layouts_returns_none(self, mock_platform):
+        """Empty layouts tuple returns None without error."""
+        op = OneHotExtDistributedOp("OneHotExt_empty")
+        result = op.infer_layout((), [32, None, None, -1])
+        self.assertIsNone(result)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_infer_layout_none_index_layout_raises(self, mock_platform):
+        """None as indices layout raises ValueError."""
+        op = OneHotExtDistributedOp("OneHotExt_none")
+        with self.assertRaises(ValueError):
+            op.infer_layout((None,), [32, None, None, -1])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_infer_layout_partial_index_layout_raises(self, mock_platform):
+        """Partial indices layout raises ValueError."""
+        self._setup_mock_platform(mock_platform)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(2, 2, 2),
+            mesh_dim_names=("dp", "cp", "mp"), init_backend=False,
+        )
+        indices_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 1)
+        indices_layout.set_partial_by_dev_axis("dp", "sum")
+
+        op = OneHotExtDistributedOp("OneHotExt_partial")
+        with self.assertRaises(ValueError):
+            op.infer_layout((indices_layout,), [32, None, None, -1])
+
+    def test_validate_num_classes_non_int_raises_type_error(self):
+        """_validate_num_classes with non-int raises TypeError."""
+        op = OneHotExtDistributedOp("OneHotExt_validate")
+        with self.assertRaises(TypeError):
+            op._validate_num_classes("not_an_int")
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_expand_impl_no_sharding_returns_none(self, mock_platform):
+        """get_expand_impl with fully replicated layout returns None."""
+        self._setup_mock_platform(mock_platform)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(2, 2, 2),
+            mesh_dim_names=("dp", "cp", "mp"), init_backend=False,
+        )
+        indices_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 1)
+        op = OneHotExtDistributedOp("OneHotExt_no_shard")
+        result = op.get_expand_impl(None, None, (indices_layout,), None)
+        self.assertIsNone(result)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_expand_impl_sharded_returns_callable(self, mock_platform):
+        """get_expand_impl with sharded layout returns a callable closure."""
+        self._setup_mock_platform(mock_platform)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(2, 2, 2),
+            mesh_dim_names=("dp", "cp", "mp"), init_backend=False,
+        )
+        indices_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 1)
+        op = OneHotExtDistributedOp("OneHotExt_sharded")
+        result = op.get_expand_impl(None, None, (indices_layout,), None)
+        self.assertTrue(callable(result))
+
+    def test_validate_indices_dtype_non_int64_raises(self):
+        """_validate_indices_dtype with non-int64 tensor raises TypeError."""
+        import mindspore as ms
+        from mindspore import Tensor as MSTensor
+        op = OneHotExtDistributedOp("OneHotExt_dtype")
+        float_indices = MSTensor([1, 2, 3], ms.float32)
+        with self.assertRaises(TypeError):
+            op._validate_indices_dtype(float_indices)
+
+
 if __name__ == "__main__":
     unittest.main()

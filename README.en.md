@@ -135,7 +135,8 @@ Currently only installation from source is supported. You need to execute:
 ```bash
 git clone https://gitcode.com/mindspore/hyper-parallel.git
 cd hyper-parallel
-pip install .
+python setup.py bdist_wheel
+pip install dist/hyper_parallel-*-py3-none-any.whl
 ```
 
 HyperParallel depends on a deep learning framework. Before using HyperParallel, you need to:

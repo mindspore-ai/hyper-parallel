@@ -634,6 +634,98 @@ class TestParallelConv3D(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Weight C_out and Bias C_out must be sharded on the same axis"):
             op.infer_layout((in_layout, w_layout, b_layout), default_extra_args)
 
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_conv3d_groups_not_divisible_for_column_parallelism_raises(self, mock_platform):
+        """
+        Feature: Column parallelism groups divisibility validation
+        Description: groups=3 with dev_num=2 (non-divisible) raises ValueError.
+        Expectation: ValueError mentioning divisibility.
+        """
+        mesh = self._make_1d_mesh(mock_platform, world_size=2, mesh_dim_names=("tp",))
+        in_placements = (Replicate(),)
+        in_layout = _build_layout(mesh, in_placements, 5)
+        w_placements = (Shard(0),)
+        w_layout = _build_layout(mesh, w_placements, 5)
+        extra_args_groups3 = (1, 0, 1, 3)
+        with self.assertRaisesRegex(ValueError, "must be divisible by tp_size"):
+            op.infer_layout((in_layout, w_layout), extra_args_groups3)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_expand_impl_no_weight_sharding_returns_none(self, mock_platform):
+        """
+        Feature: get_expand_impl with replicated weight
+        Description: When weight C_out is not sharded (w_map_0 == -1), returns None.
+        Expectation: None returned.
+        """
+        mesh = self._make_1d_mesh(mock_platform, world_size=4, mesh_dim_names=("tp",))
+        in_layout = _build_layout(mesh, (Replicate(),), 5)
+        w_layout = _build_layout(mesh, (Replicate(),), 5)
+        result = op.get_expand_impl(None, None, (in_layout, w_layout), default_extra_args)
+        self.assertIsNone(result)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_expand_impl_sharded_weight_returns_callable(self, mock_platform):
+        """
+        Feature: get_expand_impl with column-parallel weight
+        Description: When weight C_out is sharded, get_expand_impl returns a callable.
+        Expectation: Callable returned.
+        """
+        mesh = self._make_1d_mesh(mock_platform, world_size=2, mesh_dim_names=("tp",))
+        in_layout = _build_layout(mesh, (Replicate(),), 5)
+        w_layout = _build_layout(mesh, (Shard(0),), 5)
+        impl = op.get_expand_impl(None, None, (in_layout, w_layout), default_extra_args)
+        self.assertTrue(callable(impl))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_expand_impl_callable_groups_one_calls_func_directly(self, mock_platform):
+        """
+        Feature: get_expand_impl callable with groups=1
+        Description: groups=1 in the impl falls back to native func call.
+        Expectation: func called with original args and groups=1.
+        """
+        mesh = self._make_1d_mesh(mock_platform, world_size=2, mesh_dim_names=("tp",))
+        in_layout = _build_layout(mesh, (Replicate(),), 5)
+        w_layout = _build_layout(mesh, (Shard(0),), 5)
+
+        call_args = []
+
+        def mock_func(*args, **kwargs):
+            call_args.append(args)
+            return np.zeros((1,))
+
+        impl = op.get_expand_impl(mock_func, None, (in_layout, w_layout), default_extra_args)
+        input_t = np.ones((2, 6, 4, 4, 4))
+        weight_t = np.ones((4, 6, 3, 3, 3))
+        impl(input_t, weight_t, None, 1, 0, 1, 1)
+        self.assertEqual(len(call_args), 1)
+        self.assertEqual(call_args[0][-1], 1)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_get_expand_impl_callable_groups_gt_one_slices_input(self, mock_platform):
+        """
+        Feature: get_expand_impl callable with groups>1
+        Description: groups=4, dev_num=2, local_rank=0 → input channels 0-5 sliced.
+        Expectation: func called with sliced input and local_groups=2.
+        """
+        mesh = self._make_1d_mesh(mock_platform, world_size=2, mesh_dim_names=("tp",))
+        in_layout = _build_layout(mesh, (Replicate(),), 5)
+        w_layout = _build_layout(mesh, (Shard(0),), 5)
+
+        call_args = []
+
+        def mock_func(*args, **kwargs):
+            call_args.append(args)
+            return np.zeros((1,))
+
+        extra_args_groups4 = (1, 0, 1, 4)
+        impl = op.get_expand_impl(mock_func, None, (in_layout, w_layout), extra_args_groups4)
+        input_t = np.ones((2, 12, 4, 4, 4))
+        weight_t = np.ones((4, 3, 3, 3, 3))
+        impl(input_t, weight_t, None, 1, 0, 1, 4)
+        self.assertEqual(len(call_args), 1)
+        sliced_input = call_args[0][0]
+        self.assertEqual(sliced_input.shape[1], 6)
+
 
 if __name__ == "__main__":
     unittest.main()
