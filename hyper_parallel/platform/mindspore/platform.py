@@ -39,6 +39,15 @@ from mindspore.communication import create_group as new_group
 from mindspore.communication import get_rank as get_rank_id
 from mindspore.ops import communication as ops_comm
 from mindspore.ops.function import comm_func
+# Private MindSpore symbols used by ``_MSAsyncA2ALazyBwd._issue_async_a2a`` to
+# bypass the trailing reshape that ``comm_func.all_to_all_single`` performs on
+# the default compute stream before the async ``CommHandle.wait()`` fires —
+# see that helper's docstring for the full rationale.  If a future MindSpore
+# release moves or renames either symbol, this module will fail to import
+# loudly (intended — silently falling back to ``comm_func.all_to_all_single``
+# would re-introduce the race).
+from mindspore.ops.function.comm_func import _deal_comm_outputs
+from mindspore.ops.auto_generate.gen_ops_prim import inner_comm_all_to_all_v_op
 from mindspore._c_expression import TensorTransform
 import mindspore.mint.distributed as dist
 
@@ -305,31 +314,58 @@ class _MSAsyncA2ALazyBwd(_Function):
     """
 
     @staticmethod
+    def _issue_async_a2a(flat_input, send_splits, recv_splits, group):
+        """Issue an async all-to-all-v on a 1-D flat tensor.
+
+        Bypasses ``comm_func.all_to_all_single``: that wrapper appends an
+        unconditional ``result.reshape((-1,) + recv_shape_without_first_dim)``
+        on the default compute stream *before* the async ``CommHandle.wait()``
+        fires (the wait is deferred to the first consumer op via
+        :class:`AsyncCollectiveTensor`).  MindSpore's mem_pool race_checker
+        (``MS_ALLOC_CONF=memory_tracker:True``) flags that trailing reshape
+        as a cross-stream race on the HCCL output, even though for 1-D
+        inputs it is a metadata-only no-op.  Calling the inner primitive
+        directly skips the tracker-visible read on stream 0.
+
+        Args:
+            flat_input:  1-D tensor — must already be flattened by the caller.
+            send_splits: ``list[int]`` — element counts sent to each rank.
+            recv_splits: ``list[int]`` — element counts received from each rank.
+            group:       Process group.
+
+        Returns:
+            ``(output_tensor, CommHandle)`` — the 1-D output and the async handle.
+        """
+        rank_size = get_group_size(group)
+        # Positional args follow the MS auto-generated primitive signature:
+        # ``(input, group, send_splits, recv_splits, rank_size, block)``.
+        # ``block=False`` selects the async path; the handle is returned in
+        # the raw tuple and unpacked by ``_deal_comm_outputs`` below.
+        raw = inner_comm_all_to_all_v_op(
+            flat_input, group, list(send_splits), list(recv_splits), rank_size,
+            False,
+        )
+        # ``_deal_comm_outputs(raw, is_async=True)`` mirrors the async branch
+        # inside ``comm_func.all_to_all_single`` — unpacks the primitive's raw
+        # output into ``(tensor, handle)`` without the trailing reshape.
+        return _deal_comm_outputs(raw, True)
+
+    @staticmethod
     def forward(ctx, input_tensor, output_splits, input_splits, group):  # pylint: disable=arguments-differ
-        """Launch async a2a; return :class:`AsyncCollectiveTensor`."""
+        """Launch async a2a; return :class:`AsyncCollectiveTensor`.
+
+        ``input_tensor`` must already be 1-D and the splits must be element
+        counts (not row counts).  The caller is expected to flatten and
+        translate splits beforehand — see
+        :meth:`MindSporePlatform.differentiable_all_to_all_single_async`.
+        """
         ctx.input_splits = input_splits
         ctx.output_splits = output_splits
         ctx.group = group
-        output_size = int(sum(output_splits))
-        output_shape = list(input_tensor.shape)
-        output_shape[0] = output_size
-        output = mint.empty(tuple(output_shape), dtype=input_tensor.dtype)
-        # ``comm_func.all_to_all_single`` is out-of-place by default (the
-        # ``output`` arg is ignored and a fresh tensor is returned in a
-        # tuple together with the handle).  We must wrap the returned
-        # tensor, not the pre-allocated ``output`` buffer — otherwise the
-        # AsyncCollectiveTensor would wrap an uninitialized buffer and
-        # the consumer would read garbage even after ``work.wait()``.
-        # See ``mindspore/ops/function/comm_func.py:3066-3079`` and the
-        # ``is_inplace_func("all_to_all_single")`` default of ``False``.
-        result = comm_func.all_to_all_single(
-            output, input_tensor,
-            output_split_sizes=list(output_splits),
-            input_split_sizes=list(input_splits),
-            group=group,
-            async_op=True,
+        flat_input = input_tensor.reshape(-1)
+        actual_output, work = _MSAsyncA2ALazyBwd._issue_async_a2a(
+            flat_input, input_splits, output_splits, group,
         )
-        actual_output, work = _normalize_all_to_all_single_result(result, output)
         return AsyncCollectiveTensor(actual_output, work)
 
     @staticmethod
@@ -339,20 +375,10 @@ class _MSAsyncA2ALazyBwd(_Function):
         # reverse a2a (which is itself a "real" op on the data).
         if isinstance(grad_output, AsyncCollectiveTensor):
             grad_output = grad_output._wait_and_unwrap()  # pylint: disable=W0212
-        grad_output_size = int(sum(ctx.input_splits))
-        grad_input_shape = list(grad_output.shape)
-        grad_input_shape[0] = grad_output_size
-        grad_input = mint.empty(tuple(grad_input_shape), dtype=grad_output.dtype)
-        result = comm_func.all_to_all_single(
-            grad_input, grad_output,
-            output_split_sizes=list(ctx.input_splits),
-            input_split_sizes=list(ctx.output_splits),
-            group=ctx.group,
-            async_op=True,
+        flat_grad = grad_output.reshape(-1)
+        actual_grad, work = _MSAsyncA2ALazyBwd._issue_async_a2a(
+            flat_grad, ctx.output_splits, ctx.input_splits, ctx.group,
         )
-        # See forward: must use the returned tensor, not ``grad_input``,
-        # because the call is out-of-place by default.
-        actual_grad, work = _normalize_all_to_all_single_result(result, grad_input)
         lazy_grad = AsyncCollectiveTensor(actual_grad, work)
         return lazy_grad, None, None, None
 
@@ -363,19 +389,80 @@ class _MSSyncHookFunction(_Function):
 
     The role tables are intentionally identical to the Torch backend so
     the dual-thread protocol (COMM-first dispatch ordering) is the same
-    on MindSpore.  The ``"D_LAST"`` sentinel skips the rendezvous in
-    both directions — used to mark the closing D hook of the last MoE
-    layer in a chunk.
+    on MindSpore.
+
+    Hook-name semantics:
+
+    - ``"A"`` / ``"B"`` / ``"C"`` / ``"D"`` — full rendezvous on both
+      forward and backward, using ``_FWD_ROLES`` / ``_BWD_ROLES``.
+    - ``"CHUNK_START"`` — pair-0 entry hook.
+      **Forward**: full rendezvous(COMPUTE) — pairs with
+      ``D_LAST.bwd`` so the BWD thread's combine.bwd of the last
+      layer is bracketed by a barrier-synced window.
+      **Backward**: paired with ``CHUNK_END.fwd`` as the BWD-side of
+      the exit barrier (roles ``(COMPUTE, COMPUTE)``).
+    - ``"D_LAST"`` — closing D hook of the last MoE layer in a chunk.
+      **Forward**: **pure skip** — neither notify nor rendezvous.
+      The C_last → combine COMM event is left un-notified so BWD's
+      COMPUTE waiter at ``A_0.bwd`` stays parked.  This keeps FWD's
+      post-combine forward work serialised against BWD's Attn.bwd_0;
+      required because MS PyNative does not support concurrent
+      FWD-record + BWD-replay on its autograd executor.  (The Torch
+      backend takes the looser ``notify(COMM) + skip`` path here for
+      more overlap — Torch autograd is thread-safe.)
+      **Backward**: full rendezvous using ``_BWD_ROLES["D"]``; this
+      is the very first BWD rendezvous and pairs with
+      ``CHUNK_START.fwd`` to bracket combine.bwd_last.
+    - ``"CHUNK_END"`` — pair-N exit hook (FWD side).
+      **Forward**: roles ``(COMM, COMPUTE)``.  ``notify_dispatched``
+      sets the C_last event (waking BWD's A_0.bwd waiter), then
+      ``rendezvous(COMPUTE)`` parks FWD on the exit barrier so BWD's
+      Attn.bwd_0 runs with FWD already blocked — no concurrent
+      FWD-record + BWD-replay.
+      **Backward**: skipped (this would be the first node visited
+      in BWD replay; its partner ``D_LAST.bwd`` already pairs with
+      ``CHUNK_START.fwd`` on pair 0).
     """
 
     # Index encoding: 1 = COMM, 2 = COMPUTE.
     _FWD_ROLES = {
+        # ``CHUNK_START``: chunk entry on FWD.  No "previous" op on
+        # this thread within this overlap.run() — ``notify(COMPUTE)``
+        # is a no-op anyway.  Next role is COMPUTE so FWD parks on
+        # ``_comm_dispatched.wait`` for BWD's ``D_LAST.bwd`` COMM.
+        "CHUNK_START": (2, 2),
         "A": (2, 1),   # prev=Attention COMPUTE | next=dispatch COMM
         "B": (1, 2),   # prev=dispatch COMM     | next=module COMPUTE
         "C": (2, 1),   # prev=module COMPUTE    | next=combine COMM
         "D": (1, 2),   # prev=combine COMM      | next=Attention COMPUTE
+        # ``CHUNK_END``: chunk-exit hook on FWD.  Does two things in
+        # one place — both critical for MS PyNative correctness:
+        #   1. ``notify_dispatched(COMM)`` sets the C_last event from
+        #      C_last's rendezvous(COMM).  ``D_LAST.fwd`` deliberately
+        #      does NOT notify (it is a pure skip) so BWD's COMPUTE
+        #      waiter at ``A_0.bwd`` stays parked until FWD has
+        #      finished all chunk-local forward work (post-combine
+        #      sort/index_select/multiply).
+        #   2. ``rendezvous(COMPUTE)`` parks FWD on the exit barrier.
+        #      By the time BWD wakes from step 1 and starts
+        #      Attn.bwd_0, FWD is already blocked at this barrier —
+        #      no concurrent FWD-record + BWD-replay window.
+        "CHUNK_END": (1, 2),
     }
     _BWD_ROLES = {
+        # ``CHUNK_START.bwd`` is intentionally NOT engaged here.
+        # MS PyNative's autograd may skip the backward node if the
+        # chunk input lacks ``requires_grad`` (the value of
+        # ``x.grad`` is unused downstream), which would leave the
+        # pair-8 BWD partner unmatched and deadlock FWD's
+        # ``CHUNK_END`` barrier.  pair-8 BWD is instead taken out of
+        # band: the OVERLAP_B_F callback's ``bwd_fn`` makes one
+        # explicit ``coordinator.rendezvous(COMPUTE)`` after
+        # ``backward_one_chunk`` returns, paired with FWD's
+        # ``CHUNK_END.fwd`` rendezvous.
+        # ``D_LAST`` on backward routes through D's BWD role (COMM
+        # next: the upcoming combine.bwd) — see the docstring above
+        # for why we no longer skip.
         "D": (2, 1),   # prev=Attn.bwd COMPUTE      | next=combine.bwd COMM
         "C": (1, 2),   # prev=combine.bwd COMM      | next=module.bwd COMPUTE
         "B": (2, 1),   # prev=module.bwd COMPUTE    | next=dispatch.bwd COMM
@@ -393,21 +480,65 @@ class _MSSyncHookFunction(_Function):
         return _MSSyncHookFunction._ROLE_CACHE[idx]
 
     @staticmethod
+    def _passthrough(x):
+        """Identity passthrough that defeats MS autograd's identity-output handling.
+
+        When :meth:`forward` returns its input unchanged, MS PyNative's
+        ``FunctionBase.apply`` sees ``is_same_as_input=True`` on the output
+        and inserts a ``ViewAsSelfWithNoGrad`` (a ``view(self, self.shape)``
+        kernel) on the current compute stream.  If the input is an
+        :class:`AsyncCollectiveTensor` whose lazy ``CommHandle.wait()`` has
+        not yet fired, that view runs on the default stream while the HCCL
+        kernel is still writing the same memory on the comm stream — flagged
+        by MS's mem_pool ``race_checker`` (``MS_ALLOC_CONF=memory_tracker:True``).
+
+        Returning a freshly wrapped :class:`AsyncCollectiveTensor` keeps the
+        same underlying buffer and pending work, but yields a new
+        ``shared_ptr<Tensor>`` so ``is_same_as_input`` is ``False`` and no
+        autograd view is emitted.  For regular tensors the original
+        passthrough is safe (the view sits on the same stream as the data).
+
+        Note:
+            The clone shares ``_pending_work`` with the original but keeps
+            an independent ``completed`` flag.  Two assumptions:
+
+            * ``CommHandle.wait()`` is idempotent — relied on whenever both
+              wrappers end up being consumed (matches the existing
+              :meth:`AsyncCollectiveTensor._wait_and_unwrap` pattern, which
+              also does not null out ``_pending_work`` after waiting).
+            * Per-wrapper ``completed`` is intentional: a ``wait()`` on
+              stream A does not synchronize stream B, so each consumer
+              stream must be free to re-issue its own wait.
+        """
+        if isinstance(x, AsyncCollectiveTensor):
+            new_wrapper = AsyncCollectiveTensor(x.elem, x._pending_work)  # pylint: disable=W0212
+            new_wrapper.completed = x.completed
+            return new_wrapper
+        return x
+
+    @staticmethod
     def forward(ctx, x, hook_name, coordinator):  # pylint: disable=arguments-differ
         """Fire forward-direction rendezvous and return ``x`` unchanged."""
         ctx.hook_name = hook_name
         ctx.coordinator = coordinator
         if not coordinator.is_enabled():
-            return x
+            return _MSSyncHookFunction._passthrough(x)
         if hook_name == "D_LAST":
-            # Last MoE layer's closing D — no Attention follows in
-            # forward; rendezvous would be against a non-existent op.
-            return x
+            # Pure skip — neither notify nor rendezvous.  The
+            # C_last → combine COMM event is left un-notified on
+            # purpose so BWD's COMPUTE waiter at A_0.bwd stays parked
+            # until FWD reaches CHUNK_END.fwd.  This keeps FWD's
+            # post-combine forward work (sort / index_select / probs
+            # mul / strided_slice) strictly serialised against BWD's
+            # Attn.bwd_0 — required because MS PyNative does not
+            # support concurrent FWD-record + BWD-replay on the
+            # autograd executor.
+            return _MSSyncHookFunction._passthrough(x)
         prev_idx, next_idx = _MSSyncHookFunction._FWD_ROLES[hook_name]
         role_of = _MSSyncHookFunction._role_enum
         coordinator.notify_dispatched(role_of(prev_idx))
         coordinator.rendezvous(role_of(next_idx))
-        return x
+        return _MSSyncHookFunction._passthrough(x)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -415,16 +546,28 @@ class _MSSyncHookFunction(_Function):
         hook_name = ctx.hook_name
         coordinator = ctx.coordinator
         if not coordinator.is_enabled():
-            return grad_output, None, None
-        if hook_name == "D_LAST":
-            # First BWD hook to fire; combine.bwd has already dispatched
-            # freely before any rendezvous can happen.
-            return grad_output, None, None
-        prev_idx, next_idx = _MSSyncHookFunction._BWD_ROLES[hook_name]
+            return _MSSyncHookFunction._passthrough(grad_output), None, None
+        if hook_name in ("CHUNK_END", "CHUNK_START"):
+            # Both boundary hooks skip in backward:
+            # * ``CHUNK_END.bwd`` would fire FIRST in BWD replay (it
+            #   wraps the chunk's last forward op).  We do not want
+            #   a rendezvous here — pair 0 is handled by
+            #   ``D_LAST.bwd`` ↔ ``CHUNK_START.fwd``.
+            # * ``CHUNK_START.bwd`` would fire LAST.  We do not
+            #   rendezvous here either, because MS autograd may skip
+            #   the node entirely when the chunk input lacks
+            #   ``requires_grad`` (unused ``x.grad``).  pair-8 BWD
+            #   is taken out of band — see the role-table comment.
+            return _MSSyncHookFunction._passthrough(grad_output), None, None
+        # ``D_LAST.bwd`` reuses D's BWD role: it is the *first non-skip*
+        # BWD rendezvous and pairs with FWD's ``CHUNK_START`` to lock
+        # the combine.bwd_last launch inside a barrier-synced window.
+        role_name = "D" if hook_name == "D_LAST" else hook_name
+        prev_idx, next_idx = _MSSyncHookFunction._BWD_ROLES[role_name]
         role_of = _MSSyncHookFunction._role_enum
         coordinator.notify_dispatched(role_of(prev_idx))
         coordinator.rendezvous(role_of(next_idx))
-        return grad_output, None, None
+        return _MSSyncHookFunction._passthrough(grad_output), None, None
 
 
 class _MSAsyncA2AFunction(_Function):
@@ -1020,10 +1163,38 @@ class MindSporePlatform(Platform):
         collective finishes — this is what enables the comm/compute
         overlap window on the paired thread.
 
-        Returns an :class:`AsyncCollectiveTensor` that defers
-        ``CommHandle.wait()`` to the first consumer op via
-        ``__ms_dispatch__``.
+        Args:
+            input_tensor:  **1-D** tensor — the caller is responsible for
+                           flattening multi-dim inputs beforehand.
+            input_splits:  ``list[int]`` — **element** counts sent to each
+                           rank (not row counts).  For an originally
+                           ``(N, D)`` tensor, each entry is ``rows_i * D``.
+            output_splits: ``list[int]`` — element counts received from each rank.
+            group:         Process group.
+
+        Returns:
+            ``AsyncCollectiveTensor`` of shape ``(sum(output_splits),)`` that
+            defers ``CommHandle.wait()`` to the first consumer op via
+            ``__ms_dispatch__``.
+
+        Raises:
+            ValueError: if ``input_tensor`` is not 1-D.
+
+        Note:
+            The 1-D + element-count contract diverges from the Torch
+            implementation (which accepts N-D input + row-count splits).
+            The divergence is intentional for now: it lets the MS path
+            call the inner primitive directly and avoid the cross-stream
+            race that ``comm_func.all_to_all_single``'s trailing reshape
+            triggers under ``MS_ALLOC_CONF=memory_tracker:True`` —
+            see :meth:`_MSAsyncA2ALazyBwd._issue_async_a2a`.
         """
+        if input_tensor.ndim != 1:
+            raise ValueError(
+                "MindSporePlatform.differentiable_all_to_all_single_async requires a 1-D "
+                f"input_tensor (got ndim={input_tensor.ndim}, shape={tuple(input_tensor.shape)}). "
+                "Flatten the tensor and convert row-count splits to element counts before calling."
+            )
         return _MSAsyncA2ALazyBwd.apply(input_tensor, output_splits, input_splits, group)
 
     @staticmethod
@@ -1032,9 +1203,19 @@ class MindSporePlatform(Platform):
 
         Args:
             x:           Input tensor — returned unchanged.
-            hook_name:   One of ``"A"``, ``"B"``, ``"C"``, ``"D"``,
-                         or ``"D_LAST"`` (last layer's closing D —
-                         skipped on both forward and backward).
+            hook_name:   One of:
+                         * ``"A"`` / ``"B"`` / ``"C"`` / ``"D"`` —
+                           full rendezvous on both directions.
+                         * ``"CHUNK_START"`` — chunk-entry hook on
+                           forward; pairs with ``D_LAST.bwd`` so the
+                           BWD thread's combine.bwd of the last layer
+                           is bracketed by a barrier-synced sync point.
+                           Skipped on backward.
+                         * ``"D_LAST"`` — closing D of the last MoE
+                           layer in a chunk.  Forward: ``notify_dispatched``
+                           only (no Attention follows so rendezvous is
+                           skipped).  Backward: full rendezvous via D's
+                           BWD role; paired with ``CHUNK_START`` on FWD.
             coordinator: The :class:`HookCoordinator` driving the
                          rendezvous protocol.
 
