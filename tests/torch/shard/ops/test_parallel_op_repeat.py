@@ -12,198 +12,130 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""Test runner for repeat distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_repeat.py")
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_basic_unsharded():
+def test_parallel_op_repeat_group1():
     """
-    Feature: test parallel op repeat.
-    Description: test parallel op repeat.
+    Feature: parallel run case in _test_parallel_op_repeat
+    Description:
+        1. test_repeat_3d —
+        2. test_repeat_4d_input —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_repeat_3d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_repeat_4d_input", num_proc=4),
+    ])
 
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_basic_unsharded"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_repeat_basic_unsharded():
+def test_parallel_op_repeat_group1_gloo():
     """
-    Feature: test parallel op repeat (gloo cpu).
-    Description: test parallel op repeat.
+    Feature: parallel run case in _test_parallel_op_repeat
+    Description:
+        1. test_repeat_3d —
+        2. test_repeat_4d_input —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_repeat_3d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_repeat_4d_input", num_proc=4),
+    ])
 
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_basic_unsharded"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_3d():
+def test_parallel_op_repeat_group2():
     """
-    Feature: test parallel op repeat.
-    Description: test parallel op repeat.
+    Feature: parallel run case in _test_parallel_op_repeat
+    Description:
+        1. test_repeat_all_dims_replicated —
+        2. test_repeat_basic_unsharded —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_repeat_all_dims_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_repeat_basic_unsharded", num_proc=4),
+    ])
 
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_3d"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_repeat_3d():
+def test_parallel_op_repeat_group2_gloo():
     """
-    Feature: test parallel op repeat (gloo cpu).
-    Description: test parallel op repeat.
+    Feature: parallel run case in _test_parallel_op_repeat
+    Description:
+        1. test_repeat_all_dims_replicated —
+        2. test_repeat_basic_unsharded —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_repeat_all_dims_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_repeat_basic_unsharded", num_proc=4),
+    ])
 
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_3d"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_scalar_tensor():
+def test_parallel_op_repeat_group3():
     """
-    Feature: test parallel op repeat.
-    Description: test parallel op repeat.
+    Feature: parallel run case in _test_parallel_op_repeat
+    Description:
+        1. test_repeat_replicated_dim —
+        2. test_repeat_scalar_tensor —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_repeat_replicated_dim", num_proc=4),
+        TorchCase(IMPL_FILE, "test_repeat_scalar_tensor", num_proc=4),
+    ])
 
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_scalar_tensor"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_repeat_scalar_tensor():
+def test_parallel_op_repeat_group3_gloo():
     """
-    Feature: test parallel op repeat (gloo cpu).
-    Description: test parallel op repeat.
+    Feature: parallel run case in _test_parallel_op_repeat
+    Description:
+        1. test_repeat_replicated_dim —
+        2. test_repeat_scalar_tensor —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_repeat_replicated_dim", num_proc=4),
+        TorchCase(IMPL_FILE, "test_repeat_scalar_tensor", num_proc=4),
+    ])
 
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_scalar_tensor"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_replicated_dim():
+def test_parallel_op_repeat_group4():
     """
-    Feature: test parallel op repeat on a replicated dimension.
-    Description: Verify repeat preserves replication and produces correct output.
+    Feature: parallel run case in _test_parallel_op_repeat
+    Description:
+        1. test_repeat_sharded_dim_repeat_one —
+        2. test_repeat_zero_times —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_repeat_sharded_dim_repeat_one", num_proc=4),
+        TorchCase(IMPL_FILE, "test_repeat_zero_times", num_proc=4),
+    ])
 
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_replicated_dim"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_repeat_replicated_dim():
+def test_parallel_op_repeat_group4_gloo():
     """
-    Feature: test parallel op repeat on a replicated dimension (gloo cpu).
-    Description: Verify repeat preserves replication and produces correct output.
+    Feature: parallel run case in _test_parallel_op_repeat
+    Description:
+        1. test_repeat_sharded_dim_repeat_one —
+        2. test_repeat_zero_times —
     Expectation: Run success.
     """
-
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_replicated_dim"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_zero_times():
-    """
-    Feature: test parallel op repeat with zero repetitions.
-    Description: Verify repeat with 0 produces an empty tensor correctly.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_zero_times"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_repeat_zero_times():
-    """
-    Feature: test parallel op repeat with zero repetitions (gloo cpu).
-    Description: Verify repeat with 0 produces an empty tensor correctly.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_zero_times"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_4d_input():
-    """
-    Feature: test parallel op repeat with 4D input tensor.
-    Description: Verify repeat works for higher-dimensional tensors with mixed sharding.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_4d_input"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_repeat_4d_input():
-    """
-    Feature: test parallel op repeat with 4D input tensor (gloo cpu).
-    Description: Verify repeat works for higher-dimensional tensors with mixed sharding.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_4d_input"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_sharded_dim_repeat_one():
-    """
-    Feature: test parallel op repeat on sharded dimension with repeat count of 1.
-    Description: Verify repeat with count 1 on a sharded dim is allowed and preserves sharding.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_sharded_dim_repeat_one"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_repeat_sharded_dim_repeat_one():
-    """
-    Feature: test parallel op repeat on sharded dimension with repeat count of 1 (gloo cpu).
-    Description: Verify repeat with count 1 on a sharded dim is allowed and preserves sharding.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_sharded_dim_repeat_one"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_repeat_all_dims_replicated():
-    """
-    Feature: test parallel op repeat when all input dimensions are replicated.
-    Description: Verify repeat maintains replication for all dimensions.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_all_dims_replicated"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_repeat_all_dims_replicated():
-    """
-    Feature: test parallel op repeat when all input dimensions are replicated (gloo cpu).
-    Description: Verify repeat maintains replication for all dimensions.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_repeat.py"
-    case_name = "test_repeat_all_dims_replicated"
-    torchrun_case(file_name, case_name, num_proc=4)
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_repeat_sharded_dim_repeat_one", num_proc=4),
+        TorchCase(IMPL_FILE, "test_repeat_zero_times", num_proc=4),
+    ])

@@ -13,10 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """test parallel op expand"""
+from pathlib import Path
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-PARALLEL_OP_EXPAND = "parallel_op_expand.py"
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_expand.py")
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_expand_group1():
@@ -28,22 +29,22 @@ def test_parallel_op_expand_group1():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_basic_unsharded", num_proc=4),
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_scalar_tensor", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_basic_unsharded", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_scalar_tensor", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_expand_group1_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_expand_basic_unsharded
         2.test_expand_scalar_tensor
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_basic_unsharded", num_proc=4),
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_scalar_tensor", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_basic_unsharded", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_scalar_tensor", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -56,22 +57,22 @@ def test_parallel_op_expand_group2():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_as_basic", num_proc=4),
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_as_scalar_to_tensor", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_as_basic", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_as_scalar_to_tensor", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_expand_group2_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_expand_as_basic
         2.test_expand_as_scalar_to_tensor
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_as_basic", num_proc=4),
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_as_scalar_to_tensor", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_as_basic", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_as_scalar_to_tensor", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -84,22 +85,22 @@ def test_parallel_op_expand_group3():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_3d", num_proc=4),
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_prepend_new_dimensions", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_3d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_prepend_new_dimensions", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_expand_group3_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_expand_3d
         2.test_expand_prepend_new_dimensions
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_3d", num_proc=4),
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_prepend_new_dimensions", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_3d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_prepend_new_dimensions", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -112,20 +113,20 @@ def test_parallel_op_expand_group4():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_as_3d_preservation", num_proc=4),
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_as_prepend_dimensions", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_as_3d_preservation", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_as_prepend_dimensions", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_expand_group4_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_expand_as_3d_preservation
         2.test_expand_as_prepend_dimensions
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_as_3d_preservation", num_proc=4),
-        TorchCase(PARALLEL_OP_EXPAND, "test_expand_as_prepend_dimensions", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_as_3d_preservation", num_proc=4),
+        TorchCase(IMPL_FILE, "test_expand_as_prepend_dimensions", num_proc=4),
     ])

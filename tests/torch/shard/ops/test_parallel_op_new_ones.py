@@ -13,10 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """test parallel op new_ones"""
+from pathlib import Path
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-PARALLEL_OP_NEW_ONES = "parallel_op_new_ones.py"
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_new_ones.py")
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_new_ones_group1():
@@ -28,22 +29,22 @@ def test_parallel_op_new_ones_group1():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_NEW_ONES, "test_new_ones_tuple_size", num_proc=4),
-        TorchCase(PARALLEL_OP_NEW_ONES, "test_new_ones_list_size", num_proc=4),
+        TorchCase(IMPL_FILE, "test_new_ones_tuple_size", num_proc=4),
+        TorchCase(IMPL_FILE, "test_new_ones_list_size", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_new_ones_group1_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_new_ones_tuple_size
         2.test_new_ones_list_size
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_NEW_ONES, "test_new_ones_tuple_size", num_proc=4),
-        TorchCase(PARALLEL_OP_NEW_ONES, "test_new_ones_list_size", num_proc=4),
+        TorchCase(IMPL_FILE, "test_new_ones_tuple_size", num_proc=4),
+        TorchCase(IMPL_FILE, "test_new_ones_list_size", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -56,22 +57,22 @@ def test_parallel_op_new_ones_group2():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_NEW_ONES, "test_new_ones_int_size", num_proc=4),
-        TorchCase(PARALLEL_OP_NEW_ONES, "test_new_ones_input_sharding_ignored", num_proc=4),
+        TorchCase(IMPL_FILE, "test_new_ones_int_size", num_proc=4),
+        TorchCase(IMPL_FILE, "test_new_ones_input_sharding_ignored", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_new_ones_group2_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_new_ones_int_size
         2.test_new_ones_input_sharding_ignored
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_NEW_ONES, "test_new_ones_int_size", num_proc=4),
-        TorchCase(PARALLEL_OP_NEW_ONES, "test_new_ones_input_sharding_ignored", num_proc=4),
+        TorchCase(IMPL_FILE, "test_new_ones_int_size", num_proc=4),
+        TorchCase(IMPL_FILE, "test_new_ones_input_sharding_ignored", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -83,17 +84,17 @@ def test_parallel_op_new_ones_group3():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_NEW_ONES, "test_new_ones_scalar", num_proc=4),
+        TorchCase(IMPL_FILE, "test_new_ones_scalar", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_new_ones_group3_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_new_ones_scalar
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_NEW_ONES, "test_new_ones_scalar", num_proc=4),
+        TorchCase(IMPL_FILE, "test_new_ones_scalar", num_proc=4),
     ])

@@ -20,13 +20,9 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from typing import Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import numpy as np
-import pytest
-
-from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
@@ -35,7 +31,6 @@ from hyper_parallel.core.dtensor.device_mesh import (
     _DEVICE_MESH_MAP
 )
 
-from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 from hyper_parallel.core.shard._op_dispatch import LayoutCacheKey
 
@@ -81,7 +76,6 @@ class TestStackExtDispatch(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
-        self.platform = get_platform()
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
@@ -183,7 +177,6 @@ class TestNewDispatchFlow(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
-        self.platform = get_platform()
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()

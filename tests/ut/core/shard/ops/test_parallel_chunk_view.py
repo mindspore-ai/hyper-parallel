@@ -17,12 +17,10 @@ import os
 import unittest
 from unittest.mock import patch
 import numpy as np
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_chunk_view import ChunkViewDistributedOp
-from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP
@@ -37,7 +35,6 @@ class TestParallelChunkView(unittest.TestCase):
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
-        self.platform = get_platform()
         self.chunk_view_op = ChunkViewDistributedOp("chunk_view")
     
     def tearDown(self):

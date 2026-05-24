@@ -12,126 +12,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor with isinf"""
-from tests.torch.utils import torchrun_case
+"""Test runner for isinf distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_isinf.py")
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_isinf_replicate():
-    '''
-    Feature: test parallel op isinf.
-    Description: test parallel op isinf on a fully replicated tensor.
+def test_parallel_op_isinf_group1():
+    """
+    Feature: parallel run case in _test_parallel_op_isinf
+    Description:
+        1. test_isinf_2d_shard_dim0 —
+        2. test_isinf_2d_shard_dim1 —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_isinf_2d_shard_dim0", num_proc=4),
+        TorchCase(IMPL_FILE, "test_isinf_2d_shard_dim1", num_proc=4),
+    ])
 
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_isinf_replicate"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_isinf_replicate():
-    '''
-    Feature: test parallel op isinf (gloo cpu).
-    Description: test parallel op isinf on a fully replicated tensor.
+def test_parallel_op_isinf_group1_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_isinf
+    Description:
+        1. test_isinf_2d_shard_dim0 —
+        2. test_isinf_2d_shard_dim1 —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_isinf_2d_shard_dim0", num_proc=4),
+        TorchCase(IMPL_FILE, "test_isinf_2d_shard_dim1", num_proc=4),
+    ])
 
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_isinf_replicate"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_isinf_1d_shard():
-    '''
-    Feature: test parallel op isinf.
-    Description: test parallel op isinf on a 1D sharded tensor.
+def test_parallel_op_isinf_group2():
+    """
+    Feature: parallel run case in _test_parallel_op_isinf
+    Description:
+        1. test_isinf_3d_multi_shard —
+        2. test_isinf_1d_shard —
+        3. test_isinf_replicate —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_isinf_3d_multi_shard", num_proc=4),
+        TorchCase(IMPL_FILE, "test_isinf_1d_shard", num_proc=2),
+        TorchCase(IMPL_FILE, "test_isinf_replicate", num_proc=2),
+    ])
 
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_isinf_1d_shard"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_isinf_1d_shard():
-    '''
-    Feature: test parallel op isinf (gloo cpu).
-    Description: test parallel op isinf on a 1D sharded tensor.
+def test_parallel_op_isinf_group2_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_isinf
+    Description:
+        1. test_isinf_3d_multi_shard —
+        2. test_isinf_1d_shard —
+        3. test_isinf_replicate —
     Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_isinf_1d_shard"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_isinf_2d_shard_dim0():
-    '''
-    Feature: test parallel op isinf.
-    Description: test parallel op isinf on a 2D tensor sharded on dim0.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_isinf_2d_shard_dim0"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_isinf_2d_shard_dim0():
-    '''
-    Feature: test parallel op isinf (gloo cpu).
-    Description: test parallel op isinf on a 2D tensor sharded on dim0.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_isinf_2d_shard_dim0"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_isinf_2d_shard_dim1():
-    '''
-    Feature: test parallel op isinf.
-    Description: test parallel op isinf on a 2D tensor sharded on dim1.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_isinf_2d_shard_dim1"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_isinf_2d_shard_dim1():
-    '''
-    Feature: test parallel op isinf (gloo cpu).
-    Description: test parallel op isinf on a 2D tensor sharded on dim1.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_isinf_2d_shard_dim1"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_isinf_3d_multi_shard():
-    '''
-    Feature: test parallel op isinf.
-    Description: test parallel op isinf on a 3D tensor with multi-dimension sharding.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_isinf_3d_multi_shard"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_isinf_3d_multi_shard():
-    '''
-    Feature: test parallel op isinf (gloo cpu).
-    Description: test parallel op isinf on a 3D tensor with multi-dimension sharding.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_isinf.py"
-    case_name = "test_isinf_3d_multi_shard"
-    torchrun_case(file_name, case_name)
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_isinf_3d_multi_shard", num_proc=4),
+        TorchCase(IMPL_FILE, "test_isinf_1d_shard", num_proc=2),
+        TorchCase(IMPL_FILE, "test_isinf_replicate", num_proc=2),
+    ])

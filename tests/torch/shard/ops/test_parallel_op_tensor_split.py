@@ -12,270 +12,186 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor tensor_split"""
-from tests.torch.utils import torchrun_case
+"""Test runner for tensor_split distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_tensor_split.py")
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_tensor_split_by_sections_unsharded():
+def test_parallel_op_tensor_split_group1():
     """
-    Feature: test parallel op tensor_split.
-    Description: test parallel op tensor_split by integer sections.
+    Feature: parallel run case in _test_parallel_op_tensor_split
+    Description:
+        1. test_tensor_split_1d_tensor_indices —
+        2. test_tensor_split_3d_sections —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_tensor_split_1d_tensor_indices", num_proc=4),
+        TorchCase(IMPL_FILE, "test_tensor_split_3d_sections", num_proc=4),
+    ])
 
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_by_sections_unsharded"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_tensor_split_by_sections_unsharded():
+def test_parallel_op_tensor_split_group1_gloo():
     """
-    Feature: test parallel op tensor_split (gloo cpu).
-    Description: test parallel op tensor_split by integer sections.
+    Feature: parallel run case in _test_parallel_op_tensor_split
+    Description:
+        1. test_tensor_split_1d_tensor_indices —
+        2. test_tensor_split_3d_sections —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_tensor_split_1d_tensor_indices", num_proc=4),
+        TorchCase(IMPL_FILE, "test_tensor_split_3d_sections", num_proc=4),
+    ])
 
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_by_sections_unsharded"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_tensor_split_by_indices_unsharded():
+def test_parallel_op_tensor_split_group2():
     """
-    Feature: test parallel op tensor_split.
-    Description: test parallel op tensor_split by tuple of indices.
+    Feature: parallel run case in _test_parallel_op_tensor_split
+    Description:
+        1. test_tensor_split_4d_multi_shard —
+        2. test_tensor_split_by_indices_unsharded —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_tensor_split_4d_multi_shard", num_proc=4),
+        TorchCase(IMPL_FILE, "test_tensor_split_by_indices_unsharded", num_proc=4),
+    ])
 
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_by_indices_unsharded"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_tensor_split_by_indices_unsharded():
+def test_parallel_op_tensor_split_group2_gloo():
     """
-    Feature: test parallel op tensor_split (gloo cpu).
-    Description: test parallel op tensor_split by tuple of indices.
+    Feature: parallel run case in _test_parallel_op_tensor_split
+    Description:
+        1. test_tensor_split_4d_multi_shard —
+        2. test_tensor_split_by_indices_unsharded —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_tensor_split_4d_multi_shard", num_proc=4),
+        TorchCase(IMPL_FILE, "test_tensor_split_by_indices_unsharded", num_proc=4),
+    ])
 
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_by_indices_unsharded"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_tensor_split_default_dim():
+def test_parallel_op_tensor_split_group3():
     """
-    Feature: test parallel op tensor_split.
-    Description: test parallel op tensor_split using default dim 0.
+    Feature: parallel run case in _test_parallel_op_tensor_split
+    Description:
+        1. test_tensor_split_by_sections_unsharded —
+        2. test_tensor_split_default_dim —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_tensor_split_by_sections_unsharded", num_proc=4),
+        TorchCase(IMPL_FILE, "test_tensor_split_default_dim", num_proc=4),
+    ])
 
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_default_dim"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_tensor_split_default_dim():
+def test_parallel_op_tensor_split_group3_gloo():
     """
-    Feature: test parallel op tensor_split (gloo cpu).
-    Description: test parallel op tensor_split using default dim 0.
+    Feature: parallel run case in _test_parallel_op_tensor_split
+    Description:
+        1. test_tensor_split_by_sections_unsharded —
+        2. test_tensor_split_default_dim —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_tensor_split_by_sections_unsharded", num_proc=4),
+        TorchCase(IMPL_FILE, "test_tensor_split_default_dim", num_proc=4),
+    ])
 
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_default_dim"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_tensor_split_negative_dim():
+def test_parallel_op_tensor_split_group4():
     """
-    Feature: test parallel op tensor_split.
-    Description: test parallel op tensor_split using negative dim.
+    Feature: parallel run case in _test_parallel_op_tensor_split
+    Description:
+        1. test_tensor_split_list_indices —
+        2. test_tensor_split_negative_dim —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_tensor_split_list_indices", num_proc=4),
+        TorchCase(IMPL_FILE, "test_tensor_split_negative_dim", num_proc=4),
+    ])
 
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_negative_dim"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_tensor_split_negative_dim():
+def test_parallel_op_tensor_split_group4_gloo():
     """
-    Feature: test parallel op tensor_split (gloo cpu).
-    Description: test parallel op tensor_split using negative dim.
+    Feature: parallel run case in _test_parallel_op_tensor_split
+    Description:
+        1. test_tensor_split_list_indices —
+        2. test_tensor_split_negative_dim —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_tensor_split_list_indices", num_proc=4),
+        TorchCase(IMPL_FILE, "test_tensor_split_negative_dim", num_proc=4),
+    ])
 
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_negative_dim"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_tensor_split_3d_sections():
+def test_parallel_op_tensor_split_group5():
     """
-    Feature: test parallel op tensor_split.
-    Description: test parallel op tensor_split by sections on a 3D tensor.
+    Feature: parallel run case in _test_parallel_op_tensor_split
+    Description:
+        1. test_tensor_split_out_of_bounds_indices —
+        2. test_tensor_split_replicated —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_tensor_split_out_of_bounds_indices", num_proc=4),
+        TorchCase(IMPL_FILE, "test_tensor_split_replicated", num_proc=4),
+    ])
 
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_3d_sections"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_tensor_split_3d_sections():
+def test_parallel_op_tensor_split_group5_gloo():
     """
-    Feature: test parallel op tensor_split (gloo cpu).
-    Description: test parallel op tensor_split by sections on a 3D tensor.
+    Feature: parallel run case in _test_parallel_op_tensor_split
+    Description:
+        1. test_tensor_split_out_of_bounds_indices —
+        2. test_tensor_split_replicated —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_tensor_split_out_of_bounds_indices", num_proc=4),
+        TorchCase(IMPL_FILE, "test_tensor_split_replicated", num_proc=4),
+    ])
 
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_3d_sections"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_tensor_split_1d_tensor_indices():
+def test_parallel_op_tensor_split_group6():
     """
-    Feature: test parallel op tensor_split.
-    Description: test parallel op tensor_split using a 1D tensor of indices.
+    Feature: parallel run case in _test_parallel_op_tensor_split
+    Description:
+        1. test_tensor_split_uneven_sections —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_tensor_split_uneven_sections", num_proc=4),
+    ])
 
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_1d_tensor_indices"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_tensor_split_1d_tensor_indices():
+def test_parallel_op_tensor_split_group6_gloo():
     """
-    Feature: test parallel op tensor_split (gloo cpu).
-    Description: test parallel op tensor_split using a 1D tensor of indices.
+    Feature: parallel run case in _test_parallel_op_tensor_split
+    Description:
+        1. test_tensor_split_uneven_sections —
     Expectation: Run success.
     """
-
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_1d_tensor_indices"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_tensor_split_uneven_sections():
-    """
-    Feature: test parallel op tensor_split.
-    Description: test parallel op tensor_split with uneven sections.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_uneven_sections"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_tensor_split_uneven_sections():
-    """
-    Feature: test parallel op tensor_split (gloo cpu).
-    Description: test parallel op tensor_split with uneven sections.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_uneven_sections"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_tensor_split_out_of_bounds_indices():
-    """
-    Feature: test parallel op tensor_split.
-    Description: test parallel op tensor_split with out-of-bounds indices.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_out_of_bounds_indices"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_tensor_split_out_of_bounds_indices():
-    """
-    Feature: test parallel op tensor_split (gloo cpu).
-    Description: test parallel op tensor_split with out-of-bounds indices.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_out_of_bounds_indices"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_tensor_split_4d_multi_shard():
-    """
-    Feature: test parallel op tensor_split.
-    Description: test parallel op tensor_split on a 4D tensor with multi-sharding.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_4d_multi_shard"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_tensor_split_4d_multi_shard():
-    """
-    Feature: test parallel op tensor_split (gloo cpu).
-    Description: test parallel op tensor_split on a 4D tensor with multi-sharding.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_4d_multi_shard"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_tensor_split_list_indices():
-    """
-    Feature: test parallel op tensor_split.
-    Description: test parallel op tensor_split using a list of indices.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_list_indices"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_tensor_split_list_indices():
-    """
-    Feature: test parallel op tensor_split (gloo cpu).
-    Description: test parallel op tensor_split using a list of indices.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_list_indices"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_tensor_split_replicated():
-    """
-    Feature: test parallel op tensor_split.
-    Description: test parallel op tensor_split on a fully replicated tensor.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_replicated"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_tensor_split_replicated():
-    """
-    Feature: test parallel op tensor_split (gloo cpu).
-    Description: test parallel op tensor_split on a fully replicated tensor.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_tensor_split.py"
-    case_name = "test_tensor_split_replicated"
-    torchrun_case(file_name, case_name)
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_tensor_split_uneven_sections", num_proc=4),
+    ])

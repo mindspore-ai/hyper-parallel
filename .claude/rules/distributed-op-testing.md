@@ -17,6 +17,7 @@ Testing conventions for distributed operator development in HyperParallel. Cover
 ## Unit Test (UT) Conventions
 
 ### File Location
+
 - **Path**: `tests/ut/core/shard/ops/test_parallel_{operator_name}.py`
 - **Platform-agnostic**: Tests run without actual distributed communication or GPU/NPU
 
@@ -45,19 +46,19 @@ op = XxxDistributedOp("op_name")
 
 class Test<OperatorName>(unittest.TestCase):
     """Unit tests for <OperatorName>DistributedOp."""
-    
+
     def setUp(self):
         """Set up test fixtures before each test method."""
         # Clear global state
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         self.platform = get_platform()
-    
+
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
-    
+
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
         if platform_type is not None:
@@ -102,10 +103,10 @@ def test_operator_data_parallel_success(self, mock_platform):
         mesh_dim_names=("dp", "mp"),
         init_backend=False  # Important: no actual backend for UT
     )
-    
+
     placements = (Shard(0), Replicate())
     x_layout = _build_layout(mesh, placements, 2)
-    
+
     output_layout = self.op.infer_layout((x_layout,), extra_args)
 
     # Verify tensor_map
@@ -177,6 +178,7 @@ If the operator uses the default implementation (returns `None`), verify it in *
 If the operator has a custom `get_expand_impl` that returns a callable, verify it in **every test case**:
 
 The `get_expand_impl` method returns either:
+
 - `None`: No expand implementation needed (most operators)
 - `callable`: A function that handles distributed execution (e.g., Gather, MatMul with partial state)
 
@@ -197,6 +199,7 @@ assert impl is None
 ```
 
 **Operators with None impl:**
+
 - Simple element-wise operators (Add, Mul, ReLU, etc.)
 - Reshape-like operators (ExpandDims, Squeeze, Transpose, etc.)
 - Operators without partial state handling
@@ -214,6 +217,7 @@ assert callable(impl), (
 ```
 
 **Operators with callable impl:**
+
 - Gather with sharded index dimension (returns partial state)
 - MatMul with partial output (needs reduce-scatter)
 - FlashAttentionScore (needs parameter adjustment)
@@ -255,6 +259,7 @@ assert callable(impl), (
 | **ST** | End-to-end distributed execution | ❌ No - only success cases |
 
 **Reasons:**
+
 - UT runs without distributed environment, faster and more reliable for error detection
 - ST requires 8-card environment, expensive resource for error cases
 - Error handling is logic-level, not distributed-level
@@ -305,27 +310,29 @@ def test_activation_with_axis_data_parallel_1():
 
 | File | Location | Purpose |
 |------|----------|---------|
-| **Shell File** | `tests/mindspore/st/shard/ops/test_*_shard_in_python.py` | Test runner with `@arg_mark` decorators |
-| **Implementation File** | `tests/mindspore/st/shard/ops/*_shard_in_python.py` | Actual test implementation |
+| **Runner File** | `tests/mindspore/st/shard/ops/test_parallel_op_*.py` | Test runner with `@arg_mark` decorators |
+| **Implementation File** | `tests/mindspore/st/shard/ops/_test_parallel_op_*.py` | Actual test implementation |
 
-### Shell File Pattern
+### Runner File Pattern
 
 ```python
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, MindSporeCase
 
-IMPLEMENTATION_FILE = "activation_with_axis_shard_in_python.py"
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_activation_with_axis.py")
 
-@arg_mark(plat_marks=["platform_gpu"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_activation_with_axis_shard_in_python_group1():
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_activation_with_axis_group1():
     """
-    Feature: parallel run case in activation_with_axis_shard_in_python
+    Feature: parallel run case in _test_parallel_op_activation_with_axis
     Description:
-        1. test_activation_with_axis_data_parallel_1 (Softmax + Swiglu)
+        1. test_activation_with_axis_data_parallel_1 — Softmax + Swiglu data parallel
     Expectation: Run success.
     """
     parallel_run([
-        MindSporeCase(IMPLEMENTATION_FILE, "test_activation_with_axis_data_parallel_1", 11500, 8, 8, 2),
+        MindSporeCase(IMPL_FILE, "test_activation_with_axis_data_parallel_1", worker_num=8, local_worker_num=8, glog_v=2),
     ])
 ```
 
@@ -400,27 +407,45 @@ def test_activation_with_axis_data_parallel_1():
 
 | File | Location | Purpose |
 |------|----------|---------|
-| **Shell File** | `tests/torch/shard/ops/test_parallel_op_*.py` | Test runner with `@arg_mark` decorators |
-| **Implementation File** | `tests/torch/shard/ops/parallel_op_*.py` | Actual test implementation |
+| **Runner File** | `tests/torch/shard/ops/test_parallel_op_*.py` | Test runner with `@arg_mark` decorators |
+| **Implementation File** | `tests/torch/shard/ops/_test_parallel_op_*.py` | Actual test implementation |
 
-### Shell File Pattern
+### Runner File Pattern
 
 ```python
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-PARALLEL_OP_MAX = "parallel_op_max.py"
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_max.py")
 
-@arg_mark(plat_marks=["platform_gpu"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_activation_with_axis_shard_in_python_group1():
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_max_group1():
     """
-    Feature: parallel run case on op max 
+    Feature: parallel run case in _test_parallel_op_max
     Description:
-        1. test_distributed_max_element_wise
+        1. test_max_element_wise — max element-wise
+        2. test_max_dim_reduce_sharded — max dim reduce sharded
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MAX, "test_distributed_max_element_wise", 10500, 8),
+        TorchCase(IMPL_FILE, "test_max_element_wise", num_proc=4),
+        TorchCase(IMPL_FILE, "test_max_dim_reduce_sharded", num_proc=4),
+    ])
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_max_group1_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_max
+    Description:
+        1. test_max_element_wise — max element-wise
+        2. test_max_dim_reduce_sharded — max dim reduce sharded
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_max_element_wise", num_proc=4),
+        TorchCase(IMPL_FILE, "test_max_dim_reduce_sharded", num_proc=4),
     ])
 ```
 
@@ -451,7 +476,7 @@ def test_distributed_softmax_data_parallel():
     standalone_input = torch.from_numpy(standalone_input_2d_np).npu()
     standalone_output = torch.nn.functional.softmax(standalone_input, dim=1)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_placements = (Shard(0), Replicate())
 
     dist_input = distribute_tensor(standalone_input, mesh, x_placements)

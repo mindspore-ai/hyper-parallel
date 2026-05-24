@@ -13,10 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """test parallel op masked_scatter"""
+from pathlib import Path
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-PARALLEL_OP_MASKED_SCATTER = "parallel_op_masked_scatter.py"
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_masked_scatter.py")
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_masked_scatter_group1():
@@ -27,19 +28,19 @@ def test_parallel_op_masked_scatter_group1():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_basic_replicated", num_proc=4)
+        TorchCase(IMPL_FILE, "test_masked_scatter_basic_replicated", num_proc=4)
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_masked_scatter_group1_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_masked_scatter_basic_replicated
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_basic_replicated", num_proc=4)
+        TorchCase(IMPL_FILE, "test_masked_scatter_basic_replicated", num_proc=4)
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -52,22 +53,22 @@ def test_parallel_op_masked_scatter_group2():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_1d_replicated", num_proc=4),
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_3d_broadcast", num_proc=4),
+        TorchCase(IMPL_FILE, "test_masked_scatter_1d_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_masked_scatter_3d_broadcast", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_masked_scatter_group2_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_masked_scatter_1d_replicated
         2.test_masked_scatter_3d_broadcast
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_1d_replicated", num_proc=4),
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_3d_broadcast", num_proc=4),
+        TorchCase(IMPL_FILE, "test_masked_scatter_1d_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_masked_scatter_3d_broadcast", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -80,20 +81,20 @@ def test_parallel_op_masked_scatter_group3():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_oversized_source", num_proc=4),
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_all_false_mask", num_proc=4),
+        TorchCase(IMPL_FILE, "test_masked_scatter_oversized_source", num_proc=4),
+        TorchCase(IMPL_FILE, "test_masked_scatter_all_false_mask", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_masked_scatter_group3_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_masked_scatter_oversized_source
         2.test_masked_scatter_all_false_mask
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_oversized_source", num_proc=4),
-        TorchCase(PARALLEL_OP_MASKED_SCATTER, "test_masked_scatter_all_false_mask", num_proc=4),
+        TorchCase(IMPL_FILE, "test_masked_scatter_oversized_source", num_proc=4),
+        TorchCase(IMPL_FILE, "test_masked_scatter_all_false_mask", num_proc=4),
     ])

@@ -12,78 +12,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor for isnan op"""
-from tests.torch.utils import torchrun_case
+"""Test runner for isnan distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_isnan.py")
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_isnan_basic():
-    '''
-    Feature: test parallel op isnan.
-    Description: test parallel op isnan basic with sharding.
+def test_parallel_op_isnan_group1():
+    """
+    Feature: parallel run case in _test_parallel_op_isnan
+    Description:
+        1. test_isnan_3d —
+        2. test_isnan_basic —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_isnan_3d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_isnan_basic", num_proc=4),
+    ])
 
-    file_name = "parallel_op_isnan.py"
-    case_name = "test_isnan_basic"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_isnan_basic():
-    '''
-    Feature: test parallel op isnan (gloo cpu).
-    Description: test parallel op isnan basic with sharding.
+def test_parallel_op_isnan_group1_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_isnan
+    Description:
+        1. test_isnan_3d —
+        2. test_isnan_basic —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_isnan_3d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_isnan_basic", num_proc=4),
+    ])
 
-    file_name = "parallel_op_isnan.py"
-    case_name = "test_isnan_basic"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_isnan_replicate():
-    '''
-    Feature: test parallel op isnan.
-    Description: test parallel op isnan with fully replicated tensor.
+def test_parallel_op_isnan_group2():
+    """
+    Feature: parallel run case in _test_parallel_op_isnan
+    Description:
+        1. test_isnan_replicate —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_isnan_replicate", num_proc=4),
+    ])
 
-    file_name = "parallel_op_isnan.py"
-    case_name = "test_isnan_replicate"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_isnan_replicate():
-    '''
-    Feature: test parallel op isnan (gloo cpu).
-    Description: test parallel op isnan with fully replicated tensor.
+def test_parallel_op_isnan_group2_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_isnan
+    Description:
+        1. test_isnan_replicate —
     Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_isnan.py"
-    case_name = "test_isnan_replicate"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_isnan_3d():
-    '''
-    Feature: test parallel op isnan.
-    Description: test parallel op isnan on 3D tensor with mixed sharding.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_isnan.py"
-    case_name = "test_isnan_3d"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_isnan_3d():
-    '''
-    Feature: test parallel op isnan (gloo cpu).
-    Description: test parallel op isnan on 3D tensor with mixed sharding.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_isnan.py"
-    case_name = "test_isnan_3d"
-    torchrun_case(file_name, case_name)
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_isnan_replicate", num_proc=4),
+    ])

@@ -12,102 +12,70 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor dropout op"""
-from tests.torch.utils import torchrun_case
+"""Test runner for dropout distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_dropout.py")
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_dropout_basic_sharded():
-    '''
-    Feature: test parallel op dropout.
-    Description: test parallel op dropout with basic sharding.
+def test_parallel_op_dropout_group1():
+    """
+    Feature: parallel run case in _test_parallel_op_dropout
+    Description:
+        1. test_dropout_3d —
+        2. test_dropout_basic_sharded —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_dropout_3d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_dropout_basic_sharded", num_proc=4),
+    ])
 
-    file_name = "parallel_op_dropout.py"
-    case_name = "test_dropout_basic_sharded"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_dropout_basic_sharded():
-    '''
-    Feature: test parallel op dropout (gloo cpu).
-    Description: test parallel op dropout with basic sharding.
+def test_parallel_op_dropout_group1_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_dropout
+    Description:
+        1. test_dropout_3d —
+        2. test_dropout_basic_sharded —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_dropout_3d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_dropout_basic_sharded", num_proc=4),
+    ])
 
-    file_name = "parallel_op_dropout.py"
-    case_name = "test_dropout_basic_sharded"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_dropout_p0_exact_match():
-    '''
-    Feature: test parallel op dropout.
-    Description: test parallel op dropout exact numerical match when p=0.0.
+def test_parallel_op_dropout_group2():
+    """
+    Feature: parallel run case in _test_parallel_op_dropout
+    Description:
+        1. test_dropout_p0_exact_match —
+        2. test_dropout_replicate —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_dropout_p0_exact_match", num_proc=4),
+        TorchCase(IMPL_FILE, "test_dropout_replicate", num_proc=4),
+    ])
 
-    file_name = "parallel_op_dropout.py"
-    case_name = "test_dropout_p0_exact_match"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_dropout_p0_exact_match():
-    '''
-    Feature: test parallel op dropout (gloo cpu).
-    Description: test parallel op dropout exact numerical match when p=0.0.
+def test_parallel_op_dropout_group2_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_dropout
+    Description:
+        1. test_dropout_p0_exact_match —
+        2. test_dropout_replicate —
     Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_dropout.py"
-    case_name = "test_dropout_p0_exact_match"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_dropout_3d():
-    '''
-    Feature: test parallel op dropout.
-    Description: test parallel op dropout with a 3D sharded tensor.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_dropout.py"
-    case_name = "test_dropout_3d"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_dropout_3d():
-    '''
-    Feature: test parallel op dropout (gloo cpu).
-    Description: test parallel op dropout with a 3D sharded tensor.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_dropout.py"
-    case_name = "test_dropout_3d"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_dropout_replicate():
-    '''
-    Feature: test parallel op dropout.
-    Description: test parallel op dropout with a fully replicated tensor.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_dropout.py"
-    case_name = "test_dropout_replicate"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_dropout_replicate():
-    '''
-    Feature: test parallel op dropout (gloo cpu).
-    Description: test parallel op dropout with a fully replicated tensor.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_dropout.py"
-    case_name = "test_dropout_replicate"
-    torchrun_case(file_name, case_name)
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_dropout_p0_exact_match", num_proc=4),
+        TorchCase(IMPL_FILE, "test_dropout_replicate", num_proc=4),
+    ])

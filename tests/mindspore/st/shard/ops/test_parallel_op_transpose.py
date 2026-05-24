@@ -1,0 +1,62 @@
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""parallel_transpose_ext_view_shell test"""
+
+from pathlib import Path
+
+from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, MindSporeCase
+
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_transpose.py")
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_transpose_group1():
+    """
+    Feature: parallel run case in transpose_ext_view_shard_in_python
+    Description:
+        1. test_transpose_ext_view_basic_3d_1
+    Expectation: Run success.
+    """
+    parallel_run([
+        MindSporeCase(IMPL_FILE, "test_transpose_ext_view_basic_3d_1", worker_num=8, local_worker_num=8, glog_v=2),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_transpose_group2():
+    """
+    Feature: parallel run case in transpose_ext_view_shard_in_python
+    Description:
+        1. test_transpose_ext_view_negative_dims_2
+    Expectation: Run success.
+    """
+    parallel_run([
+        MindSporeCase(IMPL_FILE, "test_transpose_ext_view_negative_dims_2", worker_num=8, local_worker_num=8, glog_v=2),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_parallel_op_transpose_group3():
+    """
+    Feature: parallel run case in transpose_ext_view_shard_in_python
+    Description:
+        1. test_transpose_ext_view_same_dims_noop_3
+    Expectation: Run success.
+    """
+    parallel_run([
+        MindSporeCase(IMPL_FILE, "test_transpose_ext_view_same_dims_noop_3", worker_num=8, local_worker_num=8,
+            glog_v=2),
+    ])

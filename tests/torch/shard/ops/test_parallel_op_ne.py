@@ -12,66 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor for ne operator"""
-from tests.torch.utils import torchrun_case
+"""Test runner for ne distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_ne.py")
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_ne_basic():
-    '''
-    Feature: test parallel op ne.
-    Description: test basic element-wise comparison.
+def test_parallel_op_ne_group1():
+    """
+    Feature: parallel run case in _test_parallel_op_ne
+    Description:
+        1. test_ne_basic —
+        2. test_ne_scalar —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_ne_basic", num_proc=4),
+        TorchCase(IMPL_FILE, "test_ne_scalar", num_proc=4),
+    ])
 
-    file_name = "parallel_op_ne.py"
-    case_name = "test_ne_basic"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_ne_basic():
-    '''
-    Feature: test parallel op ne (gloo cpu).
-    Description: test basic element-wise comparison.
+def test_parallel_op_ne_group1_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_ne
+    Description:
+        1. test_ne_basic —
+        2. test_ne_scalar —
     Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_ne.py"
-    case_name = "test_ne_basic"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_ne_scalar():
-    '''
-    Feature: test parallel op ne.
-    Description: test scalar comparison.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_ne.py"
-    case_name = "test_ne_scalar"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_ne_scalar():
-    '''
-    Feature: test parallel op ne (gloo cpu).
-    Description: test scalar comparison.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_ne.py"
-    case_name = "test_ne_scalar"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_ne_partial_error():
-    '''
-    Feature: test parallel op ne.
-    Description: test exception raising when inputs have Partial status.
-    Expectation: Run success (proper exception raised).
-    '''
-
-    file_name = "parallel_op_ne.py"
-    case_name = "test_distributed_ne_partial_error"
-    torchrun_case(file_name, case_name)
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_ne_basic", num_proc=4),
+        TorchCase(IMPL_FILE, "test_ne_scalar", num_proc=4),
+    ])

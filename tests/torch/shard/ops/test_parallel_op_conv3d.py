@@ -12,294 +12,190 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test parallel op conv3d"""
-from tests.torch.utils import torchrun_case
+"""Test runner for conv3d distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_conv3d.py")
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_conv3d_data_parallel():
-    '''
-    Feature: test parallel op conv3d data parallel.
-    Description: test parallel op conv3d data parallel.
+def test_parallel_op_conv3d_group1():
+    """
+    Feature: parallel run case in _test_parallel_op_conv3d
+    Description:
+        1. test_distributed_conv3d_column_parallel —
+        2. test_distributed_conv3d_data_parallel —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_column_parallel", num_proc=4),
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_data_parallel", num_proc=4),
+    ])
 
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_data_parallel"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_conv3d_data_parallel():
-    '''
-    Feature: test parallel op conv3d data parallel (gloo cpu).
-    Description: test parallel op conv3d data parallel.
+def test_parallel_op_conv3d_group1_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_conv3d
+    Description:
+        1. test_distributed_conv3d_column_parallel —
+        2. test_distributed_conv3d_data_parallel —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_column_parallel", num_proc=4),
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_data_parallel", num_proc=4),
+    ])
 
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_data_parallel"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_conv3d_column_parallel():
-    '''
-    Feature: test parallel op conv3d column parallel.
-    Description: test parallel op conv3d column parallel.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_column_parallel"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_conv3d_column_parallel():
-    '''
-    Feature: test parallel op conv3d column parallel (gloo cpu).
-    Description: test parallel op conv3d column parallel.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_column_parallel"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_conv3d_spatial_parallel():
-    '''
-    Feature: test parallel op conv3d spatial parallel.
-    Description: test parallel op conv3d spatial parallel.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_spatial_parallel"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_conv3d_spatial_parallel():
-    '''
-    Feature: test parallel op conv3d spatial parallel (gloo cpu).
-    Description: test parallel op conv3d spatial parallel.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_spatial_parallel"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_conv3d_with_bias():
-    '''
-    Feature: test parallel op conv3d with bias.
-    Description: test parallel op conv3d with bias.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_with_bias"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_conv3d_with_bias():
-    '''
-    Feature: test parallel op conv3d with bias (gloo cpu).
-    Description: test parallel op conv3d with bias.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_with_bias"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_conv3d_row_parallel():
-    '''
-    Feature: test parallel op conv3d row parallel.
-    Description: test parallel op conv3d row parallel.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_row_parallel"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_conv3d_row_parallel():
-    '''
-    Feature: test parallel op conv3d row parallel (gloo cpu).
-    Description: test parallel op conv3d row parallel.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_row_parallel"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_distributed_conv3d_dp_cp():
-    '''
-    Feature: test parallel op conv3d data + column parallel.
-    Description: test parallel op conv3d data + column parallel on a 2D mesh.
+def test_parallel_op_conv3d_group2():
+    """
+    Feature: parallel run case in _test_parallel_op_conv3d
+    Description:
+        1. test_distributed_conv3d_dp_cp —
+        2. test_distributed_conv3d_dp_rp —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_dp_cp", num_proc=4),
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_dp_rp", num_proc=4),
+    ])
 
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_dp_cp"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_conv3d_dp_cp():
-    '''
-    Feature: test parallel op conv3d data + column parallel (gloo cpu).
-    Description: test parallel op conv3d data + column parallel on a 2D mesh.
+def test_parallel_op_conv3d_group2_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_conv3d
+    Description:
+        1. test_distributed_conv3d_dp_cp —
+        2. test_distributed_conv3d_dp_rp —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_dp_cp", num_proc=4),
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_dp_rp", num_proc=4),
+    ])
 
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_dp_cp"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_conv3d_dp_rp():
-    '''
-    Feature: test parallel op conv3d data + row parallel.
-    Description: test parallel op conv3d data + row parallel on a 2D mesh.
+def test_parallel_op_conv3d_group3():
+    """
+    Feature: parallel run case in _test_parallel_op_conv3d
+    Description:
+        1. test_distributed_conv3d_groups_cp —
+        2. test_distributed_conv3d_groups_cp_with_bias —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_groups_cp", num_proc=4),
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_groups_cp_with_bias", num_proc=4),
+    ])
 
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_dp_rp"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_conv3d_dp_rp():
-    '''
-    Feature: test parallel op conv3d data + row parallel (gloo cpu).
-    Description: test parallel op conv3d data + row parallel on a 2D mesh.
+def test_parallel_op_conv3d_group3_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_conv3d
+    Description:
+        1. test_distributed_conv3d_groups_cp —
+        2. test_distributed_conv3d_groups_cp_with_bias —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_groups_cp", num_proc=4),
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_groups_cp_with_bias", num_proc=4),
+    ])
 
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_dp_rp"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_conv3d_spatial_h():
-    '''
-    Feature: test parallel op conv3d spatial parallel on Height.
-    Description: test parallel op conv3d spatial parallel on Height axis.
+def test_parallel_op_conv3d_group4():
+    """
+    Feature: parallel run case in _test_parallel_op_conv3d
+    Description:
+        1. test_distributed_conv3d_groups_dp —
+        2. test_distributed_conv3d_row_parallel —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_groups_dp", num_proc=4),
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_row_parallel", num_proc=4),
+    ])
 
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_spatial_h"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_conv3d_spatial_h():
-    '''
-    Feature: test parallel op conv3d spatial parallel on Height (gloo cpu).
-    Description: test parallel op conv3d spatial parallel on Height axis.
+def test_parallel_op_conv3d_group4_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_conv3d
+    Description:
+        1. test_distributed_conv3d_groups_dp —
+        2. test_distributed_conv3d_row_parallel —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_groups_dp", num_proc=4),
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_row_parallel", num_proc=4),
+    ])
 
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_spatial_h"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_conv3d_spatial_w():
-    '''
-    Feature: test parallel op conv3d spatial parallel on Width.
-    Description: test parallel op conv3d spatial parallel on Width axis.
+def test_parallel_op_conv3d_group5():
+    """
+    Feature: parallel run case in _test_parallel_op_conv3d
+    Description:
+        1. test_distributed_conv3d_spatial_h —
+        2. test_distributed_conv3d_spatial_parallel —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_spatial_h", num_proc=4),
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_spatial_parallel", num_proc=4),
+    ])
 
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_spatial_w"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_conv3d_spatial_w():
-    '''
-    Feature: test parallel op conv3d spatial parallel on Width (gloo cpu).
-    Description: test parallel op conv3d spatial parallel on Width axis.
+def test_parallel_op_conv3d_group5_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_conv3d
+    Description:
+        1. test_distributed_conv3d_spatial_h —
+        2. test_distributed_conv3d_spatial_parallel —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_spatial_h", num_proc=4),
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_spatial_parallel", num_proc=4),
+    ])
 
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_spatial_w"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_conv3d_groups_dp():
-    '''
-    Feature: test parallel op conv3d with groups and data parallel.
-    Description: test parallel op conv3d with groups > 1 and data parallel.
+def test_parallel_op_conv3d_group6():
+    """
+    Feature: parallel run case in _test_parallel_op_conv3d
+    Description:
+        1. test_distributed_conv3d_spatial_w —
+        2. test_distributed_conv3d_with_bias —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_spatial_w", num_proc=4),
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_with_bias", num_proc=4),
+    ])
 
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_groups_dp"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_conv3d_groups_dp():
-    '''
-    Feature: test parallel op conv3d with groups and data parallel (gloo cpu).
-    Description: test parallel op conv3d with groups > 1 and data parallel.
+def test_parallel_op_conv3d_group6_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_conv3d
+    Description:
+        1. test_distributed_conv3d_spatial_w —
+        2. test_distributed_conv3d_with_bias —
     Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_groups_dp"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_conv3d_groups_cp():
-    '''
-    Feature: test parallel op conv3d with groups and column parallel.
-    Description: test parallel op conv3d with groups > 1 and column parallel.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_groups_cp"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_conv3d_groups_cp():
-    '''
-    Feature: test parallel op conv3d with groups and column parallel (gloo cpu).
-    Description: test parallel op conv3d with groups > 1 and column parallel.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_groups_cp"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_conv3d_groups_cp_with_bias():
-    '''
-    Feature: test parallel op conv3d with groups, column parallel and bias.
-    Description: test parallel op conv3d with groups > 1, column parallel and bias.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_groups_cp_with_bias"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_conv3d_groups_cp_with_bias():
-    '''
-    Feature: test parallel op conv3d with groups, column parallel and bias (gloo cpu).
-    Description: test parallel op conv3d with groups > 1, column parallel and bias.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_conv3d.py"
-    case_name = "test_distributed_conv3d_groups_cp_with_bias"
-    torchrun_case(file_name, case_name, num_proc=4)
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_spatial_w", num_proc=4),
+        TorchCase(IMPL_FILE, "test_distributed_conv3d_with_bias", num_proc=4),
+    ])

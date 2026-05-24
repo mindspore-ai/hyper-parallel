@@ -12,102 +12,70 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor remainder operation"""
-from tests.torch.utils import torchrun_case
+"""Test runner for remainder distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_remainder.py")
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_remainder_basic():
-    '''
-    Feature: test parallel op remainder.
-    Description: test parallel op remainder with basic identical layout tensors.
+def test_parallel_op_remainder_group1():
+    """
+    Feature: parallel run case in _test_parallel_op_remainder
+    Description:
+        1. test_remainder_basic —
+        2. test_remainder_broadcast —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_remainder_basic", num_proc=4),
+        TorchCase(IMPL_FILE, "test_remainder_broadcast", num_proc=4),
+    ])
 
-    file_name = "parallel_op_remainder.py"
-    case_name = "test_remainder_basic"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_remainder_basic():
-    '''
-    Feature: test parallel op remainder (gloo cpu).
-    Description: test parallel op remainder with basic identical layout tensors.
+def test_parallel_op_remainder_group1_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_remainder
+    Description:
+        1. test_remainder_basic —
+        2. test_remainder_broadcast —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_remainder_basic", num_proc=4),
+        TorchCase(IMPL_FILE, "test_remainder_broadcast", num_proc=4),
+    ])
 
-    file_name = "parallel_op_remainder.py"
-    case_name = "test_remainder_basic"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_remainder_scalar():
-    '''
-    Feature: test parallel op remainder.
-    Description: test parallel op remainder with scalar operand.
+def test_parallel_op_remainder_group2():
+    """
+    Feature: parallel run case in _test_parallel_op_remainder
+    Description:
+        1. test_remainder_operator_overload —
+        2. test_remainder_scalar —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_remainder_operator_overload", num_proc=4),
+        TorchCase(IMPL_FILE, "test_remainder_scalar", num_proc=4),
+    ])
 
-    file_name = "parallel_op_remainder.py"
-    case_name = "test_remainder_scalar"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_remainder_scalar():
-    '''
-    Feature: test parallel op remainder (gloo cpu).
-    Description: test parallel op remainder with scalar operand.
+def test_parallel_op_remainder_group2_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_remainder
+    Description:
+        1. test_remainder_operator_overload —
+        2. test_remainder_scalar —
     Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_remainder.py"
-    case_name = "test_remainder_scalar"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_remainder_broadcast():
-    '''
-    Feature: test parallel op remainder.
-    Description: test parallel op remainder with broadcasting shapes.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_remainder.py"
-    case_name = "test_remainder_broadcast"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_remainder_broadcast():
-    '''
-    Feature: test parallel op remainder (gloo cpu).
-    Description: test parallel op remainder with broadcasting shapes.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_remainder.py"
-    case_name = "test_remainder_broadcast"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_remainder_operator_overload():
-    '''
-    Feature: test parallel op remainder.
-    Description: test parallel op modulo (%) overload.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_remainder.py"
-    case_name = "test_remainder_operator_overload"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_remainder_operator_overload():
-    '''
-    Feature: test parallel op remainder (gloo cpu).
-    Description: test parallel op modulo (%) overload.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_remainder.py"
-    case_name = "test_remainder_operator_overload"
-    torchrun_case(file_name, case_name)
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_remainder_operator_overload", num_proc=4),
+        TorchCase(IMPL_FILE, "test_remainder_scalar", num_proc=4),
+    ])

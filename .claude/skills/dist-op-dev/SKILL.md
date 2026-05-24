@@ -86,7 +86,7 @@ When using this SKILL to develop distributed operators, create a TODOLIST, then 
   - Must: The test generation process must follow the procedure described in **workflows/05-integration-testing.md**. Execute each step in order.
   - Goal: Verify end-to-end distributed execution correctness in 8-card environment
   - Input: YAML config from Step 3, Python implementation from Step 2, analysis report from Step 1
-  - Output: `tests/mindspore/st/shard/ops/test_ops_*.py` + `*_shard_in_python.py` or `tests/torch/shard/ops/test_parallel_op_*.py` + `parallel_op_*.py`
+  - Output: `tests/mindspore/st/shard/ops/test_parallel_op_*.py` + `_test_parallel_op_*.py` or `tests/torch/shard/ops/test_parallel_op_*.py` + `_test_parallel_op_*.py`
 
 - [ ] **[Step 6](workflows/06-git-commit.md)**: Git Commit and PR Creation
 
@@ -104,6 +104,7 @@ When using this SKILL to develop distributed operators, create a TODOLIST, then 
 | **Implementation Method** | Need custom logic | Scenario 0/Scenario 1/Scenario 2 | Code volume and UT coverage |
 | **Broadcast Support** | Support broadcasting | No suffix/WithShape | YAML config and test scenarios |
 | **Partial Support** | Handle partial state | _allow_partial_inputs=True/False | get_expand_impl implementation |
+
 **Detailed decision reference:** See [Implementation Decisions](references/implementation-decisions.md)
 ---
 
