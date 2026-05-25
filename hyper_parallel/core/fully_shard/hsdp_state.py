@@ -17,7 +17,7 @@ from typing import List, Tuple, Union
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
-from hyper_parallel.core.fully_shard.hsdp_utils import HSDPConfigV2
+from hyper_parallel.core.fully_shard.hsdp_utils import HSDPConfigV2, ShardedState
 
 platform = get_platform()
 
@@ -58,6 +58,7 @@ class HSDPState:
         self._move_states_to_device()
         self._init_hsdp_params()
         self.is_shard = True
+        self.is_replicate_shard = True
         self.module_name = None
 
     def _init_hsdp_params(self):
@@ -68,32 +69,47 @@ class HSDPState:
         """move states to device"""
         raise NotImplementedError("HSDPState subclasses must implement _move_states_to_device")
 
+    def _assert_replicate_params_unsharded(self) -> None:
+        """Validate replicate params are already materialized when state says so."""
+        for param in self.replicate_params:
+            sharded_state = getattr(param, "sharded_state", None)
+            if sharded_state != ShardedState.UNSHARDED:
+                param_fqn = getattr(param, "_param_fqn", "<unknown>")
+                raise AssertionError(
+                    f"Expected replicate parameter {param_fqn} to be "
+                    f"{ShardedState.UNSHARDED}, got {sharded_state}"
+                )
+
     def shard(self, shard_replicate: bool = True):
         """change parameters to sharded state"""
-        if self.is_shard:
-            return
-
-        for param in self.sharded_hsdp_params:
-            param.to_sharded()
-        if shard_replicate:
+        if not self.is_shard:
+            for param in self.sharded_hsdp_params:
+                param.to_sharded()
+            self.is_shard = True
+        if shard_replicate and not self.is_replicate_shard:
             for param in self.replicate_params:
                 param.to_sharded()
-        self.is_shard = True
-        return
+            self.is_replicate_shard = True
 
     def unshard(self, async_op=False, unshard_replicate: bool = True):
         """change parameters to unsharded state"""
-        if not self.is_shard:
+        if not self.is_shard and (not unshard_replicate or not self.is_replicate_shard):
+            if unshard_replicate:
+                self._assert_replicate_params_unsharded()
             return
 
         if unshard_replicate:
-            for param in self.replicate_params:
-                param.unshard(async_op)
-        if self.config.comm_fusion and self.param_group is not None:
-            self.param_group.unshard(async_op)
-        else:
-            for param in self.sharded_hsdp_params:
-                param.unshard(async_op)
+            if self.is_replicate_shard:
+                for param in self.replicate_params:
+                    param.unshard(async_op)
+            else:
+                self._assert_replicate_params_unsharded()
+        if self.is_shard:
+            if self.config.comm_fusion and self.param_group is not None:
+                self.param_group.unshard(async_op)
+            else:
+                for param in self.sharded_hsdp_params:
+                    param.unshard(async_op)
         if not async_op:
             self.wait_for_unshard(unshard_replicate)
 
@@ -103,17 +119,24 @@ class HSDPState:
 
     def wait_for_unshard(self, wait_for_replicate: bool = True):
         """wait for all unshard parameters"""
-        if not self.is_shard:
+        if not self.is_shard and (not wait_for_replicate or not self.is_replicate_shard):
+            if wait_for_replicate:
+                self._assert_replicate_params_unsharded()
             return
         if wait_for_replicate:
-            for param in self.replicate_params:
-                param.wait_for_unshard()
-        if self.config.comm_fusion and self.param_group is not None:
-            self.param_group.wait_for_unshard()
-        else:
-            for param in self.sharded_hsdp_params:
-                param.wait_for_unshard()
-        self.is_shard = False
+            if self.is_replicate_shard:
+                for param in self.replicate_params:
+                    param.wait_for_unshard()
+                self.is_replicate_shard = False
+            else:
+                self._assert_replicate_params_unsharded()
+        if self.is_shard:
+            if self.config.comm_fusion and self.param_group is not None:
+                self.param_group.wait_for_unshard()
+            else:
+                for param in self.sharded_hsdp_params:
+                    param.wait_for_unshard()
+            self.is_shard = False
 
     def _iter_managed_params(self):
         """Return all fully_shard-managed parameters, including replicate_params."""

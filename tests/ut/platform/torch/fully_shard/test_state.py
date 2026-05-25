@@ -19,6 +19,8 @@ dtype no-op vs cast, and invalid input handling. All tests run on CPU.
 """
 import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 # Force torch platform before any hyper_parallel imports
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
@@ -26,6 +28,8 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 # pylint: disable=C0413
 import torch
 
+from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
+from hyper_parallel.core.fully_shard.hsdp_utils import ShardedState
 from hyper_parallel.platform.torch.fully_shard.state import _to_dtype_if_needed
 
 
@@ -87,6 +91,81 @@ class TestToDtypeIfNeeded(unittest.TestCase):
         # Act & Assert (None has no .dtype attribute)
         with self.assertRaises(AttributeError):
             _to_dtype_if_needed(None, torch.float32)
+
+
+class TestReplicateParamTransitionState(unittest.TestCase):
+    """Minimal state-machine coverage for replicate_params transitions."""
+
+    def test_backward_prefetch_skips_replicate_params(self):
+        """backward prefetch must not unshard already-materialized replicate params."""
+        state = object.__new__(HSDPState)
+        state.is_shard = True
+        state.is_replicate_shard = False
+        state.config = SimpleNamespace(comm_fusion=False)
+        state.replicate_params = [MagicMock()]
+        state.sharded_hsdp_params = [MagicMock()]
+
+        state.prefetch(unshard_replicate=False)
+
+        state.replicate_params[0].unshard.assert_not_called()
+        state.sharded_hsdp_params[0].unshard.assert_called_once_with(True)
+
+    def test_default_unshard_skips_already_unsharded_replicate_param_after_forward_reshard(self):
+        """Default unshard should be idempotent for already-materialized replicate params."""
+        state = object.__new__(HSDPState)
+        state.is_shard = False
+        state.is_replicate_shard = False
+        state.config = SimpleNamespace(comm_fusion=False)
+        replicate_param = MagicMock()
+        replicate_param.uses_param_shard = False
+        replicate_param.sharded_state = ShardedState.UNSHARDED
+        sharded_param = MagicMock()
+        state.replicate_params = [replicate_param]
+        state.sharded_hsdp_params = [sharded_param]
+
+        state.shard(shard_replicate=False)
+        state.unshard()
+
+        replicate_param.unshard.assert_not_called()
+        replicate_param.wait_for_unshard.assert_not_called()
+        sharded_param.unshard.assert_called_once_with(False)
+        sharded_param.wait_for_unshard.assert_called_once_with()
+
+    def test_default_unshard_rejects_stale_replicate_state_after_forward_reshard(self):
+        """A stale replicate state should still fail instead of being silently skipped."""
+        state = object.__new__(HSDPState)
+        state.is_shard = False
+        state.is_replicate_shard = False
+        state.config = SimpleNamespace(comm_fusion=False)
+        replicate_param = MagicMock()
+        replicate_param._param_fqn = "weight"
+        replicate_param.sharded_state = ShardedState.SHARDED
+        sharded_param = MagicMock()
+        state.replicate_params = [replicate_param]
+        state.sharded_hsdp_params = [sharded_param]
+
+        state.shard(shard_replicate=False)
+        with self.assertRaisesRegex(AssertionError, "Expected replicate parameter weight"):
+            state.unshard()
+
+        replicate_param.unshard.assert_not_called()
+        replicate_param.wait_for_unshard.assert_not_called()
+
+    def test_comm_fusion_without_param_group_falls_back_to_per_param_path(self):
+        """States without a fused group should not dereference param_group under comm_fusion."""
+        state = object.__new__(HSDPState)
+        state.is_shard = True
+        state.is_replicate_shard = True
+        state.config = SimpleNamespace(comm_fusion=True)
+        state.param_group = None
+        state.replicate_params = []
+        sharded_param = MagicMock()
+        state.sharded_hsdp_params = [sharded_param]
+
+        state.unshard()
+
+        sharded_param.unshard.assert_called_once_with(False)
+        sharded_param.wait_for_unshard.assert_called_once_with()
 
 
 if __name__ == "__main__":
