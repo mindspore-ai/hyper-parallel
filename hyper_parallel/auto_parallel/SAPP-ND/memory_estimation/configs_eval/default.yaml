@@ -1,0 +1,124 @@
+nodes_mem_comp :
+  # EvalHead
+  head :
+    name: EMBEDDING_LAYER
+    num_param_fun : num_params_embed
+    stat_fun :
+      p : stat_embed_p
+      os : stat_embed_os
+      grad : stat_embed_grad
+    dyn_fun :
+      activation : activ_embed
+      comm :
+        dp: dp_comm_embed
+        tp: tp_comm_embed
+
+  # EvalTail
+  tail :
+    name: OUTPUT_LAYER
+    num_param_fun : num_params_output
+    stat_fun :
+      p : stat_output_p
+      os : stat_output_os
+      grad : stat_output_grad
+    dyn_fun:
+      activation : activ_output
+      comm:
+        dp: comm_output
+
+  # EvalBody
+  body :
+    -
+      name: NOT_REC_LAYER
+      num_param_fun : &num_p_lay num_params_layer
+      stat_fun : &stat_lay
+        p : stat_p_layer
+        os : stat_os_layer
+        grad : stat_grad_layer
+      dyn_fun : &dyn_lay
+        activation : layer_activ
+        comm:
+            dp : dp_comm_layer
+            tp : tp_comm_layer
+            ep : ep_comm_layer
+            cp : cp_comm_layer
+    -
+      name : SEL_REC_LAYER
+      num_param_fun : *num_p_lay
+      stat_fun : *stat_lay
+      dyn_fun : *dyn_lay
+    -
+      name : FULL_REC_LAYER
+      num_param_fun : *num_p_lay
+      stat_fun : *stat_lay
+      dyn_fun :
+        activation : fullrec_layer_activ
+        comm:
+            dp: dp_comm_layer
+
+passes :
+  vpp_less_memory : False
+  swap_optimizer : False
+  dropless_tok_factor : 1
+
+base_arch_mem_comp :
+  attention :
+    num_param_fun : num_params_attn
+    qkv : attn_qkv_activations
+    score : attn_score_activations
+    proj : attn_proj_activations
+  feedforward : 
+    num_param_fun : num_params_ffn
+    activation : ffn_activations
+    moe_activ : ffn_moe_activations
+  norm : 
+    num_param_fun : num_params_norm
+    activation : norm_activations
+
+pp_sched :
+    - 
+      name : &def_sched 1f1b
+      fun : pp_1f1b_micro_factor
+    - 
+      name : seqpipe
+      fun : pp_seq1f1b_micro_factor
+    - 
+      name : zero_bubble_v
+      fun : pp_dualpipe_v_micro_factor
+    -
+      name : seqsmartvpp
+      fun : pp_seq1f1b_micro_factor
+    -
+      name : gpipe
+      fun : pp_gpipe_micro_factor
+      
+comm_expr : max(dp, tp, cp) + ep
+
+# trace_fun: num_params_attn
+default_pp_sched : *def_sched
+
+# hook_class: XY
+# hook_class: XY_Qwen
+
+# Lists of [model_name, type]
+# ppb_combined:
+#   - [
+#       ["siglip","tail"],
+#       ["ppn","head"],
+#       ["ppn","body"],
+#       ["ppn","tail"],
+#       ["qformer","head"],
+#       ["qformer","body"],
+#       ["qformer", "tail"]
+#     ]
+
+# ppb_combined:
+#   - [
+#       ["qwen2vit","tail"],
+#       ["lnmlp","head"],
+#       ["lnmlp","body"],
+#       ["lnmlp", "tail"]
+#     ]
+#   - [["deepseekv3", "head"]]
+
+# New components are either "increments" or "replacements"
