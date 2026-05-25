@@ -12,232 +12,130 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""Test runner for flatten distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_flatten.py")
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_flatten_all_dims():
-    '''
-    Feature: test parallel op flatten.
-    Description: test parallel op flatten.
+def test_parallel_op_flatten_group1():
+    """
+    Feature: parallel run case in _test_parallel_op_flatten
+    Description:
+        1. test_flatten_2d_to_1d — - Flatten a 2D tensor to 1D (start_dim=0, end_dim=1).
+        2. test_flatten_all_dims —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_flatten_2d_to_1d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_flatten_all_dims", num_proc=4),
+    ])
 
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_all_dims"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_flatten_all_dims():
-    '''
-    Feature: test parallel op flatten (gloo cpu).
-    Description: test parallel op flatten.
+def test_parallel_op_flatten_group1_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_flatten
+    Description:
+        1. test_flatten_2d_to_1d — - Flatten a 2D tensor to 1D (start_dim=0, end_dim=1).
+        2. test_flatten_all_dims —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_flatten_2d_to_1d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_flatten_all_dims", num_proc=4),
+    ])
 
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_all_dims"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_flatten_middle_dims():
-    '''
-    Feature: dtensor + torch.Tensor.flatten on middle dimensions with partial sharding
+def test_parallel_op_flatten_group2():
+    """
+    Feature: parallel run case in _test_parallel_op_flatten
     Description:
-        - Flatten dimensions 1 and 2 of a 4D distributed tensor.
-        - Input tensor has shape (4, 2, 4, 6), sharded on dim0 ("dp") and dim1 ("tp").
-        - Only one of the flattened dimensions (dim1) is sharded.
+        1. test_flatten_default_args — - Apply flatten() without explicit start_dim and end_dim.
+        2. test_flatten_middle_dims — - Flatten dimensions 1 and 2 of a 4D distributed tensor.
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_flatten_default_args", num_proc=4),
+        TorchCase(IMPL_FILE, "test_flatten_middle_dims", num_proc=4),
+    ])
 
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_middle_dims"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_flatten_middle_dims():
-    '''
-    Feature: dtensor + torch.Tensor.flatten on middle dimensions with partial sharding (gloo cpu)
+def test_parallel_op_flatten_group2_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_flatten
     Description:
-        - Flatten dimensions 1 and 2 of a 4D distributed tensor.
-        - Input tensor has shape (4, 2, 4, 6), sharded on dim0 ("dp") and dim1 ("tp").
-        - Only one of the flattened dimensions (dim1) is sharded.
+        1. test_flatten_default_args — - Apply flatten() without explicit start_dim and end_dim.
+        2. test_flatten_middle_dims — - Flatten dimensions 1 and 2 of a 4D distributed tensor.
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_flatten_default_args", num_proc=4),
+        TorchCase(IMPL_FILE, "test_flatten_middle_dims", num_proc=4),
+    ])
 
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_middle_dims"
-    torchrun_case(file_name, case_name, num_proc=4)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_flatten_unsharded():
-    '''
-    Feature: dtensor + torch.Tensor.flatten on unsharded middle dimensions
+def test_parallel_op_flatten_group3():
+    """
+    Feature: parallel run case in _test_parallel_op_flatten
     Description:
-        - Flatten dimensions 1 and 2 of a 3D distributed tensor.
-        - Input tensor has shape (8, 4, 6), sharded only on dim0 ("dp").
-        - The dimensions being flattened (dim1, dim2) are both replicated.
+        1. test_flatten_negative_dims — - Flatten dimensions using negative indices (-2, -1) on a 3D distributed tensor.
+        2. test_flatten_scalar — - Apply flatten(0, -1) to a distributed scalar tensor.
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_flatten_negative_dims", num_proc=4),
+        TorchCase(IMPL_FILE, "test_flatten_scalar", num_proc=4),
+    ])
 
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_unsharded"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_flatten_unsharded():
-    '''
-    Feature: dtensor + torch.Tensor.flatten on unsharded middle dimensions (gloo cpu)
+def test_parallel_op_flatten_group3_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_flatten
     Description:
-        - Flatten dimensions 1 and 2 of a 3D distributed tensor.
-        - Input tensor has shape (8, 4, 6), sharded only on dim0 ("dp").
-        - The dimensions being flattened (dim1, dim2) are both replicated.
+        1. test_flatten_negative_dims — - Flatten dimensions using negative indices (-2, -1) on a 3D distributed tensor.
+        2. test_flatten_scalar — - Apply flatten(0, -1) to a distributed scalar tensor.
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_flatten_negative_dims", num_proc=4),
+        TorchCase(IMPL_FILE, "test_flatten_scalar", num_proc=4),
+    ])
 
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_unsharded"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_flatten_negative_dims():
-    '''
-    Feature: dtensor + torch.Tensor.flatten with negative dimension indices
+def test_parallel_op_flatten_group4():
+    """
+    Feature: parallel run case in _test_parallel_op_flatten
     Description:
-        - Flatten dimensions using negative indices (-2, -1) on a 3D distributed tensor.
-        - Input tensor has shape (8, 4, 6), sharded on dim0 ("dp") and dim1 ("tp").
-        - The flattened dimensions correspond to dim1 and dim2, where dim1 is sharded.
+        1. test_flatten_single_dim — - Flatten a single dimension (e.g., start_dim=1, end_dim=1).
+        2. test_flatten_unsharded — - Flatten dimensions 1 and 2 of a 3D distributed tensor.
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_flatten_single_dim", num_proc=4),
+        TorchCase(IMPL_FILE, "test_flatten_unsharded", num_proc=4),
+    ])
 
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_negative_dims"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_flatten_negative_dims():
-    '''
-    Feature: dtensor + torch.Tensor.flatten with negative dimension indices (gloo cpu)
+def test_parallel_op_flatten_group4_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_flatten
     Description:
-        - Flatten dimensions using negative indices (-2, -1) on a 3D distributed tensor.
-        - Input tensor has shape (8, 4, 6), sharded on dim0 ("dp") and dim1 ("tp").
-        - The flattened dimensions correspond to dim1 and dim2, where dim1 is sharded.
+        1. test_flatten_single_dim — - Flatten a single dimension (e.g., start_dim=1, end_dim=1).
+        2. test_flatten_unsharded — - Flatten dimensions 1 and 2 of a 3D distributed tensor.
     Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_negative_dims"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_flatten_scalar():
-    '''
-    Feature: dtensor + torch.Tensor.flatten on a distributed scalar
-    Description:
-        - Apply flatten(0, -1) to a distributed scalar tensor.
-        - A scalar has no dimensions, so flatten should conceptually have no effect on its shape.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_scalar"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_flatten_scalar():
-    '''
-    Feature: dtensor + torch.Tensor.flatten on a distributed scalar (gloo cpu)
-    Description:
-        - Apply flatten(0, -1) to a distributed scalar tensor.
-        - A scalar has no dimensions, so flatten should conceptually have no effect on its shape.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_scalar"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_flatten_default_args():
-    '''
-    Feature: dtensor + torch.Tensor.flatten with default arguments
-    Description:
-        - Apply flatten() without explicit start_dim and end_dim.
-        - The default behavior is flattening all dimensions.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_default_args"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_flatten_default_args():
-    '''
-    Feature: dtensor + torch.Tensor.flatten with default arguments (gloo cpu)
-    Description:
-        - Apply flatten() without explicit start_dim and end_dim.
-        - The default behavior is flattening all dimensions.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_default_args"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_flatten_single_dim():
-    '''
-    Feature: dtensor + torch.Tensor.flatten with start_dim == end_dim
-    Description:
-        - Flatten a single dimension (e.g., start_dim=1, end_dim=1).
-        - Conceptually, this operation should not change the shape or layout.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_single_dim"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_flatten_single_dim():
-    '''
-    Feature: dtensor + torch.Tensor.flatten with start_dim == end_dim (gloo cpu)
-    Description:
-        - Flatten a single dimension (e.g., start_dim=1, end_dim=1).
-        - Conceptually, this operation should not change the shape or layout.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_single_dim"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_flatten_2d_to_1d():
-    '''
-    Feature: dtensor + torch.Tensor.flatten from 2D to 1D
-    Description:
-        - Flatten a 2D tensor to 1D (start_dim=0, end_dim=1).
-        - Input tensor has shape (8, 4), sharded on dim0 ("dp").
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_2d_to_1d"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_flatten_2d_to_1d():
-    '''
-    Feature: dtensor + torch.Tensor.flatten from 2D to 1D (gloo cpu)
-    Description:
-        - Flatten a 2D tensor to 1D (start_dim=0, end_dim=1).
-        - Input tensor has shape (8, 4), sharded on dim0 ("dp").
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_flatten.py"
-    case_name = "test_flatten_2d_to_1d"
-    torchrun_case(file_name, case_name)
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_flatten_single_dim", num_proc=4),
+        TorchCase(IMPL_FILE, "test_flatten_unsharded", num_proc=4),
+    ])

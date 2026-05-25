@@ -24,8 +24,6 @@ import pytest
 
 pytest.importorskip("mindspore")
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
-
 from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E402
     ensure_mindspore_platform_for_shard_and_dtensor,
 )

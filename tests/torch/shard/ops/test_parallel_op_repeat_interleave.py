@@ -13,10 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """test parallel op repeat_interleave"""
+from pathlib import Path
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-PARALLEL_OP_REPEAT_INTERLEAVE = "parallel_op_repeat_interleave.py"
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_repeat_interleave.py")
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_repeat_interleave_group1():
@@ -28,22 +29,22 @@ def test_parallel_op_repeat_interleave_group1():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_repeat_interleave_layout_inference", num_proc=4),
-        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_repeat_interleave_with_tensor", num_proc=4),
+        TorchCase(IMPL_FILE, "test_repeat_interleave_layout_inference", num_proc=4),
+        TorchCase(IMPL_FILE, "test_repeat_interleave_with_tensor", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_repeat_interleave_group1_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_repeat_interleave_layout_inference
         2.test_repeat_interleave_with_tensor
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_repeat_interleave_layout_inference", num_proc=4),
-        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_repeat_interleave_with_tensor", num_proc=4),
+        TorchCase(IMPL_FILE, "test_repeat_interleave_layout_inference", num_proc=4),
+        TorchCase(IMPL_FILE, "test_repeat_interleave_with_tensor", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -55,17 +56,17 @@ def test_parallel_op_repeat_interleave_group2():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_repeat_interleave_dim_none", num_proc=4)
+        TorchCase(IMPL_FILE, "test_repeat_interleave_dim_none", num_proc=4)
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_repeat_interleave_group2_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_repeat_interleave_dim_none
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_REPEAT_INTERLEAVE, "test_repeat_interleave_dim_none", num_proc=4)
+        TorchCase(IMPL_FILE, "test_repeat_interleave_dim_none", num_proc=4)
     ])

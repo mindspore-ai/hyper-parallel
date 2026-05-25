@@ -12,78 +12,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test in-place division (div_) dtensor"""
-from tests.torch.utils import torchrun_case
+"""Test runner for div_ distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_div_.py")
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_div__identical_sharding():
-    '''
-    Feature: test parallel op div_ (identical sharding).
-    Description: test parallel op div_.
+def test_parallel_op_div__group1():
+    """
+    Feature: parallel run case in _test_parallel_op_div_
+    Description:
+        1. test_div__broadcast —
+        2. test_div__identical_sharding —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_div__broadcast", num_proc=4),
+        TorchCase(IMPL_FILE, "test_div__identical_sharding", num_proc=4),
+    ])
 
-    file_name = "parallel_op_div_.py"
-    case_name = "test_div__identical_sharding"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_div__identical_sharding():
-    '''
-    Feature: test parallel op div_ (identical sharding, gloo cpu).
-    Description: test parallel op div_.
+def test_parallel_op_div__group1_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_div_
+    Description:
+        1. test_div__broadcast —
+        2. test_div__identical_sharding —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_div__broadcast", num_proc=4),
+        TorchCase(IMPL_FILE, "test_div__identical_sharding", num_proc=4),
+    ])
 
-    file_name = "parallel_op_div_.py"
-    case_name = "test_div__identical_sharding"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_div__broadcast():
-    '''
-    Feature: test parallel op div_ (broadcasting).
-    Description: test parallel op div_.
+def test_parallel_op_div__group2():
+    """
+    Feature: parallel run case in _test_parallel_op_div_
+    Description:
+        1. test_div__scalar —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_div__scalar", num_proc=4),
+    ])
 
-    file_name = "parallel_op_div_.py"
-    case_name = "test_div__broadcast"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_div__broadcast():
-    '''
-    Feature: test parallel op div_ (broadcasting, gloo cpu).
-    Description: test parallel op div_.
+def test_parallel_op_div__group2_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_div_
+    Description:
+        1. test_div__scalar —
     Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_div_.py"
-    case_name = "test_div__broadcast"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_div__scalar():
-    '''
-    Feature: test parallel op div_ (scalar).
-    Description: test parallel op div_.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_div_.py"
-    case_name = "test_div__scalar"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_div__scalar():
-    '''
-    Feature: test parallel op div_ (scalar, gloo cpu).
-    Description: test parallel op div_.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_div_.py"
-    case_name = "test_div__scalar"
-    torchrun_case(file_name, case_name)
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_div__scalar", num_proc=4),
+    ])

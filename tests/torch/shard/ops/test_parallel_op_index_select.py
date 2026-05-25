@@ -12,342 +12,220 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""Test runner for index_select distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_basic():
-    '''
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select basic unsharded dimension.
-    Expectation: Run success.
-    '''
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_index_select.py")
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_basic"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_basic():
-    '''
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select basic unsharded dimension.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_basic"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_3d():
-    '''
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select on 3D tensor with multiple sharded dimensions.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_3d"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_3d():
-    '''
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select on 3D tensor with multiple sharded dimensions.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_3d"
-    torchrun_case(file_name, case_name, num_proc=4)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_negative_dim():
-    '''
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select with a negative dimension index.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_negative_dim"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_negative_dim():
-    '''
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select with a negative dimension index.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_negative_dim"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_2d_dim0():
+def test_parallel_op_index_select_group1():
     """
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select on dim 0 with a 2D tensor.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_2d_dim0 —
+        2. test_index_select_2d_dim1 —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_2d_dim0", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_2d_dim1", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_2d_dim0"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_2d_dim0():
+def test_parallel_op_index_select_group1_gloo():
     """
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select on dim 0 with a 2D tensor.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_2d_dim0 —
+        2. test_index_select_2d_dim1 —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_2d_dim0", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_2d_dim1", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_2d_dim0"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_2d_dim1():
+def test_parallel_op_index_select_group2():
     """
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select on dim 1 with a 2D tensor.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_3d —
+        2. test_index_select_3d_dim1 —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_3d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_3d_dim1", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_2d_dim1"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_2d_dim1():
+def test_parallel_op_index_select_group2_gloo():
     """
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select on dim 1 with a 2D tensor.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_3d —
+        2. test_index_select_3d_dim1 —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_3d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_3d_dim1", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_2d_dim1"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_3d_dim1():
+def test_parallel_op_index_select_group3():
     """
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select on an unsharded dimension of a 3D tensor.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_basic —
+        2. test_index_select_duplicate_indices_sharded —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_basic", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_duplicate_indices_sharded", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_3d_dim1"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_3d_dim1():
+def test_parallel_op_index_select_group3_gloo():
     """
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select on an unsharded dimension of a 3D tensor.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_basic —
+        2. test_index_select_duplicate_indices_sharded —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_basic", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_duplicate_indices_sharded", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_3d_dim1"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_single_element():
+def test_parallel_op_index_select_group4():
     """
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select using a single-element index.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_fully_replicated —
+        2. test_index_select_negative_dim —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_fully_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_negative_dim", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_single_element"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_single_element():
+def test_parallel_op_index_select_group4_gloo():
     """
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select using a single-element index.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_fully_replicated —
+        2. test_index_select_negative_dim —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_fully_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_negative_dim", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_single_element"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_sharded_dim0_2d():
+def test_parallel_op_index_select_group5():
     """
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select on a sharded dimension 0 of a 2D tensor.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_negative_sharded_dim —
+        2. test_index_select_out_of_order_sharded —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_negative_sharded_dim", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_out_of_order_sharded", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_sharded_dim0_2d"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_sharded_dim0_2d():
+def test_parallel_op_index_select_group5_gloo():
     """
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select on a sharded dimension 0 of a 2D tensor.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_negative_sharded_dim —
+        2. test_index_select_out_of_order_sharded —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_negative_sharded_dim", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_out_of_order_sharded", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_sharded_dim0_2d"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_sharded_dim1_2d():
+def test_parallel_op_index_select_group6():
     """
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select on a sharded dimension 1 of a 2D tensor.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_sharded_dim0_2d —
+        2. test_index_select_sharded_dim1_2d —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_sharded_dim0_2d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_sharded_dim1_2d", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_sharded_dim1_2d"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_sharded_dim1_2d():
+def test_parallel_op_index_select_group6_gloo():
     """
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select on a sharded dimension 1 of a 2D tensor.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_sharded_dim0_2d —
+        2. test_index_select_sharded_dim1_2d —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_sharded_dim0_2d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_sharded_dim1_2d", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_sharded_dim1_2d"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_sharded_dim2_3d():
+def test_parallel_op_index_select_group7():
     """
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select on a sharded dimension 2 of a 3D tensor.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_sharded_dim2_3d —
+        2. test_index_select_single_element —
     Expectation: Run success.
     """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_sharded_dim2_3d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_single_element", num_proc=4),
+    ])
 
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_sharded_dim2_3d"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_sharded_dim2_3d():
+def test_parallel_op_index_select_group7_gloo():
     """
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select on a sharded dimension 2 of a 3D tensor.
+    Feature: parallel run case in _test_parallel_op_index_select
+    Description:
+        1. test_index_select_sharded_dim2_3d —
+        2. test_index_select_single_element —
     Expectation: Run success.
     """
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_sharded_dim2_3d"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_duplicate_indices_sharded():
-    """
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select on a sharded dimension with duplicate indices.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_duplicate_indices_sharded"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_duplicate_indices_sharded():
-    """
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select on a sharded dimension with duplicate indices.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_duplicate_indices_sharded"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_out_of_order_sharded():
-    """
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select on a sharded dimension with out-of-order indices.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_out_of_order_sharded"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_out_of_order_sharded():
-    """
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select on a sharded dimension with out-of-order indices.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_out_of_order_sharded"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_fully_replicated():
-    """
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select on a fully replicated tensor.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_fully_replicated"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_fully_replicated():
-    """
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select on a fully replicated tensor.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_fully_replicated"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_index_select_negative_sharded_dim():
-    """
-    Feature: test parallel op index_select.
-    Description: test parallel op index_select using a negative index on a sharded dimension.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_negative_sharded_dim"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_index_select_negative_sharded_dim():
-    """
-    Feature: test parallel op index_select (gloo cpu).
-    Description: test parallel op index_select using a negative index on a sharded dimension.
-    Expectation: Run success.
-    """
-
-    file_name = "parallel_op_index_select.py"
-    case_name = "test_index_select_negative_sharded_dim"
-    torchrun_case(file_name, case_name)
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_index_select_sharded_dim2_3d", num_proc=4),
+        TorchCase(IMPL_FILE, "test_index_select_single_element", num_proc=4),
+    ])

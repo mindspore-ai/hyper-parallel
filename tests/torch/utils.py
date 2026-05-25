@@ -16,11 +16,12 @@
 import os
 import subprocess
 import sys
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
 
-from tests.common.parallel_case import allocate_port
+from tests.common.port_utils import allocate_port
 
 
 def init_dist() -> tuple[int, int]:
@@ -42,7 +43,7 @@ def init_dist_gloo() -> int:
     return rank
 
 
-def init_backend(device_type: str):
+def init_backend(device_type: str) -> Union[tuple[int, int], int]:
     """Initialize distributed backend for the given device type.
 
     Args:
@@ -71,7 +72,36 @@ def to_device(tensor: torch.Tensor, device_type: str) -> torch.Tensor:
     return tensor
 
 
-def torchrun_case(file_name: str, case_name: str, master_port: int | None = None, num_proc: int = 8) -> None:
+def get_device_type() -> str:
+    """Return the device type for torch distributed tests.
+
+    Checks HYPER_PARALLEL_TEST_DEVICE_TYPE first. If unset, detects
+    torch_npu availability and returns "npu" or "cpu".
+
+    Returns:
+        "npu" or "cpu"
+
+    Raises:
+        ValueError: If HYPER_PARALLEL_TEST_DEVICE_TYPE is set to an unsupported value.
+    """
+    env_val = os.environ.get("HYPER_PARALLEL_TEST_DEVICE_TYPE", "").strip().lower()
+    if env_val:
+        if env_val not in ("npu", "cpu"):
+            raise ValueError(
+                f"HYPER_PARALLEL_TEST_DEVICE_TYPE must be 'npu' or 'cpu', got {env_val!r}"
+            )
+        return env_val
+    try:
+        import torch_npu  # pylint: disable=C0415,W0611
+        return "npu"
+    except ImportError:
+        return "cpu"
+
+
+_DEVICE_TYPE = get_device_type()
+
+
+def torchrun_case(file_name: str, case_name: str, master_port: Optional[int] = None, num_proc: int = 8) -> None:
     """Spawn *num_proc* workers via ``python -m torch.distributed.run`` (same as torchrun).
 
     Uses :data:`sys.executable` so conda/env interpreters work when ``torchrun`` is not on ``PATH``.

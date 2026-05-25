@@ -13,43 +13,19 @@
 # limitations under the License.
 # ============================================================================
 """parallel run case"""
-import fcntl
 import os
 import signal
 import multiprocessing as mp
-import tempfile
-from typing import Union
+from typing import Optional, Union
 
-
-def allocate_port() -> int:
-    """Atomically allocate a unique port from a circular counter.
-
-    Uses :func:`fcntl.flock` to guarantee that no two processes ever receive
-    the same port.  The counter wraps through a fixed range (10000–29999,
-    deliberately below the Linux default ephemeral range of 32768–60999)
-    so that ports are cycled safely without colliding with OS-assigned ports.
-
-    Returns:
-        A TCP port number guaranteed unique among all current callers.
-    """
-    counter_path = os.path.join(tempfile.gettempdir(), f"hp_port_counter_{os.getuid()}")
-    port_base = 10000
-    port_range = 20000
-    with open(counter_path, "a+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        f.seek(0)
-        content = f.read().strip()
-        counter = int(content) if content else 0
-        f.seek(0)
-        f.truncate()
-        f.write(str(counter + 1))
-    return port_base + (counter % port_range)
+from tests.common.port_utils import allocate_port
 
 
 class TorchCase:
     """torch case messages"""
 
-    def __init__(self, file_name: str, case_name: str, master_port: int | None = None, num_proc: int = 1):
+    def __init__(self, file_name: str, case_name: str, master_port: Optional[int] = None, num_proc: int = 1) -> None:
+        """Initialize TorchCase with file path, case name, optional port, and process count."""
         self.file_name = file_name
         self.case_name = case_name
         self.master_port = master_port
@@ -59,8 +35,9 @@ class TorchCase:
 class MindSporeCase:
     """mindspore case messages"""
 
-    def __init__(self, file_name: str, case_name: str, master_port: int, worker_num: int = 1, local_worker_num: int = 1,
-                 glog_v: int = 3):
+    def __init__(self, file_name: str, case_name: str, master_port: Optional[int] = None, worker_num: int = 1,
+                 local_worker_num: int = 1, glog_v: int = 3) -> None:
+        """Initialize MindSporeCase with file path, case name, optional port, worker counts, and log level."""
         self.glog_v = glog_v
         self.file_name = file_name
         self.case_name = case_name
@@ -69,9 +46,12 @@ class MindSporeCase:
         self.local_worker_num = local_worker_num
 
 
-def run_case(visible_devices, case: Union[TorchCase, MindSporeCase]):
-    """
-    run case in child process
+def run_case(visible_devices: list, case: Union[TorchCase, MindSporeCase]) -> None:
+    """Run a single test case in a child process with device visibility set.
+
+    Args:
+        visible_devices: List of device indices to expose via ASCEND_RT_VISIBLE_DEVICES.
+        case: The test case descriptor (TorchCase or MindSporeCase).
     """
     # become the leader of a new process group so that os.killpg on timeout
     # kills torchrun/msrun worker sub-processes as well as this wrapper
@@ -99,18 +79,23 @@ def _auto_assign_ports(cases: list) -> None:
             case.master_port = allocate_port()
 
 
-def parallel_run(cases: Union[list[TorchCase], list[MindSporeCase]], global_num_proc: int = 8):
-    """
-    parallel run cases
+def parallel_run(cases: Union[list[TorchCase], list[MindSporeCase]], global_num_proc: int = 8) -> None:
+    """Run a group of test cases in parallel, assigning disjoint device slices to each.
 
     Args:
-        cases (list[Case]): list of case messages to be run parallel
-        global_num_proc (int, optional): number of total num of process. Defaults to 8.
+        cases: List of TorchCase or MindSporeCase descriptors to run concurrently.
+            The sum of all ``num_proc`` values must not exceed ``global_num_proc``.
+        global_num_proc: Total device budget for this group. Defaults to 8.
+
+    Raises:
+        AssertionError: If the total device count exceeds ``global_num_proc``, if any
+            case times out (900 s deadline), or if any child process exits with a
+            non-zero return code.
     """
     # auto-assign ports before spawning children (avoids cross-process races)
-    torch_cases = [c for c in cases if isinstance(c, TorchCase) and c.master_port is None]
-    if torch_cases:
-        _auto_assign_ports(torch_cases)
+    unassigned = [c for c in cases if c.master_port is None]
+    if unassigned:
+        _auto_assign_ports(unassigned)
 
     # assign devices
     sum_num_proc = 0

@@ -13,10 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """test parallel op layernorm"""
+from pathlib import Path
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-PARALLEL_OP_LAYERNORM = "parallel_op_layernorm.py"
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_layernorm.py")
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_layernorm_group1():
@@ -27,19 +28,19 @@ def test_parallel_op_layernorm_group1():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_layernorm_data_parallel", num_proc=4),
+        TorchCase(IMPL_FILE, "test_layernorm_data_parallel", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_layernorm_group1_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1. test_layernorm_data_parallel
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_layernorm_data_parallel", num_proc=4),
+        TorchCase(IMPL_FILE, "test_layernorm_data_parallel", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -51,19 +52,19 @@ def test_parallel_op_layernorm_group2():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_layernorm_model_parallel", num_proc=4),
+        TorchCase(IMPL_FILE, "test_layernorm_model_parallel", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_layernorm_group2_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1. test_layernorm_model_parallel
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_layernorm_model_parallel", num_proc=4),
+        TorchCase(IMPL_FILE, "test_layernorm_model_parallel", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -75,19 +76,19 @@ def test_parallel_op_layernorm_group3():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_layernorm_hybrid_parallel", num_proc=4),
+        TorchCase(IMPL_FILE, "test_layernorm_hybrid_parallel", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_layernorm_group3_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1. test_layernorm_hybrid_parallel
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_layernorm_hybrid_parallel", num_proc=4),
+        TorchCase(IMPL_FILE, "test_layernorm_hybrid_parallel", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -99,17 +100,17 @@ def test_parallel_op_layernorm_group4():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_layernorm_all_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_layernorm_all_replicated", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_layernorm_group4_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1. test_layernorm_all_replicate
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_LAYERNORM, "test_layernorm_all_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_layernorm_all_replicated", num_proc=4),
     ])

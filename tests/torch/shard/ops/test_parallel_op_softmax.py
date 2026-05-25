@@ -1,4 +1,4 @@
-# Copyright 2025-2026 Huawei Technologies Co., Ltd
+# Copyright 2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,126 +12,96 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor"""
-from tests.torch.utils import torchrun_case
+"""Test runner for softmax distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
+
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_softmax.py")
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_softmax_data_parallel():
-    '''
-    Feature: test parallel op softmax.
-    Description: test parallel op softmax data parallel.
+def test_parallel_op_softmax_group1():
+    """
+    Feature: parallel run case in _test_parallel_op_softmax
+    Description:
+        1. test_softmax_hybrid_parallel —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_softmax_hybrid_parallel", num_proc=8),
+    ])
 
-    file_name = "parallel_op_softmax.py"
-    case_name = "test_softmax_data_parallel"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_softmax_data_parallel():
-    '''
-    Feature: test parallel op softmax (gloo cpu).
-    Description: test parallel op softmax data parallel.
+def test_parallel_op_softmax_group1_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_softmax
+    Description:
+        1. test_softmax_hybrid_parallel —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_softmax_hybrid_parallel", num_proc=8),
+    ])
 
-    file_name = "parallel_op_softmax.py"
-    case_name = "test_softmax_data_parallel"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_softmax_model_parallel():
-    '''
-    Feature: test parallel op softmax.
-    Description: test parallel op softmax model parallel.
+def test_parallel_op_softmax_group2():
+    """
+    Feature: parallel run case in _test_parallel_op_softmax
+    Description:
+        1. test_softmax_all_replicated —
+        2. test_softmax_data_parallel —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_softmax_all_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_softmax_data_parallel", num_proc=4),
+    ])
 
-    file_name = "parallel_op_softmax.py"
-    case_name = "test_softmax_model_parallel"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_softmax_model_parallel():
-    '''
-    Feature: test parallel op softmax (gloo cpu).
-    Description: test parallel op softmax model parallel.
+def test_parallel_op_softmax_group2_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_softmax
+    Description:
+        1. test_softmax_all_replicated —
+        2. test_softmax_data_parallel —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_softmax_all_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_softmax_data_parallel", num_proc=4),
+    ])
 
-    file_name = "parallel_op_softmax.py"
-    case_name = "test_softmax_model_parallel"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_softmax_hybrid_parallel():
-    '''
-    Feature: test parallel op softmax.
-    Description: test parallel op softmax hybrid parallel.
+def test_parallel_op_softmax_group3():
+    """
+    Feature: parallel run case in _test_parallel_op_softmax
+    Description:
+        1. test_softmax_model_parallel —
+        2. test_softmax_negative_dim —
     Expectation: Run success.
-    '''
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_softmax_model_parallel", num_proc=4),
+        TorchCase(IMPL_FILE, "test_softmax_negative_dim", num_proc=4),
+    ])
 
-    file_name = "parallel_op_softmax.py"
-    case_name = "test_softmax_hybrid_parallel"
-    torchrun_case(file_name, case_name)
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_softmax_hybrid_parallel():
-    '''
-    Feature: test parallel op softmax (gloo cpu).
-    Description: test parallel op softmax hybrid parallel.
+def test_parallel_op_softmax_group3_gloo():
+    """
+    Feature: parallel run case in _test_parallel_op_softmax
+    Description:
+        1. test_softmax_model_parallel —
+        2. test_softmax_negative_dim —
     Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_softmax.py"
-    case_name = "test_softmax_hybrid_parallel"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_softmax_all_replicated():
-    '''
-    Feature: test parallel op softmax.
-    Description: test parallel op softmax all replicated.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_softmax.py"
-    case_name = "test_softmax_all_replicated"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_softmax_all_replicated():
-    '''
-    Feature: test parallel op softmax (gloo cpu).
-    Description: test parallel op softmax all replicated.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_softmax.py"
-    case_name = "test_softmax_all_replicated"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_softmax_negative_dim():
-    '''
-    Feature: test parallel op softmax.
-    Description: test parallel op softmax negative dim.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_softmax.py"
-    case_name = "test_softmax_negative_dim"
-    torchrun_case(file_name, case_name)
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_softmax_negative_dim():
-    '''
-    Feature: test parallel op softmax (gloo cpu).
-    Description: test parallel op softmax negative dim.
-    Expectation: Run success.
-    '''
-
-    file_name = "parallel_op_softmax.py"
-    case_name = "test_softmax_negative_dim"
-    torchrun_case(file_name, case_name)
+    """
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_softmax_model_parallel", num_proc=4),
+        TorchCase(IMPL_FILE, "test_softmax_negative_dim", num_proc=4),
+    ])

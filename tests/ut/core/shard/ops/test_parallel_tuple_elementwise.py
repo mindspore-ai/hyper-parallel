@@ -17,8 +17,6 @@ import os
 import unittest
 from unittest.mock import patch
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
-
 import numpy as np
 
 from hyper_parallel.core.dtensor.dtensor import _build_layout

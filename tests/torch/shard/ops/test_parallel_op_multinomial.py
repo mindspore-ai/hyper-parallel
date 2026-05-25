@@ -13,10 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """test parallel op multinomial"""
+from pathlib import Path
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-PARALLEL_OP_MULTINOMIAL = "parallel_op_multinomial.py"
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_multinomial.py")
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_multinomial_group1():
@@ -28,22 +29,22 @@ def test_parallel_op_multinomial_group1():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_multinomial_1d_replicated", num_proc=4),
-        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_multinomial_2d_data_parallel", num_proc=4),
+        TorchCase(IMPL_FILE, "test_multinomial_1d_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_multinomial_2d_data_parallel", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_multinomial_group1_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_multinomial_1d_replicated
         2.test_multinomial_2d_data_parallel
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_multinomial_1d_replicated", num_proc=4),
-        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_multinomial_2d_data_parallel", num_proc=4),
+        TorchCase(IMPL_FILE, "test_multinomial_1d_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_multinomial_2d_data_parallel", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -55,17 +56,17 @@ def test_parallel_op_multinomial_group2():
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_multinomial_2d_fully_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_multinomial_2d_fully_replicated", num_proc=4),
     ])
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_multinomial_group2_gloo():
     """
-    Feature: parallel run case in shard (gloo cpu)
+    Feature: parallel run case in shard
     Description:
         1.test_multinomial_2d_fully_replicated
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(PARALLEL_OP_MULTINOMIAL, "test_multinomial_2d_fully_replicated", num_proc=4),
+        TorchCase(IMPL_FILE, "test_multinomial_2d_fully_replicated", num_proc=4),
     ])

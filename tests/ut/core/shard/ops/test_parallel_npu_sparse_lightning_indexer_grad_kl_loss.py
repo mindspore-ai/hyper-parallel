@@ -19,8 +19,6 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-
 from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE, DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_npu_sparse_lightning_indexer_grad_kl_loss import (

@@ -12,62 +12,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""test base dtensor mul_"""
-from tests.torch.utils import torchrun_case
+"""Test runner for mul_ distributed ST (PyTorch)."""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import parallel_run, TorchCase
 
-_IMPL_FILE = "parallel_op_mul_.py"
+IMPL_FILE = str(Path(__file__).resolve().parent / "_test_parallel_op_mul_.py")
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_mul_inplace_basic():
-    """
-    Feature: test parallel op mul_
-    Description: test parallel op mul_ with identical sharding layouts.
-    Expectation: Run success.
-    """
-    torchrun_case(_IMPL_FILE, "test_mul_inplace_basic")
-
-@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_mul_inplace_basic():
-    """
-    Feature: test parallel op mul_ (gloo cpu)
-    Description: test parallel op mul_ with identical sharding layouts.
-    Expectation: Run success.
-    """
-    torchrun_case(_IMPL_FILE, "test_mul_inplace_basic")
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_distributed_mul_inplace_broadcast():
+def test_parallel_op_mul__group1():
     """
-    Feature: test parallel op mul_
-    Description: test parallel op mul_ with broadcastable shapes.
+    Feature: parallel run case in _test_parallel_op_mul_
+    Description:
+        1. test_mul_inplace_basic —
+        2. test_mul_inplace_broadcast —
     Expectation: Run success.
     """
-    torchrun_case(_IMPL_FILE, "test_mul_inplace_broadcast")
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_mul_inplace_basic", num_proc=4),
+        TorchCase(IMPL_FILE, "test_mul_inplace_broadcast", num_proc=4),
+    ])
+
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_mul_inplace_broadcast():
+def test_parallel_op_mul__group1_gloo():
     """
-    Feature: test parallel op mul_ (gloo cpu)
-    Description: test parallel op mul_ with broadcastable shapes.
+    Feature: parallel run case in _test_parallel_op_mul_
+    Description:
+        1. test_mul_inplace_basic —
+        2. test_mul_inplace_broadcast —
     Expectation: Run success.
     """
-    torchrun_case(_IMPL_FILE, "test_mul_inplace_broadcast")
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_mul_inplace_basic", num_proc=4),
+        TorchCase(IMPL_FILE, "test_mul_inplace_broadcast", num_proc=4),
+    ])
+
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_distributed_mul_inplace_scalar():
+def test_parallel_op_mul__group2():
     """
-    Feature: test parallel op mul_
-    Description: test parallel op mul_ with scalar inputs.
+    Feature: parallel run case in _test_parallel_op_mul_
+    Description:
+        1. test_mul_inplace_scalar —
     Expectation: Run success.
     """
-    torchrun_case(_IMPL_FILE, "test_mul_inplace_scalar")
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_mul_inplace_scalar", num_proc=4),
+    ])
+
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_gloo_mul_inplace_scalar():
+def test_parallel_op_mul__group2_gloo():
     """
-    Feature: test parallel op mul_ (gloo cpu)
-    Description: test parallel op mul_ with scalar inputs.
+    Feature: parallel run case in _test_parallel_op_mul_
+    Description:
+        1. test_mul_inplace_scalar —
     Expectation: Run success.
     """
-    torchrun_case(_IMPL_FILE, "test_mul_inplace_scalar")
+    parallel_run([
+        TorchCase(IMPL_FILE, "test_mul_inplace_scalar", num_proc=4),
+    ])
