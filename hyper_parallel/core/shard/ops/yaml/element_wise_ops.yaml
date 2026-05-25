@@ -82,6 +82,12 @@ CellBackwardHook:
   distributed_op_file: parallel_cell_backward_hook
   infer_layout_suffix: WithTupleExpand
 
+Detach:
+  dist_op_name: _detach_dist_op
+
+StopGradient:
+  dist_op_name: _stop_gradient_dist_op
+
 Tile:
   dist_op_name: _tile_dist_op
 
