@@ -132,6 +132,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         mock_dtensor_instance._local_tensor = self.sharded_param_data
         mock_dtensor_instance.detach.return_value = mock_dtensor_instance
         mock_dtensor_instance.requires_grad_.return_value = mock_dtensor_instance
+        mock_dtensor_instance.requires_grad = False
         mock_dtensor_from_local.return_value = mock_dtensor_instance
 
         return mock_dtensor_instance
