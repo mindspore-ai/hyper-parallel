@@ -20,11 +20,26 @@ import os
 from typing import Collection
 
 
+def _force_cpu_device_target() -> None:
+    """Force MindSpore to CPU device so UTs never touch Ascend runtime.
+
+    Tensor ops such as ``narrow`` / ``copy_`` / ``contiguous`` / ``add_`` /
+    ``asnumpy`` initialize the configured device backend. Default
+    ``device_target`` on Ascend-equipped hosts is ``"Ascend"``, which calls
+    ``rtGetDeviceCount`` / ``Get soc name`` and fails on CPU-only CI runners.
+    Pinning the context to CPU keeps the UTs hardware-agnostic.
+    """
+    import mindspore as ms  # pylint: disable=import-outside-toplevel
+
+    ms.set_context(device_target="CPU")
+
+
 def _reset_platform_singleton() -> None:
     os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
     import hyper_parallel.platform.platform as _platform_mod  # pylint: disable=import-outside-toplevel
 
     _platform_mod.platform = None
+    _force_cpu_device_target()
 
 
 def _bind_platform_globals(module_names: Collection[str]) -> None:

@@ -46,7 +46,6 @@ def _call_register_post_backward_hook(scheduler, args, kwargs):
     return scheduler._register_post_backward_hook(args, kwargs)
 
 
-@unittest.skip("TestRegisterPostBackwardHook temporarily skipped.")
 class TestRegisterPostBackwardHook(unittest.TestCase):
     """Unit tests for TorchHSDPSchedulerV2._register_post_backward_hook."""
 
@@ -483,6 +482,142 @@ class TestRecomputeForwardPrefetchGuard(unittest.TestCase):
                 assert hp._param_fqn == expected, (
                     f"_param_fqn mismatch: expected={expected!r}, got={hp._param_fqn!r}"
                 )
+
+
+class TestTorchSchedulerSetup(unittest.TestCase):
+    """Unit tests for Torch scheduler setup helpers and hook registration."""
+
+    def _make_scheduler(self, mesh=None):
+        scheduler = object.__new__(TorchHSDPSchedulerV2)
+        scheduler.modules = (nn.Linear(2, 2),)
+        scheduler.mesh = mesh
+        scheduler.config = MagicMock()
+        scheduler.platform = MagicMock()
+        scheduler.device = torch.device("cpu")
+        scheduler._get_managed_params = MagicMock(return_value=[])
+        return scheduler
+
+    @patch("hyper_parallel.platform.torch.fully_shard.scheduler.TorchHSDPStateV2")
+    @patch("hyper_parallel.platform.torch.fully_shard.scheduler.FSDPMeshInfo")
+    def test_new_cell_state_uses_1d_mesh(self, mock_fsdp_mesh_info, mock_state_ctor):
+        """Explicit 1D meshes should create FSDP mesh metadata."""
+        scheduler = self._make_scheduler(mesh=MagicMock(ndim=1))
+        mock_fsdp_mesh_info.return_value = "fsdp-info"
+
+        scheduler._new_cell_state()
+
+        mock_fsdp_mesh_info.assert_called_once_with(mesh=scheduler.mesh, shard_mesh_dim=0)
+        mock_state_ctor.assert_called_once_with(
+            scheduler.modules, "fsdp-info", scheduler.config, scheduler.platform, scheduler.device
+        )
+        self.assertEqual(scheduler.mesh_info, "fsdp-info")
+
+    @patch("hyper_parallel.platform.torch.fully_shard.scheduler.TorchHSDPStateV2")
+    @patch("hyper_parallel.platform.torch.fully_shard.scheduler.HSDPMeshInfo")
+    def test_new_cell_state_uses_2d_mesh(self, mock_hsdp_mesh_info, mock_state_ctor):
+        """Explicit 2D meshes should create HSDP mesh metadata."""
+        scheduler = self._make_scheduler(mesh=MagicMock(ndim=2))
+        mock_hsdp_mesh_info.return_value = "hsdp-info"
+
+        scheduler._new_cell_state()
+
+        mock_hsdp_mesh_info.assert_called_once_with(mesh=scheduler.mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
+        mock_state_ctor.assert_called_once()
+        self.assertEqual(scheduler.mesh_info, "hsdp-info")
+
+    def test_new_cell_state_rejects_invalid_mesh_rank(self):
+        """Explicit meshes with unsupported rank should be rejected."""
+        scheduler = self._make_scheduler(mesh=MagicMock(ndim=3))
+
+        with self.assertRaisesRegex(ValueError, "only supports explicit 1D"):
+            scheduler._new_cell_state()
+
+    @patch("hyper_parallel.platform.torch.fully_shard.scheduler.TorchHSDPStateV2")
+    @patch("hyper_parallel.platform.torch.fully_shard.scheduler.DDPMeshInfo")
+    def test_new_cell_state_mesh_none_uses_compat_dtensor_mesh(self, mock_ddp_mesh_info, mock_state_ctor):
+        """Mesh-less setup should derive DDP mesh metadata from compat DTensors."""
+        class _FakeDTensor:
+            def __init__(self, mesh):
+                self.device_mesh = mesh
+
+        mesh = MagicMock()
+        mesh.to_hash.return_value = "mesh-hash"
+        scheduler = self._make_scheduler(mesh=None)
+        scheduler._get_managed_params.return_value = [_FakeDTensor(mesh)]
+        mock_ddp_mesh_info.return_value = "ddp-info"
+
+        with patch("hyper_parallel.platform.torch.fully_shard.scheduler.DTensor", _FakeDTensor):
+            scheduler._new_cell_state()
+
+        mock_ddp_mesh_info.assert_called_once_with(mesh=mesh, replicate_mesh_dim=0)
+        mock_state_ctor.assert_called_once()
+        self.assertEqual(scheduler.mesh_info, "ddp-info")
+
+    def test_new_cell_state_mesh_none_rejects_missing_or_mixed_compat_meshes(self):
+        """Mesh-less setup should reject missing or inconsistent compat DTensor meshes."""
+        class _FakeDTensor:
+            def __init__(self, mesh):
+                self.device_mesh = mesh
+
+        scheduler = self._make_scheduler(mesh=None)
+        with self.assertRaisesRegex(ValueError, "without a DTensor"):
+            scheduler._new_cell_state()
+
+        mesh_a = MagicMock()
+        mesh_a.to_hash.return_value = "a"
+        mesh_b = MagicMock()
+        mesh_b.to_hash.return_value = "b"
+        scheduler._get_managed_params.return_value = [_FakeDTensor(mesh_a), _FakeDTensor(mesh_b)]
+        with patch("hyper_parallel.platform.torch.fully_shard.scheduler.DTensor", _FakeDTensor), \
+             self.assertRaisesRegex(ValueError, "share the same mesh"):
+            scheduler._new_cell_state()
+
+    def test_grouped_hook_skip_returns_torch_noop(self):
+        """Grouped hook skip methods should preserve Torch no-op behavior."""
+        scheduler = self._make_scheduler()
+
+        self.assertIsNone(scheduler._grouped_forward_pre_hook_skip(None, (), {}))
+        self.assertIsNone(scheduler._grouped_forward_post_hook_skip("outputs"))
+
+    def test_register_forward_module_hook_uses_always_call_when_supported(self):
+        """Forward hook registration should pass always_call when supported."""
+        scheduler = self._make_scheduler()
+        captured = {}
+
+        class _ModernModule:
+            def register_forward_hook(self, hook, prepend=False, always_call=False):
+                captured["modern"] = (hook, prepend, always_call)
+
+        class _LegacyModule:
+            def register_forward_hook(self, hook, prepend=False):
+                captured["legacy"] = (hook, prepend)
+
+        hook = object()
+        scheduler._register_forward_module_hook(_ModernModule(), hook)
+        scheduler._register_forward_module_hook(_LegacyModule(), hook)
+
+        self.assertEqual(captured["modern"], (hook, False, True))
+        self.assertEqual(captured["legacy"], (hook, False))
+
+    def test_register_forward_backward_hooks_single_and_grouped(self):
+        """Hook registration should support single-module and grouped-module paths."""
+        scheduler = self._make_scheduler()
+        module = MagicMock()
+        scheduler.modules = (module,)
+        scheduler._fsdp_group_post_pending = None
+        scheduler._register_forward_backward_hooks()
+        module.register_forward_pre_hook.assert_called_once_with(scheduler._forward_pre_hook, with_kwargs=True)
+        module.register_forward_hook.assert_called_once_with(scheduler._forward_hook)
+
+        module_a = MagicMock()
+        module_b = MagicMock()
+        scheduler.modules = (module_a, module_b)
+        scheduler._fsdp_group_post_pending = set()
+        scheduler._register_forward_module_hook = MagicMock()
+        scheduler._register_forward_backward_hooks()
+        module_a.register_forward_pre_hook.assert_called_once_with(scheduler._grouped_forward_pre_hook, with_kwargs=True)
+        module_b.register_forward_pre_hook.assert_called_once_with(scheduler._grouped_forward_pre_hook, with_kwargs=True)
+        self.assertEqual(scheduler._register_forward_module_hook.call_count, 2)
 
 
 if __name__ == "__main__":

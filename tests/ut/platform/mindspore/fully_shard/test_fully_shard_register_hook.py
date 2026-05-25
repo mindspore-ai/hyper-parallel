@@ -49,7 +49,6 @@ def _call_register_post_backward_hook(scheduler, args, kwargs):
     return scheduler._register_post_backward_hook(args, kwargs)
 
 
-@unittest.skip("TestRegisterPostBackwardHook temporarily skipped.")
 class TestRegisterPostBackwardHook(unittest.TestCase):
     """Unit tests for MindSporeHSDPSchedulerV2._register_post_backward_hook."""
 
@@ -106,10 +105,13 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
             "got different object"
         )
 
-    def test_multiple_grad_tensors_preserve_identity(self):
+    @patch("hyper_parallel.platform.mindspore.fully_shard.scheduler.PostBackwardFunction.apply")
+    def test_multiple_grad_tensors_preserve_identity(self, mock_apply):
         """Multiple requires_grad=True tensors are passed through correctly.
 
         description: Pass multiple grad and no-grad tensors in both args and kwargs.
+            PostBackwardFunction.apply is mocked so the test stays CPU-only and
+            does not invoke MindSpore's pynative autograd / device init.
         expectation: All requires_grad flags are preserved; tensor data is unchanged.
         feature: _register_post_backward_hook multi-tensor correctness.
         """
@@ -122,11 +124,17 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
         ng2 = ms.Tensor(np.random.randn(1, 2).astype(np.float32))
         ng2.requires_grad = False
 
+        # Mock apply to return the same input tensors (positions match flattened
+        # args followed by flattened kwargs); the source code then propagates
+        # requires_grad onto the returned tensors.
+        mock_apply.side_effect = lambda _scheduler, *flat: tuple(flat)
+
         args = (g1, ng1)
         kwargs = {"a": g2, "b": ng2}
 
         out_args, out_kwargs = _call_register_post_backward_hook(self.scheduler, args, kwargs)
 
+        mock_apply.assert_called_once_with(self.scheduler, g1, ng1, g2, ng2)
         assert out_args[0].requires_grad is True, (
             f"Expected requires_grad=True for args[0], "
             f"got {out_args[0].requires_grad}"
@@ -152,10 +160,13 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
             f"expected {ng2.asnumpy()}, got {out_kwargs['b'].asnumpy()}"
         )
 
-    def test_integer_tensor_not_affected(self):
+    @patch("hyper_parallel.platform.mindspore.fully_shard.scheduler.PostBackwardFunction.apply")
+    def test_integer_tensor_not_affected(self, mock_apply):
         """Integer tensors (non-floating) are not affected by requires_grad.
 
         description: Pass an integer tensor alongside floating-point tensors.
+            PostBackwardFunction.apply is mocked so the test stays CPU-only and
+            does not invoke MindSpore's pynative autograd / device init.
         expectation: Integer tensor is passed through unchanged; float tensors
             preserve their requires_grad flags.
         feature: _register_post_backward_hook integer tensor handling.
@@ -167,11 +178,14 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
         no_grad_float = ms.Tensor(np.random.randn(3).astype(np.float32))
         no_grad_float.requires_grad = False
 
+        mock_apply.side_effect = lambda _scheduler, *flat: tuple(flat)
+
         args = (grad_float, int_tensor, no_grad_float)
         kwargs = {}
 
         out_args, _ = _call_register_post_backward_hook(self.scheduler, args, kwargs)
 
+        mock_apply.assert_called_once_with(self.scheduler, grad_float, int_tensor, no_grad_float)
         assert out_args[0].requires_grad is True, (
             f"Expected requires_grad=True for float grad tensor, "
             f"got {out_args[0].requires_grad}"

@@ -19,6 +19,8 @@ from hyper_parallel.core.fully_shard.hsdp_utils. All tests use CPU and simple nn
 """
 import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 # Force torch platform before any hyper_parallel imports
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
@@ -28,9 +30,19 @@ import torch
 from torch import nn
 
 from hyper_parallel.core.fully_shard.hsdp_utils import (
+    FullyShardParamMode,
+    HSDPConfigV2,
     ParamModuleInfo,
     _get_param_module_infos,
     _named_parameters_with_duplicates,
+    get_dtensor_managed_mesh,
+    get_hsdp_state,
+    get_managed_modules_parameters,
+    get_rank_list_for_axes,
+    get_split_rank_lists_for_axes,
+    infer_fully_shard_param_mode,
+    is_dtensor_managed_param,
+    unwrap_dtensor_param,
 )
 
 
@@ -146,6 +158,23 @@ class TestNamedParametersWithDuplicates(unittest.TestCase):
             _named_parameters_with_duplicates(mod, remove_duplicate=True)
         self.assertIn("remove_duplicate", str(ctx.exception))
 
+    def test_falls_back_for_modules_without_remove_duplicate_support(self):
+        """Modules that reject remove_duplicate should still expose their local params."""
+
+        class LegacyNamedParameters(SimpleLinear):
+            """Module double that mimics an older named_parameters signature."""
+
+            def named_parameters(self, prefix="", recurse=True, remove_duplicate=True):
+                if "remove_duplicate" in locals() and remove_duplicate is False:
+                    raise AssertionError("remove_duplicate unsupported")
+                return super().named_parameters(prefix=prefix, recurse=recurse)
+
+        mod = LegacyNamedParameters(4, 4)
+
+        result = _named_parameters_with_duplicates(mod, recurse=False)
+
+        self.assertEqual([name for name, _ in result], ["weight", "bias"])
+
 
 class TestGetParamModuleInfos(unittest.TestCase):
     """Unit tests for _get_param_module_infos (param -> ParamModuleInfo mapping)."""
@@ -203,6 +232,152 @@ class TestGetParamModuleInfos(unittest.TestCase):
         infos = _get_param_module_infos(params, (mod1, mod2))
         # Assert
         self.assertEqual(len(infos), len(params))
+
+    def test_shared_parameter_records_alias_owner(self):
+        """Shared parameters should remember every module/name pair that owns them."""
+        mod = SharedParamModule()
+
+        info = _get_param_module_infos([mod.weight], (mod,))[0]
+
+        self.assertIs(info.module, mod)
+        self.assertEqual(info.param_name, "weight")
+        self.assertEqual(info.shared_modules, [mod.linear])
+        self.assertEqual(info.shared_param_names, ["weight"])
+
+
+class TestHSDPConfigAndParamDiscovery(unittest.TestCase):
+    """Unit tests for config defaults and managed-parameter discovery."""
+
+    def test_config_derives_reduce_dtype_and_comm_fusion_flags(self):
+        """HSDPConfigV2 should preserve scheduler-facing configuration fields."""
+        mp_policy = SimpleNamespace(reduce_dtype=torch.float16)
+
+        config = HSDPConfigV2(
+            mesh="mesh",
+            reshard_after_forward=False,
+            shard_placement_fn="placement-fn",
+            mp_policy=mp_policy,
+            offload_policy="offload",
+            ignored_params={"ignored"},
+            replicate_params={"replicate"},
+            comm_fusion=True,
+            comm_fusion_zero_copy=True,
+        )
+
+        self.assertEqual(config.mesh, "mesh")
+        self.assertFalse(config.reshard_after_forward)
+        self.assertEqual(config.shard_placement_fn, "placement-fn")
+        self.assertEqual(config.reduce_dtype, torch.float16)
+        self.assertEqual(config.ignored_params, {"ignored"})
+        self.assertEqual(config.replicate_params, {"replicate"})
+        self.assertTrue(config.comm_fusion)
+        self.assertTrue(config.comm_fusion_zero_copy)
+
+    def test_get_managed_modules_parameters_skips_ignored_duplicates_and_initialized(self):
+        """Only unique, non-ignored, non-HSDP-initialized params should be managed."""
+        mod = SharedParamModule()
+        mod.linear.bias._hsdp_param_initialized = True
+
+        params = get_managed_modules_parameters((mod,), ignored_params=(mod.weight,))
+
+        self.assertEqual(params, [])
+
+
+class TestDTensorParamHelpers(unittest.TestCase):
+    """Unit tests for DTensor metadata detection without distributed init."""
+
+    class FakeDTensor:
+        """Small class used only to exercise isinstance-based DTensor branches."""
+
+        def __init__(self, mesh="mesh"):
+            self.device_mesh = mesh
+
+    def test_unwrap_dtensor_accepts_payload_directly_or_through_data(self):
+        """DTensor payloads may be carried by the param itself or by param.data."""
+        direct = self.FakeDTensor("direct-mesh")
+        wrapped = SimpleNamespace(data=self.FakeDTensor("data-mesh"))
+
+        with patch("hyper_parallel.core.fully_shard.hsdp_utils.DTensor", self.FakeDTensor):
+            self.assertIs(unwrap_dtensor_param(direct), direct)
+            self.assertIs(unwrap_dtensor_param(wrapped), wrapped.data)
+            self.assertTrue(is_dtensor_managed_param(wrapped))
+            self.assertEqual(get_dtensor_managed_mesh(wrapped), "data-mesh")
+
+    def test_unwrap_dtensor_accepts_minimal_layout_payload(self):
+        """Param-like objects with DTensor layout fields should be treated as managed."""
+        payload = SimpleNamespace(
+            _device_mesh="private-mesh",
+            _placements=("shard",),
+            _local_tensor=torch.ones(2),
+        )
+
+        self.assertIs(unwrap_dtensor_param(payload), payload)
+        self.assertEqual(get_dtensor_managed_mesh(payload), "private-mesh")
+        self.assertIsNone(get_dtensor_managed_mesh(torch.nn.Parameter(torch.ones(2))))
+
+    def test_infer_fully_shard_param_mode_from_dtensor_presence_and_mesh(self):
+        """Param mode should reflect whether fully_shard adds a new mesh."""
+        local_param = torch.nn.Parameter(torch.ones(2))
+        dtensor_payload = SimpleNamespace(
+            _device_mesh="tp-mesh",
+            _placements=("tp",),
+            _local_tensor=torch.ones(2),
+        )
+
+        self.assertEqual(infer_fully_shard_param_mode(None, [local_param]), FullyShardParamMode.LOCAL_PARAM)
+        self.assertEqual(infer_fully_shard_param_mode(None, [dtensor_payload]), FullyShardParamMode.DTENSOR_COMPAT)
+        self.assertEqual(infer_fully_shard_param_mode("fsdp-mesh", [dtensor_payload]), FullyShardParamMode.DTENSOR_UNIFIED)
+
+
+class TestMeshRankHelpers(unittest.TestCase):
+    """Unit tests for mesh axis to rank-list conversion."""
+
+    def _mesh(self):
+        return SimpleNamespace(rank=5, rank_list=list(range(8)), mesh_shape=(2, 2, 2))
+
+    def test_get_rank_list_for_axes_handles_empty_axes_and_missing_rank(self):
+        """Rank selection should keep the current rank when no axes vary."""
+        mesh = self._mesh()
+
+        self.assertEqual(get_rank_list_for_axes(mesh, [], rank=5), [5])
+        with self.assertRaisesRegex(ValueError, "not found"):
+            get_rank_list_for_axes(mesh, [0], rank=99)
+
+    def test_get_rank_list_for_axes_varies_only_requested_axes(self):
+        """Only requested axes should vary while complementary coordinates stay fixed."""
+        mesh = self._mesh()
+
+        self.assertEqual(get_rank_list_for_axes(mesh, [0, 2], rank=5), [0, 1, 4, 5])
+
+    def test_get_split_rank_lists_for_axes_handles_empty_full_and_partial_axes(self):
+        """Split rank lists should reflect the complementary mesh coordinates."""
+        mesh = self._mesh()
+
+        self.assertEqual(get_split_rank_lists_for_axes(mesh, []), [list(range(8))])
+        self.assertEqual(get_split_rank_lists_for_axes(mesh, [0, 1, 2]), [list(range(8))])
+        self.assertEqual(
+            get_split_rank_lists_for_axes(mesh, [1]),
+            [[0, 2], [1, 3], [4, 6], [5, 7]],
+        )
+
+
+class TestGetHSDPState(unittest.TestCase):
+    """Unit tests for resolving a fully_shard state from a managed module."""
+
+    def test_get_hsdp_state_returns_scheduler_state_for_hsdp_module(self):
+        """Managed modules should expose the state attached to their scheduler."""
+        from hyper_parallel.core.fully_shard.api import HSDPModule
+
+        class ManagedModule(HSDPModule):
+            """Minimal managed module with an installed scheduler."""
+
+        module = ManagedModule()
+        module.hsdp_scheduler = SimpleNamespace(hsdp_state="state")
+
+        self.assertEqual(get_hsdp_state(module), "state")
+        module.hsdp_scheduler = None
+        self.assertIsNone(get_hsdp_state(module))
+        self.assertIsNone(get_hsdp_state(object()))
 
 
 if __name__ == "__main__":
