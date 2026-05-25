@@ -62,3 +62,13 @@ venv/
 .cursorignore
 .claude/settings.local.json
 .claude/local/
+
+# SAPP-ND generated files
+hyper_parallel/auto_parallel/SAPP-ND/plots/
+hyper_parallel/auto_parallel/SAPP-ND/memory_estimation/plots/
+hyper_parallel/auto_parallel/SAPP-ND/memory_estimation/tests/plots/
+hyper_parallel/auto_parallel/SAPP-ND/memory_estimation/**/*.log
+hyper_parallel/auto_parallel/SAPP-ND/memory_estimation/**/*.csv
+hyper_parallel/auto_parallel/SAPP-ND/paradise/output/
+hyper_parallel/auto_parallel/SAPP-ND/paradise/results/
+hyper_parallel/auto_parallel/SAPP-ND/**/*nd_to_ppb*.json

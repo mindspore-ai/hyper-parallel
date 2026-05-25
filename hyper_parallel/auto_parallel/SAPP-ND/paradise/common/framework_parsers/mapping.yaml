@@ -1,0 +1,10 @@
+framework_parser:
+  -
+    name: "mindformers"
+    module: CostModelParserMindformers
+  -
+    name: "mindspeed"
+    module: CostModelParserMindspeed
+  -
+    name: "hyperparallel"
+    module: CostModelParserHyperparallel
