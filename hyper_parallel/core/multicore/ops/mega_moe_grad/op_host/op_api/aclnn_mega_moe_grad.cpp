@@ -97,8 +97,8 @@ ACLNN_API aclnnStatus aclnnMegaMoeGradGetWorkspaceSize(
   const aclTensor *gate, const aclTensor *grad_gate, const aclTensor *w1, const aclTensor *gate_dx,
   const aclTensor *grad_x, const aclTensor *combine_target_off, const aclTensor *combine_src_off,
   const aclTensor *combine_size, const aclTensor *permute_out, const aclTensor *gate_dw, const aclTensor *group_list,
-  const aclTensor *act_grad_tiling, const aclTensor *gate_grad_tiling, const aclTensor *w2_grad_tiling,
-  const aclTensor *w1_grad_tiling, const aclTensor *swiglu_grad_tiling, const aclTensor *gmm_workspace,
+  const aclTensor *act_grad_tiling, const aclTensor *gate_grad_tiling, const aclTensor *w1_grad_tiling,
+  const aclTensor *w2_grad_tiling, const aclTensor *swiglu_grad_tiling, const aclTensor *gmm_workspace,
   const aclTensor *swiglu_grad_workspace, const aclTensor *runtime_config, const aclTensor *all_event_counters,
   int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, uint64_t *workspaceSize,
   aclOpExecutor **executor) {
@@ -107,7 +107,7 @@ ACLNN_API aclnnStatus aclnnMegaMoeGradGetWorkspaceSize(
                  DFX_IN(dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size, hidden, hidden_dw,
                         weight, y, gate, grad_gate, w1, gate_dx, grad_x, combine_target_off, combine_src_off,
                         combine_size, permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling,
-                        w2_grad_tiling, w1_grad_tiling, swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
+                        w1_grad_tiling, w2_grad_tiling, swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
                         runtime_config, all_event_counters, rankId, ep, expert_num, hidden_size, seq_size),
                  DFX_OUT(dispatch_target, hidden_dw, y, grad_gate, gate_dx, grad_x, gate_dw));
 
@@ -141,8 +141,8 @@ ACLNN_API aclnnStatus aclnnMegaMoeGradGetWorkspaceSize(
   MAKE_CONTIGUOUS_CHECK(group_list);
   MAKE_CONTIGUOUS_CHECK(act_grad_tiling);
   MAKE_CONTIGUOUS_CHECK(gate_grad_tiling);
-  MAKE_CONTIGUOUS_CHECK(w2_grad_tiling);
   MAKE_CONTIGUOUS_CHECK(w1_grad_tiling);
+  MAKE_CONTIGUOUS_CHECK(w2_grad_tiling);
   MAKE_CONTIGUOUS_CHECK(swiglu_grad_tiling);
   MAKE_CONTIGUOUS_CHECK(gmm_workspace);
   MAKE_CONTIGUOUS_CHECK(swiglu_grad_workspace);
@@ -166,7 +166,7 @@ ACLNN_API aclnnStatus aclnnMegaMoeGradGetWorkspaceSize(
   auto bwd_output = l0op::MegaMoeGrad(
     dispatch_target, dispatch_target_off, dy, dispatch_src_off, dispatch_size, params.hidden, hidden_dw, params.weight,
     y, gate, grad_gate, params.w1, gate_dx, grad_x, combine_target_off, combine_src_off, combine_size,
-    params.permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w2_grad_tiling, w1_grad_tiling,
+    params.permute_out, gate_dw, group_list, act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
     swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace, runtime_config, all_event_counters, rankId, ep,
     expert_num, hidden_size, seq_size, executorPtr);
   bool bwd_output_success = std::all_of(bwd_output.begin(), bwd_output.end(), [](const aclTensor* ptr) {

@@ -248,7 +248,7 @@ def mega_moe_grad(
     w2, act_grad_y, gate, grad_gate, w1, gate_dx, grad_x,
     combine_target_off, combine_src_off, combine_size,
     permute_out, gate_dw, group_list,
-    act_grad_tiling, gate_grad_tiling, w2_grad_tiling, w1_grad_tiling,
+    act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
     swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
     runtime_config, all_event_counters,
     rank_id: int, ep: int, expert_num: int,
@@ -292,7 +292,7 @@ def mega_moe_grad(
         W1 weight gradient — written in-place.
     group_list :
         Cumulative expert token counts ([E] int64).
-    act_grad_tiling, gate_grad_tiling, w2_grad_tiling, w1_grad_tiling,
+    act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
     swiglu_grad_tiling :
         Pre-computed tiling tensors (from gen_runtime_data.py bwd).
     gmm_workspace, swiglu_grad_workspace :
@@ -311,7 +311,7 @@ def mega_moe_grad(
         w2, act_grad_y, gate, grad_gate, w1, gate_dx, grad_x,
         combine_target_off, combine_src_off, combine_size,
         permute_out, gate_dw, group_list,
-        act_grad_tiling, gate_grad_tiling, w2_grad_tiling, w1_grad_tiling,
+        act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
         swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
         runtime_config, all_event_counters,
         rank_id, ep, expert_num, hidden_size, seq_size,

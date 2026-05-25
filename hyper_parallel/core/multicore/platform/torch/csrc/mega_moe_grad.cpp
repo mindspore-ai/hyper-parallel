@@ -42,8 +42,8 @@ BwdReturn mega_moe_grad_npu(
     const at::Tensor& group_list,             // pos 19
     const at::Tensor& act_grad_tiling,        // pos 20
     const at::Tensor& gate_grad_tiling,       // pos 21
-    const at::Tensor& w2_grad_tiling,         // pos 22
-    const at::Tensor& w1_grad_tiling,         // pos 23
+    const at::Tensor& w1_grad_tiling,         // pos 22
+    const at::Tensor& w2_grad_tiling,         // pos 23
     const at::Tensor& swiglu_grad_tiling,     // pos 24
     const at::Tensor& gmm_workspace,          // pos 25
     const at::Tensor& swiglu_grad_workspace,  // pos 26
@@ -59,7 +59,7 @@ BwdReturn mega_moe_grad_npu(
         hidden, hidden_dw, w2, act_grad_y, gate, grad_gate, w1, gate_dx, grad_x,
         combine_target_off, combine_src_off, combine_size,
         permute_out, gate_dw, group_list,
-        act_grad_tiling, gate_grad_tiling, w2_grad_tiling, w1_grad_tiling,
+        act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
         swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
         runtime_config, all_event_counters,
         rank_id, ep, expert_num, hidden_size, seq_size);
@@ -93,8 +93,8 @@ BwdReturn mega_moe_grad_meta(
     const at::Tensor& /*group_list*/,
     const at::Tensor& /*act_grad_tiling*/,
     const at::Tensor& /*gate_grad_tiling*/,
-    const at::Tensor& /*w2_grad_tiling*/,
     const at::Tensor& /*w1_grad_tiling*/,
+    const at::Tensor& /*w2_grad_tiling*/,
     const at::Tensor& /*swiglu_grad_tiling*/,
     const at::Tensor& /*gmm_workspace*/,
     const at::Tensor& /*swiglu_grad_workspace*/,

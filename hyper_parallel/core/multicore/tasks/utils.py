@@ -91,7 +91,7 @@ def add_terminate(cfg: RuntimeConfigC, tsv, trigger_count: int) -> None:
 
     trigger_count:
       forward:  combine_op.task_num // tsv.ep * tsv.ep
-      backward: w1_grad_op.task_num + w2_grad_op.task_num + combine_op.task_num // tsv.ep * tsv.ep
+      backward: w2_grad_op.task_num + w1_grad_op.task_num + combine_op.task_num // tsv.ep * tsv.ep
     """
     cfg.all_event_num_triggers[tsv.all_event_num] = trigger_count
     task = TaskDescC()

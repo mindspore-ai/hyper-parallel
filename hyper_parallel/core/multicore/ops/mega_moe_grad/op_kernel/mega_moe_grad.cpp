@@ -25,7 +25,7 @@ __global__ __aicore__ void mega_moe_grad(
   GM_ADDR hidden, GM_ADDR hidden_dw, GM_ADDR weight, GM_ADDR y, GM_ADDR gate, GM_ADDR grad_gate, GM_ADDR w1,
   GM_ADDR gate_dx, GM_ADDR grad_x, GM_ADDR combine_target_off, GM_ADDR combine_src_off, GM_ADDR combine_size,
   GM_ADDR permute_out, GM_ADDR gate_dw, GM_ADDR group_list, GM_ADDR act_grad_tiling, GM_ADDR gate_grad_tiling,
-  GM_ADDR w2_grad_tiling, GM_ADDR w1_grad_tiling, GM_ADDR swiglu_grad_tiling, GM_ADDR gmm_workspace,
+  GM_ADDR w1_grad_tiling, GM_ADDR w2_grad_tiling, GM_ADDR swiglu_grad_tiling, GM_ADDR gmm_workspace,
   GM_ADDR swiglu_grad_workspace, GM_ADDR runtime_config, GM_ADDR all_event_counters, GM_ADDR dispatch_target_ref,
   GM_ADDR hidden_dw_ref, GM_ADDR y_ref, GM_ADDR grad_gate_ref, GM_ADDR gate_dx_ref, GM_ADDR grad_x_ref,
   GM_ADDR gate_dw_ref, GM_ADDR workspace, GM_ADDR tiling) {
@@ -54,8 +54,8 @@ __global__ __aicore__ void mega_moe_grad(
                               group_list,
                               act_grad_tiling,  // 20
                               gate_grad_tiling,
-                              w2_grad_tiling,
                               w1_grad_tiling,
+                              w2_grad_tiling,
                               swiglu_grad_tiling,
                               gmm_workspace,  // 25
                               swiglu_grad_workspace,

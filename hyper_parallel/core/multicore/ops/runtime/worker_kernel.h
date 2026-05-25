@@ -27,17 +27,7 @@
 #include "kernel_operator.h"
 #include "runtime_config.hpp"
 
-using AscendC::TPipe;
-using AscendC::TBuf;
-using AscendC::LocalTensor;
-using AscendC::GlobalTensor;
-using AscendC::SyncFunc;
-using AscendC::DataCopy;
-using AscendC::DataCacheCleanAndInvalid;
-using AscendC::PipeBarrier;
-using AscendC::PIPE_ALL;
-using AscendC::CacheLine;
-using AscendC::DcciDst;
+using namespace AscendC;  // NOLINT(build/namespaces)
 
 template <typename Derived>
 class KernelWorkerBase {
@@ -143,7 +133,7 @@ class KernelWorkerBase {
       WaitForDependency(task_desc.dependent_event);
     }
     static_cast<Derived *>(this)->ExecuteComputeKernel(task_desc);
-    if (task_desc.task_type != TASK_SHMEM_PUT_MEM_SINGAL) {
+    if (task_desc.task_type != TASK_SHMEM_PUT_MEM_SIGNAL) {
       TriggerEvent(task_desc.trigger_event);
     }
   }

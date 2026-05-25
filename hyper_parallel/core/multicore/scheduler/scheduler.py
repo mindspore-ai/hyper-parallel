@@ -68,14 +68,14 @@ def revise_gmm_task_queue_bwd(cfg: RuntimeConfigC, tsv,
                                act_grad_task_num: int,
                                num_cube_cores: int = 24) -> None:
     """
-    Backward-only: interleave w1_grad and act_grad experts in cube_task_indices.
+    Backward-only: interleave w2_grad and act_grad experts in cube_task_indices.
 
-    Result pattern: [w1_grad exp0, act_grad exp0, w1_grad exp1, act_grad exp1, ...]
-    act_grad start offset = 0; w1_grad start offset = act_grad_task_num.
+    Result pattern: [w2_grad exp0, act_grad exp0, w2_grad exp1, act_grad exp1, ...]
+    act_grad start offset = 0; w2_grad start offset = act_grad_task_num.
     """
     temp          = list(cfg.cube_task_indices)
     expert_single = tsv.single_rank_expert_num
-    changes_num   = 2   # two streams: w1_grad (index=1) and act_grad (index=0)
+    changes_num   = 2   # two streams: w2_grad (index=1) and act_grad (index=0)
 
     for i in range(expert_single * changes_num):
         index = 1 - (i % changes_num)   # alternates: 1, 0, 1, 0, ...

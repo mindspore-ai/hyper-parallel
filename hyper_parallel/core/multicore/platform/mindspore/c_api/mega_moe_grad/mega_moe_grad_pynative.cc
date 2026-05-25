@@ -49,8 +49,8 @@
 //   [19] group_list
 //   [20] act_grad_tiling
 //   [21] gate_grad_tiling
-//   [22] w2_grad_tiling
-//   [23] w1_grad_tiling
+//   [22] w1_grad_tiling
+//   [23] w2_grad_tiling
 //   [24] swiglu_grad_tiling
 //   [25] gmm_workspace
 //   [26] swiglu_grad_workspace
@@ -90,8 +90,8 @@ std::vector<ms::Tensor> npu_mega_moe_grad(
     const ms::Tensor &group_list,          // pos 19
     const ms::Tensor &act_grad_tiling,     // pos 20
     const ms::Tensor &gate_grad_tiling,    // pos 21
-    const ms::Tensor &w2_grad_tiling,      // pos 22
-    const ms::Tensor &w1_grad_tiling,      // pos 23
+    const ms::Tensor &w1_grad_tiling,      // pos 22
+    const ms::Tensor &w2_grad_tiling,      // pos 23
     const ms::Tensor &swiglu_grad_tiling,  // pos 24
     const ms::Tensor &gmm_workspace,       // pos 25
     const ms::Tensor &swiglu_grad_workspace,  // pos 26
@@ -110,7 +110,7 @@ std::vector<ms::Tensor> npu_mega_moe_grad(
       w1, gate_dx, grad_x,
       combine_target_off, combine_src_off, combine_size,
       permute_out, gate_dw, group_list,
-      act_grad_tiling, gate_grad_tiling, w2_grad_tiling, w1_grad_tiling,
+      act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
       swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
       runtime_config, all_event_counters,
       rank_id, ep, expert_num, hidden_size, seq_size));
@@ -124,7 +124,7 @@ std::vector<ms::Tensor> npu_mega_moe_grad(
       w1, gate_dx, grad_x,
       combine_target_off, combine_src_off, combine_size,
       permute_out, gate_dw, group_list,
-      act_grad_tiling, gate_grad_tiling, w2_grad_tiling, w1_grad_tiling,
+      act_grad_tiling, gate_grad_tiling, w1_grad_tiling, w2_grad_tiling,
       swiglu_grad_tiling, gmm_workspace, swiglu_grad_workspace,
       runtime_config, all_event_counters,
   };

@@ -23,8 +23,8 @@ Usage:
 Outputs (rank-independent):
     <output_dir>/act_grad_tiling.bin         (act_grad, pos 20)
     <output_dir>/gate_grad_tiling.bin        (gate_grad, pos 21)
-    <output_dir>/w2_grad_tiling.bin          (w2_grad, pos 22)
-    <output_dir>/w1_grad_tiling.bin          (w1_grad, pos 23)
+    <output_dir>/w1_grad_tiling.bin          (w1_grad, pos 22)
+    <output_dir>/w2_grad_tiling.bin          (w2_grad, pos 23)
     <output_dir>/swiglu_grad_tiling.bin      (SwiGLU-grad, pos 24)
     <output_dir>/all_event_counters.bin      1024×int32 zeros (4 KB)
     <output_dir>/gmm_workspace.bin           256 MiB zeros
@@ -47,8 +47,8 @@ from hyper_parallel.core.multicore.tasks.utils import add_terminate, add_dynamic
 from .tiling_tables import (
     get_act_grad_tiling_bytes,
     get_gate_grad_tiling_bytes,
-    get_w2_grad_tiling_bytes,
     get_w1_grad_tiling_bytes,
+    get_w2_grad_tiling_bytes,
     get_swiglu_grad_tiling_bytes,
 )
 from .graph import build_backward_graph
@@ -86,7 +86,7 @@ def build_config_for_rank(graph, tsv: TaskSplitValue, rank_id: int,
     init_task_split_value(tsv)
     tsv.rank_id = rank_id
 
-    # Fill tasks in topological order (dispatch, act_grad, w1_grad, swiglu_grad, gate_grad, combine, w2_grad)
+    # Fill tasks in topological order (dispatch, act_grad, w2_grad, swiglu_grad, gate_grad, combine, w1_grad)
     for op in graph.topological_sort():
         op.fill_config.fill(cfg, op, tsv)
 
@@ -96,12 +96,12 @@ def build_config_for_rank(graph, tsv: TaskSplitValue, rank_id: int,
     dispatch_op    = graph.get_op("dispatch")
     swiglu_grad_op = graph.get_op("swiglu_grad")
     act_grad_op    = graph.get_op("act_grad")
-    w2_grad_op     = graph.get_op("w2_grad")
     w1_grad_op     = graph.get_op("w1_grad")
+    w2_grad_op     = graph.get_op("w2_grad")
     combine_op     = graph.get_op("combine")
 
     add_terminate(cfg, tsv,
-                  w1_grad_op.task_num + w2_grad_op.task_num
+                  w2_grad_op.task_num + w1_grad_op.task_num
                   + combine_op.task_num // tsv.ep * tsv.ep)
     revise_task_queue(cfg, tsv, dispatch_op.task_num, swiglu_grad_op.task_num)
     revise_gmm_task_queue_bwd(cfg, tsv, act_grad_op.task_num, num_cube_cores=num_cube_cores)
@@ -131,8 +131,8 @@ def main():
     )
     num_groups = tsv.single_rank_expert_num
     graph = build_backward_graph(tsv,
-                                 dispatch_sv=128,  act_grad_sv=4096,  w1_grad_sv=4096,
-                                 swiglu_sv=128,    gate_grad_sv=4096, w2_grad_sv=4096,
+                                 dispatch_sv=128,  act_grad_sv=4096,  w2_grad_sv=4096,
+                                 swiglu_sv=128,    gate_grad_sv=4096, w1_grad_sv=4096,
                                  combine_sv=128,
                                  hidden_size=args.hidden_size,
                                  intermediate_size=args.intermediate_size,
@@ -143,17 +143,17 @@ def main():
 
     dispatch_op    = graph.get_op("dispatch")
     act_grad_op    = graph.get_op("act_grad")
-    w1_grad_op     = graph.get_op("w1_grad")
+    w2_grad_op     = graph.get_op("w2_grad")
     swiglu_grad_op = graph.get_op("swiglu_grad")
     gate_grad_op   = graph.get_op("gate_grad")
-    w2_grad_op     = graph.get_op("w2_grad")
+    w1_grad_op     = graph.get_op("w1_grad")
     combine_op     = graph.get_op("combine")
 
     print(f"[bwd] tp={args.tp} ep={args.ep} seq={args.seq_size} "
           f"E={args.all_expert_num} topk={args.top_k}")
     print(f"      dispatch={dispatch_op.task_num}  act_grad={act_grad_op.task_num}  "
-          f"w1_grad={w1_grad_op.task_num}  swiglu_grad={swiglu_grad_op.task_num}  "
-          f"gate_grad={gate_grad_op.task_num}  w2_grad={w2_grad_op.task_num}  "
+          f"w2_grad={w2_grad_op.task_num}  swiglu_grad={swiglu_grad_op.task_num}  "
+          f"gate_grad={gate_grad_op.task_num}  w1_grad={w1_grad_op.task_num}  "
           f"combine={combine_op.task_num}")
 
     # ── Tiling files (rank-independent) ──────────────────────────────────────
@@ -167,12 +167,12 @@ def main():
                                                    intermediate_size=args.intermediate_size,
                                                    num_groups=num_groups,
                                                    num_cube_cores=args.num_cube_cores)
-    w2_grad_bytes     = get_w2_grad_tiling_bytes(w2_grad_op.split_value,
+    w1_grad_bytes     = get_w1_grad_tiling_bytes(w1_grad_op.split_value,
                                                  hidden_size=args.hidden_size,
                                                  intermediate_size=args.intermediate_size,
                                                  num_groups=num_groups,
                                                  num_cube_cores=args.num_cube_cores)
-    w1_grad_bytes     = get_w1_grad_tiling_bytes(w1_grad_op.split_value,
+    w2_grad_bytes     = get_w2_grad_tiling_bytes(w2_grad_op.split_value,
                                                  hidden_size=args.hidden_size,
                                                  intermediate_size=args.intermediate_size,
                                                  num_groups=num_groups,
@@ -182,8 +182,8 @@ def main():
 
     write_bin(os.path.join(out, 'act_grad_tiling.bin'),   act_grad_bytes)
     write_bin(os.path.join(out, 'gate_grad_tiling.bin'),  gate_grad_bytes)
-    write_bin(os.path.join(out, 'w2_grad_tiling.bin'),    w2_grad_bytes)
     write_bin(os.path.join(out, 'w1_grad_tiling.bin'),    w1_grad_bytes)
+    write_bin(os.path.join(out, 'w2_grad_tiling.bin'),    w2_grad_bytes)
     write_bin(os.path.join(out, 'swiglu_grad_tiling.bin'), swiglu_grad_bytes)
 
     # ── Event counters + workspace (rank-independent) ─────────────────────────

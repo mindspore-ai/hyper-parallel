@@ -251,7 +251,7 @@
           "format_match_mode": "FormatDefault"
         },
         {
-          "name": "w2_grad_tiling",
+          "name": "w1_grad_tiling",
           "index": 22,
           "dtype": "uint8",
           "format": "ND",
@@ -262,7 +262,7 @@
           "format_match_mode": "FormatDefault"
         },
         {
-          "name": "w1_grad_tiling",
+          "name": "w2_grad_tiling",
           "index": 23,
           "dtype": "uint8",
           "format": "ND",
