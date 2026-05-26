@@ -15,10 +15,10 @@
 """parallel_activation_with_axis test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_activation_with_axis import ActivationWithAxisDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -38,11 +38,18 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+
+    def _infer_single_layout(self, op, cache_values):
+        """Infer and unpack a single output layout with the new cache_values API."""
+        output_layouts, _ = op.infer_layout(cache_values)
+        return output_layouts[0]
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -92,7 +99,8 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), (1,))
+        cache_values = [x_layout, 1]
+        output_layout = self._infer_single_layout(op, cache_values)
 
         expected_map = (1, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -102,9 +110,9 @@ class TestParallelActivationWithAxis(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (x_layout,), (1,)) is None, (
+        assert op.get_expand_impl(None, ((output_layout,), None), cache_values) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x_layout,), (1,))}"
+            f"got {op.get_expand_impl(None, ((output_layout,), None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -119,7 +127,8 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         x_placements = (Replicate(), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), (0,))
+        cache_values = [x_layout, 0]
+        output_layout = self._infer_single_layout(op, cache_values)
 
         expected_map = (-1, 0)
         assert output_layout.tensor_map == expected_map, (
@@ -139,7 +148,8 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         x_placements = (Shard(0), Replicate(), Shard(2))
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout = op.infer_layout((x_layout,), (1,))
+        cache_values = [x_layout, 1]
+        output_layout = self._infer_single_layout(op, cache_values)
 
         expected_map = (2, -1, 0)
         assert output_layout.tensor_map == expected_map, (
@@ -159,7 +169,8 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), (0,))
+        cache_values = [x_layout, 0]
+        output_layout = self._infer_single_layout(op, cache_values)
 
         expected_map = (-1, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -179,7 +190,8 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), (-1,))
+        cache_values = [x_layout, -1]
+        output_layout = self._infer_single_layout(op, cache_values)
 
         expected_map = (1, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -200,7 +212,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         with self.assertRaisesRegex(ValueError, "requires the reduction axis to be un-sharded"):
-            op.infer_layout((x_layout,), (0,))
+            op.infer_layout([x_layout, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_activation_with_axis_model_parallel_on_mp_axis_failure(self, mock_platform):
@@ -215,7 +227,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         with self.assertRaisesRegex(ValueError, "requires the reduction axis to be un-sharded"):
-            op.infer_layout((x_layout,), (-1,))
+            op.infer_layout([x_layout, -1])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_activation_with_axis_multi_axis_tuple(self, mock_platform):
@@ -229,7 +241,8 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         x_placements = (Replicate(), Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout = op.infer_layout((x_layout,), (0, 2))
+        cache_values = [x_layout, (0, 2)]
+        output_layout = self._infer_single_layout(op, cache_values)
 
         expected_map = (-1, -1, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -250,7 +263,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 3)
 
         with self.assertRaisesRegex(ValueError, "requires the reduction axis to be un-sharded"):
-            op.infer_layout((x_layout,), (0, 2))
+            op.infer_layout([x_layout, (0, 2)])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_activation_with_axis_input_consistency_failure(self, mock_platform):
@@ -265,7 +278,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         layout2 = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
         with self.assertRaisesRegex(ValueError, "requires all tensor inputs to have the same layout"):
-            op.infer_layout((layout1, layout2), (1,))
+            op.infer_layout([layout1, layout2, 1])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_activation_with_axis_multi_input_same_layout(self, mock_platform):
@@ -279,7 +292,8 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         layout1 = _build_layout(mesh, (Shard(0), Replicate()), 2)
         layout2 = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
-        output_layout = op.infer_layout((layout1, layout2), (1,))
+        cache_values = [layout1, layout2, 1]
+        output_layout = self._infer_single_layout(op, cache_values)
 
         expected_map = (1, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -299,7 +313,8 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         x_placements = (Shard(0), Shard(1), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout = op.infer_layout((x_layout,), (2,))
+        cache_values = [x_layout, 2]
+        output_layout = self._infer_single_layout(op, cache_values)
 
         expected_map = (2, 1, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -320,7 +335,7 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         with self.assertRaisesRegex(ValueError, "should be int or tuple"):
-            op.infer_layout((x_layout,), ("invalid",))
+            op.infer_layout([x_layout, "invalid"])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_activation_with_axis_partial_input(self, mock_platform):
@@ -336,7 +351,29 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         x_layout.set_partial_by_dev_axis("dp", "sum")
 
         with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
-            op.infer_layout((x_layout,), (1,))
+            op.infer_layout([x_layout, 1])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_activation_with_axis_preprocess(self, mock_platform):
+        """
+        Feature: ActivationWithAxis preprocess
+        Description: Convert DTensor input to local tensor and build cache_values
+        Expectation: All runtime arguments are positional and cache contains layout and axis
+        """
+        op = ActivationWithAxisDistributedOp("Softmax")
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        mock_local = MagicMock()
+        mock_tensor.to_local.return_value = mock_local
+
+        local_args, local_kwargs, cache_values = op.preprocess((mock_tensor,), {"dim": 1})
+
+        assert local_args == (mock_local, 1)
+        assert not local_kwargs
+        assert cache_values == [x_layout, 1]
 
 softmax_ms_op = ActivationWithAxisDistributedOp("Softmax")
 softmax_torch_op = ActivationWithAxisDistributedOp("softmax")
@@ -349,11 +386,18 @@ class TestParallelSoftmax(unittest.TestCase):
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+
+    def _infer_single_layout(self, op, cache_values):
+        """Infer and unpack a single output layout with the new cache_values API."""
+        output_layouts, _ = op.infer_layout(cache_values)
+        return output_layouts[0]
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
@@ -392,7 +436,8 @@ class TestParallelSoftmax(unittest.TestCase):
         x_placements = (Shard(0),)
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = softmax_ms_op.infer_layout((x_layout,), (-1,))
+        cache_values = [x_layout, -1]
+        output_layout = self._infer_single_layout(softmax_ms_op, cache_values)
         expected_map = (0, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Data Parallel test failed. Expected {expected_map},"
@@ -401,9 +446,9 @@ class TestParallelSoftmax(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert softmax_ms_op.get_expand_impl(None, output_layout, (x_layout,), (-1,)) is None, (
+        assert softmax_ms_op.get_expand_impl(None, ((output_layout,), None), cache_values) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {softmax_ms_op.get_expand_impl(None, output_layout, (x_layout,), (-1,))}"
+            f"got {softmax_ms_op.get_expand_impl(None, ((output_layout,), None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -419,7 +464,7 @@ class TestParallelSoftmax(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         with self.assertRaises(ValueError):
-            _ = softmax_ms_op.infer_layout((x_layout,), (0,))
+            _ = softmax_ms_op.infer_layout([x_layout, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_torch_softmax_data_parallel_success(self, mock_platform):
@@ -433,7 +478,8 @@ class TestParallelSoftmax(unittest.TestCase):
         x_placements = (Shard(0),)
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = softmax_torch_op.infer_layout((x_layout,), (1,))
+        cache_values = [x_layout, 1]
+        output_layout = self._infer_single_layout(softmax_torch_op, cache_values)
 
         expected_map = x_layout.tensor_map
         assert output_layout.tensor_map == expected_map, (
@@ -452,7 +498,8 @@ class TestParallelSoftmax(unittest.TestCase):
         x_placements = (Shard(0),)
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = softmax_torch_op.infer_layout((x_layout,), (-1,))
+        cache_values = [x_layout, -1]
+        output_layout = self._infer_single_layout(softmax_torch_op, cache_values)
 
         expected_map = x_layout.tensor_map
         assert output_layout.tensor_map == expected_map
@@ -470,7 +517,7 @@ class TestParallelSoftmax(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         with self.assertRaises(ValueError) as context:
-            _ = softmax_torch_op.infer_layout((x_layout,), (0,))
+            _ = softmax_torch_op.infer_layout([x_layout, 0])
 
         self.assertIn("is sharded", str(context.exception))
         self.assertIn("requires the reduction axis to be un-sharded", str(context.exception))
@@ -488,7 +535,7 @@ class TestParallelSoftmax(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         with self.assertRaises(ValueError) as context:
-            _ = softmax_torch_op.infer_layout((x_layout,), (-1,))
+            _ = softmax_torch_op.infer_layout([x_layout, -1])
 
         self.assertIn("is sharded", str(context.exception))
 
@@ -504,7 +551,8 @@ class TestParallelSoftmax(unittest.TestCase):
         x_placements = (Shard(1),)
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = softmax_torch_op.infer_layout((x_layout,), (0,))
+        cache_values = [x_layout, 0]
+        output_layout = self._infer_single_layout(softmax_torch_op, cache_values)
 
         expected_map = x_layout.tensor_map
         assert output_layout.tensor_map == expected_map
@@ -522,7 +570,7 @@ class TestParallelSoftmax(unittest.TestCase):
         layout2 = _build_layout(mesh, (Shard(1),), 2)
 
         with self.assertRaises(ValueError) as context:
-            _ = softmax_torch_op.infer_layout((layout1, layout2), (1,))
+            _ = softmax_torch_op.infer_layout([layout1, layout2, 1])
 
         self.assertIn("requires all tensor inputs to have the same layout", str(context.exception))
 
@@ -538,7 +586,8 @@ class TestParallelSoftmax(unittest.TestCase):
         x_placements = (Shard(0), Shard(2))
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout = softmax_torch_op.infer_layout((x_layout,), (1,))
+        cache_values = [x_layout, 1]
+        output_layout = self._infer_single_layout(softmax_torch_op, cache_values)
 
         expected_map = x_layout.tensor_map
         assert output_layout.tensor_map == expected_map, (
@@ -557,7 +606,8 @@ class TestParallelSoftmax(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = softmax_torch_op.infer_layout((x_layout,), (1,))
+        cache_values = [x_layout, 1]
+        output_layout = self._infer_single_layout(softmax_torch_op, cache_values)
 
         assert output_layout.tensor_map == x_layout.tensor_map
         assert output_layout.to_dict()["interleaved_parallel"] is True
@@ -580,7 +630,8 @@ class TestParallelSoftmax(unittest.TestCase):
         x_placements = (Replicate(), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = softmax_torch_op.infer_layout((x_layout,), (0,))
+        cache_values = [x_layout, 0]
+        output_layout = self._infer_single_layout(softmax_torch_op, cache_values)
 
         assert output_layout.rank_list == (3, 1, 0, 2)
         assert output_layout.tensor_map == x_layout.tensor_map
@@ -597,7 +648,8 @@ class TestParallelSoftmax(unittest.TestCase):
         layout1 = _build_layout(mesh, (Shard(0),), 2)
         layout2 = _build_layout(mesh, (Shard(0),), 2)
 
-        output_layout = softmax_torch_op.infer_layout((layout1, layout2), (1,))
+        cache_values = [layout1, layout2, 1]
+        output_layout = self._infer_single_layout(softmax_torch_op, cache_values)
 
         assert output_layout.tensor_map == layout1.tensor_map
 

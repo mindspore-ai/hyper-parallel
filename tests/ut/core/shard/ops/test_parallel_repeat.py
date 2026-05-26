@@ -15,10 +15,10 @@
 """parallel_repeat test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_repeat import RepeatDistributedOp
@@ -40,11 +40,13 @@ class TestParallelRepeat(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -82,6 +84,13 @@ class TestParallelRepeat(unittest.TestCase):
             init_backend=False
         )
 
+    def _infer_repeat(self, x_layout, *sizes):
+        """Infer repeat output layout through the new cache_values calling convention."""
+        cache_values = [x_layout, sizes]
+        output_layouts, extra_info = op.infer_layout(cache_values)
+        assert extra_info is None, f"Repeat extra_info should be None, got {extra_info}"
+        return output_layouts[0], output_layouts, cache_values
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_repeat_layout_inference(self, mock_platform):
         """
@@ -93,7 +102,7 @@ class TestParallelRepeat(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(1, 5))
+        output_layout, output_layouts, cache_values = self._infer_repeat(x_layout, 1, 5)
 
         expected_map = (1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -102,9 +111,9 @@ class TestParallelRepeat(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (x_layout,), extra_args=(1, 5)) is None, (
+        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x_layout,), extra_args=(1, 5))}"
+            f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -118,7 +127,7 @@ class TestParallelRepeat(unittest.TestCase):
         x_placements = (Shard(0), Replicate(), Shard(2))
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(1, 10, 1))
+        output_layout, _, _ = self._infer_repeat(x_layout, 1, 10, 1)
 
         expected_map = (2, -1, 0)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -136,7 +145,7 @@ class TestParallelRepeat(unittest.TestCase):
         x_placements = (Replicate(), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(2, 3, 1, 1))
+        output_layout, _, _ = self._infer_repeat(x_layout, 2, 3, 1, 1)
 
         expected_map = (-1, -1, -1, 0)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -154,7 +163,7 @@ class TestParallelRepeat(unittest.TestCase):
         x_placements = ()
         x_layout = _build_layout(mesh, x_placements, 0)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(3, 4))
+        output_layout, _, _ = self._infer_repeat(x_layout, 3, 4)
 
         expected_map = (-1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -173,7 +182,7 @@ class TestParallelRepeat(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         with self.assertRaisesRegex(ValueError, "Cannot repeat dimension 0 which is sharded"):
-            op.infer_layout((x_layout,), extra_args=(5, 1))
+            op.infer_layout([x_layout, (5, 1)])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_repeat_layout_packed_tuple_args(self, mock_platform):
@@ -186,7 +195,7 @@ class TestParallelRepeat(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=((1, 5),))
+        output_layout, _, _ = self._infer_repeat(x_layout, (1, 5))
 
         expected_map = (1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -204,7 +213,7 @@ class TestParallelRepeat(unittest.TestCase):
         x_placements = (Shard(0), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(1, 1))
+        output_layout, _, _ = self._infer_repeat(x_layout, 1, 1)
 
         expected_map = (1, 0)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -222,7 +231,7 @@ class TestParallelRepeat(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(1, 0))
+        output_layout, _, _ = self._infer_repeat(x_layout, 1, 0)
 
         expected_map = (1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -241,7 +250,7 @@ class TestParallelRepeat(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         with self.assertRaisesRegex(ValueError, "Cannot repeat dimension 0 which is sharded"):
-            op.infer_layout((x_layout,), extra_args=(0, 1))
+            op.infer_layout([x_layout, (0, 1)])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_repeat_layout_1d_to_4d_prepend(self, mock_platform):
@@ -254,7 +263,7 @@ class TestParallelRepeat(unittest.TestCase):
         x_placements = (Shard(0),)
         x_layout = _build_layout(mesh, x_placements, 1)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(2, 3, 4, 1))
+        output_layout, _, _ = self._infer_repeat(x_layout, 2, 3, 4, 1)
 
         expected_map = (-1, -1, -1, 1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -272,7 +281,7 @@ class TestParallelRepeat(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(5, 6))
+        output_layout, _, _ = self._infer_repeat(x_layout, 5, 6)
 
         expected_map = (-1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -287,37 +296,37 @@ class TestParallelRepeat(unittest.TestCase):
         Expectation: ValueError is raised complaining about invalid input layout.
         """
         with self.assertRaisesRegex(ValueError, "requires a valid input tensor layout"):
-            op.infer_layout((None,), extra_args=(1, 2))
+            op.infer_layout([None, (1, 2)])
 
         with self.assertRaisesRegex(ValueError, "requires a valid input tensor layout"):
-            op.infer_layout(tuple(), extra_args=(1, 2))
+            op.infer_layout([])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_repeat_layout_missing_extra_args(self, mock_platform):
         """
-        Feature: Validate empty extra_args
-        Description: Call infer_layout without passing repeat sizes in extra_args.
+        Feature: Validate empty repeat sizes
+        Description: Call infer_layout without passing repeat sizes in cache_values.
         Expectation: ValueError is raised complaining about missing sizes.
         """
         mesh = self._make_2x4_mesh(mock_platform)
         x_placements = (Replicate(),)
         x_layout = _build_layout(mesh, x_placements, 1)
 
-        with self.assertRaisesRegex(ValueError, "requires repeat sizes in extra_args"):
-            op.infer_layout((x_layout,), extra_args=tuple())
+        with self.assertRaisesRegex(ValueError, "requires repeat sizes in cache_values"):
+            op.infer_layout([x_layout, tuple()])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_repeat_layout_list_packed_args(self, mock_platform):
         """
-        Feature: Robust parsing of extra_args as list
-        Description: User passes repeat sizes as a list inside the extra_args tuple.
+        Feature: Robust parsing of cache_values as list
+        Description: User passes repeat sizes as a list inside cache_values.
         Expectation: Layout is correctly inferred by unpacking the list.
         """
         mesh = self._make_2x4_mesh(mock_platform)
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=([1, 5],))
+        output_layout, _, _ = self._infer_repeat(x_layout, [1, 5])
 
         expected_map = (1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -335,7 +344,7 @@ class TestParallelRepeat(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(1.0, 5.0))
+        output_layout, _, _ = self._infer_repeat(x_layout, 1.0, 5.0)
 
         expected_map = (1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -353,12 +362,46 @@ class TestParallelRepeat(unittest.TestCase):
         x_placements = (Shard(0), Shard(1), Shard(2), Replicate())
         x_layout = _build_layout(mesh, x_placements, 4)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(2, 2, 1, 1, 1, 5))
+        output_layout, _, _ = self._infer_repeat(x_layout, 2, 2, 1, 1, 1, 5)
 
         expected_map = (-1, -1, 2, 1, 0, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"Complex 3D mesh repeat failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_repeat_layout_partial_input_raises_error(self, mock_platform):
+        """
+        Feature: Validate Partial input
+        Description: Input layout has Partial status.
+        Expectation: ValueError is raised because repeat does not allow Partial input.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+
+        with self.assertRaisesRegex(ValueError, "Partial status"):
+            op.infer_layout([x_layout, (1, 1)])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_repeat_preprocess(self, mock_platform):
+        """
+        Feature: RepeatDistributedOp preprocess.
+        Description: Convert DTensor input to local tensor and build cache_values.
+        Expectation: Repeat sizes stay positional and cache_values carries layout plus sizes.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+        local_tensor = MagicMock()
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        mock_tensor.to_local.return_value = local_tensor
+
+        local_args, local_kwargs, cache_values = op.preprocess((mock_tensor, 1, 5), {})
+
+        assert local_args == (local_tensor, 1, 5), f"Unexpected local_args: {local_args}"
+        assert not local_kwargs, f"Repeat should not use kwargs, got {local_kwargs}"
+        assert cache_values == [x_layout, (1, 5)], f"Unexpected cache_values: {cache_values}"
 
 
 if __name__ == "__main__":
