@@ -210,6 +210,12 @@ if __name__ == '__main__':
             'hyper_parallel.core.multicore.platform.torch': [
                 '*.so',
             ],
+            'hyper_parallel.auto_parallel.sapp_nd.memory_estimation': [
+                'configs_eval/default.yaml',
+            ],
+            'hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers': [
+                'mapping.yaml',
+            ],
         },
         cmdclass={
             'egg_info': EggInfo,
