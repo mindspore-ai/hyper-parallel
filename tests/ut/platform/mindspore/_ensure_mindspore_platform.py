@@ -107,3 +107,11 @@ def restore_torch_platform_for_ut() -> None:
             "hyper_parallel.core.context_parallel.async_context_parallel",
         )
     )
+    try:
+        from tests.ut.dmodule._ensure_torch_dmodule import (  # pylint: disable=import-outside-toplevel
+            ensure_torch_platform_for_dmodule,
+        )
+
+        ensure_torch_platform_for_dmodule()
+    except ImportError:
+        pass
