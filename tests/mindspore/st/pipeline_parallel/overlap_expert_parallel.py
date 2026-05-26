@@ -196,22 +196,23 @@ class MiniBaseExpertParallel:
 
     @staticmethod
     def index_select(x, dim, index):
-        # MS ``ops.gather(input, indices, axis)`` is the equivalent.
-        return ops.gather(x, index, axis=dim)
+        """Gather rows of ``x`` along ``dim`` using a 1-D ``index`` tensor.
+
+        Routes through ``mint.index_select`` (pyboost → ``aclnnIndexSelect``)
+        rather than ``ops.gather`` because ``gather_op.yaml`` has no
+        ``dispatch: enable`` block and falls through to the generic aclop
+        kernel, which carries a noticeably higher host dispatch cost.  Same
+        ``(input, dim, 1-D index)`` contract as ``ops.gather``, so every
+        caller (``_permute``, ``_token_dispatch``, ``_token_combine``)
+        benefits from this single switch without touching the call sites.
+        """
+        return mint.index_select(x, dim, index)
 
     @staticmethod
     def sum(x, dim=None, keepdim=False):
         if dim is None:
             return x.sum()
         return mint.sum(x, dim=dim, keepdim=keepdim)
-
-    @staticmethod
-    def one_hot(indices, depth):
-        return ops.one_hot(
-            indices, depth,
-            ms.Tensor(1.0, mstype.float32),
-            ms.Tensor(0.0, mstype.float32),
-        )
 
     @staticmethod
     def cumsum(x, dim=0):
@@ -298,10 +299,17 @@ class OverlapExpertParallel(MiniBaseExpertParallel):
     """
 
     def __init__(self, overlap: CommComputeOverlap = None,
-                 is_last_layer: bool = False) -> None:
+                 is_last_layer: bool = False,
+                 moe_permute_fusion: bool = False) -> None:
         super().__init__()
         self._overlap = overlap
         self._d_hook = "D_LAST" if is_last_layer else "D"
+        # When True, the dispatch/combine permute chain is replaced by
+        # ``ops.moe_token_permute`` / ``ops.moe_token_unpermute`` — single
+        # fused kernels that fold the sort + fmod + index_select pipeline
+        # so host-side op dispatch cost is amortised over one call instead
+        # of ~5 small kernels.  Mirrors mindformers' ExpertParallel.moe_permute_fusion.
+        self._moe_permute_fusion = moe_permute_fusion
 
     # ------------------------------------------------------------------
     # Helpers
@@ -314,29 +322,68 @@ class OverlapExpertParallel(MiniBaseExpertParallel):
             return x
         return platform.differentiable_sync_hook(x, hook_name, self._overlap.coordinator)
 
-    @staticmethod
-    def _splits_to_elem_list(splits_tensor, block_size: int):
-        """Convert per-rank token-count splits (Tensor) to a Python
-        list of element counts (``count * block_size`` per rank).
+    def _permute(self, tokens, topk_indices, moe_permute_fusion: bool):
+        """Route tokens into expert-major order.
 
-        Same host sync semantics as ``ops.AlltoAllV``'s internal splits
-        materialisation, so no extra cost.
-        """
-        elem_splits = splits_tensor * block_size
-        return elem_splits.asnumpy().tolist()
-
-    def _async_a2a(self, flat_input, input_splits_t, output_splits_t, block_size: int):
-        """Run our async a2a on a flat tensor with token-unit splits.
+        Vendored from mindformers'
+        ``ExpertParallel._permute`` so we share the same fast / slow
+        switch.  Fusion mode collapses the manual ``sort + transpose +
+        fmod + index_select`` chain into a single ``ops.moe_token_permute``
+        kernel call, removing several host-bound op dispatches from the
+        per-layer dispatch path; non-fusion mode preserves the original
+        behavior for cross-validation.
 
         Returns:
-            An :class:`AsyncCollectiveTensor` that defers
-            ``CommHandle.wait()`` to the first consumer op.
+            ``(routed_input, sorted_topk_indices, topk_indices_flat,
+              unsort_token_indices_experts)``.  ``topk_indices_flat`` is
+            the flattened-by-topk version, threaded through to the
+            experts' ``construct`` for mindformers ``GroupedMLP`` API
+            parity (the experts ignore it; counts now come from the
+            caller-supplied ``num_tokens_per_expert``).
         """
-        input_splits = self._splits_to_elem_list(input_splits_t, block_size)
-        output_splits = self._splits_to_elem_list(output_splits_t, block_size)
-        return platform.differentiable_all_to_all_single_async(
-            flat_input, input_splits, output_splits, self.ep_group,
+        tokens_shape = tokens.shape
+        topk_indices_shape = topk_indices.shape
+        if moe_permute_fusion:
+            topk_indices_kn = self.transpose(topk_indices, 1, 0)
+            topk_indices_kn = self.reshape(topk_indices_kn, (-1,))
+            sorted_topk_indices, _ = self.sort(
+                self.cast(topk_indices_kn, mstype.float32), dim=-1,
+            )
+            tokens = ops.reshape(tokens, (-1, tokens_shape[-1]))
+            topk_indices = ops.reshape(topk_indices, (-1, topk_indices.shape[-1]))
+            routed_input, unsort_token_indices_experts = ops.moe_token_permute(
+                tokens, topk_indices.astype(mstype.int32),
+            )
+            routed_input = self.reshape(
+                routed_input, (tokens_shape[0], -1, tokens_shape[-1]),
+            )
+            unsort_token_indices_experts = self.reshape(
+                unsort_token_indices_experts,
+                (topk_indices_shape[0], topk_indices_shape[1]),
+            )
+            return routed_input, sorted_topk_indices, topk_indices_kn, unsort_token_indices_experts
+
+        # Non-fusion (manual) path.
+        topk_indices = self.transpose(topk_indices, 1, 0)
+        topk_indices = self.reshape(topk_indices, (-1,))
+        sorted_topk_indices, token_indices_experts_sorted = self.sort(
+            self.cast(topk_indices, mstype.float32), dim=-1,
         )
+        _, unsort_token_indices_experts = self.sort(
+            self.cast(token_indices_experts_sorted, mstype.float32), dim=-1,
+        )
+        unsort_token_indices_experts = self.reshape(
+            unsort_token_indices_experts,
+            (topk_indices_shape[1], topk_indices_shape[0]),
+        )
+        unsort_token_indices_experts = self.transpose(unsort_token_indices_experts, 1, 0)
+        inter_map = self.fmod(token_indices_experts_sorted, topk_indices_shape[0])
+        index = self.reshape(inter_map, (-1,))
+        routed_input = self.index_select(tokens, 0, index)
+        routed_input = self.reshape(
+            routed_input, (tokens_shape[0], -1, tokens_shape[-1]),
+        )
+        return routed_input, sorted_topk_indices, topk_indices, unsort_token_indices_experts
 
     # ------------------------------------------------------------------
     # _token_dispatch override
@@ -375,31 +422,33 @@ class OverlapExpertParallel(MiniBaseExpertParallel):
         tokens = self.concat((pad_tokens, tokens), dim=0)
         probs = self.concat((pad_probs, probs), dim=0)
         topk_indices = self.concat((pad_topk_indices, topk_indices), dim=0)
-        tokens_shape = tokens.shape
 
-        topk_indices_shape = topk_indices.shape
-        topk_indices = self.transpose(topk_indices, 1, 0)
-        topk_indices = self.reshape(topk_indices, (-1,))
-        sorted_topk_indices, token_indices_experts_sorted = self.sort(
-            self.cast(topk_indices, mstype.float32), dim=-1,
+        # Permute tokens into expert-major order via fused / manual path.
+        # ``sorted_topk_indices`` (the expert-id sequence after the source-side
+        # sort) was the payload of the now-removed routing-map a2a; we ignore
+        # it here because the receiver reconstructs the same reorder index
+        # directly from the counts matrix produced by the counts a2a (see
+        # below).
+        (routed_input, _, topk_indices,
+         unsort_token_indices_experts) = self._permute(
+            tokens, topk_indices, self._moe_permute_fusion,
         )
-        _, unsort_token_indices_experts = self.sort(
-            self.cast(token_indices_experts_sorted, mstype.float32), dim=-1,
-        )
-        unsort_token_indices_experts = self.reshape(
-            unsort_token_indices_experts, (topk_indices_shape[1], topk_indices_shape[0]),
-        )
-        unsort_token_indices_experts = self.transpose(unsort_token_indices_experts, 1, 0)
 
-        inter_map = self.fmod(token_indices_experts_sorted, topk_indices_shape[0])
-        index = self.reshape(inter_map, (-1,))
-        routed_input = self.index_select(tokens, 0, index)
-        routed_input = self.reshape(routed_input, (tokens_shape[0], -1, tokens_shape[-1]))
-
-        num_tokens_per_expert = self.sum(
-            self.one_hot(self.cast(topk_indices, mstype.int32), num_experts), dim=0,
+        # Reuse the caller-supplied ``num_tokens_per_expert`` (the router
+        # already counted the un-padded tokens) and add the padding
+        # contribution as a constant: ``pad_topk_indices = arange(num_experts
+        # * topk) % num_experts`` hits each expert id exactly ``moe_router_topk``
+        # times, so the post-padding count is ``router_count + moe_router_topk``.
+        # Mirrors the torch ``ExpertParallel`` design in
+        # ``examples/torch/pp_overlap/pp_overlap_moe_example.py`` where
+        # dispatch consumes pre-computed counts and never recomputes via
+        # ``one_hot``/``bincount`` — collapses the previous
+        # ``cast → one_hot → sum → cast`` chain (4 host dispatches + an
+        # ``[N, num_experts]`` intermediate) into a single ``add`` with no
+        # device→host sync.
+        num_tokens_per_expert = (
+            self.cast(num_tokens_per_expert, mstype.float32) + moe_router_topk
         )
-        num_tokens_per_expert = self.cast(num_tokens_per_expert, mstype.float32)
 
         original_shape = list(routed_input.shape)
 
@@ -407,7 +456,13 @@ class OverlapExpertParallel(MiniBaseExpertParallel):
         flat_in = self.reshape(routed_input, (-1,))
         flat_in = self._maybe_sync_hook(flat_in, "A")
 
-        # counts a2a — uniform splits, sync (need output for splits compute)
+        # counts a2a — uniform splits, sync.  Its output (per-source,
+        # per-local-expert count matrix ``M_local``) is the only piece of
+        # routing info the receiver needs to reorder the incoming tokens
+        # into expert-major order: the source-side ``_permute`` already
+        # guarantees that within each src block tokens arrive sorted by
+        # destination expert id, so ``M_local[s, e]`` alone fixes the
+        # permutation.  That lets us drop the separate routing-map a2a.
         counts_size = int(num_tokens_per_expert.shape[0])
         num_tokens_per_expert_group, _ = platform.all_to_all_single(
             num_tokens_per_expert,
@@ -423,55 +478,85 @@ class OverlapExpertParallel(MiniBaseExpertParallel):
         num_tokens_per_expert_group_reshaped = self.reshape(
             num_tokens_per_expert_group, (ep_degree, -1),
         )
-        output_splits = self.cast(
-            self.sum(num_tokens_per_expert_group_reshaped, dim=-1, keepdim=False),
-            mstype.int64,
-        )
         num_tokens_per_expert = self.cumsum(
             self.sum(num_tokens_per_expert_group_reshaped, dim=-2, keepdim=False), 0,
         )
         num_tokens_per_expert = self.cast(num_tokens_per_expert, mstype.int64)
 
-        # routing-map a2a — variable splits via the same comm_func path.
-        from mindspore.ops.function import comm_func as _comm_func
-        input_split_list = self._splits_to_elem_list(input_splits, 1)
-        output_split_list = self._splits_to_elem_list(output_splits, 1)
-        routing_map = self.reshape(self.cast(sorted_topk_indices, mstype.float32), (-1,))
-        routing_map_out = mint.empty(
-            (int(sum(output_split_list)),), dtype=routing_map.dtype,
-        )
-        routing_map_result = _comm_func.all_to_all_single(
-            routing_map_out, routing_map,
-            output_split_sizes=output_split_list,
-            input_split_sizes=input_split_list,
-            group=self.ep_group,
-            async_op=False,
-        )
-        routing_map = (
-            routing_map_result if isinstance(routing_map_result, ms.Tensor)
-            else routing_map_result[0]
-        )
-        routing_map = self.reshape(routing_map, (1, -1))
+        # HCCL ``all_to_all_single`` needs split sizes as host Python lists
+        # (CANN API constraint).  Drain the full ``(ep_size, num_local_experts)``
+        # count matrix to host once — both ``output_split_list`` and the
+        # dispatch reorder index are derived from it without further syncs.
+        # ``input_split_list`` still needs its own sync since the source-side
+        # breakdown lives in a separate device tensor.  Net cost: 2 host
+        # syncs per dispatch (same as before), but the routing-map a2a —
+        # one variable-splits HCCL roundtrip of ``≈num_tokens`` elements —
+        # is gone.
+        group_counts = num_tokens_per_expert_group_reshaped.asnumpy().astype(np.int64)
+        input_split_list = input_splits.asnumpy().tolist()
+        output_split_list = group_counts.sum(axis=1).tolist()
 
-        # main token a2a — async / differentiable (returns AsyncCollectiveTensor)
-        flat_out = self._async_a2a(flat_in, input_splits, output_splits, cell.hidden_size)
+        # Reconstruct the dispatch reorder index (source-block order →
+        # expert-major) from ``group_counts`` (= ``M_local``).  After the
+        # main token a2a the receiver buffer is laid out as
+        # ``[from_src_0, from_src_1, ..., from_src_{P-1}]``; within each
+        # source block tokens are already in destination-local-expert order.
+        # Per local expert ``e`` we therefore gather ``group_counts[s, e]``
+        # consecutive tokens starting at offset
+        # ``src_block_starts[s] + within_src_offsets[s, e]`` for each
+        # source ``s``.  ``combine_index`` is the inverse permutation,
+        # cached for ``_token_combine`` to undo this reorder before the
+        # combine a2a.
+        src_block_starts = np.concatenate(
+            ([0], group_counts.sum(axis=1).cumsum()[:-1]),
+        ).astype(np.int64)
+        within_src_offsets = np.concatenate(
+            (np.zeros((ep_degree, 1), dtype=np.int64),
+             group_counts[:, :-1].cumsum(axis=1)),
+            axis=1,
+        )
+        total_recv_tokens = int(group_counts.sum())
+        dispatch_index_np = np.empty(total_recv_tokens, dtype=np.int32)
+        write_pos = 0
+        for e in range(group_counts.shape[1]):
+            for s in range(ep_degree):
+                start = int(src_block_starts[s] + within_src_offsets[s, e])
+                count = int(group_counts[s, e])
+                dispatch_index_np[write_pos:write_pos + count] = np.arange(
+                    start, start + count, dtype=np.int32,
+                )
+                write_pos += count
+        combine_index_np = np.empty(total_recv_tokens, dtype=np.int32)
+        combine_index_np[dispatch_index_np] = np.arange(
+            total_recv_tokens, dtype=np.int32,
+        )
+        dispatch_index = ms.Tensor(dispatch_index_np)
+        combine_index = ms.Tensor(combine_index_np)
+
+        # main token a2a — async / differentiable (returns AsyncCollectiveTensor).
+        # Element-unit splits are computed host-side from the cached
+        # token-unit lists; no extra device→host sync needed.
+        hidden = cell.hidden_size
+        flat_out = platform.differentiable_all_to_all_single_async(
+            flat_in,
+            [s * hidden for s in input_split_list],
+            [s * hidden for s in output_split_list],
+            self.ep_group,
+        )
         flat_out = self._maybe_sync_hook(flat_out, "B")
         # First real op on flat_out triggers AsyncCollectiveTensor's
         # ``__ms_dispatch__`` → ``CommHandle.wait()`` → unwrap to plain Tensor.
         global_input_tokens = self.reshape(flat_out, (1, -1, cell.hidden_size))
 
-        # ---- Post-A2A sort + final permute layout ----
-        _, sorted_map = self.sort(routing_map)
-        _, unsorted_map = self.sort(self.cast(sorted_map, mstype.float32))
-        index = self.reshape(sorted_map, (sorted_map.shape[0] * sorted_map.shape[1],))
+        # ---- Post-A2A reorder into expert-major via precomputed index ----
         global_input_tokens_shape = global_input_tokens.shape
         global_input_tokens = self.reshape(global_input_tokens, (-1, global_input_tokens_shape[-1]))
-        global_input_tokens = self.index_select(global_input_tokens, 0, index)
+        global_input_tokens = self.index_select(global_input_tokens, 0, dispatch_index)
         global_input_tokens = self.reshape(global_input_tokens, (-1, global_input_tokens_shape[-1]))
 
         self.ctx = (
-            probs, unsorted_map, unsort_token_indices_experts,
-            input_splits, output_splits, original_shape, pad_size,
+            probs, combine_index, unsort_token_indices_experts,
+            input_split_list, output_split_list, original_shape, pad_size,
         )
         return global_input_tokens, probs, topk_indices, num_tokens_per_expert
 
@@ -483,35 +568,51 @@ class OverlapExpertParallel(MiniBaseExpertParallel):
         """Combine path with C→D hooks bracketing the combine a2a."""
         from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0415
         (
-            probs, unsorted_map, unsort_token_indices_experts,
-            input_splits, output_splits, original_shape, pad_size,
+            probs, combine_index, unsort_token_indices_experts,
+            input_split_list, output_split_list, original_shape, pad_size,
         ) = self.ctx
 
         routed_output = self.reshape(routed_output, (1, -1, cell.hidden_size))
-        index = self.reshape(unsorted_map, (-1,))
         routed_output_shape = routed_output.shape
         routed_output = self.reshape(routed_output, (-1, routed_output_shape[-1]))
-        routed_output = self.index_select(routed_output, 0, index)
+        routed_output = self.index_select(routed_output, 0, combine_index)
         routed_output = self.reshape(
             routed_output, (routed_output_shape[0], -1, routed_output_shape[-1]),
         )
 
         # ---- Combine a2a bracketed by C/D hooks ----
+        # Combine uses output→input splits (reverse direction).  Both lists
+        # are already host-side (cached in dispatch), so element-unit splits
+        # are computed without any device→host sync.
         flat_in = self.reshape(routed_output, (-1,))
         flat_in = self._maybe_sync_hook(flat_in, "C")
-        # Combine uses output→input splits (reverse direction).
-        flat_out = self._async_a2a(flat_in, output_splits, input_splits, cell.hidden_size)
+        hidden = cell.hidden_size
+        flat_out = platform.differentiable_all_to_all_single_async(
+            flat_in,
+            [s * hidden for s in output_split_list],
+            [s * hidden for s in input_split_list],
+            self.ep_group,
+        )
         flat_out = self._maybe_sync_hook(flat_out, self._d_hook)
         permutated_local_input_tokens = self.reshape(flat_out, original_shape)
 
         # ---- Post-combine routing ----
-        index = self.reshape(unsort_token_indices_experts, (-1,))
         permutated_local_input_tokens = self.reshape(
             permutated_local_input_tokens,
             (-1, permutated_local_input_tokens.shape[-1]),
         )
-        routed_output = self.index_select(permutated_local_input_tokens, 0, index)
         unsort_token_indices_experts_shape = unsort_token_indices_experts.shape
+        if self._moe_permute_fusion:
+            unsort_token_indices_experts = self.reshape(
+                unsort_token_indices_experts, (-1,),
+            )
+            routed_output = ops.moe_token_unpermute(
+                permutated_local_input_tokens,
+                unsort_token_indices_experts.astype(mstype.int32),
+            )
+        else:
+            index = self.reshape(unsort_token_indices_experts, (-1,))
+            routed_output = self.index_select(permutated_local_input_tokens, 0, index)
         routed_output = self.reshape(
             routed_output,
             (unsort_token_indices_experts_shape[0],

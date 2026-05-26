@@ -571,18 +571,22 @@ class TorchPlatform(Platform):
         return torch.full(size, fill_value, dtype=dtype)
 
     @staticmethod
-    def empty(size, dtype=None):
+    def empty(size, dtype=None, device=None):
         """
         Create an uninitialized tensor.
 
         Args:
             size (tuple): The shape of the output tensor.
             dtype (Optional[torch.dtype]): The desired data type.
+            device (Optional[torch.device or str]): Target device.  When
+                ``None`` the tensor is allocated on the default device
+                (CPU under PyTorch defaults), matching the original
+                back-compat behavior.
 
         Returns:
             Tensor: An uninitialized tensor.
         """
-        return torch.empty(size, dtype=dtype)
+        return torch.empty(size, dtype=dtype, device=device)
 
     @staticmethod
     def get_rank():

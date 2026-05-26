@@ -136,6 +136,45 @@ def _seed_linear_(linear: nn.Cell, rng: np.random.RandomState,
         linear.bias.set_data(Tensor(b_np))
 
 
+class _MiniAttnSubstitute(nn.Cell):
+    """Attention-shaped compute placeholder (NOT real attention).
+
+    Replaces the single ``Linear(h, h)`` stand-in with an MLP-shaped
+    block (``h → 4h → GELU → h``) so per-layer compute mass is large
+    enough for the ``OVERLAP_B_F`` window to actually have compute to
+    overlap against the EP a2a — the original single Linear was
+    ``~bs*seq*h^2`` FLOPs (e.g. ~17 GFLOPs at ``h=2048, seq=4096, bs=1``),
+    well below a single dispatch/combine a2a in wall time, so the
+    paired FWD thread finished its compute almost immediately and
+    spent the rest of the window waiting on comm.
+
+    Why MLP shape, not real multi-head attention: a faithful MHA would
+    materialise an ``(bs, num_heads, seq, seq)`` attention matrix in
+    fp32 which at ``seq=4096`` is ~1 GB per layer per micro-batch and
+    OOMs the test card.  Fused SDPA / FlashAttention would fix the
+    memory but adds an Ascend-specific op dependency the PoC has been
+    careful to avoid.  The MLP shape gives ~``8*bs*seq*h^2`` FLOPs at
+    bounded memory and matches the original code's intent that this
+    module is a stand-in for compute mass, not a faithful reproduction
+    of an attention block.  Bias terms are kept (mirroring the original
+    ``mint.nn.Linear`` default) so seeding stays self-explanatory.
+    """
+
+    def __init__(self, config: '_TinyConfig', rng: np.random.RandomState) -> None:
+        super().__init__()
+        hidden = config.hidden_size
+        intermediate = 4 * hidden
+        self.up = mint.nn.Linear(hidden, intermediate)
+        _seed_linear_(self.up, rng)
+        self.down = mint.nn.Linear(intermediate, hidden)
+        _seed_linear_(self.down, rng)
+
+    def construct(self, x):
+        x = self.up(x)
+        x = mint.nn.functional.gelu(x)
+        return self.down(x)
+
+
 class _MiniMoEBlock(nn.Cell):
     """Single transformer-like block: linear ``attn`` + ``MiniGroupedMLP`` MoE.
 
@@ -157,8 +196,11 @@ class _MiniMoEBlock(nn.Cell):
     def __init__(self, config: _TinyConfig, rng: np.random.RandomState) -> None:
         super().__init__()
         self.config = config
-        self.attn = mint.nn.Linear(config.hidden_size, config.hidden_size)
-        _seed_linear_(self.attn, rng)
+        # Use the MLP-shaped attention substitute (see _MiniAttnSubstitute
+        # docstring for why MHA isn't used).  Seeding lives inside the
+        # cell, so the rng-consumption order here is
+        # ``attn.up → attn.down → router → experts``.
+        self.attn = _MiniAttnSubstitute(config, rng)
         self.router = mint.nn.Linear(
             config.hidden_size, config.num_moe_experts, bias=False,
         )
@@ -210,14 +252,16 @@ class _MiniMoEBlock(nn.Cell):
         topk_indices = forced_indices.reshape(num_tokens, 1)         # (bs*seq, 1)
         topk_indices_i32 = topk_indices.to(mstype.int32)
 
-        # topk_probs[i, 0] = probs_full[i, forced_indices[i]] — gather
-        # via one-hot * sum to keep the router-weight gradient edge
-        # into the combine multiplication intact.
-        mask = ops.one_hot(
-            forced_indices, num_experts,
-            Tensor(1.0, probs_full.dtype), Tensor(0.0, probs_full.dtype),
-        )                                                            # (bs*seq, num_experts)
-        topk_probs = (probs_full * mask).sum(dim=-1, keepdim=True)   # (bs*seq, 1)
+        # topk_probs[i, 0] = probs_full[i, forced_indices[i]].
+        # ``mint.gather`` (Ascend → ``aclnnGatherV2`` single async kernel)
+        # replaces the previous ``one_hot * sum(-1)`` chain: gather is itself
+        # differentiable (backward is scatter) with identical gradient
+        # semantics on ``probs_full``, so the router-weight edge into the
+        # combine multiplication is preserved.  Eliminates two
+        # ``Tensor(scalar)`` ctors per call and the
+        # ``[bs*seq, num_experts]`` one-hot intermediate; collapses 5
+        # dispatches (Tensor + Tensor + one_hot + mul + sum) into 1.
+        topk_probs = mint.gather(probs_full, dim=1, index=topk_indices_i32)  # (bs*seq, 1)
 
         # Token counts per expert — exactly balanced by construction
         # (each expert gets num_tokens // num_experts; the first
@@ -661,6 +705,13 @@ def _build_pipeline(pp_rank, ep_mesh, cfg, use_overlap, overlap=None,
             style = OverlapExpertParallel(
                 overlap=chunk_overlap,
                 is_last_layer=(layer_idx == last_idx),
+                # Enable the ``ops.moe_token_permute`` /
+                # ``ops.moe_token_unpermute`` fused fast path — folds the
+                # manual sort + fmod + index_select chain into one kernel
+                # call to keep per-layer host dispatch out of the
+                # OVERLAP_B_F window.  Mirrors mindformers' ExpertParallel
+                # invocation with ``moe_permute_fusion=True``.
+                moe_permute_fusion=True,
             )
             style._apply(layer.experts, ep_mesh)
         # Apply OverlapExpertParallel BEFORE wrapping with recompute —

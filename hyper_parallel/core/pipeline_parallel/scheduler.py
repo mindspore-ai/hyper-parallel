@@ -1134,7 +1134,13 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
         ops = []
         short = self._short_micro()
         last_micro = self.micro_batch_num - 1
-        bubble = self._trailing_bubble()
+        # Double the bubble at each chunk's last-micro BWD: one ``bubble`` covers
+        # the missing ``rs - micro`` micros, the second offsets the next chunk
+        # by 2 slots so the wrap-around grad (rank 0 stage ``rs`` -> rank
+        # last_stage stage ``rs - 1``) lands AFTER its producer in column-scan
+        # time.  Matches the +2 cooldown-rhythm offset that non-short Interleaved
+        # 1F1B naturally has from extra 1F1B ops on rank last_stage.
+        bubble = 2 * self._trailing_bubble()
         for op_idx in range(warmup_ops + fwd_bwd_ops, total_ops):
             ops.append(None)
             bwd_stage_idx = self.backward_stage_index(op_idx - warmup_ops, stage_index)
@@ -1152,7 +1158,9 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
         short = self._short_micro()
         last_micro = self.micro_batch_num - 1
         last_stage = self.real_stage_num - 1
-        bubble = self._trailing_bubble()
+        # Double the bubble at the 1F1B->cooldown chunk boundary on rank
+        # last_stage; see :meth:`_emit_cooldown_ops` for the alignment rationale.
+        bubble = 2 * self._trailing_bubble()
         for op_idx in range(warmup_ops, warmup_ops + fwd_bwd_ops):
             fwd_stage_idx = self.forward_stage_index(op_idx, stage_index)
             fwd_micro_idx = fwd_stage_micro_index[fwd_stage_idx]
@@ -1234,7 +1242,9 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
         last_stage = self.real_stage_num - 1
         if self._short_micro() and stage_index == last_stage and bwd_steps:
             if bwd_steps[-1].micro_index == self.micro_batch_num - 1:
-                ops.extend([None] * self._trailing_bubble())
+                # Double the bubble at the 1F1B->cooldown chunk boundary;
+                # see :meth:`_emit_cooldown_ops` for the alignment rationale.
+                ops.extend([None] * (2 * self._trailing_bubble()))
         return ops
 
     def construct_stage_exec_order(self, stage_index):

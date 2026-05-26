@@ -909,13 +909,17 @@ class MindSporePlatform(Platform):
         return mint.full(size, fill_value, dtype=dtype)
 
     @staticmethod
-    def empty(size, dtype=None):
+    def empty(size, dtype=None, device=None):  # pylint: disable=unused-argument
         """
         Create an uninitialized tensor.
 
         Args:
             size (tuple): The shape of the output tensor.
             dtype (Optional[ms.Type]): The desired data type.
+            device: Accepted for cross-backend signature parity with the
+                Torch backend but ignored — under MindSpore the active
+                device is bound at process init via ``ms.set_device`` and
+                ``mint.empty`` allocates on it directly.
 
         Returns:
             Tensor: An uninitialized tensor.

@@ -306,10 +306,10 @@ class PipelineStage(PipelineStageBase):
         requires_grad = bool(meta[-1])
         if len(meta) == 4:
             self._update_layout(meta[2])
-            buffer = DTensor.from_local(platform.new_tensor(meta[0], meta[1],
-                                                            device=self.device), meta[2].mesh, meta[2].alias_placements)
+            buffer = DTensor.from_local(platform.empty(meta[0], dtype=meta[1],
+                                                       device=self.device), meta[2].mesh, meta[2].alias_placements)
         else:
-            buffer = platform.new_tensor(meta[0], meta[1], device=self.device)
+            buffer = platform.empty(meta[0], dtype=meta[1], device=self.device)
         buffer.requires_grad = requires_grad
         if micro_index in self.args_recv_info:
             recv_info = self.args_recv_info[micro_index][idx]
@@ -357,11 +357,11 @@ class PipelineStage(PipelineStageBase):
         """construct backward recv info."""
         if micro_index not in self.grad_recv_info:
             shape = tensor_send.shape if not isinstance(tensor_send, DTensor) else tensor_send.local_shape
-            buffer = platform.new_tensor(shape, tensor_send.dtype, device=self.device)
+            buffer = platform.empty(shape, dtype=tensor_send.dtype, device=self.device)
             return _RecvInfo(global_rank, buffer)
         recv_info = self.grad_recv_info[micro_index][idx]
         shape = tensor_send.shape if not isinstance(tensor_send, DTensor) else tensor_send.local_shape
-        recv_info.buffer = platform.new_tensor(shape, tensor_send.dtype, device=self.device)
+        recv_info.buffer = platform.empty(shape, dtype=tensor_send.dtype, device=self.device)
         return None
 
     def _extract_meta_from_tensor(self, tensor):

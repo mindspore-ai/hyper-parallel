@@ -25,8 +25,8 @@ from tests.mindspore.st.utils import msrun_case
 PP_OVERLAP_MOE_POC = "pp_overlap_moe_poc.py"
 
 
-#@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-#          card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_end_to_end():
     """End-to-end PP+EP+overlap on MindSpore PyNative.
 
@@ -70,8 +70,8 @@ def test_pp_overlap_moe_recompute():
                12353, worker_num=8, local_worker_num=8)
 
 
-#@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-#          card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_accuracy():
     """Numerical equivalence of overlap stack vs sync baseline.
 
