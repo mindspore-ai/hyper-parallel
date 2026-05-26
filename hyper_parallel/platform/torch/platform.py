@@ -162,6 +162,17 @@ class _TorchSyncHookFunction(torch.autograd.Function):
 
     # 4-hook role tables: (prev_role_idx, next_role_idx).
     # Index encoding: 1 = COMM, 2 = COMPUTE.
+    #
+    # Torch only uses the four core hooks A/B/C/D + D_LAST sentinel.
+    # The MS backend adds ``CHUNK_START`` / ``CHUNK_END`` because of
+    # MS-specific issues (stream binding follows the calling thread;
+    # autograd cannot have FWD-record + BWD-replay concurrently).
+    # Torch has neither problem — CUDA streams are process-wide and
+    # Torch autograd is thread-safe — so we keep the original
+    # 4-hook design here.  Do not add CHUNK_START / CHUNK_END to
+    # the Torch tables; if a future test does need them, copy the
+    # MS implementation and add the matching skip rules in
+    # ``forward`` / ``backward``.
     _FWD_ROLES = {
         #         (prev, next)      prev op          next op
         "A": (2, 1),   # COMPUTE, COMM     Attention   | dispatch
@@ -211,14 +222,18 @@ class _TorchSyncHookFunction(torch.autograd.Function):
         if not coordinator.is_enabled():
             return x
 
-        # ``D_LAST`` marks the last layer's D hook.  The "next op" after
-        # this hook is the chunk's output (no Attention follows), so the
-        # rendezvous is meaningless — skip it.  In backward this same
-        # hook is the very first BWD hook to fire, where ``combine.bwd``
-        # has already free-run before any rendezvous is possible — also
-        # skip.  Tagging at wrap time replaces the old runtime
-        # ``increment_cycle`` / ``bwd_d_should_skip`` mechanisms.
         if hook_name == "D_LAST":
+            # ``D_LAST`` marks the last layer's closing D hook — no
+            # Attention follows in this chunk, so the rendezvous is
+            # meaningless and is skipped.  We still
+            # ``notify_dispatched(COMM)`` so the COMPUTE side of the
+            # preceding ``C`` rendezvous unblocks early, letting
+            # BWD's Attn.bwd_last overlap with FWD's post-combine
+            # work — Torch autograd is thread-safe so this concurrent
+            # FWD-record + BWD-replay is fine.
+            prev_idx, _ = _TorchSyncHookFunction._FWD_ROLES["D"]
+            role_of = _TorchSyncHookFunction._role_enum
+            coordinator.notify_dispatched(role_of(prev_idx))
             return x
 
         prev_idx, next_idx = _TorchSyncHookFunction._FWD_ROLES[hook_name]
@@ -253,10 +268,13 @@ class _TorchSyncHookFunction(torch.autograd.Function):
         if not coordinator.is_enabled():
             return grad_output, None, None
 
-        # Same ``D_LAST`` semantics as forward: this is the first BWD
-        # hook to fire and combine.bwd has already dispatched freely
-        # before any rendezvous can happen, so skip the rendezvous.
         if hook_name == "D_LAST":
+            # First BWD hook to fire; combine.bwd has already
+            # dispatched freely before any rendezvous can happen.
+            # Skipping here is safe on Torch because CUDA streams
+            # are process-wide and the NCCL FIFO order is consistent
+            # across ranks regardless of which thread launched
+            # combine.bwd.
             return grad_output, None, None
 
         prev_idx, next_idx = _TorchSyncHookFunction._BWD_ROLES[hook_name]
@@ -972,7 +990,15 @@ class TorchPlatform(Platform):
 
         Args:
             x:           Input tensor.
-            hook_name:   One of ``"A"``, ``"B"``, ``"C"``, ``"D"``.
+            hook_name:   One of:
+                         * ``"A"`` / ``"B"`` / ``"C"`` / ``"D"`` —
+                           full rendezvous on both directions.
+                         * ``"D_LAST"`` — closing D of the last MoE
+                           layer in a chunk.  Forward: ``notify_dispatched``
+                           only (no Attention follows so rendezvous is
+                           skipped).  Backward: pure skip (first BWD
+                           hook to fire; combine.bwd has already
+                           dispatched freely).
             coordinator: A :class:`HookCoordinator` instance.
         """
         return _TorchSyncHookFunction.apply(x, hook_name, coordinator)
