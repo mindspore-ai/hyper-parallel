@@ -247,6 +247,12 @@ class DTensor(DTensorBase):
             return self._layout.alias_placements
         return self._placements
 
+    def _from_converted_local(self, local_tensor: Tensor) -> 'DTensor':
+        """Rebuild converted DTensor data without preserving Parameter identity."""
+        cls = DTensor if isinstance(self, platform.Parameter) else self.__class__
+        return cls(local_tensor, device_mesh=self._device_mesh,
+                   placements=self._alias_placements())
+
     def to(self, *args, **kwargs):
         """Move the DTensor to a different device or dtype.
 
@@ -263,8 +269,7 @@ class DTensor(DTensorBase):
             DTensor: A new DTensor with the converted local tensor.
         """
         new_local = self._local_tensor.to(*args, **kwargs)
-        return self.__class__(new_local, device_mesh=self._device_mesh,
-                              placements=self._alias_placements())
+        return self._from_converted_local(new_local)
 
     def float(self):
         """Convert the DTensor to float dtype.
@@ -273,8 +278,7 @@ class DTensor(DTensorBase):
             DTensor: A new DTensor with float32 local tensor.
         """
         new_local = self._local_tensor.float()
-        return self.__class__(new_local, device_mesh=self._device_mesh,
-                              placements=self._alias_placements())
+        return self._from_converted_local(new_local)
 
     def to_local(self) -> Tensor:
         """
