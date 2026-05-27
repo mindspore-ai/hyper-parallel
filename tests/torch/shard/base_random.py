@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -108,7 +108,7 @@ def test_multi_dim_sharding_offset():
 
         # Calculate expected pre-op offset
         mesh_coordinate = mesh_2d.get_coordinate()
-        shard_idx, total_shards = _calc_shard_info(mesh_coordinate, mesh_2d, placements)
+        shard_idx, total_shards = _calc_shard_info(mesh_coordinate, mesh_2d, placements, global_shape)
         shard_linear_idx = _calc_shard_linear_idx(shard_idx, total_shards)
         first_shard_size = _calc_first_shard_size(mesh_2d, placements, global_shape)
         local_size = np.prod(first_shard_size)
