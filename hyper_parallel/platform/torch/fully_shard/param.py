@@ -320,7 +320,7 @@ class TorchHSDPParamV2(HSDPParamV2):
     def accumulated_allreduced_grad(self) -> bool:
         """Whether the parameter has accumulated all-reduced gradient."""
         return self._accumulated_allreduced_grad
- 
+
     @accumulated_allreduced_grad.setter
     def accumulated_allreduced_grad(self, value: bool) -> None:
         self._accumulated_allreduced_grad = value
@@ -813,6 +813,11 @@ class TorchHSDPParamV2(HSDPParamV2):
                     "Expected sharded_param._local_tensor to be contiguous"
                 )
         self._sharding_spec = cast(DTensor, self.sharded_param).layout
+        # After ``to_empty`` replaces the module parameter with a plain tensor,
+        # re-install the DTensor ``nn.Parameter`` so the optimizer and forward
+        # hooks see the correct object.  Idempotent when the module already
+        # holds ``self.sharded_param`` (same data_ptr → no-op in practice).
+        self._setattr_on_modules(self.sharded_param)
 
     def _get_unsharded_param_data(self, async_op: bool = False) -> Tuple[torch.Tensor, Optional[dist.Work]]:
         """

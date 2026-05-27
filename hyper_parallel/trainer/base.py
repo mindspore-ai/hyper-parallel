@@ -446,10 +446,6 @@ class BaseTrainer:
             # Always materialize first (random init baseline) so no param
             # stays on meta — then overlay the checkpoint.
             self._materialize_and_init_shards()
-            # Re-tie weights — ``to_empty`` gives every nn.Parameter fresh
-            # storage so ``__init__``-time ties are broken.
-            if hasattr(self.model, "tie_weights"):
-                self.model.tie_weights()
             if weights_path:
                 self._load_weights(weights_path)
         elif weights_path:
@@ -1211,6 +1207,12 @@ class BaseTrainer:
         for module in self.model.modules():
             if hasattr(module, "reset_inv_freq"):
                 module.reset_inv_freq()
+        # Re-tie weights — ``to_empty`` gives every nn.Parameter fresh
+        # storage so ``__init__``-time ties are broken. Must happen before
+        # ``lazy_init`` re-wraps params as DTensor (non-leaf), which would
+        # cause ``register_parameter`` to reject the assignment.
+        if hasattr(self.model, "tie_weights"):
+            self.model.tie_weights()
         # ``to_empty`` strips DTensor; ``lazy_init`` re-wraps shards before
         # ``_load_weights`` / optimizer step see the params (the forward
         # pre-hook does the same later, but the loader needs DTensor first).
