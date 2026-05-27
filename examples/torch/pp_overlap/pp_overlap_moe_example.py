@@ -279,14 +279,17 @@ def make_overlap_b_f_callback(overlap: CommComputeOverlap, device: torch.device)
 
         # When overlap_p2p=True the scheduler issues FWD_RECV / BWD_RECV
         # before this OVERLAP_B_F step and stashes the handles in
-        # ctx.fwd_recv_ops / ctx.bwd_recv_ops keyed by (stage_index,
-        # micro_index).  Pop them here so each side waits on its own
-        # compute stream, letting PP-RECV stream overlap with the
-        # paired-side compute.  Empty when overlap_p2p=False.
-        fwd_recv_handles = ctx.fwd_recv_ops.pop(
+        # schedule.fwd_handle_cache / schedule.bwd_handle_cache keyed by
+        # (stage_index, micro_index).  Pop them here so each side waits on
+        # its own compute stream, letting PP-RECV stream overlap with the
+        # paired-side compute.  Empty when overlap_p2p=False.  (The
+        # ``schedule.wait_fwd_recv`` / ``wait_bwd_recv`` helpers pop *and*
+        # wait in one call; this callback splits the two so the wait can
+        # land on the worker thread's stream — see fwd_fn / bwd_fn below.)
+        fwd_recv_handles = schedule.fwd_handle_cache.pop(
             (fwd_stage.stage_index, fwd_mi), None,
         )
-        bwd_recv_handles = ctx.bwd_recv_ops.pop(
+        bwd_recv_handles = schedule.bwd_handle_cache.pop(
             (bwd_stage.stage_index, bwd_mi), None,
         )
 

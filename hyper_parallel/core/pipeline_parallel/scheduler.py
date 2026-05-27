@@ -165,33 +165,58 @@ def iter_leaf_meta_steps(step):
     yield step
 
 class PipelineContext:
-    """Context passed to custom execution functions registered via
-    :meth:`PipelineScheduleRuntime.register_custom_function`.
+    """Per-run state handed to a custom execution function (see
+    :meth:`PipelineScheduleRuntime.register_custom_function`).
 
-    Provides access to the schedule's internal state so that custom
-    handlers (e.g. OVERLAP_F_B callbacks) can perform P2P communication,
-    invoke ``forward_one_chunk`` / ``backward_one_chunk``, record losses,
-    etc.
+    A plain data carrier for one :meth:`PipelineScheduleRuntime.run_microbatches`
+    call.  The P2P helpers (``wait_fwd_recv`` / ``wait_bwd_recv`` / ``send_fwd``
+    / ``send_bwd``) and the ``enable_dxdw_split`` flag live on the schedule, so a
+    callback reaches them through :attr:`schedule`, e.g.
+    ``ctx.schedule.send_bwd(stage, micro_index)``.
 
     Attributes:
-        schedule: The :class:`PipelineScheduleRuntime` instance.
+        schedule: The owning :class:`PipelineScheduleRuntime`.
         arg_mbs: Per-micro-batch positional args.
         kwarg_mbs: Per-micro-batch keyword args.
-        losses: Mutable list for loss collection.
-        fwd_recv_ops: ``{(stage_index, micro_index): [handle, ...]}``
-            cached forward recv handles (when ``overlap_p2p=True``).
-        bwd_recv_ops: Same for backward recv handles.
-        send_handles: Mutable list of outstanding send handles.
+        losses: Mutable list collecting per-step losses.
     """
 
-    def __init__(self, schedule, arg_mbs, kwarg_mbs, losses, send_handles):
+    def __init__(self, schedule: "PipelineScheduleRuntime", arg_mbs: list,
+                 kwarg_mbs: list, losses: list) -> None:
+        """Bundle the active schedule with one run's micro-batch inputs and losses."""
         self.schedule = schedule
         self.arg_mbs = arg_mbs
         self.kwarg_mbs = kwarg_mbs
         self.losses = losses
-        self.fwd_recv_ops = schedule.fwd_handle_cache
-        self.bwd_recv_ops = schedule.bwd_handle_cache
-        self.send_handles = send_handles
+
+
+def _exec_fsdp_unshard(stage):
+    """Unshard every HSDPModule in the stage's submodule tree."""
+    for _, module in platform.get_cells_and_names(stage.submodule):
+        if isinstance(module, HSDPModule):
+            module.unshard()
+
+
+def _exec_fsdp_reshard(stage):
+    """Reshard every HSDPModule in the stage's submodule tree."""
+    for _, module in platform.get_cells_and_names(stage.submodule):
+        if isinstance(module, HSDPModule):
+            module.reshard()
+
+
+def _exec_fsdp_reduce_grad(stage):
+    """Run the stage's FSDP post-backward gradient reduction."""
+    stage.execute_reduce_grad()
+
+
+# FSDP control MetaStep -> handler(stage).  Membership also marks which
+# MetaStepTypes are FSDP control steps, so the runtime loop dispatches with a
+# single table lookup instead of re-switching on the step type.
+_FSDP_STEP_HANDLERS = {
+    MetaStepType.FSDP_UNSHARD: _exec_fsdp_unshard,
+    MetaStepType.FSDP_RESHARD: _exec_fsdp_reshard,
+    MetaStepType.FSDP_REDUCE_GRAD: _exec_fsdp_reduce_grad,
+}
 
 
 class PipelineScheduleRuntime(ABC):
@@ -245,6 +270,9 @@ class PipelineScheduleRuntime(ABC):
         self.bwd_handle_cache = {}
         self._custom_fn_map = {}
         self._pp_swap_enabled = swap
+        # Outstanding async send handle groups for the in-flight
+        # ``run_microbatches`` call; reset per run and drained at its end.
+        self._send_handles = []
 
     def register_custom_function(self, step_type: MetaStepType, fn) -> None:
         """Register a custom execution function for the given step type.
@@ -363,10 +391,78 @@ class PipelineScheduleRuntime(ABC):
         if stage.is_last_stage:
             losses.append(loss)
 
+    @property
+    def enable_dxdw_split(self) -> bool:
+        """Whether this schedule splits ``OVERLAP_B_F`` backward into dx/dw."""
+        return getattr(self, "_enable_dxdw_split", False)
+
     def _wait_p2p(self, handles):
         for handle in handles:
             if handle is not None:
                 handle.wait()
+
+    # --- P2P step primitives ------------------------------------------------
+    # One method per cross-rank comm action, used both by the runtime loop
+    # (``_exec_step``) and by OVERLAP callbacks (via ``ctx.schedule``).  With
+    # ``overlap_p2p=True`` comm is decoupled from its compute: a recv caches its
+    # handles for the consuming step to ``wait_*`` later, and a send defers its
+    # handles to the end-of-iteration drain.  With ``overlap_p2p=False`` every
+    # op waits inline.
+
+    def recv_fwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> None:
+        """Post the FWD recv for ``micro_index``; cache it (overlap_p2p) or wait now."""
+        handles = stage.exec_fwd_recv_ops(micro_index)
+        if self._overlap_p2p:
+            self.fwd_handle_cache[(stage.stage_index, micro_index)] = handles
+        else:
+            self._wait_p2p(handles)
+
+    def recv_bwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> None:
+        """Post the BWD recv for ``micro_index``; cache it (overlap_p2p) or wait now."""
+        handles = stage.exec_bwd_recv_ops(micro_index)
+        if self._overlap_p2p:
+            self.bwd_handle_cache[(stage.stage_index, micro_index)] = handles
+        else:
+            self._wait_p2p(handles)
+
+    def wait_fwd_recv(self, stage_index: int, micro_index: int) -> None:
+        """Wait the FWD recv cached by :meth:`recv_fwd`; no-op if nothing is cached."""
+        handles = self.fwd_handle_cache.pop((stage_index, micro_index), None)
+        if handles:
+            self._wait_p2p(handles)
+
+    def wait_bwd_recv(self, stage_index: int, micro_index: int) -> None:
+        """Wait the BWD recv cached by :meth:`recv_bwd`; no-op if nothing is cached."""
+        handles = self.bwd_handle_cache.pop((stage_index, micro_index), None)
+        if handles:
+            self._wait_p2p(handles)
+
+    def send_fwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> list:
+        """Send this stage's forward output for ``micro_index`` to the next stage."""
+        handles = stage.exec_fwd_send_ops(micro_index) or []
+        if self._overlap_p2p:
+            # Append the whole handle group: run_microbatches drains _send_handles
+            # group by group, so a bare handle would be wrongly iterated as a list.
+            self._send_handles.append(handles)
+        else:
+            self._wait_p2p(handles)
+        return handles
+
+    def send_bwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> list:
+        """Send this stage's input-gradient for ``micro_index`` to the previous stage.
+
+        Driven by the scheduler's ``BWD_SEND`` step. It pops the input grad that
+        the backward (unified ``backward_one_chunk`` or, under
+        ``enable_dxdw_split=True``, ``backward_input_one_chunk``) wrote to the
+        stage's ``bwd_cache``. Calling it manually in addition to the scheduled
+        ``BWD_SEND`` would double-send the gradient.
+        """
+        handles = stage.exec_bwd_send_ops(micro_index) or []
+        if self._overlap_p2p:
+            self._send_handles.append(handles)
+        else:
+            self._wait_p2p(handles)
+        return handles
 
     def _assert_in_unshard_if_needed(self, stage, check_step):
         if not isinstance(stage.submodule, HSDPModule):
@@ -379,13 +475,18 @@ class PipelineScheduleRuntime(ABC):
                 f"state, but got sharded parameters."
             )
 
-    def _exec_step(self, cur_step, arg_mbs, kwarg_mbs, losses, send_handles):
-        """Execute a single built-in step (FWD/BWD/SEND/RECV)."""
-        stage = self._stage_dict[cur_step.stage_index]
-        stage_index = cur_step.stage_index
-        micro_index = cur_step.micro_index
+    def _exec_step(self, cur_step, arg_mbs, kwarg_mbs, losses):
+        """Execute one built-in step (non-custom, non-composite).
 
-        if cur_step.type in (
+        Each comm step dispatches to a single P2P primitive; each compute step
+        first waits its cached recv (a no-op under ``overlap_p2p=False``) and
+        then runs.
+        """
+        stage = self._stage_dict[cur_step.stage_index]
+        micro_index = cur_step.micro_index
+        step_type = cur_step.type
+
+        if step_type in (
             MetaStepType.SWAP_SET_GROUP,
             MetaStepType.SWAP_LAUNCH_OFFLOAD,
             MetaStepType.SWAP_WAIT_OFFLOAD,
@@ -394,55 +495,45 @@ class PipelineScheduleRuntime(ABC):
         ):
             self._exec_pipeline_swap_step(cur_step, arg_mbs, kwarg_mbs)
 
-        elif cur_step.type == MetaStepType.FWD_RECV:
-            comm_handle = stage.exec_fwd_recv_ops(micro_index)
-            if not self._overlap_p2p:
-                self._wait_p2p(comm_handle)
-            else:
-                self.fwd_handle_cache[(stage_index, micro_index)] = comm_handle
+        elif step_type == MetaStepType.FWD_RECV:
+            self.recv_fwd(stage, micro_index)
 
-        elif cur_step.type == MetaStepType.FWD:
+        elif step_type == MetaStepType.FWD:
             self._assert_in_unshard_if_needed(stage, cur_step)
-            key = (stage_index, micro_index)
-            if self._overlap_p2p and key in self.fwd_handle_cache:
-                self._wait_p2p(self.fwd_handle_cache.pop(key))
+            self.wait_fwd_recv(stage.stage_index, micro_index)
             out = stage.forward_one_chunk(micro_index, arg_mbs[micro_index], kwarg_mbs[micro_index])
             self.update_losses(stage, out, losses)
 
-        elif cur_step.type == MetaStepType.FWD_SEND:
-            comm_handle = stage.exec_fwd_send_ops(micro_index)
-            if not self._overlap_p2p:
-                self._wait_p2p(comm_handle)
-            else:
-                send_handles.append(comm_handle)
+        elif step_type == MetaStepType.FWD_SEND:
+            self.send_fwd(stage, micro_index)
 
-        elif cur_step.type == MetaStepType.BWD_RECV:
-            comm_handle = stage.exec_bwd_recv_ops(micro_index)
-            if not self._overlap_p2p:
-                self._wait_p2p(comm_handle)
-            else:
-                self.bwd_handle_cache[(stage_index, micro_index)] = comm_handle
+        elif step_type == MetaStepType.BWD_RECV:
+            self.recv_bwd(stage, micro_index)
 
-        elif cur_step.type == MetaStepType.BWD:
+        elif step_type == MetaStepType.BWD_INPUT:
             self._assert_in_unshard_if_needed(stage, cur_step)
-            key = (stage_index, micro_index)
-            if self._overlap_p2p and key in self.bwd_handle_cache:
-                self._wait_p2p(self.bwd_handle_cache.pop(key))
+            self.wait_bwd_recv(stage.stage_index, micro_index)
+            stage.backward_input_one_chunk(micro_index)
+
+        elif step_type == MetaStepType.BWD_WEIGHT:
+            self._assert_in_unshard_if_needed(stage, cur_step)
+            self.wait_bwd_recv(stage.stage_index, micro_index)
+            stage.backward_weight_one_chunk(micro_index)
+
+        elif step_type == MetaStepType.BWD:
+            self._assert_in_unshard_if_needed(stage, cur_step)
+            self.wait_bwd_recv(stage.stage_index, micro_index)
             stage.backward_one_chunk(micro_index)
 
-        elif cur_step.type == MetaStepType.BWD_SEND:
-            comm_handle = stage.exec_bwd_send_ops(micro_index)
-            if not self._overlap_p2p:
-                self._wait_p2p(comm_handle)
-            else:
-                send_handles.append(comm_handle)
+        elif step_type == MetaStepType.BWD_SEND:
+            self.send_bwd(stage, micro_index)
 
-        elif cur_step.type in (
-            MetaStepType.FSDP_UNSHARD,
-            MetaStepType.FSDP_RESHARD,
-            MetaStepType.FSDP_REDUCE_GRAD,
-        ):
-            self._exec_fsdp_step(cur_step, stage)
+        else:
+            # FSDP control steps dispatch via the handler table; any other type
+            # is a no-op here (composite/custom types are handled upstream).
+            fsdp_handler = _FSDP_STEP_HANDLERS.get(step_type)
+            if fsdp_handler is not None:
+                fsdp_handler(stage)
 
     def _exec_pipeline_swap_step(self, cur_step, arg_mbs, kwarg_mbs):
         """Execute a pipeline activation-swap control step."""
@@ -465,20 +556,7 @@ class PipelineScheduleRuntime(ABC):
         elif cur_step.type == MetaStepType.SWAP_WAIT_LOAD:
             swap_wait_load(cur_step)
 
-    def _exec_fsdp_step(self, cur_step, stage):
-        """Execute an FSDP control step (unshard, reshard, or reduce-grad)."""
-        if cur_step.type == MetaStepType.FSDP_UNSHARD:
-            for _, module in platform.get_cells_and_names(stage.submodule):
-                if isinstance(module, HSDPModule):
-                    module.unshard()
-        elif cur_step.type == MetaStepType.FSDP_RESHARD:
-            for _, module in platform.get_cells_and_names(stage.submodule):
-                if isinstance(module, HSDPModule):
-                    module.reshard()
-        elif cur_step.type == MetaStepType.FSDP_REDUCE_GRAD:
-            stage.execute_reduce_grad()
-
-    def run_microbatches(self, arg_mbs, kwarg_mbs, losses):
+    def run_microbatches(self, arg_mbs: list, kwarg_mbs: list, losses: list) -> None:
         """Execute the schedule step by step.
 
         Steps whose :attr:`MetaStep.type` has a registered custom function
@@ -488,20 +566,38 @@ class PipelineScheduleRuntime(ABC):
         sequentially via :meth:`_exec_step` — correct but without
         comm/compute overlap.  All other steps are executed by
         :meth:`_exec_step`.
+
+        Logs one ``DEBUG`` line per non-bubble step showing the rank's
+        progress: ``rank=<r> step=<i>/<n> <MetaStep>``.  Enable with
+        ``logging.getLogger('hyper_parallel.core.pipeline_parallel.scheduler')
+        .setLevel(logging.DEBUG)`` to trace per-rank schedule advancement
+        (handy when diagnosing deadlocks or callback ordering issues).
         """
         real_stage_index = self.stages[0].stage_index % self.real_stage_num
-        send_handles = []
+        self._send_handles = []
         ctx = None  # lazily created
 
-        for cur_step in self.exec_order[real_stage_index]:
+        ordered = self.exec_order[real_stage_index]
+        total_steps = len(ordered)
+        logger.debug(
+            "run_microbatches start: rank=%d total_steps=%d micro_batch_num=%d",
+            real_stage_index, total_steps, self.micro_batch_num,
+        )
+
+        for step_idx, cur_step in enumerate(ordered):
             if cur_step is None:
                 continue
+
+            logger.debug(
+                "rank=%d step=%d/%d %s",
+                real_stage_index, step_idx, total_steps, cur_step,
+            )
 
             # Check for registered custom function
             custom_fn = self._custom_fn_map.get(cur_step.type)
             if custom_fn is not None:
                 if ctx is None:
-                    ctx = PipelineContext(self, arg_mbs, kwarg_mbs, losses, send_handles)
+                    ctx = PipelineContext(self, arg_mbs, kwarg_mbs, losses)
                 custom_fn(cur_step, ctx)
                 continue
 
@@ -512,14 +608,18 @@ class PipelineScheduleRuntime(ABC):
             if (cur_step.type in (MetaStepType.OVERLAP_F_B, MetaStepType.OVERLAP_B_F)
                     and cur_step.sub_steps):
                 for sub in cur_step.sub_steps:
-                    self._exec_step(sub, arg_mbs, kwarg_mbs, losses, send_handles)
+                    self._exec_step(sub, arg_mbs, kwarg_mbs, losses)
                 continue
 
-            self._exec_step(cur_step, arg_mbs, kwarg_mbs, losses, send_handles)
+            self._exec_step(cur_step, arg_mbs, kwarg_mbs, losses)
 
+        logger.debug(
+            "run_microbatches end: rank=%d pending_send_handles=%d",
+            real_stage_index, len(self._send_handles),
+        )
         self.sync_shared_parameters_grad()
-        while send_handles:
-            self._wait_p2p(send_handles.pop())
+        while self._send_handles:
+            self._wait_p2p(self._send_handles.pop())
 
 
 class _OverlapPhantom:
@@ -1093,7 +1193,8 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
                  output_concat_dim=None,
                  overlap_p2p=False,
                  overlap_b_f=False,
-                 swap=False):
+                 swap=False,
+                 enable_dxdw_split=False):
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
@@ -1105,6 +1206,26 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
         # pairing in the 1F1B steady-state phase.  Must be set before
         # ``construct_stage_exec_order`` is called below.
         self._overlap_b_f = overlap_b_f
+        # enable dx_dw split in overlap phase.
+        self._enable_dxdw_split = enable_dxdw_split
+        if enable_dxdw_split and not overlap_b_f:
+            raise ValueError(
+                "enable_dxdw_split=True requires overlap_b_f=True; the split "
+                "is only applied to BWD sub-steps inside OVERLAP_B_F composite steps."
+            )
+
+        self._init_round_layout()
+        self.build_exec_order()
+
+    def _init_round_layout(self):
+        """Compute per-round micro-batch counts used by stage-order emission.
+
+        Populates ``n_rounds``, ``n_microbatch_per_round`` and its prefix-sum
+        ``n_microbatch_per_round_accu`` from ``micro_batch_num``,
+        ``real_stage_num`` and ``n_local_stages``.  Factored out of
+        ``__init__`` so the pure schedule-construction path (used by offline
+        unit tests) can be exercised without instantiating stages.
+        """
         self.n_rounds = max(1, self.micro_batch_num // self.real_stage_num)
         if self.micro_batch_num < self.real_stage_num:
             base = self.micro_batch_num - self.real_stage_num
@@ -1119,12 +1240,11 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
         self.n_microbatch_per_round_accu = \
             [x * self.n_local_stages for x in itertools.accumulate(self.n_microbatch_per_round)]
         self.n_microbatch_per_round_accu.insert(0, 0)
-        self.build_exec_order()
 
     def construct_exec_order(self):
         for stage_index in range(self.real_stage_num):
             self.exec_order[stage_index] = self.construct_stage_exec_order(stage_index)
-        self.exec_order = add_send_recv(self.exec_order, self._stage_num, self.real_stage_num, style = 'loop')
+        self.exec_order = add_send_recv(self.exec_order, self._stage_num, self.real_stage_num, style='loop')
 
     def _build_stage_to_rank_index(self) -> None:
         self._stage_to_rank_index = generate_stage_to_rank_mapping(

@@ -18,7 +18,6 @@ from typing import Any, Optional, Union
 import dataclasses
 from collections import OrderedDict
 
-import contextlib
 import numpy as np
 import mindspore as ms
 import mindspore.common.dtype as mstype
@@ -1809,7 +1808,7 @@ class MindSporePlatform(Platform):
     @staticmethod
     def profiler_record(name):
         """Profiler context manager for recording operations using mindspore.profiler."""
-        return contextlib.nullcontext()
+        return ms.profiler.common.record_function.RecordFunction(name)
 
     def str_to_dtype(self, dtype_str: str) -> Any:
         """Resolve checkpoint dtype strings (``mindspore.*`` or short ``str(Tensor.dtype)`` e.g. ``Float32``)."""
