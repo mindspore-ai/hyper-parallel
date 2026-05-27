@@ -236,8 +236,6 @@ class AsyncSaveOnCpu(ms.saved_tensors_hooks):
         self.add_to_storage = False
         self.storage = Storage()
         self.count_idx = 0
-        self.pack_count = 0
-        self.unpack_count = 0
         self.policy_fn = policy_fn
 
         def pack_to_cpu(tensor: ms.Tensor):
@@ -253,20 +251,13 @@ class AsyncSaveOnCpu(ms.saved_tensors_hooks):
                 SwapManager().add_storage(group_name, self.storage)
                 self.add_to_storage = True
             funcname = f"{group_name}::{tensor.shape}"
-            self.storage.swap_storage[self.count_idx].append(SwapTensor(tensor, funcname))
-            idx = self.count_idx
+            self.storage[self.count_idx].append(SwapTensor(tensor, funcname))
             self.count_idx += 1
-            self.pack_count += 1
-            return idx
+            return tensor
 
-        def unpack_from_cpu(idx) -> ms.Tensor:
-            if isinstance(idx, ms.Tensor):
-                return idx
-
-            swap_tensor = self.storage.swap_storage[idx].pop(0)
-            tensor = swap_tensor.get_val()
-            self.unpack_count += 1
-            if self.unpack_count == self.pack_count:
+        def unpack_from_cpu(tensor) -> ms.Tensor:
+            if self.storage is not None:
+                self.storage.clear()
                 self.storage = None
             return tensor
 
@@ -343,7 +334,7 @@ def swap_tensor_wrapper(target, tag: Optional[str] = None):
         if isinstance(x, Tensor) and base_check_fn(x):
             tensor_tag = tag or f"{group_name}_swap_tensor"
             funcname = f"{tensor_tag}::{tuple(x.shape)}"
-            storage.swap_storage[count_idx].append(SwapTensor(x, funcname))
+            storage[count_idx].append(SwapTensor(x, funcname))
             count_idx += 1
         return x
 

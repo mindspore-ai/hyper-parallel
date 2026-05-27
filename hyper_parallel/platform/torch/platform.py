@@ -1202,6 +1202,10 @@ class TorchPlatform(Platform):
         return torch.no_grad()
 
     @staticmethod
+    def preserve_version_counter(tensor):
+        return torch.autograd._unsafe_preserve_version_counter(tensor)  # pylint: disable=W0212
+
+    @staticmethod
     def relu(tensor):
         return torch.relu(tensor)
 

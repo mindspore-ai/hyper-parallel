@@ -14,11 +14,16 @@
 # ============================================================================
 """enhanced with selective checkpoint support swap"""
 # pylint: disable=W0212, W0613, C0115, C0116, C0103, R1705
-from typing import Any, Optional, Union
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Union
 
 import mindspore as ms
 from mindspore import MsDispatchMode
-from hyper_parallel.core.activation_checkpoint.swap import SwapManager, Storage, SwapTensor
+from hyper_parallel.core.activation_checkpoint.swap import (
+    SwapManager,
+    Storage,
+    SwapTensor,
+)
 from hyper_parallel.core.activation_checkpoint import CheckpointPolicy
 from hyper_parallel.platform import get_platform
 
@@ -40,6 +45,14 @@ class _VersionWrapper:
         return self.val
 
 
+class _SwapCacheEntry:
+    """Pair the recompute cache and swap record around the same tensor object."""
+
+    def __init__(self, val, funcname):
+        self.save = _VersionWrapper(val)
+        self.swap = SwapTensor(val, funcname)
+
+
 def _maybe_detach(x):
     if isinstance(x, ms.Tensor) and (x.is_floating_point() or x.is_complex()):
         x = ms.ops.stop_gradient(x)
@@ -54,8 +67,9 @@ SAC_IGNORED_OPS = {"StopGradient"}
 
 
 class _CachingMindSporeDispatchMode(MsDispatchMode):
-    def __init__(self, policy_fn, storage):
+    def __init__(self, policy_fn, swap_storage, storage):
         self.policy_fn = policy_fn
+        self.swap_storage = swap_storage
         self.storage = storage
         self.add_to_storage = False
 
@@ -69,24 +83,32 @@ class _CachingMindSporeDispatchMode(MsDispatchMode):
         out = func(*args, **kwargs)
 
         if policy in (CheckpointPolicy.MUST_SAVE, CheckpointPolicy.PREFER_SAVE):
-            storage = self.storage.save_storage[func.name]
-            storage.append(platform.tree_map(lambda x: _VersionWrapper(_maybe_detach(x)), out))
+            self.storage[func.name].append(
+                platform.tree_map(lambda x: _VersionWrapper(_maybe_detach(x)), out)
+            )
         elif policy == CheckpointPolicy.MUST_SWAP:
             group_name = SwapManager().get_current_group_name()
             if not self.add_to_storage:
-                SwapManager().add_storage(group_name, self.storage)
+                SwapManager().add_storage(group_name, self.swap_storage)
                 self.add_to_storage = True
-            storage = self.storage.swap_storage[func.name]
             funcname = f"{group_name}::{func.name}"
-            storage.append(platform.tree_map(lambda x: SwapTensor(_maybe_detach(x), funcname), out))
+            entries = platform.tree_map(lambda x: _SwapCacheEntry(_maybe_detach(x), funcname), out)
+            self.storage[func.name].append(
+                platform.tree_map(lambda x: x.save, entries)
+            )
+            self.swap_storage[func.name].append(
+                platform.tree_map(lambda x: x.swap, entries)
+            )
         return out
 
 
 class _CachedMindSporeDispatchMode(MsDispatchMode):
-    def __init__(self, policy_fn, storage, allow_cache_entry_mutation):
+    def __init__(self, policy_fn, swap_storage, storage, allow_cache_entry_mutation):
         self.policy_fn = policy_fn
+        self.swap_storage = swap_storage
         self.storage = storage
         self.allow_cache_entry_mutation = allow_cache_entry_mutation
+        self._swap_cleared = False
 
     def __ms_dispatch__(self, func, args=(), kwargs=None):
         kwargs = {} if kwargs is None else kwargs
@@ -96,8 +118,12 @@ class _CachedMindSporeDispatchMode(MsDispatchMode):
         policy = self.policy_fn(SelectiveCheckpointContext(is_recompute=True),
                                 func, *args, **kwargs)
 
+        if not self._swap_cleared:
+            self.swap_storage.clear()
+            self._swap_cleared = True
+
         if policy in (CheckpointPolicy.MUST_SAVE, CheckpointPolicy.PREFER_SAVE):
-            storage = self.storage.save_storage.get(func.name)  # patch code
+            storage = self.storage.get(func.name)  # patch code
             if storage is None:
                 raise RuntimeError(f"{func} encountered during backward, but not found in storage")
             if len(storage) == 0:
@@ -107,7 +133,7 @@ class _CachedMindSporeDispatchMode(MsDispatchMode):
                 )
             out = platform.tree_map(lambda x: x.get_val(self.allow_cache_entry_mutation), storage.pop(0))
         elif policy == CheckpointPolicy.MUST_SWAP:  # patch code
-            storage = self.storage.swap_storage.get(func.name)
+            storage = self.storage.get(func.name)
             if storage is None:
                 raise RuntimeError(f"{func} encountered during backward, but not found in storage")
             if len(storage) == 0:
@@ -115,7 +141,7 @@ class _CachedMindSporeDispatchMode(MsDispatchMode):
                     "Trying to backward an extra time. You are only allowed to backward once "
                     "on any region computed under selective activation checkpoint."
                 )
-            out = platform.tree_map(lambda x: x.get_val(), storage.pop(0))
+            out = platform.tree_map(lambda x: x.get_val(self.allow_cache_entry_mutation), storage.pop(0))
         else:
             out = func(*args, **kwargs)
         return out
@@ -127,8 +153,9 @@ def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mu
     else:
         raise TypeError("policy_fn_or_list must be either a function or a list of ops.")
 
-    storage = Storage()
+    swap_storage = Storage()
+    storage: Dict[Any, List[Any]] = defaultdict(list)
     return (
-        _CachingMindSporeDispatchMode(policy_fn, storage),
-        _CachedMindSporeDispatchMode(policy_fn, storage, allow_cache_entry_mutation)
+        _CachingMindSporeDispatchMode(policy_fn, swap_storage, storage),
+        _CachedMindSporeDispatchMode(policy_fn, swap_storage, storage, allow_cache_entry_mutation)
     )

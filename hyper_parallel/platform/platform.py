@@ -1093,6 +1093,11 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement no_grad")
 
     @staticmethod
+    def preserve_version_counter(tensor):
+        """Get a context manager that preserves version for an internal tensor update."""
+        raise NotImplementedError("Platform subclasses must implement preserve_version_counter")
+
+    @staticmethod
     def relu(tensor):
         """Apply ReLU activation element-wise.
 
