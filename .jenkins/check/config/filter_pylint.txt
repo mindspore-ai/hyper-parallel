@@ -137,3 +137,23 @@
 
 # 16. Code static analysis fixes - custom_ops
 "hyper-parallel/hyper_parallel/platform/mindspore/custom_ops/"          "arguments-differ"
+
+# 17. M1 Configurable + dmodule — nested Config, dataclass(kw_only, slots), parallelize forward wrapper
+"hyper-parallel/hyper_parallel/config/"                                   "invalid-name"
+"hyper-parallel/hyper_parallel/config/"                                   "unexpected-keyword-arg"
+"hyper-parallel/hyper_parallel/dmodule/"                              "invalid-name"
+"hyper-parallel/hyper_parallel/dmodule/"                              "unexpected-keyword-arg"
+"hyper-parallel/hyper_parallel/dmodule/module.py"                     "protected-access"
+"hyper-parallel/hyper_parallel/dmodule/module.py"                     "consider-using-from-import"
+"hyper-parallel/tests/ut/config/"                                       "unexpected-keyword-arg"
+"hyper-parallel/tests/ut/config/"                                       "missing-function-docstring"
+"hyper-parallel/tests/ut/dmodule/"                                    "unexpected-keyword-arg"
+"hyper-parallel/tests/ut/dmodule/"                                    "missing-class-docstring"
+"hyper-parallel/tests/ut/dmodule/"                                    "missing-function-docstring"
+"hyper-parallel/tests/ut/dmodule/"                                    "method-hidden"
+"hyper-parallel/tests/ut/dmodule/"                                    "redefined-builtin"
+"hyper-parallel/tests/ut/dmodule/"                                    "useless-parent-delegation"
+"hyper-parallel/tests/torch/dist_module/"                               "unexpected-keyword-arg"
+"hyper-parallel/tests/torch/dist_module/"                               "method-hidden"
+"hyper-parallel/tests/torch/dist_module/"                               "missing-function-docstring"
+"hyper-parallel/tests/torch/dist_module/"                               "unused-import"
