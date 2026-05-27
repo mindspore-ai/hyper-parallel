@@ -1,131 +1,124 @@
 ---
 name: dist-op-analysis
-description: Internal analysis tool for distributed operator development — provides interface specs, Primitive/ATen mappings and HyperParallel layout derivation logic. Used by dist-op-dev workflow. NOT for direct user calls.
+description: Distributed operator analysis. Analyzes operator interfaces provided by the user and outputs a standardized implementation plan. Requires human confirmation before development begins.
 ---
 
-# HyperParallel Distributed Operator Analysis
+# Distributed Operator Analysis
 
-> ⚠️ **Internal SKILL** — This SKILL is invoked automatically by `dist-op-dev`. **Do NOT call it directly.**
+## Full Distributed Operator Development Workflow
 
-## Purpose
-
-This SKILL provides read-only analysis for HyperParallel distributed operator development. Given a MindSpore mint or PyTorch op name, it explores framework source code to extract:
-
-- Interface specifications (full parameter signatures)
-- Primitive/ATen mappings
-- Distributed sharding strategies
-- HyperParallel layout derivation logic
-
-## When Used
-
-This SKILL is automatically called by **Workflow 1: Operator Analysis** in the `dist-op-dev` SKILL. It should never be invoked directly by users.
-
----
-
-## Workflow
-
-### Step 0: Locate Framework Source Paths
-
-If the user provides a path, use it. Otherwise discover installed packages:
-
-```bash
-pip show mindspore | grep Location   # → installed location
-pip show torch       | grep Location   # → installed location
-```
-
-**Source code paths** (preferred for deep analysis): user-provided or ask. Validate:
-
-- MindSpore: must contain `mindspore/python/mindspore/mint/` (conda/pip installs lack `ccsrc/` sources)
-- PyTorch: must contain `torch/distributed/tensor/_ops/`
-
-### Step 1: Read Interface Definitions from Source
-
-**MindSpore mint** — Read actual source files to extract full signatures:
-
-- Entry: `<ms_path>/mindspore/python/mindspore/mint/__init__.py` — trace each import to its real definition
-- `mint.nn.functional` → `<ms_path>/mindspore/python/mindspore/mint/nn/functional.py`
-- `mint.linalg` / `mint.special` → corresponding submodules
-- Trace through to underlying function calls to find the **Primitive/kernel name** used
-- Important Notice: interface may call function with suffix "_ext" to map to different Primitive/kernel names with suffix "Ext".
-- YAML op definitions: `<ms_path>/mindspore/ops/op_def/yaml/{op}_op.yaml` or `func_op/` — extract input/output/attribute parameters
-
-**PyTorch** — Read actual source files:
-
-- `<pt_path>/torch/nn/functional.py` — high-level function signatures
-- `<pt_path>/torch/_refs/` — reference implementations showing parameter semantics
-- ATen op names: search `<pt_path>/torch/_C/_VariableFunctions.pyi` or use `torch.ops.aten.{op}` patterns
-
-### Step 2: Trace Distributed Implementation & Sharding Strategy
-
-**MindSpore distributed strategy** — conda/pip-installed MindSpore ships compiled binaries with no `.cc` sources. Derive sharding strategy from the HyperParallel side:
-
-- Determine the Primitive name from the YAML op definition found in Step 1
-- Look up the `DistributedOp` mapping for that Primitive in `hyper_parallel/core/shard/ops/yaml/*.yaml`
-- Read the corresponding `infer_layout()` and `get_expand_impl()` in `core/shard/ops/parallel_*.py` for sharding logic
-- For MindSpore distributed design reference, consult user-provided MindSpore source repo `ccsrc/frontend/parallel/ops_info/` (non-conda only)
-
-**PyTorch distributed DTensor strategies** — Read actual Python source:
-
-- `<pt_path>/torch/distributed/tensor/_ops/_matrix_ops.py` — mm, bmm, addmm, linear
-- `<pt_path>/torch/distributed/tensor/_ops/_pointwise_ops.py` — element-wise ops with broadcasting
-- `<pt_path>/torch/distributed/tensor/_ops/_conv_ops.py` — conv1d/2d/3d
-- `<pt_path>/torch/distributed/tensor/_ops/_view_ops.py` — reshape, transpose, permute, slice
-- `<pt_path>/torch/distributed/tensor/_ops/_einsum_strategy.py` — einsum strategy generation
-- Each uses `@register_op_strategy(aten.xxx)` returning `OpStrategy` with `PlacementStrategy` listing valid input/output placement combinations
-
-**HyperParallel mapping**:
-
-- YAML configs: `hyper_parallel/core/shard/ops/yaml/*.yaml` — maps Primitive/ATen names to `DistributedOp` class
-- Implementations: `hyper_parallel/core/shard/ops/parallel_*.py` — `infer_layout()` + optional `get_expand_impl()`
-
-### Step 3: HyperParallel Op Dispatch (`hyper_parallel/core/shard/_op_dispatch.py`)
+This skill is the entry point of the full workflow. The complete chain is:
 
 ```
-DTensorBase.__torch_function__ / __fallback__
-  → platform.get_op_name() → whitelist? → random op?
-  → YAML lookup (layout_infer_ops[op_name])
-  → infer_layout_suffix routing: "" | "WithShape" | "Reshape" | "WithTupleExpand" | "Slice"
-  → distribute_op.infer_layout(input_layouts, extra_args) → output Layout
-  → optional get_expand_impl() → execute on local tensors → DTensor.from_local()
+1. /dist-op-analysis   Analyze interfaces → output plan → STOP, wait for human confirmation
+         ↓  (human confirms plan)
+2. /dist-op-dev        Read plan → implement → write tests → run tests → fix until all pass
+                       Verification report saved to dist-op-dev/reports/
+         ↓
+3. /commit  (autogit)  Lint check → commit → push to fork branch
+         ↓
+4. /gate-doctor        Monitor CI gate → retest flakes → fix failures → gate turns green
 ```
 
-Cache keyed by `layout.compact_str + rank_id`. 45 YAML files in `core/shard/ops/yaml/`.
-
-### Step 4: DTensor / Layout / DeviceMesh
-
-- **DTensor** (`core/dtensor/dtensor.py`): `from_local()`, `to_local()`, `redistribute()`, `is_partial()` (method, not property)
-- **Layout** (`core/dtensor/layout.py`): `alias_tensor_map` maps tensor dims → device axes; `set_partial_by_dev_axis(axis, 'sum')`; `compact_str` for cache
-- **DeviceMesh** (`core/dtensor/device_mesh.py`): named axes (`dp`, `tp`, `pp`, `cp`); `get_device_num_along_axis(axis)`
-
-### Step 5: Layout Derivation & Implementation Guidance
-
-When consulted about a specific operator, provide:
-
-- **Interface spec**: full parameter signature, parameter constraints, input/output dtypes/shapes
-- **Input analysis**: which dims sharded along which device axes; kwargs affecting sharding (`dim`, `axis`, `transpose_a/b`, `keepdim`)
-- **Output layout rules**: element-wise → inherit first input; MatMul → contracting dims must match, sharded contracting → `Partial('sum')`; reduction → sharded dim reduced → `Replicate`; concat → merge on concat axis; reshape → must not cross sharded boundaries
-- **get_expand_impl analysis**: identify cases where distributed sharding produces semantically different results from single-device execution. `get_expand_impl` wraps the native op to restore equivalence — common patterns include bias/normalization scaling (Linear), attention score normalization (FlashAttention), index/coordinate remapping (index_select, gather)
-- **Suffix recommendation** — based on interface analysis, advise which `infer_layout_suffix` to use:
-  - `""` (default): op only needs input layouts + scalar kwargs (e.g., transpose flags). Most element-wise and matrix ops.
-  - `"WithShape"`: layout inference depends on input tensor shapes (e.g., broadcasting ops, `expand`, `repeat`).
-  - `"Reshape"`: op changes tensor shape in ways requiring specialized shape-to-layout mapping (e.g., `reshape`, `view`, `flatten`, `squeeze`, `unsqueeze`).
-  - `"WithTupleExpand"`: op takes tuple/list arguments that need flattening before layout extraction (e.g., `stack`, `cat` with tuple inputs).
-  - `"Slice"`: op takes begin/end/stride coordinates that must be transformed per-shard (e.g., `slice`, `slice_scatter`).
-- **Base class recommendation** — advise inheritance strategy:
-  - **`DistributedOp`** (direct): new op with unique layout logic not shared by existing ops.
-  - **Existing `*DistributedOp` subclass**: extend an existing class when the new op shares the same layout inference pattern (e.g., new element-wise variant → inherit `ElementWiseDistributedOp`; new matmul variant → inherit from `MatMulDistributedOp` or `BaseBatchMatMulDistributedOp`).
-  - **New intermediate base class**: create when multiple related ops share common layout logic but don't fit any existing class (extract shared logic into a new `BaseXxxDistributedOp`).
+Steps 3 and 4 are standard for any PR and are not specific to distributed operators.
 
 ---
 
-## Reference Files
+## Trigger
 
-- `hyper_parallel/core/shard/_op_dispatch.py` — dispatch mechanism
-- `hyper_parallel/core/shard/ops/parallel_ops.py` — `DistributedOp` base class
-- `hyper_parallel/core/shard/ops/parallel_ops_register.py` — op registry
-- `hyper_parallel/core/shard/ops/yaml/*.yaml` — operator configs (45 files)
-- `hyper_parallel/core/shard/ops/parallel_*.py` — distributed implementations
-- `hyper_parallel/core/shard/custom_shard.py` — `@custom_shard` decorator
-- `hyper_parallel/core/dtensor/{dtensor,layout,device_mesh}.py`
-- `hyper_parallel/platform/torch/dtensor.py` — torch interception
-- `hyper_parallel/platform/platform.py` — platform abstraction
+The user provides any combination of:
+- PyTorch interface (e.g. `torch.nn.functional.linear`)
+- MindSpore mint interface (e.g. `mint.sort`)
+- MindSpore Primitive name (e.g. `SortExt`)
+
+## Output Language
+
+**Write the plan in Chinese.** All section headings, descriptions, constraint rules, test case names and their descriptions in the plan file must be in Chinese. Code identifiers, file paths, and YAML snippets remain in their original form.
+
+## Step 1: Confirm Platform Scope
+
+Determine the target platform(s) from the provided interfaces and **state them explicitly in the plan**:
+
+| User provides | Platform | Confirmation needed |
+|--------------|----------|-------------------|
+| torch interface only | PyTorch only | Confirm MindSpore is out of scope? |
+| mint interface only / Primitive only | MindSpore only | Confirm PyTorch is out of scope? |
+| torch + mint / torch + Primitive | Both platforms | No extra confirmation needed |
+
+**If only a single-platform interface is provided, the plan must explicitly state the platform scope and ask the user to confirm.**
+
+## Step 2: MindSpore Interface Analysis
+
+### 2.1 mint Interface → Primitive Mapping
+
+Check `mindspore/mindspore/ops/api_def/{op_name}.yaml`:
+
+- **`kwonlyargs` field present** → mint interface supports keyword arguments (functional_overload mode), behaves like PyTorch. Parameters listed in `kwonlyargs` go into `kwargs` in `_normalize_*_args`.
+- **`kwonlyargs` field absent** → mint interface is all-positional (Primitive mode); `kwargs` is empty in `_normalize_*_args`.
+
+If `api_def/{op_name}.yaml` does not exist, trace the import path in `mindspore/python/mindspore/mint/__init__.py` to locate the underlying Primitive name (PascalCase), and treat as all-positional.
+
+**The plan must state**: the mint interface → Primitive name mapping and whether `kwonlyargs` exists (with the specific parameter names).
+
+### 2.2 Primitive Interface Details
+
+Read the Primitive definition from:
+- Structure: `mindspore/mindspore/ops/op_def/yaml/{primitive_snake_case}_op.yaml` (args/returns/dtypes)
+- Python kwonlyargs: `mindspore/mindspore/ops/api_def/{op_name}.yaml` (if `kwonlyargs` field exists)
+- Docs: `mindspore/mindspore/ops/op_def/yaml/doc/{primitive_snake_case}_doc.yaml`
+
+Extract: parameter names, dtypes, shape constraints, hardware support (Atlas A2/A3/950, etc.), known limitations.
+
+### 2.3 PyTorch Interface Details
+
+Refer to the official PyTorch documentation for the interface signature, parameter semantics, and constraints.
+
+## Step 3: Distributed Layout Derivation Analysis
+
+Based on the operator semantics, analyze the following and write them into the plan:
+
+1. **Which dimensions are naturally independent** (can be sharded): e.g. batch, head, sequence
+2. **Which dimensions cannot be sharded**: e.g. reduce dim, rotation dim
+3. **Broadcast and shard constraints for auxiliary inputs** (e.g. cos/sin)
+4. **Output layout derivation rule**: deepcopy(input), new layout, or Partial
+5. **Whether `get_expand_impl` is needed**: required when distributed result differs from single-device result
+6. **`cache_values` composition**: Layout objects first, then scalars; only include information that affects layout inference
+7. **Allowed shard scenarios**: list valid scenarios in a table (mesh, tensor_map per input); invalid scenarios are described in the constraint rules section, not in this table
+
+## Step 4: Implementation Design
+
+Design file paths and content skeletons following `templates/plan-template.md`:
+
+### 4.0 Base Class Selection (must be stated in the plan)
+
+Evaluate in order and explicitly state the choice and rationale in the plan:
+
+1. **YAML-only registration** (no new Python file): operator has purely element-wise semantics (output shape = broadcast of inputs, any dimension can be independently sharded) — add an entry to an existing YAML file, reusing `ElementWiseDistributedOp` or `ElementWiseWithPartialDistributedOp`.
+2. **Inherit an existing base class**: operator semantics are close to an existing base class but need minor customization (e.g. adding `_MS_PRIMITIVE_OP_NAMES` routing, extra validation) — subclass the nearest base class and override only what differs.
+   - `ElementWiseDistributedOp` / `ElementWiseWithPartialDistributedOp` — element-wise
+   - `TupleElementWiseDistributedOp` — element-wise with tuple inputs/outputs
+   - `ReshapeDistributedOp` — changes shape without rearranging data
+3. **New class + three-phase dispatch**: when no existing base class fits — create a new class implementing `preprocess → infer_layout(cache_values) → get_expand_impl`.
+
+**Must NOT** create a new class directly from `DistributedOp` when an existing specialized base class covers the operator's layout semantics.
+
+### 4.1 File and Interface Design
+
+Key requirements:
+
+- **`_validate_input_layouts`**: only required for new classes using three-phase dispatch; defined as `@staticmethod`, called by `infer_layout` after `_check_partial_inputs`. Performs layout validity checks only (sharding constraints, mesh consistency, etc.) — no derivation.
+- **MindSpore ST**: the Impl file must call the operator via the `mint.{op_name}` interface. Direct use of the Primitive class is forbidden. Users access operators through mint, so ST must validate that path.
+- **PyTorch ST**: if the operator interface is a native torch interface (not `torch_npu`), the Runner must include a `_gloo` variant function.
+
+## Step 5: Output the Plan
+
+Save the plan to:
+```
+hyper-parallel/.claude/skills/dist-op-analysis/plans/{OpName}_dist_op_plan.md
+```
+
+This directory is excluded by `.gitignore` and will not be committed.
+
+Fill in the complete plan following `templates/plan-template.md`, then **stop and wait for user confirmation**. Do not begin any code development.
+
+If there is any ambiguity (Primitive name cannot be determined, kwonlyargs need verification), mark the item as `[待确认]` in the plan — do not guess.

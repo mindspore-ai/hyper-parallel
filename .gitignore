@@ -62,6 +62,7 @@ venv/
 .cursorignore
 .claude/settings.local.json
 .claude/local/
+.omo/
 
 # SAPP-ND generated files
 hyper_parallel/auto_parallel/SAPP-ND/plots/
