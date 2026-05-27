@@ -1454,6 +1454,11 @@ class MindSporePlatform(Platform):
         return _no_grad()
 
     @staticmethod
+    def preserve_version_counter(tensor):
+        from mindspore.common.api import _unsafe_preserve_version_counter  # pylint: disable=C0415
+        return _unsafe_preserve_version_counter(tensor)
+
+    @staticmethod
     def relu(tensor):
         return mint.nn.functional.relu(tensor)
 
