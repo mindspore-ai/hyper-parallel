@@ -258,8 +258,26 @@ class MemoryMonitorConfig:
 
 @dataclass
 class MoEMonitorConfig:
-    """``train.moe_monitor.*`` — MoE routing / load-balance monitor (stub)."""
+    """``train.moe_monitor.*`` — MoE routing / load-balance monitor.
+
+    When enabled, :class:`~hyper_parallel.core.moe_utils.MoEMonitorCallback`
+    automatically syncs ``tokens_per_expert`` across distributed ranks and
+    updates ``expert_bias`` after each optimizer step.  The mean ``aux_loss``
+    across MoE layers is exposed via ``last_mean_aux_loss`` so that
+    :class:`LoggingCallback` can print it alongside the main training loss.
+
+    DP/TP+SP/CP group information is automatically obtained from the trainer's
+    device mesh — no manual group configuration needed.
+
+    Args:
+        enabled: Whether to activate the MoE monitor callback.
+        lr: Step size for expert bias updates. Defaults to ``1e-3``.
+        num_recomputations: Number of forward executions per optimizer step.
+            Default ``1``. Set to ``2`` when activation checkpoint is enabled.
+    """
     enabled: bool = False
+    lr: float = 1e-3
+    num_recomputations: int = 1
 
 @dataclass
 class EvalConfig:

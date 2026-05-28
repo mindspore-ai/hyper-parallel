@@ -399,7 +399,11 @@ class TestMoE(unittest.TestCase):
         )
 
     def test_load_balance_loss_attached(self):
-        """With load_balance_coeff set, output carries _load_balance_loss."""
+        """With load_balance_coeff set, output carries _load_balance_loss for logging.
+
+        The loss gradient is automatically injected into router weights via
+        MoEAuxLossAutoScaler; _load_balance_loss is a log-only attribute.
+        """
         moe = self._make_moe(load_balance_coeff=0.01)
         x = torch.randn(2, 4, 16)
         out = moe(x)
