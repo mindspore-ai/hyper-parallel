@@ -17,6 +17,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import hyper_parallel.core.dtensor.dtensor as dtensor_mod
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard
 
@@ -26,6 +27,7 @@ from hyper_parallel.core.dtensor.placement_types import Shard
 _to_fn = DTensor.__dict__["to"]
 _float_fn = DTensor.__dict__["float"]
 _alias_placements_fn = DTensor.__dict__["_alias_placements"]
+_from_converted_local_fn = DTensor.__dict__["_from_converted_local"]
 
 
 def _make_mock_dtensor(mesh="fake_mesh", placements=None, alias_placements=None):
@@ -66,6 +68,7 @@ def _make_mock_dtensor(mesh="fake_mesh", placements=None, alias_placements=None)
         """Plain Python class — records constructor calls, no Tensor baggage."""
 
         _alias_placements = _alias_placements_fn
+        _from_converted_local = _from_converted_local_fn
 
         def __init__(self, local_tensor=None, device_mesh=None, placements=None):
             calls.append({
@@ -146,6 +149,7 @@ def test_to_falls_back_to_placements_when_no_layout():
 
     class _Recorder:
         _alias_placements = _alias_placements_fn
+        _from_converted_local = _from_converted_local_fn
 
         def __init__(self, local_tensor=None, device_mesh=None, placements=None):
             calls.append({
@@ -181,3 +185,72 @@ def test_float_delegates_to_local_tensor():
     assert calls[0]["device_mesh"] == "my_mesh", (
         f"Expected device_mesh 'my_mesh', got {calls[0]['device_mesh']}"
     )
+
+
+def _make_parameter_dtensor(monkeypatch, mesh="fake_mesh", placements=None):
+    """Build a fake ParameterDTensor that must be rebuilt as base DTensor."""
+    if placements is None:
+        placements = [Shard(0)]
+
+    class _FakeParameter:
+        pass
+
+    class _BaseDTensor:
+        def __init__(self, local_tensor=None, device_mesh=None, placements=None):
+            calls.append({
+                "local_tensor": local_tensor,
+                "device_mesh": device_mesh,
+                "placements": placements,
+            })
+
+    class _ParameterDTensor(_FakeParameter):
+        _alias_placements = _alias_placements_fn
+        _from_converted_local = _from_converted_local_fn
+
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("ParameterDTensor constructor should not be used")
+
+    calls = []
+    monkeypatch.setattr(dtensor_mod.platform, "Parameter", _FakeParameter)
+    monkeypatch.setattr(dtensor_mod, "DTensor", _BaseDTensor)
+
+    mock_local = Mock(name="local_tensor")
+    mock_local.to.return_value = Mock(name="new_local")
+    mock_local.float.return_value = Mock(name="new_float_local")
+
+    fake = _ParameterDTensor.__new__(_ParameterDTensor)
+    fake._local_tensor = mock_local
+    fake._layout = SimpleNamespace(alias_placements=placements)
+    fake._placements = placements
+    fake._device_mesh = mesh
+    return fake, mock_local, calls
+
+
+def test_to_on_parameter_dtensor_returns_base_dtensor(monkeypatch):
+    """
+    Feature: DTensor.to() on ParameterDTensor
+    Description: Call to() on a parameter-wrapped DTensor.
+    Expectation: Rebuild as base DTensor instead of calling ParameterDTensor constructor.
+    """
+    fake, mock_local, calls = _make_parameter_dtensor(monkeypatch, mesh="my_mesh")
+
+    _to_fn(fake, "dtype_arg")
+
+    mock_local.to.assert_called_once_with("dtype_arg")
+    assert len(calls) == 1
+    assert calls[0]["device_mesh"] == "my_mesh"
+
+
+def test_float_on_parameter_dtensor_returns_base_dtensor(monkeypatch):
+    """
+    Feature: DTensor.float() on ParameterDTensor
+    Description: Call float() on a parameter-wrapped DTensor.
+    Expectation: Rebuild as base DTensor instead of calling ParameterDTensor constructor.
+    """
+    fake, mock_local, calls = _make_parameter_dtensor(monkeypatch, mesh="my_mesh")
+
+    _float_fn(fake)
+
+    mock_local.float.assert_called_once_with()
+    assert len(calls) == 1
+    assert calls[0]["device_mesh"] == "my_mesh"
