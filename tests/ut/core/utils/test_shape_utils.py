@@ -1,0 +1,176 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Unit tests for ``hyper_parallel.core.utils.shape_utils``.
+
+``compute_local_shape_and_global_offset`` is plain chunk math: given a
+tensor shape, a mesh, and a placement, return the per-rank local shape.
+The math has to match ``torch.chunk`` semantics (first ``remainder``
+ranks get one extra element). Coverage pins:
+
+1. Even split — ``global_size % num_devices == 0`` → every rank gets the
+   even quotient on the sharded axis.
+2. Uneven split — first ``remainder`` ranks get ``quotient + 1``, the rest
+   get ``quotient`` (matches ``torch.chunk`` exactly).
+3. ``"None"`` axis entries are no-ops (replicated dim left untouched).
+4. Multi-dim placement — sharding two tensor dims via two different mesh
+   axes does not interfere; chunk math is applied per dim independently.
+
+The mesh / layout chain is mocked so the test stays hardware-agnostic.
+"""
+# pylint: disable=protected-access
+import os
+import unittest
+from unittest.mock import patch
+
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+
+from hyper_parallel.core.utils import shape_utils
+
+
+class _FakeShardMesh:
+    """Mesh stand-in that returns canned ``(num_devices, local_rank)`` per axis.
+
+    Named ``_FakeShardMesh`` (not ``_FakeMesh``) to disambiguate from the
+    flatten-alias fake mesh in ``tests/ut/trainer/test_parallel_dims.py``.
+
+    Args:
+        axis_info: Map from axis name (e.g. ``"dp"``) to ``(num_devices, local_rank)``.
+    """
+
+    def __init__(self, axis_info):
+        self._info = axis_info
+
+    def get_device_num_along_axis(self, axis):
+        return self._info[axis][0]
+
+    def get_local_rank(self, axis):
+        return self._info[axis][1]
+
+
+class _FakeLayout:
+    """Stub layout exposing only the fields ``compute_local_shape_and_global_offset`` reads."""
+
+    def __init__(self, alias_tensor_map, mesh):
+        self.alias_tensor_map = alias_tensor_map
+        self.mesh = mesh
+
+    def placement_to_tensor_map(self, ndim):  # pylint: disable=unused-argument
+        """Real Layout populates ``alias_tensor_map`` from Placement objects here.
+
+        We pre-populate ``alias_tensor_map`` in the constructor, so this is a no-op.
+        """
+
+
+def _make_total_layout(layout_to_return):
+    """Build a ``total_layout`` callable that returns ``layout_to_return`` for any call."""
+
+    def _callable(*_args, **_kwargs):
+        return layout_to_return
+    return _callable
+
+
+class TestComputeLocalShape(unittest.TestCase):
+    """Pin the chunk-math contract used to derive every DTensor's local shape."""
+
+    def _run(self, global_shape, alias_tensor_map, axis_info, placement, *, alias=True):
+        """Drive ``compute_local_shape_and_global_offset`` with mocked layout/mesh."""
+        layout = _FakeLayout(alias_tensor_map=alias_tensor_map, mesh=_FakeShardMesh(axis_info))
+        # Patch Layout.from_device_mesh to return a "total_layout" callable, and
+        # patch _is_alias_placements to flip between the two code paths.
+        with patch.object(shape_utils, "Layout") as mock_layout_cls, \
+             patch("hyper_parallel.core.dtensor.dtensor._is_alias_placements", return_value=alias):
+            mock_layout_cls.from_device_mesh.return_value = _make_total_layout(layout)
+            return shape_utils.compute_local_shape_and_global_offset(
+                global_shape, device_mesh=None, placement=placement,
+            )
+
+    def test_even_split_along_single_axis(self):
+        """``global=8 / dp=4`` → every rank gets 2 on that axis."""
+        for rank in range(4):
+            with self.subTest(rank=rank):
+                slice_shape = self._run(
+                    global_shape=(8, 16),
+                    alias_tensor_map=("dp", "None"),
+                    axis_info={"dp": (4, rank)},
+                    placement=("dp", "None"),
+                    alias=True,
+                )
+                self.assertEqual(slice_shape, [2, 16], (
+                    f"Even split should give 2 on every rank, got {slice_shape} on rank={rank}"
+                ))
+
+    def test_uneven_split_matches_torch_chunk(self):
+        """``global=10 / num_devices=4`` → ranks 0,1 get 3 each; ranks 2,3 get 2 each."""
+        expected_per_rank = {0: 3, 1: 3, 2: 2, 3: 2}
+        for rank, expected in expected_per_rank.items():
+            with self.subTest(rank=rank):
+                slice_shape = self._run(
+                    global_shape=(10,),
+                    alias_tensor_map=("tp",),
+                    axis_info={"tp": (4, rank)},
+                    placement=("tp",),
+                    alias=True,
+                )
+                self.assertEqual(slice_shape, [expected], (
+                    f"Uneven split mismatch on rank={rank}: "
+                    f"expected={expected}, got={slice_shape[0]}"
+                ))
+
+    def test_replicate_axis_keeps_full_shape(self):
+        """``alias_tensor_map`` entries equal to ``\"None\"`` leave the dim untouched."""
+        slice_shape = self._run(
+            global_shape=(8, 12),
+            alias_tensor_map=("None", "None"),
+            axis_info={},
+            placement=("None", "None"),
+            alias=True,
+        )
+        self.assertEqual(slice_shape, [8, 12], (
+            f"Replicated tensor must keep full shape, got {slice_shape}"
+        ))
+
+    def test_multi_dim_shard_applies_per_dim_independently(self):
+        """Two tensor dims sharded along two mesh axes: math runs per-dim, no cross-talk."""
+        # dim 0 along "dp" (4 devices, rank 1 → falls below remainder=2, gets 3)
+        # dim 1 along "tp" (2 devices, rank 0 → even, gets 6)
+        slice_shape = self._run(
+            global_shape=(10, 12),
+            alias_tensor_map=("dp", "tp"),
+            axis_info={"dp": (4, 1), "tp": (2, 0)},
+            placement=("dp", "tp"),
+            alias=True,
+        )
+        self.assertEqual(slice_shape, [3, 6], (
+            f"Multi-dim shard mismatch: expected [3, 6], got {slice_shape}"
+        ))
+
+    def test_tuple_alias_runs_all_subaxes_sequentially(self):
+        """A nested-tuple entry (e.g. ``(\"dp\", \"cp\")``) chunks the dim once per sub-axis."""
+        # dim 0 sharded along both "dp" (2 devices) and "cp" (2 devices).
+        # Sequential: 8 / 2 = 4 (dp step), then 4 / 2 = 2 (cp step).
+        slice_shape = self._run(
+            global_shape=(8,),
+            alias_tensor_map=(("dp", "cp"),),
+            axis_info={"dp": (2, 0), "cp": (2, 0)},
+            placement=(("dp", "cp"),),
+            alias=True,
+        )
+        self.assertEqual(slice_shape, [2], (
+            f"Nested-tuple alias must apply both axes sequentially, got {slice_shape}"
+        ))
+
+
+if __name__ == "__main__":
+    unittest.main()
