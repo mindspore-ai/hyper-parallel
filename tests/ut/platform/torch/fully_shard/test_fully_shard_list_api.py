@@ -19,6 +19,7 @@ root filtering, validation, in-place return, scheduler backfill. Platform/mesh m
 """
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 # Force torch platform before any hyper_parallel imports
@@ -29,9 +30,15 @@ import torch
 from torch import nn
 
 from hyper_parallel.core.fully_shard.api import (
+    _check_hsdp_input_valid,
     _get_root_modules,
+    _get_device_from_mesh,
+    _normalize_replicate_params,
+    _resolve_local_tensor,
     _validate_module_for_fully_shard,
     fully_shard,
+    get_model_state_dict,
+    hsdp_sync_stream,
 )
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.platform.platform import PlatformType
@@ -213,6 +220,113 @@ class TestValidateModuleForFullyShard(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _validate_module_for_fully_shard("not a module", PlatformType.PYTORCH)
         self.assertIn("nn.Module", str(ctx.exception))
+
+
+class TestCoreApiHelpersTorch(unittest.TestCase):
+    """Unit tests for torch-side fully_shard API helpers."""
+
+    class FakeDTensor:
+        """Small DTensor stand-in used at the API boundary."""
+
+        def __init__(self, local):
+            self._local = local
+            self.local_shape = tuple(local.shape)
+            self.shape = tuple(local.shape)
+            self.device_mesh = "mesh"
+            self.layout = None
+            self.placements = ("placement",)
+
+        def to_local(self):
+            return self._local
+
+    def test_resolve_local_tensor_accepts_dtensor_and_local_plain_tensor(self):
+        """Loading should accept DTensor payloads and tensors already matching the local shard."""
+        local = torch.ones(2)
+        dtensor_local = local + 1
+        target = self.FakeDTensor(local)
+
+        with patch("hyper_parallel.core.fully_shard.api.DTensor", self.FakeDTensor):
+            self.assertIs(_resolve_local_tensor("weight", self.FakeDTensor(dtensor_local), target), dtensor_local)
+            self.assertIs(_resolve_local_tensor("weight", local, target), local)
+
+    @patch("hyper_parallel.core.fully_shard.api.distribute_tensor")
+    def test_resolve_local_tensor_distributes_global_tensor_and_rejects_bad_shape(self, mock_distribute):
+        """Global tensors should be distributed before copying into a DTensor shard."""
+        target = self.FakeDTensor(torch.zeros(2))
+        target.local_shape = (2,)
+        target.shape = (4,)
+        target.layout = SimpleNamespace(alias_placements=("alias",))
+        local_result = torch.full((2,), 3.0)
+        mock_distribute.return_value = SimpleNamespace(to_local=MagicMock(return_value=local_result))
+
+        self.assertIs(_resolve_local_tensor("weight", torch.ones(4), target), local_result)
+        mock_distribute.assert_called_once()
+        self.assertEqual(mock_distribute.call_args.args[1:], ("mesh", ("alias",)))
+        with self.assertRaisesRegex(ValueError, "matches neither local shard"):
+            _resolve_local_tensor("weight", torch.ones(3), target)
+
+    def test_normalize_replicate_params_accepts_parameters_and_rejects_plain_objects(self):
+        """replicate_params should contain only Parameters or DTensor-managed params."""
+        param = nn.Parameter(torch.ones(2))
+
+        self.assertEqual(_normalize_replicate_params(None), set())
+        self.assertEqual(_normalize_replicate_params({param}), {param})
+        with self.assertRaisesRegex(TypeError, "replicate_params"):
+            _normalize_replicate_params({object()})
+
+    def test_check_hsdp_input_valid_torch_rejects_invalid_dtype_and_comm_options(self):
+        """Torch input validation should enforce dtype and scalar option contracts."""
+        module = SimpleLinear(4, 4)
+        valid_args = {
+            "platform_type": PlatformType.PYTORCH,
+            "module": module,
+            "shard_size": 1,
+            "threshold": 0,
+            "optimizer_level": "level1",
+            "enable_grad_accumulation": False,
+            "grad_scale": 1.0,
+            "reduce_dtype": torch.float32,
+            "comm_async": False,
+            "comm_fusion": False,
+            "bucket_size": 0,
+        }
+
+        _check_hsdp_input_valid(**valid_args)
+        for key, value in [("reduce_dtype", "float32"), ("comm_async", 0), ("comm_fusion", 0), ("bucket_size", -2)]:
+            bad_args = dict(valid_args)
+            bad_args[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                _check_hsdp_input_valid(**bad_args)
+
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    def test_get_device_from_mesh_uses_torch_device_handle(self, mock_platform):
+        """Torch mesh devices should resolve through the backend device handle."""
+        device_handle = MagicMock()
+        device_handle.is_available.return_value = True
+        device_handle.current_device.return_value = "cpu"
+        mock_platform.platform_type = PlatformType.PYTORCH
+        mock_platform.get_device_handle.return_value = device_handle
+
+        self.assertEqual(_get_device_from_mesh(SimpleNamespace(device_type="npu")), torch.device("cpu"))
+        mock_platform.get_device_handle.assert_called_once_with("npu")
+
+        mock_platform.get_device_handle.return_value = None
+        with self.assertRaisesRegex(ValueError, "can't find device_handle"):
+            _get_device_from_mesh(SimpleNamespace(device_type="cuda"))
+
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    def test_state_dict_and_stream_helpers_delegate_to_platform(self, mock_platform):
+        """Public helpers should preserve the platform abstraction boundary."""
+        model = SimpleNamespace()
+        options = SimpleNamespace(kind="full")
+        state_dict = {"weight": torch.ones(1)}
+        mock_platform.get_model_state_dict.return_value = state_dict
+
+        self.assertIs(get_model_state_dict(model, options=options), state_dict)
+        mock_platform.get_model_state_dict.assert_called_once_with(model, options=options)
+
+        hsdp_sync_stream()
+        mock_platform.wait_grad_handle.assert_called_once_with()
 
 class TestFullyShardListAPI(unittest.TestCase):
     """Unit tests for fully_shard list support (mocked to avoid NPU/dist)."""

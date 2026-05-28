@@ -20,6 +20,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 
 pytest.importorskip("mindspore")
@@ -31,10 +32,13 @@ from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E4
 
 ensure_mindspore_platform_for_fully_shard()
 
+import mindspore as ms
 from mindspore import ops
 
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import FullyShardParamMode, GroupInfo
+from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
+from hyper_parallel.platform.mindspore.fully_shard import state as state_mod
 from hyper_parallel.platform.mindspore.fully_shard.state import MindSporeHSDPStateV2
 
 
@@ -61,11 +65,13 @@ def _make_state():
     state.reduce_grads = True
     state.reshard_after_backward = False
     state.requires_all_reduce = True
+    state.is_shard = True
     state.reduce_op_type = ops.ReduceOp.SUM
     state._reduce_dtype = None
     state._orig_dtype = None
     state._need_div = False
     state._ignored_allreduce_works = []
+    state._reset_sharded_params = False
     state.shard = MagicMock()
     state._apply_reduced_grad = MagicMock()
     return state
@@ -86,6 +92,11 @@ class FakeParam:
 
 class TestStateParamBookkeeping(unittest.TestCase):
     """Test parameter-mode and group bookkeeping without distributed init."""
+
+    def tearDown(self):
+        HSDPState.pre_reduce_scatter_params.clear()
+        HSDPState.pre_all_reduce_params.clear()
+        MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.state._get_param_module_infos")
     @patch("hyper_parallel.platform.mindspore.fully_shard.state.infer_fully_shard_param_mode")
@@ -187,9 +198,10 @@ class TestStateParamBookkeeping(unittest.TestCase):
         """Replicate params should reduce over the layout-driven unsharded group instead of flattening the root mesh."""
         state = _make_state()
         replicate_param = MagicMock()
+        grad = ms.Tensor(np.ones((2,), dtype=np.float32))
         replicate_param.unsharded_accumulated_grad = None
         replicate_param.unsharded_accumulated_grad_data = None
-        replicate_param.unsharded_param = SimpleNamespace(grad="grad")
+        replicate_param.unsharded_param = SimpleNamespace(grad=grad)
         # ``_allreduce_replicate_params`` calls ``.contiguous()`` on the grad
         # right before ``dist.all_reduce`` to satisfy Ascend HCCL. Use a Mock
         # whose ``.contiguous()`` returns itself so the existing identity
@@ -205,9 +217,10 @@ class TestStateParamBookkeeping(unittest.TestCase):
         mock_all_reduce.assert_called_once_with(
             normalized_grad,
             group="layout-group",
-            op="sum",
+            op=ops.ReduceOp.SUM,
             async_op=True,
         )
+        normalized_grad.contiguous.assert_called_once_with()
         self.assertEqual(state._ignored_allreduce_works, [(replicate_param, normalized_grad, 4)])
 
     def test_post_backward_uses_sync_reduction_on_layout_driven_sizes(self):
@@ -216,9 +229,11 @@ class TestStateParamBookkeeping(unittest.TestCase):
         HSDPState.pre_all_reduce_params.clear()
         MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
         state = _make_state()
-        reduce_scatter_out = MagicMock(return_value="sharded-grad")
+        sharded_grad = ms.Tensor(np.ones((2,), dtype=np.float32))
+        local_grad = ms.Tensor(np.arange(4, dtype=np.float32))
+        reduce_scatter_out = MagicMock(return_value=sharded_grad)
         all_reduce_grad = MagicMock(return_value=("reduced-grad", None))
-        unsharded = SimpleNamespace(grad="local-grad")
+        unsharded = SimpleNamespace(grad=local_grad)
 
         def _noop_accumulate():
             return None
@@ -230,7 +245,7 @@ class TestStateParamBookkeeping(unittest.TestCase):
             unsharded_param=unsharded,
             unsharded_accumulated_grad=None,
             unsharded_accumulated_grad_data=None,
-            unsharded_grad_data="local-grad",
+            unsharded_grad_data=local_grad,
             shard_size=2,
             dp_size=2,
             shard_world_size=8,
@@ -250,7 +265,7 @@ class TestStateParamBookkeeping(unittest.TestCase):
             reduce_op=ops.ReduceOp.SUM,
         )
         all_reduce_grad.assert_called_once_with(
-            grad="sharded-grad",
+            grad=sharded_grad,
             dtype=None,
             async_op=True,
             reduce_op=ops.ReduceOp.SUM,
@@ -264,6 +279,7 @@ class TestStateParamBookkeeping(unittest.TestCase):
         MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
         state = _make_state()
         mock_all_reduce.return_value = "work"
+        grad = ms.Tensor(np.ones((2,), dtype=np.float32))
 
         hsdp_param = SimpleNamespace(
             accumulate_unsharded_grad_if_needed=lambda: None,
@@ -272,7 +288,7 @@ class TestStateParamBookkeeping(unittest.TestCase):
             is_sharded=False,
             shard_size=1,
             dp_size=4,
-            sharded_param=SimpleNamespace(requires_grad=True, grad="grad"),
+            sharded_param=SimpleNamespace(requires_grad=True, grad=grad),
             unsharded_group_info=GroupInfo("group", "layout-group", 4),
         )
         state.hsdp_params = [hsdp_param]
@@ -280,14 +296,14 @@ class TestStateParamBookkeeping(unittest.TestCase):
         state.post_backward()
 
         mock_all_reduce.assert_called_once_with(
-            "grad",
+            grad,
             group="layout-group",
             op=ops.ReduceOp.SUM,
             async_op=True,
         )
         self.assertEqual(
             MindSporeHSDPStateV2.pre_direct_all_reduce_grads,
-            [("work", "grad", "grad", 4, state._need_div)],
+            [("work", grad, grad, 4, state._need_div)],
         )
         MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
 
@@ -310,6 +326,301 @@ class TestStateParamBookkeeping(unittest.TestCase):
         handle.wait.assert_called_once_with()
         target_grad.data.copy_.assert_called_once_with(reduced_grad)
         self.assertEqual(MindSporeHSDPStateV2.pre_direct_all_reduce_grads, [])
+
+    def test_pending_grad_helpers_and_stream_synchronization(self):
+        """Static helpers should normalize pending grads and skip unnecessary stream sync."""
+        local_grad = MagicMock(name="local_grad")
+        dtensor_grad = SimpleNamespace(to_local=MagicMock(return_value=local_grad))
+        accumulated = MagicMock(name="accumulated")
+        unsharded_grad = MagicMock(name="unsharded_grad")
+        param = SimpleNamespace(
+            unsharded_accumulated_grad=accumulated,
+            unsharded_accumulated_grad_data=accumulated,
+            unsharded_grad_data=unsharded_grad,
+            unsharded_param=SimpleNamespace(grad=unsharded_grad),
+            sharded_param=SimpleNamespace(grad=dtensor_grad),
+        )
+
+        self.assertIs(MindSporeHSDPStateV2._get_pending_unsharded_grad(param), accumulated)
+        self.assertTrue(MindSporeHSDPStateV2._has_pending_unsharded_grad(param))
+        self.assertIs(MindSporeHSDPStateV2._get_local_sharded_grad(param), local_grad)
+        dtensor_grad.to_local.assert_called_once_with()
+
+        no_unsharded = SimpleNamespace(
+            unsharded_accumulated_grad=None,
+            unsharded_param=None,
+            sharded_param=SimpleNamespace(grad=None),
+        )
+        self.assertFalse(MindSporeHSDPStateV2._has_pending_unsharded_grad(no_unsharded))
+        self.assertIsNone(MindSporeHSDPStateV2._get_local_sharded_grad(no_unsharded))
+
+        with patch.object(state_mod.ms.runtime, "current_stream") as current_stream:
+            MindSporeHSDPStateV2._synchronize_current_stream_if_needed(False)
+            current_stream.assert_not_called()
+            stream = MagicMock()
+            current_stream.return_value = stream
+            MindSporeHSDPStateV2._synchronize_current_stream_if_needed(True)
+            stream.synchronize.assert_called_once_with()
+
+    def test_comm_fusion_unsupported_reason_and_param_group_init(self):
+        """comm_fusion should validate parameter layout before constructing a param group."""
+        param = SimpleNamespace(
+            enable_fsdp_shard=True,
+            param_mode=FullyShardParamMode.LOCAL_PARAM,
+            _sharded_local_tensor=MagicMock(name="local_shard"),
+            shard_world_size=2,
+            _param_fqn="p0",
+        )
+
+        self.assertIn(
+            "non-sharded",
+            MindSporeHSDPStateV2._comm_fusion_unsupported_reason(
+                SimpleNamespace(enable_fsdp_shard=False)
+            ),
+        )
+        self.assertIn(
+            "param_mode",
+            MindSporeHSDPStateV2._comm_fusion_unsupported_reason(
+                SimpleNamespace(enable_fsdp_shard=True, param_mode=FullyShardParamMode.DTENSOR_COMPAT)
+            ),
+        )
+        self.assertIn(
+            "missing local shard",
+            MindSporeHSDPStateV2._comm_fusion_unsupported_reason(
+                SimpleNamespace(enable_fsdp_shard=True, param_mode=FullyShardParamMode.LOCAL_PARAM)
+            ),
+        )
+        with patch.object(state_mod, "build_rs_plan", side_effect=ValueError("bad")):
+            self.assertIn("cannot build", MindSporeHSDPStateV2._comm_fusion_unsupported_reason(param))
+        with patch.object(state_mod, "build_rs_plan", return_value=object()):
+            self.assertIsNone(MindSporeHSDPStateV2._comm_fusion_unsupported_reason(param))
+
+        state = _make_state()
+        state.config.comm_fusion = True
+        state.hsdp_params = [param]
+        with patch.object(MindSporeHSDPStateV2, "_comm_fusion_unsupported_reason", return_value=None):
+            with patch.object(state_mod, "HSDPParamGroup", return_value="param-group") as group_ctor:
+                state._init_param_group()
+        group_ctor.assert_called_once_with(
+            state.hsdp_params,
+            state.mesh_info,
+            state.device,
+            state.mp_policy,
+            state.config.comm_fusion_zero_copy,
+        )
+        self.assertEqual(state.param_group, "param-group")
+
+        with patch.object(MindSporeHSDPStateV2, "_comm_fusion_unsupported_reason", return_value="bad layout"):
+            with self.assertRaisesRegex(NotImplementedError, "bad layout"):
+                state._init_param_group()
+
+    def test_zero_grad_divide_and_move_states_to_device(self):
+        """Simple state mutators should touch only managed params and non-meta tensors."""
+        state = _make_state()
+        hsdp_param = SimpleNamespace(zero_grad=MagicMock())
+        replicate_param = SimpleNamespace(zero_grad=MagicMock())
+        state.hsdp_params = [hsdp_param]
+        state.replicate_params = [replicate_param]
+        state.zero_grad()
+        hsdp_param.zero_grad.assert_called_once_with()
+        replicate_param.zero_grad.assert_called_once_with()
+
+        tensor = MagicMock()
+        MindSporeHSDPStateV2._div_if_needed(tensor, 4, False)
+        tensor.div_.assert_not_called()
+        MindSporeHSDPStateV2._div_if_needed(tensor, 1, True)
+        tensor.div_.assert_not_called()
+        MindSporeHSDPStateV2._div_if_needed(tensor, 4, True)
+        tensor.div_.assert_called_once_with(4)
+
+        move_param = SimpleNamespace(
+            _hsdp_param_initialized=False,
+            device="cpu:0",
+            to=MagicMock(return_value="moved-param"),
+        )
+        keep_param = SimpleNamespace(
+            _hsdp_param_initialized=True,
+            device="cpu:0",
+            to=MagicMock(),
+        )
+        move_buffer = SimpleNamespace(device="cpu:0", to=MagicMock(return_value="moved-buffer"))
+        meta_buffer = SimpleNamespace(device="meta", to=MagicMock())
+        module = SimpleNamespace(
+            get_parameters=MagicMock(return_value=[move_param, keep_param]),
+            buffers=MagicMock(return_value=[move_buffer, meta_buffer]),
+        )
+        state.modules = [module]
+        state.device = "npu:0"
+        with patch.object(state_mod, "normalize_runtime_device", side_effect=lambda device: device):
+            state._move_states_to_device()
+
+        self.assertEqual(move_param.data, "moved-param")
+        keep_param.to.assert_not_called()
+        self.assertEqual(move_buffer.data, "moved-buffer")
+        meta_buffer.to.assert_not_called()
+
+    def test_lazy_init_dtype_and_validation_paths(self):
+        """lazy_init should reset sharded params once and enforce dtype/device invariants."""
+        param = SimpleNamespace(
+            is_sharded=True,
+            reset_sharded_param=MagicMock(),
+            init_dtype_attrs=MagicMock(),
+            sharded_param=SimpleNamespace(requires_grad=True, device="cpu:0"),
+            orig_dtype="float32",
+            reduce_dtype="float16",
+            _param_fqn="p0",
+        )
+        state = _make_state()
+        state.hsdp_params = [param]
+        state.offload_policy = CPUOffloadPolicy()
+
+        state.lazy_init()
+        state.lazy_init()
+
+        param.reset_sharded_param.assert_called_once_with()
+        param.init_dtype_attrs.assert_called()
+        self.assertEqual(state._orig_dtype, "float32")
+        self.assertEqual(state._reduce_dtype, "float16")
+
+        mismatch = SimpleNamespace(
+            init_dtype_attrs=MagicMock(),
+            sharded_param=SimpleNamespace(requires_grad=True, device="cpu:0"),
+            orig_dtype="float16",
+            reduce_dtype="float16",
+            _param_fqn="p1",
+        )
+        state.hsdp_params = [param, mismatch]
+        with self.assertRaises(AssertionError):
+            state._init_mp_dtypes()
+
+        meta_state = _make_state()
+        meta_state.hsdp_params = [
+            SimpleNamespace(sharded_param=SimpleNamespace(device="meta"), _param_fqn="meta_param")
+        ]
+        with self.assertRaisesRegex(RuntimeError, "meta device"):
+            meta_state._validate_no_meta_params()
+
+        npu_state = _make_state()
+        npu_state.offload_policy = CPUOffloadPolicy()
+        npu_state.hsdp_params = [
+            SimpleNamespace(sharded_param=SimpleNamespace(device="npu:0"), _param_fqn="npu_param")
+        ]
+        with self.assertRaisesRegex(RuntimeError, "CPU offloading"):
+            npu_state._validate_cpu_offload_params()
+
+    def test_finish_ignored_allreduce_waits_divides_and_applies_grad(self):
+        """Ignored replicate reductions should materialize grads and clear pending work."""
+        state = _make_state()
+        state._need_div = True
+        state._orig_dtype = "float32"
+        reduced_grad = ms.Tensor(np.full((2,), 8.0, dtype=np.float32))
+        param = SimpleNamespace(
+            all_reduce_handle=MagicMock(),
+            apply_reduced_grad=MagicMock(return_value=True),
+        )
+        state._ignored_allreduce_works = [(param, reduced_grad, 4)]
+
+        with patch.object(MindSporeHSDPStateV2, "_synchronize_current_stream_if_needed") as sync:
+            state._finish_ignored_allreduce()
+
+        param.all_reduce_handle.wait.assert_called_once_with()
+        param.apply_reduced_grad.assert_called_once_with(reduced_grad, "float32")
+        sync.assert_called_once_with(True)
+        self.assertEqual(state._ignored_allreduce_works, [])
+
+    def test_reduce_params_drains_reduce_scatter_and_all_reduce_queues(self):
+        """Queued sharded reductions should be divided, applied, and synchronized."""
+        HSDPState.pre_reduce_scatter_params.clear()
+        HSDPState.pre_all_reduce_params.clear()
+        state = _make_state()
+        rs_grad = ms.Tensor(np.full((2,), 4.0, dtype=np.float32))
+        ar_grad = ms.Tensor(np.full((2,), 6.0, dtype=np.float32))
+        rs_param = SimpleNamespace(
+            shard_world_size=4,
+            reduce_scatter_output=MagicMock(return_value=rs_grad),
+            clear_reduce_scatter_output=MagicMock(),
+            apply_reduced_grad=MagicMock(return_value=False),
+        )
+        ar_param = SimpleNamespace(
+            replicate_world_size=2,
+            all_reduce_output=MagicMock(return_value=ar_grad),
+            clear_all_reduce_output=MagicMock(),
+            apply_reduced_grad=MagicMock(return_value=True),
+        )
+        HSDPState.pre_reduce_scatter_params.append((rs_param, "orig", True))
+        HSDPState.pre_all_reduce_params.append((ar_param, "orig", True))
+
+        with patch.object(MindSporeHSDPStateV2, "_synchronize_current_stream_if_needed") as sync:
+            state.reduce_params()
+
+        rs_param.clear_reduce_scatter_output.assert_called_once_with()
+        rs_param.apply_reduced_grad.assert_called_once_with(rs_grad, "orig")
+        ar_param.clear_all_reduce_output.assert_called_once_with()
+        ar_param.apply_reduced_grad.assert_called_once_with(ar_grad, "orig")
+        sync.assert_called_once_with(True)
+
+    def test_post_backward_without_reduce_and_local_apply_branch(self):
+        """post_backward should support no-reduce and shard_size=1 local apply paths."""
+        grad = ms.Tensor(np.ones((2,), dtype=np.float32))
+        param = SimpleNamespace(
+            accumulate_unsharded_grad_if_needed=MagicMock(),
+            to_accumulated_grad_if_needed=MagicMock(),
+            sharded_param=SimpleNamespace(requires_grad=True),
+            _unsharded_param=SimpleNamespace(grad=grad),
+            unsharded_param=SimpleNamespace(grad=grad),
+            unsharded_accumulated_grad=None,
+            unsharded_accumulated_grad_data=None,
+            unsharded_grad_data=grad,
+            shard_size=1,
+            dp_size=1,
+            apply_reduced_grad=MagicMock(return_value=False),
+        )
+        state = _make_state()
+        state.hsdp_params = [param]
+        state.reduce_grads = False
+        state.reshard_after_backward = True
+        state.post_backward()
+        state.shard.assert_called_once_with()
+        param.to_accumulated_grad_if_needed.assert_called_once_with()
+
+        state = _make_state()
+        state.hsdp_params = [param]
+        HSDPState.pre_reduce_scatter_params.clear()
+        HSDPState.pre_all_reduce_params.clear()
+        state.post_backward()
+        param.apply_reduced_grad.assert_called_once_with(grad, None)
+
+    def test_post_backward_for_comm_fusion_and_reduce_op_setter(self):
+        """Fused post-backward should drain staged groups and setter should validate ops."""
+        state = _make_state()
+        state.param_group = SimpleNamespace(foreach_reduce=MagicMock())
+        state.reduce_params = MagicMock()
+        state._allreduce_replicate_params = MagicMock()
+        all_reduce_group = SimpleNamespace(wait_all_reduce_and_apply_grad=MagicMock())
+        pre_group = SimpleNamespace(apply_fusion_reduced_grad=MagicMock(), wait_reduce_scatter_and_issue_all_reduce=MagicMock())
+        comm_ctx = SimpleNamespace(all_reduce_param_group=all_reduce_group, pre_param_group=pre_group)
+
+        with patch.object(state_mod, "get_comm_ctx", return_value=comm_ctx):
+            state.post_backward_for_comm_fusion()
+
+        state.reduce_params.assert_called_once_with()
+        all_reduce_group.wait_all_reduce_and_apply_grad.assert_called_once_with()
+        pre_group.wait_reduce_scatter_and_issue_all_reduce.assert_called_once_with()
+        state.param_group.foreach_reduce.assert_called_once_with(
+            reduce_scatter_reduce_op=ops.ReduceOp.SUM,
+            needs_avg_div=False,
+        )
+        state._allreduce_replicate_params.assert_called_once_with()
+        self.assertIsNone(comm_ctx.all_reduce_param_group)
+        self.assertIsNone(comm_ctx.pre_param_group)
+
+        state.set_requires_grad_sync(False)
+        self.assertFalse(state.reduce_grads)
+        state.set_reduce_op_type("avg")
+        self.assertTrue(state._need_div)
+        self.assertEqual(state.reduce_op_type, ops.ReduceOp.SUM)
+        with self.assertRaises(ValueError):
+            state.set_reduce_op_type("mean")
 
 if __name__ == "__main__":
     unittest.main()

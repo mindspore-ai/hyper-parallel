@@ -15,6 +15,7 @@
 """Unit tests for fully_shard list support on MindSpore platform (no NPU required)."""
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -36,7 +37,13 @@ ensure_mindspore_platform_for_fully_shard()
 from mindspore import nn as ms_nn
 
 from hyper_parallel.core.fully_shard.api import (
+    HSDPModule,
+    _UnshardHandle,
+    _check_hsdp_input_valid,
+    _check_strict_keys,
+    _get_device_from_mesh,
     _get_root_modules,
+    _resolve_comm_fusion_zero_copy_default,
     _validate_module_for_fully_shard,
     fully_shard,
 )
@@ -69,15 +76,18 @@ def _make_parent_cell():
     return ParentCell
 
 
-@unittest.skip(
-    "MindSpore ``Cell`` has no ``modules()``; ``_get_root_modules`` uses PyTorch traversal until core adds parity.",
-)
 class TestGetRootModulesMindSpore(unittest.TestCase):
     """Unit tests for _get_root_modules with MindSpore Cells."""
 
     def setUp(self):
         """Set up test fixtures before each test method."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+        self.platform_type_patcher = patch(
+            "hyper_parallel.core.fully_shard.api.platform.platform_type",
+            PlatformType.MINDSPORE,
+        )
+        self.platform_type_patcher.start()
+        self.addCleanup(self.platform_type_patcher.stop)
 
     def test_sibling_cells_both_roots(self):
         """Two sibling cells (neither contains the other) are both roots."""
@@ -152,16 +162,206 @@ class TestValidateModuleForFullyShardMindSpore(unittest.TestCase):
         self.assertIn("nn.cell", str(ctx.exception))
 
 
-@unittest.skip(
-    "fully_shard(list) on MindSpore still traverses ``named_parameters`` in shared HSDP paths; "
-    "use ``parameters_and_names`` parity in core or run under ST.",
-)
+class TestCoreApiHelpersMindSpore(unittest.TestCase):
+    """Unit tests for pure fully_shard API helpers on MindSpore platform."""
+
+    def test_resolve_comm_fusion_zero_copy_default(self):
+        """Backend defaults should only enable zero-copy on PyTorch comm-fusion."""
+        self.assertTrue(
+            _resolve_comm_fusion_zero_copy_default(PlatformType.MINDSPORE, True, True)
+        )
+        self.assertFalse(
+            _resolve_comm_fusion_zero_copy_default(PlatformType.MINDSPORE, True, None)
+        )
+        self.assertFalse(
+            _resolve_comm_fusion_zero_copy_default(PlatformType.PYTORCH, False, None)
+        )
+        self.assertTrue(
+            _resolve_comm_fusion_zero_copy_default(PlatformType.PYTORCH, True, None)
+        )
+
+    def test_check_strict_keys_accepts_exact_match(self):
+        """Strict state-dict checks pass when all keys match."""
+        module = MagicMock()
+        module.state_dict.return_value = {"weight": object(), "bias": object()}
+
+        _check_strict_keys(module, {"weight": object(), "bias": object()})
+
+    def test_check_strict_keys_reports_missing_and_unexpected(self):
+        """Strict state-dict checks should report both missing and unexpected keys."""
+        module = MagicMock()
+        module.__class__.__name__ = "TinyCell"
+        module.state_dict.return_value = {"weight": object(), "bias": object()}
+
+        with self.assertRaisesRegex(RuntimeError, r"(?s)Missing key.*bias.*Unexpected key.*extra"):
+            _check_strict_keys(module, {"weight": object(), "extra": object()})
+
+    @patch("hyper_parallel.core.fully_shard.api.platform")
+    def test_get_device_from_mesh_accepts_mindspore_npu(self, mock_platform):
+        """MindSpore mesh validation returns the mesh device type directly."""
+        mock_platform.platform_type = PlatformType.MINDSPORE
+
+        self.assertEqual(_get_device_from_mesh(SimpleNamespace(device_type="npu")), "npu")
+
+    def test_get_device_from_mesh_rejects_unsupported_device(self):
+        """Only npu/cuda mesh device types are accepted by fully_shard."""
+        with self.assertRaisesRegex(AssertionError, "support device"):
+            _get_device_from_mesh(SimpleNamespace(device_type="cpu"))
+
+    def test_check_hsdp_input_valid_rejects_invalid_options(self):
+        """Input validation should reject invalid scalar options before setup."""
+        cell = ms_nn.Dense(4, 4)
+        valid_args = {
+            "platform_type": PlatformType.MINDSPORE,
+            "module": cell,
+            "shard_size": 1,
+            "threshold": 0,
+            "optimizer_level": "level1",
+            "enable_grad_accumulation": False,
+            "grad_scale": 1.0,
+            "reduce_dtype": None,
+            "comm_async": False,
+            "comm_fusion": False,
+            "bucket_size": 0,
+        }
+
+        _check_hsdp_input_valid(**valid_args)
+        for key, value in [
+            ("shard_size", 0),
+            ("threshold", -1),
+            ("optimizer_level", "bad"),
+            ("enable_grad_accumulation", 1),
+            ("grad_scale", 1),
+            ("reduce_dtype", "float32"),
+            ("comm_async", 0),
+            ("comm_fusion", 0),
+            ("bucket_size", -2),
+        ]:
+            bad_args = dict(valid_args)
+            bad_args[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                _check_hsdp_input_valid(**bad_args)
+
+
+class TestHSDPModuleInterfaceMindSpore(unittest.TestCase):
+    """Unit tests for HSDPModule interface methods that delegate to scheduler/state."""
+
+    class FakeHSDPModule(HSDPModule):
+        """Small module stub with PyTorch-like traversal for shared interface tests."""
+
+        def __init__(self, children=()):
+            super().__init__()
+            self.hsdp_scheduler = MagicMock()
+            self._children = list(children)
+
+        def modules(self):
+            return [self, *self._children]
+
+    def test_unshard_async_handle_waits_once(self):
+        """Async unshard should return an idempotent wait handle."""
+        state = MagicMock()
+        module = self.FakeHSDPModule()
+        module.hsdp_scheduler.hsdp_state = state
+
+        handle = module.unshard(async_op=True)
+        handle.wait()
+        handle.wait()
+
+        state.unshard.assert_called_once_with(True)
+        state.wait_for_unshard.assert_called_once_with()
+
+    def test_unshard_handle_without_state_is_noop(self):
+        """A no-op unshard handle should tolerate repeated waits."""
+        handle = _UnshardHandle()
+
+        handle.wait()
+        handle.wait()
+
+    def test_reshard_and_reduce_op_delegate_to_state(self):
+        """State operations should be routed through the current scheduler."""
+        state = MagicMock()
+        module = self.FakeHSDPModule()
+        module.hsdp_scheduler.hsdp_state = state
+
+        module.reshard()
+        module.set_reduce_op_type("sum")
+
+        state.shard.assert_called_once_with()
+        state.set_reduce_op_type.assert_called_once_with("sum")
+
+    @patch("hyper_parallel.core.fully_shard.api.platform.platform_type", PlatformType.MINDSPORE)
+    @patch("hyper_parallel.core.fully_shard.api.platform.get_cells_and_names")
+    def test_set_requires_gradient_sync_and_zero_grad_walk_cells(self, mock_cells):
+        """MindSpore traversal should update every nested HSDP module."""
+        child = self.FakeHSDPModule()
+        module = self.FakeHSDPModule(children=[child])
+        mock_cells.return_value = [("", module), ("child", child)]
+
+        module.set_requires_gradient_sync(False)
+        module.zero_grad()
+
+        module.hsdp_scheduler.set_requires_grad_sync.assert_called_once_with(False)
+        child.hsdp_scheduler.set_requires_grad_sync.assert_called_once_with(False)
+        module.hsdp_scheduler.zero_grad.assert_called_once_with()
+        child.hsdp_scheduler.zero_grad.assert_called_once_with()
+
+    def test_prefetch_setters_validate_module_list(self):
+        """Prefetch setters should accept only HSDPModule sequences."""
+        first = self.FakeHSDPModule()
+        second = self.FakeHSDPModule()
+
+        first.set_modules_to_forward_prefetch([second])
+        first.set_modules_to_backward_prefetch((second,))
+
+        first.hsdp_scheduler.set_forward_prefetch_cells.assert_called_once_with([second])
+        first.hsdp_scheduler.set_backward_prefetch_cells.assert_called_once_with((second,))
+        with self.assertRaisesRegex(ValueError, "HSDPModule list"):
+            first.set_modules_to_forward_prefetch([object()])
+
+    def test_recursive_scheduler_flags_use_module_traversal(self):
+        """Recursive flags should be forwarded to every nested HSDP scheduler."""
+        child = self.FakeHSDPModule()
+        module = self.FakeHSDPModule(children=[child])
+
+        with patch(
+            "hyper_parallel.core.fully_shard.api.platform.get_cells_and_names",
+            return_value=[("", module), ("child", child)],
+        ):
+            module.set_requires_all_reduce(False)
+            module.set_reshard_after_forward(False)
+            module.set_reshard_after_backward(True)
+
+        for scheduler in (module.hsdp_scheduler, child.hsdp_scheduler):
+            scheduler.set_requires_all_reduce.assert_called_once_with(False)
+            scheduler.set_reshard_after_forward.assert_called_once_with(False)
+            scheduler.set_reshard_after_backward.assert_called_once_with(True)
+
+    def test_recursive_scheduler_flags_validate_inputs(self):
+        """Recursive setters should reject non-bool values and recurse=False."""
+        module = self.FakeHSDPModule()
+
+        with self.assertRaises(ValueError):
+            module.set_requires_all_reduce(1)
+        with self.assertRaises(NotImplementedError):
+            module.set_requires_all_reduce(True, recurse=False)
+        with self.assertRaises(ValueError):
+            module.set_reshard_after_forward(1)
+        with self.assertRaises(ValueError):
+            module.set_reshard_after_backward(1)
+
+
 class TestFullyShardListAPIMindSpore(unittest.TestCase):
     """Unit tests for fully_shard list support on MindSpore (mocked to avoid NPU/dist)."""
 
     def setUp(self):
         """Set up test fixtures before each test method."""
         os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+        self.params_patcher = patch(
+            "hyper_parallel.core.fully_shard.api._get_modules_parameters",
+            return_value=[],
+        )
+        self.params_patcher.start()
+        self.addCleanup(self.params_patcher.stop)
 
     def _create_mock_mesh(self):
         """Create mock DeviceMesh to avoid distributed init."""
