@@ -101,11 +101,15 @@ def test_context_parallel_group4():
     Description:
         1. test_lb_bnsd_fa_causal
         2. test_async_ulysses_suite
+        3. test_async_colossal_suite
+        4. test_async_vs_sync_precision_suite
     Expectation: Run success.
     """
     _run_group(
         ("test_lb_bnsd_fa_causal", 13031, 2),
         ("test_async_ulysses_suite", 13200, 2),
+        ("test_async_colossal_suite", 13201, 2),
+        ("test_async_vs_sync_precision_suite", 13203, 2),
     )
 
 
