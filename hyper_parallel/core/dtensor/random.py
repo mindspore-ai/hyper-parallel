@@ -247,7 +247,7 @@ class OffsetBasedRNGTracker(_RNGStateTracker):
         """
         mesh_coordinate = device_mesh.get_coordinate()
         shard_idx_by_dim, total_num_shards_by_dim = _calc_shard_info(
-            mesh_coordinate, device_mesh, placements
+            mesh_coordinate, device_mesh, placements, global_shape
         )
         shard_linear_idx = self._calc_shard_linear_idx(
             shard_idx_by_dim, total_num_shards_by_dim
@@ -362,13 +362,13 @@ def _calc_first_shard_size(device_mesh, placements, global_shape) -> list[int]:
 
 
 def _calc_shard_info(
-    mesh_coordinate, device_mesh, placements
+    mesh_coordinate, device_mesh, placements, global_shape
 ):
     """Calculate shard information for a specific rank."""
     mesh_size = device_mesh.mesh_shape
     # note: dim_map does not allow double sharding which is the FSDP(fully_shard)+TP
     # case. Replace the custom logic with dim_map once we support it.
-    dim_map = [-1] * device_mesh.ndim
+    dim_map = [-1] * len(global_shape)
     for i, placement in enumerate(placements):
         if isinstance(placement, Shard):
             shard_dim = placement.dim
