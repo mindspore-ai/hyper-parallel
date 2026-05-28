@@ -52,6 +52,7 @@ def _run_experts_for_loop(
     w3: torch.Tensor,
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
+    scores: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run per-expert SwiGLU via a sequential loop (reference path).
 
@@ -62,6 +63,10 @@ def _run_experts_for_loop(
         x: Routed tokens in expert-major order, shape
             ``[total_routed_tokens, dim]``.
         num_tokens_per_expert: 1-D integer tensor of length ``num_experts``.
+        scores: Optional 1-D tensor of shape ``[total_routed_tokens]``.
+            Routing weights applied to intermediate activations (``silu(w1(x)) * w3(x)``)
+            before the w2 projection. When ``None``, no weighting is applied.
+            Defaults to ``None``.
 
     Returns:
         Expert output of shape ``[total_routed_tokens, dim]``.
@@ -86,6 +91,8 @@ def _run_experts_for_loop(
             continue
         x_e = x[offset:offset + n]
         h = F.silu(x_e @ w1[e].T) * (x_e @ w3[e].T)
+        if scores is not None:
+            h = h * scores[offset:offset + n].unsqueeze(-1)
         parts.append(h @ w2[e].T)
         offset += n
     if not parts:
@@ -100,6 +107,7 @@ def _run_experts_grouped_mm_gpu(
     w3: torch.Tensor,
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
+    scores: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused grouped matmul path for NVIDIA GPU using ``torch._grouped_mm``.
 
@@ -109,6 +117,10 @@ def _run_experts_grouped_mm_gpu(
         w3: Shape ``[num_experts, hidden_dim, dim]``.
         x: Shape ``[total_routed_tokens, dim]``.
         num_tokens_per_expert: 1-D integer tensor of length ``num_experts``.
+        scores: Optional 1-D tensor of shape ``[total_routed_tokens]``.
+            Routing weights applied to intermediate activations (``silu(w1(x)) * w3(x)``)
+            before the w2 projection. When ``None``, no weighting is applied.
+            Defaults to ``None``.
 
     Returns:
         Expert output of shape ``[total_routed_tokens, dim]``.
@@ -123,6 +135,8 @@ def _run_experts_grouped_mm_gpu(
     h1 = torch._grouped_mm(x, w1_t, offs=offs)  # pylint: disable=protected-access
     h3 = torch._grouped_mm(x, w3_t, offs=offs)  # pylint: disable=protected-access
     h = F.silu(h1) * h3
+    if scores is not None:
+        h = h * scores.unsqueeze(-1)
     return torch._grouped_mm(h, w2_t, offs=offs)  # pylint: disable=protected-access
 
 
@@ -132,6 +146,7 @@ def _run_experts_grouped_mm_npu(
     w3: torch.Tensor,
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
+    scores: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused grouped matmul path for Ascend NPU using ``torch_npu.npu_grouped_matmul``.
 
@@ -143,6 +158,10 @@ def _run_experts_grouped_mm_npu(
         w3: Shape ``[num_experts, hidden_dim, dim]``.
         x: Shape ``[total_routed_tokens, dim]``.
         num_tokens_per_expert: 1-D integer tensor of length ``num_experts``.
+        scores: Optional 1-D tensor of shape ``[total_routed_tokens]``.
+            Routing weights applied to intermediate activations (``silu(w1(x)) * w3(x)``)
+            before the w2 projection. When ``None``, no weighting is applied.
+            Defaults to ``None``.
 
     Returns:
         Expert output of shape ``[total_routed_tokens, dim]``.
@@ -167,6 +186,13 @@ def _run_experts_grouped_mm_npu(
     h1_list = torch_npu.npu_grouped_matmul(x_list, w1_list, group_type=-1)
     h3_list = torch_npu.npu_grouped_matmul(x_list, w3_list, group_type=-1)
     h_list = [F.silu(h1) * h3 for h1, h3 in zip(h1_list, h3_list)]
+    if scores is not None:
+        offset = 0
+        for i, h in enumerate(h_list):
+            n = counts[i]
+            if n > 0:
+                h_list[i] = h * scores[offset:offset + n].unsqueeze(-1)
+            offset += n
     out_list = torch_npu.npu_grouped_matmul(h_list, w2_list, group_type=-1)
     return torch.cat(out_list, dim=0)
 
@@ -269,6 +295,7 @@ class GroupedExperts(nn.Module):
         self,
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run all experts on their assigned tokens.
 
@@ -277,6 +304,9 @@ class GroupedExperts(nn.Module):
                 shape ``[total_routed_tokens, dim]``.
             num_tokens_per_expert: 1-D integer tensor of length
                 ``num_local_experts`` with the token count per expert.
+            scores: Optional 1-D tensor of shape ``[total_routed_tokens]``.
+                Routing weights applied to intermediate activations before w2.
+                When ``None``, no weighting is applied. Defaults to ``None``.
 
         Returns:
             Expert output of shape ``[total_routed_tokens, dim]``.
@@ -287,14 +317,14 @@ class GroupedExperts(nn.Module):
         w3 = self.w3.to_local() if isinstance(self.w3, DTensor) else self.w3
 
         if not self.use_grouped_mm:
-            return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)
+            return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert, scores)
 
         if hasattr(torch, 'npu') and torch.npu.is_available():
-            return _run_experts_grouped_mm_npu(w1, w2, w3, x, num_tokens_per_expert)
+            return _run_experts_grouped_mm_npu(w1, w2, w3, x, num_tokens_per_expert, scores)
         if torch.cuda.is_available():
-            return _run_experts_grouped_mm_gpu(w1, w2, w3, x, num_tokens_per_expert)
+            return _run_experts_grouped_mm_gpu(w1, w2, w3, x, num_tokens_per_expert, scores)
 
-        return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)
+        return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert, scores)
 
 
 # ---------------------------------------------------------------------------
@@ -596,19 +626,18 @@ class MoE(nn.Module):
         # Gather routed tokens in expert-major order.
         routed_x = x_flat[token_indices]  # [num_tokens * top_k, dim]
 
+        # --- Expert computation ---
         if self.score_before_experts:
             routed_x = routed_x * top_scores_sorted.unsqueeze(1)
+            expert_out = self.experts(routed_x, num_tokens_per_expert, scores=None)
+        else:
+            expert_out = self.experts(routed_x, num_tokens_per_expert, scores=top_scores_sorted)
 
         # --- Shared expert (parallel with routed experts) ---
         shared_out = None
         if self.shared_expert is not None:
             shared_out = self.shared_expert(x_flat)
 
-        # --- Expert computation ---
-        expert_out = self.experts(routed_x, num_tokens_per_expert)
-
-        if not self.score_before_experts:
-            expert_out = expert_out * top_scores_sorted.unsqueeze(1)
 
         # --- Scatter expert outputs back to token order ---
         # Use out-of-place ``scatter_add`` so autograd correctly records

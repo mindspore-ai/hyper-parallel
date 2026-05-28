@@ -39,6 +39,12 @@ GroupedExperts(
     num_experts: int,
     use_grouped_mm: bool = False,
 )
+
+forward(
+    x: Tensor,
+    num_tokens_per_expert: Tensor,
+    scores: Optional[Tensor] = None,
+) -> Tensor
 ```
 
 **Weight shapes:**
@@ -51,6 +57,34 @@ GroupedExperts(
 
 When weights are `DTensor` (e.g. after `ExpertParallel.apply`), `to_local()` is
 called automatically before matmul.
+
+**Forward arguments:**
+
+| Argument | Shape | Description |
+|----------|-------|-------------|
+| `x` | `[total_tokens, dim]` | Routed tokens in expert-major order |
+| `num_tokens_per_expert` | `[num_experts]` | Token count per expert |
+| `scores` | `[total_tokens]` or `None` | Optional routing weights applied to intermediate activations |
+
+**Zero-overhead activation storage (issue #109):**
+
+When `scores` is provided, routing weights are applied internally to the
+intermediate activation before the `w2` projection:
+
+```text
+h1 = w1(x)
+h3 = w3(x)
+act = silu(h1) * h3
+act_weighted = act * scores   ← internal weighting
+out = w2(act_weighted)
+```
+
+This enables memory savings in activation checkpointing: instead of saving
+both `act` and `scores`, only `act_weighted` needs to be stored. During
+backward, the gradient w.r.t. `act` can be reconstructed from
+`act_weighted` and `scores`.
+
+When `scores=None`, no weighting is applied (original behavior).
 
 ---
 
@@ -107,6 +141,17 @@ x [bs, slen, dim]
   → [+ shared_expert(x)]
   → view → [bs, slen, dim]
 ```
+
+**`score_before_experts` behavior:**
+
+| Setting | Routing weight application |
+|---------|---------------------------|
+| `score_before_experts=True` (default) | Pre-scale input: `routed_x * scores`, then `GroupedExperts(..., scores=None)` |
+| `score_before_experts=False` | Internal weighting: `GroupedExperts(..., scores=top_scores_sorted)` (zero-overhead activation storage) |
+
+When `score_before_experts=False`, routing weights are passed to `GroupedExperts`
+for internal application, enabling memory savings during activation checkpointing
+(see `GroupedExperts` documentation above).
 
 **Load balancing:**
 
