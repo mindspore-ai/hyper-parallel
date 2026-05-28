@@ -18,7 +18,6 @@ from typing import Any, Optional, Union
 import dataclasses
 from collections import OrderedDict
 
-import contextlib
 import numpy as np
 import mindspore as ms
 import mindspore.common.dtype as mstype
@@ -29,10 +28,10 @@ from mindspore import mint
 from mindspore.common.api import _no_grad
 from mindspore.common._grad_function import _Function
 from mindspore.common.dtype import type_size_in_bytes
+from mindspore.common.recompute import null_context_fn
 from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
 from mindspore.common.initializer import initializer
-from mindspore.common.recompute import null_context_fn
 from mindspore.communication import GlobalComm
 from mindspore.communication import get_group_size
 from mindspore.communication import create_group as new_group
@@ -1780,7 +1779,7 @@ class MindSporePlatform(Platform):
     @staticmethod
     def profiler_record(name):
         """Profiler context manager for recording operations using mindspore.profiler."""
-        return contextlib.nullcontext()
+        return ms.profiler.common.record_function.RecordFunction(name)
 
     def str_to_dtype(self, dtype_str: str) -> Any:
         """Resolve checkpoint dtype strings (``mindspore.*`` or short ``str(Tensor.dtype)`` e.g. ``Float32``)."""

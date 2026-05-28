@@ -178,12 +178,12 @@ class HSDPSchedulerV2:
             cast_fn = functools.partial(self.platform.cast_fp_tensor, self.mp_policy.param_dtype)
             args = self.platform.apply_to_tensors(cast_fn, args)
             kwargs = self.platform.apply_to_tensors(cast_fn, kwargs)
+        with self.platform.profiler_record(f"pre_forward unshard:{self.hsdp_state.module_name}"):
+            self.hsdp_state.unshard()
         for prefetch_cell in self.forward_prefetch_cells:
             with self.platform.profiler_record(f"pre_forward prefetch:"
                                                f"{prefetch_cell.hsdp_scheduler.hsdp_state.module_name}"):
                 prefetch_cell.hsdp_scheduler.hsdp_state.prefetch()
-        with self.platform.profiler_record(f"pre_forward unshard:{self.hsdp_state.module_name}"):
-            self.hsdp_state.unshard()
         return args, kwargs
 
     def _lazy_init_all_states(self):
@@ -241,13 +241,13 @@ class HSDPSchedulerV2:
     def _hsdp_backward_pre_hook(self, cell, grad_outputs):
         """Backward pre hook to unsharded parameter for backward process."""
         self.scheduler_state = FSDPSchedulerState.PRE_BACKWARD
+        if self.reshard_after_forward:
+            with self.platform.profiler_record(f"pre_backward unshard:{self.hsdp_state.module_name}"):
+                self.hsdp_state.unshard(unshard_replicate=False)
         for prefetch_cell in self.backward_prefetch_cells:
             with self.platform.profiler_record(f"pre_backward prefetch:"
                                                f"{prefetch_cell.hsdp_scheduler.hsdp_state.module_name}"):
                 prefetch_cell.hsdp_scheduler.hsdp_state.prefetch(unshard_replicate=False)
-        if self.reshard_after_forward:
-            with self.platform.profiler_record(f"pre_backward unshard:{self.hsdp_state.module_name}"):
-                self.hsdp_state.unshard(unshard_replicate=False)
 
     # pylint: disable=W0613
     def _hsdp_backward_hook(self, cell, grad_inputs, grad_outputs):
