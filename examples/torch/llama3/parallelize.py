@@ -34,22 +34,23 @@ from hyper_parallel import (
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 
-from model import Llama3Model
-
 
 def parallelize_llama3(
-    model: Llama3Model,
+    model: nn.Module,
     tp_mesh: DeviceMesh,
     *,
     enable_sequence_parallel: bool = True,
     enable_loss_parallel: bool = False,
-) -> Llama3Model:
-    """Apply 1-D tensor parallelism to ``model`` (TorchTitan-style TP plan).
+) -> nn.Module:
+    """Apply 1-D tensor parallelism (TorchTitan-style TP plan).
+
+    Works on :class:`~model.Llama3Model` and PP stage chunks from ``pipeline.py``
+    (missing submodule paths such as ``tok_embeddings`` on middle stages are skipped).
 
     Requires ``n_heads % tp_world_size == 0`` and ``n_kv_heads % tp_world_size == 0``.
 
     Args:
-        model: Unparallelized Llama3 demo model on device.
+        model: Model or PP stage chunk with ``cfg`` and ``layers`` attributes.
         tp_mesh: One-dimensional :class:`~hyper_parallel.core.dtensor.device_mesh.DeviceMesh`.
         enable_sequence_parallel: When ``True`` (default), use sequence parallelism on norms and
             chain Shard(1) activations like TorchTitan ``apply_tp``. ``False`` is not implemented.
