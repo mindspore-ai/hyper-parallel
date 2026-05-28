@@ -18,6 +18,7 @@ Import from the ``examples/torch/llama3`` directory (see ``tensor_parallel_examp
 """
 from model import Llama3DemoConfig, Llama3Model
 from parallelize import broadcast_state_dict_from_rank0, build_tp_mesh, parallelize_llama3
+from pipeline import build_llama3_pp_chunk, build_pipeline_stage
 
 __all__ = [
     "Llama3DemoConfig",
@@ -25,4 +26,6 @@ __all__ = [
     "broadcast_state_dict_from_rank0",
     "build_tp_mesh",
     "parallelize_llama3",
+    "build_llama3_pp_chunk",
+    "build_pipeline_stage",
 ]

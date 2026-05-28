@@ -57,6 +57,7 @@ import torch.nn.functional as F
 
 from hyper_parallel import ContextParallel, SkipDTensorDispatch, init_device_mesh
 
+from demo_utils import init_dist, train_steps
 from model import Llama3DemoConfig, Llama3Model
 from parallelize import broadcast_state_dict_from_rank0, parallelize_llama3
 
@@ -92,28 +93,8 @@ def _tp_cp_sizes_from_env(world: int) -> tuple[int, int]:
     return tp_size, cp_size
 
 
-def init_dist() -> tuple[int, int, str]:
-    """Initialize the process group and bind one device per rank.
-
-    Returns:
-        ``(rank, world_size, device_type)``.
-    """
-    if not dist.is_initialized():
-        dist.init_process_group()
-    rank = dist.get_rank()
-    world = dist.get_world_size()
-    device_type = os.environ.get("LLAMA3_DEVICE_TYPE", "npu").strip().lower()
-    if device_type == "npu":
-        torch.npu.set_device(rank)
-    elif device_type == "cuda":
-        torch.cuda.set_device(rank)
-    else:
-        raise ValueError(f"Unsupported LLAMA3_DEVICE_TYPE={device_type!r} (use npu or cuda).")
-    return rank, world, device_type
-
-
 def main() -> None:
-    """Run one Llama3 forward with TP + CP and a short CE + backward step."""
+    """Run Llama3 training steps with TP + CP."""
     rank, world, device_type = init_dist()
     device = torch.device(device_type, rank)
     tp_size, cp_size = _tp_cp_sizes_from_env(world)
@@ -155,33 +136,37 @@ def main() -> None:
     for layer in model.layers:
         cp_plan.apply(layer.attention.sdpa_core, mesh["cp"])
 
-    torch.manual_seed(2026)
-    global_tokens = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
-    dist.broadcast(global_tokens, src=0)
-
-    tokens_cp = global_tokens[:, cp_rank * seq_per_cp : (cp_rank + 1) * seq_per_cp]
-    targets_cp = tokens_cp
-    rope_seq_start = cp_rank * seq_per_cp
-
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    optimizer.zero_grad(set_to_none=True)
-    logits = model(tokens_cp, rope_seq_start=rope_seq_start)
-    loss = F.cross_entropy(
-        logits.float().reshape(-1, cfg.vocab_size),
-        targets_cp.reshape(-1),
-    )
-    with SkipDTensorDispatch():
-        loss.backward()
-        optimizer.step()
 
-    if not torch.isfinite(loss.detach()):
-        raise RuntimeError(f"rank {rank}: non-finite loss {loss.item()}")
+    for step in range(train_steps()):
+        optimizer.zero_grad(set_to_none=True)
+        torch.manual_seed(2026 + step)
+        global_tokens = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
+        global_targets = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
+        dist.broadcast(global_tokens, src=0)
+        dist.broadcast(global_targets, src=0)
 
-    if rank == 0:
-        print(
-            f"tp_cp_example OK: loss={loss.item():.4f} local_seq={logits.shape[1]}, "
-            f"tp={tp_size}, cp={cp_size}, logits_shape={tuple(logits.shape)}"
+        tokens_cp = global_tokens[:, cp_rank * seq_per_cp : (cp_rank + 1) * seq_per_cp]
+        targets_cp = global_targets[:, cp_rank * seq_per_cp : (cp_rank + 1) * seq_per_cp]
+        rope_seq_start = cp_rank * seq_per_cp
+
+        logits = model(tokens_cp, rope_seq_start=rope_seq_start)
+        loss = F.cross_entropy(
+            logits.float().reshape(-1, cfg.vocab_size),
+            targets_cp.reshape(-1),
         )
+        with SkipDTensorDispatch():
+            loss.backward()
+            optimizer.step()
+
+        if not torch.isfinite(loss.detach()):
+            raise RuntimeError(f"rank {rank}: non-finite loss {loss.item()} at step {step}")
+
+        if rank == 0:
+            print(
+                f"[tp_cp step {step}] loss={loss.item():.4f} local_seq={logits.shape[1]}, "
+                f"tp={tp_size}, cp={cp_size}"
+            )
 
 
 if __name__ == "__main__":

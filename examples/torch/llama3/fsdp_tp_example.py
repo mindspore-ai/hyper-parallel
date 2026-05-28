@@ -46,11 +46,11 @@ if str(_ROOT) not in sys.path:
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 
 from hyper_parallel import SkipDTensorDispatch, fully_shard, init_device_mesh
 
+from demo_utils import init_dist, train_steps
 from model import Llama3DemoConfig, Llama3Model
 from parallelize import broadcast_state_dict_from_rank0, parallelize_llama3
 
@@ -77,22 +77,6 @@ def _tp_size_from_env(world: int) -> int:
     if world % tp != 0:
         raise ValueError(f"world_size ({world}) must be divisible by LLAMA3_TP_SIZE ({tp}).")
     return tp
-
-
-def init_dist() -> tuple[int, int, str]:
-    """Initialize process group and bind one device per rank."""
-    if not dist.is_initialized():
-        dist.init_process_group()
-    rank = dist.get_rank()
-    world = dist.get_world_size()
-    device_type = os.environ.get("LLAMA3_DEVICE_TYPE", "npu").strip().lower()
-    if device_type == "npu":
-        torch.npu.set_device(rank)
-    elif device_type == "cuda":
-        torch.cuda.set_device(rank)
-    else:
-        raise ValueError(f"Unsupported LLAMA3_DEVICE_TYPE={device_type!r} (use npu or cuda).")
-    return rank, world, device_type
 
 
 def main() -> None:
@@ -137,13 +121,11 @@ def main() -> None:
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    # Same minibatch on every rank (smoke test; DP uses identical data like ``fsdp_demo.py``).
-    torch.manual_seed(2026)
-    tokens = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
-    targets = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
-
-    for step in range(2):
+    for step in range(train_steps()):
         optimizer.zero_grad(set_to_none=True)
+        torch.manual_seed(2026 + step)
+        tokens = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
+        targets = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
         logits = model(tokens)
         loss = F.cross_entropy(
             logits.float().reshape(-1, cfg.vocab_size),

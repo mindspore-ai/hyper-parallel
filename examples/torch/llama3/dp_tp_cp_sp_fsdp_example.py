@@ -80,6 +80,7 @@ from hyper_parallel import (
     init_device_mesh,
 )
 
+from demo_utils import init_dist, read_positive_int, train_steps
 from model import Llama3DemoConfig, Llama3Model
 from parallelize import broadcast_state_dict_from_rank0, parallelize_llama3
 
@@ -94,14 +95,7 @@ _ENV_DEFAULTS = {
 
 def _read_positive_int(name: str, default: str) -> int:
     """Parse a positive integer from environment variable ``name``."""
-    raw = os.environ.get(name, default).strip()
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if value < 1:
-        raise ValueError(f"{name} must be >= 1 (got {value}).")
-    return value
+    return read_positive_int(name, default)
 
 
 def _mesh_sizes_from_env(world: int) -> tuple[int, int, int, int]:
@@ -120,28 +114,8 @@ def _mesh_sizes_from_env(world: int) -> tuple[int, int, int, int]:
     return dp_size, fsdp_size, cp_size, tp_size
 
 
-def init_dist() -> tuple[int, int, str]:
-    """Initialize the process group and bind one device per rank.
-
-    Returns:
-        ``(rank, world_size, device_type)``.
-    """
-    if not dist.is_initialized():
-        dist.init_process_group()
-    rank = dist.get_rank()
-    world = dist.get_world_size()
-    device_type = os.environ.get("LLAMA3_DEVICE_TYPE", "npu").strip().lower()
-    if device_type == "npu":
-        torch.npu.set_device(rank)
-    elif device_type == "cuda":
-        torch.cuda.set_device(rank)
-    else:
-        raise ValueError(f"Unsupported LLAMA3_DEVICE_TYPE={device_type!r} (use npu or cuda).")
-    return rank, world, device_type
-
-
 def main() -> None:
-    """Run one Llama3 forward + backward step composing DP + TP + CP + SP + FSDP2."""
+    """Run Llama3 training steps composing DP + TP + CP + SP + FSDP2."""
     rank, world, device_type = init_dist()
     device = torch.device(device_type, rank)
     dp_size, fsdp_size, cp_size, tp_size = _mesh_sizes_from_env(world)
@@ -199,24 +173,22 @@ def main() -> None:
     # fsdp_tp example so the smoke loop runs with identical batches across DP/FSDP ranks.
     model.set_reduce_op_type("sum")
 
-    # Each (dp, fsdp) rank inside one CP+TP "view" gets one DP-domain slice of the
-    # global batch. With identical seeds + a single ``broadcast`` call, every rank
-    # observes the same global batch -- this is a smoke test, not a numerical baseline.
-    torch.manual_seed(2026)
-    global_tokens = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
-    global_targets = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
-    dist.broadcast(global_tokens, src=0)
-    dist.broadcast(global_targets, src=0)
-
-    cp_slice = slice(cp_rank * seq_per_cp, (cp_rank + 1) * seq_per_cp)
-    tokens_local = global_tokens[:, cp_slice]
-    targets_local = global_targets[:, cp_slice]
-    rope_seq_start = cp_rank * seq_per_cp
-
+    # Smoke test: broadcast identical global batch each step (not a numerical baseline).
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    for step in range(2):
+    for step in range(train_steps()):
         optimizer.zero_grad(set_to_none=True)
+        torch.manual_seed(2026 + step)
+        global_tokens = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
+        global_targets = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
+        dist.broadcast(global_tokens, src=0)
+        dist.broadcast(global_targets, src=0)
+
+        cp_slice = slice(cp_rank * seq_per_cp, (cp_rank + 1) * seq_per_cp)
+        tokens_local = global_tokens[:, cp_slice]
+        targets_local = global_targets[:, cp_slice]
+        rope_seq_start = cp_rank * seq_per_cp
+
         logits = model(tokens_local, rope_seq_start=rope_seq_start)
         loss = F.cross_entropy(
             logits.float().reshape(-1, cfg.vocab_size),

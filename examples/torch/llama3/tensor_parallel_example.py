@@ -6,7 +6,7 @@
 #
 # http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by law or agreed to in writing, software
+# Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
@@ -39,28 +39,18 @@ if str(_ROOT) not in sys.path:
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 
 from hyper_parallel import SkipDTensorDispatch
 
+from demo_utils import init_dist, train_steps
 from model import Llama3DemoConfig, Llama3Model
 from parallelize import broadcast_state_dict_from_rank0, build_tp_mesh, parallelize_llama3
 
 
-def init_dist() -> tuple[int, int]:
-    """Initialize process group and bind one NPU per rank."""
-    if not dist.is_initialized():
-        dist.init_process_group()
-    rank = dist.get_rank()
-    world = dist.get_world_size()
-    torch.npu.set_device(rank)
-    return rank, world
-
-
 def main() -> None:
-    rank, world = init_dist()
-    device = torch.device("npu", rank)
+    rank, world, device_type = init_dist()
+    device = torch.device(device_type, rank)
 
     # Heads must divide TP size; sequence length must divide TP size for Shard(1).
     cfg = Llama3DemoConfig(
@@ -74,13 +64,10 @@ def main() -> None:
     if cfg.n_heads % world != 0 or cfg.n_kv_heads % world != 0:
         raise ValueError("n_heads and n_kv_heads must be divisible by world_size.")
 
-    torch.manual_seed(42 + rank)
     model = Llama3Model(cfg).to(device=device)
-
-    # Same global weights on every rank before TP sharding.
     broadcast_state_dict_from_rank0(model)
 
-    tp_mesh = build_tp_mesh(device_type="npu")
+    tp_mesh = build_tp_mesh(device_type=device_type)
     parallelize_llama3(model, tp_mesh)
 
     batch_size = 2
@@ -90,8 +77,9 @@ def main() -> None:
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    for step in range(2):
+    for step in range(train_steps()):
         optimizer.zero_grad(set_to_none=True)
+        torch.manual_seed(1000 + step)
         tokens = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
         targets = torch.randint(0, cfg.vocab_size, (batch_size, seq_len), device=device)
 
@@ -106,7 +94,7 @@ def main() -> None:
             optimizer.step()
 
         if rank == 0:
-            print(f"[step {step}] loss = {loss.item():.4f}")
+            print(f"[tp step {step}] loss = {loss.item():.4f}")
 
 
 if __name__ == "__main__":
