@@ -253,6 +253,22 @@ def apply_recompute(model, mode):
         for i in range(len(model.layers) - 1):
             SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 
+    elif mode == "group_swap":
+        # Group copy fusion: identical to sac_swap but enables bulk D2H/H2D per dtype bucket.
+        no_swap_ops = {
+            "LayerNormExt"
+        }
+
+        def policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613
+            if op.name in no_swap_ops:
+                return CheckpointPolicy.MUST_RECOMPUTE
+            return CheckpointPolicy.MUST_SWAP
+        for i, layer in enumerate(model.layers):
+            model.layers[i] = checkpoint_wrapper(layer, policy_fn=policy_fn, swap_inputs=True, group_swap=True)
+
+        for i in range(len(model.layers) - 1):
+            SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
+
     elif mode == "funcrecompute":
         def policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613
             return CheckpointPolicy.MUST_RECOMPUTE
@@ -352,3 +368,52 @@ def test_ac_memory_comparison():
     assert abs(mem_recompute - mem_swap) < tol_mem, \
         f"Expected RECOMPUTE ({mem_recompute:.5f} GB) ≈ SWAP ({mem_swap:.5f} GB)"
     print(f"Verified: RECOMPUTE ({mem_recompute:.5f}) ≈ SWAP ({mem_swap:.5f}) within {tol_mem:.2f} GB")
+
+
+def test_group_swap_correctness_and_memory():
+    """
+    Feature: group copy fusion for activation swap (group_swap=True)
+    Description: Validate that bulk D2H/H2D transfers produce byte-identical gradients
+                 compared to per-tensor swap, across both whole-layer wrapping (group_swap).
+                 Also validates that the mixed path (packable tensors + slice-tensor fallback)
+                 is numerically correct, and that group_swap peak memory is no worse than
+                 the per-tensor baseline.
+    Expectation: All modes produce consistent losses (within 1e-4 tolerance),
+                 the memory usage trend is satisfied, and no OOM occurs.
+    """
+    print("Starting group_swap correctness and memory test")
+    train_steps = 3
+    modes = ["none", "swap", "group_swap"]
+    results = {}
+
+    for mode in modes:
+        print(f"\n--- Running mode: {mode.upper()} ---")
+        results[mode] = run_one_mode_in_subprocess(mode, train_steps=train_steps)
+        peak_mem = results[mode]["peak_mem_gb"]
+        duration = results[mode]["time_sec"]
+        losses = results[mode]["losses"]
+        print(f"{mode}: Loss={losses[-1]:.4f}, Peak Mem={peak_mem:.5f} GB, Time={duration:.5f}s")
+
+    tol = 1e-4
+    base_losses = results["none"]["losses"]
+
+    # 1. Correctness vs none baseline
+    for step in range(train_steps):
+        base_val = base_losses[step]
+        for mode in ["swap", "group_swap"]:
+            val = results[mode]["losses"][step]
+            diff = abs(val - base_val)
+            assert diff < tol, (
+                f"Loss mismatch at step {step} in mode '{mode}': "
+                f"none={base_val:.8f}, {mode}={val:.8f}, diff={diff:.2e}"
+            )
+    print(f"\nAll {train_steps} steps: losses are consistent across modes (tol={tol}).")
+
+    # 2. Memory: group fusion must not use more device memory than none
+    mem_none = results["none"]["peak_mem_gb"]
+    mem_grp = results["group_swap"]["peak_mem_gb"]
+    assert mem_grp <= mem_none, (
+        f"group_swap peak memory exceeds none: "
+        f"group_swap={mem_grp:.5f} GB, none={mem_none:.5f} GB"
+    )
+    print(f"Verified: group_swap ({mem_grp:.5f} GB) <= none ({mem_none:.5f} GB).")

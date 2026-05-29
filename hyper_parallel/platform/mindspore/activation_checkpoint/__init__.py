@@ -13,10 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore activation checkpoint implementations."""
-from hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_wrapper import (
-    CheckpointWrapper,
-    checkpoint_wrapper,
-)
 from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import (
     ActivationWrapper,
     AsyncSaveOnCpu,
@@ -31,8 +27,6 @@ from hyper_parallel.platform.mindspore.activation_checkpoint.sac import (
 
 __all__ = [
     "ActivationWrapper",
-    "CheckpointWrapper",
-    "checkpoint_wrapper",
     "AsyncSaveOnCpu",
     "SwapWrapper",
     "base_check_fn",

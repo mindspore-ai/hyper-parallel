@@ -1295,26 +1295,13 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement checkpoint")
 
     @staticmethod
-    def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
-        """Wrap a module with checkpoint functionality.
-
-        Args:
-            module: The module to wrap with checkpointing.
-            checkpoint_fn: Optional custom checkpoint function.
-            **checkpoint_fn_kwargs: Additional kwargs for checkpoint function.
-
-        Returns:
-            The wrapped module with checkpointing enabled.
-        """
-        raise NotImplementedError("Platform subclasses must implement ckpt_wrapper")
-
-    @staticmethod
-    def swap_wrapper(module, policy_fn=None):
+    def swap_wrapper(module, policy_fn=None, group_swap=False):
         """Wrap a module with activation swap functionality.
 
         Args:
             module: The module to wrap with activation swap.
             policy_fn: Optional per-tensor swap policy function.
+            group_swap (bool, optional): Whether tensors participate in group copy fusion. Default: ``False``.
 
         Returns:
             The wrapped module with activation swap enabled.
@@ -1322,17 +1309,22 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement swap_wrapper")
 
     @staticmethod
-    def swap_tensor_wrapper(target, tag=None):
+    def swap_tensor_wrapper(target, tag=None, group_swap=False):
         """Register target tensors into the current swap group.
 
         Args:
             target: A tensor or nested container of tensors to register.
             tag: Optional debug tag associated with the wrapped tensors.
+            group_swap (bool, optional): Whether tensors participate in group copy fusion. Default: ``False``.
 
         Returns:
             The original target structure, unchanged semantically.
         """
         raise NotImplementedError("Platform subclasses must implement swap_tensor_wrapper")
+
+    @staticmethod
+    def get_class_activation_wrapper():
+        raise NotImplementedError("Platform subclasses must implement get_class_activation_wrapper")
 
     @property
     def noop_context_fn(self):
@@ -1344,12 +1336,13 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement noop_context_fn")
 
     @staticmethod
-    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
+    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False):
         """Create contexts for selective activation checkpointing.
 
         Args:
             policy_fn_or_list: A policy function or list of layer names to checkpoint.
             allow_cache_entry_mutation (bool): Whether to allow cache entry mutation.
+            group_swap (bool, optional): Whether MUST_SWAP tensors participate in group copy fusion. Default: ``False``.
 
         Returns:
             Context functions for selective checkpointing.
@@ -1372,6 +1365,11 @@ class Platform:
     def get_element_size(tensor):
         """Get Tensor Element Size"""
         raise NotImplementedError("Platform subclasses must implement get_element_size")
+
+    @staticmethod
+    def alloc_tensor_buffer(numel: int, dtype, device, pin_memory: bool = False):
+        """Allocate an uninitialized 1-D tensor buffer."""
+        raise NotImplementedError("Platform subclasses must implement alloc_tensor_buffer")
 
     @staticmethod
     def tensor_to_numpy(tensor) -> np.ndarray:

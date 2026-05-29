@@ -26,9 +26,6 @@ from mindspore import Tensor
 from mindspore.common.parameter import Parameter
 from mindspore.nn import Cell
 
-from hyper_parallel.core.activation_checkpoint.activation_checkpoint import CheckpointPolicy
-from hyper_parallel.core.activation_checkpoint.swap import Storage, SwapManager, SwapTensor
-
 
 _CKPT_WRAPPED_MODULE = "_ckpt_wrapped_module"
 
@@ -82,6 +79,10 @@ class ActivationWrapper(Cell, ABC):
         self._wrapped_param_names = {
             id(param): param.name for _, param in module.parameters_and_names()
         }
+
+    @property
+    def _wrapped_module(self):
+        return self._ckpt_wrapped_module
 
     @abstractmethod
     def construct(self, *args, **kwargs):
@@ -232,26 +233,30 @@ class AsyncSaveOnCpu(ms.saved_tensors_hooks):
     """
     Context manager to offload tensors to CPU during forward pass.
     """
-    def __init__(self, policy_fn=None) -> None:
+    def __init__(self, policy_fn=None, group_swap: bool = False) -> None:
+        # pylint: disable=C0415
+        from hyper_parallel.core.activation_checkpoint.activation_checkpoint import CheckpointPolicy
+        from hyper_parallel.core.activation_checkpoint.swap import Storage, SwapManager, SwapTensor
         self.add_to_storage = False
         self.storage = Storage()
         self.count_idx = 0
         self.policy_fn = policy_fn
 
+        # Cache per-context-manager state once to avoid per-tensor singleton lookups.
+        swap_manager = SwapManager()
         def pack_to_cpu(tensor: ms.Tensor):
-            # skip ineligible tensors
             if not base_check_fn(tensor):
                 return tensor
-
-            if (policy_fn is not None) and (policy_fn(tensor)==CheckpointPolicy.MUST_SAVE):
+            if (policy_fn is not None) and (policy_fn(tensor) == CheckpointPolicy.MUST_SAVE):
                 return tensor
-
-            group_name = SwapManager().get_current_group_name()
+            group_name = swap_manager.get_current_group_name()
             if not self.add_to_storage:
-                SwapManager().add_storage(group_name, self.storage)
+                swap_manager.add_storage(group_name, self.storage)
                 self.add_to_storage = True
             funcname = f"{group_name}::{tensor.shape}"
-            self.storage[self.count_idx].append(SwapTensor(tensor, funcname))
+            self.storage[self.count_idx].append(
+                SwapTensor(tensor, funcname, group_swap=group_swap)
+            )
             self.count_idx += 1
             return tensor
 
@@ -284,16 +289,26 @@ class SwapWrapper(ActivationWrapper):
         >>> model.layers[i].attn = swap_wrapper(model.layers[i].attn, policy_fn)
     """
 
-    def __init__(self, mod: Union[Cell, Callable], policy_fn: Optional[Callable] = None):
+    def __init__(
+        self,
+        mod: Union[Cell, Callable],
+        policy_fn: Optional[Callable] = None,
+        group_swap: bool = False,
+    ):
         super().__init__(mod)
         self.policy_fn = policy_fn
+        self.group_swap = group_swap
 
     def construct(self, *args, **kwargs):
-        with AsyncSaveOnCpu(policy_fn=self.policy_fn):
+        with AsyncSaveOnCpu(policy_fn=self.policy_fn, group_swap=self.group_swap):
             return self._ckpt_wrapped_module(*args, **kwargs)
 
 
-def swap_wrapper(module: Union[Cell, Callable], policy_fn: Optional[Callable] = None) -> SwapWrapper:
+def swap_wrapper(
+    module: Union[Cell, Callable],
+    policy_fn: Optional[Callable] = None,
+    group_swap: bool = False,
+) -> SwapWrapper:
     """
     Wrap *module* with async activation swap.
 
@@ -307,23 +322,26 @@ def swap_wrapper(module: Union[Cell, Callable], policy_fn: Optional[Callable] = 
     Returns:
         SwapWrapper: The wrapped cell with activation swap enabled.
     """
-    return SwapWrapper(module, policy_fn)
+    return SwapWrapper(module, policy_fn, group_swap)
 
 
-def swap_tensor_wrapper(target, tag: Optional[str] = None):
+def swap_tensor_wrapper(target, tag: Optional[str] = None, group_swap: bool = False):
     """Register selected tensors into the current swap group.
 
     This helper is intended to be used inside a forward path that already
     participates in the existing swap scheduling managed by ``SwapManager``.
     It preserves the input structure and returns the original tensors.
     """
-    group_name = SwapManager().get_current_group_name()
+    # pylint: disable=C0415
+    from hyper_parallel.core.activation_checkpoint.swap import Storage, SwapManager, SwapTensor
+    swap_manager = SwapManager()
+    group_name = swap_manager.get_current_group_name()
     if not group_name:
         warnings.warn(
             f"Tensor {tag} cannot be swapped, for its group is unregistered."
         )
         return target
-    if SwapManager().is_last_group(group_name):
+    if swap_manager.is_last_group(group_name):
         return target
 
     storage = Storage()
@@ -334,7 +352,7 @@ def swap_tensor_wrapper(target, tag: Optional[str] = None):
         if isinstance(x, Tensor) and base_check_fn(x):
             tensor_tag = tag or f"{group_name}_swap_tensor"
             funcname = f"{tensor_tag}::{tuple(x.shape)}"
-            storage[count_idx].append(SwapTensor(x, funcname))
+            storage[count_idx].append(SwapTensor(x, funcname, group_swap=group_swap))
             count_idx += 1
         return x
 
@@ -349,5 +367,5 @@ def swap_tensor_wrapper(target, tag: Optional[str] = None):
 
     wrapped = _map(target)
     if count_idx > 0:
-        SwapManager().add_storage(group_name, storage)
+        _manager.add_storage(group_name, storage)
     return wrapped

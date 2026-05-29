@@ -30,7 +30,7 @@ from torch.nn import Parameter, Module
 from torch.nn.utils.rnn import PackedSequence
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.utils.checkpoint import noop_context_fn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+
 import torch.distributed.nn.functional as dist_func
 import torch.distributed as dist
 from hyper_parallel.platform.torch.dtensor import DTensorBase
@@ -1317,34 +1317,32 @@ class TorchPlatform(Platform):
         return torch.utils.checkpoint.checkpoint
 
     @staticmethod
-    def ckpt_wrapper(module, checkpoint_fn=None, **checkpoint_fn_kwargs):
-        # pylint: disable=C0415
-        from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import FuncModule
-        if callable(module) and not isinstance(module, torch.nn.Module):
-            module = FuncModule(module)
-        return checkpoint_wrapper(module, checkpoint_fn=checkpoint_fn, **checkpoint_fn_kwargs)
-
-    @staticmethod
-    def swap_wrapper(module, policy_fn=None):
+    def swap_wrapper(module, policy_fn=None, group_swap=False):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import swap_wrapper
-        return swap_wrapper(module, policy_fn=policy_fn)
+        return swap_wrapper(module, policy_fn=policy_fn, group_swap=group_swap)
 
     @staticmethod
-    def swap_tensor_wrapper(target, tag=None):
+    def swap_tensor_wrapper(target, tag=None, group_swap=False):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import swap_tensor_wrapper
-        return swap_tensor_wrapper(target, tag=tag)
+        return swap_tensor_wrapper(target, tag=tag, group_swap=group_swap)
+
+    @staticmethod
+    def get_class_activation_wrapper():
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import ActivationWrapper
+        return ActivationWrapper
 
     @property
     def noop_context_fn(self):
         return noop_context_fn
 
     @staticmethod
-    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
+    def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False, group_swap=False):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.sac import create_selective_checkpoint_contexts
-        return create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation)
+        return create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation, group_swap)
 
     @staticmethod
     def async_save_on_cpu(policy_fn=None):
@@ -1356,6 +1354,13 @@ class TorchPlatform(Platform):
     def get_element_size(tensor):
         """Get Tensor Element Size"""
         return tensor.element_size()
+
+    @staticmethod
+    def alloc_tensor_buffer(numel: int, dtype, device, pin_memory: bool = False):
+        """Allocate an uninitialized 1-D tensor buffer."""
+        if pin_memory:
+            return torch.empty(numel, dtype=dtype, device='cpu', pin_memory=True)
+        return torch.empty(numel, dtype=dtype, device=device)
 
     @staticmethod
     def tensor_to_numpy(tensor) -> np.ndarray:
