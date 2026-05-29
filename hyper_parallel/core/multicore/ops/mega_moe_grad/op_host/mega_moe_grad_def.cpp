@@ -128,12 +128,12 @@ class MegaMoeGrad : public OpDef {
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
-        this->Input("w2_grad_tiling")
+        this->Input("w1_grad_tiling")
             .ParamType(REQUIRED)
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
-        this->Input("w1_grad_tiling")
+        this->Input("w2_grad_tiling")
             .ParamType(REQUIRED)
             .DataType({ge::DT_UINT8, ge::DT_UINT8})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})

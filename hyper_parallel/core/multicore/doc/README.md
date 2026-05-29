@@ -48,10 +48,10 @@ Multicore MoE-FFN 将上述五个算子**融合为一个 kernel**，由 AIC（AI
 
 ```text
 AllToAll-Dispatch → ┌─ GMM1(act_grad) ──────────────────────┐
-                    └─ GMM4(w1_grad)                          │
+                    └─ GMM4(w2_grad)                          │
                                                               ▼
                                                SwiGLU-grad → GMM2(gate_grad) → ┌─ AllToAll-Combine
-                                                                                └─ GMM3(w2_grad)
+                                                                                └─ GMM3(w1_grad)
 ```
 
 GMM1 与 GMM4 并行，AllToAll-Combine 与 GMM3 并行，进一步减少空闲等待。
@@ -275,27 +275,27 @@ dispatch ──► up_proj (GMM1) ──► swiglu ──► down_proj (GMM2) �
 
 ```text
 dispatch ──► act_grad (GMM1) ──────────────────────────────────────────────────────────┐
-         └── w1_grad (GMM4)                                                             │
+         └── w2_grad (GMM4)                                                             │
                                                                                         ▼
                                                     swiglu_grad ──► gate_grad (GMM2) ──► combine
-                                                                                     └── w2_grad (GMM3)
+                                                                                     └── w1_grad (GMM3)
 ```
 
 | 算子 | 映射 | 输入 | 输出 |
 |---|---|---|---|
 | dispatch | AllToAll | `dy`（输入梯度） | `dispatch_target`（分发后梯度） |
 | act_grad (GMM1) | `dispatch_target @ w2.T` | `dispatch_target`, `w2` | `act_grad_y`（激活梯度） |
-| w1_grad (GMM4) | `hidden.T @ dispatch_target` | `hidden`（正向 SwiGLU 输出）, `dispatch_target` | `hidden_dw`（W2 权重梯度） |
+| w2_grad (GMM4) | `hidden.T @ dispatch_target` | `hidden`（正向 SwiGLU 输出）, `dispatch_target` | `hidden_dw`（W2 权重梯度） |
 | swiglu_grad | SwiGLU backward | `act_grad_y`, `gate`（正向 up_proj_y） | `grad_gate`（SwiGLU 梯度） |
 | gate_grad (GMM2) | `grad_gate @ w1.T` | `grad_gate`, `w1` | `gate_dx`（combine 前梯度） |
-| w2_grad (GMM3) | `gate.T @ grad_gate` | `gate`（正向 up_proj_y）, `grad_gate` | `gate_dw`（W1 权重梯度） |
+| w1_grad (GMM3) | `permute_out.T @ grad_gate` | `permute_out`（正向 dispatch_target）, `grad_gate` | `gate_dw`（W1 权重梯度） |
 | combine | AllToAll | `gate_dx` | `grad_x`（汇聚后梯度） |
 
 ### 4.2 并行执行说明
 
-- **act_grad（GMM1）与 w1_grad（GMM4）并行**：两者均依赖 dispatch 输出 `target`；GMM1 使用 `advance_mode="cube_only"`（只推进 task 计数，不推进 event），GMM4 使用 `advance_mode="cube_custom"` 统一推进 event，避免重复计数。
+- **act_grad（GMM1）与 w2_grad（GMM4）并行**：两者均依赖 dispatch 输出 `target`；GMM1 使用 `advance_mode="cube_only"`（只推进 task 计数，不推进 event），GMM4 使用 `advance_mode="cube_custom"` 统一推进 event，避免重复计数。
 
-- **combine 与 w2_grad（GMM3）并行**：两者均依赖 gate_grad（GMM2）输出；combine 使用 `advance_mode="vector_only"`，GMM3 使用 `cube_custom` 处理 event。
+- **combine 与 w1_grad（GMM3）并行**：两者均依赖 gate_grad（GMM2）输出；combine 使用 `advance_mode="vector_only"`，GMM3 使用 `cube_custom` 处理 event。
 
 ### 4.3 Tiling 文件（反向，各 rank 共用）
 
@@ -303,8 +303,8 @@ dispatch ──► act_grad (GMM1) ───────────────
 |---|---|---|
 | `act_grad_tiling.bin` | `act_grad_tiling` | GMM1 反向 tiling（dispatch_target @ W2.T） |
 | `gate_grad_tiling.bin` | `gate_grad_tiling` | GMM2 反向 tiling（grad_gate @ W1.T） |
-| `w2_grad_tiling.bin` | `w2_grad_tiling` | GMM3（W2 权重梯度）tiling |
-| `w1_grad_tiling.bin` | `w1_grad_tiling` | GMM4（W1 权重梯度）tiling |
+| `w1_grad_tiling.bin` | `w1_grad_tiling` | GMM3（W1 权重梯度）tiling |
+| `w2_grad_tiling.bin` | `w2_grad_tiling` | GMM4（W2 权重梯度）tiling |
 | `swiglu_grad_tiling.bin` | `swiglu_grad_tiling` | SwiGLU 反向 tiling |
 
 生成方式见第 6.2 节。
@@ -372,10 +372,10 @@ combine   [(1,0)]  → gmm2_y.split_dim == 0 ✓
 
 ```python
 # ✅ 正确：inputs[1]=target 是 dispatch 的输出，图内连通
-w1_grad: split_inputs=[(1, 0)]   # inputs[1] = target
+w2_grad: split_inputs=[(1, 0)]   # inputs[1] = target
 
 # ❌ 错误：inputs[0]=hidden（外部叶子），split_dim 永远 -1
-w1_grad: split_inputs=[(0, 0)]   # task_num 始终 = 1
+w2_grad: split_inputs=[(0, 0)]   # task_num 始终 = 1
 ```
 
 ### 5.4 Event 驱动协调
@@ -401,9 +401,9 @@ trigger_event = all_event_num  （全局唯一 event）
 | 算子 | advance_mode | 说明 |
 |---|---|---|
 | act_grad (GMM1) | `cube_only` | 只推进 task 计数，不推进 event |
-| w1_grad (GMM4) | `cube_custom` | 统一推进 event（补偿 GMM1 未推进的部分） |
+| w2_grad (GMM4) | `cube_custom` | 统一推进 event（补偿 GMM1 未推进的部分） |
 | combine | `vector_only` | 只推进 task 计数 |
-| w2_grad (GMM3) | `cube_custom` | 统一推进 event |
+| w1_grad (GMM3) | `cube_custom` | 统一推进 event |
 
 ### 5.5 Task 切分参数设计原则
 
@@ -495,8 +495,8 @@ python -m hyper_parallel.core.multicore.modules.mega_moe.backward.gen_runtime_da
 <output_dir>/
 ├── act_grad_tiling.bin             # GMM1 反向 tiling（各 rank 共用）
 ├── gate_grad_tiling.bin            # GMM2 反向 tiling
-├── w2_grad_tiling.bin              # GMM3（W2 梯度）tiling
-├── w1_grad_tiling.bin              # GMM4（W1 梯度）tiling
+├── w1_grad_tiling.bin              # GMM3（W1 梯度）tiling
+├── w2_grad_tiling.bin              # GMM4（W2 梯度）tiling
 ├── swiglu_grad_tiling.bin          # SwiGLU 反向 tiling
 ├── all_event_counters.bin          # 4096 uint8 zeros，4 KB（各 rank 共用）
 ├── gmm_workspace.bin
@@ -679,11 +679,11 @@ mc.mega_moe(
     swiglu_tiling,        # uint8                     SwiGLU tiling
     down_proj_tiling,     # uint8                     GMM2 tiling
     runtime_config,       # uint8                     per-rank 调度配置，from gen_runtime_data.py
-    all_event_counters,   # [4096]                    uint8  事件同步计数器（symmetric memory）
+    all_event_counters,   # uint8  事件同步计数器（symmetric memory）
     # 标量
     rank_id,              # int  当前 rank
     ep,                   # int  Expert Parallel 度
-    expert_num,           # int  本 rank 持有的 expert 数（= all_expert_num // ep）
+    expert_num,           # int  全局 expert 总数（all_expert_num）
     hidden_size,          # int  隐藏层维度
     seq_size,             # int  全局序列长度
 )
@@ -717,20 +717,20 @@ mc.mega_moe_grad(
     combine_target_off,   # [all_expert_num]            int64  每 expert 的远端写偏移
     combine_src_off,      # [all_expert_num]            int64  每 expert 的本地读偏移
     combine_size,         # [all_expert_num]            int32  每 expert 发送的元素数
-    # w2_grad（GMM3）、w1_grad（GMM4）
+    # w1_grad（GMM3）、w2_grad（GMM4）
     permute_out,          # [tokens, hidden]            bf16   W1 梯度计算的 in-place 中间缓冲区
     gate_dw,              # [E, hidden, intermediate*2] bf16  W1 权重梯度，output（in-place）
     group_list,           # [E]                         int64  每 expert token 累积和
     # 配置张量
     act_grad_tiling,      # uint8                       GMM1 反向 tiling
     gate_grad_tiling,     # uint8                       GMM2 反向 tiling
-    w2_grad_tiling,       # uint8                       GMM3（W2 梯度）tiling
-    w1_grad_tiling,       # uint8                       GMM4（W1 梯度）tiling
+    w1_grad_tiling,       # uint8                       GMM3（W1 梯度）tiling
+    w2_grad_tiling,       # uint8                       GMM4（W2 梯度）tiling
     swiglu_grad_tiling,   # uint8                       SwiGLU 反向 tiling
     gmm_workspace,        # [256*1024*1024]             uint8  GMM 工作区
     swiglu_grad_workspace, # [64*1024*1024]             uint8  SwiGLU 反向工作区
     runtime_config,       # uint8                       per-rank 调度配置
-    all_event_counters,   # [4096]                      uint8  事件同步计数器（symmetric memory）
+    all_event_counters,   # uint8  事件同步计数器（symmetric memory）
     # 标量
     rank_id, ep, expert_num, hidden_size, seq_size,
 )
@@ -744,7 +744,7 @@ mc.mega_moe_grad(
 
 ```bash
 # msrun 2 卡
-msrun --worker_num=2 tests/mindspore/st/multicore/moe.py
+msrun --worker_num=2 tests/mindspore/st/multicore/mega_moe.py
 
 # pytest 入口
 pytest tests/mindspore/st/multicore/test_moe.py -v

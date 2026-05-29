@@ -40,8 +40,8 @@ ACLNN_API aclnnStatus aclnnMegaMoeGradGetWorkspaceSize(
   const aclTensor *gate, const aclTensor *grad_gate, const aclTensor *w1, const aclTensor *gate_dx,
   const aclTensor *grad_x, const aclTensor *combine_target_off, const aclTensor *combine_src_off,
   const aclTensor *combine_size, const aclTensor *permute_out, const aclTensor *gate_dw, const aclTensor *group_list,
-  const aclTensor *act_grad_tiling, const aclTensor *gate_grad_tiling, const aclTensor *w2_grad_tiling,
-  const aclTensor *w1_grad_tiling, const aclTensor *swiglu_grad_tiling, const aclTensor *gmm_workspace,
+  const aclTensor *act_grad_tiling, const aclTensor *gate_grad_tiling, const aclTensor *w1_grad_tiling,
+  const aclTensor *w2_grad_tiling, const aclTensor *swiglu_grad_tiling, const aclTensor *gmm_workspace,
   const aclTensor *swiglu_grad_workspace, const aclTensor *runtime_config, const aclTensor *all_event_counters,
   int64_t rankId, int64_t ep, int64_t expert_num, int64_t hidden_size, int64_t seq_size, uint64_t *workspaceSize,
   aclOpExecutor **executor);

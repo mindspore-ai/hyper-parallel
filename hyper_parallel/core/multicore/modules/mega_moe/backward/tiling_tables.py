@@ -213,7 +213,7 @@ def get_gate_grad_tiling_bytes(split_value: int, *,
     return _expand_gmm_string(csv, repeat=num_cube_cores)
 
 
-def get_w2_grad_tiling_bytes(split_value: int, *,
+def get_w1_grad_tiling_bytes(split_value: int, *,
                                 hidden_size: int = 7168,
                                 intermediate_size: int = 2048,
                                 num_groups: int = 8,
@@ -229,7 +229,7 @@ def get_w2_grad_tiling_bytes(split_value: int, *,
     return _expand_gmm_string(csv, repeat=num_cube_cores)
 
 
-def get_w1_grad_tiling_bytes(split_value: int, *,
+def get_w2_grad_tiling_bytes(split_value: int, *,
                                  hidden_size: int = 7168,
                                  intermediate_size: int = 2048,
                                  num_groups: int = 8,

@@ -45,9 +45,9 @@ mega_moe_grad:
       dtype: tensor
     gate_grad_tiling:
       dtype: tensor
-    w2_grad_tiling:
-      dtype: tensor
     w1_grad_tiling:
+      dtype: tensor
+    w2_grad_tiling:
       dtype: tensor
     swiglu_grad_tiling:
       dtype: tensor

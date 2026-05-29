@@ -30,20 +30,20 @@ from hyper_parallel.core.multicore.tasks.utils import (
 @dataclass
 class GmmFillConfig(FillConfig):
     """
-    GMM fill config covering all variants (fwd up_proj/down_proj, bwd act_grad/w1_grad/
-    gate_grad/w2_grad).  Tensor attributes (tensor_type, dtype_size, is_dynamic,
+    GMM fill config covering all variants (fwd up_proj/down_proj, bwd act_grad/w2_grad/
+    gate_grad/w1_grad).  Tensor attributes (tensor_type, dtype_size, is_dynamic,
     transpose, shape) are read from TensorSpec.
 
     offset_inputs : Set[int]
         Input indices that receive base_ptr_offset and dynamic_shape.
         activation GMMs (up_proj, down_proj, act_grad, gate_grad): {0}
-        weight-grad GMMs (w1_grad, w2_grad): {0, 1}
+        weight-grad GMMs (w2_grad, w1_grad): {0, 1}
 
     rank_in_event : bool
         True  → dependent_event adds single_rank_expert_num * rank_id.
-                 GMM1 (fwd/bwd), GMM4/w1_grad (bwd).
+                 GMM1 (fwd/bwd), GMM4/w2_grad (bwd).
         False → no rank offset.
-                 GMM2 (fwd/bwd), GMM3/w2_grad (bwd).
+                 GMM2 (fwd/bwd), GMM3/w1_grad (bwd).
 
     global_trigger : bool
         False → trigger_event = pre_event_num + data_index + 1 (per-expert).

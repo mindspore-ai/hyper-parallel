@@ -42,7 +42,7 @@ class KernelWorker : public KernelWorkerBase<KernelWorker> {
       case TASK_SWI_GLU:
         ExecuteSwiglu(task_desc);
         break;
-      case TASK_SHMEM_PUT_MEM_SINGAL:
+      case TASK_SHMEM_PUT_MEM_SIGNAL:
         ExecuteShmemPutMem(task_desc);
         break;
       default:
