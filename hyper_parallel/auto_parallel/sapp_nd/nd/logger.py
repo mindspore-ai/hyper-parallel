@@ -15,7 +15,6 @@
 """logger for parall"""
 import logging
 from typing import cast
-from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger as memo_logger
 
 DEFAULT_STDOUT_FORMAT = (
     "[%(levelname)s] %(asctime)s [%(filename)s:%(lineno)d] - %(message)s"
@@ -62,21 +61,22 @@ def setup_logger(name: str, level: int = logging.DEBUG):
     previous_logger_cls = logging.getLoggerClass()
     logging.setLoggerClass(MyLogger)
     try:
-        paradise_logger = cast(MyLogger, logging.getLogger(name))
+        nd_logger = cast(MyLogger, logging.getLogger(name))
     finally:
         logging.setLoggerClass(previous_logger_cls)
-    paradise_logger.setLevel(level)
-    paradise_logger.addHandler(ch)
+    nd_logger.setLevel(level)
+    nd_logger.addHandler(ch)
 
-    return paradise_logger
+    return nd_logger
 
 
-logger = setup_logger("Paradise")
+logger = setup_logger("ND")
 perf_logger = setup_logger("Perf. estim.")
 
 
 def set_verbose_level(level):
     """Assign level to each logger from a global level"""
+    memo_logger = logging.getLogger("memory_estimation")
     memo_logger.disabled = True
     perf_logger.disabled = True
     logger.disabled = True

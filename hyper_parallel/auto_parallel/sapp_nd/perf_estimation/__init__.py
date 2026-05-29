@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""SAPP-ND automatic parallel toolkit."""
+"""SAPP-ND performance estimation utilities."""
 
-__all__ = ["memory_estimation", "nd", "perf_estimation"]
+__all__ = ["comm_time", "estimate", "getters", "utils_classes"]

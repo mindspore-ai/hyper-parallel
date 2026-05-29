@@ -22,8 +22,6 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from tests.common.mark_utils import arg_mark
-
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.estimate_v2 import EvaluatorV2
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
@@ -33,7 +31,6 @@ WORK_PATH = os.path.dirname(os.path.abspath(__file__))
 class TestSappNDMemoryEstimation(unittest.TestCase):
     """A test class for SAPP-ND memory estimation."""
 
-    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_memory_estimation_smoke(self):
         """
         Feature: TestSappNDMemoryEstimation.

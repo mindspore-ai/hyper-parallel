@@ -93,7 +93,7 @@ class EvaluatorV2(_Utils, _HookManager):
         return insights
 
     def estimate_layer_memory(
-        self, stages: list = None, ppb_format=1, device_type=Hard.Device_910B
+        self, stages: list = None, ppb_format=1, device_type=Hard.Device_A2
     ) -> Dict:
         """PPB's input"""
         logger.info(device_type)

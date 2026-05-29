@@ -105,11 +105,16 @@ class Type:
         return assignment
 
 
-# Device_910B = Machine(devices_per_node=8, inter_node_bw=10, intra_node_bw=50)
-Device_910B = Type(name="910B", bounds=[8, None], bandwidths=[50, 10])
+# Device_A2 = Machine(devices_per_node=8, inter_node_bw=10, intra_node_bw=50)
+Device_A2 = Type(name="A2", bounds=[8, None], bandwidths=[50, 10])
 Device_A3 = Type(
     name="A3", bounds=[16, 24, None], bandwidths=[200, 25, 10]
 )
+device_map = {
+    "A2": Device_A2,
+    "A3": Device_A3,
+    "V100": Type(name="V100", bounds=[8, None], bandwidths=[50, 10]),
+}
 
 
 class Machine:
@@ -122,11 +127,18 @@ class Machine:
         self.number = number
         if isinstance(device, int):
             if device == 2:
-                self.device = Device_910B
+                self.device = Device_A2
             elif device == 3:
                 self.device = Device_A3
             else:
                 raise ValueError(f"Ascend A{device} unknown")
+        elif isinstance(device, str):
+            if device not in device_map:
+                raise ValueError(
+                    f"Device {device} is not supported. "
+                    f"Supported devices: {list(device_map.keys())}"
+                )
+            self.device = device_map[device]
         else:
             self.device = device
 
