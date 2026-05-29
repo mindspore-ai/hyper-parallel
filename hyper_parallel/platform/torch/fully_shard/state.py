@@ -222,8 +222,7 @@ class TorchHSDPStateV2(HSDPState):
                 self.replicate_params.append(hsdp_param)
             else:
                 self.hsdp_params.append(hsdp_param)
-                if hsdp_param.is_sharded:
-                    self.sharded_hsdp_params.append(hsdp_param)
+                self.sharded_hsdp_params.append(hsdp_param)
 
     def _init_mp_dtypes(self):
         """init mp dtypes for hsdp parameters and replicate parameters"""
@@ -267,8 +266,7 @@ class TorchHSDPStateV2(HSDPState):
     def lazy_init(self):
         if self.is_shard and not self._reset_sharded_params:
             for hsdp_param in self.hsdp_params:
-                if hsdp_param.is_sharded:
-                    hsdp_param.reset_sharded_param()
+                hsdp_param.reset_sharded_param()
             self._reset_sharded_params = True
         self._validate_no_meta_params()
         self._validate_cpu_offload_params()
@@ -421,7 +419,7 @@ class TorchHSDPStateV2(HSDPState):
                     if self._can_direct_all_reduce_compat_grad(hsdp_param):
                         reduce_op = self._resolve_reduce_op(hsdp_param)
                         self._queue_direct_compat_all_reduce(hsdp_param, reduce_op)
-            
+
             # Step 1: wait prev reduce_scatter (for params needing allreduce)
             prev_group = self._wait_prev_reduce_scatter()
 
