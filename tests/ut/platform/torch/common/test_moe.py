@@ -469,9 +469,245 @@ class TestMoE(unittest.TestCase):
         )
 
 
-# ---------------------------------------------------------------------------
 # TestRegisterExpertBiasUpdater
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# TestZeroOverheadActivation
+# ---------------------------------------------------------------------------
+
+class TestZeroOverheadActivation(unittest.TestCase):
+    """Unit tests for zero-overhead activation storage optimization (issue #109).
+
+    Tests the internalization of routing score weighting into GroupedExperts,
+    which enables activation memory savings by avoiding separate storage of
+    intermediate activations and routing scores.
+    """
+
+    def setUp(self):
+        """Create test fixtures for GroupedExperts."""
+        torch.manual_seed(42)
+        self.dim = 8
+        self.hidden = 16
+        self.num_experts = 4
+
+    def _make_counts(self, total: int, num_experts: int) -> torch.Tensor:
+        """Create token-count tensor that sums to *total*.
+
+        Args:
+            total: Total number of tokens.
+            num_experts: Number of experts.
+
+        Returns:
+            Token count tensor of shape [num_experts].
+        """
+        counts = torch.zeros(num_experts, dtype=torch.long)
+        for i in range(total):
+            counts[i % num_experts] += 1
+        return counts
+
+    def test_for_loop_internal_vs_external_weighting(self):
+        """ZO-01: for-loop path internal scores matches external weighting.
+
+        When scores are applied internally (inside GroupedExperts), the output
+        should be numerically equivalent to applying scores externally (after
+        GroupedExperts forward).
+        """
+        experts = GroupedExperts(
+            dim=self.dim, hidden_dim=self.hidden, num_experts=self.num_experts,
+            use_grouped_mm=False,
+        )
+        total = 12
+        counts = self._make_counts(total, self.num_experts)
+        x = torch.randn(total, self.dim)
+        scores = torch.rand(total)
+
+        out_internal = experts(x, counts, scores=scores)
+
+        out_unweighted = experts(x, counts, scores=None)
+        out_external = out_unweighted * scores.unsqueeze(-1)
+
+        assert torch.allclose(out_internal, out_external, atol=1e-6), (
+            f"Internal vs external weighting mismatch: max_diff="
+            f"{(out_internal - out_external).abs().max().item():.2e}"
+        )
+
+    def test_gpu_grouped_mm_internal_vs_external_weighting(self):
+        """ZO-02: GPU grouped_mm path internal scores matches external weighting.
+
+        When scores are applied internally via grouped_mm path, the output
+        should match external weighting (within bfloat16 precision).
+        """
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available for GPU grouped_mm test")
+
+        experts = GroupedExperts(
+            dim=self.dim, hidden_dim=self.hidden, num_experts=self.num_experts,
+            use_grouped_mm=True,
+        ).cuda()
+        total = 12
+        counts = self._make_counts(total, self.num_experts).cuda()
+        x = torch.randn(total, self.dim, device="cuda")
+        scores = torch.rand(total, device="cuda")
+
+        out_internal = experts(x, counts, scores=scores)
+
+        out_unweighted = experts(x, counts, scores=None)
+        out_external = out_unweighted * scores.unsqueeze(-1)
+
+        assert torch.allclose(out_internal, out_external, atol=1e-4), (
+            f"GPU grouped_mm internal vs external weighting mismatch: max_diff="
+            f"{(out_internal - out_external).abs().max().item():.2e}"
+        )
+
+    def test_scores_none_behavior_unchanged(self):
+        """ZO-03: scores=None preserves original GroupedExperts behavior.
+
+        When scores is None, GroupedExperts should behave exactly as before
+        the zero-overhead optimization was added.
+        """
+        experts = GroupedExperts(
+            dim=self.dim, hidden_dim=self.hidden, num_experts=self.num_experts,
+            use_grouped_mm=False,
+        )
+        total = 10
+        counts = self._make_counts(total, self.num_experts)
+        x = torch.randn(total, self.dim)
+
+        out_default = experts(x, counts)
+        out_explicit_none = experts(x, counts, scores=None)
+
+        assert torch.allclose(out_default, out_explicit_none, atol=1e-7), (
+            f"scores=None behavior changed: max_diff="
+            f"{(out_default - out_explicit_none).abs().max().item():.2e}"
+        )
+
+    def test_zero_tokens_expert_with_scores(self):
+        """ZO-04: Experts with 0 tokens handle scores without error.
+
+        When an expert has 0 tokens, the forward pass should not crash and
+        should produce correct output for other experts.
+        """
+        experts = GroupedExperts(
+            dim=self.dim, hidden_dim=self.hidden, num_experts=self.num_experts,
+            use_grouped_mm=False,
+        )
+        counts = torch.tensor([5, 0, 3, 0])
+        total = int(counts.sum())
+        x = torch.randn(total, self.dim)
+        scores = torch.rand(total)
+
+        out = experts(x, counts, scores=scores)
+
+        assert out.shape == (total, self.dim), (
+            f"Expected shape ({total}, {self.dim}), got {out.shape}"
+        )
+        assert not torch.isnan(out).any(), "Output contains NaN values"
+        assert not torch.isinf(out).any(), "Output contains Inf values"
+
+    def test_backward_gradients_flow_with_scores(self):
+        """ZO-05: Gradients flow correctly when scores are provided.
+
+        Backward pass should compute gradients for all parameters and the
+        scores tensor when scores is not None.
+        """
+        experts = GroupedExperts(
+            dim=self.dim, hidden_dim=self.hidden, num_experts=self.num_experts,
+            use_grouped_mm=False,
+        )
+        total = 10
+        counts = self._make_counts(total, self.num_experts)
+        x = torch.randn(total, self.dim, requires_grad=True)
+        scores = torch.rand(total, requires_grad=True)
+
+        out = experts(x, counts, scores=scores)
+        out.sum().backward()
+
+        assert x.grad is not None, "Input x has no gradient"
+        assert scores.grad is not None, "Scores has no gradient"
+        assert experts.w1.grad is not None, "w1 has no gradient"
+        assert experts.w2.grad is not None, "w2 has no gradient"
+        assert experts.w3.grad is not None, "w3 has no gradient"
+
+        assert torch.isfinite(x.grad).all(), "x.grad contains non-finite values"
+        assert torch.isfinite(scores.grad).all(), "scores.grad contains non-finite values"
+
+    def test_scores_all_ones_equivalence(self):
+        """ZO-06: scores=all-ones matches scores=None output.
+
+        When all scores are 1.0, the output should be identical to the
+        case where scores is None (no weighting applied).
+        """
+        experts = GroupedExperts(
+            dim=self.dim, hidden_dim=self.hidden, num_experts=self.num_experts,
+            use_grouped_mm=False,
+        )
+        total = 10
+        counts = self._make_counts(total, self.num_experts)
+        x = torch.randn(total, self.dim)
+        scores_ones = torch.ones(total)
+
+        out_with_ones = experts(x, counts, scores=scores_ones)
+        out_without_scores = experts(x, counts, scores=None)
+
+        assert torch.allclose(out_with_ones, out_without_scores, atol=1e-6), (
+            f"scores=all-ones vs scores=None mismatch: max_diff="
+            f"{(out_with_ones - out_without_scores).abs().max().item():.2e}"
+        )
+
+    def test_moe_integration_score_before_experts_false(self):
+        """Integration test: MoE with score_before_experts=False uses internal scores.
+
+        When score_before_experts=False, MoE should pass scores to GroupedExperts
+        and not apply external weighting.
+        """
+        torch.manual_seed(100)
+        moe = MoE(
+            dim=self.dim,
+            hidden_dim=self.hidden,
+            num_experts=self.num_experts,
+            top_k=2,
+            score_before_experts=False,
+        )
+        x = torch.randn(2, 4, self.dim)
+        out = moe(x)
+
+        assert out.shape == x.shape, f"Expected shape {x.shape}, got {out.shape}"
+        assert not torch.isnan(out).any(), "MoE output contains NaN values"
+
+    def test_moe_integration_score_before_experts_true(self):
+        """Integration test: MoE with score_before_experts=True unchanged.
+
+        When score_before_experts=True, MoE should pre-scale inputs and pass
+        scores=None to GroupedExperts (original behavior preserved).
+        """
+        torch.manual_seed(101)
+        moe_true = MoE(
+            dim=self.dim,
+            hidden_dim=self.hidden,
+            num_experts=self.num_experts,
+            top_k=2,
+            score_before_experts=True,
+        )
+        moe_false = MoE(
+            dim=self.dim,
+            hidden_dim=self.hidden,
+            num_experts=self.num_experts,
+            top_k=2,
+            score_before_experts=False,
+        )
+        moe_false.experts.load_state_dict(moe_true.experts.state_dict())
+        moe_false.router.load_state_dict(moe_true.router.state_dict())
+
+        x = torch.randn(2, 4, self.dim)
+        out_true = moe_true(x)
+        out_false = moe_false(x)
+
+        assert out_true.shape == x.shape, f"Expected shape {x.shape}, got {out_true.shape}"
+        assert not torch.isnan(out_true).any(), "MoE output contains NaN values"
+        assert not torch.allclose(out_true, out_false), (
+            "score_before_experts=True and False should produce different outputs"
+        )
 if __name__ == "__main__":
     unittest.main()
