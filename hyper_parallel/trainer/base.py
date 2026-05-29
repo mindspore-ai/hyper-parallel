@@ -48,7 +48,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.models.spec.registry import get_spec
 from hyper_parallel.trainer.parallel_dims import ParallelDims
-from hyper_parallel.trainer.utils.loss import count_loss_token
+from hyper_parallel.trainer.utils.loss import count_loss_token, mean_global_loss
 from hyper_parallel.trainer.callbacks.base import (
     LoggingCallback,
     CheckpointCallback,
@@ -913,7 +913,9 @@ class BaseTrainer:
             # 1-card grad_accum=N tracks the FSDP path's effective grad.
             scaled_loss = loss / num_micro if num_micro > 1 else loss
         else:
-            scaled_loss = loss * (micro_batch_tokens / global_tokens) * dp_size
+            scaled_loss = mean_global_loss(
+                loss, micro_batch_tokens, global_tokens, dp_size,
+            )
 
         # Backward (with training context)
         with self.model_bwd_context:
