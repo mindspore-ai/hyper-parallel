@@ -25,7 +25,7 @@ import importlib
 import matplotlib.pyplot as plt
 from PIL import Image
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
-from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger as paradise_logger
+from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger as nd_logger
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context, MemType
@@ -64,7 +64,7 @@ class _Backbone:
             if config:
                 if kwargs.get("log_level", 1) == 0:
                     # logger.setLevel(logging.CRITICAL)
-                    paradise_logger.setLevel(logging.CRITICAL)
+                    nd_logger.setLevel(logging.CRITICAL)
                 self.update_config(config)
             else:
                 raise AttributeError("missing config")

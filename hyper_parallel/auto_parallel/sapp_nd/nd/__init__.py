@@ -14,4 +14,13 @@
 # ============================================================================
 """SAPP-ND normalized description helpers."""
 
-__all__ = ["common", "dimensions", "logger"]
+__all__ = [
+    "balancing_adapter",
+    "common",
+    "debug",
+    "dimensions",
+    "global_config",
+    "logger",
+    "parallelize",
+    "run_nd",
+]

@@ -149,7 +149,7 @@ scheduling settings. A partition is represented as `layers[stage][chunk]`, where
 Parser modules convert a framework-specific config file into a normalized
 `CostModelConfig` object. The memory evaluator only depends on the normalized
 fields, so a new framework parser should keep all framework-specific names and
-validation inside `paradise/common/framework_parsers/`.
+validation inside `nd/common/framework_parsers/`.
 
 The default parser lookup is based on the input suffix:
 
@@ -168,7 +168,7 @@ e = EvaluatorV2("model_config.toml", framework="hyperparallel")
 To add a parser for a new input format:
 
 1. Create `cost_model_parser_<name>.py` under
-   `paradise/common/framework_parsers/`.
+   `nd/common/framework_parsers/`.
 2. Define a parser class that inherits `_CostModelParser`.
 3. Register the parser in `framework_parsers/mapping.yaml`.
 4. Implement `parse()` and assign normalized values to `self.ccfg`.

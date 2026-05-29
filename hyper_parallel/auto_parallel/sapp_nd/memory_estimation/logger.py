@@ -44,11 +44,11 @@ def setup_logger(name: str, level: int = logging.DEBUG):
     ch.setFormatter(FORMATTER)
 
     logging.Logger.output = logging.Logger.critical
-    paradise_logger = logging.getLogger(name)
-    paradise_logger.setLevel(level)
-    paradise_logger.addHandler(ch)
+    memory_logger = logging.getLogger(name)
+    memory_logger.setLevel(level)
+    memory_logger.addHandler(ch)
 
-    return paradise_logger
+    return memory_logger
 
 
 logger = setup_logger("memory_estimation")
