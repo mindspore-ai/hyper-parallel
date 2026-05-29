@@ -20,7 +20,7 @@ import threading
 import warnings
 
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from hyper_parallel.platform import get_platform
 
@@ -75,6 +75,19 @@ def _return_cpu_pinned_buf(buf):
     _CPU_PINNED_POOL[str(buf.dtype)].append(buf)
 
 
+def _collect_device_storage_ptrs(tensors: Any) -> Set[int]:
+    """Collect device storage pointers from a nested tensor structure."""
+    storage_ptrs = set()
+
+    def _collect(x):
+        if isinstance(x, platform.Tensor) and str(x.device).lower() != "cpu":
+            storage_ptrs.add(x.untyped_storage().data_ptr())
+        return x
+
+    platform.tree_map(_collect, tensors)
+    return storage_ptrs
+
+
 class SwapTensor:
     """A tensor that can be swapped between device and host memory asynchronously."""
     STATE_DEVICE = "device"
@@ -121,19 +134,12 @@ class SwapTensor:
         """Mark this wrapper as a duplicate registration in the same swap group."""
         self._duplicate_swap = True
 
-    def protect_if_aliases(self, output_tensors: List[Any]) -> None:
-        """Keep tensors that alias the wrapped module output on device."""
+    def protect_if_aliases(self, alias_storage_ptrs: Set[int]) -> None:
+        """Keep tensors that alias externally-owned tensors on device."""
         if self._state == self.STATE_NON_TENSOR:
             return
-        self_storage_ptr = self.val.untyped_storage().data_ptr()
-        for out in output_tensors:
-            if not isinstance(out, platform.Tensor):
-                continue
-            if str(out.device).lower() == "cpu":
-                continue
-            if out.untyped_storage().data_ptr() == self_storage_ptr:
-                self._keep_on_device = True
-                return
+        if self.val.untyped_storage().data_ptr() in alias_storage_ptrs:
+            self._keep_on_device = True
 
     def get_val(self) -> Any:
         if self._state == self.STATE_NON_TENSOR:
@@ -310,22 +316,14 @@ class Storage:
             seen_keys.add(dedup_key)
         return duplicate_count
 
-    def protect_output_tensors(self, outputs: Any):
-        """Avoid offloading tensors that alias the wrapped module outputs."""
-        output_tensors = []
-
-        def _collect_outputs(x):
-            if isinstance(x, platform.Tensor):
-                output_tensors.append(x)
-            return x
-
-        platform.tree_map(_collect_outputs, outputs)
-        if not output_tensors:
+    def protect_alias_storage_ptrs(self, alias_storage_ptrs: Set[int]):
+        """Avoid offloading swap entries that alias externally-owned storage."""
+        if not alias_storage_ptrs:
             return
 
         def _protect_tensor(x):
             if isinstance(x, SwapTensor):
-                x.protect_if_aliases(output_tensors)
+                x.protect_if_aliases(alias_storage_ptrs)
             return x
 
         for storage_list in self.values():
@@ -427,10 +425,13 @@ class SwapGroup:
             )
         self._storages.append(storage)
 
-    def protect_output_tensors(self, outputs: Any):
-        """Protect current module outputs from premature offload."""
+    def protect_alias_tensors(self, tensors: Any):
+        """Protect externally-owned tensors from premature offload."""
+        alias_storage_ptrs = _collect_device_storage_ptrs(tensors)
+        if not alias_storage_ptrs:
+            return
         for storage in self._storages:
-            storage.protect_output_tensors(outputs)
+            storage.protect_alias_storage_ptrs(alias_storage_ptrs)
 
     def _collect_packable_tensors(self) -> int:
         """Identify tensors eligible for group packing and mark them for bulk copy.
@@ -723,12 +724,12 @@ class SwapManager:
             copy_stream = self._get_copy_stream()
         group.launch_offload(copy_stream)
 
-    def protect_output_tensors(self, group_name: str, outputs: Any):
-        """Keep tensors that alias the module output on device."""
+    def protect_alias_tensors(self, group_name: str, tensors: Any):
+        """Keep tensors that alias externally-owned tensors on device."""
         group = self._groups.get(group_name)
         if group is None:
             raise RuntimeError(f"Group {group_name} does not exist.")
-        group.protect_output_tensors(outputs)
+        group.protect_alias_tensors(tensors)
 
     def wait_offload(self, group_name: str):
         """Wait for offload to complete for a specified swap group."""
@@ -857,7 +858,7 @@ class SwapManager:
                 return
             next_name = module._swap_group_order.get('next', None)
             if next_name:
-                SwapManager().protect_output_tensors(group_name, output)
+                SwapManager().protect_alias_tensors(group_name, output)
                 SwapManager().launch_offload(group_name)
             prev_name = module._swap_group_order.get('prev', None)
             if prev_name:

@@ -250,6 +250,8 @@ class AsyncSaveOnCpu(ms.saved_tensors_hooks):
             if (policy_fn is not None) and (policy_fn(tensor) == CheckpointPolicy.MUST_SAVE):
                 return tensor
             group_name = swap_manager.get_current_group_name()
+            if not group_name:
+                return tensor
             if not self.add_to_storage:
                 swap_manager.add_storage(group_name, self.storage)
                 self.add_to_storage = True

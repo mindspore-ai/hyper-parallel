@@ -42,6 +42,11 @@ class MetaStepType(Enum):
     FSDP_UNSHARD = auto()
     FSDP_RESHARD = auto()
     FSDP_REDUCE_GRAD = auto()
+    SWAP_SET_GROUP = auto()
+    SWAP_LAUNCH_OFFLOAD = auto()
+    SWAP_WAIT_OFFLOAD = auto()
+    SWAP_LAUNCH_LOAD = auto()
+    SWAP_WAIT_LOAD = auto()
 
 
 class MetaStep:
@@ -208,6 +213,9 @@ class PipelineScheduleRuntime(ABC):
             Default ``None``.
         kwargs_batch_dim (dict, optional): Specify the batch dim of the kwargs.
             Default ``None``.
+        swap (bool, optional): Whether to inject pipeline activation swap
+            control steps. Supported by ``ScheduleGPipe``, ``Schedule1F1B``,
+            and ``ScheduleInterleaved1F1B``. Default ``False``.
     """
     def __init__(self,
                  stages,
@@ -215,7 +223,8 @@ class PipelineScheduleRuntime(ABC):
                  args_batch_dim=None,
                  kwargs_batch_dim=None,
                  output_concat_dim=None,
-                 overlap_p2p=False):
+                 overlap_p2p=False,
+                 swap=False):
         self.stages = self._check_stages(stages)
         self.micro_batch_num = micro_batch_num
         self._args_batch_dim = args_batch_dim
@@ -235,6 +244,7 @@ class PipelineScheduleRuntime(ABC):
         self.fwd_handle_cache = {}
         self.bwd_handle_cache = {}
         self._custom_fn_map = {}
+        self._pp_swap_enabled = swap
 
     def register_custom_function(self, step_type: MetaStepType, fn) -> None:
         """Register a custom execution function for the given step type.
@@ -277,6 +287,16 @@ class PipelineScheduleRuntime(ABC):
             self.micro_batch_num,
         )
 
+    def _inject_local_pp_swap_actions(self):
+        """Annotate the local rank schedule with pipeline activation-swap actions."""
+        if not self._pp_swap_enabled:
+            return
+        current_rank = self._stage_to_rank_index[self.stages[0].stage_index]
+        from hyper_parallel.core.pipeline_parallel.pipeline_swap import (  # pylint: disable=C0415
+            inject_pipeline_swap_steps,
+        )
+        self.exec_order[current_rank] = inject_pipeline_swap_steps(self.exec_order[current_rank])
+
     @abstractmethod
     def _build_stage_to_rank_index(self) -> None:
         """
@@ -289,8 +309,9 @@ class PipelineScheduleRuntime(ABC):
         """Build exec order, PP cmopute and PP comms(Send/Recv)"""
 
     def build_exec_order(self) -> None:
-        """Build the execution order and inject FSDP actions."""
+        """Build the execution order and inject optional PP-swap/FSDP actions."""
         self.construct_exec_order()
+        self._inject_local_pp_swap_actions()
         self._inject_local_fsdp_actions()
 
     def convert_stages_dict(self):
@@ -364,7 +385,16 @@ class PipelineScheduleRuntime(ABC):
         stage_index = cur_step.stage_index
         micro_index = cur_step.micro_index
 
-        if cur_step.type == MetaStepType.FWD_RECV:
+        if cur_step.type in (
+            MetaStepType.SWAP_SET_GROUP,
+            MetaStepType.SWAP_LAUNCH_OFFLOAD,
+            MetaStepType.SWAP_WAIT_OFFLOAD,
+            MetaStepType.SWAP_LAUNCH_LOAD,
+            MetaStepType.SWAP_WAIT_LOAD,
+        ):
+            self._exec_pipeline_swap_step(cur_step, arg_mbs, kwarg_mbs)
+
+        elif cur_step.type == MetaStepType.FWD_RECV:
             comm_handle = stage.exec_fwd_recv_ops(micro_index)
             if not self._overlap_p2p:
                 self._wait_p2p(comm_handle)
@@ -413,6 +443,27 @@ class PipelineScheduleRuntime(ABC):
             MetaStepType.FSDP_REDUCE_GRAD,
         ):
             self._exec_fsdp_step(cur_step, stage)
+
+    def _exec_pipeline_swap_step(self, cur_step, arg_mbs, kwarg_mbs):
+        """Execute a pipeline activation-swap control step."""
+        from hyper_parallel.core.pipeline_parallel.pipeline_swap import (  # pylint: disable=C0415
+            swap_launch_load,
+            swap_launch_offload,
+            swap_set_group,
+            swap_wait_load,
+            swap_wait_offload,
+        )
+
+        if cur_step.type == MetaStepType.SWAP_SET_GROUP:
+            swap_set_group(cur_step)
+        elif cur_step.type == MetaStepType.SWAP_LAUNCH_OFFLOAD:
+            swap_launch_offload(cur_step, self, arg_mbs, kwarg_mbs)
+        elif cur_step.type == MetaStepType.SWAP_WAIT_OFFLOAD:
+            swap_wait_offload(cur_step)
+        elif cur_step.type == MetaStepType.SWAP_LAUNCH_LOAD:
+            swap_launch_load(cur_step)
+        elif cur_step.type == MetaStepType.SWAP_WAIT_LOAD:
+            swap_wait_load(cur_step)
 
     def _exec_fsdp_step(self, cur_step, stage):
         """Execute an FSDP control step (unshard, reshard, or reduce-grad)."""
@@ -892,12 +943,14 @@ class ScheduleGPipe(PipelineScheduleRuntime):
                  micro_batch_num,
                  args_batch_dim=None,
                  kwargs_batch_dim=None,
-                 output_concat_dim=None):
+                 output_concat_dim=None,
+                 swap=False):
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
                          kwargs_batch_dim=kwargs_batch_dim,
-                         output_concat_dim=output_concat_dim)
+                         output_concat_dim=output_concat_dim,
+                         swap=swap)
         self.build_exec_order()
 
     def _build_stage_to_rank_index(self) -> None:
@@ -934,12 +987,14 @@ class Schedule1F1B(PipelineScheduleRuntime):
                  micro_batch_num,
                  args_batch_dim=None,
                  kwargs_batch_dim=None,
-                 output_concat_dim=None):
+                 output_concat_dim=None,
+                 swap=False):
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
                          kwargs_batch_dim=kwargs_batch_dim,
-                         output_concat_dim=output_concat_dim)
+                         output_concat_dim=output_concat_dim,
+                         swap=swap)
         self.build_exec_order()
 
     def _build_stage_to_rank_index(self) -> None:
@@ -1037,13 +1092,15 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
                  kwargs_batch_dim=None,
                  output_concat_dim=None,
                  overlap_p2p=False,
-                 overlap_b_f=False):
+                 overlap_b_f=False,
+                 swap=False):
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
                          kwargs_batch_dim=kwargs_batch_dim,
                          output_concat_dim=output_concat_dim,
-                         overlap_p2p=overlap_p2p)
+                         overlap_p2p=overlap_p2p,
+                         swap=swap)
         # _overlap_b_f selects between plain F/B emission and OVERLAP_B_F
         # pairing in the 1F1B steady-state phase.  Must be set before
         # ``construct_stage_exec_order`` is called below.
