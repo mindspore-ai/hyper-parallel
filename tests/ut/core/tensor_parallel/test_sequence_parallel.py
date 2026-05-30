@@ -210,7 +210,7 @@ class TestSequenceParallelIO(unittest.TestCase):
         out = SequenceParallel._prepare_input_fn(
             sequence_sharding, mod, inputs, mesh
         )
-        self.assertIs(out, mock_dt)
+        self.assertIs(out[0], mock_dt)
         mock_dt.redistribute.assert_not_called()
 
     def test_prepare_input_fn_dtensor_redistributes_when_mismatch(self):
@@ -231,7 +231,7 @@ class TestSequenceParallelIO(unittest.TestCase):
             sequence_sharding, mod, inputs, mesh
         )
         mock_dt.redistribute.assert_called_once_with(mesh, sequence_sharding)
-        self.assertIs(out, redistributed)
+        self.assertIs(out[0], redistributed)
 
     def test_prepare_input_fn_invalid_type_raises(self):
         """

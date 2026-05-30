@@ -109,13 +109,17 @@ class ColwiseParallel(ParallelStyle):
         *,
         input_layouts: Optional[Placement] = None,
         output_layouts: Optional[Placement] = None,
-        use_local_output: bool = True,
+        use_local_output: Optional[bool] = None,
     ) -> None:
         super().__init__()
+        self._input_layouts_arg = input_layouts
+        self._output_layouts_arg = output_layouts
+        self._use_local_output_arg = use_local_output
+
         self.input_layouts: Tuple[Placement, ...] = (input_layouts or Replicate(),)
         self.output_layouts: Tuple[Placement, ...] = (output_layouts or Shard(-1),)
         self.desired_input_layouts: Tuple[Placement, ...] = (Replicate(),)
-        self.use_local_output = use_local_output
+        self.use_local_output = use_local_output if use_local_output is not None else True
 
     def __repr__(self) -> str:
         return (
@@ -143,7 +147,8 @@ class ColwiseParallel(ParallelStyle):
             input_tensor = input_tensor.redistribute(
                 device_mesh, desired_input_layouts,
             )
-        return input_tensor
+        # MindSpore requires tuple return from pre-hook
+        return (input_tensor,)
 
     def _partition_linear_fn(self, module: Any, device_mesh: DeviceMesh) -> None:
         """Shard Linear weight/bias along ``Shard(0)`` (column-wise)."""
@@ -301,7 +306,8 @@ class RowwiseParallel(ParallelStyle):
             input_tensor = input_tensor.redistribute(
                 device_mesh, desired_input_layouts,
             )
-        return input_tensor
+        # MindSpore requires tuple return from pre-hook
+        return (input_tensor,)
 
     def _partition_linear_fn(self, module: Any, device_mesh: DeviceMesh) -> None:
         """Shard Linear weight along ``Shard(1)`` (row-wise); bias to ``Replicate()``."""
@@ -466,12 +472,13 @@ class SequenceParallel(ParallelStyle):
         if isinstance(input_tensor, DTensor):
             if tuple(input_tensor.placements) != tuple(sequence_sharding):
                 input_tensor = input_tensor.redistribute(device_mesh, sequence_sharding)
-            return input_tensor
-        if platform.is_tensor(input_tensor):
-            return DTensor.from_local(input_tensor, device_mesh, sequence_sharding)
-        raise ValueError(
-            f"expecting input of {mod} to be a tensor or DTensor, but got {type(input_tensor)}"
-        )
+        elif platform.is_tensor(input_tensor):
+            input_tensor = DTensor.from_local(input_tensor, device_mesh, sequence_sharding)
+        else:
+            raise ValueError(
+                f"expecting input of {mod} to be a tensor or DTensor, but got {type(input_tensor)}"
+            )
+        return (input_tensor,)
 
     @staticmethod
     def _prepare_output_fn(use_local_output: bool, outputs: Any) -> Any:

@@ -162,8 +162,7 @@ class DTensorBase(Tensor):
             DTensorBase: A new DTensor with the same data but detached from the computation graph.
         """
         detached_local = self._local_tensor.detach()
-        alias_p = self._layout.alias_placements if hasattr(self, '_layout') and self._layout else self._placements
-        return self.__class__(detached_local, device_mesh=self._device_mesh, placements=alias_p)
+        return self.__class__(detached_local, device_mesh=self._device_mesh, placements=self._alias_placements())
 
     def detach_(self):
         """
@@ -275,8 +274,7 @@ class DTensorBase(Tensor):
         if dtype is None:
             return self._local_tensor.type()
         new_local = self._local_tensor.to(dtype=dtype, non_blocking=non_blocking)
-        alias_p = self._layout.alias_placements if hasattr(self, '_layout') and self._layout else self._placements
-        return self.__class__(new_local, device_mesh=self._device_mesh, placements=alias_p)
+        return self.__class__(new_local, device_mesh=self._device_mesh, placements=self._alias_placements())
 
     def size(self, dim: Optional[int] = None):
         """
@@ -366,6 +364,31 @@ class DTensorBase(Tensor):
         return self
 
     # ====================== Auxiliary print ======================
+    def _alias_placements(self):
+        """Return alias_placements from layout, falling back to _placements."""
+        if hasattr(self, '_layout') and self._layout is not None:
+            return self._layout.alias_placements
+        return self._placements
+
+    def to(self, *args, **kwargs):
+        """Move the DTensor to a different device or dtype.
+
+        This method overrides the base Tensor.to() to properly reconstruct
+        a DTensor with device_mesh and placements preserved. Uses _make_subclass
+        to avoid issues with Parameter subclasses that don't accept extra kwargs.
+
+        Args:
+            *args: Arguments passed to the underlying tensor's to() method.
+            **kwargs: Keyword arguments for the tensor conversion.
+
+        Returns:
+            DTensorBase: A new DTensor with the converted local tensor.
+        """
+        new_local = self._local_tensor.to(*args, **kwargs)
+        new_dt = Tensor._make_subclass(type(self), new_local, new_local.requires_grad)
+        new_dt.__init_data__(new_local, self._device_mesh, self._alias_placements())
+        return new_dt
+
     def __repr__(self) -> str:
         return (
             f"DTensor(\n"
