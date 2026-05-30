@@ -80,7 +80,7 @@ def _make_state(mp_policy, hsdp_params):
     state.offload_policy = None
     state.hsdp_params = hsdp_params
     state.replicate_params = []
-    state._ignored_allreduce_works = []
+    MindSporeHSDPStateV2._ignored_allreduce_works = []
     state._reset_sharded_params = True   # Skip the reset_sharded_param branch
     state.is_shard = True                # Match HSDPState.__init__ default
     return state
@@ -579,14 +579,14 @@ class TestReplicateParamGradHandling(unittest.TestCase):
         param.to_sharded_dtensor.return_value = sharded_grad_dtensor
         param.unsharded_accumulated_grad_data = None
 
-        state._ignored_allreduce_works = [(param, reduced_grad, 2)]
+        MindSporeHSDPStateV2._ignored_allreduce_works = [(param, reduced_grad, 2, ms.float32, True)]
 
         state._finish_ignored_allreduce()
 
         param.all_reduce_handle.wait.assert_called_once_with()
         reduced_grad.div_.assert_called_once_with(2)
         param.apply_reduced_grad.assert_called_once_with(reduced_grad, ms.float32)
-        self.assertEqual(state._ignored_allreduce_works, [])
+        self.assertEqual(MindSporeHSDPStateV2._ignored_allreduce_works, [])
 
 
 class TestParameterRebinding(unittest.TestCase):
