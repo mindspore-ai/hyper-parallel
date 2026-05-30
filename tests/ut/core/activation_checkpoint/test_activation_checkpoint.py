@@ -14,7 +14,6 @@
 # ============================================================================
 """Unit tests for activation checkpoint module."""
 import contextlib
-import functools
 import os
 import unittest
 from unittest.mock import MagicMock, patch
@@ -25,12 +24,11 @@ os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.activation_checkpoint.activation_checkpoint import (
     CheckpointPolicy,
-    CheckpointWrapper,
     checkpoint,
-    ckpt_wrapper,
+    checkpoint_wrapper,
     swap,
 )
-from hyper_parallel.core.activation_checkpoint.swap import SwapManager
+from hyper_parallel.platform.torch.activation_checkpoint.checkpoint_wrapper import CheckpointWrapper
 
 
 class TestCheckpointPolicy(unittest.TestCase):
@@ -165,7 +163,7 @@ class TestSwapFunction(unittest.TestCase):
         result = swap(dummy_fn, 3)
 
         self.assertEqual(result, 6)
-        mock_plat.async_save_on_cpu.assert_called_once_with(policy_fn=None)
+        mock_plat.async_save_on_cpu.assert_called_once_with(policy_fn=None, group_swap=False)
 
     def test_swap_with_policy_fn(self, mock_plat):
         """Test swap passes policy_fn to async_save_on_cpu."""
@@ -179,7 +177,7 @@ class TestSwapFunction(unittest.TestCase):
         result = swap(dummy_fn, 3, policy_fn=policy)
 
         self.assertEqual(result, 6)
-        mock_plat.async_save_on_cpu.assert_called_once_with(policy_fn=policy)
+        mock_plat.async_save_on_cpu.assert_called_once_with(policy_fn=policy, group_swap=False)
 
     def test_swap_with_kwargs(self, mock_plat):
         """Test swap forwards kwargs to the function."""
@@ -191,7 +189,7 @@ class TestSwapFunction(unittest.TestCase):
         result = swap(dummy_fn, 3, scale=2.0)
 
         self.assertEqual(result, 6.0)
-        mock_plat.async_save_on_cpu.assert_called_once_with(policy_fn=None)
+        mock_plat.async_save_on_cpu.assert_called_once_with(policy_fn=None, group_swap=False)
 
     def test_swap_with_args_and_kwargs(self, mock_plat):
         """Test swap with args and kwargs."""
@@ -203,27 +201,11 @@ class TestSwapFunction(unittest.TestCase):
         result = swap(dummy_fn, 1, 2, c=3)
 
         self.assertEqual(result, 6)
-        mock_plat.async_save_on_cpu.assert_called_once_with(policy_fn=None)
-
-
-class _FakeModule:
-    """Fake module that behaves like a wrapped module for CheckpointWrapper testing."""
-
-    def __init__(self, name="fake"):
-        self._name = name
-
-    def __call__(self, *args, **kwargs):
-        return args, kwargs
-
-    def forward(self, *args, **kwargs):
-        return self(*args, **kwargs)
-
-    def construct(self, *args, **kwargs):
-        return self(*args, **kwargs)
+        mock_plat.async_save_on_cpu.assert_called_once_with(policy_fn=None, group_swap=False)
 
 
 class _BaseWrapperModule(torch.nn.Module):
-    """Minimal torch module used as wrapped module in CheckpointWrapper tests."""
+    """Minimal torch module used in checkpoint_wrapper alias tests."""
 
     def __init__(self, factor=2):
         super().__init__()
@@ -235,147 +217,40 @@ class _BaseWrapperModule(torch.nn.Module):
 
 
 @patch("hyper_parallel.core.activation_checkpoint.activation_checkpoint.plat")
-class TestCheckpointWrapper(unittest.TestCase):
-    """Unit tests for CheckpointWrapper."""
-
-    def test_init_stores_attributes(self, mock_plat):
-        """Test __init__ stores mod, group_swap, and kwargs."""
-        mod = _BaseWrapperModule()
-        wrapper = CheckpointWrapper(mod, group_swap=True, policy_fn=lambda x: x)
-
-        self.assertIsNotNone(wrapper._wrapped_module)
-        self.assertTrue(wrapper.group_swap)
-        self.assertIn("policy_fn", wrapper.checkpoint_kwargs)
-
-    def test_init_default_group_swap_false(self, mock_plat):
-        """Test group_swap defaults to False."""
-        mod = _BaseWrapperModule()
-        wrapper = CheckpointWrapper(mod)
-
-        self.assertFalse(wrapper.group_swap)
-        self.assertEqual(wrapper.checkpoint_kwargs, {})
-
-    def test_forward_returns_result(self, mock_plat):
-        """Test forward() calls checkpoint and returns result."""
-        mock_plat.checkpoint.return_value = "forward_result"
-        mock_plat.noop_context_fn = "noop"
-
-        mod = _BaseWrapperModule()
-        wrapper = CheckpointWrapper(mod)
-
-        result = wrapper.forward(torch.randn(2, 4))
-
-        self.assertEqual(result, "forward_result")
-
-    def test_construct_returns_result(self, mock_plat):
-        """Test construct() calls checkpoint and returns result."""
-        mock_plat.checkpoint.return_value = "construct_result"
-        mock_plat.noop_context_fn = "noop"
-
-        mod = _BaseWrapperModule()
-        wrapper = CheckpointWrapper(mod)
-
-        result = wrapper.construct(torch.randn(2, 4))
-
-        self.assertEqual(result, "construct_result")
-
-    def test_do_checkpoint_with_group_swap_uses_selective_context(self, mock_plat):
-        """Test _do_checkpoint with group_swap=True uses selective checkpoint context."""
-        mock_plat.checkpoint.return_value = "result"
-
-        mod = _BaseWrapperModule()
-        wrapper = CheckpointWrapper(mod, group_swap=True)
-
-        result = wrapper.forward(torch.randn(2, 4))
-
-        self.assertEqual(result, "result")
-        call_kwargs = mock_plat.checkpoint.call_args[1]
-        ctx_fn = call_kwargs.get("context_fn")
-        self.assertIsInstance(ctx_fn, functools.partial,
-                              f"Expected context_fn to be a partial, got {type(ctx_fn)}")
-
-    def test_do_checkpoint_with_swap_group_name(self, mock_plat):
-        """Test _do_checkpoint with _swap_group_name attribute sets current group."""
-        mock_plat.checkpoint.return_value = "result"
-        mock_plat.noop_context_fn = "noop"
-
-        mod = _BaseWrapperModule()
-        wrapper = CheckpointWrapper(mod)
-        wrapper._swap_group_name = "test_group"
-
-        # Patch SwapManager singleton instance method
-        with patch.object(
-            SwapManager, "set_current_group_name"
-        ) as mock_set_group:
-            result = wrapper.forward(torch.randn(2, 4))
-
-            self.assertEqual(result, "result")
-            mock_set_group.assert_called_once_with("test_group")
-
-    def test_do_checkpoint_without_swap_group_name(self, mock_plat):
-        """Test _do_checkpoint without _swap_group_name does not call SwapManager."""
-        mock_plat.checkpoint.return_value = "result"
-        mock_plat.noop_context_fn = "noop"
-
-        mod = _BaseWrapperModule()
-        wrapper = CheckpointWrapper(mod)
-
-        result = wrapper.forward(torch.randn(2, 4))
-
-        self.assertEqual(result, "result")
-
-    def test_do_checkpoint_passes_checkpoint_kwargs(self, mock_plat):
-        """Test _do_checkpoint forwards stored checkpoint_kwargs to context_fn builder."""
-        mock_plat.checkpoint.return_value = "result"
-
-        mod = _BaseWrapperModule()
-        policy = lambda x: CheckpointPolicy.MUST_SAVE  # pylint: disable=C3001
-        wrapper = CheckpointWrapper(mod, policy_fn=policy)
-
-        result = wrapper.forward(torch.randn(2, 4))
-
-        self.assertEqual(result, "result")
-        call_kwargs = mock_plat.checkpoint.call_args[1]
-        ctx_fn = call_kwargs.get("context_fn")
-        self.assertIsInstance(ctx_fn, functools.partial,
-                              f"Expected context_fn to be a partial for policy_fn, got {type(ctx_fn)}")
-
-
-@patch("hyper_parallel.core.activation_checkpoint.activation_checkpoint.plat")
 class TestCkptWrapper(unittest.TestCase):
-    """Unit tests for ckpt_wrapper() factory function."""
+    """Unit tests for checkpoint_wrapper() factory function."""
 
     def test_returns_checkpoint_wrapper(self, mock_plat):
-        """Test ckpt_wrapper returns a CheckpointWrapper instance."""
+        """Test checkpoint_wrapper returns a CheckpointWrapper instance."""
         mod = _BaseWrapperModule()
 
-        result = ckpt_wrapper(mod)
+        result = checkpoint_wrapper(mod)
 
         self.assertIsInstance(result, CheckpointWrapper)
 
     def test_passes_group_swap(self, mock_plat):
-        """Test ckpt_wrapper passes group_swap to CheckpointWrapper."""
+        """Test checkpoint_wrapper passes group_swap to CheckpointWrapper."""
         mod = _BaseWrapperModule()
 
-        result = ckpt_wrapper(mod, group_swap=True)
+        result = checkpoint_wrapper(mod, group_swap=True)
 
-        self.assertTrue(result.group_swap)
+        self.assertTrue(result.checkpoint_kwargs["group_swap"])
 
     def test_passes_checkpoint_kwargs(self, mock_plat):
-        """Test ckpt_wrapper passes kwargs to CheckpointWrapper."""
+        """Test checkpoint_wrapper passes kwargs to CheckpointWrapper."""
         mod = _BaseWrapperModule()
         policy = lambda x: x  # pylint: disable=C3001
 
-        result = ckpt_wrapper(mod, policy_fn=policy)
+        result = checkpoint_wrapper(mod, policy_fn=policy)
 
         self.assertIn("policy_fn", result.checkpoint_kwargs)
         self.assertEqual(result.checkpoint_kwargs["policy_fn"], policy)
 
     def test_with_callable(self, mock_plat):
-        """Test ckpt_wrapper works with callable (lambda)."""
+        """Test checkpoint_wrapper works with callable (lambda)."""
         fn = lambda x: x * 2  # pylint: disable=C3001
 
-        result = ckpt_wrapper(fn)
+        result = checkpoint_wrapper(fn)
 
         self.assertIsInstance(result, CheckpointWrapper)
 
@@ -383,12 +258,6 @@ class TestCkptWrapper(unittest.TestCase):
 @patch("hyper_parallel.core.activation_checkpoint.activation_checkpoint.plat")
 class TestModuleLevelAliases(unittest.TestCase):
     """Unit tests for module-level aliases (swap_wrapper, swap_tensor_wrapper, checkpoint_wrapper)."""
-
-    def test_checkpoint_wrapper_is_ckpt_wrapper(self, mock_plat):
-        """Test checkpoint_wrapper alias points to ckpt_wrapper."""
-        from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
-
-        self.assertIs(checkpoint_wrapper, ckpt_wrapper)
 
     def test_swap_wrapper_is_callable(self, mock_plat):
         """Test swap_wrapper is a callable."""

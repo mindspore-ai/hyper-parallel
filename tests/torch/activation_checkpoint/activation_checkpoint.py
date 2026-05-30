@@ -14,9 +14,10 @@
 # ============================================================================
 """Activation checkpoint memory comparison: None vs Recompute vs Save vs Swap"""
 import copy
+import pytest
 import torch
 
-from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, checkpoint_wrapper
+from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, checkpoint_wrapper, swap_wrapper
 from tests.torch.common_net import SimpleTransformer
 from tests.torch.activation_checkpoint.utils import prepare_data, seed_memory_time_context, train_one_mode
 
@@ -64,6 +65,15 @@ def apply_recompute(model, mode):
 
         for i, layer in enumerate(model.layers):
             model.layers[i] = checkpoint_wrapper(layer, policy_fn=policy_fn)
+    elif mode == "overlap_1":
+        model.layers[1]= checkpoint_wrapper(model.layers[1])
+        model.layers[1].ffn[0] = checkpoint_wrapper(model.layers[1].ffn[0])
+    elif mode == "overlap_2":
+        model.layers[2].ffn[0]= checkpoint_wrapper(model.layers[2].ffn[0])
+        model.layers[2] = swap_wrapper(model.layers[2])
+    elif mode == "overlap_3":
+        model.layers[2].attn= swap_wrapper(model.layers[2].attn)
+        model.layers[2].attn.out_proj = swap_wrapper(model.layers[2].attn.out_proj)
     else:
         raise ValueError(f"Unknown mode: {mode}")
     return model
@@ -216,3 +226,11 @@ def test_checkpoint_wrapper_accepts_func():
             f"Loss mismatch at step {step}: "
             f"ref={ref_loss.item():.8f}, ckpt={ckpt_loss.item():.8f}, diff={diff:.2e}"
         )
+
+
+@pytest.mark.parametrize("mode", ["overlap_1", "overlap_2", "overlap_3"])
+def test_overlap_wrapper(mode):
+    base_model = SimpleTransformer(vocab_size=32000, dim=2048, depth=16).npu()
+    with pytest.raises(ValueError) as exc_info:
+        apply_recompute(base_model, mode)
+    assert "Wrapping overlapping module regions is not allowed" in str(exc_info.value)

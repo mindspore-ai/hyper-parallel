@@ -16,7 +16,7 @@
 import contextlib
 import enum
 from functools import partial
-from typing import Any, Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from hyper_parallel.platform import get_platform
 plat = get_platform()
@@ -162,14 +162,15 @@ def checkpoint(
             supplied together, the resulting factories are composed: their
             forward and recompute contexts are stacked so all enter in
             order and exit in reverse.
-        group_swap (bool, optional): Whether MUST_SWAP tensors participate in group copy fusion. Default: ``False``.
+        group_swap (bool, optional): Whether MUST_SWAP tensors participate in group copy fusion.
+            Only effective when ``policy_fn`` is provided. Default: ``False``.
         **kwargs: Additional keyword arguments to pass to the function.
 
     Returns:
         The result of applying the function with checkpointing.
     """
     factories: list = []
-    if policy_fn is not None or group_swap:
+    if policy_fn is not None:
         factories.append(partial(plat.create_selective_checkpoint_contexts, policy_fn, group_swap=group_swap))
     if context_fn is not None:
         factories.append(context_fn)
@@ -181,14 +182,14 @@ def checkpoint(
     else:
         composed_context_fn = _compose_context_fns(tuple(factories))
 
-    context = plat.async_save_on_cpu if swap_inputs else contextlib.nullcontext
+    context = partial(plat.async_save_on_cpu, group_swap=group_swap) if swap_inputs else contextlib.nullcontext
     with context():
         return plat.checkpoint(
             function, *args, context_fn=composed_context_fn, use_reentrant=False, **kwargs
         )
 
 
-def swap(function, *args, policy_fn=None, **kwargs):
+def swap(function, *args, policy_fn=None, group_swap=False, **kwargs):
     """Apply activation swap to a function call.
 
     Offloads intermediate activations saved by the autograd engine to CPU
@@ -204,6 +205,8 @@ def swap(function, *args, policy_fn=None, **kwargs):
             that return ``CheckpointPolicy.MUST_SAVE`` are kept on device;
             all other eligible tensors are offloaded.  When ``None``, all
             eligible tensors are offloaded.
+        group_swap (bool, optional): Whether swapped tensors participate in
+            group copy fusion.  Default: ``False``.
         **kwargs: Keyword arguments forwarded to *function*.
 
     Returns:
@@ -212,88 +215,10 @@ def swap(function, *args, policy_fn=None, **kwargs):
     Example:
         >>> output = swap(layer, x, policy_fn=lambda t: CheckpointPolicy.MUST_SAVE)
     """
-    with plat.async_save_on_cpu(policy_fn=policy_fn):
+    with plat.async_save_on_cpu(policy_fn=policy_fn, group_swap=group_swap):
         return function(*args, **kwargs)
 
 
-class CheckpointWrapper(plat.get_class_activation_wrapper()):
-    """
-    Wrap a module with activation checkpointing.
-
-    On each forward call the wrapped module is executed under
-    :func:`~hyper_parallel.core.activation_checkpoint.checkpoint`, which
-    applies the platform-native recompute primitive
-    (``torch.utils.checkpoint.checkpoint`` for PyTorch).
-
-    Args:
-        mod (Any): The module or callable to wrap.
-        group_swap (bool, optional): Whether ``MUST_SWAP`` tensors participate in
-            group copy fusion.  Defaults to ``False``.
-        **checkpoint_kwargs: Extra keyword arguments forwarded to
-            :func:`~hyper_parallel.core.activation_checkpoint.checkpoint`
-            on every forward call (e.g. ``policy_fn``).
-
-    Example:
-        >>> from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
-        >>> wrapped = checkpoint_wrapper(my_module, group_swap=True)
-        >>> output = wrapped(inputs)
-    """
-
-    def __init__(
-        self,
-        mod: Any,
-        group_swap: bool = False,
-        **checkpoint_kwargs: Any,
-    ):
-        super().__init__(mod)
-        self.group_swap = group_swap
-        self.checkpoint_kwargs = checkpoint_kwargs
-
-    def _do_checkpoint(self, wrapped_module: Any, *args: Any, **kwargs: Any) -> Any:
-        # Checkpoint may save inputs before the wrapped cell's pre-hook runs.
-        group_name = getattr(self, "_swap_group_name", None)
-        if group_name is not None:
-            from hyper_parallel.core.activation_checkpoint.swap import SwapManager  # pylint: disable=C0415
-            SwapManager().set_current_group_name(group_name)
-        return checkpoint(
-            wrapped_module,
-            *args,
-            group_swap=self.group_swap,
-            **self.checkpoint_kwargs,
-            **kwargs,
-        )
-
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        return self._do_checkpoint(self._wrapped_module, *args, **kwargs)
-
-    def construct(self, *args: Any, **kwargs: Any) -> Any:
-        return self._do_checkpoint(self._wrapped_module, *args, **kwargs)
-
-
-def ckpt_wrapper(module, group_swap: bool = False, **checkpoint_kwargs):
-    """Wrap *module* with activation checkpointing.
-
-    Args:
-        module (Any): The module or callable to wrap.
-        group_swap (bool, optional): Whether ``MUST_SWAP`` tensors participate in group
-            copy fusion.  Forwarded to
-            :func:`~hyper_parallel.core.activation_checkpoint.checkpoint`
-            on every forward call. Default: ``False``.
-        **checkpoint_kwargs: Extra keyword arguments forwarded to
-            :func:`~hyper_parallel.core.activation_checkpoint.checkpoint`
-            on every forward call (e.g. ``policy_fn``).
-
-    Returns:
-        A platform-specific ``CheckpointWrapper`` instance.
-
-    Example:
-        >>> from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
-        >>> model.layers[i] = checkpoint_wrapper(model.layers[i])
-        >>> wrapped_fn = checkpoint_wrapper(lambda x: x * 2, group_swap=True)
-    """
-    return CheckpointWrapper(module, group_swap=group_swap, **checkpoint_kwargs)
-
-
-checkpoint_wrapper = ckpt_wrapper
+checkpoint_wrapper = plat.checkpoint_wrapper
 swap_wrapper = plat.swap_wrapper
 swap_tensor_wrapper = plat.swap_tensor_wrapper

@@ -1346,6 +1346,12 @@ class TorchPlatform(Platform):
         return torch.utils.checkpoint.checkpoint
 
     @staticmethod
+    def checkpoint_wrapper(module, **checkpoint_kwargs):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.checkpoint_wrapper import ckpt_wrapper
+        return ckpt_wrapper(module, **checkpoint_kwargs)
+
+    @staticmethod
     def swap_wrapper(module, policy_fn=None, group_swap=False):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import swap_wrapper
@@ -1374,10 +1380,10 @@ class TorchPlatform(Platform):
         return create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation, group_swap)
 
     @staticmethod
-    def async_save_on_cpu(policy_fn=None):
+    def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import AsyncSaveOnCpu
-        return AsyncSaveOnCpu(policy_fn)
+        return AsyncSaveOnCpu(policy_fn, group_swap=group_swap)
 
     @staticmethod
     def get_element_size(tensor):

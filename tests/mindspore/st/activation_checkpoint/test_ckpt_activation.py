@@ -25,5 +25,8 @@ def test_sac_group():
     """
     parallel_run([
         MindSporeCase(BASE_SHARD, "test_ac_memory_comparison", 11637, 1),
-        MindSporeCase(BASE_SHARD, "test_group_swap_correctness_and_memory", 11638, 1)
+        MindSporeCase(BASE_SHARD, "test_group_swap_correctness_and_memory", 11638, 1),
+        MindSporeCase(BASE_SHARD, "test_swap_manager_manual_group_api", 11639, 1),
+        MindSporeCase(BASE_SHARD, "test_inplace_modification", 11640, 1),
+        MindSporeCase(BASE_SHARD, "test_overlap_wrapper", 11641, 1)
     ])

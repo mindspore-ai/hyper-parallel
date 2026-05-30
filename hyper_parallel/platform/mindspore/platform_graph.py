@@ -40,6 +40,10 @@ class MindSporeGraphPlatform(MindSporePlatform):
     def swap_wrapper(module, policy_fn=None, group_swap=False):
         raise NotImplementedError("swap_wrapper is not supported on MindSpore Graph platform")
 
+    @staticmethod
+    def checkpoint_wrapper(module, **checkpoint_kwargs):
+        raise NotImplementedError("checkpoint_wrapper is not supported on MindSpore Graph platform")
+
     @property
     def noop_context_fn(self):
         raise NotImplementedError("noop_context_fn is not supported on MindSpore Graph platform")
@@ -49,7 +53,7 @@ class MindSporeGraphPlatform(MindSporePlatform):
         raise NotImplementedError("create_selective_checkpoint_contexts is not supported on MindSpore Graph platform")
 
     @staticmethod
-    def async_save_on_cpu(policy_fn=None):
+    def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
         raise NotImplementedError("async_save_on_cpu is not supported on MindSpore Graph platform")
 
     @staticmethod

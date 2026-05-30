@@ -59,6 +59,79 @@ class FuncModule(nn.Module):
         return self._fn(*args, **kwargs)
 
 
+def _iter_wrappable_callable_attrs(module: nn.Module) -> Iterator[tuple[str, Callable]]:
+    """Yield public callable attributes that PyTorch does not register as child modules."""
+    for attr_name, attr_value in vars(module).items():
+        if attr_name.startswith("_") or isinstance(attr_value, nn.Module):
+            continue
+        if callable(attr_value):
+            yield attr_name, attr_value
+
+
+def _mark_wrapped(obj: Any) -> None:
+    try:
+        obj._is_wrapped = True  # pylint: disable=W0212
+    except (AttributeError, TypeError):
+        pass
+
+
+def _get_wrapped_callable(module: nn.Module) -> Optional[Callable]:
+    wrapped_module = getattr(module, _SWAP_WRAPPED_MODULE, None)
+    if isinstance(wrapped_module, FuncModule):
+        return getattr(wrapped_module, "_fn", None)
+    return None
+
+
+def _raise_callable_already_wrapped(callable_obj: Callable) -> None:
+    raise ValueError(
+        f"Callable '{callable_obj.__class__.__name__}' is already wrapped. "
+        "Wrapping overlapping module regions is not allowed."
+    )
+
+
+def _check_callable_attr_not_wrapped(owner: nn.Module, attr_name: str, attr_value: Callable) -> None:
+    del owner, attr_name
+    if getattr(attr_value, '_is_wrapped', False):
+        _raise_callable_already_wrapped(attr_value)
+
+
+def _check_and_mark_callable(callable_obj: Callable) -> None:
+    if getattr(callable_obj, '_is_wrapped', False):
+        raise ValueError(
+            f"Callable '{callable_obj.__class__.__name__}' or one of its ancestors is already wrapped. "
+            "Wrapping overlapping module regions is not allowed."
+        )
+    _mark_wrapped(callable_obj)
+
+
+def _check_and_mark_wrapped(module: nn.Module) -> None:
+    """Validate no wrapping overlap, then mark module and all descendants as wrapped."""
+    if getattr(module, '_is_wrapped', False):
+        raise ValueError(
+            f"Module '{module.__class__.__name__}' or one of its ancestors is already wrapped. "
+            "Wrapping overlapping module regions is not allowed."
+        )
+    for submodule in module.modules():
+        if submodule is module:
+            continue
+        if getattr(submodule, '_is_wrapped', False):
+            wrapped_callable = _get_wrapped_callable(submodule)
+            if wrapped_callable is not None:
+                _raise_callable_already_wrapped(wrapped_callable)
+            raise ValueError(
+                f"Submodule '{getattr(submodule, '_swap_wrapped_module', submodule).__class__.__name__}' of "
+                f"'{module.__class__.__name__}' is already wrapped. "
+                "Wrapping overlapping module regions is not allowed."
+            )
+    for submodule in module.modules():
+        for attr_name, attr_value in _iter_wrappable_callable_attrs(submodule):
+            _check_callable_attr_not_wrapped(submodule, attr_name, attr_value)
+    for submodule in module.modules():
+        _mark_wrapped(submodule)
+        for _, attr_value in _iter_wrappable_callable_attrs(submodule):
+            _mark_wrapped(attr_value)
+
+
 def base_check_fn(tensor) -> bool:
     """
     Basic check to determine if a tensor is eligible for offloading.
@@ -88,8 +161,11 @@ class AsyncSaveOnCpu(torch.autograd.graph.saved_tensors_hooks):
         def pack_to_cpu(tensor: torch.Tensor):
             if not base_check_fn(tensor):
                 return tensor
-            if (policy_fn is not None) and (policy_fn(tensor) == CheckpointPolicy.MUST_SAVE):
-                return tensor
+            if policy_fn is not None:
+                if policy_fn(tensor) == CheckpointPolicy.MUST_SAVE:
+                    return tensor
+                if policy_fn(tensor) != CheckpointPolicy.MUST_SWAP:
+                    raise RuntimeError(f"Swap :set an invalid policy {policy_fn(tensor)}")
             group_name = swap_manager.get_current_group_name()
             if not group_name:
                 return tensor
@@ -121,9 +197,14 @@ class ActivationWrapper(torch.nn.Module, ABC):
 
     def __init__(self, module: Union[nn.Module, Callable]):
         if callable(module) and not isinstance(module, nn.Module):
+            _check_and_mark_callable(module)
             module = FuncModule(module)
+            _mark_wrapped(module)
+        else:
+            _check_and_mark_wrapped(module)
         super().__init__()
         self._swap_wrapped_module = module
+        self._is_wrapped = True
         # state_dict post hook to remove prefix to allow loading into a
         # non-swap wrapped module.
         self._register_state_dict_hook(self._post_state_dict_hook)
@@ -261,5 +342,5 @@ def swap_tensor_wrapper(target, tag: Optional[str] = None, group_swap: bool = Fa
         target,
     )
     if count_idx > 0:
-        _manager.add_storage(group_name, storage)
+        swap_manager.add_storage(group_name, storage)
     return wrapped

@@ -12,13 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Activation checkpointing related interfaces"""
-from .checkpoint_wrapper import CheckpointWrapper, ckpt_wrapper
-from .activation_swap import swap_wrapper, swap_tensor_wrapper
-
-__all__ = [
-    "CheckpointWrapper",
-    "ckpt_wrapper",
-    "swap_wrapper",
-    "swap_tensor_wrapper",
-]
+"""Unit tests for PyTorch activation checkpoint platform modules."""

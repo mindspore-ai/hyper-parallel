@@ -21,10 +21,11 @@ import sys
 import time
 from contextlib import contextmanager
 
+import pytest
 import numpy as np
 import mindspore as ms
 from mindspore import nn, Tensor, mint
-from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, checkpoint_wrapper
+from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, checkpoint_wrapper, swap_wrapper
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 enable_mindspore_backward_compat()
 
@@ -36,7 +37,7 @@ enable_mindspore_backward_compat()
 class TransformerBlock(nn.Cell):
     """A simple Transformer block for testing purposes."""
 
-    def __init__(self, dim=256, num_heads=4):
+    def __init__(self, dim=256, num_heads=4, inplace=False):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -47,6 +48,7 @@ class TransformerBlock(nn.Cell):
         self.norm2 = mint.nn.LayerNorm((dim,))
         self.ffn1 = nn.Dense(dim, dim * 4, has_bias=False)
         self.ffn2 = nn.Dense(dim * 4, dim, has_bias=False)
+        self.inplace = inplace
 
     def construct(self, x):
         """TransformerBlock construct"""
@@ -62,6 +64,8 @@ class TransformerBlock(nn.Cell):
             k.reshape(-1, s, self.head_dim).transpose(-2, -1),
         ) * scale
         attn = mint.nn.functional.softmax(attn, dim=-1)
+        if self.inplace:
+            attn += 1
         out = mint.bmm(attn, v.reshape(-1, s, self.head_dim))
         out = out.view(b, self.num_heads, s, self.head_dim).transpose(0, 2, 1, 3).reshape(b, s, d)
         out = self.out_proj(out)
@@ -76,10 +80,10 @@ class TransformerBlock(nn.Cell):
 class SimpleTransformer(nn.Cell):
     """A simple Transformer model for testing purposes."""
 
-    def __init__(self, vocab_size=32000, dim=512, depth=8):
+    def __init__(self, vocab_size=32000, dim=512, depth=8, inplace=False):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, dim)
-        self.layers = nn.CellList([TransformerBlock(dim) for _ in range(depth)])
+        self.layers = nn.CellList([TransformerBlock(dim, inplace=inplace) for _ in range(depth)])
         self.norm = mint.nn.LayerNorm((dim,))
         self.head = nn.Dense(dim, vocab_size, has_bias=False)
 
@@ -158,14 +162,14 @@ def train_one_mode(net, data_list, train_steps=3):
     return losses
 
 
-def run_one_mode(mode, train_steps=3, seed=42):
+def run_one_mode(mode, train_steps=3, seed=42, inplace=False):
     """Build a fresh model and measure one mode in a clean interpreter."""
     ms.set_context(mode=ms.PYNATIVE_MODE)
     set_seed(seed)
     data_list = prepare_data()
     try:
         with seed_memory_time_context(seed=seed) as stats:
-            base_model = SimpleTransformer(vocab_size=32000, dim=512, depth=16)
+            base_model = SimpleTransformer(vocab_size=32000, dim=512, depth=16, inplace=inplace)
             model = apply_recompute(base_model, mode)
             losses = train_one_mode(model, data_list, train_steps)
         return {
@@ -179,7 +183,7 @@ def run_one_mode(mode, train_steps=3, seed=42):
         ms.runtime.empty_cache()
 
 
-def run_one_mode_in_subprocess(mode, train_steps=3, seed=42):
+def run_one_mode_in_subprocess(mode, train_steps=3, seed=42, inplace=False):
     """Run one mode in an isolated subprocess to avoid cross-mode cache residue."""
     project_root = Path(__file__).resolve().parents[4]
     command = [
@@ -188,7 +192,7 @@ def run_one_mode_in_subprocess(mode, train_steps=3, seed=42):
         (
             "import json; "
             "from tests.mindspore.st.activation_checkpoint.ckpt_activation import run_one_mode; "
-            f"result = run_one_mode({mode!r}, train_steps={train_steps}, seed={seed}); "
+            f"result = run_one_mode({mode!r}, train_steps={train_steps}, seed={seed}, inplace={inplace}); "
             "print('__AC_RESULT__' + json.dumps(result, sort_keys=True))"
         ),
     ]
@@ -295,6 +299,18 @@ def apply_recompute(model, mode):
 
         for i in range(len(model.layers) - 1):
             SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
+
+    elif mode == "overlap_1":
+        model.layers[1].ffn1.matmul = checkpoint_wrapper(model.layers[1].ffn1.matmul)
+        model.layers[1].ffn1 = checkpoint_wrapper(model.layers[1].ffn1)
+
+    elif mode == "overlap_2":
+        model.layers[1].ffn1 = checkpoint_wrapper(model.layers[1].ffn1)
+        model.layers[1].ffn1.matmul = checkpoint_wrapper(model.layers[1].ffn1.matmul)
+
+    elif mode == "overlap_3":
+        model.layers[2].ffn2.reshape = checkpoint_wrapper(model.layers[2].ffn2.reshape)
+        model.layers[2].ffn2 = swap_wrapper(model.layers[2].ffn2)
 
     else:
         raise ValueError(f"Unknown mode: {mode}")
@@ -417,3 +433,69 @@ def test_group_swap_correctness_and_memory():
         f"group_swap={mem_grp:.5f} GB, none={mem_none:.5f} GB"
     )
     print(f"Verified: group_swap ({mem_grp:.5f} GB) <= none ({mem_none:.5f} GB).")
+
+
+def test_swap_manager_manual_group_api():
+    """test manual group"""
+    ms.set_context(mode=ms.PYNATIVE_MODE)
+
+    class TinySwapNet(nn.Cell):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = nn.Dense(8, 16)
+            self.fc2 = nn.Dense(16, 4)
+
+        def construct(self, x):
+            x = self.fc1(x)
+            x = ms.ops.relu(x)
+            return self.fc2(x)
+
+    def policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613
+        return CheckpointPolicy.MUST_SWAP
+
+    set_seed(2024)
+    x = Tensor(np.random.randn(4, 8).astype(np.float32))
+
+    set_seed(2024)
+    baseline_net = TinySwapNet()
+    baseline_loss = ms.ops.sum(baseline_net(x))
+
+    set_seed(2024)
+    group_name = f"manual_swap_group_{time.time_ns()}"
+    swap_manager = SwapManager()
+    swap_manager.set_current_group_name(group_name)
+
+    net = checkpoint_wrapper(TinySwapNet(), policy_fn=policy_fn)
+    out = net(x)
+
+    swap_manager.launch_offload(group_name)
+    swap_manager.wait_offload(group_name)
+    swap_manager.launch_load(group_name)
+    swap_manager.wait_load(group_name)
+
+    loss = ms.ops.sum(out)
+    assert abs(float(loss.asnumpy()) - float(baseline_loss.asnumpy())) < 1e-5
+    loss.backward()
+    assert all(param.grad is not None for param in net.trainable_params())
+
+
+def test_inplace_modification():
+    """
+    Feature: Inplace modification detection in selective activation checkpoint
+    Description: When a tensor cached under SAC is modified in-place during the forward pass,
+                 the backward recompute detects the version mismatch (sac.py _VersionWrapper.get_val)
+                 and should raise a RuntimeError.
+    Expectation: RuntimeError containing the mutation message is raised from the subprocess.
+    """
+    train_steps = 3
+    mode = "swap"
+    with pytest.raises(RuntimeError) as exc_info:
+        run_one_mode_in_subprocess(mode, train_steps=train_steps, inplace=True)
+    assert "Tensor cached during selective activation checkpoint has been mutated" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("mode", ["overlap_1", "overlap_2", "overlap_3"])
+def test_overlap_wrapper(mode):
+    with pytest.raises(ValueError) as exc_info:
+        apply_recompute(SimpleTransformer(vocab_size=32000, dim=512, depth=4), mode)
+    assert "Wrapping overlapping module regions is not allowed" in str(exc_info.value)
