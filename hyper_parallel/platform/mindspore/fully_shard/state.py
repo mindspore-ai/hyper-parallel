@@ -47,6 +47,9 @@ def _to_dtype_if_needed(
 
 class MindSporeHSDPStateV2(HSDPState):
     """MindSpore HSDP cell state"""
+    # Record async all-reduces for replicate_params so they can overlap with
+    # the next module's backward before being materialized.
+    _ignored_allreduce_works = []
     # DTensor compat parameters in pure-TP mode can accumulate gradients
     # directly on ``sharded_param.grad`` without materializing an
     # ``_unsharded_param``. Track those async all-reduces separately from the
@@ -106,7 +109,6 @@ class MindSporeHSDPStateV2(HSDPState):
             != FullyShardParamMode.LOCAL_PARAM
             for param in self._iter_managed_params()
         )
-        self._ignored_allreduce_works = []
         self._reset_sharded_params = False
         self._init_param_group()
 
@@ -339,7 +341,9 @@ class MindSporeHSDPStateV2(HSDPState):
                 param.all_reduce_handle = dist.all_reduce(
                     reduced_grad, group=reduce_group, op=self.reduce_op_type, async_op=async_op
                 )
-            self._ignored_allreduce_works.append((param, reduced_grad, reduce_group_size))
+            MindSporeHSDPStateV2._ignored_allreduce_works.append(
+                (param, reduced_grad, reduce_group_size, self._orig_dtype, self._need_div)
+            )
 
     def _finish_ignored_allreduce(self) -> None:
         """
@@ -350,21 +354,23 @@ class MindSporeHSDPStateV2(HSDPState):
         Casts reduced_grad back to _orig_dtype if needed;
         Assigns the final tensor to param.grad.
         """
-        if not self._ignored_allreduce_works:
+        if not MindSporeHSDPStateV2._ignored_allreduce_works:
             return
 
         need_synchronize = False
-        for param, reduced_grad, reduce_group_size in self._ignored_allreduce_works:
+        while MindSporeHSDPStateV2._ignored_allreduce_works:
+            param, reduced_grad, reduce_group_size, orig_dtype, need_div = (
+                MindSporeHSDPStateV2._ignored_allreduce_works.pop(0)
+            )
             if param.all_reduce_handle:
                 param.all_reduce_handle.wait()
-            self._div_if_needed(reduced_grad, reduce_group_size, self._need_div)
+            self._div_if_needed(reduced_grad, reduce_group_size, need_div)
             need_synchronize = (
-                param.apply_reduced_grad(reduced_grad, self._orig_dtype)
+                param.apply_reduced_grad(reduced_grad, orig_dtype)
                 or need_synchronize
             )
 
         self._synchronize_current_stream_if_needed(need_synchronize)
-        self._ignored_allreduce_works.clear()
 
     def reduce_params(self):
         """Drain pending sharded parameter reductions and materialize sharded grads."""
@@ -404,6 +410,7 @@ class MindSporeHSDPStateV2(HSDPState):
     def post_backward_for_comm_fusion(self):
         """Drive the fused gradient-reduction pipeline for sharded params."""
         self.reduce_params()
+        self._finish_ignored_allreduce()
         comm_ctx = get_comm_ctx()
         if comm_ctx.all_reduce_param_group is not None:
             comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
@@ -510,6 +517,7 @@ class MindSporeHSDPStateV2(HSDPState):
             return
         if not self.comm_fusion:
             self.reduce_params()
+            self._finish_ignored_allreduce()
             self._allreduce_replicate_params()
             for hsdp_param in self.hsdp_params:
                 if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
@@ -530,7 +538,6 @@ class MindSporeHSDPStateV2(HSDPState):
                         self._orig_dtype,
                     )
                     self._synchronize_current_stream_if_needed(need_synchronize)
-            self._finish_ignored_allreduce()
         else:
             self.post_backward_for_comm_fusion()
         if self.reshard_after_backward:

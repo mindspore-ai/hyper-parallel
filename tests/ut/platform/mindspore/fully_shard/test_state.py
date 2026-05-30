@@ -70,7 +70,7 @@ def _make_state():
     state._reduce_dtype = None
     state._orig_dtype = None
     state._need_div = False
-    state._ignored_allreduce_works = []
+    MindSporeHSDPStateV2._ignored_allreduce_works = []
     state._reset_sharded_params = False
     state.shard = MagicMock()
     state._apply_reduced_grad = MagicMock()
@@ -221,7 +221,10 @@ class TestStateParamBookkeeping(unittest.TestCase):
             async_op=True,
         )
         normalized_grad.contiguous.assert_called_once_with()
-        self.assertEqual(state._ignored_allreduce_works, [(replicate_param, normalized_grad, 4)])
+        self.assertEqual(
+            MindSporeHSDPStateV2._ignored_allreduce_works,
+            [(replicate_param, normalized_grad, 4, None, False)],
+        )
 
     def test_post_backward_uses_sync_reduction_on_layout_driven_sizes(self):
         """post_backward should use layout-driven sizes and waitable sync reductions before applying grads."""
@@ -518,7 +521,7 @@ class TestStateParamBookkeeping(unittest.TestCase):
             all_reduce_handle=MagicMock(),
             apply_reduced_grad=MagicMock(return_value=True),
         )
-        state._ignored_allreduce_works = [(param, reduced_grad, 4)]
+        MindSporeHSDPStateV2._ignored_allreduce_works = [(param, reduced_grad, 4, "float32", True)]
 
         with patch.object(MindSporeHSDPStateV2, "_synchronize_current_stream_if_needed") as sync:
             state._finish_ignored_allreduce()
@@ -526,7 +529,48 @@ class TestStateParamBookkeeping(unittest.TestCase):
         param.all_reduce_handle.wait.assert_called_once_with()
         param.apply_reduced_grad.assert_called_once_with(reduced_grad, "float32")
         sync.assert_called_once_with(True)
-        self.assertEqual(state._ignored_allreduce_works, [])
+        self.assertEqual(MindSporeHSDPStateV2._ignored_allreduce_works, [])
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.state.dist.all_reduce")
+    def test_post_backward_defers_replicate_allreduce_until_later_drain(self, mock_all_reduce):
+        """post_backward should issue replicate all-reduce and leave apply for the next drain."""
+        HSDPState.pre_reduce_scatter_params.clear()
+        HSDPState.pre_all_reduce_params.clear()
+        MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
+        state = _make_state()
+        state._need_div = True
+        state._orig_dtype = "float32"
+        handle = MagicMock()
+        mock_all_reduce.return_value = handle
+        normalized_grad = MagicMock(name="normalized_grad")
+        normalized_grad.contiguous.return_value = normalized_grad
+        replicate_param = SimpleNamespace(
+            unsharded_accumulated_grad=None,
+            unsharded_accumulated_grad_data=None,
+            _unsharded_param=SimpleNamespace(grad=ms.Tensor(np.ones((2,), dtype=np.float32))),
+            unsharded_param=SimpleNamespace(grad=ms.Tensor(np.ones((2,), dtype=np.float32))),
+            unsharded_grad_data=normalized_grad,
+            unsharded_group_info=GroupInfo("group", "layout-group", 4),
+            all_reduce_handle=None,
+            apply_reduced_grad=MagicMock(return_value=False),
+            accumulate_unsharded_grad_if_needed=MagicMock(),
+        )
+        state.replicate_params = [replicate_param]
+        state.hsdp_params = []
+
+        state.post_backward()
+
+        handle.wait.assert_not_called()
+        self.assertEqual(
+            MindSporeHSDPStateV2._ignored_allreduce_works,
+            [(replicate_param, normalized_grad, 4, "float32", True)],
+        )
+
+        state._finish_ignored_allreduce()
+
+        handle.wait.assert_called_once_with()
+        replicate_param.apply_reduced_grad.assert_called_once_with(normalized_grad, "float32")
+        self.assertEqual(MindSporeHSDPStateV2._ignored_allreduce_works, [])
 
     def test_reduce_params_drains_reduce_scatter_and_all_reduce_queues(self):
         """Queued sharded reductions should be divided, applied, and synchronized."""
