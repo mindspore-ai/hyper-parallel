@@ -1275,6 +1275,30 @@ class MindSporePlatform(Platform):
     def all_to_all_single(input_tensor, output_shape, group, async_op=False):
         return _mindspore_all_to_all_single(input_tensor, output_shape, group, async_op=async_op)
 
+    # Exact MindSpore collective primitive names (CamelCase, as seen via
+    # ``op.name`` under the SAC dispatch mode).  Plain ``Reduce`` / ``Gather`` /
+    # ``Scatter`` are intentionally excluded — they false-match the non-comm
+    # tensor ops ``ReduceSum`` / ``GatherV2`` / ``ScatterUpdate``.  ``Broadcast``
+    # (the collective) is exact-matched and so does not catch ``BroadcastTo``.
+    _COLLECTIVE_OP_NAMES = frozenset({
+        "AllReduce", "AllGather", "AllGatherV", "ReduceScatter", "ReduceScatterV",
+        "AllToAll", "AllToAllV", "Broadcast", "NeighborExchange", "NeighborExchangeV2",
+    })
+
+    @staticmethod
+    def is_collective_op(op) -> bool:
+        """Recognise MindSpore communication collectives by primitive name.
+
+        Matches the async ``InnerComm*`` primitives (e.g. ``InnerCommAllToAllV``,
+        ``InnerCommAllReduce``) by prefix and the sync collectives by exact name
+        (see :data:`_COLLECTIVE_OP_NAMES`).
+        """
+        name = getattr(op, "name", None) or getattr(op, "__name__", "") or ""
+        name = str(name)
+        if name.startswith("InnerComm"):
+            return True
+        return name in MindSporePlatform._COLLECTIVE_OP_NAMES
+
     @staticmethod
     def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,
                                             handle_box=None):

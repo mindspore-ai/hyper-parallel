@@ -628,6 +628,31 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement all_to_all_single")
 
     @staticmethod
+    def is_collective_op(op) -> bool:
+        """Whether ``op`` is a communication collective.
+
+        Used by selective-activation-checkpoint policies — e.g.
+        :func:`hyper_parallel.core.activation_checkpoint.keep_collectives_policy`
+        — to keep a collective's output across a recompute re-run instead of
+        re-issuing it (so the re-run collective cannot race the peer thread's
+        collective on the shared process group under comm/compute overlap).
+
+        Returns ``False`` by default; each platform backend overrides it to
+        recognise its collective ops (all-to-all, all-reduce, all-gather,
+        reduce-scatter, broadcast, ...).  A ``False`` default degrades the
+        policy to "recompute everything" — safe, just unoptimised.
+
+        Args:
+            op: The dispatched op — a MindSpore primitive (has ``.name``) or a
+                PyTorch ``OpOverload``.
+
+        Returns:
+            ``True`` if ``op`` is a communication collective, else ``False``.
+        """
+        del op
+        return False
+
+    @staticmethod
     def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,
                                             handle_box=None):
         """Differentiable wrapper that waits for a pre-launched async all-gather.

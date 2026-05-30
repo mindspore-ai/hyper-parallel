@@ -26,8 +26,8 @@ Provides token permutation helpers and four parallel styles that compose with
 - :class:`ExpertTensorParallel` — combined EP + TP on a 2-D mesh ``[ep, tp]``;
   weights are doubly sharded, dispatch uses the EP sub-mesh.
 """
+import threading
 from abc import ABC, abstractmethod
-from typing import Optional
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
@@ -284,12 +284,18 @@ class ExpertParallel(BaseExpertParallel):
     """
 
     def __init__(self) -> None:
-        # State saved between _token_dispatch and _token_combine within one
-        # forward pass.  Safe for standard (non-pipeline) training.
-        self._input_splits: list = []
-        self._output_splits: list = []
-        self._input_shape: Optional[tuple] = None
-        self._permuted_indices = None
+        # Per-thread LIFO stack of dispatch→combine state.  Single-thread
+        # training uses one slot; overlap_b_f's BWD-recompute thread gets
+        # its own slot so its dispatch cannot overwrite values the FWD
+        # thread's combine is still using.
+        self._tls = threading.local()
+
+    def _state_stack(self) -> list:
+        stack = getattr(self._tls, "stack", None)
+        if stack is None:
+            stack = []
+            self._tls.stack = stack
+        return stack
 
     def _partition_fn(
         self, name: str, module: Module, device_mesh: DeviceMesh
@@ -361,8 +367,6 @@ class ExpertParallel(BaseExpertParallel):
         # ``2 * ep_size`` scalar ``int()`` D2H syncs with 2.
         input_splits = num_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1).tolist()
         output_splits = counts_out.view(ep_size, num_local_experts).sum(dim=1).tolist()
-        self._input_splits = input_splits
-        self._output_splits = output_splits
 
         # --- Step 3: exchange actual tokens (differentiable) ---
         dispatched = platform.differentiable_all_to_all_single(
@@ -370,9 +374,10 @@ class ExpertParallel(BaseExpertParallel):
         )
 
         # --- Step 4: rank-major → expert-major permutation ---
-        self._input_shape, permuted, self._permuted_indices, local_counts = _permute(
+        input_shape, permuted, permuted_indices, local_counts = _permute(
             dispatched, counts_out, ep_size, num_local_experts
         )
+        self._state_stack().append((input_splits, output_splits, input_shape, permuted_indices))
         return permuted, local_counts
 
     def _token_combine(self, module: Module, routed_output, device_mesh: DeviceMesh):
@@ -393,14 +398,16 @@ class ExpertParallel(BaseExpertParallel):
         del module
         ep_group = device_mesh.get_group()
 
+        input_splits, output_splits, input_shape, permuted_indices = self._state_stack().pop()
+
         # expert-major → rank-major
-        unpermuted = _unpermute(routed_output, self._input_shape, self._permuted_indices)
+        unpermuted = _unpermute(routed_output, input_shape, permuted_indices)
 
         # reverse all-to-all (output/input splits are swapped)
         combined = platform.differentiable_all_to_all_single(
             unpermuted,
-            self._output_splits,   # was output, now becomes input
-            self._input_splits,    # was input, now becomes output
+            output_splits,   # was output, now becomes input
+            input_splits,    # was input, now becomes output
             group=ep_group,
         )
         return combined

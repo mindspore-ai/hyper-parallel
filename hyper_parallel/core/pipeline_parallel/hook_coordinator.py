@@ -104,6 +104,24 @@ class HookCoordinator:
         self._my_event: threading.local = threading.local()
         self._state_lock = threading.Lock()
         self._enabled = False
+        # Set True by :meth:`depart` when one thread finishes its chunk
+        # while the partner still has rendezvous points pending — e.g. the
+        # paired forward / backward chunks have **different layer counts**,
+        # so one side fires more A/B/C/D hooks than the other.  Once set,
+        # the partner's remaining ``rendezvous`` / ``notify_dispatched``
+        # calls become no-ops so its excess hooks run solo instead of
+        # blocking forever on the 2-party barrier.  Reset by :meth:`enable`
+        # at the start of each dual-pipe session.
+        self._departed = False
+        # Optional one-shot callback fired on the first NON-suppressed
+        # rendezvous of a dual-pipe session.  In a recompute-gated session
+        # the FWD thread is parked on the gate until it is opened, so that
+        # first real rendezvous is always the BWD thread's first grad-phase
+        # rendezvous — exactly the moment the FWD thread can safely resume
+        # (the BWD thread is past any initial re-run record).
+        # CommComputeOverlap.run uses it to open the FWD gate.  Reset by
+        # :meth:`enable`.
+        self._gate_opener = None
         # Per-thread "is recomputing" flag.  Set by the recompute wrapper
         # around its forward re-run so that every ``rendezvous`` /
         # ``notify_dispatched`` call from that thread becomes a no-op
@@ -125,6 +143,8 @@ class HookCoordinator:
             self._barrier = threading.Barrier(2)
             self._comm_dispatched = threading.Event()
             self._my_event = threading.local()
+            self._departed = False
+            self._gate_opener = None
             self._enabled = True
 
     def disable(self) -> None:
@@ -140,9 +160,67 @@ class HookCoordinator:
         # Release any compute-side waiter so it does not hang on shutdown.
         self._comm_dispatched.set()
 
+    def depart(self) -> None:
+        """Signal that the calling thread has finished its overlap region.
+
+        Unlike :meth:`disable` (a hard shutdown used on error or at the very
+        end of a session), ``depart`` is the **graceful one-party-left**
+        path.  When the two threads drive forward / backward chunks with
+        different numbers of sync hooks — e.g. the paired chunks have
+        different layer counts — the thread with fewer hooks reaches the end
+        of its work first.  It calls ``depart`` so the partner's remaining
+        :meth:`rendezvous` / :meth:`notify_dispatched` calls short-circuit to
+        no-ops and the partner's excess hooks run solo (no overlap, but
+        numerically identical to running the chunk on its own) instead of
+        blocking forever on the 2-party barrier the departed thread will
+        never reach again.
+
+        Idempotent and safe to call from either thread.  Effects:
+
+        1. ``_departed = True`` — subsequent hook calls on the partner
+           short-circuit (see :meth:`rendezvous` / :meth:`notify_dispatched`).
+        2. ``barrier.abort()`` — releases the partner if it is currently
+           blocked in ``barrier.wait()`` (it returns via ``BrokenBarrierError``).
+        3. ``_comm_dispatched.set()`` — releases the partner if it is a
+           ``COMPUTE`` caller already past the barrier and blocked on the
+           per-rendezvous event.
+
+        Note:
+            Coordination is **not** torn down here (``_enabled`` stays True);
+            :meth:`enable` performs the full reset at the next session.  Use
+            :meth:`disable` for the error / end-of-session hard stop.
+        """
+        with self._state_lock:
+            self._departed = True
+            barrier = self._barrier
+        if barrier is not None:
+            barrier.abort()
+        # Release any compute-side waiter parked past the barrier.
+        self._comm_dispatched.set()
+
     def is_enabled(self) -> bool:
         """Return whether coordination is currently active."""
         return self._enabled
+
+    def set_gate_opener(self, opener) -> None:
+        """Register a one-shot callback fired on the first real rendezvous.
+
+        ``opener`` is invoked exactly once, on the first :meth:`rendezvous`
+        call that is not skipped (the coordinator is enabled, no party has
+        departed, and the caller is not in a recompute re-run).  In a
+        recompute-gated session the FWD thread is parked on the gate until it
+        is opened, so that first real rendezvous is always the BWD thread's
+        first grad-phase rendezvous — exactly the moment the FWD thread can
+        safely resume (the BWD thread is past any initial re-run record).
+        This is what lets mixed per-layer recompute — where a non-recomputed
+        layer's backward fires rendezvous BEFORE the first re-run — avoid the
+        deadlock that opening the gate only at the first ``recompute_ctx``
+        exit would cause.
+
+        Args:
+            opener: Zero-arg callable, or ``None`` to disable.
+        """
+        self._gate_opener = opener
 
     def set_recomputing(self, value: bool) -> None:
         """Mark the calling thread as currently recomputing (or not).
@@ -241,12 +319,24 @@ class HookCoordinator:
             raise TypeError(
                 f"Argument 'role' must be HookRole, but got type {type(role)}."
             )
-        if not self._enabled or self.is_recomputing():
-            # Skip rendezvous during a recompute re-run; the original
-            # forward already paired this hook with its BWD partner,
-            # and re-firing the rendezvous would double-count the
-            # barrier participants.
+        if not self._enabled or self._departed or self.is_recomputing():
+            # Skip when the partner has departed (it finished its chunk
+            # first — e.g. a shorter layer count — so this side runs its
+            # remaining hooks solo), or during a recompute re-run (the
+            # original forward already paired this hook with its BWD
+            # partner, and re-firing the rendezvous would double-count the
+            # barrier participants).
             return
+
+        # First non-suppressed rendezvous of the session opens the FWD
+        # recompute gate (if one was installed by CommComputeOverlap.run).
+        # Fires once; the FWD thread is parked on the gate until now, so this
+        # is always the BWD thread's first grad-phase rendezvous.  See
+        # :meth:`set_gate_opener`.
+        opener = self._gate_opener
+        if opener is not None:
+            self._gate_opener = None
+            opener()
 
         # COMM side: create a per-rendezvous event *before* the barrier.
         # After the barrier both threads reference the same fresh event.
@@ -284,8 +374,9 @@ class HookCoordinator:
             raise TypeError(
                 f"Argument 'role' must be HookRole, but got type {type(role)}."
             )
-        if not self._enabled or self.is_recomputing():
-            # See :meth:`rendezvous` for why we skip during recompute.
+        if not self._enabled or self._departed or self.is_recomputing():
+            # See :meth:`rendezvous` for why we skip when the partner has
+            # departed or this thread is in a recompute re-run.
             return
         if role is HookRole.COMM:
             evt = getattr(self._my_event, "evt", None)
