@@ -28,6 +28,10 @@ FSDP2's ``_NormPartial`` norm computation path:
 * **All ranks participate in the same collectives** regardless of local
   gradient availability, preventing collective-misalignment deadlocks.
 
+The finite p-norm is bit-exact with upstream only for the pure-FSDP,
+single-dtype case; mixed sharded + replicated is mathematically correct
+but intentionally diverges (see ``_total_norm_fsdp2_aligned``).
+
 Note: PP does not use DTensor layout for gradients today.  Cross-stage
 norm aggregation will require an additional manual all-reduce and is
 left for future work.
@@ -355,9 +359,14 @@ def _get_total_norm(
     norm_type: float,
     mesh_cache: Dict[int, object],
     device: torch.device,
-    all_grads: Optional[List[torch.Tensor]] = None,
+    norm_grads: List[torch.Tensor],
+    key_per_grad: List[_GradGroupKey],
 ) -> torch.Tensor:
-    """Compute total gradient norm with per-group all-reduce."""
+    """Compute total gradient norm with per-group all-reduce.
+
+    ``norm_grads`` (parallel to ``key_per_grad``) holds the tensor whose
+    norm to take per parameter; only the finite p-norm path consumes it.
+    """
     if norm_type == math.inf:
         return _total_norm_inf(
             grad_groups, norm_type, mesh_cache, device,
@@ -377,7 +386,8 @@ def _get_total_norm(
 
     # Finite p-norm: FSDP2-aligned sequence.
     total_p = _total_norm_fsdp2_aligned(
-        grad_groups, norm_type, mesh_cache, device, all_grads,
+        grad_groups, norm_type, mesh_cache, device,
+        norm_grads, key_per_grad,
     )
     return total_p ** (1.0 / norm_type)
 
@@ -421,54 +431,106 @@ def _total_norm_sum(grad_groups, norm_type, mesh_cache, device):
     return total
 
 
+def _reduction_signature(grad_groups, mesh_cache):
+    """Bucket grad-group keys by the *process group(s)* they reduce over.
+
+    Two keys that reduce over the same set of process groups (same global
+    ranks per shard dim) must be **pooled** so their norms accumulate in
+    one stack -- matching FSDP2's single foreach-norm + single reduce and
+    keeping the loss bit-exact even when params live on several distinct
+    ``DeviceMesh`` objects that share the same DP process group (common
+    for multi-component models).  Keys that reduce over *different*
+    process groups (TP+FSDP heterogeneous sharding, expert parallel) get
+    separate buckets, each reduced over its own group.
+
+    Returns ``(key_to_sig, sig_groups, sig_order)``:
+
+    * ``key_to_sig``  -- ``key -> signature`` (hashable; ``()`` = replicate
+      / no communication).
+    * ``sig_groups``  -- ``signature -> list[ProcessGroup]`` to all-reduce.
+    * ``sig_order``   -- signatures in first-seen (parameter) order, so all
+      ranks issue the same collectives in the same order.
+    """
+    key_to_sig: Dict[_GradGroupKey, Tuple] = {}
+    sig_groups: Dict[Tuple, List[object]] = {}
+    sig_order: List[Tuple] = []
+    for mesh_id, shard_dims in grad_groups:
+        if shard_dims and mesh_id is not None:
+            mesh = mesh_cache[mesh_id]
+            groups = [mesh.get_group(dim) for dim in shard_dims]
+            sig = tuple(
+                tuple(dist.get_process_group_ranks(group)) for group in groups
+            )
+        else:
+            groups = []
+            sig = ()
+        key_to_sig[(mesh_id, shard_dims)] = sig
+        if sig not in sig_groups:
+            sig_groups[sig] = groups
+            sig_order.append(sig)
+    return key_to_sig, sig_groups, sig_order
+
+
 def _total_norm_fsdp2_aligned(grad_groups, norm_type, mesh_cache, device,
-                              all_grads=None):
+                              norm_grads, key_per_grad):
     """FSDP2-aligned norm for finite p-norms.
 
-    Computes per-param norms in **original parameter order** (matching
-    FSDP2's ``[vector_norm(g) for g in grads]`` iteration), then does
-    ONE stack → ONE vector_norm → ONE all_reduce.
+    Grads are bucketed by the *process group* they reduce over (see
+    :func:`_reduction_signature`); ``norm_grads`` supplies, in global
+    parameter order, the Partial-reduced (already-global) view for Partial
+    grads and the raw local grad otherwise.  Each bucket does ONE ``stack``
+    → ONE ``vector_norm`` → ``^p`` → ONE ``all_reduce SUM`` per shard dim,
+    and the buckets are summed locally.
 
-    The original parameter order matters because ``vector_norm(stack(...))``
-    accumulates in stack order. Different orders can produce 1 ULP
-    different results on non-rank-0 ranks, causing the all_reduce sum
-    to differ.
+    Reduction rules:
+
+    * Sharded bucket -- reduce over its own group(s).  Same-group params
+      across distinct ``DeviceMesh`` objects pool into one reduce; distinct
+      groups (TP+FSDP heterogeneous, expert parallel) stay separate -- the
+      per-group convention also used by :func:`_total_norm_inf` /
+      :func:`_total_norm_sum` and by VeOmni / torchtitan.
+    * Replicate bucket (signature ``()``) -- contribute norm² locally with
+      NO communication; reducing it over the shard group would over-count
+      it ``shard_world_size`` times (the FSDP1 convention).
+
+    Empty-but-present buckets still issue their all_reduce (identity ``0``
+    for SUM) so all ranks run the same collectives.
+
+    Bit-exact with upstream ``torch.nn.utils.clip_grad_norm_`` only for the
+    pure-FSDP, single-bucket, single-dtype case.  Mixed shard + replicate is
+    mathematically correct but intentionally diverges (upstream folds the
+    replicate norm into one ``_NormPartial`` reduce and over-counts it);
+    mixed-dtype follows upstream's :func:`_per_tensor_norms` device/dtype
+    regrouping rather than strict global order.
 
     Returns the global sum of p-th powers (caller takes p-th root).
     """
-    # --- Phase 1: find the reduce group ---
-    reduce_mesh = None
-    reduce_shard_dims: Tuple[int, ...] = ()
+    key_to_sig, sig_groups, sig_order = _reduction_signature(
+        grad_groups, mesh_cache,
+    )
 
-    for (mesh_id, shard_dims), _ in grad_groups.items():
-        if mesh_id is not None and reduce_mesh is None:
-            reduce_mesh = mesh_cache[mesh_id]
-            reduce_shard_dims = shard_dims
+    # Bucket norms by reduction signature, preserving global parameter order.
+    sig_grads: Dict[Tuple, List[torch.Tensor]] = {sig: [] for sig in sig_order}
+    for grad, key in zip(norm_grads, key_per_grad):
+        sig_grads[key_to_sig[key]].append(grad)
 
-    # --- Phase 1b: per-param norms in ORIGINAL param order ---
-    # all_grads is in the same order as `parameters` passed to clip_grad_norm_,
-    # matching FSDP2's `[p.grad for p in parameters if p.grad is not None]`.
-    if all_grads:
-        all_norms = _per_tensor_norms(all_grads, norm_type, device)
-    else:
-        all_norms = []
+    total_p = torch.tensor(0.0, device=device, dtype=torch.float32)
+    for sig in sig_order:
+        grads = sig_grads[sig]
+        if grads:
+            norms = _per_tensor_norms(grads, norm_type, device)
+            local_p = torch.linalg.vector_norm(
+                torch.stack(norms).to(torch.float32), norm_type,
+            ) ** norm_type
+        else:
+            local_p = torch.tensor(0.0, device=device, dtype=torch.float32)
 
-    # --- Phase 2: ONE vector_norm on local norms ---
-    if not all_norms:
-        partial_sq = torch.tensor(0.0, device=device, dtype=torch.float32)
-    else:
-        combined = torch.linalg.vector_norm(
-            torch.stack(all_norms), norm_type,
-        )
-        partial_sq = combined ** norm_type
+        for group in sig_groups[sig]:
+            dist.all_reduce(local_p, op=dist.ReduceOp.SUM, group=group)
 
-    # --- Phase 3: ONE all_reduce ---
-    if reduce_mesh is not None:
-        for dim in reduce_shard_dims:
-            dist.all_reduce(partial_sq, op=dist.ReduceOp.SUM,
-                            group=reduce_mesh.get_group(dim))
+        total_p = total_p + local_p
 
-    return partial_sq
+    return total_p
 
 
 def _build_coalesce_buffer(
@@ -606,6 +668,8 @@ def _build_grad_groups(  # pylint: disable=R0914
 ) -> Tuple[
     Dict[_GradGroupKey, List[torch.Tensor]],
     List[torch.Tensor],
+    List[torch.Tensor],
+    List[_GradGroupKey],
     Dict[int, object],
     torch.device,
     bool,
@@ -623,7 +687,16 @@ def _build_grad_groups(  # pylint: disable=R0914
     collectives into O(G) where G is the number of distinct
     ``(mesh, partial_info)`` groups (typically 1 for TP+FSDP).
 
-    Returns ``(grad_groups, all_grads, mesh_cache, device, has_dtensor_grad)``.
+    Returns
+        ``(grad_groups, all_grads, norm_grads, key_per_grad, mesh_cache,
+        device, has_dtensor_grad)``.  ``grad_groups`` maps each
+        ``(mesh_id, shard_dims)`` key to its grads; ``all_grads`` is the
+        flat list of raw local grads (global parameter order) scaled
+        in-place by the clip step; ``norm_grads`` is parallel to
+        ``all_grads`` but holds the Partial-reduced view for Partial grads
+        (the value whose norm is taken on the finite-p path);
+        ``key_per_grad`` is parallel to both and maps each grad back to its
+        group key.
     """
     # --- Phase 1: classify all parameters ---
     param_infos: List[Tuple] = []
@@ -655,6 +728,11 @@ def _build_grad_groups(  # pylint: disable=R0914
         list,
     )
     all_grads: List[torch.Tensor] = []
+    # norm_grads / key_per_grad are parallel to all_grads (see Returns): the
+    # norm-input view (Partial-reduced where coalesced, else raw local) and
+    # the group key per grad, kept in global parameter order.
+    norm_grads: List[torch.Tensor] = []
+    key_per_grad: List[_GradGroupKey] = []
     has_dtensor_grad = False
 
     for idx, info in enumerate(param_infos):
@@ -670,14 +748,18 @@ def _build_grad_groups(  # pylint: disable=R0914
         if isinstance(grad_obj, DTensor):
             has_dtensor_grad = True
         all_grads.append(local_grad)
+        key_per_grad.append(key)
         if idx in reduced:
-            # Use Partial-reduced view for norm computation.
             grad_groups[key].append(reduced[idx])
+            norm_grads.append(reduced[idx])
         else:
-            # Non-Partial: use original grad directly.
             grad_groups[key].append(local_grad)
+            norm_grads.append(local_grad)
 
-    return grad_groups, all_grads, mesh_cache, device, has_dtensor_grad
+    return (
+        grad_groups, all_grads, norm_grads, key_per_grad,
+        mesh_cache, device, has_dtensor_grad,
+    )
 
 
 def _clip_grads_with_norm_(
@@ -785,13 +867,17 @@ def clip_grad_norm_(
 
     params = _normalize_parameters(parameters)
 
-    grad_groups, all_grads, mesh_cache, device, has_dtensor_grad = _build_grad_groups(params)
+    (
+        grad_groups, all_grads, norm_grads, key_per_grad,
+        mesh_cache, device, has_dtensor_grad,
+    ) = _build_grad_groups(params)
 
     # -- Norm + clip (all ranks participate) --------------------------------
     # _compute_local_norm returns identity elements for empty groups,
     # so the subsequent all-reduce is safe and semantically neutral.
     total_norm = _get_total_norm(
-        grad_groups, norm_type, mesh_cache, device, all_grads,
+        grad_groups, norm_type, mesh_cache, device,
+        norm_grads, key_per_grad,
     )
 
     if error_if_nonfinite and torch.logical_or(
