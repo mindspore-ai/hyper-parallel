@@ -225,8 +225,8 @@ class LoggingCallback(Callback):
                 metrics["mfu"] = f"{mfu * 100:.1f}%"
 
         # Include aux_loss from MoEMonitorCallback when available.
-        moe_cb = self.trainer.moe_monitor_callback
-        aux_loss = getattr(moe_cb, 'last_mean_aux_loss', None)
+        moe_cb = getattr(self.trainer, 'moe_monitor_callback', None)
+        aux_loss = getattr(moe_cb, 'last_mean_aux_loss', None) if moe_cb is not None else None
         if aux_loss is not None:
             metrics["aux_loss"] = f"{aux_loss:.6f}"
 
