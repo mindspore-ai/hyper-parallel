@@ -12,24 +12,44 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Accelerate-style FSDP2 utilities backed by HyperParallel fully_shard."""
+"""Core HyperParallel utilities for LlamaFactory integration."""
+
 import copy
 import functools
+import json
+import logging
+import os
 import re
+import types
 import warnings
 from collections.abc import Iterable
-from typing import cast
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, cast
 
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy,
+    transformer_auto_wrap_policy,
+)
 
-from hyper_parallel import init_device_mesh
+from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.fully_shard.api import HSDPModule, fully_shard
-from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy
+from hyper_parallel.core.fully_shard.utils import (
+    CPUOffloadPolicy,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
+)
 from hyper_parallel.platform import get_platform
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 _DTYPE_MAP = {
     "float32": torch.float32,
@@ -39,6 +59,101 @@ _DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
     "bf16": torch.bfloat16,
 }
+
+_VALID_DTYPES = {"float32", "float16", "bfloat16", "fp32", "fp16", "bf16"}
+
+HSDP_MODEL_NAME = "hsdp_model"
+HSDP_OPTIMIZER_NAME = "optimizer"
+
+
+@dataclass
+class HyperParallelArguments:
+    """Minimal HyperParallel configuration needed by the trainer backend."""
+
+    tp_size: int = 1
+    device_type: str = "auto"
+    param_dtype: Optional[str] = None
+    reduce_dtype: Optional[str] = None
+    reshard_after_forward: Optional[bool] = None
+    fsdp_size: Optional[int] = None
+
+    activation_mode: str = "none"
+    activation_swap_inputs: bool = True
+
+    def validate(self) -> None:
+        """Validate supported argument values."""
+        if self.tp_size != 1:
+            raise ValueError(
+                "Current trainer backend only supports replacing FSDP/fully_shard. "
+                f"Expected tp_size=1, got {self.tp_size}."
+            )
+        if self.param_dtype is not None and self.param_dtype not in _VALID_DTYPES:
+            raise ValueError(
+                f"param_dtype must be one of {sorted(_VALID_DTYPES)}, got {self.param_dtype!r}."
+            )
+        if self.reduce_dtype is not None and self.reduce_dtype not in _VALID_DTYPES:
+            raise ValueError(
+                f"reduce_dtype must be one of {sorted(_VALID_DTYPES)}, got {self.reduce_dtype!r}."
+            )
+        if self.device_type not in {"auto", "npu", "cuda", "cpu"}:
+            raise ValueError(
+                f"device_type must be one of ['auto', 'cpu', 'cuda', 'npu'], got {self.device_type!r}."
+            )
+        if self.reshard_after_forward is not None and not isinstance(
+            self.reshard_after_forward, bool
+        ):
+            raise ValueError(
+                "reshard_after_forward must be a bool when provided, "
+                f"got {type(self.reshard_after_forward).__name__}."
+            )
+        if self.fsdp_size is not None:
+            if (
+                not isinstance(self.fsdp_size, int)
+                or isinstance(self.fsdp_size, bool)
+                or self.fsdp_size <= 0
+            ):
+                raise ValueError(
+                    f"fsdp_size must be a positive int when provided, got {self.fsdp_size!r}."
+                )
+        valid_activation_modes = {"none", "recompute", "swap"}
+        if self.activation_mode not in valid_activation_modes:
+            raise ValueError(
+                f"activation_mode must be one of {sorted(valid_activation_modes)}, "
+                f"got {self.activation_mode!r}."
+            )
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "HyperParallelArguments":
+        """Build arguments from a plain dict."""
+        known_fields = set(cls.__dataclass_fields__)  # pylint: disable=no-member
+        hp_args = cls(
+            **{key: value for key, value in config.items() if key in known_fields}
+        )
+        hp_args.validate()
+        return hp_args
+
+    @classmethod
+    def from_finetuning_args(cls, finetuning_args) -> "HyperParallelArguments":
+        """Extract HyperParallel arguments from LlamaFactory finetuning args."""
+        raw = getattr(finetuning_args, "hyper_parallel_args", None)
+        if raw is None:
+            hp_args = cls()
+            hp_args.validate()
+            return hp_args
+        if isinstance(raw, str):
+            with open(raw, "r", encoding="utf-8") as file:
+                raw = json.load(file)
+        if not isinstance(raw, dict):
+            raise ValueError(
+                "finetuning_args.hyper_parallel_args must be a dict or JSON file path, "
+                f"got {type(raw).__name__}."
+            )
+        return cls.from_dict(raw)
+
+
+# ---------------------------------------------------------------------------
+# Device / mesh / mixed precision resolution
+# ---------------------------------------------------------------------------
 
 
 def _resolve_device_type(hp_args) -> str:
@@ -53,10 +168,34 @@ def _resolve_device_type(hp_args) -> str:
 
 
 def _build_device_mesh(accelerator, hp_args):
-    """Build an FSDP mesh compatible with Accelerate's FSDP2 expectations."""
+    """Build an FSDP mesh compatible with Accelerate's FSDP2 expectations.
+
+    When ``hp_args.fsdp_size`` is set, build a 2D HSDP mesh
+    (``dp`` × ``fsdp``) directly so the run uses HSDP instead of plain 1D
+    FSDP.  Otherwise inherit the mesh from Accelerate (1D FSDP).
+    """
+    if hp_args.fsdp_size is not None:
+        device_type = _resolve_device_type(hp_args)
+        world_size = get_platform().get_world_size()
+        fsdp_size = hp_args.fsdp_size
+        if fsdp_size >= world_size:
+            return init_device_mesh(device_type, (world_size,), mesh_dim_names=("dp",))
+        if world_size % fsdp_size != 0:
+            raise ValueError(
+                f"world_size={world_size} must be divisible by fsdp_size={fsdp_size}."
+            )
+        dp_size = world_size // fsdp_size
+        return init_device_mesh(
+            device_type,
+            (dp_size, fsdp_size),
+            mesh_dim_names=("dp", "fsdp"),
+        )
+
     mesh = getattr(accelerator, "torch_device_mesh", None)
     if mesh is not None:
-        fsdp_dim_names = getattr(getattr(accelerator, "parallelism_config", None), "fsdp_dim_names", None)
+        fsdp_dim_names = getattr(
+            getattr(accelerator, "parallelism_config", None), "fsdp_dim_names", None
+        )
         if fsdp_dim_names:
             return mesh[tuple(fsdp_dim_names)]
         return mesh
@@ -69,9 +208,15 @@ def _build_device_mesh(accelerator, hp_args):
 def _build_mp_policy(hp_args) -> MixedPrecisionPolicy:
     """Build HyperParallel mixed precision policy."""
     return MixedPrecisionPolicy(
-        param_dtype=_DTYPE_MAP[hp_args.param_dtype] if hp_args.param_dtype is not None else None,
-        reduce_dtype=_DTYPE_MAP[hp_args.reduce_dtype] if hp_args.reduce_dtype is not None else None,
-        output_dtype=_DTYPE_MAP[hp_args.param_dtype] if hp_args.param_dtype is not None else None,
+        param_dtype=_DTYPE_MAP[hp_args.param_dtype]
+        if hp_args.param_dtype is not None
+        else None,
+        reduce_dtype=_DTYPE_MAP[hp_args.reduce_dtype]
+        if hp_args.reduce_dtype is not None
+        else None,
+        output_dtype=_DTYPE_MAP[hp_args.param_dtype]
+        if hp_args.param_dtype is not None
+        else None,
         cast_forward_inputs=True,
     )
 
@@ -118,6 +263,11 @@ def _resolve_mp_policy(fsdp2_plugin, hp_args) -> MixedPrecisionPolicy:
     return resolved_policy
 
 
+# ---------------------------------------------------------------------------
+# Model traversal and wrapping helpers
+# ---------------------------------------------------------------------------
+
+
 def _is_compiled_module(model: nn.Module) -> bool:
     """Best-effort check for compiled modules."""
     return hasattr(model, "_orig_mod")
@@ -137,7 +287,9 @@ def _get_module_children_bottom_up(model: nn.Module, return_fqns: bool = False):
     return modules
 
 
-def _get_non_persistent_buffers(model: nn.Module, recurse: bool = True, fqns: bool = True):
+def _get_non_persistent_buffers(
+    model: nn.Module, recurse: bool = True, fqns: bool = True
+):
     """Collect non-persistent buffers."""
     buffers = set()
     for module_name, module in model.named_modules():
@@ -167,8 +319,9 @@ def _move_model_to_meta(model: nn.Module) -> nn.Module:
     return model
 
 
-
-def _get_parameters_from_modules(modules: Iterable[nn.Module] | str, model: nn.Module, device) -> set[nn.Parameter]:
+def _get_parameters_from_modules(
+    modules: Iterable[nn.Module] | str, model: nn.Module, device
+) -> set[nn.Parameter]:
     """Convert ignored modules to ignored parameters, matching Accelerate behaviour."""
     if modules is None:
         return set()
@@ -204,7 +357,9 @@ def _prepare_auto_wrap_policy(fsdp2_plugin, model: nn.Module):
         for layer_class in transformer_cls_names_to_wrap:
             transformer_cls = _get_module_class_from_name(model, layer_class)
             if transformer_cls is None:
-                raise ValueError(f"Could not find the transformer layer class {layer_class} in the model.")
+                raise ValueError(
+                    f"Could not find the transformer layer class {layer_class} in the model."
+                )
             transformer_cls_to_wrap.add(transformer_cls)
 
         def policy(module: nn.Module) -> bool:
@@ -215,7 +370,10 @@ def _prepare_auto_wrap_policy(fsdp2_plugin, model: nn.Module):
     elif fn is size_based_auto_wrap_policy:
 
         def policy(module: nn.Module) -> bool:
-            return sum(param.numel() for param in module.parameters()) > fsdp2_plugin.min_num_params
+            return (
+                sum(param.numel() for param in module.parameters())
+                > fsdp2_plugin.min_num_params
+            )
 
     else:
         return None
@@ -223,12 +381,85 @@ def _prepare_auto_wrap_policy(fsdp2_plugin, model: nn.Module):
     return policy
 
 
-def fsdp2_load_full_state_dict(accelerator, model: nn.Module, full_sd: dict, cpu_offload: bool = False):
+# ---------------------------------------------------------------------------
+# Checkpoint and export helpers
+# ---------------------------------------------------------------------------
+
+
+def _localize_optimizer_state(optim_sd: dict) -> dict:
+    """Convert DTensors in optimizer state dict to local CPU tensors for serialization."""
+    new_state = {}
+    for param_idx, state in optim_sd.get("state", {}).items():
+        local_state = {}
+        for key, val in state.items():
+            if isinstance(val, DTensor):
+                local_state[key] = val.to_local().detach().cpu()
+            elif isinstance(val, torch.Tensor):
+                local_state[key] = val.detach().cpu()
+            else:
+                local_state[key] = val
+        new_state[param_idx] = local_state
+    return {"state": new_state, "param_groups": optim_sd.get("param_groups", [])}
+
+
+def _load_local_optimizer_state(optimizer, saved_sd: dict) -> None:
+    """Copy saved local optimizer state into the optimizer's current state."""
+    param_by_idx: dict[int, torch.nn.Parameter] = {}
+    idx = 0
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            param_by_idx[idx] = p
+            idx += 1
+
+    for param_idx, saved_state in saved_sd.get("state", {}).items():
+        param_idx = int(param_idx) if isinstance(param_idx, str) else param_idx
+        param = param_by_idx.get(param_idx)
+        if param is None or param not in optimizer.state:
+            continue
+        current_state = optimizer.state[param]
+        for key, saved_val in saved_state.items():
+            current_val = current_state.get(key)
+            if current_val is None:
+                if isinstance(saved_val, torch.Tensor):
+                    device = (
+                        param.to_local().device
+                        if isinstance(param, DTensor)
+                        else param.device
+                    )
+                    current_state[key] = saved_val.to(device)
+                else:
+                    current_state[key] = saved_val
+            elif isinstance(current_val, DTensor):
+                local = current_val.to_local()
+                local.copy_(saved_val.to(local.device))
+            elif isinstance(current_val, torch.Tensor):
+                current_val.copy_(saved_val.to(current_val.device))
+            else:
+                current_state[key] = saved_val
+
+    for saved_group, current_group in zip(
+        saved_sd.get("param_groups", []), optimizer.param_groups
+    ):
+        for key, val in saved_group.items():
+            if key != "params":
+                current_group[key] = val
+
+
+# ---------------------------------------------------------------------------
+# Accelerate compatibility shims
+# ---------------------------------------------------------------------------
+
+
+def fsdp2_load_full_state_dict(
+    accelerator, model: nn.Module, full_sd: dict, cpu_offload: bool = False
+):
     """Load full state dict into a HyperParallel-sharded model following Accelerate semantics."""
     meta_sharded_sd = model.state_dict()
     local_sd = {}
 
-    def _infer_parameter_dtype(target_model: nn.Module, param_name: str, empty_param: torch.Tensor):
+    def _infer_parameter_dtype(
+        target_model: nn.Module, param_name: str, empty_param: torch.Tensor
+    ):
         try:
             old_param = target_model.get_parameter(param_name)
         except Exception:  # pylint: disable=broad-except
@@ -244,12 +475,17 @@ def fsdp2_load_full_state_dict(accelerator, model: nn.Module, full_sd: dict, cpu
 
         is_torch_e4m3fn_available = hasattr(torch, "float8_e4m3fn")
         casting_dtype = None
-        is_param_float8 = is_torch_e4m3fn_available and empty_param.dtype == torch.float8_e4m3fn
+        is_param_float8 = (
+            is_torch_e4m3fn_available and empty_param.dtype == torch.float8_e4m3fn
+        )
         if empty_param.dtype.is_floating_point and not is_param_float8:
             casting_dtype = old_param.dtype
         if isinstance(old_param, DTensor):
             local_param = old_param.to_local()
-            return local_param is not None and local_param.is_contiguous(), casting_dtype
+            return (
+                local_param is not None and local_param.is_contiguous(),
+                casting_dtype,
+            )
         return old_param is not None and old_param.is_contiguous(), casting_dtype
 
     def _cast_and_contiguous(tensor: torch.Tensor, to_contiguous: bool, dtype):
@@ -259,7 +495,9 @@ def fsdp2_load_full_state_dict(accelerator, model: nn.Module, full_sd: dict, cpu
                 local_tensor = local_tensor.to(dtype=dtype)
             if to_contiguous:
                 local_tensor = local_tensor.contiguous()
-            return DTensor.from_local(local_tensor, tensor.device_mesh, tensor.placements)
+            return DTensor.from_local(
+                local_tensor, tensor.device_mesh, tensor.placements
+            )
         if dtype is not None:
             tensor = tensor.to(dtype=dtype)
         if to_contiguous:
@@ -277,7 +515,11 @@ def fsdp2_load_full_state_dict(accelerator, model: nn.Module, full_sd: dict, cpu
             sharded_param = meta_sharded_sd[param_name]
         else:
             param_name, sharded_param = item
-            full_param = torch.empty(sharded_param.size(), device=accelerator.device, dtype=sharded_param.dtype)
+            full_param = torch.empty(
+                sharded_param.size(),
+                device=accelerator.device,
+                dtype=sharded_param.dtype,
+            )
 
         if isinstance(full_param, DTensor):
             full_param = full_param.to_local()
@@ -286,11 +528,15 @@ def fsdp2_load_full_state_dict(accelerator, model: nn.Module, full_sd: dict, cpu
         dist.broadcast(full_param, src=0, group=dist.group.WORLD)
 
         if isinstance(sharded_param, DTensor):
-            local_param = distribute_tensor(full_param, sharded_param.device_mesh, sharded_param.placements).to_local()
+            local_param = distribute_tensor(
+                full_param, sharded_param.device_mesh, sharded_param.placements
+            ).to_local()
         else:
             local_param = full_param
 
-        to_contiguous, casting_dtype = _infer_parameter_dtype(model, param_name, local_param)
+        to_contiguous, casting_dtype = _infer_parameter_dtype(
+            model, param_name, local_param
+        )
         local_param = _cast_and_contiguous(local_param, to_contiguous, casting_dtype)
         if isinstance(local_param, DTensor):
             local_param = local_param.to_local()
@@ -311,9 +557,16 @@ def fsdp2_prepare_auto_wrap_policy(fsdp2_plugin, model: nn.Module):
     return _prepare_auto_wrap_policy(fsdp2_plugin, model)
 
 
-def get_parameters_from_modules(modules: Iterable[nn.Module] | str, model: nn.Module, device) -> set[nn.Parameter]:
+def get_parameters_from_modules(
+    modules: Iterable[nn.Module] | str, model: nn.Module, device
+) -> set[nn.Parameter]:
     """Convert ignored modules to ignored parameters."""
     return _get_parameters_from_modules(modules, model, device)
+
+
+# ---------------------------------------------------------------------------
+# Runtime preparation helpers
+# ---------------------------------------------------------------------------
 
 
 def _is_fsdp2_wrapped_model(model: nn.Module) -> bool:
@@ -370,7 +623,9 @@ def _build_fsdp2_kwargs(accelerator, model: nn.Module, hp_args, fsdp2_plugin) ->
         "offload_policy": _resolve_offload_policy(fsdp2_plugin),
         "mp_policy": _resolve_mp_policy(fsdp2_plugin, hp_args),
         "mesh": mesh if mesh is not None else None,
-        "ignored_params": get_parameters_from_modules(fsdp2_plugin.ignored_modules, model, accelerator.device),
+        "ignored_params": get_parameters_from_modules(
+            fsdp2_plugin.ignored_modules, model, accelerator.device
+        ),
         "comm_fusion": True,
     }
     replicate_params = _collect_replicate_params(model, _resolve_shard_size(mesh))
@@ -381,17 +636,28 @@ def _build_fsdp2_kwargs(accelerator, model: nn.Module, hp_args, fsdp2_plugin) ->
 
 def _model_has_4bit_params(model: nn.Module) -> bool:
     """Return whether the model contains bitsandbytes 4-bit parameters."""
-    return any(param.__class__.__name__ == "Params4bit" for _, param in model.named_parameters())
+    return any(
+        param.__class__.__name__ == "Params4bit"
+        for _, param in model.named_parameters()
+    )
 
 
-def _prepare_cpu_ram_efficient_loading(model: nn.Module, enabled: bool) -> dict[str, torch.Tensor]:
+def _prepare_cpu_ram_efficient_loading(
+    model: nn.Module, enabled: bool
+) -> dict[str, torch.Tensor]:
     """Capture non-persistent buffers before cpu_ram_efficient_loading rematerializes the model."""
     if not enabled:
         return {}
 
-    non_persistent_buffer_fqns = _get_non_persistent_buffers(model, recurse=True, fqns=True)
+    non_persistent_buffer_fqns = _get_non_persistent_buffers(
+        model, recurse=True, fqns=True
+    )
     original_non_persistent_buffers = copy.deepcopy(
-        {name: buffer for name, buffer in model.named_buffers() if name in non_persistent_buffer_fqns}
+        {
+            name: buffer
+            for name, buffer in model.named_buffers()
+            if name in non_persistent_buffer_fqns
+        }
     )
     return original_non_persistent_buffers
 
@@ -417,14 +683,16 @@ def _setup_prefetch(model: nn.Module) -> None:
     Backward prefetch uses reversed module order because backward execution
     proceeds from the last layer to the first.
     """
-    wrapped_modules = [m for m in model.modules() if isinstance(m, HSDPModule) and m is not model]
+    wrapped_modules = [
+        m for m in model.modules() if isinstance(m, HSDPModule) and m is not model
+    ]
     num_to_forward_prefetch = 1
     num_to_backward_prefetch = 1
 
     # Forward prefetch: each layer prefetches the next layer(s)
     for i, layer in enumerate(wrapped_modules):
         j_end = min(len(wrapped_modules), i + 1 + num_to_forward_prefetch)
-        forward_targets = wrapped_modules[i + 1:j_end]
+        forward_targets = wrapped_modules[i + 1 : j_end]
         if forward_targets:
             layer.set_modules_to_forward_prefetch(forward_targets)
 
@@ -432,12 +700,14 @@ def _setup_prefetch(model: nn.Module) -> None:
     wrapped_modules.reverse()
     for i, layer in enumerate(wrapped_modules):
         j_end = min(len(wrapped_modules), i + 1 + num_to_backward_prefetch)
-        backward_targets = wrapped_modules[i + 1:j_end]
+        backward_targets = wrapped_modules[i + 1 : j_end]
         if backward_targets:
             layer.set_modules_to_backward_prefetch(backward_targets)
 
 
-def _restore_non_persistent_buffers(model: nn.Module, buffers: dict[str, torch.Tensor], device) -> None:
+def _restore_non_persistent_buffers(
+    model: nn.Module, buffers: dict[str, torch.Tensor], device
+) -> None:
     """Restore non-persistent buffers after cpu_ram_efficient_loading finishes."""
     if not buffers:
         return
@@ -450,7 +720,9 @@ def _restore_non_persistent_buffers(model: nn.Module, buffers: dict[str, torch.T
         else:
             local_buffer_name = fqn
             parent_module = model
-        parent_module.register_buffer(local_buffer_name, buffer_tensor, persistent=False)
+        parent_module.register_buffer(
+            local_buffer_name, buffer_tensor, persistent=False
+        )
 
     if hasattr(model, "tie_weights"):
         model.tie_weights()
@@ -464,7 +736,9 @@ def _maybe_upcast_trainable_params(accelerator, model: nn.Module) -> None:
     so comm_fusion uses the new fp32 parameter dtype as well.
     """
     model_dtype = getattr(model, "dtype", None)
-    should_upcast = accelerator.mixed_precision != "no" and (model_dtype is None or model_dtype != torch.float32)
+    should_upcast = accelerator.mixed_precision != "no" and (
+        model_dtype is None or model_dtype != torch.float32
+    )
     if not should_upcast:
         return
 
@@ -486,6 +760,131 @@ def _maybe_upcast_trainable_params(accelerator, model: nn.Module) -> None:
             "may affect the precision of model checkpoints."
         )
 
+
+# ---------------------------------------------------------------------------
+# Optimizer wiring
+# ---------------------------------------------------------------------------
+
+
+def wrap_optimizer_with_skip_dtensor_dispatch(optimizer) -> None:
+    """Wrap optimizer.step so DTensor dispatch is skipped during parameter updates."""
+    if getattr(optimizer, "_hp_step_wrapped", False):
+        return
+
+    original_step = optimizer.step
+
+    def _hp_step(bound_optimizer, *args, **kwargs):
+        del bound_optimizer
+        with SkipDTensorDispatch():
+            return original_step(*args, **kwargs)
+
+    optimizer.step = types.MethodType(_hp_step, optimizer)
+    setattr(optimizer, "_hp_step_wrapped", True)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint I/O
+# ---------------------------------------------------------------------------
+
+
+def export_to_hf_format(model: nn.Module, tokenizer, save_dir: str) -> None:
+    """Gather full state dict via HyperParallel and save in HuggingFace-compatible format."""
+    from hyper_parallel.core.fully_shard.api import (  # pylint: disable=C0415
+        get_model_state_dict as hp_get_model_state_dict,
+    )
+    from torch.distributed.checkpoint.state_dict import StateDictOptions  # pylint: disable=C0415
+
+    export_dir = Path(save_dir)
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    state_dict = hp_get_model_state_dict(model, options=options)
+
+    if get_platform().get_rank() == 0:
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        if hasattr(model, "save_pretrained"):
+            model.save_pretrained(str(export_dir), state_dict=state_dict)
+        else:
+            torch.save(state_dict, export_dir / "pytorch_model.bin")
+
+        if tokenizer is not None:
+            tokenizer.save_pretrained(str(export_dir))
+
+    if get_platform().get_world_size() > 1:
+        torch.distributed.barrier()
+
+
+def save_hsdp_checkpoint(
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    lr_scheduler,
+    output_dir: str,
+    should_save_scheduler: bool = True,
+) -> None:
+    """Save HSDP model/optimizer shards per-rank and scheduler."""
+    from hyper_parallel.core.distributed_checkpoint.api import save as hp_save  # pylint: disable=C0415
+
+    os.makedirs(output_dir, exist_ok=True)
+    rank = get_platform().get_rank()
+
+    model_dir = os.path.join(output_dir, f"{HSDP_MODEL_NAME}_0")
+    os.makedirs(model_dir, exist_ok=True)
+    logger.info("Saving HSDP model shards to %s (rank %d)", model_dir, rank)
+    model_sd = model.state_dict()
+    hp_save(model_sd, checkpoint_id=model_dir, use_collectives=False)
+
+    if optimizer is not None:
+        optim_file = os.path.join(output_dir, f"{HSDP_OPTIMIZER_NAME}_rank{rank}.pt")
+        logger.info("Saving optimizer shard to %s", optim_file)
+        local_optim_sd = _localize_optimizer_state(optimizer.state_dict())
+        torch.save(local_optim_sd, optim_file)
+
+    if should_save_scheduler and lr_scheduler is not None:
+        torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+
+
+def load_hsdp_model(model: nn.Module, checkpoint_dir: str) -> bool:
+    """Load model from HSDP sharded checkpoint saved by ``hp_save``."""
+    from hyper_parallel.core.distributed_checkpoint.api import load as hp_load  # pylint: disable=C0415
+
+    model_dir = os.path.join(checkpoint_dir, f"{HSDP_MODEL_NAME}_0")
+
+    if not os.path.isdir(model_dir):
+        return False
+
+    logger.info("Loading HSDP model shards from %s", model_dir)
+    state_dict = model.state_dict()
+    hp_load(state_dict, checkpoint_id=model_dir, use_collectives=False)
+    model.load_state_dict(state_dict)
+    return True
+
+
+def load_hsdp_optimizer_and_scheduler(
+    optimizer: Optional[torch.optim.Optimizer],
+    lr_scheduler,
+    checkpoint_dir: str,
+) -> None:
+    """Load optimizer/scheduler from per-rank checkpoint files."""
+    if checkpoint_dir is None:
+        return
+
+    rank = get_platform().get_rank()
+    optim_file = os.path.join(checkpoint_dir, f"{HSDP_OPTIMIZER_NAME}_rank{rank}.pt")
+
+    if os.path.isfile(optim_file) and optimizer is not None:
+        logger.info("Loading optimizer shard from %s", optim_file)
+        saved_sd = torch.load(optim_file, map_location="cpu", weights_only=True)
+        _load_local_optimizer_state(optimizer, saved_sd)
+
+    scheduler_file = os.path.join(checkpoint_dir, "scheduler.pt")
+    if os.path.isfile(scheduler_file) and lr_scheduler is not None:
+        lr_scheduler.load_state_dict(
+            torch.load(scheduler_file, map_location="cpu", weights_only=True)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entry point: fsdp2_prepare_model
+# ---------------------------------------------------------------------------
 
 
 def fsdp2_prepare_model(accelerator, model: nn.Module, hp_args) -> nn.Module:
@@ -516,12 +915,28 @@ def fsdp2_prepare_model(accelerator, model: nn.Module, hp_args) -> nn.Module:
 
     model_has_params4bit = _model_has_4bit_params(model)
     original_sd = model.state_dict()
-    should_restore_non_persistent_buffers = fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit
-    original_non_persistent_buffers = _prepare_cpu_ram_efficient_loading(model, should_restore_non_persistent_buffers)
+    should_restore_non_persistent_buffers = (
+        fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit
+    )
+    original_non_persistent_buffers = _prepare_cpu_ram_efficient_loading(
+        model, should_restore_non_persistent_buffers
+    )
     if should_restore_non_persistent_buffers:
         model = _move_model_to_meta(model)
 
     fsdp2_kwargs = _build_fsdp2_kwargs(accelerator, model, hp_args, fsdp2_plugin)
+
+    # Detect transformer blocks before fully_shard modifies the model tree.
+    # The block references (parent, attr, ModuleList) survive FSDP wrapping
+    # since fully_shard modifies modules in-place rather than replacing them.
+    from hyper_parallel.integration.llamafactory.activation import (  # pylint: disable=C0415
+        find_transformer_blocks,
+        setup_activation_optimization,
+    )
+
+    block_info = (
+        find_transformer_blocks(model) if hp_args.activation_mode != "none" else None
+    )
 
     _apply_auto_wrap_policy(model, fsdp2_plugin, fsdp2_kwargs)
     if not isinstance(model, HSDPModule):
@@ -537,6 +952,14 @@ def fsdp2_prepare_model(accelerator, model: nn.Module, hp_args) -> nn.Module:
             cpu_offload=_is_cpu_offload_enabled(fsdp2_plugin.cpu_offload),
         )
 
-    _restore_non_persistent_buffers(model, original_non_persistent_buffers, accelerator.device)
+    # Activation wrapping after loading: the loading path is identical to
+    # the non-activation case, avoiding interaction between CheckpointWrapper's
+    # setattr replacement and load_state_dict(assign=True).  We pass the
+    # pre-detected block_info since FSDP may have changed the model structure.
+    setup_activation_optimization(model, hp_args, block_info=block_info)
+
+    _restore_non_persistent_buffers(
+        model, original_non_persistent_buffers, accelerator.device
+    )
     _maybe_upcast_trainable_params(accelerator, model)
     return model
