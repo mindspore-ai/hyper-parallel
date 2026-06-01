@@ -1,0 +1,41 @@
+{
+    "name": "llama2_70b_prof",
+    "pre_defined_layer": {
+      "LlamaEmbedding": 0,
+      "LlamaRMSNorm": -1
+    },
+    "auto_partition_layer": {
+      "LLamaDecodeLayer": 96
+    },
+    "layers_description": [
+      {
+        "name": "LlamaEmbedding",
+        "model_name": "llama2_70b_prof",
+        "type": "HEAD",
+        "time": 13,
+        "nb_layer": 1,
+        "memory_parameter": 9236
+      },
+      {
+        "name": "LLamaDecodeLayer",
+        "model_name": "llama2_70b_prof",
+        "type": "BODY",
+        "time": 100,
+        "nb_layer": 96,
+        "memory_parameter": 1710,
+        "memory_activation": 994,
+        "memory_select_rec": 739,
+        "memory_both_comm_select": 403,
+        "memory_recompute": 32
+
+      },
+      {
+        "name": "LlamaRMSNorm",
+        "model_name": "llama2_70b_prof",
+        "type": "TAIL",
+        "time": 113,
+        "nb_layer": 1,
+        "memory_parameter": 5794
+      }
+    ]
+  }
