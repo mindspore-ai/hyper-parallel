@@ -653,6 +653,7 @@ class MoE(nn.Module):
         self.score_before_experts = score_before_experts
         self.load_balance_coeff = load_balance_coeff
         self.sequence_partition_group = sequence_partition_group
+        self.last_aux_loss: Optional[torch.Tensor] = None
         self.enable_expert_bias = True
 
         # Auxiliary-loss-free load-balance buffers (no gradient).
