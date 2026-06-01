@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,9 +13,28 @@
 # limitations under the License.
 # ============================================================================
 """mindspore dtensor base"""
+from contextlib import contextmanager
+import warnings
 from mindspore.common.tensor import Tensor
 from mindspore.common.initializer import initializer
-from mindspore._c_expression import NoFallbackGuard
+
+try:
+    from mindspore._c_expression import NoFallbackGuard  # pylint: disable=C0415
+except ImportError:
+    warnings.warn(
+        "mindspore._c_expression.NoFallbackGuard not available; "
+        "using no-op fallback guard. This may allow recursive fallback dispatch "
+        "in some edge cases. Please upgrade MindSpore to a version that provides "
+        "NoFallbackGuard for proper protection against recursive dispatch.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+    @contextmanager
+    def _no_fallback_guard():
+        yield
+
+    NoFallbackGuard = _no_fallback_guard
 
 
 class DTensorBase(Tensor):
@@ -239,3 +258,28 @@ class DTensorBase(Tensor):
             local_param_info_value: The value to be set as the param_info value in the local tensor.
         """
         self._local_tensor.param_info = local_param_info_value
+
+    def _alias_placements(self):
+        """Return alias_placements from layout, falling back to _placements."""
+        if hasattr(self, '_layout') and self._layout is not None:
+            return self._layout.alias_placements
+        return self._placements
+
+    def to(self, *args, **kwargs):
+        """Move the DTensor to a different device or dtype.
+
+        This method overrides the base Tensor.to() to properly reconstruct
+        a DTensor with device_mesh and placements preserved. Uses _make_subclass
+        to avoid issues with Parameter subclasses that don't accept extra kwargs.
+
+        Args:
+            *args: Arguments passed to the underlying tensor's to() method.
+            **kwargs: Keyword arguments for the tensor conversion.
+
+        Returns:
+            DTensorBase: A new DTensor with the converted local tensor.
+        """
+        new_local = self._local_tensor.to(*args, **kwargs)
+        new_dt = Tensor._make_subclass(type(self), new_local)
+        new_dt.__init_data__(new_local, self._device_mesh, self._alias_placements())
+        return new_dt

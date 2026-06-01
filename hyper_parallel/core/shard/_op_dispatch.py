@@ -13,13 +13,14 @@
 # limitations under the License.
 # ============================================================================
 """_op_dispatch"""
-import os
-import sys
 import atexit
 import glob
 import importlib
-from typing import Any, List, Dict, Optional, Set
+import os
+import sys
+import warnings
 from itertools import chain
+from typing import Any, Dict, List, Optional, Set
 
 import yaml
 
@@ -28,6 +29,10 @@ from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.random import OffsetBasedRNGTracker, is_rng_supported_mesh
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
+
+from hyper_parallel.core.tensor_parallel._ce_op_registry import is_loss_parallel_op, is_decomposed_ce_op
+from hyper_parallel.core.tensor_parallel.loss_parallel import is_loss_parallel_active
+from hyper_parallel.core.tensor_parallel.loss_parallel_ops_common import _is_shard_on_last_dim
 
 platform = get_platform()
 Tensor = platform.Tensor
@@ -550,7 +555,18 @@ class OpDispatcher:
     def _with_layout_infer_reshape(func: callable, *args) -> Tensor:
         """_with_layout_infer_reshape"""
         input_tensor = args[0]
-        shape = args[1]
+
+        # PyTorch reshape signature: reshape(*shape)
+        # Can be called as:
+        #   reshape(-1, 1024) -> args = (tensor, -1, 1024)
+        #   reshape((-1, 1024)) -> args = (tensor, (-1, 1024))
+        #   reshape([4, 16, 1024]) -> args = (tensor, [4, 16, 1024])
+        if len(args) > 2:
+            # Multiple int arguments: reshape(-1, 1024)
+            shape = args[1:]
+        else:
+            # Single argument: reshape((4, 16, 1024)) or reshape(4)
+            shape = args[1]
 
         layout = input_tensor.layout
         input_layouts = [layout]
@@ -918,6 +934,47 @@ class OpDispatcher:
         """
         return {k: OpDispatcher._unwrap_value(v) for k, v in kwargs.items()}
 
+    @staticmethod
+    def _gather_dtensors_to_full(args: tuple, kwargs: dict) -> tuple:
+        """Gather all DTensor arguments to full tensors for fallback execution.
+
+        Used when an operator has no parallel layout implementation. All DTensor
+        arguments are gathered to full tensors before calling the standard operator.
+
+        Args:
+            args: Op call positional arguments, may contain DTensor instances.
+            kwargs: Op call keyword arguments, may contain DTensor instances.
+
+        Returns:
+            Tuple of (unwrapped_args, unwrapped_kwargs) with DTensor values
+            replaced by their full tensor representations.
+
+        Warning:
+            This fallback performs all-gather which may consume significant memory.
+            Operators without layout implementations should be registered properly.
+        """
+        def gather(value: object) -> object:
+            if isinstance(value, DTensor):
+                return value.full_tensor()
+            if isinstance(value, tuple):
+                return tuple(gather(e) for e in value)
+            if isinstance(value, list):
+                return [gather(e) for e in value]
+            return value
+
+        gathered_args = [gather(arg) for arg in args]
+        gathered_kwargs = {k: gather(v) for k, v in kwargs.items()}
+
+        warnings.warn(
+            "Operator has no distributed layout implementation. "
+            "Falling back to all-gather which may consume significant memory. "
+            "Consider registering a proper distributed operator.",
+            UserWarning,
+            stacklevel=4
+        )
+
+        return gathered_args, gathered_kwargs
+
     def _should_bypass_dispatch(self, op_name: str) -> bool:
         """Return True if the op should bypass DTensor dispatch and run locally.
 
@@ -929,6 +986,106 @@ class OpDispatcher:
         """
         skip_dispatch = get_dtensor_dispatch() is False and op_name not in get_no_skip_ops()
         return op_name in self.whitelist or skip_dispatch
+
+    def _should_dispatch_loss_parallel(self, op_name: str) -> bool:
+        """Check if should dispatch through loss_parallel path.
+
+        Args:
+            op_name: Canonical operator name from platform.get_op_name().
+
+        Returns:
+            True when in loss_parallel context and op is a CE entry point.
+        """
+        return is_loss_parallel_active() and is_loss_parallel_op(op_name)
+
+    def _check_decomposed_ce_op_in_loss_parallel(self, op_name: str, args: tuple, kwargs: dict):
+        """Check if decomposed CE ops are called in loss_parallel context.
+
+        Args:
+            op_name: Canonical operator name.
+            args: Positional arguments for op_call.
+            kwargs: Keyword arguments for op_call.
+
+        Raises:
+            ValueError: If decomposed CE op is called in loss_parallel context
+                       with vocab-sharded DTensor input.
+        """
+        if not is_loss_parallel_active() or not is_decomposed_ce_op(op_name):
+            return
+
+        has_vocab_sharded_dtensor = False
+        for arg in args:
+            if isinstance(arg, DTensor) and _is_shard_on_last_dim(arg):
+                has_vocab_sharded_dtensor = True
+                break
+        if not has_vocab_sharded_dtensor:
+            for val in kwargs.values():
+                if isinstance(val, DTensor) and _is_shard_on_last_dim(val):
+                    has_vocab_sharded_dtensor = True
+                    break
+
+        if has_vocab_sharded_dtensor:
+            raise ValueError(
+                f"Operator '{op_name}' is a decomposed component of cross_entropy and should not be called "
+                f"directly within loss_parallel() context. Use F.cross_entropy(logits, targets) instead. "
+                f"For example, replace:\n"
+                f"  with loss_parallel():\n"
+                f"      log_probs = F.log_softmax(logits, dim=-1)\n"
+                f"      loss = F.nll_loss(log_probs, targets)\n"
+                f"with:\n"
+                f"  with loss_parallel():\n"
+                f"      loss = F.cross_entropy(logits, targets)"
+            )
+
+    def _dispatch_loss_parallel(self, op_call: callable, args: tuple, kwargs: dict):
+        """Dispatch cross_entropy through the loss_parallel distributed kernel.
+
+        Args:
+            op_call: The raw operator callable.
+            args: Positional arguments for op_call.
+            kwargs: Keyword arguments for op_call.
+
+        Returns:
+            Result of the distributed cross_entropy computation.
+        """
+        if platform.platform_type == PlatformType.PYTORCH:
+            # pylint: disable=C0415
+            from hyper_parallel.platform.torch.loss_parallel_ops import distributed_cross_entropy_from_op_call
+        elif platform.platform_type == PlatformType.MINDSPORE:
+            # pylint: disable=C0415
+            from hyper_parallel.platform.mindspore.loss_parallel_ops import distributed_cross_entropy_from_op_call
+        else:
+            raise RuntimeError(f"Unsupported platform for loss_parallel: {platform.platform_type}")
+        return distributed_cross_entropy_from_op_call(op_call, args, kwargs)
+
+    def _check_ce_op_without_loss_parallel_context(self, op_name: str, args: tuple):
+        """Check if CE op is called with Shard(-1) DTensor outside loss_parallel context.
+
+        Args:
+            op_name: Canonical operator name.
+            args: Positional arguments for op_call.
+
+        Raises:
+            ValueError: If CE op is called with Shard(-1) logits outside loss_parallel context.
+        """
+        if is_loss_parallel_active() or not is_loss_parallel_op(op_name):
+            return
+
+        if len(args) == 0 or not isinstance(args[0], DTensor):
+            return
+
+        logits = args[0]
+        if _is_shard_on_last_dim(logits):
+            raise ValueError(
+                f"Operator '{op_name}' requires loss_parallel context when input logits are "
+                f"sharded on the vocabulary dimension (Shard(-1)). Please wrap your forward "
+                f"and backward pass with loss_parallel():\n"
+                f"  with loss_parallel():\n"
+                f"      loss = F.cross_entropy(logits, targets)\n"
+                f"      loss.backward()\n"
+                f"If you intentionally want to gather all shards to compute cross_entropy "
+                f"(not recommended for large vocabulary), use logits.full_tensor() explicitly."
+            )
 
     def _dispatch_layout_infer(
         self, op_name: str, op_call: callable, args: tuple, kwargs: dict
@@ -948,6 +1105,34 @@ class OpDispatcher:
             RuntimeError: If op_name is not registered or has an unknown suffix.
         """
         if op_name not in self.layout_infer_ops:
+            has_dtensor = any(isinstance(arg, DTensor) for arg in args)
+            has_dtensor = has_dtensor or any(isinstance(v, DTensor) for v in kwargs.values())
+            if has_dtensor:
+                self._check_ce_op_without_loss_parallel_context(op_name, args)
+
+                if not is_loss_parallel_op(op_name):
+                    raise RuntimeError(
+                        f"Operator {op_name} does not contain parallel layout infer func. "
+                        f"DTensor dispatch requires explicit layout inference registration. "
+                        f"Please register a distributed operator for '{op_name}' or use local tensors."
+                    )
+
+                gathered_args, gathered_kwargs = self._gather_dtensors_to_full(args, kwargs)
+
+                # Special handling for cross_entropy with 3D logits (only when NOT in loss_parallel context)
+                # PyTorch expects: logits [N, C], targets [N]
+                # But LLM forward returns: logits [batch, seq, vocab], targets [batch, seq]
+                # Note: nll_loss input is log_probs, typically already 2D, so we only reshape for cross_entropy
+                if op_name == "cross_entropy" and len(gathered_args) >= 2:
+                    logits = gathered_args[0]
+                    targets = gathered_args[1]
+                    if isinstance(logits, Tensor) and isinstance(targets, Tensor):
+                        if logits.ndim > 2 and targets.ndim > 1 and targets.ndim == logits.ndim - 1:
+                            vocab_size = logits.shape[-1]
+                            gathered_args[0] = logits.reshape(-1, vocab_size)
+                            gathered_args[1] = targets.reshape(-1)
+
+                return op_call(*gathered_args, **gathered_kwargs)
             raise RuntimeError(f"Operator {op_name} does not contain parallel layout infer func.")
 
         cache_manager = LayoutCacheManager.get_instance()
@@ -1015,8 +1200,11 @@ class OpDispatcher:
         if op_name in self._random_ops or op_name in self._random_ms_ops:
             return self._dispatch_random_op(op_name, op_call, args, kwargs)
 
-        # Auto-register ops that were registered programmatically via DistributedOp
-        # (e.g. through DFunction) without a corresponding YAML entry.
+        self._check_decomposed_ce_op_in_loss_parallel(op_name, args, kwargs)
+
+        if self._should_dispatch_loss_parallel(op_name):
+            return self._dispatch_loss_parallel(op_call, args, kwargs)
+
         if op_name not in self.layout_infer_ops and get_distributed_op(op_name) is not None:
             self.layout_infer_ops[op_name] = {}
 

@@ -23,8 +23,13 @@ from hyper_parallel.core.tensor_parallel.style import (
     RowwiseParallel,
     SequenceParallel,
 )
+from hyper_parallel.core.tensor_parallel.loss_parallel import (
+    loss_parallel,
+    is_loss_parallel_active,
+)
 
 __all__ = [
+    # Parallel styles
     "ColwiseParallel",
     "ParallelStyle",
     "PrepareModuleInput",
@@ -32,5 +37,9 @@ __all__ = [
     "PrepareModuleOutput",
     "RowwiseParallel",
     "SequenceParallel",
+    # Module parallelization
     "parallelize_module",
+    # Loss parallel
+    "loss_parallel",
+    "is_loss_parallel_active",
 ]

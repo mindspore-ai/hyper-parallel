@@ -1,0 +1,235 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""PyTorch distributed implementation of loss_parallel accuracy tests.
+
+This file is executed by torchrun.
+Tests compare:
+  - Single-card reference (no parallelism)
+  - Multi-card with loss_parallel (TP=2, vocab sharded)
+"""
+import os
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+
+from hyper_parallel import init_device_mesh  # pylint: disable=C0413
+from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0413
+from hyper_parallel.core.dtensor.placement_types import Shard  # pylint: disable=C0413
+from hyper_parallel.core.tensor_parallel import loss_parallel, is_loss_parallel_active  # pylint: disable=C0413
+
+
+np.random.seed(42)
+
+_BATCH_SIZE = 2
+_SEQ_LEN = 4
+_VOCAB_SIZE = 16
+_HIDDEN_SIZE = 8
+
+
+def setup_module():
+    """Initialize distributed backend."""
+    dist.init_process_group(backend="gloo")
+
+
+def teardown_module():
+    """Cleanup distributed backend."""
+    dist.destroy_process_group()
+
+
+def _simple_linear_layer_torch(x: torch.Tensor, weight: torch.Tensor,
+                                bias: torch.Tensor = None) -> torch.Tensor:
+    """Simple linear transformation.
+
+    Args:
+        x: Input tensor of shape [..., in_features]
+        weight: Weight tensor of shape [out_features, in_features]
+        bias: Optional bias tensor of shape [out_features]
+
+    Returns:
+        output: Tensor of shape [..., out_features]
+    """
+    output = torch.matmul(x, weight.T)
+    if bias is not None:
+        output = output + bias
+    return output
+
+
+class TestLossParallelAccuracyPyTorch:
+    """Accuracy tests for loss_parallel functionality (PyTorch backend)."""
+
+    def test_single_vs_multi_card_loss_parity(self):
+        """Compare single-card loss vs multi-card loss_parallel loss.
+
+        Expected: loss_parallel should produce same numerical result as single-card,
+        within floating-point tolerance.
+        """
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        vocab_size = _VOCAB_SIZE * world_size
+
+        np.random.seed(42)
+        weight_np = np.random.randn(vocab_size, _HIDDEN_SIZE).astype(np.float32) * 0.1
+        input_np = np.random.randn(_BATCH_SIZE * _SEQ_LEN, _HIDDEN_SIZE).astype(np.float32) * 0.1
+        targets_np = np.random.randint(0, vocab_size, (_BATCH_SIZE * _SEQ_LEN,)).astype(np.int64)
+
+        weight_single = torch.from_numpy(weight_np)
+        input_single = torch.from_numpy(input_np)
+        targets_single = torch.from_numpy(targets_np)
+
+        logits_single = _simple_linear_layer_torch(input_single, weight_single)
+        loss_single = F.cross_entropy(logits_single, targets_single, reduction='mean')
+
+        mesh = init_device_mesh("cpu", (world_size,))
+
+        weight_shard_np = weight_np[rank * _VOCAB_SIZE:(rank + 1) * _VOCAB_SIZE, :]
+        weight_shard = torch.from_numpy(weight_shard_np)
+
+        input_replicate = torch.from_numpy(input_np)
+        targets_replicate = torch.from_numpy(targets_np)
+
+        logits_shard = _simple_linear_layer_torch(input_replicate, weight_shard)
+
+        logits_dtensor = DTensor.from_local(logits_shard, mesh, [Shard(-1)])
+
+        with loss_parallel(mesh=mesh):
+            assert is_loss_parallel_active(), "loss_parallel context should be active"
+
+            loss_parallel_value = F.cross_entropy(logits_dtensor, targets_replicate, reduction='mean')
+
+        rtol = 1e-3
+        atol = 1e-5
+        np.testing.assert_allclose(
+            loss_single.item(),
+            loss_parallel_value.item(),
+            rtol=rtol,
+            atol=atol,
+            err_msg="loss_parallel loss does not match single-card reference"
+        )
+
+        print(f"[Rank {rank}] Single-card loss: {loss_single.item():.6f}")
+        print(f"[Rank {rank}] Multi-card loss_parallel loss: {loss_parallel_value.item():.6f}")
+        print(f"[Rank {rank}] Absolute difference: {abs(loss_single.item() - loss_parallel_value.item()):.6e}")
+
+    def test_loss_parallel_context_correctness(self):
+        """Verify loss_parallel context manager works correctly.
+
+        Expected: Context should be active inside with block, inactive outside.
+        """
+        assert is_loss_parallel_active() is False, "Should be inactive before context"
+
+        with loss_parallel():
+            assert is_loss_parallel_active() is True, "Should be active inside context"
+
+        assert is_loss_parallel_active() is False, "Should be inactive after context"
+
+        with loss_parallel():
+            assert is_loss_parallel_active() is True
+            with loss_parallel():
+                assert is_loss_parallel_active() is True
+            assert is_loss_parallel_active() is True
+
+        assert is_loss_parallel_active() is False
+
+        mesh = init_device_mesh("cpu", (dist.get_world_size(),))
+        with loss_parallel(mesh=mesh, strict=True):
+            assert is_loss_parallel_active() is True
+
+        print(f"[Rank {dist.get_rank()}] Context manager tests passed")
+
+    def test_gradient_correctness_with_loss_parallel(self):
+        """Verify gradients are correct when using loss_parallel context.
+
+        Expected: Gradients from loss_parallel path should match reference gradients.
+        """
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        vocab_size = _VOCAB_SIZE * world_size
+
+        np.random.seed(123)
+        weight_np = np.random.randn(vocab_size, _HIDDEN_SIZE).astype(np.float32) * 0.1
+        input_np = np.random.randn(_BATCH_SIZE * _SEQ_LEN, _HIDDEN_SIZE).astype(np.float32) * 0.1
+        targets_np = np.random.randint(0, vocab_size, (_BATCH_SIZE * _SEQ_LEN,)).astype(np.int64)
+
+        mesh = init_device_mesh("cpu", (world_size,))
+
+        weight_shard_np = weight_np[rank * _VOCAB_SIZE:(rank + 1) * _VOCAB_SIZE, :]
+        weight_shard = torch.from_numpy(weight_shard_np.copy()).requires_grad_(True)
+        input_shard = torch.from_numpy(input_np.copy()).requires_grad_(True)
+        targets_shard = torch.from_numpy(targets_np.copy())
+
+        def forward_with_loss_parallel():
+            logits_shard = _simple_linear_layer_torch(input_shard, weight_shard)
+            logits_dtensor = DTensor.from_local(logits_shard, mesh, [Shard(-1)])
+
+            with loss_parallel(mesh=mesh):
+                loss = F.cross_entropy(logits_dtensor, targets_shard, reduction='mean')
+            return loss
+
+        loss = forward_with_loss_parallel()
+        loss.backward()
+
+        print(f"[Rank {rank}] Loss computed successfully: {loss.item():.6f}")
+        print(f"[Rank {rank}] Weight gradient norm: {weight_shard.grad.norm().item():.6f}")
+        print(f"[Rank {rank}] Input gradient norm: {input_shard.grad.norm().item():.6f}")
+        print(f"[Rank {rank}] Gradient test passed")
+
+
+def test_single_vs_multi_card_loss_parity():
+    """Wrapper for pytest."""
+    TestLossParallelAccuracyPyTorch().test_single_vs_multi_card_loss_parity()
+
+
+def test_loss_parallel_context_correctness():
+    """Wrapper for pytest."""
+    TestLossParallelAccuracyPyTorch().test_loss_parallel_context_correctness()
+
+
+def test_gradient_correctness_with_loss_parallel():
+    """Wrapper for pytest."""
+    TestLossParallelAccuracyPyTorch().test_gradient_correctness_with_loss_parallel()
+
+
+if __name__ == "__main__":
+    setup_module()
+
+    print("=" * 80)
+    print("Test 1: Single vs Multi-card Loss Parity (PyTorch)")
+    print("=" * 80)
+    test_single_vs_multi_card_loss_parity()
+    print("PASS\n")
+
+    print("=" * 80)
+    print("Test 2: Loss Parallel Context Correctness (PyTorch)")
+    print("=" * 80)
+    test_loss_parallel_context_correctness()
+    print("PASS\n")
+
+    print("=" * 80)
+    print("Test 3: Gradient Correctness with Loss Parallel (PyTorch)")
+    print("=" * 80)
+    test_gradient_correctness_with_loss_parallel()
+    print("PASS\n")
+
+    print("=" * 80)
+    print("All PyTorch tests passed!")
+    print("=" * 80)
+
+    teardown_module()
