@@ -42,7 +42,7 @@ from hyper_parallel.platform.torch.common.moe import (  # pylint: disable=C0413
 class TestFeedForward(unittest.TestCase):
     """Unit tests for FeedForward (SwiGLU FFN)."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Create a small FeedForward on CPU."""
         torch.manual_seed(0)
         self.dim = 8
@@ -96,7 +96,7 @@ class TestFeedForward(unittest.TestCase):
 class TestGroupedExperts(unittest.TestCase):
     """Unit tests for GroupedExperts (batched SwiGLU expert computation)."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Create a small GroupedExperts with 4 experts on CPU."""
         torch.manual_seed(1)
         self.dim = 8
@@ -144,7 +144,8 @@ class TestGroupedExperts(unittest.TestCase):
         experts = deepcopy(self.experts)
         call_counts = [0]
 
-        def make_mock(real_data):
+        def make_mock(real_data: torch.Tensor) -> MagicMock:
+            """Wrap a tensor in a DTensor mock returning it on to_local()."""
             mock = MagicMock(spec=DTensor)
             mock.to_local.return_value = real_data
             return mock
@@ -300,6 +301,211 @@ class TestTokenChoiceTopKRouter(unittest.TestCase):
         assert torch.allclose(scores_2, scores_1 * 2, atol=1e-5), (
             f"Expected scores doubled with route_scale=2; "
             f"max_diff={(scores_2 - scores_1 * 2).abs().max().item():.2e}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestMoEPermutation
+# ---------------------------------------------------------------------------
+
+class TestMoEPermutation(unittest.TestCase):
+    """Unit tests for MoE.permutation (standalone, extracted from forward)."""
+
+    def setUp(self) -> None:
+        """Create a small MoE instance for testing permutation in isolation."""
+        torch.manual_seed(42)
+        self.num_experts = 4
+        self.top_k = 2
+        self.moe = MoE(dim=16, hidden_dim=32, num_experts=self.num_experts, top_k=self.top_k)
+
+    def test_output_shapes(self):
+        """permutation returns three tensors with correct shapes."""
+        num_tokens = 10
+        selected = torch.randint(0, self.num_experts, (num_tokens, self.top_k))
+        scores = torch.rand(num_tokens, self.top_k)
+        token_indices, scores_sorted, counts = self.moe.permutation(selected, scores)
+        expected_len = num_tokens * self.top_k
+        assert token_indices.shape == (expected_len,), (
+            f"token_indices shape {token_indices.shape}, expected ({expected_len},)"
+        )
+        assert scores_sorted.shape == (expected_len,), (
+            f"scores_sorted shape {scores_sorted.shape}, expected ({expected_len},)"
+        )
+        assert counts.shape == (self.num_experts,), (
+            f"counts shape {counts.shape}, expected ({self.num_experts},)"
+        )
+
+    def test_expert_major_ordering(self):
+        """Sorted expert IDs are non-decreasing (expert-major order)."""
+        num_tokens = 8
+        selected = torch.randint(0, self.num_experts, (num_tokens, self.top_k))
+        scores = torch.rand(num_tokens, self.top_k)
+        token_indices, scores_sorted, counts = self.moe.permutation(selected, scores)
+        flat_experts = selected.flatten()
+        flat_indices = flat_experts.argsort(stable=True)
+        experts_in_order = flat_experts[flat_indices]
+        assert (experts_in_order[1:] >= experts_in_order[:-1]).all(), (
+            f"Expert IDs in sorted order are not non-decreasing: {experts_in_order.tolist()}"
+        )
+
+    def test_token_indices_valid(self):
+        """token_indices are all valid token row indices."""
+        num_tokens = 12
+        selected = torch.randint(0, self.num_experts, (num_tokens, self.top_k))
+        scores = torch.rand(num_tokens, self.top_k)
+        token_indices, _, _ = self.moe.permutation(selected, scores)
+        assert token_indices.min() >= 0, (
+            f"token_indices min={token_indices.min()}, expected >= 0"
+        )
+        assert token_indices.max() < num_tokens, (
+            f"token_indices max={token_indices.max()}, expected < {num_tokens}"
+        )
+
+    def test_counts_match_bincount(self):
+        """num_tokens_per_expert matches bincount on flat experts."""
+        num_tokens = 15
+        selected = torch.randint(0, self.num_experts, (num_tokens, self.top_k))
+        scores = torch.rand(num_tokens, self.top_k)
+        _, _, counts = self.moe.permutation(selected, scores)
+        expected = torch.bincount(selected.flatten(), minlength=self.num_experts)
+        assert torch.equal(counts, expected), (
+            f"counts {counts.tolist()} does not match bincount {expected.tolist()}"
+        )
+
+    def test_pure_function_no_side_effects(self):
+        """permutation does not modify MoE instance state."""
+        num_tokens = 6
+        selected = torch.randint(0, self.num_experts, (num_tokens, self.top_k))
+        scores = torch.rand(num_tokens, self.top_k)
+        expert_bias_before = self.moe.expert_bias.clone()
+        tokens_per_expert_before = self.moe.tokens_per_expert.clone()
+        router_state_before = deepcopy(self.moe.router.gate.state_dict())
+        self.moe.permutation(selected, scores)
+        assert torch.equal(self.moe.expert_bias, expert_bias_before), (
+            "expert_bias was modified by permutation"
+        )
+        assert torch.equal(self.moe.tokens_per_expert, tokens_per_expert_before), (
+            "tokens_per_expert was modified by permutation"
+        )
+        for key, param in self.moe.router.gate.state_dict().items():
+            assert torch.equal(param, router_state_before[key]), (
+                f"router.gate.{key} was modified by permutation"
+            )
+
+    def test_empty_input(self):
+        """permutation with num_tokens=0 returns empty results."""
+        selected = torch.empty(0, self.top_k, dtype=torch.long)
+        scores = torch.empty(0, self.top_k)
+        token_indices, scores_sorted, counts = self.moe.permutation(selected, scores)
+        assert token_indices.numel() == 0, (
+            f"token_indices numel={token_indices.numel()}, expected 0"
+        )
+        assert scores_sorted.numel() == 0, (
+            f"scores_sorted numel={scores_sorted.numel()}, expected 0"
+        )
+        assert counts.shape == (self.num_experts,), (
+            f"counts shape {counts.shape}, expected ({self.num_experts},)"
+        )
+        assert counts.sum() == 0, (
+            f"counts sum={counts.sum()}, expected 0"
+        )
+
+    def test_single_token(self):
+        """permutation with a single token works correctly."""
+        selected = torch.tensor([[0, 2]])
+        scores = torch.tensor([[0.6, 0.4]])
+        token_indices, scores_sorted, counts = self.moe.permutation(selected, scores)
+        assert token_indices.shape == (2,), (
+            f"token_indices shape {token_indices.shape}, expected (2,)"
+        )
+        assert counts[0] == 1 and counts[2] == 1, (
+            f"counts {counts.tolist()}, expected expert 0 and 2 to have 1 token each"
+        )
+
+    def test_scores_sorted_match_indices(self):
+        """scores_sorted[i] should equal top_scores[token_indices[i]] for each i."""
+        num_tokens = 8
+        selected = torch.randint(0, self.num_experts, (num_tokens, self.top_k))
+        scores = torch.rand(num_tokens, self.top_k)
+        _, scores_sorted, _ = self.moe.permutation(selected, scores)
+        flat_scores_original = scores.flatten()
+        assert set(scores_sorted.tolist()) == set(flat_scores_original.tolist()) or \
+            torch.allclose(scores_sorted.sort()[0], flat_scores_original.sort()[0]), (
+            "scores_sorted is not a permutation of flat scores"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestMoEUnpermutation
+# ---------------------------------------------------------------------------
+
+class TestMoEUnpermutation(unittest.TestCase):
+    """Unit tests for MoE.unpermutation (standalone, extracted from forward)."""
+
+    def setUp(self) -> None:
+        """Create a small MoE instance for testing unpermutation in isolation."""
+        torch.manual_seed(42)
+        self.dim = 16
+        self.num_experts = 4
+        self.top_k = 2
+        self.moe = MoE(
+            dim=self.dim, hidden_dim=32, num_experts=self.num_experts, top_k=self.top_k
+        )
+
+    def test_output_shape(self):
+        """unpermutation returns tensor of shape (num_tokens, dim)."""
+        num_tokens = 10
+        total_routed = num_tokens * self.top_k
+        expert_out = torch.randn(total_routed, self.dim)
+        token_indices = torch.arange(total_routed) % num_tokens
+        result = self.moe.unpermutation(expert_out, token_indices, num_tokens, self.dim)
+        assert result.shape == (num_tokens, self.dim), (
+            f"unpermutation output shape {result.shape}, expected ({num_tokens}, {self.dim})"
+        )
+
+    def test_round_trip_with_permutation(self):
+        """unpermutation reverses permutation when expert is identity."""
+        num_tokens = 8
+        selected = torch.randint(0, self.num_experts, (num_tokens, self.top_k))
+        scores = torch.rand(num_tokens, self.top_k)
+        token_indices, scores_sorted, _ = self.moe.permutation(selected, scores)
+        original_flat = torch.randn(num_tokens, self.dim)
+        # Simulate: after permutation, expert_out[i] = original[token_indices[i]]
+        expert_out = original_flat[token_indices]
+        result = self.moe.unpermutation(expert_out, token_indices, num_tokens, self.dim)
+        # Each token appears top_k times in expert_out with different indices
+        # unpermutation scatter_adds them back — should equal original * top_k
+        expected = original_flat * self.top_k
+        assert torch.allclose(result, expected, atol=1e-6), (
+            f"Round-trip failed: max_diff={(result - expected).abs().max().item():.2e}"
+        )
+
+    def test_gradient_flows(self):
+        """Gradient flows back through unpermutation."""
+        num_tokens = 6
+        total_routed = num_tokens * self.top_k
+        expert_out = torch.randn(total_routed, self.dim, requires_grad=True)
+        token_indices = torch.randint(0, num_tokens, (total_routed,))
+        result = self.moe.unpermutation(expert_out, token_indices, num_tokens, self.dim)
+        result.sum().backward()
+        assert expert_out.grad is not None, (
+            "expert_out has no gradient after backward through unpermutation"
+        )
+
+    def test_single_expert_takes_all_tokens(self):
+        """All tokens routed to the same expert still scatter-add correctly."""
+        num_tokens = 5
+        total_routed = num_tokens * self.top_k
+        # All token_indices point to token 0
+        token_indices = torch.zeros(total_routed, dtype=torch.long)
+        expert_out = torch.ones(total_routed, self.dim)
+        result = self.moe.unpermutation(expert_out, token_indices, num_tokens, self.dim)
+        assert result[0, 0].item() == float(total_routed), (
+            f"token 0 dim 0 should sum to {total_routed}, got {result[0, 0].item()}"
+        )
+        # Other tokens should be zero
+        assert (result[1:] == 0).all(), (
+            f"tokens 1..{num_tokens - 1} should be all-zero"
         )
 
 
@@ -489,7 +695,7 @@ class TestZeroOverheadActivation(unittest.TestCase):
     intermediate activations and routing scores.
     """
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Create test fixtures for GroupedExperts."""
         torch.manual_seed(42)
         self.dim = 8

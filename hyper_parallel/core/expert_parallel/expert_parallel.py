@@ -26,8 +26,9 @@ Provides token permutation helpers and four parallel styles that compose with
 - :class:`ExpertTensorParallel` — combined EP + TP on a 2-D mesh ``[ep, tp]``;
   weights are doubly sharded, dispatch uses the EP sub-mesh.
 """
-import threading
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Optional
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
@@ -46,6 +47,7 @@ platform = get_platform()
 Module = platform.Module
 
 __all__ = [
+    "AllToAllTokenDispatcher",
     "BaseExpertParallel",
     "ExpertParallel",
     "TensorParallel",
@@ -255,73 +257,47 @@ class BaseExpertParallel(ParallelStyle, ABC):
 
 
 # ---------------------------------------------------------------------------
-# ExpertParallel — standard all-to-all EP
+# DispatchContext — state shared between token dispatch and combine
 # ---------------------------------------------------------------------------
 
-class ExpertParallel(BaseExpertParallel):
-    """Expert Parallel: shard experts across ranks via all-to-all token routing.
+@dataclass
+class DispatchContext:
+    """Holds state shared between token dispatch and combine within one forward pass.
 
-    Applies :meth:`apply` to a :class:`GroupedExperts` module:
-
-    1. **Partition** — distributes expert weights on dim 0 (``Shard(0)``) so
-       each rank holds ``num_experts // ep_degree`` local experts.
-    2. **Token dispatch** (forward pre-hook) — two-step all-to-all:
-       a. Exchange token counts (non-differentiable).
-       b. Exchange actual tokens (differentiable, gradient flows back).
-       Followed by rank-major → expert-major permutation.
-    3. **Token combine** (forward post-hook) — expert-major → rank-major
-       unpermute, then reverse all-to-all (differentiable).
-
-    All collectives use ``platform.differentiable_all_to_all_single`` /
-    ``platform.all_to_all_single`` — no direct ``torch.distributed`` calls.
-
-    Args:
-        None
-
-    Example::
-        >>> ep_style = ExpertParallel()
-        >>> sharded_experts = ep_style.apply(experts_module, ep_device_mesh)
+    Built by :meth:`AllToAllTokenDispatcher.dispatch` and consumed by
+    :meth:`AllToAllTokenDispatcher.combine`.  The caller
+    (e.g. :class:`ExpertParallel`) stores this on the instance between the
+    paired dispatch/combine calls.
     """
 
-    def __init__(self) -> None:
-        # Per-thread LIFO stack of dispatch→combine state.  Single-thread
-        # training uses one slot; overlap_b_f's BWD-recompute thread gets
-        # its own slot so its dispatch cannot overwrite values the FWD
-        # thread's combine is still using.
-        self._tls = threading.local()
+    input_splits: list
+    output_splits: list
+    input_shape: Optional[tuple] = None
+    permuted_indices: Optional[object] = None
 
-    def _state_stack(self) -> list:
-        stack = getattr(self._tls, "stack", None)
-        if stack is None:
-            stack = []
-            self._tls.stack = stack
-        return stack
 
-    def _partition_fn(
-        self, name: str, module: Module, device_mesh: DeviceMesh
-    ) -> None:
-        """Shard all expert parameters along dim 0 (expert dimension).
+# ---------------------------------------------------------------------------
+# AllToAllTokenDispatcher — token dispatch/combine via all-to-all
+# ---------------------------------------------------------------------------
 
-        Args:
-            name: Submodule name (unused).
-            module: The module whose parameters are being sharded.
-            device_mesh: EP device mesh.
-        """
-        del name
-        for key, param in _distribute_module_iter_params(module):
-            if param is None:
-                continue
-            src = _distribute_module_param_source(param)
-            requires_grad = bool(getattr(param, "requires_grad", True))
-            dt = distribute_tensor(src, device_mesh, [Shard(0)])
-            new_param = _distribute_module_new_parameter(key, dt, requires_grad)
-            _distribute_module_set_param(module, key, new_param)
+class AllToAllTokenDispatcher:
+    """Token dispatch and combine via all-to-all for expert parallelism.
 
-    def _token_dispatch(self, module: Module, inputs, device_mesh: DeviceMesh):
+    Provides :meth:`dispatch` and :meth:`combine` as static methods that
+    receive and return a :class:`DispatchContext` object.  This decouples
+    the all-to-all token routing logic from the parallel style class so
+    that it can be reused or tested independently.
+
+    Callers (e.g. :class:`ExpertParallel`) are responsible for storing the
+    context between the paired dispatch/combine calls.
+    """
+
+    @staticmethod
+    def dispatch(module: Module, inputs: tuple, device_mesh: DeviceMesh) -> tuple:
         """Dispatch tokens to their assigned ranks via all-to-all.
 
-        Called as an ``input_fn`` hook by ``distribute_module``.  Receives the
-        module's forward inputs and returns transformed inputs.
+        Called as an ``input_fn`` hook by :func:`distribute_module`.  Receives
+        the module's forward inputs and returns transformed inputs.
 
         Args:
             module: The ``GroupedExperts`` module (unused here).
@@ -331,8 +307,10 @@ class ExpertParallel(BaseExpertParallel):
             device_mesh: EP device mesh (1-D).
 
         Returns:
-            Tuple ``(permuted_local_input, local_token_counts)`` ready for
-            local expert computation.
+            Tuple ``(permuted_local_input, local_token_counts, ctx)`` —
+            the first two elements are the transformed inputs for local
+            expert computation; *ctx* is a :class:`DispatchContext`
+            carrying the updated state to be stored by the caller.
         """
         del module
         routed_input, num_tokens_per_expert = inputs[0], inputs[1]
@@ -377,19 +355,27 @@ class ExpertParallel(BaseExpertParallel):
         input_shape, permuted, permuted_indices, local_counts = _permute(
             dispatched, counts_out, ep_size, num_local_experts
         )
-        self._state_stack().append((input_splits, output_splits, input_shape, permuted_indices))
-        return permuted, local_counts
+        ctx = DispatchContext(
+            input_splits=input_splits,
+            output_splits=output_splits,
+            input_shape=input_shape,
+            permuted_indices=permuted_indices,
+        )
+        return permuted, local_counts, ctx
 
-    def _token_combine(self, module: Module, routed_output, device_mesh: DeviceMesh):
+    @staticmethod
+    def combine(module: Module, routed_output: object, device_mesh: DeviceMesh, ctx: DispatchContext) -> object:
         """Gather expert outputs back to the originating ranks via all-to-all.
 
-        Called as an ``output_fn`` hook by ``distribute_module``.
+        Called as an ``output_fn`` hook by :func:`distribute_module`.
 
         Args:
             module: The ``GroupedExperts`` module (unused).
             routed_output: Expert output tensor in expert-major order,
                 shape ``[sum(local_counts), dim]``.
             device_mesh: EP device mesh (1-D).
+            ctx: :class:`DispatchContext` previously returned by
+                :meth:`dispatch`.
 
         Returns:
             Token tensor in the original token-major layout,
@@ -398,19 +384,110 @@ class ExpertParallel(BaseExpertParallel):
         del module
         ep_group = device_mesh.get_group()
 
-        input_splits, output_splits, input_shape, permuted_indices = self._state_stack().pop()
-
         # expert-major → rank-major
-        unpermuted = _unpermute(routed_output, input_shape, permuted_indices)
+        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices)
 
         # reverse all-to-all (output/input splits are swapped)
         combined = platform.differentiable_all_to_all_single(
             unpermuted,
-            output_splits,   # was output, now becomes input
-            input_splits,    # was input, now becomes output
+            ctx.output_splits,   # was output, now becomes input
+            ctx.input_splits,    # was input, now becomes output
             group=ep_group,
         )
         return combined
+
+
+# ---------------------------------------------------------------------------
+# ExpertParallel — standard all-to-all EP
+# ---------------------------------------------------------------------------
+
+class ExpertParallel(BaseExpertParallel):
+    """Expert Parallel: shard experts across ranks via all-to-all token routing.
+
+    Applies :meth:`apply` to a :class:`GroupedExperts` module:
+
+    1. **Partition** — distributes expert weights on dim 0 (``Shard(0)``) so
+       each rank holds ``num_experts // ep_degree`` local experts.
+    2. **Token dispatch** (forward pre-hook) — two-step all-to-all:
+       a. Exchange token counts (non-differentiable).
+       b. Exchange actual tokens (differentiable, gradient flows back).
+       Followed by rank-major → expert-major permutation.
+    3. **Token combine** (forward post-hook) — expert-major → rank-major
+       unpermute, then reverse all-to-all (differentiable).
+
+    All collectives use ``platform.differentiable_all_to_all_single`` /
+    ``platform.all_to_all_single`` — no direct ``torch.distributed`` calls.
+
+    Args:
+        None
+
+    Example::
+        >>> ep_style = ExpertParallel()
+        >>> sharded_experts = ep_style.apply(experts_module, ep_device_mesh)
+    """
+
+    def __init__(self) -> None:
+        """Initialize ExpertParallel with no dispatch context."""
+        self._dispatch_ctx: Optional[DispatchContext] = None
+
+    def _token_dispatch(self, module: Module, inputs, device_mesh: DeviceMesh):
+        """Dispatch tokens to their assigned ranks via all-to-all.
+
+        Delegates to :meth:`AllToAllTokenDispatcher.dispatch` and stores the
+        returned :class:`DispatchContext` on the instance for the matching
+        :meth:`_token_combine` call.
+
+        Args:
+            module: The ``GroupedExperts`` module (unused here).
+            inputs: Tuple ``(routed_input, num_tokens_per_expert)``.
+            device_mesh: EP device mesh (1-D).
+
+        Returns:
+            Tuple ``(permuted_local_input, local_token_counts)``.
+        """
+        permuted, local_counts, self._dispatch_ctx = (
+            AllToAllTokenDispatcher.dispatch(module, inputs, device_mesh)
+        )
+        return permuted, local_counts
+
+    def _token_combine(self, module: Module, routed_output, device_mesh: DeviceMesh):
+        """Gather expert outputs back to the originating ranks via all-to-all.
+
+        Delegates to :meth:`AllToAllTokenDispatcher.combine`, passing the
+        :class:`DispatchContext` stored by :meth:`_token_dispatch`.
+
+        Args:
+            module: The ``GroupedExperts`` module (unused).
+            routed_output: Expert output tensor in expert-major order.
+            device_mesh: EP device mesh (1-D).
+
+        Returns:
+            Token tensor in the original token-major layout.
+        """
+        return AllToAllTokenDispatcher.combine(
+            module, routed_output, device_mesh, self._dispatch_ctx,
+        )
+
+    def _partition_fn(
+        self, name: str, module: Module, device_mesh: DeviceMesh
+    ) -> None:
+        """Shard all expert parameters along dim 0 (expert dimension).
+
+        Args:
+            name: Submodule name (unused).
+            module: The module whose parameters are being sharded.
+            device_mesh: EP device mesh.
+        """
+        del name
+        for key, param in _distribute_module_iter_params(module):
+            if param is None:
+                continue
+            src = _distribute_module_param_source(param)
+            requires_grad = bool(getattr(param, "requires_grad", True))
+            dt = distribute_tensor(src, device_mesh, [Shard(0)])
+            new_param = _distribute_module_new_parameter(key, dt, requires_grad)
+            _distribute_module_set_param(module, key, new_param)
+
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +585,37 @@ class ExpertTensorParallel(ExpertParallel):
         >>> sharded = etp_style.apply(experts_module, ep_tp_2d_mesh)
     """
 
+    def _token_dispatch(self, module: Module, inputs, device_mesh: DeviceMesh):
+        """Dispatch tokens using only the EP sub-mesh.
+
+        Args:
+            module: The ``GroupedExperts`` module.
+            inputs: Forward inputs tuple.
+            device_mesh: 2-D device mesh with dims ``("ep", "tp")``.
+
+        Returns:
+            Transformed inputs for local expert computation.
+        """
+        permuted, local_counts, self._dispatch_ctx = (
+            AllToAllTokenDispatcher.dispatch(module, inputs, device_mesh["ep"])
+        )
+        return permuted, local_counts
+
+    def _token_combine(self, module: Module, routed_output, device_mesh: DeviceMesh):
+        """Combine tokens using only the EP sub-mesh.
+
+        Args:
+            module: The ``GroupedExperts`` module.
+            routed_output: Expert output tensor in expert-major order.
+            device_mesh: 2-D device mesh with dims ``("ep", "tp")``.
+
+        Returns:
+            Token tensor in the original token-major layout.
+        """
+        return AllToAllTokenDispatcher.combine(
+            module, routed_output, device_mesh["ep"], self._dispatch_ctx,
+        )
+
     def _partition_fn(
         self, name: str, module: Module, device_mesh: DeviceMesh
     ) -> None:
@@ -536,29 +644,3 @@ class ExpertTensorParallel(ExpertParallel):
             dt = distribute_tensor(src, device_mesh, [Shard(0), Shard(tp_dim)])
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
-
-    def _token_dispatch(self, module: Module, inputs, device_mesh: DeviceMesh):
-        """Dispatch tokens using only the EP sub-mesh.
-
-        Args:
-            module: The ``GroupedExperts`` module.
-            inputs: Forward inputs tuple.
-            device_mesh: 2-D device mesh with dims ``("ep", "tp")``.
-
-        Returns:
-            Transformed inputs for local expert computation.
-        """
-        return super()._token_dispatch(module, inputs, device_mesh["ep"])
-
-    def _token_combine(self, module: Module, routed_output, device_mesh: DeviceMesh):
-        """Combine tokens using only the EP sub-mesh.
-
-        Args:
-            module: The ``GroupedExperts`` module.
-            routed_output: Expert output tensor in expert-major order.
-            device_mesh: 2-D device mesh with dims ``("ep", "tp")``.
-
-        Returns:
-            Token tensor in the original token-major layout.
-        """
-        return super()._token_combine(module, routed_output, device_mesh["ep"])
