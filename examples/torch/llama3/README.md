@@ -21,6 +21,7 @@
 | `pp_example.py` | **仅 PP：**1-D mesh `(pp,)`，`Schedule1F1B`，每 rank 一个 stage；stage 0 喂 token，末 stage 算 CE。 |
 | `pp_tp_example.py` | **PP + TP：**2-D mesh `(pp, tp)`，stage 内 `parallelize_llama3`，`Schedule1F1B` + P2P。 |
 | `pp_fsdp_tp_cp_sp_example.py` | **8 卡综合：PP + FSDP2 + TP + CP + SP。**4-D mesh `(pp, fsdp, cp, tp)`，默认 `(2,2,2,1)`。 |
+| `pp_fsdp_cp_example.py` | **8 卡：PP + FSDP2 + CP。**3-D mesh `(pp, fsdp, cp)`，默认 `(2,2,2)`。 |
 | `__init__.py` | 再导出主要符号；示例脚本会把本目录加入 `sys.path`。 |
 
 ---
@@ -255,6 +256,38 @@ LLAMA3_TP_SIZE=2 torchrun --nnodes=1 --nproc_per_node=16 pp_fsdp_tp_cp_sp_exampl
 > | 2 | 2 | 2 | 1 | **默认**，PP+CP 均 2 |
 > | 2 | 4 | 1 | 1 | PP=2，FSDP=4 |
 > | 4 | 2 | 1 | 1 | PP=4（每层一 stage） |
+
+---
+
+## 运行八：8 卡 PP + FSDP2 + CP
+
+`pp_fsdp_cp_example.py` 在 3-D `DeviceMesh` `(pp, fsdp, cp)` 上同时启用三种并行：
+
+| 维度 | 组件 | 说明 |
+|------|------|------|
+| `mesh["pp"]` | **PP** | `Schedule1F1B`；每 PP rank 一段 stage chunk（`pipeline.py`）。 |
+| `mesh["cp"]` | **CP** | `ContextParallel` 挂在每个 `layer.attention.sdpa_core`。 |
+| `mesh["fsdp"]` | **FSDP2** | `fully_shard` 在每个 PP stage 内沿 `fsdp` 轴分片参数。 |
+
+需满足 **`world_size == pp * fsdp * cp`**。默认 `(pp, fsdp, cp) = (2, 2, 2)`，即 8 卡。
+
+```bash
+cd examples/torch/llama3
+torchrun --nnodes=1 --nproc_per_node=8 pp_fsdp_cp_example.py
+```
+
+可选环境变量（默认见括号）：
+
+| 变量 | 含义 | 默认 |
+|------|------|------|
+| `LLAMA3_PP_SIZE` | 流水线并行宽度 | `2` |
+| `LLAMA3_FSDP_SIZE` | FSDP2 分片宽度（每个 PP stage 内的 decoder block） | `2` |
+| `LLAMA3_CP_SIZE` | 上下文并行宽度 | `2` |
+| `LLAMA3_DEVICE_TYPE` | `npu` 或 `cuda` | `npu` |
+
+约束：**`n_layers >= pp`**；**`seq_len % cp == 0`**；**`fsdp >= 2`**；每 step 使用 **`micro_batch_num=1`**（与 PP+FSDP 调度兼容）。
+
+> **说明：**FSDP 仅包裹各 **decoder block**（不 wrap stage 根模块），避免 PP 调度器注入的显式 unshard/reshard 与 Torch autograd 冲突。`fsdp=1` 不可用（DTensor mesh_shape 不匹配）。
 
 ---
 
