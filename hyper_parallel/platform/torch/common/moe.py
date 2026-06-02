@@ -25,7 +25,7 @@ Distributed collectives are handled by
 contains only single-device computation.
 """
 import math
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -38,6 +38,7 @@ __all__ = [
     "GroupedExperts",
     "TokenChoiceTopKRouter",
     "MoE",
+    "MoEAuxLossAutoScaler",
     "update_expert_bias",
 ]
 
@@ -466,6 +467,7 @@ def _compute_load_balance_loss(
     top_scores: torch.Tensor,
     selected_experts: torch.Tensor,
     num_experts: int,
+    sequence_partition_group: Optional[Any] = None,
 ) -> torch.Tensor:
     """Compute load-balance auxiliary loss.
 
@@ -478,14 +480,28 @@ def _compute_load_balance_loss(
     When routing is perfectly balanced, loss ≈ 1.0.
     When routing is imbalanced, loss > 1.0.
 
+    When ``sequence_partition_group`` is provided (e.g. the TP×CP or CP
+    process group), ``expert_fraction`` (token counts) is all-reduced across
+    the group so that the loss reflects the *global* token distribution over
+    the full sequence.  ``expert_prob`` is kept local to preserve gradient
+    flow back to the router weights, and ``num_tokens`` is scaled by
+    ``num_sub_sequence`` (the group world size) to account for the sharded
+    sequence dimension.  This follows the Megatron-LM
+    ``full_sequence_aux_loss`` pattern.
+
     Args:
         top_scores: Routing weights, shape ``[num_tokens, top_k]``.
         selected_experts: Expert IDs, shape ``[num_tokens, top_k]``.
         num_experts: Total number of experts.
+        sequence_partition_group: Optional process group spanning the
+            sequence-partition dimension (TP+SP or CP).  When not ``None``,
+            ``expert_fraction`` is all-reduced across this group.
 
     Returns:
         Scalar loss tensor. Returns 0.0 for empty input.
     """
+    import torch.distributed as dist  # pylint: disable=C0415
+
     num_tokens, top_k = top_scores.shape
 
     if num_tokens == 0:
@@ -498,17 +514,96 @@ def _compute_load_balance_loss(
         num_experts, dtype=top_scores.dtype, device=top_scores.device
     )
     expert_fraction.scatter_add_(0, flat_experts, torch.ones_like(flat_scores))
-    expert_fraction = expert_fraction / (num_tokens * top_k)
+
+    num_sub_sequence = 1
+    if sequence_partition_group is not None:
+        num_sub_sequence = dist.get_world_size(sequence_partition_group)
+        dist.all_reduce(expert_fraction, group=sequence_partition_group)
+
+    expert_fraction = expert_fraction / (num_tokens * num_sub_sequence * top_k)
 
     expert_prob = torch.zeros(
         num_experts, dtype=top_scores.dtype, device=top_scores.device
     )
     expert_prob.scatter_add_(0, flat_experts, flat_scores)
-    expert_prob = expert_prob / num_tokens
+    expert_prob = expert_prob / (num_tokens * num_sub_sequence)
 
     loss = num_experts * (expert_fraction * expert_prob).sum()
 
     return loss
+
+
+# ---------------------------------------------------------------------------
+# MoEAuxLossAutoScaler — gradient injection for auxiliary loss
+# ---------------------------------------------------------------------------
+
+
+class MoEAuxLossAutoScaler(torch.autograd.Function):
+    """Autograd function that injects auxiliary-loss gradient into the backward chain.
+
+    Forward transparently passes through ``top_scores`` (values unchanged).
+    Backward injects a scaled gradient for ``aux_loss``, causing its gradients
+    to flow through the router weights without adding aux_loss to the main
+    loss explicitly.
+
+    The loss scale is managed via the class-level :meth:`set_loss_scale` method,
+    which should be called before ``loss.backward()`` in the training loop
+    (typically by the pipeline schedule or training framework).
+
+    Reference: Megatron-LM ``megatron/core/transformer/moe/moe_utils.py``
+    """
+
+    main_loss_backward_scale: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def forward(ctx: Any, output: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
+        """Pass through ``output`` unchanged; save ``aux_loss`` for backward.
+
+        Args:
+            output: Router output (e.g. ``top_scores``), passed through unchanged.
+            aux_loss: Scalar auxiliary loss tensor to inject gradient for.
+
+        Returns:
+            The ``output`` tensor, identical in value but with an added
+            autograd edge to ``aux_loss``.
+        """
+        ctx.save_for_backward(aux_loss)
+        return output
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple:
+        """Inject scaled aux_loss gradient into the backward chain.
+
+        Args:
+            grad_output: Gradient flowing back through ``output``.
+
+        Returns:
+            Tuple of (grad_output unchanged, scaled aux_loss gradient).
+        """
+        (aux_loss,) = ctx.saved_tensors
+        if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                1.0, device=aux_loss.device,
+            )
+        aux_loss_backward_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
+        scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
+        return grad_output, scaled_aux_loss_grad
+
+    @staticmethod
+    def set_loss_scale(scale: torch.Tensor) -> None:
+        """Set the gradient scale for auxiliary loss.
+
+        Should be called before ``loss.backward()`` in the training loop.
+        Uses in-place copy on subsequent calls to avoid tensor reallocation.
+
+        Args:
+            scale: Tensor containing the loss scale value, typically
+                ``1 / (num_microbatches * dp_size)`` or similar.
+        """
+        if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = scale
+        else:
+            MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
 
 # ---------------------------------------------------------------------------
@@ -530,8 +625,16 @@ class MoE(nn.Module):
         score_before_experts: If ``True``, multiply routed tokens by routing
             weights *before* expert computation; otherwise multiply expert
             outputs *after*.  Defaults to ``True``.
-        load_balance_coeff: When not ``None``, attaches an auxiliary load-
-            balance loss as ``output._load_balance_loss``.
+        load_balance_coeff: When not ``None``, enables auxiliary load-balance
+            loss.  The loss gradient is automatically injected into router
+            weights via :class:`MoEAuxLossAutoScaler` (no manual loss
+            addition needed).  The scalar loss value is attached as
+            ``output._load_balance_loss`` for logging purposes.
+        sequence_partition_group: Optional process group spanning the
+            sequence-partition dimension (TP+SP or CP).  When provided,
+            ``expert_fraction`` is all-reduced across this group so the
+            load-balance loss reflects global token distribution.  Defaults
+            to ``None`` (no cross-rank synchronization).
         shared_expert: Optional :class:`FeedForward` running on every token
             in parallel; output added to routed-expert output.
         router_kwargs: Extra keyword arguments forwarded to
@@ -560,6 +663,7 @@ class MoE(nn.Module):
         top_k: int = 1,
         score_before_experts: bool = True,
         load_balance_coeff: Optional[float] = None,
+        sequence_partition_group: Optional[Any] = None,
         shared_expert: Optional[FeedForward] = None,
         router_kwargs: Optional[dict] = None,
         use_grouped_mm: bool = False,
@@ -578,6 +682,9 @@ class MoE(nn.Module):
         self.top_k = top_k
         self.score_before_experts = score_before_experts
         self.load_balance_coeff = load_balance_coeff
+        self.sequence_partition_group = sequence_partition_group
+        self.last_aux_loss: Optional[torch.Tensor] = None
+        self.enable_expert_bias = True
 
         # Auxiliary-loss-free load-balance buffers (no gradient).
         self.register_buffer("expert_bias", torch.zeros(num_experts))
@@ -592,7 +699,9 @@ class MoE(nn.Module):
         Returns:
             Output tensor of shape ``[batch, seq_len, dim]``.  When
             ``load_balance_coeff`` is set, carries a ``_load_balance_loss``
-            attribute with the auxiliary loss scalar.
+            attribute with the auxiliary loss scalar (for logging only;
+            gradient injection is handled automatically by
+            :class:`MoEAuxLossAutoScaler`).
         """
         # Extract local tensor if input arrives as DTensor (TP path).
         if isinstance(x, DTensor):
@@ -610,6 +719,24 @@ class MoE(nn.Module):
         # Accumulate token histogram without creating gradient nodes.
         with torch.no_grad():
             self.tokens_per_expert.add_(token_counts.float())
+
+        # --- Auxiliary load-balance loss ---
+        # Compute aux_loss early and attach it to top_scores via
+        # MoEAuxLossAutoScaler so that backward through top_scores
+        # also triggers aux_loss gradient (injected into router weights).
+        if self.load_balance_coeff is not None:
+            lb_loss = self.load_balance_coeff * _compute_load_balance_loss(
+                top_scores, selected_experts, self.num_experts,
+                sequence_partition_group=self.sequence_partition_group,
+            )
+            # Apply AutoScaler *before* top_scores is used in the forward path
+            # so that the main backward through top_scores triggers aux_loss
+            # gradient injection. Forward values are unchanged.
+            top_scores = MoEAuxLossAutoScaler.apply(top_scores, lb_loss)
+            self.last_aux_loss = lb_loss.detach()
+        else:
+            lb_loss = None
+            self.last_aux_loss = None
 
         # --- Token permutation: token-major → expert-major (inline argsort) ---
         # flat_experts[i] is the expert ID for the i-th (token, top_k) slot.
@@ -657,14 +784,52 @@ class MoE(nn.Module):
 
         result = out.view(bs, seq_len, dim)
 
-        # Auxiliary load-balance loss attached to the returned tensor.
-        if self.load_balance_coeff is not None:
-            lb_loss = self.load_balance_coeff * _compute_load_balance_loss(
-                top_scores, selected_experts, self.num_experts
-            )
+        # Attach auxiliary loss to the returned tensor for logging.
+        if lb_loss is not None:
             result._load_balance_loss = lb_loss  # pylint: disable=protected-access
 
         return result
+
+    def update_expert_bias(
+        self,
+        lr: float = 1e-3,
+        num_recomputations: int = 1,
+    ) -> None:
+        """Update expert bias for auxiliary-loss-free load balancing.
+
+        Should be called once per training step after the optimizer step.
+        Adjusts ``expert_bias`` to push token load towards the mean, then
+        resets the ``tokens_per_expert`` accumulator.
+
+        The update delta is centered to have zero mean, preventing systematic
+        drift of all bias values over time.
+
+        When activation checkpoint is enabled, forward is re-executed during
+        backward, causing ``tokens_per_expert`` to accumulate twice (or more).
+        Use ``num_recomputations`` to correct for this double-counting.
+
+        Args:
+            lr: Step size for the bias update.  Defaults to ``1e-3``.
+            num_recomputations: Number of times forward is executed per optimizer
+                step. Default ``1`` (normal training). Set to ``2`` when activation
+                checkpoint is enabled (forward + recompute during backward). For
+                nested checkpoint strategies, set to the actual execution count.
+
+        Example::
+            >>> # Single-card scenario without activation checkpoint:
+            >>> moe_layer.update_expert_bias(lr=1e-3)
+            >>>
+            >>> # With activation checkpoint (forward executed twice):
+            >>> moe_layer.update_expert_bias(lr=1e-3, num_recomputations=2)
+        """
+        with torch.no_grad():
+            if num_recomputations > 1:
+                self.tokens_per_expert.div_(num_recomputations)
+            avg = self.tokens_per_expert.float().mean()
+            delta = lr * (avg - self.tokens_per_expert.float()).sign()
+            delta = delta - delta.mean()
+            self.expert_bias.data += delta
+            self.tokens_per_expert.zero_()
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +842,9 @@ def update_expert_bias(
     num_recomputations: int = 1,
 ) -> None:
     """Update expert bias for auxiliary-loss-free load balancing.
+
+    This is a module-level wrapper that calls ``moe.update_expert_bias()``.
+    Prefer calling the instance method directly.
 
     Should be called once per training step after the optimizer step.
     Adjusts ``moe.expert_bias`` to push token load towards the mean, then
@@ -704,11 +872,4 @@ def update_expert_bias(
         >>> # With activation checkpoint (forward executed twice):
         >>> update_expert_bias(moe_layer, lr=1e-3, num_recomputations=2)
     """
-    with torch.no_grad():
-        if num_recomputations > 1:
-            moe.tokens_per_expert.div_(num_recomputations)
-        avg = moe.tokens_per_expert.float().mean()
-        delta = lr * (avg - moe.tokens_per_expert.float()).sign()
-        delta = delta - delta.mean()
-        moe.expert_bias.data += delta
-        moe.tokens_per_expert.zero_()
+    moe.update_expert_bias(lr=lr, num_recomputations=num_recomputations)

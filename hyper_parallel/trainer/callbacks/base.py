@@ -224,6 +224,12 @@ class LoggingCallback(Callback):
                 metrics["tflops"] = f"{observed_tflops:.1f}"
                 metrics["mfu"] = f"{mfu * 100:.1f}%"
 
+        # Include aux_loss from MoEMonitorCallback when available.
+        moe_cb = getattr(self.trainer, 'moe_monitor_callback', None)
+        aux_loss = getattr(moe_cb, 'last_mean_aux_loss', None) if moe_cb is not None else None
+        if aux_loss is not None:
+            metrics["aux_loss"] = f"{aux_loss:.6f}"
+
         logger.info_rank0(" | ".join(f"{k}={v}" for k, v in metrics.items()))
 
         record = {
@@ -233,6 +239,7 @@ class LoggingCallback(Callback):
             "lr": lr,
             "step_time": elapsed,
             "tokens_per_sec": tokens_per_sec,
+            "aux_loss": aux_loss,
         }
         state.log_history.append(record)
 
@@ -642,25 +649,82 @@ class ProgressCallback(Callback):
             self._pbar = None
 
 class MoEMonitorCallback(Callback):
-    """Mixture-of-Experts load-balancing monitor stub.
+    """Mixture-of-Experts load-balancing monitor.
 
-    Tracks expert routing statistics (token counts per expert, load imbalance)
-    during training.  Full implementation requires MoE-specific hooks in the
-    model's router; this stub logs a one-time info message so it is visible
-    in logs when enabled.
+    Delegates to :class:`~hyper_parallel.core.moe_utils.MoEMonitorCallback`
+    for expert bias updates and aux_loss aggregation.  Exposes
+    ``last_mean_aux_loss`` so that :class:`LoggingCallback` can include it
+    in the main training loss log line.
+
+    Config: ``cfg.train.moe_monitor.*`` (see :class:`MoEMonitorConfig`).
     """
 
     def __init__(self, trainer: "BaseTrainer") -> None:
+        """Initialize MoEMonitorCallback from trainer config."""
         super().__init__(trainer)
         moe_cfg = getattr(trainer.args, 'moe_monitor', None)
         self.enabled = getattr(moe_cfg, 'enabled', False) if moe_cfg else False
+        self._impl = None
+
+        if self.enabled:
+            from hyper_parallel.core.moe_utils import (  # pylint: disable=C0415
+                MoEMonitorCallback as _CoreMoEMonitorCallback,
+            )
+            from hyper_parallel.core.fully_shard.hsdp_utils import (  # pylint: disable=C0415
+                GroupInfo,
+            )
+            lr = getattr(moe_cfg, 'lr', 1e-3)
+            num_recomputations = getattr(moe_cfg, 'num_recomputations', 1)
+
+            # Resolve DP/TP/CP groups from trainer's device mesh.
+            dp_group = getattr(self.trainer, '_dp_group_info', None)
+            tp_group = None
+            cp_group = None
+            mesh = getattr(self.trainer, 'mesh', None)
+            if mesh is not None:
+                for name, attr_name in [("tp", "tp_group"), ("cp", "cp_group")]:
+                    try:
+                        raw_group = mesh.get_group(name)
+                        group_info = GroupInfo(
+                            group_name=name, group=raw_group,
+                            rank_size=raw_group.size(),
+                        )
+                        if attr_name == "tp_group":
+                            tp_group = group_info
+                        else:
+                            cp_group = group_info
+                    except (KeyError, ValueError, AttributeError):
+                        pass
+
+            self._impl = _CoreMoEMonitorCallback(
+                model=self.trainer.model,
+                lr=lr,
+                dp_group=dp_group,
+                tp_group=tp_group,
+                cp_group=cp_group,
+                num_recomputations=num_recomputations,
+            )
+
+    @property
+    def last_mean_aux_loss(self) -> Optional[float]:
+        """Mean aux_loss across MoE layers from the last ``on_step_end``."""
+        if self._impl is not None:
+            return self._impl.last_mean_aux_loss
+        return None
 
     def on_train_begin(self, state: "TrainerState", **kwargs) -> None:
+        """Log one-time confirmation when MoE monitoring is enabled."""
         if self.enabled and platform.get_rank() == 0:
-            logger.info(
-                "MoEMonitorCallback: MoE expert-load monitoring enabled "
-                "(stub — full implementation pending model router hooks)"
-            )
+            logger.info("MoEMonitorCallback: MoE expert-load monitoring enabled")
+
+    def on_step_end(self, state: "TrainerState", *, loss: float = None,
+                    grad_norm: float = None, **kwargs) -> None:
+        """Delegate expert bias update to core MoEMonitorCallback."""
+        if self._impl is not None:
+            self._impl.on_step_end()
+
+    def on_substep_end(self, state: "TrainerState", **kwargs) -> None:
+        """No-op; expert bias updates happen in on_step_end."""
 
 class GradientHealthCallback(Callback):
     """Detect NaN / Inf grad_norm and raise / warn.

@@ -159,8 +159,10 @@ for internal application, enabling memory savings during activation checkpointin
   scores; updated externally via `update_expert_bias()`.
 - `tokens_per_expert` buffer — accumulates expert load counts across forward
   calls; reset by `update_expert_bias()`.
-- `load_balance_coeff` — when set, attaches `_load_balance_loss` to the output
-  tensor for auxiliary loss computation.
+- `load_balance_coeff` — when set, enables auxiliary load-balance loss.  The
+  loss gradient is automatically injected into router weights via
+  `MoEAuxLossAutoScaler` (no manual loss addition needed).  The scalar loss
+  value is attached as `output._load_balance_loss` for logging.
 
 ```python
 def update_expert_bias(
