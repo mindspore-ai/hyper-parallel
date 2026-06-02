@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""ST entry for ``.claude/agents/init.md`` meta -> to_empty -> reset_parameters (MindSpore)."""
+"""ST entry for the meta init_empty_weights -> to_empty -> reset_parameters flow (MindSpore)."""
 
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import MindSporeCase, parallel_run

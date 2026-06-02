@@ -60,7 +60,7 @@ def init_mint_normal(dtensor):
 
 
 class VocabEmbedding(nn.Cell):
-    """Vocabulary embedding from ``.claude/agents/init.md`` pseudo-code."""
+    """Vocabulary embedding for the empty-weights / reset_parameter flow."""
 
     def __init__(
         self,

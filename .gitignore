@@ -59,9 +59,6 @@ venv/
 *.swp
 
 # tools
-.cursorignore
-.claude/settings.local.json
-.claude/local/
 .omo/
 
 # SAPP-ND generated files

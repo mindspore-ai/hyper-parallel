@@ -15,7 +15,7 @@
 """Offline checkpoint conversion: Hugging Face safetensors layout and HyperParallel DCP.
 
 Covers **full checkpoint** (unsharded weights) and **shard checkpoint** (e.g. HF multi-file safetensors),
-``state_dict`` validation, HF-style save/load, and DCP read/write (see ``.claude/rules/offline_transform.md``).
+``state_dict`` validation, HF-style save/load, and DCP read/write (see ``.agent/rules/offline_transform.md``).
 
 Public symbols are listed in ``__all__``; sharding helpers and split types are internal.
 """
