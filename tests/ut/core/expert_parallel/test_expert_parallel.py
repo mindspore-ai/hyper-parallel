@@ -337,13 +337,14 @@ class TestExpertParallelDispatch(unittest.TestCase):
         """
         self._call_dispatch(mock_platform)
         # rank0 block: 3+2=5, rank1 block: 1+4=5
+        input_splits, output_splits, _, _ = self.ep._state_stack()[-1]
         self.assertEqual(
-            self.ep._input_splits, [5, 5],
-            f"_input_splits={self.ep._input_splits}, expected [5, 5]"
+            input_splits, [5, 5],
+            f"input_splits={input_splits}, expected [5, 5]"
         )
         self.assertEqual(
-            self.ep._output_splits, [5, 5],
-            f"_output_splits={self.ep._output_splits}, expected [5, 5]"
+            output_splits, [5, 5],
+            f"output_splits={output_splits}, expected [5, 5]"
         )
 
     @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
@@ -365,15 +366,19 @@ class TestExpertParallelDispatch(unittest.TestCase):
     def test_dispatch_saves_state_for_combine(self, mock_platform):
         """
         Feature: ExpertParallel._token_dispatch state preservation
-        Description: After dispatch, _input_splits, _output_splits,
-            _input_shape, and _permuted_indices are saved for use by combine.
-        Expectation: all four state attributes are not None / non-empty
+        Description: After dispatch, input_splits, output_splits, input_shape,
+            and permuted_indices are pushed onto the per-thread state stack
+            for use by combine.
+        Expectation: one entry on the stack with four non-None components
         """
         self._call_dispatch(mock_platform)
-        self.assertIsNotNone(self.ep._input_splits, "_input_splits should be set")
-        self.assertIsNotNone(self.ep._output_splits, "_output_splits should be set")
-        self.assertIsNotNone(self.ep._input_shape, "_input_shape should be set")
-        self.assertIsNotNone(self.ep._permuted_indices, "_permuted_indices should be set")
+        stack = self.ep._state_stack()
+        self.assertEqual(len(stack), 1, f"stack depth={len(stack)}, expected 1")
+        input_splits, output_splits, input_shape, permuted_indices = stack[-1]
+        self.assertIsNotNone(input_splits, f"input_splits should be set, got {input_splits}")
+        self.assertIsNotNone(output_splits, f"output_splits should be set, got {output_splits}")
+        self.assertIsNotNone(input_shape, f"input_shape should be set, got {input_shape}")
+        self.assertIsNotNone(permuted_indices, f"permuted_indices should be set, got {permuted_indices}")
 
 
 # ---------------------------------------------------------------------------
@@ -486,10 +491,11 @@ class TestExpertParallelCombine(unittest.TestCase):
         call_args_list = mock_platform.differentiable_all_to_all_single.call_args_list
         # call_args_list[0] = dispatch call, call_args_list[1] = combine call
         self.assertGreaterEqual(len(call_args_list), 2)
+        dispatch_call = call_args_list[0]
         combine_call = call_args_list[1]
         # positional args: (inp, input_splits, output_splits, group)
+        dispatch_output_splits = dispatch_call.args[2]
         combine_input_splits = combine_call.args[1]
-        dispatch_output_splits = self.ep._output_splits
         self.assertEqual(
             combine_input_splits, dispatch_output_splits,
             (f"combine input_splits={combine_input_splits} "

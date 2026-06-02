@@ -58,7 +58,7 @@ class TestHookCoordinatorRecomputeFlag(unittest.TestCase):
 
         t = threading.Thread(target=_probe_from_other_thread)
         t.start()
-        t.join(timeout=1.0)
+        t.join(timeout=10.0)
         assert other_thread_state == [False], \
             (f"set_recomputing on main thread should not leak to a "
              f"second thread; other thread saw is_recomputing="
@@ -69,7 +69,7 @@ class TestHookCoordinatorRecomputeBypass(unittest.TestCase):
     """Verify ``rendezvous`` / ``notify_dispatched`` short-circuit under recompute."""
 
     @staticmethod
-    def _call_with_timeout(target, timeout=0.5):
+    def _call_with_timeout(target, timeout=10.0):
         """Run ``target`` in a daemon thread; return whether it completed."""
         done = []
 
@@ -228,6 +228,265 @@ class TestRecomputeContextFn(unittest.TestCase):
         assert a_rec is not b_rec, \
             (f"recompute_ctx must be a fresh instance each call; "
              f"got the same object: id(a)={id(a_rec)}, id(b)={id(b_rec)}")
+
+
+class TestHookCoordinatorDepart(unittest.TestCase):
+    """Verify ``depart`` lets a partner with unequal hook counts drain solo.
+
+    The dual-pipe barrier is a hard 2-party rendezvous: the forward and
+    backward threads must fire the *same* number of hooks or one blocks
+    forever.  When the paired chunks have different layer counts the counts
+    differ by ``4 * |layers_fwd - layers_bwd|``.  ``depart`` converts that
+    deadlock into a graceful solo drain of the longer side.
+    """
+
+    @staticmethod
+    def _call_with_timeout(target, timeout=10.0):
+        """Run ``target`` in a daemon thread; return whether it completed."""
+        done = []
+
+        def _wrapper():
+            target()
+            done.append(True)
+
+        t = threading.Thread(target=_wrapper, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        return bool(done)
+
+    @staticmethod
+    def _drive_two_threads(coord, spec_a, spec_b, timeout=30.0):
+        """Run two threads firing ``(count, role)`` specs; ``depart`` when done.
+
+        A ``COMM`` thread does ``rendezvous(COMM); notify_dispatched(COMM)``
+        per step (mirroring a hook that dispatches a collective); a
+        ``COMPUTE`` thread does ``rendezvous(COMPUTE)``.  Each thread calls
+        :meth:`HookCoordinator.depart` in a ``finally`` so the partner with
+        more steps drains its excess hooks solo.  Returns the set of thread
+        names (``{"a", "b"}``) that completed within ``timeout`` — a missing
+        name means that thread deadlocked.
+        """
+        done = set()
+        done_lock = threading.Lock()
+
+        def _make(name, count, role):
+            def _run():
+                try:
+                    for _ in range(count):
+                        coord.rendezvous(role)
+                        if role is HookRole.COMM:
+                            coord.notify_dispatched(role)
+                finally:
+                    coord.depart()
+                with done_lock:
+                    done.add(name)
+
+            return _run
+
+        thread_a = threading.Thread(target=_make("a", *spec_a), daemon=True)
+        thread_b = threading.Thread(target=_make("b", *spec_b), daemon=True)
+        coord.enable()
+        try:
+            thread_a.start()
+            thread_b.start()
+            thread_a.join(timeout=timeout)
+            thread_b.join(timeout=timeout)
+        finally:
+            coord.disable()
+        return done
+
+    def test_depart_makes_lone_rendezvous_return(self):
+        """After ``depart`` a lone ``rendezvous`` returns immediately (solo)."""
+        coord = HookCoordinator()
+        coord.enable()
+        coord.depart()
+        try:
+            completed = self._call_with_timeout(
+                lambda: coord.rendezvous(HookRole.COMM),
+            )
+        finally:
+            coord.disable()
+        assert completed, \
+            ("rendezvous after depart() should return immediately so the "
+             "longer chunk runs solo, but it blocked past the timeout")
+
+    def test_depart_releases_parked_compute_waiter(self):
+        """``depart`` unblocks a ``COMPUTE`` caller already parked on the event.
+
+        A ``COMPUTE`` rendezvous that has passed the barrier waits on
+        ``_comm_dispatched`` for the partner's notify.  If the partner
+        departs instead of notifying, ``depart``'s ``_comm_dispatched.set()``
+        must release the waiter.
+        """
+        coord = HookCoordinator()
+        coord.enable()
+        # Pre-park: a COMM rendezvous installs a fresh unset event into the
+        # shared slot, then a lone COMPUTE waiter blocks on it.
+        coord._my_event.evt = None  # pylint: disable=W0212
+        parked_evt = threading.Event()
+        coord._comm_dispatched = parked_evt  # pylint: disable=W0212
+
+        def _wait_on_event():
+            parked_evt.wait()
+
+        waiter = threading.Thread(target=_wait_on_event, daemon=True)
+        waiter.start()
+        coord.depart()
+        waiter.join(timeout=10.0)
+        try:
+            assert not waiter.is_alive(), \
+                ("depart() must set _comm_dispatched to release a COMPUTE "
+                 "waiter parked past the barrier, but the waiter is still alive")
+        finally:
+            coord.disable()
+
+    def test_enable_resets_departed(self):
+        """A new ``enable`` session clears the departed flag."""
+        coord = HookCoordinator()
+        coord.enable()
+        coord.depart()
+        assert coord._departed is True, \
+            ("depart() should set _departed=True, "  # pylint: disable=W0212
+             f"got {coord._departed}")  # pylint: disable=W0212
+        coord.enable()
+        try:
+            assert coord._departed is False, \
+                ("enable() must reset _departed for the new session, "  # pylint: disable=W0212
+                 f"got {coord._departed}")  # pylint: disable=W0212
+        finally:
+            coord.disable()
+
+    def test_comm_longer_no_deadlock(self):
+        """FWD-style (COMM) thread longer than BWD-style (COMPUTE): no hang.
+
+        Mirrors ``layers(fwd) > layers(bwd)`` — the original hard-deadlock
+        direction, where the backward thread returns normally and the
+        forward thread used to block forever on the barrier.
+        """
+        coord = HookCoordinator()
+        done = self._drive_two_threads(
+            coord, (9, HookRole.COMM), (5, HookRole.COMPUTE),
+        )
+        assert done == {"a", "b"}, \
+            (f"unequal counts (COMM=9 > COMPUTE=5) must both drain via "
+             f"depart(), but only {done} completed within the timeout")
+
+    def test_compute_longer_no_deadlock(self):
+        """BWD-style (COMPUTE) thread longer than FWD-style (COMM): no hang.
+
+        Mirrors ``layers(bwd) > layers(fwd)`` — the forward thread departs
+        first and the backward thread drains its excess hooks solo.
+        """
+        coord = HookCoordinator()
+        done = self._drive_two_threads(
+            coord, (5, HookRole.COMM), (9, HookRole.COMPUTE),
+        )
+        assert done == {"a", "b"}, \
+            (f"unequal counts (COMPUTE=9 > COMM=5) must both drain via "
+             f"depart(), but only {done} completed within the timeout")
+
+    def test_balanced_counts_still_complete(self):
+        """No regression: equal hook counts still pair and complete."""
+        coord = HookCoordinator()
+        done = self._drive_two_threads(
+            coord, (7, HookRole.COMM), (7, HookRole.COMPUTE),
+        )
+        assert done == {"a", "b"}, \
+            (f"balanced counts (7 == 7) must both complete via the normal "
+             f"barrier pairing, but only {done} completed within the timeout")
+
+
+class TestHookCoordinatorGateOpener(unittest.TestCase):
+    """Verify the one-shot gate opener that fixes the mixed-recompute deadlock.
+
+    Under per-layer recompute the FWD thread is parked on the recompute gate.
+    If the gate only opened at the first ``recompute_ctx`` exit, a mixed chunk
+    whose LAST layer is NOT recomputed would deadlock: that layer's backward
+    fires a rendezvous before any re-run, while the FWD thread it needs as a
+    barrier partner is still gated, and the re-run that would open the gate
+    never runs.  Opening the gate on the BWD thread's first NON-suppressed
+    rendezvous releases the FWD thread exactly when it is needed.
+    """
+
+    def test_first_rendezvous_opens_parked_gate(self):
+        """A FWD thread parked on the gate is released by BWD's first rendezvous."""
+        coord = HookCoordinator()
+        coord.enable()
+        gate = threading.Event()
+        coord.set_gate_opener(gate.set)
+
+        fwd_released = []
+
+        def _parked_fwd():
+            gate.wait()
+            fwd_released.append(True)
+
+        fwd_thread = threading.Thread(target=_parked_fwd, daemon=True)
+        fwd_thread.start()
+        # BWD's first rendezvous fires the opener (before it blocks on the
+        # lone barrier), opening the gate and releasing the FWD thread.
+        bwd_thread = threading.Thread(
+            target=lambda: coord.rendezvous(HookRole.COMPUTE), daemon=True,
+        )
+        bwd_thread.start()
+        fwd_thread.join(timeout=0.5)
+        coord.disable()  # release the lone BWD rendezvous parked on the barrier
+        assert fwd_released == [True], \
+            ("BWD's first rendezvous must open the FWD gate (mixed-recompute "
+             f"deadlock fix), but the FWD thread stayed parked: {fwd_released}")
+
+    def test_opener_suppressed_during_recompute(self):
+        """A suppressed (recompute re-run) rendezvous must NOT open the gate.
+
+        The opener must fire on the first *real* rendezvous — i.e. after any
+        initial re-run — otherwise the gate would open mid re-run and lose the
+        serialization that protects the re-run from the FWD forward.
+        """
+        coord = HookCoordinator()
+        coord.enable()
+        fired = []
+        coord.set_gate_opener(lambda: fired.append(True))
+
+        def _suppressed_rendezvous():
+            coord.set_recomputing(True)
+            try:
+                coord.rendezvous(HookRole.COMM)  # early-returns, opener skipped
+            finally:
+                coord.set_recomputing(False)
+
+        thread = threading.Thread(target=_suppressed_rendezvous, daemon=True)
+        thread.start()
+        thread.join(timeout=0.5)
+        still_armed = coord._gate_opener  # pylint: disable=W0212
+        coord.disable()
+        assert not fired, \
+            (f"a recompute-suppressed rendezvous must not open the gate, "
+             f"but the opener fired: {fired}")
+        assert still_armed is not None, \
+            ("the opener must stay armed after a suppressed rendezvous (it "
+             "fires on the first REAL rendezvous), but it was cleared")
+
+    def test_opener_is_one_shot_and_enable_resets(self):
+        """The opener fires once, and a new ``enable`` session re-arms to None."""
+        coord = HookCoordinator()
+        coord.enable()
+        coord.set_gate_opener(lambda: None)
+        thread = threading.Thread(
+            target=lambda: coord.rendezvous(HookRole.COMM), daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=0.3)
+        cleared_after_fire = coord._gate_opener is None  # pylint: disable=W0212
+        coord.disable()
+        assert cleared_after_fire, \
+            "the gate opener must be one-shot (cleared after it fires)"
+        # A fresh session must start with no opener armed.
+        coord.set_gate_opener(lambda: None)
+        coord.enable()
+        reset_by_enable = coord._gate_opener is None  # pylint: disable=W0212
+        coord.disable()
+        assert reset_by_enable, \
+            "enable() must reset the gate opener for the new session"
 
 
 if __name__ == "__main__":

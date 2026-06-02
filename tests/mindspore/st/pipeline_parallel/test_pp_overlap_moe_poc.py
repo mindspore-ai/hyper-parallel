@@ -44,30 +44,78 @@ def test_pp_overlap_moe_end_to_end():
                12351, worker_num=8, local_worker_num=8)
 
 
-#@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
-#          card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_recompute():
-    """End-to-end smoke check: PP+EP+overlap + ``ms.recompute(use_reentrant=False)``.
+    """PP+EP+overlap + activation checkpoint via ``overlap.wrap_checkpoint``.
 
-    Feature: HookCoordinator recompute bypass via context_fn.
+    Feature: ``CommComputeOverlap.wrap_checkpoint`` and
+        :func:`hyper_parallel.core.activation_checkpoint.checkpoint`'s
+        ``context_fn`` plumbing.
     Description:
         8 ranks, PP=4 × EP=2.  Same topology as
-        :func:`test_pp_overlap_moe_end_to_end` but every chunk is
-        wrapped in ``ms.recompute(use_reentrant=False, context_fn=
-        coord.recompute_context_fn)``.  The ``context_fn`` brackets
-        the backward-time forward re-run with
-        ``set_recomputing(True/False)`` so the re-run's A/B/C/D and
-        CHUNK_START/CHUNK_END hooks become no-ops and the BWD-paired
-        rendezvous count stays balanced.
+        :func:`test_pp_overlap_moe_end_to_end` but each chunk is wrapped
+        via ``CommComputeOverlap.wrap_checkpoint`` — the public helper
+        that composes the coordinator's hook-bypass with the
+        ``_fwd_gate`` event inside
+        ``hyper_parallel.core.activation_checkpoint.checkpoint``, so the
+        BWD-time re-run runs serially and only the grad phase overlaps
+        with the FWD thread.  Serializing the re-run is required on MS
+        PyNative, whose autograd executor does not support concurrent
+        FWD-record + BWD-replay; calling ``ms.recompute`` directly under
+        overlap_b_f deadlocks.
     Expectation:
-        Iteration completes without deadlock, grads non-zero on at
-        least some params.  A deadlock here usually means the
-        recompute bypass is not bracketing the re-run (e.g. someone
-        passed ``use_reentrant=True``, which is the MindSpore default
-        and is *not* hookable from Python).
+        Iteration completes without deadlock and yields non-zero grads.
+        A deadlock here usually means ``context_fn`` was lost between
+        :func:`checkpoint` and ``ms.recompute``, or the FWD gate was
+        not opened on ``recompute_ctx`` exit.
     """
-    msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_recompute_smoke",
+    msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_recompute",
                12353, worker_num=8, local_worker_num=8)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_pp_overlap_moe_recompute_per_layer():
+    """Per-layer (multi-segment) activation checkpoint under overlap_b_f.
+
+    Feature: per-layer (multi-segment) recompute composing with overlap_b_f.
+    Description:
+        8 ranks, PP=4 × EP=2.  Each chunk wraps EACH layer in its own
+        ``checkpoint`` segment (``_MoEChunk.enable_per_layer_recompute``), so
+        backward performs multiple re-runs.  The FWD recompute gate opens on
+        the BWD thread's first grad-phase rendezvous, so the re-runs serialize
+        against the FWD forward via the barrier.  Compares overlap+recompute
+        grads against a sync baseline.
+    Expectation:
+        No deadlock; grads and last-rank losses match the sync baseline
+        within ``rtol=1e-3, atol=1e-3``.
+    """
+    msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_recompute_per_layer",
+               12355, worker_num=8, local_worker_num=8)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_pp_overlap_moe_recompute_mixed():
+    """Mixed per-layer recompute (some layers recompute, some don't) under overlap_b_f.
+
+    Feature: mixed per-layer recompute — the case op-granularity SAC cannot
+        express and that the single-``_fwd_gate`` opening (at first
+        ``recompute_ctx`` exit) used to deadlock.
+    Description:
+        8 ranks, PP=4 × EP=2, 2 layers per chunk.  Only layer 0 of each chunk
+        is recomputed; layer 1 runs directly.  Because the non-recomputed
+        last layer's backward fires a rendezvous before the first re-run, this
+        only avoids deadlock once the gate opens on the BWD thread's first
+        rendezvous (``HookCoordinator.set_gate_opener``).  Compares grads
+        against a sync baseline.
+    Expectation:
+        No deadlock; grads and last-rank losses match the sync baseline
+        within ``rtol=1e-3, atol=1e-3``.
+    """
+    msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_recompute_mixed",
+               12356, worker_num=8, local_worker_num=8)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
@@ -93,3 +141,25 @@ def test_pp_overlap_moe_accuracy():
     """
     msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_accuracy",
                12352, worker_num=8, local_worker_num=8)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_pp_overlap_moe_variable_layers():
+    """Heterogeneous per-chunk layer counts under overlap_b_f.
+
+    Feature: ``HookCoordinator.depart`` graceful one-party-left drain.
+    Description:
+        8 ranks, PP=4 × EP=2.  Each PP rank holds 2 interleaved chunks
+        with ``[3, 2]`` MoE layers (NOT uniform), so every OVERLAP_B_F
+        step in the 1F1B steady state pairs a BWD and FWD chunk of
+        different layer counts.  The dual-thread rendezvous counts then
+        differ by a full layer; without ``depart`` the shorter chunk's
+        thread returns and the longer chunk's thread blocks forever on
+        the 2-party barrier.  Compares overlap vs sync-baseline grads.
+    Expectation:
+        Iteration completes without deadlock; grads and per-micro-batch
+        losses match the sync baseline within ``rtol=1e-3, atol=1e-3``.
+    """
+    msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_variable_layers",
+               12354, worker_num=8, local_worker_num=8)

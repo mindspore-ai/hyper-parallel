@@ -16,7 +16,7 @@
 import contextlib
 import enum
 from functools import partial
-from typing import Any
+from typing import Any, Callable, Optional, Tuple
 
 from hyper_parallel.platform import get_platform
 plat = get_platform()
@@ -58,7 +58,91 @@ class CheckpointPolicy(enum.Enum):
     MUST_SWAP = 4
 
 
-def checkpoint(function, *args, swap_inputs=False, policy_fn=None, group_swap=False, **kwargs):
+def keep_collectives_policy(ctx, op, *args, **kwargs):  # pylint: disable=W0613
+    """Selective-checkpoint policy: keep communication, recompute compute.
+
+    Returns :attr:`CheckpointPolicy.MUST_SAVE` for communication collectives
+    (all-to-all / all-reduce / all-gather / reduce-scatter / broadcast, detected
+    via :meth:`hyper_parallel.platform.Platform.is_collective_op`) and
+    :attr:`CheckpointPolicy.PREFER_RECOMPUTE` for every other (compute) op.
+
+    Pass it as the ``policy_fn`` of :func:`checkpoint` when checkpointing a
+    region that issues collectives under a dual-thread comm/compute overlap
+    schedule.  The backward-time re-run then RESTORES each saved collective
+    output instead of re-issuing the collective, so the re-run collective
+    cannot race the peer thread's collective on the shared process group —
+    removing the numerical nondeterminism an un-serialised re-run collective
+    would inject, while still recomputing (and saving the memory of) compute.
+
+    Args:
+        ctx: Selective-checkpoint context (unused; present for the
+            ``policy_fn(ctx, op, *args, **kwargs)`` contract).
+        op: The op being dispatched.
+        *args: ``op`` positional arguments (unused).
+        **kwargs: ``op`` keyword arguments (unused).
+
+    Returns:
+        ``CheckpointPolicy.MUST_SAVE`` if ``op`` is a collective, else
+        ``CheckpointPolicy.PREFER_RECOMPUTE``.
+
+    Example:
+        >>> from hyper_parallel.core.activation_checkpoint import (
+        ...     checkpoint, keep_collectives_policy,
+        ... )
+        >>> out = checkpoint(layer, x, policy_fn=keep_collectives_policy)  # doctest: +SKIP
+    """
+    if plat.is_collective_op(op):
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+class _StackedCtx:
+    """Compose multiple context managers as one — enter in order, exit reversed."""
+
+    def __init__(self, ctxs) -> None:
+        self._ctxs = list(ctxs)
+        self._stack = contextlib.ExitStack()
+
+    def __enter__(self):
+        self._stack.__enter__()
+        for ctx in self._ctxs:
+            self._stack.enter_context(ctx)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._stack.__exit__(exc_type, exc_val, exc_tb)
+
+
+def _compose_context_fns(
+    factories: Tuple[Callable[[], Tuple[object, object]], ...],
+) -> Callable[[], Tuple[_StackedCtx, _StackedCtx]]:
+    """Combine ``(forward_ctx, recompute_ctx)`` factories into one factory.
+
+    ``ms.recompute`` / ``torch.utils.checkpoint(use_reentrant=False)`` call
+    ``context_fn()`` once per invocation and unpack the result as
+    ``(forward_ctx, recompute_ctx)``.  This helper calls each input factory
+    once, then stacks all forward contexts and all recompute contexts into
+    two :class:`_StackedCtx` instances so the composite respects the
+    single-call contract.
+    """
+    def factory() -> Tuple[_StackedCtx, _StackedCtx]:
+        pairs = [fn() for fn in factories]
+        fwd_ctxs = [pair[0] for pair in pairs]
+        rec_ctxs = [pair[1] for pair in pairs]
+        return _StackedCtx(fwd_ctxs), _StackedCtx(rec_ctxs)
+
+    return factory
+
+
+def checkpoint(
+    function,
+    *args,
+    swap_inputs: bool = False,
+    policy_fn: Optional[Callable] = None,
+    context_fn: Optional[Callable[[], Tuple[object, object]]] = None,
+    group_swap: bool = False,
+    **kwargs,
+):
     """
     Apply activation checkpointing to a function with optional input swapping.
 
@@ -67,19 +151,41 @@ def checkpoint(function, *args, swap_inputs=False, policy_fn=None, group_swap=Fa
         *args: Arguments to pass to the function.
         swap_inputs (bool): Whether to enable input swapping using async_save_on_cpu context.
         policy_fn (callable, optional): Function that determines checkpoint policy for operations.
+        context_fn (callable, optional): A no-arg factory returning a
+            ``(forward_ctx, recompute_ctx)`` pair, matching the
+            ``context_fn`` contract of ``ms.recompute(use_reentrant=False)``
+            and ``torch.utils.checkpoint(use_reentrant=False)``.  Use this
+            to bracket the backward-time forward re-run with custom logic
+            such as
+            :meth:`hyper_parallel.core.pipeline_parallel.CommComputeOverlap.make_recompute_context_fn`.
+            When ``policy_fn``, ``group_swap`` and ``context_fn`` are
+            supplied together, the resulting factories are composed: their
+            forward and recompute contexts are stacked so all enter in
+            order and exit in reverse.
         group_swap (bool, optional): Whether MUST_SWAP tensors participate in group copy fusion. Default: ``False``.
         **kwargs: Additional keyword arguments to pass to the function.
 
     Returns:
         The result of applying the function with checkpointing.
     """
-    context_fn = (
-        partial(plat.create_selective_checkpoint_contexts, policy_fn, group_swap=group_swap)
-        if policy_fn or group_swap else plat.noop_context_fn
-    )
+    factories: list = []
+    if policy_fn is not None or group_swap:
+        factories.append(partial(plat.create_selective_checkpoint_contexts, policy_fn, group_swap=group_swap))
+    if context_fn is not None:
+        factories.append(context_fn)
+
+    if not factories:
+        composed_context_fn = plat.noop_context_fn
+    elif len(factories) == 1:
+        composed_context_fn = factories[0]
+    else:
+        composed_context_fn = _compose_context_fns(tuple(factories))
+
     context = plat.async_save_on_cpu if swap_inputs else contextlib.nullcontext
     with context():
-        return plat.checkpoint(function, *args, context_fn=context_fn, use_reentrant=False, **kwargs)
+        return plat.checkpoint(
+            function, *args, context_fn=composed_context_fn, use_reentrant=False, **kwargs
+        )
 
 
 def swap(function, *args, policy_fn=None, **kwargs):
