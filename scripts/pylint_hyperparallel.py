@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Project-specific pylint checks aligned with .claude/rules/code-style.md."""
+"""Project-specific pylint checks aligned with .agent/rules/code-style.md."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
     "limitations under the License.",
 )
 BACKEND_IMPORTS = {"torch", "mindspore"}
-PLATFORM_ALLOWED_PARTS = ("hyper_parallel/platform/", "tests/", "scripts/", ".claude/")
+PLATFORM_ALLOWED_PARTS = ("hyper_parallel/platform/", "tests/", "scripts/", ".agent/")
 PUBLIC_MAGIC_ALLOWLIST = {
     "__init__", "__call__", "__enter__", "__exit__", "__iter__", "__next__",
     "__len__", "__getitem__", "__setitem__", "__delitem__", "__contains__",
@@ -172,7 +172,7 @@ class HyperParallelChecker(BaseChecker):
         """
         if not _is_platform_agnostic_module(self._module_path):
             return
-        for name, _alias in node.names:
+        for name, _ in node.names:
             root_name = name.split(".", maxsplit=1)[0]
             if root_name in BACKEND_IMPORTS:
                 self.add_message("forbidden-backend-import", node=node, args=(name,))

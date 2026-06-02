@@ -1,0 +1,21 @@
+#!/bin/bash
+# Git commit-msg hook: reject commit messages containing AI-assistant attribution trailers.
+# Install: cp .agent/hooks/commit-msg .git/hooks/commit-msg && chmod +x .git/hooks/commit-msg
+#
+# This hook runs for all git commits (editor/agent UI and manual git commit).
+# autogit commit also validates via commit_msg_check.py before calling git.
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+CHECK_SCRIPT="${REPO_ROOT}/.agent/skills/autogit/scripts/commit_msg_check.py"
+
+if [ -z "$1" ]; then
+  echo "commit-msg hook: no message file path" >&2
+  exit 1
+fi
+
+if [ ! -f "$CHECK_SCRIPT" ]; then
+  exit 0
+fi
+
+python3 "$CHECK_SCRIPT" "$1"
+exit $?
