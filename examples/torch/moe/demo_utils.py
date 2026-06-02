@@ -19,6 +19,7 @@ import os
 
 import torch
 import torch.distributed as dist
+import torch_npu  # pylint: disable=W0611
 
 TRAIN_STEPS = 10
 

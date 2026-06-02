@@ -24,12 +24,28 @@ from .parallelize import (
     parallelize_moe_ep,
     parallelize_moe_tp,
 )
+from .pipeline import (
+    MicrobatchLossPipelineStage,
+    build_moe_pp_chunk,
+    build_pipeline_stage,
+    count_moe_parameters,
+    extract_stage_state_dict,
+    layer_range_for_pp_stage,
+    split_batch_dim0,
+)
 
 __all__ = [
+    "MicrobatchLossPipelineStage",
     "MoEDemoConfig",
     "MoEDemoModel",
-    "broadcast_state_dict_from_rank0",
     "build_ep_mesh",
+    "build_moe_pp_chunk",
+    "build_pipeline_stage",
+    "count_moe_parameters",
+    "broadcast_state_dict_from_rank0",
+    "extract_stage_state_dict",
+    "layer_range_for_pp_stage",
     "parallelize_moe_ep",
     "parallelize_moe_tp",
+    "split_batch_dim0",
 ]
