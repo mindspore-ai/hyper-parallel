@@ -19,7 +19,7 @@ from hyper_parallel.core.context_parallel.async_context_parallel import (
     _allgather_reconstruct,
     _launch_async_allgather_seq,
 )
-from hyper_parallel.core.context_parallel.context_parallel import _ensure_1d
+from hyper_parallel.core.context_parallel.context_parallel import _ensure_1d, _localize_foreign_dtensor
 from hyper_parallel.core.context_parallel.dsa_context_parallel import (
     DSAIndexerContextParallel,
     DSAIndexerLossContextParallel,
@@ -62,8 +62,8 @@ class _AsyncSequenceReplicateSlot:
             return output[0]
         return None
 
-    @staticmethod
-    def _local_tensor(value: Any) -> Any:
+    def _local_tensor(self, value: Any) -> Any:
+        value = _localize_foreign_dtensor(value, self.device_mesh, self.seq_dim)
         return value.to_local() if isinstance(value, DTensor) else value
 
     def register_launch_hook(self, module: Optional[Module], slot_name: str) -> None:
@@ -149,7 +149,7 @@ class AsyncDSAIndexerContextParallel(DSAIndexerContextParallel):
             cp_mesh,
             key_fn=lambda value: async_state.wait("key", value),
         )
-        return self._apply_with_specs(module, specs)
+        return self._apply_with_specs(module, specs, cp_mesh)
 
 
 class AsyncDSASparseAttentionContextParallel(DSASparseAttentionContextParallel):
@@ -199,4 +199,4 @@ class AsyncDSAIndexerLossContextParallel(DSAIndexerLossContextParallel):
                 "key_rope": lambda value: async_state.wait("key_rope", value),
             },
         )
-        return self._apply_with_loss_specs(module, specs, self._get_local_idx(cp_mesh))
+        return self._apply_with_loss_specs(module, specs, self._get_local_idx(cp_mesh), cp_mesh)

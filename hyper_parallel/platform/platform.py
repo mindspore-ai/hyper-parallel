@@ -166,7 +166,7 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement get_op_name")
 
     @staticmethod
-    def differentiable_all_gather_concat(data, group, concat_size, concat_dim):
+    def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
         """Perform differentiable all-gather and concatenate tensors along a dimension.
 
         Args:
@@ -174,6 +174,7 @@ class Platform:
             group: The process group for collective communication.
             concat_size (int): The size to concatenate along concat_dim.
             concat_dim (int): The dimension along which to concatenate.
+            rank_list: Optional rank order expected by the logical layout.
 
         Returns:
             The concatenated tensor after all-gather operation.

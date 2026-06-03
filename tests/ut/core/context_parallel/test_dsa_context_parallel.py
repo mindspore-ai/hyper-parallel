@@ -30,10 +30,17 @@ from hyper_parallel.core.context_parallel import (
     DSAIndexerLossContextParallel,
     DSASparseAttentionContextParallel,
 )
+from hyper_parallel.core.context_parallel.context_parallel import (
+    ContextParallel,
+    _OUTPUT_LAYOUT_STACK_ATTR,
+    _drop_cp_from_output,
+    _non_cp_dtensor_layout,
+    _to_cp_dtensor,
+)
 from hyper_parallel.core.context_parallel.async_dsa_context_parallel import _AsyncSequenceReplicateSlot
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
 
 
@@ -89,6 +96,169 @@ class TestDsaContextParallel(unittest.TestCase):
             mesh_dim_names=("cp",),
             init_backend=False,
         )
+
+    def _make_cp_tp_meshes(self, mock_platform):
+        self._setup_mock_platform(mock_platform, world_size=1)
+        root = init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(1, 1),
+            mesh_dim_names=("cp", "tp"),
+            init_backend=False,
+        )
+        return root["cp"], root["tp"]
+
+    def _make_tp_cp_meshes(self, mock_platform):
+        self._setup_mock_platform(mock_platform, world_size=1)
+        root = init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(1, 1),
+            mesh_dim_names=("tp", "cp"),
+            init_backend=False,
+        )
+        return root["cp"], root["tp"]
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_non_cp_dtensor_enters_cp_on_composed_mesh_and_drops_cp_on_exit(self, mock_mesh_platform):
+        """TP DTensor inputs should run inside CP+TP and leave CP with TP preserved."""
+        cp_mesh, tp_mesh = self._make_cp_tp_meshes(mock_mesh_platform)
+        tp_local = torch.randn(2, 4, 8, 16)
+        tp_dtensor = DTensor.from_local(tp_local, tp_mesh, (Shard(2),))
+
+        with _patch_torch_dist_rank():
+            cp_tp_dtensor = _to_cp_dtensor(
+                tp_dtensor,
+                cp_mesh,
+                (Shard(1),),
+                (Shard(1),),
+                seq_dim=1,
+            )
+
+        self.assertEqual(cp_tp_dtensor.device_mesh.mesh_dim_names, ("cp", "tp"))
+        self.assertEqual(cp_tp_dtensor.placements, (Shard(1), Shard(2)))
+
+        layout = _non_cp_dtensor_layout(cp_tp_dtensor, cp_mesh, seq_dim=1)
+        with _patch_torch_dist_rank():
+            output = _drop_cp_from_output(cp_tp_dtensor, layout, (Shard(1),))
+
+        self.assertIsInstance(output, DTensor)
+        self.assertEqual(output.device_mesh.mesh_dim_names, ("tp",))
+        self.assertEqual(output.placements, (Shard(2),))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_cp_head_shard_uses_strided_shard_when_tp_already_shards_head(self, mock_mesh_platform):
+        """CP Shard(seq)->Shard(head) should preserve right-to-left head split order with TP."""
+        self._setup_mock_platform(mock_mesh_platform, world_size=2)
+        root = init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(1, 2),
+            mesh_dim_names=("cp", "tp"),
+            init_backend=False,
+        )
+        cp_mesh = root["cp"]
+        tp_mesh = root["tp"]
+        tp_local = torch.randn(2, 4, 4, 16)
+        tp_dtensor = DTensor.from_local(tp_local, tp_mesh, (Shard(2),))
+
+        with _patch_torch_dist_rank(world_size=2):
+            cp_tp_dtensor = _to_cp_dtensor(
+                tp_dtensor,
+                cp_mesh,
+                (Shard(1),),
+                (Shard(2),),
+                seq_dim=1,
+            )
+
+        self.assertEqual(cp_tp_dtensor.device_mesh.mesh_dim_names, ("cp", "tp"))
+        self.assertEqual(cp_tp_dtensor.placements, (StridedShard(2, 2), Shard(2)))
+        self.assertEqual(cp_tp_dtensor._layout.tensor_map, (-1, -1, (0, 1), -1))
+
+        layout = _non_cp_dtensor_layout(cp_tp_dtensor, cp_mesh, seq_dim=1)
+        with _patch_torch_dist_rank(world_size=2):
+            output = _drop_cp_from_output(cp_tp_dtensor, layout, (Shard(2),))
+
+        self.assertIsInstance(output, DTensor)
+        self.assertEqual(output.device_mesh.mesh_dim_names, ("tp",))
+        self.assertEqual(output.placements, (Shard(2),))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_context_parallel_output_policy_follows_q_input_boundary(self, mock_mesh_platform):
+        """With DTensor output enabled, CP mirrors local/CP/TP input boundaries."""
+        cp_mesh, tp_mesh = self._make_cp_tp_meshes(mock_mesh_platform)
+        module = _SingleIdentityModule()
+        style = ContextParallel(seq_dim=1, head_dim=2, ulysses_degree=1, use_local_output=False)
+        local = torch.randn(2, 4, 8, 16)
+
+        with _patch_torch_dist_rank():
+            cp_internal = DTensor.from_local(local, cp_mesh, (Shard(1),))
+
+            style._record_q_output_tp_layout(module, [local], {}, cp_mesh)
+            local_output = style._post_hook_colossal(module, (), cp_internal, cp_mesh)
+            self.assertNotIsInstance(local_output, DTensor)
+            self.assertFalse(hasattr(module, _OUTPUT_LAYOUT_STACK_ATTR))
+
+            cp_input = DTensor.from_local(local, cp_mesh, (Shard(1),))
+            style._record_q_output_tp_layout(module, [cp_input], {}, cp_mesh)
+            cp_output = style._post_hook_colossal(module, (), cp_internal, cp_mesh)
+            self.assertIsInstance(cp_output, DTensor)
+            self.assertEqual(cp_output.device_mesh.mesh_dim_names, ("cp",))
+            self.assertEqual(cp_output.placements, (Shard(1),))
+
+            tp_input = DTensor.from_local(local, tp_mesh, (Shard(2),))
+            composed_mesh = _non_cp_dtensor_layout(tp_input, cp_mesh, seq_dim=1)[2]
+            cp_tp_internal = DTensor.from_local(local, composed_mesh, (Shard(1), Shard(2)))
+            style._record_q_output_tp_layout(module, [tp_input], {}, cp_mesh)
+            tp_output = style._post_hook_colossal(module, (), cp_tp_internal, cp_mesh)
+            self.assertIsInstance(tp_output, DTensor)
+            self.assertEqual(tp_output.device_mesh.mesh_dim_names, ("tp",))
+            self.assertEqual(tp_output.placements, (Shard(2),))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_output_layout_record_uses_stack_for_reentrant_forward(self, mock_mesh_platform):
+        """Nested CP forwards should pop the most recent Q layout first."""
+        cp_mesh = self._make_cp_mesh(mock_mesh_platform)
+        module = _SingleIdentityModule()
+        style = ContextParallel(seq_dim=1, head_dim=2, ulysses_degree=1, use_local_output=False)
+        local = torch.randn(2, 4, 8, 16)
+
+        with _patch_torch_dist_rank():
+            cp_input = DTensor.from_local(local, cp_mesh, (Shard(1),))
+            cp_internal = DTensor.from_local(local, cp_mesh, (Shard(1),))
+
+            style._record_q_output_tp_layout(module, [local], {}, cp_mesh)
+            style._record_q_output_tp_layout(module, [cp_input], {}, cp_mesh)
+            inner_output = style._post_hook_colossal(module, (), cp_internal, cp_mesh)
+            outer_output = style._post_hook_colossal(module, (), cp_internal, cp_mesh)
+
+        self.assertIsInstance(inner_output, DTensor)
+        self.assertNotIsInstance(outer_output, DTensor)
+        self.assertFalse(hasattr(module, _OUTPUT_LAYOUT_STACK_ATTR))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_composed_mesh_follows_root_order_when_cp_is_after_tp(self, mock_mesh_platform):
+        """TP+CP composition should preserve placements when root order is TP,CP."""
+        cp_mesh, tp_mesh = self._make_tp_cp_meshes(mock_mesh_platform)
+        tp_local = torch.randn(2, 4, 8, 16)
+        tp_dtensor = DTensor.from_local(tp_local, tp_mesh, (Shard(2),))
+
+        with _patch_torch_dist_rank():
+            tp_cp_dtensor = _to_cp_dtensor(
+                tp_dtensor,
+                cp_mesh,
+                (Shard(1),),
+                (Shard(1),),
+                seq_dim=1,
+            )
+
+        self.assertEqual(tp_cp_dtensor.device_mesh.mesh_dim_names, ("tp", "cp"))
+        self.assertEqual(tp_cp_dtensor.placements, (Shard(2), Shard(1)))
+
+        layout = _non_cp_dtensor_layout(tp_cp_dtensor, cp_mesh, seq_dim=1)
+        with _patch_torch_dist_rank():
+            output = _drop_cp_from_output(tp_cp_dtensor, layout, (Shard(1),))
+
+        self.assertIsInstance(output, DTensor)
+        self.assertEqual(output.device_mesh.mesh_dim_names, ("tp",))
+        self.assertEqual(output.placements, (Shard(2),))
 
     def test_rejects_non_colossal_mode(self):
         """Only Colossal-style CP is supported in the first implementation."""

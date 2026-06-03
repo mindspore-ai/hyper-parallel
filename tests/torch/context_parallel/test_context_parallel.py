@@ -20,6 +20,7 @@ Each launcher uses ``parallel_run`` to execute several worker cases from
 Typical packing:
   - up to four 2-card worker cases per launcher
   - up to two 4-card worker cases per launcher
+  - one 8-card worker case per launcher
 """
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
@@ -152,8 +153,10 @@ def test_context_parallel_group7():
     Feature: parallel_run launcher for 4-card TP+CP integration coverage
     Description:
         1. test_tp_cp_combination_npu
+        2. test_tp_cp_dtensor_composed_mesh_npu
     Expectation: Run success.
     """
     _run_group(
         ("test_tp_cp_combination_npu", 13110, 4),
+        ("test_tp_cp_dtensor_composed_mesh_npu", 13120, 4),
     )

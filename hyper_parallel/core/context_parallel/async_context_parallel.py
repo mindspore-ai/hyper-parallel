@@ -26,10 +26,17 @@ from typing import Optional
 
 from hyper_parallel.core.context_parallel.context_parallel import (
     ContextParallel,
-    _build_2d_mesh,
+    _build_hybrid_cp_mesh,
+    _compose_cp_non_cp_placements,
     _ensure_1d,
+    _finalize_ata_output,
     _gather_seq,
     _gather_head_to_seq,
+    _is_cp_composed_dtensor,
+    _localize_foreign_dtensor,
+    _non_cp_dtensor_layout,
+    _pop_output_layout,
+    _to_cp_dtensor,
 )
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -143,6 +150,12 @@ def _to_local(tensor: Tensor) -> Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
+def _to_cp_local(tensor: Tensor, submesh: DeviceMesh, seq_dim: int) -> Tensor:
+    """Return the local tensor CP async collectives should consume."""
+    tensor = _localize_foreign_dtensor(tensor, submesh, seq_dim)
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
+
+
 # ---------------------------------------------------------------------------
 # AsyncContextParallel
 # ---------------------------------------------------------------------------
@@ -163,6 +176,9 @@ class AsyncContextParallel(ContextParallel):
         ulysses_degree:  Ulysses sub-mesh size (see :class:`ContextParallel`).
         qkv_indices:     Positional indices of (Q, K, V) in attention forward.
         qkv_kwarg_names: Keyword names for (Q, K, V).
+        use_local_output: Return local tensors after CP when True.  When False,
+                          keep CP DTensor outputs, or drop the CP axis from
+                          composed CP+TP outputs and keep the non-CP layout.
         load_balance:    Load-balance flag forwarded to base class.
     """
 
@@ -173,6 +189,7 @@ class AsyncContextParallel(ContextParallel):
         ulysses_degree: Optional[int] = None,
         qkv_indices: tuple = (0, 1, 2),
         qkv_kwarg_names: tuple = (),
+        use_local_output: bool = False,
         load_balance: bool = False,
     ):
         super().__init__(
@@ -181,6 +198,7 @@ class AsyncContextParallel(ContextParallel):
             ulysses_degree=ulysses_degree,
             qkv_indices=qkv_indices,
             qkv_kwarg_names=qkv_kwarg_names,
+            use_local_output=use_local_output,
             load_balance=load_balance,
         )
 
@@ -252,6 +270,7 @@ class AsyncContextParallel(ContextParallel):
         self._register_ag_proj_hooks(
             k_proj,
             v_proj,
+            submesh=co_submesh,
             group=group,
             world_size=cp_size,
             fwd_slots=fwd_ag_slots,
@@ -293,30 +312,39 @@ class AsyncContextParallel(ContextParallel):
             group = ds_submesh.get_group()
             pre_hook = partial(
                 self._attn_pre_hook_ulysses,
+                ds_submesh=ds_submesh,
                 group=group,
                 world_size=ds,
                 fwd_slots=fwd_slots,
                 bwd_slots=bwd_slots,
             )
+            post_hook = partial(self._attn_post_hook_ata, ds_submesh=ds_submesh)
         else:
-            two_d_mesh = _build_2d_mesh(device_mesh, ds, co)
-            dim_names = two_d_mesh.mesh_dim_names
+            hybrid_cp_mesh = _build_hybrid_cp_mesh(device_mesh, ds, co)
+            dim_names = hybrid_cp_mesh.mesh_dim_names
             assert dim_names is not None, "2-D mesh must have mesh_dim_names (guaranteed by _build_2d_mesh)"
-            ds_submesh = two_d_mesh[dim_names[1]]
+            ds_submesh = hybrid_cp_mesh[dim_names[1]]
             group = ds_submesh.get_group()
             pre_hook = partial(
                 self._attn_pre_hook_hybrid,
+                ds_submesh=ds_submesh,
                 group=group,
                 world_size=ds,
-                two_d_mesh=two_d_mesh,
+                hybrid_cp_mesh=hybrid_cp_mesh,
                 fwd_slots=fwd_slots,
                 bwd_slots=bwd_slots,
+            )
+            post_hook = partial(
+                self._post_hook_hybrid,
+                hybrid_cp_mesh=hybrid_cp_mesh,
+                ds_submesh=ds_submesh,
             )
 
         self._register_proj_hooks(
             q_proj,
             k_proj,
             v_proj,
+            submesh=ds_submesh,
             group=group,
             world_size=ds,
             fwd_slots=fwd_slots,
@@ -327,20 +355,18 @@ class AsyncContextParallel(ContextParallel):
             pre_hook,
             with_kwargs=True,
         )
-        module.register_forward_hook(
-            partial(self._attn_post_hook_ata, ds_submesh=ds_submesh)
-        )
+        module.register_forward_hook(post_hook)
         return module
 
     # ------------------------------------------------------------------
     # Shared: projection hooks registration
     # ------------------------------------------------------------------
 
-    def _register_proj_hooks(self, q_proj, k_proj, v_proj, group, world_size, fwd_slots, bwd_slots):
+    def _register_proj_hooks(self, q_proj, k_proj, v_proj, submesh, group, world_size, fwd_slots, bwd_slots):
         """Register forward and backward hooks on all three projection modules."""
         for key, proj in [("q", q_proj), ("k", k_proj), ("v", v_proj)]:
             proj.register_forward_hook(
-                partial(self._proj_post_hook, key=key, group=group, world_size=world_size,
+                partial(self._proj_post_hook, key=key, submesh=submesh, group=group, world_size=world_size,
                         fwd_slots=fwd_slots)
             )
             platform.register_full_backward_pre_hook(
@@ -349,20 +375,20 @@ class AsyncContextParallel(ContextParallel):
             )
 
     def _proj_post_hook(  # pylint: disable=unused-argument,too-many-arguments
-        self, module, inputs, output, key, group, world_size, fwd_slots
+        self, module, inputs, output, key, submesh, group, world_size, fwd_slots
     ):
         """Launch async seq→head A2A after projection; return original output unchanged."""
-        tensor = output.to_local() if isinstance(output, DTensor) else output
+        tensor = _to_cp_local(output, submesh, self.seq_dim)
         fwd_slots[key] = _launch_async_a2a_seq_to_head(
             tensor, group, world_size, self.head_dim
         )
         return output
 
-    def _register_ag_proj_hooks(self, k_proj, v_proj, group, world_size, fwd_slots, bwd_slots):
+    def _register_ag_proj_hooks(self, k_proj, v_proj, submesh, group, world_size, fwd_slots, bwd_slots):
         """Register async AllGather hooks for K/V projection modules."""
         for key, proj in [("k", k_proj), ("v", v_proj)]:
             proj.register_forward_hook(
-                partial(self._proj_ag_post_hook, key=key, group=group, world_size=world_size,
+                partial(self._proj_ag_post_hook, key=key, submesh=submesh, group=group, world_size=world_size,
                         fwd_slots=fwd_slots)
             )
             platform.register_full_backward_pre_hook(
@@ -371,10 +397,10 @@ class AsyncContextParallel(ContextParallel):
             )
 
     def _proj_ag_post_hook(  # pylint: disable=unused-argument,too-many-arguments
-        self, module, inputs, output, key, group, world_size, fwd_slots
+        self, module, inputs, output, key, submesh, group, world_size, fwd_slots
     ):
         """Launch async K/V AllGather after projection; return original output."""
-        tensor = output.to_local() if isinstance(output, DTensor) else output
+        tensor = _to_cp_local(output, submesh, self.seq_dim)
         fwd_slots[key] = _launch_async_allgather_seq(
             tensor, group, world_size, self.seq_dim
         )
@@ -436,6 +462,7 @@ class AsyncContextParallel(ContextParallel):
         self,
         args,
         kwargs,
+        submesh,
         transform_q,
         transform_k,
         transform_v,
@@ -457,7 +484,7 @@ class AsyncContextParallel(ContextParallel):
                 new_args,
                 new_kwargs,
                 pos,
-                transform(_to_local(value)),
+                transform(_to_cp_local(value, submesh, self.seq_dim)),
             )
         return tuple(new_args), new_kwargs
 
@@ -466,25 +493,49 @@ class AsyncContextParallel(ContextParallel):
     # ------------------------------------------------------------------
 
     def _attn_pre_hook_ulysses(  # pylint: disable=unused-argument,too-many-arguments
-        self, module, args, kwargs, group, world_size, fwd_slots, bwd_slots
+        self, module, args, kwargs, group, world_size, fwd_slots, bwd_slots, ds_submesh=None
     ):
         """Wait Q/K/V A2A and return head-scattered args/kwargs."""
+        self._record_q_output_tp_layout(module, args, kwargs, ds_submesh)
+
         def make_a2a(key):
-            return lambda value: self._wait_a2a(
-                value,
-                group,
-                world_size,
-                fwd_slots,
-                key,
-                bwd_slots[key],
-            )
+            def transform(value):
+                local = self._wait_a2a(
+                    value,
+                    group,
+                    world_size,
+                    fwd_slots,
+                    key,
+                    bwd_slots[key],
+                )
+                if ds_submesh is None:
+                    return local
+                out_mesh, out_placements = self._ulysses_cp_layout_from_input(value, ds_submesh)
+                return DTensor.from_local(local, out_mesh, out_placements)
+            return transform
 
         return self._apply_qkv_transforms(
             args,
             kwargs,
+            ds_submesh,
             transform_q=make_a2a("q"),
             transform_k=make_a2a("k"),
             transform_v=make_a2a("v"),
+        )
+
+    def _ulysses_cp_layout_from_input(self, t, ds_submesh):
+        """Return the pure-Ulysses execution mesh and placements for one input tensor."""
+        cp_placements = (Shard(self.head_dim),)
+        layout = _non_cp_dtensor_layout(t, ds_submesh, self.seq_dim)
+        if layout is None:
+            return ds_submesh, cp_placements
+        non_cp_mesh, non_cp_placements, composed_mesh = layout
+        return composed_mesh, _compose_cp_non_cp_placements(
+            composed_mesh,
+            ds_submesh,
+            cp_placements,
+            non_cp_mesh,
+            non_cp_placements,
         )
 
     def _attn_pre_hook_colossal(  # pylint: disable=unused-argument,too-many-arguments
@@ -495,15 +546,18 @@ class AsyncContextParallel(ContextParallel):
         new_kwargs = dict(kwargs)
 
         q_value = self._get_qkv_value(new_args, new_kwargs, 0)
-        if q_value is not None and not isinstance(q_value, DTensor):
+        self._record_q_output_tp_layout(module, new_args, new_kwargs, co_submesh)
+        if q_value is not None:
             self._set_qkv_value(
                 new_args,
                 new_kwargs,
                 0,
-                DTensor.from_local(
-                    _to_local(q_value),
+                _to_cp_dtensor(
+                    q_value,
                     co_submesh,
                     (Shard(self.seq_dim),),
+                    (Shard(self.seq_dim),),
+                    self.seq_dim,
                 ),
             )
 
@@ -511,7 +565,7 @@ class AsyncContextParallel(ContextParallel):
             value = self._get_qkv_value(new_args, new_kwargs, pos)
             if value is None:
                 continue
-            local = _to_local(value)
+            local = _to_cp_local(value, co_submesh, self.seq_dim)
             work, out_perm = fwd_slots[key]
             fwd_slots[key] = None
             gathered = self._wait_allgather(
@@ -522,6 +576,28 @@ class AsyncContextParallel(ContextParallel):
                 out_perm,
                 bwd_slots[key],
             )
+            if isinstance(value, DTensor):
+                layout = _non_cp_dtensor_layout(value, co_submesh, self.seq_dim)
+                if layout is not None:
+                    non_cp_mesh, non_cp_placements, composed_mesh = layout
+                    composed_placements = _compose_cp_non_cp_placements(
+                        composed_mesh,
+                        co_submesh,
+                        (Replicate(),),
+                        non_cp_mesh,
+                        non_cp_placements,
+                    )
+                    self._set_qkv_value(
+                        new_args,
+                        new_kwargs,
+                        pos,
+                        DTensor.from_local(
+                            gathered.to_local() if isinstance(gathered, DTensor) else gathered,
+                            composed_mesh,
+                            composed_placements,
+                        ),
+                    )
+                    continue
             self._set_qkv_value(
                 new_args,
                 new_kwargs,
@@ -536,39 +612,47 @@ class AsyncContextParallel(ContextParallel):
         return tuple(new_args), new_kwargs
 
     def _attn_pre_hook_hybrid(  # pylint: disable=too-many-locals,too-many-arguments
-        self, module, args, kwargs, group, world_size, two_d_mesh,  # pylint: disable=unused-argument
-        fwd_slots, bwd_slots
+        self, module, args, kwargs, group, world_size, hybrid_cp_mesh,  # pylint: disable=unused-argument
+        fwd_slots, bwd_slots, ds_submesh=None
     ):
         """Wait Ulysses A2A for Q/K/V, then synchronously gather K/V on the co-submesh."""
         new_args = list(args)
         new_kwargs = dict(kwargs)
 
-        co_submesh = two_d_mesh[two_d_mesh.mesh_dim_names[0]]
+        co_submesh = hybrid_cp_mesh[hybrid_cp_mesh.mesh_dim_names[0]]
+        if ds_submesh is None:
+            ds_submesh = hybrid_cp_mesh[hybrid_cp_mesh.mesh_dim_names[1]]
+        self._record_q_output_tp_layout(module, new_args, new_kwargs, hybrid_cp_mesh)
 
         q_value = self._get_qkv_value(new_args, new_kwargs, 0)
         if q_value is not None:
+            q_mesh, q_placements = self._hybrid_cp_layout_from_input(
+                q_value,
+                hybrid_cp_mesh,
+                (Shard(self.seq_dim), Shard(self.head_dim)),
+            )
             self._set_qkv_value(
                 new_args,
                 new_kwargs,
                 0,
                 DTensor.from_local(
                     self._wait_a2a(
-                        _to_local(q_value),
+                        _to_cp_local(q_value, ds_submesh, self.seq_dim),
                         group,
                         world_size,
                         fwd_slots,
                         "q",
                         bwd_slots["q"],
                     ),
-                    two_d_mesh,
-                    (Shard(self.seq_dim), Shard(self.head_dim)),
+                    q_mesh,
+                    q_placements,
                 ),
             )
 
         k_value = self._get_qkv_value(new_args, new_kwargs, 1)
         if k_value is not None:
             k_ul = self._wait_a2a(
-                _to_local(k_value),
+                _to_cp_local(k_value, ds_submesh, self.seq_dim),
                 group,
                 world_size,
                 fwd_slots,
@@ -576,21 +660,25 @@ class AsyncContextParallel(ContextParallel):
                 bwd_slots["k"],
             )
             k_full = _gather_seq(k_ul, co_submesh, self.seq_dim)
+            k_mesh, k_placements = self._hybrid_kv_gather_placements(
+                k_value,
+                hybrid_cp_mesh,
+            )
             self._set_qkv_value(
                 new_args,
                 new_kwargs,
                 1,
                 DTensor.from_local(
                     _to_local(k_full),
-                    two_d_mesh,
-                    (Replicate(), Shard(self.head_dim)),
+                    k_mesh,
+                    k_placements,
                 ),
             )
 
         v_value = self._get_qkv_value(new_args, new_kwargs, 2)
         if v_value is not None:
             v_ul = self._wait_a2a(
-                _to_local(v_value),
+                _to_cp_local(v_value, ds_submesh, self.seq_dim),
                 group,
                 world_size,
                 fwd_slots,
@@ -598,14 +686,18 @@ class AsyncContextParallel(ContextParallel):
                 bwd_slots["v"],
             )
             v_full = _gather_seq(v_ul, co_submesh, self.seq_dim)
+            v_mesh, v_placements = self._hybrid_kv_gather_placements(
+                v_value,
+                hybrid_cp_mesh,
+            )
             self._set_qkv_value(
                 new_args,
                 new_kwargs,
                 2,
                 DTensor.from_local(
                     _to_local(v_full),
-                    two_d_mesh,
-                    (Replicate(), Shard(self.head_dim)),
+                    v_mesh,
+                    v_placements,
                 ),
             )
 
@@ -617,13 +709,18 @@ class AsyncContextParallel(ContextParallel):
 
     def _attn_post_hook_ata(self, module, args, output, ds_submesh):  # pylint: disable=unused-argument
         """Reverse head→seq gather on ds_submesh; returns local tensor."""
+        output_layout = _pop_output_layout(module)
+
         def _process(o):
             if isinstance(o, (Tensor, DTensor)):
-                if isinstance(o, DTensor):
+                if isinstance(o, DTensor) and not _is_cp_composed_dtensor(o, ds_submesh):
                     o = o.to_local()
-                return _gather_head_to_seq(
+                seq_dtensor = _gather_head_to_seq(
                     o, ds_submesh, self.seq_dim, self.head_dim
-                ).to_local()
+                )
+                return _finalize_ata_output(
+                    seq_dtensor, output_layout, ds_submesh, self.seq_dim, self.use_local_output
+                )
             return o
 
         if isinstance(output, (tuple, list)):

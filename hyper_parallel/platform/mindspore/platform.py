@@ -974,7 +974,8 @@ class MindSporePlatform(Platform):
         return func.name
 
     @staticmethod
-    def differentiable_all_gather_concat(data, group, concat_size, concat_dim):
+    def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
+        # rank_list is accepted for torch parity; MindSpore keeps the existing group order.
         output, _ = comm_func.all_gather_into_tensor(None, data, group=group)
         if concat_dim == 0:
             return output
