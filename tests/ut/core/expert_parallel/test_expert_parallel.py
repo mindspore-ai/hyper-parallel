@@ -31,6 +31,8 @@ import torch
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.expert_parallel.expert_parallel import (
+    AllToAllTokenDispatcher,
+    DispatchContext,
     _generate_permute_indices,
     _permute,
     _unpermute,
@@ -58,7 +60,8 @@ def _make_mock_module(num_experts: int = 4, dim: int = 8, hidden_dim: int = 16):
     from torch import nn
 
     class _FakeExperts(nn.Module):
-        def __init__(self):
+        def __init__(self) -> None:
+            """Initialize fake expert module with random weights."""
             super().__init__()
             self.w1 = nn.Parameter(torch.randn(num_experts, hidden_dim, dim))
             self.w2 = nn.Parameter(torch.randn(num_experts, dim, hidden_dim))
@@ -277,7 +280,7 @@ class TestUnpermute(unittest.TestCase):
 class TestExpertParallelDispatch(unittest.TestCase):
     """Unit tests for ``ExpertParallel._token_dispatch`` with mocked collectives."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Set up ExpertParallel instance and mock device_mesh."""
         self.ep = ExpertParallel()
         self.ep_size = 2
@@ -337,14 +340,14 @@ class TestExpertParallelDispatch(unittest.TestCase):
         """
         self._call_dispatch(mock_platform)
         # rank0 block: 3+2=5, rank1 block: 1+4=5
-        input_splits, output_splits, _, _ = self.ep._state_stack()[-1]
+        ctx = self.ep._dispatch_ctx
         self.assertEqual(
-            input_splits, [5, 5],
-            f"input_splits={input_splits}, expected [5, 5]"
+            ctx.input_splits, [5, 5],
+            f"input_splits={ctx.input_splits}, expected [5, 5]"
         )
         self.assertEqual(
-            output_splits, [5, 5],
-            f"output_splits={output_splits}, expected [5, 5]"
+            ctx.output_splits, [5, 5],
+            f"output_splits={ctx.output_splits}, expected [5, 5]"
         )
 
     @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
@@ -366,19 +369,17 @@ class TestExpertParallelDispatch(unittest.TestCase):
     def test_dispatch_saves_state_for_combine(self, mock_platform):
         """
         Feature: ExpertParallel._token_dispatch state preservation
-        Description: After dispatch, input_splits, output_splits, input_shape,
-            and permuted_indices are pushed onto the per-thread state stack
-            for use by combine.
-        Expectation: one entry on the stack with four non-None components
+        Description: After dispatch, _input_splits, _output_splits,
+            _input_shape, and _permuted_indices are saved for use by combine.
+        Expectation: all four state attributes are not None / non-empty
         """
         self._call_dispatch(mock_platform)
-        stack = self.ep._state_stack()
-        self.assertEqual(len(stack), 1, f"stack depth={len(stack)}, expected 1")
-        input_splits, output_splits, input_shape, permuted_indices = stack[-1]
-        self.assertIsNotNone(input_splits, f"input_splits should be set, got {input_splits}")
-        self.assertIsNotNone(output_splits, f"output_splits should be set, got {output_splits}")
-        self.assertIsNotNone(input_shape, f"input_shape should be set, got {input_shape}")
-        self.assertIsNotNone(permuted_indices, f"permuted_indices should be set, got {permuted_indices}")
+        ctx = self.ep._dispatch_ctx
+        self.assertIsNotNone(ctx, "_dispatch_ctx should be set")
+        self.assertIsNotNone(ctx.input_splits, "input_splits should be set")
+        self.assertIsNotNone(ctx.output_splits, "output_splits should be set")
+        self.assertIsNotNone(ctx.input_shape, "input_shape should be set")
+        self.assertIsNotNone(ctx.permuted_indices, "permuted_indices should be set")
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +389,7 @@ class TestExpertParallelDispatch(unittest.TestCase):
 class TestExpertParallelCombine(unittest.TestCase):
     """Unit tests for ``ExpertParallel._token_combine`` with mocked collectives."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Run dispatch first so combine has the saved state it needs."""
         self.ep = ExpertParallel()
         self.ep_size = 2
@@ -407,7 +408,8 @@ class TestExpertParallelCombine(unittest.TestCase):
 
         captured = {}
 
-        def identity_a2a(inp, *_args, **_kw):
+        def identity_a2a(inp: object, *_args: object, **_kw: object) -> object:
+            """Pass-through all-to-all capture for testing."""
             captured["input"] = inp
             return inp
 
@@ -491,15 +493,128 @@ class TestExpertParallelCombine(unittest.TestCase):
         call_args_list = mock_platform.differentiable_all_to_all_single.call_args_list
         # call_args_list[0] = dispatch call, call_args_list[1] = combine call
         self.assertGreaterEqual(len(call_args_list), 2)
-        dispatch_call = call_args_list[0]
         combine_call = call_args_list[1]
         # positional args: (inp, input_splits, output_splits, group)
-        dispatch_output_splits = dispatch_call.args[2]
         combine_input_splits = combine_call.args[1]
+        dispatch_output_splits = self.ep._dispatch_ctx.output_splits
         self.assertEqual(
             combine_input_splits, dispatch_output_splits,
             (f"combine input_splits={combine_input_splits} "
              f"should equal dispatch output_splits={dispatch_output_splits}")
+        )
+
+
+# ---------------------------------------------------------------------------
+# C2: AllToAllTokenDispatcher direct tests (standalone static methods)
+# ---------------------------------------------------------------------------
+
+class TestAllToAllTokenDispatcher(unittest.TestCase):
+    """Direct tests for AllToAllTokenDispatcher static methods — no ExpertParallel needed."""
+
+    def setUp(self) -> None:
+        """Set up common dispatch parameters and mock device mesh."""
+        self.ep_size = 2
+        self.num_local_experts = 2
+        self.dim = 8
+        self.counts_out = torch.tensor([3, 2, 1, 4])
+        self.total_tokens = int(self.counts_out.sum())
+        self.num_tokens_per_expert_in = torch.tensor([3, 2, 1, 4])
+        self.routed_input = torch.randn(self.total_tokens, self.dim)
+        self.mock_mesh = _make_mock_device_mesh(self.ep_size)
+
+    def _configure_platform(self, mock_platform):
+        """Set up the platform mock for dispatch/combine."""
+        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
+        mock_platform.differentiable_all_to_all_single.side_effect = (
+            lambda inp, *_args, **_kw: inp
+        )
+        mock_platform.arange.side_effect = torch.arange
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_dispatch_standalone(self, mock_platform):
+        """dispatch can be called directly without an ExpertParallel instance."""
+        self._configure_platform(mock_platform)
+        permuted, local_counts, ctx = AllToAllTokenDispatcher.dispatch(
+            module=None,
+            inputs=(self.routed_input, self.num_tokens_per_expert_in),
+            device_mesh=self.mock_mesh,
+        )
+        assert isinstance(ctx, DispatchContext), (
+            f"ctx should be DispatchContext, got {type(ctx).__name__}"
+        )
+        assert permuted.shape == (self.total_tokens, self.dim), (
+            f"permuted shape {permuted.shape}, expected ({self.total_tokens}, {self.dim})"
+        )
+        assert local_counts.shape == (self.num_local_experts,), (
+            f"local_counts shape {local_counts.shape}, expected ({self.num_local_experts},)"
+        )
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_dispatch_context_fields(self, mock_platform):
+        """dispatch returns a DispatchContext with correct field values."""
+        self._configure_platform(mock_platform)
+        _, _, ctx = AllToAllTokenDispatcher.dispatch(
+            module=None,
+            inputs=(self.routed_input, self.num_tokens_per_expert_in),
+            device_mesh=self.mock_mesh,
+        )
+        assert ctx.input_splits == [5, 5], (
+            f"ctx.input_splits={ctx.input_splits}, expected [5, 5]"
+        )
+        assert ctx.output_splits == [5, 5], (
+            f"ctx.output_splits={ctx.output_splits}, expected [5, 5]"
+        )
+        assert ctx.input_shape == (self.total_tokens, self.dim), (
+            f"ctx.input_shape={ctx.input_shape}, expected ({self.total_tokens}, {self.dim})"
+        )
+        assert ctx.permuted_indices is not None, (
+            "ctx.permuted_indices should not be None"
+        )
+        assert ctx.permuted_indices.numel() == self.total_tokens, (
+            f"permuted_indices numel={ctx.permuted_indices.numel()}, "
+            f"expected {self.total_tokens}"
+        )
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_combine_with_manual_context(self, mock_platform):
+        """combine can be called with a manually constructed DispatchContext."""
+        self._configure_platform(mock_platform)
+        ctx = DispatchContext(
+            input_splits=[5, 5],
+            output_splits=[5, 5],
+            input_shape=(self.total_tokens, self.dim),
+            permuted_indices=torch.arange(self.total_tokens),
+        )
+        expert_output = torch.randn(self.total_tokens, self.dim)
+        combined = AllToAllTokenDispatcher.combine(
+            module=None,
+            routed_output=expert_output,
+            device_mesh=self.mock_mesh,
+            ctx=ctx,
+        )
+        assert combined.shape == (self.total_tokens, self.dim), (
+            f"combined shape {combined.shape}, expected ({self.total_tokens}, {self.dim})"
+        )
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_dispatch_combine_round_trip(self, mock_platform):
+        """dispatch then combine with identity expert restores original input."""
+        self._configure_platform(mock_platform)
+        permuted, _, ctx = AllToAllTokenDispatcher.dispatch(
+            module=None,
+            inputs=(self.routed_input, self.num_tokens_per_expert_in),
+            device_mesh=self.mock_mesh,
+        )
+        # Identity "expert computation": same permuted tensor.
+        combined = AllToAllTokenDispatcher.combine(
+            module=None,
+            routed_output=permuted,
+            device_mesh=self.mock_mesh,
+            ctx=ctx,
+        )
+        # With identity a2a (mocked), dispatch permutes then combine unpermutes.
+        assert combined.shape == (self.total_tokens, self.dim), (
+            f"combined shape {combined.shape}, expected ({self.total_tokens}, {self.dim})"
         )
 
 

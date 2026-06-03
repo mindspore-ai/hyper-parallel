@@ -25,7 +25,7 @@ Distributed collectives are handled by
 contains only single-device computation.
 """
 import math
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import torch
 from torch import nn
@@ -220,6 +220,13 @@ class FeedForward(nn.Module):
     """
 
     def __init__(self, dim: int, hidden_dim: int, bias: bool = False) -> None:
+        """Initialize FeedForward with three linear layers.
+
+        Args:
+            dim: Input embedding dimension.
+            hidden_dim: Intermediate hidden dimension.
+            bias: Whether to add a learnable bias.  Defaults to ``False``.
+        """
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
         self.w2 = nn.Linear(hidden_dim, dim, bias=bias)
@@ -277,6 +284,14 @@ class GroupedExperts(nn.Module):
         num_experts: int,
         use_grouped_mm: bool = False,
     ) -> None:
+        """Initialize GroupedExperts with stacked expert weight matrices.
+
+        Args:
+            dim: Input embedding dimension.
+            hidden_dim: Intermediate hidden dimension.
+            num_experts: Number of experts.
+            use_grouped_mm: Whether to use grouped matrix multiplication.
+        """
         super().__init__()
         # Weight layout: [num_experts, out_dim, in_dim] so that the standard
         # linear operation is x @ w[e].T.
@@ -365,6 +380,17 @@ class TokenChoiceTopKRouter(nn.Module):
         num_limited_groups: Optional[int] = None,
         route_scale: float = 1.0,
     ) -> None:
+        """Initialize the top-K router.
+
+        Args:
+            dim: Input dimension of token representations.
+            num_experts: Total number of experts.
+            top_k: Number of experts to select per token.
+            score_func: Scoring function, ``"sigmoid"`` or ``"softmax"``.
+            num_expert_groups: Number of expert groups for node-limited routing.
+            num_limited_groups: Number of groups each token can route to.
+            route_scale: Scalar multiplier applied to routing scores.
+        """
         super().__init__()
         if score_func not in ("sigmoid", "softmax"):
             raise ValueError(
@@ -386,7 +412,7 @@ class TokenChoiceTopKRouter(nn.Module):
         self,
         x: torch.Tensor,
         expert_bias: Optional[torch.Tensor] = None,
-    ):
+    ) -> tuple:
         """Compute routing scores and top-K expert assignments.
 
         Args:
@@ -668,6 +694,20 @@ class MoE(nn.Module):
         router_kwargs: Optional[dict] = None,
         use_grouped_mm: bool = False,
     ) -> None:
+        """Initialize MoE block with experts, router and optional shared expert.
+
+        Args:
+            dim: Input embedding dimension.
+            hidden_dim: Intermediate hidden dimension of each expert.
+            num_experts: Number of experts.
+            top_k: Number of experts to select per token.
+            score_before_experts: If ``True``, multiply routed hidden states by
+                the routing score.
+            load_balance_coeff: Load-balance loss coefficient.
+            shared_expert: Optional shared expert applied to all tokens.
+            router_kwargs: Additional keyword arguments for the router.
+            use_grouped_mm: Whether to use grouped matrix multiplication.
+        """
         super().__init__()
         router_kw = router_kwargs or {}
         self.experts = GroupedExperts(
@@ -689,6 +729,68 @@ class MoE(nn.Module):
         # Auxiliary-loss-free load-balance buffers (no gradient).
         self.register_buffer("expert_bias", torch.zeros(num_experts))
         self.register_buffer("tokens_per_expert", torch.zeros(num_experts))
+
+    def permutation(
+        self,
+        selected_experts: torch.Tensor,
+        top_scores: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute token-major → expert-major permutation indices.
+
+        Args:
+            selected_experts: Expert IDs of shape ``[num_tokens, top_k]``.
+            top_scores: Routing weights of shape ``[num_tokens, top_k]``.
+
+        Returns:
+            Tuple of ``(token_indices, top_scores_sorted,
+            num_tokens_per_expert)`` where *token_indices* maps each
+            expert-major slot back to its source token row,
+            *top_scores_sorted* are the scores in expert-major order, and
+            *num_tokens_per_expert* has shape ``[num_experts]``.
+        """
+        # flat_experts[i] is the expert ID for the i-th (token, top_k) slot.
+        flat_experts = selected_experts.flatten()                  # [num_tokens * top_k]
+        flat_indices = flat_experts.argsort(stable=True)           # expert-major permutation
+        top_scores_sorted = top_scores.flatten()[flat_indices]     # [num_tokens * top_k]
+        # Each entry in flat_indices maps to a position in [0, num_tokens * top_k);
+        # divide by top_k to recover the original token row index.
+        token_indices = flat_indices // self.top_k                 # [num_tokens * top_k]
+        num_tokens_per_expert = torch.bincount(
+            flat_experts, minlength=self.num_experts
+        )
+        return token_indices, top_scores_sorted, num_tokens_per_expert
+
+    def unpermutation(
+        self,
+        expert_out: torch.Tensor,
+        token_indices: torch.Tensor,
+        num_tokens: int,
+        dim: int,
+    ) -> torch.Tensor:
+        """Scatter expert outputs back to token-major order.
+
+        Args:
+            expert_out: Expert output tensor in expert-major order,
+                shape ``[total_routed_tokens, dim]``.
+            token_indices: Permutation indices from :meth:`permutation`,
+                shape ``[num_tokens * top_k]``.
+            num_tokens: Total number of tokens (unflattened).
+            dim: Feature dimension.
+
+        Returns:
+            Token-major output tensor of shape ``[num_tokens, dim]``.
+        """
+        # Use out-of-place ``scatter_add`` so autograd correctly records
+        # ``ScatterAddBackward``; ``new_zeros + scatter_add_`` on some
+        # backends (torch_npu) leaves the leaf un-upgraded and the result
+        # without a ``grad_fn``.
+        return torch.zeros(
+            num_tokens, dim, dtype=expert_out.dtype, device=expert_out.device,
+        ).scatter_add(
+            0,
+            token_indices.unsqueeze(1).expand(-1, dim),
+            expert_out,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the MoE layer.
@@ -738,16 +840,9 @@ class MoE(nn.Module):
             lb_loss = None
             self.last_aux_loss = None
 
-        # --- Token permutation: token-major → expert-major (inline argsort) ---
-        # flat_experts[i] is the expert ID for the i-th (token, top_k) slot.
-        flat_experts = selected_experts.flatten()                  # [num_tokens * top_k]
-        flat_indices = flat_experts.argsort(stable=True)           # expert-major permutation
-        top_scores_sorted = top_scores.flatten()[flat_indices]     # [num_tokens * top_k]
-        # Each entry in flat_indices maps to a position in [0, num_tokens * top_k);
-        # divide by top_k to recover the original token row index.
-        token_indices = flat_indices // self.top_k                 # [num_tokens * top_k]
-        num_tokens_per_expert = torch.bincount(
-            flat_experts, minlength=self.num_experts
+        # --- Token permutation: token-major → expert-major ---
+        token_indices, top_scores_sorted, num_tokens_per_expert = self.permutation(
+            selected_experts, top_scores
         )
 
         # Gather routed tokens in expert-major order.
@@ -767,17 +862,7 @@ class MoE(nn.Module):
 
 
         # --- Scatter expert outputs back to token order ---
-        # Use out-of-place ``scatter_add`` so autograd correctly records
-        # ``ScatterAddBackward``; ``new_zeros + scatter_add_`` on some
-        # backends (torch_npu) leaves the leaf un-upgraded and the result
-        # without a ``grad_fn``.
-        out = torch.zeros(
-            num_tokens, dim, dtype=x_flat.dtype, device=x_flat.device,
-        ).scatter_add(
-            0,
-            token_indices.unsqueeze(1).expand(-1, dim),
-            expert_out,
-        )
+        out = self.unpermutation(expert_out, token_indices, num_tokens, dim)
 
         if shared_out is not None:
             out = out + shared_out
