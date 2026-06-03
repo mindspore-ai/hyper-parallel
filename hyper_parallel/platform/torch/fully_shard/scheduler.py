@@ -113,7 +113,17 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         flat_outputs, _ = tree_flatten(outputs)
         for output in flat_outputs:
             if isinstance(output, torch.Tensor) and output.requires_grad:
-                output.register_hook(self._backward_pre_hook)
+                handle_ref = [None]
+                # pylint: disable=C0103, W0102
+                def wrapper_for_backward_pre_hook(grad, _handle_ref=handle_ref):
+                    """Remove this hook after it fires to prevent accmulation"""
+                    handle = _handle_ref[0]
+                    if handle is not None:
+                        handle.remove()
+                    return self._backward_pre_hook(grad)
+                # pylint: enable=C0103, W0102
+                handle = output.register_hook(wrapper_for_backward_pre_hook)
+                handle_ref[0] = handle
         return outputs
 
     def _forward_hook(self, cell, inputs, outputs):  # pylint: disable=R1710
