@@ -16,7 +16,6 @@
 from .activation_checkpoint import (
     CheckpointPolicy,
     checkpoint,
-    keep_collectives_policy,
     swap,
     checkpoint_wrapper,
     swap_wrapper,

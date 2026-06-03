@@ -58,44 +58,6 @@ class CheckpointPolicy(enum.Enum):
     MUST_SWAP = 4
 
 
-def keep_collectives_policy(ctx, op, *args, **kwargs):  # pylint: disable=W0613
-    """Selective-checkpoint policy: keep communication, recompute compute.
-
-    Returns :attr:`CheckpointPolicy.MUST_SAVE` for communication collectives
-    (all-to-all / all-reduce / all-gather / reduce-scatter / broadcast, detected
-    via :meth:`hyper_parallel.platform.Platform.is_collective_op`) and
-    :attr:`CheckpointPolicy.PREFER_RECOMPUTE` for every other (compute) op.
-
-    Pass it as the ``policy_fn`` of :func:`checkpoint` when checkpointing a
-    region that issues collectives under a dual-thread comm/compute overlap
-    schedule.  The backward-time re-run then RESTORES each saved collective
-    output instead of re-issuing the collective, so the re-run collective
-    cannot race the peer thread's collective on the shared process group —
-    removing the numerical nondeterminism an un-serialised re-run collective
-    would inject, while still recomputing (and saving the memory of) compute.
-
-    Args:
-        ctx: Selective-checkpoint context (unused; present for the
-            ``policy_fn(ctx, op, *args, **kwargs)`` contract).
-        op: The op being dispatched.
-        *args: ``op`` positional arguments (unused).
-        **kwargs: ``op`` keyword arguments (unused).
-
-    Returns:
-        ``CheckpointPolicy.MUST_SAVE`` if ``op`` is a collective, else
-        ``CheckpointPolicy.PREFER_RECOMPUTE``.
-
-    Example:
-        >>> from hyper_parallel.core.activation_checkpoint import (
-        ...     checkpoint, keep_collectives_policy,
-        ... )
-        >>> out = checkpoint(layer, x, policy_fn=keep_collectives_policy)  # doctest: +SKIP
-    """
-    if plat.is_collective_op(op):
-        return CheckpointPolicy.MUST_SAVE
-    return CheckpointPolicy.PREFER_RECOMPUTE
-
-
 class _StackedCtx:
     """Compose multiple context managers as one — enter in order, exit reversed."""
 
@@ -155,9 +117,7 @@ def checkpoint(
             ``(forward_ctx, recompute_ctx)`` pair, matching the
             ``context_fn`` contract of ``ms.recompute(use_reentrant=False)``
             and ``torch.utils.checkpoint(use_reentrant=False)``.  Use this
-            to bracket the backward-time forward re-run with custom logic
-            such as
-            :meth:`hyper_parallel.core.pipeline_parallel.CommComputeOverlap.make_recompute_context_fn`.
+            to bracket the backward-time forward re-run with custom logic.
             When ``policy_fn``, ``group_swap`` and ``context_fn`` are
             supplied together, the resulting factories are composed: their
             forward and recompute contexts are stacked so all enter in

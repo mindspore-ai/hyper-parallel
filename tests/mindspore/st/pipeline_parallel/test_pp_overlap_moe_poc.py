@@ -44,37 +44,30 @@ def test_pp_overlap_moe_end_to_end():
                12351, worker_num=8, local_worker_num=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_recompute():
-    """PP+EP+overlap + activation checkpoint via ``overlap.wrap_checkpoint``.
+    """PP+EP+overlap + activation checkpoint via ``checkpoint_wrapper``.
 
-    Feature: ``CommComputeOverlap.wrap_checkpoint`` and
-        :func:`hyper_parallel.core.activation_checkpoint.checkpoint`'s
-        ``context_fn`` plumbing.
+    Feature: chunk-level activation checkpoint composing with overlap_b_f.
     Description:
         8 ranks, PP=4 × EP=2.  Same topology as
         :func:`test_pp_overlap_moe_end_to_end` but each chunk is wrapped
-        via ``CommComputeOverlap.wrap_checkpoint`` — the public helper
-        that composes the coordinator's hook-bypass with the
-        ``_fwd_gate`` event inside
-        ``hyper_parallel.core.activation_checkpoint.checkpoint``, so the
-        BWD-time re-run runs serially and only the grad phase overlaps
-        with the FWD thread.  Serializing the re-run is required on MS
-        PyNative, whose autograd executor does not support concurrent
-        FWD-record + BWD-replay; calling ``ms.recompute`` directly under
-        overlap_b_f deadlocks.
+        with
+        :func:`hyper_parallel.core.activation_checkpoint.checkpoint_wrapper`.
+        The chunk's forward re-run is fired serially before the paired
+        backward by :meth:`PipelineStage.recompute_one_chunk` and reused
+        during backward, so the re-run never races the FWD thread's forward
+        record (MS PyNative does not support concurrent FWD-record +
+        BWD-replay) and only the grad phase overlaps with the FWD thread.
     Expectation:
         Iteration completes without deadlock and yields non-zero grads.
-        A deadlock here usually means ``context_fn`` was lost between
-        :func:`checkpoint` and ``ms.recompute``, or the FWD gate was
-        not opened on ``recompute_ctx`` exit.
     """
     msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_recompute",
                12353, worker_num=8, local_worker_num=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_recompute_per_layer():
     """Per-layer (multi-segment) activation checkpoint under overlap_b_f.
@@ -83,9 +76,9 @@ def test_pp_overlap_moe_recompute_per_layer():
     Description:
         8 ranks, PP=4 × EP=2.  Each chunk wraps EACH layer in its own
         ``checkpoint`` segment (``_MoEChunk.enable_per_layer_recompute``), so
-        backward performs multiple re-runs.  The FWD recompute gate opens on
-        the BWD thread's first grad-phase rendezvous, so the re-runs serialize
-        against the FWD forward via the barrier.  Compares overlap+recompute
+        backward reuses several pre-fired re-runs.  The re-runs are fired
+        serially before the paired backward by
+        ``PipelineStage.recompute_one_chunk``.  Compares overlap+recompute
         grads against a sync baseline.
     Expectation:
         No deadlock; grads and last-rank losses match the sync baseline
@@ -95,21 +88,19 @@ def test_pp_overlap_moe_recompute_per_layer():
                12355, worker_num=8, local_worker_num=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_recompute_mixed():
     """Mixed per-layer recompute (some layers recompute, some don't) under overlap_b_f.
 
     Feature: mixed per-layer recompute — the case op-granularity SAC cannot
-        express and that the single-``_fwd_gate`` opening (at first
-        ``recompute_ctx`` exit) used to deadlock.
+        express.
     Description:
         8 ranks, PP=4 × EP=2, 2 layers per chunk.  Only layer 0 of each chunk
-        is recomputed; layer 1 runs directly.  Because the non-recomputed
-        last layer's backward fires a rendezvous before the first re-run, this
-        only avoids deadlock once the gate opens on the BWD thread's first
-        rendezvous (``HookCoordinator.set_gate_opener``).  Compares grads
-        against a sync baseline.
+        is recomputed; layer 1 runs directly (its activations are kept).  The
+        recomputed layer's re-run is fired serially before the paired backward
+        by ``PipelineStage.recompute_one_chunk`` and reused during backward.
+        Compares grads against a sync baseline.
     Expectation:
         No deadlock; grads and last-rank losses match the sync baseline
         within ``rtol=1e-3, atol=1e-3``.

@@ -988,24 +988,6 @@ class TorchPlatform(Platform):
         return output, work
 
     @staticmethod
-    def is_collective_op(op) -> bool:
-        """Recognise PyTorch functional collectives by namespace.
-
-        Functional collectives (``all_to_all_single`` / ``all_reduce`` /
-        ``all_gather_into_tensor`` / ``reduce_scatter_tensor`` / ...) live in the
-        ``_c10d_functional`` (and legacy ``c10d``) namespaces.  ``OpOverload`` /
-        ``OpOverloadPacket`` expose the namespaced name via ``.name`` (e.g.
-        ``_c10d_functional::all_to_all_single.default``), so a ``"c10d"`` namespace
-        match is robust and does not false-match ``aten``/compute ops.
-        """
-        name = getattr(op, "name", None)
-        if callable(name):  # OpOverload.name is a str attr in some versions, a method in others
-            name = name()
-        if not name:
-            name = getattr(op, "__name__", "") or str(op)
-        return "c10d" in str(name)
-
-    @staticmethod
     def differentiable_all_to_all_single(input_tensor, input_splits, output_splits, group):
         """Variable-split all-to-all with autograd support for EP token dispatch/combine."""
         out_total = sum(output_splits)
