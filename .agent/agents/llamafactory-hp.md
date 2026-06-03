@@ -37,13 +37,21 @@ Only touch core code when the integration cannot be fixed at the adapter layer.
 
 ## Main Files
 
-- `hyper_parallel/integration/llamafactory/trainer.py`
-  - trainer-side integration
-  - temporary Accelerate patching
-  - grad clipping / optimizer wrapping / checkpoint save-load glue
+- `hyper_parallel/integration/llamafactory/__init__.py`
+  - public surface re-exported to the LlamaFactory side
 - `hyper_parallel/integration/llamafactory/utils.py`
-  - FSDP2 preparation path
+  - `HyperParallelArguments` config dataclass
+  - `fsdp2_prepare_model()` — FSDP2 preparation path
   - config translation from Accelerate plugin to HyperParallel runtime
+  - optimizer wrapping, checkpoint save/load helpers, HF export
+- `hyper_parallel/integration/llamafactory/activation.py`
+  - `find_transformer_blocks()` — discovers gc-enabled containers
+  - `setup_activation_optimization()` — installs recompute / swap wrappers
+
+> The trainer itself (`HyperParallelTrainer`) lives in the **LlamaFactory
+> repository** (`src/llamafactory/train/hyper_parallel/`), not here.  This repo
+> only exposes the capability layer; orchestration & business logic belong on
+> the LlamaFactory side.
 
 ## Behavior Expectations
 

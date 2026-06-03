@@ -12,29 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Minimal unit tests for the HyperParallel LlamaFactory trainer integration."""
+"""Unit tests for HyperParallel LlamaFactory integration utilities.
+
+Tests cover: args, checkpoint_io, optimizer, and utils modules.
+Trainer tests live on the LlamaFactory side.
+"""
+
 # pylint: disable=wrong-import-position,protected-access
 import sys
 import types
 from types import ModuleType
 
+import pytest
 import torch
 
+# Stub transformers and accelerate if not installed (needed by utils.py imports)
 try:
-    from transformers import Seq2SeqTrainer
+    from transformers import Seq2SeqTrainer  # noqa: F401
 except ImportError:
     transformers_stub = ModuleType("transformers")
 
     class Seq2SeqTrainer:  # type: ignore[no-redef]
         def __init__(self, *args, **kwargs):
             del args, kwargs
-
-        def train(self, *args, **kwargs):
-            del args, kwargs
-            raise NotImplementedError
-
-        def create_optimizer(self):
-            raise NotImplementedError
 
     transformers_stub.Seq2SeqTrainer = Seq2SeqTrainer
     sys.modules["transformers"] = transformers_stub
@@ -46,18 +46,14 @@ if "accelerate.accelerator" not in sys.modules:
     accelerate_stub.accelerator = accelerator_stub
     sys.modules["accelerate.accelerator"] = accelerator_stub
 
-import hyper_parallel.integration.llamafactory.trainer as trainer_mod
-from hyper_parallel.integration.llamafactory.trainer import (
-    HyperParallelArguments,
-    HyperParallelTrainer,
-    _export_to_hf_format,
-    _normalize_hf_export_state_dict,
-    _wrap_optimizer_step_with_skip_dtensor_dispatch,
-)
+import hyper_parallel.integration.llamafactory.utils as lf_utils
 from hyper_parallel.integration.llamafactory.utils import (
+    HyperParallelArguments,
+    export_to_hf_format,
     _build_fsdp2_kwargs,
     _is_cpu_offload_enabled,
     _resolve_mp_policy,
+    wrap_optimizer_with_skip_dtensor_dispatch,
 )
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, OffloadPolicy
 
@@ -69,36 +65,6 @@ class _FakeOptimizer:
     def step(self, closure=None):
         self.calls.append(closure)
         return "stepped"
-
-
-class _FakeAccelerator:
-    """Minimal accelerator double for patch lifecycle tests."""
-
-    def __init__(self):
-        self.is_fsdp2 = True
-        self._models = []
-        self.unscale_calls = 0
-
-    def clip_grad_norm_(self, parameters, max_norm, norm_type=2):
-        return ("orig", list(parameters), max_norm, norm_type)
-
-    def unscale_gradients(self):
-        self.unscale_calls += 1
-
-
-class _FakeHSDPModule:
-    def parameters(self):
-        return []
-
-
-def _build_trainer_for_patch_tests():
-    trainer = object.__new__(HyperParallelTrainer)
-    trainer._hp_args = HyperParallelArguments()
-    trainer.accelerator = _FakeAccelerator()
-    trainer._orig_accelerator_clip_grad_norm = trainer.accelerator.clip_grad_norm_
-    trainer._orig_fsdp2_prepare_model = None
-    trainer._accelerator_patches_active = False
-    return trainer
 
 
 def test_cpu_offload_enabled_detection():
@@ -128,6 +94,10 @@ def test_hp_args_reshard_after_forward_defaults_to_accelerate_plugin(monkeypatch
         "hyper_parallel.integration.llamafactory.utils.get_parameters_from_modules",
         lambda modules, model, device: set(),
     )
+    monkeypatch.setattr(
+        "hyper_parallel.integration.llamafactory.utils._resolve_shard_size",
+        lambda mesh: 1,
+    )
 
     accelerator = types.SimpleNamespace(device=torch.device("cpu"))
     plugin = types.SimpleNamespace(
@@ -137,7 +107,9 @@ def test_hp_args_reshard_after_forward_defaults_to_accelerate_plugin(monkeypatch
         ignored_modules=None,
     )
 
-    kwargs = _build_fsdp2_kwargs(accelerator, torch.nn.Linear(2, 2), HyperParallelArguments(), plugin)
+    kwargs = _build_fsdp2_kwargs(
+        accelerator, torch.nn.Linear(2, 2), HyperParallelArguments(), plugin
+    )
 
     assert kwargs["reshard_after_forward"] is False
 
@@ -155,6 +127,10 @@ def test_hp_args_reshard_after_forward_overrides_accelerate_plugin(monkeypatch):
     monkeypatch.setattr(
         "hyper_parallel.integration.llamafactory.utils.get_parameters_from_modules",
         lambda modules, model, device: set(),
+    )
+    monkeypatch.setattr(
+        "hyper_parallel.integration.llamafactory.utils._resolve_shard_size",
+        lambda mesh: 1,
     )
 
     accelerator = types.SimpleNamespace(device=torch.device("cpu"))
@@ -267,9 +243,9 @@ def test_wrap_optimizer_step_uses_skip_dtensor_dispatch(monkeypatch):
             enter_exit.append("exit")
 
     optimizer = _FakeOptimizer()
-    monkeypatch.setattr(trainer_mod, "SkipDTensorDispatch", _FakeSkip)
+    monkeypatch.setattr(lf_utils, "SkipDTensorDispatch", _FakeSkip)
 
-    _wrap_optimizer_step_with_skip_dtensor_dispatch(optimizer)
+    wrap_optimizer_with_skip_dtensor_dispatch(optimizer)
 
     assert hasattr(optimizer.step, "__func__")
     result = optimizer.step("closure")
@@ -277,72 +253,6 @@ def test_wrap_optimizer_step_uses_skip_dtensor_dispatch(monkeypatch):
     assert result == "stepped"
     assert optimizer.calls == ["closure"]
     assert enter_exit == ["enter", "exit"]
-
-
-def test_train_activates_and_restores_accelerator_patches(monkeypatch):
-    """
-    Feature: Patch lifecycle isolation
-    Description: Trainer should patch Accelerate only during train() and restore afterwards.
-    Expectation: fsdp2_prepare_model and clip_grad_norm_ are restored after training.
-    """
-    trainer = _build_trainer_for_patch_tests()
-
-    import accelerate.accelerator as acc_module  # pylint: disable=C0415
-
-    original_fsdp2_prepare_model = acc_module.fsdp2_prepare_model
-    original_clip_grad_norm = trainer.accelerator.clip_grad_norm_
-
-    super_calls = []
-
-    def _fake_super_train(self, *args, **kwargs):
-        super_calls.append((args, kwargs))
-        assert acc_module.fsdp2_prepare_model is not original_fsdp2_prepare_model
-        assert self.accelerator.clip_grad_norm_ is not original_clip_grad_norm
-        return "trained"
-
-    monkeypatch.setattr(Seq2SeqTrainer, "train", _fake_super_train)
-
-    result = trainer.train("arg", named=True)
-
-    assert result == "trained"
-    assert super_calls == [(("arg",), {"named": True})]
-    assert acc_module.fsdp2_prepare_model is original_fsdp2_prepare_model
-    assert trainer.accelerator.clip_grad_norm_.__func__ is original_clip_grad_norm.__func__
-    assert trainer.accelerator.clip_grad_norm_.__self__ is original_clip_grad_norm.__self__
-    assert trainer._accelerator_patches_active is False
-
-
-def test_clip_grad_norm_dispatches_to_local_impl(monkeypatch):
-    """
-    Feature: Gradient clipping backend replacement
-    Description: In FSDP2 mode with an HSDP model, Accelerate clip_grad_norm_
-    should dispatch to HyperParallel clip impl.
-    Expectation: HyperParallel clip_grad_norm_ is called by default instead of the original accelerator path.
-    """
-    trainer = _build_trainer_for_patch_tests()
-    model = _FakeHSDPModule()
-    params = [torch.nn.Parameter(torch.tensor([1.0]))]
-    model.parameters = lambda: params
-    trainer.accelerator._models = [model]
-
-    local_calls = []
-    monkeypatch.setattr(trainer_mod, "HSDPModule", _FakeHSDPModule)
-    monkeypatch.setattr(
-        trainer_mod,
-        "hp_clip_grad_norm_",
-        lambda parameters, max_norm, norm_type=2: local_calls.append((list(parameters), max_norm, norm_type))
-        or "local",
-    )
-
-    trainer._activate_accelerator_patches()
-    try:
-        result = trainer.accelerator.clip_grad_norm_(params, 1.5, norm_type=1.0)
-    finally:
-        trainer._restore_accelerator_patches()
-
-    assert result == "local"
-    assert trainer.accelerator.unscale_calls == 1
-    assert local_calls == [(params, 1.5, 1.0)]
 
 
 def test_export_to_hf_format_uses_hf_default_shard_size(monkeypatch, tmp_path):
@@ -376,7 +286,7 @@ def test_export_to_hf_format_uses_hf_default_shard_size(monkeypatch, tmp_path):
     def _fake_get_platform():
         return _FakePlatform()
 
-    monkeypatch.setattr(trainer_mod, "get_platform", _fake_get_platform)
+    monkeypatch.setattr(lf_utils, "get_platform", _fake_get_platform)
 
     def _fake_get_model_state_dict(model, options=None):
         del model, options
@@ -387,62 +297,186 @@ def test_export_to_hf_format_uses_hf_default_shard_size(monkeypatch, tmp_path):
         _fake_get_model_state_dict,
     )
 
-    _export_to_hf_format(_FakeModel(), _FakeTokenizer(), str(tmp_path))
+    export_to_hf_format(_FakeModel(), _FakeTokenizer(), str(tmp_path))
 
     assert captured["save_dir"] == str(tmp_path)
     assert captured["tokenizer_dir"] == str(tmp_path)
-    assert captured["state_dict"]["weight"].dtype == torch.float32
+    # Export preserves the gathered state-dict dtype; no fp32 cast at save time.
+    assert captured["state_dict"]["weight"].dtype == torch.bfloat16
     assert captured["model_max_shard_size"] is None
     assert captured["tokenizer_max_shard_size"] is None
 
 
-def test_normalize_hf_export_state_dict_upcasts_floating_tensors_and_keeps_aliases():
-    """
-    Feature: HF export state dict normalization
-    Description: Floating tensors should be exported in fp32 without breaking tied/shared tensors.
-    Expectation: Lower-precision floating tensors are upcast to fp32 and aliases remain shared.
-    """
-    base = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
-    aliased = base.view(2, 3)
-    int_tensor = torch.tensor([1, 2, 3], dtype=torch.int64)
+# ---------------------------------------------------------------------------
+# Tests: fsdp_size validation and device mesh construction
+# ---------------------------------------------------------------------------
 
-    normalized = _normalize_hf_export_state_dict(
-        {
-            "bf16": base,
-            "alias": aliased,
-            "fp32": torch.ones(2, dtype=torch.float32),
-            "int": int_tensor,
-        }
+
+def test_hp_args_fsdp_size_defaults_to_none():
+    """
+    Feature: fsdp_size default
+    Description: fsdp_size is optional; when not provided it stays None and validate passes.
+    Expectation: HyperParallelArguments() has fsdp_size=None and validates cleanly.
+    """
+    args = HyperParallelArguments()
+    args.validate()
+    assert args.fsdp_size is None, f"Expected fsdp_size=None, got {args.fsdp_size!r}"
+
+
+def test_hp_args_fsdp_size_accepts_positive_int():
+    """
+    Feature: fsdp_size validation accepts positive int
+    Description: A positive integer fsdp_size must pass validation.
+    Expectation: validate() does not raise for fsdp_size=4.
+    """
+    args = HyperParallelArguments(fsdp_size=4)
+    args.validate()
+    assert args.fsdp_size == 4, f"Expected fsdp_size=4, got {args.fsdp_size!r}"
+
+
+def test_hp_args_fsdp_size_rejects_zero_and_negative():
+    """
+    Feature: fsdp_size validation rejects non-positive
+    Description: 0 and negative values must raise during validation.
+    Expectation: ValueError mentioning fsdp_size for both 0 and -1.
+    """
+    for bad in (0, -1, -8):
+        args = HyperParallelArguments(fsdp_size=bad)
+        with pytest.raises(ValueError, match="fsdp_size"):
+            args.validate()
+
+
+def test_hp_args_fsdp_size_rejects_non_int():
+    """
+    Feature: fsdp_size validation rejects non-int
+    Description: Non-int values (including bool, which Python treats as int subtype) must raise.
+    Expectation: ValueError mentioning fsdp_size for string, float, bool inputs.
+    """
+    for bad in ("4", 4.0, True):
+        args = HyperParallelArguments(fsdp_size=bad)
+        with pytest.raises(ValueError, match="fsdp_size"):
+            args.validate()
+
+
+def _patch_mesh_environment(monkeypatch, world_size):
+    """Install fake init_device_mesh + get_platform that records call args."""
+    calls = {}
+
+    def fake_init(device_type, shape, mesh_dim_names=None):
+        calls["device_type"] = device_type
+        calls["shape"] = shape
+        calls["mesh_dim_names"] = mesh_dim_names
+        return f"mesh<{shape}, {mesh_dim_names}>"
+
+    class FakePlatform:
+        @staticmethod
+        def get_world_size():
+            return world_size
+
+    monkeypatch.setattr(lf_utils, "init_device_mesh", fake_init)
+    monkeypatch.setattr(lf_utils, "get_platform", FakePlatform)
+    return calls
+
+
+def test_build_device_mesh_2d_when_fsdp_size_lt_world_size(monkeypatch):
+    """
+    Feature: 2D HSDP mesh construction
+    Description: fsdp_size < world_size and world_size % fsdp_size == 0 builds a 2D (dp, fsdp) mesh.
+    Expectation: init_device_mesh receives shape (dp_size, fsdp_size) with dim names ("dp", "fsdp").
+    """
+    calls = _patch_mesh_environment(monkeypatch, world_size=8)
+    accelerator = types.SimpleNamespace(device=torch.device("cpu"))
+    hp_args = HyperParallelArguments(fsdp_size=4, device_type="cpu")
+
+    mesh = lf_utils._build_device_mesh(accelerator, hp_args)
+
+    assert calls["shape"] == (2, 4), f"Expected shape (2, 4), got {calls['shape']}"
+    assert calls["mesh_dim_names"] == ("dp", "fsdp"), (
+        f"Expected dim names ('dp', 'fsdp'), got {calls['mesh_dim_names']}"
+    )
+    assert mesh == "mesh<(2, 4), ('dp', 'fsdp')>", f"Unexpected mesh: {mesh}"
+
+
+def test_build_device_mesh_1d_when_fsdp_size_ge_world_size(monkeypatch):
+    """
+    Feature: 1D fallback when fsdp_size covers the whole world
+    Description: fsdp_size >= world_size collapses to a 1D ("dp",) mesh.
+    Expectation: init_device_mesh receives shape (world_size,) with dim name ("dp",).
+    """
+    calls = _patch_mesh_environment(monkeypatch, world_size=4)
+    accelerator = types.SimpleNamespace(device=torch.device("cpu"))
+    hp_args = HyperParallelArguments(fsdp_size=4, device_type="cpu")
+
+    lf_utils._build_device_mesh(accelerator, hp_args)
+
+    assert calls["shape"] == (4,), f"Expected shape (4,), got {calls['shape']}"
+    assert calls["mesh_dim_names"] == ("dp",), (
+        f"Expected dim names ('dp',), got {calls['mesh_dim_names']}"
     )
 
-    assert normalized["bf16"].dtype == torch.float32
-    assert normalized["alias"].dtype == torch.float32
-    assert normalized["fp32"].dtype == torch.float32
-    assert normalized["int"] is int_tensor
-    assert normalized["bf16"] is normalized["alias"]
 
-
-def test_save_model_internal_call_exports_hf_weights(monkeypatch, tmp_path):
+def test_build_device_mesh_raises_when_world_size_not_divisible(monkeypatch):
     """
-    Feature: Intermediate checkpoint export
-    Description: save_model(_internal_call=True) should still export HF-format
-    weights into the checkpoint directory.
-    Expectation: The internal save path calls the HF export helper with the checkpoint directory.
+    Feature: Divisibility check
+    Description: world_size not divisible by fsdp_size must raise.
+    Expectation: ValueError naming both world_size and fsdp_size.
     """
-    trainer = object.__new__(HyperParallelTrainer)
-    trainer.args = types.SimpleNamespace(output_dir=str(tmp_path / "default"))
-    trainer.model = object()
-    trainer.processing_class = object()
+    _patch_mesh_environment(monkeypatch, world_size=8)
+    accelerator = types.SimpleNamespace(device=torch.device("cpu"))
+    hp_args = HyperParallelArguments(fsdp_size=3, device_type="cpu")
 
-    calls = []
-    monkeypatch.setattr(
-        trainer_mod,
-        "_export_to_hf_format",
-        lambda model, tokenizer, save_dir: calls.append((model, tokenizer, save_dir)),
+    with pytest.raises(
+        ValueError, match="world_size=8 must be divisible by fsdp_size=3"
+    ):
+        lf_utils._build_device_mesh(accelerator, hp_args)
+
+
+def test_build_device_mesh_ignores_accelerate_mesh_when_fsdp_size_set(monkeypatch):
+    """
+    Feature: fsdp_size bypasses accelerate-cached mesh
+    Description: When fsdp_size is set, accelerator.torch_device_mesh is ignored
+    so we get a fresh 2D HSDP mesh instead of a cached 1D FSDP mesh.
+    Expectation: init_device_mesh is called and the cached mesh is not returned.
+    """
+    calls = _patch_mesh_environment(monkeypatch, world_size=8)
+    # Accelerator carries a cached mesh that *would* be returned by the
+    # default branch — fsdp_size must override it.
+    accelerator = types.SimpleNamespace(
+        device=torch.device("cpu"),
+        torch_device_mesh="CACHED_1D_MESH",
+        parallelism_config=None,
+    )
+    hp_args = HyperParallelArguments(fsdp_size=4, device_type="cpu")
+
+    mesh = lf_utils._build_device_mesh(accelerator, hp_args)
+
+    assert mesh != "CACHED_1D_MESH", (
+        "fsdp_size must override the cached accelerator mesh"
+    )
+    assert calls["shape"] == (2, 4), (
+        f"Expected init_device_mesh called with shape (2, 4), got {calls['shape']}"
     )
 
-    checkpoint_dir = tmp_path / "checkpoint-3"
-    trainer.save_model(str(checkpoint_dir), _internal_call=True)
 
-    assert checkpoint_dir.is_dir()
-    assert calls == [(trainer.model, trainer.processing_class, str(checkpoint_dir))]
+def test_build_device_mesh_uses_accelerate_mesh_when_fsdp_size_none(monkeypatch):
+    """
+    Feature: backward compatibility when fsdp_size is None
+    Description: With fsdp_size=None, behavior is unchanged — the accelerate-cached mesh is returned.
+    Expectation: init_device_mesh is NOT called; the cached mesh is returned verbatim.
+    """
+    calls = _patch_mesh_environment(monkeypatch, world_size=8)
+    accelerator = types.SimpleNamespace(
+        device=torch.device("cpu"),
+        torch_device_mesh="CACHED_1D_MESH",
+        parallelism_config=None,
+    )
+    hp_args = HyperParallelArguments()  # fsdp_size=None
+
+    mesh = lf_utils._build_device_mesh(accelerator, hp_args)
+
+    assert mesh == "CACHED_1D_MESH", (
+        f"Expected cached mesh to be returned, got {mesh!r}"
+    )
+    assert "shape" not in calls, (
+        "init_device_mesh should not be called when fsdp_size is None and cached mesh exists"
+    )
