@@ -14,10 +14,10 @@
 """parallel_pad test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_pad import PadDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -35,11 +35,13 @@ class TestParallelPad(unittest.TestCase):
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
@@ -73,15 +75,18 @@ class TestParallelPad(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
 
         pad = (1, 1)
-        output_layout = op.infer_layout((x_layout,), extra_args=(pad,))
+        cache_values = [x_layout, pad]
+        output_layouts, extra_info = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
+        assert extra_info is None, f"Pad extra_info should be None, got {extra_info}"
         assert output_layout.to_dict()["tensor_map"] == x_layout.to_dict()["tensor_map"]
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (x_layout,), extra_args=(pad,)) is None, (
+        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x_layout,), extra_args=(pad,))}"
+            f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -98,7 +103,7 @@ class TestParallelPad(unittest.TestCase):
         pad = (0, 0, 1, 1)
 
         with self.assertRaisesRegex(ValueError, "does not support padding on a sharded dimension"):
-            op.infer_layout((x_layout,), extra_args=(pad,))
+            op.infer_layout([x_layout, pad])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_pad_infer_layout_mixed_dims(self, mock_platform):
@@ -112,12 +117,14 @@ class TestParallelPad(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 3)
 
         pad_success = (1, 1)
-        output_layout = op.infer_layout((x_layout,), extra_args=(pad_success,))
+        output_layouts, extra_info = op.infer_layout([x_layout, pad_success])
+        output_layout = output_layouts[0]
+        assert extra_info is None, f"Pad extra_info should be None, got {extra_info}"
         assert output_layout.to_dict()["tensor_map"] == x_layout.to_dict()["tensor_map"]
 
         pad_fail = (0, 0, 1, 1)
         with self.assertRaisesRegex(ValueError, "does not support padding on a sharded dimension"):
-            op.infer_layout((x_layout,), extra_args=(pad_fail,))
+            op.infer_layout([x_layout, pad_fail])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_pad_infer_layout_zero_padding_on_sharded(self, mock_platform):
@@ -132,7 +139,9 @@ class TestParallelPad(unittest.TestCase):
 
         pad = (1, 1, 0, 0)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(pad,))
+        output_layouts, extra_info = op.infer_layout([x_layout, pad])
+        output_layout = output_layouts[0]
+        assert extra_info is None, f"Pad extra_info should be None, got {extra_info}"
         assert output_layout.to_dict()["tensor_map"] == x_layout.to_dict()["tensor_map"]
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -147,10 +156,45 @@ class TestParallelPad(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 1)
 
         with self.assertRaisesRegex(ValueError, "Pad tuple length must be even"):
-            op.infer_layout((x_layout,), extra_args=((1, 2, 3),))
+            op.infer_layout([x_layout, (1, 2, 3)])
 
         with self.assertRaisesRegex(ValueError, "but tensor only has"):
-            op.infer_layout((x_layout,), extra_args=((1, 1, 1, 1),))
+            op.infer_layout([x_layout, (1, 1, 1, 1)])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_pad_partial_input_raises_error(self, mock_platform):
+        """
+        Feature: Partial input validation
+        Description: Input has Partial status set on dp axis.
+        Expectation: Raises ValueError.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+
+        with self.assertRaisesRegex(ValueError, "Partial status"):
+            op.infer_layout([x_layout, (1, 1)])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_pad_preprocess_positional_args(self, mock_platform):
+        """
+        Feature: Pad preprocess
+        Description: Pad arguments are normalized into positional args for local execution.
+        Expectation: local_kwargs is empty and cache_values carries layout and pad.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        mock_tensor.to_local.return_value = MagicMock()
+
+        pad = (1, 1)
+        local_args, local_kwargs, cache_values = op.preprocess((mock_tensor, pad), {})
+
+        assert not local_kwargs, f"Pad local_kwargs should be empty, got {local_kwargs}"
+        assert len(local_args) == 4, f"Pad local_args should have 4 elements, got {len(local_args)}"
+        assert local_args[1:] == (pad, 'constant', None), f"Unexpected Pad local_args tail: {local_args[1:]}"
+        assert cache_values == [x_layout, pad], f"Unexpected Pad cache_values: {cache_values}"
 
 
 if __name__ == "__main__":

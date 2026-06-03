@@ -16,66 +16,105 @@
 Distributed implementation for Concat operator.
 """
 
+from typing import Tuple
+
 from .parallel_ops import DistributedOp
+
+
+# pylint: disable=unused-argument
+def _normalize_concat_args(tensors, dim=0, **kwargs):
+    """
+    Normalize arguments for Concat operator.
+    """
+    return (tensors, dim), {}
 
 
 class ConcatDistributedOp(DistributedOp):
     """Distributed implementation for Concat."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layout for Concat and normalize the concatenation dimension.
-        Raises an error if the specified concatenation dimension is sharded.
+        Preprocess arguments for Concat operator.
 
         Args:
-            layouts (tuple): Layouts of input tensors and scalar arguments.
-            extra_args (list): Additional arguments (e.g., dim). Modified in-place
-                               to store the normalized positive dimension.
+            args (tuple): Input arguments, first element is the input tensor sequence.
+            kwargs (dict): Keyword arguments, may contain dim.
 
         Returns:
-            Layout: The inferred output layout (identical to the input layouts).
+            tuple: (local_args, local_kwargs, cache_values)
         """
-        # Filter out None values which correspond to scalar arguments (e.g., dim)
+        args, _ = _normalize_concat_args(*args, **kwargs)
+        tensors = args[0]
+        dim = args[1]
+
+        local_tensors = tuple(t.to_local() if hasattr(t, "to_local") else t for t in tensors)
+        layouts = [getattr(t, "layout", None) for t in tensors]
+
+        local_args = (local_tensors, dim)
+        local_kwargs = {}
+        cache_values = layouts + [dim]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layouts for Concat operator.
+
+        Rules:
+            1. Inputs must not have Partial status.
+            2. At least one input must be a DTensor.
+            3. All input DTensors must have the same layout.
+            4. dim must be an integer within the valid range [-ndim, ndim-1].
+            5. The concatenation dimension must not be sharded.
+            6. Output layout is identical to the input layout.
+
+        Args:
+            cache_values (list): [input_layout, ..., dim] where non-DTensor inputs
+                use None as their layout sentinel.
+
+        Returns:
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If inputs are invalid, layouts mismatch, dim is out of range,
+                or the concatenation dimension is sharded.
+        """
+        layouts = cache_values[:-1]
+        dim = cache_values[-1]
         valid_layouts = [layout for layout in layouts if layout is not None]
 
         if not valid_layouts:
-            raise ValueError(f"Operation {self.op_name}: cat requires at least one input DTensor.")
+            raise ValueError(f"For {self.op_name}, cat requires at least one input DTensor.")
 
-        # In this framework, we assume inputs must be aligned to the same layout
-        # for concatenation. We use the first valid layout as the reference.
+        self._check_partial_inputs(valid_layouts)
+
         base_layout = valid_layouts[0]
 
-        # Verify consistency across all valid input layouts
-        for _, layout in enumerate(valid_layouts):
+        for layout in valid_layouts:
             if layout != base_layout:
                 raise ValueError(
-                    f"Operation {self.op_name}: All input tensors must have the same layout. "
+                    f"For {self.op_name}, All input tensors must have the same layout. "
                     f"Expected layout: {base_layout}, Mismatched layout: {layout}"
                 )
 
-        # Extract dim from extra_args, assuming the framework populates it correctly
-        dim = extra_args[0] if extra_args else 0
+        if not isinstance(dim, int):
+            raise ValueError(
+                f"For {self.op_name}, dimension should be int, but got {type(dim)}"
+            )
 
-        # Convert negative dim to positive
-        ndim = len(base_layout.tensor_map)
+        ndim = len(base_layout.alias_tensor_map)
+        if dim < -ndim or dim >= ndim:
+            raise ValueError(
+                f"For {self.op_name}, dimension out of range "
+                f"(expected to be in range of [{-ndim}, {ndim - 1}], but got {dim})"
+            )
+
         actual_dim = dim if dim >= 0 else dim + ndim
 
-        # Check if the concatenation dimension is sharded
-        mapping = base_layout.tensor_map[actual_dim]
-        mapping_list = mapping if isinstance(mapping, tuple) else (mapping,)
-        is_sharded = any(m != -1 for m in mapping_list)
-
-        if is_sharded:
+        mapping = base_layout.alias_tensor_map[actual_dim]
+        if mapping != "None":
             raise ValueError(
-                f"Operation {self.op_name}: Concatenation along a sharded dimension "
+                f"For {self.op_name}, Concatenation along a sharded dimension "
                 f"(dim={dim}, normalized_dim={actual_dim}) is not supported."
             )
 
-        # Store the normalized actual_dim back into extra_args
-        # so get_expand_impl can use it directly as a positive integer
-        if extra_args:
-            extra_args[0] = actual_dim
-        else:
-            extra_args.append(actual_dim)
-
-        return base_layout
+        return ((base_layout,), None)

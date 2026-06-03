@@ -31,6 +31,35 @@ from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 op = IndexSelectDistributedOp("index_select")
 
 
+def _infer_one(distributed_op, cache_values):
+    """Run new infer_layout(cache_values) and return the single output layout."""
+    output_layouts, _ = distributed_op.infer_layout(cache_values)
+    return output_layouts[0]
+
+
+def _expand_impl(distributed_op, func, output_layout, cache_values):
+    """Run new get_expand_impl(func, infer_result, cache_values)."""
+    return distributed_op.get_expand_impl(func, ((output_layout,), None), cache_values)
+
+
+def _index_select_cache(layouts, extra_args):
+    """Build IndexSelect cache_values from legacy test fixtures."""
+    return [layouts[0], layouts[2], extra_args[0]]
+
+
+class _MockDTensor:
+    """Small DTensor-like object for preprocess tests."""
+
+    def __init__(self, layout, local_value=None, shape=None):
+        self.layout = layout
+        self._layout = layout
+        self._local_value = local_value if local_value is not None else object()
+        self.shape = shape
+
+    def to_local(self):
+        return self._local_value
+
+
 class TestParallelGatherD(unittest.TestCase):
     """Unit tests for GatherDDistributedOp."""
     def setUp(self):
@@ -87,6 +116,21 @@ class TestParallelGatherD(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_gatherd_preprocess(self, mock_platform):
+        """Verify GatherD preprocess builds positional local args and cache_values."""
+        mesh = self._make_2x4_mesh(mock_platform)
+        input_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+        index_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        input_tensor = _MockDTensor(input_layout, local_value="input")
+        index_tensor = _MockDTensor(index_layout, local_value="index")
+
+        local_args, local_kwargs, cache_values = self.op.preprocess((input_tensor, 0, index_tensor), {})
+
+        assert local_args == ("input", 0, "index")
+        assert not local_kwargs
+        assert cache_values == [input_layout, index_layout, 0]
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_gatherd_data_parallel_dim0(self, mock_platform):
         """
         Feature: Data Parallel for GatherD
@@ -99,7 +143,7 @@ class TestParallelGatherD(unittest.TestCase):
         index_placements = (Replicate(), Replicate())
         index_layout = _build_layout(mesh, index_placements, 2)
         dim = 0
-        output_layout = self.op.infer_layout((input_layout, None, index_layout), [dim])
+        output_layout = _infer_one(self.op, [input_layout, index_layout, dim])
         expected_map = (-1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Data parallel dim0 inference failed. Expected {expected_map}, got {output_layout.tensor_map}"
@@ -108,7 +152,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert output_layout.partial == ['sum', None], (
             f"Expected partial ['sum', None], got {output_layout.partial}"
         )
-        impl = self.op.get_expand_impl(None, output_layout, (input_layout, None, index_layout), [dim])
+        impl = _expand_impl(self.op, None, output_layout, [input_layout, index_layout, dim])
         assert impl is not None, "Data parallel dim0 should have expand implementation"
         assert callable(impl), "Returned impl should be a callable function"
 
@@ -125,7 +169,7 @@ class TestParallelGatherD(unittest.TestCase):
         index_placements = (Replicate(), Replicate())
         index_layout = _build_layout(mesh, index_placements, 2)
         dim = 1
-        output_layout = self.op.infer_layout((input_layout, None, index_layout), [dim])
+        output_layout = _infer_one(self.op, [input_layout, index_layout, dim])
         expected_map = (-1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Data parallel dim1 inference failed. Expected {expected_map}, got {output_layout.tensor_map}"
@@ -134,7 +178,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert output_layout.partial == [None, 'sum'], (
             f"Expected partial [None, 'sum'], got {output_layout.partial}"
         )
-        impl = self.op.get_expand_impl(None, output_layout, (input_layout, None, index_layout), [dim])
+        impl = _expand_impl(self.op, None, output_layout, [input_layout, index_layout, dim])
         assert impl is not None, "Data parallel dim1 should have expand implementation"
         assert callable(impl), "Returned impl should be a callable function"
 
@@ -152,7 +196,7 @@ class TestParallelGatherD(unittest.TestCase):
         index_layout = _build_layout(mesh, index_placements, 2)
         dim = 0
         with self.assertRaisesRegex(ValueError, "same sharding on non-dim axis 1"):
-            self.op.infer_layout((input_layout, None, index_layout), [dim])
+            _infer_one(self.op, [input_layout, index_layout, dim])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_gatherd_column_parallel(self, mock_platform):
@@ -168,7 +212,7 @@ class TestParallelGatherD(unittest.TestCase):
         index_layout = _build_layout(mesh, index_placements, 2)
         dim = 0
         with self.assertRaisesRegex(ValueError, "same sharding on non-dim axis 1"):
-            self.op.infer_layout((input_layout, None, index_layout), [dim])
+            _infer_one(self.op, [input_layout, index_layout, dim])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_gatherd_row_parallel(self, mock_platform):
@@ -183,7 +227,7 @@ class TestParallelGatherD(unittest.TestCase):
         index_placements = (Replicate(), Shard(0))
         index_layout = _build_layout(mesh, index_placements, 2)
         dim = 0
-        output_layout = self.op.infer_layout((input_layout, None, index_layout), [dim])
+        output_layout = _infer_one(self.op, [input_layout, index_layout, dim])
         expected_map = (0, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Row parallel expand failed. Expected {expected_map}, got {output_layout.tensor_map}"
@@ -192,7 +236,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert output_layout.partial == ['sum', None], (
             f"Expected partial ['sum', None], got {output_layout.partial}"
         )
-        impl = self.op.get_expand_impl(None, output_layout, (input_layout, None, index_layout), [dim])
+        impl = _expand_impl(self.op, None, output_layout, [input_layout, index_layout, dim])
         assert impl is not None, "Row parallel should have expand implementation"
         assert callable(impl), "Returned impl should be a callable function"
 
@@ -211,7 +255,7 @@ class TestParallelGatherD(unittest.TestCase):
         index_layout = _build_layout(mesh, index_placements, 2)
         dim = 0
         with self.assertRaisesRegex(ValueError, "Partial dim must be replicate."):
-            self.op.infer_layout((input_layout, None, index_layout), [dim])
+            _infer_one(self.op, [input_layout, index_layout, dim])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_gatherd_input_multi_shard_with_matched_index_non_dim_shard(self, mock_platform):
@@ -227,7 +271,7 @@ class TestParallelGatherD(unittest.TestCase):
         index_placements = (Replicate(), Shard(1))
         index_layout = _build_layout(mesh, index_placements, 2)
         dim = 0
-        output_layout = self.op.infer_layout((input_layout, None, index_layout), [dim])
+        output_layout = _infer_one(self.op, [input_layout, index_layout, dim])
         expected_map = (-1, 0)
         assert output_layout.tensor_map == expected_map, (
             f"Matched non-dim shard inference failed. Expected {expected_map}, got {output_layout.tensor_map}"
@@ -236,7 +280,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert output_layout.partial == ['sum', None], (
             f"Expected partial ['sum', None], got {output_layout.partial}"
         )
-        impl = self.op.get_expand_impl(None, output_layout, (input_layout, None, index_layout), [dim])
+        impl = _expand_impl(self.op, None, output_layout, [input_layout, index_layout, dim])
         assert impl is not None, "Matched non-dim shard case should have expand implementation"
         assert callable(impl), "Returned impl should be a callable function"
 
@@ -255,7 +299,7 @@ class TestParallelGatherD(unittest.TestCase):
         index_placements = (Replicate(), Replicate(), Shard(1))
         index_layout = _build_layout(mesh, index_placements, 3)
         dim = 1
-        output_layout = self.op.infer_layout((input_layout, None, index_layout), [dim])
+        output_layout = _infer_one(self.op, [input_layout, index_layout, dim])
         expected_map = (-1, 0, -1)
         assert output_layout.tensor_map == expected_map, (
             f"3D mesh multi-shard inference failed. Expected {expected_map}, got {output_layout.tensor_map}"
@@ -264,7 +308,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert output_layout.partial == [None, 'sum', None], (
             f"Expected partial [None, 'sum', None], got {output_layout.partial}"
         )
-        impl = self.op.get_expand_impl(None, output_layout, (input_layout, None, index_layout), [dim])
+        impl = _expand_impl(self.op, None, output_layout, [input_layout, index_layout, dim])
         assert impl is not None, "3D mesh with sharded index should have expand implementation"
         assert callable(impl), "Returned impl should be a callable function"
 
@@ -283,7 +327,7 @@ class TestParallelGatherD(unittest.TestCase):
         index_placements = (Shard(0), Replicate(), Shard(1))
         index_layout = _build_layout(mesh, index_placements, 3)
         dim = 1
-        output_layout = self.op.infer_layout((input_layout, None, index_layout), [dim])
+        output_layout = _infer_one(self.op, [input_layout, index_layout, dim])
         expected_map = (2, 0, -1)
         assert output_layout.tensor_map == expected_map, (
             f"3D mesh matched non-dim shard inference failed. Expected {expected_map}, got {output_layout.tensor_map}"
@@ -292,7 +336,7 @@ class TestParallelGatherD(unittest.TestCase):
         assert output_layout.partial == [None, 'sum', None], (
             f"Expected partial [None, 'sum', None], got {output_layout.partial}"
         )
-        impl = self.op.get_expand_impl(None, output_layout, (input_layout, None, index_layout), [dim])
+        impl = _expand_impl(self.op, None, output_layout, [input_layout, index_layout, dim])
         assert impl is not None, "3D mesh matched non-dim shard case should have expand implementation"
         assert callable(impl), "Returned impl should be a callable function"
 
@@ -310,33 +354,7 @@ class TestParallelGatherD(unittest.TestCase):
         index_layout = _build_layout(mesh, index_placements, 2)
         dim = 1
         with self.assertRaisesRegex(ValueError, "same number of dimensions"):
-            self.op.infer_layout((input_layout, None, index_layout), [dim])
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_gatherd_invalid_layouts_error(self, mock_platform):
-        """
-        Feature: GatherD input layout validation
-        Description: Fewer than the required three layouts are provided.
-        Expectation: Raise ValueError.
-        """
-        mesh = self._make_2x4_mesh(mock_platform)
-        input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-        dim = 0
-        with self.assertRaisesRegex(ValueError, "requires 3 layouts"):
-            self.op.infer_layout((input_layout, None,), [dim])
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_gatherd_missing_dim_arg_error(self, mock_platform):
-        """
-        Feature: GatherD extra argument validation
-        Description: The required dim argument is not provided.
-        Expectation: Raise ValueError.
-        """
-        mesh = self._make_2x4_mesh(mock_platform)
-        input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-        index_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-        with self.assertRaisesRegex(ValueError, "requires 1 extra arg"):
-            self.op.infer_layout((input_layout, None, index_layout), [])
+            _infer_one(self.op, [input_layout, index_layout, dim])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_gatherd_invalid_dim_error(self, mock_platform):
@@ -351,7 +369,7 @@ class TestParallelGatherD(unittest.TestCase):
         index_layout = _build_layout(mesh, input_placements, 2)
         dim = 5
         with self.assertRaisesRegex(ValueError, "out of valid range"):
-            self.op.infer_layout((input_layout, None, index_layout), [dim])
+            _infer_one(self.op, [input_layout, index_layout, dim])
 
 
 class TestParallelGatherNd(unittest.TestCase):
@@ -364,12 +382,14 @@ class TestParallelGatherNd(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
         self.op = GatherNdDistributedOp("GatherNd")
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -403,6 +423,39 @@ class TestParallelGatherNd(unittest.TestCase):
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=mesh_dim_names)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_gathernd_preprocess_with_shape(self, mock_platform):
+        """Verify GatherNd preprocess caches layouts and shapes."""
+        mesh = self._make_1d_mesh(mock_platform, world_size=8)
+        input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        indices_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+        input_tensor = _MockDTensor(input_layout, local_value="input", shape=(16, 64))
+        indices = _MockDTensor(indices_layout, local_value="indices", shape=(16, 2))
+
+        local_args, local_kwargs, cache_values = self.op.preprocess((input_tensor, indices), {})
+
+        assert local_args == ("input", "indices")
+        assert not local_kwargs
+        assert cache_values == [input_layout, indices_layout, (16, 64), (16, 2)]
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_gathernd_preprocess_packed_call(self, mock_platform):
+        """Verify GatherNd preprocess preserves MindSpore packed fallback calls."""
+        mesh = self._make_1d_mesh(mock_platform, world_size=8)
+        input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        indices_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+        input_tensor = _MockDTensor(input_layout, local_value="input", shape=(16, 64))
+        indices = _MockDTensor(indices_layout, local_value="indices", shape=(16, 2))
+        prim = object()
+
+        local_args, local_kwargs, cache_values = self.op.preprocess(
+            (prim, "GatherNd", (input_tensor, indices)), {}
+        )
+
+        assert local_args == (prim, "GatherNd", ("input", "indices"))
+        assert not local_kwargs
+        assert cache_values == [input_layout, indices_layout, (16, 64), (16, 2)]
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_gathernd_data_parallel(self, mock_platform):
         """
         Feature: GatherNd layout inference.
@@ -414,7 +467,7 @@ class TestParallelGatherNd(unittest.TestCase):
         p_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         i_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
-        out_layout = self.op.infer_layout((p_layout, i_layout), (([16, 64], [16, 2]),))
+        out_layout = _infer_one(self.op, [p_layout, i_layout, [16, 64], [16, 2]])
         expected_map = (0,)
         assert out_layout.tensor_map == expected_map, (
             f"GatherNd data parallel failed. Expected {expected_map}, got {out_layout.tensor_map}"
@@ -422,9 +475,9 @@ class TestParallelGatherNd(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert self.op.get_expand_impl(None, out_layout, (p_layout, i_layout), (([16, 64], [16, 2]),)) is None, (
+        assert _expand_impl(self.op, None, out_layout, [p_layout, i_layout, [16, 64], [16, 2]]) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {self.op.get_expand_impl(None, out_layout, (p_layout, i_layout), (([16, 64], [16, 2]),))}"
+            f"got {_expand_impl(self.op, None, out_layout, [p_layout, i_layout, [16, 64], [16, 2]])}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -439,7 +492,7 @@ class TestParallelGatherNd(unittest.TestCase):
         p_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         i_layout = _build_layout(mesh, (Replicate(), Shard(0)), 2)
 
-        out_layout = self.op.infer_layout((p_layout, i_layout), (([16, 64], [16, 2]),))
+        out_layout = _infer_one(self.op, [p_layout, i_layout, [16, 64], [16, 2]])
         expected_map = (0,)
         assert out_layout.tensor_map == expected_map, (
             f"GatherNd model parallel failed. Expected {expected_map}, got {out_layout.tensor_map}"
@@ -457,7 +510,7 @@ class TestParallelGatherNd(unittest.TestCase):
         p_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         i_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
-        out_layout = self.op.infer_layout((p_layout, i_layout), (([16, 64], [16, 2]),))
+        out_layout = _infer_one(self.op, [p_layout, i_layout, [16, 64], [16, 2]])
         expected_map = (-1,)
         assert out_layout.tensor_map == expected_map, (
             f"GatherNd replicated failed. Expected {expected_map}, got {out_layout.tensor_map}"
@@ -476,7 +529,7 @@ class TestParallelGatherNd(unittest.TestCase):
         i_layout = _build_layout(mesh, (Shard(0), Shard(1)), 2)
 
         with self.assertRaises(ValueError):
-            self.op.infer_layout((p_layout, i_layout), (([16, 64], [16, 2]),))
+            _infer_one(self.op, [p_layout, i_layout, [16, 64], [16, 2]])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_gathernd_params_sharded_error(self, mock_platform):
@@ -491,7 +544,7 @@ class TestParallelGatherNd(unittest.TestCase):
         i_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
         with self.assertRaises(ValueError):
-            self.op.infer_layout((p_layout, i_layout), (([16, 64], [16, 2]),))
+            _infer_one(self.op, [p_layout, i_layout, [16, 64], [16, 2]])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_gathernd_3d_indices_no_extra_args(self, mock_platform):
@@ -505,7 +558,7 @@ class TestParallelGatherNd(unittest.TestCase):
         p_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
         i_layout = _build_layout(mesh, (Shard(0), Shard(1), Replicate()), 3)
 
-        out_layout = self.op.infer_layout((p_layout, i_layout), (([16, 64, 32], [16, 8, 2]),))
+        out_layout = _infer_one(self.op, [p_layout, i_layout, [16, 64, 32], [16, 8, 2]])
         expected_map = (2, 1, -1)
         assert out_layout.tensor_map == expected_map, (
             f"GatherNd 3D indices failed. Expected {expected_map}, got {out_layout.tensor_map}"
@@ -523,7 +576,7 @@ class TestParallelGatherNd(unittest.TestCase):
         p_layout = None
         i_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
-        out_layout = self.op.infer_layout((p_layout, i_layout), (([16, 64], [16, 2]),))
+        out_layout = _infer_one(self.op, [p_layout, i_layout, [16, 64], [16, 2]])
         expected_map = (0,)
         assert out_layout.tensor_map == expected_map, (
             f"GatherNd params None failed. Expected {expected_map}, got {out_layout.tensor_map}"
@@ -540,11 +593,13 @@ class TestParallelIndexSelect(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -578,6 +633,21 @@ class TestParallelIndexSelect(unittest.TestCase):
         return init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("dp",))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_index_select_preprocess(self, mock_platform):
+        """Verify IndexSelect preprocess builds positional local args and cache_values."""
+        mesh = self._make_2x4_mesh(mock_platform)
+        p_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+        i_layout = _build_layout(mesh, (Replicate(), Replicate()), 1)
+        input_tensor = _MockDTensor(p_layout, local_value="input")
+        index = _MockDTensor(i_layout, local_value="index")
+
+        local_args, local_kwargs, cache_values = op.preprocess((input_tensor, 0, index), {})
+
+        assert local_args == ("input", 0, "index")
+        assert not local_kwargs
+        assert cache_values == [p_layout, i_layout, 0]
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_valid_axis_0(self, mock_platform):
         """
         Feature: Valid index_select on axis 0
@@ -594,16 +664,16 @@ class TestParallelIndexSelect(unittest.TestCase):
         layouts = (p_layout, None, i_layout)
         extra_args = (0,)
 
-        output_layout = op.infer_layout(layouts, extra_args)
+        output_layout = _infer_one(op, _index_select_cache(layouts, extra_args))
 
         expected_map = (1, 0)
         assert output_layout.tensor_map == expected_map, (
             f"Axis 0 inference failed. Expected {expected_map}, got {output_layout.tensor_map}"
         )
 
-        assert op.get_expand_impl(None, output_layout, layouts, extra_args) is None, (
+        assert _expand_impl(op, None, output_layout, _index_select_cache(layouts, extra_args)) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, layouts, extra_args)}"
+            f"got {_expand_impl(op, None, output_layout, _index_select_cache(layouts, extra_args))}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -623,16 +693,16 @@ class TestParallelIndexSelect(unittest.TestCase):
         layouts = (p_layout, None, i_layout)
         extra_args = (1,)
 
-        output_layout = op.infer_layout(layouts, extra_args)
+        output_layout = _infer_one(op, _index_select_cache(layouts, extra_args))
 
         expected_map = (1, 0)
         assert output_layout.tensor_map == expected_map, (
             f"Axis 1 inference failed. Expected {expected_map}, got {output_layout.tensor_map}"
         )
 
-        assert op.get_expand_impl(None, output_layout, layouts, extra_args) is None, (
+        assert _expand_impl(op, None, output_layout, _index_select_cache(layouts, extra_args)) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, layouts, extra_args)}"
+            f"got {_expand_impl(op, None, output_layout, _index_select_cache(layouts, extra_args))}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -652,16 +722,16 @@ class TestParallelIndexSelect(unittest.TestCase):
         layouts = (p_layout, None, i_layout)
         extra_args = (-1,)
 
-        output_layout = op.infer_layout(layouts, extra_args)
+        output_layout = _infer_one(op, _index_select_cache(layouts, extra_args))
 
         expected_map = (1, 0)
         assert output_layout.tensor_map == expected_map, (
             f"Negative axis inference failed. Expected {expected_map}, got {output_layout.tensor_map}"
         )
 
-        assert op.get_expand_impl(None, output_layout, layouts, extra_args) is None, (
+        assert _expand_impl(op, None, output_layout, _index_select_cache(layouts, extra_args)) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, layouts, extra_args)}"
+            f"got {_expand_impl(op, None, output_layout, _index_select_cache(layouts, extra_args))}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -679,7 +749,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         extra_args = (0,)
 
         with self.assertRaisesRegex(ValueError, "index is not a one-dimensional Tensor"):
-            op.infer_layout(layouts, extra_args)
+            _infer_one(op, _index_select_cache(layouts, extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_invalid_axis_positive(self, mock_platform):
@@ -696,7 +766,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         extra_args = (2,)
 
         with self.assertRaisesRegex(ValueError, "is out of valid range"):
-            op.infer_layout(layouts, extra_args)
+            _infer_one(op, _index_select_cache(layouts, extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_invalid_axis_negative(self, mock_platform):
@@ -713,30 +783,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         extra_args = (-3,)
 
         with self.assertRaisesRegex(ValueError, "is out of valid range"):
-            op.infer_layout(layouts, extra_args)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_index_select_invalid_layouts_length(self, mock_platform):
-        """
-        Feature: Invalid layouts length
-        Description: Pass an incomplete layouts tuple to infer_layout.
-        Expectation: Raises ValueError about missing required layouts length.
-        """
-        mesh = self._make_2x4_mesh(mock_platform)
-        p_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-        i_layout = _build_layout(mesh, (Replicate(), Replicate()), 1)
-
-        layouts = (p_layout, i_layout)
-        extra_args = (0,)
-
-        with self.assertRaisesRegex(ValueError, "Gather ops requires 3 layouts"):
-            op.infer_layout(layouts, extra_args)
-
-        layouts_valid = (p_layout, None, i_layout)
-        extra_args_invalid = ()
-
-        with self.assertRaisesRegex(ValueError, "Gather ops requires 1 extra args"):
-            op.infer_layout(layouts_valid, extra_args_invalid)
+            _infer_one(op, _index_select_cache(layouts, extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_unsharded_axis_unsharded_index(self, mock_platform):
@@ -753,16 +800,16 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_placements = [Replicate(), Replicate()]
         i_layout = _build_layout(mesh, i_placements, 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(1,))
+        output_layout = _infer_one(op, [p_layout, i_layout, 1])
 
         expected_map = (1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"Unsharded axis failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-        assert op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,)) is None, (
+        assert _expand_impl(op, None, output_layout, [p_layout, i_layout, 1]) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,))}"
+            f"got {_expand_impl(op, None, output_layout, [p_layout, i_layout, 1])}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -780,13 +827,13 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_placements = [Replicate(), Replicate()]
         i_layout = _build_layout(mesh, i_placements, 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(1,))
+        output_layout = _infer_one(op, [p_layout, i_layout, 1])
 
         expected_map = (1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"Sharded axis failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
-        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,))
+        impl = _expand_impl(op, None, output_layout, [p_layout, i_layout, 1])
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -806,13 +853,13 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_placements = [Replicate(), Replicate()]
         i_layout = _build_layout(mesh, i_placements, 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(-1,))
+        output_layout = _infer_one(op, [p_layout, i_layout, -1])
 
         expected_map = (1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"Negative axis failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
-        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,))
+        impl = _expand_impl(op, None, output_layout, [p_layout, i_layout, 1])
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -832,7 +879,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_layout = _build_layout(mesh, i_placements, 1)
 
         with self.assertRaisesRegex(ValueError, "dim value 2 is out of valid range"):
-            op.infer_layout((p_layout, None, i_layout), extra_args=(2,))
+            _infer_one(op, [p_layout, i_layout, 2])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_axis_out_of_bounds_negative(self, mock_platform):
@@ -848,7 +895,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_layout = _build_layout(mesh, i_placements, 1)
 
         with self.assertRaisesRegex(ValueError, "dim value -3 is out of valid range"):
-            op.infer_layout((p_layout, None, i_layout), extra_args=(-3,))
+            _infer_one(op, [p_layout, i_layout, -3])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_invalid_index_ndim_2(self, mock_platform):
@@ -865,39 +912,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_layout = _build_layout(mesh, i_placements, 2)
 
         with self.assertRaisesRegex(ValueError, "index is not a one-dimensional Tensor"):
-            op.infer_layout((p_layout, None, i_layout), extra_args=(0,))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_index_select_invalid_layouts_length_2(self, mock_platform):
-        """
-        Feature: Index select layout inference
-        Description: An invalid number of layouts are passed to the operator.
-        Expectation: ValueError is raised.
-        """
-        mesh = self._make_2x4_mesh(mock_platform, mesh_dim_names=("dp", "mp"))
-        p_placements = [Shard(0), Replicate()]
-        p_layout = _build_layout(mesh, p_placements, 2)
-        i_placements = [Replicate(), Replicate()]
-        i_layout = _build_layout(mesh, i_placements, 1)
-
-        with self.assertRaisesRegex(ValueError, "Gather ops requires 3 layouts"):
-            op.infer_layout((p_layout, i_layout), extra_args=(0,))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_index_select_invalid_extra_args_length(self, mock_platform):
-        """
-        Feature: Index select layout inference
-        Description: An invalid number of extra arguments are passed.
-        Expectation: ValueError is raised.
-        """
-        mesh = self._make_2x4_mesh(mock_platform, mesh_dim_names=("dp", "mp"))
-        p_placements = [Shard(0), Replicate()]
-        p_layout = _build_layout(mesh, p_placements, 2)
-        i_placements = [Replicate(), Replicate()]
-        i_layout = _build_layout(mesh, i_placements, 1)
-
-        with self.assertRaisesRegex(ValueError, "Gather ops requires 1 extra args"):
-            op.infer_layout((p_layout, None, i_layout), extra_args=(0, 1))
+            _infer_one(op, [p_layout, i_layout, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_invalid_partial_input(self, mock_platform):
@@ -914,7 +929,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_layout = _build_layout(mesh, i_placements, 1)
 
         with self.assertRaisesRegex(ValueError, "Partial status which is not allowed"):
-            op.infer_layout((p_layout, None, i_layout), extra_args=(0,))
+            _infer_one(op, [p_layout, i_layout, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_3d_input_axis_0(self, mock_platform):
@@ -931,13 +946,13 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_placements = [Replicate(), Replicate()]
         i_layout = _build_layout(mesh, i_placements, 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(0,))
+        output_layout = _infer_one(op, [p_layout, i_layout, 0])
 
         expected_map = (-1, 0, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"3D input axis 0 failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
-        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,))
+        impl = _expand_impl(op, None, output_layout, [p_layout, i_layout, 1])
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -958,14 +973,14 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_placements = [Replicate(), Replicate()]
         i_layout = _build_layout(mesh, i_placements, 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(0,))
+        output_layout = _infer_one(op, [p_layout, i_layout, 0])
 
         expected_map = (-1,)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"1D input axis 0 failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (0,))
+        impl = _expand_impl(op, None, output_layout, [p_layout, i_layout, 0])
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -987,14 +1002,14 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_layout = _build_layout(mesh, i_placements, 0)
 
         with self.assertRaisesRegex(ValueError, "index is not a one-dimensional Tensor"):
-            op.infer_layout((p_layout, None, i_layout), extra_args=(0,))
+            _infer_one(op, [p_layout, i_layout, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_get_expand_impl_unsharded(self, mock_platform):
         """
         Feature: Index select expand implementation
         Description: The selected axis is not sharded ("None").
-        Expectation: The implementation falls back and returns the original standard function.
+        Expectation: The implementation falls back to the dispatcher default.
         """
         mesh = self._make_2x4_mesh(mock_platform, mesh_dim_names=("dp", "mp"))
 
@@ -1004,9 +1019,9 @@ class TestParallelIndexSelect(unittest.TestCase):
         def dummy_func():
             pass
 
-        impl = op.get_expand_impl(dummy_func, None, [p_layout], [0])
+        impl = op.get_expand_impl(dummy_func, None, [p_layout, None, 0])
 
-        assert impl is dummy_func, "Should return original function when axis is unsharded"
+        assert impl is None, "Should return None when axis is unsharded"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_get_expand_impl_sharded(self, mock_platform):
@@ -1023,7 +1038,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         def dummy_func():
             pass
 
-        impl = op.get_expand_impl(dummy_func, None, [p_layout], [0])
+        impl = op.get_expand_impl(dummy_func, None, [p_layout, None, 0])
 
         assert impl is not dummy_func, "Should return custom wrapper when axis is sharded"
         assert impl.__name__ == "expand_impl", "Wrapper function should be named 'expand_impl'"
@@ -1043,14 +1058,14 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_placements = [Replicate(), Replicate()]
         i_layout = _build_layout(mesh, i_placements, 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(-2,))
+        output_layout = _infer_one(op, [p_layout, i_layout, -2])
 
         expected_map = (1, -1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"Negative axis on 3D tensor failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (-2,))
+        impl = _expand_impl(op, None, output_layout, [p_layout, i_layout, -2])
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -1071,16 +1086,16 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_placements = [Replicate(), Replicate()]
         i_layout = _build_layout(mesh, i_placements, 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(2,))
+        output_layout = _infer_one(op, [p_layout, i_layout, 2])
 
         expected_map = (1, -1, -1, 0)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"4D tensor axis 2 failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-        assert op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (2,)) is None, (
+        assert _expand_impl(op, None, output_layout, [p_layout, i_layout, 2]) is None, (
             f"get_expand_impl test failed. Expected None,"
-            f"got {op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (2,))}"
+            f"got {_expand_impl(op, None, output_layout, [p_layout, i_layout, 2])}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -1098,14 +1113,14 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_placements = [Replicate(), Replicate(), Replicate()]
         i_layout = _build_layout(mesh, i_placements, 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(1,))
+        output_layout = _infer_one(op, [p_layout, i_layout, 1])
 
         expected_map = (2, -1, 0)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"3D mesh fully sharded failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,))
+        impl = _expand_impl(op, None, output_layout, [p_layout, i_layout, 1])
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -1126,14 +1141,14 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_placements = [Replicate()]
         i_layout = _build_layout(mesh, i_placements, 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(0,))
+        output_layout = _infer_one(op, [p_layout, i_layout, 0])
 
         expected_map = (-1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"1D mesh param sharded failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (0,))
+        impl = _expand_impl(op, None, output_layout, [p_layout, i_layout, 0])
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -1154,16 +1169,16 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_placements = [Shard(0)]
         i_layout = _build_layout(mesh, i_placements, 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(1,))
+        output_layout = _infer_one(op, [p_layout, i_layout, 1])
 
         expected_map = (-1, 0)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"1D mesh index sharded failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-        assert op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,)) is None, (
+        assert _expand_impl(op, None, output_layout, [p_layout, i_layout, 1]) is None, (
             f"get_expand_impl test failed. Expected None,"
-            f"got {op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (1,))}"
+            f"got {_expand_impl(op, None, output_layout, [p_layout, i_layout, 1])}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -1181,14 +1196,14 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_placements = [Replicate(), Replicate()]
         i_layout = _build_layout(mesh, i_placements, 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(-1,))
+        output_layout = _infer_one(op, [p_layout, i_layout, -1])
 
         expected_map = (-1,)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"1D param negative axis failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (-1,))
+        impl = _expand_impl(op, None, output_layout, [p_layout, i_layout, -1])
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -1209,14 +1224,14 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_placements = [Replicate(), Replicate()]
         i_layout = _build_layout(mesh, i_placements, 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(4,))
+        output_layout = _infer_one(op, [p_layout, i_layout, 4])
 
         expected_map = (1, -1, -1, -1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"5D param last axis failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
         )
 
-        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (4,))
+        impl = _expand_impl(op, None, output_layout, [p_layout, i_layout, 4])
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -1233,13 +1248,13 @@ class TestParallelIndexSelect(unittest.TestCase):
         p_layout = _build_layout(mesh, [Shard(0), Replicate()], 2)
         i_layout = _build_layout(mesh, [Replicate(), Replicate()], 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(0,))
+        output_layout = _infer_one(op, [p_layout, i_layout, 0])
 
         assert output_layout.mesh_shape == p_layout.mesh_shape, (
             "Output mesh shape does not match input mesh shape."
         )
 
-        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (0,))
+        impl = _expand_impl(op, None, output_layout, [p_layout, i_layout, 0])
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -1256,13 +1271,13 @@ class TestParallelIndexSelect(unittest.TestCase):
         p_layout = _build_layout(mesh, [Shard(0), Replicate()], 2)
         i_layout = _build_layout(mesh, [Replicate(), Replicate()], 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(0,))
+        output_layout = _infer_one(op, [p_layout, i_layout, 0])
 
         assert output_layout.alias_name == p_layout.alias_name, (
             "Output alias name does not match input alias name."
         )
 
-        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (0,))
+        impl = _expand_impl(op, None, output_layout, [p_layout, i_layout, 0])
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -1279,13 +1294,13 @@ class TestParallelIndexSelect(unittest.TestCase):
         p_layout = _build_layout(mesh, [Shard(0), Replicate()], 2)
         i_layout = _build_layout(mesh, [Replicate(), Replicate()], 1)
 
-        output_layout = op.infer_layout((p_layout, None, i_layout), extra_args=(0,))
+        output_layout = _infer_one(op, [p_layout, i_layout, 0])
 
         assert output_layout.rank_list == p_layout.rank_list, (
             "Output rank list does not match input rank list."
         )
 
-        impl = op.get_expand_impl(None, output_layout, (p_layout, None, i_layout), (0,))
+        impl = _expand_impl(op, None, output_layout, [p_layout, i_layout, 0])
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -1304,7 +1319,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         def dummy_func():
             pass
 
-        impl = op.get_expand_impl(dummy_func, None, [p_layout], [-1])
+        impl = op.get_expand_impl(dummy_func, None, [p_layout, None, -1])
 
         assert impl is not dummy_func, "Should return custom wrapper for negative sharded axis."
         assert impl.__name__ == "expand_impl", "Wrapper function should be named 'expand_impl'."
@@ -1314,7 +1329,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         """
         Feature: get_expand_impl with unsharded axis but other sharded dims
         Description: The target axis is unsharded, but a different dimension of the tensor is sharded.
-        Expectation: Returns the original function because the selected axis itself requires no cross-device sync.
+        Expectation: Returns None because the selected axis itself requires no cross-device sync.
         """
         mesh = self._make_2x4_mesh(mock_platform)
 
@@ -1323,12 +1338,9 @@ class TestParallelIndexSelect(unittest.TestCase):
         def dummy_func():
             pass
 
-        impl = op.get_expand_impl(dummy_func, None, [p_layout], [1])
+        impl = op.get_expand_impl(dummy_func, None, [p_layout, None, 1])
 
-        assert impl is dummy_func, (
-            "Should return original function when target axis is unsharded, "
-            "regardless of other dims."
-        )
+        assert impl is None, "Should return None when target axis is unsharded, regardless of other dims."
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_partial_index_layout_invalid(self, mock_platform):
@@ -1344,17 +1356,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_layout = _build_layout(mesh, i_placements, 1)
 
         with self.assertRaisesRegex(ValueError, "Partial status which is not allowed"):
-            op.infer_layout((p_layout, None, i_layout), extra_args=(0,))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_index_select_empty_layouts_invalid(self, mock_platform):
-        """
-        Feature: Layout validation
-        Description: Pass an empty tuple for layouts.
-        Expectation: Raises ValueError regarding the required layout length.
-        """
-        with self.assertRaisesRegex(ValueError, "Gather ops requires 3 layouts"):
-            op.infer_layout((), extra_args=(0,))
+            _infer_one(op, [p_layout, i_layout, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_index_select_0d_param_invalid(self, mock_platform):
@@ -1369,22 +1371,7 @@ class TestParallelIndexSelect(unittest.TestCase):
         i_layout = _build_layout(mesh, [Replicate(), Replicate()], 1)
 
         with self.assertRaisesRegex(ValueError, "dim value 0 is out of valid range"):
-            op.infer_layout((p_layout, None, i_layout), extra_args=(0,))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_index_select_two_extra_args_invalid(self, mock_platform):
-        """
-        Feature: Extra arguments validation
-        Description: Pass an extra argument tuple with length greater than 1.
-        Expectation: Raises ValueError regarding required extra_args length.
-        """
-        mesh = self._make_2x4_mesh(mock_platform)
-        p_layout = _build_layout(mesh, [Replicate(), Replicate()], 2)
-        i_layout = _build_layout(mesh, [Replicate(), Replicate()], 1)
-
-        with self.assertRaisesRegex(ValueError, "Gather ops requires 1 extra args"):
-            op.infer_layout((p_layout, None, i_layout), extra_args=(0, 1))
-
+            _infer_one(op, [p_layout, i_layout, 0])
 
 if __name__ == "__main__":
     unittest.main()

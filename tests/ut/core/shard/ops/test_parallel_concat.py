@@ -15,12 +15,14 @@
 """parallel_concat test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_concat import ConcatDistributedOp
+from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP
@@ -40,11 +42,14 @@ class TestParallelCat(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+        self.platform = get_platform()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -93,9 +98,8 @@ class TestParallelCat(unittest.TestCase):
         x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
         y_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
 
-        extra_args = [0]
         with self.assertRaisesRegex(ValueError, "All input tensors must have the same layout"):
-            op.infer_layout((x_layout, y_layout), extra_args=extra_args)
+            op.infer_layout([x_layout, y_layout, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_get_expand_impl_unsharded_dim(self, mock_platform):
@@ -108,9 +112,10 @@ class TestParallelCat(unittest.TestCase):
         placements = (Shard(0), Replicate())
         layout = _build_layout(mesh, placements, 2)
 
-        extra_args = [1]
+        cache_values = [layout, layout, 1]
+        output_layouts, extra_info = op.infer_layout(cache_values)
 
-        assert op.get_expand_impl(None, layout, (layout, layout), extra_args) is None, (
+        assert op.get_expand_impl(None, (output_layouts, extra_info), cache_values) is None, (
             "Concatenating on an unsharded dimension should return None to use the fallback PyTorch cat."
         )
 
@@ -125,42 +130,41 @@ class TestParallelCat(unittest.TestCase):
         placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, placements, 2)
 
-        extra_args = [1]
-        output_layout = op.infer_layout((x_layout, x_layout, x_layout), extra_args=extra_args)
+        cache_values = [x_layout, x_layout, x_layout, 1]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         assert output_layout == x_layout, "Output layout should be identical to the input layout."
-        assert extra_args[0] == 1, "Dimension should remain 1."
+        assert cache_values[-1] == 1, "Dimension should remain 1."
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_negative_dim_3d(self, mock_platform):
         """
         Feature: Negative dimension normalization for 3D tensors
         Description: Concatenate 3D tensors using dim=-2
-        Expectation: Output layout matches, and extra_args normalizes dim=-2 to dim=1
+        Expectation: Output layout matches when dim=-2 resolves to dim=1
         """
         mesh = self._make_2x2x2_mesh(mock_platform)
         placements = (Shard(0), Replicate(), Shard(2))
         x_layout = _build_layout(mesh, placements, 3)
 
-        extra_args = [-2]
-        op.infer_layout((x_layout, x_layout), extra_args=extra_args)
+        output_layouts, _ = op.infer_layout([x_layout, x_layout, -2])
 
-        assert extra_args[0] == 1, f"Negative dimension -2 should be normalized to 1, got {extra_args[0]}."
+        assert output_layouts[0] == x_layout, "Negative dimension -2 should be accepted as dim 1."
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_dim_minus_ndim(self, mock_platform):
         """
         Feature: Negative dimension normalization boundary case (dim = -ndim)
         Description: Concatenate 2D tensors using dim=-2
-        Expectation: extra_args normalizes dim=-2 to dim=0
+        Expectation: dim=-2 is accepted as dim=0
         """
         mesh = self._make_2x4_mesh(mock_platform)
         x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
-        extra_args = [-2]
-        op.infer_layout((x_layout, x_layout), extra_args=extra_args)
+        output_layouts, _ = op.infer_layout([x_layout, x_layout, -2])
 
-        assert extra_args[0] == 0, f"Dimension -2 on a 2D tensor should normalize to 0, got {extra_args[0]}."
+        assert output_layouts[0] == x_layout, "Dimension -2 on a 2D tensor should be accepted as dim 0."
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_get_expand_impl_unsharded_dim_3d(self, mock_platform):
@@ -172,9 +176,10 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x2x2_mesh(mock_platform)
         x_layout = _build_layout(mesh, (Shard(0), Replicate(), Shard(2)), 3)
 
-        extra_args = [1]
+        cache_values = [x_layout, x_layout, 1]
+        output_layouts, extra_info = op.infer_layout(cache_values)
 
-        assert op.get_expand_impl(None, x_layout, (x_layout, x_layout), extra_args) is None, (
+        assert op.get_expand_impl(None, (output_layouts, extra_info), cache_values) is None, (
             "Concatenating on an unsharded dimension should return None."
         )
 
@@ -189,9 +194,8 @@ class TestParallelCat(unittest.TestCase):
         layout_1 = _build_layout(mesh, (Shard(0), Replicate()), 2)
         layout_2 = _build_layout(mesh, (Replicate(), Shard(1)), 2)
 
-        extra_args = [0]
         with self.assertRaisesRegex(ValueError, "All input tensors must have the same layout"):
-            op.infer_layout((layout_1, layout_1, layout_2), extra_args=extra_args)
+            op.infer_layout([layout_1, layout_1, layout_2, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_get_expand_impl_all_replicated(self, mock_platform):
@@ -203,13 +207,15 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x4_mesh(mock_platform)
         x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
-        extra_args_0 = [0]
-        extra_args_1 = [1]
+        cache_values_0 = [x_layout, x_layout, 0]
+        output_layouts_0, extra_info_0 = op.infer_layout(cache_values_0)
+        cache_values_1 = [x_layout, x_layout, 1]
+        output_layouts_1, extra_info_1 = op.infer_layout(cache_values_1)
 
-        assert op.get_expand_impl(None, x_layout, (x_layout, x_layout), extra_args_0) is None, (
+        assert op.get_expand_impl(None, (output_layouts_0, extra_info_0), cache_values_0) is None, (
             "Fully replicated tensor should return None for dim=0."
         )
-        assert op.get_expand_impl(None, x_layout, (x_layout, x_layout), extra_args_1) is None, (
+        assert op.get_expand_impl(None, (output_layouts_1, extra_info_1), cache_values_1) is None, (
             "Fully replicated tensor should return None for dim=1."
         )
 
@@ -223,9 +229,8 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x4_mesh(mock_platform)
         layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
-        extra_args = [0]
         with self.assertRaisesRegex(ValueError, "Concatenation along a sharded dimension"):
-            op.infer_layout((layout, layout), extra_args=extra_args)
+            op.infer_layout([layout, layout, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_negative_sharded_dim_raises(self, mock_platform):
@@ -237,9 +242,8 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x4_mesh(mock_platform)
         layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
 
-        extra_args = [-1]
         with self.assertRaisesRegex(ValueError, r"normalized_dim=1\) is not supported"):
-            op.infer_layout((layout, layout), extra_args=extra_args)
+            op.infer_layout([layout, layout, -1])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_empty_inputs(self, mock_platform):
@@ -248,9 +252,8 @@ class TestParallelCat(unittest.TestCase):
         Description: Pass an empty tuple to layouts
         Expectation: ValueError is raised requiring at least one input DTensor
         """
-        extra_args = [0]
         with self.assertRaisesRegex(ValueError, "cat requires at least one input DTensor"):
-            op.infer_layout((), extra_args=extra_args)
+            op.infer_layout([0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_scalar_args_ignored(self, mock_platform):
@@ -262,26 +265,38 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x4_mesh(mock_platform)
         layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
 
-        extra_args = [0]
-        output_layout = op.infer_layout((layout, None, layout), extra_args=extra_args)
+        output_layouts, _ = op.infer_layout([layout, None, layout, 0])
+        output_layout = output_layouts[0]
         assert output_layout == layout, "Output layout should match the valid base layout."
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_default_dim(self, mock_platform):
         """
         Feature: Cat layout inference with default dimension
-        Description: Pass an empty extra_args list, which defaults dim to 0 internally
-        Expectation: Defaults to dim=0, normalizes it, and appends it to extra_args
+        Description: Pass the default normalized dim=0 produced by preprocess
+        Expectation: The default dimension 0 is accepted
         """
         mesh = self._make_2x4_mesh(mock_platform)
         layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
 
-        extra_args = []
-        output_layout = op.infer_layout((layout, layout), extra_args=extra_args)
+        tensor_1 = MagicMock()
+        tensor_2 = MagicMock()
+        tensor_1.layout = layout
+        tensor_2.layout = layout
+        tensor_1.to_local.return_value = MagicMock()
+        tensor_2.to_local.return_value = MagicMock()
+
+        local_args, local_kwargs, cache_values = op.preprocess(((tensor_1, tensor_2),), {})
+
+        assert not local_kwargs
+        assert local_args[1] == 0
+        assert len(cache_values) == 3
+        assert cache_values[-1] == 0, "Default dimension 0 should be appended to cache_values."
+
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         assert output_layout == layout
-        assert len(extra_args) == 1
-        assert extra_args[0] == 0, "Default dimension 0 should be appended to extra_args."
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_default_dim_sharded(self, mock_platform):
@@ -293,9 +308,8 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x4_mesh(mock_platform)
         layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
-        extra_args = []
         with self.assertRaisesRegex(ValueError, "Concatenation along a sharded dimension"):
-            op.infer_layout((layout, layout), extra_args=extra_args)
+            op.infer_layout([layout, layout, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_single_input(self, mock_platform):
@@ -307,8 +321,8 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x4_mesh(mock_platform)
         layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
 
-        extra_args = [0]
-        output_layout = op.infer_layout((layout,), extra_args=extra_args)
+        output_layouts, _ = op.infer_layout([layout, 0])
+        output_layout = output_layouts[0]
         assert output_layout == layout
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -321,9 +335,8 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x2x2_mesh(mock_platform)
         layout = _build_layout(mesh, (Replicate(), Shard(1), Replicate()), 3)
 
-        extra_args = [1]
         with self.assertRaisesRegex(ValueError, "Concatenation along a sharded dimension"):
-            op.infer_layout((layout, layout, layout), extra_args=extra_args)
+            op.infer_layout([layout, layout, layout, 1])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_all_none_layouts(self, mock_platform):
@@ -332,9 +345,8 @@ class TestParallelCat(unittest.TestCase):
         Description: Extreme edge case where no DTensor layout is provided (e.g. all inputs are scalar/normal tensors)
         Expectation: ValueError is raised indicating at least one DTensor is required
         """
-        extra_args = [0]
         with self.assertRaisesRegex(ValueError, "cat requires at least one input DTensor"):
-            op.infer_layout((None, None), extra_args=extra_args)
+            op.infer_layout([None, None, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_1d_mesh(self, mock_platform):
@@ -346,11 +358,10 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_1d_mesh(mock_platform, world_size=4)
         layout = _build_layout(mesh, (Replicate(),), 1)
 
-        extra_args = [0]
-        output_layout = op.infer_layout((layout, layout), extra_args=extra_args)
+        output_layouts, _ = op.infer_layout([layout, layout, 0])
+        output_layout = output_layouts[0]
 
         assert output_layout == layout, "1D mesh concatenation on Replicate dim should succeed."
-        assert extra_args[0] == 0
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_4d_tensor_dim2(self, mock_platform):
@@ -362,8 +373,8 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x2_mesh(mock_platform)
         layout = _build_layout(mesh, (Shard(0), Shard(1), Replicate(), Replicate()), 4)
 
-        extra_args = [2]
-        output_layout = op.infer_layout((layout, layout), extra_args=extra_args)
+        output_layouts, _ = op.infer_layout([layout, layout, 2])
+        output_layout = output_layouts[0]
 
         assert output_layout == layout, "Concatenating 4D tensor on unsharded dim 2 should succeed."
 
@@ -377,26 +388,26 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x2_mesh(mock_platform)
         layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
-        extra_args = [1]
-        output_layout = op.infer_layout((layout, layout), extra_args=extra_args)
+        output_layouts, _ = op.infer_layout([layout, layout, 1])
+        output_layout = output_layouts[0]
 
         assert output_layout == layout
-        assert extra_args[0] == 1
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_cat_get_expand_impl_empty_extra_args(self, mock_platform):
+    def test_cat_get_expand_impl_cache_values(self, mock_platform):
         """
-        Feature: get_expand_impl with empty extra_args
-        Description: Call get_expand_impl with extra_args=[] to ensure it handles boundary conditions safely
+        Feature: get_expand_impl with cache values
+        Description: Call get_expand_impl with the new infer_result and cache_values arguments
         Expectation: Returns None, delegating to native cat
         """
         mesh = self._make_2x2_mesh(mock_platform)
         layout = _build_layout(mesh, (Replicate(), Shard(0)), 2)
 
-        extra_args = []
+        cache_values = [layout, layout]
+        infer_result = ((layout,), None)
 
-        assert op.get_expand_impl(None, layout, (layout, layout), extra_args) is None, (
-            "Empty extra_args should be safely handled by get_expand_impl."
+        assert op.get_expand_impl(None, infer_result, cache_values) is None, (
+            "Cache values should be safely handled by get_expand_impl."
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -409,8 +420,8 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x2_mesh(mock_platform, mesh_dim_names=("dp", "interleaved_parallel"))
         layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
-        extra_args = [1]
-        output_layout = op.infer_layout((layout, layout), extra_args=extra_args)
+        output_layouts, _ = op.infer_layout([layout, layout, 1])
+        output_layout = output_layouts[0]
 
         assert output_layout == layout
 
@@ -424,11 +435,10 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x2_mesh(mock_platform)
         layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
-        extra_args = [-1]
-        output_layout = op.infer_layout((layout, layout), extra_args=extra_args)
+        output_layouts, _ = op.infer_layout([layout, layout, -1])
+        output_layout = output_layouts[0]
 
         assert output_layout == layout
-        assert extra_args[0] == 1, "Negative dimension -1 should be successfully normalized to 1."
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_interspersed_nones(self, mock_platform):
@@ -440,8 +450,8 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x2_mesh(mock_platform)
         layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
-        extra_args = [1]
-        output_layout = op.infer_layout((None, layout, None, layout, None), extra_args=extra_args)
+        output_layouts, _ = op.infer_layout([None, layout, None, layout, None, 1])
+        output_layout = output_layouts[0]
 
         assert output_layout == layout, "Should correctly ignore all None layouts and return the valid base layout."
 
@@ -455,23 +465,21 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x2x2_mesh(mock_platform)
         layout = _build_layout(mesh, (Shard(0), Shard(1), Replicate()), 3)
 
-        extra_args = [0]
         with self.assertRaisesRegex(ValueError, "Concatenation along a sharded dimension"):
-            op.infer_layout((layout, layout), extra_args=extra_args)
+            op.infer_layout([layout, layout, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_out_of_bounds_dim_positive(self, mock_platform):
         """
         Feature: Cat layout inference with out-of-bounds dimension
         Description: Pass a dimension index that exceeds the tensor's dimensionality
-        Expectation: IndexError is naturally raised when trying to access tensor_map
+        Expectation: ValueError is raised by dim range validation
         """
         mesh = self._make_2x2_mesh(mock_platform)
         layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
-        extra_args = [5]
-        with self.assertRaises(IndexError):
-            op.infer_layout((layout, layout), extra_args=extra_args)
+        with self.assertRaises(ValueError):
+            op.infer_layout([layout, layout, 5])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_get_expand_impl_multi_layout_tuple(self, mock_platform):
@@ -483,9 +491,10 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x2_mesh(mock_platform)
         layout = _build_layout(mesh, (Replicate(), Shard(0)), 2)
 
-        extra_args = [0]
+        cache_values = [layout, layout, layout, 1]
+        output_layouts, extra_info = op.infer_layout(cache_values)
 
-        assert op.get_expand_impl(None, layout, (layout, layout, layout), extra_args) is None, (
+        assert op.get_expand_impl(None, (output_layouts, extra_info), cache_values) is None, (
             "Should return None to use native cat implementation."
         )
 
@@ -500,9 +509,8 @@ class TestParallelCat(unittest.TestCase):
         layout1 = _build_layout(mesh, (Shard(0), Replicate()), 2)
         layout2 = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
-        extra_args = [1]
         with self.assertRaisesRegex(ValueError, "All input tensors must have the same layout"):
-            op.infer_layout((layout1, layout2), extra_args=extra_args)
+            op.infer_layout([layout1, layout2, 1])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_mismatch_shard0_vs_shard1(self, mock_platform):
@@ -515,9 +523,8 @@ class TestParallelCat(unittest.TestCase):
         layout1 = _build_layout(mesh, (Shard(0), Replicate()), 2)
         layout2 = _build_layout(mesh, (Shard(1), Replicate()), 2)
 
-        extra_args = [1]
         with self.assertRaisesRegex(ValueError, "All input tensors must have the same layout"):
-            op.infer_layout((layout1, layout2), extra_args=extra_args)
+            op.infer_layout([layout1, layout2, 1])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cat_layout_inference_negative_dim_normalization_3d(self, mock_platform):
@@ -529,10 +536,9 @@ class TestParallelCat(unittest.TestCase):
         mesh = self._make_2x2_mesh(mock_platform)
         layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 3)
 
-        extra_args = [-1]
-        op.infer_layout((layout, layout), extra_args=extra_args)
+        output_layouts, _ = op.infer_layout([layout, layout, -1])
 
-        assert extra_args[0] == 2, "Negative dim -1 for a 3D tensor should correctly normalize to 2."
+        assert output_layouts[0] == layout, "Negative dim -1 for a 3D tensor should be accepted as dim 2."
 
 
 if __name__ == "__main__":

@@ -16,14 +16,40 @@
 Distributed implementation for Repeat operator.
 """
 
+from typing import Tuple
+
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
+
+
+def _normalize_repeat_args(x, *sizes):
+    return (x,) + sizes, {}
 
 
 class RepeatDistributedOp(DistributedOp):
     """Distributed implementation for torch.Tensor.repeat."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for torch.Tensor.repeat.
+
+        Args:
+            args (tuple): Input tensor followed by repeat sizes.
+            kwargs (dict): Keyword arguments.
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, _ = _normalize_repeat_args(*args, **kwargs)
+        input_tensor = args[0]
+        sizes = args[1:]
+
+        local_args = (input_tensor.to_local(),) + sizes
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, sizes]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layout for torch.Tensor.repeat.
 
@@ -34,36 +60,46 @@ class RepeatDistributedOp(DistributedOp):
           - The number of repeat dimensions cannot be smaller than the tensor dimensions.
           - Dimensions being repeated (>1 or 0) MUST be unsharded.
 
+        Rules:
+            1. Input must not have Partial status.
+            2. Repeat sizes must be provided.
+            3. New prepended dimensions are unsharded.
+            4. Existing dimensions with repeat size 1 preserve the input sharding.
+            5. Existing dimensions with repeat size other than 1 must not be sharded.
+
         Args:
-            layouts (tuple): Layouts of inputs. Expected:
-                layouts[0] (Layout): Input tensor layout (required).
-            extra_args (tuple/list): Should contain the repeat sizes.
+            cache_values (list): [input_layout, repeat_sizes].
 
         Returns:
-            Layout: Output tensor layout with:
-                - New prepended dimensions: unsharded (-1)
-                - Repeated existing dimensions (size != 1): unsharded (-1)
-                - Preserved existing dimensions (size == 1): original sharding preserved
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If input layout is missing, input has Partial status, repeat sizes
+                are missing, or a sharded dimension is repeated.
         """
-        if not layouts or layouts[0] is None:
+        if not cache_values or cache_values[0] is None:
             raise ValueError(
-                f"Operation {self.op_name}: repeat requires a valid input tensor layout."
+                f"For {self.op_name}, repeat requires a valid input tensor layout."
             )
 
-        input_layout = layouts[0]
+        input_layout = cache_values[0]
+        self._check_partial_inputs([input_layout])
+
         in_tensor_map = input_layout.tensor_map
+        in_alias_map = input_layout.alias_tensor_map
         input_ndim = len(in_tensor_map)
 
-        if not extra_args or len(extra_args) < 1:
+        if len(cache_values) < 2 or not cache_values[1]:
             raise ValueError(
-                f"Operation {self.op_name}: repeat requires repeat sizes in extra_args."
+                f"For {self.op_name}, repeat requires repeat sizes in cache_values."
             )
 
         # Robustly handle sizes unpacking (e.g., if args are packed as a single tuple)
-        if len(extra_args) == 1 and isinstance(extra_args[0], (tuple, list)):
-            flat_args = extra_args[0]
+        repeat_sizes = cache_values[1]
+        if len(repeat_sizes) == 1 and isinstance(repeat_sizes[0], (tuple, list)):
+            flat_args = repeat_sizes[0]
         else:
-            flat_args = extra_args
+            flat_args = repeat_sizes
 
         # Normalize repeat sizes to tuple of ints
         repeats = []
@@ -79,7 +115,7 @@ class RepeatDistributedOp(DistributedOp):
 
         # Rule 1: New prepended dimensions are always unsharded
         for _ in range(num_new_dims):
-            output_map.append(-1)
+            output_map.append("None")
 
         # Rule 2: Process existing dimensions
         for i in range(input_ndim):
@@ -88,29 +124,22 @@ class RepeatDistributedOp(DistributedOp):
 
             if repeat_times == 1:
                 # If the dimension is not repeated, keep the original sharding
-                output_map.append(in_tensor_map[i])
+                output_map.append(in_alias_map[i])
             else:
                 # If the dimension is repeated (or zeroed), it cannot be currently sharded
-                if in_tensor_map[i] != -1:
+                mapping = in_alias_map[i]
+                if mapping != "None":
                     raise ValueError(
-                        f"Operation {self.op_name}: Cannot repeat dimension {i} which is sharded. "
+                        f"For {self.op_name}, Cannot repeat dimension {i} which is sharded. "
                         f"Please redistribute (unshard) the tensor along this dimension first."
                     )
                 # Repeated dimension remains unsharded in output
-                output_map.append(-1)
+                output_map.append("None")
 
         # Construct output layout mapping
         mesh_shape = input_layout.mesh_shape
         alias_name = input_layout.alias_name
         rank_list = input_layout.rank_list
-
-        def idx_to_alias(idx, aliases):
-            """Convert layout index back to alias string mapping"""
-            if idx == -1:
-                return "None"
-            return aliases[len(aliases) - idx - 1]
-
-        output_alias_map = tuple(idx_to_alias(idx, alias_name) for idx in output_map)
 
         # Instantiate new layout
         output_layout = Layout(
@@ -118,6 +147,6 @@ class RepeatDistributedOp(DistributedOp):
             alias_name=alias_name,
             rank_list=rank_list
         )
-        output_layout = output_layout(*output_alias_map)
+        output_layout = output_layout(*output_map)
 
-        return output_layout
+        return ((output_layout,), None)

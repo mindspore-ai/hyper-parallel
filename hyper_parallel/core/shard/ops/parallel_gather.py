@@ -16,41 +16,72 @@
 Distributed implementation for Gather operator.
 """
 
+from typing import Tuple
+
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
 
 
+def _normalize_index_select_args(input_tensor, dim, index):
+    return (input_tensor, dim, index), {}
+
+
+def _normalize_gatherd_args(input_tensor, dim, index):
+    return (input_tensor, dim, index), {}
+
+
+def _normalize_gathernd_args(input_tensor, indices):
+    return (input_tensor, indices), {}
+
+
 class IndexSelectDistributedOp(DistributedOp):
     """Distributed implementation for Index Select operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for IndexSelect operator.
+
+        Args:
+            args (tuple): Input arguments (input, dim, index).
+            kwargs (dict): Keyword arguments.
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, _ = _normalize_index_select_args(*args, **kwargs)
+        input_tensor, dim, index = args[0], args[1], args[2]
+        local_args = (input_tensor.to_local(), dim, index.to_local())
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, index.layout, dim]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layouts for Index Select operations.
 
+        Rules:
+            1. Input and index must not have Partial status.
+            2. cache_values must contain [input_layout, index_layout, dim].
+            3. dim must be within the valid input rank range.
+            4. index must be one-dimensional.
+            5. Output replaces the selected input dimension with the index layout.
+            6. If the selected input dimension is sharded, output carries Partial('sum').
+
         Args:
-            layouts: Layouts of input tensors
-            extra_args: extra_args of input tensors
+            cache_values (list): [input_layout, index_layout, dim].
 
         Returns:
-            tuple: Layout for output tensor.
+            tuple: ((output_layout,), None)
 
         Raises:
             ValueError: If input layouts are not compatible or have partial status.
         """
-        # Check partial inputs
         if not self._allow_partial_inputs:
-            self._check_partial_inputs(layouts)
-
-        # Check inputs
-        if len(layouts) != 3:
-            raise ValueError(f"Gather ops requires 3 layouts, but {len(layouts)}")
-        if len(extra_args) != 1:
-            raise ValueError(f"Gather ops requires 1 extra args, but {len(extra_args)}")
+            self._check_partial_inputs(cache_values[:2])
 
         # Parse layout info
-        p_layout, i_layout = layouts[0], layouts[2]
-        axis = extra_args[0]
+        p_layout, i_layout, axis = cache_values[0], cache_values[1], cache_values[2]
 
         p_tensor_map = p_layout.alias_tensor_map
         i_tensor_map = i_layout.alias_tensor_map
@@ -58,7 +89,7 @@ class IndexSelectDistributedOp(DistributedOp):
         # 1. Validate the axis range before any manipulation
         if axis < -len(p_tensor_map) or axis >= len(p_tensor_map):
             raise ValueError(
-                f"Operation {self.op_name}: dim value {axis} is out of valid range"
+                f"For {self.op_name}, dim value {axis} is out of valid range"
             )
 
         # 2. Convert negative axis to positive index to avoid Python slicing bugs
@@ -67,7 +98,7 @@ class IndexSelectDistributedOp(DistributedOp):
 
         if len(i_tensor_map) != 1:
             raise ValueError(
-                f"Operation {self.op_name}: index is not a one-dimensional Tensor"
+                f"For {self.op_name}, index is not a one-dimensional Tensor"
             )
 
         # 3. Create output layout map
@@ -97,14 +128,14 @@ class IndexSelectDistributedOp(DistributedOp):
             else:
                 output_layout.set_partial_by_dev_axis(shard_mesh_dim_name, 'sum')
 
-        return output_layout
+        return ((output_layout,), None)
 
-    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
+    def get_expand_impl(self, func, infer_result, cache_values):
         """
         Get the expanded execution implementation for Index Select.
         """
-        p_layout = layouts[0]
-        axis = extra_args[0]
+        p_layout = cache_values[0]
+        axis = cache_values[2]
         if axis < 0:
             axis += len(p_layout.alias_tensor_map)
 
@@ -112,7 +143,7 @@ class IndexSelectDistributedOp(DistributedOp):
 
         # If the axis is NOT sharded, fallback to standard execution
         if shard_mesh_dim_name == "None":
-            return func
+            return None
 
         # If the axis IS sharded, return a custom function with Masking ONLY.
         # The explicit AllReduce is completely removed.
@@ -178,56 +209,67 @@ class GatherDDistributedOp(DistributedOp):
     - Output inherits the sharding pattern of the input tensor
     """
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for GatherD operator.
+
+        Args:
+            args (tuple): Input arguments (input, dim, index).
+            kwargs (dict): Keyword arguments.
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, _ = _normalize_gatherd_args(*args, **kwargs)
+        input_tensor, dim, index = args[0], args[1], args[2]
+        local_args = (input_tensor.to_local(), dim, index.to_local())
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, index.layout, dim]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layouts for GatherD operations.
+
+        Rules:
+            1. Input and index must not have Partial status.
+            2. cache_values must contain [input_layout, index_layout, dim].
+            3. Input and index must have the same rank.
+            4. dim must be within the valid input rank range.
+            5. Input and index must use the same sharding on non-dim axes.
+            6. Output inherits index layout and becomes Partial('sum') when dim is sharded.
+
         Args:
-            layouts: Layouts of input tensors [input_layout, dim_layout, index_layout]
-            extra_args: Extra arguments containing [dim]
+            cache_values (list): [input_layout, index_layout, dim].
+
         Returns:
-            Layout: Layout for output tensor.
+            tuple: ((output_layout,), None)
+
         Raises:
             ValueError: If input layouts are not compatible or have partial status.
         """
-        # Check partial inputs
         if not self._allow_partial_inputs:
-            self._check_partial_inputs(layouts)
+            self._check_partial_inputs(cache_values[:2])
 
-        # Validate input count
-        if len(layouts) != 3:
-            raise ValueError(
-                f"Operation {self.op_name}: requires 3 layouts (input, dim, index), "
-                f"but got {len(layouts)}"
-            )
-        # Validate extra_args (should contain dim)
-        if len(extra_args) != 1:
-            raise ValueError(
-                f"Operation {self.op_name}: requires 1 extra arg (dim), "
-                f"but got {len(extra_args)}"
-            )
-        # Parse layouts: [input, dim (non-tensor), index]
-        # Note: dim is a scalar, so layouts[1] should be None
-        input_layout = layouts[0]
-        index_layout = layouts[2]
-        dim = extra_args[0]
+        input_layout, index_layout, dim = cache_values[0], cache_values[1], cache_values[2]
         # Validate layouts exist
         if input_layout is None or not hasattr(input_layout, "tensor_map"):
-            raise ValueError(f"Operation {self.op_name}: input layout cannot be None")
+            raise ValueError(f"For {self.op_name}, input layout cannot be None")
         if index_layout is None or not hasattr(index_layout, "tensor_map"):
-            raise ValueError(f"Operation {self.op_name}: index layout cannot be None")
-        input_tensor_map = input_layout.tensor_map
-        index_tensor_map = index_layout.tensor_map
+            raise ValueError(f"For {self.op_name}, index layout cannot be None")
+        input_tensor_map = input_layout.alias_tensor_map
+        index_tensor_map = index_layout.alias_tensor_map
         # Validate same rank
         if len(input_tensor_map) != len(index_tensor_map):
             raise ValueError(
-                f"Operation {self.op_name}: input and index must have the same number of dimensions. "
+                f"For {self.op_name}, input and index must have the same number of dimensions. "
                 f"Got input rank={len(input_tensor_map)}, index rank={len(index_tensor_map)}"
             )
         # Validate dim is in valid range
         rank = len(input_tensor_map)
         if dim < -rank or dim >= rank:
             raise ValueError(
-                f"Operation {self.op_name}: dim value {dim} is out of valid range [{-rank}, {rank-1}]"
+                f"For {self.op_name}, dim value {dim} is out of valid range [{-rank}, {rank-1}]"
             )
         # Normalize negative dim
         if dim < 0:
@@ -237,7 +279,7 @@ class GatherDDistributedOp(DistributedOp):
                 continue
             if input_axis_map != index_axis_map:
                 raise ValueError(
-                    f"Operation {self.op_name}: input and index must use the same sharding on non-dim axis {axis}. "
+                    f"For {self.op_name}, input and index must use the same sharding on non-dim axis {axis}. "
                     f"Got input tensor_map={input_tensor_map}, index tensor_map={index_tensor_map}, dim={dim}"
                 )
         # Output inherits index layout
@@ -247,15 +289,17 @@ class GatherDDistributedOp(DistributedOp):
             rank_list=index_layout.rank_list,
         )
         output_layout.set_tensor_map(index_layout.tensor_map)
-        if input_tensor_map[dim] != -1:
+        dim_axis_name = input_tensor_map[dim]
+        if dim_axis_name != "None":
             # pylint: disable=protected-access
             # Inherit current partial state from index layout
             output_layout._partial = list(index_layout.partial)
-            # Calculate the device axis name for the dim dimension
-            # tensor_map uses reverse indexing: tensor_map[i] = len(alias_name) - 1 - device_axis
-            device_axis_idx = len(index_layout.alias_name) - 1 - input_tensor_map[dim]
-            dim_axis_name = index_layout.alias_name[device_axis_idx]
-            output_layout.set_partial_by_dev_axis(dim_axis_name, 'sum')
+            if isinstance(dim_axis_name, tuple):
+                for axis_name in dim_axis_name:
+                    if axis_name != "None":
+                        output_layout.set_partial_by_dev_axis(axis_name, 'sum')
+            else:
+                output_layout.set_partial_by_dev_axis(dim_axis_name, 'sum')
         # pylint: disable=protected-access
         # Rebuild readable alias tensor map
         output_layout._alias_tensor_map = output_layout._build_readable_tensor_map()
@@ -264,9 +308,9 @@ class GatherDDistributedOp(DistributedOp):
         output_layout.tensor_map_to_placement()
         # Update compact string description
         output_layout.update_compact_str()
-        return output_layout
+        return ((output_layout,), None)
 
-    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
+    def get_expand_impl(self, func, infer_result, cache_values):
         """
         Returns the execution implementation wrapper for distributed GatherD.
         
@@ -275,21 +319,24 @@ class GatherDDistributedOp(DistributedOp):
         
         Args:
             func: The original GatherD function to wrap
-            output_layout: The inferred output layout
-            layouts: Layouts of input tensors [input_layout, dim_layout, index_layout]
-            extra_args: Extra arguments containing [dim]
+            infer_result: The inferred output layouts and extra info
+            cache_values: [input_layout, index_layout, dim]
             
         Returns:
             Callable: Distributed implementation wrapper, or None if no sharding
         """
-        input_layout = layouts[0]
-        dim = extra_args[0]
-        # Get tensor maps
-        input_tensor_map = input_layout.tensor_map
+        input_layout = cache_values[0]
+        dim = cache_values[2]
+        if dim < 0:
+            dim += len(input_layout.tensor_map)
+        input_alias_map = input_layout.alias_tensor_map
         # Check if dim axis is sharded (enhanced MP)
-        # tensor_map[dim] == -1 means replicated, otherwise sharded
-        if input_tensor_map[dim] == -1: # native sharding, no need for custom implementation
+        if input_alias_map[dim] == "None": # native sharding, no need for custom implementation
             return None
+
+        dim_axis_name = input_alias_map[dim]
+        if isinstance(dim_axis_name, tuple):
+            dim_axis_name = next(axis for axis in dim_axis_name if axis != "None")
 
         def distributed_gatherd_impl(*args, **kwargs):
             """
@@ -302,8 +349,7 @@ class GatherDDistributedOp(DistributedOp):
             index_tensor = args[2]
             # Calculate local partition offset for the dim axis
             mesh = input_layout.mesh
-            # Convert tensor_map index to mesh axis index (reverse order)
-            mesh_dim_idx = len(mesh.mesh_shape) - 1 - input_tensor_map[dim]
+            mesh_dim_idx = input_layout.alias_name.index(dim_axis_name)
             # Get the coordinate of current rank along the mesh dimension
             dim_coord = mesh.get_local_rank(mesh_dim_idx)
             # Calculate the size of input tensor's dim dimension per partition
@@ -336,9 +382,49 @@ class GatherDDistributedOp(DistributedOp):
 class GatherNdDistributedOp(DistributedOp):
     """Distributed implementation for GatherNd operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for GatherNd operator.
+
+        Args:
+            args (tuple): Input arguments (input, indices).
+            kwargs (dict): Keyword arguments.
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        packed_call = None
+        if len(args) == 3 and isinstance(args[1], str) and isinstance(args[2], (tuple, list)):
+            packed_call = (args[0], args[1])
+            args = tuple(args[2])
+
+        args, _ = _normalize_gathernd_args(*args, **kwargs)
+        input_tensor, indices = args[0], args[1]
+        local_input = input_tensor.to_local() if hasattr(input_tensor, "_layout") else input_tensor
+        local_indices = indices.to_local()
+        if packed_call is not None:
+            local_args = (packed_call[0], packed_call[1], (local_input, local_indices))
+        else:
+            local_args = (local_input, local_indices)
+        local_kwargs = {}
+        cache_values = [
+            input_tensor.layout if hasattr(input_tensor, "_layout") else None,
+            indices.layout,
+            input_tensor.shape,
+            indices.shape,
+        ]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layout for GatherNd.
+
+        Rules:
+            1. Input and indices must not have Partial status.
+            2. cache_values must contain [input_layout_or_None, indices_layout, input_shape, indices_shape].
+            3. indices[-1] (K) must be replicated.
+            4. input indexed dims [0:K) must be replicated when input layout is provided.
+            5. Output inherits indices[:-1] sharding plus input trailing dims input[K:].
 
         For GatherNd: out.shape = indices.shape[:-1] + input_x.shape[K:], where K = indices.shape[-1].
 
@@ -351,10 +437,21 @@ class GatherNdDistributedOp(DistributedOp):
         Output Layout:
         output_tensor_map = indices_tensor_map[:-1] + input_tensor_map[K:]
         If input_layout is None, input trailing dims are treated as replicated ("None").
-        """
-        input_layout, indices_layout = self._parse_input_layouts(layouts)
 
-        input_shape, indices_shape = self._get_input_shapes(extra_args)
+        Args:
+            cache_values (list): [input_layout_or_None, indices_layout, input_shape, indices_shape].
+
+        Returns:
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If input layouts, tensor maps, or shapes violate the rules above.
+        """
+        input_layout, indices_layout = self._parse_input_layouts(cache_values[:2])
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([input_layout, indices_layout])
+
+        input_shape, indices_shape = self._get_input_shapes(cache_values[2:])
         k, trail_rank = self._get_k_and_trailing_rank(input_shape, indices_shape)
 
         input_tensor_map, indices_tensor_map = self._validate_tensor_maps(
@@ -378,13 +475,13 @@ class GatherNdDistributedOp(DistributedOp):
         else:
             output_layout = output_layout("None")
 
-        return output_layout
+        return ((output_layout,), None)
 
     def _parse_input_layouts(self, layouts):
         """Parse and validate input layouts."""
         if len(layouts) < 2:
             raise ValueError(
-                f"Operation {self.op_name} requires at least 2 input layouts, but got {len(layouts)}"
+                f"For {self.op_name}, requires at least 2 input layouts, but got {len(layouts)}"
             )
 
         input_layout, indices_layout = layouts[0], layouts[1]
@@ -393,13 +490,13 @@ class GatherNdDistributedOp(DistributedOp):
         for extra_layout in layouts[2:]:
             if extra_layout is not None:
                 raise ValueError(
-                    f"Operation {self.op_name} only supports 2 tensor inputs, but got extra tensor layout: "
+                    f"For {self.op_name}, only supports 2 tensor inputs, but got extra tensor layout: "
                     f"{extra_layout}"
                 )
 
         # For GatherNd: input_layout can be None (treated as fully replicated), but indices_layout must exist.
         if indices_layout is None or not hasattr(indices_layout, "alias_tensor_map"):
-            raise ValueError(f"Operation {self.op_name}: Indices layout cannot be None")
+            raise ValueError(f"For {self.op_name}, indices layout cannot be None")
 
         return input_layout, indices_layout
 
@@ -409,12 +506,12 @@ class GatherNdDistributedOp(DistributedOp):
 
         # Validate: indices tensor_map must exist and last dimension cannot be split.
         if not indices_tensor_map:
-            raise ValueError(f"Operation {self.op_name}: indices tensor_map cannot be empty")
+            raise ValueError(f"For {self.op_name}, indices tensor_map cannot be empty")
 
         last_axis = indices_tensor_map[-1]
         if not self._is_none_axis(last_axis):
             raise ValueError(
-                f"Operation {self.op_name}: The last dimension of indices cannot be split. "
+                f"For {self.op_name}, the last dimension of indices cannot be split. "
                 f"Got indices[-1] = {last_axis}"
             )
 
@@ -425,7 +522,7 @@ class GatherNdDistributedOp(DistributedOp):
 
             if k > len(input_tensor_map):
                 raise ValueError(
-                    f"Operation {self.op_name}: indices last dim (K={k}) is larger than input rank "
+                    f"For {self.op_name}, indices last dim (K={k}) is larger than input rank "
                     f"({len(input_tensor_map)})"
                 )
 
@@ -433,34 +530,33 @@ class GatherNdDistributedOp(DistributedOp):
             for axis_name in input_tensor_map[:k]:
                 if not self._is_none_axis(axis_name):
                     raise ValueError(
-                        f"Operation {self.op_name}: input_x cannot be split on indexed dims [0:{k}). "
+                        f"For {self.op_name}, input_x cannot be split on indexed dims [0:{k}). "
                         f"These dims must be 'None', but got tensor_map: {input_tensor_map}"
                     )
 
         return input_tensor_map, indices_tensor_map
 
-    def _get_input_shapes(self, extra_args):
-        """Get input and indices shapes from extra_args (WithShape suffix required)."""
+    def _get_input_shapes(self, shape_values):
+        """Get input and indices shapes from cache values."""
         input_shapes = None
-        if extra_args and hasattr(extra_args[-1], "__len__") and len(extra_args[-1]) >= 2:
-            input_shapes = extra_args[-1]
+        if shape_values and len(shape_values) == 2:
+            input_shapes = shape_values
 
         if input_shapes is None:
             raise ValueError(
-                f"Operation {self.op_name}: missing input_shapes in extra_args. "
-                f"Please configure yaml with infer_layout_suffix: WithShape."
+                f"For {self.op_name}, missing input_shapes in cache_values."
             )
 
         input_shape = input_shapes[0]
         indices_shape = input_shapes[1]
         if input_shape is None or indices_shape is None:
-            raise ValueError(f"Operation {self.op_name}: input_shapes contains None: {input_shapes}")
+            raise ValueError(f"For {self.op_name}, input_shapes contains None: {input_shapes}")
 
         input_shape = self._normalize_shape(input_shape, "input")
         indices_shape = self._normalize_shape(indices_shape, "indices")
 
         if len(indices_shape) < 1:
-            raise ValueError(f"Operation {self.op_name}: indices shape invalid: {indices_shape}")
+            raise ValueError(f"For {self.op_name}, indices shape invalid: {indices_shape}")
 
         return input_shape, indices_shape
 
@@ -469,12 +565,12 @@ class GatherNdDistributedOp(DistributedOp):
         try:
             norm = tuple(shape)
         except TypeError as err:
-            raise ValueError(f"Operation {self.op_name}: {name} shape is not iterable: {shape}") from err
+            raise ValueError(f"For {self.op_name}, {name} shape is not iterable: {shape}") from err
 
         try:
             norm = tuple(int(dim) for dim in norm)
         except (TypeError, ValueError) as err:
-            raise ValueError(f"Operation {self.op_name}: {name} shape contains non-integer dims: {norm}") from err
+            raise ValueError(f"For {self.op_name}, {name} shape contains non-integer dims: {norm}") from err
 
         return norm
 
@@ -484,15 +580,15 @@ class GatherNdDistributedOp(DistributedOp):
         try:
             k = int(k)
         except (TypeError, ValueError) as err:
-            raise ValueError(f"Operation {self.op_name}: indices last dim (K) is invalid: {k}") from err
+            raise ValueError(f"For {self.op_name}, indices last dim (K) is invalid: {k}") from err
 
         if k <= 0:
-            raise ValueError(f"Operation {self.op_name}: indices last dim (K) must be positive, but got {k}")
+            raise ValueError(f"For {self.op_name}, indices last dim (K) must be positive, but got {k}")
 
         trail_rank = len(input_shape) - k
         if trail_rank < 0:
             raise ValueError(
-                f"Operation {self.op_name}: indices last dim (K={k}) is larger than input rank ({len(input_shape)})"
+                f"For {self.op_name}, indices last dim (K={k}) is larger than input rank ({len(input_shape)})"
             )
 
         return k, trail_rank

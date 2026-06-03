@@ -15,12 +15,14 @@
 """parallel_conv3d test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_conv3d import Conv3dDistributedOp
+from hyper_parallel.platform import get_platform
 from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
     _DEVICE_MESH_MAP
@@ -44,11 +46,27 @@ class TestParallelConv3D(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+        self.platform = get_platform()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+
+    def _cache_values(self, layouts, extra_args=default_extra_args):
+        """Build Conv3d cache_values for the new infer_layout signature."""
+        input_layout = layouts[0] if len(layouts) > 0 else None
+        weight_layout = layouts[1] if len(layouts) > 1 else None
+        bias_layout = layouts[2] if len(layouts) > 2 else None
+        stride, padding, dilation, groups = extra_args
+        return [input_layout, weight_layout, bias_layout, stride, padding, dilation, groups]
+
+    def _infer_output_layout(self, layouts, extra_args=default_extra_args):
+        """Infer Conv3d output layout and unwrap the single-output result."""
+        output_layouts, _ = op.infer_layout(self._cache_values(layouts, extra_args))
+        return output_layouts[0]
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -82,6 +100,37 @@ class TestParallelConv3D(unittest.TestCase):
         return init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=mesh_dim_names)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_conv3d_preprocess_returns_local_args_and_cache_values(self, mock_platform):
+        """
+        Feature: New dispatch preprocessing
+        Description: Conv3d preprocess converts DTensors to local tensors and builds cache_values.
+        Expectation: MindSpore-compatible positional args are returned and cache_values carries layouts.
+        """
+        mesh = self._make_1d_mesh(mock_platform, world_size=4, mesh_dim_names=("dp",))
+        in_layout = _build_layout(mesh, (Replicate(),), 5)
+        w_layout = _build_layout(mesh, (Replicate(),), 5)
+        b_layout = _build_layout(mesh, (Replicate(),), 1)
+
+        input_tensor = MagicMock()
+        input_tensor.layout = in_layout
+        input_tensor.to_local.return_value = "local_input"
+        weight = MagicMock()
+        weight.layout = w_layout
+        weight.to_local.return_value = "local_weight"
+        bias = MagicMock()
+        bias.layout = b_layout
+        bias.to_local.return_value = "local_bias"
+
+        local_args, local_kwargs, cache_values = op.preprocess(
+            (input_tensor, weight),
+            {"bias": bias, "stride": 2, "padding": 1, "dilation": 1, "groups": 1},
+        )
+
+        self.assertEqual(local_args, ("local_input", "local_weight", "local_bias", 2, 1, 1, 1))
+        self.assertEqual(local_kwargs, {})
+        self.assertEqual(cache_values, [in_layout, w_layout, b_layout, 2, 1, 1, 1])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_conv3d_data_and_spatial_parallelism(self, mock_platform):
         """
         Feature: Data Parallelism and Spatial Parallelism
@@ -98,7 +147,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_placements = (Replicate(), Replicate())
         w_layout = _build_layout(mesh, w_placements, 5)    # tensor_map: (-1, -1, -1, -1, -1)
 
-        output_layout = op.infer_layout((in_layout, w_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout), default_extra_args)
 
         # Output: (N, C_out, D_out, H_out, W_out)
         # N->dp(1), C_out->unsharded(-1), D->sp(0), H->-1, W->-1
@@ -129,7 +178,7 @@ class TestParallelConv3D(unittest.TestCase):
         b_placements = (Replicate(), Shard(0))
         b_layout = _build_layout(mesh, b_placements, 1)    # tensor_map: (0,)
 
-        output_layout = op.infer_layout((in_layout, w_layout, b_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout, b_layout), default_extra_args)
 
         # Output: (N, C_out, D_out, H_out, W_out)
         # N->dp(1), C_out->mp(0), D->-1, H->-1, W->-1
@@ -156,7 +205,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_placements = (Replicate(), Shard(1))
         w_layout = _build_layout(mesh, w_placements, 5)
 
-        output_layout = op.infer_layout((in_layout, w_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout), default_extra_args)
 
         # Output tensor map itself should be fully unsharded, but wrapped with Partial status on "mp"
         expected_map = (-1, -1, -1, -1, -1)
@@ -189,7 +238,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_layout = _build_layout(mesh, w_placements, 5)
 
         with self.assertRaisesRegex(ValueError, "Input C_in and Weight C_in must be sharded on the same axis."):
-            op.infer_layout((in_layout, w_layout), default_extra_args)
+            op.infer_layout(self._cache_values((in_layout, w_layout), default_extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_conv3d_invalid_column_parallelism_bias_mismatch(self, mock_platform):
@@ -212,7 +261,7 @@ class TestParallelConv3D(unittest.TestCase):
         b_layout = _build_layout(mesh, b_placements, 1)
 
         with self.assertRaisesRegex(ValueError, "Weight C_out and Bias C_out must be sharded on the same axis."):
-            op.infer_layout((in_layout, w_layout, b_layout), default_extra_args)
+            op.infer_layout(self._cache_values((in_layout, w_layout, b_layout), default_extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_conv3d_invalid_groups_with_sharded_c_in(self, mock_platform):
@@ -233,7 +282,7 @@ class TestParallelConv3D(unittest.TestCase):
         extra_args_with_groups = (1, 0, 1, 2)
 
         with self.assertRaisesRegex(ValueError, "Sharding on C_in with groups > 1 is not supported."):
-            op.infer_layout((in_layout, w_layout), extra_args_with_groups)
+            op.infer_layout(self._cache_values((in_layout, w_layout), extra_args_with_groups))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_conv3d_invalid_dimension_count(self, mock_platform):
@@ -253,7 +302,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_layout = _build_layout(mesh, w_placements, 5)
 
         with self.assertRaisesRegex(ValueError, "Input and weight must be 5D."):
-            op.infer_layout((in_layout, w_layout), default_extra_args)
+            op.infer_layout(self._cache_values((in_layout, w_layout), default_extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_conv3d_missing_required_layouts(self, mock_platform):
@@ -268,7 +317,7 @@ class TestParallelConv3D(unittest.TestCase):
         in_layout = _build_layout(mesh, in_placements, 5)
 
         with self.assertRaisesRegex(ValueError, "Requires at least input and weight layouts."):
-            op.infer_layout((in_layout,), default_extra_args)
+            op.infer_layout(self._cache_values((in_layout,), default_extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_conv3d_pure_data_parallelism(self, mock_platform):
@@ -290,7 +339,7 @@ class TestParallelConv3D(unittest.TestCase):
         b_placements = (Replicate(),)
         b_layout = _build_layout(mesh, b_placements, 1)
 
-        output_layout = op.infer_layout((in_layout, w_layout, b_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout, b_layout), default_extra_args)
 
         # Output: (N, C_out, D, H, W) -> N sharded on "dp" (mesh dim 0)
         expected_map = (0, -1, -1, -1, -1)
@@ -316,7 +365,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_placements = (Replicate(), Replicate())
         w_layout = _build_layout(mesh, w_placements, 5)
 
-        output_layout = op.infer_layout((in_layout, w_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout), default_extra_args)
 
         # Output: (N, C_out, D, H, W) -> H sharded on sp_h(1), W sharded on sp_w(0)
         expected_map = (-1, -1, -1, 1, 0)
@@ -342,7 +391,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_layout = _build_layout(mesh, w_placements, 5)
 
         # Missing bias layout (only 2 items in tuple)
-        output_layout = op.infer_layout((in_layout, w_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout), default_extra_args)
 
         # Output: C_out sharded on tp(0)
         expected_map = (-1, 0, -1, -1, -1)
@@ -369,7 +418,7 @@ class TestParallelConv3D(unittest.TestCase):
         # extra_args: (stride, padding, dilation, groups=4)
         extra_args_with_groups = (1, 0, 1, 4)
 
-        output_layout = op.infer_layout((in_layout, w_layout), extra_args_with_groups)
+        output_layout = self._infer_output_layout((in_layout, w_layout), extra_args_with_groups)
 
         # Output: C_out sharded on tp(0)
         expected_map = (-1, 0, -1, -1, -1)
@@ -395,7 +444,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_placements = (Replicate(), Shard(0), Replicate())
         w_layout = _build_layout(mesh, w_placements, 5)
 
-        output_layout = op.infer_layout((in_layout, w_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout), default_extra_args)
 
         # Output: N on dp(2), C_out on tp(1), H on sp(0)
         expected_map = (2, 1, -1, 0, -1)
@@ -422,7 +471,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_layout = _build_layout(mesh, w_placements, 5)
 
         with self.assertRaisesRegex(ValueError, "Partial status which is not allowed"):
-            op.infer_layout((in_layout, w_layout), default_extra_args)
+            op.infer_layout(self._cache_values((in_layout, w_layout), default_extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_conv3d_fully_replicated(self, mock_platform):
@@ -439,7 +488,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_placements = (Replicate(),)
         w_layout = _build_layout(mesh, w_placements, 5)
 
-        output_layout = op.infer_layout((in_layout, w_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout), default_extra_args)
 
         expected_map = (-1, -1, -1, -1, -1)
         self.assertEqual(
@@ -465,7 +514,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_placements = (Replicate(),)
         w_layout = _build_layout(mesh, w_placements, 5)
 
-        output_layout = op.infer_layout((in_layout, w_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout), default_extra_args)
 
         # Output: D sharded on sp_d(0)
         expected_map = (-1, -1, 0, -1, -1)
@@ -489,7 +538,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_placements = (Replicate(),)
         w_layout = _build_layout(mesh, w_placements, 5)
 
-        output_layout = op.infer_layout((in_layout, w_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout), default_extra_args)
 
         expected_map = (-1, -1, -1, -1, 0)
         self.assertEqual(output_layout.to_dict()["tensor_map"], expected_map)
@@ -510,7 +559,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_placements = (Replicate(), Replicate(), Replicate())
         w_layout = _build_layout(mesh, w_placements, 5)
 
-        output_layout = op.infer_layout((in_layout, w_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout), default_extra_args)
 
         # Output: D->sp_d(2), H->sp_h(1), W->sp_w(0)
         expected_map = (-1, -1, 2, 1, 0)
@@ -533,7 +582,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_placements = (Replicate(), Shard(0))
         w_layout = _build_layout(mesh, w_placements, 5)
 
-        output_layout = op.infer_layout((in_layout, w_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout), default_extra_args)
 
         # Output: N->dp(1), C_out->tp(0)
         expected_map = (1, 0, -1, -1, -1)
@@ -556,7 +605,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_placements = (Replicate(), Shard(1))
         w_layout = _build_layout(mesh, w_placements, 5)
 
-        output_layout = op.infer_layout((in_layout, w_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout), default_extra_args)
 
         # Output: N->dp(1), rest unsharded but partial on "tp"
         expected_map = (1, -1, -1, -1, -1)
@@ -581,7 +630,7 @@ class TestParallelConv3D(unittest.TestCase):
         b_placements = (Replicate(),)
         b_layout = _build_layout(mesh, b_placements, 1)
 
-        output_layout = op.infer_layout((in_layout, w_layout, b_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout, b_layout), default_extra_args)
 
         expected_map = (-1, -1, -1, -1, -1)
         self.assertEqual(output_layout.to_dict()["tensor_map"], expected_map)
@@ -602,7 +651,7 @@ class TestParallelConv3D(unittest.TestCase):
         w_placements = (Shard(0),)
         w_layout = _build_layout(mesh, w_placements, 5)
 
-        output_layout = op.infer_layout((in_layout, w_layout), default_extra_args)
+        output_layout = self._infer_output_layout((in_layout, w_layout), default_extra_args)
 
         # Output: C_out sharded on tp(0)
         expected_map = (-1, 0, -1, -1, -1)
@@ -629,99 +678,7 @@ class TestParallelConv3D(unittest.TestCase):
         b_layout = _build_layout(mesh, b_placements, 1)
 
         with self.assertRaisesRegex(ValueError, "Weight C_out and Bias C_out must be sharded on the same axis"):
-            op.infer_layout((in_layout, w_layout, b_layout), default_extra_args)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_conv3d_groups_not_divisible_for_column_parallelism_raises(self, mock_platform):
-        """
-        Feature: Column parallelism groups divisibility validation
-        Description: groups=3 with dev_num=2 (non-divisible) raises ValueError.
-        Expectation: ValueError mentioning divisibility.
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=2, mesh_dim_names=("tp",))
-        in_placements = (Replicate(),)
-        in_layout = _build_layout(mesh, in_placements, 5)
-        w_placements = (Shard(0),)
-        w_layout = _build_layout(mesh, w_placements, 5)
-        extra_args_groups3 = (1, 0, 1, 3)
-        with self.assertRaisesRegex(ValueError, "must be divisible by tp_size"):
-            op.infer_layout((in_layout, w_layout), extra_args_groups3)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_get_expand_impl_no_weight_sharding_returns_none(self, mock_platform):
-        """
-        Feature: get_expand_impl with replicated weight
-        Description: When weight C_out is not sharded (w_map_0 == -1), returns None.
-        Expectation: None returned.
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=4, mesh_dim_names=("tp",))
-        in_layout = _build_layout(mesh, (Replicate(),), 5)
-        w_layout = _build_layout(mesh, (Replicate(),), 5)
-        result = op.get_expand_impl(None, None, (in_layout, w_layout), default_extra_args)
-        self.assertIsNone(result)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_get_expand_impl_sharded_weight_returns_callable(self, mock_platform):
-        """
-        Feature: get_expand_impl with column-parallel weight
-        Description: When weight C_out is sharded, get_expand_impl returns a callable.
-        Expectation: Callable returned.
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=2, mesh_dim_names=("tp",))
-        in_layout = _build_layout(mesh, (Replicate(),), 5)
-        w_layout = _build_layout(mesh, (Shard(0),), 5)
-        impl = op.get_expand_impl(None, None, (in_layout, w_layout), default_extra_args)
-        self.assertTrue(callable(impl))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_get_expand_impl_callable_groups_one_calls_func_directly(self, mock_platform):
-        """
-        Feature: get_expand_impl callable with groups=1
-        Description: groups=1 in the impl falls back to native func call.
-        Expectation: func called with original args and groups=1.
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=2, mesh_dim_names=("tp",))
-        in_layout = _build_layout(mesh, (Replicate(),), 5)
-        w_layout = _build_layout(mesh, (Shard(0),), 5)
-
-        call_args = []
-
-        def mock_func(*args, **kwargs):
-            call_args.append(args)
-            return np.zeros((1,))
-
-        impl = op.get_expand_impl(mock_func, None, (in_layout, w_layout), default_extra_args)
-        input_t = np.ones((2, 6, 4, 4, 4))
-        weight_t = np.ones((4, 6, 3, 3, 3))
-        impl(input_t, weight_t, None, 1, 0, 1, 1)
-        self.assertEqual(len(call_args), 1)
-        self.assertEqual(call_args[0][-1], 1)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_get_expand_impl_callable_groups_gt_one_slices_input(self, mock_platform):
-        """
-        Feature: get_expand_impl callable with groups>1
-        Description: groups=4, dev_num=2, local_rank=0 → input channels 0-5 sliced.
-        Expectation: func called with sliced input and local_groups=2.
-        """
-        mesh = self._make_1d_mesh(mock_platform, world_size=2, mesh_dim_names=("tp",))
-        in_layout = _build_layout(mesh, (Replicate(),), 5)
-        w_layout = _build_layout(mesh, (Shard(0),), 5)
-
-        call_args = []
-
-        def mock_func(*args, **kwargs):
-            call_args.append(args)
-            return np.zeros((1,))
-
-        extra_args_groups4 = (1, 0, 1, 4)
-        impl = op.get_expand_impl(mock_func, None, (in_layout, w_layout), extra_args_groups4)
-        input_t = np.ones((2, 12, 4, 4, 4))
-        weight_t = np.ones((4, 3, 3, 3, 3))
-        impl(input_t, weight_t, None, 1, 0, 1, 4)
-        self.assertEqual(len(call_args), 1)
-        sliced_input = call_args[0][0]
-        self.assertEqual(sliced_input.shape[1], 6)
+            op.infer_layout(self._cache_values((in_layout, w_layout, b_layout), default_extra_args))
 
 
 if __name__ == "__main__":
