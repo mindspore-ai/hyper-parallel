@@ -110,7 +110,7 @@ def _validate_layout_and_mode(style_name: str, layout: str, mode: str) -> tuple[
     return layout, 1 if layout == "BSND" else 0
 
 
-def _finalize_output(value: Any, use_local_output: bool, output_layout=None, seq_dim: int | None = None) -> Any:
+def _finalize_output(value: Any, use_local_output: bool, output_layout=None, seq_dim: Optional[int] = None) -> Any:
     """Convert direct DTensor outputs, or one-level tuple/list outputs, to local tensors."""
     output_kind, layout = output_layout if output_layout is not None else (None, None)
 

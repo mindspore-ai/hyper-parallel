@@ -28,7 +28,7 @@ Provides token permutation helpers and four parallel styles that compose with
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, List, Tuple
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
@@ -188,7 +188,43 @@ def _unpermute(out, original_shape, permuted_indices):
 
 
 # ---------------------------------------------------------------------------
-# BaseExpertParallel — abstract base for all-to-all EP strategies
+# DispatchContext — state shared between token dispatch and combine
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DispatchContext:
+    """Intermediate state between token dispatch and combine.
+    
+    Stored in ``module._ep_dispatch_ctx`` for a single forward pass.
+    This solves the instance sharing problem when the same ExpertParallel
+    style object is applied to multiple layers:
+    
+    Example problem (before this fix):
+        ep_style = ExpertParallel()
+        ep_style.apply(layer1.experts, mesh)  # registers hooks
+        ep_style.apply(layer2.experts, mesh)  # reuses same ep_style
+        
+        # During forward:
+        # layer1.dispatch writes to ep_style._state_stack
+        # layer2.dispatch pushes to same stack ← INTERLEAVING
+        # layer1.combine pops wrong state (LIFO violation)
+    
+    Solution: Store context per-module, not per-style-instance.
+
+    Built by :meth:`AllToAllTokenDispatcher.dispatch` and consumed by
+    :meth:`AllToAllTokenDispatcher.combine`.  The caller
+    (e.g. :class:`ExpertParallel`) stores this on the module between the
+    paired dispatch/combine calls.
+    """
+
+    input_splits: List[int]
+    output_splits: List[int]
+    input_shape: Tuple[int, ...]
+    permuted_indices: Any
+
+
+# ---------------------------------------------------------------------------
+# AllToAllTokenDispatcher — token dispatch/combine via all-to-all
 # ---------------------------------------------------------------------------
 
 class BaseExpertParallel(ParallelStyle, ABC):
@@ -257,26 +293,6 @@ class BaseExpertParallel(ParallelStyle, ABC):
 
 
 # ---------------------------------------------------------------------------
-# DispatchContext — state shared between token dispatch and combine
-# ---------------------------------------------------------------------------
-
-@dataclass
-class DispatchContext:
-    """Holds state shared between token dispatch and combine within one forward pass.
-
-    Built by :meth:`AllToAllTokenDispatcher.dispatch` and consumed by
-    :meth:`AllToAllTokenDispatcher.combine`.  The caller
-    (e.g. :class:`ExpertParallel`) stores this on the instance between the
-    paired dispatch/combine calls.
-    """
-
-    input_splits: list
-    output_splits: list
-    input_shape: Optional[tuple] = None
-    permuted_indices: Optional[object] = None
-
-
-# ---------------------------------------------------------------------------
 # AllToAllTokenDispatcher — token dispatch/combine via all-to-all
 # ---------------------------------------------------------------------------
 
@@ -300,7 +316,7 @@ class AllToAllTokenDispatcher:
         the module's forward inputs and returns transformed inputs.
 
         Args:
-            module: The ``GroupedExperts`` module (unused here).
+            module: The ``GroupedExperts`` module.
             inputs: Tuple ``(routed_input, num_tokens_per_expert)`` where
                 ``routed_input`` has shape ``[total_tokens, dim]`` and
                 ``num_tokens_per_expert`` has shape ``[num_experts]``.
@@ -312,7 +328,7 @@ class AllToAllTokenDispatcher:
             expert computation; *ctx* is a :class:`DispatchContext`
             carrying the updated state to be stored by the caller.
         """
-        del module
+        del module  # module unused, kept for API consistency
         routed_input, num_tokens_per_expert = inputs[0], inputs[1]
         ep_group = device_mesh.get_group()
         ep_size = device_mesh.size()
@@ -355,12 +371,18 @@ class AllToAllTokenDispatcher:
         input_shape, permuted, permuted_indices, local_counts = _permute(
             dispatched, counts_out, ep_size, num_local_experts
         )
+
+        # Build dispatch context for combine step.
+        # Caller (e.g., ExpertParallel._token_dispatch) is responsible for storing
+        # this context and passing it to combine(). This decouples dispatch/combine
+        # from module state and solves the instance sharing problem.
         ctx = DispatchContext(
             input_splits=input_splits,
             output_splits=output_splits,
             input_shape=input_shape,
             permuted_indices=permuted_indices,
         )
+
         return permuted, local_counts, ctx
 
     @staticmethod
@@ -368,9 +390,10 @@ class AllToAllTokenDispatcher:
         """Gather expert outputs back to the originating ranks via all-to-all.
 
         Called as an ``output_fn`` hook by :func:`distribute_module`.
+        Receives dispatch context from the caller (previously returned by dispatch).
 
         Args:
-            module: The ``GroupedExperts`` module (unused).
+            module: The ``GroupedExperts`` module (unused, for API consistency).
             routed_output: Expert output tensor in expert-major order,
                 shape ``[sum(local_counts), dim]``.
             device_mesh: EP device mesh (1-D).
@@ -381,7 +404,7 @@ class AllToAllTokenDispatcher:
             Token tensor in the original token-major layout,
             shape ``[sum(input_splits), dim]``.
         """
-        del module
+        del module  # module not used, kept for API consistency
         ep_group = device_mesh.get_group()
 
         # expert-major → rank-major
@@ -427,45 +450,69 @@ class ExpertParallel(BaseExpertParallel):
     """
 
     def __init__(self) -> None:
-        """Initialize ExpertParallel with no dispatch context."""
-        self._dispatch_ctx: Optional[DispatchContext] = None
+        """Initialize ExpertParallel."""
 
     def _token_dispatch(self, module: Module, inputs, device_mesh: DeviceMesh):
         """Dispatch tokens to their assigned ranks via all-to-all.
 
-        Delegates to :meth:`AllToAllTokenDispatcher.dispatch` and stores the
-        returned :class:`DispatchContext` on the instance for the matching
-        :meth:`_token_combine` call.
+        Delegates to :meth:`AllToAllTokenDispatcher.dispatch`, stores the
+        returned :class:`DispatchContext` on the module attribute for the
+        matching :meth:`_token_combine` call.
 
         Args:
-            module: The ``GroupedExperts`` module (unused here).
+            module: The ``GroupedExperts`` module.
             inputs: Tuple ``(routed_input, num_tokens_per_expert)``.
             device_mesh: EP device mesh (1-D).
 
         Returns:
             Tuple ``(permuted_local_input, local_token_counts)``.
         """
-        permuted, local_counts, self._dispatch_ctx = (
+        permuted, local_counts, ctx = (
             AllToAllTokenDispatcher.dispatch(module, inputs, device_mesh)
         )
+        # Store context in module attribute for _token_combine to read.
+        # Using module attribute ensures each module has its own context,
+        # solving the instance sharing problem when the same ExpertParallel
+        # style object is applied to multiple GroupedExperts modules.
+        # pylint: disable=W0212
+        module._ep_dispatch_ctx = ctx
         return permuted, local_counts
 
     def _token_combine(self, module: Module, routed_output, device_mesh: DeviceMesh):
         """Gather expert outputs back to the originating ranks via all-to-all.
 
-        Delegates to :meth:`AllToAllTokenDispatcher.combine`, passing the
-        :class:`DispatchContext` stored by :meth:`_token_dispatch`.
+        Reads :class:`DispatchContext` from module attribute set by
+        :meth:`_token_dispatch` and delegates to
+        :meth:`AllToAllTokenDispatcher.combine`.
 
         Args:
-            module: The ``GroupedExperts`` module (unused).
+            module: The ``GroupedExperts`` module.
             routed_output: Expert output tensor in expert-major order.
             device_mesh: EP device mesh (1-D).
 
         Returns:
             Token tensor in the original token-major layout.
+            
+        Raises:
+            RuntimeError: If dispatch context is not found (dispatch was not called).
         """
+        # Read dispatch context from module attribute set by _token_dispatch.
+        # pylint: disable=W0212
+        ctx = getattr(module, "_ep_dispatch_ctx", None)
+        if ctx is None:
+            raise RuntimeError(
+                "_token_combine called but no dispatch context found in module. "
+                "This indicates _token_dispatch was not called before _token_combine, "
+                "or the context was already consumed by a previous combine call."
+            )
+
+        # Note: Do NOT delete the context here. In PyTorch, the tensors in ctx
+        # are captured by autograd graph and don't need the attribute. But in
+        # MindSpore PyNative mode, deleting the attribute may break backward.
+        # The context will be overwritten on the next forward call.
+
         return AllToAllTokenDispatcher.combine(
-            module, routed_output, device_mesh, self._dispatch_ctx,
+            module, routed_output, device_mesh, ctx,
         )
 
     def _partition_fn(
@@ -596,9 +643,12 @@ class ExpertTensorParallel(ExpertParallel):
         Returns:
             Transformed inputs for local expert computation.
         """
-        permuted, local_counts, self._dispatch_ctx = (
+        permuted, local_counts, ctx = (
             AllToAllTokenDispatcher.dispatch(module, inputs, device_mesh["ep"])
         )
+        # Store context in module attribute for _token_combine to read.
+        # pylint: disable=W0212
+        module._ep_dispatch_ctx = ctx
         return permuted, local_counts
 
     def _token_combine(self, module: Module, routed_output, device_mesh: DeviceMesh):
@@ -612,8 +662,23 @@ class ExpertTensorParallel(ExpertParallel):
         Returns:
             Token tensor in the original token-major layout.
         """
+        # Read dispatch context from module attribute set by _token_dispatch.
+        # pylint: disable=W0212
+        ctx = getattr(module, "_ep_dispatch_ctx", None)
+        if ctx is None:
+            raise RuntimeError(
+                "_token_combine called but no dispatch context found in module. "
+                "This indicates _token_dispatch was not called before _token_combine, "
+                "or the context was already consumed by a previous combine call."
+            )
+
+        # Note: Do NOT delete the context here. In PyTorch, the tensors in ctx
+        # are captured by autograd graph and don't need the attribute. But in
+        # MindSpore PyNative mode, deleting the attribute may break backward.
+        # The context will be overwritten on the next forward call.
+
         return AllToAllTokenDispatcher.combine(
-            module, routed_output, device_mesh["ep"], self._dispatch_ctx,
+            module, routed_output, device_mesh["ep"], ctx,
         )
 
     def _partition_fn(

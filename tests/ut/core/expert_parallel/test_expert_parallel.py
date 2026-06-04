@@ -295,6 +295,7 @@ class TestExpertParallelDispatch(unittest.TestCase):
         self.num_tokens_per_expert_in = torch.tensor([3, 2, 1, 4])
         self.routed_input = torch.randn(self.total_tokens, self.dim)
         self.mock_mesh = _make_mock_device_mesh(self.ep_size)
+        self.module = _make_mock_module()
 
     def _call_dispatch(self, mock_platform):
         """Configure platform mock and call _token_dispatch."""
@@ -307,7 +308,7 @@ class TestExpertParallelDispatch(unittest.TestCase):
         mock_platform.arange.side_effect = torch.arange
 
         return self.ep._token_dispatch(
-            module=None,
+            module=self.module,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
             device_mesh=self.mock_mesh,
         )
@@ -340,7 +341,7 @@ class TestExpertParallelDispatch(unittest.TestCase):
         """
         self._call_dispatch(mock_platform)
         # rank0 block: 3+2=5, rank1 block: 1+4=5
-        ctx = self.ep._dispatch_ctx
+        ctx = self.module._ep_dispatch_ctx
         self.assertEqual(
             ctx.input_splits, [5, 5],
             f"input_splits={ctx.input_splits}, expected [5, 5]"
@@ -369,17 +370,94 @@ class TestExpertParallelDispatch(unittest.TestCase):
     def test_dispatch_saves_state_for_combine(self, mock_platform):
         """
         Feature: ExpertParallel._token_dispatch state preservation
-        Description: After dispatch, _input_splits, _output_splits,
-            _input_shape, and _permuted_indices are saved for use by combine.
-        Expectation: all four state attributes are not None / non-empty
+        Description: After dispatch, input_splits, output_splits, input_shape,
+            and permuted_indices are stored in module._ep_dispatch_ctx
+            for use by combine.
+        Expectation: module has _ep_dispatch_ctx with four non-None components
         """
         self._call_dispatch(mock_platform)
-        ctx = self.ep._dispatch_ctx
-        self.assertIsNotNone(ctx, "_dispatch_ctx should be set")
-        self.assertIsNotNone(ctx.input_splits, "input_splits should be set")
-        self.assertIsNotNone(ctx.output_splits, "output_splits should be set")
-        self.assertIsNotNone(ctx.input_shape, "input_shape should be set")
-        self.assertIsNotNone(ctx.permuted_indices, "permuted_indices should be set")
+        self.assertTrue(hasattr(self.module, "_ep_dispatch_ctx"),
+                       "module should have _ep_dispatch_ctx attribute")
+        ctx = self.module._ep_dispatch_ctx
+        self.assertIsNotNone(ctx.input_splits, f"input_splits should be set, got {ctx.input_splits}")
+        self.assertIsNotNone(ctx.output_splits, f"output_splits should be set, got {ctx.output_splits}")
+        self.assertIsNotNone(ctx.input_shape, f"input_shape should be set, got {ctx.input_shape}")
+        self.assertIsNotNone(ctx.permuted_indices, f"permuted_indices should be set, got {ctx.permuted_indices}")
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_two_consecutive_forwards_isolate_state(self, mock_platform):
+        """
+        Feature: ExpertParallel state isolation across forwards
+        Description: Consecutive forward passes should have independent dispatch contexts.
+        Expectation: Second forward does not affect first results, context persists for backward pass.
+        """
+        # Setup mocks
+        counts_out = torch.tensor([3, 2, 1, 4])
+        total_tokens = int(counts_out.sum())
+        mock_platform.all_to_all_single.return_value = (counts_out, None)
+        mock_platform.differentiable_all_to_all_single.side_effect = (
+            lambda inp, *_args, **_kw: inp
+        )
+        mock_platform.arange.side_effect = torch.arange
+
+        module = _make_mock_module()
+        mock_mesh = _make_mock_device_mesh(self.ep_size)
+
+        # First forward
+        inputs1 = (torch.randn(total_tokens, self.dim), torch.tensor([3, 2, 1, 4]))
+        self.ep._token_dispatch(module, inputs1, mock_mesh)
+        
+        # Context should be set after dispatch
+        self.assertTrue(hasattr(module, "_ep_dispatch_ctx"), 
+                       "module should have _ep_dispatch_ctx after dispatch")
+        ctx1 = module._ep_dispatch_ctx
+        ctx1_id = id(ctx1)
+        
+        # Combine should NOT clear the context (needed for backward pass in PyNative mode)
+        output1 = torch.randn(total_tokens, self.dim)
+        combined1 = self.ep._token_combine(module, output1, mock_mesh)
+        self.assertTrue(hasattr(module, "_ep_dispatch_ctx"), 
+                       "module._ep_dispatch_ctx should persist after combine for backward pass")
+        self.assertIs(module._ep_dispatch_ctx, ctx1, 
+                     "Context should remain the same object after combine")
+
+        # Second forward with different data - context gets overwritten
+        counts_out2 = torch.tensor([4, 2, 2, 4])
+        total_tokens2 = int(counts_out2.sum())
+        mock_platform.all_to_all_single.return_value = (counts_out2, None)
+        
+        inputs2 = (torch.randn(total_tokens2, self.dim), torch.tensor([4, 2, 2, 4]))
+        self.ep._token_dispatch(module, inputs2, mock_mesh)
+        
+        # Context should be a new object (overwritten), not the same as first forward
+        self.assertTrue(hasattr(module, "_ep_dispatch_ctx"))
+        ctx2 = module._ep_dispatch_ctx
+        ctx2_id = id(ctx2)
+        self.assertNotEqual(ctx1_id, ctx2_id, 
+                           "Each forward should create a new dispatch context")
+        self.assertIsNot(ctx1, ctx2,
+                        "Second forward should overwrite context with new object")
+        
+        # Combine after second forward
+        output2 = torch.randn(total_tokens2, self.dim)
+        combined2 = self.ep._token_combine(module, output2, mock_mesh)
+        # Context still persists after combine
+        self.assertTrue(hasattr(module, "_ep_dispatch_ctx"),
+                       "module._ep_dispatch_ctx should persist after second combine")
+        self.assertIs(module._ep_dispatch_ctx, ctx2,
+                     "Context should be the second context object")
+
+    def test_combine_without_dispatch_raises_error(self):
+        """
+        Feature: ExpertParallel error handling
+        Description: _token_combine called before _token_dispatch should raise RuntimeError.
+        Expectation: RuntimeError with descriptive message about missing context.
+        """
+        module = _make_mock_module()
+        mock_mesh = _make_mock_device_mesh(self.ep_size)
+        
+        with self.assertRaisesRegex(RuntimeError, "no dispatch context found"):
+            self.ep._token_combine(module, torch.randn(10, self.dim), mock_mesh)
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +478,7 @@ class TestExpertParallelCombine(unittest.TestCase):
         self.num_tokens_per_expert_in = torch.tensor([3, 2, 1, 4])
         self.routed_input = torch.randn(self.total_tokens, self.dim)
         self.mock_mesh = _make_mock_device_mesh(self.ep_size)
+        self.module = _make_mock_module()
 
     def _run_dispatch_and_combine(self, expert_output, mock_platform):
         """Run dispatch then combine using the same platform mock."""
@@ -416,12 +495,12 @@ class TestExpertParallelCombine(unittest.TestCase):
         mock_platform.differentiable_all_to_all_single.side_effect = identity_a2a
 
         self.ep._token_dispatch(
-            module=None,
+            module=self.module,
             inputs=(self.routed_input, self.num_tokens_per_expert_in),
             device_mesh=self.mock_mesh,
         )
         combined = self.ep._token_combine(
-            module=None,
+            module=self.module,
             routed_output=expert_output,
             device_mesh=self.mock_mesh,
         )
@@ -489,14 +568,38 @@ class TestExpertParallelCombine(unittest.TestCase):
         Expectation: the second a2a call's input_splits == dispatch output_splits
         """
         expert_output = torch.randn(self.total_tokens, self.dim)
-        self._run_dispatch_and_combine(expert_output, mock_platform)
+        
+        # Setup mocks and run dispatch
+        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
+        mock_platform.arange.side_effect = torch.arange
+
+        def identity_a2a(inp: object, *_args: object, **_kw: object) -> object:
+            return inp
+
+        mock_platform.differentiable_all_to_all_single.side_effect = identity_a2a
+
+        self.ep._token_dispatch(
+            module=self.module,
+            inputs=(self.routed_input, self.num_tokens_per_expert_in),
+            device_mesh=self.mock_mesh,
+        )
+        
+        # Read dispatch context BEFORE combine clears it
+        dispatch_output_splits = self.module._ep_dispatch_ctx.output_splits
+        
+        # Now run combine
+        self.ep._token_combine(
+            module=self.module,
+            routed_output=expert_output,
+            device_mesh=self.mock_mesh,
+        )
+        
         call_args_list = mock_platform.differentiable_all_to_all_single.call_args_list
         # call_args_list[0] = dispatch call, call_args_list[1] = combine call
         self.assertGreaterEqual(len(call_args_list), 2)
         combine_call = call_args_list[1]
         # positional args: (inp, input_splits, output_splits, group)
         combine_input_splits = combine_call.args[1]
-        dispatch_output_splits = self.ep._dispatch_ctx.output_splits
         self.assertEqual(
             combine_input_splits, dispatch_output_splits,
             (f"combine input_splits={combine_input_splits} "
@@ -812,8 +915,9 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
         )
         mock_platform.arange.side_effect = torch.arange
 
+        module = _make_mock_module()
         etp._token_dispatch(
-            module=None,
+            module=module,
             inputs=(routed_input, num_tokens_per_expert),
             device_mesh=full_mesh,
         )
@@ -847,8 +951,9 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
         mock_platform.arange.side_effect = torch.arange
 
         # First dispatch to set state
+        module = _make_mock_module()
         etp._token_dispatch(
-            module=None,
+            module=module,
             inputs=(routed_input, num_tokens_per_expert),
             device_mesh=full_mesh,
         )
@@ -856,7 +961,7 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
         full_mesh.__getitem__.reset_mock()
         expert_output = torch.randn(total_tokens, dim)
         etp._token_combine(
-            module=None,
+            module=module,
             routed_output=expert_output,
             device_mesh=full_mesh,
         )
