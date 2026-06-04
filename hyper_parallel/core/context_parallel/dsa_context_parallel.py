@@ -29,7 +29,15 @@ stay replicated.
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from hyper_parallel.core.context_parallel.context_parallel import _ensure_1d, _gather_seq
+from hyper_parallel.core.context_parallel.context_parallel import (
+    _OUTPUT_NON_CP,
+    _drop_cp_from_output,
+    _ensure_1d,
+    _non_cp_dtensor_layout,
+    _pop_output_layout,
+    _push_output_layout,
+    _to_cp_dtensor,
+)
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
@@ -52,18 +60,14 @@ def _to_sequence_shard(value: Any, device_mesh: DeviceMesh, seq_dim: int) -> Any
     """Annotate ``value`` as sequence-sharded on ``device_mesh``."""
     if not _is_tensor_or_dtensor(value):
         return value
-    if isinstance(value, DTensor):
-        return value.redistribute(device_mesh, (Shard(seq_dim),))
-    return DTensor.from_local(value, device_mesh, (Shard(seq_dim),))
+    return _to_cp_dtensor(value, device_mesh, (Shard(seq_dim),), (Shard(seq_dim),), seq_dim)
 
 
 def _to_sequence_replicate(value: Any, device_mesh: DeviceMesh, seq_dim: int) -> Any:
     """Annotate ``value`` as local sequence shard, then all-gather on CP."""
     if not _is_tensor_or_dtensor(value):
         return value
-    if isinstance(value, DTensor):
-        return value.redistribute(device_mesh, (Replicate(),))
-    return _gather_seq(value, device_mesh, seq_dim)
+    return _to_cp_dtensor(value, device_mesh, (Shard(seq_dim),), (Replicate(),), seq_dim)
 
 
 def _maybe_replace_arg(args: list, index: Optional[int], fn) -> None:
@@ -106,14 +110,23 @@ def _validate_layout_and_mode(style_name: str, layout: str, mode: str) -> tuple[
     return layout, 1 if layout == "BSND" else 0
 
 
-def _finalize_output(value: Any, use_local_output: bool) -> Any:
+def _finalize_output(value: Any, use_local_output: bool, output_layout=None, seq_dim: int | None = None) -> Any:
     """Convert direct DTensor outputs, or one-level tuple/list outputs, to local tensors."""
+    output_kind, layout = output_layout if output_layout is not None else (None, None)
+
+    def finalize_one(item):
+        if use_local_output:
+            return item.to_local() if isinstance(item, DTensor) else item
+        if output_kind == _OUTPUT_NON_CP and seq_dim is not None:
+            return _drop_cp_from_output(item, layout, (Shard(seq_dim),))
+        return item
+
     if isinstance(value, DTensor):
-        return value.to_local() if use_local_output else value
+        return finalize_one(value)
     if isinstance(value, tuple):
-        return tuple(v.to_local() if use_local_output and isinstance(v, DTensor) else v for v in value)
+        return tuple(finalize_one(v) for v in value)
     if isinstance(value, list):
-        return [v.to_local() if use_local_output and isinstance(v, DTensor) else v for v in value]
+        return [finalize_one(v) for v in value]
     return value
 
 
@@ -131,12 +144,32 @@ def _dtensor_to_local_reducing_partial(value: Any) -> Any:
     return value.to_local()
 
 
-def _register_boundary_hooks(module: Module, pre_hook, use_local_output: bool) -> None:
+def _register_boundary_hooks(module: Module, pre_hook, use_local_output: bool, seq_dim: int) -> None:
     """Register a DSA boundary pre-hook and its public output conversion hook."""
     platform.register_forward_pre_hook(module, pre_hook, with_kwargs=True)
     module.register_forward_hook(
-        lambda _module, _args, outputs: _finalize_output(outputs, use_local_output)
+        lambda _module, _args, outputs: _finalize_output(
+            outputs,
+            use_local_output,
+            _pop_output_layout(_module),
+            seq_dim,
+        )
     )
+
+
+def _record_query_output_layout(module: Module, value: Any, cp_mesh: DeviceMesh, seq_dim: int) -> None:
+    """Remember the non-CP query layout so outputs can drop CP on exit."""
+    layout = _non_cp_dtensor_layout(value, cp_mesh, seq_dim)
+    _push_output_layout(module, (_OUTPUT_NON_CP, layout) if layout is not None else None)
+
+
+def _read_value(args: list, kwargs: dict, index: Optional[int], kwarg_name: Optional[str]) -> Any:
+    """Read a positional or keyword value from a hook argument pair."""
+    if index is not None and index < len(args):
+        return args[index]
+    if kwarg_name is not None and kwarg_name in kwargs:
+        return kwargs[kwarg_name]
+    return None
 
 
 def _configure_sparse_attention_boundary(  # pylint: disable=too-many-arguments
@@ -206,13 +239,18 @@ def _apply_sparse_attention_boundary(
     ]
 
     def _pre_hook(hook_module, args, kwargs):
-        del hook_module
         new_args = list(args)
         new_kwargs = dict(kwargs)
+        _record_query_output_layout(
+            hook_module,
+            _read_value(new_args, new_kwargs, style.query_index, style.query_kwarg_name),
+            cp_mesh,
+            style.seq_dim,
+        )
         _apply_param_specs(new_args, new_kwargs, specs)
         return tuple(new_args), new_kwargs
 
-    _register_boundary_hooks(module, _pre_hook, style.use_local_output)
+    _register_boundary_hooks(module, _pre_hook, style.use_local_output, style.seq_dim)
     return module
 
 
@@ -237,7 +275,7 @@ class DSAIndexerContextParallel(ParallelStyle):
             query_kwarg_name: Optional[str] = None,
             key_kwarg_name: Optional[str] = None,
             weights_kwarg_name: Optional[str] = None,
-            use_local_output: bool = True,
+            use_local_output: bool = False,
     ) -> None:
         super().__init__()
         layout, seq_dim = _validate_layout_and_mode(self.__class__.__name__, layout, mode)
@@ -276,16 +314,21 @@ class DSAIndexerContextParallel(ParallelStyle):
             _ParamSpec(self.weights_index, self.weights_kwarg_name, shard),
         ]
 
-    def _apply_with_specs(self, module: Module, specs: list[_ParamSpec]) -> Module:
+    def _apply_with_specs(self, module: Module, specs: list[_ParamSpec], cp_mesh: DeviceMesh) -> Module:
         """Register indexer hooks driven by parameter specs."""
         def _pre_hook(hook_module, args, kwargs):
-            del hook_module
             new_args = list(args)
             new_kwargs = dict(kwargs)
+            _record_query_output_layout(
+                hook_module,
+                _read_value(new_args, new_kwargs, self.query_index, self.query_kwarg_name),
+                cp_mesh,
+                self.seq_dim,
+            )
             _apply_param_specs(new_args, new_kwargs, specs)
             return tuple(new_args), new_kwargs
 
-        _register_boundary_hooks(module, _pre_hook, self.use_local_output)
+        _register_boundary_hooks(module, _pre_hook, self.use_local_output, self.seq_dim)
         return module
 
     def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
@@ -295,7 +338,7 @@ class DSAIndexerContextParallel(ParallelStyle):
             cp_mesh,
             key_fn=lambda value: self._replicate_key_side(value, cp_mesh),
         )
-        return self._apply_with_specs(module, specs)
+        return self._apply_with_specs(module, specs, cp_mesh)
 
 
 class DSASparseAttentionContextParallel(ParallelStyle):
@@ -326,7 +369,7 @@ class DSASparseAttentionContextParallel(ParallelStyle):
             key_rope_index: Optional[int] = 5,
             query_rope_kwarg_name: Optional[str] = "query_rope",
             key_rope_kwarg_name: Optional[str] = "key_rope",
-            use_local_output: bool = True,
+            use_local_output: bool = False,
     ) -> None:
         super().__init__()
         _configure_sparse_attention_boundary(
@@ -397,7 +440,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
             topk_kwarg_name: Optional[str] = None,
             query_rope_kwarg_name: Optional[str] = None,
             key_rope_kwarg_name: Optional[str] = None,
-            use_local_output: bool = True,
+            use_local_output: bool = False,
     ) -> None:
         super().__init__()
         layout, seq_dim = _validate_layout_and_mode(self.__class__.__name__, layout, mode)
@@ -466,8 +509,9 @@ class DSAIndexerLossContextParallel(ParallelStyle):
 
     def _process_outputs(self, module: Module, outputs: Any) -> Any:
         """Finalize indexer-loss outputs, reducing Partial values when needed."""
+        output_layout = _pop_output_layout(module)
         if not self.use_local_output:
-            return outputs
+            return _finalize_output(outputs, False, output_layout, self.seq_dim)
         if not isinstance(outputs, (tuple, list)) or len(outputs) < 4:
             return _finalize_output(outputs, use_local_output=True)
 
@@ -513,11 +557,23 @@ class DSAIndexerLossContextParallel(ParallelStyle):
         rank = platform.get_rank()
         return rank_list.index(rank) if rank in rank_list else 0
 
-    def _apply_with_loss_specs(self, module: Module, specs: list[_ParamSpec], local_idx: int) -> Module:
+    def _apply_with_loss_specs(
+            self,
+            module: Module,
+            specs: list[_ParamSpec],
+            local_idx: int,
+            cp_mesh: DeviceMesh,
+    ) -> Module:
         """Register indexer-loss hooks driven by parameter specs."""
         def _pre_hook(hook_module, args, kwargs):
             new_args = list(args)
             new_kwargs = dict(kwargs)
+            _record_query_output_layout(
+                hook_module,
+                _read_value(new_args, new_kwargs, self.query_index, self.query_kwarg_name),
+                cp_mesh,
+                self.seq_dim,
+            )
             key_shape = self._read_key_indexer_shape(new_args, new_kwargs)
             setattr(hook_module, "_hp_dsa_loss_key_index_local_shape", key_shape)
             setattr(hook_module, "_hp_dsa_loss_local_idx", local_idx)
@@ -543,4 +599,4 @@ class DSAIndexerLossContextParallel(ParallelStyle):
                 "key_rope": replicate,
             },
         )
-        return self._apply_with_loss_specs(module, specs, self._get_local_idx(cp_mesh))
+        return self._apply_with_loss_specs(module, specs, self._get_local_idx(cp_mesh), cp_mesh)

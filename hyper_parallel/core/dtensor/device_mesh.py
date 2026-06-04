@@ -822,25 +822,97 @@ class DeviceMesh:
     @staticmethod
     def _validate_concatenate_inputs(
             meshes: Sequence['DeviceMesh'],
-    ) -> tuple['DeviceMesh', tuple[str, ...], tuple[int, ...]]:
-        """Validate concatenate inputs and return the shared root metadata."""
+    ) -> tuple['DeviceMesh', tuple['DeviceMesh', ...], tuple[str, ...], tuple[int, ...]]:
+        """Validate concatenate inputs and return root metadata plus canonical mesh views."""
         if len(meshes) == 0:
             raise ValueError("DeviceMesh.concatenate expects at least one mesh.")
         if len(meshes) == 1:
-            return meshes[0]._get_root_mesh(), tuple(meshes[0].mesh_dim_names or ()), meshes[0]._flatten_rank_map
+            return (
+                meshes[0]._get_root_mesh(),
+                tuple(meshes),
+                tuple(meshes[0].mesh_dim_names or ()),
+                meshes[0]._flatten_rank_map,
+            )
 
-        root_mesh = meshes[0]._get_root_mesh()  # pylint: disable=protected-access
+        # Torch treats the flattened rank map as the common root tensor identity.
+        # If a peer view lost root metadata, recover canonical views from any input that still has it.
+        root_mesh = next(
+            (mesh._get_root_mesh() for mesh in meshes if mesh.root_mesh is not None),  # pylint: disable=protected-access
+            meshes[0]._get_root_mesh(),  # pylint: disable=protected-access
+        )
         requested_dim_names: list[str] = []
-        flatten_rank_map = meshes[0]._flatten_rank_map  # pylint: disable=protected-access
+        canonical_meshes: list['DeviceMesh'] = []
+        flatten_rank_map = root_mesh._flatten_rank_map  # pylint: disable=protected-access
+        anchor_meshes = DeviceMesh._collect_concatenate_anchor_meshes(meshes, root_mesh)
         for mesh in meshes:
-            if mesh._get_root_mesh().to_hash() != root_mesh.to_hash():  # pylint: disable=protected-access
-                raise ValueError("DeviceMesh.concatenate expects all meshes to share the same root mesh.")
-            if mesh._flatten_rank_map != flatten_rank_map:  # pylint: disable=protected-access
-                raise ValueError("DeviceMesh.concatenate expects all meshes to share the same root mesh.")
             if not mesh.mesh_dim_names:
                 raise ValueError("DeviceMesh.concatenate requires mesh_dim_names on every input mesh.")
-            requested_dim_names.extend(mesh.mesh_dim_names)
-        return root_mesh, tuple(requested_dim_names), flatten_rank_map
+            if mesh._flatten_rank_map == flatten_rank_map:  # pylint: disable=protected-access
+                canonical_mesh = mesh
+            else:
+                canonical_mesh = DeviceMesh._recover_concatenate_mesh_from_anchors(
+                    mesh,
+                    anchor_meshes,
+                    flatten_rank_map,
+                )
+                if canonical_mesh is None:
+                    raise ValueError("DeviceMesh.concatenate expects all meshes to share the same root mesh.")
+            canonical_meshes.append(canonical_mesh)
+            requested_dim_names.extend(canonical_mesh.mesh_dim_names)
+        return root_mesh, tuple(canonical_meshes), tuple(requested_dim_names), flatten_rank_map
+
+    @staticmethod
+    def _collect_concatenate_anchor_meshes(
+            meshes: Sequence['DeviceMesh'],
+            root_mesh: 'DeviceMesh',
+    ) -> list['DeviceMesh']:
+        """Collect mesh views that can recover orphaned concatenate inputs by dim name."""
+        anchor_meshes: list['DeviceMesh'] = []
+        seen_ids: set[int] = set()
+
+        def add_anchor(mesh: Optional['DeviceMesh']) -> None:
+            if mesh is None or id(mesh) in seen_ids:
+                return
+            seen_ids.add(id(mesh))
+            anchor_meshes.append(mesh)
+
+        add_anchor(root_mesh)
+        for flatten_mesh in root_mesh.get_flatten_mapping().values():
+            add_anchor(flatten_mesh)
+
+        for mesh in meshes:
+            if mesh.root_mesh is None:
+                continue
+            add_anchor(mesh)
+            add_anchor(mesh._get_root_mesh())  # pylint: disable=protected-access
+            for source_mesh, _ in getattr(mesh, "_dim_group_sources", ()):
+                if isinstance(source_mesh, DeviceMesh):
+                    add_anchor(source_mesh)
+                    add_anchor(source_mesh._get_root_mesh())  # pylint: disable=protected-access
+
+        return anchor_meshes
+
+    @staticmethod
+    def _recover_concatenate_mesh_from_anchors(
+            mesh: 'DeviceMesh',
+            anchor_meshes: Sequence['DeviceMesh'],
+            flatten_rank_map: tuple[int, ...],
+    ) -> Optional['DeviceMesh']:
+        """Recover an orphan mesh as a view in the shared root coordinate system."""
+        mesh_dim_names = tuple(mesh.mesh_dim_names or ())
+        for anchor_mesh in anchor_meshes:
+            try:
+                candidate = anchor_mesh[mesh_dim_names]
+            except (KeyError, ValueError, RuntimeError, NotImplementedError):
+                continue
+            if (
+                    candidate.device_type == mesh.device_type
+                    and candidate.mesh_shape == mesh.mesh_shape
+                    and candidate.rank_list == mesh.rank_list
+                    and candidate._flatten_rank_map == flatten_rank_map  # pylint: disable=protected-access
+            ):
+                return candidate
+        return None
 
     @staticmethod
     def _validate_concatenate_root_order(root_mesh: 'DeviceMesh', requested_dim_names: tuple[str, ...]) -> None:
@@ -928,7 +1000,7 @@ class DeviceMesh:
         """Concatenate multiple sub-mesh views into one wider layout-backed mesh."""
         if len(meshes) == 1:
             return meshes[0]
-        root_mesh, requested_dim_names, _ = DeviceMesh._validate_concatenate_inputs(meshes)
+        root_mesh, canonical_meshes, requested_dim_names, _ = DeviceMesh._validate_concatenate_inputs(meshes)
         DeviceMesh._validate_concatenate_root_order(root_mesh, requested_dim_names)
         (
             concat_dim_names,
@@ -937,18 +1009,18 @@ class DeviceMesh:
             concat_dim_group_names,
             concat_dim_group_backends,
             concat_dim_group_sources,
-        ) = DeviceMesh._collect_concatenate_metadata(meshes)
+        ) = DeviceMesh._collect_concatenate_metadata(canonical_meshes)
         concat_layout = DeviceMesh._build_concatenate_layout(concat_sizes, concat_strides)
         if not concat_layout.check_non_overlap():
             raise ValueError(f"Cannot concatenate overlapping meshes: {meshes}")
 
         res_mesh = DeviceMesh(
-            meshes[0].device_type,
+            root_mesh.device_type,
             mesh_dim_names=tuple(concat_dim_names),
             _init_backend=False,
             _layout=concat_layout,
-            _rank_map=meshes[0]._rank_map,  # pylint: disable=protected-access
-            _root_mesh=meshes[0]._get_root_mesh(),  # pylint: disable=protected-access
+            _rank_map=root_mesh._rank_map,  # pylint: disable=protected-access
+            _root_mesh=root_mesh,
         )
         DeviceMesh._set_concatenated_group_state(
             res_mesh,

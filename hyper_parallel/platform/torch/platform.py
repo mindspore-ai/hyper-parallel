@@ -706,8 +706,13 @@ class TorchPlatform(Platform):
         return "unknown_op"
 
     @staticmethod
-    def differentiable_all_gather_concat(data, group, concat_size, concat_dim):
-        output = dist_func.all_gather(data, group=group)
+    def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
+        output = list(dist_func.all_gather(data, group=group))
+        if rank_list is not None:
+            group_ranks = dist.get_process_group_ranks(group)
+            if tuple(rank_list) != tuple(group_ranks):
+                rank_to_idx = {int(rank): idx for idx, rank in enumerate(group_ranks)}
+                output = [output[rank_to_idx[int(rank)]] for rank in rank_list]
         return torch.cat(output, dim=concat_dim)
 
     @staticmethod
@@ -904,8 +909,14 @@ class TorchPlatform(Platform):
             input_tensor.requires_grad = True
 
     def _create_group(self, rank_list):
+        normalized_rank_list = tuple(sorted(rank_list))
+        world_rank_list = tuple(range(self.get_world_size()))
+        if normalized_rank_list == world_rank_list:
+            group = _get_default_group()
+            EXISTING_COMM_GROUPS[str(normalized_rank_list)] = group
+            return group
         group_dict = create_sub_groups(rank_list)
-        return group_dict[tuple(rank_list)]
+        return group_dict[normalized_rank_list]
 
     @staticmethod
     def all_gather_into_tensor(data, group_info, async_op=False):

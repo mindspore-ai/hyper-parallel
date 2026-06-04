@@ -61,7 +61,7 @@ class TensorRedistribution:
         concat_dim = args[-1]
         group = platform.create_group(rank_list)
         concat_size = len(rank_list)
-        return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim)
+        return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
 
 
     def _construct_strided_slice(self, x, *args):
@@ -76,7 +76,7 @@ class TensorRedistribution:
         concat_dim = args[0]
         concat_size = args[1]
         group = platform.create_group(rank_list)
-        return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim)
+        return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
 
     def _construct_all_split(self, x, *args):
         """args: (split_dim, split_size, group)"""

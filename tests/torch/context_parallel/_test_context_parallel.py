@@ -41,7 +41,7 @@ Run 4-card tests:
         -m pytest -s tests/torch/context_parallel/_test_context_parallel.py \\
         -k "hybrid or tp or a3"
 """
-from typing import Optional, Sequence
+from typing import NamedTuple, Optional, Sequence
 
 import numpy as np
 import torch
@@ -52,6 +52,8 @@ import torch_npu  # type: ignore[import-untyped]
 import pytest
 
 from hyper_parallel import init_device_mesh, ContextParallel, AsyncContextParallel, parallelize_module
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Shard
 from tests.torch.utils import init_dist
 
 
@@ -93,6 +95,68 @@ def _sync_workers():
     if dist.is_initialized():
         dist.barrier()
 
+
+class _TpCpDtensorCase(NamedTuple):
+    """One composed TP+CP DTensor integration scenario."""
+
+    label: str
+    tp_size: int
+    cp_size: int
+    ulysses_degree: Optional[int]
+    load_balance: bool
+    use_local_output: bool
+
+
+_TP_CP_DTENSOR_4CARD_CASES = (
+    _TpCpDtensorCase(
+        label="I3_colossal_dtensor_compose",
+        tp_size=2,
+        cp_size=2,
+        ulysses_degree=1,
+        load_balance=False,
+        use_local_output=False,
+    ),
+    _TpCpDtensorCase(
+        label="I3_ulysses_dtensor_compose",
+        tp_size=2,
+        cp_size=2,
+        ulysses_degree=None,
+        load_balance=False,
+        use_local_output=False,
+    ),
+    _TpCpDtensorCase(
+        label="I3_load_balance_dtensor_compose",
+        tp_size=2,
+        cp_size=2,
+        ulysses_degree=1,
+        load_balance=True,
+        use_local_output=False,
+    ),
+    _TpCpDtensorCase(
+        label="I3_colossal_dtensor_local_output",
+        tp_size=2,
+        cp_size=2,
+        ulysses_degree=1,
+        load_balance=False,
+        use_local_output=True,
+    ),
+    _TpCpDtensorCase(
+        label="I3_ulysses_dtensor_local_output",
+        tp_size=2,
+        cp_size=2,
+        ulysses_degree=None,
+        load_balance=False,
+        use_local_output=True,
+    ),
+    _TpCpDtensorCase(
+        label="I3_load_balance_dtensor_local_output",
+        tp_size=2,
+        cp_size=2,
+        ulysses_degree=1,
+        load_balance=True,
+        use_local_output=True,
+    ),
+)
 
 # ---------------------------------------------------------------------------
 # Attention modules
@@ -2104,7 +2168,7 @@ def test_tp_cp_combination_npu():
     batch, seq_len, num_heads, head_dim = 1, 8, 4, 16
     tp_size, cp_size = 2, 2
 
-    mesh = init_device_mesh("npu", (tp_size, cp_size), mesh_dim_names=("tp", "cp"))
+    mesh = init_device_mesh("npu", (cp_size, tp_size), mesh_dim_names=("cp", "tp"))
     tp_rank = mesh.get_local_rank("tp")
     cp_rank = mesh.get_local_rank("cp")
 
@@ -2134,3 +2198,90 @@ def test_tp_cp_combination_npu():
     assert not torch.isnan(cp_out).any(), f"[Rank {rank}] NaN in TP×CP output"
     assert not torch.isinf(cp_out).any(), f"[Rank {rank}] Inf in TP×CP output"
     print(f"[Rank {rank}] I2_tp_cp_combination_npu: shape {tuple(cp_out.shape)} OK")
+
+
+@pytest.mark.skipif(
+    dist.is_initialized() and dist.get_world_size() < 4,
+    reason="TP+CP DTensor test requires world_size=4",
+)
+@pytest.mark.parametrize(
+    "case",
+    _TP_CP_DTENSOR_4CARD_CASES,
+    ids=[case.label for case in _TP_CP_DTENSOR_4CARD_CASES],
+)
+def test_tp_cp_dtensor_composed_mesh_npu(case: _TpCpDtensorCase):
+    """I3: TP-head-sharded DTensor inputs run through CP+TP composed meshes.
+
+    This covers the full-DTensor-style boundary in Colossal, Ulysses, and
+    load-balance CP:
+      TP DTensor -> CP+TP DTensor -> output with CP dropped back to TP DTensor.
+    """
+    _run_tp_cp_dtensor_composed_mesh_case(case)
+    _sync_workers()
+
+def _run_tp_cp_dtensor_composed_mesh_case(case: _TpCpDtensorCase):
+    """Run one TP-head-sharded DTensor CP+TP composition case for a CP mode."""
+    rank = _init_dist_npu()
+    world_size = case.tp_size * case.cp_size
+    if dist.get_world_size() != world_size:
+        pytest.skip(f"{case.label} requires world_size={world_size}")
+
+    batch, seq_len, num_heads, head_dim = 1, 4 * case.cp_size, 4, 16
+    mesh = init_device_mesh("npu", (case.cp_size, case.tp_size), mesh_dim_names=("cp", "tp"))
+    tp_mesh = mesh["tp"]
+    cp_mesh = mesh["cp"]
+    tp_rank = mesh.get_local_rank("tp")
+    cp_rank = mesh.get_local_rank("cp")
+
+    local_s = seq_len // case.cp_size
+    local_h = num_heads // case.tp_size
+
+    torch.manual_seed(23)
+    full_q = torch.randn(batch, seq_len, num_heads, head_dim, dtype=torch.float16, device="npu")
+    full_k = torch.randn(batch, seq_len, num_heads, head_dim, dtype=torch.float16, device="npu")
+    full_v = torch.randn(batch, seq_len, num_heads, head_dim, dtype=torch.float16, device="npu")
+    dist.broadcast(full_q, src=0)
+    dist.broadcast(full_k, src=0)
+    dist.broadcast(full_v, src=0)
+
+    head_slice = slice(tp_rank * local_h, (tp_rank + 1) * local_h)
+    seq_slice = slice(cp_rank * local_s, (cp_rank + 1) * local_s)
+    local_q = full_q[:, seq_slice, head_slice].contiguous()
+    local_k = full_k[:, seq_slice, head_slice].contiguous()
+    local_v = full_v[:, seq_slice, head_slice].contiguous()
+
+    q_dt = DTensor.from_local(local_q, tp_mesh, (Shard(2),))
+    k_dt = DTensor.from_local(local_k, tp_mesh, (Shard(2),))
+    v_dt = DTensor.from_local(local_v, tp_mesh, (Shard(2),))
+
+    core_attn = SimpleAttnBSHD()
+    ContextParallel(
+        seq_dim=1,
+        head_dim=2,
+        ulysses_degree=case.ulysses_degree,
+        load_balance=case.load_balance,
+        use_local_output=case.use_local_output,
+    ).apply(core_attn, cp_mesh)
+
+    with torch.no_grad():
+        cp_out = core_attn(q_dt, k_dt, v_dt)
+
+    if case.use_local_output:
+        assert not isinstance(cp_out, DTensor)
+        out_local = cp_out
+    else:
+        assert isinstance(cp_out, DTensor)
+        assert tuple(cp_out.device_mesh.rank_list) == tuple(tp_mesh.rank_list)
+        assert cp_out.device_mesh.mesh_dim_names == tp_mesh.mesh_dim_names
+        assert tuple(cp_out.placements) == (Shard(2),)
+        out_local = cp_out.to_local()
+    ref_attn = SimpleAttnBSHD()
+    with torch.no_grad():
+        ref_local = ref_attn(
+            local_q,
+            full_k[:, :, head_slice].contiguous(),
+            full_v[:, :, head_slice].contiguous(),
+        )
+
+    assert out_local.shape == (batch, local_s, local_h, head_dim)
+    _assert_close(out_local, ref_local, rank, case.label)
