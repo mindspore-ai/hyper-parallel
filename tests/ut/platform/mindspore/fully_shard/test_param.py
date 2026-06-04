@@ -72,6 +72,28 @@ class FakeDTensorPayload:
         return self._local_tensor
 
 
+class HookSourceParam:
+    """Small hook source exposing the MindSpore Tensor.hooks() shape."""
+
+    def __init__(self, hooks):
+        self._hooks = hooks
+
+    def hooks(self):
+        return list(self._hooks)
+
+
+class HookableParam:
+    """Replacement parameter that records migrated hooks."""
+
+    def __init__(self, requires_grad=True):
+        self.requires_grad = requires_grad
+        self.registered_hooks = []
+
+    def register_hook(self, hook):
+        self.registered_hooks.append(hook)
+        return SimpleNamespace(remove=lambda: None)
+
+
 class TestMindSporeParam(unittest.TestCase):
     """Cover DTensor-aware constructor and helper behavior."""
 
@@ -472,6 +494,64 @@ class TestMindSporeParam(unittest.TestCase):
         MindSporeHSDPParamV2.clear_all_reduce_output(hsdp_param)
 
         self.assertIsNone(hsdp_param._all_reduce_output)
+
+    def test_save_backward_hooks_reads_mindspore_hooks_and_deduplicates(self):
+        """MindSpore Tensor.hooks() should be used as the source for user param hooks."""
+        hsdp_param = _new_hsdp_param_v2()
+
+        def hook_a(grad):
+            return grad
+
+        def hook_b(grad):
+            return grad
+
+        source = HookSourceParam([hook_a, hook_a, hook_b])
+
+        MindSporeHSDPParamV2._save_backward_hooks(hsdp_param, source)
+        MindSporeHSDPParamV2._save_backward_hooks(hsdp_param, source)
+
+        self.assertEqual(hsdp_param._orig_param_hooks, [hook_a, hook_b])
+
+    def test_setattr_on_modules_migrates_saved_hooks_once(self):
+        """Swapping module params should migrate saved hooks to the active replacement once."""
+        hsdp_param = _new_hsdp_param_v2()
+        primary = SimpleNamespace()
+        shared = SimpleNamespace()
+        hsdp_param._module_info = SimpleNamespace(
+            module=primary,
+            param_name="weight",
+            shared_modules=[shared],
+            shared_param_names=["tied_weight"],
+        )
+
+        def hook(grad):
+            return grad
+
+        hsdp_param.sharded_param = HookSourceParam([hook])
+        new_param = HookableParam(requires_grad=True)
+
+        MindSporeHSDPParamV2._setattr_on_modules(hsdp_param, new_param)
+        MindSporeHSDPParamV2._setattr_on_modules(hsdp_param, new_param)
+
+        self.assertIs(primary.weight, new_param)
+        self.assertIs(shared.tied_weight, new_param)
+        self.assertEqual(new_param.registered_hooks, [hook])
+        self.assertTrue(new_param.migrate_backward_hooks_run_once)
+
+    def test_migrate_backward_hooks_skips_frozen_params(self):
+        """Saved hooks should not be registered on parameters that do not require gradients."""
+        hsdp_param = _new_hsdp_param_v2()
+
+        def hook(grad):
+            return grad
+
+        hsdp_param._orig_param_hooks = [hook]
+        frozen_param = HookableParam(requires_grad=False)
+
+        MindSporeHSDPParamV2._migrate_backward_hooks(hsdp_param, frozen_param)
+
+        self.assertEqual(frozen_param.registered_hooks, [])
+        self.assertTrue(frozen_param.migrate_backward_hooks_run_once)
 
     def test_setattr_on_modules_updates_primary_and_shared_owners(self):
         """Parameter swapping should keep primary and shared module owners in sync."""

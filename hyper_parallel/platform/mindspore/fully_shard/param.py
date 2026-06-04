@@ -164,6 +164,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self.pin_memory = (
             self.offload_to_cpu and cast(CPUOffloadPolicy, offload_policy).pin_memory
         )
+        self._orig_param_hooks: List[Callable] = []
         self.grad_offload_event: Optional[ms.runtime.Event] = None
         dtensor_payload = unwrap_dtensor_param(param)
         self._orig_param_is_dtensor = dtensor_payload is not None
@@ -175,6 +176,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self._spmd_replicate_mesh_dim = getattr(self.mesh_info, "replicate_mesh_dim", None)
         self._init_sharded_param(param, shard_placement_fn)
         self._init_group_infos()
+        self._save_backward_hooks(param)
         self.all_gather_outputs: List[ms.Tensor] = []
         self.unsharded_accumulated_grad = None
         self._unsharded_param: Optional[Parameter] = None
@@ -224,6 +226,53 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         storage = param_data.untyped_storage()
         if storage.size() != 0:
             storage.resize_(0)
+
+    def _iter_backward_hooks(self, param: Parameter) -> List[Callable]:
+        """Return backward hooks registered on a MindSpore Tensor/Parameter."""
+        hooks_getter = getattr(param, "hooks", None)
+        if callable(hooks_getter):
+            try:
+                return list(hooks_getter())
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+
+        backward_hooks = getattr(param, "_backward_hooks", None)
+        if backward_hooks is None:
+            return []
+        if hasattr(backward_hooks, "values"):
+            return list(backward_hooks.values())
+        return list(backward_hooks)
+
+    def _save_backward_hooks(self, param: Parameter) -> None:
+        """Save user-registered parameter backward hooks for later parameter swaps."""
+        if not hasattr(self, "_orig_param_hooks"):
+            self._orig_param_hooks = []
+        if not hasattr(self, "_saved_hook_ids"):
+            self._saved_hook_ids = set()
+
+        for hook_func in self._iter_backward_hooks(param):
+            hook_func_id = id(hook_func)
+            if hook_func_id not in self._saved_hook_ids:
+                self._orig_param_hooks.append(hook_func)
+                self._saved_hook_ids.add(hook_func_id)
+
+    def _migrate_backward_hooks(self, new_param: Parameter) -> None:
+        """Migrate saved user backward hooks to the active sharded/unsharded parameter."""
+        if not getattr(self, "_orig_param_hooks", None):
+            return
+        if hasattr(new_param, "migrate_backward_hooks_run_once"):
+            return
+        register_hook = getattr(new_param, "register_hook", None)
+        if not callable(register_hook):
+            return
+
+        for hook_func in self._orig_param_hooks:
+            try:
+                if getattr(new_param, "requires_grad", False):
+                    register_hook(hook_func)
+            except (RuntimeError, TypeError, ValueError):
+                pass
+        new_param.migrate_backward_hooks_run_once = True
 
     @_no_grad()
     def _init_sharded_param(
@@ -399,6 +448,9 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         else:
             # slow path
             setattr(self._module_info.module, self._module_info.param_name, param)
+        if hasattr(self, "sharded_param"):
+            self._save_backward_hooks(self.sharded_param)
+        self._migrate_backward_hooks(param)
 
         # Iterate through all modules that share this parameter to prevent pointer desync.
         for shared_module, shared_param_name in zip(
