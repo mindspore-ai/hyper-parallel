@@ -141,19 +141,21 @@ class MiniBaseExpertParallel:
       * Operator references (``self.reshape``, ``self.cast``, ...) so
         subclasses can transcribe mindformers-style dispatch / combine
         code without depending on ``mindformers``.
-      * State holders (``self.ctx``, ``self.input_layout``,
-        ``self.ep_group``, ``self.ep_size``) shared between dispatch
-        and combine.
+      * State holders (``self.input_layout``, ``self.ep_group``,
+        ``self.ep_size``) shared between dispatch and combine.
       * ``_apply`` to wrap an experts module so user calls
         (``experts(...)``) go through
         ``_token_dispatch → original construct → _token_combine``.
 
     Subclasses override :meth:`_token_dispatch` / :meth:`_token_combine`.
+    
+    Note: Dispatch context is stored per-module (via setattr) to avoid
+    instance-sharing bugs when the same style object is applied to
+    multiple layers. See commit ad38438 for details.
     """
 
     def __init__(self) -> None:
         # State populated by ``_apply`` and by the dispatch/combine pair.
-        self.ctx = None
         self.input_layout = None
         self.ep_group = None
         self.ep_size = None
@@ -554,10 +556,13 @@ class OverlapExpertParallel(MiniBaseExpertParallel):
         global_input_tokens = self.index_select(global_input_tokens, 0, dispatch_index)
         global_input_tokens = self.reshape(global_input_tokens, (-1, global_input_tokens_shape[-1]))
 
-        self.ctx = (
+        # Store dispatch context in module attribute to avoid instance-sharing
+        # bugs when the same style is applied to multiple layers.
+        # Matches the fix in core ExpertParallel (commit ad38438).
+        setattr(cell, "_ep_overlap_dispatch_ctx", (
             probs, combine_index, unsort_token_indices_experts,
             input_split_list, output_split_list, original_shape, pad_size,
-        )
+        ))
         return global_input_tokens, probs, topk_indices, num_tokens_per_expert
 
     # ------------------------------------------------------------------
@@ -567,10 +572,22 @@ class OverlapExpertParallel(MiniBaseExpertParallel):
     def _token_combine(self, device_mesh, cell, args, routed_output):  # pylint: disable=W0613
         """Combine path with C→D hooks bracketing the combine a2a."""
         from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0415
+        # Read dispatch context from module attribute set by _token_dispatch.
+        ctx = getattr(cell, "_ep_overlap_dispatch_ctx", None)
+        if ctx is None:
+            raise RuntimeError(
+                "_token_combine called but no dispatch context found in module. "
+                "This indicates _token_dispatch was not called before _token_combine, "
+                "or the context was already consumed by a previous combine call."
+            )
+        # Note: In MindSpore PyNative mode, do NOT delete the context immediately.
+        # The autograd graph may need to access module attributes during backward.
+        # The context will be overwritten on the next forward call.
+
         (
             probs, combine_index, unsort_token_indices_experts,
             input_split_list, output_split_list, original_shape, pad_size,
-        ) = self.ctx
+        ) = ctx
 
         routed_output = self.reshape(routed_output, (1, -1, cell.hidden_size))
         routed_output_shape = routed_output.shape
