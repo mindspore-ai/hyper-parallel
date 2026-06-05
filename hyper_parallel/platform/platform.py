@@ -1321,6 +1321,20 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement checkpoint")
 
     @staticmethod
+    def checkpoint_wrapper(module, **checkpoint_kwargs):
+        """Wrap a module with activation checkpointing functionality.
+
+        Args:
+            module: The module or callable to wrap with activation checkpointing.
+            **checkpoint_kwargs: Keyword arguments forwarded to the framework
+                checkpoint wrapper implementation.
+
+        Returns:
+            The wrapped module with activation checkpointing enabled.
+        """
+        raise NotImplementedError("Platform subclasses must implement checkpoint_wrapper")
+
+    @staticmethod
     def swap_wrapper(module, policy_fn=None, group_swap=False):
         """Wrap a module with activation swap functionality.
 
@@ -1376,11 +1390,13 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement create_selective_checkpoint_contexts")
 
     @staticmethod
-    def async_save_on_cpu(policy_fn=None):
+    def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
         """Create an async CPU offload context for activation checkpointing.
 
         Args:
             policy_fn: Optional policy function to determine which activations to offload.
+            group_swap (bool): Whether swapped tensors participate in group copy fusion.
+                Default: ``False``.
 
         Returns:
             Context manager for async CPU offloading during checkpointing.

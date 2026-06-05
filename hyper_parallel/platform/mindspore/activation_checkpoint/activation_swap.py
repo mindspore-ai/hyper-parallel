@@ -60,6 +60,83 @@ class FuncCell(Cell):
         return self._fn(*args, **kwargs)
 
 
+def _iter_wrappable_callable_attrs(module: Cell) -> Iterator[tuple[str, Callable]]:
+    """Yield public callable attributes that MindSpore does not register as child cells."""
+    for attr_name, attr_value in vars(module).items():
+        if attr_name.startswith("_") or isinstance(attr_value, Cell):
+            continue
+        if callable(attr_value):
+            yield attr_name, attr_value
+
+
+def _mark_wrapped(obj: Any) -> None:
+    try:
+        obj._is_wrapped = True  # pylint: disable=W0212
+    except (AttributeError, TypeError):
+        pass
+
+
+def _get_wrapped_callable(cell: Cell) -> Optional[Callable]:
+    wrapped_module = getattr(cell, _CKPT_WRAPPED_MODULE, None)
+    if isinstance(wrapped_module, FuncCell):
+        return getattr(wrapped_module, "_fn", None)
+    return None
+
+
+def _raise_callable_already_wrapped(callable_obj: Callable) -> None:
+    raise ValueError(
+        f"Callable '{callable_obj.__class__.__name__}' is already wrapped. "
+        "Wrapping overlapping module regions is not allowed."
+    )
+
+
+def _check_callable_attr_not_wrapped(owner: Cell, attr_name: str, attr_value: Callable) -> None:
+    del owner, attr_name
+    if getattr(attr_value, '_is_wrapped', False):
+        _raise_callable_already_wrapped(attr_value)
+
+
+def _check_and_mark_callable(callable_obj: Callable) -> None:
+    if getattr(callable_obj, '_is_wrapped', False):
+        raise ValueError(
+            f"Callable '{callable_obj.__class__.__name__}' or one of its ancestors is already wrapped. "
+            "Wrapping overlapping module regions is not allowed."
+        )
+    _mark_wrapped(callable_obj)
+
+
+def _check_and_mark_wrapped(module: Cell) -> None:
+    """Validate no wrapping overlap, then mark module and all descendants as wrapped.
+
+    Raises:
+        ValueError: If ``module`` or any of its descendants is already wrapped.
+    """
+    if getattr(module, '_is_wrapped', False):
+        raise ValueError(
+            f"Module '{module.__class__.__name__}' or one of its ancestors is already wrapped. "
+            "Wrapping overlapping module regions is not allowed."
+        )
+    for _, submodule in module.cells_and_names():
+        if submodule is module:
+            continue
+        if getattr(submodule, '_is_wrapped', False):
+            wrapped_callable = _get_wrapped_callable(submodule)
+            if wrapped_callable is not None:
+                _raise_callable_already_wrapped(wrapped_callable)
+            raise ValueError(
+                f"Submodule '{getattr(submodule, '_ckpt_wrapped_module', submodule).__class__.__name__}' of "
+                f"'{module.__class__.__name__}' is already wrapped. "
+                "Wrapping overlapping module regions is not allowed."
+            )
+    for _, submodule in module.cells_and_names():
+        for attr_name, attr_value in _iter_wrappable_callable_attrs(submodule):
+            _check_callable_attr_not_wrapped(submodule, attr_name, attr_value)
+    for _, submodule in module.cells_and_names():
+        _mark_wrapped(submodule)
+        for _, attr_value in _iter_wrappable_callable_attrs(submodule):
+            _mark_wrapped(attr_value)
+
+
 class ActivationWrapper(Cell, ABC):
     """
     Base class for Activation Checkpoint Wrapper in MindSpore.
@@ -73,9 +150,14 @@ class ActivationWrapper(Cell, ABC):
 
     def __init__(self, module: Union[Cell, Callable]):
         if callable(module) and not isinstance(module, Cell):
+            _check_and_mark_callable(module)
             module = FuncCell(module)
+            _mark_wrapped(module)
+        else:
+            _check_and_mark_wrapped(module)
         super().__init__(auto_prefix=False)
         self._ckpt_wrapped_module = module
+        self._is_wrapped = True
         self._wrapped_param_names = {
             id(param): param.name for _, param in module.parameters_and_names()
         }
@@ -247,8 +329,11 @@ class AsyncSaveOnCpu(ms.saved_tensors_hooks):
         def pack_to_cpu(tensor: ms.Tensor):
             if not base_check_fn(tensor):
                 return tensor
-            if (policy_fn is not None) and (policy_fn(tensor) == CheckpointPolicy.MUST_SAVE):
-                return tensor
+            if policy_fn is not None:
+                if policy_fn(tensor) == CheckpointPolicy.MUST_SAVE:
+                    return tensor
+                if policy_fn(tensor) != CheckpointPolicy.MUST_SWAP:
+                    raise RuntimeError(f"Swap :set an invalid policy {policy_fn(tensor)}")
             group_name = swap_manager.get_current_group_name()
             if not group_name:
                 return tensor
@@ -369,5 +454,5 @@ def swap_tensor_wrapper(target, tag: Optional[str] = None, group_swap: bool = Fa
 
     wrapped = _map(target)
     if count_idx > 0:
-        _manager.add_storage(group_name, storage)
+        swap_manager.add_storage(group_name, storage)
     return wrapped

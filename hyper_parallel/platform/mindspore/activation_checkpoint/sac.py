@@ -31,13 +31,16 @@ platform = get_platform()
 
 class _VersionWrapper:
     # Check that cached tensors are not mutated.
-    def __init__(self, val):
+    def __init__(self, val, version_source):
         self.val: Union[ms.Tensor, Any] = val
-        self.version: Optional[int] = val._version if isinstance(val, ms.Tensor) else None
+        self.version_source: Union[ms.Tensor, Any] = version_source
+        self.version: Optional[int] = (
+            version_source._version if isinstance(version_source, ms.Tensor) else None
+        )
 
     def get_val(self, allow_cache_entry_mutation):
         if self.version is not None and not allow_cache_entry_mutation:
-            if self.val._version != self.version:
+            if self.version_source._version != self.version:
                 # Can we give user a stack trace of where the mutation happened?
                 raise RuntimeError(
                     "Tensor cached during selective activation checkpoint has been mutated"
@@ -46,11 +49,12 @@ class _VersionWrapper:
 
 
 class _SwapCacheEntry:
-    """Pair the recompute cache and swap record around the same tensor object."""
+    """Pair the recompute cache and swap record around one op output."""
 
     def __init__(self, val, funcname, group_swap=False):
-        self.save = _VersionWrapper(val)
-        self.swap = SwapTensor(val, funcname, group_swap=group_swap)
+        cache_val = _maybe_detach(val)
+        self.save = _VersionWrapper(cache_val, val)
+        self.swap = SwapTensor(cache_val, funcname, group_swap=group_swap)
 
 
 def _maybe_detach(x):
@@ -88,7 +92,9 @@ class _CachingMindSporeDispatchMode(MsDispatchMode):
 
         if policy in (CheckpointPolicy.MUST_SAVE, CheckpointPolicy.PREFER_SAVE):
             self.storage[func.name].append(
-                platform.tree_map(lambda x: _VersionWrapper(_maybe_detach(x)), out)
+                platform.tree_map(
+                    lambda x: _VersionWrapper(_maybe_detach(x), x), out
+                )
             )
         elif policy == CheckpointPolicy.MUST_SWAP:
             if not self.add_to_storage:
@@ -99,7 +105,7 @@ class _CachingMindSporeDispatchMode(MsDispatchMode):
             funcname = f"{self._group_prefix}{func.name}"
             group_swap = self.group_swap
             entries = platform.tree_map(
-                lambda x: _SwapCacheEntry(_maybe_detach(x), funcname, group_swap=group_swap), out
+                lambda x: _SwapCacheEntry(x, funcname, group_swap=group_swap), out
             )
             self.storage[func.name].append(
                 platform.tree_map(lambda x: x.save, entries)
@@ -107,6 +113,8 @@ class _CachingMindSporeDispatchMode(MsDispatchMode):
             self.swap_storage[func.name].append(
                 platform.tree_map(lambda x: x.swap, entries)
             )
+        elif policy != CheckpointPolicy.MUST_RECOMPUTE:
+            raise RuntimeError(f"Checkpoint Activation: {func.name} encountered an invalid policy {policy}")
         return out
 
 

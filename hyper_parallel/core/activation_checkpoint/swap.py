@@ -789,6 +789,13 @@ class SwapManager:
 
         Ensures idempotency: safe to call multiple times on the same layer pair.
         """
+        if first_layer is second_layer:
+            warnings.warn(
+                "set_forward_prefetch_layer: "
+                "Prefetching between identical layers has no effect.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         def _ensure_group_name(module):
             """Assign a unique swap group name to the module if not already assigned."""

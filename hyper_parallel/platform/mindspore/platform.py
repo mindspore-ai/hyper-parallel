@@ -1674,6 +1674,12 @@ class MindSporePlatform(Platform):
         return ms.recompute
 
     @staticmethod
+    def checkpoint_wrapper(module, **checkpoint_kwargs):
+        # pylint: disable=C0415
+        from hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_wrapper import ckpt_wrapper
+        return ckpt_wrapper(module, **checkpoint_kwargs)
+
+    @staticmethod
     def swap_wrapper(module, policy_fn=None, group_swap=False):
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import swap_wrapper
@@ -1704,10 +1710,10 @@ class MindSporePlatform(Platform):
                                                     group_swap=group_swap)
 
     @staticmethod
-    def async_save_on_cpu(policy_fn=None):
+    def async_save_on_cpu(policy_fn=None, group_swap: bool = False):
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap import AsyncSaveOnCpu
-        return AsyncSaveOnCpu(policy_fn=policy_fn)
+        return AsyncSaveOnCpu(policy_fn=policy_fn, group_swap=group_swap)
 
     _MS_DEVICE_MAP = {
         "npu": "Ascend",

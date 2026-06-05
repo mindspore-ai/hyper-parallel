@@ -30,5 +30,6 @@ def test_ac_memory_comparison():
     """
     parallel_run([
         TorchCase(ACTIVATION_CHECKPOINT, "test_ac_memory_comparison", 12404, 1),
-        TorchCase(ACTIVATION_CHECKPOINT, "test_checkpoint_wrapper_accepts_func", 12405, 1)
+        TorchCase(ACTIVATION_CHECKPOINT, "test_checkpoint_wrapper_accepts_func", 12405, 1),
+        TorchCase(ACTIVATION_CHECKPOINT, "test_overlap_wrapper", 12406, 1)
     ])
