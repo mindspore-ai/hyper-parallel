@@ -20,6 +20,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from typing import Optional, Callable, Any, Union
+import types
 import warnings
 import mindspore as ms
 from mindspore import Tensor
@@ -61,9 +62,21 @@ class FuncCell(Cell):
 
 
 def _iter_wrappable_callable_attrs(module: Cell) -> Iterator[tuple[str, Callable]]:
-    """Yield public callable attributes that MindSpore does not register as child cells."""
+    """Yield public per-instance callable attributes not registered as child cells.
+
+    Plain functions, builtins and bound methods are skipped: these are stateless
+    module-level utilities shared by reference across many modules (e.g.
+    ``self.reshape = mint.reshape`` / ``self.cast = ops.cast`` repeated in every
+    layer).  They are never standalone checkpoint regions, and marking a shared
+    function's ``_is_wrapped`` flag would both mutate a global object and falsely
+    flag every sibling module that references the same function as an overlapping
+    wrap.  Only per-instance callables (e.g. MindSpore ``Primitive`` objects)
+    participate in overlap tracking.
+    """
     for attr_name, attr_value in vars(module).items():
         if attr_name.startswith("_") or isinstance(attr_value, Cell):
+            continue
+        if isinstance(attr_value, (types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
             continue
         if callable(attr_value):
             yield attr_name, attr_value
