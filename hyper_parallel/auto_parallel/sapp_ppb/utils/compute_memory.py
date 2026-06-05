@@ -15,10 +15,10 @@
 """Derive per-layer memory parameters from a set of dry-run stage observations."""
 import numpy as np
 
-import sapp_ppb.utils.recompute as Recompute
-from sapp_ppb.utils.layer import Layer
-from sapp_ppb.utils.logger import logger
-from sapp_ppb.utils.stage import Stage, filter_stage_id
+import hyper_parallel.auto_parallel.sapp_ppb.utils.recompute as Recompute
+from hyper_parallel.auto_parallel.sapp_ppb.utils.layer import Layer
+from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
+from hyper_parallel.auto_parallel.sapp_ppb.utils.stage import Stage, filter_stage_id
 
 
 class ComputeMemory:

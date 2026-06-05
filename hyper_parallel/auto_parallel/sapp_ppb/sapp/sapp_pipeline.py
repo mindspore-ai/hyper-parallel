@@ -20,12 +20,12 @@ from typing import Any, Dict, List, Optional, Union
 import matplotlib.pyplot as plt
 import yaml
 
-import sapp_ppb.simulator.pp_simulator as sim
-import sapp_ppb.utils.recompute as Recompute
-from sapp_ppb.sapp.sapp_solver import SappSolver
-from sapp_ppb.utils.check_rules import check_yaml_depth_before_loading
-from sapp_ppb.utils.layer import Layer, filter_layer_type
-from sapp_ppb.utils.logger import logger
+import hyper_parallel.auto_parallel.sapp_ppb.simulator.pp_simulator as sim
+import hyper_parallel.auto_parallel.sapp_ppb.utils.recompute as Recompute
+from hyper_parallel.auto_parallel.sapp_ppb.sapp.sapp_solver import SappSolver
+from hyper_parallel.auto_parallel.sapp_ppb.utils.check_rules import check_yaml_depth_before_loading
+from hyper_parallel.auto_parallel.sapp_ppb.utils.layer import Layer, filter_layer_type
+from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
 
 
 class SappPipeline:

@@ -17,12 +17,12 @@ import argparse
 import os
 import sys
 
-from sapp_ppb.sapp.sapp_pipeline import SappPipeline
-from sapp_ppb.utils import interactive
-from sapp_ppb.utils.compute_memory import compute_memories
-from sapp_ppb.utils.config import initialize_layer_json
-from sapp_ppb.utils.layer import generate_layers_list
-from sapp_ppb.utils.logger import logger
+from hyper_parallel.auto_parallel.sapp_ppb.sapp.sapp_pipeline import SappPipeline
+from hyper_parallel.auto_parallel.sapp_ppb.utils import interactive
+from hyper_parallel.auto_parallel.sapp_ppb.utils.compute_memory import compute_memories
+from hyper_parallel.auto_parallel.sapp_ppb.utils.config import initialize_layer_json
+from hyper_parallel.auto_parallel.sapp_ppb.utils.layer import generate_layers_list
+from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
 
 
 def _str2bool(value: str) -> bool:

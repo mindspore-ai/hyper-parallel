@@ -20,12 +20,12 @@ import sys
 
 import numpy as np
 
-from sapp_ppb.simulator.causal_error import CausalCommError, CausalError
-from sapp_ppb.simulator.pipeline_builder import PipelineBuilder
-from sapp_ppb.simulator.plot_manager import PlotMgr
-from sapp_ppb.simulator.sim_block import BlockSim, RecBlockSim, SendBlockSim
-from sapp_ppb.simulator.utils import apply_color, apply_format, format_2d_inputs
-from sapp_ppb.utils.logger import logger
+from hyper_parallel.auto_parallel.sapp_ppb.simulator.causal_error import CausalCommError, CausalError
+from hyper_parallel.auto_parallel.sapp_ppb.simulator.pipeline_builder import PipelineBuilder
+from hyper_parallel.auto_parallel.sapp_ppb.simulator.plot_manager import PlotMgr
+from hyper_parallel.auto_parallel.sapp_ppb.simulator.sim_block import BlockSim, RecBlockSim, SendBlockSim
+from hyper_parallel.auto_parallel.sapp_ppb.simulator.utils import apply_color, apply_format, format_2d_inputs
+from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
 
 sys.setrecursionlimit(8192)
 

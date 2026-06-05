@@ -16,7 +16,7 @@
 from enum import IntEnum
 from typing import Any, Dict, List, Optional
 
-from sapp_ppb.utils.logger import logger
+from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
 
 TYPE = IntEnum("RecomputeType", ["NONE", "SLCT", "COMM", "BOTH", "FULL"], start=0)
 OFFSET = "offset"
