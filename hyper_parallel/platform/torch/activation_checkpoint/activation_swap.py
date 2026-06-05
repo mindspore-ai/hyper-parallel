@@ -21,6 +21,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from typing import Optional, Callable, Any, Union
+import types
 import warnings
 import torch
 from torch import nn
@@ -60,9 +61,20 @@ class FuncModule(nn.Module):
 
 
 def _iter_wrappable_callable_attrs(module: nn.Module) -> Iterator[tuple[str, Callable]]:
-    """Yield public callable attributes that PyTorch does not register as child modules."""
+    """Yield public per-instance callable attributes not registered as child modules.
+
+    Plain functions, builtins and bound methods are skipped: these are stateless
+    module-level utilities shared by reference across many modules (e.g.
+    ``self.act = F.gelu`` repeated in every layer).  They are never standalone
+    checkpoint regions, and marking a shared function's ``_is_wrapped`` flag
+    would both mutate a global object and falsely flag every sibling module that
+    references the same function as an overlapping wrap.  Only per-instance
+    callables participate in overlap tracking.
+    """
     for attr_name, attr_value in vars(module).items():
         if attr_name.startswith("_") or isinstance(attr_value, nn.Module):
+            continue
+        if isinstance(attr_value, (types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
             continue
         if callable(attr_value):
             yield attr_name, attr_value
