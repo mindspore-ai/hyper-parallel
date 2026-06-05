@@ -66,10 +66,7 @@ from hyper_parallel.core.pipeline_parallel import (
     ScheduleInterleaved1F1B,
 )
 from hyper_parallel.platform import get_platform
-from hyper_parallel.core.activation_checkpoint.activation_checkpoint import (
-    CheckpointPolicy,
-    keep_collectives_policy,
-)
+from hyper_parallel.core.activation_checkpoint.activation_checkpoint import checkpoint_wrapper
 
 from tests.mindspore.st.pipeline_parallel.overlap_expert_parallel import (
     MiniGroupedMLP,
@@ -318,14 +315,12 @@ class _MoEChunk(nn.Cell):
             _MiniMoEBlock(config, rng) for _ in range(num_layers)
         ])
         # When per-layer recompute is enabled, holds one
-        # ``overlap.wrap_checkpoint(layer)`` callable per layer so each layer
+        # ``checkpoint_wrapper(layer)`` callable per layer so each layer
         # becomes its OWN checkpoint segment (multi-segment).  None means no
         # per-layer checkpoint (the layer runs directly).
         self._per_layer_calls = None
 
-    def enable_per_layer_recompute(self, overlap: CommComputeOverlap,
-                                   recompute_layers=None,
-                                   save_collectives: bool = True) -> None:
+    def enable_per_layer_recompute(self, recompute_layers=None) -> None:
         """Wrap selected layers' forward in their own ``checkpoint`` segment.
 
         Multi-segment activation checkpoint with **per-layer granularity**:
@@ -334,36 +329,27 @@ class _MoEChunk(nn.Cell):
         activations are kept, not recomputed).  This is exactly the
         "recompute some layers, keep others" pattern that SAC's op-granularity
         ``policy_fn`` cannot express.  The ``CHUNK_START`` / ``CHUNK_END``
-        hooks stay OUTSIDE the per-layer checkpoints, so only the layers'
-        A/B/C/D hooks are re-fired (and suppressed) on each re-run.  Must be
-        called after :class:`OverlapExpertParallel` has been applied to each
-        layer's experts so the wrapped call includes the EP sync hooks.
+        hooks stay OUTSIDE the per-layer checkpoints, and each selected
+        layer's forward re-run is fired serially before the paired backward
+        by :meth:`PipelineStage.recompute_one_chunk` and reused during
+        backward.  Must be called after :class:`OverlapExpertParallel` has
+        been applied to each layer's experts so the wrapped call includes the
+        EP sync hooks.
 
         Args:
-            overlap: The :class:`CommComputeOverlap` whose ``wrap_checkpoint``
-                routes each selected layer through
-                ``activation_checkpoint.checkpoint`` with the overlap-aware
-                recompute ``context_fn``.
             recompute_layers: Iterable of layer indices to checkpoint.  When
                 ``None`` (default) every layer is checkpointed.  A subset
                 (e.g. ``{0}``) leaves the other layers running directly —
                 the mixed recompute case.
-            save_collectives: When ``True`` (default) a SAC ``policy_fn``
-                (:func:`_save_collectives_policy`) keeps the EP a2a outputs
-                (``MUST_SAVE``) so the re-run restores them instead of
-                re-issuing the collective — eliminating the ~1e-3 numerical
-                flake from a re-run a2a racing the FWD thread's a2a.  Set
-                ``False`` to reproduce the old (flaky) re-run-the-a2a path.
         """
         if recompute_layers is None:
             recompute_layers = set(range(len(self.layers)))
         else:
             recompute_layers = set(recompute_layers)
-        ckpt_kwargs = {"policy_fn": _save_collectives_policy} if save_collectives else {}
         calls = []
         for idx, layer in enumerate(self.layers):
             if idx in recompute_layers:
-                calls.append(overlap.wrap_checkpoint(layer, **ckpt_kwargs))
+                calls.append(checkpoint_wrapper(layer))
             else:
                 # Non-recomputed layer: run the cell directly (its activations
                 # are kept by autograd, no backward-time re-run).
@@ -408,42 +394,24 @@ class _MoEChunk(nn.Cell):
 # Recompute wrapper (PyNative)
 # =========================================================================
 
-# The "keep communication, recompute compute" SAC policy now lives in core as
-# ``keep_collectives_policy`` (robust collective detection via
-# ``platform.is_collective_op`` instead of an op-name string match).  Alias it
-# under the original name so the recompute wiring below is unchanged; this PoC
-# now exercises the productionised core policy end-to-end.
-_save_collectives_policy = keep_collectives_policy
-
 
 class _RecomputeChunkWrapper(nn.Cell):
     """Wrap a chunk so its forward is checkpointed under overlap_b_f.
 
-    Routes the chunk's forward through the public
-    ``CommComputeOverlap.wrap_checkpoint`` helper, which calls
-    ``hyper_parallel.core.activation_checkpoint.checkpoint`` with the
-    ``context_fn`` from ``make_recompute_context_fn`` — i.e. both the
-    HookCoordinator hook-bypass *and* the FWD-thread gate that holds
-    the FWD thread on ``_fwd_gate.wait()`` until the BWD-time re-run
-    exits.  Exercises exactly the path real users hit when combining
-    ``overlap_b_f`` with activation checkpoint.
-
-    The gate is required, not just an optimisation: MS PyNative does not
-    support concurrent FWD-record + BWD-replay on its autograd executor,
-    so the ``ms.recompute`` forward re-run (an extra record) must not run
-    while the FWD thread is recording its own forward.  Calling
-    ``ms.recompute`` directly without the gate deadlocks on MS.
+    Routes the chunk's forward through
+    ``hyper_parallel.core.activation_checkpoint.checkpoint_wrapper`` (plain
+    ``ms.recompute``).  The chunk's forward re-run is fired serially before
+    the paired backward by :meth:`PipelineStage.recompute_one_chunk` and
+    reused during backward, so the re-run never races the FWD thread's
+    forward record on the MS PyNative autograd executor.  Exercises exactly
+    the path real users hit when combining ``overlap_b_f`` with activation
+    checkpoint.
     """
 
-    def __init__(self, inner: nn.Cell, overlap: CommComputeOverlap,
-                 save_collectives: bool = True) -> None:
+    def __init__(self, inner: nn.Cell) -> None:
         super().__init__()
         self.inner = inner
-        # ``save_collectives`` keeps the EP a2a outputs (MUST_SAVE) so the
-        # whole-chunk re-run restores them instead of re-issuing the
-        # collectives — see :func:`_save_collectives_policy`.
-        ckpt_kwargs = {"policy_fn": _save_collectives_policy} if save_collectives else {}
-        self._wrapped_call = overlap.wrap_checkpoint(self.inner, **ckpt_kwargs)
+        self._wrapped_call = checkpoint_wrapper(self.inner)
 
     def construct(self, x):
         return self._wrapped_call(x)
@@ -513,6 +481,11 @@ def _make_overlap_b_f_callback(overlap: CommComputeOverlap):
             if overlap.coordinator.is_enabled():
                 overlap.coordinator.rendezvous(HookRole.COMPUTE)
 
+        # Fire the BWD chunk's recompute serially on the main thread BEFORE
+        # spawning the backward thread, so the forward re-run never races
+        # fwd_fn's forward record.  ``backward_one_chunk`` then reuses the
+        # cached activations instead of re-running on the daemon thread.
+        bwd_stage.recompute_one_chunk(bwd_mi)
         overlap.run(fwd_fn=fwd_fn, bwd_fn=bwd_fn)
 
     return _callback
@@ -645,27 +618,19 @@ def test_pp_overlap_moe_end_to_end():
 def test_pp_overlap_moe_recompute():
     """Production-path checkpoint integration with overlap_b_f.
 
-    Feature: ``CommComputeOverlap.wrap_checkpoint`` /
-        ``make_recompute_context_fn`` route the chunk's recompute through
-        ``hyper_parallel.core.activation_checkpoint.checkpoint`` and gate
-        the FWD thread on the BWD-time re-run via ``_fwd_gate``.
+    Feature: ``checkpoint_wrapper`` chunk recompute composing with overlap_b_f,
+        with the re-run fired serially by ``PipelineStage.recompute_one_chunk``.
     Description:
         Same topology as :func:`test_pp_overlap_moe_end_to_end` (4 ranks,
         PP=2 × EP=2, 2 chunks × 2 layers), but each chunk is wrapped in
-        :class:`_RecomputeChunkWrapper`, which uses the public
-        ``overlap.wrap_checkpoint`` API.  This verifies that the
-        ``context_fn`` plumbing in
-        ``core.activation_checkpoint.activation_checkpoint.checkpoint`` and
-        the gate installation in :meth:`CommComputeOverlap.run` correctly
-        serialize the BWD-time re-run against the FWD thread.  Serializing
-        the re-run is required on MS PyNative, whose autograd executor does
-        not support concurrent FWD-record + BWD-replay; calling
-        ``ms.recompute`` directly under overlap_b_f deadlocks.
+        :class:`_RecomputeChunkWrapper`, which uses ``checkpoint_wrapper``.
+        The chunk's forward re-run is fired serially before the paired
+        backward by :meth:`PipelineStage.recompute_one_chunk` and reused
+        during backward, so the re-run never races the FWD thread's forward
+        record.  Serializing the re-run is required on MS PyNative, whose
+        autograd executor does not support concurrent FWD-record + BWD-replay.
     Expectation:
         Iteration completes without deadlock and produces non-zero grads.
-        A deadlock here typically means ``context_fn`` was not threaded
-        through to ``plat.checkpoint`` or the gate was not opened on
-        ``recompute_ctx`` exit.
     """
     rank, device, pp_mesh, ep_mesh = _init_pp_ep_mesh()
     pp_rank = pp_mesh.get_local_rank()
@@ -711,9 +676,8 @@ def test_pp_overlap_moe_recompute():
                 nonzero += 1
     assert nonzero > 0, \
         (f"[rank{rank}] no non-zero grads after recompute backward — "
-         f"either context_fn was not threaded through plat.checkpoint or the "
-         f"FWD gate was not opened on recompute_ctx exit. "
-         f"total_params={total}, nonzero_grads={nonzero}")
+         f"recompute_one_chunk did not rebuild/reuse the checkpointed "
+         f"activations. total_params={total}, nonzero_grads={nonzero}")
 
     if pp_rank == PP_SIZE - 1 and ep_mesh.get_local_rank() == 0 and losses:
         loss_val = float(losses[0].mean().asnumpy())
@@ -731,8 +695,7 @@ def test_pp_overlap_moe_recompute():
 
 def _build_pipeline(pp_rank, ep_mesh, cfg, use_overlap, overlap=None,
                     recompute=False, layers_per_chunk=None,
-                    recompute_granularity="chunk", recompute_layers=None,
-                    save_collectives=True):
+                    recompute_granularity="chunk", recompute_layers=None):
     """Build interleaved MoE chunks with either Overlap or vanilla EP.
 
     Args:
@@ -748,10 +711,10 @@ def _build_pipeline(pp_rank, ep_mesh, cfg, use_overlap, overlap=None,
         overlap: The shared :class:`CommComputeOverlap` — required when
             ``use_overlap`` is True.
         recompute: If True, wrap each chunk in :class:`_RecomputeChunkWrapper`
-            so its forward is checkpointed via ``overlap.wrap_checkpoint``,
-            which serializes the backward-time re-run against the FWD
-            thread.  Only valid alongside ``use_overlap=True`` (the gate
-            and hook-bypass have nothing to coordinate without overlap).
+            so its forward is checkpointed via ``checkpoint_wrapper``; the
+            re-run is fired serially before the paired backward by
+            ``PipelineStage.recompute_one_chunk``.  Only exercised alongside
+            ``use_overlap=True`` in this PoC.
         layers_per_chunk: Optional list of per-chunk MoE layer counts, one
             entry per interleaved chunk.  When ``None`` every chunk uses
             ``MOE_LAYERS_PER_CHUNK``.  A heterogeneous list (e.g. ``[3, 2]``)
@@ -767,20 +730,14 @@ def _build_pipeline(pp_rank, ep_mesh, cfg, use_overlap, overlap=None,
             ="layer"`` only).  ``None`` = all layers in every chunk; a single
             set = the same selection for all chunks; a list/tuple of sets =
             one selection per chunk (e.g. ``[{0, 1}, {0}]``).
-        save_collectives: When ``True`` (default) the recompute path keeps the
-            EP a2a outputs via :func:`_save_collectives_policy` (``MUST_SAVE``),
-            so the backward-time re-run restores them instead of re-issuing
-            the collective — fixes the ~1e-3 numerical flake on recomputed
-            layers.  Set ``False`` for the old re-run-the-a2a behaviour.
 
     Returns:
         ``(chunks, stage_indices)``.
     """
     if recompute and not use_overlap:
         raise ValueError(
-            "_build_pipeline: recompute=True only makes sense with "
-            "use_overlap=True (without overlap the recompute gate has "
-            "nothing to coordinate)."
+            "_build_pipeline: recompute=True is only exercised with "
+            "use_overlap=True in this PoC."
         )
     if recompute_granularity not in ("chunk", "layer"):
         raise ValueError(
@@ -852,16 +809,12 @@ def _build_pipeline(pp_rank, ep_mesh, cfg, use_overlap, overlap=None,
                 # Multi-segment: selected layers each get their own
                 # checkpoint, CHUNK_* hooks stay outside.  ``recompute_layers``
                 # selects which layers recompute (None = all); a subset is the
-                # mixed "recompute some, keep others" case.  ``save_collectives``
-                # keeps the EP a2a outputs so the re-run does not re-issue them.
+                # mixed "recompute some, keep others" case.
                 block.enable_per_layer_recompute(
-                    chunk_overlap, recompute_layers=per_chunk_recompute[chunk_id],
-                    save_collectives=save_collectives,
+                    recompute_layers=per_chunk_recompute[chunk_id],
                 )
             else:
-                block = _RecomputeChunkWrapper(
-                    block, chunk_overlap, save_collectives=save_collectives,
-                )
+                block = _RecomputeChunkWrapper(block)
         chunks.append(block)
         stage_indices.append(pp_rank + chunk_id * PP_SIZE)
     return chunks, stage_indices
@@ -1139,31 +1092,23 @@ def test_pp_overlap_moe_variable_layers():
 
 
 # =========================================================================
-# Per-layer (multi-segment) recompute probe: does MS tolerate a BWD-thread
-# re-run record concurrent with the FWD thread's forward record?
+# Per-layer (multi-segment) recompute under overlap_b_f.
 # =========================================================================
 
 def test_pp_overlap_moe_recompute_per_layer():
-    """Per-layer (multi-segment) checkpoint under overlap_b_f — correctness probe.
+    """Per-layer (multi-segment) checkpoint under overlap_b_f — correctness.
 
     Feature: multi-segment activation checkpoint under ``overlap_b_f``.
     Description:
         8 ranks, PP=4 × EP=2.  Each chunk wraps EACH layer in its OWN
-        ``checkpoint`` segment (:meth:`_MoEChunk.enable_per_layer_recompute`),
-        so the backward performs MULTIPLE re-runs interspersed with grad
-        phases.  The single ``_fwd_gate`` only serializes the FIRST segment's
-        re-run, so segments ``2..N`` re-run while the FWD thread is already
-        recording its own forward.  Builds the model twice from identical
-        numpy-seeded weights — sync baseline (no overlap, no recompute) vs
-        per-layer recompute under the full overlap stack — and compares every
-        trainable parameter's gradient.
-
-        This is the empirical probe for whether MS PyNative tolerates a
-        BWD-thread re-run record concurrent with the FWD-thread forward
-        record.  A deadlock (caught by the msrun timeout) or a grad mismatch
-        means the concurrent-record path is unsafe and a re-closable
-        record-exclusion gate is required; a match across runs means
-        per-layer recompute composes with ``overlap_b_f`` as-is.
+        ``checkpoint`` segment (:meth:`_MoEChunk.enable_per_layer_recompute`).
+        All segments' forward re-runs are fired serially before the paired
+        backward by :meth:`PipelineStage.recompute_one_chunk` and reused during
+        backward, so no re-run record runs concurrently with the FWD thread's
+        forward record.  Builds the model twice from identical numpy-seeded
+        weights — sync baseline (no overlap, no recompute) vs per-layer
+        recompute under the full overlap stack — and compares every trainable
+        parameter's gradient.
     Expectation:
         No deadlock; per-parameter gradients (and last-rank per-micro-batch
         losses) match the sync baseline within ``rtol=1e-3, atol=1e-3`` on
@@ -1234,9 +1179,8 @@ def test_pp_overlap_moe_recompute_per_layer():
 
 
 # Recompute only the FIRST layer of each chunk, keep the rest.  The first
-# layer (forward order) is the LAST processed in backward, so its lone
-# re-run — and the single ``_fwd_gate`` opening — happens late, and the
-# recomputed / non-recomputed layers alternate asymmetrically in backward.
+# layer (forward order) is the LAST processed in backward; its re-run is
+# fired serially before the backward by recompute_one_chunk and reused.
 # This is the "recompute some layers, keep others" case the user flagged.
 MIXED_RECOMPUTE_LAYERS = {0}
 
@@ -1360,10 +1304,8 @@ def _assert_overlap_matches_baseline(rank, pp_rank, baseline_losses, baseline_gr
 
 
 # 3-layer-per-chunk stress config for mixed recompute: recompute ONLY layer 0,
-# keep layers 1 and 2.  Both kept layers are processed first in backward
-# (before the single re-run), so the FWD gate opens only on the BWD thread's
-# first rendezvous — the latest-opening, hardest case for ``set_gate_opener``
-# — and at a layer count the 2-layer mixed test does not cover.
+# keep layers 1 and 2.  Exercises mixed per-layer recompute at a deeper layer
+# count than the 2-layer mixed test, with the recomputed layer last in backward.
 MIXED_3LAYER_PER_CHUNK = [3, 3]
 MIXED_3LAYER_RECOMPUTE_LAYERS = {0}
 
@@ -1374,11 +1316,10 @@ def test_pp_overlap_moe_recompute_mixed_3layer():
     Feature: mixed per-layer recompute robustness at a non-default depth.
     Description:
         8 ranks, PP=4 × EP=2, 3 layers per chunk, only layer 0 recomputed
-        (layers 1 and 2 kept).  Both kept layers' backward fire rendezvous
-        before the single re-run, so the gate opens only on the BWD thread's
-        first rendezvous (after two grad phases) — the latest-opening, hardest
-        case for the ``set_gate_opener`` fix — at a layer count the 2-layer
-        test does not cover.  Compares grads against a sync baseline.
+        (layers 1 and 2 kept).  The recomputed layer's re-run is fired serially
+        before the paired backward by ``PipelineStage.recompute_one_chunk`` and
+        reused during backward — exercised here at a deeper layer count than the
+        2-layer mixed test.  Compares grads against a sync baseline.
     Expectation:
         No deadlock; grads and last-rank losses match the sync baseline within
         ``rtol=1e-3, atol=1e-3``.
@@ -1424,33 +1365,32 @@ def test_pp_overlap_moe_recompute_mixed_3layer():
           f"params={len(baseline_grads)})", flush=True)
 
 
-# All three fixes composed in one config:
+# Two stressors composed in one config:
 #   chunk0: 4 layers, recompute {0, 1}, keep {2, 3}  (kept layers at the end)
 #   chunk1: 3 layers, recompute {0},    keep {1, 2}
 # so a single OVERLAP_B_F step pairs a 4-layer chunk (17 rendezvous) with a
-# 3-layer chunk (13) -> depart drains the 4-rendezvous mismatch;  the kept
-# layers sit at the end (forward) = first in backward -> gate-opener opens on
-# the BWD thread's first grad rendezvous;  every recomputed layer keeps its EP
-# a2a (MUST_SAVE) so no re-run a2a races the FWD thread.
+# 3-layer chunk (13) -> depart drains the 4-rendezvous mismatch;  every
+# recomputed layer keeps its EP a2a (MUST_SAVE) so the serial re-run does not
+# re-issue the collective.
 COMBINED_LAYERS_PER_CHUNK = [4, 3]
 COMBINED_RECOMPUTE_LAYERS = [{0, 1}, {0}]
 
 
 def test_pp_overlap_moe_recompute_combined():
-    """All three fixes at once: variable layers + mixed recompute + save a2a.
+    """Combined stressors: variable layers + mixed recompute + save a2a.
 
-    Feature: ``HookCoordinator.depart`` (variable layers) ×
-        ``set_gate_opener`` (mixed recompute) × :func:`_save_collectives_policy`
-        (a2a not recomputed), composed in a single config.
+    Feature: ``HookCoordinator.depart`` (variable layers) × mixed per-layer
+        recompute, composed in a single config.
     Description:
         8 ranks, PP=4 × EP=2.  ``chunk0`` has 4 layers (recompute ``{0, 1}``,
         keep ``{2, 3}``); ``chunk1`` has 3 layers (recompute ``{0}``, keep
         ``{1, 2}``).  Every recomputed layer keeps its EP a2a output
-        (``MUST_SAVE``) and recomputes only the compute ops.  This is the
-        strongest combined stressor: the depart drain (17-vs-13 rendezvous),
-        the gate-opener (kept layers first in backward), and the
-        save-collectives policy (no racing re-run a2a) all fire together.
-        Compares grads against a sync baseline.
+        (``MUST_SAVE``) and recomputes only the compute ops; the re-runs are
+        fired serially before each backward by
+        ``PipelineStage.recompute_one_chunk``.  This is the strongest combined
+        stressor: the depart drain (17-vs-13 rendezvous) and the
+        save-collectives policy (no racing re-run a2a) fire together with mixed
+        recompute.  Compares grads against a sync baseline.
     Expectation:
         No deadlock; per-parameter gradients (and last-rank losses) match the
         sync baseline within ``rtol=1e-3, atol=1e-3`` on every rank.

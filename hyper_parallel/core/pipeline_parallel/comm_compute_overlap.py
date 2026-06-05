@@ -50,11 +50,9 @@ Typical integration::
     )
 """
 import threading
-from contextlib import contextmanager, nullcontext
-from typing import Callable, Optional, Tuple
+from typing import Callable
 
 from hyper_parallel.platform import get_platform
-from hyper_parallel.core.activation_checkpoint.activation_checkpoint import checkpoint
 from hyper_parallel.core.pipeline_parallel.hook_coordinator import HookCoordinator
 
 platform = get_platform()
@@ -77,117 +75,11 @@ class CommComputeOverlap:
 
     def __init__(self) -> None:
         self._coordinator = HookCoordinator()
-        # Flipped on the first call to make_recompute_context_fn /
-        # wrap_checkpoint.  Tells run() to gate the FWD thread on the BWD
-        # thread's recompute completion, so the re-run executes serially
-        # (no FWD-thread random / a2a / instance-state interleaving).
-        self._has_recompute: bool = False
-        # Fresh per-run() Event when _has_recompute is True; ``set()`` by
-        # the first recompute_ctx exit per run, which opens the FWD gate.
-        self._fwd_gate: Optional[threading.Event] = None
 
     @property
     def coordinator(self) -> HookCoordinator:
         """The underlying :class:`HookCoordinator` instance."""
         return self._coordinator
-
-    # ------------------------------------------------------------------
-    # Recompute integration
-    # ------------------------------------------------------------------
-
-    def make_recompute_context_fn(self) -> Callable[[], Tuple[object, object]]:
-        """Build a ``context_fn`` for the activation-checkpoint recompute path.
-
-        Returns a factory matching the
-        ``ms.recompute(use_reentrant=False, context_fn=...)`` /
-        ``torch.utils.checkpoint(use_reentrant=False, context_fn=...)``
-        contract.  The recompute side of the returned pair brackets the
-        backward-time forward re-run with two effects:
-
-        1. ``HookCoordinator.set_recomputing(True/False)`` — the dual-pipe
-           A/B/C/D/CHUNK_* sync hooks become no-ops on the re-run, so the
-           barrier participant count stays balanced.  Without this the
-           re-run double-fires every rendezvous and deadlocks the two-thread
-           schedule.
-        2. ``CommComputeOverlap._fwd_gate.set()`` on scope exit — a SAFETY NET
-           for the FWD-thread gate installed by :meth:`run`.  The gate's
-           primary trigger is the coordinator's one-shot opener, which fires
-           on the BWD thread's first NON-suppressed rendezvous (the re-run's
-           hooks are suppressed by effect 1, so the first real rendezvous is
-           the grad phase that follows the *first* re-run); see
-           :meth:`run` and :meth:`HookCoordinator.set_gate_opener`.  Until the
-           gate opens the FWD thread is parked on ``gate.wait()``, so the
-           initial re-run owns the RNG, the EP a2a group, and the
-           ``ExpertParallel`` instance state exclusively.
-
-        Marks the owning overlap instance as ``_has_recompute = True`` so
-        :meth:`run` installs the gate around ``fwd_fn``.
-
-        Note:
-            Multiple checkpointed segments per ``run()`` (per-layer / mixed
-            fine-grained checkpoint, not just one chunk-level wrap) are
-            supported.  The gate opens at the first BWD grad-phase rendezvous,
-            so segments ``2..N`` re-run while the FWD thread is parked on the
-            2-party barrier (it cannot advance past a hook without its BWD
-            partner, which is busy re-running), serializing each re-run record
-            against the FWD forward record.  This is validated by the
-            ``test_pp_overlap_moe_recompute_per_layer`` /
-            ``test_pp_overlap_moe_recompute_mixed`` system tests.
-
-        Returns:
-            A no-arg callable returning ``(forward_ctx, recompute_ctx)`` on
-            every invocation, suitable as the ``context_fn`` argument to
-            :func:`hyper_parallel.core.activation_checkpoint.checkpoint`.
-        """
-        self._has_recompute = True
-        coord = self._coordinator
-        overlap = self
-
-        def factory() -> Tuple[object, object]:
-
-            @contextmanager
-            def _recompute_scope():
-                coord.set_recomputing(True)
-                try:
-                    yield
-                finally:
-                    coord.set_recomputing(False)
-                    gate = overlap._fwd_gate    # pylint: disable=W0212
-                    if gate is not None:
-                        gate.set()
-
-            return nullcontext(), _recompute_scope()
-
-        return factory
-
-    def wrap_checkpoint(self, fn: Callable, **ckpt_kwargs) -> Callable:
-        """Return ``fn`` wrapped in :func:`checkpoint` with the overlap-aware ``context_fn``.
-
-        Convenience for the common case of running a module / callable under
-        activation checkpoint while a dual-thread overlap schedule is also
-        active.  The returned callable forwards positional and keyword
-        arguments to ``fn`` and routes the recompute through
-        :meth:`make_recompute_context_fn`.
-
-        Args:
-            fn: The callable (typically an ``nn.Cell``/``nn.Module`` forward,
-                or a chunk function) whose execution should be checkpointed.
-            **ckpt_kwargs: Extra keyword arguments forwarded once to
-                :func:`hyper_parallel.core.activation_checkpoint.checkpoint`
-                — e.g. ``policy_fn`` for SAC, ``swap_inputs=True``.  Runtime
-                arguments to ``fn`` are passed via the returned callable's
-                own ``*args, **kwargs``.
-
-        Returns:
-            A callable with the same signature as ``fn`` that executes under
-            activation checkpoint with overlap-aware recompute bracketing.
-        """
-        ctx_fn = self.make_recompute_context_fn()
-
-        def _wrapped(*args, **kwargs):
-            return checkpoint(fn, *args, context_fn=ctx_fn, **ckpt_kwargs, **kwargs)
-
-        return _wrapped
 
     # ------------------------------------------------------------------
     # Wrapping helpers
@@ -272,15 +164,6 @@ class CommComputeOverlap:
         :meth:`wrap_combine` at wrap time, so no per-call layer count is
         needed here.
 
-        When recompute integration is active (:meth:`make_recompute_context_fn`
-        or :meth:`wrap_checkpoint` has been called on this instance), the
-        FWD thread is gated on the BWD thread's first ``recompute_ctx``
-        exit so the BWD re-run runs serially, then ``fwd_fn`` and the
-        BWD grad phase overlap.  Pipeline cycle time is unchanged in the
-        common chunk-level checkpoint case (see
-        :meth:`make_recompute_context_fn` for the analysis and the
-        single-segment limitation).
-
         Args:
             fwd_fn: Callable that executes the forward pass.
             bwd_fn: Callable that executes the backward pass.  If it needs
@@ -293,38 +176,8 @@ class CommComputeOverlap:
         """
         self._coordinator.enable()
 
-        # Reset the per-run FWD gate.  When _has_recompute is True the
-        # gate opens on the BWD thread's first recompute_ctx exit (or as
-        # a safety net at the end of bwd_fn).  Otherwise the gate stays
-        # None and fwd_fn starts immediately.
-        if self._has_recompute:
-            self._fwd_gate = threading.Event()
-            # Open the gate at the BWD thread's FIRST grad-phase rendezvous,
-            # not at the first recompute_ctx exit.  For mixed per-layer
-            # recompute — where a non-recomputed layer's backward fires
-            # rendezvous BEFORE the first re-run — the recompute_ctx-exit
-            # trigger opens the gate too late: the FWD thread stays parked
-            # while the BWD thread blocks on the barrier waiting for it, and
-            # the re-run that would open the gate never runs (circular
-            # deadlock).  The first-rendezvous trigger releases FWD exactly
-            # when BWD needs it as a barrier partner, while still holding FWD
-            # through any initial re-run (whose suppressed hooks are not a
-            # real rendezvous).  See HookCoordinator.set_gate_opener.
-            self._coordinator.set_gate_opener(self._fwd_gate.set)
-            original_fwd_fn = fwd_fn
-            gate_for_fwd = self._fwd_gate
-
-            def _gated_fwd_fn():
-                gate_for_fwd.wait()
-                original_fwd_fn()
-
-            fwd_fn = _gated_fwd_fn
-        else:
-            self._fwd_gate = None
-
         exc_box: list = []
         coordinator = self._coordinator
-        gate = self._fwd_gate
 
         def _bwd_target():
             try:
@@ -346,12 +199,6 @@ class CommComputeOverlap:
                 # normal return previously left FWD hanging whenever
                 # ``layers(fwd) > layers(bwd)``.
                 coordinator.depart()
-                # Safety net: release the FWD gate even if no recompute
-                # fired (e.g. this bwd_fn did not traverse a checkpointed
-                # segment, or it died before reaching one).  Idempotent
-                # with the recompute_ctx-driven set().
-                if gate is not None:
-                    gate.set()
 
         thread = threading.Thread(target=_bwd_target, daemon=True)
         thread.start()

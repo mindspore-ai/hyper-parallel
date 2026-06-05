@@ -33,9 +33,8 @@ boundary hooks into a single ``CA`` hook, removing the ``NONE`` role and
 allowing combine + Attention to run without barrier interruption.
 """
 import threading
-from contextlib import contextmanager, nullcontext
 from enum import Enum
-from typing import Optional, Tuple
+from typing import Optional
 
 
 class HookRole(Enum):
@@ -113,23 +112,6 @@ class HookCoordinator:
         # blocking forever on the 2-party barrier.  Reset by :meth:`enable`
         # at the start of each dual-pipe session.
         self._departed = False
-        # Optional one-shot callback fired on the first NON-suppressed
-        # rendezvous of a dual-pipe session.  In a recompute-gated session
-        # the FWD thread is parked on the gate until it is opened, so that
-        # first real rendezvous is always the BWD thread's first grad-phase
-        # rendezvous — exactly the moment the FWD thread can safely resume
-        # (the BWD thread is past any initial re-run record).
-        # CommComputeOverlap.run uses it to open the FWD gate.  Reset by
-        # :meth:`enable`.
-        self._gate_opener = None
-        # Per-thread "is recomputing" flag.  Set by the recompute wrapper
-        # around its forward re-run so that every ``rendezvous`` /
-        # ``notify_dispatched`` call from that thread becomes a no-op
-        # during the re-run.  Without this, the second forward pass
-        # would fire the A/B/C/D/CHUNK_START/CHUNK_END hooks again,
-        # doubling the rendezvous count on the BWD-paired side and
-        # deadlocking the barrier.
-        self._recompute_local: threading.local = threading.local()
 
     def enable(self) -> None:
         """Enable coordination for a new dual-pipe session.
@@ -144,7 +126,6 @@ class HookCoordinator:
             self._comm_dispatched = threading.Event()
             self._my_event = threading.local()
             self._departed = False
-            self._gate_opener = None
             self._enabled = True
 
     def disable(self) -> None:
@@ -202,106 +183,6 @@ class HookCoordinator:
         """Return whether coordination is currently active."""
         return self._enabled
 
-    def set_gate_opener(self, opener) -> None:
-        """Register a one-shot callback fired on the first real rendezvous.
-
-        ``opener`` is invoked exactly once, on the first :meth:`rendezvous`
-        call that is not skipped (the coordinator is enabled, no party has
-        departed, and the caller is not in a recompute re-run).  In a
-        recompute-gated session the FWD thread is parked on the gate until it
-        is opened, so that first real rendezvous is always the BWD thread's
-        first grad-phase rendezvous — exactly the moment the FWD thread can
-        safely resume (the BWD thread is past any initial re-run record).
-        This is what lets mixed per-layer recompute — where a non-recomputed
-        layer's backward fires rendezvous BEFORE the first re-run — avoid the
-        deadlock that opening the gate only at the first ``recompute_ctx``
-        exit would cause.
-
-        Args:
-            opener: Zero-arg callable, or ``None`` to disable.
-        """
-        self._gate_opener = opener
-
-    def set_recomputing(self, value: bool) -> None:
-        """Mark the calling thread as currently recomputing (or not).
-
-        When set, every :meth:`rendezvous` / :meth:`notify_dispatched`
-        call from this thread becomes a no-op, so the recompute-driven
-        forward re-run does not double-fire the chunk's sync hooks.
-
-        Most callers will not invoke this directly — use
-        :meth:`recompute_context_fn` as the ``context_fn`` argument to
-        ``mindspore.recompute(use_reentrant=False, context_fn=...)``,
-        which brackets the re-run with this flag automatically.  Manual
-        ``set_recomputing(True/False)`` is the fallback when wiring a
-        custom recompute autograd function.
-
-        Per-thread (``threading.local``) so the FWD thread's normal
-        forward and the BWD thread's recompute re-run cannot collide.
-
-        Important:
-            MindSpore's ``ms.recompute`` defaults to ``use_reentrant=True``,
-            whose re-run lives entirely inside the C++ grad executor —
-            this flag will **not** be set automatically on that path.
-            Always pass ``use_reentrant=False`` when relying on the
-            HookCoordinator bypass, or wrap your own recompute autograd
-            function and set the flag manually around the re-run.
-        """
-        self._recompute_local.val = value
-
-    def is_recomputing(self) -> bool:
-        """Whether the calling thread is currently in a recompute re-run."""
-        return getattr(self._recompute_local, "val", False)
-
-    def recompute_context_fn(self) -> Tuple[object, object]:
-        """A ``context_fn`` for ``mindspore.recompute(use_reentrant=False, ...)``.
-
-        ``ms.recompute(..., context_fn=callable)`` calls the supplied
-        callable once and unpacks the result as ``(forward_ctx,
-        recompute_ctx)``: ``forward_ctx`` brackets the original forward
-        pass; ``recompute_ctx`` brackets the backward-time re-run
-        (see ``mindspore/python/mindspore/common/recompute.py:539,562``).
-
-        This method itself **is** the callable — bind ``self`` and pass
-        the bound method directly::
-
-            out = ms.recompute(
-                chunk, x,
-                use_reentrant=False,
-                context_fn=coord.recompute_context_fn,
-            )
-
-        On every call we return:
-
-        * ``forward_ctx`` — :class:`contextlib.nullcontext` so the
-          original forward fires its A/B/C/D/CHUNK_* hooks normally.
-        * ``recompute_ctx`` — a context manager that calls
-          :meth:`set_recomputing` ``True`` on entry and ``False`` on
-          exit, so the re-run's hook calls become no-ops and the
-          BWD-paired rendezvous count stays balanced.
-
-        Returns:
-            ``(forward_ctx, recompute_ctx)`` — a fresh pair every call.
-            Each context manager is single-use, matching ms.recompute's
-            "call once per ``recompute`` invocation" contract.
-
-        Note:
-            Only effective when ``use_reentrant=False`` is also passed.
-            See :meth:`set_recomputing` for why the default reentrant
-            path bypasses this hook.
-        """
-        coord = self
-
-        @contextmanager
-        def _recompute_scope():
-            coord.set_recomputing(True)
-            try:
-                yield
-            finally:
-                coord.set_recomputing(False)
-
-        return nullcontext(), _recompute_scope()
-
     def rendezvous(self, role: HookRole) -> None:
         """Synchronize with the paired thread and enforce comm-first ordering.
 
@@ -319,24 +200,11 @@ class HookCoordinator:
             raise TypeError(
                 f"Argument 'role' must be HookRole, but got type {type(role)}."
             )
-        if not self._enabled or self._departed or self.is_recomputing():
+        if not self._enabled or self._departed:
             # Skip when the partner has departed (it finished its chunk
             # first — e.g. a shorter layer count — so this side runs its
-            # remaining hooks solo), or during a recompute re-run (the
-            # original forward already paired this hook with its BWD
-            # partner, and re-firing the rendezvous would double-count the
-            # barrier participants).
+            # remaining hooks solo).
             return
-
-        # First non-suppressed rendezvous of the session opens the FWD
-        # recompute gate (if one was installed by CommComputeOverlap.run).
-        # Fires once; the FWD thread is parked on the gate until now, so this
-        # is always the BWD thread's first grad-phase rendezvous.  See
-        # :meth:`set_gate_opener`.
-        opener = self._gate_opener
-        if opener is not None:
-            self._gate_opener = None
-            opener()
 
         # COMM side: create a per-rendezvous event *before* the barrier.
         # After the barrier both threads reference the same fresh event.
@@ -374,9 +242,9 @@ class HookCoordinator:
             raise TypeError(
                 f"Argument 'role' must be HookRole, but got type {type(role)}."
             )
-        if not self._enabled or self._departed or self.is_recomputing():
+        if not self._enabled or self._departed:
             # See :meth:`rendezvous` for why we skip when the partner has
-            # departed or this thread is in a recompute re-run.
+            # departed.
             return
         if role is HookRole.COMM:
             evt = getattr(self._my_event, "evt", None)

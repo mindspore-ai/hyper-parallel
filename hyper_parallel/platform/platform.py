@@ -629,31 +629,6 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement all_to_all_single")
 
     @staticmethod
-    def is_collective_op(op) -> bool:
-        """Whether ``op`` is a communication collective.
-
-        Used by selective-activation-checkpoint policies — e.g.
-        :func:`hyper_parallel.core.activation_checkpoint.keep_collectives_policy`
-        — to keep a collective's output across a recompute re-run instead of
-        re-issuing it (so the re-run collective cannot race the peer thread's
-        collective on the shared process group under comm/compute overlap).
-
-        Returns ``False`` by default; each platform backend overrides it to
-        recognise its collective ops (all-to-all, all-reduce, all-gather,
-        reduce-scatter, broadcast, ...).  A ``False`` default degrades the
-        policy to "recompute everything" — safe, just unoptimised.
-
-        Args:
-            op: The dispatched op — a MindSpore primitive (has ``.name``) or a
-                PyTorch ``OpOverload``.
-
-        Returns:
-            ``True`` if ``op`` is a communication collective, else ``False``.
-        """
-        del op
-        return False
-
-    @staticmethod
     def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,
                                             handle_box=None):
         """Differentiable wrapper that waits for a pre-launched async all-gather.
@@ -1402,6 +1377,58 @@ class Platform:
             Context manager for async CPU offloading during checkpointing.
         """
         raise NotImplementedError("Platform subclasses must implement async_save_on_cpu")
+
+    @staticmethod
+    def recompute_handle_collector_ctx():
+        """Context manager that collects recompute handles created in its scope.
+
+        Yields:
+            A list populated with one opaque recompute handle per checkpointed
+            block executed during the forward pass within the context.  Each
+            handle can later be fired via :meth:`recompute_handle`.
+        """
+        raise NotImplementedError("Platform subclasses must implement recompute_handle_collector_ctx")
+
+    @staticmethod
+    def recompute_handle(handle, session_id):
+        """Eagerly fire one checkpointed block's forward re-run.
+
+        Materializes and caches the block's activations under ``session_id`` so
+        a later backward in the same session reuses them instead of re-running.
+
+        Args:
+            handle: An opaque recompute handle from
+                :meth:`recompute_handle_collector_ctx`.
+            session_id: Stable key shared by the producing re-run and the
+                consuming backward.
+        """
+        raise NotImplementedError("Platform subclasses must implement recompute_handle")
+
+    @staticmethod
+    def recompute_session_ctx(session_id, retain_on_unpack=False):
+        """Context manager binding recompute unpack to a caller-provided session.
+
+        Args:
+            session_id: Stable session key.  Recompute caches are keyed by this
+                instead of the transient autodiff engine id, so a re-run fired
+                under one engine can be reused by another.
+            retain_on_unpack (bool): When ``True``, unpack returns recomputed
+                tensors without popping them, so a later backward can consume
+                them.  Default: ``False``.
+
+        Returns:
+            A context manager activating the session for its scope.
+        """
+        raise NotImplementedError("Platform subclasses must implement recompute_session_ctx")
+
+    @staticmethod
+    def clear_recompute_session(session_id):
+        """Release retained recompute data for a session.
+
+        Args:
+            session_id: The session key whose cached recompute data is cleared.
+        """
+        raise NotImplementedError("Platform subclasses must implement clear_recompute_session")
 
     @staticmethod
     def get_element_size(tensor):

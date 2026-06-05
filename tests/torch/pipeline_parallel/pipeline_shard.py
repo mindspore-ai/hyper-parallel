@@ -22,7 +22,7 @@ from hyper_parallel import PipelineStage
 from hyper_parallel import ScheduleInterleaved1F1B
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.sharding_plan import ShardingPlan
-from .simple_mlp import SimpleMLP, model_split_manual, run_standalone, init_hccl, get_stage_index, get_rank_list
+from .simple_mlp import SimpleMLP, model_split_manual, run_standalone, init_hccl, get_stage_index
 
 
 def run_parallel(micro_batch_num):
@@ -36,18 +36,16 @@ def run_parallel(micro_batch_num):
     # pp config
     num_stages = 4
     local_batch_size = micro_batch_num
-    rank_list = get_rank_list(num_stages)
     stage_index = get_stage_index(num_stages)
 
     # Create DeviceMesh
     mesh = init_device_mesh(
-        device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("pp", "dp", "tp"), rank_list=rank_list
-    )
-    # mesh = init_device_mesh(device_type="npu", mesh_shape=(1, 2), mesh_dim_names=("dp", "tp"), rank_list=rank_list)
-
+        device_type="npu", mesh_shape=(4, 1, 2), mesh_dim_names=("pp", "dp", "tp"))
+    pp_mesh = mesh["pp"]
+    tp_mesh = mesh["tp"]
     # Define placements using Placement format
-    w_tp_none = (Replicate(), Shard(0))  # tp shard on dim 0
-    w_none_tp = (Replicate(), Shard(1))  # tp shard on dim 1
+    w_tp_none = (Shard(0),)  # tp shard on dim 0
+    w_none_tp = (Shard(1),)  # tp shard on dim 1
 
     sharding_plan = ShardingPlan(
         plan={"mlp_layers.0.weight": w_none_tp,
@@ -61,24 +59,24 @@ def run_parallel(micro_batch_num):
     local_hidden_size = 16
 
     model0 = SimpleMLP(8, local_hidden_size, local_hidden_size)
-    model0 = shard_module(model0, device_mesh=mesh, sharding_plan=sharding_plan)
+    model0 = shard_module(model0, device_mesh=tp_mesh, sharding_plan=sharding_plan)
     model1 = SimpleMLP(8, local_hidden_size, local_hidden_size)
-    model1 = shard_module(model1, device_mesh=mesh, sharding_plan=sharding_plan)
+    model1 = shard_module(model1, device_mesh=tp_mesh, sharding_plan=sharding_plan)
     model_split_manual(model0, stage_index, 8)
     model_split_manual(model1, stage_index + 4, 8)
 
     # pp stage
     device = torch.device("npu")
-    pipeline_stage0 = PipelineStage(model0, stage_index, num_stages + 4, device)
-    pipeline_stage1 = PipelineStage(model1, stage_index + 4, num_stages + 4, device)
+    pipeline_stage0 = PipelineStage(model0, stage_index, num_stages + 4, device, mesh=pp_mesh)
+    pipeline_stage1 = PipelineStage(model1, stage_index + 4, num_stages + 4, device, mesh=pp_mesh)
     schedule = ScheduleInterleaved1F1B([pipeline_stage0, pipeline_stage1], micro_batch_num)
 
     # input
     local_batch_size = 8
     local_hidden_size = 16
     x = torch.ones(local_batch_size, local_hidden_size, dtype=torch.float32).npu()
-    x_placements = (Shard(0), Replicate())  # dp shard on dim 0
-    d_x = DTensor.from_local(x, mesh, x_placements)
+    x_placements = (Replicate(),)
+    d_x = DTensor.from_local(x, tp_mesh, x_placements)
 
     # train config
     epochs = 1
