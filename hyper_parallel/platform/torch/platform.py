@@ -1385,6 +1385,11 @@ class TorchPlatform(Platform):
         return tensor.cpu().numpy()
 
     @staticmethod
+    def from_numpy(np_array):
+        """Create a host (CPU) PyTorch tensor from a numpy array."""
+        return torch.from_numpy(np_array)
+
+    @staticmethod
     def clip_grad_norm_(
         parameters, max_norm, norm_type=2.0,
         error_if_nonfinite=False, foreach=None,

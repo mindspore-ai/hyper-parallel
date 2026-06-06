@@ -1750,6 +1750,11 @@ class MindSporePlatform(Platform):
         return tensor.asnumpy()
 
     @staticmethod
+    def from_numpy(np_array):
+        """Create a host (CPU) MindSpore tensor from a numpy array."""
+        return ms.from_numpy(np_array)
+
+    @staticmethod
 
     def clip_grad_norm_(
         parameters, max_norm, norm_type=2.0,
