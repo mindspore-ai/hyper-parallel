@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """hybrid shard data parallel interface"""
-import warnings
 from collections import namedtuple
 from typing import Any, List, Mapping, cast, Optional, Union
 
@@ -256,21 +255,26 @@ class HSDPModule:
             strict (bool): If ``True`` (default), missing or unexpected keys
                 raise ``RuntimeError``, matching ``nn.Module.load_state_dict``
                 semantics.
-            assign (bool): Accepted for API compatibility with
-                ``nn.Module.load_state_dict(assign=True)`` but currently
-                ignored; HSDP always copies into existing DTensor storage.
+            assign (bool): When ``True`` *and* every value in ``state_dict`` is
+                already a hyper DTensor, defer to the standard
+                ``nn.Module.load_state_dict(assign=True)``, which replaces the
+                module's parameters/buffers with the given DTensors instead of
+                copying into existing storage. This is required when loading
+                sharded DTensors onto a meta-device model (e.g.
+                ``cpu_ram_efficient_loading``). If ``state_dict`` contains any
+                plain tensor (local-shard or global shape), ``assign`` is
+                ignored and the copy/distribute path below is used so the
+                target stays a properly sharded DTensor.
 
         Raises:
             RuntimeError: When ``strict`` is ``True`` and keys do not match.
             ValueError: When a plain tensor shape matches neither the local
                 shard shape nor the global shape of the target DTensor.
         """
-        if assign:
-            warnings.warn(
-                "HSDPModule.load_state_dict: assign=True is ignored; "
-                "HSDP always copies into existing DTensor parameters.",
-                stacklevel=2,
-            )
+        if assign and state_dict and all(
+            isinstance(val, DTensor) for val in state_dict.values()
+        ):
+            return super().load_state_dict(state_dict, strict=strict, assign=True)
         self_module = cast(platform.Module, self)
 
         target_map: dict[str, platform.Tensor] = {}
