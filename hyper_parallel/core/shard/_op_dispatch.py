@@ -235,6 +235,15 @@ class OpDispatcher:
     """
     OpDispatcher
     """
+
+    # Whitelisted ops that mutate args[0]'s storage in place. The dispatch bypass
+    # must return the original DTensor self for these, not the unwrapped local
+    # result, or it demotes a DTensor accumulator to a plain Tensor and breaks the
+    # next op that adds a DTensor to it (e.g. grad-accumulation `loss += micro_loss`).
+    # Class-level so it stays available on instances built via __new__ (e.g. tests).
+    _INPLACE_BYPASS_OPS = frozenset(
+        {"InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv"})
+
     def __init__(self):
         self._env_yaml_dir: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_YAML_DIR")
         self._env_python_path: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_PYTHON_PATH")
@@ -1195,7 +1204,10 @@ class OpDispatcher:
         op_name = platform.get_op_name(op_call)
 
         if self._should_bypass_dispatch(op_name):
-            return op_call(*self._unwrap_args(args), **self._unwrap_kwargs(kwargs))
+            result = op_call(*self._unwrap_args(args), **self._unwrap_kwargs(kwargs))
+            if op_name in self._INPLACE_BYPASS_OPS and args and isinstance(args[0], DTensor):
+                return args[0]
+            return result
 
         if op_name in self._random_ops or op_name in self._random_ms_ops:
             return self._dispatch_random_op(op_name, op_call, args, kwargs)
