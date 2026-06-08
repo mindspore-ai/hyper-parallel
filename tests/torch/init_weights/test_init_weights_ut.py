@@ -144,3 +144,43 @@ class TestDictPollutionRegression:
         assert isinstance(model.p, _CustomParameter), (
             f"expected _CustomParameter, got {type(model.p).__name__}"
         )
+
+
+class _NetFromParam(nn.Module):
+    """Register a pre-built parameter so tests control its exact ``__dict__``."""
+
+    def __init__(self, param):
+        super().__init__()
+        self.register_parameter("p", param)
+
+
+class TestExtraParamAttributes:
+    """A parameter may carry attributes in its ``__dict__`` (attached by the
+    user or by a framework). Those must be preserved as instance attributes on
+    the reconstructed parameter and never forwarded to the subclass ``__new__``,
+    whose signature need not accept them as keyword arguments.
+
+    Regression for the crash::
+
+        TypeError: <Param>.__new__() got an unexpected keyword argument '<attr>'
+    """
+
+    def test_extra_attr_does_not_crash_and_is_preserved(self):
+        """An attribute on a narrow-signature subclass survives the move and
+        must not drag a stale ``requires_grad`` back into ``__dict__``."""
+        param = _CustomParameter(torch.tensor([1.0]))
+        param.framework_internal_id = "abc123"
+
+        with init_on_device(torch.device("meta")):
+            model = _NetFromParam(param)
+
+        assert model.p.is_meta, f"expected meta param, got {model.p.device}"
+        assert model.p.framework_internal_id == "abc123", (
+            f"extra attribute lost during reconstruction, __dict__={model.p.__dict__}"
+        )
+        assert isinstance(model.p, _CustomParameter), (
+            f"expected _CustomParameter, got {type(model.p).__name__}"
+        )
+        assert "requires_grad" not in model.p.__dict__, (
+            f"__dict__ must not shadow C++ requires_grad, got {model.p.__dict__}"
+        )

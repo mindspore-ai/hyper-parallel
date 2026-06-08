@@ -34,14 +34,14 @@ def init_on_device(device, include_buffers=False):
     # pylint: disable=W0212
     def _register_parameter(module, name, param):
         orig_register_parameter(module, name, param)
-        if param is not None:
-            orig_param = module._parameters[name]
-            param_cls = type(orig_param)
-            kwargs = orig_param.__dict__
-            new_param = (param if param.device == device
-                         else param_cls(orig_param.to(device), **kwargs))
-            new_param.requires_grad = param.requires_grad
-            module._parameters[name] = new_param
+        if param is None or param.device == device:
+            return
+        # Rebuild with data only, then restore instance attributes via __dict__:
+        # forwarding them to __new__ crashes subclasses with a narrow signature.
+        new_param = type(param)(param.to(device))
+        new_param.__dict__.update(param.__dict__)
+        new_param.requires_grad = param.requires_grad
+        module._parameters[name] = new_param
 
     # pylint: disable=W0212
     def _register_buffer(module, name, buffer, persistent=True):
