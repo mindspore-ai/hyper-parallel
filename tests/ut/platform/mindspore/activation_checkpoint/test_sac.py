@@ -24,10 +24,12 @@ import pytest
 pytest.importorskip("mindspore")
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 from tests.ut.platform.mindspore._ensure_mindspore_platform import (
     ensure_mindspore_platform_default,
 )
 
+enable_mindspore_backward_compat()
 ensure_mindspore_platform_default()
 
 import mindspore as ms
@@ -39,6 +41,7 @@ from hyper_parallel.platform.mindspore.activation_checkpoint.sac import (
     SelectiveCheckpointContext,
     _CachedMindSporeDispatchMode,
     _CachingMindSporeDispatchMode,
+    _SwapCacheEntry,
     _VersionWrapper,
     _maybe_detach,
     create_selective_checkpoint_contexts,
@@ -71,9 +74,9 @@ class TestSacHelpers(unittest.TestCase):
         self.assertFalse(SelectiveCheckpointContext(is_recompute=False).is_recompute)
         self.assertTrue(SelectiveCheckpointContext(is_recompute=True).is_recompute)
 
-    def test_version_wrapper_returns_value_for_non_tensor_source(self):
-        """Non-tensor version sources should return the cached value directly."""
-        wrapper = _VersionWrapper("cached", "source")
+    def test_version_wrapper_returns_value_for_non_tensor(self):
+        """Non-tensor cached values should be returned directly."""
+        wrapper = _VersionWrapper("cached")
 
         self.assertEqual(wrapper.get_val(allow_cache_entry_mutation=False), "cached")
 
@@ -84,6 +87,17 @@ class TestSacHelpers(unittest.TestCase):
         result = _maybe_detach(source)
 
         self.assertIsInstance(result, ms.Tensor)
+
+    def test_swap_cache_entry_uses_cached_tensor_for_save_and_swap(self):
+        """Swap cache entries should wrap the same cached value for save and swap."""
+        source = _tensor([1.0, 2.0])
+        cached = _maybe_detach(source)
+
+        entry = _SwapCacheEntry(cached, "Add", group_swap=True)
+
+        self.assertIs(entry.save.val, cached)
+        self.assertIs(entry.swap.val, cached)
+        self.assertTrue(entry.swap.group_swap)
 
 
 class TestCreateSelectiveCheckpointContexts(unittest.TestCase):

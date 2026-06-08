@@ -29,6 +29,7 @@ from hyper_parallel.platform.torch.activation_checkpoint.sac import (
     SelectiveCheckpointContext,
     _CachedTorchDispatchMode,
     _CachingTorchDispatchMode,
+    _SwapCacheEntry,
     _VersionWrapper,
     _maybe_detach,
     _policy_from_bool,
@@ -50,9 +51,9 @@ class TestSacHelpers(unittest.TestCase):
         self.assertTrue(SelectiveCheckpointContext(is_recompute=True).is_recompute)
 
     def test_version_wrapper_detects_mutation(self):
-        """Version wrappers should detect source tensor mutation on replay."""
+        """Version wrappers should detect cached tensor mutation on replay."""
         source = torch.ones(2)
-        wrapper = _VersionWrapper(source.detach(), source)
+        wrapper = _VersionWrapper(source)
 
         source.add_(1)
 
@@ -68,6 +69,17 @@ class TestSacHelpers(unittest.TestCase):
 
         self.assertFalse(result.requires_grad)
         self.assertIsNot(result, source)
+
+    def test_swap_cache_entry_uses_cached_tensor_for_save_and_swap(self):
+        """Swap cache entries should wrap the same cached value for save and swap."""
+        source = torch.ones(2, requires_grad=True)
+        cached = _maybe_detach(source, any_ret_has_alias_info=False)
+
+        entry = _SwapCacheEntry(cached, "aten.add.Tensor", group_swap=True)
+
+        self.assertIs(entry.save.val, cached)
+        self.assertIs(entry.swap.val, cached)
+        self.assertTrue(entry.swap.group_swap)
 
 
 class TestCreateSelectiveCheckpointContexts(unittest.TestCase):
