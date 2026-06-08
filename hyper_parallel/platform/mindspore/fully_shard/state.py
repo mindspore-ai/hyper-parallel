@@ -492,6 +492,11 @@ class MindSporeHSDPStateV2(HSDPState):
         if grad is None:
             return
         reduced_grad = _to_dtype_if_needed(grad, self._reduce_dtype)
+        # All-reduce needs a contiguous buffer; the local sharded grad may be a
+        # non-contiguous view (same as _allreduce_replicate_params). No-op when
+        # already contiguous; the copy is written back to grad in
+        # _complete_direct_all_reduce.
+        reduced_grad = reduced_grad.contiguous()
         reduce_group_info = getattr(hsdp_param, "unsharded_group_info", None)
         reduce_group = reduce_group_info.group if reduce_group_info is not None else None
         reduce_group_size = reduce_group_info.rank_size if reduce_group_info is not None else 1

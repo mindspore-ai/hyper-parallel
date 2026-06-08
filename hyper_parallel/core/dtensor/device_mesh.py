@@ -23,10 +23,24 @@ import numpy as np
 
 from hyper_parallel.core.dtensor._mesh_layout import IntTuple, _MeshLayout, _contiguous_strides, _is_int
 from hyper_parallel.platform import get_platform
-from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, Platform, PlatformType
 
 platform = get_platform()
 Tensor = platform.Tensor
+
+
+def _host_tensor_from_numpy(np_array: np.ndarray):
+    """Build a host-resident int tensor from a NumPy array for rank/mesh bookkeeping.
+
+    A real platform's ``from_numpy`` keeps the tensor off the meta device, so it stays
+    ``asnumpy``-able even when a DeviceMesh is built under ``ms.DeviceCtx("meta")``
+    (``fully_shard`` with ``mesh=None``). Unit tests run with a mocked ``platform``
+    (no real ``from_numpy``, and never under a meta context), so fall back to the plain
+    ``Tensor`` constructor there.
+    """
+    if isinstance(platform, Platform):
+        return platform.from_numpy(np_array)
+    return Tensor(np_array).int()
 
 
 class _MeshEnv(threading.local):
@@ -314,7 +328,7 @@ class DeviceMesh:
 
     @staticmethod
     def _build_rank_map_from_mesh(mesh: Tensor) -> Tensor:
-        return Tensor(platform.tensor_to_numpy(mesh).reshape(-1)).int()
+        return _host_tensor_from_numpy(platform.tensor_to_numpy(mesh).reshape(-1).astype(np.int32))
 
     @staticmethod
     def _convert_rank_map_to_tensor(rank_map: Tensor) -> Tensor:
@@ -334,7 +348,7 @@ class DeviceMesh:
             # reshape/cast is needed.
             return rank_map
         rank_map_np = np.array(rank_map)
-        return Tensor(rank_map_np.reshape(-1).astype(np.int32)).int()
+        return _host_tensor_from_numpy(rank_map_np.reshape(-1).astype(np.int32))
 
     @staticmethod
     def _get_mesh_tensor_from_full_mesh(full_mesh: Tensor, current_rank: Optional[int] = None) -> Tensor:
@@ -421,7 +435,7 @@ class DeviceMesh:
             )
 
         mesh = mesh.astype(np.int32)
-        return Tensor(mesh).int()
+        return _host_tensor_from_numpy(mesh)
 
     @staticmethod
     def _init_one_process_group(mesh_shape: tuple[int, ...], mesh_dim_names: tuple[str, ...],

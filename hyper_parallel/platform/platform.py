@@ -1453,6 +1453,17 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement tensor_to_numpy")
 
     @staticmethod
+    def from_numpy(np_array):
+        """Create a host-resident tensor from a NumPy array (inverse of tensor_to_numpy).
+
+        The result stays on the host regardless of the active device context, so it
+        remains asnumpy-able even when built under ``ms.DeviceCtx("meta")`` (e.g. while
+        ``fully_shard`` lazily constructs a default device mesh). Use it for rank/mesh
+        bookkeeping tensors, which are only ever read back via ``tensor_to_numpy``.
+        """
+        raise NotImplementedError("Platform subclasses must implement from_numpy")
+
+    @staticmethod
     def profiler_record(name):
         """Record a profiler event with the given name.
 
