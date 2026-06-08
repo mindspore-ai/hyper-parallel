@@ -18,6 +18,9 @@ from typing import Any, Optional
 from hyper_parallel.core.context_parallel.async_context_parallel import (
     _allgather_reconstruct,
     _launch_async_allgather_seq,
+    _make_async_cp_slot,
+    _slot_comm,
+    _wrap_async_cp_result,
 )
 from hyper_parallel.core.context_parallel.context_parallel import _ensure_1d, _localize_foreign_dtensor
 from hyper_parallel.core.context_parallel.dsa_context_parallel import (
@@ -66,6 +69,22 @@ class _AsyncSequenceReplicateSlot:
         value = _localize_foreign_dtensor(value, self.device_mesh, self.seq_dim)
         return value.to_local() if isinstance(value, DTensor) else value
 
+    def _make_slot(self, value: Any, local: Any, work, out_perm) -> dict:
+        """Create an async sequence-replicate slot with layout metadata."""
+        slot = _make_async_cp_slot(
+            work,
+            out_perm,
+            value,
+            self.device_mesh,
+            (Replicate(),),
+            self.seq_dim,
+        )
+        slot["local"] = local
+        return slot
+
+    def _wrap_gathered(self, gathered: Any, slot) -> Any:
+        return _wrap_async_cp_result(gathered, slot, self.device_mesh, (Replicate(),))
+
     def register_launch_hook(self, module: Optional[Module], slot_name: str) -> None:
         """Register a producer-side launch hook when a handoff module exists."""
         if module is None:
@@ -105,10 +124,10 @@ class _AsyncSequenceReplicateSlot:
         if not platform.is_tensor(local):
             return
         if self.world_size <= 1:
-            self._slots.setdefault(slot_name, []).append((local, None, None))
+            self._slots.setdefault(slot_name, []).append(self._make_slot(value, local, None, None))
             return
         work, out_perm = _launch_async_allgather_seq(local, self.group, self.world_size, self.seq_dim)
-        self._slots.setdefault(slot_name, []).append((local, work, out_perm))
+        self._slots.setdefault(slot_name, []).append(self._make_slot(value, local, work, out_perm))
 
     def wait(self, slot_name: str, value: Any) -> Any:
         """Wait on a pre-launched gather, or fall back to consumer-local launch."""
@@ -116,9 +135,14 @@ class _AsyncSequenceReplicateSlot:
             return value
         slot = self._slots.get(slot_name)
         if slot:
-            local, work, out_perm = slot.pop(0)
+            item = slot.pop(0)
+            if isinstance(item, dict):
+                local = item["local"]
+                work, out_perm = _slot_comm(item)
+            else:
+                local, work, out_perm = item
             if work is None:
-                return DTensor.from_local(local, self.device_mesh, (Replicate(),))
+                return self._wrap_gathered(local, item)
             gathered = platform.differentiable_async_allgather_wait(
                 local,
                 work,
@@ -128,7 +152,7 @@ class _AsyncSequenceReplicateSlot:
                 self.seq_dim,
                 self._bwd_slots.setdefault(slot_name, []),
             )
-            return DTensor.from_local(gathered, self.device_mesh, (Replicate(),))
+            return self._wrap_gathered(gathered, item)
         return _to_sequence_replicate(value, self.device_mesh, self.seq_dim)
 
 

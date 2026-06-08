@@ -156,6 +156,51 @@ def _to_cp_local(tensor: Tensor, submesh: DeviceMesh, seq_dim: int) -> Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
+def _cp_execution_layout_from_input(tensor: Tensor, cp_mesh: DeviceMesh, cp_placements, seq_dim: int) -> tuple:
+    """Return the DTensor layout to use after a raw async CP collective."""
+    cp_placements = tuple(cp_placements)
+    layout = _non_cp_dtensor_layout(tensor, cp_mesh, seq_dim)
+    if layout is None:
+        return cp_mesh, cp_placements
+    non_cp_mesh, non_cp_placements, composed_mesh = layout
+    return composed_mesh, _compose_cp_non_cp_placements(
+        composed_mesh,
+        cp_mesh,
+        cp_placements,
+        non_cp_mesh,
+        non_cp_placements,
+    )
+
+
+def _make_async_cp_slot(work, out_perm, tensor: Tensor, cp_mesh: DeviceMesh, cp_placements, seq_dim: int) -> dict:
+    """Store an async handle together with the layout needed after wait."""
+    return {
+        "work": work,
+        "out_perm": out_perm,
+        "layout": _cp_execution_layout_from_input(tensor, cp_mesh, cp_placements, seq_dim),
+    }
+
+
+def _slot_comm(slot):
+    """Return ``(work, out_perm)`` from a new metadata slot or a legacy tuple."""
+    if isinstance(slot, dict):
+        return slot["work"], slot["out_perm"]
+    return slot
+
+
+def _slot_layout(slot, fallback_mesh: DeviceMesh, fallback_placements) -> tuple:
+    """Return the post-collective layout recorded in *slot*."""
+    if isinstance(slot, dict) and "layout" in slot:
+        return slot["layout"]
+    return fallback_mesh, tuple(fallback_placements)
+
+
+def _wrap_async_cp_result(local: Tensor, slot, fallback_mesh: DeviceMesh, fallback_placements) -> "DTensor":
+    """Wrap a waited async result with the layout captured before communication."""
+    mesh, placements = _slot_layout(slot, fallback_mesh, fallback_placements)
+    return DTensor.from_local(local, mesh, placements)
+
+
 # ---------------------------------------------------------------------------
 # AsyncContextParallel
 # ---------------------------------------------------------------------------
@@ -310,6 +355,8 @@ class AsyncContextParallel(ContextParallel):
         if co == 1:
             ds_submesh = _ensure_1d(device_mesh)
             group = ds_submesh.get_group()
+            a2a_layout_mesh = ds_submesh
+            a2a_layout_placements = (Shard(self.head_dim),)
             pre_hook = partial(
                 self._attn_pre_hook_ulysses,
                 ds_submesh=ds_submesh,
@@ -325,6 +372,8 @@ class AsyncContextParallel(ContextParallel):
             assert dim_names is not None, "2-D mesh must have mesh_dim_names (guaranteed by _build_2d_mesh)"
             ds_submesh = hybrid_cp_mesh[dim_names[1]]
             group = ds_submesh.get_group()
+            a2a_layout_mesh = hybrid_cp_mesh
+            a2a_layout_placements = (Shard(self.seq_dim), Shard(self.head_dim))
             pre_hook = partial(
                 self._attn_pre_hook_hybrid,
                 ds_submesh=ds_submesh,
@@ -349,6 +398,8 @@ class AsyncContextParallel(ContextParallel):
             world_size=ds,
             fwd_slots=fwd_slots,
             bwd_slots=bwd_slots,
+            layout_mesh=a2a_layout_mesh,
+            layout_placements=a2a_layout_placements,
         )
         platform.register_forward_pre_hook(
             module,
@@ -362,12 +413,24 @@ class AsyncContextParallel(ContextParallel):
     # Shared: projection hooks registration
     # ------------------------------------------------------------------
 
-    def _register_proj_hooks(self, q_proj, k_proj, v_proj, submesh, group, world_size, fwd_slots, bwd_slots):
+    def _register_proj_hooks(
+        self,
+        q_proj,
+        k_proj,
+        v_proj,
+        submesh,
+        group,
+        world_size,
+        fwd_slots,
+        bwd_slots,
+        layout_mesh,
+        layout_placements,
+    ):
         """Register forward and backward hooks on all three projection modules."""
         for key, proj in [("q", q_proj), ("k", k_proj), ("v", v_proj)]:
             proj.register_forward_hook(
                 partial(self._proj_post_hook, key=key, submesh=submesh, group=group, world_size=world_size,
-                        fwd_slots=fwd_slots)
+                        fwd_slots=fwd_slots, layout_mesh=layout_mesh, layout_placements=layout_placements)
             )
             platform.register_full_backward_pre_hook(
                 proj,
@@ -375,12 +438,20 @@ class AsyncContextParallel(ContextParallel):
             )
 
     def _proj_post_hook(  # pylint: disable=unused-argument,too-many-arguments
-        self, module, inputs, output, key, submesh, group, world_size, fwd_slots
+        self, module, inputs, output, key, submesh, group, world_size, fwd_slots, layout_mesh, layout_placements
     ):
         """Launch async seq→head A2A after projection; return original output unchanged."""
         tensor = _to_cp_local(output, submesh, self.seq_dim)
-        fwd_slots[key] = _launch_async_a2a_seq_to_head(
+        work, out_perm = _launch_async_a2a_seq_to_head(
             tensor, group, world_size, self.head_dim
+        )
+        fwd_slots[key] = _make_async_cp_slot(
+            work,
+            out_perm,
+            output,
+            layout_mesh,
+            layout_placements,
+            self.seq_dim,
         )
         return output
 
@@ -401,8 +472,16 @@ class AsyncContextParallel(ContextParallel):
     ):
         """Launch async K/V AllGather after projection; return original output."""
         tensor = _to_cp_local(output, submesh, self.seq_dim)
-        fwd_slots[key] = _launch_async_allgather_seq(
+        work, out_perm = _launch_async_allgather_seq(
             tensor, group, world_size, self.seq_dim
+        )
+        fwd_slots[key] = _make_async_cp_slot(
+            work,
+            out_perm,
+            output,
+            submesh,
+            (Replicate(),),
+            self.seq_dim,
         )
         return output
 
@@ -434,13 +513,37 @@ class AsyncContextParallel(ContextParallel):
 
     def _wait_a2a(self, tensor, group, world_size, fwd_slots, key, bwd_slot):
         """Wait for pre-launched A2A; returns head-scattered tensor (differentiable)."""
-        work, out_perm = fwd_slots[key]
+        slot = fwd_slots[key]
+        work, out_perm = _slot_comm(slot)
         fwd_slots[key] = None
         return platform.differentiable_async_a2a_wait(
             tensor, work, out_perm, group, world_size,
             self.seq_dim, self.head_dim,  # concat_dim=seq_dim, split_dim=head_dim
             bwd_slot,
         )
+
+    def _wait_a2a_dtensor(
+        self,
+        tensor,
+        group,
+        world_size,
+        fwd_slots,
+        key,
+        bwd_slot,
+        fallback_mesh,
+        fallback_placements,
+    ):
+        """Wait for pre-launched A2A and wrap the result with captured CP+non-CP layout."""
+        slot = fwd_slots[key]
+        local = self._wait_a2a(
+            tensor,
+            group,
+            world_size,
+            fwd_slots,
+            key,
+            bwd_slot,
+        )
+        return _wrap_async_cp_result(local, slot, fallback_mesh, fallback_placements)
 
     def _wait_allgather(self, tensor, group, world_size, work, out_perm, bwd_slot=None):
         """Wait for pre-launched AllGather and return gathered tensor."""
@@ -469,8 +572,9 @@ class AsyncContextParallel(ContextParallel):
     ):
         """Apply transforms to Q/K/V and return modified ``(args, kwargs)``.
 
-        Each transform receives the local tensor (DTensor unwrapped if needed)
-        and returns the value to place back into the attention call.
+        Each transform receives ``(original, local)``.  The local tensor is the
+        raw communication buffer, while the original value carries any non-CP
+        DTensor layout that must be restored after the async wait.
         """
         new_args = list(args)
         new_kwargs = dict(kwargs)
@@ -484,7 +588,7 @@ class AsyncContextParallel(ContextParallel):
                 new_args,
                 new_kwargs,
                 pos,
-                transform(_to_cp_local(value, submesh, self.seq_dim)),
+                transform(value, _to_cp_local(value, submesh, self.seq_dim)),
             )
         return tuple(new_args), new_kwargs
 
@@ -499,19 +603,26 @@ class AsyncContextParallel(ContextParallel):
         self._record_q_output_tp_layout(module, args, kwargs, ds_submesh)
 
         def make_a2a(key):
-            def transform(value):
-                local = self._wait_a2a(
-                    value,
+            def transform(value, local_value):  # pylint: disable=unused-argument
+                if ds_submesh is None:
+                    return self._wait_a2a(
+                        local_value,
+                        group,
+                        world_size,
+                        fwd_slots,
+                        key,
+                        bwd_slots[key],
+                    )
+                return self._wait_a2a_dtensor(
+                    local_value,
                     group,
                     world_size,
                     fwd_slots,
                     key,
                     bwd_slots[key],
+                    ds_submesh,
+                    (Shard(self.head_dim),),
                 )
-                if ds_submesh is None:
-                    return local
-                out_mesh, out_placements = self._ulysses_cp_layout_from_input(value, ds_submesh)
-                return DTensor.from_local(local, out_mesh, out_placements)
             return transform
 
         return self._apply_qkv_transforms(
@@ -566,7 +677,8 @@ class AsyncContextParallel(ContextParallel):
             if value is None:
                 continue
             local = _to_cp_local(value, co_submesh, self.seq_dim)
-            work, out_perm = fwd_slots[key]
+            slot = fwd_slots[key]
+            work, out_perm = _slot_comm(slot)
             fwd_slots[key] = None
             gathered = self._wait_allgather(
                 local,
@@ -626,38 +738,33 @@ class AsyncContextParallel(ContextParallel):
 
         q_value = self._get_qkv_value(new_args, new_kwargs, 0)
         if q_value is not None:
-            q_mesh, q_placements = self._hybrid_cp_layout_from_input(
-                q_value,
-                hybrid_cp_mesh,
-                (Shard(self.seq_dim), Shard(self.head_dim)),
-            )
             self._set_qkv_value(
                 new_args,
                 new_kwargs,
                 0,
-                DTensor.from_local(
-                    self._wait_a2a(
-                        _to_cp_local(q_value, ds_submesh, self.seq_dim),
-                        group,
-                        world_size,
-                        fwd_slots,
-                        "q",
-                        bwd_slots["q"],
-                    ),
-                    q_mesh,
-                    q_placements,
+                self._wait_a2a_dtensor(
+                    _to_cp_local(q_value, ds_submesh, self.seq_dim),
+                    group,
+                    world_size,
+                    fwd_slots,
+                    "q",
+                    bwd_slots["q"],
+                    hybrid_cp_mesh,
+                    (Shard(self.seq_dim), Shard(self.head_dim)),
                 ),
             )
 
         k_value = self._get_qkv_value(new_args, new_kwargs, 1)
         if k_value is not None:
-            k_ul = self._wait_a2a(
+            k_ul = self._wait_a2a_dtensor(
                 _to_cp_local(k_value, ds_submesh, self.seq_dim),
                 group,
                 world_size,
                 fwd_slots,
                 "k",
                 bwd_slots["k"],
+                hybrid_cp_mesh,
+                (Shard(self.seq_dim), Shard(self.head_dim)),
             )
             k_full = _gather_seq(k_ul, co_submesh, self.seq_dim)
             k_mesh, k_placements = self._hybrid_kv_gather_placements(
@@ -677,13 +784,15 @@ class AsyncContextParallel(ContextParallel):
 
         v_value = self._get_qkv_value(new_args, new_kwargs, 2)
         if v_value is not None:
-            v_ul = self._wait_a2a(
+            v_ul = self._wait_a2a_dtensor(
                 _to_cp_local(v_value, ds_submesh, self.seq_dim),
                 group,
                 world_size,
                 fwd_slots,
                 "v",
                 bwd_slots["v"],
+                hybrid_cp_mesh,
+                (Shard(self.seq_dim), Shard(self.head_dim)),
             )
             v_full = _gather_seq(v_ul, co_submesh, self.seq_dim)
             v_mesh, v_placements = self._hybrid_kv_gather_placements(

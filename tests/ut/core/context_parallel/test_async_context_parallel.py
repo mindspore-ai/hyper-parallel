@@ -17,12 +17,16 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.core.context_parallel import async_context_parallel as async_cp_module  # noqa: E402
+from hyper_parallel.core.dtensor.device_mesh import _DEVICE_MESH_MAP, init_device_mesh  # noqa: E402
+from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard  # noqa: E402
+from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType  # noqa: E402
 
 
 class _FakeTwoDMesh:
@@ -38,6 +42,8 @@ class TestAsyncContextParallelKwargs(unittest.TestCase):
     """CPU-only tests for Q/K/V passed as keyword arguments."""
 
     def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
         self.style = async_cp_module.AsyncContextParallel(
             qkv_indices=(10, 11, 12),
             qkv_kwarg_names=("query", "key", "value"),
@@ -45,6 +51,10 @@ class TestAsyncContextParallelKwargs(unittest.TestCase):
         self.query = torch.tensor([1.0])
         self.key = torch.tensor([2.0])
         self.value = torch.tensor([3.0])
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
 
     @staticmethod
     def _kwargs(query, key, value):
@@ -103,12 +113,12 @@ class TestAsyncContextParallelKwargs(unittest.TestCase):
         offsets = {"q": 10.0, "k": 20.0, "v": 30.0}
         from_local = MagicMock(side_effect=lambda tensor, mesh, placements: (tensor, mesh, placements))
 
-        def fake_wait(tensor, group, world_size, fwd_slots, key, bwd_slot):
-            del group, world_size, fwd_slots, bwd_slot
+        def fake_wait(tensor, group, world_size, fwd_slots, key, bwd_slot, fallback_mesh, fallback_placements):
+            del group, world_size, fwd_slots, bwd_slot, fallback_mesh, fallback_placements
             return tensor + offsets[key]
 
         with patch.object(async_cp_module.DTensor, "from_local", side_effect=from_local), \
-                patch.object(self.style, "_wait_a2a", side_effect=fake_wait), \
+                patch.object(self.style, "_wait_a2a_dtensor", side_effect=fake_wait), \
                 patch.object(async_cp_module, "_gather_seq", side_effect=lambda tensor, *unused: tensor + 1.0):
             args, kwargs = self.style._attn_pre_hook_hybrid(  # pylint: disable=protected-access
                 None,
@@ -122,52 +132,180 @@ class TestAsyncContextParallelKwargs(unittest.TestCase):
             )
 
         self.assertEqual(args, ())
-        self.assertTrue(torch.equal(kwargs["query"][0], self.query + 10.0))
+        self.assertTrue(torch.equal(kwargs["query"], self.query + 10.0))
         self.assertTrue(torch.equal(kwargs["key"][0], self.key + 21.0))
         self.assertTrue(torch.equal(kwargs["value"][0], self.value + 31.0))
-        self.assertEqual(from_local.call_count, 3)
+        self.assertEqual(from_local.call_count, 2)
 
-    def test_hybrid_pre_hook_preserves_non_cp_placements(self):
-        """Hybrid async pre-hook should wrap outputs on composed CP+non-CP layouts."""
-        offsets = {"q": 10.0, "k": 20.0, "v": 30.0}
-        hybrid_mesh = _FakeTwoDMesh()
-        non_cp_mesh = "tp_mesh"
-        composed_mesh = "co_ds_tp_mesh"
-        non_cp_placements = (Shard(2),)
-        from_local = MagicMock(side_effect=lambda tensor, mesh, placements: (tensor, mesh, placements))
 
-        def fake_wait(tensor, group, world_size, fwd_slots, key, bwd_slot):
-            del group, world_size, fwd_slots, bwd_slot
-            return tensor + offsets[key]
+def _setup_mock_mesh_platform(mock_platform, world_size, rank=0):
+    """Configure a mocked device-mesh platform for CPU-only DTensor tests."""
+    mock_platform.platform_type = PlatformType.PYTORCH
+    mock_platform.get_rank.return_value = rank
+    mock_platform.get_world_size.return_value = world_size
+    mock_platform.tensor_to_numpy.side_effect = (
+        lambda tensor: tensor.detach().cpu().numpy() if hasattr(tensor, "detach") else np.array(tensor)
+    )
 
-        def fake_hybrid_layout(value, cp_mesh, cp_placements):
-            del value, cp_mesh
-            if cp_placements[0].is_replicate():
-                return composed_mesh, (Replicate(), StridedShard(2, 2), Shard(2))
-            return composed_mesh, (Shard(1), StridedShard(2, 2), Shard(2))
 
-        with patch.object(async_cp_module.DTensor, "from_local", side_effect=from_local), \
-                patch.object(self.style, "_wait_a2a", side_effect=fake_wait), \
-                patch.object(async_cp_module, "_gather_seq", side_effect=lambda tensor, *unused: tensor + 1.0), \
-                patch.object(self.style, "_hybrid_cp_layout_from_input", side_effect=fake_hybrid_layout):
-            args, kwargs = self.style._attn_pre_hook_hybrid(  # pylint: disable=protected-access
-                None,
-                (),
-                self._kwargs(self.query, self.key, self.value),
+class TestAsyncContextParallelLayoutSlots(unittest.TestCase):
+    """Regression tests for preserving non-CP DTensor layout in async CP slots."""
+
+    def setUp(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        self.style = async_cp_module.AsyncContextParallel(seq_dim=1, head_dim=2)
+
+    def tearDown(self):
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+
+    @staticmethod
+    def _tp_sharded_tensor(tp_mesh):
+        local = torch.randn(1, 4, 4, 2)
+        return DTensor.from_local(local, tp_mesh, (Shard(2),))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_ulysses_slot_restores_cp_tp_composed_head_layout(self, mock_mesh_platform):
+        """Async Ulysses wait should restore CP+TP layout instead of CP-only layout."""
+        _setup_mock_mesh_platform(mock_mesh_platform, world_size=4)
+        root = init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(2, 2),
+            mesh_dim_names=("cp", "tp"),
+            rank_list=(0, 1, 2, 3),
+            init_backend=False,
+        )
+        cp_mesh = root["cp"]
+        tp_dtensor = self._tp_sharded_tensor(root["tp"])
+        slot = async_cp_module._make_async_cp_slot(  # pylint: disable=protected-access
+            work="work",
+            out_perm="out_perm",
+            tensor=tp_dtensor,
+            cp_mesh=cp_mesh,
+            cp_placements=(Shard(2),),
+            seq_dim=1,
+        )
+        local_after_a2a = torch.randn(1, 8, 2, 2)
+        result = async_cp_module._wrap_async_cp_result(  # pylint: disable=protected-access
+            local_after_a2a,
+            slot,
+            cp_mesh,
+            (Shard(2),),
+        )
+
+        self.assertIsInstance(result, DTensor)
+        self.assertEqual(result.device_mesh.mesh_dim_names, ("cp", "tp"))
+        self.assertEqual(result.placements, (StridedShard(2, 2), Shard(2)))
+        self.assertTrue(torch.equal(result.to_local(), local_after_a2a))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_colossal_slot_restores_tp_layout_after_async_allgather(self, mock_mesh_platform):
+        """Async Colossal K/V all-gather should keep TP layout metadata."""
+        _setup_mock_mesh_platform(mock_mesh_platform, world_size=4)
+        root = init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(2, 2),
+            mesh_dim_names=("cp", "tp"),
+            rank_list=(0, 1, 2, 3),
+            init_backend=False,
+        )
+        cp_mesh = root["cp"]
+        tp_dtensor = self._tp_sharded_tensor(root["tp"])
+        slot = async_cp_module._make_async_cp_slot(  # pylint: disable=protected-access
+            work="work",
+            out_perm="out_perm",
+            tensor=tp_dtensor,
+            cp_mesh=cp_mesh,
+            cp_placements=(Replicate(),),
+            seq_dim=1,
+        )
+        gathered = torch.randn(1, 8, 4, 2)
+        result = async_cp_module._wrap_async_cp_result(  # pylint: disable=protected-access
+            gathered,
+            slot,
+            cp_mesh,
+            (Replicate(),),
+        )
+
+        self.assertIsInstance(result, DTensor)
+        self.assertEqual(result.device_mesh.mesh_dim_names, ("cp", "tp"))
+        self.assertEqual(result.placements, (Replicate(), Shard(2)))
+        self.assertTrue(torch.equal(result.to_local(), gathered))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_hybrid_slot_restores_co_ds_tp_composed_layout(self, mock_mesh_platform):
+        """Async Hybrid A2A should restore the full CO+DS+TP execution layout."""
+        _setup_mock_mesh_platform(mock_mesh_platform, world_size=8)
+        root = init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(2, 2, 2),
+            mesh_dim_names=("co", "ds", "tp"),
+            rank_list=tuple(range(8)),
+            init_backend=False,
+        )
+        hybrid_cp_mesh = root[("co", "ds")]
+        tp_dtensor = self._tp_sharded_tensor(root["tp"])
+        slot = async_cp_module._make_async_cp_slot(  # pylint: disable=protected-access
+            work="work",
+            out_perm="out_perm",
+            tensor=tp_dtensor,
+            cp_mesh=hybrid_cp_mesh,
+            cp_placements=(Shard(1), Shard(2)),
+            seq_dim=1,
+        )
+        local_after_a2a = torch.randn(1, 8, 2, 2)
+        result = async_cp_module._wrap_async_cp_result(  # pylint: disable=protected-access
+            local_after_a2a,
+            slot,
+            hybrid_cp_mesh,
+            (Shard(1), Shard(2)),
+        )
+
+        self.assertIsInstance(result, DTensor)
+        self.assertEqual(result.device_mesh.mesh_dim_names, ("co", "ds", "tp"))
+        self.assertEqual(result.placements, (Shard(1), StridedShard(2, 2), Shard(2)))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_wait_a2a_dtensor_wraps_wait_result_with_recorded_layout(self, mock_mesh_platform):
+        """_wait_a2a_dtensor should use the slot layout captured before communication."""
+        _setup_mock_mesh_platform(mock_mesh_platform, world_size=4)
+        root = init_device_mesh(
+            device_type="cpu",
+            mesh_shape=(2, 2),
+            mesh_dim_names=("cp", "tp"),
+            rank_list=(0, 1, 2, 3),
+            init_backend=False,
+        )
+        cp_mesh = root["cp"]
+        tp_dtensor = self._tp_sharded_tensor(root["tp"])
+        slot = async_cp_module._make_async_cp_slot(  # pylint: disable=protected-access
+            work="work",
+            out_perm="out_perm",
+            tensor=tp_dtensor,
+            cp_mesh=cp_mesh,
+            cp_placements=(Shard(2),),
+            seq_dim=1,
+        )
+        waited_local = torch.randn(1, 8, 2, 2)
+
+        with patch.object(self.style, "_wait_a2a", return_value=waited_local) as wait_a2a:
+            result = self.style._wait_a2a_dtensor(  # pylint: disable=protected-access
+                tp_dtensor.to_local(),
                 group="ds_group",
                 world_size=2,
-                hybrid_cp_mesh=hybrid_mesh,
-                fwd_slots={"q": "q_slot", "k": "k_slot", "v": "v_slot"},
-                bwd_slots={"q": [], "k": [], "v": []},
+                fwd_slots={"q": slot},
+                key="q",
+                bwd_slot=[],
+                fallback_mesh=cp_mesh,
+                fallback_placements=(Shard(2),),
             )
 
-        self.assertEqual(args, ())
-        self.assertEqual(kwargs["query"][1], composed_mesh)
-        self.assertEqual(kwargs["query"][2], (Shard(1), StridedShard(2, 2), Shard(2)))
-        self.assertEqual(kwargs["key"][1], composed_mesh)
-        self.assertEqual(kwargs["key"][2], (Replicate(), StridedShard(2, 2), Shard(2)))
-        self.assertEqual(kwargs["value"][1], composed_mesh)
-        self.assertEqual(kwargs["value"][2], (Replicate(), StridedShard(2, 2), Shard(2)))
+        wait_a2a.assert_called_once()
+        self.assertIsInstance(result, DTensor)
+        self.assertEqual(result.device_mesh.mesh_dim_names, ("cp", "tp"))
+        self.assertEqual(result.placements, (StridedShard(2, 2), Shard(2)))
+        self.assertTrue(torch.equal(result.to_local(), waited_local))
 
 
 if __name__ == "__main__":
