@@ -244,6 +244,16 @@ class OpDispatcher:
     _INPLACE_BYPASS_OPS = frozenset(
         {"InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv"})
 
+    # MindSpore random kernels that always mutate an existing tensor in place.
+    # Out-of-place random kernels belong in _random_ms_ops only, not here.
+    _RANDOM_INPLACE_MS_OPS = frozenset({
+        "InplaceBernoulliScalar",
+        "InplaceBernoulliTensor",
+        "InplaceNormal",
+        "InplaceRandom",
+        "InplaceUniform",
+    })
+
     def __init__(self):
         self._env_yaml_dir: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_YAML_DIR")
         self._env_python_path: Optional[str] = os.environ.get("HYPER_PARALLEL_OPS_PYTHON_PATH")
@@ -271,9 +281,12 @@ class OpDispatcher:
         # Only mint random op support
         # MindSpore use the actual kernel name.
         self._random_ms_ops = {
-            "BernoulliExt", "MultinomialExt", "InplaceNormal", "InplaceUniform",
+            "BernoulliExt", "MultinomialExt",
+            "InplaceBernoulliScalar", "InplaceBernoulliTensor",
+            "InplaceNormal", "InplaceRandom", "InplaceUniform",
+            "NormalFloatFloat", "NormalFloatTensor", "NormalTensorFloat", "NormalTensorTensor",
             "RandpermExt", "Randn", "RandLikeExt", "RandnLike", "RandInt", "RandIntLike", "RandExt",
-            "FuncDropoutExt"
+            "FuncDropoutExt", "UniformExt",
         }
         self._rng_tracker: Optional[OffsetBasedRNGTracker] = None
 
@@ -885,19 +898,36 @@ class OpDispatcher:
         else:
             local_results = op_call(*local_args, **local_kwargs)
 
-        return self._wrap_random_result(op_name, local_results, first_arg)
+        return self._wrap_random_result(op_name, local_results, first_arg, args, kwargs)
 
     @staticmethod
-    def _wrap_random_result(op_name, local_results, first_arg):
+    def _func_dropout_ext_inplace(args, kwargs) -> bool:
+        """Return True when FuncDropoutExt is invoked with inplace=True."""
+        # Kernel signature: (input, p, training, inplace, seed, offset).
+        if len(args) >= 4:
+            return bool(args[3])
+        return bool(kwargs.get("inplace", False))
+
+    @staticmethod
+    def _random_op_returns_self(op_name: str, args, kwargs) -> bool:
+        """Return True when a random op mutates an existing DTensor in place."""
+        if op_name in OpDispatcher._RANDOM_INPLACE_MS_OPS:
+            return True
+        if op_name == "FuncDropoutExt":
+            return OpDispatcher._func_dropout_ext_inplace(args, kwargs)
+        # Torch random inplace ops follow the ATen '_' suffix convention.
+        return op_name.endswith('_')
+
+    @staticmethod
+    def _wrap_random_result(op_name, local_results, first_arg, args, kwargs):
         """Wrap a random op's local result(s) back into DTensor(s).
 
-        In-place ops return the input DTensor itself. PyTorch in-place names end
-        with '_' (normal_); every MindSpore in-place kernel is named 'Inplace*'
-        (InplaceNormal/InplaceUniform/InplaceRandom/InplaceBernoulli*), so the
-        prefix covers all current and future in-place random kernels. Only random
-        ops reach this branch, so there are no non-in-place 'Inplace*' false hits.
+        In-place ops return the input DTensor itself. Torch random inplace ops use
+        the ATen '_' suffix; MindSpore inplace random kernels are listed in
+        ``_RANDOM_INPLACE_MS_OPS``. ``FuncDropoutExt`` is handled separately
+        because the same kernel serves both modes via its ``inplace`` argument.
         """
-        if op_name.endswith('_') or op_name.startswith('Inplace'):
+        if OpDispatcher._random_op_returns_self(op_name, args, kwargs):
             return first_arg
         mesh = first_arg.device_mesh
         placements = first_arg.layout.alias_placements
