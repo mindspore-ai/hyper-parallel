@@ -58,6 +58,14 @@ from mindspore import Tensor, mint, nn, ops
 from mindspore.common import dtype as mstype
 from mindspore.communication import init as comm_init
 from mindspore.communication import get_rank, get_group_size
+from mindspore.profiler import (
+    ProfilerActivity,
+    ProfilerLevel,
+    _ExperimentalConfig,
+    profile,
+    tensorboard_trace_handler,
+)
+from mindspore.profiler import schedule as profiler_schedule
 
 from hyper_parallel import PipelineStage, init_device_mesh
 from hyper_parallel.core.pipeline_parallel import (
@@ -81,9 +89,9 @@ platform = get_platform()
 # Hyperparams
 # =========================================================================
 
-PP_SIZE = 4
-EP_SIZE = 2
-WORLD_SIZE = PP_SIZE * EP_SIZE  # 4
+PP_SIZE = int(os.environ.get("PP_OVERLAP_PP_SIZE", "4"))
+EP_SIZE = int(os.environ.get("PP_OVERLAP_EP_SIZE", "2"))
+WORLD_SIZE = PP_SIZE * EP_SIZE  # default 8 (PP4xEP2); env-overridable for 4-card runs
 
 HIDDEN_SIZE = 2048
 MOE_FFN_HIDDEN_SIZE = 2048
@@ -97,6 +105,11 @@ VIRTUAL_STAGES = PP_SIZE * CHUNKS_PER_RANK  # 4
 MICRO_BATCH_NUM = 8
 BS = 8         # must be divisible by MICRO_BATCH_NUM
 SEQ_LEN = 4096
+
+# dx/dw accuracy + profiling loop (env-overridable so hardware runs can tune
+# the wall-clock / timeout trade-off without editing the file).
+NUM_STEPS = int(os.environ.get("PP_OVERLAP_NUM_STEPS", "100"))
+PROFILE_STEP = int(os.environ.get("PP_OVERLAP_PROFILE_STEP", "5"))
 
 
 # =========================================================================
@@ -430,6 +443,16 @@ def _make_overlap_b_f_callback(overlap: CommComputeOverlap):
     BWD on forward's saved stream regardless, and MS's current device
     is process-wide (not thread-local like Torch), so the daemon BWD
     thread inherits the right device from the main thread automatically.
+
+    Honors ``ctx.schedule.enable_dxdw_split``:
+
+    * ``False`` — ``bwd_fn`` runs the unified ``backward_one_chunk`` and
+      the scheduler's ``BWD_SEND`` step issues the gradient send.
+    * ``True``  — ``bwd_fn`` runs ``backward_input_one_chunk`` →
+      ``backward_weight_one_chunk``.  The execution order is unchanged: the
+      scheduler's ``BWD_SEND`` step still issues the gradient send in its
+      original position, picking up the ``dx`` that ``backward_input_one_chunk``
+      wrote to ``bwd_cache``.
     """
 
     def _callback(step, ctx):
@@ -439,16 +462,8 @@ def _make_overlap_b_f_callback(overlap: CommComputeOverlap):
         bwd_stage = schedule._stage_dict[bwd_step.stage_index]
         fwd_mi, bwd_mi = fwd_step.micro_index, bwd_step.micro_index
 
-        fwd_recv_handles = ctx.fwd_recv_ops.pop(
-            (fwd_stage.stage_index, fwd_mi), None,
-        )
-        bwd_recv_handles = ctx.bwd_recv_ops.pop(
-            (bwd_stage.stage_index, bwd_mi), None,
-        )
-
         def fwd_fn():
-            if fwd_recv_handles:
-                schedule._wait_p2p(fwd_recv_handles)
+            schedule.wait_fwd_recv(fwd_stage.stage_index, fwd_mi)
             out = fwd_stage.forward_one_chunk(
                 fwd_mi, ctx.arg_mbs[fwd_mi], ctx.kwarg_mbs[fwd_mi],
             )
@@ -466,20 +481,37 @@ def _make_overlap_b_f_callback(overlap: CommComputeOverlap):
             # kernel ran.  MindSpore's current-device is process-wide
             # (not thread-local like Torch), so the daemon BWD thread
             # already inherits the right device from the main thread.
-            if bwd_recv_handles:
-                schedule._wait_p2p(bwd_recv_handles)
-            bwd_stage.backward_one_chunk(bwd_mi)
-            # Pair-8 BWD partner is taken out of band: MS autograd may
-            # skip ``CHUNK_START.bwd`` when the chunk input has no
-            # ``requires_grad`` (its ``x.grad`` is unused), and we
-            # cannot rely on the autograd node firing.  Do one
-            # explicit ``rendezvous(COMPUTE)`` here so FWD's
-            # ``CHUNK_END.fwd`` barrier always has a partner.
-            from hyper_parallel.core.pipeline_parallel.hook_coordinator import (  # pylint: disable=C0415
-                HookRole,
-            )
-            if overlap.coordinator.is_enabled():
-                overlap.coordinator.rendezvous(HookRole.COMPUTE)
+            # Top-level span over the whole bwd_fn body so the trace shows the
+            # daemon BWD thread actually executing (it brackets wait_bwd_recv,
+            # dx/send/dw, and the rendezvous).  If this span is absent from a
+            # rank's trace, bwd_fn did not run for that (stage, micro).
+            with platform.profiler_record(
+                    f"dxdw/bwd_fn/stage_{bwd_stage.stage_index}/mi_{bwd_mi}"):
+                schedule.wait_bwd_recv(bwd_stage.stage_index, bwd_mi)
+                # First-stage degeneration (no input grad -> dx no-op, dw does
+                # the full backward) is handled inside the stage methods, so the
+                # same dx -> dw sequence applies to every stage.  The execution
+                # order is NOT modified: the scheduler keeps its own ``BWD_SEND``
+                # step in its original position, so dx only needs to write
+                # ``bwd_cache`` (it does) for that send to pick up the input grad
+                # after the callback returns.
+                if schedule.enable_dxdw_split:
+                    # dx / dw are profiler-tagged inside the stage methods.
+                    bwd_stage.backward_input_one_chunk(bwd_mi)
+                    bwd_stage.backward_weight_one_chunk(bwd_mi)
+                else:
+                    bwd_stage.backward_one_chunk(bwd_mi)
+                # Pair-8 BWD partner is taken out of band: MS autograd may
+                # skip ``CHUNK_START.bwd`` when the chunk input has no
+                # ``requires_grad`` (its ``x.grad`` is unused), and we
+                # cannot rely on the autograd node firing.  Do one
+                # explicit ``rendezvous(COMPUTE)`` here so FWD's
+                # ``CHUNK_END.fwd`` barrier always has a partner.
+                from hyper_parallel.core.pipeline_parallel.hook_coordinator import (  # pylint: disable=C0415
+                    HookRole,
+                )
+                if overlap.coordinator.is_enabled():
+                    overlap.coordinator.rendezvous(HookRole.COMPUTE)
 
         # Fire the BWD chunk's recompute serially on the main thread BEFORE
         # spawning the backward thread, so the forward re-run never races
@@ -838,13 +870,18 @@ def _fingerprint_params(chunks):
 
 
 def _run_one_iteration(chunks, stage_indices, pp_rank, device, pp_mesh,
-                       overlap_p2p, overlap_b_f, callback=None):
+                       overlap_p2p, overlap_b_f, callback=None,
+                       enable_dxdw_split=False, x_input=None):
     """Run one schedule iteration; return ``(losses_np, grads_named, init_fp)``.
 
     ``losses_np`` is a list of ``np.ndarray`` (only non-empty on the last
     PP rank); ``grads_named`` is a list of ``(param_name, np_grad_or_None)``
     in trainable-param iteration order; ``init_fp`` is the pre-run weight
     fingerprint used to detect RNG drift between the two builds.
+
+    ``x_input`` overrides the stage-0 input tensor; pass the *same* tensor to
+    the baseline and split runs of a step so their numerics are comparable.
+    When ``None`` a fixed per-rank seed is used (single-iteration callers).
     """
     init_fp = _fingerprint_params(chunks)
     stages = [
@@ -855,15 +892,19 @@ def _run_one_iteration(chunks, stage_indices, pp_rank, device, pp_mesh,
     schedule = ScheduleInterleaved1F1B(
         stages, MICRO_BATCH_NUM,
         overlap_p2p=overlap_p2p, overlap_b_f=overlap_b_f,
+        enable_dxdw_split=enable_dxdw_split,
     )
     if callback is not None:
         schedule.register_custom_function(MetaStepType.OVERLAP_B_F, callback)
 
     # Numpy RNG with explicit seed so x is identical across the two runs
     # regardless of MS global RNG state drift between iterations.
-    x = Tensor(
-        np.random.RandomState(100 + pp_rank).randn(BS, SEQ_LEN, HIDDEN_SIZE).astype(np.float32),
-    )
+    if x_input is None:
+        x = Tensor(
+            np.random.RandomState(100 + pp_rank).randn(BS, SEQ_LEN, HIDDEN_SIZE).astype(np.float32),
+        )
+    else:
+        x = x_input
     if pp_rank == 0:
         losses = schedule.run(x)
     else:
@@ -1434,6 +1475,162 @@ def test_pp_overlap_moe_recompute_combined():
           f"(layers_per_chunk={COMBINED_LAYERS_PER_CHUNK}, "
           f"recompute_layers={[sorted(s) for s in COMBINED_RECOMPUTE_LAYERS]}, "
           f"params={len(baseline_grads)})", flush=True)
+
+
+# =========================================================================
+# dx/dw split accuracy + profiling test (OVERLAP_B_F backward split)
+# =========================================================================
+
+def _zero_grads(chunks):
+    """Reset accumulated grads on every trainable param (per-step zero_grad).
+
+    The pipeline backward accumulates into ``param.grad`` (``+=``); zeroing
+    between steps keeps each step's grads independent so the split-vs-baseline
+    comparison is per-step rather than over a growing sum.
+    """
+    for chunk in chunks:
+        for p in chunk.trainable_params():
+            p.grad = None
+
+
+def _compare_step(rank, pp_rank, step, base, split, rtol, atol):
+    """Assert one step's split-vs-baseline equivalence; return (loss, grad) max diff."""
+    base_losses, base_grads = base
+    split_losses, split_grads = split
+    loss_diff = 0.0
+    grad_diff = 0.0
+    if pp_rank == PP_SIZE - 1:
+        assert len(base_losses) == len(split_losses), \
+            (f"[rank{rank}] step{step} loss count mismatch: "
+             f"base={len(base_losses)}, split={len(split_losses)}")
+        for i, (bl, sl) in enumerate(zip(base_losses, split_losses)):
+            loss_diff = max(loss_diff, float(np.abs(bl - sl)))
+            assert np.allclose(bl, sl, rtol=rtol, atol=atol), \
+                (f"[rank{rank}] step{step} loss[{i}] mismatch: "
+                 f"base={float(bl):.6f}, split={float(sl):.6f}, "
+                 f"abs_diff={float(np.abs(bl - sl)):.6e}")
+    assert len(base_grads) == len(split_grads), \
+        (f"[rank{rank}] step{step} grad count mismatch: "
+         f"base={len(base_grads)}, split={len(split_grads)}")
+    for i, ((bn, bg), (sn, sg)) in enumerate(zip(base_grads, split_grads)):
+        assert bn == sn, \
+            (f"[rank{rank}] step{step} grad[{i}] param name mismatch: "
+             f"base={bn}, split={sn}")
+        assert (bg is None) == (sg is None), \
+            (f"[rank{rank}] step{step} grad[{i}] ({bn}) None-state mismatch: "
+             f"base_none={bg is None}, split_none={sg is None}")
+        if bg is None:
+            continue
+        grad_diff = max(grad_diff, float(np.abs(bg - sg).max()))
+        assert np.allclose(bg, sg, rtol=rtol, atol=atol), \
+            (f"[rank{rank}] step{step} grad[{i}] ({bn}) mismatch: "
+             f"max_abs_diff={float(np.abs(bg - sg).max()):.6e}, "
+             f"base_norm={float(np.linalg.norm(bg)):.6e}, "
+             f"split_norm={float(np.linalg.norm(sg)):.6e}")
+    return loss_diff, grad_diff
+
+
+def test_pp_overlap_moe_dxdw_accuracy():
+    """Numerical equivalence over ``NUM_STEPS`` steps, profiling step ``PROFILE_STEP``.
+
+    Feature: Accuracy check + profiling for the ``OVERLAP_B_F`` dx/dw split
+        on MindSpore PyNative.
+    Description:
+        Builds two models from identical seeds: a **sync baseline** with the
+        overlap stack OFF (``use_overlap=False``, ``overlap_p2p=False``,
+        ``overlap_b_f=False``, no callback) — the same ground truth as
+        :func:`test_pp_overlap_moe_accuracy` — and the dx/dw split path
+        (``enable_dxdw_split=True``: callback runs ``backward_input_one_chunk``
+        → ``backward_weight_one_chunk`` while the scheduler issues ``BWD_SEND``
+        in its original position).  Runs ``NUM_STEPS`` steps; each step feeds
+        the *same* fresh input to both paths, zeroes grads, runs both, and
+        asserts equivalence — the baseline comparison is mandatory, there is no
+        skip path.  A ``mindspore.profiler.profile`` with
+        ``schedule(wait=PROFILE_STEP-1, active=1)`` captures only the
+        ``PROFILE_STEP``-th step; dx / dw carry ``profiler_record`` tags so the
+        split shows up as distinct spans.  Both ``NUM_STEPS`` and
+        ``PROFILE_STEP`` are env-overridable.
+    Expectation:
+        Per step, losses match within ``rtol=1e-3, atol=1e-3`` on rank
+        ``PP_SIZE-1`` and grads match within the same tolerance on every rank.
+        A mismatch typically means: dx forgot to write ``bwd_cache`` (so the
+        scheduler's ``BWD_SEND`` sends a stale grad), dw's grad_fn lost
+        intermediates after dx, or the overlap path itself diverged from the
+        sync baseline (same failure modes as ``test_pp_overlap_moe_accuracy``).
+    """
+    rank, device, pp_mesh, ep_mesh = _init_pp_ep_mesh()
+    pp_rank = pp_mesh.get_local_rank()
+    cfg = _TinyConfig()
+
+    rtol, atol = 1e-3, 1e-3
+
+    # dx/dw split pipeline (always built — this is the path under profile).
+    split_overlap = CommComputeOverlap()
+    split_chunks, split_si = _build_pipeline(
+        pp_rank, ep_mesh, cfg, use_overlap=True, overlap=split_overlap,
+    )
+    split_cb = _make_overlap_b_f_callback(split_overlap)
+
+    # Sync baseline (overlap off) — same ground truth as
+    # ``test_pp_overlap_moe_accuracy``: ``use_overlap=False`` with both overlap
+    # flags off and no OVERLAP_B_F callback.  Built from the same seeded init in
+    # ``_build_pipeline`` so its weights are bit-identical to the split build,
+    # and kept alive across the loop to avoid re-seeding drift.
+    base_chunks, base_si = _build_pipeline(
+        pp_rank, ep_mesh, cfg, use_overlap=False,
+    )
+
+    # on_trace_ready=None -> profiler writes to its default output_path "./data"
+    # (each rank under its own ascend_ms subdir).
+    prof_dir = "./data"
+    prof_sched = profiler_schedule(
+        wait=1, warmup=2, active=1, repeat=1, skip_first=0,
+    )
+    exp_cfg = _ExperimentalConfig(profiler_level=ProfilerLevel.Level1)
+    max_loss_diff = 0.0
+    max_grad_diff = 0.0
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
+        schedule=prof_sched,
+        on_trace_ready=None,
+        experimental_config=exp_cfg,
+        with_stack=True,
+    ) as prof:
+        for step in range(1, NUM_STEPS + 1):
+            # Vary input per step so the loop exercises distinct activations;
+            # when comparing, the same tensor feeds both paths.
+            x = Tensor(
+                np.random.RandomState(100 + pp_rank + step * 1000)
+                .randn(BS, SEQ_LEN, HIDDEN_SIZE).astype(np.float32),
+            )
+            # Sync baseline (overlap off) is the ground truth; the dx/dw split
+            # must match it every step — there is no skip path.
+            _zero_grads(base_chunks)
+            base_losses, base_grads, _ = _run_one_iteration(
+                base_chunks, base_si, pp_rank, device, pp_mesh,
+                overlap_p2p=False, overlap_b_f=False, x_input=x,
+            )
+            _zero_grads(split_chunks)
+            split_losses, split_grads, _ = _run_one_iteration(
+                split_chunks, split_si, pp_rank, device, pp_mesh,
+                overlap_p2p=True, overlap_b_f=True, enable_dxdw_split=True,
+                callback=split_cb, x_input=x,
+            )
+            loss_diff, grad_diff = _compare_step(
+                rank, pp_rank, step,
+                (base_losses, base_grads), (split_losses, split_grads),
+                rtol, atol,
+            )
+            max_loss_diff = max(max_loss_diff, loss_diff)
+            max_grad_diff = max(max_grad_diff, grad_diff)
+            prof.step()
+
+    print(f"[rank{rank}] pp_overlap_moe_dxdw_accuracy: PASS "
+          f"(steps={NUM_STEPS}, rtol={rtol}, atol={atol}, "
+          f"max_loss_diff={max_loss_diff:.3e}, max_grad_diff={max_grad_diff:.3e}, "
+          f"profile_dir={prof_dir})",
+          flush=True)
 
 
 if __name__ == "__main__":

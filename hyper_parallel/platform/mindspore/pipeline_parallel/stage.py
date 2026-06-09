@@ -222,6 +222,73 @@ class PipelineStageBase:
         self._clear_recv_buffer(self.grad_recv_info, micro_index)
         self._clear_recv_buffer(self.args_recv_info, micro_index)
 
+    def backward_input_one_chunk(self, micro_index):
+        """dx-only backward; keeps grad_fn alive in cache for the paired dw call.
+
+        Writes ``bwd_cache[micro_index]`` so ``exec_bwd_send_ops`` can pop and
+        send the input grads while dw runs locally.  Does NOT clear recv
+        buffers — dw still needs ``grad_fn._saved_intermediates`` which may
+        reference activations stored in ``args_recv_info``.
+
+        The first stage is a no-op: its input does not require grad, so there
+        is no dx to compute and no gradient to send upstream.  The paired
+        :meth:`backward_weight_one_chunk` runs the full backward instead, so
+        ``grad_fn`` is left untouched in the cache for it to pop.
+        """
+        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
+        if not self._has_backward:
+            return
+        with get_platform().profiler_record(f"backward_input_one_chunk: stage_{self.stage_index}/mi_{micro_index}"):
+            for _, mod in self.submodule.cells_and_names():
+                if not isinstance(mod, HSDPModule):
+                    continue
+                mod.set_reshard_after_backward(False)
+                mod.set_requires_gradient_sync(False)
+            if self.is_first_stage:
+                return
+            # Index, NOT pop: backward_weight_one_chunk performs the terminal pop.
+            grad_fn = self.fwd_grad_fn_cache[micro_index]
+            if self.is_last_stage:
+                sens = self.get_last_stage_sens(self.last_stage_outputs)
+            else:
+                sens = self._build_padded_sens(micro_index)
+            _ = grad_fn.compute_input_grad(sens=sens)
+            input_grads = [recv_info.buffer.grad for recv_info in self.args_recv_info[micro_index]
+                           if recv_info.requires_grad]
+            self.bwd_cache[micro_index] = input_grads
+
+    def backward_weight_one_chunk(self, micro_index):
+        """dw-only backward; pops grad_fn (terminal) and clears recv buffers.
+
+        For the first stage there is no captured dx state — its input does not
+        require grad, so :meth:`backward_input_one_chunk` was a no-op and no
+        intermediate gradients were saved.  The full backward ``grad_fn(sens)``
+        runs here instead, which yields only weight gradients (the stage has no
+        input grad to compute).
+        """
+        from hyper_parallel.core.fully_shard.api import HSDPModule  # pylint: disable=C0415
+        if not self._has_backward:
+            return
+        with get_platform().profiler_record(f"backward_weight_one_chunk: stage_{self.stage_index}/mi_{micro_index}"):
+            for _, mod in self.submodule.cells_and_names():
+                if not isinstance(mod, HSDPModule):
+                    continue
+                mod.set_reshard_after_backward(False)
+                mod.set_requires_gradient_sync(False)
+
+            grad_fn = self.fwd_grad_fn_cache.pop(micro_index)
+            if self.is_first_stage:
+                sens = self._build_padded_sens(micro_index)
+                _ = grad_fn(sens=sens)
+            else:
+                if not grad_fn._saved_intermediates:  # pylint: disable=protected-access
+                    raise RuntimeError(
+                        f"stage: {self.stage_index} micro_{micro_index} dw called before dx."
+                    )
+                grad_fn.compute_weight_grad()
+            self._clear_recv_buffer(self.grad_recv_info, micro_index)
+            self._clear_recv_buffer(self.args_recv_info, micro_index)
+
     def _construct_backward_func(self):
         """construct backward func."""
         enable_mindspore_backward_compat()
