@@ -633,26 +633,6 @@ class TestMoE(unittest.TestCase):
             "Outputs with and without shared_expert are identical"
         )
 
-    def test_dtensor_input_calls_to_local(self):
-        """MoE.forward calls to_local() when input is a DTensor."""
-        from hyper_parallel.core.dtensor.dtensor import DTensor
-        moe = self._make_moe()
-        x_local = torch.randn(2, 4, 16)
-
-        mock_dt = MagicMock(spec=DTensor)
-        mock_dt.to_local.return_value = x_local
-
-        with patch(
-            "hyper_parallel.platform.torch.common.moe.DTensor", DTensor
-        ):
-            # Make isinstance(mock_dt, DTensor) return True
-            with patch(
-                "hyper_parallel.platform.torch.common.moe.isinstance",
-                side_effect=lambda obj, cls: True if obj is mock_dt else isinstance(obj, cls),
-            ):
-                moe(mock_dt)
-        mock_dt.to_local.assert_called_once()
-
     def test_backward_gradients_flow(self):
         """loss.backward() propagates gradients to router gate weights."""
         moe = self._make_moe()

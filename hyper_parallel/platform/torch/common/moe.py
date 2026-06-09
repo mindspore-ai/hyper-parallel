@@ -805,10 +805,6 @@ class MoE(nn.Module):
             gradient injection is handled automatically by
             :class:`MoEAuxLossAutoScaler`).
         """
-        # Extract local tensor if input arrives as DTensor (TP path).
-        if isinstance(x, DTensor):
-            x = x.to_local()
-
         bs, seq_len, dim = x.shape
         num_tokens = bs * seq_len
         x_flat = x.view(num_tokens, dim)  # [num_tokens, dim]
