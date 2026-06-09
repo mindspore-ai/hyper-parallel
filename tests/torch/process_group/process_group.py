@@ -70,5 +70,6 @@ def test_process_group():
 
         destroy_process_group(split_group_from_group)
 
-    destroy_process_group(group)
+    # create_group(full-world) returns the world group alias; destroying it explicitly and then the
+    # world group would tear the same communicator down twice. Let the final world teardown release it.
     destroy_process_group()

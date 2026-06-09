@@ -13,10 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """test process group"""
+import os
+
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-PROCESS_GROUP = "process_group.py"
+# resolve worker path from this file's dir so torchrun finds it regardless of pytest CWD
+PROCESS_GROUP = os.path.join(os.path.dirname(__file__), "process_group.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
