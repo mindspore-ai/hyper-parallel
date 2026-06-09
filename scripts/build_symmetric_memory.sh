@@ -24,9 +24,13 @@ BUILD_DIR=$PROJECT_ROOT/build
 export HP_THIRD_PARTY_DIR="${PROJECT_ROOT}/3rdparty"
 mkdir -p $HP_THIRD_PARTY_DIR
 
-BUILD_TYPE=RELEASE
+# Host GCC must be in [7.3.0, 11.3.0] (mindspore-aligned). Per-link ABI control
+# now lives inside each CMakeLists.txt, so the obsolete USE_CXX11_ABI switch is
+# removed.
+source "${SCRIPT_DIR}/check_gcc_version.sh"
+check_gcc_version || exit 1
 
-USE_CXX11_ABI=ON
+BUILD_TYPE=RELEASE
 
 COMPILE_OPTIONS=""
 
@@ -249,7 +253,7 @@ function build_aclshmem_ops() {
     rm -rf $OPS_BUILD_DIR
     mkdir -p $OPS_BUILD_DIR
     OPS_INSTALL_DIR="$BUILD_DIR"/lib/hyper_parallel
-    cmake -S . --no-warn-unused-cli -B $OPS_BUILD_DIR $COMPILE_OPTIONS -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DUSE_CXX11_ABI=$USE_CXX11_ABI -DCMAKE_INSTALL_PREFIX=$OPS_INSTALL_DIR
+    cmake -S . --no-warn-unused-cli -B $OPS_BUILD_DIR $COMPILE_OPTIONS -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DCMAKE_INSTALL_PREFIX=$OPS_INSTALL_DIR
     
     cmake --build $OPS_BUILD_DIR -j
     cmake --install $OPS_BUILD_DIR
@@ -264,7 +268,7 @@ function build_torch_library() {
     rm -rf $TORCH_BUILD_DIR
     mkdir -p $TORCH_BUILD_DIR
     TORCH_INSTALL_DIR="$BUILD_DIR"/lib/hyper_parallel/platform/torch/symmetric_memory
-    cmake -S ./ --no-warn-unused-cli -B $TORCH_BUILD_DIR $COMPILE_OPTIONS -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DUSE_CXX11_ABI=$USE_CXX11_ABI -DCMAKE_INSTALL_PREFIX=$TORCH_INSTALL_DIR -DPython3_EXECUTABLE="$(which python3)" -DBUILD_TORCH_LIB=True
+    cmake -S ./ --no-warn-unused-cli -B $TORCH_BUILD_DIR $COMPILE_OPTIONS -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DCMAKE_INSTALL_PREFIX=$TORCH_INSTALL_DIR -DPython3_EXECUTABLE="$(which python3)" -DBUILD_TORCH_LIB=True
     cmake --build $TORCH_BUILD_DIR -j
     cmake --install $TORCH_BUILD_DIR
     cd "$PROJECT_ROOT" || exit
@@ -278,7 +282,7 @@ function build_ms_library() {
     rm -rf $MS_BUILD_DIR
     mkdir -p $MS_BUILD_DIR
     MS_INSTALL_DIR="$BUILD_DIR"/lib/hyper_parallel/platform/mindspore/symmetric_memory
-    cmake -S ./ --no-warn-unused-cli -B $MS_BUILD_DIR $COMPILE_OPTIONS -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DUSE_CXX11_ABI=$USE_CXX11_ABI -DCMAKE_INSTALL_PREFIX=$MS_INSTALL_DIR -DPython3_EXECUTABLE="$(which python3)" -DBUILD_MS_LIB=True
+    cmake -S ./ --no-warn-unused-cli -B $MS_BUILD_DIR $COMPILE_OPTIONS -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DCMAKE_INSTALL_PREFIX=$MS_INSTALL_DIR -DPython3_EXECUTABLE="$(which python3)" -DBUILD_MS_LIB=True
     cmake --build $MS_BUILD_DIR -j
     cmake --install $MS_BUILD_DIR
     cd "$PROJECT_ROOT" || exit

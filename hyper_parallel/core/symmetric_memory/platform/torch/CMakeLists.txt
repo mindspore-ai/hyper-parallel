@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.18)
 project(aclshmem_torch)
 
+# torch link path: ABI must match PyTorch / torch_npu (=1, official default since 2.7).
+add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 

@@ -18,12 +18,13 @@
 import sys
 import logging
 import os
+import re
 import shutil
 import stat
 import platform
 import subprocess
 from importlib import import_module
-from setuptools import setup, find_packages
+from setuptools import setup, find_packages, Distribution
 from setuptools.command.egg_info import egg_info
 from setuptools.command.build_py import build_py
 from setuptools.command.install import install
@@ -31,6 +32,37 @@ from setuptools.command.install import install
 ROOT_DIR = os.path.dirname(__file__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _check_gcc_version():
+    """Enforce host GCC in [7.3.0, 11.3.0], aligned with mindspore policy.
+
+    Fatal on <7.3.0; warning on >11.3.0. No-op if gcc is unavailable on PATH
+    (setup may run in environments where only python deps are inspected).
+    """
+    gcc_bin = os.environ.get("CC", "gcc")
+    try:
+        out = subprocess.check_output(
+            [gcc_bin, "-dumpfullversion", "-dumpversion"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip().splitlines()[0]
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        logger.warning("GCC not found via '%s'; skipping host GCC version check.", gcc_bin)
+        return
+    m = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", out)
+    if not m:
+        logger.warning("Could not parse GCC version '%s'; skipping check.", out)
+        return
+    major, minor, patch = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+    num = major * 10000 + minor * 100 + patch
+    if num < 70300:
+        raise SystemExit(
+            f"ERROR: GCC version {out} < 7.3.0. Install GCC >= 7.3.0 (mindspore-compatible)."
+        )
+    if num > 110300:
+        logger.warning("GCC version %s > 11.3.0; may cause unknown problems.", out)
+    else:
+        logger.info("GCC %s accepted (target range [7.3.0, 11.3.0]).", out)
 
 
 
@@ -47,7 +79,7 @@ def get_platform():
     Returns:
         str, platform name in lowercase.
     """
-    return platform.system().strip().lower()
+    return f"{platform.system().strip().lower()}_{platform.machine().strip().lower()}"
 
 
 def get_description():
@@ -115,14 +147,24 @@ class BuildPy(build_py):
     """Build py files."""
 
     def run(self):
-        hyper_parallel_lib_dir = os.path.join(
+        _check_gcc_version()
+        # Native build scripts write .so files into build/lib/hyper_parallel/
+        # (a fixed path baked into their CMake install rules). When the wheel
+        # is tagged as platform-specific (BinaryDistribution), setuptools'
+        # build_py writes to build/lib.<plat>-<py>/ instead, so we have to
+        # mirror the script outputs into self.build_lib after super().run().
+        native_lib_dir = os.path.join(
             os.path.dirname(__file__), 'build', 'lib', 'hyper_parallel')
-        shutil.rmtree(hyper_parallel_lib_dir, ignore_errors=True)
+        shutil.rmtree(native_lib_dir, ignore_errors=True)
         self._run_shell_script_optional("scripts/build_symmetric_memory.sh")
         self._run_shell_script_optional("scripts/build_multicore.sh")
         self._run_shell_script_optional("scripts/build_custom_ops.sh")
         super().run()
-        update_permissions(hyper_parallel_lib_dir)
+        target_lib_dir = os.path.join(self.build_lib, 'hyper_parallel')
+        if os.path.isdir(native_lib_dir) and \
+           os.path.abspath(native_lib_dir) != os.path.abspath(target_lib_dir):
+            shutil.copytree(native_lib_dir, target_lib_dir, dirs_exist_ok=True)
+        update_permissions(target_lib_dir)
 
     def _run_shell_script(self, script_path, args=None, capture_output=False):
         """Execute specified shell script with error handling"""
@@ -165,14 +207,35 @@ class Install(install):
             update_permissions(hyper_parallel_dir)
 
 
+class BinaryDistribution(Distribution):
+    """Force wheel to be tagged as a binary distribution.
+
+    The package ships pre-compiled .so files (built by scripts/build_*.sh and
+    bundled via package_data). Without this hint setuptools/wheel would label
+    the wheel as pure-python (py3-none-any), which lets pip install it under
+    incompatible Python versions or CPU architectures and triggers
+    'Python version mismatch' at import time.
+    """
+
+    def has_ext_modules(self) -> bool:
+        """Return True so wheel is tagged for a specific cpython + platform."""
+        return True
+
+
 if __name__ == '__main__':
     version_info = sys.version_info
-    if (version_info.major, version_info.minor) < (3, 7):
-        sys.stderr.write('Python version should be at least 3.7\r\n')
+    if (version_info.major, version_info.minor) < (3, 10) or \
+       (version_info.major, version_info.minor) >= (3, 13):
+        sys.stderr.write('Python version must be in [3.10, 3.13).\r\n')
         sys.exit(1)
 
     write_commit_id()
 
+    _cmdclass = {
+        'egg_info': EggInfo,
+        'build_py': BuildPy,
+        'install': Install,
+    }
     setup(
         name='hyper_parallel',
         version='0.1.0',
@@ -217,14 +280,10 @@ if __name__ == '__main__':
                 'mapping.yaml',
             ],
         },
-        cmdclass={
-            'egg_info': EggInfo,
-            'build_py': BuildPy,
-            'install': Install,
-        },
-        python_requires='>=3.7',
+        cmdclass=_cmdclass,
+        distclass=BinaryDistribution,
+        python_requires='>=3.10,<3.13',
         install_requires=get_install_requires(),
-        setup_requires=['ninja >= 1.10.0'],
         classifiers=[
             'Development Status :: 4 - Beta',
             'Environment :: Console',
@@ -233,11 +292,9 @@ if __name__ == '__main__':
             'Intended Audience :: Developers',
             'License :: OSI Approved :: Apache Software License',
             'Programming Language :: Python :: 3 :: Only',
-            'Programming Language :: Python :: 3.7',
-            'Programming Language :: Python :: 3.8',
-            'Programming Language :: Python :: 3.9',
             'Programming Language :: Python :: 3.10',
             'Programming Language :: Python :: 3.11',
+            'Programming Language :: Python :: 3.12',
             'Topic :: Scientific/Engineering',
             'Topic :: Scientific/Engineering :: Artificial Intelligence',
             'Topic :: Software Development',

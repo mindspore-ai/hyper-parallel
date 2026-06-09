@@ -136,6 +136,8 @@ ext = NpuExtension(
     name="hyper_parallel_mega_moe_pta",
     sources=source_files,
     extra_compile_args=[
+        # torch link path: ABI must match PyTorch / torch_npu (=1, official default since 2.7).
+        '-D_GLIBCXX_USE_CXX11_ABI=1',
         '-I' + os.path.join(PYTORCH_NPU_INSTALL_PATH, "include/third_party/acl/inc"),
         '-I' + os.path.join(PYTORCH_NPU_INSTALL_PATH, "include/third_party/op-plugin"),
         '-I' + os.path.join(PYTORCH_NPU_INSTALL_PATH, "include/third_party/op-plugin/op_plugin/include"),

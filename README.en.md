@@ -136,13 +136,40 @@ Currently only installation from source is supported. You need to execute:
 git clone https://gitcode.com/mindspore/hyper-parallel.git
 cd hyper-parallel
 python setup.py bdist_wheel
-pip install dist/hyper_parallel-*-py3-none-any.whl
+# Wheel filename is tagged with the current Python version and CPU arch,
+# e.g. cp310-cp310-linux_aarch64.
+pip install dist/hyper_parallel-*.whl
 ```
 
-HyperParallel depends on a deep learning framework. Before using HyperParallel, you need to:
+General requirements (build + runtime):
+
+- Python 3.10, 3.11 or 3.12 (the produced wheel is only installable on the
+  matching minor version)
+- Architecture: linux_aarch64 or linux_x86_64 (wheels ship prebuilt .so files;
+  the tag must match the install host, cross-arch installs are rejected by pip)
+- Host GCC must fall in the [7.3.0, 11.3.0] range (aligned with MindSpore's
+  compile policy)
+- Host glibc must be no older than the build host's glibc. Wheels produced on
+  e.g. OpenEuler 22.03 (glibc 2.34) cannot run on systems with glibc < 2.34;
+  build inside an older release image when targeting legacy hosts.
+
+Additional build-only tools (needed when producing the wheel; end users
+installing the wheel do NOT need these):
+
+- CMake >= 3.18
+- CANN toolkit (`ASCEND_HOME_PATH` must be set; build scripts try to source
+  `/usr/local/Ascend/cann/set_env.sh` automatically)
+- bisheng compiler (from CANN; used to compile symmetric_memory CCE kernels)
+- MindSpore >= 2.8 (driven by `CustomOpBuilder` at build time to produce
+  custom_ops / multicore .so; also a runtime dep for most users)
+- Optional: when `BUILD_TORCH_EXTENSION=true`, also need PyTorch >= 2.7
+  (CXX11 ABI=1) and torch_npu; when `USE_NINJA=1`, also need ninja
+
+Runtime dependencies:
 
 - Install a deep learning framework
 - Recommended MindSpore version >= 2.8, preferably using the latest MindSpore version, refer to [here](https://atomgit.com/mindspore/mindspore#%E5%AE%89%E8%A3%85)
+- For the PyTorch path, use PyTorch >= 2.7 built with `_GLIBCXX_USE_CXX11_ABI=1` (the default for official wheels).
 
 ## Usage Instructions
 

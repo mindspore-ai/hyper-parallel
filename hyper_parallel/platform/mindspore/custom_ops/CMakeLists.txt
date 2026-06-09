@@ -20,6 +20,9 @@
 cmake_minimum_required(VERSION 3.18)
 project(hyper_parallel_custom_ops_ms)
 
+# mindspore link path: ABI must match mindspore (=0).
+add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0)
+
 set(MS_EXTENSION_NAME "hyper_parallel_custom_ops_ms")
 set(BUILD_EXTENSION_DIR "${CMAKE_BINARY_DIR}/lib")
 
@@ -65,6 +68,7 @@ ms.ops.CustomOpBuilder(
     op_def=[],
     op_doc=[],
     backend='Ascend',
+    cflags='-D_GLIBCXX_USE_CXX11_ABI=0',
     build_dir='${BUILD_EXTENSION_DIR}',
     debug_mode=${ENABLE_DEBUG}
 ).build()

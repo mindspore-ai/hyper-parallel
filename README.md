@@ -136,13 +136,30 @@ HyperParallel提供昇腾超节点亲和的分布式并行加速能力，在保�
 git clone https://gitcode.com/mindspore/hyper-parallel.git
 cd hyper-parallel
 python setup.py bdist_wheel
-pip install dist/hyper_parallel-*-py3-none-any.whl
+# whl 文件名按当前 Python 和架构生成，例如 cp310-cp310-linux_aarch64
+pip install dist/hyper_parallel-*.whl
 ```
 
-HyperParallel 依赖深度学习框架，在使用HyperParallel前，你需要：<br>
+通用要求（构建 + 运行）：
+
+- Python 3.10、3.11 或 3.12（构建出的 whl 仅可装到对应小版本的解释器上）
+- 架构：linux_aarch64 或 linux_x86_64（whl 内含预编译 .so，文件名 tag 与编译机一致；跨架构无法安装）
+- 主机 GCC 版本须落在 [7.3.0, 11.3.0] 区间（与 MindSpore 编译策略一致）
+- 主机 glibc 需不低于编译机的 glibc 版本；如部署到旧系统，请在更老的发布镜像内编译。例如在 OpenEuler 22.03（glibc 2.34）编出的 whl 无法在 glibc < 2.34 的环境运行
+
+额外构建工具（仅编译 whl 时需要，最终用户安装 whl 无需）：
+
+- CMake ≥ 3.18
+- CANN 工具链（需要可用的 `ASCEND_HOME_PATH`；脚本会尝试 source `/usr/local/Ascend/cann/set_env.sh`）
+- bisheng 编译器（来自 CANN，用于 symmetric_memory CCE 内核编译）
+- MindSpore ≥ 2.8（构建期由 `CustomOpBuilder` 调用以编 custom_ops 和 multicore .so；同时也是大多数用户的运行时依赖）
+- 可选：启用 `BUILD_TORCH_EXTENSION=true` 时还需 PyTorch ≥ 2.7（CXX11 ABI=1）+ torch_npu；如设 `USE_NINJA=1` 还需 ninja
+
+运行时依赖：
 
 - 安装深度学习框架
 - 推荐安装的MindSpore版本 >= 2.8，最好使用最新的MindSpore版本，参考[此处](https://atomgit.com/mindspore/mindspore#%E5%AE%89%E8%A3%85)
+- 若使用 PyTorch 路径，需要 PyTorch >= 2.7（编译时启用 `_GLIBCXX_USE_CXX11_ABI=1` 的版本，官方 wheel 即满足）
 
 ## 使用说明
 
