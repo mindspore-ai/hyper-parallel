@@ -28,10 +28,10 @@ from mindspore import mint
 from mindspore.common.api import _no_grad
 from mindspore.common._grad_function import _Function
 from mindspore.common.dtype import type_size_in_bytes
+from mindspore.common.recompute import null_context_fn
 from mindspore.common.parameter import Parameter
 from mindspore.common.tensor import Tensor
 from mindspore.common.initializer import initializer
-from mindspore.common.recompute import null_context_fn
 from mindspore.communication import GlobalComm
 from mindspore.communication import get_group_size
 from mindspore.communication import create_group as new_group
