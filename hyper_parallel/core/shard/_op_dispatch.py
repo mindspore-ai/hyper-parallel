@@ -885,19 +885,30 @@ class OpDispatcher:
         else:
             local_results = op_call(*local_args, **local_kwargs)
 
-        # in-place ops
-        if op_name.endswith('_'):
+        return self._wrap_random_result(op_name, local_results, first_arg)
+
+    @staticmethod
+    def _wrap_random_result(op_name, local_results, first_arg):
+        """Wrap a random op's local result(s) back into DTensor(s).
+
+        In-place ops return the input DTensor itself. PyTorch in-place names end
+        with '_' (normal_); every MindSpore in-place kernel is named 'Inplace*'
+        (InplaceNormal/InplaceUniform/InplaceRandom/InplaceBernoulli*), so the
+        prefix covers all current and future in-place random kernels. Only random
+        ops reach this branch, so there are no non-in-place 'Inplace*' false hits.
+        """
+        if op_name.endswith('_') or op_name.startswith('Inplace'):
             return first_arg
-        # non-in-place ops
+        mesh = first_arg.device_mesh
+        placements = first_arg.layout.alias_placements
         # Some ops return tuple/list, e.g. native_dropout returns (output, mask).
         if isinstance(local_results, (tuple, list)):
             return tuple(
-                DTensor.from_local(r, first_arg.device_mesh, first_arg.layout.alias_placements)
-                if isinstance(r, Tensor) else r
+                DTensor.from_local(r, mesh, placements) if isinstance(r, Tensor) else r
                 for r in local_results
             )
         if isinstance(local_results, Tensor):
-            return DTensor.from_local(local_results, first_arg.device_mesh, first_arg.layout.alias_placements)
+            return DTensor.from_local(local_results, mesh, placements)
         # Fallback: return as-is for non-Tensor results (currently unreachable with existing _random_ops).
         return local_results
 

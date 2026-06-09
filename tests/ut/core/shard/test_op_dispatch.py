@@ -1173,6 +1173,57 @@ class TestDispatchRandomPath(unittest.TestCase):
         self.assertEqual(result, "ms_random_result")
 
 
+class TestDispatchRandomInplaceReturnsSelf(unittest.TestCase):
+    """
+    Feature: OpDispatcher._dispatch_random_op return value for in-place random ops.
+    Description: In-place random ops must return the input DTensor itself, not a new
+                 wrapper. PyTorch in-place names end with '_' (e.g. normal_); every
+                 MindSpore in-place kernel is named 'Inplace*' (InplaceNormal,
+                 InplaceUniform, InplaceRandom, InplaceBernoulliScalar,
+                 InplaceBernoulliTensor). Non-in-place random ops (e.g. Randn) instead
+                 return a freshly wrapped DTensor.
+    Expectation: _dispatch_random_op returns self for in-place names and a new wrapper
+                 for non-in-place names.
+    """
+
+    def _dispatch(self, op_name, op_call):
+        """Run _dispatch_random_op for op_name with RNG support disabled; return (result, first_arg)."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        d = object.__new__(OpDispatcher)
+        d._rng_tracker = None
+        first_arg = MagicMock(spec=DTensor)
+        with patch("hyper_parallel.core.shard._op_dispatch.is_rng_supported_mesh", return_value=False):
+            result = d._dispatch_random_op(op_name, op_call, (first_arg,), {})
+
+        op_call.assert_called_once()
+        return result, first_arg
+
+    def test_inplace_ops_return_self(self):
+        """PyTorch '_' suffix and every MindSpore 'Inplace*' random kernel return self."""
+        for op_name in (
+            "normal_",
+            "InplaceNormal",
+            "InplaceUniform",
+            "InplaceRandom",
+            "InplaceBernoulliScalar",
+            "InplaceBernoulliTensor",
+        ):
+            with self.subTest(op_name=op_name):
+                result, first_arg = self._dispatch(op_name, MagicMock(return_value=MagicMock()))
+                self.assertIs(result, first_arg)
+
+    def test_non_inplace_op_returns_new_wrapper(self):
+        """A non-in-place random op (e.g. Randn) wraps the result in a new DTensor."""
+        from hyper_parallel.core.shard._op_dispatch import Tensor
+
+        op_call = MagicMock(return_value=MagicMock(spec=Tensor))
+        with patch.object(DTensor, "from_local", return_value="new_wrapper"):
+            result, first_arg = self._dispatch("Randn", op_call)
+        self.assertIsNot(result, first_arg)
+        self.assertEqual(result, "new_wrapper")
+
+
 class TestProcessArgsWithDTensor(unittest.TestCase):
     """
     Feature: OpDispatcher._process_args_and_kwargs DTensor branches.
