@@ -61,6 +61,21 @@ def test_clip_grad_norm_frozen_params():
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_clip_grad_norm_replicate_params():
+    """
+    Feature: clip_grad_norm_ with mixed FSDP-sharded + replicate_params
+    Description:
+        Replicate-grad norms must not be all-reduced over the shard group.
+        Otherwise replicate norm² is multiplied by shard_world_size,
+        inflating the reported global norm.
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(_TEST_CLIP_GRAD, "test_clip_grad_norm_replicate_params", 12367, 8)
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_clip_grad_norm_multi_group():
     """
     Feature: multi-grad-group parameter ordering stability

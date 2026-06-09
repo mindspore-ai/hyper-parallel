@@ -71,8 +71,12 @@ def _get_fsdp_kwargs(mesh):
     }
 
 
-def _gather_full(model, attr="grad"):
-    """All-gather sharded tensors to reconstruct full values."""
+def _gather_full(model, attr="grad", include_replicate=False):
+    """All-gather sharded tensors to reconstruct full values.
+
+    When ``include_replicate=True`` also walks ``replicate_params``;
+    their local tensor is already the global value after all-reduce.
+    """
     result = []
     for module in model.modules():
         if not hasattr(module, "hsdp_scheduler"):
@@ -80,7 +84,10 @@ def _gather_full(model, attr="grad"):
         hsdp_state = module.hsdp_scheduler.hsdp_state
         if hsdp_state is None:
             continue
-        for hp in hsdp_state.hsdp_params:
+        params = list(hsdp_state.hsdp_params)
+        if include_replicate:
+            params.extend(hsdp_state.replicate_params)
+        for hp in params:
             if not hp.sharded_param.requires_grad:
                 continue
             if attr == "grad":
@@ -363,6 +370,79 @@ def test_clip_grad_norm_frozen_params():
     # Restore
     params[0].requires_grad_(True)
     params[0].grad = saved_grad
+
+
+# ===================================================================
+# Test D-replicate – Mixed FSDP-sharded + replicate_params over-count
+# ===================================================================
+
+def test_clip_grad_norm_replicate_params():  # pylint: disable=R0914
+    """Replicate-grad norms must not be all-reduced over the shard group.
+
+    Regression: ``_total_norm_fsdp2_aligned`` previously stacked
+    per-tensor norms across ALL grad groups and did ONE all_reduce
+    over the first non-empty group's shard dims. Replicated grads
+    (already identical on every shard rank) got summed by the shard
+    world size, e.g. DP=8 with ~28% norm² from replicate_params
+    inflated 28 → 48.
+
+    Setup chooses every layer's bias as ``replicate_params`` so the
+    replicate contribution is large enough to fail the old code but
+    small enough that the weights still dominate.
+    """
+    init_dist()
+
+    mesh = init_device_mesh(
+        device_type="npu", mesh_shape=(8,),
+        mesh_dim_names=("dp",),
+    )
+    fsdp_kwargs = _get_fsdp_kwargs(mesh)
+    world_size = len(mesh.rank_list)
+
+    torch.manual_seed(_SEED)
+
+    model = DenseMutiLayerNet(64, layer_num=4, has_bias=True)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.copy_(torch.randn_like(p) * 0.1)
+
+    # Biases stay replicated; weights go through the FSDP shard path.
+    fsdp_kwargs["replicate_params"] = {
+        layer.bias for layer in model.layers
+    }
+
+    for layer in model.layers:
+        fully_shard(layer, **fsdp_kwargs)
+    model = fully_shard(model, **fsdp_kwargs)
+    model.set_reduce_op_type("sum")
+
+    x = torch.rand(4, 64).npu()
+    with SkipDTensorDispatch():
+        out = model(x)
+        loss = out
+        loss.backward(torch.tensor(1.0 / world_size).npu())
+
+    saved = _save_grads(model)
+    full_grads = _gather_full(model, "grad", include_replicate=True)
+    ref_norm, ref_clipped = _ref_clip(full_grads, _MAX_NORM, 2.0)
+
+    _restore_grads(model, saved)
+    with SkipDTensorDispatch():
+        our_norm = clip_grad_norm_(model, _MAX_NORM, norm_type=2.0)
+
+    rank = dist.get_rank()
+    assert _close(our_norm, ref_norm), (
+        f"[rank={rank}] replicate over-count regression: "
+        f"got={our_norm.item():.6e}, ref={ref_norm.item():.6e}, "
+        f"shard_world_size={world_size}"
+    )
+
+    our_clipped = _gather_full(model, "grad", include_replicate=True)
+    for i, (rg, og) in enumerate(zip(ref_clipped, our_clipped)):
+        assert _close(og, rg), (
+            f"[rank={rank}] replicate clipped grad[{i}] mismatch: "
+            f"max_diff={torch.max(torch.abs(og - rg)).item():.2e}"
+        )
 
 
 # ===================================================================
