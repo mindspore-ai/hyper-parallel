@@ -39,6 +39,10 @@ fi
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
 
+# Host GCC must be in [7.3.0, 11.3.0] (mindspore-aligned).
+source "${SCRIPT_DIR}/check_gcc_version.sh"
+check_gcc_version || exit 1
+
 # ── Extract prebuild vendors tarball ──────────────────────────────────────────
 PREBUILD_DIR="$PROJECT_ROOT/hyper_parallel/core/multicore/prebuild"
 TARBALL="$PREBUILD_DIR/mega_moe.tar.gz"

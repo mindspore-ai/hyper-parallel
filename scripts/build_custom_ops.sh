@@ -33,6 +33,10 @@ fi
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
 
+# Host GCC must be in [7.3.0, 11.3.0] (mindspore-aligned).
+source "${SCRIPT_DIR}/check_gcc_version.sh"
+check_gcc_version || exit 1
+
 CUSTOM_OPS_SRC="$PROJECT_ROOT/hyper_parallel/platform/mindspore/custom_ops"
 CUSTOM_OPS_BUILD_DIR="$CUSTOM_OPS_SRC/build"
 BUILD_TYPE="${CMAKE_BUILD_TYPE:-RELEASE}"

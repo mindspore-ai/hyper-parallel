@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.18)
 project(aclshmem_ms)
 
+# mindspore link path: ABI must match mindspore (=0).
+add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=0)
+
 # =============================================================================
 # Configuration and Validation
 # =============================================================================
@@ -71,6 +74,11 @@ foreach(INC_DIR_ITEM ${INCLUDE_DIRS})
         set(CFLAGS_INCLUDES "${CFLAGS_INCLUDES} -I${INC_DIR_ITEM}")
     endif()
 endforeach()
+
+# Propagate ABI=0 to the CustomOpBuilder-driven g++ compilation. The
+# add_compile_definitions() at file top only affects targets compiled by
+# CMake itself; this line is what actually reaches the .so.
+set(CFLAGS_INCLUDES "${CFLAGS_INCLUDES} -D_GLIBCXX_USE_CXX11_ABI=0")
 
 set(MS_LOG_FILE "${MS_PATH}/include/mindspore/core/include/utils/log_adapter.h")
 get_filename_component(PROJECT_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.." ABSOLUTE)

@@ -97,6 +97,10 @@ function(aclshmem_add_share_lib NAME)
         ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/obj"
     )
 
+    # Public-layer host code: ABI=0 to match CANN's host-side policy
+    # (cf. ops-transformer/cmake/intf_pub.cmake). Exposed interface is POD-only
+    # (see ops/include/shmem_kernel.h), so this is safe for both ms (=0) and
+    # torch (=1) wrappers to link against.
     target_compile_options(${NAME}_shared PRIVATE ${CMAKE_CPP_COMPILE_OPTIONS} -D_GLIBCXX_USE_CXX11_ABI=0)
     target_include_directories(${NAME}_shared PRIVATE
         ${SHMEM_HOME_PATH}/shmem/include
