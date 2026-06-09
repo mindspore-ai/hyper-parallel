@@ -84,6 +84,7 @@ class _FakeHSDPParam:
         self.unsharded_group_info = GroupInfo("dp", _FakeGroup(dp_size), dp_size)
         self.orig_dtype = torch.float32
         self.reduce_dtype = torch.float32
+        self.gradient_scaling_factor = None
         self.init_dtype_attrs = MagicMock()
         self.reset_sharded_param = MagicMock()
         self.accumulate_unsharded_grad_if_needed = MagicMock()
@@ -423,8 +424,9 @@ class TestTorchHSDPStateV2(unittest.TestCase):
 
         TorchHSDPStateV2._queue_compat_all_reduce(state, param, torch.distributed.ReduceOp.SUM)
 
+        # Pure all-reduce path passes grad=None so all_reduce_grad fetches the
+        # unsharded grad itself and owns the scaling.
         param.all_reduce_grad.assert_called_once_with(
-            grad=param.unsharded_grad_data,
             dtype=torch.float32,
             reduce_op=torch.distributed.ReduceOp.SUM,
         )

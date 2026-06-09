@@ -35,6 +35,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     GroupInfo,
     ParamModuleInfo,
     ShardedState,
+    apply_gradient_scaling_factor,
     get_rank_list_for_axes,
     get_split_rank_lists_for_axes,
 )
@@ -170,6 +171,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         self._save_backward_hooks(param)
         self._grad = None
         self._accumulated_allreduced_grad = True
+        self.gradient_scaling_factor = None
 
     @property
     def uses_param_shard(self) -> bool:
@@ -397,6 +399,12 @@ class TorchHSDPParamV2(HSDPParamV2):
         Reshapes ``reduced_grad`` to match the local shard, optionally
         offloads to CPU, then accumulates or assigns onto
         ``hsdp_param.sharded_param.grad``.
+
+        Note:
+            Gradient scaling (``gradient_scaling_factor``) is applied earlier on
+            the reduce input (see ``reduce_scatter_grad`` / ``foreach_reduce``),
+            never here, so accumulation stays ``sum_i(g_i * factor)`` rather than
+            scaling the already-accumulated grad again.
 
         Args:
             reduced_grad (torch.Tensor): Gradient after reduce-scatter
@@ -934,7 +942,8 @@ class TorchHSDPParamV2(HSDPParamV2):
         )
         plan = build_rs_plan(self, self._grad, plan_world_size)
         grad_flat = pack_for_reduce_scatter(self._grad, plan).reshape(-1)
-
+        # apply gradient_scaling_factor (reduce-scatter leg)
+        apply_gradient_scaling_factor(grad_flat, self.gradient_scaling_factor)
         # If parameter is not sharded (below threshold), no reduce-scatter needed
         if not self.is_sharded:
             if output_buffer is not None:
@@ -970,7 +979,6 @@ class TorchHSDPParamV2(HSDPParamV2):
             self._reduce_scatter_output = output_buffer
         else:
             self._reduce_scatter_output = torch.empty(output_numel, dtype=reduce_dtype, device=self._grad.device)
-
         # Execute reduce_scatter_tensor
         self.reduce_scatter_handle = dist.reduce_scatter_tensor(
             self._reduce_scatter_output,
@@ -986,21 +994,28 @@ class TorchHSDPParamV2(HSDPParamV2):
         grad: Optional[torch.Tensor] = None,
         dtype: Optional[torch.dtype] = None,
         async_op: bool = True,
-        reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG
+        reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG,
     ) -> Union[None, Tuple[torch.Tensor, Optional[dist.Work]]]:
         """
         Perform all-reduce on gradient (across replicate dimension in HSDP mode).
 
         Args:
-            grad: Gradient tensor to reduce. If None, will use unsharded_param.grad
-                or unsharded_accumulated_grad based on use_accumulated_grad flag.
+            grad: Gradient tensor to reduce. If None, this is a pure all-reduce
+                path (no preceding reduce-scatter): the unsharded grad is fetched
+                here and ``gradient_scaling_factor`` is applied in this leg. If a
+                grad is passed in, it is the already-scaled output of
+                ``reduce_scatter_grad`` (chained HSDP all-reduce) and is not
+                scaled again. Whether the grad is fetched here is therefore the
+                signal for which leg owns the scaling -- no extra flag needed.
             async_op: Whether to execute asynchronously.
             reduce_op: Optional[dist.ReduceOp] = dist.ReduceOp.AVG.
 
         Returns:
             (reduced_grad, handle): Reduced gradient and communication handle.
         """
-        # If grad is not provided, get from parameter
+        # grad is None => pure all-reduce path: fetch the unsharded grad and own
+        # the scaling here, since it never went through reduce_scatter_grad.
+        scale_here = grad is None
         if grad is None:
             if self.unsharded_accumulated_grad is not None:
                 grad = self.unsharded_accumulated_grad_data
@@ -1009,6 +1024,11 @@ class TorchHSDPParamV2(HSDPParamV2):
 
         if dtype is not None and dtype != grad.dtype:
             grad = grad.to(dtype)
+
+        if scale_here:
+            # all-reduce below is in-place on grad, so scaling in-place here keeps
+            # the same semantics: reduce(g_i * factor) == factor * reduce(g_i).
+            apply_gradient_scaling_factor(grad, self.gradient_scaling_factor)
 
         if self.unsharded_group_info.group is None or self.replicate_world_size <= 1:
             return grad, None

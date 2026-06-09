@@ -365,6 +365,45 @@ class HSDPModule:
         if hsdp_state := self.hsdp_scheduler.hsdp_state:
             hsdp_state.set_reduce_op_type(reduce_op_type)
 
+    def set_gradient_scaling_factor(self, factor=None):
+        """
+        Set a multiplicative scaling factor applied to gradients after
+        reduce-scatter / all-reduce and before they are written into
+        ``sharded_param.grad``.
+
+        ``factor`` may be ``None`` (disable scaling), a Python ``float``/``int``,
+        or a 0-dim/1-element tensor. Setting ``factor`` to ``None`` (the default
+        on construction) skips the scaling op entirely so no extra device-side
+        ``mul_`` is launched on the hot path.
+
+        Args:
+            factor (None | float | int | platform.Tensor): Scaling coefficient.
+                Use ``None`` to disable scaling.
+
+        Raises:
+            ValueError: If ``factor`` is not one of the supported types or is a
+                tensor with more than one element.
+        """
+        if factor is not None:
+            if isinstance(factor, bool):
+                raise ValueError(
+                    f"gradient_scaling_factor must be None, float, int or a 1-element Tensor, "
+                    f"but got bool {factor}."
+                )
+            if isinstance(factor, platform.Tensor):
+                if factor.numel() != 1:
+                    raise ValueError(
+                        f"gradient_scaling_factor tensor must have exactly 1 element, "
+                        f"but got shape {tuple(factor.shape)}."
+                    )
+            elif not isinstance(factor, (float, int)):
+                raise ValueError(
+                    f"gradient_scaling_factor must be None, float, int or a 1-element Tensor, "
+                    f"but got {type(factor).__name__}."
+                )
+        if hsdp_state := self.hsdp_scheduler.hsdp_state:
+            hsdp_state.set_gradient_scaling_factor(factor)
+
 
 def _extend_module_with_hsdp_interface(module):
     """Dynamically extend module's class to inherit from HSDPModule, adding HSDP capabilities."""

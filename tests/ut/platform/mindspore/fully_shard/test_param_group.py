@@ -89,6 +89,7 @@ def _new_param_group():
     group._flat_cast_buffer = None
     group._orig_dtype = ms.float32
     group._reduce_dtype = ms.float32
+    group.gradient_scaling_factor = None
     return group
 
 

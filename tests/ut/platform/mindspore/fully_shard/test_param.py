@@ -49,6 +49,7 @@ def _new_hsdp_param_v2() -> MindSporeHSDPParamV2:
     """Build a bare :class:`MindSporeHSDPParamV2` with fields ``__init__`` normally sets."""
     obj = object.__new__(MindSporeHSDPParamV2)
     obj.all_gather_outputs = []
+    obj.gradient_scaling_factor = None
     return obj
 
 

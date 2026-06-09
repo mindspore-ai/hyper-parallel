@@ -22,6 +22,7 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     _get_param_module_infos,
     FullyShardParamMode,
     infer_fully_shard_param_mode,
+    apply_gradient_scaling_factor,
 )
 from hyper_parallel.platform.mindspore.fully_shard.pack_utils import build_rs_plan
 from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
@@ -327,6 +328,12 @@ class MindSporeHSDPStateV2(HSDPState):
             if reduced_grad is None:
                 reduced_grad = param.unsharded_grad_data
             reduced_grad = _to_dtype_if_needed(reduced_grad, self._reduce_dtype)
+            # Replicate params reduce only through this DDP-style all-reduce (they
+            # never go through reduce_scatter_grad / all_reduce_grad), so this leg
+            # owns the scaling. The all-reduce below is in-place, so scaling
+            # in-place first keeps reduce(g_i * factor) == factor * reduce(g_i),
+            # and it also covers the no-all-reduce (single-replica) branch.
+            apply_gradient_scaling_factor(reduced_grad, param.gradient_scaling_factor)
             reduce_group_info = getattr(param, "unsharded_group_info", None)
             reduce_group = reduce_group_info.group if reduce_group_info is not None else None
             reduce_group_size = reduce_group_info.rank_size if reduce_group_info is not None else 1
@@ -466,8 +473,9 @@ class MindSporeHSDPStateV2(HSDPState):
         """Queue the compatibility all-reduce path without FSDP sharding."""
         if not self._should_run_all_reduce(hsdp_param):
             return
+        # Pure all-reduce path: pass grad=None so all_reduce_grad fetches the
+        # unsharded grad itself and owns the scaling (no reduce-scatter here).
         hsdp_param.all_reduce_grad(
-            grad=self._get_pending_unsharded_grad(hsdp_param),
             dtype=self._reduce_dtype,
             async_op=True,
             reduce_op=self.reduce_op_type,
@@ -497,6 +505,9 @@ class MindSporeHSDPStateV2(HSDPState):
         # already contiguous; the copy is written back to grad in
         # _complete_direct_all_reduce.
         reduced_grad = reduced_grad.contiguous()
+        # Pure all-reduce path (no reduce-scatter): this leg owns the scaling.
+        # all-reduce below is in-place, so scale in-place before it.
+        apply_gradient_scaling_factor(reduced_grad, hsdp_param.gradient_scaling_factor)
         reduce_group_info = getattr(hsdp_param, "unsharded_group_info", None)
         reduce_group = reduce_group_info.group if reduce_group_info is not None else None
         reduce_group_size = reduce_group_info.rank_size if reduce_group_info is not None else 1
@@ -538,8 +549,15 @@ class MindSporeHSDPStateV2(HSDPState):
                 elif self._should_run_all_reduce(hsdp_param):
                     self._queue_compat_all_reduce(hsdp_param)
                 else:
+                    # No-communication path (shard_size == 1, no all-reduce):
+                    # this leg owns the scaling since the grad never goes through
+                    # reduce_scatter_grad / all_reduce_grad.
+                    pending_grad = self._get_pending_unsharded_grad(hsdp_param)
+                    apply_gradient_scaling_factor(
+                        pending_grad, hsdp_param.gradient_scaling_factor
+                    )
                     need_synchronize = hsdp_param.apply_reduced_grad(
-                        self._get_pending_unsharded_grad(hsdp_param),
+                        pending_grad,
                         self._orig_dtype,
                     )
                     self._synchronize_current_stream_if_needed(need_synchronize)

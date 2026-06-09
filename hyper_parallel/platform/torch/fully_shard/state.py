@@ -24,7 +24,9 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
     FullyShardParamMode,
     _get_param_module_infos,
     infer_fully_shard_param_mode,
+    apply_gradient_scaling_factor,
 )
+from hyper_parallel.core.fully_shard.utils import HSDPMeshInfo
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
 from hyper_parallel.platform.torch.fully_shard.pack_utils import build_rs_plan
@@ -306,7 +308,7 @@ class TorchHSDPStateV2(HSDPState):
             comm_ctx.pre_param_group = None
         if self.param_group is not None:
             self.param_group.foreach_reduce(
-                reduce_scatter_reduce_op=self.reduce_op_type
+                reduce_scatter_reduce_op=self.reduce_op_type,
             )
         for hsdp_param in self.replicate_params:
             if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
@@ -364,8 +366,9 @@ class TorchHSDPStateV2(HSDPState):
         """Queue the compatibility all-reduce path without FSDP sharding."""
         if not self._should_run_all_reduce(hsdp_param):
             return
+        # Pure all-reduce path: pass grad=None so all_reduce_grad fetches the
+        # unsharded grad itself and owns the scaling (no reduce-scatter here).
         hsdp_param.all_reduce_grad(
-            grad=self._get_pending_unsharded_grad(hsdp_param),
             dtype=self._reduce_dtype,
             reduce_op=reduce_op,
         )
@@ -391,6 +394,9 @@ class TorchHSDPStateV2(HSDPState):
         reduced_grad = grad
         if self._reduce_dtype is not None and reduced_grad.dtype != self._reduce_dtype:
             reduced_grad = reduced_grad.to(self._reduce_dtype)
+        # Pure all-reduce path (no reduce-scatter): this leg owns the scaling.
+        # all-reduce below is in-place, so scale in-place before it.
+        apply_gradient_scaling_factor(reduced_grad, hsdp_param.gradient_scaling_factor)
         handle = None
         if hsdp_param.unsharded_group_info.group is not None and hsdp_param.dp_size > 1:
             handle = torch.distributed.all_reduce(

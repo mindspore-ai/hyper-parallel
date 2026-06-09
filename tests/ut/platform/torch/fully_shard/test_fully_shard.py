@@ -718,6 +718,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2 = object.__new__(TorchHSDPParamV2)
         param_v2.sharded_state = ShardedState.UNSHARDED
         param_v2.unsharded_accumulated_grad = None
+        param_v2.gradient_scaling_factor = None
         param_v2._unsharded_param = MagicMock()
         grad = torch.arange(16, dtype=torch.float32).view(4, 4)
         param_v2._unsharded_param.grad = grad
@@ -741,6 +742,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2 = object.__new__(TorchHSDPParamV2)
         param_v2.sharded_state = ShardedState.UNSHARDED
         param_v2.unsharded_accumulated_grad = None
+        param_v2.gradient_scaling_factor = None
         param_v2._unsharded_param = MagicMock()
         grad = torch.arange(32, dtype=torch.float32).view(4, 8)
         param_v2._unsharded_param.grad = grad
@@ -767,6 +769,7 @@ class TestTorchHSDPParamV2(unittest.TestCase):
         param_v2 = object.__new__(TorchHSDPParamV2)
         param_v2.sharded_state = ShardedState.UNSHARDED
         param_v2.unsharded_accumulated_grad = None
+        param_v2.gradient_scaling_factor = None
         param_v2._unsharded_param = MagicMock()
         param_v2._unsharded_param.grad = torch.ones(4, 4)
         param_v2.is_sharded = True
@@ -1561,6 +1564,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         hsdp_param.sharded_param.requires_grad = True
         hsdp_param.sharded_param.grad = torch.ones(2, 2)
         hsdp_param.unsharded_group_info.group = MagicMock()
+        hsdp_param.gradient_scaling_factor = None
         state.hsdp_params.append(hsdp_param)
 
         with patch("hyper_parallel.platform.torch.fully_shard.state.torch.distributed.all_reduce") as mock_all_reduce:
@@ -1641,6 +1645,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         state._queue_compat_all_reduce = MagicMock()
         state.param_group = MagicMock()
         state.replicate_params = []
+        state.gradient_scaling_factor = None
         mock_get_comm_ctx.return_value = SimpleNamespace(
             all_reduce_param_group=None,
             pre_param_group=None,
@@ -1659,7 +1664,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
 
         state.reduce_params.assert_called_once()
         state.param_group.foreach_reduce.assert_called_once_with(
-            reduce_scatter_reduce_op=torch.distributed.ReduceOp.AVG
+            reduce_scatter_reduce_op=torch.distributed.ReduceOp.AVG,
         )
         state._queue_compat_all_reduce.assert_called_once_with(
             replicate_param,
@@ -1704,6 +1709,7 @@ class TestFullyShardMeshUtils(unittest.TestCase):
         param_group.mp_policy = MixedPrecisionPolicy()
         param_group._orig_dtype = torch.float32
         param_group._reduce_output = torch.arange(8, dtype=torch.float32)
+        param_group._reduce_scaling_factor = None
         param_group.hsdp_params = []
         param_group._reduce_hsdp_params = []
         param_group.shard_group = MagicMock()
