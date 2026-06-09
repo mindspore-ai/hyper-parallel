@@ -25,12 +25,23 @@ def test_dcp_with_optimizer_tp_dp():
     Feature: fully_shard + DCP + flatten_state_dict + bytes (multi-GPU).
 
     Same style as test_fully_shard_auto_grad.
-    Description:
-        1. test_dcp_with_optimizer_tp_dp
-        2. test_dcp_async_save_with_optimizer_tp_dp
+    Description: test_dcp_with_optimizer_tp_dp
     Expectation: Run success.
     """
     parallel_run([
         TorchCase(_TEST_DCP_TP_DP, "test_dcp_with_optimizer_tp_dp", 12502, 4),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+def test_dcp_async_save_with_optimizer_tp_dp():
+    """
+    Feature: fully_shard + DCP + flatten_state_dict + bytes (multi-GPU).
+
+    Same style as test_fully_shard_auto_grad.
+    Description: test_dcp_async_save_with_optimizer_tp_dp
+    Expectation: Run success.
+    """
+    parallel_run([
         TorchCase(_TEST_DCP_TP_DP, "test_dcp_async_save_with_optimizer_tp_dp", 12503, 4),
     ])
