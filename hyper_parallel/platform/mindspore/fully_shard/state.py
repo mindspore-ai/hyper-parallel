@@ -241,8 +241,7 @@ class MindSporeHSDPStateV2(HSDPState):
                 self.replicate_params.append(hsdp_param)
             else:
                 self.hsdp_params.append(hsdp_param)
-                if hsdp_param.is_sharded:
-                    self.sharded_hsdp_params.append(hsdp_param)
+                self.sharded_hsdp_params.append(hsdp_param)
 
     def _init_mp_dtypes(self):
         """init mp dtypes for hsdp parameters and replicate parameters"""
