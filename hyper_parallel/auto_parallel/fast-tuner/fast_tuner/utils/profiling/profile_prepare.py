@@ -238,11 +238,21 @@ def budget_profile_config_generator(config, para, available_devices):
     return None
 
 def taylor_pp_adaptor(profile_info):
+    """Adapt profiling info for the Taylor pipeline parallel solver.
+
+    Computes the ratio of dense-layer to MoE-layer cost and the
+    backward-to-forward cost ratio for MoE layers.
+    """
     layer_ratio = (profile_info['dense_fw']+profile_info['dense_bw'])/(profile_info['moe_fw']+profile_info['moe_bw'])
     backward_ratio = profile_info['moe_bw']/profile_info['moe_fw']
     return layer_ratio, backward_ratio
 
 def sapp_adaptor(profile_info):
+    """Adapt profiling info for the SAPP (Semi-Auto Parallel Pipeline) solver.
+
+    Decomposes profile info into embedding, body dense, body MoE, and tail costs
+    by dividing forward+backward times by 3 for averaging.
+    """
     body_dense = (profile_info['dense_fw']+profile_info['dense_bw'])/3
     body_moe = (profile_info['moe_fw']+profile_info['moe_bw'])/3
     tail = profile_info['head']/3

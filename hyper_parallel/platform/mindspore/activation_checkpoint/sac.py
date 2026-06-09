@@ -29,6 +29,7 @@ from hyper_parallel.platform import get_platform
 
 platform = get_platform()
 
+
 class _VersionWrapper:
     # Check that cached tensors are not mutated.
     def __init__(self, val, version_source):

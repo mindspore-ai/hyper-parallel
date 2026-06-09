@@ -80,6 +80,7 @@ def _tp_size_from_env(world: int) -> int:
 
 
 def main() -> None:
+    """Entry point: initialize distributed backend, build a Llama3 model with TP+FSDP, and run a training loop."""
     rank, world, device_type = init_dist()
     device = torch.device(device_type, rank)
     tp_size = _tp_size_from_env(world)

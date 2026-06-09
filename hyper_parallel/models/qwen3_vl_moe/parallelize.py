@@ -31,6 +31,7 @@ from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 
 logger = logging.getLogger(__name__)
 
+
 def _resolve_dp_mesh(mesh):
     try:
         return mesh["fsdp"]
@@ -40,6 +41,7 @@ def _resolve_dp_mesh(mesh):
         return mesh["dp_shard"]
     except (KeyError, TypeError):
         return mesh
+
 
 def _resolve_mp_policy(cfg):
     """Build MixedPrecisionPolicy from cfg.train.mixed_precision, or None."""
@@ -61,6 +63,7 @@ def _resolve_mp_policy(cfg):
         reduce_dtype=reduce_dtype,
         output_dtype=output_dtype,
     )
+
 
 def _apply_vl_visual_tower(model, mesh, cfg) -> None:
     """VL-specific: cast frozen visual params to ``param_dtype`` and per-block
@@ -121,6 +124,7 @@ def _apply_vl_visual_tower(model, mesh, cfg) -> None:
     fully_shard(visual, **fsdp_kwargs)
     logger.info_rank0("VL visual tower wrapped (per-block + root)")
 
+
 def _apply_ac(model, cfg) -> None:
     """Apply ac (internal)."""
     ac_mode = getattr(cfg.train.gradient_checkpointing, "activation_checkpoint", "off")
@@ -135,6 +139,7 @@ def _apply_ac(model, cfg) -> None:
         model.layers[i] = checkpoint_wrapper(layer)
     logger.info_rank0("AC applied to %d Qwen3-VL-MoE text layers (mode=%s)",
                       len(layers), ac_mode)
+
 
 def _apply_fsdp(model, mesh, cfg) -> None:
     """Per-text-layer + root FSDP wrap. Visual tower is wrapped separately by
@@ -176,6 +181,7 @@ def _apply_fsdp(model, mesh, cfg) -> None:
                 replicate_params.add(param)
     if shard_dim_overrides:
         overrides = shard_dim_overrides
+
         def _shard_placement_fn(param):
             dim = overrides.get(id(param))
             return Shard(dim) if dim is not None else None
@@ -196,6 +202,7 @@ def _apply_fsdp(model, mesh, cfg) -> None:
     fully_shard(model, **fsdp_kwargs)
     logger.info_rank0("FSDP applied to Qwen3-VL-MoE: %d text layers + root",
                       len(layers))
+
 
 def parallelize_qwen3_vl_moe(model, mesh, cfg):
     """Apply VL visual handling + text AC / FSDP.

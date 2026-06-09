@@ -41,6 +41,8 @@ class HSDPSchedulerContext:
 class HSDPSchedulerV2:
     """HSDPScheduler is used to scheduler hsdp"""
     root_bp_state = False
+
+
     def __init__(self, cell: Union[platform.Module, Tuple[platform.Module, ...]], mesh,
                  reshard_after_forward, shard_placement_fn,
                  mp_policy, offload_policy, ignored_params, replicate_params, device, comm_fusion,
@@ -165,7 +167,7 @@ class HSDPSchedulerV2:
                     submod_scheduler = getattr(module, "hsdp_scheduler", None)
                     if submod_scheduler and submod_scheduler.scheduler_ctx is not self.scheduler_ctx:
                         submod_scheduler.scheduler_ctx = self.scheduler_ctx
-    
+
         if not self._is_root and not self.hsdp_state.module_name:
             for module_name, module in platform.get_cells_and_names(self.scheduler_ctx.root_module):
                 if module == self.cell:

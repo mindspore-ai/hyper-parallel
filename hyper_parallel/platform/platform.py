@@ -308,6 +308,7 @@ class Platform:
 
     @staticmethod
     def get_modules(module):
+        """Return all sub-modules contained in the given module."""
         raise NotImplementedError("Platform subclasses must implement get_modules")
 
     @staticmethod
@@ -930,10 +931,12 @@ class Platform:
 
     @staticmethod
     def get_symmetric_memory_handler():
+        """Return a platform-specific symmetric memory handler instance."""
         raise NotImplementedError("Platform subclasses must implement get_symmetric_memory_handler")
 
     @staticmethod
     def load_into_param(param, data):
+        """Load data into a parameter, handling framework-specific semantics."""
         raise NotImplementedError("Platform subclasses must implement load_into_param")
 
     def create_group(self, rank_list):
@@ -1339,6 +1342,7 @@ class Platform:
 
     @staticmethod
     def get_class_activation_wrapper():
+        """Return the platform-specific activation wrapper class."""
         raise NotImplementedError("Platform subclasses must implement get_class_activation_wrapper")
 
     @property

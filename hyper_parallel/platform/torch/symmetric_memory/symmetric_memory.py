@@ -66,6 +66,7 @@ class TorchSymmetricMemoryHandler:
 
     @staticmethod
     def is_shmem_available():
+        """Return True if the symmetric memory shared library was loaded successfully."""
         return _is_shmem_available
 
     @staticmethod
@@ -81,16 +82,19 @@ class TorchSymmetricMemoryHandler:
 
     @staticmethod
     def barrier():
+        """Synchronize all ranks via a distributed barrier."""
         dist.barrier()
 
     @staticmethod
     def rendezvous(tensor, group):
+        """Allocate symmetric memory across ranks; not needed in CANN SHMEM v1.0.0."""
         raise NotImplementedError("In CANN SHMEM v1.0.0, rendezvous is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
                                   "so this function is not implemented. ")
 
     @staticmethod
     def set_signal_pad_size(size: int) -> None:
+        """Set the signal pad size; not implemented for CANN SHMEM v1.0.0."""
         raise NotImplementedError("In CANN SHMEM v1.0.0, set_signal_pad_size is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
                                   "you can create symmetric signal memory by empty() "
@@ -98,6 +102,7 @@ class TorchSymmetricMemoryHandler:
 
     @staticmethod
     def get_signal_pad_size() -> int:
+        """Return the signal pad size; not implemented for CANN SHMEM v1.0.0."""
         raise NotImplementedError("In CANN SHMEM v1.0.0, get_signal_pad_size is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
                                   "you can create symmetric signal memory by empty() "

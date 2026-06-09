@@ -157,3 +157,4 @@
 "hyper-parallel/tests/torch/dist_module/"                               "method-hidden"
 "hyper-parallel/tests/torch/dist_module/"                               "missing-function-docstring"
 "hyper-parallel/tests/torch/dist_module/"                               "unused-import"
+"hyper-parallel/hyper_parallel/core/pipeline_parallel/scheduler.py"     "unnecessary-pass"

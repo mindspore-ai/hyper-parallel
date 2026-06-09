@@ -172,6 +172,7 @@ class LayoutCacheKey:
     def __repr__(self):
         return f"LayoutCacheKey({self._tuple})"
 
+
 class LayoutCacheManager:
     """
     Cache layout in infer layout.

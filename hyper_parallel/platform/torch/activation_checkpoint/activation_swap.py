@@ -57,6 +57,7 @@ class FuncModule(nn.Module):
         self._fn = fn
 
     def forward(self, *args, **kwargs):
+        """Invoke the wrapped callable with the given arguments."""
         return self._fn(*args, **kwargs)
 
 
@@ -230,6 +231,7 @@ class ActivationWrapper(torch.nn.Module, ABC):
 
     @abstractmethod
     def forward(self, *args, **kwargs):
+        """Run the wrapped module's forward pass with activation swapping. Must be implemented by subclasses."""
         raise ValueError("Subclasses should implement forward().")
 
     def __getattr__(self, name: str) -> Any:
@@ -306,6 +308,7 @@ class SwapWrapper(ActivationWrapper):
         self.group_swap = group_swap
 
     def forward(self, *args, **kwargs):
+        """Run the wrapped module inside an AsyncSaveOnCpu context for activation swapping."""
         with AsyncSaveOnCpu(policy_fn=self.policy_fn, group_swap=self.group_swap):
             return self._swap_wrapped_module(*args, **kwargs)
 
@@ -315,6 +318,7 @@ def swap_wrapper(
     policy_fn: Optional[Callable] = None,
     group_swap: bool = False,
 ) -> SwapWrapper:
+    """Wrap a module or callable with activation swap functionality."""
     return SwapWrapper(module, policy_fn, group_swap)
 
 

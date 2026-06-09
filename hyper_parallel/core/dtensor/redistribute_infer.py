@@ -33,15 +33,18 @@ class TensorMap:
         self.dims = dims
 
     def get_dim_by_idx(self, index: int) -> Union[int, Tuple[int, ...]]:
+        """Return the dimension value at the given index, or NONE if out of range."""
         return self.dims[index] if index < len(self.dims) else NONE
 
     def get_index_by_value(self, value: Union[int, Tuple[int, ...]]) -> int:
+        """Return the index of the first dimension matching the given value, or NONE."""
         for i, dim in enumerate(self.dims):
             if dim == value:
                 return i
         return NONE
 
     def get_index_contain_value(self, value: Union[int, Tuple[int, ...]]) -> int:
+        """Return the index of the tuple dimension whose suffix matches the given value, or NONE."""
         for i, dim in enumerate(self.dims):
             if not isinstance(dim, tuple):
                 continue

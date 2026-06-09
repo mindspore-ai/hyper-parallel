@@ -97,6 +97,7 @@ class ResultCsv:
                 row[h.index('vp')] = 1
 
     def shell_to_row(self, shell_file, row):
+        """Parse a shell configuration file and populate the corresponding CSV row fields."""
         h = self.header
         configs, _ = pp_util.parse_shell(shell_file)
         row[h.index('layers')] = configs.get('NUM_LAYERS')

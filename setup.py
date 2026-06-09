@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_readme_content():
+    """Read and return the contents of README.md for use as the package long description."""
     pwd = os.path.dirname(os.path.realpath(__file__))
     with open(os.path.join(pwd, 'README.md'), encoding='UTF-8') as f:
         return f.read()
@@ -91,6 +92,7 @@ def update_permissions(path):
 
 
 def write_commit_id():
+    """Write the current git branch name and latest commit hash to the .commit_id file."""
     ret_code = os.system("git rev-parse --abbrev-ref HEAD > ./hyper_parallel/.commit_id "
                          "&& git log --abbrev-commit -1 >> ./hyper_parallel/.commit_id")
     if ret_code != 0:

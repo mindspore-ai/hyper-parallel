@@ -46,6 +46,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+
 def _remap_simple_key(hf_key: str, max_layer: int) -> str | None:
     """Return hyper key for simple HF keys, or None to skip.
 
@@ -77,6 +78,7 @@ def _remap_simple_key(hf_key: str, max_layer: int) -> str | None:
 
     logger.debug("Unmapped HF key dropped: %s", hf_key)
     return None
+
 
 def _normalize_packed_experts(
     gate_up_proj: torch.Tensor,
@@ -113,6 +115,7 @@ def _normalize_packed_experts(
             f"down_proj per-expert shape {tuple(d0.shape)} unexpected"
         )
     return gate_up, down_w
+
 
 def load_hf_qwen3_5_moe_state_dict(
     weights_path: str,

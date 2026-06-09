@@ -33,6 +33,7 @@ from hyper_parallel.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 
 logger = logging.getLogger(__name__)
 
+
 def _apply_ac(model, cfg) -> None:
     """Apply ac (internal)."""
     ac_mode = getattr(cfg.train.gradient_checkpointing, "activation_checkpoint", "off")
@@ -46,6 +47,7 @@ def _apply_ac(model, cfg) -> None:
     for i, layer in enumerate(layers):
         model.layers[i] = checkpoint_wrapper(layer)
     logger.info_rank0("AC applied to %d Qwen3.5-MoE layers (mode=%s)", len(layers), ac_mode)
+
 
 def _apply_fsdp(model, mesh, cfg) -> None:
     """Per-layer + root FSDP wrap.
@@ -115,6 +117,7 @@ def _apply_fsdp(model, mesh, cfg) -> None:
                 replicate_params.add(param)
     if shard_dim_overrides:
         overrides = shard_dim_overrides
+
         def _shard_placement_fn(param):
             dim = overrides.get(id(param))
             return Shard(dim) if dim is not None else None
@@ -138,6 +141,7 @@ def _apply_fsdp(model, mesh, cfg) -> None:
         "FSDP applied to Qwen3.5-MoE: %d layers + root  replicate=%d",
         len(layers), len(replicate_params),
     )
+
 
 def parallelize_qwen3_5_moe(
     model: Qwen3_5MoeForCausalLM, mesh, cfg

@@ -27,6 +27,7 @@ from fast_tuner.utils.logger import logger
 
 
 def cal_model_layers_num(input_args):
+    """Calculate the total number of model layers including multi-token prediction depth."""
     if input_args.model.model_config.mtp_depth is None:
         input_args.model.model_config.mtp_depth = 0
     return input_args.model.model_config.num_layers + input_args.model.model_config.mtp_depth
@@ -378,6 +379,7 @@ def generate_files(candidate_configs, des_file_directory, file_task, para, input
 
 
 def is_dualpipe_open(input_args):
+    """Check whether the dual-pipeline (zero_bubble_v) scheduler is enabled in the input arguments."""
     if input_args.mf_args is None:
         return False
     parallel_cfg = input_args.mf_args.parallel
@@ -389,10 +391,12 @@ def is_dualpipe_open(input_args):
     return use_zero_bubble_v
 
 def check_dryrun_parallel_number(parallel_num):
+    """Validate that the dryrun parallel number does not exceed the allowed limit of 16."""
     if parallel_num > 16:
         raise ValueError(f"The parallel number {parallel_num} is too large.")
 
 def parse_args_from_json(args):
+    """Load additional argument values from a JSON config file and set them on the args namespace."""
     with open(args.config, 'r', encoding='utf-8') as f:
         data = json.load(f)
     for key, value in data.items():

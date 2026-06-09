@@ -81,6 +81,7 @@ class _MicroBatch(nn.Cell):
         return args_after_split, kwargs_after_split
 
     def split_inputs_with_custom_shard(self, input_tensor, cur_arg_batch_dim, micro_idx):
+        """Split a DTensor input along the batch dimension using its custom shard layout."""
         if not isinstance(input_tensor, hyper_parallel.DTensor):
             raise TypeError(f"Input type {type(input_tensor)} is not DTensor.")
         input_layout = input_tensor.layout

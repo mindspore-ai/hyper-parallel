@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 class Callback:
     """Base class for all trainer callbacks.
 
@@ -151,6 +152,7 @@ class Callback:
         dict for sinks (TensorBoard / W&B) to log.
         """
 
+
 class LoggingCallback(Callback):
     """Log training metrics: loss, grad_norm, lr, throughput.
 
@@ -247,6 +249,7 @@ class LoggingCallback(Callback):
         dispatch = getattr(self.trainer, "dispatch_log_event", None)
         if dispatch is not None:
             dispatch(record)
+
 
 class CheckpointCallback(Callback):
     """Save distributed checkpoints and handle resume.
@@ -460,6 +463,7 @@ class CheckpointCallback(Callback):
 
         # HF format export is handled by SafetensorsExportCallback (separate concern).
 
+
 class SafetensorsExportCallback(Callback):
     """Export model weights in HuggingFace safetensor format.
 
@@ -546,6 +550,7 @@ class SafetensorsExportCallback(Callback):
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning_rank0("Failed to save HF checkpoint: %s", exc)
 
+
 class EvalCallback(Callback):
     """Evaluation callback stub.
 
@@ -563,6 +568,7 @@ class EvalCallback(Callback):
                 logger.warning(
                     "EvalCallback: evaluation not implemented (step=%d)", state.global_step
                 )
+
 
 class ProfilerCallback(Callback):
     """Training profiler callback — STUB (not verified).
@@ -584,6 +590,7 @@ class ProfilerCallback(Callback):
                 "relying on traces."
             )
 
+
 class WandbCallback(Callback):
     """Weights & Biases logging callback — STUB (not verified).
 
@@ -603,6 +610,7 @@ class WandbCallback(Callback):
                 "stub — nothing is sent to W&B. Implement before relying on "
                 "W&B dashboards."
             )
+
 
 class ProgressCallback(Callback):
     """tqdm progress bar callback (rank 0 only).
@@ -647,6 +655,7 @@ class ProgressCallback(Callback):
         if self._pbar is not None:
             self._pbar.close()
             self._pbar = None
+
 
 class MoEMonitorCallback(Callback):
     """Mixture-of-Experts load-balancing monitor.
@@ -726,6 +735,7 @@ class MoEMonitorCallback(Callback):
     def on_substep_end(self, state: "TrainerState", **kwargs) -> None:
         """No-op; expert bias updates happen in on_step_end."""
 
+
 class GradientHealthCallback(Callback):
     """Detect NaN / Inf grad_norm and raise / warn.
 
@@ -765,6 +775,7 @@ class GradientHealthCallback(Callback):
                     "Disable cfg.train.debug.check_nan_inf to skip this guard."
                 )
 
+
 class GCCallback(Callback):
     """Explicit garbage-collection scheduler.
 
@@ -796,6 +807,7 @@ class GCCallback(Callback):
             return
         gc.collect()
 
+
 class TensorBoardCallback(Callback):
     """TensorBoard scalar writer — STUB (not verified).
 
@@ -815,6 +827,7 @@ class TensorBoardCallback(Callback):
                 "is a stub — nothing is written to TensorBoard. Implement "
                 "before relying on TB scalars."
             )
+
 
 class MemoryMonitorCallback(Callback):
     """Peak / current device memory monitor — STUB (not verified).

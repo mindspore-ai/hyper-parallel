@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+
 class SwiGLUMLP(nn.Module):
     """SwiGLU MLP (Llama / Qwen / Mistral convention).
 
@@ -36,4 +37,5 @@ class SwiGLUMLP(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the SwiGLU feed-forward transformation."""
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))

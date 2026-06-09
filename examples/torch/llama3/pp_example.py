@@ -73,6 +73,7 @@ def _pp_size_from_env(world: int) -> int:
 
 
 def main() -> None:
+    """Entry point: run a Llama3 pipeline-parallel training demo."""
     rank, world, device_type = init_dist()
     device = torch.device(device_type, rank)
     pp_size = _pp_size_from_env(world)

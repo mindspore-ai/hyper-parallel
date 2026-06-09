@@ -30,6 +30,7 @@ from hyper_parallel.trainer.base import BaseTrainer
 
 logger = logging.getLogger(__name__)
 
+
 class LLMTrainer:
     """Trainer for LM pretraining and SFT.
 
@@ -260,8 +261,10 @@ class LLMTrainer:
             """Wrap HF dataset for torch DataLoader."""
             def __init__(self, hf_ds):
                 self.data = hf_ds
+
             def __len__(self):
                 return len(self.data)
+
             def __getitem__(self, idx):
                 item = self.data[idx]
                 return {
@@ -329,8 +332,10 @@ class LLMTrainer:
         class PresetPtDataset(Dataset):
             def __init__(self, samples):
                 self.samples = samples
+
             def __len__(self):
                 return len(self.samples)
+
             def __getitem__(self, idx):
                 return self.samples[idx]
 

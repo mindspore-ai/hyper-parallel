@@ -75,6 +75,7 @@ _UNIVERSAL_FIELDS = (
     "max_position_embeddings",
 )
 
+
 def _resolve_kwargs(model_cfg) -> dict:
     """Build the full kwargs dict for :class:`Qwen3_5MoeConfig`.
 
@@ -94,6 +95,7 @@ def _resolve_kwargs(model_cfg) -> dict:
     if isinstance(extra, dict):
         kwargs.update(extra)
     return kwargs
+
 
 def _build(cfg) -> Qwen3_5MoeForCausalLM:
     """Translate trainer cfg → Qwen3_5MoeConfig → model.

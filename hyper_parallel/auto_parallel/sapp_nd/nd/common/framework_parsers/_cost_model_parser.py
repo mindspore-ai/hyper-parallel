@@ -32,7 +32,11 @@ class _CostModelParser(ABC):
 
     @abstractmethod
     def parse(self):
-        pass
+        """Parse the cost model configuration and populate the cost model variables.
+
+        Subclasses must implement this method to read framework-specific
+        configuration values into the shared _CostModVar instance.
+        """
 
     def config_optimizer_shard(self, ccfg):
         """OP related variables"""

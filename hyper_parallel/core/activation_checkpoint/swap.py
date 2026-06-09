@@ -142,6 +142,11 @@ class SwapTensor:
             self._keep_on_device = True
 
     def get_val(self) -> Any:
+        """Return the underlying tensor value.
+
+        Raises RuntimeError if the tensor is not currently in the 'device' state.
+        Non-tensor values are returned directly regardless of state.
+        """
         if self._state == self.STATE_NON_TENSOR:
             return self.val
         if self._state != self.STATE_DEVICE:
@@ -258,6 +263,7 @@ class SwapTensor:
 
     @property
     def state(self) -> str:
+        """Return the current swap state of this tensor (device, host, d2h, h2d, or non_tensor)."""
         return self._state
 
     def __repr__(self):
@@ -283,9 +289,11 @@ class Storage:
         return self._data[key]
 
     def values(self):
+        """Return an iterable view of all stored lists."""
         return self._data.values()
 
     def clear(self):
+        """Remove all entries from the storage."""
         self._data.clear()
 
     def iter_swap_tensors(self):
@@ -377,6 +385,7 @@ class Storage:
     def launch_offload(self):
         """launch async offload for all tensors in swap storage"""
         def _async_offload(x):
+
             if isinstance(x, SwapTensor):
                 x.async_offload()
             return x
@@ -766,9 +775,11 @@ class SwapManager:
             group._storages.clear()
 
     def get_current_group_name(self) -> str:
+        """Return the name of the currently active swap group."""
         return self._current_group_name
 
     def set_current_group_name(self, group_name: str) -> None:
+        """Set the name of the currently active swap group."""
         self._current_group_name = group_name
 
     def is_last_group(self, group_name: Optional[str] = None) -> bool:

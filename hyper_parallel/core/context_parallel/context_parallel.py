@@ -156,7 +156,8 @@ def _split_cp_composed_layout(tensor: "DTensor", cp_mesh: DeviceMesh):
         return None
     mesh = tensor.device_mesh
     dim_names = mesh.mesh_dim_names
-    assert dim_names is not None
+    if dim_names is None:
+        raise ValueError("dim_names must not be None")
     cp_names = set(cp_mesh.mesh_dim_names or ())
     non_cp_names = tuple(name for name in dim_names if name not in cp_names)
     if len(non_cp_names) == 0:
@@ -417,8 +418,6 @@ def _gather_seq(
     return _to_cp_dtensor(tensor, submesh, (Shard(seq_dim),), (Replicate(),), seq_dim)
 
 
-
-
 # ---------------------------------------------------------------------------
 # Unified ContextParallel
 # ---------------------------------------------------------------------------
@@ -539,7 +538,8 @@ class ContextParallel(ParallelStyle):
             # Hybrid
             hybrid_cp_mesh = _build_hybrid_cp_mesh(device_mesh, ds, co)
             dim_names = hybrid_cp_mesh.mesh_dim_names
-            assert dim_names is not None, "2-D mesh must have mesh_dim_names (guaranteed by _build_2d_mesh)"
+            if dim_names is None:
+                raise ValueError("2-D mesh must have mesh_dim_names (guaranteed by _build_2d_mesh)")
             ds_submesh = hybrid_cp_mesh[dim_names[1]]
             module.register_forward_pre_hook(
                 partial(

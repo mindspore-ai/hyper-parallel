@@ -27,6 +27,7 @@ class TorchCustomOps:
 
     @staticmethod
     def npu_dense_lightning_indexer_softmax_lse(*args, **kwargs):
+        """NPU dense lightning indexer softmax log-sum-exp operator; not supported on PyTorch."""
         raise NotImplementedError(
             "npu_dense_lightning_indexer_softmax_lse is not supported "
             "on the PyTorch platform."
@@ -34,6 +35,7 @@ class TorchCustomOps:
 
     @staticmethod
     def npu_dense_lightning_indexer_grad_kl_loss(*args, **kwargs):
+        """NPU dense lightning indexer gradient KL loss operator; not supported on PyTorch."""
         raise NotImplementedError(
             "npu_dense_lightning_indexer_grad_kl_loss is not supported "
             "on the PyTorch platform."
@@ -41,6 +43,7 @@ class TorchCustomOps:
 
     @staticmethod
     def npu_sparse_lightning_indexer_grad_kl_loss(*args, **kwargs):
+        """NPU sparse lightning indexer gradient KL loss operator; not supported on PyTorch."""
         raise NotImplementedError(
             "npu_sparse_lightning_indexer_grad_kl_loss is not supported "
             "on the PyTorch platform."
@@ -48,12 +51,14 @@ class TorchCustomOps:
 
     @staticmethod
     def npu_mhc_post(*args, **kwargs):
+        """NPU MHC post-processing operator; not supported on PyTorch."""
         raise NotImplementedError(
             "npu_mhc_post is not supported on the PyTorch platform."
         )
 
     @staticmethod
     def npu_mhc_pre_sinkhorn(*args, **kwargs):
+        """NPU MHC pre-Sinkhorn operator; not supported on PyTorch."""
         raise NotImplementedError(
             "npu_mhc_pre_sinkhorn is not supported on the PyTorch platform."
         )

@@ -197,10 +197,12 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 
     @property
     def uses_param_shard(self) -> bool:
+        """Whether FSDP sharding is enabled for this parameter."""
         return self.enable_fsdp_shard
 
     @property
     def is_dtensor_compat_mode(self) -> bool:
+        """Whether this parameter uses DTensor compatibility mode."""
         return self.param_mode == FullyShardParamMode.DTENSOR_COMPAT
 
     def _get_data_parallel_shard_placement(self, placements: list, shard_placement: Shard):
@@ -804,6 +806,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         return self._reduce_scatter_output, self.reduce_scatter_handle
 
     def zero_grad(self):
+        """Reset the sharded parameter's gradient to None."""
         self.sharded_param.grad = None
 
     def all_reduce_grad(
@@ -921,5 +924,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
 def set_requires_grad_if_needed(
     src_tensor: ms.Tensor, dst_tensor: ms.Tensor
 ) -> None:
+    """Synchronize the requires_grad flag from src_tensor to dst_tensor if they differ."""
     if src_tensor.requires_grad != dst_tensor.requires_grad:
         dst_tensor.requires_grad_(src_tensor.requires_grad)

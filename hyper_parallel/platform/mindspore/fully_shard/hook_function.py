@@ -21,11 +21,13 @@ class PostBackwardFunction(_Function):
 
     @staticmethod
     def forward(ctx, hsdp_scheduler, *inputs):
+        """Forward pass that stores the HSDP scheduler in context for the backward hook."""
         ctx.hsdp_scheduler = hsdp_scheduler
         return inputs
 
     @staticmethod
     def backward(ctx, *grads):
+        """Backward pass that triggers the post-backward hook on the HSDP scheduler."""
         # pylint: disable=W0212
         ctx.hsdp_scheduler._backward_hook()
         return (None,) + grads

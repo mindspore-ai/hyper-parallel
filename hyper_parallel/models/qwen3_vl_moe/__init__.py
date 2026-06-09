@@ -77,6 +77,7 @@ _VISION_DEFAULTS = {
     "deepstack_visual_indexes": [8, 16, 24],
 }
 
+
 def _load_text_config_defaults(model_cfg) -> dict:
     """Load text config defaults (internal)."""
     weights_path = getattr(model_cfg, "weights_path", None)
@@ -94,6 +95,7 @@ def _load_text_config_defaults(model_cfg) -> dict:
     if "mrope_section" in rope:
         text["mrope_section"] = rope["mrope_section"]
     return {k: v for k, v in text.items() if k in _DEFAULTS}
+
 
 def _load_full_config_defaults(model_cfg) -> dict:
     """Load full config defaults (internal)."""
@@ -124,6 +126,7 @@ def _load_full_config_defaults(model_cfg) -> dict:
         "composite": composite,
     }
 
+
 def _resolve_kwargs(model_cfg) -> dict:
     """Resolve config with checkpoint config between defaults and YAML."""
     kwargs = dict(_DEFAULTS)
@@ -139,6 +142,7 @@ def _resolve_kwargs(model_cfg) -> dict:
         kwargs.update(extra)
         kwargs.pop("vl", None)
     return kwargs
+
 
 def _build_vl(cfg) -> Qwen3VLMoeForConditionalGeneration:
     """Build vl (internal)."""
@@ -174,6 +178,7 @@ def _build_vl(cfg) -> Qwen3VLMoeForConditionalGeneration:
             **composite_kwargs,
         )
     )
+
 
 def _build(cfg):
     extra = getattr(cfg.model, "config_overrides", None)

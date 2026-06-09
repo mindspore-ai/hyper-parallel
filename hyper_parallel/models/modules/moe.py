@@ -23,6 +23,7 @@ from torch.nn import functional as F
 
 from hyper_parallel.models.modules.feed_forward import SwiGLUMLP
 
+
 class MoEExperts(nn.Module):
     """Packed MoE experts: ``num_experts`` experts as 3-D parameters.
 
@@ -82,6 +83,7 @@ class MoEExperts(nn.Module):
             expert_outputs[token_idx, top_k_pos] = current_hidden_states.to(expert_outputs.dtype)
         return expert_outputs.sum(dim=1)
 
+
 class MoE(nn.Module):
     """MoE block: router + packed experts with top-k dispatch."""
 
@@ -99,6 +101,7 @@ class MoE(nn.Module):
         self.experts = MoEExperts(num_experts, hidden_size, moe_intermediate_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Route input through top-k experts and return weighted output."""
         bsz, seq_len, h = x.shape
         x_flat = x.view(-1, h)
 
@@ -108,6 +111,7 @@ class MoE(nn.Module):
 
         out = self.experts(x_flat, topk_idx, topk_weights)
         return out.view(bsz, seq_len, h)
+
 
 class TopKRouter(nn.Module):
     """Top-k MoE router with softmax-then-topk-then-renormalize logic.
@@ -132,12 +136,14 @@ class TopKRouter(nn.Module):
         self.weight = nn.Parameter(torch.zeros(num_experts, hidden_size))
 
     def forward(self, hidden_states: torch.Tensor):
+        """Route tokens via softmax-then-topk with renormalization."""
         flat = hidden_states.reshape(-1, self.hidden_size)
         router_logits = F.linear(flat, self.weight)
         router_probs = F.softmax(router_logits, dim=-1, dtype=torch.float32)
         top_value, top_index = torch.topk(router_probs, self.top_k, dim=-1)
         top_value /= top_value.sum(dim=-1, keepdim=True)
         top_value = top_value.to(router_logits.dtype)
+
         return router_logits, top_value, top_index
 
 class SharedExpertMoE(nn.Module):

@@ -99,6 +99,7 @@ def build_config_for_rank(graph, tsv: TaskSplitValue, rank_id: int,
 
 
 def write_bin(path: str, data: bytes) -> None:
+    """Write binary data to a file, creating parent directories if needed."""
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     with open(path, 'wb') as f:
         f.write(data)
@@ -106,6 +107,7 @@ def write_bin(path: str, data: bytes) -> None:
 
 
 def main():
+    """Entry point for forward pass runtime data generation."""
     args = parse_args()
     out  = args.output_dir
 

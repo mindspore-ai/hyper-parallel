@@ -149,6 +149,7 @@ class AllGatherMetadataCache:
 
     @classmethod
     def get_metadata(cls, hsdp_params, fn):
+        """Retrieve or compute all-gather metadata, caching the result by parameter identity."""
         param_key = tuple((id(p), getattr(p, "version", 0)) for p in hsdp_params)
         key = hash(param_key)
         if key in cls._cache:
@@ -444,6 +445,7 @@ class HSDPParamGroup:
             hsdp_param.to_unsharded()
 
     def alloc_all_gather_output(self, total_output_numel, dtype):
+        """Allocate or resize the fused all-gather output buffer to the specified size and dtype."""
         normalized_device = _normalize_device(self.device)
         if self.ag_output is None or self.ag_output.dtype != dtype:
             self.ag_output = ms.mint.empty((total_output_numel,), dtype=dtype, device=normalized_device)
@@ -454,6 +456,7 @@ class HSDPParamGroup:
             storage.resize_(expected_size)
 
     def free_all_gather_output(self):
+        """Release the fused all-gather output buffer by resizing its storage to zero."""
         if self.ag_output is None:
             return
         storage = self.ag_output.untyped_storage()

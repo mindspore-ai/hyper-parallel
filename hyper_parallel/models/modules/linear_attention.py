@@ -43,11 +43,13 @@ from torch.nn import functional as F
 
 from hyper_parallel.models.modules.rmsnorm import RMSNormGated
 
+
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     """L2-normalize along ``dim``."""
     # ``(x * x).sum`` (MulBackward) instead of ``x.pow(2).sum`` (PowBackward):
     # equal math, NPU yields ULP-different gradients across the two ops.
     return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+
 
 def torch_chunk_gated_delta_rule(
     query: torch.Tensor,
@@ -145,6 +147,7 @@ def torch_chunk_gated_delta_rule(
     core_attn_out = core_attn_out[:, :, :sequence_length]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
+
 
 class GatedDeltaNet(nn.Module):
     """Gated DeltaNet linear-attention block (Qwen3.5 / Qwen3-Next style).

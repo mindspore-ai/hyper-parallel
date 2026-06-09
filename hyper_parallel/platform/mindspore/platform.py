@@ -1421,6 +1421,7 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def get_multicore_handler():
+        """Create and return a MindSpore multicore handler instance."""
         # pylint: disable=C0415
         from hyper_parallel.platform.mindspore.multicore import MSMulticoreHandler
         return MSMulticoreHandler()

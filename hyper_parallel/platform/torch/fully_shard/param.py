@@ -17,7 +17,6 @@
 # ============================================================================
 """HSDP parameter"""
 # pylint: disable=W0212
-import itertools
 from typing import Callable, List, Optional, Tuple, Union, cast
 
 import torch

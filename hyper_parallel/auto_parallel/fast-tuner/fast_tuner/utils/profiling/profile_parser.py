@@ -27,6 +27,10 @@ from fast_tuner.ndsearch.memory_model import compute_weight_and_optimizer_memory
 encoding = 'utf-8'
 
 def find_file_by_name(directory, filename):
+    """Recursively search for a file by name under the given directory.
+
+    Returns the full path if found, otherwise logs an error and returns None.
+    """
     for root, _, files in os.walk(directory):
         if filename in files:
             return os.path.join(root, filename)
@@ -34,6 +38,12 @@ def find_file_by_name(directory, filename):
     return None
 
 def median_mean(durs):
+    """Compute the mean of the middle 50% of values, converted to milliseconds.
+
+    Discards the lowest and highest quartiles to reduce outlier sensitivity,
+    then returns the average of the remaining values divided by 1000,
+    rounded to 3 decimal places.
+    """
     if len(durs) == 0:
         logger.info("get durs no values")
         return 0
@@ -183,6 +193,7 @@ class ProfileParser:
             self.profile_data = json.load(f)
 
     def refresh(self):
+        """Reset all profiling accumulators and computed values to their defaults."""
         self.profile_data = []
         (self.dense_fws, self.dense_bws, self.recomp_dense_bws, self.moe_fws, self.moe_bws,
          self.recomp_moe_bws, self.totals) = [
@@ -191,12 +202,18 @@ class ProfileParser:
          self.total, self.head_ratio, self.num_last_stage_layers, self.mtp) = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
     def release(self):
+        """Release the loaded profile data to free memory."""
         self.profile_data = []
 
     def set_tid(self, a, g):
+        """Set the thread IDs used to filter forward and backward attention operations."""
         self.att_tid, self.grad_att_tid = a, g
 
     def extract_atts(self):
+        """Extract FlashAttention forward and backward timestamps from the loaded profile data.
+
+        Returns two lists: forward attention timestamps and backward attention timestamps.
+        """
         atts, grad_atts = [], []
         for line in self.profile_data:
             name = line['name']
@@ -654,6 +671,12 @@ class ProfileMemParser:
         mem_info.write_to_txt(memory_file_name)
 
     def set_static_mem(self, mem_info, profile_file):
+        """Set static memory information by computing weight, optimizer, and vocab sizes.
+
+        Parses the profile config file to derive dense layer size, MoE layer size,
+        and vocabulary size, then populates the MemoryInfo object accordingly.
+        Returns the parsed input arguments.
+        """
         self.para.TOML_PATH = profile_file
         input_args = ParaForNd(self.para)
         dense_size, moe_size, vocab_size = compute_weight_and_optimizer_memory(input_args)
@@ -665,6 +688,11 @@ class ProfileMemParser:
         return input_args
 
     def cal_dynamic_mem(self, mem_info, cur_input_args):
+        """Calculate dynamic (activation) memory per layer from peak and static memory.
+
+        For pp==1, divides total dynamic memory evenly across layers and stores
+        the result in the provided MemoryInfo object.
+        """
         dynamic_mem_total = self.peak_memory_usage - self.static_memory_usage
         if cur_input_args.pp == 1:
             dynamic_mem_layer = dynamic_mem_total // cur_input_args.num_layers

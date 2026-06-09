@@ -540,7 +540,6 @@ class ExpertParallel(BaseExpertParallel):
 # ---------------------------------------------------------------------------
 # TensorParallel — TP-only weight sharding for experts (no token dispatch)
 # ---------------------------------------------------------------------------
-
 class TensorParallel(ParallelStyle):
     """Tensor Parallel for expert weights (no token dispatch).
 

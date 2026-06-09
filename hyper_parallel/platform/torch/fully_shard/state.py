@@ -56,6 +56,7 @@ class TorchHSDPStateV2(HSDPState):
     pre_direct_all_reduce_grads = []
     # Record AllReduceParamGroup that has reduce_scatter issued, waiting for next post_backward to process
     pre_all_reduce_groups: List[AllReduceParamGroup] = []
+
     # Record AllReduceParamGroup that has all_reduce issued, waiting for root_backward_hook to apply
     pending_all_reduce_groups: List[AllReduceParamGroup] = []
     @staticmethod
@@ -266,6 +267,7 @@ class TorchHSDPStateV2(HSDPState):
             )
 
     def lazy_init(self):
+        """Deferred initialization: reset sharded params, validate devices, and set mixed-precision dtypes."""
         if self.is_shard and not self._reset_sharded_params:
             for hsdp_param in self.hsdp_params:
                 hsdp_param.reset_sharded_param()

@@ -115,6 +115,7 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
             if isinstance(output, torch.Tensor) and output.requires_grad:
                 handle_ref = [None]
                 # pylint: disable=C0103, W0102
+
                 def wrapper_for_backward_pre_hook(grad, _handle_ref=handle_ref):
                     """Remove this hook after it fires to prevent accmulation"""
                     handle = _handle_ref[0]

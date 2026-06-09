@@ -89,14 +89,17 @@ class _PhiloxState:
 
     @property
     def state(self):
+        """Return the underlying RNG state tensor (CPU uint8)."""
         return self._state
 
     @property
     def offset(self) -> int:
+        """Return the offset value (last 8 bytes) of the Philox RNG state."""
         return int(self._state[8:].view(dtype=platform.tensor_dtype.int64).item())
 
     @offset.setter
     def offset(self, offset: int) -> None:
+        """Set the offset value of the Philox RNG state."""
         offset_tensor = Tensor([offset], dtype=platform.tensor_dtype.uint64).view(
             platform.tensor_dtype.uint8
         ) # device?
@@ -104,10 +107,12 @@ class _PhiloxState:
 
     @property
     def seed(self) -> int:
+        """Return the seed value (first 8 bytes) of the Philox RNG state."""
         return int(self._state[:8].view(dtype=platform.tensor_dtype.uint64).item())
 
     @seed.setter
     def seed(self, seed: int) -> None:
+        """Set the seed value of the Philox RNG state."""
         seed_tensor = Tensor([seed], dtype=platform.tensor_dtype.uint64).view(
             platform.tensor_dtype.uint8
         )# device
@@ -136,10 +141,12 @@ class _RNGStateTracker:
 
     @property
     def distribute_region_enabled(self) -> bool:
+        """Return whether the RNG distribute region is enabled for distributed random operations."""
         return self._use_distribute_region
 
     @distribute_region_enabled.setter
     def distribute_region_enabled(self, value) -> None:
+        """Set whether the RNG distribute region is enabled."""
         self._use_distribute_region = value
 
     def _distribute_region(

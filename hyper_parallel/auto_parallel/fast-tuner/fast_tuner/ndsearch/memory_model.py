@@ -26,6 +26,7 @@ from fast_tuner.utils.dryrun_manage import launch_dryrun, read_dryrun_info
 
 
 def memory_simple_prune(config, profile_info):
+    """Check if the estimated peak memory fits within the device memory limit using a simple heuristic."""
     memory_max = config.memory_max
     tmp_layer = config.num_layer // config.pp_size
     profile_memory = config.pp_size * tmp_layer * profile_info.act_mem_full_recomp \
@@ -98,6 +99,7 @@ def grey_box_memory_prune(mindformers_args, dryrun_info_init, test_ep, max_exper
     return memory_aware_configs
 
 def find_power_of_two(m):
+    """Return the exponent if m is an exact power of two, otherwise return None."""
     if m <= 0:
         return None
     power = math.log2(m)

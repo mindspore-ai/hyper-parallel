@@ -148,6 +148,7 @@ def _precision_close(
 
 
 def main() -> None:
+    """Entry point: run standalone vs EP distributed training loop and verify correctness."""
     rank, world, device_type = init_dist()
     device = torch.device(device_type, rank)
 

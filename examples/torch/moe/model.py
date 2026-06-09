@@ -125,6 +125,7 @@ class BshdSdpaCore(nn.Module):
     """Causal scaled dot-product attention in BSHD layout ``[B, S, H, D]``."""
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Compute causal scaled dot-product attention in BSHD layout."""
         qh = q.transpose(1, 2)
         kh = k.transpose(1, 2)
         vh = v.transpose(1, 2)
@@ -141,6 +142,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RMS normalization to the input tensor."""
         dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -241,6 +243,7 @@ class MoETransformerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        """Forward pass: residual attention block followed by residual MoE feed-forward block."""
         h = x + self.attention(self.attention_norm(x), freqs_cis)
         return h + self.feed_forward(self.ffn_norm(h))
 

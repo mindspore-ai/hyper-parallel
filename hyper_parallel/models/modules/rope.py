@@ -19,6 +19,7 @@ from typing import List, Optional
 import torch
 from torch import nn
 
+
 def _use_npu_rotary_mul() -> bool:
     """True when ``HYPER_USE_V1_KERNELS=1`` and ``torch_npu`` is importable.
 
@@ -32,6 +33,7 @@ def _use_npu_rotary_mul() -> bool:
         return True
     except ImportError:
         return False
+
 
 class RotaryEmbedding(nn.Module):
     """Rotary Position Embedding.
@@ -86,6 +88,7 @@ class RotaryEmbedding(nn.Module):
         freqs = torch.outer(flat, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
+
 
 class MultiModalRotaryEmbedding(RotaryEmbedding):
     """Interleaved multi-modal RoPE used by Qwen3-VL / Qwen2-VL.
@@ -149,11 +152,13 @@ class MultiModalRotaryEmbedding(RotaryEmbedding):
         emb = torch.cat((out, out), dim=-1)
         return emb.cos().to(dtype=x.dtype), emb.sin().to(dtype=x.dtype)
 
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     """Rotate half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
+
 
 def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor,
                          cos: torch.Tensor, sin: torch.Tensor):

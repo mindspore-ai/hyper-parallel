@@ -204,26 +204,32 @@ class TaskSplitValue:
     # ── Derived properties ────────────────────────────────────────────────────
     @property
     def single_rank_expert_num(self) -> int:
+        """Number of experts assigned to a single rank."""
         return self.all_expert_num // self.ep
 
     @property
     def seq_all(self) -> int:
+        """Total sequence length after accounting for EP and TP parallelism."""
         return (self.seq_size * self.ep * self.top_k) // self.tp
 
     @property
     def per_expert_seq(self) -> int:
+        """Sequence length per expert (across all EP ranks)."""
         return self.seq_all // self.top_k
 
     @property
     def per_rank_seq(self) -> int:
+        """Sequence length assigned to each rank."""
         return self.seq_all // self.ep
 
     @property
     def per_expert_seq_to_other(self) -> int:
+        """Sequence length per expert when sending to other ranks."""
         return self.seq_all // (self.ep * self.top_k)
 
     @property
     def all_event_num(self) -> int:
+        """Total number of events needed for the schedule."""
         e = self.single_rank_expert_num
         return 1 + self.all_expert_num + e + e + e
 

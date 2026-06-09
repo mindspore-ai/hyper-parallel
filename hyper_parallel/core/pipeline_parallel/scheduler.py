@@ -75,14 +75,17 @@ class MetaStep:
 
     @property
     def micro_index(self):
+        """Return the micro-batch index of this step."""
         return self._micro_index
 
     @property
     def stage_index(self):
+        """Return the stage index of this step."""
         return self._stage_index
 
     @property
     def type(self):
+        """Return the MetaStepType of this step."""
         return self._type
 
     @property
@@ -119,6 +122,7 @@ class MetaStep:
 
     @staticmethod
     def from_str(step_str):
+        """Parse a MetaStep from its string representation."""
         pass
 
 def generate_stage_to_rank_mapping(real_stage_num, stage_num, style='loop'):
@@ -150,6 +154,7 @@ def generate_rank_to_stage_mapping(real_stage_num, stage_num, style='loop'):
     rank_to_stages = defaultdict(list)
     for stage_index, rank in stage_to_rank.items():
         rank_to_stages[rank].append(stage_index)
+
     for stages in rank_to_stages.values():
         stages.sort()
     return dict(rank_to_stages)
@@ -160,6 +165,7 @@ def iter_leaf_meta_steps(step):
         return
     if step.type == MetaStepType.OVERLAP_F_B:
         for sub_step in step.sub_steps:
+
             yield from iter_leaf_meta_steps(sub_step)
         return
     yield step

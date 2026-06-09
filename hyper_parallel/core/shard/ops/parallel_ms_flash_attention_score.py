@@ -835,7 +835,8 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
                 is_dynamic = dynamic_info.get('is_dynamic', False)
 
                 if lb_split_id is not None:
-                    assert lb_split_num is not None
+                    if lb_split_num is None:
+                        raise ValueError("lb_split_num must not be None when lb_split_id is set")
                     split_id = lb_split_id
                     seq_split_num = lb_split_num   # override for sparse param computation
                 else:

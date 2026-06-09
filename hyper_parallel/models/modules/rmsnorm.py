@@ -19,6 +19,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+
 def _use_npu_rms_norm() -> bool:
     """True when ``HYPER_USE_V1_KERNELS=1`` and ``torch_npu`` is importable.
 
@@ -32,6 +33,7 @@ def _use_npu_rms_norm() -> bool:
         return True
     except ImportError:
         return False
+
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization.
@@ -59,6 +61,7 @@ class RMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         return self.weight * hidden_states.to(input_dtype)
 
+
 class RMSNormGated(nn.Module):
     """RMSNorm with multiplicative SiLU-gated path — used by Qwen3.5 / Qwen3-Next
     Gated DeltaNet to fuse the per-head normalization and the residual gate.
@@ -78,6 +81,7 @@ class RMSNormGated(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Apply RMS normalization followed by SiLU-gated scaling."""
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)

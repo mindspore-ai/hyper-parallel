@@ -28,10 +28,12 @@ def register_tiling(tiling_position: int, data: bytes) -> None:
 
 
 def get_tiling(tiling_position: int) -> bytes:
+    """Retrieve pre-serialized tiling bytes for the given position."""
     if tiling_position not in _registry:
         raise KeyError(f"No tiling registered at position {tiling_position}")
     return _registry[tiling_position]
 
 
 def clear() -> None:
+    """Clear all registered tiling data."""
     _registry.clear()

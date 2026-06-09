@@ -56,5 +56,6 @@ class InputParam:
         raise AttributeError(f"'InputParam' object has no attribute '{name}'")
 
     def print_params(self):
+        """Log all parameter mappings and their current values."""
         for key, value in self.PARAM_MAPPING.items():
             logger.info(f"{key}: {value} = {getattr(self, key)}")

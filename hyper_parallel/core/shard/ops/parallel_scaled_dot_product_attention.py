@@ -318,7 +318,8 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
                     )
 
                 if lb_split_id is not None:
-                    assert lb_split_num is not None
+                    if lb_split_num is None:
+                        raise ValueError("lb_split_num must not be None when lb_split_id is set")
                     split_id = lb_split_id
                     seq_split_num = lb_split_num   # for global_q_len in _adjust_attn_mask_for_sp
                 else:

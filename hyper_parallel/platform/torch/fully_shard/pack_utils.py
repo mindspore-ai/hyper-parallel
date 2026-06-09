@@ -131,6 +131,7 @@ def _current_strided_layout_is_supported(
 
 
 def supports_same_dim_strided_layout(hsdp_param: Any) -> bool:
+    """Check whether the parameter's StridedShard layout is supported for same-dim packing."""
     ctx = _resolve_same_dim_strided_context(hsdp_param)
     if ctx is None:
         return False

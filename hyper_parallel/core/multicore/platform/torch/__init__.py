@@ -187,6 +187,7 @@ from . import hyper_parallel_mega_moe_pta  # noqa: F401, E402  # pylint: disable
 # Python wrappers — thin pass-through to the registered C++ ops
 # ---------------------------------------------------------------------------
 
+
 def mega_moe(
     dispatch_target, dispatch_target_off,
     dispatch_src, dispatch_src_off, dispatch_size,

@@ -69,6 +69,7 @@ def apply_rotary_emb(xq: Tensor, xk: Tensor, cos: Tensor, sin: Tensor) -> Tuple[
 
 
 def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
+    """Repeat KV heads to match the number of query heads for grouped-query attention (GQA)."""
     if n_rep == 1:
         return x
     b, n_kv, s, d = int(x.shape[0]), int(x.shape[1]), int(x.shape[2]), int(x.shape[3])
@@ -134,7 +135,8 @@ class Llama3Attention(nn.Cell):
         self.n_heads = cfg.n_heads
         self.n_kv_heads = cfg.n_kv_heads
         self.head_dim = cfg.dim // cfg.n_heads
-        assert cfg.n_heads % cfg.n_kv_heads == 0
+        if cfg.n_heads % cfg.n_kv_heads != 0:
+            raise ValueError(f"n_heads ({cfg.n_heads}) must be divisible by n_kv_heads ({cfg.n_kv_heads})")
         self.n_rep = cfg.n_heads // cfg.n_kv_heads
         self.tp_mesh_size: int = 1
         self.tp_mesh: Optional[DeviceMesh] = None
@@ -227,6 +229,7 @@ class Llama3LocalEmbedding(nn.Embedding):
         return out * mask_f
 
     def construct(self, token_ids: Tensor) -> Tensor:
+        """Embed token IDs using row-parallel vocab sharding under SkipDTensorDispatch."""
         with SkipDTensorDispatch():
             return self._row_parallel_lookup(token_ids, self.embedding_table)
 
@@ -241,6 +244,7 @@ class Llama3FeedForward(nn.Cell):
         self.w3 = nn.Dense(dim, hidden_dim, has_bias=False)
 
     def construct(self, x: Tensor) -> Tensor:
+        """SwiGLU feed-forward: up-project with w1/w3, apply SiLU gating, then down-project with w2."""
         return self.w2(mint.nn.functional.silu(self.w1(x)) * self.w3(x))
 
 
@@ -255,6 +259,7 @@ class Llama3TransformerBlock(nn.Cell):
         self.feed_forward = Llama3FeedForward(cfg.dim, hidden_dim)
 
     def construct(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        """Decoder block forward: attention with residual, then feed-forward with residual."""
         h = x + self.attention(self.attention_norm(x), cos, sin)
         return h + self.feed_forward(self.ffn_norm(h))
 
@@ -281,6 +286,7 @@ class Llama3Model(nn.Cell):
         self.freqs_sin = Tensor(sin_np, dtype=ms.float32)
 
     def construct(self, token_ids: Tensor) -> Tensor:
+        """Full model forward: embed tokens, run through transformer layers, and produce logits."""
         h = self.tok_embeddings(token_ids)
         cos = self.freqs_cos
         sin = self.freqs_sin

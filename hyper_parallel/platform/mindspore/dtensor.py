@@ -164,11 +164,13 @@ class DTensorBase(Tensor):
     @property
     # pylint: disable=C2801
     def data(self):
+        """Return the underlying tensor data, preserving the DTensorBase subclass."""
         return Tensor.data.__get__(self, type(self))
 
     @data.setter
     # pylint: disable=C2801
     def data(self, value):
+        """Set the underlying tensor data, extracting the local shard if a DTensor is given."""
         local_value = value.to_local() if isinstance(value, DTensorBase) else value
         Tensor.data.__set__(self, local_value)
         Tensor.data.__set__(self._local_tensor, local_value)

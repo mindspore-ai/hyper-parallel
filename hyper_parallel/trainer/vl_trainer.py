@@ -201,8 +201,10 @@ class VLTrainer:
         class PresetPtVLDataset(Dataset):
             def __init__(self, samples):
                 self.samples = samples
+
             def __len__(self):
                 return len(self.samples)
+
             def __getitem__(self, idx):
                 return self.samples[idx]
 
@@ -238,4 +240,5 @@ class VLTrainer:
         self.base.collate_fn = _vl_collate
 
     def train(self):
+        """Run the full training loop by delegating to the underlying BaseTrainer."""
         return self.base.train()

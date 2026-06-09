@@ -32,20 +32,25 @@ class MindSporeCustomOps:
 
     @staticmethod
     def npu_dense_lightning_indexer_softmax_lse(*args, **kwargs):
+        """Compute dense lightning indexer softmax log-sum-exp via custom NPU operator."""
         return NpuDenseLightningIndexerSoftmaxLseDFunction.apply(*args, **kwargs)
 
     @staticmethod
     def npu_dense_lightning_indexer_grad_kl_loss(*args, **kwargs):
+        """Compute dense lightning indexer KL-loss gradient via custom NPU operator."""
         return NpuDenseLightningIndexerGradKlLossDFunction.apply(*args, **kwargs)
 
     @staticmethod
     def npu_sparse_lightning_indexer_grad_kl_loss(*args, **kwargs):
+        """Compute sparse lightning indexer KL-loss gradient via custom NPU operator."""
         return NpuSparseLightningIndexerGradKlLossDFunction.apply(*args, **kwargs)
 
     @staticmethod
     def npu_mhc_post(*args, **kwargs):
+        """Apply the NPU MHC post-processing custom operator."""
         return NpuMhcPostDFunction.apply(*args, **kwargs)
 
     @staticmethod
     def npu_mhc_pre_sinkhorn(*args, **kwargs):
+        """Apply the NPU MHC pre-Sinkhorn custom operator."""
         return NpuMhcPreSinkhornDFunction.apply(*args, **kwargs)

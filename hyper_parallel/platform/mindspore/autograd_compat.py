@@ -93,6 +93,7 @@ def retains_grad(self):
 
 @property
 def grad_fn(self):
+    """Return the gradient function node, or None for leaf tensors."""
     if self._grad_node and self._grad_node.is_leaf():
         return None
     return self._grad_node
@@ -100,6 +101,7 @@ def grad_fn(self):
 
 @property
 def output_nr(self):
+    """Return the output index of this tensor in the autograd graph."""
     return self._output_index
 
 

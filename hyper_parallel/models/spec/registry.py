@@ -21,6 +21,7 @@ from hyper_parallel.models.spec.model_spec import ModelSpec
 
 _SPEC_REGISTRY: dict[str, ModelSpec] = {}
 
+
 def register_spec(name: str, spec: ModelSpec) -> None:
     """Register a ModelSpec under the given name.
 
@@ -37,6 +38,7 @@ def register_spec(name: str, spec: ModelSpec) -> None:
             f"Existing: {_SPEC_REGISTRY[name]}, new: {spec}"
         )
     _SPEC_REGISTRY[name] = spec
+
 
 def get_spec(name: str) -> ModelSpec:
     """Look up a registered ModelSpec by name.

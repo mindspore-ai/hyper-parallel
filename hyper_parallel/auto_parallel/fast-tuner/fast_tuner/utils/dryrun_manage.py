@@ -24,6 +24,7 @@ from fast_tuner.utils.logger import logger
 
 
 def env_update(rank_size, env_variable_json):
+    """Load environment variables from a JSON file and update the process environment with the given rank size."""
     # set env vars
     with open(env_variable_json, 'r', encoding='utf-8') as f:
         env_vars = json.load(f)
@@ -31,6 +32,7 @@ def env_update(rank_size, env_variable_json):
     os.environ.update(env_vars)
 
 def create_target_dir(file, target_directory):
+    """Construct the target output directory path for a dryrun file."""
     output_dir = os.path.splitext(file)[0]
     target_dir = os.path.join(target_directory, f"dryrun_{output_dir}")
     return target_dir
@@ -55,6 +57,7 @@ def execute_command(para, config_file_path, target_dir, rank_id, tp):
         logger.error(f"The command execution failed.: {e}")
 
 def calculate_rank_id(input_args, match, layer_num, rank_size):
+    """Determine the rank ID for dryrun based on pipeline parallelism and dual-pipeline settings."""
     if is_dualpipe_open(input_args):
         return rank_size - 1
     pp = int(match.group(3))
@@ -99,6 +102,7 @@ def read_dryrun_info(root_dir):
     return result_list
 
 def get_file_pattern(root_dir, input_args, para):
+    """Select the appropriate regex file-name pattern based on config file type and whether the model uses experts."""
     logger.info(f"Reading file pattern from {root_dir}")
     if para.SHELL_PATH:
         if input_args.expert_num is None:

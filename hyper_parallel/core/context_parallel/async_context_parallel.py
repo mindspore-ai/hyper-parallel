@@ -369,7 +369,8 @@ class AsyncContextParallel(ContextParallel):
         else:
             hybrid_cp_mesh = _build_hybrid_cp_mesh(device_mesh, ds, co)
             dim_names = hybrid_cp_mesh.mesh_dim_names
-            assert dim_names is not None, "2-D mesh must have mesh_dim_names (guaranteed by _build_2d_mesh)"
+            if dim_names is None:
+                raise ValueError("2-D mesh must have mesh_dim_names (guaranteed by _build_2d_mesh)")
             ds_submesh = hybrid_cp_mesh[dim_names[1]]
             group = ds_submesh.get_group()
             a2a_layout_mesh = hybrid_cp_mesh

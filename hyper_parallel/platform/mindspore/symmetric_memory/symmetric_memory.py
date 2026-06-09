@@ -45,10 +45,12 @@ class MSSymmetricMemoryHandler:
 
     @staticmethod
     def is_shmem_available():
+        """Check whether the symmetric memory shared library is available on this host."""
         return _is_shmem_available
 
     @staticmethod
     def empty(size, dtype):
+        """Allocate an uninitialized symmetric memory tensor of the given size and dtype."""
         if not MSSymmetricMemoryHandler._is_init:
             MSSymmetricMemoryHandler._init_shmem()
         with ms.runtime.use_mem_pool(MSSymmetricMemoryHandler._mem_pool):
@@ -56,12 +58,14 @@ class MSSymmetricMemoryHandler:
 
     @staticmethod
     def rendezvous(tensor, group):
+        """Not implemented: symmetric memory is allocated at init time in CANN SHMEM v1.0.0."""
         raise NotImplementedError("In CANN SHMEM v1.0.0, rendezvous is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
                                   "so this function is not implemented. ")
 
     @staticmethod
     def set_signal_pad_size(size: int) -> None:
+        """Not implemented: signal padding is not needed in CANN SHMEM v1.0.0."""
         raise NotImplementedError("In CANN SHMEM v1.0.0, set_signal_pad_size is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
                                   "you can create symmetric signal memory by empty() "
@@ -69,6 +73,7 @@ class MSSymmetricMemoryHandler:
 
     @staticmethod
     def get_signal_pad_size() -> int:
+        """Not implemented: signal padding is not needed in CANN SHMEM v1.0.0."""
         raise NotImplementedError("In CANN SHMEM v1.0.0, get_signal_pad_size is not needed, "
                                   "symmetric memory are allocated at init time by SYMMETRIC_MEMORY_HEAP_SIZE, "
                                   "you can create symmetric signal memory by empty() "
@@ -100,6 +105,7 @@ class MSSymmetricMemoryHandler:
 
     @staticmethod
     def shmem_wait_for_signal(depend_tensor, signal, signal_offset, compare_value, compare_op):
+        """Block until the symmetric memory signal matches the expected value and comparison operation."""
         aclshmem_ms.signal_wait_until(depend_tensor, signal, signal_offset, compare_value, compare_op)
 
     @staticmethod
@@ -114,6 +120,7 @@ class MSSymmetricMemoryHandler:
 
     @staticmethod
     def barrier():
+        """Synchronize all ranks with a distributed barrier."""
         ms.mint.distributed.barrier()
 
     @classmethod
@@ -157,12 +164,15 @@ class MSSymmetricMemoryHandler:
 
     @classmethod
     def shmem_alltoall(cls, send_tensor_list, receive_tensor, receive_list):
+        """Not yet implemented: symmetric memory all-to-all collective."""
         raise NotImplementedError("Mindspore SymmetricMemory will implement shmem_alltoall later")
 
     @classmethod
     def fused_all_gather_matmul(cls, a, b, c, gather_out, signal, block_size=None):
+        """Not yet implemented: fused all-gather followed by matrix multiplication."""
         raise NotImplementedError("Mindspore SymmetricMemory will implement fused_all_gather_matmul later")
 
     @classmethod
     def fused_matmul_reduce_scatter(cls, x1, x2, symm_tensor, signal, reduce_op):
+        """Not yet implemented: fused matrix multiplication followed by reduce-scatter."""
         raise NotImplementedError("Mindspore SymmetricMemory will implement fused_matmul_reduce_scatter later")

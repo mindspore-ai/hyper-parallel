@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 _BUILTIN_NAMESPACE = "hyper_parallel.models"
 _EXCLUDE_FROM_LIST = frozenset({"modules", "spec"})  # shared blocks / spec layer, not models
 
+
 def discover_model_spec(name: str) -> str:
     """Import the package that registers ``ModelSpec`` for ``name``.
 
@@ -81,6 +82,7 @@ def discover_model_spec(name: str) -> str:
         ) from exc
     logger.info("Model spec auto-discovered: model.name=%s -> %s", name, candidate)
     return candidate
+
 
 def _list_builtin_models() -> list[str]:
     """List subpackages under ``hyper_parallel.models`` that look like models.

@@ -37,12 +37,14 @@ class BatchDimSpec:
 
     @staticmethod
     def from_tuple(batch_dims):
+        """Create a tuple of BatchDimSpec from a tuple of batch dimensions."""
         if not isinstance(batch_dims, tuple):
             raise TypeError(f"batch_dims must be tuple, but got type {type(batch_dims)}.")
         return tuple(BatchDimSpec(dim) for dim in batch_dims)
 
     @staticmethod
     def from_dict(batch_dims):
+        """Create a dict of BatchDimSpec from a dict mapping keys to batch dimensions."""
         if not isinstance(batch_dims, dict):
             raise TypeError(f"batch_dims must be dict, but got type {type(batch_dims)}.")
         return {k: BatchDimSpec(v) for k, v in batch_dims.items()}
@@ -65,20 +67,25 @@ class _RecvInfo:
 
     @property
     def global_rank(self):
+        """Return the global rank of the peer process."""
         return self._global_rank
 
     @property
     def buffer(self):
+        """Return the receive/send buffer tensor."""
         return self._buffer
 
     @buffer.setter
     def buffer(self, val):
+        """Set the receive/send buffer tensor."""
         self._buffer = val
 
     @property
     def requires_grad(self) -> bool:
+        """Whether the corresponding forward tensor requires a gradient."""
         return self._requires_grad
 
     @requires_grad.setter
     def requires_grad(self, val: bool) -> None:
+        """Set whether the corresponding forward tensor requires a gradient."""
         self._requires_grad = bool(val)

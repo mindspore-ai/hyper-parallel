@@ -74,6 +74,7 @@ class _MicroBatch(nn.Module):
         return args_after_split, kwargs_after_split
 
     def split_inputs_with_custom_shard(self, input_tensor, cur_arg_batch_dim, micro_idx):
+        """Split a DTensor input along the batch dimension while preserving its distributed layout."""
         input_layout = input_tensor.layout
         func_wrap = hyper_parallel.custom_shard(self.split_inputs,
                                  device_mesh=input_layout.mesh,

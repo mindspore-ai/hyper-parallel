@@ -21,6 +21,7 @@ from hyper_parallel import get_platform
 
 platform = get_platform()
 
+
 def count_loss_token(batch: Dict[str, Any]) -> int:
     """Count non-padding tokens in a micro-batch.
 
@@ -38,6 +39,7 @@ def count_loss_token(batch: Dict[str, Any]) -> int:
     if labels is None:
         return 0
     return int((labels != -100).sum().item())
+
 
 def mean_global_loss(
     loss: Any,
