@@ -445,6 +445,23 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertTrue(torch.equal(out[1].to_local(), producer_key))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_async_dsa_handoff_preserves_non_cp_tp_layout(self, mock_mesh_platform):
+        """Prelaunched DSA sequence-replicate handoff should restore CP+TP layout."""
+        cp_mesh, tp_mesh = self._make_cp_tp_meshes(mock_mesh_platform)
+        slot = _AsyncSequenceReplicateSlot(cp_mesh, seq_dim=1)
+        producer_key = DTensor.from_local(torch.randn(2, 4, 4, 16), tp_mesh, (Shard(2),))
+        stale_key = DTensor.from_local(torch.zeros(2, 4, 4, 16), tp_mesh, (Shard(2),))
+
+        with _patch_torch_dist_rank():
+            slot.launch("key", producer_key)
+            out = slot.wait("key", stale_key)
+
+        self.assertIsInstance(out, DTensor)
+        self.assertEqual(out.device_mesh.mesh_dim_names, ("cp", "tp"))
+        self.assertEqual(out.placements, (Replicate(), Shard(2)))
+        self.assertTrue(torch.equal(out.to_local(), producer_key.to_local()))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_async_sparse_attention_waits_prelaunched_handoffs(self, mock_mesh_platform):
         """Async sparse FA CP should wait producer hooks for key/value/key_rope."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
