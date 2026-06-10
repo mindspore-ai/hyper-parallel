@@ -491,7 +491,7 @@ def test_inplace_modification():
     mode = "swap"
     with pytest.raises(RuntimeError) as exc_info:
         run_one_mode_in_subprocess(mode, train_steps=train_steps, inplace=True)
-    assert "Tensor cached during selective activation checkpoint has been mutated" in str(exc_info.value)
+    assert "In-place modification happened" in str(exc_info.value)
 
 
 @pytest.mark.parametrize("mode", ["overlap_1", "overlap_2", "overlap_3"])
