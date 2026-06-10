@@ -615,9 +615,9 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         shard_dim = self.hsdp_placement.dim
         length = local_tensor.shape[shard_dim] if local_tensor.numel() > 0 else 0
         if not same_local_tensor:
-            if local_tensor.shape != sharded_size :
+            if local_tensor.shape != sharded_size:
                 raise AssertionError(
-                    f"Expected sharded_size to be {sharded_size}, got {local_tensor.size()}"
+                    f"Expected sharded_size to be {sharded_size}, got {local_tensor.shape}"
                 )
             updated_local_tensor = True
         if self.pin_memory and not local_tensor.is_pinned():
