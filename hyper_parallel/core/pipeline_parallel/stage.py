@@ -74,6 +74,11 @@ class PipelineStage(PipelineStageBase):
         submodule: Segmented model.
         stage_index (int): Stage index of current stage.
         stage_num (int): Total stage number.
+        device (Union[str, Device], optional): Device on which the P2P communication buffers are
+            allocated. Default ``None``, resolved to the current accelerator device. Under PyTorch an
+            explicit ``None`` would place the buffers on CPU, which HCCL/NCCL rejects (``No backend type
+            associated with device type cpu``); the fallback avoids that. MindSpore binds the device at
+            process init and ignores this argument.
         group (ProcessGroup): Group of p2p communication.
         src_stage (int, optional): Src stage index for recv. Default ``None``
         dst_stage (int, optional): Dst stage index for send. Default ``None``
@@ -94,7 +99,7 @@ class PipelineStage(PipelineStageBase):
         super().__init__(submodule, stage_index, stage_num, group, has_backward)
         self.submodule = submodule
         self.pp_group = self._check_pp_group(group)
-        self.device = device
+        self.device = device if device is not None else platform.device()
         self.mesh = mesh
         self._has_backward = has_backward
         self._recv_info = []
