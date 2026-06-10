@@ -245,6 +245,7 @@ class TestMindSporeScheduler(unittest.TestCase):
         """Root backward should finish staged fused groups and state reductions once."""
         scheduler = _make_scheduler()
         scheduler.scheduler_state = FSDPSchedulerState.FORWARD
+        scheduler._is_root = True
         scheduler._hsdp_backward_hook = MagicMock()
         all_reduce_group = SimpleNamespace(wait_all_reduce_and_apply_grad=MagicMock())
         pre_group = SimpleNamespace(apply_fusion_reduced_grad=MagicMock())
