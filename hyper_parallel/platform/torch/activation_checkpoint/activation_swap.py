@@ -243,6 +243,40 @@ class ActivationWrapper(torch.nn.Module, ABC):
         """Forward indexing calls in case the module is a nn.Sequential."""
         return self._swap_wrapped_module.__getitem__(key)  # type: ignore[operator]
 
+    def named_modules(
+        self,
+        memo: Optional[set[nn.Module]] = None,
+        prefix: str = "",
+        remove_duplicate: bool = True,
+    ) -> Iterator[tuple[str, nn.Module]]:
+        """
+        Yield wrapped-module children without exposing the internal wrapper prefix.
+
+        PyTorch parent modules implement ``named_parameters(recurse=True)`` by
+        iterating ``named_modules()`` and reading each module's direct
+        ``_parameters``. They do not call child modules' ``named_parameters()``
+        overrides. Exposing the wrapped module under the wrapper's own prefix
+        keeps root-module traversals aligned with ``state_dict()`` keys.
+
+        Args:
+            memo (Optional[set[nn.Module]], optional): A memo set to avoid infinite recursion. Default: ``None``.
+            prefix (str, optional): A prefix to prepend to all module names. Default: ``""``.
+            remove_duplicate (bool, optional): Whether to remove duplicate modules. Default: ``True``.
+
+        Returns:
+            Iterator[tuple[str, nn.Module]] An iterator of (name, module) pairs.
+        """
+        if memo is None:
+            memo = set()
+        if self not in memo:
+            memo.add(self)
+            yield prefix, self
+        yield from self._swap_wrapped_module.named_modules(
+            memo=memo,
+            prefix=prefix,
+            remove_duplicate=remove_duplicate,
+        )
+
     def named_parameters(
         self,
         *args,

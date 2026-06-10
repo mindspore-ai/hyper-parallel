@@ -118,6 +118,17 @@ class TestSwapWrapper(unittest.TestCase):
         self.assertTrue(all(not name.startswith("_swap_wrapped_module.") for name, _ in wrapper.named_parameters()))
         self.assertTrue(all(not key.startswith("_swap_wrapped_module.") for key in wrapper.state_dict()))
 
+    def test_parent_named_parameters_strips_wrapped_module_prefix(self):
+        """Parent module traversal should see the same parameter keys as state_dict."""
+        parent = torch.nn.Module()
+        parent.layer = swap_wrapper(torch.nn.Linear(2, 2))
+
+        parameter_names = [name for name, _ in parent.named_parameters()]
+
+        self.assertIn("layer.weight", parameter_names)
+        self.assertIn("layer.bias", parameter_names)
+        self.assertTrue(all("_swap_wrapped_module" not in name for name in parameter_names))
+
 
 class TestAsyncSaveOnCpu(unittest.TestCase):
     """Unit tests for AsyncSaveOnCpu."""
