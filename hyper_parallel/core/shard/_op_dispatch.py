@@ -265,14 +265,14 @@ class OpDispatcher:
         self._setup_paths_from_env()
 
         self.layout_infer_ops = self.safe_load_yaml_from_dir()
-        self.whitelist = ["InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv", "typeof", "DistCommIsend",
+        self.whitelist = ["typeof", "DistCommIsend",
                           "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather", "DistCommBatchIsendIrecv",
                           "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__", "register_hook",
                           "is_complex", "chunk", "__bool__", "__len__", "__format__", "dim",
                           "_has_compatible_shallow_copy_type", "is_floating_point", "is_contiguous"]
 
         # Ops requiring args unpacking for layout inference (packed as prim, name, real_args).
-        self.unpack_ops = ["ScatterUpdate", "Mod", "GatherNd"]
+        self.unpack_ops = ["ScatterUpdate", "Mod", "GatherNd", "StopGradient"]
 
         self._random_ops = {
             "normal_", "uniform_", "bernoulli", "bernoulli_",
@@ -1036,7 +1036,7 @@ class OpDispatcher:
             True when the op is whitelisted or DTensor dispatch is globally disabled.
         """
         skip_dispatch = get_dtensor_dispatch() is False and op_name not in get_no_skip_ops()
-        return op_name in self.whitelist or skip_dispatch
+        return op_name in self.whitelist or op_name in self._INPLACE_BYPASS_OPS or skip_dispatch
 
     def _should_dispatch_loss_parallel(self, op_name: str) -> bool:
         """Check if should dispatch through loss_parallel path.

@@ -45,6 +45,9 @@ Sigmoid:
 SiLU:
   dist_op_name: _silu_dist_op
 
+GeluExt:
+  dist_op_name: _gelu_ext_dist_op
+
 Cos:
   dist_op_name: _cos_dist_op
 
