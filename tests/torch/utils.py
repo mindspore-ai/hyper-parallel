@@ -141,8 +141,9 @@ def torchrun_case(file_name: str, case_name: str, master_port: Optional[int] = N
         if result.returncode == 0:
             return
         # Retry on port-in-use errors; surface any other failure immediately.
+        # DistNetworkError casing differs across torch versions ("Address"/"address").
         combined = result.stdout + result.stderr
-        if "Address already in use" not in combined:
+        if "address already in use" not in combined.lower():
             print(combined, file=sys.stderr)
             assert result.returncode == 0, f"torchrun failed with exit code {result.returncode}"
         if attempt == max_attempts - 1:

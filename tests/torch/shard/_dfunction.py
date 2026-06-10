@@ -31,7 +31,7 @@ from hyper_parallel.core.dtensor.dtensor import _build_layout, distribute_tensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
-from tests.torch.utils import init_dist
+from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 from tests.torch.shard.utils import global_to_local, local_to_global
 
 np.random.seed(42)
@@ -303,11 +303,11 @@ def test_dtensor_forward_output_is_dtensor():
     """
     from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0415
 
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    x = torch.from_numpy(_X_NP).npu()
-    y = torch.from_numpy(_Y_NP).npu()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    x = to_device(torch.from_numpy(_X_NP), _DEVICE_TYPE)
+    y = to_device(torch.from_numpy(_Y_NP), _DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
 
     x_dist = distribute_tensor(x, mesh, (Shard(0), Replicate()))
     y_dist = distribute_tensor(y, mesh, (Shard(0), Replicate()))
@@ -331,13 +331,13 @@ def test_dtensor_forward_numerical_correctness():
         - Gather and compare.
     Expectation: Numerically equivalent results.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    x = torch.from_numpy(_X_NP).npu()
-    y = torch.from_numpy(_Y_NP).npu()
+    x = to_device(torch.from_numpy(_X_NP), _DEVICE_TYPE)
+    y = to_device(torch.from_numpy(_Y_NP), _DEVICE_TYPE)
     standalone = x + y
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_dist = distribute_tensor(x, mesh, (Shard(0), Replicate()))
     y_dist = distribute_tensor(y, mesh, (Shard(0), Replicate()))
 
@@ -363,11 +363,11 @@ def test_layout_cache_hit():
     """
     from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op  # pylint: disable=C0415
 
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    x = torch.from_numpy(_X_NP).npu()
-    y = torch.from_numpy(_Y_NP).npu()
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    x = to_device(torch.from_numpy(_X_NP), _DEVICE_TYPE)
+    y = to_device(torch.from_numpy(_Y_NP), _DEVICE_TYPE)
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_dist = distribute_tensor(x, mesh, (Shard(0), Replicate()))
     y_dist = distribute_tensor(y, mesh, (Shard(0), Replicate()))
 
@@ -400,14 +400,14 @@ def test_dtensor_backward_gradient_correctness():
         - Verify that local tensor gradients are numerically correct.
     Expectation: Gradient values match expected (all-ones from sum loss).
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     x_np = np.ones((8, 16), dtype=np.float32)
     y_np = np.zeros((8, 16), dtype=np.float32)
-    x = torch.from_numpy(x_np).npu().requires_grad_(True)
-    y = torch.from_numpy(y_np).npu().requires_grad_(True)
+    x = to_device(torch.from_numpy(x_np), _DEVICE_TYPE).requires_grad_(True)
+    y = to_device(torch.from_numpy(y_np), _DEVICE_TYPE).requires_grad_(True)
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_dist = distribute_tensor(x, mesh, (Shard(0), Replicate()))
     y_dist = distribute_tensor(y, mesh, (Shard(0), Replicate()))
 
@@ -436,16 +436,16 @@ def test_single_vs_multi_card_forward_parity():
         - Gather the distributed result and compare with the single-card result.
     Expectation: Results are numerically identical.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    x = torch.from_numpy(_X_NP).npu()
-    y = torch.from_numpy(_Y_NP).npu()
+    x = to_device(torch.from_numpy(_X_NP), _DEVICE_TYPE)
+    y = to_device(torch.from_numpy(_Y_NP), _DEVICE_TYPE)
 
     # Single-card reference
     standalone = _ElemWiseFunc.apply(x, y)
 
     # Multi-card via distributed path
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_dist = distribute_tensor(x, mesh, (Shard(0), Replicate()))
     y_dist = distribute_tensor(y, mesh, (Shard(0), Replicate()))
     result_dist = _ElemWiseFunc.apply(x_dist, y_dist)
@@ -465,25 +465,25 @@ def test_single_vs_multi_card_backward_parity():
           the single-card gradient.
     Expectation: local_grad == standalone_grad[slice_for_this_rank].
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     x_np = np.ones((8, 16), dtype=np.float32)
     y_np = np.zeros((8, 16), dtype=np.float32)
 
     # Single-card reference
-    x_full = torch.from_numpy(x_np).npu().requires_grad_(True)
-    y_full = torch.from_numpy(y_np).npu().requires_grad_(True)
+    x_full = to_device(torch.from_numpy(x_np), _DEVICE_TYPE).requires_grad_(True)
+    y_full = to_device(torch.from_numpy(y_np), _DEVICE_TYPE).requires_grad_(True)
     standalone_out = _ElemWiseFunc.apply(x_full, y_full)
     standalone_out.sum().backward()
     standalone_x_grad = x_full.grad.detach()  # shape [8, 16], all ones
 
     # Multi-card path
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_dist = distribute_tensor(
-        torch.from_numpy(x_np).npu().requires_grad_(True), mesh, (Shard(0), Replicate())
+        to_device(torch.from_numpy(x_np), _DEVICE_TYPE).requires_grad_(True), mesh, (Shard(0), Replicate())
     )
     y_dist = distribute_tensor(
-        torch.from_numpy(y_np).npu().requires_grad_(True), mesh, (Shard(0), Replicate())
+        to_device(torch.from_numpy(y_np), _DEVICE_TYPE).requires_grad_(True), mesh, (Shard(0), Replicate())
     )
 
     x_local = x_dist.to_local()
@@ -516,10 +516,10 @@ def test_relu_forward_backward():
         - Verify gradient is 1 where input > 0 and 0 elsewhere.
     Expectation: Forward and backward numerically correct.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     x_np = np.random.randn(8, 16).astype(np.float32)
-    x = torch.from_numpy(x_np).npu().requires_grad_(True)
+    x = to_device(torch.from_numpy(x_np), _DEVICE_TYPE).requires_grad_(True)
 
     # Single-card reference
     standalone = x.clamp(min=0)
@@ -528,9 +528,9 @@ def test_relu_forward_backward():
     x.grad = None
 
     # Multi-card
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_dist = distribute_tensor(
-        torch.from_numpy(x_np).npu().requires_grad_(True), mesh, (Shard(0), Replicate())
+        to_device(torch.from_numpy(x_np), _DEVICE_TYPE).requires_grad_(True), mesh, (Shard(0), Replicate())
     )
 
     x_local = x_dist.to_local()
@@ -566,13 +566,13 @@ def test_linear_colwise_dispatch_new():
         - get_expand_impl returns None (contracting not sharded).
     Expectation: Output matches F.linear(x_full, w_full) gathered; backward runs.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    x = torch.from_numpy(_X_NP).npu()
-    w = torch.from_numpy(_W_COL_NP).npu()
+    x = to_device(torch.from_numpy(_X_NP), _DEVICE_TYPE)
+    w = to_device(torch.from_numpy(_W_COL_NP), _DEVICE_TYPE)
     standalone = F.linear(x, w)  # [8, 32]
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     x_dist = distribute_tensor(x.requires_grad_(True), mesh, (Shard(0), Replicate()))
     w_dist = distribute_tensor(w.requires_grad_(True), mesh, (Replicate(), Replicate()))
 
@@ -617,14 +617,14 @@ def test_linear_rowwise_get_expand_impl():
         - After reduce_partial(), the output should match F.linear(x_full, w_full, bias).
     Expectation: Forward output (after reduction) numerically matches standalone.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    x = torch.from_numpy(_X_NP).npu()
-    w = torch.from_numpy(_W_ROW_NP).npu()
-    bias = torch.from_numpy(_BIAS_NP).npu()
+    x = to_device(torch.from_numpy(_X_NP), _DEVICE_TYPE)
+    w = to_device(torch.from_numpy(_W_ROW_NP), _DEVICE_TYPE)
+    bias = to_device(torch.from_numpy(_BIAS_NP), _DEVICE_TYPE)
     standalone = F.linear(x, w, bias)  # [8, 32]
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
     # Shard contracting (in) dimension across TP
     x_dist = distribute_tensor(x, mesh, (Replicate(), Shard(1)))
     w_dist = distribute_tensor(w, mesh, (Replicate(), Shard(1)))

@@ -54,7 +54,7 @@ def test_llama3_tensor_parallel_and_fsdp_tp():
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )

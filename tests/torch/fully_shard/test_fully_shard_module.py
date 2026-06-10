@@ -20,7 +20,7 @@ from tests.common.parallel_case import parallel_run, TorchCase
 _TEST_FULLY_SHARD_MODULE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_module.py")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_fully_shard_module_group1():
     """
     Feature: parallel run cases in fully_shard module

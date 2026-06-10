@@ -31,14 +31,12 @@ from copy import deepcopy
 import torch
 import torch.distributed as dist
 
-import torch_npu  # noqa: F401  — Ascend NPU
-
 from hyper_parallel import init_device_mesh
 from hyper_parallel.platform.torch.common import FeedForward, MoE
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
-from tests.torch.utils import init_dist
+from tests.torch.utils import _DEVICE_TYPE, init_backend
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +91,8 @@ def _build_standalone_moe(
         Initialised MoE module on *device*.
     """
     torch.manual_seed(42)
-    torch.npu.manual_seed(42)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(42)
     moe = MoE(dim=dim, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k,
               use_grouped_mm=use_grouped_mm)
     moe = moe.to(device)
@@ -139,9 +138,10 @@ def test_ep_forward_backward_npu():
         - dim: 64, hidden_dim: 128
         - batch_size: 4, seq_len: 16
     """
-    rank, device_id = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"npu:{device_id}")
+    device = torch.device(_DEVICE_TYPE)
 
     dim, hidden_dim = 64, 128
     bs, slen = 4, 16
@@ -152,14 +152,15 @@ def test_ep_forward_backward_npu():
     standalone_moe = _build_standalone_moe(dim, hidden_dim, num_experts, top_k, device)
 
     torch.manual_seed(100)
-    torch.npu.manual_seed(100)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(100)
     x_ref = torch.randn(bs, slen, dim, device=device)
 
     standalone_out, standalone_x_grad = _run_forward_backward(standalone_moe, x_ref)
 
     # ---- EP distributed ----
     ep_moe = _build_standalone_moe(dim, hidden_dim, num_experts, top_k, device)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("ep",))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("ep",))
     ExpertParallel().apply(ep_moe.experts, mesh)
 
     ep_out, ep_x_grad = _run_forward_backward(ep_moe, x_ref)
@@ -190,9 +191,10 @@ def test_ep_multi_experts_per_rank_npu():
         - dim: 64, hidden_dim: 128
         - batch_size: 4, seq_len: 16
     """
-    rank, device_id = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"npu:{device_id}")
+    device = torch.device(_DEVICE_TYPE)
 
     dim, hidden_dim = 64, 128
     bs, slen = 4, 16
@@ -201,22 +203,25 @@ def test_ep_multi_experts_per_rank_npu():
 
     # ---- Standalone reference ----
     torch.manual_seed(44)
-    torch.npu.manual_seed(44)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(44)
     standalone_moe = MoE(dim=dim, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k)
     standalone_moe = standalone_moe.to(device)
 
     torch.manual_seed(102)
-    torch.npu.manual_seed(102)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(102)
     x_ref = torch.randn(bs, slen, dim, device=device)
 
     standalone_out, standalone_x_grad = _run_forward_backward(standalone_moe, x_ref)
 
     # ---- EP distributed (2 local experts per rank) ----
     torch.manual_seed(44)
-    torch.npu.manual_seed(44)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(44)
     ep_moe = MoE(dim=dim, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k)
     ep_moe = ep_moe.to(device)
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("ep",))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("ep",))
     ExpertParallel().apply(ep_moe.experts, mesh)
 
     ep_out, ep_x_grad = _run_forward_backward(ep_moe, x_ref)
@@ -252,9 +257,10 @@ def test_ep_grouped_mm_npu():
         - dim: 64, hidden_dim: 128
         - batch_size: 4, seq_len: 16
     """
-    rank, device_id = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"npu:{device_id}")
+    device = torch.device(_DEVICE_TYPE)
 
     dim, hidden_dim = 64, 128
     bs, slen = 4, 16
@@ -263,26 +269,29 @@ def test_ep_grouped_mm_npu():
 
     # ---- for-loop reference (EP, no grouped_mm) ----
     torch.manual_seed(45)
-    torch.npu.manual_seed(45)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(45)
     ref_moe = MoE(dim=dim, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k,
                   use_grouped_mm=False)
     ref_moe = ref_moe.to(device)
-    mesh_ref = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("ep",))
+    mesh_ref = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("ep",))
     ExpertParallel().apply(ref_moe.experts, mesh_ref)
 
     torch.manual_seed(103)
-    torch.npu.manual_seed(103)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(103)
     x_ref = torch.randn(bs, slen, dim, device=device)
 
     ref_out, ref_x_grad = _run_forward_backward(ref_moe, x_ref)
 
     # ---- grouped_mm EP ----
     torch.manual_seed(45)
-    torch.npu.manual_seed(45)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(45)
     gmm_moe = MoE(dim=dim, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k,
                   use_grouped_mm=True)
     gmm_moe = gmm_moe.to(device)
-    mesh_gmm = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("ep",))
+    mesh_gmm = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("ep",))
     ExpertParallel().apply(gmm_moe.experts, mesh_gmm)
 
     gmm_out, gmm_x_grad = _run_forward_backward(gmm_moe, x_ref)
@@ -425,11 +434,12 @@ def _run_local_shard_ep(
     local_slen = slen // world_size
     start = rank * local_slen
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("ep",))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("ep",))
 
     # Build standalone and EP models with identical weights (same seed).
     torch.manual_seed(seed_model)
-    torch.npu.manual_seed(seed_model)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(seed_model)
     shared_ref = FeedForward(dim=dim, hidden_dim=shared_expert_hidden) if shared_expert_hidden > 0 else None
     standalone_moe = MoE(
         dim=dim, hidden_dim=hidden_dim, num_experts=num_experts,
@@ -437,7 +447,8 @@ def _run_local_shard_ep(
     ).to(device)
 
     torch.manual_seed(seed_model)
-    torch.npu.manual_seed(seed_model)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(seed_model)
     shared_ep = FeedForward(dim=dim, hidden_dim=shared_expert_hidden) if shared_expert_hidden > 0 else None
     ep_moe = MoE(
         dim=dim, hidden_dim=hidden_dim, num_experts=num_experts,
@@ -448,7 +459,8 @@ def _run_local_shard_ep(
 
     # Global input — identical on all ranks (same seed).
     torch.manual_seed(seed_input)
-    torch.npu.manual_seed(seed_input)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(seed_input)
     x_global = torch.randn(bs, slen, dim, device=device)
 
     # Standalone reference: full global sequence → [bs, slen, dim] output.
@@ -493,9 +505,10 @@ def test_ep_local_shard_forward_backward_npu():
         - top_k: 2, dim: 64, hidden_dim: 128
         - batch_size: 4, slen: 16 (local_slen=4 per rank)
     """
-    rank, device_id = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"npu:{device_id}")
+    device = torch.device(_DEVICE_TYPE)
     _run_local_shard_ep(
         rank=rank, world_size=world_size, device=device,
         dim=64, hidden_dim=128, num_experts=world_size, top_k=2,
@@ -523,9 +536,10 @@ def test_ep_local_shard_multi_expert_npu():
         - top_k: 2, dim: 64, hidden_dim: 128
         - batch_size: 4, slen: 16
     """
-    rank, device_id = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"npu:{device_id}")
+    device = torch.device(_DEVICE_TYPE)
     _run_local_shard_ep(
         rank=rank, world_size=world_size, device=device,
         dim=64, hidden_dim=128, num_experts=world_size * 2, top_k=2,
@@ -553,9 +567,10 @@ def test_ep_local_shard_grouped_mm_npu():
         - top_k: 2, dim: 64, hidden_dim: 128
         - batch_size: 4, slen: 16
     """
-    rank, device_id = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"npu:{device_id}")
+    device = torch.device(_DEVICE_TYPE)
     _run_local_shard_ep(
         rank=rank, world_size=world_size, device=device,
         dim=64, hidden_dim=128, num_experts=world_size, top_k=2,
@@ -583,9 +598,10 @@ def test_ep_local_shard_top1_npu():
         - num_experts: 4 (one per rank), top_k: 1
         - dim: 64, hidden_dim: 128, batch_size: 4, slen: 16
     """
-    rank, device_id = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"npu:{device_id}")
+    device = torch.device(_DEVICE_TYPE)
     _run_local_shard_ep(
         rank=rank, world_size=world_size, device=device,
         dim=64, hidden_dim=128, num_experts=world_size, top_k=1,
@@ -613,9 +629,10 @@ def test_ep_local_shard_shared_expert_npu():
         - shared_expert hidden_dim: 128
         - dim: 64, hidden_dim: 128, batch_size: 4, slen: 16
     """
-    rank, device_id = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"npu:{device_id}")
+    device = torch.device(_DEVICE_TYPE)
     _run_local_shard_ep(
         rank=rank, world_size=world_size, device=device,
         dim=64, hidden_dim=128, num_experts=world_size, top_k=2,

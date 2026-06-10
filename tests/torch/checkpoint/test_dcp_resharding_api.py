@@ -20,7 +20,7 @@ from tests.common.parallel_case import TorchCase, parallel_run
 DCP_RESHARDING_API = "dcp_resharding_api.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dcp_resharding_api_group1():
     """
     Feature: parallel run smoke case for checkpoint DCP safe_open reads under resharding.
@@ -30,6 +30,19 @@ def test_dcp_resharding_api_group1():
     """
     parallel_run([
         TorchCase(DCP_RESHARDING_API, "test_dcp_safe_open_basic_resharding_load", 12256, 4),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_dcp_resharding_api_group1_gloo():
+    """
+    Feature: parallel run smoke case for checkpoint DCP safe_open reads under resharding.
+    Description:
+        1.test_dcp_safe_open_basic_resharding_load
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(DCP_RESHARDING_API, "test_dcp_safe_open_basic_resharding_load", num_proc=4),
     ])
 
 

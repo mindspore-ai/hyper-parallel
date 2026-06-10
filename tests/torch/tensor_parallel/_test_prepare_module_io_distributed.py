@@ -26,8 +26,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-import torch_npu  # noqa: F401  -- Ascend NPU
-
 from hyper_parallel import (
     ColwiseParallel,
     DTensor,
@@ -39,12 +37,12 @@ from hyper_parallel import (
     parallelize_module,
 )
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
-from tests.torch.utils import init_dist
+from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
 
 def _make_tp_mesh_1d():
     return init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(dist.get_world_size(),),
         mesh_dim_names=("tp",),
     )
@@ -70,7 +68,7 @@ def test_prepare_module_input_identity_roundtrip_npu():
     Description: Identity module, use_local_output=False, redistribute output back to Shard(0) local.
     Expectation: Restored local tensor equals input on every rank.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     if dist.get_world_size() != 2:
         pytest.skip("launcher uses 2 ranks")
     mesh = _make_tp_mesh_1d()
@@ -80,7 +78,7 @@ def test_prepare_module_input_identity_roundtrip_npu():
         def forward(self, x):
             return x
 
-    m = Dummy().npu()
+    m = to_device(Dummy(), _DEVICE_TYPE)
     parallelize_module(
         m,
         mesh,
@@ -91,9 +89,10 @@ def test_prepare_module_input_identity_roundtrip_npu():
         ),
     )
     torch.manual_seed(10600)
-    torch.npu.manual_seed(10600)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(10600)
     # Dim 0 for Shard(0) and later redistribute must split evenly on world_size.
-    inp = torch.rand(4, 8, dtype=torch.float32, device="npu")
+    inp = torch.rand(4, 8, dtype=torch.float32, device=_DEVICE_TYPE)
     if rank != 0:
         inp = torch.empty_like(inp)
     dist.broadcast(inp, src=0)
@@ -110,7 +109,7 @@ def test_prepare_module_output_replicate_to_shard_npu():
     Description: Identity forward receives DTensor(Replicate); hook outputs Shard(0) local slice.
     Expectation: Local output matches the corresponding dim-0 chunk of the same global tensor (CPU).
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     if dist.get_world_size() != 2:
         pytest.skip("launcher uses 2 ranks")
     mesh = _make_tp_mesh_1d()
@@ -121,7 +120,7 @@ def test_prepare_module_output_replicate_to_shard_npu():
         def forward(self, x):
             return x
 
-    m = Dummy().npu()
+    m = to_device(Dummy(), _DEVICE_TYPE)
     parallelize_module(
         m,
         mesh,
@@ -133,7 +132,7 @@ def test_prepare_module_output_replicate_to_shard_npu():
     )
     torch.manual_seed(10601)
     inp_cpu = torch.rand(16, 7, dtype=torch.float32)
-    inp_npu = inp_cpu.npu()
+    inp_npu = to_device(inp_cpu, _DEVICE_TYPE)
     dt = DTensor.from_local(inp_npu, mesh, [Replicate()])
     out = m(dt)
     ref_chunk = inp_cpu.chunk(ws, dim=0)[rank]
@@ -146,7 +145,7 @@ def test_prepare_module_input_output_chain_npu():
     Description: Same layout pipeline as PyTorch test; compare to explicit DTensor chain on CPU reference.
     Expectation: Module output equals manual from_local + redistribute + to_local on CPU side semantics.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     if dist.get_world_size() != 2:
         pytest.skip("launcher uses 2 ranks")
     mesh = _make_tp_mesh_1d()
@@ -156,7 +155,7 @@ def test_prepare_module_input_output_chain_npu():
         def forward(self, x):
             return x
 
-    m = Dummy().npu()
+    m = to_device(Dummy(), _DEVICE_TYPE)
     parallelize_module(
         m,
         mesh,
@@ -169,9 +168,10 @@ def test_prepare_module_input_output_chain_npu():
         ),
     )
     torch.manual_seed(10602)
-    torch.npu.manual_seed(10602)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(10602)
     # Last dim must divide world_size for Replicate -> Shard(1) redistribute.
-    inp = torch.rand(4, 8, dtype=torch.float32, device="npu")
+    inp = torch.rand(4, 8, dtype=torch.float32, device=_DEVICE_TYPE)
     if rank != 0:
         inp = torch.empty_like(inp)
     dist.broadcast(inp, src=0)
@@ -191,7 +191,7 @@ def test_prepare_module_input_then_colwise_linear_vs_cpu_npu():
     Description: Sequence-style shard on dim-1 per rank; prepare replicates full input; Colwise shards output.
     Expectation: all_gather on output last dim matches CPU reference on full input.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     if dist.get_world_size() != 2:
         pytest.skip("launcher uses 2 ranks")
     mesh = _make_tp_mesh_1d()
@@ -211,17 +211,18 @@ def test_prepare_module_input_then_colwise_linear_vs_cpu_npu():
     assert out_f % ws == 0
 
     torch.manual_seed(10603)
-    torch.npu.manual_seed(10603)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(10603)
     w_cpu = torch.randn(out_f, in_f, dtype=torch.float32)
     b_cpu = torch.randn(out_f, dtype=torch.float32)
     x_full = torch.randn(batch, in_f, dtype=torch.float32)
     y_ref = F.linear(x_full, w_cpu, b_cpu)
 
-    x_local = x_full.chunk(ws, dim=1)[rank].npu()
-    block = Block(in_f, out_f).npu()
+    x_local = to_device(x_full.chunk(ws, dim=1)[rank], _DEVICE_TYPE)
+    block = to_device(Block(in_f, out_f), _DEVICE_TYPE)
     with torch.no_grad():
-        block.lin.weight.copy_(w_cpu.npu())
-        block.lin.bias.copy_(b_cpu.npu())
+        block.lin.weight.copy_(to_device(w_cpu, _DEVICE_TYPE))
+        block.lin.bias.copy_(to_device(b_cpu, _DEVICE_TYPE))
 
     parallelize_module(
         block,
@@ -253,7 +254,7 @@ def test_prepare_module_output_after_rowwise_vs_cpu_npu():
     Description: Sharded input on last dim; rowwise produces replicated local output; output hook shards dim 0.
     Expectation: Concatenated shards along dim 0 match CPU F.linear on full input.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     if dist.get_world_size() != 2:
         pytest.skip("launcher uses 2 ranks")
     mesh = _make_tp_mesh_1d()
@@ -272,17 +273,18 @@ def test_prepare_module_output_after_rowwise_vs_cpu_npu():
     assert in_f % ws == 0
 
     torch.manual_seed(10610)
-    torch.npu.manual_seed(10610)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(10610)
     w_cpu = torch.randn(out_f, in_f, dtype=torch.float32)
     b_cpu = torch.randn(out_f, dtype=torch.float32)
     x_full = torch.randn(batch, in_f, dtype=torch.float32)
     y_ref = F.linear(x_full, w_cpu, b_cpu)
 
-    x_local = x_full.chunk(ws, dim=-1)[rank].npu()
-    w_mod = Wrapped(in_f, out_f).npu()
+    x_local = to_device(x_full.chunk(ws, dim=-1)[rank], _DEVICE_TYPE)
+    w_mod = to_device(Wrapped(in_f, out_f), _DEVICE_TYPE)
     with torch.no_grad():
-        w_mod.lin.weight.copy_(w_cpu.npu())
-        w_mod.lin.bias.copy_(b_cpu.npu())
+        w_mod.lin.weight.copy_(to_device(w_cpu, _DEVICE_TYPE))
+        w_mod.lin.bias.copy_(to_device(b_cpu, _DEVICE_TYPE))
 
     parallelize_module(
         w_mod.lin,
@@ -309,7 +311,7 @@ def test_prepare_module_input_with_kwarg_scale_npu():
     Description: forward(x, scale=...); both annotated Replicate; use_local_output=True.
     Expectation: x * scale matches CPU reference.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     if dist.get_world_size() != 2:
         pytest.skip("launcher uses 2 ranks")
     mesh = _make_tp_mesh_1d()
@@ -318,7 +320,7 @@ def test_prepare_module_input_with_kwarg_scale_npu():
         def forward(self, x, scale=None):
             return x * scale
 
-    m = Scaled().npu()
+    m = to_device(Scaled(), _DEVICE_TYPE)
     parallelize_module(
         m,
         mesh,
@@ -330,8 +332,8 @@ def test_prepare_module_input_with_kwarg_scale_npu():
             use_local_output=True,
         ),
     )
-    x = torch.ones(2, 3, dtype=torch.float32, device="npu") * 1.5
-    scale = torch.tensor(2.0, dtype=torch.float32, device="npu")
+    x = torch.ones(2, 3, dtype=torch.float32, device=_DEVICE_TYPE) * 1.5
+    scale = torch.tensor(2.0, dtype=torch.float32, device=_DEVICE_TYPE)
     dist.broadcast(x, src=0)
     dist.broadcast(scale, src=0)
     out = m(x, scale=scale)
@@ -345,7 +347,7 @@ def test_prepare_module_input_none_placeholder_dual_arg_npu():
     Description: Second arg only is wrapped Replicate->Replicate (no-op redistribute).
     Expectation: Output equals second argument tensor.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     if dist.get_world_size() != 2:
         pytest.skip("launcher uses 2 ranks")
     mesh = _make_tp_mesh_1d()
@@ -354,7 +356,7 @@ def test_prepare_module_input_none_placeholder_dual_arg_npu():
         def forward(self, x, y):  # pylint: disable=unused-argument
             return y
 
-    m = PickSecond().npu()
+    m = to_device(PickSecond(), _DEVICE_TYPE)
     parallelize_module(
         m,
         mesh,
@@ -364,8 +366,8 @@ def test_prepare_module_input_none_placeholder_dual_arg_npu():
             use_local_output=True,
         ),
     )
-    x = torch.randn(2, 2, dtype=torch.float32, device="npu")
-    y = torch.randn(2, 2, dtype=torch.float32, device="npu")
+    x = torch.randn(2, 2, dtype=torch.float32, device=_DEVICE_TYPE)
+    y = torch.randn(2, 2, dtype=torch.float32, device=_DEVICE_TYPE)
     dist.broadcast(x, src=0)
     dist.broadcast(y, src=0)
     out = m(x, y)
@@ -378,7 +380,7 @@ def test_prepare_module_output_tuple_with_none_slot_npu():
     Description: First tensor Replicate->Shard(0); second slot None (passthrough scalar tensor).
     Expectation: First matches dim-0 chunk of input; second remains scalar 1.0.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     if dist.get_world_size() != 2:
         pytest.skip("launcher uses 2 ranks")
     mesh = _make_tp_mesh_1d()
@@ -389,7 +391,7 @@ def test_prepare_module_output_tuple_with_none_slot_npu():
         def forward(self, x):
             return x, torch.ones((), dtype=x.dtype, device=x.device)
 
-    m = DupOut().npu()
+    m = to_device(DupOut(), _DEVICE_TYPE)
     parallelize_module(
         m,
         mesh,
@@ -400,7 +402,7 @@ def test_prepare_module_output_tuple_with_none_slot_npu():
         ),
     )
     torch.manual_seed(10613)
-    x = torch.rand(10, 4, dtype=torch.float32, device="npu")
+    x = torch.rand(10, 4, dtype=torch.float32, device=_DEVICE_TYPE)
     dist.broadcast(x, src=0)
     a, b = m(x)
     ref_a = x.cpu().chunk(ws, dim=0)[rank]
@@ -420,7 +422,7 @@ def test_prepare_module_input_colwise_pipeline_vs_cpu_npu():
     Description: in_f / out_f divisible by 4; CPU F.linear reference on full x.
     Expectation: Gathered Colwise outputs match CPU reference.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     if dist.get_world_size() != 4:
         pytest.skip("launcher uses 4 ranks")
     mesh = _make_tp_mesh_1d()
@@ -440,17 +442,18 @@ def test_prepare_module_input_colwise_pipeline_vs_cpu_npu():
     assert out_f % ws == 0
 
     torch.manual_seed(10620)
-    torch.npu.manual_seed(10620)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(10620)
     w_cpu = torch.randn(out_f, in_f, dtype=torch.float32)
     b_cpu = torch.randn(out_f, dtype=torch.float32)
     x_full = torch.randn(batch, in_f, dtype=torch.float32)
     y_ref = F.linear(x_full, w_cpu, b_cpu)
 
-    x_local = x_full.chunk(ws, dim=1)[rank].npu()
-    block = Block(in_f, out_f).npu()
+    x_local = to_device(x_full.chunk(ws, dim=1)[rank], _DEVICE_TYPE)
+    block = to_device(Block(in_f, out_f), _DEVICE_TYPE)
     with torch.no_grad():
-        block.lin.weight.copy_(w_cpu.npu())
-        block.lin.bias.copy_(b_cpu.npu())
+        block.lin.weight.copy_(to_device(w_cpu, _DEVICE_TYPE))
+        block.lin.bias.copy_(to_device(b_cpu, _DEVICE_TYPE))
 
     parallelize_module(
         block,
@@ -477,7 +480,7 @@ def test_prepare_module_input_output_mlp_block_vs_cpu_npu():
     Description: Input sharded on dim-1 per rank; root I/O style mirrors seq-TP pattern; CPU forward on full x.
     Expectation: Concatenated output shards along dim 1 match CPU MLP output.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     if dist.get_world_size() != 4:
         pytest.skip("launcher uses 4 ranks")
     mesh = _make_tp_mesh_1d()
@@ -499,15 +502,16 @@ def test_prepare_module_input_output_mlp_block_vs_cpu_npu():
     assert d_out % ws == 0
 
     torch.manual_seed(10621)
-    torch.npu.manual_seed(10621)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(10621)
     mlp_ref = TinyMlp(d_in, d_h, d_out)
-    mlp = TinyMlp(d_in, d_h, d_out).npu()
+    mlp = to_device(TinyMlp(d_in, d_h, d_out), _DEVICE_TYPE)
     mlp.load_state_dict(mlp_ref.state_dict())
     x_full = torch.randn(batch, d_in, dtype=torch.float32)
     with torch.no_grad():
         y_ref = mlp_ref(x_full)
 
-    x_local = x_full.chunk(ws, dim=1)[rank].npu()
+    x_local = to_device(x_full.chunk(ws, dim=1)[rank], _DEVICE_TYPE)
 
     parallelize_module(
         mlp,

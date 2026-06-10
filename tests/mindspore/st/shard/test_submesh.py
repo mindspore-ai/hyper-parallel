@@ -20,7 +20,7 @@ from tests.common.parallel_case import parallel_run, MindSporeCase
 SUBMESH = "submesh.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group1():
     """
     Feature: parallel run case in submesh
@@ -50,7 +50,7 @@ def test_submesh_group2():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group3():
     """
     Feature: parallel run case in submesh
@@ -76,7 +76,7 @@ def test_submesh_group4():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group5():
     """
     Feature: parallel run case in submesh
@@ -89,7 +89,7 @@ def test_submesh_group5():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group6():
     """
     Feature: parallel run case in submesh
@@ -102,7 +102,7 @@ def test_submesh_group6():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group7():
     """
     Feature: parallel run case in submesh
@@ -115,7 +115,7 @@ def test_submesh_group7():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group8():
     """
     Feature: parallel run case in submesh
@@ -128,7 +128,7 @@ def test_submesh_group8():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group9():
     """
     Feature: parallel run case in submesh
@@ -141,7 +141,7 @@ def test_submesh_group9():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group10():
     """
     Feature: parallel run case in submesh
@@ -154,7 +154,7 @@ def test_submesh_group10():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group11():
     """
     Feature: parallel run case in submesh
@@ -167,7 +167,7 @@ def test_submesh_group11():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group12():
     """
     Feature: parallel run case in submesh
@@ -180,7 +180,7 @@ def test_submesh_group12():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group13():
     """
     Feature: parallel run case in submesh

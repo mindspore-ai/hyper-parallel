@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ from tests.common.parallel_case import parallel_run, TorchCase
 BASE_DTENSOR_INIT = "base_dtensor_init.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_base_dtensor_init_group1():
     """
     Feature: parallel run case in shard
@@ -35,4 +35,23 @@ def test_base_dtensor_init_group1():
         TorchCase(BASE_DTENSOR_INIT, "test_empty", 11336, 2),
         TorchCase(BASE_DTENSOR_INIT, "test_full", 11337, 2),
         TorchCase(BASE_DTENSOR_INIT, "test_zeros", 11338, 2),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_base_dtensor_init_group1_gloo():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_ones
+        2.test_empty
+        3.test_full
+        4.test_zeros
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(BASE_DTENSOR_INIT, "test_ones", num_proc=2),
+        TorchCase(BASE_DTENSOR_INIT, "test_empty", num_proc=2),
+        TorchCase(BASE_DTENSOR_INIT, "test_full", num_proc=2),
+        TorchCase(BASE_DTENSOR_INIT, "test_zeros", num_proc=2),
     ])

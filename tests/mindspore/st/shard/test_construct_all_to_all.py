@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ from tests.common.parallel_case import parallel_run, MindSporeCase
 CONSTRUCT_ALL_TO_ALL = "construct_all_to_all.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_construct_all_to_all_group1():
     """
     Feature: parallel run case in construct_all_to_all
@@ -33,7 +33,7 @@ def test_construct_all_to_all_group1():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_construct_all_to_all_group2():
     """
     Feature: parallel run case in construct_all_to_all

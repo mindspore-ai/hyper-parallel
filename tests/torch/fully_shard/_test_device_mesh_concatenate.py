@@ -23,7 +23,7 @@ import torch
 
 from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from tests.torch.utils import init_dist
+from tests.torch.utils import _DEVICE_TYPE, init_backend
 
 
 def _assert_mesh_matches(mesh: DeviceMesh, expected_shape, expected_names, expected_ranks):
@@ -49,9 +49,10 @@ def test_device_mesh_concatenate_supports_root_and_flattened_dims():
         both the original ``tp`` mesh and the flattened ``tp_flat`` mesh.
     Expectation: Concatenated meshes have the expected shape, names, and rank lists.
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = torch.distributed.get_rank()
 
-    root_mesh = init_device_mesh("npu", (2, 2), mesh_dim_names=("fsdp", "tp"))
+    root_mesh = init_device_mesh(_DEVICE_TYPE, (2, 2), mesh_dim_names=("fsdp", "tp"))
     fsdp_mesh = root_mesh["fsdp"]
     tp_mesh = root_mesh["tp"]
     tp_flat_mesh = tp_mesh.flatten("tp_flat")
@@ -76,9 +77,9 @@ def test_device_mesh_concatenate_rejects_out_of_root_order():
         concatenate ``fsdp`` before ``tp``.
     Expectation: Concatenate raises ValueError for violating root mesh order.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    root_mesh = init_device_mesh("npu", (2, 2), mesh_dim_names=("tp", "fsdp"))
+    root_mesh = init_device_mesh(_DEVICE_TYPE, (2, 2), mesh_dim_names=("tp", "fsdp"))
     fsdp_mesh = root_mesh["fsdp"]
     tp_mesh = root_mesh["tp"]
 

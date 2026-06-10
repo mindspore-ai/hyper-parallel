@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ def test_redistribute_group1():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_redistribute_group2():
     """
     Feature: parallel run case in shard
@@ -44,4 +44,17 @@ def test_redistribute_group2():
     """
     parallel_run([
         TorchCase(REDISTRIBUTE, "test_different_mesh", 11335, 2),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_redistribute_group2_gloo():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_different_mesh
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(REDISTRIBUTE, "test_different_mesh", num_proc=2),
     ])

@@ -49,9 +49,29 @@ def _run_group(*cases):
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_tp_styles_two_card_wave_one():
+    """
+    Feature: first parallel_run — four 2-card worker cases (sum ranks = 8)
+    Description:
+        1. test_colwise_unsupported_module_raises_npu
+        2. test_rowwise_unsupported_module_raises_npu
+        3. test_colwise_linear_forward_precision_npu
+        4. test_colwise_linear_backward_gradient_npu
+    Expectation: Run success.
+    """
+    _run_group(
+        ("test_colwise_unsupported_module_raises_npu", 10500, 2),
+        ("test_rowwise_unsupported_module_raises_npu", 10501, 2),
+        ("test_colwise_linear_forward_precision_npu", 10502, 2),
+        ("test_colwise_linear_backward_gradient_npu", 10503, 2),
+    )
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_tp_styles_two_card_wave_one_gloo():
     """
     Feature: first parallel_run — four 2-card worker cases (sum ranks = 8)
     Description:
@@ -89,9 +109,25 @@ def test_tp_styles_two_card_wave_two():
     )
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_tp_styles_four_card_wave():
+    """
+    Feature: third parallel_run — two 4-card worker cases (sum ranks = 8)
+    Description:
+        1. test_colwise_linear_forward_precision_npu (wider TP mesh)
+        2. test_rowwise_linear_forward_precision_npu (wider TP mesh)
+    Expectation: Run success.
+    """
+    _run_group(
+        ("test_colwise_linear_forward_precision_npu", 10520, 4),
+        ("test_rowwise_linear_forward_precision_npu", 10521, 4),
+    )
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_tp_styles_four_card_wave_gloo():
     """
     Feature: third parallel_run — two 4-card worker cases (sum ranks = 8)
     Description:

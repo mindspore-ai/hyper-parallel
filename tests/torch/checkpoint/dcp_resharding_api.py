@@ -33,7 +33,7 @@ from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.platform import get_platform
 from tests.torch.common_net import FullyShardTestNet
-from tests.torch.utils import init_dist
+from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
 FULLY_SHARD_HIDDEN_SIZE = 32
 FULLY_SHARD_LAYERS = 2
@@ -76,7 +76,7 @@ def _run_safe_open_reshard_case(
 
     try:
         save_mesh = init_device_mesh(
-            device_type="npu",
+            device_type=_DEVICE_TYPE,
             mesh_shape=save_mesh_shape,
             mesh_dim_names=mesh_dim_names,
         )
@@ -87,7 +87,7 @@ def _run_safe_open_reshard_case(
             local_shape = param_config["local_shape"]
             placements = param_config["placements"]
 
-            local_tensor = torch.randn(*local_shape).npu()
+            local_tensor = to_device(torch.randn(*local_shape), _DEVICE_TYPE)
             dtensor = DTensor.from_local(local_tensor, save_mesh, placements)
             save_state_dict[param_name] = dtensor
             original_global_tensors[param_name] = dtensor.full_tensor().clone()
@@ -103,7 +103,7 @@ def _run_safe_open_reshard_case(
         load_mesh = None
         if current_rank < load_mesh_size:
             load_mesh = init_device_mesh(
-                device_type="npu",
+                device_type=_DEVICE_TYPE,
                 mesh_shape=load_mesh_shape,
                 mesh_dim_names=mesh_dim_names,
                 rank_list=tuple(range(load_mesh_size)),
@@ -113,7 +113,7 @@ def _run_safe_open_reshard_case(
                 local_shape = param_config["local_shape"]
                 placements = param_config["placements"]
 
-                local_tensor = torch.zeros(*local_shape).npu()
+                local_tensor = to_device(torch.zeros(*local_shape), _DEVICE_TYPE)
                 load_state_dict[param_name] = DTensor.from_local(local_tensor, load_mesh, placements)
 
         with mock.patch.object(
@@ -145,12 +145,12 @@ def _build_tp_dp_fully_shard_model(num_cards: int) -> FullyShardTestNet:
     assert num_cards == 4, f"fully_shard resharding test requires 4 cards, but got {num_cards}"
 
     root_mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(num_cards,),
         mesh_dim_names=("axis0",),
     )
     mesh_2d = DeviceMesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh=np.array(root_mesh.rank_list, dtype=np.int32).reshape(2, 2),
         mesh_dim_names=("dp", "tp"),
     )
@@ -225,7 +225,7 @@ def test_dcp_safe_open_basic_resharding_load() -> None:
         3. Verify the loaded global tensors still match the saved global tensors.
     Expectation: The basic TP4-to-TP2 resharding smoke case runs successfully.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     torch.manual_seed(3)
     np.random.seed(2)
 
@@ -253,7 +253,7 @@ def test_dcp_safe_open_with_real_resharding_load() -> None:
         3. Verify load enters filesystem_storage.safe_open and reconstructed tensors are correct.
     Expectation: safe_open is used and loaded global tensors match the saved global tensors.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     torch.manual_seed(3)
     np.random.seed(2)
 
@@ -313,7 +313,7 @@ def test_dcp_safe_open_with_fully_shard_tp_dp_resharding_load() -> None:
         3. Verify safe_open is used and reconstructed full tensors match the saved full tensors.
     Expectation: DCP load-time resharding rebuilds TP target tensors from fully_shard checkpoint shards.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     torch.manual_seed(7)
     np.random.seed(7)
 
@@ -358,14 +358,14 @@ def test_dcp_safe_open_with_fully_shard_tp_dp_resharding_load() -> None:
         load_mesh = None
         if current_rank < 2:
             load_mesh = init_device_mesh(
-                device_type="npu",
+                device_type=_DEVICE_TYPE,
                 mesh_shape=(1, 2),
                 mesh_dim_names=("dp", "tp"),
                 rank_list=(0, 1),
             )
             load_state_dict["model"] = {}
             for param_config in load_param_configs:
-                local_tensor = torch.zeros(*param_config["local_shape"]).npu()
+                local_tensor = to_device(torch.zeros(*param_config["local_shape"]), _DEVICE_TYPE)
                 load_state_dict["model"][param_config["name"]] = DTensor.from_local(
                     local_tensor,
                     load_mesh,

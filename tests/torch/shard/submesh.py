@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ from hyper_parallel import init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.platform import get_platform
-from tests.torch.utils import init_dist
+from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
 platform = get_platform()
 
@@ -50,14 +50,14 @@ def test_full_mesh_shard_forward_1():
     Description: Data parallel.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    x_input = torch.from_numpy(x_input_np).npu()
-    w_input = torch.from_numpy(w_input_np).npu()
-    b_input = torch.from_numpy(b_input_np).npu()
+    x_input = to_device(torch.from_numpy(x_input_np), _DEVICE_TYPE)
+    w_input = to_device(torch.from_numpy(w_input_np), _DEVICE_TYPE)
+    b_input = to_device(torch.from_numpy(b_input_np), _DEVICE_TYPE)
 
     # 4 devices
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
     x_p = (Shard(0), Replicate())
     w_p = (Replicate(), Shard(1))
     b_p = (Replicate(), Shard(0))
@@ -71,7 +71,7 @@ def test_full_mesh_shard_forward_1():
             [0, 1, 2, 3],
             [4, 5, 6, 7]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -80,7 +80,7 @@ def test_full_mesh_shard_forward_1():
             [8, 9, 10, 11],
             [12, 13, 14, 15]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -91,12 +91,12 @@ def test_full_mesh_shard_forward_1():
             [8, 9],
             [12, 13]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_w.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_w.to_local()}"
         )
         arr_b = np.array([0, 1]).astype(np.float32)
-        shard_tensor_b = torch.from_numpy(arr_b).npu()
+        shard_tensor_b = to_device(torch.from_numpy(arr_b), _DEVICE_TYPE)
         assert dist_b.to_local().equal(shard_tensor_b), (
             f"Expected dist_x tensor {shard_tensor_b}, but got {dist_b.to_local()}"
         )
@@ -107,12 +107,12 @@ def test_full_mesh_shard_forward_1():
             [10, 11],
             [14, 15]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_w.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_w.to_local()}"
         )
         arr_b = np.array([2, 3]).astype(np.float32)
-        shard_tensor_b = torch.from_numpy(arr_b).npu()
+        shard_tensor_b = to_device(torch.from_numpy(arr_b), _DEVICE_TYPE)
         assert dist_b.to_local().equal(shard_tensor_b), (
             f"Expected dist_x tensor {shard_tensor_b}, but got {dist_b.to_local()}"
         )
@@ -135,7 +135,7 @@ def test_sub_mesh_column_parallel_forward():
     Description: Data parallel + (weight) column parallel.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     rank = platform.get_rank()
     x_input_np_2 = None
@@ -150,12 +150,12 @@ def test_sub_mesh_column_parallel_forward():
             [12, 13, 14, 15]
         ]).astype(np.float32)
 
-    x_input = torch.from_numpy(x_input_np_2).npu()
-    w_input = torch.from_numpy(w_input_np).npu()
-    b_input = torch.from_numpy(b_input_np).npu()
+    x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
+    w_input = to_device(torch.from_numpy(w_input_np), _DEVICE_TYPE)
+    b_input = to_device(torch.from_numpy(b_input_np), _DEVICE_TYPE)
 
     # 4 devices
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
     tp_mesh = mesh["tp"]
     x_p = (Replicate(),)
     w_p = (Shard(1),)
@@ -170,7 +170,7 @@ def test_sub_mesh_column_parallel_forward():
             [0, 1, 2, 3],
             [4, 5, 6, 7]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -179,7 +179,7 @@ def test_sub_mesh_column_parallel_forward():
             [8, 9, 10, 11],
             [12, 13, 14, 15]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -190,12 +190,12 @@ def test_sub_mesh_column_parallel_forward():
             [8, 9],
             [12, 13]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_w.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_w.to_local()}"
         )
         arr_b = np.array([0, 1]).astype(np.float32)
-        shard_tensor_b = torch.from_numpy(arr_b).npu()
+        shard_tensor_b = to_device(torch.from_numpy(arr_b), _DEVICE_TYPE)
         assert dist_b.to_local().equal(shard_tensor_b), (
             f"Expected dist_x tensor {shard_tensor_b}, but got {dist_b.to_local()}"
         )
@@ -206,12 +206,12 @@ def test_sub_mesh_column_parallel_forward():
             [10, 11],
             [14, 15]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_w.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_w.to_local()}"
         )
         arr_b = np.array([2, 3]).astype(np.float32)
-        shard_tensor_b = torch.from_numpy(arr_b).npu()
+        shard_tensor_b = to_device(torch.from_numpy(arr_b), _DEVICE_TYPE)
         assert dist_b.to_local().equal(shard_tensor_b), (
             f"Expected dist_x tensor {shard_tensor_b}, but got {dist_b.to_local()}"
         )
@@ -233,14 +233,14 @@ def test_full_mesh_shard_forward_2():
     Description: Data parallel.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    x_input = torch.from_numpy(x_input_np).npu()
-    w_input = torch.from_numpy(w_input_np).npu()
-    b_input = torch.from_numpy(b_input_np).npu()
+    x_input = to_device(torch.from_numpy(x_input_np), _DEVICE_TYPE)
+    w_input = to_device(torch.from_numpy(w_input_np), _DEVICE_TYPE)
+    b_input = to_device(torch.from_numpy(b_input_np), _DEVICE_TYPE)
 
     # 4 devices
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
     x_p = (Shard(0), Shard(1))
     w_p = (Replicate(), Shard(0))
     b_p = (Replicate(), Replicate())
@@ -254,7 +254,7 @@ def test_full_mesh_shard_forward_2():
             [0, 1],
             [4, 5]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -263,7 +263,7 @@ def test_full_mesh_shard_forward_2():
             [2, 3],
             [6, 7]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -272,7 +272,7 @@ def test_full_mesh_shard_forward_2():
             [8, 9],
             [12, 13]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -281,7 +281,7 @@ def test_full_mesh_shard_forward_2():
             [10, 11],
             [14, 15]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -290,7 +290,7 @@ def test_full_mesh_shard_forward_2():
             [0, 1, 2, 3],
             [4, 5, 6, 7]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_w.to_local().equal(shard_tensor), (
             f"Expected dist_w tensor {shard_tensor}, but got {dist_w.to_local()}"
         )
@@ -299,7 +299,7 @@ def test_full_mesh_shard_forward_2():
             [8, 9, 10, 11],
             [12, 13, 14, 15]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_w.to_local().equal(shard_tensor), (
             f"Expected dist_w tensor {shard_tensor}, but got {dist_w.to_local()}"
         )
@@ -323,7 +323,7 @@ def test_sub_mesh_row_parallel_forward():
     Description: Data parallel + (weight) row parallel.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     rank = platform.get_rank()
     x_input_np_2 = None
@@ -338,12 +338,12 @@ def test_sub_mesh_row_parallel_forward():
             [12, 13, 14, 15]
         ]).astype(np.float32)
 
-    x_input = torch.from_numpy(x_input_np_2).npu()
-    w_input = torch.from_numpy(w_input_np).npu()
-    b_input = torch.from_numpy(b_input_np).npu()
+    x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
+    w_input = to_device(torch.from_numpy(w_input_np), _DEVICE_TYPE)
+    b_input = to_device(torch.from_numpy(b_input_np), _DEVICE_TYPE)
 
     # 4 devices
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
     tp_mesh = mesh["tp"]
     x_p = (Shard(1),)
     w_p = (Shard(0),)
@@ -357,7 +357,7 @@ def test_sub_mesh_row_parallel_forward():
             [0, 1],
             [4, 5]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -366,7 +366,7 @@ def test_sub_mesh_row_parallel_forward():
             [2, 3],
             [6, 7]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -375,7 +375,7 @@ def test_sub_mesh_row_parallel_forward():
             [8, 9],
             [12, 13]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -384,7 +384,7 @@ def test_sub_mesh_row_parallel_forward():
             [10, 11],
             [14, 15]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -393,7 +393,7 @@ def test_sub_mesh_row_parallel_forward():
             [0, 1, 2, 3],
             [4, 5, 6, 7]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_w.to_local().equal(shard_tensor), (
             f"Expected dist_w tensor {shard_tensor}, but got {dist_w.to_local()}"
         )
@@ -402,7 +402,7 @@ def test_sub_mesh_row_parallel_forward():
             [8, 9, 10, 11],
             [12, 13, 14, 15]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_w.to_local().equal(shard_tensor), (
             f"Expected dist_w tensor {shard_tensor}, but got {dist_w.to_local()}"
         )
@@ -426,7 +426,7 @@ def test_sub_mesh_row_parallel_redistribute_forward():
     Description: Data parallel + (weight) row parallel.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     rank = platform.get_rank()
     x_input_np_2 = None
@@ -448,12 +448,12 @@ def test_sub_mesh_row_parallel_redistribute_forward():
     ]).astype(np.float32)
     b_input_np_2 = np.array([0, 1, 2, 3]).astype(np.float32)
 
-    x_input = torch.from_numpy(x_input_np_2).npu()
-    w_input = torch.from_numpy(w_input_np_2).npu()
-    b_input = torch.from_numpy(b_input_np_2).npu()
+    x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
+    w_input = to_device(torch.from_numpy(w_input_np_2), _DEVICE_TYPE)
+    b_input = to_device(torch.from_numpy(b_input_np_2), _DEVICE_TYPE)
 
     # 4 devices
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
     tp_mesh = mesh["tp"]
     x_p = (Shard(1),)
     w_p = (Shard(0),)
@@ -468,7 +468,7 @@ def test_sub_mesh_row_parallel_redistribute_forward():
             [0, 1],
             [0, 1]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -477,7 +477,7 @@ def test_sub_mesh_row_parallel_redistribute_forward():
             [0, 1],
             [0, 1],
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -486,7 +486,7 @@ def test_sub_mesh_row_parallel_redistribute_forward():
             [2, 3],
             [2, 3]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -495,7 +495,7 @@ def test_sub_mesh_row_parallel_redistribute_forward():
             [2, 3],
             [2, 3]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_tensor), (
             f"Expected dist_x tensor {shard_tensor}, but got {dist_x.to_local()}"
         )
@@ -504,7 +504,7 @@ def test_sub_mesh_row_parallel_redistribute_forward():
             [0, 1, 0, 1],
             [0, 1, 0, 1]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_w.to_local().equal(shard_tensor), (
             f"Expected dist_w tensor {shard_tensor}, but got {dist_w.to_local()}"
         )
@@ -513,7 +513,7 @@ def test_sub_mesh_row_parallel_redistribute_forward():
             [2, 3, 2, 3],
             [2, 3, 2, 3]
         ]).astype(np.float32)
-        shard_tensor = torch.from_numpy(arr).npu()
+        shard_tensor = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_w.to_local().equal(shard_tensor), (
             f"Expected dist_w tensor {shard_tensor}, but got {dist_w.to_local()}"
         )
@@ -550,12 +550,12 @@ def test_sub_mesh_redistribute_1():
     Description: sub_mesh + redistribute.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    x_input = torch.from_numpy(x_input_np).npu()
+    x_input = to_device(torch.from_numpy(x_input_np), _DEVICE_TYPE)
     rank = platform.get_rank()
 
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
 
     # shard tp
     tp_mesh = mesh["tp"]
@@ -569,7 +569,7 @@ def test_sub_mesh_redistribute_1():
             [8, 9],
             [12, 13]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -580,7 +580,7 @@ def test_sub_mesh_redistribute_1():
             [10, 11],
             [14, 15]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -592,7 +592,7 @@ def test_sub_mesh_redistribute_1():
             [0, 1, 2, 3],
             [4, 5, 6, 7],
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -601,7 +601,7 @@ def test_sub_mesh_redistribute_1():
             [8, 9, 10, 11],
             [12, 13, 14, 15],
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -618,7 +618,7 @@ def test_sub_mesh_redistribute_1():
             [0, 1, 2, 3],
             [4, 5, 6, 7]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -627,7 +627,7 @@ def test_sub_mesh_redistribute_1():
             [8, 9, 10, 11],
             [12, 13, 14, 15]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -640,7 +640,7 @@ def test_sub_mesh_redistribute_1():
         [8, 9, 10, 11],
         [12, 13, 14, 15]
     ]).astype(np.float32)
-    shard_x = torch.from_numpy(arr).npu()
+    shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
     assert new_dist_x.to_local().equal(shard_x), (
         f"Expected dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
     )
@@ -655,12 +655,12 @@ def test_sub_mesh_redistribute_2():
     Description: sub_mesh + redistribute.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
-    x_input = torch.from_numpy(x_input_np).npu()
+    x_input = to_device(torch.from_numpy(x_input_np), _DEVICE_TYPE)
     rank = platform.get_rank()
 
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2), mesh_dim_names = ("dp", "tp"))
 
     # shard dp
     dp_mesh = mesh["dp"]
@@ -672,7 +672,7 @@ def test_sub_mesh_redistribute_2():
             [0, 1, 2, 3],
             [4, 5, 6, 7]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -681,7 +681,7 @@ def test_sub_mesh_redistribute_2():
             [8, 9, 10, 11],
             [12, 13, 14, 15]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -695,7 +695,7 @@ def test_sub_mesh_redistribute_2():
             [8, 9],
             [12, 13]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -706,7 +706,7 @@ def test_sub_mesh_redistribute_2():
             [10, 11],
             [14, 15]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -724,7 +724,7 @@ def test_sub_mesh_redistribute_2():
             [0, 1, 2, 3],
             [4, 5, 6, 7]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -733,7 +733,7 @@ def test_sub_mesh_redistribute_2():
             [8, 9, 10, 11],
             [12, 13, 14, 15]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -748,13 +748,13 @@ def test_sub_mesh_redistribute_3():
     Description: sub_mesh + redistribute.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     x_input_np_2 = np.arange(64).reshape(8, 8).astype(np.float32)
-    x_input = torch.from_numpy(x_input_np_2).npu()
+    x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
     rank = platform.get_rank()
 
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (1, 2), mesh_dim_names = ("dp", "tp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (1, 2), mesh_dim_names = ("dp", "tp"))
 
     # shard tp
     tp_mesh = mesh["tp"]
@@ -772,7 +772,7 @@ def test_sub_mesh_redistribute_3():
             [48, 49, 50, 51],
             [56, 57, 58, 59]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -787,7 +787,7 @@ def test_sub_mesh_redistribute_3():
             [52, 53, 54, 55],
             [60, 61, 62, 63]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -801,7 +801,7 @@ def test_sub_mesh_redistribute_3():
             [16, 17, 18, 19, 20, 21, 22, 23],
             [24, 25, 26, 27, 28, 29, 30, 31]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -812,7 +812,7 @@ def test_sub_mesh_redistribute_3():
             [48, 49, 50, 51, 52, 53, 54, 55],
             [56, 57, 58, 59, 60, 61, 62, 63]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -827,12 +827,12 @@ def test_sub_mesh_redistribute_4():
     Description: sub_mesh + redistribute.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     x_input_np_2 = np.arange(64).reshape(8, 8).astype(np.float32)
-    x_input = torch.from_numpy(x_input_np_2).npu()
+    x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
 
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (1, 2), mesh_dim_names = ("dp", "tp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (1, 2), mesh_dim_names = ("dp", "tp"))
 
     # shard tp
     tp_mesh = mesh["dp"]
@@ -856,12 +856,12 @@ def test_sub_mesh_redistribute_5():
     Description: sub_mesh + redistribute.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     x_input_np_2 = np.arange(8).reshape(2, 2, 2).astype(np.float32)
-    x_input = torch.from_numpy(x_input_np_2).npu()
+    x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
     rank = platform.get_rank()
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
 
     # shard dp
     dp_mesh = mesh["dp"]
@@ -873,7 +873,7 @@ def test_sub_mesh_redistribute_5():
             [[0, 1],
             [2, 3]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -882,7 +882,7 @@ def test_sub_mesh_redistribute_5():
             [[4, 5],
             [6, 7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -894,7 +894,7 @@ def test_sub_mesh_redistribute_5():
             [[0, 1]],
             [[4, 5]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -903,7 +903,7 @@ def test_sub_mesh_redistribute_5():
             [[2, 3]],
             [[6, 7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -918,7 +918,7 @@ def test_sub_mesh_redistribute_5():
             [[0], [2]],
             [[4], [6]],
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -927,7 +927,7 @@ def test_sub_mesh_redistribute_5():
             [[1], [3]],
             [[5], [7]],
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -942,12 +942,12 @@ def test_sub_mesh_redistribute_6():
     Description: sub_mesh + redistribute.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     x_input_np_2 = np.arange(8).reshape(2, 2, 2).astype(np.float32)
-    x_input = torch.from_numpy(x_input_np_2).npu()
+    x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
     rank = platform.get_rank()
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
 
     # shard tp
     tp_mesh = mesh["tp"]
@@ -959,7 +959,7 @@ def test_sub_mesh_redistribute_6():
             [[0, 1],
             [2, 3]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -968,7 +968,7 @@ def test_sub_mesh_redistribute_6():
             [[4, 5],
             [6, 7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -980,7 +980,7 @@ def test_sub_mesh_redistribute_6():
             [[0, 1]],
             [[4, 5]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -989,7 +989,7 @@ def test_sub_mesh_redistribute_6():
             [[2, 3]],
             [[6, 7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1004,7 +1004,7 @@ def test_sub_mesh_redistribute_6():
             [[0], [2]],
             [[4], [6]],
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1013,7 +1013,7 @@ def test_sub_mesh_redistribute_6():
             [[1], [3]],
             [[5], [7]],
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1028,12 +1028,12 @@ def test_sub_mesh_redistribute_7():
     Description: sub_mesh + redistribute.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     x_input_np_2 = np.arange(8).reshape(2, 2, 2).astype(np.float32)
-    x_input = torch.from_numpy(x_input_np_2).npu()
+    x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
     rank = platform.get_rank()
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
 
     # shard mp
     mp_mesh = mesh["mp"]
@@ -1045,7 +1045,7 @@ def test_sub_mesh_redistribute_7():
             [[0, 1],
             [2, 3]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1054,7 +1054,7 @@ def test_sub_mesh_redistribute_7():
             [[4, 5],
             [6, 7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1066,7 +1066,7 @@ def test_sub_mesh_redistribute_7():
             [[0, 1]],
             [[4, 5]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1075,7 +1075,7 @@ def test_sub_mesh_redistribute_7():
             [[2, 3]],
             [[6, 7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1090,7 +1090,7 @@ def test_sub_mesh_redistribute_7():
             [[0], [2]],
             [[4], [6]],
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1099,7 +1099,7 @@ def test_sub_mesh_redistribute_7():
             [[1], [3]],
             [[5], [7]],
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1114,12 +1114,12 @@ def test_sub_mesh_redistribute_8():
     Description: sub_mesh + redistribute.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     x_input_np_2 = np.arange(8).reshape(2, 2, 2).astype(np.float32)
-    x_input = torch.from_numpy(x_input_np_2).npu()
+    x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
     rank = platform.get_rank()
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
 
     # shard dp tp
     dtp_mesh = mesh["dp", "tp"]
@@ -1130,7 +1130,7 @@ def test_sub_mesh_redistribute_8():
         arr = np.array([
             [[0, 1]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1138,7 +1138,7 @@ def test_sub_mesh_redistribute_8():
         arr = np.array([
             [[2, 3]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1146,7 +1146,7 @@ def test_sub_mesh_redistribute_8():
         arr = np.array([
             [[4, 5]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1154,7 +1154,7 @@ def test_sub_mesh_redistribute_8():
         arr = np.array([
             [[6, 7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1165,7 +1165,7 @@ def test_sub_mesh_redistribute_8():
         arr = np.array([
             [[0], [2]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1173,7 +1173,7 @@ def test_sub_mesh_redistribute_8():
         arr = np.array([
             [[1], [3]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1181,7 +1181,7 @@ def test_sub_mesh_redistribute_8():
         arr = np.array([
             [[4], [6]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1189,7 +1189,7 @@ def test_sub_mesh_redistribute_8():
         arr = np.array([
             [[5], [7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1203,7 +1203,7 @@ def test_sub_mesh_redistribute_8():
         arr = np.array([
             [[0]], [[4]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1211,7 +1211,7 @@ def test_sub_mesh_redistribute_8():
         arr = np.array([
             [[1]], [[5]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1219,7 +1219,7 @@ def test_sub_mesh_redistribute_8():
         arr = np.array([
             [[2]], [[6]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1227,7 +1227,7 @@ def test_sub_mesh_redistribute_8():
         arr = np.array([
             [[3]], [[7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1242,12 +1242,12 @@ def test_sub_mesh_redistribute_9():
     Description: sub_mesh + redistribute.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     x_input_np_2 = np.arange(8).reshape(2, 2, 2).astype(np.float32)
-    x_input = torch.from_numpy(x_input_np_2).npu()
+    x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
     rank = platform.get_rank()
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
 
     # shard dp mp
     dtp_mesh = mesh["dp", "mp"]
@@ -1258,7 +1258,7 @@ def test_sub_mesh_redistribute_9():
         arr = np.array([
             [[0, 1]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1267,7 +1267,7 @@ def test_sub_mesh_redistribute_9():
         arr = np.array([
             [[2, 3]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1275,7 +1275,7 @@ def test_sub_mesh_redistribute_9():
         arr = np.array([
             [[4, 5]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1283,7 +1283,7 @@ def test_sub_mesh_redistribute_9():
         arr = np.array([
             [[6, 7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1294,7 +1294,7 @@ def test_sub_mesh_redistribute_9():
         arr = np.array([
             [[0], [2]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1302,7 +1302,7 @@ def test_sub_mesh_redistribute_9():
         arr = np.array([
             [[1], [3]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1310,7 +1310,7 @@ def test_sub_mesh_redistribute_9():
         arr = np.array([
             [[4], [6]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1318,7 +1318,7 @@ def test_sub_mesh_redistribute_9():
         arr = np.array([
             [[5], [7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1332,7 +1332,7 @@ def test_sub_mesh_redistribute_9():
         arr = np.array([
             [[0]], [[4]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1340,7 +1340,7 @@ def test_sub_mesh_redistribute_9():
         arr = np.array([
             [[1]], [[5]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1348,7 +1348,7 @@ def test_sub_mesh_redistribute_9():
         arr = np.array([
             [[2]], [[6]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1356,7 +1356,7 @@ def test_sub_mesh_redistribute_9():
         arr = np.array([
             [[3]], [[7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1371,12 +1371,12 @@ def test_sub_mesh_redistribute_10():
     Description: sub_mesh + redistribute.
     Expectation: Success.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     x_input_np_2 = np.arange(8).reshape(2, 2, 2).astype(np.float32)
-    x_input = torch.from_numpy(x_input_np_2).npu()
+    x_input = to_device(torch.from_numpy(x_input_np_2), _DEVICE_TYPE)
     rank = platform.get_rank()
-    mesh = init_device_mesh(device_type = "npu", mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
+    mesh = init_device_mesh(device_type = _DEVICE_TYPE, mesh_shape = (2, 2, 2), mesh_dim_names = ("dp", "tp", "mp"))
 
     # shard tp mp
     dtp_mesh = mesh["tp", "mp"]
@@ -1387,7 +1387,7 @@ def test_sub_mesh_redistribute_10():
         arr = np.array([
             [[0, 1]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1396,7 +1396,7 @@ def test_sub_mesh_redistribute_10():
         arr = np.array([
             [[2, 3]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1404,7 +1404,7 @@ def test_sub_mesh_redistribute_10():
         arr = np.array([
             [[4, 5]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1412,7 +1412,7 @@ def test_sub_mesh_redistribute_10():
         arr = np.array([
             [[6, 7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert dist_x.to_local().equal(shard_x), (
             f"Expected dist_x tensor {shard_x}, but got {dist_x.to_local()}"
         )
@@ -1423,7 +1423,7 @@ def test_sub_mesh_redistribute_10():
         arr = np.array([
             [[0], [2]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1431,7 +1431,7 @@ def test_sub_mesh_redistribute_10():
         arr = np.array([
             [[1], [3]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1439,7 +1439,7 @@ def test_sub_mesh_redistribute_10():
         arr = np.array([
             [[4], [6]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1447,7 +1447,7 @@ def test_sub_mesh_redistribute_10():
         arr = np.array([
             [[5], [7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1461,7 +1461,7 @@ def test_sub_mesh_redistribute_10():
         arr = np.array([
             [[0]], [[4]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1469,7 +1469,7 @@ def test_sub_mesh_redistribute_10():
         arr = np.array([
             [[1]], [[5]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1477,7 +1477,7 @@ def test_sub_mesh_redistribute_10():
         arr = np.array([
             [[2]], [[6]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )
@@ -1485,7 +1485,7 @@ def test_sub_mesh_redistribute_10():
         arr = np.array([
             [[3]], [[7]]
         ]).astype(np.float32)
-        shard_x = torch.from_numpy(arr).npu()
+        shard_x = to_device(torch.from_numpy(arr), _DEVICE_TYPE)
         assert new_dist_x.to_local().equal(shard_x), (
             f"Expected new_dist_x tensor {shard_x}, but got {new_dist_x.to_local()}"
         )

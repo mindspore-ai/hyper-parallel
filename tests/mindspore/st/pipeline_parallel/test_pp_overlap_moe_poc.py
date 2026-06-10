@@ -25,7 +25,7 @@ from tests.mindspore.st.utils import msrun_case
 PP_OVERLAP_MOE_POC = "pp_overlap_moe_poc.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_end_to_end():
     """End-to-end PP+EP+overlap on MindSpore PyNative.
@@ -44,7 +44,7 @@ def test_pp_overlap_moe_end_to_end():
                12351, worker_num=8, local_worker_num=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_recompute():
     """PP+EP+overlap + activation checkpoint via ``checkpoint_wrapper``.
@@ -67,7 +67,7 @@ def test_pp_overlap_moe_recompute():
                12353, worker_num=8, local_worker_num=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_recompute_per_layer():
     """Per-layer (multi-segment) activation checkpoint under overlap_b_f.
@@ -88,7 +88,7 @@ def test_pp_overlap_moe_recompute_per_layer():
                12355, worker_num=8, local_worker_num=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_recompute_mixed():
     """Mixed per-layer recompute (some layers recompute, some don't) under overlap_b_f.
@@ -134,7 +134,7 @@ def test_pp_overlap_moe_accuracy():
                12352, worker_num=8, local_worker_num=8)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_pp_overlap_moe_variable_layers():
     """Heterogeneous per-chunk layer counts under overlap_b_f.

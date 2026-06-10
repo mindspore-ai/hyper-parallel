@@ -16,16 +16,15 @@
 import torch
 from torch import nn
 import torch.distributed as dist
-# pylint: disable=W0611
-import torch_npu  # Ascend NPU core adapter
 from hyper_parallel import DTensor
+from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
 
 class MLP(nn.Module):
     """MLP net."""
     def __init__(self, in_size, out_size):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(in_size, out_size, dtype=torch.float32).npu())
+        self.weight = nn.Parameter(to_device(torch.ones(in_size, out_size, dtype=torch.float32), _DEVICE_TYPE))
         # ``p=0`` keeps the graph as a random-op module without consuming RNG or changing values,
         # so PP vs standalone ``allclose`` in ``test_vpp`` still holds. Non-zero dropout needs
         # per-rank aligned ``torch.manual_seed`` / device seed; it still may not match standalone
@@ -67,19 +66,17 @@ def model_split_manual(model, stage_index, num_layers):
 def run_standalone(dim, model):
     """run standalone."""
     steps = 1
-    data = torch.ones(dim, 16, dtype=torch.float32).npu()
+    data = to_device(torch.ones(dim, 16, dtype=torch.float32), _DEVICE_TYPE)
     for _ in range(steps):
         loss = model(data)
-        sens = torch.ones(loss.shape, dtype=loss.dtype, device="npu")
+        sens = torch.ones(loss.shape, dtype=loss.dtype, device=_DEVICE_TYPE)
         loss.backward(gradient=sens)
     return loss
 
 
 def init_hccl():
     """init hccl and set device"""
-    dist.init_process_group("hccl")
-    rank_id = dist.get_rank()
-    torch.npu.set_device(rank_id)
+    init_backend(_DEVICE_TYPE)
 
 
 def get_stage_index(stage_num):

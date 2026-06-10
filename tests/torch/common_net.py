@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,12 +16,14 @@
 import torch
 from torch import nn
 
+from tests.torch.utils import _DEVICE_TYPE, to_device
+
 
 class SimpleModel(nn.Module):
     """simple model"""
     def __init__(self):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(8, 8).npu())
+        self.weight = nn.Parameter(to_device(torch.ones(8, 8), _DEVICE_TYPE))
 
     def forward(self, x):
         x = torch.matmul(x, self.weight)
@@ -39,9 +41,9 @@ class DenseNet(nn.Module):
         if not callable(init_fn):
             raise ValueError(f"weight_init must be None or callable, but got {type(weight_init)}")
         weight = init_fn(in_channels, hidden_size)
-        self.weight = nn.Parameter(weight.npu())
+        self.weight = nn.Parameter(to_device(weight, _DEVICE_TYPE))
         if self.has_bias:
-            self.bias = nn.Parameter(torch.zeros(hidden_size).npu())
+            self.bias = nn.Parameter(to_device(torch.zeros(hidden_size), _DEVICE_TYPE))
 
     def forward(self, x):
         x = torch.matmul(x, self.weight)
@@ -112,7 +114,7 @@ class FullyShardTestNet(nn.Module):
     """net for fully_shard test"""
     def __init__(self, dense_hidden, dense_layer_num, has_bias=True, dense_weight_init=None):
         super().__init__()
-        self.w1 = nn.Parameter(torch.rand(dense_hidden, dense_hidden).npu())
+        self.w1 = nn.Parameter(to_device(torch.rand(dense_hidden, dense_hidden), _DEVICE_TYPE))
         self.dense_layers = DenseMutiLayerNet(
             dense_hidden,
             dense_layer_num,

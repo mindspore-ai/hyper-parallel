@@ -19,7 +19,7 @@ from tests.common.parallel_case import parallel_run, TorchCase
 _TEST_FILE = "_test_gradient_scaling_factor_hsdp_acc.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_gradient_scaling_factor_hsdp_acc_group1():
     """
     Feature: parallel run case for HSDPModule.set_gradient_scaling_factor under

@@ -29,7 +29,7 @@ _WORKER = "_test_llama3_accuracy.py"
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="onecard",
     essential_mark="essential",
 )
@@ -45,7 +45,7 @@ def test_llama3_single_card_baseline():
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
