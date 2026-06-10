@@ -37,6 +37,11 @@ class MetaStepType(Enum):
     FWD_SEND = auto()
     BWD_RECV = auto()
     BWD_SEND = auto()
+    # Composite P2P: a contiguous run of FWD_SEND/FWD_RECV/BWD_SEND/BWD_RECV
+    # coalesced by ``coalesce_p2p`` into one step whose ``sub_steps`` the runtime
+    # groups by peer and issues as ``batch_isend_irecv`` (same-peer send+recv ->
+    # duplex).  Only produced under ``p2p_transport="batch"``.
+    BATCH_SEND_RECV = auto()
     OVERLAP_F_B = auto()
     OVERLAP_B_F = auto()
     FSDP_UNSHARD = auto()
@@ -66,12 +71,20 @@ class MetaStep:
         sub_steps (tuple[MetaStep, MetaStep] | None): For composite types
             only: ``(fwd, bwd)`` for ``OVERLAP_F_B``, ``(bwd, fwd)`` for
             ``OVERLAP_B_F``.
+        boundary_p2p (tuple[MetaStep, ...] | None): For ``OVERLAP_B_F`` under
+            the ``"boundary"`` P2P transport only: P2P steps to issue at the
+            fwd/bwd boundary inside the overlap (the forward's ``FWD_SEND``
+            plus the next slot's recvs), hoisted out of the following gap by
+            ``attach_fwd_boundary_p2p``.  Issued via
+            :meth:`PipelineScheduleRuntime.exec_boundary_p2p`.
     """
-    def __init__(self, micro_index, meta_type, stage_index, sub_steps=None):
+    def __init__(self, micro_index, meta_type, stage_index, sub_steps=None,
+                 boundary_p2p=None):
         self._type = meta_type
         self._micro_index = micro_index
         self._stage_index = stage_index
         self._sub_steps = sub_steps
+        self._boundary_p2p = boundary_p2p
 
     @property
     def micro_index(self):
@@ -90,6 +103,11 @@ class MetaStep:
         """Sub-steps for composite types: ``(fwd, bwd)`` for OVERLAP_F_B,
         ``(bwd, fwd)`` for OVERLAP_B_F, or ``None``."""
         return self._sub_steps
+
+    @property
+    def boundary_p2p(self):
+        """P2P steps to issue at the overlap's fwd/bwd boundary, or ``None``."""
+        return self._boundary_p2p
 
     def __eq__(self, value):
         if not isinstance(value, MetaStep):
@@ -241,7 +259,27 @@ class PipelineScheduleRuntime(ABC):
         swap (bool, optional): Whether to inject pipeline activation swap
             control steps. Supported by ``ScheduleGPipe``, ``Schedule1F1B``,
             and ``ScheduleInterleaved1F1B``. Default ``False``.
+        p2p_transport (str, optional): How pipeline send/recv are issued.
+            ``"auto"`` (default) — gap-time duplex batching on overlap_b_f
+            schedules (``coalesce_p2p``: same-peer send+recv as one
+            ``batch_isend_irecv``, TX||RX; hardware-validated and measured a
+            net win on real workloads), plain per-op ``isend``/``irecv``
+            everywhere else.  ``"plain"`` — force per-op ``isend``/``irecv``
+            (escape hatch for transports or topologies where batching
+            misbehaves).  ``"batch"`` — duplex batching explicitly (what
+            ``"auto"`` picks under overlap_b_f).  ``"boundary"`` —
+            EXPERIMENTAL fwd-boundary batching: each overlap's ``F_SEND`` +
+            the next slot's recvs go out mid-overlap, right after the forward,
+            as per-op solo batches; only ``B_SEND`` waits for the backward.
+            Avoids the duplex handle's send-coupling (a2a-friendly) and posts
+            the activation send ~half a slot early, but is not yet
+            hardware-validated — opt in deliberately.  Must be set identically
+            on every rank — HCCL cannot match a batched op against a plain one
+            (EI0005).
     """
+
+    _P2P_TRANSPORTS = ("auto", "plain", "batch", "boundary")
+
     def __init__(self,
                  stages,
                  micro_batch_num,
@@ -249,7 +287,13 @@ class PipelineScheduleRuntime(ABC):
                  kwargs_batch_dim=None,
                  output_concat_dim=None,
                  overlap_p2p=False,
-                 swap=False):
+                 swap=False,
+                 p2p_transport="auto"):
+        if p2p_transport not in self._P2P_TRANSPORTS:
+            raise ValueError(
+                f"p2p_transport must be one of {self._P2P_TRANSPORTS}, got "
+                f"{p2p_transport!r}"
+            )
         self.stages = self._check_stages(stages)
         self.micro_batch_num = micro_batch_num
         self._args_batch_dim = args_batch_dim
@@ -273,6 +317,51 @@ class PipelineScheduleRuntime(ABC):
         # Outstanding async send handle groups for the in-flight
         # ``run_microbatches`` call; reset per run and drained at its end.
         self._send_handles = []
+        # ``p2p_transport`` resolves in ``build_exec_order`` (it needs the
+        # subclass's ``_overlap_b_f``) to one of:
+        #
+        #  * ``"batch"`` (the ``"auto"`` default on overlap_b_f schedules) —
+        #    gap-time duplex via ``coalesce_p2p``: same-peer send+recv as one
+        #    ``batch_isend_irecv`` (TX||RX on the full-duplex link).
+        #    Hardware-validated and MEASURED a net win on real workloads — the
+        #    duplex saving outweighs its known cost (MS's single handle couples
+        #    the riding send into the compute-gating recv wait, which can
+        #    shave EP a2a overlap).
+        #  * ``"plain"`` (the ``"auto"`` default elsewhere) — per-op
+        #    ``isend``/``irecv``, the upstream-original path.
+        #  * ``"boundary"`` (EXPERIMENTAL, explicit opt-in only) — fwd-boundary
+        #    batching.  ``attach_fwd_boundary_p2p`` hangs each steady gap's
+        #    ``F_SEND`` (its data is ready when the overlap's forward finishes
+        #    — the backward, ~2x FLOPs, is the long pole) plus the next slot's
+        #    recvs on the OVERLAP_B_F step; the stage's after-forward hook
+        #    fires ``exec_boundary_p2p`` at the fwd/bwd boundary, while the
+        #    backward is still running.  The send leaves roughly half a slot
+        #    early — the only mode that moves the SENDER's post time — and the
+        #    recv handles carry no send (a2a-friendly).  Every op is a per-op
+        #    solo batch and ``coalesce_p2p`` is NOT run: a hoisted recv cannot
+        #    stay duplexed with a send that is only ready later, and
+        #    asymmetric shapes (one end duplex, other end split) hang —
+        #    all-solo keeps per-pair batch sequences complementary
+        #    ([S,R] vs [R,S]), safe under both candidate HCCL pairing
+        #    semantics.  Promote to the auto default only after it earns both
+        #    a hardware accuracy pass and a perf win over "batch".
+        #
+        # Two transport invariants for any future rewrite: plain per-pair
+        # streams need the gap's recv-first/send-first complementarity (a
+        # send-crossing hoist made both ends recv-first -> rendezvous deadlock,
+        # 2026-06), and batch pairing needs per-pair shape mirroring (a
+        # one-sided split made 2 solos face 1 duplex -> hang, 2026-06).
+        self._p2p_transport = p2p_transport
+        # Effective mode + per-op batch gating; set by ``build_exec_order``.
+        self._p2p_mode = None
+        self._batch_p2p = False
+        # OVERLAP steps whose boundary_p2p was already issued this run (the
+        # stage after-forward hook and the post-step safety net are both
+        # allowed to call exec_boundary_p2p; reset per run_microbatches call).
+        self._boundary_issued = set()
+        # (fwd stage_index, micro_index) -> armed OVERLAP step, consumed by the
+        # stage after-forward hook to fire the boundary issue mid-overlap.
+        self._pending_boundary = {}
 
     def register_custom_function(self, step_type: MetaStepType, fn) -> None:
         """Register a custom execution function for the given step type.
@@ -337,10 +426,34 @@ class PipelineScheduleRuntime(ABC):
         """Build exec order, PP cmopute and PP comms(Send/Recv)"""
 
     def build_exec_order(self) -> None:
-        """Build the execution order and inject optional PP-swap/FSDP actions."""
+        """Build the execution order and inject optional PP-swap/FSDP actions.
+
+        Also resolves ``p2p_transport``: ``"auto"`` becomes ``"batch"`` (the
+        measured-beneficial duplex) on schedules running with ``overlap_b_f``
+        and ``"plain"`` everywhere else, then the matching order-rewrite pass
+        runs last (after swap/FSDP injection) so it sees the final per-rank
+        order.
+        """
+        mode = self._p2p_transport
+        if mode == "auto":
+            mode = "batch" if getattr(self, "_overlap_b_f", False) else "plain"
+        self._p2p_mode = mode
+        self._batch_p2p = mode != "plain"
         self.construct_exec_order()
         self._inject_local_pp_swap_actions()
         self._inject_local_fsdp_actions()
+        if mode == "boundary":
+            # fwd-boundary mode: hang the forward's F_SEND + next slot's recvs
+            # on the OVERLAP step (issued mid-overlap, right after the
+            # forward).  Everything stays per-op solo batches — deliberately
+            # NO coalesce_p2p (see __init__).
+            self.exec_order = attach_fwd_boundary_p2p(self.exec_order)
+        elif mode == "batch":
+            # Coalesce contiguous P2P runs into BATCH_SEND_RECV so the runtime
+            # issues same-peer send+recv as one duplex batch.  NOTE: couples
+            # the riding send into the compute-gating recv wait — see
+            # __init__.
+            self.exec_order = coalesce_p2p(self.exec_order)
 
     def convert_stages_dict(self):
         """convert stages to dict."""
@@ -373,6 +486,24 @@ class PipelineScheduleRuntime(ABC):
         """init stages."""
         for stage in self.stages:
             stage.init(self.n_local_stages)
+            # After-forward hook: lets the schedule issue fwd-boundary P2P the
+            # moment a forward chunk completes (no-op unless an OVERLAP step
+            # with boundary_p2p was armed for that (stage, micro)).
+            stage._after_forward_chunk = self._on_forward_chunk_done  # pylint: disable=W0212
+
+    def _on_forward_chunk_done(self, stage_index, micro_index):
+        """Stage after-forward hook: fire the armed boundary P2P, if any.
+
+        Runs on the thread executing the forward (the overlap callback's
+        ``fwd_fn`` / the main thread), at the fwd/bwd boundary — the paired
+        backward is still running, so the boundary ops overlap it.  Keyed by
+        the overlap's forward ``(stage_index, micro_index)``; unrelated
+        forwards (warm-up steps, recompute re-runs of past micros) miss the
+        key and no-op.
+        """
+        step = self._pending_boundary.pop((stage_index, micro_index), None)
+        if step is not None:
+            self.exec_boundary_p2p(step)
 
     def run(self, *args, **kwargs):
         """schedule run."""
@@ -401,6 +532,21 @@ class PipelineScheduleRuntime(ABC):
             if handle is not None:
                 handle.wait()
 
+    def _batched_issue(self, specs):
+        """Launch same-peer P2P ``specs`` as one ``batch_isend_irecv`` group.
+
+        ``specs`` are ``(op_type, tensor, peer_global_rank)`` from the stage's
+        ``*_specs`` builders (which carry the meta/bookkeeping side effects).
+        Returns ``[handle]`` (the single batch handle) or ``[]`` — shaped like
+        the per-op ``exec_*_ops`` return so the cache / drain paths are
+        unchanged.  Only the launch is coalesced; matching stays per-peer FIFO.
+        """
+        if not specs:
+            return []
+        ops = [platform.p2p_op(op_type, tensor, peer) for op_type, tensor, peer in specs]
+        handle = platform.batch_isend_irecv(ops)
+        return [handle] if handle is not None else []
+
     # --- P2P step primitives ------------------------------------------------
     # One method per cross-rank comm action, used both by the runtime loop
     # (``_exec_step``) and by OVERLAP callbacks (via ``ctx.schedule``).  With
@@ -411,7 +557,8 @@ class PipelineScheduleRuntime(ABC):
 
     def recv_fwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> None:
         """Post the FWD recv for ``micro_index``; cache it (overlap_p2p) or wait now."""
-        handles = stage.exec_fwd_recv_ops(micro_index)
+        handles = (self._batched_issue(stage.fwd_recv_specs(micro_index))
+                   if self._batch_p2p else stage.exec_fwd_recv_ops(micro_index))
         if self._overlap_p2p:
             self.fwd_handle_cache[(stage.stage_index, micro_index)] = handles
         else:
@@ -419,7 +566,8 @@ class PipelineScheduleRuntime(ABC):
 
     def recv_bwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> None:
         """Post the BWD recv for ``micro_index``; cache it (overlap_p2p) or wait now."""
-        handles = stage.exec_bwd_recv_ops(micro_index)
+        handles = (self._batched_issue(stage.bwd_recv_specs(micro_index))
+                   if self._batch_p2p else stage.exec_bwd_recv_ops(micro_index))
         if self._overlap_p2p:
             self.bwd_handle_cache[(stage.stage_index, micro_index)] = handles
         else:
@@ -439,7 +587,8 @@ class PipelineScheduleRuntime(ABC):
 
     def send_fwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> list:
         """Send this stage's forward output for ``micro_index`` to the next stage."""
-        handles = stage.exec_fwd_send_ops(micro_index) or []
+        handles = (self._batched_issue(stage.fwd_send_specs(micro_index))
+                   if self._batch_p2p else stage.exec_fwd_send_ops(micro_index)) or []
         if self._overlap_p2p:
             # Append the whole handle group: run_microbatches drains _send_handles
             # group by group, so a bare handle would be wrongly iterated as a list.
@@ -457,12 +606,123 @@ class PipelineScheduleRuntime(ABC):
         stage's ``bwd_cache``. Calling it manually in addition to the scheduled
         ``BWD_SEND`` would double-send the gradient.
         """
-        handles = stage.exec_bwd_send_ops(micro_index) or []
+        handles = (self._batched_issue(stage.bwd_send_specs(micro_index))
+                   if self._batch_p2p else stage.exec_bwd_send_ops(micro_index)) or []
         if self._overlap_p2p:
             self._send_handles.append(handles)
         else:
             self._wait_p2p(handles)
         return handles
+
+    def _arm_boundary(self, step):
+        """Register ``step`` for the stage after-forward hook; return its key.
+
+        No-op (returns ``None``) unless ``step`` carries ``boundary_p2p``.  The
+        key is the overlap's forward ``(stage_index, micro_index)`` — exactly
+        what the hook receives when that forward chunk completes.
+        """
+        if not getattr(step, "boundary_p2p", None) or not step.sub_steps:
+            return None
+        fwd_sub = next((s for s in step.sub_steps
+                        if s.type == MetaStepType.FWD), None)
+        if fwd_sub is None:
+            return None
+        key = (fwd_sub.stage_index, fwd_sub.micro_index)
+        self._pending_boundary[key] = step
+        return key
+
+    def _finish_boundary(self, step, armed_key) -> None:
+        """Post-step safety net: issue any boundary P2P the hook missed."""
+        self.exec_boundary_p2p(step)
+        if armed_key is not None:
+            self._pending_boundary.pop(armed_key, None)
+
+    def exec_boundary_p2p(self, step) -> None:
+        """Issue ``step.boundary_p2p`` (fwd-boundary P2P) once per run.
+
+        Fired by the stage after-forward hook (``_on_forward_chunk_done``) the
+        moment the overlap's forward chunk completes — the backward is still
+        running on its own thread, so the F_SEND leaves ~half a slot early and
+        the next slot's recvs are already posted when the peers' sends arrive.
+        Idempotent per ``run_microbatches`` call: the post-step safety net
+        (``_finish_boundary``) also invokes it, so an overlap whose forward
+        never went through ``forward_one_chunk`` degrades to gap-time issue
+        order instead of dropping the ops.
+
+        Dispatches through the existing per-op helpers (``send_fwd`` /
+        ``recv_fwd`` / ``recv_bwd``), so batching, handle caching for
+        ``wait_*_recv`` and deferred-send bookkeeping behave exactly like the
+        scheduled steps they replace.  No-op for steps without
+        ``boundary_p2p``.
+        """
+        ops = getattr(step, "boundary_p2p", None)
+        if not ops or id(step) in self._boundary_issued:
+            return
+        self._boundary_issued.add(id(step))
+        for sub in ops:
+            stage = self._stage_dict[sub.stage_index]
+            if sub.type == MetaStepType.FWD_SEND:
+                self.send_fwd(stage, sub.micro_index)
+            elif sub.type == MetaStepType.FWD_RECV:
+                self.recv_fwd(stage, sub.micro_index)
+            elif sub.type == MetaStepType.BWD_RECV:
+                self.recv_bwd(stage, sub.micro_index)
+            elif sub.type == MetaStepType.BWD_SEND:
+                # attach_fwd_boundary_p2p never hoists BWD_SEND (its grad is
+                # produced by the backward still in flight); defensive only.
+                self.send_bwd(stage, sub.micro_index)
+
+    # ``op_type -> (specs builder name, route kind)`` for a coalesced sub-step.
+    # ``route`` is the recv-cache kind (so wait_*_recv finds the handle), or
+    # ``None`` for a send (no local consumer).
+    _BATCH_SUB_DISPATCH = {
+        MetaStepType.FWD_RECV: ("fwd_recv_specs", "fwd"),
+        MetaStepType.BWD_RECV: ("bwd_recv_specs", "bwd"),
+        MetaStepType.FWD_SEND: ("fwd_send_specs", None),
+        MetaStepType.BWD_SEND: ("bwd_send_specs", None),
+    }
+
+    def _exec_batch_send_recv(self, step) -> None:
+        """Execute a coalesced P2P run: one ``batch_isend_irecv`` per peer.
+
+        Builds each sub-step's specs (same meta/bookkeeping side effects as the
+        per-step ``recv_fwd`` / ``send_fwd`` / ...), groups every op by peer
+        global rank, and issues one batch per peer so a same-peer send+recv runs
+        duplex.  Handle routing mirrors the per-step path: under
+        ``overlap_p2p`` a batch carrying a recv is cached for ``wait_*_recv``
+        (its send rides along), a send-only batch defers to ``_send_handles``;
+        without ``overlap_p2p`` every batch waits inline.
+        """
+        # (op_type, tensor, peer, route) per op; route = (kind, stage, micro) for
+        # a recv, else None.
+        tagged = []
+        for sub in step.sub_steps:
+            builder_name, kind = self._BATCH_SUB_DISPATCH[sub.type]
+            stage = self._stage_dict[sub.stage_index]
+            specs = getattr(stage, builder_name)(sub.micro_index)
+            route = (kind, sub.stage_index, sub.micro_index) if kind is not None else None
+            for op_type, tensor, peer in specs:
+                tagged.append((op_type, tensor, peer, route))
+
+        by_peer = {}
+        for item in tagged:
+            by_peer.setdefault(item[2], []).append(item)
+
+        for items in by_peer.values():
+            ops = [platform.p2p_op(op_type, tensor, peer) for op_type, tensor, peer, _ in items]
+            handle = platform.batch_isend_irecv(ops)
+            if handle is None:
+                continue
+            if not self._overlap_p2p:
+                self._wait_p2p([handle])
+                continue
+            recv_routes = [route for *_, route in items if route is not None]
+            if recv_routes:
+                for kind, si, mi in recv_routes:
+                    cache = self.fwd_handle_cache if kind == "fwd" else self.bwd_handle_cache
+                    cache[(si, mi)] = [handle]
+            else:
+                self._send_handles.append([handle])
 
     def _assert_in_unshard_if_needed(self, stage, check_step):
         if not isinstance(stage.submodule, HSDPModule):
@@ -575,6 +835,8 @@ class PipelineScheduleRuntime(ABC):
         """
         real_stage_index = self.stages[0].stage_index % self.real_stage_num
         self._send_handles = []
+        self._boundary_issued = set()
+        self._pending_boundary = {}
         ctx = None  # lazily created
 
         ordered = self.exec_order[real_stage_index]
@@ -593,12 +855,28 @@ class PipelineScheduleRuntime(ABC):
                 real_stage_index, step_idx, total_steps, cur_step,
             )
 
+            # Arm the fwd-boundary hook: when this step carries boundary_p2p,
+            # the stage's after-forward hook fires exec_boundary_p2p the moment
+            # the overlap's forward chunk completes (works for any callback —
+            # no callback cooperation needed).
+            armed_key = self._arm_boundary(cur_step)
+
             # Check for registered custom function
             custom_fn = self._custom_fn_map.get(cur_step.type)
             if custom_fn is not None:
                 if ctx is None:
                     ctx = PipelineContext(self, arg_mbs, kwarg_mbs, losses)
                 custom_fn(cur_step, ctx)
+                # Safety net: if the forward hook never fired (custom fwd path),
+                # issue the boundary ops now (gap-time order) instead of
+                # dropping them.  Idempotent.
+                self._finish_boundary(cur_step, armed_key)
+                continue
+
+            # Coalesced P2P block: group sub-steps by peer, issue one
+            # batch_isend_irecv per peer (same-peer send+recv -> duplex).
+            if cur_step.type == MetaStepType.BATCH_SEND_RECV:
+                self._exec_batch_send_recv(cur_step)
                 continue
 
             # Default for composite OVERLAP steps: run sub_steps sequentially.
@@ -609,6 +887,7 @@ class PipelineScheduleRuntime(ABC):
                     and cur_step.sub_steps):
                 for sub in cur_step.sub_steps:
                     self._exec_step(sub, arg_mbs, kwarg_mbs, losses)
+                self._finish_boundary(cur_step, armed_key)
                 continue
 
             self._exec_step(cur_step, arg_mbs, kwarg_mbs, losses)
@@ -741,6 +1020,153 @@ def _column_scan_insert_comms(expanded, real_stage_num, insert_step_comms):
     return new_schedule
 
 
+_P2P_STEP_TYPES = frozenset({
+    MetaStepType.FWD_SEND, MetaStepType.FWD_RECV,
+    MetaStepType.BWD_SEND, MetaStepType.BWD_RECV,
+})
+
+
+def coalesce_p2p(exec_order):
+    """Coalesce maximal contiguous runs of >=2 P2P steps into BATCH_SEND_RECV.
+
+    A *run* is a maximal sequence of consecutive ``FWD_SEND`` / ``FWD_RECV`` /
+    ``BWD_SEND`` / ``BWD_RECV`` steps with no compute / overlap / bubble (``None``)
+    step between them — so no recv in the run is consumed before the batch is
+    issued, and all sends' data is already produced.  Each such run is replaced
+    by a single :class:`MetaStep` of type ``BATCH_SEND_RECV`` carrying the run as
+    ``sub_steps`` (order preserved, so per-direction FIFO is kept); the runtime
+    groups those sub-steps by peer and issues one ``batch_isend_irecv`` per peer
+    (same-peer send+recv -> duplex).  Runs of length 1 are left untouched (the
+    per-op batched path still batches them, so every transfer is still
+    batch-vs-batch).  Pure ``exec_order -> exec_order`` transform.
+
+    Args:
+        exec_order: ``{rank: [MetaStep | None, ...]}``.
+
+    Returns:
+        A new ``{rank: [...]}`` with contiguous P2P runs coalesced.
+    """
+    def _flush(run, new):
+        if len(run) >= 2:
+            new.append(MetaStep(None, MetaStepType.BATCH_SEND_RECV, None, sub_steps=tuple(run)))
+        else:
+            new.extend(run)
+
+    out = {}
+    for rank, order in exec_order.items():
+        new = []
+        run = []
+        for step in order:
+            if step is not None and step.type in _P2P_STEP_TYPES:
+                run.append(step)
+                continue
+            _flush(run, new)
+            run = []
+            new.append(step)
+        _flush(run, new)
+        out[rank] = new
+    return out
+
+
+_RECV_STEP_TYPES = frozenset({MetaStepType.FWD_RECV, MetaStepType.BWD_RECV})
+
+
+def attach_fwd_boundary_p2p(exec_order):
+    """Hang each overlap gap's boundary-safe P2P on the OVERLAP_B_F step.
+
+    For every ``OVERLAP_B_F`` step, the contiguous P2P run right after it is
+    split by data readiness at the overlap's fwd/bwd boundary (forward is the
+    short side; backward, ~2x FLOPs, is the long pole):
+
+      * the forward's own ``FWD_SEND`` — its payload exists the moment the
+        forward sub-step finishes, no need to wait out the backward;
+      * every ``FWD_RECV`` / ``BWD_RECV`` — no data dependency at all;
+
+    are removed from the gap and attached to the OVERLAP step as
+    ``boundary_p2p`` (order: ``F_SEND`` first, then the recvs in original
+    order), to be issued by :meth:`PipelineScheduleRuntime.exec_boundary_p2p`
+    at the boundary, while the backward is still running.  ``BWD_SEND`` (its
+    grad is produced by that backward) and any send not produced by this
+    overlap's forward stay in the gap.
+
+    Pairing shape (the reason this composition is safe where naive
+    hoist+coalesce hung): with every op issued as a per-op solo batch, each
+    pair's per-pair batch sequence per slot is ``[F_SEND, B_RECV]`` on the
+    prev end and ``[F_RECV, B_SEND]`` on the next end — complementary at every
+    position and equal in count, so it matches under both per-direction FIFO
+    and per-pair shape-mirroring semantics.  Per-direction FIFO data order is
+    preserved (each direction's ops keep their relative order; they all shift
+    by the same amount).  Pure ``exec_order -> exec_order`` transform.
+
+    Args:
+        exec_order: ``{rank: [MetaStep | None, ...]}``.
+
+    Returns:
+        A new ``{rank: [...]}`` with boundary P2P attached to OVERLAP steps.
+    """
+    out = {}
+    for rank, order in exec_order.items():
+        new = []
+        i = 0
+        while i < len(order):
+            step = order[i]
+            if (step is None or step.type != MetaStepType.OVERLAP_B_F
+                    or not step.sub_steps):
+                new.append(step)
+                i += 1
+                continue
+            run, j = _p2p_run_after(order, i + 1)
+            boundary, leftover = _split_boundary_run(step, run)
+            if not boundary:
+                new.append(step)
+                i += 1
+                continue
+            new.append(MetaStep(step.micro_index, step.type, step.stage_index,
+                                sub_steps=step.sub_steps, boundary_p2p=boundary))
+            new.extend(leftover)
+            i = j
+        out[rank] = new
+    return out
+
+
+def _p2p_run_after(order, start):
+    """Collect the contiguous P2P run starting at ``start``.
+
+    Returns ``(run, end)`` where ``end`` is the index of the first step past
+    the run (a compute step, ``None`` bubble, or end of order).
+    """
+    run = []
+    j = start
+    while j < len(order) and order[j] is not None and order[j].type in _P2P_STEP_TYPES:
+        run.append(order[j])
+        j += 1
+    return run, j
+
+
+def _split_boundary_run(step, run):
+    """Split an overlap's trailing P2P run by fwd/bwd-boundary data readiness.
+
+    Returns ``(boundary, leftover)``: ``boundary`` holds the overlap's own
+    forward ``FWD_SEND`` (payload ready at the boundary) first, then every
+    recv (no data dependency), keeping original order; ``leftover`` keeps the
+    sends produced by the still-running backward, in place.
+    """
+    fwd_sub = next((s for s in step.sub_steps
+                    if s.type == MetaStepType.FWD), None)
+
+    def _is_own_fwd_send(s):
+        return (fwd_sub is not None
+                and s.type == MetaStepType.FWD_SEND
+                and s.stage_index == fwd_sub.stage_index
+                and s.micro_index == fwd_sub.micro_index)
+
+    boundary = ([s for s in run if _is_own_fwd_send(s)]
+                + [s for s in run if s.type in _RECV_STEP_TYPES])
+    taken = {id(s) for s in boundary}
+    leftover = [s for s in run if id(s) not in taken]
+    return tuple(boundary), leftover
+
+
 def add_send_recv(scheduler, stage_num, real_stage_num, style='loop'):
     """Insert P2P send/recv operations into a per-rank compute schedule.
 
@@ -756,6 +1182,19 @@ def add_send_recv(scheduler, stage_num, real_stage_num, style='loop'):
 
     Even ranks are processed before odd ranks at each time step to avoid
     P2P deadlocks between adjacent ranks.
+
+    The resulting per-gap op order (steady state:
+    ``[B_RECV, B_SEND, F_RECV, F_SEND]``) is LOAD-BEARING, not cosmetic.
+    Each adjacent rank pair shares one comm (HCCL split-by-group) on which
+    plain send/recv execute in queue order, and this layout makes one end of
+    every pair recv-first while the other is send-first, so the two queue
+    heads always match (recv<->send), then the tails match (send<->recv).
+    Any later pass that reorders P2P ops relative to EACH OTHER breaks this:
+    a (since removed) hoist variant that moved recvs across sends made both
+    ends recv-first and deadlocked on hardware (2026-06).
+    ``attach_fwd_boundary_p2p`` (the ``"boundary"`` transport) is safe: it keeps
+    every per-direction FIFO and runs on the batch transport with per-op solo
+    batches, whose per-pair sequences stay complementary.
 
     Args:
         scheduler: ``{rank: [MetaStep | None, ...]}`` — compute schedule
@@ -1194,14 +1633,16 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
                  overlap_p2p=False,
                  overlap_b_f=False,
                  swap=False,
-                 enable_dxdw_split=False):
+                 enable_dxdw_split=False,
+                 p2p_transport="auto"):
         super().__init__(stages,
                          micro_batch_num,
                          args_batch_dim=args_batch_dim,
                          kwargs_batch_dim=kwargs_batch_dim,
                          output_concat_dim=output_concat_dim,
                          overlap_p2p=overlap_p2p,
-                         swap=swap)
+                         swap=swap,
+                         p2p_transport=p2p_transport)
         # _overlap_b_f selects between plain F/B emission and OVERLAP_B_F
         # pairing in the 1F1B steady-state phase.  Must be set before
         # ``construct_stage_exec_order`` is called below.

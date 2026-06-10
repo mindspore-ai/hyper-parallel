@@ -1198,6 +1198,30 @@ class MindSporePlatform(Platform):
         return dist.irecv(tensor, src, group, tag)
 
     @staticmethod
+    def p2p_op(op_type, tensor, peer, group=None):
+        # pylint: disable=C0415
+        from mindspore.mint.distributed import P2POp
+        return P2POp(op_type, tensor, peer, group)
+
+    @staticmethod
+    def batch_isend_irecv(p2p_ops):
+        """Launch a peer-batched P2P group.
+
+        MindSpore's ``batch_isend_irecv`` lowers the whole list to a single
+        ``HcclBatchISendIRecv`` kernel on one comm stream and returns a list
+        with one packaging ``CommHandle``; we hand that single handle back so
+        callers can defer the whole batch's wait to one consumption point.
+        A send and a recv to the same peer therefore overlap on the duplex
+        link inside this one kernel.
+        """
+        # pylint: disable=C0415
+        from mindspore.mint.distributed import batch_isend_irecv
+        if not p2p_ops:
+            return None
+        handles = batch_isend_irecv(p2p_ops)
+        return handles[0] if handles else None
+
+    @staticmethod
     def p2p_exchange(tensor, peer_rank: int, group=None):  # pylint: disable=unused-argument
         raise NotImplementedError(
             "p2p_exchange is not yet supported on the MindSpore platform."

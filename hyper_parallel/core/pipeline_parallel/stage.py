@@ -336,10 +336,17 @@ class PipelineStage(PipelineStageBase):
         obj_list = self._meta_cache
         return obj_list
 
-    def exec_fwd_recv_ops(self, micro_index):
-        """Execute the forward recv operation."""
+    def fwd_recv_specs(self, micro_index):
+        """Prepare forward-recv buffers (+ bookkeeping) without launching.
+
+        Returns a list of ``(op_type, tensor, peer_global_rank)`` tuples (all
+        ``"irecv"``) ready to feed ``platform.irecv`` one-by-one or to pack
+        into ``platform.batch_isend_irecv``.  Side effects (meta exchange,
+        ``args_recv_info`` population) match :meth:`exec_fwd_recv_ops` so the
+        two paths stay interchangeable.
+        """
         recv_infos = []
-        comm_handles = []
+        specs = []
         global_rank = self._global_rank(self.src_stage)
         meta_list = self._communicate_meta(global_rank)[0]
         self._recv_num = len(meta_list)
@@ -347,11 +354,14 @@ class PipelineStage(PipelineStageBase):
             recv_info = self._construct_forward_recv_info(micro_index, idx, global_rank, meta)
             if micro_index not in self.args_recv_info:
                 recv_infos.append(recv_info)
-            handle = platform.irecv(recv_info.buffer, global_rank)
-            comm_handles.append(handle)
+            specs.append(("irecv", recv_info.buffer, global_rank))
         if recv_infos:
             self.args_recv_info[micro_index] = recv_infos
-        return comm_handles
+        return specs
+
+    def exec_fwd_recv_ops(self, micro_index):
+        """Execute the forward recv operation."""
+        return [platform.irecv(tensor, rank) for _, tensor, rank in self.fwd_recv_specs(micro_index)]
 
     def _construct_backward_recv_info(self, micro_index, idx, global_rank, tensor_send):
         """construct backward recv info."""
@@ -399,11 +409,21 @@ class PipelineStage(PipelineStageBase):
         so ``backward_one_chunk`` (esp. on MindSpore) can rebuild a
         zero-padded sens matching the wrapped forward's output structure.
         """
-        comm_handle = []
+        return [platform.isend(tensor, rank) for _, tensor, rank in self.fwd_send_specs(micro_index)]
+
+    def fwd_send_specs(self, micro_index):
+        """Prepare forward-send tensors (+ bookkeeping) without launching.
+
+        Returns ``(op_type, tensor, peer_global_rank)`` tuples (all
+        ``"isend"``).  Performs the same meta exchange and ``grad_recv_info``
+        reservation as the launching path, so the output tensors it returns
+        must stay alive until the caller waits the resulting handle(s).
+        """
         if self.is_last_stage:
-            return comm_handle
+            return []
         out = self.fwd_outputs_cache.pop(micro_index)
         bwd_recv_infos = []
+        specs = []
         output_meta = [self._extract_meta_from_tensor(each_out) for each_out in out]
         # Keep meta alive for backward — fwd_outputs_cache has just been popped.
         self._fwd_output_meta[micro_index] = output_meta
@@ -416,22 +436,25 @@ class PipelineStage(PipelineStageBase):
                 if recv_info is not None:
                     bwd_recv_infos.append(recv_info)
                 bwd_idx += 1
-            handle = platform.isend(out[idx], global_rank)
-            comm_handle.append(handle)
+            specs.append(("isend", out[idx], global_rank))
         if bwd_recv_infos:
             self.grad_recv_info[micro_index] = bwd_recv_infos
-        return comm_handle
+        return specs
+
+    def bwd_recv_specs(self, micro_index):
+        """Prepare backward-recv (grad) buffers without launching.
+
+        Returns ``(op_type, tensor, peer_global_rank)`` tuples (all
+        ``"irecv"``).  Empty when no grad is expected for ``micro_index``
+        (e.g. its forward output had ``requires_grad=False``).
+        """
+        if micro_index not in self.grad_recv_info:
+            return []
+        return [("irecv", info.buffer, info.global_rank) for info in self.grad_recv_info[micro_index]]
 
     def exec_bwd_recv_ops(self, micro_index):
         """Execute the backward recv operation."""
-        comm_handle = []
-        if micro_index not in self.grad_recv_info:
-            return comm_handle
-        for recv_info in self.grad_recv_info[micro_index]:
-            global_rank = recv_info.global_rank
-            handle = platform.irecv(recv_info.buffer, global_rank)
-            comm_handle.append(handle)
-        return comm_handle
+        return [platform.irecv(tensor, rank) for _, tensor, rank in self.bwd_recv_specs(micro_index)]
 
     def exec_bwd_send_ops(self, micro_index):
         """Execute the backward send operation.
@@ -442,15 +465,20 @@ class PipelineStage(PipelineStageBase):
         ``grad_recv_info``).  Pairing via ``zip`` keeps send count and
         peer irecv count consistent.
         """
-        comm_handle = []
+        return [platform.isend(tensor, rank) for _, tensor, rank in self.bwd_send_specs(micro_index)]
+
+    def bwd_send_specs(self, micro_index):
+        """Prepare backward-send (input-grad) tensors without launching.
+
+        Returns ``(op_type, tensor, peer_global_rank)`` tuples (all
+        ``"isend"``), pairing each grad with the rg=True slot of
+        ``args_recv_info`` exactly as the launching path does.
+        """
         if micro_index not in self.args_recv_info:
-            return comm_handle
+            return []
         out = self.bwd_cache.pop(micro_index)
         rg_infos = [info for info in self.args_recv_info[micro_index] if info.requires_grad]
-        for cur_out, info in zip(out, rg_infos):
-            handle = platform.isend(cur_out, info.global_rank)
-            comm_handle.append(handle)
-        return comm_handle
+        return [("isend", cur_out, info.global_rank) for cur_out, info in zip(out, rg_infos)]
 
     def execute_reduce_grad(self):
         """Trigger FSDP post-backward gradient reduction and root hook for the stage submodule."""

@@ -58,6 +58,11 @@ class PipelineStageBase:
         self.fwd_grad_fn_cache = {}
         self.bwd_cache = {}
         self.last_stage_outputs = None  # Initialized in forward_one_chunk()
+        # Set by the schedule (``PipelineScheduleRuntime._init_stages``); called
+        # as ``hook(stage_index, micro_index)`` right after a forward chunk
+        # completes.  Drives the fwd-boundary P2P issue without requiring the
+        # OVERLAP callback to cooperate.  ``None`` -> no-op.
+        self._after_forward_chunk = None
 
     def clear_cache(self):
         """clear cache."""
@@ -148,6 +153,11 @@ class PipelineStageBase:
         self.fwd_outputs_cache[micro_index] = out_tuple
         if self.is_last_stage:
             self.last_stage_outputs = out
+        if self._after_forward_chunk is not None:
+            # fwd/bwd boundary signal: the chunk's kernels are enqueued and its
+            # output is cached, so the schedule may issue boundary P2P (e.g.
+            # this chunk's FWD_SEND) while the paired backward is still running.
+            self._after_forward_chunk(self.stage_index, micro_index)
         return out
 
     def recompute_one_chunk(self, micro_index):

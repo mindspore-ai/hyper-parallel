@@ -17,6 +17,7 @@ Unit tests for pipeline parallel scheduling functions.
 This module contains test classes for validating various functions in the scheduling module.
 """
 
+import collections
 import sys
 import unittest
 from unittest.mock import Mock, patch
@@ -32,6 +33,10 @@ from hyper_parallel.core.pipeline_parallel.scheduler import (
     detect_cycle_in_graph,
     parse_and_validate,
     generate_operations,
+    coalesce_p2p,
+    attach_fwd_boundary_p2p,
+    _P2P_STEP_TYPES,
+    _RECV_STEP_TYPES,
 )
 
 sys.setrecursionlimit(10000)
@@ -426,6 +431,183 @@ class TestParseAndValidate(unittest.TestCase):
             "3": []
         }
         parse_and_validate(data)
+
+class TestCoalesceP2P(unittest.TestCase):
+    """Tests for ``coalesce_p2p`` — the ``batch_p2p`` order-rewrite pass."""
+
+    @staticmethod
+    def _build_overlap_bf_order():
+        """Build a real PP=4 x 2-chunk overlap_b_f exec order, no stages needed."""
+        schedule = object.__new__(ScheduleInterleaved1F1B)
+        # pylint: disable=protected-access
+        schedule.real_stage_num = 4
+        schedule._stage_num = 8
+        schedule.n_local_stages = 2
+        schedule.micro_batch_num = 8
+        schedule._overlap_b_f = True
+        schedule.n_rounds = 2
+        schedule.n_microbatch_per_round = [4, 4]
+        schedule.n_microbatch_per_round_accu = [0, 8, 16]
+        schedule.exec_order = {}
+        ScheduleInterleaved1F1B.construct_exec_order(schedule)
+        return schedule.exec_order
+
+    def test_coalesce_preserves_order_and_removes_runs(self):
+        """On a real overlap_b_f order: no leftover P2P run, flatten == original."""
+        order = self._build_overlap_bf_order()
+        coalesced = coalesce_p2p(order)
+        n_batch = 0
+        for rank in order:
+            seq = coalesced[rank]
+            run = 0
+            for step in seq:
+                if step is not None and step.type in _P2P_STEP_TYPES:
+                    run += 1
+                    self.assertLessEqual(run, 1, f"rank{rank}: leftover P2P run")
+                else:
+                    run = 0
+            flat = []
+            for step in seq:
+                if step is not None and step.type == MetaStepType.BATCH_SEND_RECV:
+                    self.assertGreaterEqual(len(step.sub_steps), 2)
+                    self.assertTrue(all(s.type in _P2P_STEP_TYPES for s in step.sub_steps))
+                    n_batch += 1
+                    flat.extend(step.sub_steps)
+                else:
+                    flat.append(step)
+            self.assertEqual(flat, order[rank], f"rank{rank}: flatten != original")
+        self.assertGreater(n_batch, 0, "no BATCH_SEND_RECV produced")
+
+    def test_coalesce_leaves_singleton_p2p(self):
+        """An isolated P2P step (run length 1) is left untouched."""
+        order = {0: [
+            MetaStep(0, MetaStepType.FWD, 0),
+            MetaStep(0, MetaStepType.FWD_SEND, 0),
+            MetaStep(1, MetaStepType.FWD, 0),
+        ]}
+        self.assertEqual(coalesce_p2p(order)[0], order[0])
+
+    def test_coalesce_groups_contiguous_run(self):
+        """A contiguous run of >=2 P2P steps becomes one BATCH_SEND_RECV."""
+        order = {0: [
+            MetaStep(0, MetaStepType.FWD, 0),
+            MetaStep(0, MetaStepType.BWD_RECV, 0),
+            MetaStep(0, MetaStepType.FWD_SEND, 0),
+            MetaStep(1, MetaStepType.FWD, 0),
+        ]}
+        coalesced = coalesce_p2p(order)[0]
+        self.assertEqual([s.type for s in coalesced],
+                         [MetaStepType.FWD, MetaStepType.BATCH_SEND_RECV, MetaStepType.FWD])
+        batch = coalesced[1]
+        self.assertEqual([s.type for s in batch.sub_steps],
+                         [MetaStepType.BWD_RECV, MetaStepType.FWD_SEND])
+
+
+class TestFwdBoundaryP2P(unittest.TestCase):
+    """Tests for ``attach_fwd_boundary_p2p`` — the "boundary" transport pass.
+
+    Safety contract: only the overlap's OWN forward ``FWD_SEND`` (payload ready
+    at the fwd/bwd boundary) and recvs (no data dependency) move; ``BWD_SEND``
+    stays in the gap; per-direction FIFO is preserved; nothing is lost or
+    duplicated.  The complementary per-pair shape ([F_SEND, B_RECV] vs
+    [F_RECV, B_SEND], all per-op solo batches) is what keeps HCCL batch
+    pairing matched — the naive hoist+coalesce composition violated it and
+    hung on hardware.
+    """
+
+    @staticmethod
+    def _build_overlap_bf_order():
+        """Build a real PP=4 x 2-chunk overlap_b_f exec order, no stages needed."""
+        schedule = object.__new__(ScheduleInterleaved1F1B)
+        # pylint: disable=protected-access
+        schedule.real_stage_num = 4
+        schedule._stage_num = 8
+        schedule.n_local_stages = 2
+        schedule.micro_batch_num = 8
+        schedule._overlap_b_f = True
+        schedule.n_rounds = 2
+        schedule.n_microbatch_per_round = [4, 4]
+        schedule.n_microbatch_per_round_accu = [0, 8, 16]
+        schedule.exec_order = {}
+        ScheduleInterleaved1F1B.construct_exec_order(schedule)
+        return schedule.exec_order
+
+    @staticmethod
+    def _key(step):
+        return (step.type, step.stage_index, step.micro_index)
+
+    @staticmethod
+    def _flatten(order):
+        """Re-insert each boundary_p2p at its issue position (after its OVL)."""
+        out = []
+        for step in order:
+            if step is None:
+                continue
+            out.append(step)
+            if getattr(step, "boundary_p2p", None):
+                out.extend(step.boundary_p2p)
+        return out
+
+    def test_invalid_p2p_transport_rejected(self):
+        """Unknown transport values fail fast, before stages are touched."""
+        with self.assertRaises(ValueError):
+            ScheduleInterleaved1F1B(None, 1, p2p_transport="bogus")
+
+    def test_multiset_and_direction_fifo_preserved(self):
+        """No P2P op lost/duplicated; per-direction FIFO unchanged."""
+        order = self._build_overlap_bf_order()
+        attached = attach_fwd_boundary_p2p(order)
+        n_boundary = 0
+        for rank in order:
+            before = [s for s in order[rank] if s is not None]
+            after = self._flatten(attached[rank])
+            self.assertEqual(
+                collections.Counter(self._key(s) for s in before
+                                    if s.type in _P2P_STEP_TYPES),
+                collections.Counter(self._key(s) for s in after
+                                    if s.type in _P2P_STEP_TYPES),
+                f"rank{rank}: P2P multiset changed")
+            for p2p_type in _P2P_STEP_TYPES:
+                self.assertEqual(
+                    [self._key(s) for s in before if s.type == p2p_type],
+                    [self._key(s) for s in after if s.type == p2p_type],
+                    f"rank{rank}: {p2p_type} FIFO changed")
+            n_boundary += sum(1 for s in attached[rank]
+                              if s is not None and getattr(s, "boundary_p2p", None))
+        self.assertGreater(n_boundary, 0, "pass attached nothing")
+
+    def test_boundary_content_and_gap_residue(self):
+        """boundary = own-fwd F_SEND first + recvs; gap keeps BWD_SEND only."""
+        attached = attach_fwd_boundary_p2p(self._build_overlap_bf_order())
+        for rank, seq in attached.items():
+            for i, step in enumerate(seq):
+                boundary = (getattr(step, "boundary_p2p", None)
+                            if step is not None else None)
+                if not boundary:
+                    continue
+                fwd_sub = next(s for s in step.sub_steps
+                               if s.type == MetaStepType.FWD)
+                kinds = [s.type for s in boundary]
+                self.assertNotIn(MetaStepType.BWD_SEND, kinds,
+                                 f"rank{rank}: BWD_SEND must stay in the gap")
+                for snd in (s for s in boundary
+                            if s.type == MetaStepType.FWD_SEND):
+                    self.assertEqual(
+                        (snd.stage_index, snd.micro_index),
+                        (fwd_sub.stage_index, fwd_sub.micro_index),
+                        f"rank{rank}: boundary F_SEND is not the overlap's own "
+                        "forward output")
+                if MetaStepType.FWD_SEND in kinds:
+                    self.assertEqual(kinds[0], MetaStepType.FWD_SEND,
+                                     f"rank{rank}: F_SEND must be issued first")
+                j = i + 1
+                while (j < len(seq) and seq[j] is not None
+                       and seq[j].type in _P2P_STEP_TYPES):
+                    self.assertNotIn(seq[j].type, _RECV_STEP_TYPES,
+                                     f"rank{rank}: recv left in the gap behind "
+                                     "a boundary overlap")
+                    j += 1
+
 
 class TestDetectCycleInGraph(unittest.TestCase):
     """Test class for cycle detection in graphs."""

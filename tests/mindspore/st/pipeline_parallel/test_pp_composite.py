@@ -20,7 +20,7 @@ from tests.common.parallel_case import MindSporeCase, parallel_run
 _TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_pp_composite.py")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_pp_plus_fully_shard_replicate():
     """
