@@ -1172,55 +1172,207 @@ class TestDispatchRandomPath(unittest.TestCase):
         result = d.dispatch(fake_op, (), {})
         self.assertEqual(result, "ms_random_result")
 
+    @patch("hyper_parallel.core.shard._op_dispatch.platform")
+    def test_dispatch_new_ms_random_ops_path(self, mock_platform):
+        """Newly whitelisted MindSpore random kernels route to _dispatch_random_op."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        for op_name in ("NormalTensorTensor", "UniformExt", "RandExt"):
+            with self.subTest(op_name=op_name):
+                mock_platform.get_op_name.return_value = op_name
+                d = object.__new__(OpDispatcher)
+                d.whitelist = []
+                d._random_ops = set()
+                d._random_ms_ops = {op_name}
+                d.layout_infer_ops = {}
+                d._dispatch_random_op = MagicMock(return_value=f"{op_name}_result")
+                result = d.dispatch(MagicMock(), (), {})
+                self.assertEqual(result, f"{op_name}_result")
+                d._dispatch_random_op.assert_called_once()
+
+
+class TestRandomOpReturnsSelf(unittest.TestCase):
+    """
+    Feature: OpDispatcher._random_op_returns_self.
+    Description: Explicit MindSpore inplace set, FuncDropoutExt special case,
+                 and Torch '_' suffix drive inplace return semantics.
+    Expectation: Correct True/False for representative op names and arguments.
+    """
+
+    def test_random_inplace_ms_ops_return_true(self):
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        for op_name in OpDispatcher._RANDOM_INPLACE_MS_OPS:
+            with self.subTest(op_name=op_name):
+                self.assertTrue(OpDispatcher._random_op_returns_self(op_name, (), {}))
+
+    def test_random_inplace_ms_ops_subset_of_random_ms_ops(self):
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        d = OpDispatcher()
+        self.assertTrue(
+            OpDispatcher._RANDOM_INPLACE_MS_OPS.issubset(d._random_ms_ops),
+            "Every MindSpore inplace random kernel must also be in _random_ms_ops.",
+        )
+
+    def test_ms_out_of_place_random_ops_return_false(self):
+        """MindSpore out-of-place random kernels must not return self."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        for op_name in (
+            "BernoulliExt",
+            "MultinomialExt",
+            "NormalTensorTensor",
+            "UniformExt",
+            "RandExt",
+            "FuncDropoutExt",
+        ):
+            with self.subTest(op_name=op_name):
+                self.assertFalse(OpDispatcher._random_op_returns_self(op_name, (MagicMock(),), {}))
+
+    def test_torch_inplace_suffix_returns_true(self):
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        self.assertTrue(OpDispatcher._random_op_returns_self("normal_", (), {}))
+        self.assertTrue(OpDispatcher._random_op_returns_self("bernoulli_", (), {}))
+
+    def test_torch_out_of_place_random_ops_return_false(self):
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        for op_name in ("bernoulli", "randn", "rand", "native_dropout"):
+            with self.subTest(op_name=op_name):
+                self.assertFalse(OpDispatcher._random_op_returns_self(op_name, (), {}))
+
+    def test_non_random_inplace_name_does_not_match_prefix_heuristic(self):
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        self.assertFalse(OpDispatcher._random_op_returns_self("InplaceAddExt", (), {}))
+
+    def test_func_dropout_ext_inplace_via_args(self):
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        args = (MagicMock(), 0.5, True, True, MagicMock(), MagicMock())
+        self.assertTrue(OpDispatcher._random_op_returns_self("FuncDropoutExt", args, {}))
+        self.assertTrue(OpDispatcher._func_dropout_ext_inplace(args, {}))
+
+    def test_func_dropout_ext_inplace_via_kwargs(self):
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        self.assertTrue(
+            OpDispatcher._random_op_returns_self(
+                "FuncDropoutExt", (MagicMock(), 0.5, True), {"inplace": True}
+            )
+        )
+        self.assertTrue(
+            OpDispatcher._func_dropout_ext_inplace((MagicMock(), 0.5, True), {"inplace": True})
+        )
+
+    def test_func_dropout_ext_out_of_place_returns_false(self):
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        args = (MagicMock(), 0.5, True, False, MagicMock(), MagicMock())
+        self.assertFalse(OpDispatcher._random_op_returns_self("FuncDropoutExt", args, {}))
+
 
 class TestDispatchRandomInplaceReturnsSelf(unittest.TestCase):
     """
     Feature: OpDispatcher._dispatch_random_op return value for in-place random ops.
     Description: In-place random ops must return the input DTensor itself, not a new
-                 wrapper. PyTorch in-place names end with '_' (e.g. normal_); every
-                 MindSpore in-place kernel is named 'Inplace*' (InplaceNormal,
-                 InplaceUniform, InplaceRandom, InplaceBernoulliScalar,
-                 InplaceBernoulliTensor). Non-in-place random ops (e.g. Randn) instead
-                 return a freshly wrapped DTensor.
+                 wrapper. Torch in-place names end with '_' (e.g. normal_);
+                 MindSpore in-place random kernels are listed in
+                 ``OpDispatcher._RANDOM_INPLACE_MS_OPS``. ``FuncDropoutExt`` uses
+                 its ``inplace`` argument instead. Non-in-place random ops (e.g.
+                 Randn) return a freshly wrapped DTensor.
     Expectation: _dispatch_random_op returns self for in-place names and a new wrapper
                  for non-in-place names.
     """
 
-    def _dispatch(self, op_name, op_call):
+    def _dispatch(self, op_name, op_call, args=(), kwargs=None):
         """Run _dispatch_random_op for op_name with RNG support disabled; return (result, first_arg)."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
 
+        if kwargs is None:
+            kwargs = {}
         d = object.__new__(OpDispatcher)
         d._rng_tracker = None
-        first_arg = MagicMock(spec=DTensor)
+        if not args:
+            first_arg = MagicMock(spec=DTensor)
+            args = (first_arg,)
+        else:
+            first_arg = args[0]
         with patch("hyper_parallel.core.shard._op_dispatch.is_rng_supported_mesh", return_value=False):
-            result = d._dispatch_random_op(op_name, op_call, (first_arg,), {})
+            result = d._dispatch_random_op(op_name, op_call, args, kwargs)
 
         op_call.assert_called_once()
         return result, first_arg
 
     def test_inplace_ops_return_self(self):
-        """PyTorch '_' suffix and every MindSpore 'Inplace*' random kernel return self."""
-        for op_name in (
-            "normal_",
-            "InplaceNormal",
-            "InplaceUniform",
-            "InplaceRandom",
-            "InplaceBernoulliScalar",
-            "InplaceBernoulliTensor",
-        ):
+        """Torch '_' suffix and _RANDOM_INPLACE_MS_OPS kernels return self."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
+
+        for op_name in ("normal_", *OpDispatcher._RANDOM_INPLACE_MS_OPS):
             with self.subTest(op_name=op_name):
                 result, first_arg = self._dispatch(op_name, MagicMock(return_value=MagicMock()))
                 self.assertIs(result, first_arg)
 
     def test_non_inplace_op_returns_new_wrapper(self):
-        """A non-in-place random op (e.g. Randn) wraps the result in a new DTensor."""
+        """Out-of-place random ops wrap the result in a new DTensor."""
+        from hyper_parallel.core.shard._op_dispatch import OpDispatcher, Tensor
+
+        out_of_place_ops = (
+            "Randn",
+            "BernoulliExt",
+            "UniformExt",
+            "NormalTensorTensor",
+            "RandExt",
+        )
+        for op_name in out_of_place_ops:
+            with self.subTest(op_name=op_name):
+                self.assertNotIn(op_name, OpDispatcher._RANDOM_INPLACE_MS_OPS)
+                op_call = MagicMock(return_value=MagicMock(spec=Tensor))
+                with patch.object(DTensor, "from_local", return_value="new_wrapper"):
+                    result, first_arg = self._dispatch(op_name, op_call)
+                self.assertIsNot(result, first_arg)
+                self.assertEqual(result, "new_wrapper")
+
+    def test_func_dropout_ext_inplace_returns_self(self):
+        """FuncDropoutExt(inplace=True) returns the input DTensor, not a new wrapper."""
+        first_arg = MagicMock(spec=DTensor)
+        op_call = MagicMock(return_value=MagicMock())
+        result, returned_first_arg = self._dispatch(
+            "FuncDropoutExt",
+            op_call,
+            args=(first_arg, 0.5, True, True, MagicMock(), MagicMock()),
+        )
+        self.assertIs(result, returned_first_arg)
+        self.assertIs(result, first_arg)
+
+    def test_func_dropout_ext_inplace_via_kwargs_returns_self(self):
+        """FuncDropoutExt(inplace=True) via kwargs returns the input DTensor."""
+        first_arg = MagicMock(spec=DTensor)
+        op_call = MagicMock(return_value=MagicMock())
+        result, returned_first_arg = self._dispatch(
+            "FuncDropoutExt",
+            op_call,
+            args=(first_arg, 0.5, True),
+            kwargs={"inplace": True},
+        )
+        self.assertIs(result, returned_first_arg)
+        self.assertIs(result, first_arg)
+
+    def test_func_dropout_ext_out_of_place_wraps(self):
+        """FuncDropoutExt(inplace=False) wraps the local result in a new DTensor."""
         from hyper_parallel.core.shard._op_dispatch import Tensor
 
+        first_arg = MagicMock(spec=DTensor)
         op_call = MagicMock(return_value=MagicMock(spec=Tensor))
         with patch.object(DTensor, "from_local", return_value="new_wrapper"):
-            result, first_arg = self._dispatch("Randn", op_call)
-        self.assertIsNot(result, first_arg)
+            result, returned_first_arg = self._dispatch(
+                "FuncDropoutExt",
+                op_call,
+                args=(first_arg, 0.5, True, False, MagicMock(), MagicMock()),
+            )
+        self.assertIsNot(result, returned_first_arg)
         self.assertEqual(result, "new_wrapper")
 
 
