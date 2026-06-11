@@ -195,6 +195,12 @@ class _CostModVar:
         return None
 
     def get_framework_parser(self, framework):
+        """Look up and return the parser class for the given framework name.
+
+        Uses the mapping YAML file to find the corresponding parser module
+        class name, then loads and returns it. Raises AttributeError if the
+        framework name is not found in the mapping.
+        """
         yml = Config(MAPPING_YML)
         mod_name = next((e["module"] for e in yml.framework_parser if e["name"] == framework), None)
         if not mod_name:

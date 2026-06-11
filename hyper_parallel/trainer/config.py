@@ -64,6 +64,7 @@ _BOOL_FALSE_STRINGS = frozenset(("false", "no", "n", "off", "0", "f"))
 # model:
 # ============================================================================
 
+
 @dataclass
 class ModelConfig:
     """``model.*`` — model identity, weights, and architecture overrides.
@@ -95,6 +96,7 @@ class ModelConfig:
 # ============================================================================
 # data:
 # ============================================================================
+
 
 @dataclass
 class DataConfig:
@@ -129,6 +131,7 @@ class DataConfig:
 # train.* — sub-configs
 # ============================================================================
 
+
 @dataclass
 class AcceleratorConfig:
     """``train.accelerator.*`` — parallelism topology.
@@ -160,6 +163,7 @@ class AcceleratorConfig:
     # reduction order across runs.
     comm_fusion: bool = True
 
+
 @dataclass
 class MixedPrecisionConfig:
     """``train.mixed_precision.*`` — FSDP2 mp_policy fields.
@@ -174,6 +178,7 @@ class MixedPrecisionConfig:
     reduce_dtype: str = "float32"
     output_dtype: Optional[str] = None
 
+
 @dataclass
 class GradientCheckpointingConfig:
     """``train.gradient_checkpointing.*`` — activation recomputation.
@@ -181,6 +186,7 @@ class GradientCheckpointingConfig:
     . Modes: ``"off"``, ``"full"``, or ``"selective"``.
     """
     activation_checkpoint: str = "off"
+
 
 @dataclass
 class OptimizerConfig:
@@ -204,6 +210,7 @@ class OptimizerConfig:
     eps: float = 1e-8
     betas: tuple = (0.9, 0.999)
 
+
 @dataclass
 class CheckpointConfig:
     """``train.checkpoint.*`` — DCP save / load + HF export."""
@@ -212,6 +219,7 @@ class CheckpointConfig:
     save_hf_weights: bool = True
     load_path: Optional[str] = None
     save_async: bool = False
+
 
 @dataclass
 class LoggingConfig:
@@ -223,12 +231,14 @@ class LoggingConfig:
     model_flops_per_token: Optional[int] = None
     peak_tflops: Optional[float] = None  # e.g. 312.0 for A100 bf16
 
+
 @dataclass
 class TensorBoardConfig:
     """``train.tensorboard.*`` — TB SummaryWriter on rank 0."""
     enabled: bool = False
     output_dir: str = "tb_traces"
     log_steps: int = 1
+
 
 @dataclass
 class WandbConfig:
@@ -237,6 +247,7 @@ class WandbConfig:
     project: str = "hyper-parallel"
     run_name: Optional[str] = None
     log_steps: int = 1
+
 
 @dataclass
 class ProfileConfig:
@@ -249,12 +260,14 @@ class ProfileConfig:
     warmup_steps: int = 1
     active_steps: int = 3
 
+
 @dataclass
 class MemoryMonitorConfig:
     """``train.memory_monitor.*`` — periodic device-memory snapshot."""
     enabled: bool = False
     log_steps: int = 50
     reset_peak_each_step: bool = False
+
 
 @dataclass
 class MoEMonitorConfig:
@@ -279,11 +292,13 @@ class MoEMonitorConfig:
     lr: float = 1e-3
     num_recomputations: int = 1
 
+
 @dataclass
 class EvalConfig:
     """``train.eval.*`` — eval cadence + dataset."""
     eval_steps: int = 0
     eval_dataset: Optional[str] = None
+
 
 @dataclass
 class DebugConfig:
@@ -301,6 +316,7 @@ class DebugConfig:
 # ============================================================================
 # train: (top of the train section, holds the sub-configs)
 # ============================================================================
+
 
 @dataclass
 class TrainConfig:
@@ -343,6 +359,7 @@ class TrainConfig:
 # Top-level: model / data / train (and only these three)
 # ============================================================================
 
+
 @dataclass
 class HyperTrainerConfig:
     """Top-level config — strict three-tier ().
@@ -371,6 +388,7 @@ class HyperTrainerConfig:
 #   ``false/no/n/off/0/f`` -> ``False``. Only applied when the dataclass
 #   field type resolves to ``bool`` or ``Optional[bool]`` to avoid ambiguity.
 
+
 def _string_to_bool(value: Any) -> bool:
     """Convert common string representations of booleans to ``bool``.
 
@@ -398,6 +416,7 @@ def _string_to_bool(value: Any) -> bool:
         f"Cannot convert {value!r} to bool. "
         "Expected one of: true/false/yes/no/y/n/on/off/1/0/t/f"
     )
+
 
 def _resolve_field_type(cls: Type, dot_path: str) -> Optional[Type]:
     """Walk a dataclass hierarchy to find the resolved type of a dot-path field.
@@ -429,6 +448,7 @@ def _resolve_field_type(cls: Type, dot_path: str) -> Optional[Type]:
             field_type = unwrapped[0] if len(unwrapped) == 1 else field_type
         current_cls = field_type
     return current_cls
+
 
 def _coerce_cli_value(raw: str, dot_path: str, root_class: Type) -> Any:
     """Parse a CLI string value, coercing to the correct type for the field.
@@ -463,6 +483,7 @@ def _coerce_cli_value(raw: str, dot_path: str, root_class: Type) -> Any:
         return raw.lower() == "true"
     return raw
 
+
 def _deep_update(source: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
     """Recursively update source dict with overrides dict."""
     for key, value in overrides.items():
@@ -473,6 +494,7 @@ def _deep_update(source: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str,
     return source
 
 _ALLOWED_TOP_LEVEL_KEYS = frozenset({"model", "data", "train"})
+
 
 def _validate_top_level(config: Dict[str, Any]) -> None:
     """Reject any top-level key other than ``model`` / ``data`` / ``train``.
@@ -519,6 +541,7 @@ def _validate_top_level(config: Dict[str, Any]) -> None:
         % (forbidden, "\n".join(hints))
     )
 
+
 def _instantiate_recursive(cls: Type[T], config_dict: Dict[str, Any]) -> T:
     """Recursively convert a dict into nested dataclass instances.
 
@@ -561,6 +584,7 @@ def _instantiate_recursive(cls: Type[T], config_dict: Dict[str, Any]) -> T:
             field_values[field_info.name] = raw_value
 
     return cls(**field_values)
+
 
 def parse_args(root_class: Type[T]) -> T:
     """Parse training config from YAML file + CLI overrides.

@@ -1343,6 +1343,7 @@ class PipelineSimulator:
 
     @staticmethod
     def diff_4_swap(i_b, i_bn, lines, p):
+        """Swap adjacent blocks when the gap is exactly 4 to resolve scheduling conflicts."""
         if i_bn - i_b == 4:
             if lines[p][i_b + 1].dual.stage == lines[p][i_b + 2].dual.stage and lines[p][i_b + 2].dual.stage == \
                     lines[p][i_b + 3].dual.stage:
@@ -1350,6 +1351,7 @@ class PipelineSimulator:
                     lines[p][i_b + 1], lines[p][i_b + 2] = lines[p][i_b + 2], lines[p][i_b + 1]
 
     def vpp_send_delay(self, lines) -> list[list[BlockSim]]:
+        """Apply send delays for VPP blocks during the stable phase."""
         if self.micro_num % self.pp != 0:
             return lines
         for p in range(self.pp):

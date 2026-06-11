@@ -97,6 +97,11 @@ class ParallelInput:
         return model_files
 
     def get_args_info(self, para, config_file):
+        """Extract model arguments from a TOML config file using ParaForNd.
+
+        Returns a ParaForNd instance if the config file is in TOML format,
+        otherwise returns None.
+        """
         if config_file.name.endswith('.toml'):
             para.TOML_PATH = config_file
             model_args = ParaForNd(para)

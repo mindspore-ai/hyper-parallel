@@ -47,6 +47,7 @@ _UNIVERSAL_FIELDS = (
     "max_position_embeddings",
 )
 
+
 def _resolve_overrides(model_cfg) -> dict:
     """Merge universal ``ModelConfig`` fields with ``config_overrides`` dict.
 
@@ -65,6 +66,7 @@ def _resolve_overrides(model_cfg) -> dict:
     if isinstance(extra, dict):
         overrides.update(extra)
     return overrides
+
 
 def _build(cfg) -> Qwen3_5ForCausalLM:
     """Construct the dense Qwen3.5 model from a ``HyperTrainerConfig``."""

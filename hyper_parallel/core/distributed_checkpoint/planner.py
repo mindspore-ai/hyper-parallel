@@ -150,6 +150,7 @@ class LoadPlan:
     storage_data: Optional[dict[MetadataIndex, Any]] = None  # Storage-specific data mapping
     planner_data: Any = None  # Planner-specific data (can be any type)
 
+
 class SavePlanner(abc.ABC):
     """Abstract base class for save planners."""
 

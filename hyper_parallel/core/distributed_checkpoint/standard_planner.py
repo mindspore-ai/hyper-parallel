@@ -344,6 +344,7 @@ class StandardSavePlanner(SavePlanner):
             return obj
         raise TypeError(f"Unsupported write item type: {item.type}")
 
+
 def create_read_items_for_chunk_list(
     fqn: str,
     checkpoint_md: TensorStorageMetadata,

@@ -24,6 +24,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+
 def _remap_key(
     hf_key: str,
     max_layer: int,
@@ -58,6 +59,7 @@ def _remap_key(
         if layer_idx > max_layer:
             return None
     return hf_key if include_visual else tail
+
 
 def load_hf_qwen3_vl_moe_state_dict(
     weights_path: str,

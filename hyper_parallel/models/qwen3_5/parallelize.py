@@ -45,6 +45,7 @@ def _apply_ac(model, cfg) -> None:
         model.layers[i] = checkpoint_wrapper(layer)
     logger.info_rank0("AC applied to %d Qwen3.5 layers (mode=%s)", len(layers), ac_mode)
 
+
 def _apply_fsdp(model, mesh, cfg) -> None:
     """Per-layer + root FSDP wrap. At dp_size==1 still wraps so the gradient
     reduction code path matches dp_size>1 (HCCL all-reduce is a no-op at
@@ -98,6 +99,7 @@ def _apply_fsdp(model, mesh, cfg) -> None:
         fully_shard(layer, **fsdp_kwargs)
     fully_shard(model, **fsdp_kwargs)
     logger.info_rank0("FSDP applied to Qwen3.5: %d layers + root", len(layers))
+
 
 def parallelize_qwen3_5(model: Qwen3_5ForCausalLM, mesh, cfg) -> Qwen3_5ForCausalLM:
     """Apply AC / FSDP to a Qwen3.5 dense model (AC inside FSDP boundary)."""

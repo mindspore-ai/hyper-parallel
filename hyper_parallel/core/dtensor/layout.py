@@ -520,6 +520,7 @@ class Layout:
 
     @property
     def alias_tensor_map(self):
+        """Return the human-readable alias tensor map for this layout."""
         return self._alias_tensor_map
 
     @property
@@ -608,6 +609,7 @@ class Layout:
         return None
 
     def reset_partial(self):
+        """Clear all partial statuses and regenerate placements from the tensor map."""
         self._partial = [None] * len(self.mesh_shape)
         self.tensor_map_to_placement()
         self.update_compact_str()
@@ -699,6 +701,7 @@ class Layout:
         return self._mesh.get_devices_for_axis(axis, rank)
 
     def get_comm_group_by_axis(self, axis):
+        """Return the communication group for the specified mesh axis via the underlying DeviceMesh."""
         return self._mesh.get_comm_group_by_axis(axis)
 
     def repeat_num(self):
@@ -740,9 +743,11 @@ class Layout:
 
     @property
     def compact_str(self):
+        """Return the cached compact string representation of this layout."""
         return self._compact_str
 
     def update_compact_str(self):
+        """Recompute and store the compact string representation of this layout."""
         self._compact_str = self._to_compact_string()
 
     def to_string(self):

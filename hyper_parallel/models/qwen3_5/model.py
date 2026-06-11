@@ -67,6 +67,7 @@ class Qwen3_5RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0613
+        """Apply residual-style RMS normalization: ``(1 + weight) * normed``."""
         input_dtype = x.dtype
         x_fp = x.float()
         normed = x_fp * torch.rsqrt(x_fp.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -139,6 +140,7 @@ class Qwen3_5Config:
 # ============================================================================
 # One hybrid dense layer
 # ============================================================================
+
 
 class Qwen3_5Decoder(nn.Module):
     """One Qwen3.5 dense layer: pre-norm → (linear_attn | self_attn) → MLP.
@@ -240,6 +242,7 @@ class Qwen3_5Decoder(nn.Module):
 # Top-level dense model
 # ============================================================================
 
+
 class Qwen3_5TextModel(nn.Module):
     """Inner text decoder — owns ``embed_tokens``, ``layers``, ``norm``, ``rotary_emb``.
 
@@ -312,21 +315,26 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     @property
     def layers(self):
+        """Return the decoder layer list."""
         return self.model.layers
 
     @property
     def embed_tokens(self):
+        """Return the input token embedding layer."""
         return self.model.embed_tokens
 
     @property
     def norm(self):
+        """Return the final RMS normalization layer."""
         return self.model.norm
 
     @property
     def rotary_emb(self):
+        """Return the multi-modal rotary embedding used by full-attention layers."""
         return self.model.rotary_emb
 
     def tie_weights(self) -> None:
+        """Re-tie lm_head and embed_tokens weights after parameter reinitialization."""
         # Re-tie after ``to_empty`` — fresh per-Parameter storage breaks the
         # ``__init__``-time tie.
         if getattr(self.config, "tie_word_embeddings", False):

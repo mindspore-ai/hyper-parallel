@@ -183,6 +183,7 @@ class _AsyncA2ALazyBwd(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_tensor, output_splits, input_splits, group):  # pylint: disable=arguments-differ
+        """Perform the forward all-to-all single collective, saving splits and group for backward."""
         ctx.input_splits = input_splits
         ctx.output_splits = output_splits
         ctx.group = group
@@ -194,6 +195,7 @@ class _AsyncA2ALazyBwd(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Compute the backward pass by performing the inverse all-to-all with swapped splits."""
         # pylint: disable=C0415
         from torch.distributed._functional_collectives import all_to_all_single
         grad_input = all_to_all_single(
@@ -838,6 +840,7 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def get_device_handle(device_type: str = "npu"):
+        """Return the torch device module (e.g. ``torch.npu`` or ``torch.cuda``) for the given device type."""
         try:
             handle =  getattr(torch, device_type)
         except AttributeError as e:
@@ -1121,6 +1124,7 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def get_multicore_handler():
+        """Return a TorchMulticoreHandler instance for multi-core device management."""
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.multicore import TorchMulticoreHandler
         return TorchMulticoreHandler()

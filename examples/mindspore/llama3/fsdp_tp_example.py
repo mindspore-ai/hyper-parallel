@@ -82,6 +82,7 @@ def _sync_parameter_names_from_fqn(cell: nn.Cell) -> None:
 
 
 def main() -> None:
+    """Entry point: initialize distributed backend, build a Llama3 model with TP+FSDP, and run a training loop."""
     dist.init()
     rank = get_rank()
     world = get_group_size()

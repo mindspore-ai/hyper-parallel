@@ -160,12 +160,14 @@ class Solution:
             self.check_time_list()
 
     def cal_peak_mem(self, solved_model: Model):
+        """Calculate peak memory by setting activation and recompute counts from the solved model."""
         self.peak_num = micro.PeakNum(solved_model.sort_micro)
         self.peak_num.set_peak_act_recompute_num(self.x_type2, self.rs_type2, self.ra_type2,
                                                  self.x_type1, self.rs_type1, self.ra_type1,
                                                  solved_model.memory)
 
     def set_total_dis(self):
+        """Compute and store total layer, offset, recompute-saved, and recompute-activation distributions per stage."""
         self.layer_dis = self.x_type1 + self.x_type2
         self.offset = (self.layer_dis - (self.init_config.num_layers_type1 + self.init_config.num_layers_type2) //
                        (self.init_config.pp_interleave_num * self.init_config.pipeline_stage))
@@ -247,6 +249,7 @@ class Solution:
         logger.info(list(self.peak_num.peak_num_recompute_type2.values()))
 
 def extract_solution_file(yaml_file, sol_file):
+    """Load an expert input config and a solution file, parse and print the solution details."""
     expert_input = ExpertInput(yaml_file, '')
     expert_input.is_dryrun = False
     init_config = InitConfig(expert_input)

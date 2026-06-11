@@ -44,6 +44,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+
 def _remap_simple_key(hf_key: str, max_layer: int) -> Optional[str]:
     """Return hyper key for an HF dense-Qwen3.5 key, or None to skip.
 
@@ -78,6 +79,7 @@ def _remap_simple_key(hf_key: str, max_layer: int) -> Optional[str]:
 
     logger.debug("Unmapped HF key dropped: %s", hf_key)
     return None
+
 
 def load_hf_qwen3_5_state_dict(
     weights_path: str,

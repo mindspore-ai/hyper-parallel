@@ -77,6 +77,7 @@ if TYPE_CHECKING:
 platform = get_platform()
 logger = logging.getLogger(__name__)
 
+
 class TrainerState:
     """Mutable training state shared across callbacks.
 
@@ -91,6 +92,7 @@ class TrainerState:
         self.epoch: int = 0
         self.max_steps: int = max_steps
         self.log_history: list = []
+
 
 class BaseTrainer:
     """Composable training skeleton.
@@ -276,8 +278,10 @@ class BaseTrainer:
                     self.seq_length = seq_length
                     self.vocab = vocab
                     self.base_seed = base_seed
+
                 def __len__(self):
                     return self.num_samples
+
                 def __getitem__(self, idx):
                     g = torch.Generator().manual_seed(self.base_seed + idx)
                     input_ids = torch.randint(
@@ -1378,6 +1382,7 @@ class BaseTrainer:
         # Strip wrapper segments (e.g. ``_checkpoint_wrapped_module``) so
         # loader keys match ``named_parameters`` paths.
         wrapper_segments = ("._checkpoint_wrapped_module",)
+
         def _strip(k: str) -> str:
             for s in wrapper_segments:
                 k = k.replace(s, "")

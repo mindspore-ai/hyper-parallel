@@ -213,6 +213,7 @@ class AttentionMoEBlock(nn.Module):
         self.moe = MoE(dim=dim, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass: self-attention with residual connection followed by MoE feed-forward."""
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         attn = torch.softmax(q @ k.transpose(-1, -2) / (k.size(-1) ** 0.5), dim=-1)
@@ -239,6 +240,7 @@ class AttentionThenMoE(nn.Module):
         ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run all stacked Attention+MoE blocks sequentially and return the final output."""
         for layer in self.layers:
             x = layer(x)
         return x
@@ -357,6 +359,7 @@ def _init_dist():
 
 
 def main() -> None:
+    """Entry point: set up PP+EP mesh, build interleaved MoE chunks with overlap, and run the schedule."""
     rank, device, device_type = _init_dist()
     world_size = dist.get_world_size()
 

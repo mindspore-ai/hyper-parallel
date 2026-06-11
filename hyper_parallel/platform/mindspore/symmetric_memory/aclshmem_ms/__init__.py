@@ -28,6 +28,7 @@ Example usage:
 import os
 import glob
 
+
 def _find_plugin():
     """Find plugin .so file path automatically."""
     current_path = os.path.dirname(os.path.abspath(__file__))

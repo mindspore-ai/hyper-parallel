@@ -64,6 +64,7 @@ class ParaForNd:
         self.get_args_from_file(para)
 
     def print_member_value(self):
+        """Log all member attribute names and their current values."""
         for attr, value in self.__dict__.items():
             logger.info(f"{attr}: {value}")
 
@@ -81,6 +82,7 @@ class ParaForNd:
             return value_str  # return original if not numeric
 
     def parse_toml_parameters(self, toml_file_path):
+        """Load and return parameters from a TOML configuration file."""
         params = toml.load(toml_file_path)
         return params
 

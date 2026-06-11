@@ -33,7 +33,9 @@ _symm_handler = platform.get_symmetric_memory_handler()
 
 
 def is_shmem_available() -> bool:
+    """Check whether symmetric memory (shmem) is available on the current platform."""
     return _symm_handler.is_shmem_available()
+
 
 def empty(shape, dtype):
     r"""
@@ -55,6 +57,7 @@ def empty(shape, dtype):
     """
     return _symm_handler.empty(shape, dtype)
 
+
 def barrier():
     r"""
     A synchronization barrier for all processes in the default process group.
@@ -67,6 +70,7 @@ def barrier():
         >>> symmetric_memory.barrier()
     """
     return _symm_handler.barrier()
+
 
 def rendezvous(tensor, group):
     r"""
@@ -86,6 +90,7 @@ def rendezvous(tensor, group):
             participating processes. This can be either a group name or a process group object.
     """
     return _symm_handler.rendezvous(tensor, group)
+
 
 def set_signal_pad_size(size: int) -> None:
     r"""
@@ -120,17 +125,20 @@ def get_signal_pad_size() -> int:
     """
     return _symm_handler.get_signal_pad_size()
 
+
 def shmem_put(target, target_offset, src, src_offset, size, target_rank):
     r"""
     Perform a one-sided send operation to write data from the local source tensor to a target tensor.
     """
     _symm_handler.shmem_put(target, target_offset, src, src_offset, size, target_rank)
 
+
 def shmem_get(target, target_offset, src, src_offset, size, target_rank):
     r"""
     Perform a one-sided receive operation to read data from a target tensor into the local source tensor.
     """
     _symm_handler.shmem_get(target, target_offset, src, src_offset, size, target_rank)
+
 
 def shmem_signal_op(signal, signal_offset, signal_value, signal_op, target_rank):
     r"""
@@ -149,6 +157,7 @@ def shmem_signal_op(signal, signal_offset, signal_value, signal_op, target_rank)
     """
     _symm_handler.shmem_signal_op(signal, signal_offset, signal_value, signal_op, target_rank)
 
+
 def shmem_wait_for_signal(depend_tensor, signal, signal_offset, compare_value, compare_op):
     r"""
     Wait for a signal to satisfy a specified condition before proceeding.
@@ -165,6 +174,7 @@ def shmem_wait_for_signal(depend_tensor, signal, signal_offset, compare_value, c
             0: equal, 1: greater than, 2: less than. Defaults to 0.
     """
     _symm_handler.shmem_wait_for_signal(depend_tensor, signal, signal_offset, compare_value, compare_op)
+
 
 def shmem_put_with_signal(target, target_offset, src, src_offset,
                           size, signal, signal_offset, signal_value, signal_op, target_rank):
@@ -191,6 +201,7 @@ def shmem_put_with_signal(target, target_offset, src, src_offset,
     _symm_handler.shmem_put_with_signal(target, target_offset, src, src_offset,
                                         size, signal, signal_offset, signal_value, signal_op, target_rank)
 
+
 def shmem_allgather(output_tensor, input_tensor):
     """
     This interface only supports torch for now, the mindspore version is still in development.
@@ -205,6 +216,7 @@ def shmem_allgather(output_tensor, input_tensor):
         input_tensor (tensor): The local tensor to be gathered from each rank.
     """
     _symm_handler.shmem_allgather(output_tensor, input_tensor)
+
 
 def shmem_alltoall(send_tensor_list, receive_tensor, receive_list):
     """
@@ -223,6 +235,7 @@ def shmem_alltoall(send_tensor_list, receive_tensor, receive_list):
             where receive_list[i] is the size of the data to be received from rank i.
     """
     _symm_handler.shmem_alltoall(send_tensor_list, receive_tensor, receive_list)
+
 
 def fused_all_gather_matmul(a, b, c, gather_out, signal, block_size):
     """
@@ -244,6 +257,7 @@ def fused_all_gather_matmul(a, b, c, gather_out, signal, block_size):
         block_size: Optional block size for tiled computation.
     """
     return _symm_handler.fused_all_gather_matmul(a, b, c, gather_out, signal, block_size)
+
 
 def fused_matmul_reduce_scatter(x1, x2, symm_tensor, signal, reduce_op):
     """

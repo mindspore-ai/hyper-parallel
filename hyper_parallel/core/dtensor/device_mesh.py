@@ -403,11 +403,13 @@ class DeviceMesh:
         return tuple(coords)
 
     def size(self, mesh_dim=None) -> int:
+        """Return the size along a specific mesh dimension, or total number of devices if mesh_dim is None."""
         if mesh_dim is not None:
             return self.mesh.shape[mesh_dim]
         return self.mesh.numel()
 
     def get_coordinate(self):
+        """Return the multi-dimensional coordinate of the current rank in the mesh, or None."""
         return self._coordinate_on_dim if self._coordinate_on_dim else None
 
     def __enter__(self) -> "DeviceMesh":
@@ -529,40 +531,50 @@ class DeviceMesh:
 
     @property
     def rank(self):
+        """Return the global rank of the current process within this device mesh."""
         return self._rank
 
     @property
     def mesh_shape(self):
+        """Return the shape of the device mesh as a tuple of integers."""
         return self._mesh_shape
 
     @property
     def rank_list(self):
+        """Return the tuple of ranks participating in this device mesh."""
         return self._rank_list
 
     @property
     def ndim(self) -> int:
+        """Return the number of dimensions in the device mesh."""
         return self._ndim
 
     @property
     def shape(self) -> tuple:
+        """Return the shape of the device mesh as a tuple."""
         return self._mesh_shape
 
     @property
     def root_mesh(self) -> Optional['DeviceMesh']:
+        """Return the root DeviceMesh from which this mesh was sliced, or None."""
         return self._root_mesh
 
     @root_mesh.setter
     def root_mesh(self, value: Optional['DeviceMesh']):
+        """Set the root DeviceMesh from which this mesh was sliced."""
         self._root_mesh = value
 
     @property
     def sub_mesh(self) -> List['DeviceMesh']:
+        """Return the list of sub-meshes derived from this device mesh."""
         return self._sub_mesh
 
     def get_flatten_mapping(self) -> dict:
+        """Return the mapping of sub-mesh names to their flattened DeviceMesh instances."""
         return self._flatten_mapping
 
     def add_flatten_mapping(self, name: str, mesh: 'DeviceMesh') -> None:
+        """Register a named DeviceMesh in the flatten mapping cache."""
         self._flatten_mapping[name] = mesh
 
     def __getitem__(self, sub_mesh_dim_names: Union[str, tuple[str, ...]]) -> 'DeviceMesh':
@@ -736,6 +748,7 @@ class DeviceMesh:
         return self.get_comm_group_by_axis(mesh_dim)
 
     def get_all_groups(self) -> list:
+        """Return the communication groups for all mesh dimensions."""
         if not hasattr(self, "_dim_group_names"):
             raise RuntimeError("DeviceMesh process groups not initialized!")
 
@@ -825,6 +838,7 @@ class DeviceMesh:
         return coord[dim_index]
 
     def flatten(self, mesh_dim_name: Optional[str] = None) -> 'DeviceMesh':
+        """Flatten the device mesh into a 1-D mesh and return the new DeviceMesh."""
         return self._create_flatten_mesh(mesh_dim_name)
 
     def _get_root_mesh(self) -> 'DeviceMesh':
@@ -1185,6 +1199,11 @@ class DeviceMesh:
         return self._create_unflatten_mesh(dim, mesh_sizes, mesh_dim_names, backend_override_tuple)
 
     def assert_axis(self, axis, operate_name):
+        """Validate that the given axis name exists in mesh_dim_names.
+
+        Raises RuntimeError if mesh_dim_names is not set, or ValueError
+        if the axis is not among the declared mesh dimension names.
+        """
         if not self.mesh_dim_names:
             raise RuntimeError(f"mesh_dim_names not specified, {operate_name} is not supported.")
         if axis not in self.mesh_dim_names:  # pylint: disable=E1135
@@ -1193,16 +1212,19 @@ class DeviceMesh:
             )
 
     def axis_id(self, axis):
+        """Return the reverse-indexed device dimension id for the named axis, or -1 for 'None'."""
         if axis == "None":
             return -1
         self.assert_axis(axis, "axis_id")
         return self._dev_name_to_dev_id[axis]
 
     def axis_index(self, axis):
+        """Return the positional index of the named axis within the mesh dimensions."""
         self.assert_axis(axis, "axis_index")
         return self._dev_name_to_index[axis]
 
     def get_device_num_along_axis(self, axis):
+        """Return the number of devices along the named mesh axis."""
         self.assert_axis(axis, "get_device_num_along_axis")
         return self.mesh_shape[self.mesh_dim_names.index(axis)]
 
@@ -1377,6 +1399,7 @@ class DeviceMesh:
         return result_ranks
 
     def to_hash(self):
+        """Return a hashable tuple that uniquely identifies this device mesh configuration."""
         map_key = (self.mesh_shape, self.mesh_dim_names, self.rank_list)
         return map_key
 

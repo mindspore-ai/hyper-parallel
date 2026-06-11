@@ -97,6 +97,7 @@ class ComputeGraph:
         self._insertion_order: list = []
 
     def add_op(self, op: OperatorNode) -> 'ComputeGraph':
+        """Add an operator node to the graph."""
         self._nodes[op.name] = op
         self._insertion_order.append(op.name)
         return self
@@ -110,6 +111,7 @@ class ComputeGraph:
         return self
 
     def get_op(self, name: str) -> OperatorNode:
+        """Retrieve an operator node by name."""
         return self._nodes[name]
 
     def topological_sort(self) -> List[OperatorNode]:

@@ -60,6 +60,7 @@ from hyper_parallel import init_device_mesh
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class ParallelDims:
     """Validated parallel degrees + lazy mesh builder.
@@ -416,18 +417,22 @@ class ParallelDims:
 
     @property
     def tp_enabled(self) -> bool:
+        """Return True if tensor parallelism is enabled (tp > 1)."""
         return self.tp > 1
 
     @property
     def cp_enabled(self) -> bool:
+        """Return True if context parallelism is enabled (cp > 1)."""
         return self.cp > 1
 
     @property
     def ep_enabled(self) -> bool:
+        """Return True if expert parallelism is enabled (ep > 1)."""
         return self.ep > 1
 
     @property
     def pp_enabled(self) -> bool:
+        """Return True if pipeline parallelism is enabled (pp > 1)."""
         return self.pp > 1
 
     @property

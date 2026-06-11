@@ -49,6 +49,7 @@ from parallelize import broadcast_state_dict_from_rank0, build_tp_mesh, parallel
 
 
 def main() -> None:
+    """Entry point: initialize distributed backend, build and parallelize a Llama3 model, then run training."""
     rank, world, device_type = init_dist()
     device = torch.device(device_type, rank)
 

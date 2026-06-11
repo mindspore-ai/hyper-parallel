@@ -525,6 +525,7 @@ class MindSporeHSDPStateV2(HSDPState):
         )
 
     def post_backward(self, *_):
+        """Post-backward hook that accumulates, reduces, and reshards gradients for all managed parameters."""
         for hsdp_param in self._iter_managed_params():
             hsdp_param.accumulate_unsharded_grad_if_needed()
         if not self.reduce_grads:

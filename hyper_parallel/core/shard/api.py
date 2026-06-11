@@ -508,14 +508,18 @@ def parallelize_value_and_grad(fn, weights, sens=None):
     # 2. if the input of parallize_value_and_grad is cell and it is directly used as the input for grad,
     #    the operations before and after its __call__ function will not enter the auto-diff process.
     class CellWrapper(Module):
+        """Cell wrapper."""
+
         def __init__(self, net):
             super().__init__(auto_prefix=False)
             self.network = net
 
         def construct(self, *args, **kwargs):
+            """Delegate construction to the wrapped network."""
             return self.network(*args, **kwargs)
 
         def forward(self, *args, **kwargs):
+            """Execute the wrapped network's forward pass."""
             return self.network(*args, **kwargs)
 
     fn = CellWrapper(fn)

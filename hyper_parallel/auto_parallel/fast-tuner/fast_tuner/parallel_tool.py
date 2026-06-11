@@ -91,6 +91,7 @@ def taylor_search_tool(para):
     pipeline_proc(pipeline_input)
 
 def main():
+    """Entry point that parses command-line arguments and runs the parallel search tool."""
     logger.info('start to run parallel tool')
     parser = argparse.ArgumentParser(description='Run taylor_search_tool with user input parameters')
     parser.add_argument(f"--{InputParam.PARAM_MAPPING['YAML_PATH']}", default='',

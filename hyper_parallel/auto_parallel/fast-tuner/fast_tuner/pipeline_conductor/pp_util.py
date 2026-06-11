@@ -34,6 +34,7 @@ dryrun_shell_dir = 'dryrun_shell'
 dryrun_error = 'Dryrun failed, please check the mindspore environment!'
 
 def update_yaml_value(yaml_file, key, value):
+    """Update or add a top-level key-value pair in a YAML file."""
     with open(yaml_file, 'r', encoding='utf-8') as file:
         yaml_data = yaml.safe_load(file)
         if key in yaml_data:
@@ -128,6 +129,7 @@ def write_config_to_shell(offset, shell_file):
 
 
 def str2bool(v):
+    """Convert a string representation of a boolean into an actual bool; raises ArgumentTypeError on failure."""
     if isinstance(v, bool):
         return v
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
@@ -138,6 +140,7 @@ def str2bool(v):
 
 
 def str2list(v):
+    """Convert a string representation of a list into an actual list; raises ArgumentTypeError on failure."""
     if isinstance(v, list):
         return v
     if isinstance(ast.literal_eval(v), list):
@@ -146,6 +149,7 @@ def str2list(v):
 
 
 def str2int(v):
+    """Convert a string to an int; raises ArgumentTypeError on failure."""
     if isinstance(v, int):
         return v
     if isinstance(int(v), int):
@@ -154,6 +158,7 @@ def str2int(v):
 
 
 def str2dict(v):
+    """Convert a string representation of a dict into an actual dict; raises ArgumentTypeError on failure."""
     if isinstance(v, dict):
         return v
     if isinstance(ast.literal_eval(v), dict):
@@ -255,6 +260,7 @@ def build_recompute_config(is_select_recompute, is_recompute, select_recompute_l
 
 
 def construct_distribution(num_micro, num_stage):
+    """Build a distribution list that divides micro-batches across pipeline stages, with remainder in the first part."""
     parts, remainder = num_micro // num_stage, num_micro % num_stage
     distribution = []
     for part in range(parts):
@@ -313,14 +319,17 @@ def sort_micro(parts, num_vpp, num_stage, distribution, low_mem, seq_split, is_f
 
 
 def get_init_input_peak_mem():
+    """Return an empty list as the default init input peak memory placeholder."""
     return []
 
 
 def get_state_input_peak_mem():
+    """Return an empty list as the default state input peak memory placeholder."""
     return []
 
 
 def get_ranks_stages(yaml_file):
+    """Extract total rank size and pipeline stage count from a YAML configuration file."""
     with open(yaml_file, 'r', encoding='utf-8') as file:
         data = yaml.safe_load(file)
         pipeline_stage = data['parallel_config']['pipeline_stage']
@@ -331,6 +340,7 @@ def get_ranks_stages(yaml_file):
 
 
 def get_shell_ranks_stages(shell_file):
+    """Extract total rank size and pipeline stage count from a shell configuration file."""
     configs = parse_shell(shell_file)[0]
     pipeline_stage = configs.get('PP')
     model_parallel = configs.get('TP')
@@ -340,6 +350,7 @@ def get_shell_ranks_stages(shell_file):
 
 
 def get_layers_distribution(offset, num_layers, num_stages, num_vpp):
+    """Compute the number of layers assigned to each stage and VPP rank given an offset matrix."""
     layers_stage_vpp = [[0 for _ in range(num_vpp)] for _ in range(num_stages)]
     for stage in range(num_stages):
         for vpp in range(num_vpp):
@@ -529,6 +540,7 @@ def parse_shell(shell_file):
 
 
 def configs_to_shell(shell_name, configs, unparses):
+    """Write configuration key-value pairs and unparsed lines back to a shell script file."""
     with open(shell_name, 'w', encoding='utf-8') as f:
         for key, value in configs.items():
             if isinstance(value, int) or value[0] == '$':
@@ -539,6 +551,7 @@ def configs_to_shell(shell_name, configs, unparses):
 
 
 def flatten_to_str(lst, num=0):
+    """Recursively flatten a nested list of integers into a comma-separated string, adding num to each integer."""
     items = []
     for item in lst:
         if isinstance(item, list):

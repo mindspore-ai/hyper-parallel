@@ -20,6 +20,7 @@ Each model registers a ModelSpec that tells the trainer how to construct and
 from dataclasses import dataclass
 from typing import Callable, Optional, Type
 
+
 @dataclass
 class ModelSpec:
     """Per-model registration bundle.

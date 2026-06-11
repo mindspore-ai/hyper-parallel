@@ -44,6 +44,7 @@ from typing import Optional
 # Going through platform avoids importing torch / mindspore here directly.
 # ---------------------------------------------------------------------------
 
+
 def _get_rank() -> int:
     """Best-effort rank lookup.
 
@@ -72,6 +73,7 @@ _DEFAULT_FORMAT = (
 )
 _DATE_FORMAT = "%H:%M:%S"
 
+
 class _RankInjector(logging.Filter):
     """Inject the current rank into every record as ``record.rank``.
 
@@ -84,6 +86,7 @@ class _RankInjector(logging.Filter):
         if not hasattr(record, "rank"):
             record.rank = _get_rank()
         return True
+
 
 def init_logger(
     level: int = logging.INFO,
@@ -114,6 +117,7 @@ def init_logger(
     handler.addFilter(_RankInjector())
     root.addHandler(handler)
 
+
 def get_logger(name: Optional[str] = None) -> logging.Logger:
     """Return a logger with the rank-aware helpers attached.
 
@@ -128,11 +132,13 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
 # Standalone module-level functions.
 # ---------------------------------------------------------------------------
 
+
 def info_rank0(self, msg, *args, **kwargs) -> None:
     """``logger.info`` that fires only on rank 0."""
     if _get_rank() == 0:
         kwargs.setdefault("stacklevel", 2)
         self.info(msg, *args, **kwargs)
+
 
 def warning_rank0(self, msg, *args, **kwargs) -> None:
     """``logger.warning`` that fires only on rank 0."""
@@ -140,11 +146,13 @@ def warning_rank0(self, msg, *args, **kwargs) -> None:
         kwargs.setdefault("stacklevel", 2)
         self.warning(msg, *args, **kwargs)
 
+
 @functools.lru_cache(maxsize=None)
 def _info_once_cached(name: str, msg: str) -> None:
     """LRU-cached one-shot info; key = (logger name, message)."""
     if _get_rank() == 0:
         logging.getLogger(name).info(msg)
+
 
 def info_once(self, msg, *args, **kwargs) -> None:  # pylint: disable=W0613
     """``logger.info`` that fires at most once across the whole run."""
@@ -152,10 +160,12 @@ def info_once(self, msg, *args, **kwargs) -> None:  # pylint: disable=W0613
         msg = msg % args
     _info_once_cached(self.name, str(msg))
 
+
 @functools.lru_cache(maxsize=None)
 def _warning_once_cached(name: str, msg: str) -> None:
     if _get_rank() == 0:
         logging.getLogger(name).warning(msg)
+
 
 def warning_once(self, msg, *args, **kwargs) -> None:  # pylint: disable=W0613
     """``logger.warning`` that fires at most once across the whole run."""
@@ -169,6 +179,7 @@ def warning_once(self, msg, *args, **kwargs) -> None:  # pylint: disable=W0613
 # ---------------------------------------------------------------------------
 
 _INSTALLED = False
+
 
 def _install_logger_methods() -> None:
     """Idempotently install rank-aware helpers on ``logging.Logger``."""

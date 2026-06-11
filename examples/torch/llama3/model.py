@@ -50,9 +50,10 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Ten
     if hasattr(freqs_cis, "to_local"):
         freqs_cis = freqs_cis.to_local()
     ndim = x.ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1]), (
-        f"freqs_cis {freqs_cis.shape} vs x {x.shape}"
-    )
+    if freqs_cis.shape != (x.shape[1], x.shape[-1]):
+        raise ValueError(
+            f"freqs_cis {freqs_cis.shape} vs x {x.shape}"
+        )
     shape = [d if i in (1, ndim - 1) else 1 for i, d in enumerate(x.shape)]
     with SkipDTensorDispatch():
         return freqs_cis.view(*shape)
@@ -76,6 +77,7 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Repeat KV heads to match the number of query heads for grouped-query attention (GQA)."""
     if n_rep == 1:
         return x
     b, n_kv, s, d = x.shape
@@ -129,6 +131,7 @@ class Llama3RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RMS normalization to the input tensor."""
         dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -159,7 +162,8 @@ class Llama3Attention(nn.Module):
         self.n_heads = cfg.n_heads
         self.n_kv_heads = cfg.n_kv_heads
         self.head_dim = cfg.dim // cfg.n_heads
-        assert cfg.n_heads % cfg.n_kv_heads == 0
+        if cfg.n_heads % cfg.n_kv_heads != 0:
+            raise ValueError(f"n_heads ({cfg.n_heads}) must be divisible by n_kv_heads ({cfg.n_kv_heads})")
         self.n_rep = cfg.n_heads // cfg.n_kv_heads
         # Set by ``parallelize_llama3`` to the 1-D TP mesh size (default 1 = no TP).
         self.tp_mesh_size: int = 1
@@ -217,6 +221,7 @@ class Llama3FeedForward(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the SwiGLU feed-forward transformation."""
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 

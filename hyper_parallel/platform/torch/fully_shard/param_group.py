@@ -920,8 +920,8 @@ class HSDPParamGroup:
                 elif self.device.type == "cuda":
                     torch.cuda.current_stream().synchronize()
                 else:
-                    raise NotImplementedError(f"Unsupported device type {self.device} for \
-                                              synchronization after CPU offload.")
+                    raise NotImplementedError(f"Unsupported device type {self.device} for "
+                                              f"synchronization after CPU offload.")
         self._reduce_output = None  # Release fused reduce buffer
         self._reduce_hsdp_params = None
         self._active_param_flat_offsets = []

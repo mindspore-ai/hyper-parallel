@@ -48,10 +48,12 @@ class SharedParameterInfo:
 
     @property
     def parameter(self):
+        """Return the shared parameter object."""
         return self._parameter
 
     @property
     def shared_stage(self):
+        """Return the list of stages sharing this parameter."""
         return self._shared_stage
 
     def __repr__(self):
@@ -121,6 +123,7 @@ class PipelineStage(PipelineStageBase):
         self._virtual_chunk_num = 1
 
     def init(self, virtual_chunk_num):
+        """Initialize the pipeline stage: set virtual chunk count, PP group, and sync shared parameters."""
         self._virtual_chunk_num = virtual_chunk_num
         self._init_pp_group()
         self._sync_shared_parameters()

@@ -233,6 +233,7 @@ def _print_summary(
 
 
 def main() -> None:
+    """Entry point: set up PP+EP distributed mesh, verify correctness against standalone model."""
     rank, world, device_type = init_dist()
     device = torch.device(device_type, rank)
     pp_size, ep_size = _parallel_sizes_from_env(world)

@@ -69,6 +69,7 @@ class ExtendBackwardHook(BackwardHook):
     """Override BackwardHook for none tuple inputs."""
 
     def setup_output_hook(self, args):
+        """Set up the output hook, handling non-tuple non-Tensor args via pytree flattening."""
         if not isinstance(args, tuple) and not isinstance(args, Tensor):
             arg_list, args_spec = tree_flatten(args)
             arg_list = super().setup_output_hook(tuple(arg_list))
@@ -77,5 +78,6 @@ class ExtendBackwardHook(BackwardHook):
 
 
 def override_functions():
+    """Replace PyTorch's default BackwardHookFunction and BackwardHook with DTensor-aware versions."""
     _functions.BackwardHookFunction = DTensorBackwardHookFunction
     module.BackwardHook = ExtendBackwardHook

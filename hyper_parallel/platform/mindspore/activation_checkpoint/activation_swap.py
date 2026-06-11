@@ -58,6 +58,7 @@ class FuncCell(Cell):
         self._fn = fn
 
     def construct(self, *args, **kwargs):
+        """Delegate to the wrapped function."""
         return self._fn(*args, **kwargs)
 
 
@@ -181,6 +182,7 @@ class ActivationWrapper(Cell, ABC):
 
     @abstractmethod
     def construct(self, *args, **kwargs):
+        """Abstract construct method — subclasses must override."""
         raise ValueError("Subclasses should implement construct().")
 
     def __getattr__(self, name: str) -> Any:
@@ -337,6 +339,7 @@ class AsyncSaveOnCpu(ms.saved_tensors_hooks):
         self.count_idx = 0
         self.policy_fn = policy_fn
 
+
         # Cache per-context-manager state once to avoid per-tensor singleton lookups.
         swap_manager = SwapManager()
         def pack_to_cpu(tensor: ms.Tensor):
@@ -400,6 +403,7 @@ class SwapWrapper(ActivationWrapper):
         self.group_swap = group_swap
 
     def construct(self, *args, **kwargs):
+        """Execute the wrapped module inside an async CPU-swap context."""
         with AsyncSaveOnCpu(policy_fn=self.policy_fn, group_swap=self.group_swap):
             return self._ckpt_wrapped_module(*args, **kwargs)
 

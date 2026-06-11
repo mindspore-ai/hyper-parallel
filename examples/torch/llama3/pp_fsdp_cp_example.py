@@ -237,6 +237,7 @@ def _run_training_loop(
 
 
 def main() -> None:
+    """Entry point: run a Llama3 pipeline + FSDP + context-parallel training demo."""
     rank, world, device_type = init_dist()
     device = torch.device(device_type, rank)
     pp_size, fsdp_size, cp_size = _mesh_sizes_from_env(world)
