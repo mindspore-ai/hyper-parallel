@@ -98,6 +98,9 @@ class _MicroBatch(nn.Cell):
         if cur_arg_batch_dim == -1:
             return input_tensor
         batch_dim_shape = input_tensor.shape[cur_arg_batch_dim]
+        if batch_dim_shape % self.micro_batch_num != 0:
+            raise ValueError(f"Batch dimension size {batch_dim_shape} is not divisible by \
+                micro_batch_num {self.micro_batch_num}")
         micro_batch_begin = (batch_dim_shape // self.micro_batch_num) * micro_idx
         micro_batch_end = (batch_dim_shape // self.micro_batch_num) * (micro_idx + 1)
         strided_slice_begin = [0] * input_tensor.ndim
