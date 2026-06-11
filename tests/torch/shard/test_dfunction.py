@@ -64,7 +64,7 @@ def test_dfunction_group3():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_dfunction_group4():
     """
     Feature: DFunction with custom ReLU and column-parallel Linear
@@ -76,6 +76,21 @@ def test_dfunction_group4():
     parallel_run([
         TorchCase(DIST_FUNCTION, "test_relu_forward_backward", 13008, 4),
         TorchCase(DIST_FUNCTION, "test_linear_colwise_dispatch_new", 13009, 4),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_dfunction_group4_gloo():
+    """
+    Feature: DFunction with custom ReLU and column-parallel Linear
+    Description:
+        1. test_relu_forward_backward
+        2. test_linear_colwise_dispatch_new
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(DIST_FUNCTION, "test_relu_forward_backward", num_proc=4),
+        TorchCase(DIST_FUNCTION, "test_linear_colwise_dispatch_new", num_proc=4),
     ])
 
 

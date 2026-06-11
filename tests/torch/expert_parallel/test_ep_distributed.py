@@ -95,9 +95,26 @@ def test_ep_grouped_mm():
     )
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_ep_local_shard_forward_backward():
+    """
+    Feature: ExpertParallel with local-shard token input, forward/backward precision.
+    Description:
+        4-card EP with 4 experts (one per rank).  Each rank receives its own
+        token slice (slen // 4).  Verifies that EP output and input gradients
+        match the standalone (single-rank, same local slice) reference within
+        rtol=1e-3, atol=1e-3.
+    Expectation: Run success.
+    """
+    _run_group(
+        ("test_ep_local_shard_forward_backward_npu", 10484, 4),
+    )
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_ep_local_shard_forward_backward_gloo():
     """
     Feature: ExpertParallel with local-shard token input, forward/backward precision.
     Description:

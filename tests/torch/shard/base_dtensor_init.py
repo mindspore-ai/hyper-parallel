@@ -1,16 +1,31 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+
 """Distributed tensor initialization consistency tests."""
 import torch
 import torch.distributed as dist
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.dtensor.dtensor import ones, empty, full, zeros
-from tests.torch.utils import init_dist
+from tests.torch.utils import _DEVICE_TYPE, init_backend
 
-init_dist()
+init_backend(_DEVICE_TYPE)
 
 def build_device_mesh():
     world_size = dist.get_world_size()
-    return init_device_mesh("npu", (world_size,), mesh_dim_names=("dp",))
+    return init_device_mesh(_DEVICE_TYPE, (world_size,), mesh_dim_names=("dp",))
 
 def assert_equal(x,y):
     assert (x == y).all()

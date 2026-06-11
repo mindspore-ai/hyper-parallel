@@ -33,17 +33,15 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-import torch_npu  # noqa: F401  -- Ascend NPU
-
 from hyper_parallel import ColwiseParallel, RowwiseParallel, init_device_mesh, parallelize_module
 from hyper_parallel.core.dtensor.placement_types import Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
 
 def _make_tp_mesh_1d():
     """1-D mesh covering all ranks in the default process group."""
     return init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(dist.get_world_size(),),
         mesh_dim_names=("tp",),
     )
@@ -74,11 +72,12 @@ def test_colwise_linear_forward_precision_npu():
         4. Compare output with CPU F.linear(x, w, b)
     Expectation: NPU output close to CPU reference
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
     world_size = dist.get_world_size()
     torch.manual_seed(42)
-    torch.npu.manual_seed(42)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(42)
 
     in_f, out_f, batch = 32, 64, 8
     assert out_f % world_size == 0, (
@@ -90,11 +89,11 @@ def test_colwise_linear_forward_precision_npu():
     x = torch.randn(batch, in_f, dtype=torch.float32)
     y_ref = F.linear(x, w, b)
 
-    linear = nn.Linear(in_f, out_f, bias=True).npu()
+    linear = to_device(nn.Linear(in_f, out_f, bias=True), _DEVICE_TYPE)
     with torch.no_grad():
-        linear.weight.copy_(w.npu())
-        linear.bias.copy_(b.npu())
-    x_npu = x.npu()
+        linear.weight.copy_(to_device(w, _DEVICE_TYPE))
+        linear.bias.copy_(to_device(b, _DEVICE_TYPE))
+    x_npu = to_device(x, _DEVICE_TYPE)
 
     sharded = parallelize_module(linear, mesh, ColwiseParallel())
     with torch.no_grad():
@@ -115,11 +114,12 @@ def test_colwise_linear_backward_gradient_npu():
         3. Gather weight gradients from all ranks, compare with CPU reference
     Expectation: Gathered weight grad close to CPU reference grad
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
     world_size = dist.get_world_size()
     torch.manual_seed(100)
-    torch.npu.manual_seed(100)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(100)
 
     in_f, out_f, batch = 16, 32, 4
     assert out_f % world_size == 0, (
@@ -137,11 +137,11 @@ def test_colwise_linear_backward_gradient_npu():
     y_ref.sum().backward()
 
     # NPU sharded
-    linear = nn.Linear(in_f, out_f, bias=True).npu()
+    linear = to_device(nn.Linear(in_f, out_f, bias=True), _DEVICE_TYPE)
     with torch.no_grad():
-        linear.weight.copy_(w.npu())
-        linear.bias.copy_(b.npu())
-    x_npu = x.npu().requires_grad_(True)
+        linear.weight.copy_(to_device(w, _DEVICE_TYPE))
+        linear.bias.copy_(to_device(b, _DEVICE_TYPE))
+    x_npu = to_device(x, _DEVICE_TYPE).requires_grad_(True)
 
     sharded = parallelize_module(linear, mesh, ColwiseParallel())
     y_hp = sharded(x_npu)
@@ -173,11 +173,12 @@ def test_rowwise_linear_forward_precision_npu():
         4. Compare output (after all-reduce) with CPU F.linear(x, w, b)
     Expectation: NPU output close to CPU reference
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
     world_size = dist.get_world_size()
     torch.manual_seed(43)
-    torch.npu.manual_seed(43)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(43)
 
     in_f, out_f, batch = 32, 24, 8
     assert in_f % world_size == 0, (
@@ -189,11 +190,11 @@ def test_rowwise_linear_forward_precision_npu():
     x = torch.randn(batch, in_f, dtype=torch.float32)
     y_ref = F.linear(x, w, b)
 
-    linear = nn.Linear(in_f, out_f, bias=True).npu()
+    linear = to_device(nn.Linear(in_f, out_f, bias=True), _DEVICE_TYPE)
     with torch.no_grad():
-        linear.weight.copy_(w.npu())
-        linear.bias.copy_(b.npu())
-    x_npu = x.npu()
+        linear.weight.copy_(to_device(w, _DEVICE_TYPE))
+        linear.bias.copy_(to_device(b, _DEVICE_TYPE))
+    x_npu = to_device(x, _DEVICE_TYPE)
 
     sharded = parallelize_module(
         linear, mesh, RowwiseParallel(input_layouts=Replicate())
@@ -212,11 +213,12 @@ def test_rowwise_linear_backward_gradient_npu():
         3. Gather weight gradients from all ranks, compare with CPU reference
     Expectation: Gathered weight grad close to CPU reference grad
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
     world_size = dist.get_world_size()
     torch.manual_seed(101)
-    torch.npu.manual_seed(101)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(101)
 
     in_f, out_f, batch = 16, 12, 4
     assert in_f % world_size == 0, (
@@ -234,11 +236,11 @@ def test_rowwise_linear_backward_gradient_npu():
     y_ref.sum().backward()
 
     # NPU sharded
-    linear = nn.Linear(in_f, out_f, bias=True).npu()
+    linear = to_device(nn.Linear(in_f, out_f, bias=True), _DEVICE_TYPE)
     with torch.no_grad():
-        linear.weight.copy_(w.npu())
-        linear.bias.copy_(b.npu())
-    x_npu = x.npu().requires_grad_(True)
+        linear.weight.copy_(to_device(w, _DEVICE_TYPE))
+        linear.bias.copy_(to_device(b, _DEVICE_TYPE))
+    x_npu = to_device(x, _DEVICE_TYPE).requires_grad_(True)
 
     sharded = parallelize_module(
         linear, mesh, RowwiseParallel(input_layouts=Replicate())
@@ -273,11 +275,12 @@ def test_mlp_colwise_rowwise_forward_precision_npu():
         3. Compare end-to-end output with CPU MLP reference
     Expectation: NPU MLP output close to CPU reference
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
     world_size = dist.get_world_size()
     torch.manual_seed(44)
-    torch.npu.manual_seed(44)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(44)
 
     in_f, hidden_f, out_f, batch = 32, 64, 24, 8
     assert hidden_f % world_size == 0, (
@@ -311,13 +314,13 @@ def test_mlp_colwise_rowwise_forward_precision_npu():
         def forward(self, x):
             return self.linear2(F.relu(self.linear1(x)))
 
-    model = MLP().npu()
+    model = to_device(MLP(), _DEVICE_TYPE)
     with torch.no_grad():
-        model.linear1.weight.copy_(w1_data.npu())
-        model.linear1.bias.copy_(b1_data.npu())
-        model.linear2.weight.copy_(w2_data.npu())
-        model.linear2.bias.copy_(b2_data.npu())
-    x_npu = x.npu()
+        model.linear1.weight.copy_(to_device(w1_data, _DEVICE_TYPE))
+        model.linear1.bias.copy_(to_device(b1_data, _DEVICE_TYPE))
+        model.linear2.weight.copy_(to_device(w2_data, _DEVICE_TYPE))
+        model.linear2.bias.copy_(to_device(b2_data, _DEVICE_TYPE))
+    x_npu = to_device(x, _DEVICE_TYPE)
 
     # parallelize_module applies styles at module (layer) granularity:
     #   "linear1" → ColwiseParallel() shards model.linear1 (nn.Linear) column-wise
@@ -346,11 +349,12 @@ def test_colwise_embedding_forward_precision_npu():
         3. Forward through sharded module, compare gathered output with CPU reference
     Expectation: Gathered NPU output close to CPU reference
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
     world_size = dist.get_world_size()
     torch.manual_seed(45)
-    torch.npu.manual_seed(45)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(45)
 
     num_embeddings, embedding_dim, batch, seq_len = 100, 64, 4, 8
     assert embedding_dim % world_size == 0, (
@@ -361,10 +365,10 @@ def test_colwise_embedding_forward_precision_npu():
     ids = torch.randint(0, num_embeddings, (batch, seq_len), dtype=torch.long)
     y_ref = F.embedding(ids, weight)
 
-    embedding = nn.Embedding(num_embeddings, embedding_dim).npu()
+    embedding = to_device(nn.Embedding(num_embeddings, embedding_dim), _DEVICE_TYPE)
     with torch.no_grad():
-        embedding.weight.copy_(weight.npu())
-    ids_npu = ids.npu()
+        embedding.weight.copy_(to_device(weight, _DEVICE_TYPE))
+    ids_npu = to_device(ids, _DEVICE_TYPE)
 
     sharded = parallelize_module(embedding, mesh, ColwiseParallel())
     with torch.no_grad():
@@ -389,11 +393,11 @@ def test_colwise_unsupported_module_raises_npu():
     Description: apply ColwiseParallel to nn.LayerNorm
     Expectation: raises NotImplementedError
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
 
     style = ColwiseParallel()
-    module = nn.LayerNorm(8).npu()
+    module = to_device(nn.LayerNorm(8), _DEVICE_TYPE)
 
     with pytest.raises(NotImplementedError):
         style.apply(module, mesh)
@@ -405,11 +409,11 @@ def test_rowwise_unsupported_module_raises_npu():
     Description: apply RowwiseParallel to nn.LayerNorm
     Expectation: raises NotImplementedError
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
 
     style = RowwiseParallel()
-    module = nn.LayerNorm(8).npu()
+    module = to_device(nn.LayerNorm(8), _DEVICE_TYPE)
 
     with pytest.raises(NotImplementedError):
         style.apply(module, mesh)

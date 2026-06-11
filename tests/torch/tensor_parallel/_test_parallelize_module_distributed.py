@@ -29,11 +29,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
-import torch_npu  # noqa: F401  — Ascend NPU
-
 from hyper_parallel import init_device_mesh, parallelize_module
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
-from tests.torch.utils import init_dist
+from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
 
 class _VerifyMeshParallelStyle(ParallelStyle):
@@ -86,7 +84,7 @@ class _CountingParallelStyle(ParallelStyle):
 def _make_tp_mesh_1d():
     """1-D mesh covering all ranks in the default process group."""
     return init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(dist.get_world_size(),),
         mesh_dim_names=("tp",),
     )
@@ -247,21 +245,22 @@ def test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu():
     Description: shard out_features; all_gather outputs — same layout as PyTorch ColwiseParallel
     Expectation: gathered NPU output close to PyTorch reference on CPU
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
     torch.manual_seed(42)
-    torch.npu.manual_seed(42)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(42)
     in_f, out_f, batch = 32, 64, 8
     w = torch.randn(out_f, in_f, dtype=torch.float32)
     b = torch.randn(out_f, dtype=torch.float32)
     x = torch.randn(batch, in_f, dtype=torch.float32)
     y_ref = F.linear(x, w, b)
 
-    linear = nn.Linear(in_f, out_f, bias=True).npu()
+    linear = to_device(nn.Linear(in_f, out_f, bias=True), _DEVICE_TYPE)
     with torch.no_grad():
-        linear.weight.copy_(w.npu())
-        linear.bias.copy_(b.npu())
-    x_npu = x.npu()
+        linear.weight.copy_(to_device(w, _DEVICE_TYPE))
+        linear.bias.copy_(to_device(b, _DEVICE_TYPE))
+    x_npu = to_device(x, _DEVICE_TYPE)
 
     sharded = parallelize_module(linear, mesh, _ColwiseLinearPrecisionStyle())
     y_hp = sharded(x_npu)
@@ -274,21 +273,22 @@ def test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu():
     Description: shard in_features; allreduce partials — same layout as PyTorch RowwiseParallel
     Expectation: NPU output close to PyTorch reference on CPU
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
     torch.manual_seed(43)
-    torch.npu.manual_seed(43)
+    if _DEVICE_TYPE == "npu":
+        torch.npu.manual_seed(43)
     in_f, out_f, batch = 32, 24, 8
     w = torch.randn(out_f, in_f, dtype=torch.float32)
     b = torch.randn(out_f, dtype=torch.float32)
     x = torch.randn(batch, in_f, dtype=torch.float32)
     y_ref = F.linear(x, w, b)
 
-    linear = nn.Linear(in_f, out_f, bias=True).npu()
+    linear = to_device(nn.Linear(in_f, out_f, bias=True), _DEVICE_TYPE)
     with torch.no_grad():
-        linear.weight.copy_(w.npu())
-        linear.bias.copy_(b.npu())
-    x_npu = x.npu()
+        linear.weight.copy_(to_device(w, _DEVICE_TYPE))
+        linear.bias.copy_(to_device(b, _DEVICE_TYPE))
+    x_npu = to_device(x, _DEVICE_TYPE)
 
     sharded = parallelize_module(linear, mesh, _RowwiseLinearPrecisionStyle())
     y_hp = sharded(x_npu)
@@ -301,9 +301,9 @@ def test_parallelize_module_mesh_aligned_with_process_group_npu():
     Description: init dist, 1-D mesh over all ranks, parallelize_module with _VerifyMeshParallelStyle
     Expectation: style apply passes; mesh rank_list matches world size and contains current rank
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
-    m = nn.Identity().npu()
+    m = to_device(nn.Identity(), _DEVICE_TYPE)
     parallelize_module(m, mesh, _VerifyMeshParallelStyle())
 
 
@@ -313,7 +313,7 @@ def test_parallelize_module_dict_fnmatch_npu():
     Description: MLP with net1, net2, other on NPU; plan {"net*": one CountingParallelStyle}
     Expectation: style.count==2; net1/net2 apply count 1; other has no apply count attr
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
 
     class _MLP(nn.Module):
@@ -323,7 +323,7 @@ def test_parallelize_module_dict_fnmatch_npu():
             self.net2 = nn.Identity()
             self.other = nn.Identity()
 
-    model = _MLP().npu()
+    model = to_device(_MLP(), _DEVICE_TYPE)
     style = _CountingParallelStyle()
     parallelize_module(model, mesh, {"net*": style})
     assert style.count == 2
@@ -338,9 +338,9 @@ def test_parallelize_module_src_data_rank_npu():
     Description: two calls with src_data_rank=1 then src_data_rank=None on same Linear module
     Expectation: first style src_data_rank==1; second style src_data_rank is None
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
-    m = nn.Linear(2, 2).npu()
+    m = to_device(nn.Linear(2, 2), _DEVICE_TYPE)
     style = _VerifyMeshParallelStyle()
     parallelize_module(m, mesh, style, src_data_rank=1)
     assert style.src_data_rank == 1
@@ -355,9 +355,9 @@ def test_parallelize_module_single_style_root_npu():
     Description: Linear on NPU with one CountingParallelStyle as parallelize_plan
     Expectation: style.count==1 and root module parallelize apply count is 1
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     mesh = _make_tp_mesh_1d()
-    m = nn.Linear(3, 3).npu()
+    m = to_device(nn.Linear(3, 3), _DEVICE_TYPE)
     style = _CountingParallelStyle()
     parallelize_module(m, mesh, style)
     assert style.count == 1

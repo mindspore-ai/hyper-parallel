@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ def test_submesh_group1():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group2():
     """
     Feature: parallel run case in shard
@@ -46,6 +46,21 @@ def test_submesh_group2():
     parallel_run([
         TorchCase(SUBMESH, "test_full_mesh_shard_forward_2", 11754, 4),
         TorchCase(SUBMESH, "test_sub_mesh_row_parallel_forward", 11755, 4),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_submesh_group2_gloo():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_full_mesh_shard_forward_2
+        2.test_sub_mesh_row_parallel_forward
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_full_mesh_shard_forward_2", num_proc=4),
+        TorchCase(SUBMESH, "test_sub_mesh_row_parallel_forward", num_proc=4),
     ])
 
 
@@ -62,7 +77,7 @@ def test_submesh_group3():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group4():
     """
     Feature: parallel run case in shard
@@ -77,7 +92,22 @@ def test_submesh_group4():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_submesh_group4_gloo():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_sub_mesh_redistribute_1
+        2.test_sub_mesh_redistribute_2
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_1", num_proc=4),
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_2", num_proc=4),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_submesh_group5():
     """
     Feature: parallel run case in shard
@@ -89,6 +119,21 @@ def test_submesh_group5():
     parallel_run([
         TorchCase(SUBMESH, "test_sub_mesh_redistribute_3", 11759, 2),
         TorchCase(SUBMESH, "test_sub_mesh_redistribute_4", 11760, 2),
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_submesh_group5_gloo():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_sub_mesh_redistribute_3
+        2.test_sub_mesh_redistribute_4
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_3", num_proc=2),
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_4", num_proc=2),
     ])
 
 
@@ -157,7 +202,7 @@ def test_sub_mesh_redistribute_9():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_sub_mesh_redistribute_10():
     """
     Feature: parallel run case in shard
@@ -167,4 +212,17 @@ def test_sub_mesh_redistribute_10():
     """
     parallel_run([
         TorchCase(SUBMESH, "test_sub_mesh_redistribute_10", 11766, 8)
+    ])
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_sub_mesh_redistribute_10_gloo():
+    """
+    Feature: parallel run case in shard
+    Description:
+        1.test_sub_mesh_redistribute_10
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(SUBMESH, "test_sub_mesh_redistribute_10", num_proc=8)
     ])

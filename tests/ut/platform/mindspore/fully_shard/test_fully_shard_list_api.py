@@ -204,9 +204,9 @@ class TestCoreApiHelpersMindSpore(unittest.TestCase):
         self.assertEqual(_get_device_from_mesh(SimpleNamespace(device_type="npu")), "npu")
 
     def test_get_device_from_mesh_rejects_unsupported_device(self):
-        """Only npu/cuda mesh device types are accepted by fully_shard."""
+        """Only npu/cuda/cpu mesh device types are accepted by fully_shard."""
         with self.assertRaisesRegex(AssertionError, "support device"):
-            _get_device_from_mesh(SimpleNamespace(device_type="cpu"))
+            _get_device_from_mesh(SimpleNamespace(device_type="xpu"))
 
     def test_check_hsdp_input_valid_rejects_invalid_options(self):
         """Input validation should reject invalid scalar options before setup."""

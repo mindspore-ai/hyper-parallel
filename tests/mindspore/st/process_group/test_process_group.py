@@ -20,7 +20,7 @@ DEVICE_MESH = "device_mesh.py"
 PROCESS_GROUP = "process_group.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_process_group_group1():
     """
     Feature: parallel run case in process_group
@@ -39,7 +39,7 @@ def test_process_group_group1():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_process_group_group2():
     """
     Feature: parallel run case in process_group

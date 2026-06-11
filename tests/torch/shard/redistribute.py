@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,11 +16,9 @@
 import numpy as np
 import torch
 import pytest
-# pylint: disable=W0611
-import torch_npu
 from hyper_parallel import DTensor, init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
 
 def test_shard_to_replicate():
@@ -29,11 +27,11 @@ def test_shard_to_replicate():
     Description:
     Expectation: Run success.
     '''
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     # Create DeviceMesh
     mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(1, 2),
         mesh_dim_names=("dp", "tp")
     )
@@ -42,7 +40,7 @@ def test_shard_to_replicate():
     x_placements = (Replicate(), Shard(1))
     dst_placements = (Replicate(), Replicate())
 
-    dist_x = DTensor.from_local(torch.ones(8, 4).npu(), mesh, x_placements)
+    dist_x = DTensor.from_local(to_device(torch.ones(8, 4), _DEVICE_TYPE), mesh, x_placements)
     out = dist_x.redistribute(mesh, dst_placements)
 
     expect_out = torch.ones(8, 8)
@@ -58,11 +56,11 @@ def test_replicate_to_shard():
     Description:
     Expectation: Run success.
     '''
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     # Create DeviceMesh
     mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(1, 2),
         mesh_dim_names=("dp", "tp")
     )
@@ -71,7 +69,7 @@ def test_replicate_to_shard():
     dst_placements = (Replicate(), Shard(1))
     x_placements = (Replicate(), Replicate())
 
-    dist_x = DTensor.from_local(torch.ones(8, 8).npu(), mesh, x_placements)
+    dist_x = DTensor.from_local(to_device(torch.ones(8, 8), _DEVICE_TYPE), mesh, x_placements)
     out = dist_x.redistribute(mesh, dst_placements)
 
     expect_out = torch.ones(8, 4)
@@ -87,11 +85,11 @@ def test_different_mesh():
     Description:
     Expectation: Run success.
     '''
-    init_dist()
+    init_backend(_DEVICE_TYPE)
 
     # Create DeviceMesh with 3 dimensions
     mesh_3d = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(1, 2, 1),
         mesh_dim_names=("dp", "tp", "sp")
     )
@@ -101,14 +99,14 @@ def test_different_mesh():
 
     # Create DeviceMesh with 2 dimensions
     mesh_2d = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(1, 2),
         mesh_dim_names=("dp", "tp")
     )
 
     x_placements = (Replicate(), Replicate())
 
-    dist_x = DTensor.from_local(torch.ones(8, 8).npu(), mesh_2d, x_placements)
+    dist_x = DTensor.from_local(to_device(torch.ones(8, 8), _DEVICE_TYPE), mesh_2d, x_placements)
 
     # Redistributing between different meshes should raise RuntimeError
     with pytest.raises(RuntimeError):

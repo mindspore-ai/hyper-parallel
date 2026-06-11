@@ -45,9 +45,19 @@ def _run_quad_gpu_wave():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_tp_sequence_parallel_dual_gpu_wave():
+    """
+    Feature: four ``SequenceParallel`` scenarios on **2** NPU ranks
+    Expectation: all four worker cases succeed.
+    """
+    _run_dual_gpu_wave()
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_tp_sequence_parallel_dual_gpu_wave_gloo():
     """
     Feature: four ``SequenceParallel`` scenarios on **2** NPU ranks
     Expectation: all four worker cases succeed.

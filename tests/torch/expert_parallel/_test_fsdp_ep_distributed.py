@@ -161,7 +161,7 @@ def test_fsdp_ep_three_step_training_npu():
         1. Build standalone MoE and FSDP+EP MoE with identical seeds.
         2. Train both for 3 steps on the same input batch.
         3. Compare loss trajectory and final parameters between standalone and FSDP+EP.
-    Expectation: 
+    Expectation:
         - Loss decreases monotonically for both.
         - Loss values match between standalone and FSDP+EP at each step.
         - Final parameters match after 3 steps.

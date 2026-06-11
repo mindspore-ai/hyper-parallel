@@ -29,7 +29,7 @@ _SKIP_REASON = (
 
 
 @pytest.mark.skip(reason=_SKIP_REASON)
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_gradient_scaling_factor_hsdp_acc():
     """
     Feature: fully_shard set_gradient_scaling_factor under HSDP + gradient

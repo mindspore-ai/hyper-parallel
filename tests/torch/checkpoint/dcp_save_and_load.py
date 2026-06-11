@@ -26,7 +26,7 @@ from hyper_parallel.core.distributed_checkpoint import async_save, load, save
 from hyper_parallel.core.distributed_checkpoint.metadata import Metadata
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
-from tests.torch.utils import init_dist
+from tests.torch.utils import _DEVICE_TYPE, init_backend, to_device
 
 
 def _run_dcp_save_load_test(
@@ -55,13 +55,13 @@ def _run_dcp_save_load_test(
             key is name, value is shape tuple (e.g., {'buffer': (10, 8)}). Default None.
         use_collectives (bool): If True, use collective communication for save/load coordination. Default True.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     torch.manual_seed(seed)
     np.random.seed(seed - 1)
 
     # Create DeviceMesh
     alias_name = ("dp", "tp")
-    device_mesh = init_device_mesh(device_type="npu", mesh_shape=mesh_shape, mesh_dim_names=alias_name)
+    device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=mesh_shape, mesh_dim_names=alias_name)
 
     # Create DTensors based on configurations
     state_dict = {}
@@ -73,7 +73,7 @@ def _run_dcp_save_load_test(
         placements = param_config['placements']
         local_shape = param_config['local_shape']
 
-        local_tensor = torch.randn(*local_shape).npu()
+        local_tensor = to_device(torch.randn(*local_shape), _DEVICE_TYPE)
         dtensor = DTensor.from_local(local_tensor, device_mesh, placements)
         state_dict[param_name] = dtensor
         original_local_tensors[param_name] = dtensor.to_local().clone()
@@ -88,7 +88,7 @@ def _run_dcp_save_load_test(
     original_tensors: dict[str, Any] = {}
     if tensor_values:
         for tensor_name, tensor_shape in tensor_values.items():
-            tensor = torch.randn(*tensor_shape).npu()
+            tensor = to_device(torch.randn(*tensor_shape), _DEVICE_TYPE)
             state_dict[tensor_name] = tensor
             original_tensors[tensor_name] = tensor.clone()
 
@@ -118,7 +118,7 @@ def _run_dcp_save_load_test(
         placements = param_config['placements']
         local_shape = param_config['local_shape']
 
-        load_local_tensor = torch.zeros(*local_shape).npu()
+        load_local_tensor = to_device(torch.zeros(*local_shape), _DEVICE_TYPE)
         load_dtensor = DTensor.from_local(load_local_tensor, device_mesh, placements)
         load_state_dict[param_name] = load_dtensor
 
@@ -136,7 +136,7 @@ def _run_dcp_save_load_test(
     # Initialize torch Tensor values in load_state_dict (will be overwritten by load)
     if tensor_values:
         for tensor_name, tensor_shape in tensor_values.items():
-            load_state_dict[tensor_name] = torch.zeros(*tensor_shape).npu()
+            load_state_dict[tensor_name] = to_device(torch.zeros(*tensor_shape), _DEVICE_TYPE)
 
     # Call load API
     load(load_state_dict, checkpoint_id=checkpoint_path, use_collectives=use_collectives)
@@ -185,12 +185,12 @@ def _run_dcp_async_save_load_test(
     """
     Same as :func:`_run_dcp_save_load_test` but persists via :func:`async_save` and ``persist_completion``.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     torch.manual_seed(seed)
     np.random.seed(seed - 1)
 
     alias_name = ("dp", "tp")
-    device_mesh = init_device_mesh(device_type="npu", mesh_shape=mesh_shape, mesh_dim_names=alias_name)
+    device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=mesh_shape, mesh_dim_names=alias_name)
 
     state_dict = {}
     original_local_tensors = {}
@@ -201,7 +201,7 @@ def _run_dcp_async_save_load_test(
         placements = param_config['placements']
         local_shape = param_config['local_shape']
 
-        local_tensor = torch.randn(*local_shape).npu()
+        local_tensor = to_device(torch.randn(*local_shape), _DEVICE_TYPE)
         dtensor = DTensor.from_local(local_tensor, device_mesh, placements)
         state_dict[param_name] = dtensor
         original_local_tensors[param_name] = dtensor.to_local().clone()
@@ -214,7 +214,7 @@ def _run_dcp_async_save_load_test(
     original_tensors: dict[str, Any] = {}
     if tensor_values:
         for tensor_name, tensor_shape in tensor_values.items():
-            tensor = torch.randn(*tensor_shape).npu()
+            tensor = to_device(torch.randn(*tensor_shape), _DEVICE_TYPE)
             state_dict[tensor_name] = tensor
             original_tensors[tensor_name] = tensor.clone()
 
@@ -242,7 +242,7 @@ def _run_dcp_async_save_load_test(
         placements = param_config['placements']
         local_shape = param_config['local_shape']
 
-        load_local_tensor = torch.zeros(*local_shape).npu()
+        load_local_tensor = to_device(torch.zeros(*local_shape), _DEVICE_TYPE)
         load_dtensor = DTensor.from_local(load_local_tensor, device_mesh, placements)
         load_state_dict[param_name] = load_dtensor
 
@@ -257,7 +257,7 @@ def _run_dcp_async_save_load_test(
 
     if tensor_values:
         for tensor_name, tensor_shape in tensor_values.items():
-            load_state_dict[tensor_name] = torch.zeros(*tensor_shape).npu()
+            load_state_dict[tensor_name] = to_device(torch.zeros(*tensor_shape), _DEVICE_TYPE)
 
     load(load_state_dict, checkpoint_id=checkpoint_path, use_collectives=use_collectives)
 
@@ -473,14 +473,14 @@ def _run_dcp_save_load_with_different_mesh_test(
         scalar_values (Optional[dict[str, Any]]): Optional dict of scalar values to save/load
             (e.g., {'epoch': 10, 'lr': 0.001}). Default None.
     """
-    init_dist()
+    init_backend(_DEVICE_TYPE)
     torch.manual_seed(seed)
     np.random.seed(seed - 1)
 
     # ========== SAVE PHASE: Use save_mesh_shape ==========
     # Create DeviceMesh for save
     alias_name = ("dp", "tp")
-    save_device_mesh = init_device_mesh(device_type="npu", mesh_shape=save_mesh_shape, mesh_dim_names=alias_name)
+    save_device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=save_mesh_shape, mesh_dim_names=alias_name)
 
     # Create DTensors based on save configurations
     save_state_dict = {}
@@ -492,7 +492,7 @@ def _run_dcp_save_load_with_different_mesh_test(
         placements = param_config['placements']
         local_shape = param_config['local_shape']
 
-        local_tensor = torch.randn(*local_shape).npu()
+        local_tensor = to_device(torch.randn(*local_shape), _DEVICE_TYPE)
         dtensor = DTensor.from_local(local_tensor, save_device_mesh, placements)
         save_state_dict[param_name] = dtensor
         # Store global tensor for verification (gather from all ranks)
@@ -534,7 +534,7 @@ def _run_dcp_save_load_with_different_mesh_test(
     if current_rank < load_mesh_size:
         # Create DeviceMesh for load using only the first load_mesh_size ranks
         load_rank_list = tuple(range(load_mesh_size))
-        load_device_mesh = init_device_mesh(device_type="npu", mesh_shape=load_mesh_shape,
+        load_device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=load_mesh_shape,
                                             mesh_dim_names=alias_name, rank_list=load_rank_list)
     else:
         # Ranks beyond load_mesh_size don't participate in load
@@ -549,7 +549,7 @@ def _run_dcp_save_load_with_different_mesh_test(
             placements = param_config['placements']
             local_shape = param_config['local_shape']
 
-            load_local_tensor = torch.zeros(*local_shape).npu()
+            load_local_tensor = to_device(torch.zeros(*local_shape), _DEVICE_TYPE)
             load_dtensor = DTensor.from_local(load_local_tensor, load_device_mesh, placements)
             load_state_dict[param_name] = load_dtensor
 

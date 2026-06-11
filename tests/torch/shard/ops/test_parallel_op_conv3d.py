@@ -51,7 +51,7 @@ def test_parallel_op_conv3d_group1_gloo():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_parallel_op_conv3d_group2():
     """
     Feature: parallel run case in _test_parallel_op_conv3d

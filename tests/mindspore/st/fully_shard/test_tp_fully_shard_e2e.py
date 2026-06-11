@@ -42,7 +42,7 @@ def _run_tp_fully_shard_cases(*cases: MindSporeCase):
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -59,7 +59,7 @@ def test_tp_plus_fully_shard_basic_shape_suite():
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -91,7 +91,7 @@ def test_tp_plus_fully_shard_setup_and_compat_suite():
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -109,7 +109,7 @@ def test_tp_plus_fully_shard_same_dim_non_dim0_match_standalone():
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )

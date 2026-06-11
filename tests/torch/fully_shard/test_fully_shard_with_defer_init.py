@@ -19,7 +19,7 @@ from tests.common.parallel_case import parallel_run, TorchCase
 _TEST_FULLY_SHARD_WITH_DEFER_INIT = "_test_fully_shard_with_defer_init.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_fully_shard_meta_init():
     """
     Feature: Test fully_shard with meta device initialization

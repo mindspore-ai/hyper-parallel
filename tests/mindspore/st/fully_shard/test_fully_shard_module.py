@@ -21,7 +21,7 @@ from tests.common.parallel_case import MindSporeCase, parallel_run
 _TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_module.py")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_fully_shard_module_suite():
     """
     Feature: parallel run cases in fully_shard module (MindSpore)

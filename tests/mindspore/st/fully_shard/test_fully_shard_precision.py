@@ -128,7 +128,7 @@ def test_ms_zero3_partial_shard_prefetch_recompute():
 
 
 @pytest.mark.skip(reason="Case failed after upgrading mindspore version")
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_zero3_fully_shard_replicate_params():
     """
     Feature: Compare partial_shard precision with standalone baseline
@@ -138,7 +138,7 @@ def test_ms_zero3_fully_shard_replicate_params():
     run_case(case_name=f"{inspect.stack()[0].function}")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_zero3_fully_shard_grad_accum():
     """
     Feature: Compare fully_shard gradient accumulation precision with standalone baseline
@@ -161,7 +161,7 @@ def test_ms_zero3_fully_shard_prefetch_recompute_grad_accum():
 
 
 @pytest.mark.skip(reason="The Mindspore framework has a bug that causes a core dump when the process exits.")
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_zero1_fully_shard_grad_accum():
     """
     Feature: Compare zero1-style fully_shard gradient accumulation precision with standalone baseline
@@ -174,7 +174,7 @@ def test_ms_zero1_fully_shard_grad_accum():
     run_case(case_name=f"{inspect.stack()[0].function}")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_fully_shard_list_unit_precision():
     """
     Feature: fully_shard(list) numerical parity vs standalone (MindSpore).
@@ -197,7 +197,7 @@ def test_ms_fully_shard_list_unit_prefetch_recompute_precision():
     run_list_precision_case(case_name=f"{inspect.stack()[0].function}")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_zero3_fully_shard_empty_weight():
     """
     Feature: Compare empty init fully_shard precision with standalone baseline
@@ -207,7 +207,7 @@ def test_ms_zero3_fully_shard_empty_weight():
     run_case(case_name=f"{inspect.stack()[0].function}")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_zero3_fully_shard_comm_fusion():
     """
     Feature: Compare fully_shard comm_fusion precision with standalone baseline
@@ -218,7 +218,7 @@ def test_ms_zero3_fully_shard_comm_fusion():
     run_case(case_name=f"{inspect.stack()[0].function}")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_zero3_fully_shard_comm_fusion_prefetch():
     """
     Feature: Compare fully_shard comm_fusion + prefetch precision with standalone baseline

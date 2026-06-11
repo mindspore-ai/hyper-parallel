@@ -42,7 +42,7 @@ def _run_group(*cases):
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_distribute_module_group_npu():
     """
@@ -62,9 +62,45 @@ def test_distribute_module_group_npu():
     )
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_distribute_module_group_npu_gloo():
+    """
+    Feature: parallel_run launcher for 2-card ``distribute_module`` integration tests
+    Description:
+        1. test_distribute_module_replicate_all_params_npu
+        2. test_distribute_module_shard_all_linears_npu
+        3. test_distribute_module_partial_shard_replicate_rest_npu
+        4. test_distribute_module_input_output_hooks_npu
+    Expectation: Run success.
+    """
+    _run_group(
+        ("test_distribute_module_replicate_all_params_npu", 10470, 2),
+        ("test_distribute_module_shard_all_linears_npu", 10471, 2),
+        ("test_distribute_module_partial_shard_replicate_rest_npu", 10472, 2),
+        ("test_distribute_module_input_output_hooks_npu", 10473, 2),
+    )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_distribute_module_precision_4card():
+    """
+    Feature: parallel_run launcher for 4-card ``distribute_module`` linear precision
+    Description:
+        1. test_distribute_module_colwise_linear_precision_vs_pytorch_ref_npu
+        2. test_distribute_module_rowwise_linear_precision_vs_pytorch_ref_npu
+    Expectation: Run success.
+    """
+    _run_group(
+        ("test_distribute_module_colwise_linear_precision_vs_pytorch_ref_npu", 10474, 4),
+        ("test_distribute_module_rowwise_linear_precision_vs_pytorch_ref_npu", 10475, 4),
+    )
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_distribute_module_precision_4card_gloo():
     """
     Feature: parallel_run launcher for 4-card ``distribute_module`` linear precision
     Description:

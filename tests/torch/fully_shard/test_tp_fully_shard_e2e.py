@@ -53,7 +53,7 @@ def test_tp_fully_shard_typical_networks():
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -70,7 +70,7 @@ def test_pure_tp_replicate_grad_managed_by_fully_shard_matches_standalone():
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -89,7 +89,7 @@ def test_hsdp_tp_comm_fusion_replicate_group_guards():
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )
@@ -106,7 +106,7 @@ def test_hsdp_tp_comm_fusion_replicate_param_guard():
 
 @arg_mark(
     plat_marks=["platform_ascend910b"],
-    level_mark="level0",
+    level_mark="level1",
     card_mark="allcards",
     essential_mark="essential",
 )

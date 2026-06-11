@@ -50,7 +50,7 @@ def test_scalar_backward_grad_correctness():
     np.testing.assert_allclose(w.grad.asnumpy(), np.array([1.0, 2.0, 3.0], dtype=np.float32))
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_backward_with_sens_grad_correctness():
     """
     Feature: MindSpore backward compatibility with explicit sens.
@@ -68,7 +68,7 @@ def test_backward_with_sens_grad_correctness():
     np.testing.assert_allclose(w.grad.asnumpy(), np.array([0.1, 0.4, 0.9], dtype=np.float32))
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_retain_grad_keeps_non_leaf_grad_correctness():
     """
     Feature: MindSpore backward compatibility for retain_grad.

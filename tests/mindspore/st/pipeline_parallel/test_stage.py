@@ -39,7 +39,7 @@ class CountNet(nn.Cell):
         return ops.matmul(x, self.w)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_pipeline_stage_backward_reuses_forward_and_gradfn_result():
     """
     Feature: pipeline stage backward integration.

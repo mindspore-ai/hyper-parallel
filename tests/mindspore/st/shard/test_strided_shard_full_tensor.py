@@ -22,7 +22,7 @@ from tests.common.parallel_case import MindSporeCase, parallel_run
 _WORKER = str(Path(__file__).resolve().parent / "strided_shard_full_tensor.py")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_strided_shard_full_tensor_mindspore():
     """

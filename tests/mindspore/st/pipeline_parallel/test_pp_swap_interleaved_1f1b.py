@@ -137,7 +137,7 @@ def _run_interleaved_swap_scenario(log_prefix: str, overlap_b_f: bool):
         _cleanup_rank_mem_files(mem_tag)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_interleaved_1f1b_pipeline_swap_memory():
     """
@@ -154,7 +154,7 @@ def test_interleaved_1f1b_pipeline_swap_memory():
     _run_interleaved_swap_scenario("test_interleaved_1f1b", overlap_b_f=False)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_interleaved_1f1b_overlap_b_f_pipeline_swap_memory():
     """

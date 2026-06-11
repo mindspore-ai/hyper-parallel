@@ -39,7 +39,7 @@ def _run_group(*cases):
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_parallelize_module_functional_2card():
     """
@@ -59,9 +59,45 @@ def test_parallelize_module_functional_2card():
     )
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_parallelize_module_functional_2card_gloo():
+    """
+    Feature: parallel_run launcher for 2-card parallelize_module functional coverage
+    Description:
+        1. test_parallelize_module_mesh_aligned_with_process_group_npu
+        2. test_parallelize_module_dict_fnmatch_npu
+        3. test_parallelize_module_src_data_rank_npu
+        4. test_parallelize_module_single_style_root_npu
+    Expectation: Run success.
+    """
+    _run_group(
+        ("test_parallelize_module_mesh_aligned_with_process_group_npu", 10460, 2),
+        ("test_parallelize_module_dict_fnmatch_npu", 10461, 2),
+        ("test_parallelize_module_src_data_rank_npu", 10462, 2),
+        ("test_parallelize_module_single_style_root_npu", 10463, 2),
+    )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
           card_mark="allcards", essential_mark="essential")
 def test_parallelize_module_precision_4card():
+    """
+    Feature: parallel_run launcher for 4-card parallelize_module precision vs CPU reference
+    Description:
+        1. test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu
+        2. test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu
+    Expectation: Run success.
+    """
+    _run_group(
+        ("test_parallelize_module_colwise_linear_precision_vs_pytorch_ref_npu", 10464, 4),
+        ("test_parallelize_module_rowwise_linear_precision_vs_pytorch_ref_npu", 10465, 4),
+    )
+
+
+@arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_parallelize_module_precision_4card_gloo():
     """
     Feature: parallel_run launcher for 4-card parallelize_module precision vs CPU reference
     Description:

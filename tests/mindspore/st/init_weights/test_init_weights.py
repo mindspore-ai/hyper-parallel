@@ -29,7 +29,7 @@ from tests.common.parallel_case import MindSporeCase, parallel_run
 _TEST_INIT_WEIGHTS = "_test_init_weights.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_init_weights():
     """
     Feature: parallel run case in init_weights (MindSpore)
@@ -43,7 +43,7 @@ def test_init_weights():
     ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_init_on_device_include_buffers_true_raises() -> None:
     """MindSpore backend should reject include_buffers=True."""
     with pytest.raises(ValueError, match="does not support include_buffers=True"):
@@ -51,7 +51,7 @@ def test_init_on_device_include_buffers_true_raises() -> None:
             pass
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_init_on_device_invalid_device_raises() -> None:
     """MindSpore backend should reject unsupported external device values."""
     with pytest.raises(ValueError, match='only "npu", "cpu", and "meta" are allowed'):

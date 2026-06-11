@@ -19,7 +19,7 @@ from tests.mindspore.st.utils import msrun_case
 _FILE_NAME = "_test_fully_shard_auto_grad.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_ms_chunked_output_fully_shard():
     """
     Feature: fully_shard autograd with chunked output (MindSpore)

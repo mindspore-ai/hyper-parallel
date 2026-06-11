@@ -82,7 +82,7 @@ def test_forward_and_gradfn_populates_parameter_grad():
     _assert_param_grad_allclose(net.w, [[3.0]])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="essential")
 def test_forward_and_gradfn_parameter_grad_accumulates():
     """
     Feature: forward_and_gradfn grad accumulation.

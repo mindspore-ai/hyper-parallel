@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,9 +17,8 @@
 import os
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 import torch.distributed as dist
-import torch_npu
 import torch
-from tests.torch.utils import init_dist
+from tests.torch.utils import _DEVICE_TYPE, init_backend
 from tests.torch.common_net import DenseNet
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.fully_shard.hsdp_utils import (
@@ -44,7 +43,7 @@ platform = get_platform()
 
 
 def _current_device():
-    device_handle = platform.get_device_handle()
+    device_handle = platform.get_device_handle(_DEVICE_TYPE)
     return torch.device(device_handle.current_device())
 
 
@@ -64,18 +63,19 @@ def test_hsdp_param_v2_fsdp_1d_mesh():
     Description: Test TorchHSDPParamV2 with 1D FSDP mesh
     Expectation: sharded param shape is correct and state is SHARDED
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP (shard only)
-    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model and get parameter
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle()
+    device_handle = platform.get_device_handle(_DEVICE_TYPE)
     # Create TorchHSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -110,7 +110,8 @@ def test_hsdp_param_v2_hsdp_2d_mesh():
     Description: Test TorchHSDPParamV2 with 2D HSDP mesh (replicate + shard)
     Expectation: sharded param shape is correct with 2D mesh
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Create 2D mesh for HSDP: (replicate_dim, shard_dim)
@@ -118,7 +119,7 @@ def test_hsdp_param_v2_hsdp_2d_mesh():
     replicate_size = 2
     shard_size = world_size // replicate_size
     device_mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(replicate_size, shard_size),
         mesh_dim_names=("replicate", "shard")
     )
@@ -132,7 +133,7 @@ def test_hsdp_param_v2_hsdp_2d_mesh():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle()
+    device_handle = platform.get_device_handle(_DEVICE_TYPE)
     # Create TorchHSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -164,18 +165,19 @@ def test_hsdp_param_v2_sharded_state_transitions():
     Description: Test state transitions (sharded -> unsharded -> sharded)
     Expectation: state transitions work correctly
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP
-    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model and parameter
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle()
+    device_handle = platform.get_device_handle(_DEVICE_TYPE)
     # Create TorchHSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -225,11 +227,12 @@ def test_hsdp_param_v2_custom_shard_placement():
     Description: Test TorchHSDPParamV2 with custom shard placement function
     Expectation: custom shard placement is applied correctly
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Create 1D mesh
-    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model with 2D weight
@@ -240,7 +243,7 @@ def test_hsdp_param_v2_custom_shard_placement():
     # Custom shard placement function - shard along dim 1 instead of default dim 0
     def custom_shard_fn(param):
         return Shard(1)
-    device_handle = platform.get_device_handle()
+    device_handle = platform.get_device_handle(_DEVICE_TYPE)
     # Create TorchHSDPParamV2 with custom placement
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -270,11 +273,12 @@ def test_hsdp_param_v2_mixed_precision():
     Description: Test TorchHSDPParamV2 with mixed precision policy
     Expectation: dtype attributes are set correctly
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Create mesh
-    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model
@@ -287,7 +291,7 @@ def test_hsdp_param_v2_mixed_precision():
         param_dtype=torch.float16,
         reduce_dtype=torch.float32,
     )
-    device_handle = platform.get_device_handle()
+    device_handle = platform.get_device_handle(_DEVICE_TYPE)
     # Create TorchHSDPParamV2 with mixed precision
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -315,11 +319,12 @@ def test_hsdp_param_v2_all_gather_comm():
     Description: Test param-level all-gather communication
     Expectation: all-gather correctly reconstructs full parameter
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP
-    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model with known values
@@ -327,7 +332,7 @@ def test_hsdp_param_v2_all_gather_comm():
     net = DenseNet(in_channels, hidden_size)
     # Initialize weight with rank-based values for verification
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle()
+    device_handle = platform.get_device_handle(_DEVICE_TYPE)
     # Create TorchHSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -358,18 +363,19 @@ def test_hsdp_param_v2_prefetch_unshard():
     Description: Test async prefetch and unshard workflow
     Expectation: prefetch correctly prepares unsharded parameter
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP
-    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle()
+    device_handle = platform.get_device_handle(_DEVICE_TYPE)
     # Create TorchHSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -399,18 +405,19 @@ def test_hsdp_param_v2_unshard_shard_cycle():
     Description: Test complete unshard -> shard cycle with communication
     Expectation: state transitions and communication work correctly
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP
-    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle()
+    device_handle = platform.get_device_handle(_DEVICE_TYPE)
     # Create TorchHSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -441,18 +448,19 @@ def test_hsdp_param_v2_reduce_scatter_grad():
     Description: Test reduce-scatter gradient communication with deterministic data
     Expectation: gradient is correctly reduced and scattered
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP
-    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle()
+    device_handle = platform.get_device_handle(_DEVICE_TYPE)
     # Create TorchHSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -498,14 +506,15 @@ def test_hsdp_param_v2_all_reduce_grad():
     Description: Test all-reduce gradient communication in HSDP mode
     Expectation: gradient is correctly all-reduced across replicate dimension
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Create 2D mesh for HSDP: (replicate_dim, shard_dim)
     replicate_size = 2
     shard_size = world_size // replicate_size
     device_mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(replicate_size, shard_size),
         mesh_dim_names=("replicate", "shard")
     )
@@ -519,7 +528,7 @@ def test_hsdp_param_v2_all_reduce_grad():
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle()
+    device_handle = platform.get_device_handle(_DEVICE_TYPE)
     # Create TorchHSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -565,18 +574,19 @@ def test_hsdp_param_v2_accumulate_grad():
     Description: Test gradient accumulation workflow with deterministic data
     Expectation: gradients are correctly accumulated across iterations
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Create 1D mesh for FSDP
-    device_mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    device_mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=device_mesh, shard_mesh_dim=0)
 
     # Create model
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
     module_info = ParamModuleInfo(module=net, param_name="weight")
-    device_handle = platform.get_device_handle()
+    device_handle = platform.get_device_handle(_DEVICE_TYPE)
     # Create TorchHSDPParamV2
     hsdp_param = _build_hsdp_param(
         param=net.weight,
@@ -635,14 +645,15 @@ def test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout():
     Description: Test DTensor param on 2D dp x tp mesh with fully_shard enabled.
     Expectation: fully_shard only adds DP sharding and preserves TP placement after unshard.
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
     tp_size = 2
     assert world_size % tp_size == 0, "world_size should be divisible by tp_size"
     dp_size = world_size // tp_size
 
     root_mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(dp_size, tp_size),
         mesh_dim_names=("dp", "tp"),
     )
@@ -652,7 +663,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_preserve_tp_layout():
 
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
-    local_weight = torch.full((in_channels, hidden_size // tp_size), float(rank), device="npu")
+    local_weight = torch.full((in_channels, hidden_size // tp_size), float(rank), device=_DEVICE_TYPE)
     net.weight = torch.nn.Parameter(
         DTensor.from_local(local_weight, tp_mesh, (Shard(1),))
     )
@@ -687,14 +698,15 @@ def test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard():
     Description: Test DTensor param on 2D dp x tp mesh when TP and fully_shard split the same tensor dim.
     Expectation: fully_shard uses StridedShard and layout tensor_map preserves the split order.
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
     tp_size = 2
     assert world_size % tp_size == 0, "world_size should be divisible by tp_size"
     dp_size = world_size // tp_size
 
     root_mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(dp_size, tp_size),
         mesh_dim_names=("dp", "tp"),
     )
@@ -704,7 +716,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_same_dim_uses_strided_shard():
 
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
-    local_weight = torch.full((in_channels // tp_size, hidden_size), float(rank), device="npu")
+    local_weight = torch.full((in_channels // tp_size, hidden_size), float(rank), device=_DEVICE_TYPE)
     net.weight = torch.nn.Parameter(
         DTensor.from_local(local_weight, tp_mesh, (Shard(0),))
     )
@@ -739,7 +751,8 @@ def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim():
     Description: Test DTensor param on 3D dp x tp x ep mesh.
     Expectation: unshard only restores the DP/FSDP dim and keeps TP/EP placements unchanged.
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
     dp_size = 2
     tp_size = 2
@@ -747,7 +760,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim():
     ep_size = world_size // (dp_size * tp_size)
 
     root_mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(dp_size, tp_size, ep_size),
         mesh_dim_names=("dp", "tp", "ep"),
     )
@@ -757,7 +770,7 @@ def test_hsdp_param_v2_dtensor_dp_tp_ep_unshard_only_fsdp_dim():
 
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
-    local_weight = torch.full((in_channels, hidden_size // tp_size), float(rank), device="npu")
+    local_weight = torch.full((in_channels, hidden_size // tp_size), float(rank), device=_DEVICE_TYPE)
     net.weight = torch.nn.Parameter(
         DTensor.from_local(local_weight, tp_ep_mesh, (Shard(1), Replicate()))
     )
@@ -791,11 +804,12 @@ def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
     Description: Test the DTensor compatibility mode without extra fully_shard parameter sharding.
     Expectation: TP-replicated parameters are synchronized by all-reduce only.
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(world_size,),
         mesh_dim_names=("tp",),
     )
@@ -803,7 +817,7 @@ def test_hsdp_param_v2_pure_tp_no_param_shard_all_reduce():
 
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
-    local_weight = torch.full((in_channels, hidden_size), float(rank), device="npu")
+    local_weight = torch.full((in_channels, hidden_size), float(rank), device=_DEVICE_TYPE)
     net.weight = torch.nn.Parameter(
         DTensor.from_local(local_weight, mesh, (Replicate(),))
     )
@@ -842,11 +856,12 @@ def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce():
     Description: Test DTensor compatibility mode for already sharded distributed parameters.
     Expectation: TP-sharded parameters do not create an all-reduce group in the compatibility path.
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(world_size,),
         mesh_dim_names=("tp",),
     )
@@ -854,7 +869,7 @@ def test_hsdp_param_v2_pure_tp_sharded_param_skips_all_reduce():
 
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
-    local_weight = torch.full((in_channels, hidden_size // world_size), float(rank), device="npu")
+    local_weight = torch.full((in_channels, hidden_size // world_size), float(rank), device=_DEVICE_TYPE)
     net.weight = torch.nn.Parameter(
         DTensor.from_local(local_weight, mesh, (Shard(1),))
     )
@@ -887,7 +902,8 @@ def test_hsdp_param_v2_explicit_dp_mesh_prefixes_unified_layout():
     Description: Test unified mesh uses explicit DP mesh prefix followed by TP mesh.
     Expectation: DP replicate group size stays correct and StridedShard is applied on the FSDP axis.
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
     if world_size % 4 != 0:
         print(f"[Rank {rank}] Skip explicit DP mesh prefix test because world_size={world_size} is not divisible by 4")
@@ -897,7 +913,7 @@ def test_hsdp_param_v2_explicit_dp_mesh_prefixes_unified_layout():
     dp_size = 2
     fsdp_size = 2
     root_mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(dp_size, fsdp_size, tp_size),
         mesh_dim_names=("dp", "fsdp", "tp"),
     )
@@ -907,7 +923,7 @@ def test_hsdp_param_v2_explicit_dp_mesh_prefixes_unified_layout():
 
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
-    local_weight = torch.full((in_channels // max(tp_size, 1), hidden_size), float(rank), device="npu")
+    local_weight = torch.full((in_channels // max(tp_size, 1), hidden_size), float(rank), device=_DEVICE_TYPE)
     net.weight = torch.nn.Parameter(
         DTensor.from_local(local_weight, tp_mesh, (Shard(0),))
     )
@@ -939,7 +955,8 @@ def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
     Description: Test DTensor unified layout keeps the explicit DP/FSDP dims on the unified mesh.
     Expectation: shard/replicate mesh dims and unsharded group construction stay correct.
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
     if world_size % 4 != 0:
         print(f"[Rank {rank}] Skip reordered mesh remap test because world_size={world_size} is not divisible by 4")
@@ -949,7 +966,7 @@ def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
     dp_size = 2
     fsdp_size = 2
     root_mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(dp_size, fsdp_size, tp_size),
         mesh_dim_names=("dp", "fsdp", "tp"),
     )
@@ -959,7 +976,7 @@ def test_hsdp_param_v2_reordered_mesh_remaps_dp_dims_for_dtensor():
 
     in_channels, hidden_size = 32, 64
     net = DenseNet(in_channels, hidden_size)
-    local_weight = torch.full((in_channels // max(tp_size, 1), hidden_size), float(rank), device="npu")
+    local_weight = torch.full((in_channels // max(tp_size, 1), hidden_size), float(rank), device=_DEVICE_TYPE)
     net.weight = torch.nn.Parameter(
         DTensor.from_local(local_weight, tp_mesh, (Shard(0),))
     )
@@ -1000,13 +1017,14 @@ def test_hsdp_param_v2_non_dim0_unshard_round_trip():
     Description: Test non-dim0 fully_shard reconstructs the original tensor after all-gather.
     Expectation: local shard and unsharded parameter both match the reference layout.
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
     if world_size <= 1:
         print(f"[Rank {rank}] Skip non-dim0 unshard round-trip because world_size={world_size}")
         return
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=mesh, shard_mesh_dim=0)
     in_channels, hidden_size = 8, world_size * 4
     net = DenseNet(in_channels, hidden_size)
@@ -1047,13 +1065,14 @@ def test_hsdp_param_v2_non_dim0_reduce_scatter_grad():
     Description: Test non-dim0 fully_shard packs gradients with chunk-cat and recovers local shard grad.
     Expectation: reduce_scatter_grad and apply_reduced_grad match the reference dim1 shards.
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
     if world_size <= 1:
         print(f"[Rank {rank}] Skip non-dim0 RS test because world_size={world_size}")
         return
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    mesh = init_device_mesh(device_type=_DEVICE_TYPE, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     mesh_info = FSDPMeshInfo(mesh=mesh, shard_mesh_dim=0)
     in_channels, hidden_size = 8, world_size * 4
     net = DenseNet(in_channels, hidden_size)
@@ -1108,7 +1127,8 @@ def test_hsdp_param_v2_same_dim_strided_non_dim0_backward():
     Description: Test same-dim TP + fully_shard on dim=1 restores the TP-local view and shards grads correctly.
     Expectation: placements, unshard, reduce_scatter_grad, and apply_reduced_grad all match the reference layout.
     """
-    rank, _ = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
     tp_size = 2
     if world_size < 4 or world_size % tp_size != 0:
@@ -1117,7 +1137,7 @@ def test_hsdp_param_v2_same_dim_strided_non_dim0_backward():
 
     dp_size = world_size // tp_size
     root_mesh = init_device_mesh(
-        device_type="npu",
+        device_type=_DEVICE_TYPE,
         mesh_shape=(dp_size, tp_size),
         mesh_dim_names=("dp", "tp"),
     )

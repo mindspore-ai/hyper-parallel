@@ -19,7 +19,7 @@ from tests.torch.utils import torchrun_case
 file_name = "_test_fully_shard_replicate_params.py"
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_fully_shard_replicate_params():
     """
     Feature: Test_zero3_fully_shard.
@@ -31,7 +31,7 @@ def test_zero3_fully_shard_replicate_params():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_fully_shard_replicate_params_with_offload():
     """
     Feature: test_zero3_fully_shard_replicate_params_with_offload.
@@ -43,7 +43,7 @@ def test_zero3_fully_shard_replicate_params_with_offload():
     torchrun_case(file_name, case_name, master_port)
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_zero3_partial_shard_replicate_params():
     """
     Feature: test_zero3_partial_shard_replicate_params.
