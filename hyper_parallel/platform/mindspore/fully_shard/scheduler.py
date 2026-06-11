@@ -18,6 +18,7 @@ import mindspore as ms
 from mindspore._c_expression import _DisableMsDispatchMode
 from mindspore.common.api import _pynative_executor
 from mindspore.utils._pytree import tree_flatten, tree_unflatten
+from hyper_parallel.tools.logging import get_logger
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2, FSDPSchedulerState
 from hyper_parallel.core.fully_shard.hsdp_utils import get_dtensor_managed_mesh
 from hyper_parallel.platform.mindspore.fully_shard.hook_function import PostBackwardFunction
@@ -25,6 +26,8 @@ from hyper_parallel.platform.mindspore.fully_shard.param_group import get_comm_c
 from hyper_parallel.platform.mindspore.fully_shard.state import MindSporeHSDPStateV2
 from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, HSDPMeshInfo, DDPMeshInfo
 from hyper_parallel.platform import get_platform
+
+logger = get_logger("FSDP")
 
 
 class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
@@ -165,16 +168,29 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         activation recompute) is independent of the drain and is cleared only by the root
         module's own hook, keyed on ``_is_root``.
         """
+        logger.debug("hook=root_backward_hook enter module=%s", self.hsdp_state)
         self._backward_hook()
         if self._is_root:
             HSDPSchedulerV2.root_bp_state = False
         comm_ctx = get_comm_ctx()
         if comm_ctx.all_reduce_param_group is not None:
+            logger.debug(
+                "hook=root_backward_hook wait=comm_fusion_all_reduce module=%s",
+                self.hsdp_state,
+            )
             comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
             comm_ctx.all_reduce_param_group = None
         if comm_ctx.pre_param_group is not None:
+            logger.debug(
+                "hook=root_backward_hook apply=comm_fusion_reduce_scatter module=%s",
+                self.hsdp_state,
+            )
             comm_ctx.pre_param_group.apply_fusion_reduced_grad()
             comm_ctx.pre_param_group = None
+        logger.debug(
+            "hook=root_backward_hook action=reduce_params module=%s",
+            self.hsdp_state,
+        )
         self.hsdp_state.reduce_params()
         self.hsdp_state._finish_ignored_allreduce()
 

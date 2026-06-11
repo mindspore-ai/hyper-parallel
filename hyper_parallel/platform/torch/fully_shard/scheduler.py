@@ -19,12 +19,15 @@ from typing import List
 from torch.autograd import Variable
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.tools.logging import get_logger
 from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2, FSDPSchedulerState
 from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, DDPMeshInfo, HSDPMeshInfo
 from hyper_parallel.platform.torch.fully_shard.hook_function import PostBackwardFunction
 from hyper_parallel.platform.torch.fully_shard.state import TorchHSDPStateV2
 from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx
 from hyper_parallel.platform import get_platform
+
+logger = get_logger("FSDP")
 
 
 class TorchHSDPSchedulerV2(HSDPSchedulerV2):
@@ -170,25 +173,43 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         independent of the reduce branch: it is cleared only by the root module's own
         hook, keyed on ``_is_root``.
         """
+        logger.debug("hook=root_backward_hook enter module=%s", self.hsdp_state)
         apply_final_reduce = self.scheduler_state != FSDPSchedulerState.BACKWARD
         self._backward_hook()
         if self._is_root:
             HSDPSchedulerV2.root_bp_state = False
         if apply_final_reduce or force_reduce:
             with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
+                logger.debug(
+                    "hook=root_backward_hook action=final_reduce module=%s",
+                    self.hsdp_state,
+                )
                 # Drain any pending async fused reduction from the last module's backward
                 comm_ctx = get_comm_ctx()
                 # Drain any pending pipelined HSDP reductions (comm_fusion=True)
                 if comm_ctx.all_reduce_param_group is not None:
+                    logger.debug(
+                        "hook=root_backward_hook wait=comm_fusion_all_reduce module=%s",
+                        self.hsdp_state,
+                    )
                     comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
                     comm_ctx.all_reduce_param_group = None
                 if comm_ctx.pre_param_group is not None:
+                    logger.debug(
+                        "hook=root_backward_hook apply=comm_fusion_reduce_scatter module=%s",
+                        self.hsdp_state,
+                    )
                     comm_ctx.pre_param_group.apply_fusion_reduced_grad()
                     comm_ctx.pre_param_group = None
 
                 # Process the last module's reduce_scatter and allreduce (comm_fusion=False)
                 if TorchHSDPStateV2.pre_all_reduce_groups:
                     for group in TorchHSDPStateV2.pre_all_reduce_groups:
+                        logger.debug(
+                            "hook=root_backward_hook wait=pre_reduce_scatter group_size=%s module=%s",
+                            len(group.hsdp_params),
+                            self.hsdp_state,
+                        )
                         # Wait reduce_scatter
                         for hsdp_param in group.hsdp_params:
                             hsdp_param.reduce_scatter_output()
@@ -199,6 +220,11 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
                         # The gradients in sharded_param.grad are reduce_scatter results (not allreduced)
                         group.accumulate_existing_grads_to_buffer()
                         # Issue allreduce
+                        logger.debug(
+                            "hook=root_backward_hook launch=fused_all_reduce group_size=%s module=%s",
+                            len(group.hsdp_params),
+                            self.hsdp_state,
+                        )
                         group.issue_async_allreduce()
                         TorchHSDPStateV2.pending_all_reduce_groups.append(group)
                     TorchHSDPStateV2.pre_all_reduce_groups.clear()
