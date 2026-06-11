@@ -16,12 +16,12 @@
 from collections import namedtuple
 from typing import Any, List
 
-import sapp_ppb.utils.recompute as Recompute
-from sapp_ppb.sapp.sapp_pipeline import SappPipeline
-from sapp_ppb.utils.config import generate_solvable_config, print_dryrun_config
-from sapp_ppb.utils.error import check_in_bounds
-from sapp_ppb.utils.layer import Layer
-from sapp_ppb.utils.logger import logger
+import hyper_parallel.auto_parallel.sapp_ppb.utils.recompute as Recompute
+from hyper_parallel.auto_parallel.sapp_ppb.sapp.sapp_pipeline import SappPipeline
+from hyper_parallel.auto_parallel.sapp_ppb.utils.config import generate_solvable_config, print_dryrun_config
+from hyper_parallel.auto_parallel.sapp_ppb.utils.error import check_in_bounds
+from hyper_parallel.auto_parallel.sapp_ppb.utils.layer import Layer
+from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
 
 YES_OR_NO = "[y/n]? "
 

@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import matplotlib.pyplot as plt
 
-from sapp_ppb.simulator.plot_manager import PlotMgr
-from sapp_ppb.simulator.sim_block import BlockSim, MicroBlockSim
-from sapp_ppb.utils.logger import logger
+from hyper_parallel.auto_parallel.sapp_ppb.simulator.plot_manager import PlotMgr
+from hyper_parallel.auto_parallel.sapp_ppb.simulator.sim_block import BlockSim, MicroBlockSim
+from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
 
 
 class CausalError(Exception):

@@ -23,13 +23,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import yaml
 
-import sapp_ppb.utils.recompute as Recompute
-from sapp_ppb.sapp.sapp_solver import SappSolver
-from sapp_ppb.utils.check_rules import check_yaml_depth_before_loading
-from sapp_ppb.utils.computation_analyzer import ComputationAnalyzer
-from sapp_ppb.utils.compute_memory import ComputeMemory, Stage
-from sapp_ppb.utils.layer import Layer
-from sapp_ppb.utils.logger import logger
+import hyper_parallel.auto_parallel.sapp_ppb.utils.recompute as Recompute
+from hyper_parallel.auto_parallel.sapp_ppb.sapp.sapp_solver import SappSolver
+from hyper_parallel.auto_parallel.sapp_ppb.utils.check_rules import check_yaml_depth_before_loading
+from hyper_parallel.auto_parallel.sapp_ppb.utils.computation_analyzer import ComputationAnalyzer
+from hyper_parallel.auto_parallel.sapp_ppb.utils.compute_memory import ComputeMemory, Stage
+from hyper_parallel.auto_parallel.sapp_ppb.utils.layer import Layer
+from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
 
 random.seed()
 

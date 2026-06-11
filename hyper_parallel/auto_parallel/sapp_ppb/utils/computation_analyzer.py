@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 
 from tqdm import tqdm
 
-from sapp_ppb.utils.logger import logger
+from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
 
 UNSTABLE_STEPS = 2
 

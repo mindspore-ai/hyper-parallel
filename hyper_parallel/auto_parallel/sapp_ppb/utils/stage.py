@@ -14,8 +14,8 @@
 # ============================================================================
 """Stage descriptor used by the ILP solver to represent one pipeline stage's workload."""
 
-import sapp_ppb.utils.recompute as Recompute
-from sapp_ppb.utils.error import assert_sapp
+import hyper_parallel.auto_parallel.sapp_ppb.utils.recompute as Recompute
+from hyper_parallel.auto_parallel.sapp_ppb.utils.error import assert_sapp
 
 
 class Stage:

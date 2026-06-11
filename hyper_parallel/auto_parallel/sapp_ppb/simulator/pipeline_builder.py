@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Callable, List
 
-from sapp_ppb.simulator.sim_block import BlockSim, HeadBlockSim, MicroBlockSim
+from hyper_parallel.auto_parallel.sapp_ppb.simulator.sim_block import BlockSim, HeadBlockSim, MicroBlockSim
 
 BuilderFn = Callable[..., List[BlockSim]]
 

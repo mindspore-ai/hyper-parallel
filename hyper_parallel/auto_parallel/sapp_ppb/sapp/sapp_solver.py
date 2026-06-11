@@ -21,9 +21,9 @@ from typing import Any, Dict, List, Optional
 
 import pulp as lpSolver
 
-import sapp_ppb.utils.recompute as Recompute
-from sapp_ppb.utils.layer import Layer
-from sapp_ppb.utils.logger import logger
+import hyper_parallel.auto_parallel.sapp_ppb.utils.recompute as Recompute
+from hyper_parallel.auto_parallel.sapp_ppb.utils.layer import Layer
+from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
 
 # seqpipe const
 tensor_float_16 = 2

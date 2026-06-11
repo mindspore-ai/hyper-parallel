@@ -20,7 +20,7 @@ from typing import Any, Callable, List, Tuple, Union
 import numpy as np
 from matplotlib import colors
 
-from sapp_ppb.utils.logger import logger
+from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
 
 ScalarOrMatrix = Union[int, float, List[List[Union[int, float]]], Tuple[Tuple[Union[int, float], ...], ...]]
 

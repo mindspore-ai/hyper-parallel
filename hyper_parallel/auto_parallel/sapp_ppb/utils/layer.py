@@ -18,9 +18,9 @@ import os
 from enum import Enum
 from typing import Any, Dict, Optional
 
-import sapp_ppb.utils.recompute as Recompute
-from sapp_ppb.utils.computation_analyzer import ComputationAnalyzer
-from sapp_ppb.utils.logger import logger
+import hyper_parallel.auto_parallel.sapp_ppb.utils.recompute as Recompute
+from hyper_parallel.auto_parallel.sapp_ppb.utils.computation_analyzer import ComputationAnalyzer
+from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
 
 
 class Layer:

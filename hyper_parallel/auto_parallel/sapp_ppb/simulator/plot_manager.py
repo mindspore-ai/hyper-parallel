@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.transforms import ScaledTranslation
 
-from sapp_ppb.simulator.sim_block import BlockSim, MicroBlockSim
+from hyper_parallel.auto_parallel.sapp_ppb.simulator.sim_block import BlockSim, MicroBlockSim
 
 
 class PlotMgr:

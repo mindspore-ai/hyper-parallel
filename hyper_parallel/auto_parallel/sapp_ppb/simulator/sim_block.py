@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Polygon, Rectangle
 
-from sapp_ppb.simulator.utils import color_mix, dfs_builder
+from hyper_parallel.auto_parallel.sapp_ppb.simulator.utils import color_mix, dfs_builder
 
 
 @dataclass
