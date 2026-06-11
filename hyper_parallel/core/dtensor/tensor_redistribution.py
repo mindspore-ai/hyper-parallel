@@ -303,7 +303,7 @@ class TensorRedistribution:
                 continue
             dev_axis = from_layout.alias_name[dev_axis_index]
             apply_shard_dim = to_layout.get_dev_axis_apply_shard_axis(dev_axis)
-            comm_op = "ReduceScatter" if apply_shard_dim else "AllReduce"
+            comm_op = "ReduceScatter" if apply_shard_dim is not None else "AllReduce"
             pending_reduce_op_list.append((comm_op, op, dev_axis, apply_shard_dim))
 
         # sort reduce op
