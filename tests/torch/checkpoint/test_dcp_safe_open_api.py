@@ -2,7 +2,7 @@
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
-DCP_SAFE_OPEN_API = "tests/torch/checkpoint/dcp_safe_open_api.py"
+DCP_SAFE_OPEN_API = "dcp_safe_open_api.py"
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="onecard", essential_mark="unessential")

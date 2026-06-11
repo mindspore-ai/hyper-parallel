@@ -31,7 +31,6 @@ def test_dcp_save_and_load_group1():
     """
     parallel_run([
         TorchCase(DCP_SAVE_AND_LOAD, "test_dcp_save_and_load_with_dtensor_and_tensor_and_scalar", 12253, 4),
-        TorchCase(DCP_SAVE_AND_LOAD, "test_dcp_async_save_and_load_with_dtensor_and_tensor_and_scalar", 12256, 4),
     ])
 
 
@@ -45,6 +44,7 @@ def test_dcp_save_and_load_group2():
     """
     parallel_run([
         TorchCase(DCP_SAVE_AND_LOAD, "test_dcp_save_and_load_with_full_tensor", 12255, 2),
+        TorchCase(DCP_SAVE_AND_LOAD, "test_dcp_async_save_and_load_with_dtensor_and_tensor_and_scalar", 12256, 4),
     ])
 
 

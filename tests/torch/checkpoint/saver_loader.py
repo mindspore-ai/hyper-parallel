@@ -29,16 +29,12 @@ def test_save_load_checkpoint():
     """
     model = SimpleModel().npu()
     original_state_dict = model.state_dict()
-    save_data = {
-        "model_state_dict": original_state_dict,
-    }
 
     # save checkpoint
     pid = os.getpid()
     file_path = f"tmp_{pid}.safetensors"
-    save_checkpoint(save_data, file_path)
+    save_checkpoint(original_state_dict, file_path)
 
     # load checkpoint
     load_dict = load_checkpoint(file_path)
-    os.remove(file_path)
-    assert isinstance(load_dict, dict)
+    assert load_dict.keys() == original_state_dict.keys()
