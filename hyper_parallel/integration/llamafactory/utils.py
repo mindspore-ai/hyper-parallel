@@ -233,15 +233,6 @@ def _resolve_offload_policy(fsdp2_plugin) -> OffloadPolicy:
     return OffloadPolicy()
 
 
-def _is_cpu_offload_enabled(cpu_offload) -> bool:
-    """Return whether CPU offload is truly enabled."""
-    if cpu_offload is True:
-        return True
-    if isinstance(cpu_offload, CPUOffloadPolicy):
-        return True
-    return type(cpu_offload).__name__ == "CPUOffloadPolicy"
-
-
 def _resolve_mp_policy(fsdp2_plugin, hp_args) -> MixedPrecisionPolicy:
     """Resolve mixed precision with Accelerate defaults and optional HyperParallel overrides."""
     policy = getattr(fsdp2_plugin, "mixed_precision_policy", None)
@@ -450,54 +441,43 @@ def _load_local_optimizer_state(optimizer, saved_sd: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def fsdp2_load_full_state_dict(
-    accelerator, model: nn.Module, full_sd: dict, cpu_offload: bool = False
-):
-    """Load full state dict into a HyperParallel-sharded model following Accelerate semantics."""
-    meta_sharded_sd = model.state_dict()
-    local_sd = {}
+def fsdp2_load_full_state_dict(accelerator, model: nn.Module, full_sd: dict):
+    """
+    Loads the full state dict (could be only on rank 0) into the sharded model. This is done by broadcasting the
+    parameters from rank 0 to all other ranks. This function modifies the model in-place.
 
-    def _infer_parameter_dtype(
-        target_model: nn.Module, param_name: str, empty_param: torch.Tensor
-    ):
+    Args:
+        accelerator (`Accelerator`): The accelerator instance
+        model (`nn.Module`):
+            The model to load the state dict into, expected to be on meta device or a VRAM spike can occur
+        full_sd (`dict`): The full state dict to load, can only be on rank 0
+    """
+    # Model was previously copied to meta device
+    meta_sharded_sd = model.state_dict()
+    sharded_sd = {}
+
+    # Rank 0 distributes the full state dict to other ranks
+    def _infer_parameter_dtype(target_model, param_name, empty_param):
         try:
-            old_param = target_model.get_parameter(param_name)
-        except Exception:  # pylint: disable=broad-except
-            old_param = None
-        if old_param is None:
-            try:
-                old_param = target_model.get_buffer(param_name)
-            except Exception:  # pylint: disable=broad-except
-                old_param = None
-        if old_param is None:
-            base_name, local_name = param_name.rsplit(".", 1)
-            old_param = getattr(target_model.get_submodule(base_name), local_name)
+            old_param = target_model.get_parameter_or_buffer(param_name)
+        except AttributeError:
+            # Need this for LORA, as there some params are not *parameters* of sorts
+            base_param_name, local_param_name = param_name.rsplit(".", 1)
+            submodule = target_model.get_submodule(base_param_name)
+            old_param = getattr(submodule, local_param_name)
 
         is_torch_e4m3fn_available = hasattr(torch, "float8_e4m3fn")
         casting_dtype = None
-        is_param_float8 = (
+        is_param_float8_e4m3fn = (
             is_torch_e4m3fn_available and empty_param.dtype == torch.float8_e4m3fn
         )
-        if empty_param.dtype.is_floating_point and not is_param_float8:
+
+        if empty_param.dtype.is_floating_point and not is_param_float8_e4m3fn:
             casting_dtype = old_param.dtype
-        if isinstance(old_param, DTensor):
-            local_param = old_param.to_local()
-            return (
-                local_param is not None and local_param.is_contiguous(),
-                casting_dtype,
-            )
+
         return old_param is not None and old_param.is_contiguous(), casting_dtype
 
-    def _cast_and_contiguous(tensor: torch.Tensor, to_contiguous: bool, dtype):
-        if isinstance(tensor, DTensor):
-            local_tensor = tensor.to_local()
-            if dtype is not None:
-                local_tensor = local_tensor.to(dtype=dtype)
-            if to_contiguous:
-                local_tensor = local_tensor.contiguous()
-            return DTensor.from_local(
-                local_tensor, tensor.device_mesh, tensor.placements
-            )
+    def _cast_and_contiguous(tensor, to_contiguous, dtype):
         if dtype is not None:
             tensor = tensor.to(dtype=dtype)
         if to_contiguous:
@@ -505,50 +485,49 @@ def fsdp2_load_full_state_dict(
         return tensor
 
     if accelerator.is_main_process:
-        iterable = full_sd.items()
+        for (param_name, full_param), sharded_param in zip(
+            full_sd.items(), meta_sharded_sd.values()
+        ):
+            device_mesh = sharded_param.device_mesh
+            full_param = full_param.detach().to(device_mesh.device_type)
+            dist.broadcast(full_param, src=0, group=dist.group.WORLD)
+            sharded_tensor = distribute_tensor(
+                full_param, device_mesh, sharded_param.placements
+            )
+            to_contiguous, casting_dtype = _infer_parameter_dtype(
+                model,
+                param_name,
+                full_param,
+            )
+            sharded_tensor = _cast_and_contiguous(
+                sharded_tensor, to_contiguous, casting_dtype
+            )
+            sharded_sd[param_name] = sharded_tensor
+    # We need this else to have a matching `broadcast` for all of the ranks, else we deadlock
     else:
-        iterable = meta_sharded_sd.items()
-
-    for item in iterable:
-        if accelerator.is_main_process:
-            param_name, full_param = item
-            sharded_param = meta_sharded_sd[param_name]
-        else:
-            param_name, sharded_param = item
-            full_param = torch.empty(
+        for param_name, sharded_param in meta_sharded_sd.items():
+            device_mesh = sharded_param.device_mesh
+            full_tensor = torch.empty(
                 sharded_param.size(),
-                device=accelerator.device,
+                device=device_mesh.device_type,
                 dtype=sharded_param.dtype,
             )
+            dist.broadcast(full_tensor, src=0, group=dist.group.WORLD)
+            sharded_tensor = distribute_tensor(
+                full_tensor, device_mesh, sharded_param.placements
+            )
+            to_contiguous, casting_dtype = _infer_parameter_dtype(
+                model,
+                param_name,
+                full_tensor,
+            )
+            sharded_tensor = _cast_and_contiguous(
+                sharded_tensor, to_contiguous, casting_dtype
+            )
+            sharded_sd[param_name] = sharded_tensor
 
-        if isinstance(full_param, DTensor):
-            full_param = full_param.to_local()
-
-        full_param = full_param.detach().to(accelerator.device)
-        dist.broadcast(full_param, src=0, group=dist.group.WORLD)
-
-        if isinstance(sharded_param, DTensor):
-            local_param = distribute_tensor(
-                full_param, sharded_param.device_mesh, sharded_param.placements
-            ).to_local()
-        else:
-            local_param = full_param
-
-        to_contiguous, casting_dtype = _infer_parameter_dtype(
-            model, param_name, local_param
-        )
-        local_param = _cast_and_contiguous(local_param, to_contiguous, casting_dtype)
-        if isinstance(local_param, DTensor):
-            local_param = local_param.to_local()
-        local_param = local_param.detach().clone()
-        if not local_param.is_contiguous():
-            local_param = local_param.contiguous()
-        if cpu_offload:
-            local_param = local_param.to("cpu")
-
-        local_sd[param_name] = local_param
-
-    cast(nn.Module, model).load_state_dict(local_sd, assign=True)
+    # we set `assign=True` because our params are on meta device
+    cast(nn.Module, model).load_state_dict(sharded_sd, assign=True)
     return model
 
 
@@ -945,12 +924,7 @@ def fsdp2_prepare_model(accelerator, model: nn.Module, hp_args) -> nn.Module:
     _setup_prefetch(model)
 
     if fsdp2_plugin.cpu_ram_efficient_loading:
-        fsdp2_load_full_state_dict(
-            accelerator,
-            model,
-            original_sd,
-            cpu_offload=_is_cpu_offload_enabled(fsdp2_plugin.cpu_offload),
-        )
+        fsdp2_load_full_state_dict(accelerator, model, original_sd)
 
     # Activation wrapping after loading: the loading path is identical to
     # the non-activation case, avoiding interaction between CheckpointWrapper's

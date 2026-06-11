@@ -51,11 +51,9 @@ from hyper_parallel.integration.llamafactory.utils import (
     HyperParallelArguments,
     export_to_hf_format,
     _build_fsdp2_kwargs,
-    _is_cpu_offload_enabled,
     _resolve_mp_policy,
     wrap_optimizer_with_skip_dtensor_dispatch,
 )
-from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, OffloadPolicy
 
 
 class _FakeOptimizer:
@@ -65,19 +63,6 @@ class _FakeOptimizer:
     def step(self, closure=None):
         self.calls.append(closure)
         return "stepped"
-
-
-def test_cpu_offload_enabled_detection():
-    """
-    Feature: CPU offload enablement detection
-    Description: Only real CPU offload config should be treated as enabled.
-    Expectation: Falsey/default policies stay disabled, CPU offload policies enable the path.
-    """
-    assert _is_cpu_offload_enabled(False) is False
-    assert _is_cpu_offload_enabled(None) is False
-    assert _is_cpu_offload_enabled(OffloadPolicy()) is False
-    assert _is_cpu_offload_enabled(True) is True
-    assert _is_cpu_offload_enabled(CPUOffloadPolicy()) is True
 
 
 def test_hp_args_reshard_after_forward_defaults_to_accelerate_plugin(monkeypatch):
