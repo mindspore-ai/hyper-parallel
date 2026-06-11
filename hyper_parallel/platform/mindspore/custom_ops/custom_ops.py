@@ -22,6 +22,7 @@ from hyper_parallel.platform.mindspore.custom_ops.custom_op_impl import (
     NpuDenseLightningIndexerGradKlLossDFunction,
     NpuDenseLightningIndexerSoftmaxLseDFunction,
     NpuMhcPostDFunction,
+    NpuMhcPreClampSinkhornDFunction,
     NpuMhcPreSinkhornDFunction,
     NpuSparseLightningIndexerGradKlLossDFunction,
 )
@@ -54,3 +55,7 @@ class MindSporeCustomOps:
     def npu_mhc_pre_sinkhorn(*args, **kwargs):
         """Apply the NPU MHC pre-Sinkhorn custom operator."""
         return NpuMhcPreSinkhornDFunction.apply(*args, **kwargs)
+
+    @staticmethod
+    def npu_mhc_pre_clamp_sinkhorn(*args, **kwargs):
+        return NpuMhcPreClampSinkhornDFunction.apply(*args, **kwargs)

@@ -191,3 +191,33 @@ def npu_mhc_pre_sinkhorn(
         hc_mult, num_iters,
         hc_eps, norm_eps, out_flag,
     )
+
+
+def npu_mhc_pre_clamp_sinkhorn(
+        x,
+        phi,
+        alpha,
+        bias,
+        *,
+        hc_mult: int = 4,
+        num_iters: int = 20,
+        hc_eps: float = 1e-6,
+        norm_eps: float = 1e-6,
+        out_flag: bool = True,
+        clamp_min: float = 0.0,
+        clamp_max: float = 0.0,
+) -> Tuple:
+    """MHC pre-processing with clamp and Sinkhorn normalization.
+
+    .. warning::
+        This is an experimental API that subject to change or deletion.
+
+    Returns:
+        tuple: 9 output tensors.
+    """
+    return _platform.custom_ops.npu_mhc_pre_clamp_sinkhorn(
+        x, phi, alpha, bias,
+        hc_mult, num_iters,
+        hc_eps, norm_eps, out_flag,
+        clamp_min, clamp_max,
+    )

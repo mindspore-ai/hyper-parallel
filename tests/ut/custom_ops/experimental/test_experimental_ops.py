@@ -34,6 +34,7 @@ from hyper_parallel.custom_ops.experimental.experimental_ops import (  # noqa: E
     npu_dense_lightning_indexer_grad_kl_loss,
     npu_dense_lightning_indexer_softmax_lse,
     npu_mhc_post,
+    npu_mhc_pre_clamp_sinkhorn,
     npu_mhc_pre_sinkhorn,
     npu_sparse_lightning_indexer_grad_kl_loss,
 )
@@ -255,6 +256,49 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
         mock_platform.custom_ops.npu_mhc_pre_sinkhorn.assert_called_once_with(
             "x", "phi", "alpha", "bias",
             8, 10, 1e-4, 1e-5, False,
+        )
+
+
+class TestNpuMhcPreClampSinkhorn(unittest.TestCase):
+    """
+    Feature: npu_mhc_pre_clamp_sinkhorn wrapper.
+    Description: Required args and optional keyword args forwarded to platform.
+    Expectation: Platform method called once with the correct argument set.
+    """
+
+    @patch(_PATCH_TARGET)
+    def test_required_args_use_defaults(self, mock_platform):
+        """Required args only: optional kwargs default to their declared values."""
+        expected = tuple(MagicMock() for _ in range(9))
+        mock_platform.custom_ops.npu_mhc_pre_clamp_sinkhorn.return_value = expected
+
+        result = npu_mhc_pre_clamp_sinkhorn("x", "phi", "alpha", "bias")
+
+        mock_platform.custom_ops.npu_mhc_pre_clamp_sinkhorn.assert_called_once_with(
+            "x", "phi", "alpha", "bias",
+            4, 20, 1e-6, 1e-6, True, 0.0, 0.0,
+        )
+        self.assertIs(result, expected)
+
+    @patch(_PATCH_TARGET)
+    def test_custom_kwargs_forwarded(self, mock_platform):
+        """Custom clamp keyword argument values are forwarded to the platform."""
+        mock_platform.custom_ops.npu_mhc_pre_clamp_sinkhorn.return_value = None
+
+        npu_mhc_pre_clamp_sinkhorn(
+            "x", "phi", "alpha", "bias",
+            hc_mult=8,
+            num_iters=10,
+            hc_eps=1e-4,
+            norm_eps=1e-5,
+            out_flag=False,
+            clamp_min=-50.0,
+            clamp_max=50.0,
+        )
+
+        mock_platform.custom_ops.npu_mhc_pre_clamp_sinkhorn.assert_called_once_with(
+            "x", "phi", "alpha", "bias",
+            8, 10, 1e-4, 1e-5, False, -50.0, 50.0,
         )
 
 

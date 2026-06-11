@@ -28,24 +28,37 @@ _BUILD_LIB = os.path.join(_CC_DIR, "build", "lib")
 if _BUILD_LIB not in sys.path:
     sys.path.insert(0, _BUILD_LIB)
 
+_CUSTOM_OP_SOURCES = [
+    os.path.join(_CC_DIR, "module.cc"),
+    os.path.join(_CC_DIR, "dense_lightning_indexer_grad_kl_loss.cc"),
+    os.path.join(_CC_DIR, "dense_lightning_indexer_softmax_lse.cc"),
+    os.path.join(_CC_DIR, "sparse_lightning_indexer_grad_kl_loss.cc"),
+    os.path.join(_CC_DIR, "mhc_post.cc"),
+    os.path.join(_CC_DIR, "mhc_post_backward.cc"),
+    os.path.join(_CC_DIR, "mhc_pre_sinkhorn.cc"),
+    os.path.join(_CC_DIR, "mhc_pre_sinkhorn_backward.cc"),
+    os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn.cc"),
+    os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn_backward.cc"),
+]
+
+
+def _build_custom_ops():
+    return ms.ops.CustomOpBuilder(
+        _MS_EXTENSION_NAME,
+        _CUSTOM_OP_SOURCES,
+        backend="Ascend",
+    ).load()
+
+
 try:
     _custom_ops = __import__(_MS_EXTENSION_NAME)
 except ImportError:
     # Source-tree development: .so not pre-built; JIT-compile from local .cc files.
-    _custom_ops = ms.ops.CustomOpBuilder(
-        _MS_EXTENSION_NAME,
-        [
-            os.path.join(_CC_DIR, "module.cc"),
-            os.path.join(_CC_DIR, "dense_lightning_indexer_grad_kl_loss.cc"),
-            os.path.join(_CC_DIR, "dense_lightning_indexer_softmax_lse.cc"),
-            os.path.join(_CC_DIR, "sparse_lightning_indexer_grad_kl_loss.cc"),
-            os.path.join(_CC_DIR, "mhc_post.cc"),
-            os.path.join(_CC_DIR, "mhc_post_backward.cc"),
-            os.path.join(_CC_DIR, "mhc_pre_sinkhorn.cc"),
-            os.path.join(_CC_DIR, "mhc_pre_sinkhorn_backward.cc"),
-        ],
-        backend="Ascend",
-    ).load()
+    _custom_ops = _build_custom_ops()
+else:
+    # Rebuild stale source-tree extensions that predate newly added symbols.
+    if not hasattr(_custom_ops, "npu_mhc_pre_clamp_sinkhorn"):
+        _custom_ops = _build_custom_ops()
 
 
 def _ensure_contiguous(*tensors):
@@ -67,7 +80,7 @@ class NpuDenseLightningIndexerSoftmaxLseDFunction(DFunction):  # pylint: disable
     DTensor calls through the distributed dispatch framework using the
     registered DistributedOp with the same op_name.
 
-    All 9 forward arguments after ``ctx`` are positional to stay compatible
+    All 11 forward arguments after ``ctx`` are positional to stay compatible
     with both MindSpore autograd function conventions.
 
     No backward is defined because the operator does not require gradients.
@@ -351,3 +364,50 @@ class NpuMhcPreSinkhornDFunction(DFunction):  # pylint: disable=W0221
             h_pre, hc_before_norm, inv_rms, sum_out, norm_out,
             ctx.hc_eps)
         return grads[0], grads[1], grads[2], grads[3], None, None, None, None, None
+
+
+class NpuMhcPreClampSinkhornDFunction(DFunction):  # pylint: disable=W0221
+    """DFunction wrapper for npu_mhc_pre_clamp_sinkhorn on MindSpore.
+
+    This matches the static-graph aclnnMhcPreClampSinkhorn integration:
+    forward has 11 arguments and returns 9 tensors, and backward consumes
+    h_res_logits plus clamp_min/clamp_max.
+    """
+
+    _op_name = "npu_mhc_pre_clamp_sinkhorn"
+
+    @staticmethod
+    def forward(ctx, x, phi, alpha, bias, hc_mult, num_iters, hc_eps, norm_eps,
+                out_flag, clamp_min, clamp_max):
+        """Forward pass: delegates to the clamp-enabled Ascend custom kernel."""
+        result = _custom_ops.npu_mhc_pre_clamp_sinkhorn(
+            x, phi, alpha, bias, hc_mult, num_iters, hc_eps, norm_eps,
+            out_flag, clamp_min, clamp_max
+        )
+        _, _, _, h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits = result
+        ctx.save_for_backward(x, phi, alpha, bias,
+                              h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits)
+        ctx.hc_eps = hc_eps
+        ctx.clamp_min = clamp_min
+        ctx.clamp_max = clamp_max
+        return result
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """Backward pass: calls npu_mhc_pre_clamp_sinkhorn_backward kernel."""
+        x, phi, alpha, bias, h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits = ctx.saved_tensors
+        (grad_h_in, grad_h_post, grad_h_res,
+         x, phi, alpha, bias,
+         h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits) = _ensure_contiguous(
+            grad_outputs[0], grad_outputs[1], grad_outputs[2],
+            x, phi, alpha, bias,
+            h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits)
+        n = grad_h_post.shape[-1]
+        grad_h_res = ms.ops.reshape(grad_h_res, tuple(grad_h_res.shape[:-1]) + (n, n))
+
+        grads = _custom_ops.npu_mhc_pre_clamp_sinkhorn_backward(
+            grad_h_in, grad_h_post, grad_h_res,
+            x, phi, alpha, bias,
+            h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits,
+            ctx.hc_eps, ctx.clamp_min, ctx.clamp_max)
+        return grads[0], grads[1], grads[2], grads[3], None, None, None, None, None, None, None
