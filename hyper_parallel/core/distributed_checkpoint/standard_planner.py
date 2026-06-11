@@ -449,6 +449,8 @@ class StandardLoadPlanner(LoadPlanner):
         strict = not self.allow_partial_load
         for fqn, obj in self.state_dict.items():
             if fqn not in self.metadata.state_dict_metadata:
+                if fqn.endswith(('matched_adamw_rms', 'step')):
+                    continue
                 if strict:
                     raise RuntimeError(f"Missing key in checkpoint state_dict: {fqn}.")
                 continue
