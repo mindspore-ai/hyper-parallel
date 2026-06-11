@@ -523,6 +523,42 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement irecv")
 
     @staticmethod
+    def p2p_op(op_type, tensor, peer, group=None):
+        """Build a batched-P2P descriptor (no launch).
+
+        Returns an opaque object understood by :meth:`batch_isend_irecv`.
+        Lets callers assemble a mixed send/recv batch that the backend can
+        run concurrently (e.g. TX/RX duplex on one link) in a single op.
+
+        Args:
+            op_type (str): ``"isend"`` or ``"irecv"``.
+            tensor: Tensor to send, or the buffer to receive into.
+            peer (int): Global rank of the peer.
+            group: Process group. ``None`` uses the default group.
+
+        Returns:
+            A backend P2P-op descriptor.
+        """
+        raise NotImplementedError("Platform subclasses must implement p2p_op")
+
+    @staticmethod
+    def batch_isend_irecv(p2p_ops):
+        """Launch a batch of :meth:`p2p_op` descriptors as one async op.
+
+        The whole batch shares a single completion handle (the backend runs
+        the items concurrently on one comm stream), so a send and a recv to
+        the same peer overlap on the duplex link.
+
+        Args:
+            p2p_ops (list): Descriptors from :meth:`p2p_op`.
+
+        Returns:
+            A single work handle covering the whole batch, or ``None`` when
+            ``p2p_ops`` is empty.
+        """
+        raise NotImplementedError("Platform subclasses must implement batch_isend_irecv")
+
+    @staticmethod
     def p2p_exchange(tensor, peer_rank: int, group=None):
         """Differentiable symmetric P2P exchange (send local tensor, receive peer's tensor).
 

@@ -181,3 +181,71 @@ def test_pp_overlap_moe_dxdw_accuracy():
     """
     msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_dxdw_accuracy",
                12357, worker_num=8, local_worker_num=8)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_pp_overlap_moe_recompute_save_a2a():
+    """Chunk recompute that keeps (does not recompute) the EP all-to-all.
+
+    Feature: op-granularity selective recompute (SAC ``MUST_SAVE`` for the a2a)
+        composing with overlap_b_f.
+    Description:
+        8 ranks, PP=4 x EP=2.  Each chunk's forward saves every EP all-to-all
+        output; the serial re-forward fired by ``recompute_one_chunk`` restores
+        them instead of re-issuing the HCCL all-to-all, while every other op is
+        recomputed.  This is the only path that recomputes a layer's compute
+        while keeping its a2a (layer-granularity recompute re-runs the a2a).
+        Compares overlap+save-a2a grads against a sync baseline and checks the
+        a2a went through SAC's save+restore path (not re-communicated).
+    Expectation:
+        No deadlock; grads and last-rank losses match the sync baseline within
+        ``rtol=1e-3, atol=1e-3``; the a2a is classified in both the forward and
+        the recompute phase.
+    """
+    msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_recompute_save_a2a",
+               12358, worker_num=8, local_worker_num=8)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_pp_overlap_moe_accuracy_batch_p2p():
+    """Same-peer duplex P2P batching — numerical equivalence vs sync baseline.
+
+    Feature: ``p2p_transport="batch"`` — ``coalesce_p2p`` merges each same-peer
+        send+recv into one ``batch_isend_irecv`` (TX||RX duplex); both endpoints
+        batched, matched per-peer FIFO.
+    Description:
+        8 ranks, PP=4 x EP=2.  Overlap stack built with
+        ``p2p_transport="batch"`` compared against the plain sync baseline.
+        Coalescing only regroups the launch, so numerics must be unchanged.
+    Expectation:
+        No ``HcclBatchISendIRecv`` EI0005, no deadlock; losses and grads match
+        the sync baseline within ``rtol=1e-3, atol=1e-3``.
+    """
+    msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_accuracy_batch_p2p",
+               12359, worker_num=8, local_worker_num=8)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_pp_overlap_moe_accuracy_boundary():
+    """fwd-boundary batching (EXPERIMENTAL opt-in) — equivalence vs baseline.
+
+    Feature: ``p2p_transport="boundary"``: the overlap's ``F_SEND`` (payload
+        ready when the forward finishes; the backward is the long pole) plus
+        the next slot's recvs are issued mid-overlap by the stage's
+        after-forward hook via ``exec_boundary_p2p``, so the activation send
+        leaves ~half a slot early and no send rides a compute-gating recv
+        handle (a2a-friendly).  The auto default under overlap_b_f is the
+        measured-beneficial duplex "batch"; passing here is the prerequisite
+        for ever promoting boundary.
+    Description:
+        8 ranks, PP=4 x EP=2.  Overlap stack built with
+        ``p2p_transport="boundary"`` compared against the plain sync baseline.
+    Expectation:
+        No EI0005, no hang; losses and grads match the sync baseline within
+        ``rtol=1e-3, atol=1e-3``.
+    """
+    msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_accuracy_boundary",
+               12365, worker_num=8, local_worker_num=8)

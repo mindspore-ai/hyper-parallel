@@ -74,7 +74,9 @@ from hyper_parallel.core.pipeline_parallel import (
     ScheduleInterleaved1F1B,
 )
 from hyper_parallel.platform import get_platform
-from hyper_parallel.core.activation_checkpoint.activation_checkpoint import checkpoint_wrapper
+from hyper_parallel.core.activation_checkpoint.activation_checkpoint import (
+    checkpoint, checkpoint_wrapper, CheckpointPolicy,
+)
 
 from tests.mindspore.st.pipeline_parallel.overlap_expert_parallel import (
     MiniGroupedMLP,
@@ -422,12 +424,66 @@ class _RecomputeChunkWrapper(nn.Cell):
     """
 
     def __init__(self, inner: nn.Cell) -> None:
-        super().__init__()
+        # auto_prefix=False: Cell.__setattr__ would otherwise rename every
+        # wrapped param to "inner.<name>", breaking grad-name comparison
+        # against the unwrapped baseline (same convention as TrainOneStepCell).
+        super().__init__(auto_prefix=False)
         self.inner = inner
         self._wrapped_call = checkpoint_wrapper(self.inner)
 
     def construct(self, x):
         return self._wrapped_call(x)
+
+
+# Records (is_recompute,) every time the save-a2a policy classifies an
+# all-to-all op, so a test can prove the EP a2a went through SAC's
+# save (forward) + restore (recompute) path instead of being re-communicated.
+# Per-process (each rank is its own msrun worker).
+_A2A_SAC_SEEN: list = []
+
+
+def _save_a2a_policy(ctx, func, *args, **kwargs):  # pylint: disable=unused-argument
+    """SAC policy: keep (MUST_SAVE) the EP all-to-all output, recompute the rest.
+
+    Op-granularity selective activation checkpoint.  The chunk's dispatch /
+    combine ``inner_comm_all_to_all_v`` (matched by normalized name) is saved
+    in the forward pass and **restored from storage during the backward
+    re-run**, so ``recompute_one_chunk`` re-runs only the local compute and
+    re-issues no EP HCCL.  Every other op returns MUST_RECOMPUTE.
+
+    Note: this MS SAC's forward (caching) pass accepts only MUST_SAVE /
+    PREFER_SAVE / MUST_SWAP / MUST_RECOMPUTE and raises on PREFER_RECOMPUTE
+    (``sac.py``), so the non-a2a default must be MUST_RECOMPUTE, not
+    PREFER_RECOMPUTE.
+
+    Layer-granularity recompute (``enable_per_layer_recompute``) cannot express
+    this — it can only keep/recompute whole layers, not the a2a inside one.
+    """
+    name = func.name.lower().replace("_", "")
+    if "alltoall" in name:
+        _A2A_SAC_SEEN.append(bool(getattr(ctx, "is_recompute", False)))
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.MUST_RECOMPUTE
+
+
+class _RecomputeChunkWrapperSaveA2A(nn.Cell):
+    """Chunk recompute that SAVES the EP all-to-all (op-granularity SAC).
+
+    Routes the chunk forward through ``checkpoint(..., policy_fn=_save_a2a_policy)``
+    instead of plain ``checkpoint_wrapper``.  The serial re-forward fired by
+    :meth:`PipelineStage.recompute_one_chunk` reruns local compute but restores
+    the dispatch/combine a2a outputs from storage — no EP HCCL is re-issued
+    during recompute.  Exercises the "recompute compute, keep comm" path.
+    """
+
+    def __init__(self, inner: nn.Cell) -> None:
+        # auto_prefix=False keeps wrapped param names unchanged (no "inner."
+        # prefix) so the grad-name comparison against the baseline holds.
+        super().__init__(auto_prefix=False)
+        self.inner = inner
+
+    def construct(self, x):
+        return checkpoint(self.inner, x, policy_fn=_save_a2a_policy)
 
 
 # =========================================================================
@@ -464,6 +520,10 @@ def _make_overlap_b_f_callback(overlap: CommComputeOverlap):
 
         def fwd_fn():
             schedule.wait_fwd_recv(fwd_stage.stage_index, fwd_mi)
+            # ``forward_one_chunk`` fires the schedule's after-forward hook,
+            # which issues the fwd-boundary P2P (p2p_transport="boundary")
+            # while the backward is still running — no callback cooperation
+            # needed here.  No-op under the default duplex transport.
             out = fwd_stage.forward_one_chunk(
                 fwd_mi, ctx.arg_mbs[fwd_mi], ctx.kwarg_mbs[fwd_mi],
             )
@@ -771,10 +831,10 @@ def _build_pipeline(pp_rank, ep_mesh, cfg, use_overlap, overlap=None,
             "_build_pipeline: recompute=True is only exercised with "
             "use_overlap=True in this PoC."
         )
-    if recompute_granularity not in ("chunk", "layer"):
+    if recompute_granularity not in ("chunk", "layer", "chunk_save_a2a"):
         raise ValueError(
-            f"_build_pipeline: recompute_granularity must be 'chunk' or "
-            f"'layer', got {recompute_granularity!r}"
+            f"_build_pipeline: recompute_granularity must be 'chunk', 'layer', "
+            f"or 'chunk_save_a2a', got {recompute_granularity!r}"
         )
     if layers_per_chunk is None:
         layers_per_chunk = [MOE_LAYERS_PER_CHUNK] * CHUNKS_PER_RANK
@@ -845,6 +905,10 @@ def _build_pipeline(pp_rank, ep_mesh, cfg, use_overlap, overlap=None,
                 block.enable_per_layer_recompute(
                     recompute_layers=per_chunk_recompute[chunk_id],
                 )
+            elif recompute_granularity == "chunk_save_a2a":
+                # Op-granularity: recompute the chunk but SAVE the EP a2a so the
+                # backward re-run restores it instead of re-communicating.
+                block = _RecomputeChunkWrapperSaveA2A(block)
             else:
                 block = _RecomputeChunkWrapper(block)
         chunks.append(block)
@@ -871,7 +935,7 @@ def _fingerprint_params(chunks):
 
 def _run_one_iteration(chunks, stage_indices, pp_rank, device, pp_mesh,
                        overlap_p2p, overlap_b_f, callback=None,
-                       enable_dxdw_split=False, x_input=None):
+                       enable_dxdw_split=False, x_input=None, p2p_transport="auto"):
     """Run one schedule iteration; return ``(losses_np, grads_named, init_fp)``.
 
     ``losses_np`` is a list of ``np.ndarray`` (only non-empty on the last
@@ -892,7 +956,7 @@ def _run_one_iteration(chunks, stage_indices, pp_rank, device, pp_mesh,
     schedule = ScheduleInterleaved1F1B(
         stages, MICRO_BATCH_NUM,
         overlap_p2p=overlap_p2p, overlap_b_f=overlap_b_f,
-        enable_dxdw_split=enable_dxdw_split,
+        enable_dxdw_split=enable_dxdw_split, p2p_transport=p2p_transport,
     )
     if callback is not None:
         schedule.register_custom_function(MetaStepType.OVERLAP_B_F, callback)
@@ -1631,6 +1695,196 @@ def test_pp_overlap_moe_dxdw_accuracy():
           f"max_loss_diff={max_loss_diff:.3e}, max_grad_diff={max_grad_diff:.3e}, "
           f"profile_dir={prof_dir})",
           flush=True)
+
+
+def test_pp_overlap_moe_recompute_save_a2a():
+    """Chunk recompute that KEEPS (does not recompute) the EP all-to-all.
+
+    Feature: op-granularity selective recompute under overlap_b_f — recompute
+        the chunk's local compute but SAVE/restore the dispatch+combine a2a.
+    Description:
+        8 ranks, PP=4 x EP=2.  Each chunk is wrapped with
+        ``_RecomputeChunkWrapperSaveA2A`` (``checkpoint(policy_fn=_save_a2a_policy)``):
+        the forward saves every EP all-to-all output, and the serial re-forward
+        fired by ``PipelineStage.recompute_one_chunk`` RESTORES them from storage
+        instead of re-issuing the HCCL all-to-all, while every other op is
+        recomputed.  Unlike ``recompute_granularity="layer"`` (which keeps/
+        recomputes whole layers and re-runs the a2a), this is op-granularity and
+        is the only way to recompute a layer's compute while keeping its a2a.
+        Compares against a sync baseline and checks the a2a actually went through
+        SAC's save (forward) + restore (recompute) path.
+    Expectation:
+        No deadlock; the save-a2a policy classifies the a2a in BOTH the forward
+        (cache) and the recompute (restore) phase — proving it was not
+        re-communicated; per-parameter grads and last-rank losses match the sync
+        baseline within ``rtol=1e-3, atol=1e-3`` on every rank.
+    """
+    rank, device, pp_mesh, ep_mesh = _init_pp_ep_mesh()
+    pp_rank = pp_mesh.get_local_rank()
+    cfg = _TinyConfig()
+
+    # ---- Sync baseline: no overlap, no recompute (ground truth). ----
+    baseline_chunks, baseline_si = _build_pipeline(
+        pp_rank, ep_mesh, cfg, use_overlap=False,
+    )
+    baseline_losses, baseline_grads, _ = _run_one_iteration(
+        baseline_chunks, baseline_si, pp_rank, device, pp_mesh,
+        overlap_p2p=False, overlap_b_f=False,
+    )
+    del baseline_chunks
+    platform.barrier()
+
+    # ---- Chunk recompute that SAVES the EP a2a, under the full overlap stack. ----
+    overlap = CommComputeOverlap()
+    overlap_chunks, overlap_si = _build_pipeline(
+        pp_rank, ep_mesh, cfg, use_overlap=True, overlap=overlap,
+        recompute=True, recompute_granularity="chunk_save_a2a",
+    )
+    _A2A_SAC_SEEN.clear()
+    overlap_losses, overlap_grads, _ = _run_one_iteration(
+        overlap_chunks, overlap_si, pp_rank, device, pp_mesh,
+        overlap_p2p=True, overlap_b_f=True,
+        callback=_make_overlap_b_f_callback(overlap),
+    )
+
+    # ---- Verify the a2a went through SAC save (forward) + restore (recompute),
+    # ---- i.e. it was NOT re-communicated during the backward re-run. ----
+    fwd_saves = sum(1 for is_rec in _A2A_SAC_SEEN if not is_rec)
+    rec_restores = sum(1 for is_rec in _A2A_SAC_SEEN if is_rec)
+    assert fwd_saves > 0, (
+        f"[rank{rank}] save-a2a policy never matched the a2a op in the forward "
+        f"pass — SAC did not intercept it. Check the op-name match in "
+        f"_save_a2a_policy (seen={_A2A_SAC_SEEN[:8]}).")
+    assert rec_restores > 0, (
+        f"[rank{rank}] a2a never classified during recompute — the re-run did "
+        f"not hit the SAC cached path, so the a2a may have been re-communicated "
+        f"(fwd_saves={fwd_saves}, rec_restores={rec_restores}).")
+
+    _assert_overlap_matches_baseline(
+        rank, pp_rank, baseline_losses, baseline_grads,
+        overlap_losses, overlap_grads, label="recompute_save_a2a",
+    )
+    print(f"[rank{rank}] pp_overlap_moe_recompute_save_a2a: PASS "
+          f"(a2a fwd_saves={fwd_saves}, rec_restores={rec_restores}, "
+          f"params={len(baseline_grads)})", flush=True)
+
+
+def test_pp_overlap_moe_accuracy_batch_p2p():
+    """Numerical equivalence vs sync baseline with same-peer duplex P2P batching.
+
+    Feature: ``p2p_transport="batch"`` (what the ``"auto"`` default resolves
+        to under overlap_b_f) — ``build_exec_order`` runs ``coalesce_p2p``,
+        turning each contiguous P2P run into a ``BATCH_SEND_RECV`` step that the
+        runtime groups by peer and issues as one ``batch_isend_irecv`` per peer
+        (same-peer send+recv -> TX||RX duplex); leftover singletons are batched
+        too, so every transfer is batch-vs-batch, matched per-peer FIFO.
+    Description:
+        Same topology as :func:`test_pp_overlap_moe_accuracy`.  The overlap run
+        is built with ``overlap_p2p=True, overlap_b_f=True,
+        p2p_transport="batch"``; the baseline is the plain sync stack.  Coalescing only changes how the launch
+        is grouped (same sends/recvs, same data), so numerics must be unchanged.
+    Expectation:
+        No ``HcclBatchISendIRecv`` EI0005, no deadlock; per-micro-batch losses
+        (last PP rank) and per-parameter grads (every rank) match the sync
+        baseline within ``rtol=1e-3, atol=1e-3`` — proving duplex-batched P2P is
+        numerically correct in the real overlap_b_f schedule.
+    """
+    rank, device, pp_mesh, ep_mesh = _init_pp_ep_mesh()
+    pp_rank = pp_mesh.get_local_rank()
+    cfg = _TinyConfig()
+
+    # ---- Sync baseline (plain P2P, no overlap). ----
+    baseline_chunks, baseline_si = _build_pipeline(
+        pp_rank, ep_mesh, cfg, use_overlap=False,
+    )
+    baseline_losses, baseline_grads, _ = _run_one_iteration(
+        baseline_chunks, baseline_si, pp_rank, device, pp_mesh,
+        overlap_p2p=False, overlap_b_f=False,
+    )
+    del baseline_chunks
+    platform.barrier()
+
+    # ---- Overlap stack with ALL PP P2P batched. ----
+    overlap = CommComputeOverlap()
+    overlap_chunks, overlap_si = _build_pipeline(
+        pp_rank, ep_mesh, cfg, use_overlap=True, overlap=overlap,
+    )
+    overlap_losses, overlap_grads, _ = _run_one_iteration(
+        overlap_chunks, overlap_si, pp_rank, device, pp_mesh,
+        overlap_p2p=True, overlap_b_f=True,
+        callback=_make_overlap_b_f_callback(overlap),
+        p2p_transport="batch",
+    )
+
+    _assert_overlap_matches_baseline(
+        rank, pp_rank, baseline_losses, baseline_grads,
+        overlap_losses, overlap_grads, label="batch_p2p",
+    )
+    print(f"[rank{rank}] pp_overlap_moe_accuracy_batch_p2p: PASS "
+          f"(all PP P2P via batch_isend_irecv, params={len(baseline_grads)})",
+          flush=True)
+
+
+def test_pp_overlap_moe_accuracy_boundary():
+    """fwd-boundary batching (EXPERIMENTAL p2p_transport="boundary") vs baseline.
+
+    Feature: the combined mode — ``attach_fwd_boundary_p2p`` hangs each steady
+        gap's ``F_SEND`` (payload ready when the overlap's forward finishes;
+        the backward is the long pole) plus the next slot's recvs on the
+        OVERLAP_B_F step, and the callback's ``fwd_fn`` issues them mid-overlap
+        via ``exec_boundary_p2p`` — so the activation send leaves ~half a slot
+        early and the peer's next recv-wait is largely hidden.  Every op is a
+        per-op solo batch (no ``coalesce_p2p``): per-pair batch sequences stay
+        complementary ``[F_SEND, B_RECV]`` vs ``[F_RECV, B_SEND]``, safe under
+        both candidate HCCL batch-pairing semantics (the earlier naive
+        hoist+coalesce composition violated shape mirroring and hung here).
+    Description:
+        Same topology as :func:`test_pp_overlap_moe_accuracy`.  The overlap run
+        is built with ``overlap_p2p=True, overlap_b_f=True,
+        p2p_transport="boundary"`` (explicit opt-in — the auto default under
+        overlap_b_f is the measured-beneficial duplex "batch"); the baseline is
+        the plain sync stack.  Passing here is the gate for ever promoting
+        boundary to the auto default.  The mode
+        only changes *when* and *how grouped* the P2P launches are (same ops,
+        same per-direction FIFO), so numerics must be unchanged.
+    Expectation:
+        No EI0005, no hang; per-micro-batch losses (last PP rank) and
+        per-parameter grads (every rank) match the sync baseline within
+        ``rtol=1e-3, atol=1e-3``.
+    """
+    rank, device, pp_mesh, ep_mesh = _init_pp_ep_mesh()
+    pp_rank = pp_mesh.get_local_rank()
+    cfg = _TinyConfig()
+
+    # ---- Sync baseline (plain P2P, no overlap). ----
+    baseline_chunks, baseline_si = _build_pipeline(
+        pp_rank, ep_mesh, cfg, use_overlap=False,
+    )
+    baseline_losses, baseline_grads, _ = _run_one_iteration(
+        baseline_chunks, baseline_si, pp_rank, device, pp_mesh,
+        overlap_p2p=False, overlap_b_f=False,
+    )
+    del baseline_chunks
+    platform.barrier()
+
+    # ---- Overlap stack with fwd-boundary batching. ----
+    overlap = CommComputeOverlap()
+    overlap_chunks, overlap_si = _build_pipeline(
+        pp_rank, ep_mesh, cfg, use_overlap=True, overlap=overlap,
+    )
+    overlap_losses, overlap_grads, _ = _run_one_iteration(
+        overlap_chunks, overlap_si, pp_rank, device, pp_mesh,
+        overlap_p2p=True, overlap_b_f=True,
+        callback=_make_overlap_b_f_callback(overlap),
+        p2p_transport="boundary",
+    )
+
+    _assert_overlap_matches_baseline(
+        rank, pp_rank, baseline_losses, baseline_grads,
+        overlap_losses, overlap_grads, label="boundary",
+    )
+    print(f"[rank{rank}] pp_overlap_moe_accuracy_boundary: PASS "
+          f"(fwd-boundary batching, params={len(baseline_grads)})", flush=True)
 
 
 if __name__ == "__main__":
