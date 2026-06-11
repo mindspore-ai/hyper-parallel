@@ -49,6 +49,7 @@ std::vector<ms::Tensor> npu_mhc_pre_clamp_sinkhorn_backward(
   return {grad_x, grad_phi, grad_alpha, grad_bias};
 }
 
+// cppcheck-suppress syntaxError
 MS_CUSTOM_OPS_EXTENSION_MODULE(m) {
   m.def("npu_mhc_pre_clamp_sinkhorn_backward", PYBOOST_CALLER(4, custom::npu_mhc_pre_clamp_sinkhorn_backward));
 }

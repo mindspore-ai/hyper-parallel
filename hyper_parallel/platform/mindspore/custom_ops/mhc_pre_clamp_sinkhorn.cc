@@ -22,7 +22,8 @@
 namespace custom {
 namespace {
 using MhcPreClampSinkhornOutputs =
-  std::tuple<ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor>;
+  std::tuple<ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor, ms::Tensor,
+             ms::Tensor>;
 
 MhcPreClampSinkhornOutputs GenResultTensors(const ms::Tensor &x, int64_t num_iters) {
   const auto &x_shape = x.shape();
@@ -100,6 +101,7 @@ std::vector<ms::Tensor> npu_mhc_pre_clamp_sinkhorn(const ms::Tensor &x, const ms
   return {h_in, h_post, h_res, h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits};
 }
 
+// cppcheck-suppress syntaxError
 MS_CUSTOM_OPS_EXTENSION_MODULE(m) {
   m.def("npu_mhc_pre_clamp_sinkhorn", PYBOOST_CALLER(9, custom::npu_mhc_pre_clamp_sinkhorn));
 }

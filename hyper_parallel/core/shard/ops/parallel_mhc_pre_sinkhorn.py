@@ -125,6 +125,28 @@ def _validate_tensor_map_dims(
             )
 
 
+def _validate_input_layouts_mhc_pre_sinkhorn(
+        x_layout: Layout,
+        phi_layout: Layout,
+        alpha_layout: Layout,
+        bias_layout: Layout,
+) -> None:
+    """Validate input layouts for npu_mhc_pre_sinkhorn operator."""
+    x_tm = x_layout.tensor_map
+    x_tm_len = len(x_tm)
+
+    rules = _MHC_PRE_SINKHORN_VALIDATION_RULES.get(x_tm_len)
+    if rules is None:
+        raise ValueError(
+            f"For npu_mhc_pre_sinkhorn, tensor_map length should be 4 or 3, but got {x_tm_len}"
+        )
+
+    _validate_tensor_map_dims(x_tm, rules["op_name"], rules["forbidden_dims"])
+    _validate_tensor_map_dims(phi_layout.tensor_map, rules["op_name"], rules["phi_forbidden_dims"])
+    _validate_tensor_map_dims(alpha_layout.tensor_map, rules["op_name"], rules["alpha_forbidden_dims"])
+    _validate_tensor_map_dims(bias_layout.tensor_map, rules["op_name"], rules["bias_forbidden_dims"])
+
+
 class NpuMhcPreSinkhornDistributedOp(DistributedOp):
     """DistributedOp for npu_mhc_pre_sinkhorn operator.
 
@@ -175,43 +197,17 @@ class NpuMhcPreSinkhornDistributedOp(DistributedOp):
         ]
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         x_layout, phi_layout, alpha_layout, bias_layout = cache_values
 
         self._check_partial_inputs([x_layout, phi_layout, alpha_layout, bias_layout])
 
-        self._validate_input_layouts_mhc_pre_sinkhorn(
+        _validate_input_layouts_mhc_pre_sinkhorn(
             x_layout, phi_layout, alpha_layout, bias_layout
         )
 
         out_layouts = self._infer_output_layouts(x_layout)
         return out_layouts, None
-
-    @staticmethod
-    def _validate_input_layouts_mhc_pre_sinkhorn(
-            x_layout: Layout,
-            phi_layout: Layout,
-            alpha_layout: Layout,
-            bias_layout: Layout,
-    ) -> None:
-        """Validate input layouts for npu_mhc_pre_sinkhorn operator."""
-        x_tm = x_layout.tensor_map
-        x_tm_len = len(x_tm)
-
-        # Get validation rules from table based on tensor_map length
-        rules = _MHC_PRE_SINKHORN_VALIDATION_RULES.get(x_tm_len)
-        if rules is None:
-            raise ValueError(
-                f"For npu_mhc_pre_sinkhorn, tensor_map length should be 4 or 3, but got {x_tm_len}"
-            )
-
-        # Validate forbidden dimensions (N must be replicated)
-        _validate_tensor_map_dims(x_tm, rules["op_name"], rules["forbidden_dims"])
-
-        # Validate phi, alpha, bias must be fully replicated
-        _validate_tensor_map_dims(phi_layout.tensor_map, rules["op_name"], rules["phi_forbidden_dims"])
-        _validate_tensor_map_dims(alpha_layout.tensor_map, rules["op_name"], rules["alpha_forbidden_dims"])
-        _validate_tensor_map_dims(bias_layout.tensor_map, rules["op_name"], rules["bias_forbidden_dims"])
 
     @staticmethod
     def _infer_output_layouts(
@@ -281,11 +277,11 @@ class NpuMhcPreClampSinkhornDistributedOp(DistributedOp):
         ]
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         x_layout, phi_layout, alpha_layout, bias_layout = cache_values
 
         self._check_partial_inputs([x_layout, phi_layout, alpha_layout, bias_layout])
-        NpuMhcPreSinkhornDistributedOp._validate_input_layouts_mhc_pre_sinkhorn(
+        _validate_input_layouts_mhc_pre_sinkhorn(
             x_layout, phi_layout, alpha_layout, bias_layout
         )
 
