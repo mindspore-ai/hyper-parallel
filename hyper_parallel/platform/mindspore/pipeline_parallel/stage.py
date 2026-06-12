@@ -258,11 +258,23 @@ class PipelineStageBase:
                 return
             # Index, NOT pop: backward_weight_one_chunk performs the terminal pop.
             grad_fn = self.fwd_grad_fn_cache[micro_index]
+            handles = self.recompute_handles.get(micro_index)
             if self.is_last_stage:
                 sens = self.get_last_stage_sens(self.last_stage_outputs)
             else:
                 sens = self._build_padded_sens(micro_index)
-            _ = grad_fn.compute_input_grad(sens=sens)
+            # The session registry is global but the "current session" is a
+            # ContextVar, so enter it on THIS thread or the unpack misses the
+            # pre-fired cache and lazily re-runs the forward here — racing the
+            # paired forward and firing stray overlap hooks on the bwd thread.
+            # retain_on_unpack=True: dw consumes the same session afterwards.
+            session_ctx = (
+                get_platform().recompute_session_ctx(
+                    session_id=(self.stage_index, micro_index), retain_on_unpack=True)
+                if handles else contextlib.nullcontext()
+            )
+            with session_ctx:
+                _ = grad_fn.compute_input_grad(sens=sens)
             input_grads = [recv_info.buffer.grad for recv_info in self.args_recv_info[micro_index]
                            if recv_info.requires_grad]
             self.bwd_cache[micro_index] = input_grads
@@ -287,15 +299,26 @@ class PipelineStageBase:
                 mod.set_requires_gradient_sync(False)
 
             grad_fn = self.fwd_grad_fn_cache.pop(micro_index)
-            if self.is_first_stage:
-                sens = self._build_padded_sens(micro_index)
-                _ = grad_fn(sens=sens)
-            else:
-                if not grad_fn._saved_intermediates:  # pylint: disable=protected-access
-                    raise RuntimeError(
-                        f"stage: {self.stage_index} micro_{micro_index} dw called before dx."
-                    )
-                grad_fn.compute_weight_grad()
+            handles = self.recompute_handles.pop(micro_index, None)
+            platform = get_platform()
+            session_id = (self.stage_index, micro_index)
+            # Terminal consumer of the chunk's recompute session (dx retained).
+            session_ctx = (
+                platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=False)
+                if handles else contextlib.nullcontext()
+            )
+            with session_ctx:
+                if self.is_first_stage:
+                    sens = self._build_padded_sens(micro_index)
+                    _ = grad_fn(sens=sens)
+                else:
+                    if not grad_fn._saved_intermediates:  # pylint: disable=protected-access
+                        raise RuntimeError(
+                            f"stage: {self.stage_index} micro_{micro_index} dw called before dx."
+                        )
+                    grad_fn.compute_weight_grad()
+            if handles:
+                platform.clear_recompute_session(session_id)
             self._clear_recv_buffer(self.grad_recv_info, micro_index)
             self._clear_recv_buffer(self.args_recv_info, micro_index)
 

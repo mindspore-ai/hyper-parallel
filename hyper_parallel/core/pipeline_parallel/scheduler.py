@@ -1173,6 +1173,58 @@ def _split_boundary_run(step, run):
     return tuple(boundary), leftover
 
 
+def split_overlap_dxdw(exec_order: dict) -> dict:
+    """Split each OVERLAP_B_F backward into dx (in the pair) + dw (after the gap).
+
+    Rewrites ``(BWD, FWD)`` sub_steps to ``(BWD_INPUT, FWD)`` and inserts the
+    matching ``BWD_WEIGHT`` after the contiguous P2P run that follows the
+    overlap.  The overlap then joins at ``max(dx, fwd)`` instead of
+    ``max(dx + dw, fwd)``, so the gap's ``BWD_SEND`` (dx already wrote its
+    grad to ``bwd_cache``) and the next slot's recvs are issued a dw earlier;
+    under ``overlap_p2p`` they are async and dw computes while they fly.
+
+    Comm placement is untouched: the pass runs after ``add_send_recv`` and
+    only moves local compute, so the cross-rank matching order is identical,
+    and the P2P run stays contiguous (dw lands after it, not inside) so
+    ``coalesce_p2p`` / ``attach_fwd_boundary_p2p`` see the same gap shape.
+
+    First-stage (``stage_index == 0``) backwards stay unified: their dx is a
+    no-op (no input grad to compute or send), so splitting would only move
+    the whole backward out of the overlap and lose its fwd overlap.
+
+    Args:
+        exec_order: ``{rank: [MetaStep | None, ...]}``.
+
+    Returns:
+        A new ``{rank: [...]}`` with overlap backwards split into dx/dw.
+    """
+    out = {}
+    for rank, order in exec_order.items():
+        new = []
+        i = 0
+        n = len(order)
+        while i < n:
+            step = order[i]
+            i += 1
+            if (step is None or step.type != MetaStepType.OVERLAP_B_F
+                    or not step.sub_steps):
+                new.append(step)
+                continue
+            bwd_sub, fwd_sub = step.sub_steps
+            if bwd_sub.type != MetaStepType.BWD or bwd_sub.stage_index == 0:
+                new.append(step)
+                continue
+            dx = MetaStep(bwd_sub.micro_index, MetaStepType.BWD_INPUT, bwd_sub.stage_index)
+            new.append(MetaStep(step.micro_index, step.type, step.stage_index,
+                                sub_steps=(dx, fwd_sub)))
+            run, i = _p2p_run_after(order, i)
+            new.extend(run)
+            new.append(MetaStep(bwd_sub.micro_index, MetaStepType.BWD_WEIGHT,
+                                bwd_sub.stage_index))
+        out[rank] = new
+    return out
+
+
 def add_send_recv(scheduler, stage_num, real_stage_num, style='loop'):
     """Insert P2P send/recv operations into a per-rank compute schedule.
 
@@ -1620,8 +1672,14 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
       a registered callback can drive comm/compute overlap (typically
       via :class:`CommComputeOverlap` for MoE EP A2A).  Users register
       the callback through :meth:`register_custom_function`.
+    * ``enable_dxdw_split=True`` (requires ``overlap_b_f``): each
+      steady-state pair becomes ``(BWD_INPUT_i, F_{i+1})`` and the
+      ``BWD_WEIGHT_i`` runs as its own step after the pair's P2P gap
+      (see :func:`split_overlap_dxdw`), so the input-grad send is
+      issued once dx and the paired forward finish instead of waiting
+      out the full backward.
 
-    The two flags are independent and can be combined.
+    The two overlap flags are independent and can be combined.
 
     Example:
         >>> # Plain interleaved 1F1B
@@ -1653,12 +1711,22 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
         # pairing in the 1F1B steady-state phase.  Must be set before
         # ``construct_stage_exec_order`` is called below.
         self._overlap_b_f = overlap_b_f
-        # enable dx_dw split in overlap phase.
+        # dx/dw split: ``construct_exec_order`` rewrites each steady-state
+        # OVERLAP_B_F pair to ``(BWD_INPUT, FWD)`` and re-emits the matching
+        # BWD_WEIGHT after the pair's P2P gap (``split_overlap_dxdw``), so the
+        # input-grad send leaves at ``max(dx, fwd)`` and dw overlaps with the
+        # in-flight P2P instead of delaying it.
         self._enable_dxdw_split = enable_dxdw_split
         if enable_dxdw_split and not overlap_b_f:
             raise ValueError(
                 "enable_dxdw_split=True requires overlap_b_f=True; the split "
                 "is only applied to BWD sub-steps inside OVERLAP_B_F composite steps."
+            )
+        if enable_dxdw_split and swap:
+            raise ValueError(
+                "enable_dxdw_split=True is incompatible with swap=True: "
+                "pipeline-swap injection anchors on unified BWD steps and "
+                "does not recognize the split BWD_INPUT/BWD_WEIGHT steps."
             )
 
         self._init_round_layout()
@@ -1692,6 +1760,8 @@ class ScheduleInterleaved1F1B(PipelineScheduleRuntime):
         for stage_index in range(self.real_stage_num):
             self.exec_order[stage_index] = self.construct_stage_exec_order(stage_index)
         self.exec_order = add_send_recv(self.exec_order, self._stage_num, self.real_stage_num, style='loop')
+        if self.enable_dxdw_split:
+            self.exec_order = split_overlap_dxdw(self.exec_order)
 
     def _build_stage_to_rank_index(self) -> None:
         self._stage_to_rank_index = generate_stage_to_rank_mapping(

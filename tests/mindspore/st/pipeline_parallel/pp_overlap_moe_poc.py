@@ -500,15 +500,16 @@ def _make_overlap_b_f_callback(overlap: CommComputeOverlap):
     is process-wide (not thread-local like Torch), so the daemon BWD
     thread inherits the right device from the main thread automatically.
 
-    Honors ``ctx.schedule.enable_dxdw_split``:
+    Dispatches on the bwd sub-step's type:
 
-    * ``False`` — ``bwd_fn`` runs the unified ``backward_one_chunk`` and
+    * ``BWD`` — ``bwd_fn`` runs the unified ``backward_one_chunk`` and
       the scheduler's ``BWD_SEND`` step issues the gradient send.
-    * ``True``  — ``bwd_fn`` runs ``backward_input_one_chunk`` →
-      ``backward_weight_one_chunk``.  The execution order is unchanged: the
-      scheduler's ``BWD_SEND`` step still issues the gradient send in its
-      original position, picking up the ``dx`` that ``backward_input_one_chunk``
-      wrote to ``bwd_cache``.
+    * ``BWD_INPUT`` (``enable_dxdw_split=True``: the schedule rewrote the
+      pair via ``split_overlap_dxdw``) — ``bwd_fn`` runs only
+      ``backward_input_one_chunk``; the overlap joins at ``max(dx, fwd)``,
+      the gap's ``BWD_SEND`` picks up the dx grad from ``bwd_cache``, and
+      the matching ``BWD_WEIGHT`` step then runs dw on the main thread
+      while that P2P is in flight.
     """
 
     def _callback(step, ctx):
@@ -548,17 +549,14 @@ def _make_overlap_b_f_callback(overlap: CommComputeOverlap):
             with platform.profiler_record(
                     f"dxdw/bwd_fn/stage_{bwd_stage.stage_index}/mi_{bwd_mi}"):
                 schedule.wait_bwd_recv(bwd_stage.stage_index, bwd_mi)
-                # First-stage degeneration (no input grad -> dx no-op, dw does
-                # the full backward) is handled inside the stage methods, so the
-                # same dx -> dw sequence applies to every stage.  The execution
-                # order is NOT modified: the scheduler keeps its own ``BWD_SEND``
-                # step in its original position, so dx only needs to write
-                # ``bwd_cache`` (it does) for that send to pick up the input grad
-                # after the callback returns.
-                if schedule.enable_dxdw_split:
-                    # dx / dw are profiler-tagged inside the stage methods.
+                # Under enable_dxdw_split the schedule emits (BWD_INPUT, FWD)
+                # pairs (stage-0 pairs stay unified BWD: dx would be a no-op
+                # there), so dispatch on the sub-step type.  dx writes
+                # ``bwd_cache``; the gap's BWD_SEND and the standalone
+                # BWD_WEIGHT step that follow the overlap consume it on the
+                # main thread.
+                if bwd_step.type == MetaStepType.BWD_INPUT:
                     bwd_stage.backward_input_one_chunk(bwd_mi)
-                    bwd_stage.backward_weight_one_chunk(bwd_mi)
                 else:
                     bwd_stage.backward_one_chunk(bwd_mi)
                 # Pair-8 BWD partner is taken out of band: MS autograd may
@@ -1604,9 +1602,10 @@ def test_pp_overlap_moe_dxdw_accuracy():
         overlap stack OFF (``use_overlap=False``, ``overlap_p2p=False``,
         ``overlap_b_f=False``, no callback) — the same ground truth as
         :func:`test_pp_overlap_moe_accuracy` — and the dx/dw split path
-        (``enable_dxdw_split=True``: callback runs ``backward_input_one_chunk``
-        → ``backward_weight_one_chunk`` while the scheduler issues ``BWD_SEND``
-        in its original position).  Runs ``NUM_STEPS`` steps; each step feeds
+        (``enable_dxdw_split=True``: the schedule pairs ``(BWD_INPUT, FWD)``
+        in each ``OVERLAP_B_F`` and runs the matching ``BWD_WEIGHT`` after the
+        pair's P2P gap, so the grad send issues once dx and the paired forward
+        finish, before dw).  Runs ``NUM_STEPS`` steps; each step feeds
         the *same* fresh input to both paths, zeroes grads, runs both, and
         asserts equivalence — the baseline comparison is mandatory, there is no
         skip path.  A ``mindspore.profiler.profile`` with
@@ -1765,6 +1764,78 @@ def test_pp_overlap_moe_recompute_save_a2a():
         overlap_losses, overlap_grads, label="recompute_save_a2a",
     )
     print(f"[rank{rank}] pp_overlap_moe_recompute_save_a2a: PASS "
+          f"(a2a fwd_saves={fwd_saves}, rec_restores={rec_restores}, "
+          f"params={len(baseline_grads)})", flush=True)
+
+
+def test_pp_overlap_moe_recompute_save_a2a_dxdw():
+    """Save-a2a chunk recompute combined with the dx/dw split.
+
+    Feature: ``enable_dxdw_split`` x activation checkpoint — the split backward
+        halves must reuse the chunk's pre-fired recompute session.
+    Description:
+        Same topology and SAC policy as
+        :func:`test_pp_overlap_moe_recompute_save_a2a`, with the overlap run
+        built under ``enable_dxdw_split=True``.  MS keeps the *current*
+        recompute session in a ContextVar (thread-local) over a global cache,
+        so ``backward_input_one_chunk`` / ``backward_weight_one_chunk`` must
+        each enter ``recompute_session_ctx`` on their own thread (dx retains
+        for dw; dw is the terminal consumer).  Without that, dx's unpack
+        misses the cache ``recompute_one_chunk`` pre-fired and lazily re-runs
+        the chunk forward on the BWD thread — its a2a hooks rendezvous against
+        the paired forward's hooks and both threads deadlock.
+    Expectation:
+        No hang; the a2a is SAC-saved in the forward and restored during the
+        single pre-fired recompute (never re-communicated, and dx/dw trigger
+        no second re-run); losses and grads match the sync baseline within
+        ``rtol=1e-3, atol=1e-3`` on every rank.
+    """
+    rank, device, pp_mesh, ep_mesh = _init_pp_ep_mesh()
+    pp_rank = pp_mesh.get_local_rank()
+    cfg = _TinyConfig()
+
+    # ---- Sync baseline: no overlap, no recompute (ground truth). ----
+    baseline_chunks, baseline_si = _build_pipeline(
+        pp_rank, ep_mesh, cfg, use_overlap=False,
+    )
+    baseline_losses, baseline_grads, _ = _run_one_iteration(
+        baseline_chunks, baseline_si, pp_rank, device, pp_mesh,
+        overlap_p2p=False, overlap_b_f=False,
+    )
+    del baseline_chunks
+    platform.barrier()
+
+    # ---- Save-a2a recompute + dx/dw split under the full overlap stack. ----
+    overlap = CommComputeOverlap()
+    overlap_chunks, overlap_si = _build_pipeline(
+        pp_rank, ep_mesh, cfg, use_overlap=True, overlap=overlap,
+        recompute=True, recompute_granularity="chunk_save_a2a",
+    )
+    _A2A_SAC_SEEN.clear()
+    overlap_losses, overlap_grads, _ = _run_one_iteration(
+        overlap_chunks, overlap_si, pp_rank, device, pp_mesh,
+        overlap_p2p=True, overlap_b_f=True, enable_dxdw_split=True,
+        callback=_make_overlap_b_f_callback(overlap),
+    )
+
+    fwd_saves = sum(1 for is_rec in _A2A_SAC_SEEN if not is_rec)
+    rec_restores = sum(1 for is_rec in _A2A_SAC_SEEN if is_rec)
+    assert fwd_saves > 0, (
+        f"[rank{rank}] save-a2a policy never matched the a2a op in the forward "
+        f"pass — SAC did not intercept it (seen={_A2A_SAC_SEEN[:8]}).")
+    # Equality, not just >0: a split half missing its session ctx re-runs the
+    # chunk forward a second time and inflates the recompute-side count.
+    assert rec_restores == fwd_saves, (
+        f"[rank{rank}] a2a classified {rec_restores} times during recompute vs "
+        f"{fwd_saves} forward saves — expected exactly one pre-fired re-run; "
+        f"a mismatch means dx/dw triggered an extra lazy re-run (or the SAC "
+        f"cached path was missed).")
+
+    _assert_overlap_matches_baseline(
+        rank, pp_rank, baseline_losses, baseline_grads,
+        overlap_losses, overlap_grads, label="recompute_save_a2a_dxdw",
+    )
+    print(f"[rank{rank}] pp_overlap_moe_recompute_save_a2a_dxdw: PASS "
           f"(a2a fwd_saves={fwd_saves}, rec_restores={rec_restores}, "
           f"params={len(baseline_grads)})", flush=True)
 
