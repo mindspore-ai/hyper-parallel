@@ -1,4 +1,4 @@
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2024-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ def find_file_by_name(directory, filename):
         if filename in files:
             return os.path.join(root, filename)
     return None
+
 
 def decide_pp_dp(config, available_devices):
     """
@@ -64,6 +65,7 @@ def decide_pp_dp(config, available_devices):
         dp //= cur_multiple
     return [dp, tp, pp, ep, cp, op]
 
+
 def decide_dp(config, available_devices):
     """
     :param config: [config, available_devices]
@@ -87,6 +89,7 @@ def decide_dp(config, available_devices):
                 f'dp_size ({dp}) is not divisible by ep_size({ep}), for config: dp: {dp}, tp: {tp}, pp: {pp}, ep: {ep}')
             return None
     return [dp, tp, pp, ep]
+
 
 def decide_dp_for_titan(config, available_devices):
     """
@@ -116,6 +119,7 @@ def decide_dp_for_titan(config, available_devices):
         op //= cur_multiple
         dp //= cur_multiple
     return [dp, tp, pp, ep, cp, op]
+
 
 def decide_pp_dp_llama(config, available_devices):
     """
@@ -152,6 +156,7 @@ def decide_pp_dp_llama(config, available_devices):
         dp //= cur_multiple
     return [dp, tp, pp]
 
+
 def trans_config_satisfy_rank_num(mem_prune_space, para, input_args):
     """
 
@@ -176,6 +181,7 @@ def trans_config_satisfy_rank_num(mem_prune_space, para, input_args):
         profile_configs = profile_configs[:10]
     print(*(config for config in profile_configs), sep='\n')
     return profile_configs
+
 
 def budget_profile_config_generator(config, para, available_devices):
     """
@@ -237,6 +243,7 @@ def budget_profile_config_generator(config, para, available_devices):
     print('Error: No config file path!')
     return None
 
+
 def taylor_pp_adaptor(profile_info):
     """Adapt profiling info for the Taylor pipeline parallel solver.
 
@@ -246,6 +253,7 @@ def taylor_pp_adaptor(profile_info):
     layer_ratio = (profile_info['dense_fw']+profile_info['dense_bw'])/(profile_info['moe_fw']+profile_info['moe_bw'])
     backward_ratio = profile_info['moe_bw']/profile_info['moe_fw']
     return layer_ratio, backward_ratio
+
 
 def sapp_adaptor(profile_info):
     """Adapt profiling info for the SAPP (Semi-Auto Parallel Pipeline) solver.
@@ -257,6 +265,7 @@ def sapp_adaptor(profile_info):
     body_moe = (profile_info['moe_fw']+profile_info['moe_bw'])/3
     tail = profile_info['head']/3
     return profile_info['embed'], body_dense, body_moe, tail
+
 
 def profile_prepare(mem_prune_space, para, input_args):
     """

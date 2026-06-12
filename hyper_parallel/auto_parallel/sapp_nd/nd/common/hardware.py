@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -177,6 +177,7 @@ def prime_factors(n):
         n = n // divisor
     return factors
 
+
 def all_factors_combinations(factors):
     """Computes all divisors from a prime factor list"""
     def rec_factors(n, factors):
@@ -187,6 +188,7 @@ def all_factors_combinations(factors):
             combinations = combinations.union(rec_factors(n * u, remaining))
         return combinations
     return rec_factors(1, factors)
+
 
 def all_divisors(n, reverse=False, min_bound=1, max_bound=float("inf")):
     """Computes all divisors of an integer n"""

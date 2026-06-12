@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -927,6 +927,7 @@ class HSDPParamGroup:
         self._active_param_flat_offsets = []
         self._active_replicate_buckets = {}
         self._pending_all_reduce_handles = []
+
 
 class AllReduceParamGroup:
     """Groups HSDP parameters by replicate group for fused async all-reduce.

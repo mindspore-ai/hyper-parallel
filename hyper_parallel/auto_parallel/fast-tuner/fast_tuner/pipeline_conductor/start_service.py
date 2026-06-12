@@ -1,4 +1,4 @@
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2024-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@ default_time_limit = 1e10
 model_class = 0
 
 # expert input: expert can change per environment
+
 class ExpertInput:
     """Expert input configuration for pipeline tuning.
 

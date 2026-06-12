@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ from abc import abstractmethod
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import _CostModVar
+
 
 class _CostModelParser(ABC):
     """abstract parser class"""
