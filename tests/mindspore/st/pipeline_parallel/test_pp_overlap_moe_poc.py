@@ -167,8 +167,9 @@ def test_pp_overlap_moe_dxdw_accuracy():
         twice with identical seed and identical input — a sync baseline
         with the overlap stack OFF (the same ground truth as
         ``test_pp_overlap_moe_accuracy``) and the dx/dw split path
-        (``enable_dxdw_split=True``: callback runs dx → dw while the
-        scheduler issues ``BWD_SEND`` in its original position).  Each of
+        (``enable_dxdw_split=True``: each ``OVERLAP_B_F`` pairs
+        ``(BWD_INPUT, FWD)`` and the matching ``BWD_WEIGHT`` runs after the
+        pair's P2P gap, so the grad send issues before dw).  Each of
         ``NUM_STEPS`` steps feeds the same input to both and asserts
         equivalence — the comparison is mandatory.  Compares per-micro-batch
         losses on the last PP rank and per-parameter gradients on every rank.
@@ -205,6 +206,28 @@ def test_pp_overlap_moe_recompute_save_a2a():
     """
     msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_recompute_save_a2a",
                12358, worker_num=8, local_worker_num=8)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
+          card_mark="allcards", essential_mark="essential")
+def test_pp_overlap_moe_recompute_save_a2a_dxdw():
+    """Save-a2a chunk recompute combined with the dx/dw split.
+
+    Feature: ``enable_dxdw_split`` x activation checkpoint.
+    Description:
+        8 ranks, PP=4 x EP=2, same SAC save-a2a policy as
+        ``test_pp_overlap_moe_recompute_save_a2a`` but with the schedule-level
+        dx/dw split enabled.  The split backward halves must enter the chunk's
+        pre-fired recompute session on their own thread; otherwise dx's unpack
+        misses the cache and lazily re-runs the chunk forward on the BWD
+        thread, deadlocking against the paired forward's overlap hooks.
+    Expectation:
+        No hang; the a2a is SAC-saved and restored exactly once (the pre-fired
+        recompute); grads and last-rank losses match the sync baseline within
+        ``rtol=1e-3, atol=1e-3``.
+    """
+    msrun_case(3, PP_OVERLAP_MOE_POC, "test_pp_overlap_moe_recompute_save_a2a_dxdw",
+               12366, worker_num=8, local_worker_num=8)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",

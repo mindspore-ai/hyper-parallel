@@ -296,6 +296,90 @@ class TestParseAndValidate(unittest.TestCase):
         self.assertLess(pos(MetaStepType.SWAP_LAUNCH_OFFLOAD, 0, 7), pos(MetaStepType.SWAP_WAIT_OFFLOAD, 0, 7))
         self.assertLess(pos(MetaStepType.SWAP_WAIT_LOAD, 4, 0), leaf_pos(MetaStepType.BWD, 4, 0))
 
+    def test_interleaved_1f1b_overlap_dxdw_split(self):
+        """dxdw split: pairs become (BWD_INPUT, FWD); BWD_WEIGHT lands after the gap."""
+        def build(enable_split):
+            schedule = object.__new__(ScheduleInterleaved1F1B)
+            # pylint: disable=protected-access
+            schedule.real_stage_num = 4
+            schedule._stage_num = 8
+            schedule.n_local_stages = 2
+            schedule.micro_batch_num = 8
+            schedule._overlap_b_f = True
+            schedule._enable_dxdw_split = enable_split
+            schedule.n_rounds = 2
+            schedule.n_microbatch_per_round = [4, 4]
+            schedule.n_microbatch_per_round_accu = [0, 8, 16]
+            schedule.exec_order = {}
+            ScheduleInterleaved1F1B.construct_exec_order(schedule)
+            return schedule.exec_order
+
+        def p2p_seq(order):
+            return [(s.type, s.stage_index, s.micro_index)
+                    for s in order if s is not None and s.type in _P2P_STEP_TYPES]
+
+        def leaf_bwd_keys(order, types):
+            keys = []
+            for s in order:
+                if s is None:
+                    continue
+                subs = s.sub_steps if s.type == MetaStepType.OVERLAP_B_F else (s,)
+                keys.extend((x.stage_index, x.micro_index)
+                            for x in subs if x.type in types)
+            return sorted(keys)
+
+        base = build(False)
+        split = build(True)
+        for rank in range(4):
+            base_order, split_order = base[rank], split[rank]
+            # The pass must not move any comm relative to other comms.
+            self.assertEqual(p2p_seq(base_order), p2p_seq(split_order))
+
+            split_pairs = 0
+            for idx, step in enumerate(split_order):
+                if step is None or step.type != MetaStepType.OVERLAP_B_F:
+                    continue
+                bwd_sub, fwd_sub = step.sub_steps
+                self.assertEqual(fwd_sub.type, MetaStepType.FWD)
+                if bwd_sub.stage_index == 0:
+                    # First-stage dx is a no-op; the pair stays unified.
+                    self.assertEqual(bwd_sub.type, MetaStepType.BWD)
+                    continue
+                self.assertEqual(bwd_sub.type, MetaStepType.BWD_INPUT)
+                split_pairs += 1
+                # Only P2P between the overlap and its BWD_WEIGHT, with this
+                # pair's BWD_SEND among it.
+                j = idx + 1
+                gap = []
+                while (j < len(split_order) and split_order[j] is not None
+                       and split_order[j].type in _P2P_STEP_TYPES):
+                    gap.append(split_order[j])
+                    j += 1
+                self.assertLess(j, len(split_order),
+                                "overlap pair missing its BWD_WEIGHT")
+                dw = split_order[j]
+                self.assertEqual(
+                    (dw.type, dw.stage_index, dw.micro_index),
+                    (MetaStepType.BWD_WEIGHT, bwd_sub.stage_index, bwd_sub.micro_index),
+                )
+                self.assertIn(
+                    (MetaStepType.BWD_SEND, bwd_sub.stage_index, bwd_sub.micro_index),
+                    [(s.type, s.stage_index, s.micro_index) for s in gap],
+                )
+
+            # One BWD_WEIGHT per split pair, and backward coverage unchanged:
+            # every (stage, micro) backward appears exactly once, unified or
+            # as a dx half.
+            self.assertEqual(
+                split_pairs,
+                sum(1 for s in split_order
+                    if s is not None and s.type == MetaStepType.BWD_WEIGHT),
+            )
+            self.assertEqual(
+                leaf_bwd_keys(base_order, {MetaStepType.BWD}),
+                leaf_bwd_keys(split_order, {MetaStepType.BWD, MetaStepType.BWD_INPUT}),
+            )
+
     def test_pipeline_swap_schedule_injects_current_rank_only(self):
         """Schedule-level swap injection should only rewrite current rank order."""
         def eligible_order(stage_index):
