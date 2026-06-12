@@ -36,6 +36,7 @@ from hyper_parallel.custom_ops.experimental.experimental_ops import (
     npu_dense_lightning_indexer_grad_kl_loss,
     npu_dense_lightning_indexer_softmax_lse,
     npu_mhc_post,
+    npu_mhc_pre_clamp_sinkhorn,
     npu_mhc_pre_sinkhorn,
     npu_sparse_lightning_indexer_grad_kl_loss,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "npu_dense_lightning_indexer_grad_kl_loss",
     "npu_dense_lightning_indexer_softmax_lse",
     "npu_mhc_post",
+    "npu_mhc_pre_clamp_sinkhorn",
     "npu_mhc_pre_sinkhorn",
     "npu_sparse_lightning_indexer_grad_kl_loss",
 ]
