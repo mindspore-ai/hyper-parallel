@@ -277,7 +277,6 @@ def make_overlap_b_f_callback(overlap: CommComputeOverlap, device: torch.device)
         fwd_stage = schedule._stage_dict[fwd_step.stage_index]  # pylint: disable=W0212
         bwd_stage = schedule._stage_dict[bwd_step.stage_index]  # pylint: disable=W0212
         fwd_mi, bwd_mi = fwd_step.micro_index, bwd_step.micro_index
-        last_bwd = bwd_mi == schedule.micro_batch_num - 1
 
         # When overlap_p2p=True the scheduler issues FWD_RECV / BWD_RECV
         # before this OVERLAP_B_F step and stashes the handles in
@@ -331,7 +330,7 @@ def make_overlap_b_f_callback(overlap: CommComputeOverlap, device: torch.device)
                 torch.cuda.set_device(device.index)
             if bwd_recv_handles:
                 schedule._wait_p2p(bwd_recv_handles)  # pylint: disable=W0212
-            bwd_stage.backward_one_chunk(bwd_mi, last_bwd)
+            bwd_stage.backward_one_chunk(bwd_mi)
 
         overlap.run(fwd_fn=fwd_fn, bwd_fn=bwd_fn)
 

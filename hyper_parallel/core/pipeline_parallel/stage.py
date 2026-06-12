@@ -505,7 +505,10 @@ class PipelineStage(PipelineStageBase):
             sub_mod_state.reduce_params()
 
         # No public API exposes the root backward finalization; call the platform hook directly.
-        fsdp_module.hsdp_scheduler._root_backward_hook()  # pylint: disable=protected-access
+        # force_reduce=True: the recv buffer's PostBackwardFunction has put the root into
+        # scheduler_state==BACKWARD, so the natural gate would skip the final drain and the
+        # last module's reduce-scatter would lag one optimizer step.
+        fsdp_module.hsdp_scheduler._root_backward_hook(force_reduce=True)  # pylint: disable=protected-access
 
     def _build_padded_sens(self, micro_index):
         """Build an N-length sens list aligned with the forward output structure.

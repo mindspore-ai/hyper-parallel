@@ -147,21 +147,34 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
 
-    def _root_backward_hook(self):
-        """Root backward hook: finalize gradient reduction for the outermost HSDP module.
+    def _root_backward_hook(self, force_reduce=False):
+        """Finalize gradient reduction for the outermost HSDP module after backward.
 
-        For the root module (the last to finish backward), this hook drains any
-        pending fused reduction from ``CommContext`` and then calls ``reduce_params()``
-        to apply the final per-parameter gradient reduction.
+        ``apply_final_reduce`` selects between two cases, distinguished by whether
+        this unit's forward input was differentiable:
 
-        For comm_fusion=False mode, it also:
-        1. Processes the last module's reduce_scatter and issues its allreduce
-        2. Calls delay_apply_reduce_grads to wait all allreduce and apply gradients
+        * input ``requires_grad=False`` (the common case): no ``PostBackwardFunction``
+          is inserted on the input, so ``scheduler_state != BACKWARD`` and this hook
+          owns the finalization -- it drains the pending reductions (comm_fusion=True
+          via ``CommContext``; comm_fusion=False via the last module's reduce_scatter
+          + allreduce) and applies the per-parameter gradients.
+        * input ``requires_grad=True`` (a boundary case where the unit is fed a
+          differentiable activation from an enclosing graph): the input's
+          ``PostBackwardFunction`` drives ``scheduler_state == BACKWARD``, so the
+          natural path does not finalize here. ``force_reduce`` lets a caller that
+          owns that backward boundary demand the drain happen now rather than have it
+          deferred a step.
+
+        ``root_bp_state`` -- whether the top-level root module's backward is still in
+        flight, used to gate forward prefetch during activation recompute -- is
+        independent of the reduce branch: it is cleared only by the root module's own
+        hook, keyed on ``_is_root``.
         """
         apply_final_reduce = self.scheduler_state != FSDPSchedulerState.BACKWARD
         self._backward_hook()
-        if apply_final_reduce:
+        if self._is_root:
             HSDPSchedulerV2.root_bp_state = False
+        if apply_final_reduce or force_reduce:
             with torch.profiler.record_function(f"root_backward reduce:{self.hsdp_state.module_name}"):
                 # Drain any pending async fused reduction from the last module's backward
                 comm_ctx = get_comm_ctx()
