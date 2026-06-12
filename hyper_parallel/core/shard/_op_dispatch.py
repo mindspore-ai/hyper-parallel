@@ -266,7 +266,7 @@ class OpDispatcher:
 
         self.layout_infer_ops = self.safe_load_yaml_from_dir()
         self.whitelist = ["InplaceAddExt", "InplaceSubExt", "InplaceMul", "InplaceDiv", "typeof", "DistCommIsend",
-                          "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather",
+                          "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather", "DistCommBatchIsendIrecv",
                           "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__", "register_hook",
                           "is_complex", "chunk", "__bool__", "__len__", "__format__", "dim",
                           "_has_compatible_shallow_copy_type", "is_floating_point", "is_contiguous"]
