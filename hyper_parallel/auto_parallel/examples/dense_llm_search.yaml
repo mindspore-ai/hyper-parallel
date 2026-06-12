@@ -1,0 +1,52 @@
+# ============================================================================
+# HyperParallel Auto Parallel Strategy Search — Dense LLM Example
+# ============================================================================
+# This file demonstrates a complete search configuration for a Dense
+# Transformer LLM (e.g. LLaMA3-8B style).
+#
+# Parallelism dimensions:
+#   scalar (e.g. cp: 1) → fixed input
+#   list   (e.g. tp: [1,2,4]) → search candidate (output)
+#   "auto" → let the searcher decide the range
+
+model:
+  name: "llama3-8b-dense"
+  n_layers: 32
+  dim: 4096
+  inter_dim: 11008
+  n_heads: 32
+  n_kv_heads: 8
+  vocab_size: 128256
+  seq_len: 8192
+  local_batch_size: 1
+  compute_dtype: "bfloat16"
+  use_flash_attention: true
+  moe_enabled: false
+
+cluster:
+  num_nodes: 4
+  cards_per_node: 8
+  device_memory_gb: 64.0
+  device_type: "A2"
+  intra_node_bandwidth_gbps: 200.0
+  inter_node_bandwidth_gbps: 100.0
+
+parallelism:
+  dp: [1, 2, 4, 8]
+  fsdp: [1, 2]
+  tp: [1, 2, 4, 8]
+  pp: [1, 2, 4]
+  cp: [1, 2]
+  ep: 1
+  micro_batch_num: [1, 2, 4]
+
+constraint:
+  global_batch_size: 128
+  memory_limit_gb: 60.0
+
+recompute: "selective"
+
+pp_config:
+  stage_partition_mode: "uniform"
+  pp_interleave_num: 1
+  pipeline_schedule: "1F1B"

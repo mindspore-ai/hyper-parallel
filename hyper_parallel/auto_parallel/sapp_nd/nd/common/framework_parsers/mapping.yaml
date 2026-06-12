@@ -8,3 +8,8 @@ framework_parser:
   -
     name: "hyperparallel"
     module: CostModelParserHyperparallel
+    # DEPRECATED: placeholder for old TorchTitan TOML format.
+    # Use "hyper_v2" instead.  To be removed in a follow-up PR.
+  -
+    name: "hyper_v2"
+    module: CostModelParserHyperV2

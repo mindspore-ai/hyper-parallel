@@ -184,7 +184,19 @@ def _build(cfg):
     extra = getattr(cfg.model, "config_overrides", None)
     if isinstance(extra, dict) and extra.get("vl", False):
         return _build_vl(cfg)
-    return Qwen3VLMoeForCausalLM(Qwen3VLMoeTextConfig(**_resolve_kwargs(cfg.model)))
+    return Qwen3VLMoeForCausalLM(_build_config(cfg))
+
+
+def _build_config(cfg) -> Qwen3VLMoeTextConfig:
+    """Construct only the ``Qwen3VLMoeTextConfig`` from a ``HyperTrainerConfig``.
+
+    Returns the text config object without building the full model.
+    Used by the SAPP-ND Hyper YAML parser for memory estimation.
+    The vision config is not needed since memory estimation only uses
+    text-model hyperparameters.
+    """
+    return Qwen3VLMoeTextConfig(**_resolve_kwargs(cfg.model))
+
 
 register_spec(
     "qwen3_vl_moe",

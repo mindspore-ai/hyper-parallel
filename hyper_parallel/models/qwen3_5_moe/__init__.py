@@ -103,7 +103,17 @@ def _build(cfg) -> Qwen3_5MoeForCausalLM:
     A minimal YAML ``model: {name: qwen3_5_moe, weights_path: ...}`` is
     enough — every other field falls through to the 35B-A3B defaults.
     """
-    return Qwen3_5MoeForCausalLM(Qwen3_5MoeConfig(**_resolve_kwargs(cfg.model)))
+    return Qwen3_5MoeForCausalLM(_build_config(cfg))
+
+
+def _build_config(cfg) -> Qwen3_5MoeConfig:
+    """Construct only the ``Qwen3_5MoeConfig`` from a ``HyperTrainerConfig``.
+
+    Returns the model-specific config object without building the full
+    model. Used by the SAPP-ND Hyper YAML parser for memory estimation.
+    """
+    return Qwen3_5MoeConfig(**_resolve_kwargs(cfg.model))
+
 
 register_spec(
     "qwen3_5_moe",
