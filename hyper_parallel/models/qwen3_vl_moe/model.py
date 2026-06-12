@@ -386,6 +386,7 @@ class Qwen3VLMoeVisionMLP(nn.Module):
 
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
 
+
 class Qwen3VLMoeVisionDecoder(nn.Module):
     """One Qwen3-VL vision encoder block."""
 
@@ -411,6 +412,7 @@ class Qwen3VLMoeVisionDecoder(nn.Module):
         )
 
         return hidden_states + self.mlp(self.norm2(hidden_states))
+
 
 class Qwen3VLMoeVisionPatchEmbed(nn.Module):
     """3D patch embedding used by Qwen3-VL."""
@@ -443,6 +445,7 @@ class Qwen3VLMoeVisionPatchEmbed(nn.Module):
 
         return hidden_states.view(-1, self.embed_dim)
 
+
 class Qwen3VLMoeVisionPatchMerger(nn.Module):
     """Patch merger and DeepStack merger."""
 
@@ -469,6 +472,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         x = x.view(-1, self.hidden_size)
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
+
 @dataclass
 class Qwen3VLMoeVisionOutput:
     """Small output container for native vision forward."""
@@ -477,6 +481,7 @@ class Qwen3VLMoeVisionOutput:
 
     pooler_output: torch.Tensor | list[torch.Tensor]
     deepstack_features: list[torch.Tensor]
+
 
 class Qwen3VLMoeVisionModel(nn.Module):
     """Native Qwen3-VL-MoE vision tower."""
@@ -656,6 +661,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
             deepstack_features=deepstack_features,
         )
 
+
 class Qwen3VLMoeTextTopKRouter(nn.Module):
     """Router matching HF ``Qwen3VLMoeTextTopKRouter``."""
 
@@ -680,6 +686,7 @@ class Qwen3VLMoeTextTopKRouter(nn.Module):
         router_top_value = router_top_value / router_top_value.sum(dim=-1, keepdim=True)
         router_top_value = router_top_value.to(hidden_states.dtype)
         return router_logits, router_top_value, router_indices
+
 
 class Qwen3VLMoeTextExperts(nn.Module):
     """Packed expert weights for Qwen3-VL-MoE text experts.
@@ -775,6 +782,7 @@ class Qwen3VLMoeTextExperts(nn.Module):
         )
         return next_states
 
+
 class Qwen3VLMoeTextSparseMoE(nn.Module):
     """Sparse MoE for the text decoder.
 
@@ -826,6 +834,7 @@ class Qwen3VLMoeTextSparseMoE(nn.Module):
             hidden_states_2d, router_weights, router_indices,
         )
         return next_states.reshape(batch_size, sequence_length, hidden_dim), router_logits
+
 
 class Qwen3VLMoeTextAttention(GroupQueryAttention):
     """Qwen3-VL-MoE text attention with selectable attention backend.
@@ -909,6 +918,7 @@ class Qwen3VLMoeTextAttention(GroupQueryAttention):
         attn_output = attn_output.contiguous().view(bsz, seq_len, -1)
         return self.o_proj(attn_output)
 
+
 class Qwen3VLMoeTextDecoder(nn.Module):
     """One Qwen3-VL-MoE text decoder layer."""
 
@@ -973,6 +983,7 @@ class Qwen3VLMoeTextDecoder(nn.Module):
         if isinstance(hidden_states, tuple):
             hidden_states, _ = hidden_states
         return residual + hidden_states
+
 
 class Qwen3VLMoeTextModel(nn.Module):
     """Text decoder used by the multimodal conditional generation wrapper."""
@@ -1100,6 +1111,7 @@ class Qwen3VLMoeTextModel(nn.Module):
                     hidden_states, visual_pos_masks, deepstack_visual_embeds[layer_idx],
                 )
         return self.norm(hidden_states)
+
 
 class Qwen3VLMoeModel(nn.Module):
     """Composite Qwen3-VL-MoE model with native visual token injection."""
@@ -1298,6 +1310,7 @@ class Qwen3VLMoeModel(nn.Module):
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
 
+
 class Qwen3VLMoeForCausalLM(nn.Module):
     """Text-only CausalLM wrapper with HF-compatible state-dict names."""
 
@@ -1359,6 +1372,7 @@ class Qwen3VLMoeForCausalLM(nn.Module):
                 ignore_index=-100,
             )
         return {"loss": loss, "logits": logits}
+
 
 class Qwen3VLMoeForConditionalGeneration(nn.Module):
     """Native multimodal Qwen3-VL-MoE conditional generation model."""

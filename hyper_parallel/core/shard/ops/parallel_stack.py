@@ -21,6 +21,7 @@ from .parallel_ops import DistributedOp
 
 # pylint: disable=unused-argument
 
+
 def _normalize_stack_args(tensors, dim=0, **kwargs):
     """
     Normalize arguments for torch.stack.

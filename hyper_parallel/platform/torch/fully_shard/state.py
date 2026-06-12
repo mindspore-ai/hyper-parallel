@@ -59,6 +59,7 @@ class TorchHSDPStateV2(HSDPState):
 
     # Record AllReduceParamGroup that has all_reduce issued, waiting for root_backward_hook to apply
     pending_all_reduce_groups: List[AllReduceParamGroup] = []
+
     @staticmethod
     def _get_pending_unsharded_grad(hsdp_param):
         """Return the pending unsharded gradient tensor for all-reduce-based paths."""

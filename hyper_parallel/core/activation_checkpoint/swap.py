@@ -394,6 +394,7 @@ class Storage:
             for item in storage_list:
                 platform.tree_map(_async_offload, item)
 
+
 class SwapGroup:
     """Manager for a group of storages to coordinate swap operations.
 
