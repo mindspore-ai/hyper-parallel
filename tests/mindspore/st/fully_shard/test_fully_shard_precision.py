@@ -13,228 +13,190 @@
 # limitations under the License.
 # ============================================================================
 """Test fully_shard precision comparison with standalone baseline"""
-import inspect
 import os
 import shutil
 import subprocess
 
-import pytest
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import MindSporeCase, parallel_run
 
 # Temporary directory for baseline artifacts
 TEMP_DIR = os.path.join(os.path.dirname(__file__), "temp_baseline")
-file_name = "_fully_shard_precision.py"
-file_name_list = "_precision_fully_shard_list.py"
+_PRECISION_IMPL = os.path.join(os.path.dirname(__file__), "_fully_shard_precision.py")
+_LIST_PRECISION_IMPL = os.path.join(os.path.dirname(__file__), "_precision_fully_shard_list.py")
 
 
-def run_baseline() -> None:
-    """Run standalone baseline training"""
+def _generate_baseline() -> None:
+    """Generate shared baseline artifacts (standalone checkpoint + loss reference)."""
+    if os.path.exists(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
     print("Running standalone baseline training...")
-    cmd = f"python {os.path.dirname(__file__)}/{file_name} --generate-baseline"
+    cmd = f"python {_PRECISION_IMPL} --generate-baseline"
     process = subprocess.run(cmd, shell=True, check=False)
-
     assert process.returncode == 0, "Baseline training failed"
-
     print("Baseline training completed successfully")
 
 
-def run_case(case_name: str) -> None:
-    """Run the specified test case with setup and teardown"""
+def _cleanup_baseline() -> None:
+    """Remove baseline artifacts directory if it exists."""
+    if os.path.exists(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+        print(f"Cleaned up temporary directory: {TEMP_DIR}")
+
+
+# ---------------------------------------------------------------------------
+# 2-card groups: baseline shared within the group
+# ---------------------------------------------------------------------------
+
+def _run_basic_group(case_names):
+    """Generate baseline once, then run the given 2-card precision cases via parallel_run."""
     try:
-        if os.path.exists(TEMP_DIR):
-            print(f"Cleaning up existing temporary directory before start: {TEMP_DIR}")
-            shutil.rmtree(TEMP_DIR)
-
-        run_baseline()
-
-        glob_v = 2
-        master_port = 18178
-        msrun_case(glob_v, file_name, case_name, master_port)
+        _generate_baseline()
+        parallel_run([
+            MindSporeCase(_PRECISION_IMPL, name, worker_num=2, local_worker_num=2)
+            for name in case_names
+        ])
     finally:
-        if os.path.exists(TEMP_DIR):
-            shutil.rmtree(TEMP_DIR)
-            print(f"Cleaned up temporary directory: {TEMP_DIR}")
+        _cleanup_baseline()
 
 
-def run_list_precision_case(case_name: str) -> None:
-    """Run list-unit precision case (reference training lives in-script; no standalone baseline)."""
+def _run_comm_fusion_group(case_names):
+    """Generate baseline once, then run comm_fusion 2-card cases."""
     try:
-        if os.path.exists(TEMP_DIR):
-            print(f"Cleaning up existing temporary directory before start: {TEMP_DIR}")
-            shutil.rmtree(TEMP_DIR)
-
-        glob_v = 2
-        master_port = 18525
-        script_path = os.path.join(os.path.dirname(__file__), file_name_list)
-        msrun_case(glob_v, script_path, case_name, master_port)
+        _generate_baseline()
+        parallel_run([
+            MindSporeCase(_PRECISION_IMPL, name, worker_num=2, local_worker_num=2)
+            for name in case_names
+        ])
     finally:
-        if os.path.exists(TEMP_DIR):
-            shutil.rmtree(TEMP_DIR)
-            print(f"Cleaned up temporary directory: {TEMP_DIR}")
+        _cleanup_baseline()
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_fully_shard():
-    """
-    Feature: Compare fully_shard precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training, then compare losses on rank 0
-    Expectation: Losses should match within tolerance
-    """
-    run_case(case_name=f"{inspect.stack()[0].function}")
+def _run_grad_accum_group(case_names):
+    """Generate baseline once, then run grad_accum 2-card cases."""
+    try:
+        _generate_baseline()
+        parallel_run([
+            MindSporeCase(_PRECISION_IMPL, name, worker_num=2, local_worker_num=2)
+            for name in case_names
+        ])
+    finally:
+        _cleanup_baseline()
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_fully_shard_prefetch():
-    """
-    Feature: Compare fully_shard prefetch precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training with prefetch enabled,
-                 then compare losses on rank 0
-    Expectation: Losses should match within tolerance
-    """
-    run_case(case_name=f"{inspect.stack()[0].function}")
+# ---------------------------------------------------------------------------
+# 4-card 2D-mesh group
+# ---------------------------------------------------------------------------
+
+def _run_partial_shard_group(case_names):
+    """Generate baseline once, then run partial_shard 4-card cases."""
+    try:
+        _generate_baseline()
+        parallel_run([
+            MindSporeCase(_PRECISION_IMPL, name, worker_num=4, local_worker_num=4)
+            for name in case_names
+        ])
+    finally:
+        _cleanup_baseline()
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_fully_shard_prefetch_recompute():
-    """
-    Feature: Compare fully_shard prefetch + recompute precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training with prefetch and activation
-                 recompute enabled, then compare losses on rank 0
-    Expectation: Losses should match within tolerance
-    """
-    run_case(case_name=f"{inspect.stack()[0].function}")
+# ---------------------------------------------------------------------------
+# list-unit precision group (no shared baseline; each uses get_group_size())
+# ---------------------------------------------------------------------------
+
+def _run_list_precision_group(case_names):
+    """Run list-unit precision cases (no shared baseline; each uses get_group_size())."""
+    try:
+        _cleanup_baseline()
+        parallel_run([
+            MindSporeCase(_LIST_PRECISION_IMPL, name, worker_num=4, local_worker_num=4)
+            for name in case_names
+        ])
+    finally:
+        _cleanup_baseline()
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_partial_shard():
-    """
-    Feature: Compare partial_shard precision with standalone baseline
-    Description: Run standalone baseline and partial_shard multi-card training, then compare losses on rank 0
-    Expectation: Losses should match within tolerance
-    """
-    run_case(case_name=f"{inspect.stack()[0].function}")
+# ============================================================================
+# Test functions
+# ============================================================================
 
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_partial_shard_prefetch_recompute():
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_ms_zero3_basic_suite():
     """
-    Feature: Compare partial_shard prefetch + recompute precision with standalone baseline
-    Description: Run standalone baseline and partial_shard multi-card training with prefetch and activation
-                 recompute enabled, then compare losses on rank 0
-    Expectation: Losses should match within tolerance
+    Feature: fully_shard basic and prefetch/recompute/empty_init precision.
+    Description:
+        1. test_ms_zero3_fully_shard — basic fully_shard with 1D dp mesh.
+        2. test_ms_zero3_fully_shard_prefetch — with child-module prefetch.
+        3. test_ms_zero3_fully_shard_prefetch_recompute — with prefetch + activation recompute.
+        4. test_ms_zero3_fully_shard_empty_weight — with init_empty_weights.
+    Expectation: All losses match standalone baseline within tolerance.
     """
-    run_case(case_name=f"{inspect.stack()[0].function}")
-
-
-@pytest.mark.skip(reason="Case failed after upgrading mindspore version")
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_fully_shard_replicate_params():
-    """
-    Feature: Compare partial_shard precision with standalone baseline
-    Description: Run standalone baseline and partial_shard multi-card training, then compare losses on rank 0
-    Expectation: Losses should match within tolerance
-    """
-    run_case(case_name=f"{inspect.stack()[0].function}")
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_fully_shard_grad_accum():
-    """
-    Feature: Compare fully_shard gradient accumulation precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training with gradient accumulation,
-                 then compare losses on rank 0
-    Expectation: Losses should match within tolerance
-    """
-    run_case(case_name=f"{inspect.stack()[0].function}")
+    _run_basic_group([
+        "test_ms_zero3_fully_shard",
+        "test_ms_zero3_fully_shard_prefetch",
+        "test_ms_zero3_fully_shard_prefetch_recompute",
+        "test_ms_zero3_fully_shard_empty_weight",
+    ])
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_fully_shard_prefetch_recompute_grad_accum():
+def test_ms_zero3_comm_fusion_suite():
     """
-    Feature: Compare fully_shard prefetch + recompute + gradient accumulation precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training with prefetch, activation
-                 recompute, and gradient accumulation, then compare losses on rank 0
-    Expectation: Losses should match within tolerance
+    Feature: fully_shard comm_fusion precision.
+    Description:
+        1. test_ms_zero3_fully_shard_comm_fusion — with comm_fusion.
+        2. test_ms_zero3_fully_shard_comm_fusion_prefetch — with comm_fusion + prefetch.
+    Expectation: All losses match standalone baseline within tolerance.
     """
-    run_case(case_name=f"{inspect.stack()[0].function}")
+    _run_comm_fusion_group([
+        "test_ms_zero3_fully_shard_comm_fusion",
+        "test_ms_zero3_fully_shard_comm_fusion_prefetch",
+    ])
 
 
-@pytest.mark.skip(reason="The Mindspore framework has a bug that causes a core dump when the process exits.")
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero1_fully_shard_grad_accum():
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_ms_zero3_grad_accum_suite():
     """
-    Feature: Compare zero1-style fully_shard gradient accumulation precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training
-                 on replicated parameters with gradient accumulation,
-                 disable grad sync on intermediate micro steps via set_requires_gradient_sync(False),
-                 and synchronize only when accumulation reaches the optimizer step
-    Expectation: Losses should match within tolerance
+    Feature: fully_shard gradient accumulation (zero3 / comm_fusion) precision.
+    Description:
+        1. test_ms_zero3_fully_shard_grad_accum — basic gradient accumulation.
+        2. test_ms_zero3_fully_shard_prefetch_recompute_grad_accum — with prefetch + recompute.
+        3. test_ms_zero3_fully_shard_grad_accum_comm_fusion — with comm_fusion.
+    Expectation: All losses match standalone baseline within tolerance.
     """
-    run_case(case_name=f"{inspect.stack()[0].function}")
+    _run_grad_accum_group([
+        "test_ms_zero3_fully_shard_grad_accum",
+        "test_ms_zero3_fully_shard_prefetch_recompute_grad_accum",
+        "test_ms_zero3_fully_shard_grad_accum_comm_fusion",
+    ])
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_fully_shard_list_unit_precision():
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_ms_zero3_partial_shard_suite():
+    """
+    Feature: fully_shard with 2D (dp, op) partial shard mesh.
+    Description:
+        1. test_ms_zero3_partial_shard — basic partial shard.
+        2. test_ms_zero3_partial_shard_prefetch_recompute — with prefetch + recompute.
+    Expectation: All losses match standalone baseline within tolerance.
+    """
+    _run_partial_shard_group([
+        "test_ms_zero3_partial_shard",
+        "test_ms_zero3_partial_shard_prefetch_recompute",
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_ms_fully_shard_list_unit_precision_suite():
     """
     Feature: fully_shard(list) numerical parity vs standalone (MindSpore).
-    Description: Nested fully_shard with ``fully_shard([dense1, dense2], reshard_after_forward=False)``;
-        compare final loss and dense1 grad shard to non-sharded training (same seed).
+    Description:
+        1. test_ms_fully_shard_list_unit_precision — fully_shard([dense1, dense2], reshard_after_forward=False);
+           compare final loss and dense1 grad shard to non-sharded training.
+        2. test_ms_fully_shard_list_unit_prefetch_recompute_precision — same with prefetch + recompute.
     Expectation: Run success (grouped hooks aligned with PyTorch FSDP2 list semantics).
     """
-    run_list_precision_case(case_name=f"{inspect.stack()[0].function}")
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_fully_shard_list_unit_prefetch_recompute_precision():
-    """
-    Feature: fully_shard(list) numerical parity vs standalone with prefetch and recompute (MindSpore).
-    Description: Nested fully_shard with ``fully_shard([dense1, dense2], reshard_after_forward=False)``
-        plus prefetch and activation recompute; compare final loss and dense1 grad shard to
-        non-sharded training (same seed).
-    Expectation: Run success (grouped hooks aligned with PyTorch FSDP2 list semantics).
-    """
-    run_list_precision_case(case_name=f"{inspect.stack()[0].function}")
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_fully_shard_empty_weight():
-    """
-    Feature: Compare empty init fully_shard precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training, then compare losses on rank 0
-    Expectation: Losses should match within tolerance
-    """
-    run_case(case_name=f"{inspect.stack()[0].function}")
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_fully_shard_comm_fusion():
-    """
-    Feature: Compare fully_shard comm_fusion precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training with comm_fusion enabled,
-                 then compare losses on rank 0
-    Expectation: Losses should match within tolerance
-    """
-    run_case(case_name=f"{inspect.stack()[0].function}")
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_fully_shard_comm_fusion_prefetch():
-    """
-    Feature: Compare fully_shard comm_fusion + prefetch precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training with comm_fusion and
-                 prefetch enabled, then compare losses on rank 0
-    Expectation: Losses should match within tolerance
-    """
-    run_case(case_name=f"{inspect.stack()[0].function}")
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_ms_zero3_fully_shard_grad_accum_comm_fusion():
-    """
-    Feature: Compare fully_shard gradient accumulation + comm_fusion precision with standalone baseline
-    Description: Run standalone baseline and fully_shard multi-card training with gradient accumulation
-                 and comm_fusion enabled, then compare losses on rank 0
-    Expectation: Losses should match within tolerance
-    """
-    run_case(case_name=f"{inspect.stack()[0].function}")
+    _run_list_precision_group([
+        "test_ms_fully_shard_list_unit_precision",
+        "test_ms_fully_shard_list_unit_prefetch_recompute_precision",
+    ])

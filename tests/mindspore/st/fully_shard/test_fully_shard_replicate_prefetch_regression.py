@@ -13,52 +13,30 @@
 # limitations under the License.
 # ============================================================================
 """Launch MindSpore fully_shard replicate_params prefetch regression ST."""
-import pytest
+import os
 
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import MindSporeCase, parallel_run
 
-_FILE_NAME = "_test_fully_shard_replicate_prefetch_regression.py"
-_SKIP_REASON = (
-    "Temporarily skipped: the regression body passes, but MindSpore msrun workers "
-    "may core dump during process teardown after replicate_params cases complete."
-)
+_TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_replicate_prefetch_regression.py")
 
 
-@pytest.mark.skip(reason=_SKIP_REASON)
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_fully_shard_replicate_params_backward_prefetch_regression():
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_ms_fully_shard_replicate_prefetch_regression_suite():
     """
-    Feature: fully_shard replicate_params with backward prefetch (MindSpore).
-    Description: Launch a 4-card msrun case that creates the mixed state introduced by
-        ``replicate_params`` and then triggers backward prefetch on the already-materialized child.
-    Expectation: Run success without the historical ``Expected sharded_state ... got UNSHARDED``
-        assertion during prefetch.
+    Feature: fully_shard replicate_params prefetch and TP DTensor state regression (MindSpore).
+    Description:
+        1. test_ms_fully_shard_replicate_params_backward_prefetch_regression (2 card)
+           - replicate_params + backward prefetch mixed state.
+        2. test_ms_hsdp_replicate_dtensor_state_visible_after_backward (4 card)
+           - TP DTensor replicate state read after backward.
+    Expectation: Run success without historical assertion errors.
     """
-    msrun_case(
-        2,
-        _FILE_NAME,
-        "test_ms_fully_shard_replicate_params_backward_prefetch_regression",
-        18533,
-        worker_num=4,
-        local_worker_num=4,
-    )
-
-
-@pytest.mark.skip(reason=_SKIP_REASON)
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_hsdp_replicate_dtensor_state_visible_after_backward():
-    """
-    Feature: HSDP replicate_params with a TP-sharded DTensor state (MindSpore).
-    Description: Launch a 4-card msrun case that updates a max_logits-like
-        replicate parameter in forward and reads it after HSDP post-backward reshard.
-    Expectation: Callback-style post-step read observes the updated non-zero value.
-    """
-    msrun_case(
-        2,
-        _FILE_NAME,
-        "test_ms_hsdp_replicate_dtensor_state_visible_after_backward",
-        18534,
-        worker_num=4,
-        local_worker_num=4,
-    )
+    parallel_run([
+        MindSporeCase(_TEST_FILE,
+                      "test_ms_fully_shard_replicate_params_backward_prefetch_regression",
+                      worker_num=2, local_worker_num=2),
+        MindSporeCase(_TEST_FILE,
+                      "test_ms_hsdp_replicate_dtensor_state_visible_after_backward",
+                      worker_num=4, local_worker_num=4),
+    ])

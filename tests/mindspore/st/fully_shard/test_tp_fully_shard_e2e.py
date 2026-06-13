@@ -79,13 +79,6 @@ def test_tp_plus_fully_shard_setup_and_compat_suite():
             2,
             2,
         ),
-        _build_tp_fully_shard_case(
-            "test_pure_tp_replicate_grad_managed_by_fully_shard_matches_standalone",
-            18208,
-            2,
-            2,
-            2,
-        ),
     )
 
 

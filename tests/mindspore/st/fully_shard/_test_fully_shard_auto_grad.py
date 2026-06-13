@@ -15,7 +15,7 @@
 """test fully_shard with chunked output layer and autograd (MindSpore)"""
 import mindspore as ms
 from mindspore import mint, nn, Tensor
-from mindspore.communication import get_rank, init
+from mindspore.communication import get_group_size, get_rank, init
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh, DTensor
 from hyper_parallel.core.fully_shard.api import fully_shard
@@ -110,7 +110,8 @@ def test_chunked_output_fully_shard():
     num_chunks = 4
     steps = 1
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
+    ws = get_group_size()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(ws,), mesh_dim_names=("dp",))
     mp_policy = MixedPrecisionPolicy()
 
     model = MLPAndChunkedOutputLayer(hidden_size, output_size, num_chunks)

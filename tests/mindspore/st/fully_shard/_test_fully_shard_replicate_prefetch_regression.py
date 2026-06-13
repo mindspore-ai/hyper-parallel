@@ -16,8 +16,8 @@
 import mindspore as ms
 import numpy as np
 
-from mindspore import Tensor, mint, nn, Parameter
-from mindspore.communication import get_rank, init
+from mindspore import Tensor, nn, Parameter
+from mindspore.communication import get_group_size, get_rank, init
 
 from hyper_parallel import SkipDTensorDispatch, init_device_mesh
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
@@ -81,7 +81,7 @@ class ReplicateStateNet(nn.Cell):
         )
 
     def construct(self, x):
-        self.max_logits_val.copy_(mint.ones_like(self.max_logits_val) * 7.0)
+        self.max_logits_val.fill_(7.0)
         return self.dense(x)
 
 
@@ -101,7 +101,8 @@ def test_ms_fully_shard_replicate_params_backward_prefetch_regression():
     init()
     rank_id = get_rank()
 
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(4,), mesh_dim_names=("dp",))
+    ws = get_group_size()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(ws,), mesh_dim_names=("dp",))
     net = SlimLeNet16()
     mp_policy = MixedPrecisionPolicy(
         param_dtype=ms.float32,
@@ -143,13 +144,16 @@ def test_ms_fully_shard_replicate_params_backward_prefetch_regression():
 
 
 def test_ms_hsdp_replicate_dtensor_state_visible_after_backward():
-    """End-to-end regression for TP DTensor replicate state under HSDP.
+    """End-to-end regression for TP DTensor replicate state under fully_shard.
 
-    Feature: HSDP ``replicate_params`` with a TP-sharded DTensor state parameter.
+    Feature: ``replicate_params`` with a TP-sharded DTensor state parameter.
     Description: ``ReplicateStateNet`` updates ``max_logits_val`` in forward,
-        then HSDP switches the module back to the sharded parameter object after
-        backward. The callback-style read from the module must observe the
-        updated value instead of the initial zeros.
+        then fully_shard switches the module back to the sharded parameter object
+        after backward. The callback-style read from the module must observe the
+        updated value instead of the initial zeros. ``max_logits_val`` is sharded
+        on the ``tp`` sub-mesh and managed by fully_shard on the disjoint ``dp``
+        sub-mesh so the unified DTensor layout is ``(dp, tp)`` rather than
+        duplicating the ``tp`` dimension.
     Expectation: ``max_logits_val`` remains greater than zero after backward.
     """
     ms.set_context(mode=ms.PYNATIVE_MODE)
@@ -164,7 +168,7 @@ def test_ms_hsdp_replicate_dtensor_state_visible_after_backward():
         output_dtype=ms.float32,
         cast_forward_inputs=False,
     )
-    fully_shard(net, mesh=mesh, mp_policy=mp_policy, replicate_params={net.max_logits_val})
+    fully_shard(net, mesh=mesh["dp"], mp_policy=mp_policy, replicate_params={net.max_logits_val})
 
     loss_fn = nn.CrossEntropyLoss()
     data = Tensor(np.random.randn(8, 32).astype(np.float32))

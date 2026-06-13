@@ -13,10 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """launch _test_fully_shard_auto_grad.py cases (MindSpore)"""
-from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+import os
 
-_FILE_NAME = "_test_fully_shard_auto_grad.py"
+from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import MindSporeCase, parallel_run
+
+_TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_auto_grad.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -27,4 +29,6 @@ def test_ms_chunked_output_fully_shard():
         multiple times in a for-loop with results concatenated and a single backward.
     Expectation: Run success.
     """
-    msrun_case(2, _FILE_NAME, "test_chunked_output_fully_shard", 18501, worker_num=4, local_worker_num=4)
+    parallel_run([
+        MindSporeCase(_TEST_FILE, "test_chunked_output_fully_shard", worker_num=2, local_worker_num=2),
+    ])
