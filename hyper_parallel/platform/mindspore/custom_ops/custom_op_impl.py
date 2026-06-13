@@ -358,6 +358,8 @@ class NpuMhcPreSinkhornDFunction(DFunction):  # pylint: disable=W0221
             grad_outputs[0], grad_outputs[1], grad_outputs[2],
             x, phi, alpha, bias,
             h_pre, hc_before_norm, inv_rms, sum_out, norm_out)
+        b, s, n = grad_h_post.shape
+        grad_h_res = grad_h_res.reshape(b, s, n, n)
         grads = _custom_ops.npu_mhc_pre_sinkhorn_backward(
             grad_h_in, grad_h_post, grad_h_res,
             x, phi, alpha, bias,
