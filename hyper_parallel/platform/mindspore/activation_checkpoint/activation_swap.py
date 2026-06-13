@@ -61,6 +61,11 @@ class FuncCell(Cell):
         return self._fn(*args, **kwargs)
 
 
+def _is_shared_function_callable(callable_obj: Callable) -> bool:
+    """Return True for stateless function objects commonly shared by modules."""
+    return isinstance(callable_obj, (types.FunctionType, types.BuiltinFunctionType, types.MethodType))
+
+
 def _iter_wrappable_callable_attrs(module: Cell) -> Iterator[tuple[str, Callable]]:
     """Yield public per-instance callable attributes not registered as child cells.
 
@@ -76,7 +81,7 @@ def _iter_wrappable_callable_attrs(module: Cell) -> Iterator[tuple[str, Callable
     for attr_name, attr_value in vars(module).items():
         if attr_name.startswith("_") or isinstance(attr_value, Cell):
             continue
-        if isinstance(attr_value, (types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
+        if _is_shared_function_callable(attr_value):
             continue
         if callable(attr_value):
             yield attr_name, attr_value
@@ -93,11 +98,13 @@ def _get_wrapped_callable(cell: Cell) -> Optional[Callable]:
     wrapped_module = getattr(cell, _CKPT_WRAPPED_MODULE, None)
     if isinstance(wrapped_module, FuncCell):
         return getattr(wrapped_module, "_fn", None)
+    if isinstance(cell, FuncCell):
+        return getattr(cell, "_fn", None)
     return None
 
 
 def _raise_callable_already_wrapped(callable_obj: Callable) -> None:
-    raise ValueError(
+    warnings.warn(
         f"Callable '{callable_obj.__class__.__name__}' is already wrapped. "
         "Wrapping overlapping module regions is not allowed."
     )
@@ -110,8 +117,10 @@ def _check_callable_attr_not_wrapped(owner: Cell, attr_name: str, attr_value: Ca
 
 
 def _check_and_mark_callable(callable_obj: Callable) -> None:
+    if _is_shared_function_callable(callable_obj):
+        return
     if getattr(callable_obj, '_is_wrapped', False):
-        raise ValueError(
+        warnings.warn(
             f"Callable '{callable_obj.__class__.__name__}' or one of its ancestors is already wrapped. "
             "Wrapping overlapping module regions is not allowed."
         )
@@ -125,18 +134,20 @@ def _check_and_mark_wrapped(module: Cell) -> None:
         ValueError: If ``module`` or any of its descendants is already wrapped.
     """
     if getattr(module, '_is_wrapped', False):
-        raise ValueError(
+        warnings.warn(
             f"Module '{module.__class__.__name__}' or one of its ancestors is already wrapped. "
             "Wrapping overlapping module regions is not allowed."
         )
     for _, submodule in module.cells_and_names():
         if submodule is module:
             continue
+        wrapped_callable = _get_wrapped_callable(submodule)
+        if wrapped_callable is not None and _is_shared_function_callable(wrapped_callable):
+            continue
         if getattr(submodule, '_is_wrapped', False):
-            wrapped_callable = _get_wrapped_callable(submodule)
             if wrapped_callable is not None:
                 _raise_callable_already_wrapped(wrapped_callable)
-            raise ValueError(
+            warnings.warn(
                 f"Submodule '{getattr(submodule, '_ckpt_wrapped_module', submodule).__class__.__name__}' of "
                 f"'{module.__class__.__name__}' is already wrapped. "
                 "Wrapping overlapping module regions is not allowed."

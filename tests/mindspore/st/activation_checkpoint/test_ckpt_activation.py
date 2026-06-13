@@ -24,9 +24,11 @@ def test_sac_group():
     Expectation: Run success.
     """
     parallel_run([
-        MindSporeCase(BASE_SHARD, "test_ac_memory_comparison", 11637, 1),
-        MindSporeCase(BASE_SHARD, "test_group_swap_correctness_and_memory", 11638, 1),
-        MindSporeCase(BASE_SHARD, "test_swap_manager_manual_group_api", 11639, 1),
-        MindSporeCase(BASE_SHARD, "test_inplace_modification", 11640, 1),
-        MindSporeCase(BASE_SHARD, "test_overlap_wrapper", 11641, 1)
+        MindSporeCase(BASE_SHARD, "test_basic_ac_memory_comparison", 11637, 1),
+        MindSporeCase(BASE_SHARD, "test_func_ac_memory_comparison", 11638, 1),
+        MindSporeCase(BASE_SHARD, "test_group_swap_correctness_and_memory", 11639, 1),
+        MindSporeCase(BASE_SHARD, "test_swap_manager_manual_group_api", 11640, 1),
+        MindSporeCase(BASE_SHARD, "test_inplace_modification", 11641, 1),
+        MindSporeCase(BASE_SHARD, "test_wrapper_overlap_detection_cases", 11642, 1),
+        MindSporeCase(BASE_SHARD, "test_wrapper_non_overlapping_allowed_cases", 11643, 1)
     ])

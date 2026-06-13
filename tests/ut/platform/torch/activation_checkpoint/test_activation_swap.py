@@ -102,11 +102,11 @@ class TestSwapWrapper(unittest.TestCase):
         self.assertEqual(wrapper(torch.tensor(2)).item(), 3)
 
     def test_rejects_overlapping_wrap(self):
-        """Wrapping the same module twice should raise a ValueError."""
+        """Wrapping the same module twice should warn."""
         mod = _TinyModule()
         swap_wrapper(mod)
 
-        with self.assertRaisesRegex(ValueError, "already wrapped"):
+        with self.assertWarnsRegex(UserWarning, "already wrapped"):
             swap_wrapper(mod)
 
     def test_forwards_attributes_and_strips_state_dict_prefix(self):

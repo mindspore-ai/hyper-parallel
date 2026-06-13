@@ -65,15 +65,6 @@ def apply_recompute(model, mode):
 
         for i, layer in enumerate(model.layers):
             model.layers[i] = checkpoint_wrapper(layer, policy_fn=policy_fn)
-    elif mode == "overlap_1":
-        model.layers[1]= checkpoint_wrapper(model.layers[1])
-        model.layers[1].ffn[0] = checkpoint_wrapper(model.layers[1].ffn[0])
-    elif mode == "overlap_2":
-        model.layers[2].ffn[0]= checkpoint_wrapper(model.layers[2].ffn[0])
-        model.layers[2] = swap_wrapper(model.layers[2])
-    elif mode == "overlap_3":
-        model.layers[2].attn= swap_wrapper(model.layers[2].attn)
-        model.layers[2].attn.out_proj = swap_wrapper(model.layers[2].attn.out_proj)
     else:
         raise ValueError(f"Unknown mode: {mode}")
     return model
@@ -228,9 +219,230 @@ def test_checkpoint_wrapper_accepts_func():
         )
 
 
-@pytest.mark.parametrize("mode", ["overlap_1", "overlap_2", "overlap_3"])
-def test_overlap_wrapper(mode):
-    base_model = SimpleTransformer(vocab_size=32000, dim=2048, depth=16).npu()
-    with pytest.raises(ValueError) as exc_info:
-        apply_recompute(base_model, mode)
-    assert "Wrapping overlapping module regions is not allowed" in str(exc_info.value)
+class _OverlapTransformerBlock(torch.nn.Module):
+    """Small transformer-style block used for wrapper overlap detection."""
+
+    def __init__(self, dim=4, hidden_dim=8):
+        super().__init__()
+        self.norm1 = torch.nn.LayerNorm(dim)
+        self.qkv = torch.nn.Linear(dim, dim * 3)
+        self.out_proj = torch.nn.Linear(dim * 3, dim)
+        self.norm2 = torch.nn.LayerNorm(dim)
+        self.ffn1 = torch.nn.Linear(dim, hidden_dim)
+        self.ffn2 = torch.nn.Linear(hidden_dim, dim)
+
+        def local_activation(x):
+            return torch.relu(x)
+
+        self.local_activation = local_activation
+        self.framework_mul = torch.mul
+
+    def scale(self, x):
+        return x * 2
+
+    def forward(self, x):
+        residual = x
+        x = self.norm1(x)
+        x = self.out_proj(self.qkv(x))
+        x = residual + x
+        residual = x
+        x = self.norm2(x)
+        x = self.local_activation(self.ffn1(x))
+        x = self.framework_mul(x, torch.tensor(1.0, device=x.device, dtype=x.dtype))
+        return residual + self.ffn2(x)
+
+
+class _OverlapTransformerNet(torch.nn.Module):
+    """Three-block net used to validate nested wrapper overlap detection."""
+
+    def __init__(self, dim=4, depth=3):
+        super().__init__()
+        self.embed = torch.nn.Linear(dim, dim)
+        self.blocks = torch.nn.ModuleList([_OverlapTransformerBlock(dim=dim) for _ in range(depth)])
+        self.norm = torch.nn.LayerNorm(dim)
+        self.head = torch.nn.Linear(dim, dim)
+
+        def root_activation(x):
+            return torch.relu(x)
+
+        self.root_activation = root_activation
+        self.framework_mul = torch.mul
+
+    def scale(self, x):
+        return x * 2
+
+    def forward(self, x):
+        x = self.embed(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.root_activation(x)
+        x = self.norm(x)
+        return self.head(x)
+
+
+def _overlap_same_module_twice():
+    net = _OverlapTransformerNet()
+    checkpoint_wrapper(net.blocks[0].ffn1)
+    checkpoint_wrapper(net.blocks[0].ffn1)
+
+
+def _overlap_checkpoint_then_swap_same_module():
+    net = _OverlapTransformerNet()
+    checkpoint_wrapper(net.blocks[0].ffn1)
+    swap_wrapper(net.blocks[0].ffn1)
+
+
+def _overlap_leaf_then_parent():
+    net = _OverlapTransformerNet()
+    net.blocks[0].ffn1 = checkpoint_wrapper(net.blocks[0].ffn1)
+    checkpoint_wrapper(net)
+
+
+def _overlap_parent_then_leaf():
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.blocks[0].ffn1)
+
+
+def _overlap_block_then_parent():
+    net = _OverlapTransformerNet()
+    net.blocks[1] = checkpoint_wrapper(net.blocks[1])
+    checkpoint_wrapper(net)
+
+
+def _overlap_parent_then_block():
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.blocks[1])
+
+
+def _overlap_leaf_then_block():
+    net = _OverlapTransformerNet()
+    net.blocks[1].ffn1 = checkpoint_wrapper(net.blocks[1].ffn1)
+    checkpoint_wrapper(net.blocks[1])
+
+
+def _overlap_block_then_leaf():
+    net = _OverlapTransformerNet()
+    wrapped_block = checkpoint_wrapper(net.blocks[1])
+    checkpoint_wrapper(wrapped_block.ffn1)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        _overlap_same_module_twice,
+        _overlap_checkpoint_then_swap_same_module,
+        _overlap_leaf_then_parent,
+        _overlap_parent_then_leaf,
+        _overlap_block_then_parent,
+        _overlap_parent_then_block,
+        _overlap_leaf_then_block,
+        _overlap_block_then_leaf,
+    ],
+)
+def test_wrapper_overlap_detection_cases(case):
+    """Overlapping wrapper regions should warn consistently."""
+    with pytest.warns(UserWarning, match="Wrapping overlapping module regions is not allowed"):
+        case()
+
+
+def _allowed_distinct_sibling_modules():
+    net = _OverlapTransformerNet()
+    net.blocks[0].ffn1 = checkpoint_wrapper(net.blocks[0].ffn1)
+    net.blocks[0].ffn2 = swap_wrapper(net.blocks[0].ffn2)
+
+
+def _allowed_distinct_blocks():
+    net = _OverlapTransformerNet()
+    net.blocks[0] = checkpoint_wrapper(net.blocks[0])
+    net.blocks[1] = swap_wrapper(net.blocks[1])
+
+
+def _allowed_distinct_block_callables():
+    net = _OverlapTransformerNet()
+    net.blocks[0].local_activation = checkpoint_wrapper(net.blocks[0].local_activation)
+    net.blocks[1].local_activation = swap_wrapper(net.blocks[1].local_activation)
+
+
+def _allowed_framework_function_reuse():
+    checkpoint_wrapper(torch.mul)
+    swap_wrapper(torch.mul)
+
+
+def _allowed_framework_function_attr_after_parent_wrap():
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.blocks[0].framework_mul)
+    checkpoint_wrapper(wrapped.blocks[1].framework_mul)
+
+
+def _allowed_root_framework_function_attr_after_parent_wrap():
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.framework_mul)
+
+
+def _allowed_bound_method_reuse():
+    net = _OverlapTransformerNet()
+    checkpoint_wrapper(net.blocks[0].scale)
+    swap_wrapper(net.blocks[0].scale)
+
+
+def _allowed_root_bound_method_reuse():
+    net = _OverlapTransformerNet()
+    checkpoint_wrapper(net.scale)
+    swap_wrapper(net.scale)
+
+
+def _allowed_callable_attr_then_parent():
+    net = _OverlapTransformerNet()
+    net.blocks[2].local_activation = checkpoint_wrapper(net.blocks[2].local_activation)
+    checkpoint_wrapper(net.blocks[2])
+
+
+def _allowed_parent_then_callable_attr():
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net.blocks[2])
+    checkpoint_wrapper(wrapped.local_activation)
+
+
+def _allowed_root_callable_attr_then_parent():
+    net = _OverlapTransformerNet()
+    net.root_activation = checkpoint_wrapper(net.root_activation)
+    checkpoint_wrapper(net)
+
+
+def _allowed_parent_then_root_callable_attr():
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.root_activation)
+
+
+def _allowed_diff_callables():
+    net = _OverlapTransformerNet()
+    net.blocks[1].local_activation = checkpoint_wrapper(net.blocks[1].local_activation)
+    net.blocks[2].local_activation = checkpoint_wrapper(net.blocks[2].local_activation)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        _allowed_distinct_sibling_modules,
+        _allowed_distinct_blocks,
+        _allowed_distinct_block_callables,
+        _allowed_framework_function_reuse,
+        _allowed_framework_function_attr_after_parent_wrap,
+        _allowed_root_framework_function_attr_after_parent_wrap,
+        _allowed_bound_method_reuse,
+        _allowed_root_bound_method_reuse,
+        _allowed_callable_attr_then_parent,
+        _allowed_parent_then_callable_attr,
+        _allowed_root_callable_attr_then_parent,
+        _allowed_parent_then_root_callable_attr,
+        _allowed_diff_callables,
+    ],
+)
+def test_wrapper_non_overlapping_allowed_cases(case):
+    """Non-overlapping or explicitly exempt callable configurations should be allowed."""
+    case()
