@@ -19,6 +19,7 @@ __all__ = ["get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDP
            "init_parameters", "init_empty_weights", "init_on_device",
            "shard_module", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch",
            "MetaStep", "MetaStepType", "BatchDimSpec", "PipelineStage", "ScheduleInterleaved1F1B",
+           "ScheduleMPipeTranspose",
            "init_process_group", "destroy_process_group", "get_process_group_ranks", "get_backend", "split_group",
            "get_group_local_rank", "mark_created_groups",
            "ContextParallel", "AsyncContextParallel",
@@ -39,8 +40,8 @@ from hyper_parallel.core.dtensor.init_weights import init_empty_weights, init_on
 from hyper_parallel.core.shard.api import shard_module
 from hyper_parallel.core.shard.api import parallelize_value_and_grad
 from hyper_parallel.core.shard.custom_shard import custom_shard
-from hyper_parallel.core.pipeline_parallel import (PipelineStage, ScheduleInterleaved1F1B, MetaStep, MetaStepType,
-                                                   BatchDimSpec)
+from hyper_parallel.core.pipeline_parallel import (PipelineStage, ScheduleInterleaved1F1B, ScheduleMPipeTranspose,
+                                                   MetaStep, MetaStepType, BatchDimSpec)
 from hyper_parallel.collectives.cc import (init_process_group, destroy_process_group, get_process_group_ranks,
                                            get_backend, split_group, get_group_local_rank, mark_created_groups)
 from hyper_parallel.core.context_parallel import (
