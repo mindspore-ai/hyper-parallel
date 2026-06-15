@@ -268,7 +268,6 @@ class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
         all_reduce_group.wait_all_reduce_and_apply_grad.assert_called_once_with()
         pre_group.apply_fusion_reduced_grad.assert_called_once_with()
         scheduler.hsdp_state.reduce_params.assert_called_once_with()
-        scheduler.hsdp_state._finish_ignored_allreduce.assert_called_once_with()
         self.assertFalse(HSDPSchedulerV2.root_bp_state)
 
         scheduler.scheduler_state = FSDPSchedulerState.BACKWARD

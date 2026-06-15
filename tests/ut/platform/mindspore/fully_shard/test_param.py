@@ -803,6 +803,7 @@ class TestMindSporeParam(unittest.TestCase):
 
         self.assertIs(reduced_grad, grad)
         self.assertIsNone(handle)
+        self.assertIs(hsdp_param._all_reduce_output, grad)
 
     def test_all_reduce_grad_rejects_missing_group_for_multi_rank(self):
         """Multi-rank all-reduce requires a concrete process group."""
