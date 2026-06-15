@@ -1,4 +1,4 @@
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2024-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ from fast_tuner.utils.profiling.profile_info import ProfileInfo
 from fast_tuner.pipeline_conductor.dryrun import DryRun, DRYRUN_CONFIG_ERROR
 from fast_tuner.ndsearch.para_for_nd_search import ParaForNd
 
+
 class ParallelConfig:
     def __init__(self, gbs, config):
         self.dp = config[0]
@@ -32,11 +33,13 @@ class ParallelConfig:
         self.ep = config[3]
         self.micro = gbs / self.dp
 
+
 class PipelineInputConfig:
     def __init__(self, profiling_info: ProfileInfo, config_path, model_args = None):
         self.profiling_info = profiling_info
         self.config_path = config_path
         self.model_args = model_args
+
 
 class ParallelInput:
     """define the input of parallel"""

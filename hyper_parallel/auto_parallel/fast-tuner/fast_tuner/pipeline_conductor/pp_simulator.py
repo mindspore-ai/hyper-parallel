@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ from matplotlib import colors
 from matplotlib.transforms import ScaledTranslation
 sys.setrecursionlimit(8192)
 
+
 def format_2d_inputs(a, raw, col):
     """
     format 2d inputs info
@@ -49,6 +50,7 @@ def apply_color(l: list, c: list[str]):
         l[idx] = f"\033[{c[idx]}m{formatted_item}\033[0m"
     return l
 
+
 def apply_format(l:list):
     """apply format"""
     s = f'{l[0]:^22}'
@@ -56,6 +58,7 @@ def apply_format(l:list):
     for i in range(len(l) - 1):
         s = f'{s}{symbol[i]}{l[i + 1]:^22}'
     return s
+
 
 def color_mix(c1, c2, w1=0.5, w2=0.5):
     """apply mix"""
@@ -88,6 +91,7 @@ class CausalError(Exception):
         plt.show()
         return f"{self.msg}"
 
+
 class CausalCommError(Exception):
     """
     Exception raised for communication causal errors in pipeline simulation.
@@ -111,6 +115,7 @@ class CausalCommError(Exception):
     def __str__(self):
         plt.show()
         return f"{self.msg}"
+
 
 def dfs_builder(comm=False):
     """dfs builder"""
@@ -1379,6 +1384,7 @@ class PipelineSimulator:
                 elif block.phase == 'stable':
                     self._send_block_delay(lines, p, b, 1)
         return lines
+
 
 def test_comm_imba_zero():
     """Test case."""

@@ -1,4 +1,4 @@
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2024-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import yaml
 from fast_tuner.utils.logger import logger
 from fast_tuner.pipeline_conductor import pp_util
 from fast_tuner.pipeline_conductor.dryrun import DryRun, DRYRUN_CONFIG_ERROR
+
 
 class ResultCsv:
     """

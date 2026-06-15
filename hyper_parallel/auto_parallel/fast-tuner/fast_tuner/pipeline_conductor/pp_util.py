@@ -1,4 +1,4 @@
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2024-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ pipeline_output_file = 'pipeline_output'
 dryrun_yaml_dir = 'dryrun_yaml'
 dryrun_shell_dir = 'dryrun_shell'
 dryrun_error = 'Dryrun failed, please check the mindspore environment!'
+
 
 def update_yaml_value(yaml_file, key, value):
     """Update or add a top-level key-value pair in a YAML file."""

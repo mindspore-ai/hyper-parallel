@@ -1,4 +1,4 @@
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2024-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -38,6 +38,7 @@ from fast_tuner.pipeline_conductor.pipeline_parallel import pipeline_proc
 
 
 __all__ = ['taylor_search_tool']
+
 
 def taylor_search_tool(para):
     """
@@ -89,6 +90,7 @@ def taylor_search_tool(para):
     # pipeline solve TODO: pass candidate_configs in instead of parsing csv
     pipeline_input = ParallelInput(para, profile_file_dir)
     pipeline_proc(pipeline_input)
+
 
 def main():
     """Entry point that parses command-line arguments and runs the parallel search tool."""

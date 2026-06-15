@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,11 +31,13 @@ def env_update(rank_size, env_variable_json):
     env_vars['RANK_SIZE'] = str(rank_size)
     os.environ.update(env_vars)
 
+
 def create_target_dir(file, target_directory):
     """Construct the target output directory path for a dryrun file."""
     output_dir = os.path.splitext(file)[0]
     target_dir = os.path.join(target_directory, f"dryrun_{output_dir}")
     return target_dir
+
 
 def execute_command(para, config_file_path, target_dir, rank_id, tp):
     '''execute dryrun command'''
@@ -56,6 +58,7 @@ def execute_command(para, config_file_path, target_dir, rank_id, tp):
     except OSError as e:
         logger.error(f"The command execution failed.: {e}")
 
+
 def calculate_rank_id(input_args, match, layer_num, rank_size):
     """Determine the rank ID for dryrun based on pipeline parallelism and dual-pipeline settings."""
     if is_dualpipe_open(input_args):
@@ -66,6 +69,7 @@ def calculate_rank_id(input_args, match, layer_num, rank_size):
     if rank_id == rank_size:
         rank_id -= 1
     return rank_id
+
 
 def read_dryrun_info(root_dir):
     '''read the peak mem from dryrun log'''
@@ -101,6 +105,7 @@ def read_dryrun_info(root_dir):
     logger.info('\n'.join(str(item) for item in result_list))
     return result_list
 
+
 def get_file_pattern(root_dir, input_args, para):
     """Select the appropriate regex file-name pattern based on config file type and whether the model uses experts."""
     logger.info(f"Reading file pattern from {root_dir}")
@@ -112,6 +117,7 @@ def get_file_pattern(root_dir, input_args, para):
     else:
         pattern = MODULE_PATTERN_REG_YAML
     return pattern
+
 
 def launch_dryrun(input_args, dryrun_file_dir, dryrun_data_dir, para):
     '''dryrun launcher'''

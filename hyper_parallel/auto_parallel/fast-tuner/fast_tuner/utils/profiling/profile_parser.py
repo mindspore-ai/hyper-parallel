@@ -1,4 +1,4 @@
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2024-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ from fast_tuner.ndsearch.memory_model import compute_weight_and_optimizer_memory
 
 encoding = 'utf-8'
 
+
 def find_file_by_name(directory, filename):
     """Recursively search for a file by name under the given directory.
 
@@ -36,6 +37,7 @@ def find_file_by_name(directory, filename):
             return os.path.join(root, filename)
     logger.error(f'No such file {filename} in directory {directory}')
     return None
+
 
 def median_mean(durs):
     """Compute the mean of the middle 50% of values, converted to milliseconds.
@@ -49,6 +51,7 @@ def median_mean(durs):
         return 0
     median_durs = durs[len(durs)//4:len(durs) - len(durs)//4]
     return round(statistics.mean(median_durs)/1000, 3)
+
 
 class ProfileParser:
     '''
@@ -591,6 +594,7 @@ class ProfileParser:
             profile_result[-4] = self.moe_bw / self.moe_fw
             profile_result[-5] = 0.3
 
+
 class MemoryInfo:
     """
     Memory information
@@ -634,12 +638,14 @@ class MemoryInfo:
             file.write(f'lm_head_mem={self.lm_head_mem}\n')
             logger.info(f'Write memory info to {memory_file_name}')
 
+
 class ProfileMemParser:
     """
     Docstring for ProfileMemParser
     """
     pipeline_output_file = 'pipeline_output'
     memory_info_dir = 'memory_info'
+
     def __init__(self, input_args, para):
         self.profile_mem_data = None
         self.input_args = input_args

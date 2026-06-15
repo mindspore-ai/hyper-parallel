@@ -1,4 +1,4 @@
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2024-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,6 +36,7 @@ def memory_simple_prune(config, profile_info):
         return False
     return True
 
+
 def trans_format(dryrun_info_init, test_ep):
     """
     trans dryrun_info_init to [dp, tp, pp, ep, peak_mem_ep1, peak_mem_ep2]
@@ -55,6 +56,7 @@ def trans_format(dryrun_info_init, test_ep):
         config_mem_dict[key][index] = peak_mem
 
     return [list(key) + value for key, value in config_mem_dict.items()]
+
 
 def grey_box_memory_prune(mindformers_args, dryrun_info_init, test_ep, max_expert_parallel):
     """
@@ -98,6 +100,7 @@ def grey_box_memory_prune(mindformers_args, dryrun_info_init, test_ep, max_exper
                 memory_aware_configs.append([dp, tp, pp, ep, evaluate_mem])
     return memory_aware_configs
 
+
 def find_power_of_two(m):
     """Return the exponent if m is an exact power of two, otherwise return None."""
     if m <= 0:
@@ -106,6 +109,7 @@ def find_power_of_two(m):
     if power.is_integer():
         return int(power)
     return None
+
 
 def filter_oom(search_space, input_args, para):
     """
@@ -176,6 +180,7 @@ def filter_oom(search_space, input_args, para):
                 f"format: [dp, tp, pp, ep, cp, op/fsdp, evaluate_peak_mem]")
     return candidate_configs
 
+
 def select_dry_config(valid_configs, input_args):
     """
 
@@ -212,6 +217,7 @@ def select_dry_config(valid_configs, input_args):
     logger.info(f"Dryrun candidate config size: {len(ans)}")
     return ans
 
+
 def generate_csv(output_path, dryrun_config, input_args):
     """
     generate nd result to csv file
@@ -235,11 +241,13 @@ def generate_csv(output_path, dryrun_config, input_args):
     except OSError as e:
         logger.info(f"write CSV file fail: {e}")
 
+
 class CareTpye(Enum):
     UNKNOWN = 0
     WITH_EXPERT_MF = 1
     NO_EXPERT = 2
     WITH_EXPERT_NO_MF = 3
+
 
 def generate_dry_config(care_part_configs, input_args, test_ep):
     """
@@ -292,6 +300,7 @@ def generate_dry_config(care_part_configs, input_args, test_ep):
     return dry_run_config
 
 NUM_BYTES_IN_MEGA = 1024 * 1024
+
 
 def compute_weight_and_optimizer_memory(input_args):
     """

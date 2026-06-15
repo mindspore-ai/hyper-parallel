@@ -1,4 +1,4 @@
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2024-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -201,6 +201,7 @@ class ExpertFilterManager:
     def gbs_for_dp_expert(self, candidate_space):
         """Filter configs where global batch size is divisible by data parallelism size."""
         return [config for config in candidate_space if self.get_gbs() % self.get_dp(config) == 0]
+
 
 def expert_filter_configs(search_spaces, input_args, gbs):
     """

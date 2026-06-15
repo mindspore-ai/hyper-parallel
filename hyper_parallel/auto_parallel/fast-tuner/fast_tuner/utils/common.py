@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,6 +41,7 @@ MODULE_PATTERN_REG_YAML = r'DP(\d+)_TP(\d+)_PP(\d+)_EP(\d+)_pretrain.yaml'
 MOE_PATTERN_REG_SHELL = r'DP(\d+)_TP(\d+)_PP(\d+)_EP(\d+)_pretrain.sh'
 LLAMA_PATTERN_REG_SHELL = r'DP(\d+)_TP(\d+)_PP(\d+)_pretrain.sh'
 
+
 def initial_offset(pipeline_stage, num_layers):
     '''
     set offset in a memory friendly way such that
@@ -63,6 +64,7 @@ def initial_offset(pipeline_stage, num_layers):
             offset[vpp][pipeline_stage - stage - 2] += 1
             remainder -= 1
     return offset[0]
+
 
 def offset_for_dualpipe(pipeline_stage, num_layers):
     '''
@@ -93,10 +95,12 @@ def offset_for_dualpipe(pipeline_stage, num_layers):
         offset[1][stage] = vpp2_layer - origin_base
     return offset
 
+
 def cal_world_size(input_args):
     '''compute the worldsize from config'''
     world_size = input_args.dp * input_args.tp * input_args.pp * input_args.cp
     return world_size
+
 
 def generate_dryrun_yaml(destination_file, config, para):
     """
@@ -133,6 +137,7 @@ def generate_dryrun_yaml(destination_file, config, para):
 
     logger.info(f"The dryrun YAML file copied and modified, new file is: {destination_file}")
 
+
 def generate_dryrun_shell(destination_file, config, para):
     """
 
@@ -147,6 +152,7 @@ def generate_dryrun_shell(destination_file, config, para):
     configs['PP'] = config[2]
     configs_to_shell(destination_file, configs, unparses)
     logger.info(f'The dryrun SHELL file copied and modified, new file is {destination_file}')
+
 
 def generate_profile_yaml(destination_file, config, para):
     """
@@ -186,6 +192,7 @@ def generate_profile_yaml(destination_file, config, para):
         yaml.dump(yaml_data, file, default_flow_style=False, allow_unicode=True)
 
     logger.info(f"The profile YAML file copied and modified, config_para is: {config}")
+
 
 def generate_profile_shell(destination_file, config, para):
     """
@@ -263,6 +270,7 @@ def generate_profile_shell(destination_file, config, para):
     insert_profile_args_final(destination_file)
     logger.info(f'The profile SHELL file copied and modified, new file is {destination_file}')
     return output_dir
+
 
 def generate_profile_toml(destination_file, config, para):
     '''generate toml file for profile'''
@@ -347,6 +355,7 @@ TASK_FUNCTION_MAP = {
     "profile_toml": generate_profile_toml,
 }
 
+
 def generate_files(candidate_configs, des_file_directory, file_task, para, input_args):
     '''generate config files w.r.t your training library'''
     # create dir if not exists
@@ -390,10 +399,12 @@ def is_dualpipe_open(input_args):
     )
     return use_zero_bubble_v
 
+
 def check_dryrun_parallel_number(parallel_num):
     """Validate that the dryrun parallel number does not exceed the allowed limit of 16."""
     if parallel_num > 16:
         raise ValueError(f"The parallel number {parallel_num} is too large.")
+
 
 def parse_args_from_json(args):
     """Load additional argument values from a JSON config file and set them on the args namespace."""

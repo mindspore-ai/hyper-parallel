@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ from fast_tuner.pipeline_conductor.math_model import Model
 from fast_tuner.pipeline_conductor import micro
 from fast_tuner.pipeline_conductor.start_service import ExpertInput
 from fast_tuner.utils.logger import logger
+
 
 class Solution:
     '''
@@ -247,6 +248,7 @@ class Solution:
         logger.info(list(self.peak_num.peak_num_select_recom_type2.values()))
         logger.info('the number of full recomputes of the type of layer2')
         logger.info(list(self.peak_num.peak_num_recompute_type2.values()))
+
 
 def extract_solution_file(yaml_file, sol_file):
     """Load an expert input config and a solution file, parse and print the solution details."""

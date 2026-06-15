@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -41,6 +41,7 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
 GENERALIZE_PIPELINE_CALCULATION = False
 MANUAL_P2P_RATIO = 0.002
 BACKWARD_RATIO = 2
+
 
 def op_table(cfg):
     """op compute load formulas"""
@@ -159,6 +160,7 @@ def efficiency(x):
     )
     return eff
 
+
 def throughput(precision_bytes, flop):
     """assumes matrix"""
     eff = efficiency(flop / (10.0**12))
@@ -181,6 +183,7 @@ def get_dynamic_ratio(cfg):
     if cfg.n_exp == 1:
         return 3 / 2 * (cfg.hff + cfg.s) * (8192 / (cfg.h + cfg.s))
     return 3 / 2 * (cfg.hff_exp + cfg.s) * (8192 / (cfg.h + cfg.s))
+
 
 def estimate_stage(*args, **kwargs):
     """stage level estimation"""
@@ -234,6 +237,7 @@ def estimate_stage(*args, **kwargs):
     return [perf[i] + re_perf[i] for i in range(len(perf))]
     #penalty_fn(stage)
     #return stage
+
 
 def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
     """pipeline level estimation"""
