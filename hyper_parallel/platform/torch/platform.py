@@ -399,6 +399,13 @@ else:
     _OP_MAP['mean'] = dist.ReduceOp.SUM
 
 
+def _ensure_contiguous(x):
+    """Return a contiguous copy of *x* if not already contiguous."""
+    if not x.is_contiguous() or x.storage_offset() != 0:
+        x = x.contiguous()
+    return x
+
+
 # pylint: disable=C0103
 class TorchPlatform(Platform):
     """Torch platform api"""
@@ -709,6 +716,7 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
+        data = _ensure_contiguous(data)
         output = list(dist_func.all_gather(data, group=group))
         if rank_list is not None:
             group_ranks = dist.get_process_group_ranks(group)
@@ -723,6 +731,7 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def differentiable_all_to_all(input_data, output_shape, group):
+        input_data = _ensure_contiguous(input_data)
         output_tensor = torch.empty(output_shape, device=input_data.device, dtype=input_data.dtype)
         output_tensor = dist_func.all_to_all_single(
             output_tensor,
@@ -746,6 +755,7 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def differentiable_all_reduce(data, op, group):
+        data = _ensure_contiguous(data)
         # Resolve the op from string to ReduceOp enum if necessary
         reduce_op = _OP_MAP.get(op, dist.ReduceOp.SUM) if isinstance(op, str) else op
         return dist_func.all_reduce(data, op=reduce_op, group=group)
@@ -825,6 +835,7 @@ class TorchPlatform(Platform):
 
     @staticmethod
     def differentiable_reduce_scatter(data, dev_num, axis, op, group):
+        data = _ensure_contiguous(data)
         input_tuple = torch.chunk(data, dev_num, dim=axis)
         output_tensor = torch.empty(input_tuple[0].shape, device=data.device, dtype=data.dtype)
 

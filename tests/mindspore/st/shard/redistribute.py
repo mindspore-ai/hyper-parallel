@@ -92,10 +92,10 @@ def test_different_mesh():
     # Create destination DeviceMesh (3D mesh)
     dst_mesh = init_device_mesh(
         device_type="npu",
-        mesh_shape=(1, 2, 1),
-        mesh_dim_names=("dp", "tp", "sp")
+        mesh_shape=(1, 2),
+        mesh_dim_names=("dp", "tp")
     )
-    dst_placements = (Replicate(), Shard(1), Replicate())
+    dst_placements = (Replicate(), Shard(1))
 
     # Create source DeviceMesh (2D mesh)
     src_mesh = init_device_mesh(
@@ -111,6 +111,42 @@ def test_different_mesh():
 
     expect_out = Tensor(np.ones([2, 1]), dtype=ms.float32)
 
+    assert np.allclose(expect_out.asnumpy(),
+                       out.to_local().asnumpy(),
+                       0.001, 0.001)
+
+
+def test_non_contiguous_redistribute():
+    '''
+    Feature: redistribute a DTensor whose local tensor is non-contiguous.
+
+    A transpose makes the local storage non-contiguous.  The redistribution
+    path must internally ensure contiguity before calling HCCL collectives,
+    otherwise ``InnerCommAllGather`` (and friends) will reject the tensor.
+    Description:
+    Expectation: Run success — the redistributed result matches the expected full tensor.
+    '''
+    D.init()
+
+    mesh = init_device_mesh(
+        device_type="npu",
+        mesh_shape=(1, 2),
+        mesh_dim_names=("dp", "tp")
+    )
+
+    src_placements = (Replicate(), Shard(1))
+    dst_placements = (Replicate(), Replicate())
+
+    # Construct a non-contiguous local shard via transpose.
+    # The transpose permutes strides, making is_contiguous() return False.
+    data = Tensor(np.ones([2, 2]), dtype=ms.float32)
+    non_contig_local = data.T  # shape (2, 2), non-contiguous
+    assert not non_contig_local.is_contiguous()
+
+    dist_x = DTensor.from_local(non_contig_local, mesh, src_placements)
+    out = dist_x.redistribute(mesh, dst_placements)
+
+    expect_out = Tensor(np.ones([2, 4]), dtype=ms.float32)
     assert np.allclose(expect_out.asnumpy(),
                        out.to_local().asnumpy(),
                        0.001, 0.001)

@@ -111,3 +111,37 @@ def test_different_mesh():
     # Redistributing between different meshes should raise RuntimeError
     with pytest.raises(RuntimeError):
         dist_x.redistribute(mesh_3d, dst_placements)
+
+
+def test_non_contiguous_redistribute():
+    '''
+    Feature: redistribute a DTensor whose local tensor is non-contiguous.
+
+    A transpose makes the local storage non-contiguous.  The redistribution
+    path must internally ensure contiguity before calling communication ops.
+    Description:
+    Expectation: Run success — the redistributed result matches the expected full tensor.
+    '''
+    init_backend(_DEVICE_TYPE)
+
+    mesh = init_device_mesh(
+        device_type=_DEVICE_TYPE,
+        mesh_shape=(1, 2),
+        mesh_dim_names=("dp", "tp")
+    )
+
+    src_placements = (Replicate(), Shard(1))
+    dst_placements = (Replicate(), Replicate())
+
+    # Non-contiguous local shard via transpose.
+    data = torch.ones(2, 2)
+    non_contig_local = data.T  # shape (2, 2), non-contiguous
+    assert not non_contig_local.is_contiguous()
+
+    dist_x = DTensor.from_local(to_device(non_contig_local, _DEVICE_TYPE), mesh, src_placements)
+    out = dist_x.redistribute(mesh, dst_placements)
+
+    expect_out = torch.ones(2, 4)
+    assert np.allclose(expect_out.cpu().detach().numpy(),
+                       out.to_local().cpu().detach().numpy(),
+                       0.001, 0.001)

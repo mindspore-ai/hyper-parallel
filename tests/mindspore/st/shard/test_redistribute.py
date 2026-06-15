@@ -28,10 +28,12 @@ def test_redistribute_group1():
         1. test_shard_to_replicate
         2. test_replicate_to_shard
         3. test_different_mesh
+        4. test_non_contiguous_redistribute
     Expectation: Run success.
     """
     parallel_run([
         MindSporeCase(REDISTRIBUTE, "test_shard_to_replicate", 11333, 2, 2),
         MindSporeCase(REDISTRIBUTE, "test_replicate_to_shard", 11334, 2, 2),
         MindSporeCase(REDISTRIBUTE, "test_different_mesh", 11335, 2, 2),
+        MindSporeCase(REDISTRIBUTE, "test_non_contiguous_redistribute", 11336, 2, 2),
     ])
