@@ -885,8 +885,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             apply_gradient_scaling_factor(grad, self.gradient_scaling_factor)
         reduce_group_info = self.unsharded_group_info
         if reduce_group_info.rank_size <= 1:
-            self._all_reduce_output = grad
-            self.all_reduce_handle = None
             return grad, None
         reduce_group = reduce_group_info.group
         if reduce_group is None:
