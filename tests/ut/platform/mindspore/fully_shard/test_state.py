@@ -37,7 +37,7 @@ from mindspore import ops
 
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import FullyShardParamMode, GroupInfo
-from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
+from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy, MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.fully_shard import state as state_mod
 from hyper_parallel.platform.mindspore.fully_shard.state import MindSporeHSDPStateV2
 
@@ -243,6 +243,9 @@ class TestStateParamBookkeeping(unittest.TestCase):
 
         hsdp_param = SimpleNamespace(
             accumulate_unsharded_grad_if_needed=_noop_accumulate,
+            param_mode=FullyShardParamMode.LOCAL_PARAM,
+            enable_fsdp_shard=True,
+            is_sharded=True,
             sharded_param=SimpleNamespace(requires_grad=True),
             _unsharded_param=unsharded,
             unsharded_param=unsharded,
@@ -294,6 +297,7 @@ class TestStateParamBookkeeping(unittest.TestCase):
             sharded_param=SimpleNamespace(requires_grad=True, grad=grad),
             unsharded_group_info=GroupInfo("group", "layout-group", 4),
             gradient_scaling_factor=None,
+            mp_policy=MixedPrecisionPolicy(),
         )
         state.hsdp_params = [hsdp_param]
 
@@ -307,7 +311,7 @@ class TestStateParamBookkeeping(unittest.TestCase):
         )
         self.assertEqual(
             MindSporeHSDPStateV2.pre_direct_all_reduce_grads,
-            [("work", grad, grad, 4, state._need_div)],
+            [(hsdp_param, "work", grad, grad, 4, state._need_div)],
         )
         MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
 
@@ -321,14 +325,38 @@ class TestStateParamBookkeeping(unittest.TestCase):
         target_grad = MagicMock()
         reduced_grad.dtype = "float32"
         target_grad.dtype = "float32"
+        hsdp_param = SimpleNamespace(mp_policy=MixedPrecisionPolicy())
         MindSporeHSDPStateV2.pre_direct_all_reduce_grads = [
-            (handle, reduced_grad, target_grad, 4, state._need_div)
+            (hsdp_param, handle, reduced_grad, target_grad, 4, state._need_div)
         ]
 
         state.reduce_params()
 
         handle.wait.assert_called_once_with()
         target_grad.data.copy_.assert_called_once_with(reduced_grad)
+        self.assertEqual(MindSporeHSDPStateV2.pre_direct_all_reduce_grads, [])
+
+    def test_reduce_params_drains_direct_dtensor_compat_all_reduce_to_main_grad(self):
+        """The direct compat queue should route fp32-main-grad policy through apply_reduced_grad."""
+        HSDPState.pre_reduce_scatter_params.clear()
+        HSDPState.pre_all_reduce_params.clear()
+        state = _make_state()
+        handle = MagicMock()
+        reduced_grad = MagicMock()
+        target_grad = MagicMock()
+        hsdp_param = SimpleNamespace(
+            mp_policy=MixedPrecisionPolicy(apply_grad_on_fp32_main_grad=True),
+            apply_reduced_grad=MagicMock(return_value=False),
+        )
+        MindSporeHSDPStateV2.pre_direct_all_reduce_grads = [
+            (hsdp_param, handle, reduced_grad, target_grad, 4, state._need_div)
+        ]
+
+        state.reduce_params()
+
+        handle.wait.assert_called_once_with()
+        hsdp_param.apply_reduced_grad.assert_called_once_with(reduced_grad, state._orig_dtype)
+        target_grad.data.copy_.assert_not_called()
         self.assertEqual(MindSporeHSDPStateV2.pre_direct_all_reduce_grads, [])
 
     def test_pending_grad_helpers_and_stream_synchronization(self):

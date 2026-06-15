@@ -401,13 +401,18 @@ class MindSporeHSDPStateV2(HSDPState):
                 or need_synchronize
             )
         while MindSporeHSDPStateV2.pre_direct_all_reduce_grads:
-            handle, reduced_grad, target_grad, reduce_group_size, need_div = (
+            hsdp_param, handle, reduced_grad, target_grad, reduce_group_size, need_div = (
                 MindSporeHSDPStateV2.pre_direct_all_reduce_grads.pop(0)
             )
             if handle is not None:
                 handle.wait()
             self._div_if_needed(reduced_grad, reduce_group_size, need_div)
-            if reduced_grad is not target_grad:
+            if hsdp_param.mp_policy.apply_grad_on_fp32_main_grad:
+                need_synchronize = (
+                    hsdp_param.apply_reduced_grad(reduced_grad, self._orig_dtype)
+                    or need_synchronize
+                )
+            elif reduced_grad is not target_grad:
                 if reduced_grad.dtype != target_grad.dtype:
                     reduced_grad = reduced_grad.to(target_grad.dtype)
                 copy_without_bumping_version(target_grad, reduced_grad)
@@ -521,7 +526,7 @@ class MindSporeHSDPStateV2(HSDPState):
                 async_op=True,
             )
         MindSporeHSDPStateV2.pre_direct_all_reduce_grads.append(
-            (handle, reduced_grad, grad, reduce_group_size, self._need_div)
+            (hsdp_param, handle, reduced_grad, grad, reduce_group_size, self._need_div)
         )
 
     def post_backward(self, *_):

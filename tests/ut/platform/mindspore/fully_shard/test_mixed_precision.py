@@ -66,6 +66,7 @@ def _new_hsdp_param_v2() -> MindSporeHSDPParamV2:
     obj = object.__new__(MindSporeHSDPParamV2)
     obj.all_gather_outputs = []
     obj.enable_fsdp_shard = True
+    obj.mp_policy = MixedPrecisionPolicy()
     return obj
 
 
@@ -355,6 +356,7 @@ class TestApplyReducedGrad(unittest.TestCase):
         """
         hsdp_param = MagicMock()
         hsdp_param.sharded_size = (8, 8)
+        hsdp_param.mp_policy = MixedPrecisionPolicy()
         hsdp_param.offload_to_cpu = False
         hsdp_param.sharded_param.grad = None
         hsdp_param.unsharded_accumulated_grad_data = None
@@ -389,6 +391,7 @@ class TestApplyReducedGrad(unittest.TestCase):
         existing_grad._local_tensor = local_tensor
         hsdp_param = MagicMock()
         hsdp_param.sharded_size = (4,)
+        hsdp_param.mp_policy = MixedPrecisionPolicy()
         hsdp_param.offload_to_cpu = False
         hsdp_param.sharded_param.grad = existing_grad
         hsdp_param.unsharded_accumulated_grad_data = None
@@ -412,6 +415,7 @@ class TestApplyReducedGrad(unittest.TestCase):
         """
         hsdp_param = MagicMock()
         hsdp_param.sharded_size = (4,)
+        hsdp_param.mp_policy = MixedPrecisionPolicy()
         hsdp_param.offload_to_cpu = False
         hsdp_param.sharded_param.grad = None
         hsdp_param.unsharded_accumulated_grad_data = None
@@ -437,6 +441,7 @@ class TestApplyReducedGrad(unittest.TestCase):
         """
         hsdp_param = MagicMock()
         hsdp_param.sharded_size = (4,)
+        hsdp_param.mp_policy = MixedPrecisionPolicy()
         hsdp_param.offload_to_cpu = False
         hsdp_param.sharded_param.grad = None
         hsdp_param.unsharded_accumulated_grad = MagicMock(name="accumulated_grad")
@@ -463,6 +468,7 @@ class TestApplyReducedGrad(unittest.TestCase):
         """
         hsdp_param = MagicMock()
         hsdp_param.sharded_size = (4,)
+        hsdp_param.mp_policy = MixedPrecisionPolicy()
         hsdp_param.offload_to_cpu = True
         hsdp_param.pin_memory = True
         hsdp_param.sharded_param.grad = None

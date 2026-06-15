@@ -36,7 +36,7 @@ import mindspore as ms
 
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_utils import FullyShardParamMode, GroupInfo, ShardedState
-from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo
+from hyper_parallel.core.fully_shard.utils import FSDPMeshInfo, MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_without_bumping_version
 from hyper_parallel.platform.mindspore.fully_shard.param import (
     MindSporeHSDPParamV2,
@@ -50,6 +50,7 @@ def _new_hsdp_param_v2() -> MindSporeHSDPParamV2:
     obj = object.__new__(MindSporeHSDPParamV2)
     obj.all_gather_outputs = []
     obj.gradient_scaling_factor = None
+    obj.mp_policy = MixedPrecisionPolicy()
     return obj
 
 
@@ -659,15 +660,16 @@ class TestMindSporeParam(unittest.TestCase):
         hsdp_param.to_sharded.assert_called_once_with()
 
     def test_assert_in_states_and_zero_grad_validate_param_lifecycle(self):
-        """State checks should fail loudly and zero_grad should clear the sharded grad."""
+        """State checks should fail loudly and zero_grad should clear sharded grad buffers."""
         hsdp_param = _new_hsdp_param_v2()
         hsdp_param.sharded_state = ShardedState.SHARDED
-        hsdp_param.sharded_param = SimpleNamespace(grad="grad")
+        hsdp_param.sharded_param = SimpleNamespace(grad="grad", main_grad="main-grad")
 
         with self.assertRaisesRegex(AssertionError, "Expected sharded_state"):
             MindSporeHSDPParamV2._assert_in_states(hsdp_param, ShardedState.UNSHARDED)
         MindSporeHSDPParamV2.zero_grad(hsdp_param)
         self.assertIsNone(hsdp_param.sharded_param.grad)
+        self.assertIsNone(hsdp_param.sharded_param.main_grad)
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.param.dist.all_reduce")
     def test_all_reduce_grad_uses_accumulated_grad_when_no_explicit_grad(self, mock_all_reduce):
@@ -850,6 +852,78 @@ class TestMindSporeParam(unittest.TestCase):
         np.testing.assert_allclose(
             hsdp_param.sharded_param.grad._local_tensor.asnumpy(),
             np.full((2, 2), 2.0, dtype=np.float32),
+        )
+        self.assertIsNone(hsdp_param.unsharded_accumulated_grad)
+
+    def test_apply_reduced_grad_assigns_main_grad_without_casting_reduced_dtype(self):
+        """Main-grad path should keep the reduced-gradient dtype, matching torch."""
+        hsdp_param = _new_hsdp_param_v2()
+        hsdp_param.mp_policy = MixedPrecisionPolicy(apply_grad_on_fp32_main_grad=True)
+        hsdp_param.sharded_size = (2, 2)
+        hsdp_param.sharded_param = SimpleNamespace(grad="old-grad")
+        hsdp_param.offload_to_cpu = False
+        hsdp_param.to_sharded_dtensor = MagicMock(side_effect=lambda tensor: SimpleNamespace(_local_tensor=tensor))
+        hsdp_param.unsharded_accumulated_grad = None
+        hsdp_param._unsharded_param = SimpleNamespace(grad="old-unsharded-grad")
+        reduced_grad = ms.Tensor(np.arange(4, dtype=np.float16))
+
+        need_synchronize = MindSporeHSDPParamV2.apply_reduced_grad(hsdp_param, reduced_grad, ms.float16)
+
+        self.assertFalse(need_synchronize)
+        self.assertIsNone(hsdp_param.sharded_param.grad)
+        main_grad = hsdp_param.sharded_param.main_grad
+        self.assertEqual(main_grad._local_tensor.dtype, ms.float16)
+        np.testing.assert_allclose(
+            main_grad._local_tensor.asnumpy(),
+            np.arange(4, dtype=np.float16).reshape(2, 2),
+        )
+        self.assertIsNone(hsdp_param._unsharded_param.grad)
+
+    def test_apply_reduced_grad_assigns_main_grad_without_unsharded_param(self):
+        """Direct DTENSOR_COMPAT applies reduced grads without an unsharded param."""
+        hsdp_param = _new_hsdp_param_v2()
+        hsdp_param.mp_policy = MixedPrecisionPolicy(apply_grad_on_fp32_main_grad=True)
+        hsdp_param.sharded_size = (2,)
+        hsdp_param.sharded_param = SimpleNamespace(grad="old-grad")
+        hsdp_param.offload_to_cpu = False
+        hsdp_param.to_sharded_dtensor = MagicMock(side_effect=lambda tensor: SimpleNamespace(_local_tensor=tensor))
+        hsdp_param.unsharded_accumulated_grad = None
+        hsdp_param._unsharded_param = None
+        reduced_grad = ms.Tensor(np.array([1.0, 2.0], dtype=np.float16))
+
+        need_synchronize = MindSporeHSDPParamV2.apply_reduced_grad(hsdp_param, reduced_grad, ms.float16)
+
+        self.assertFalse(need_synchronize)
+        self.assertIsNone(hsdp_param.sharded_param.grad)
+        main_grad = hsdp_param.sharded_param.main_grad
+        self.assertEqual(main_grad._local_tensor.dtype, ms.float16)
+        np.testing.assert_allclose(
+            main_grad._local_tensor.asnumpy(),
+            np.array([1.0, 2.0], dtype=np.float16),
+        )
+
+    def test_apply_reduced_grad_accumulates_existing_main_grad(self):
+        """Existing main_grad should accumulate in place and keep grad cleared."""
+        hsdp_param = _new_hsdp_param_v2()
+        hsdp_param.mp_policy = MixedPrecisionPolicy(apply_grad_on_fp32_main_grad=True)
+        hsdp_param.sharded_size = (2,)
+        local_main_grad = ms.Tensor(np.ones((2,), dtype=np.float32))
+        hsdp_param.sharded_param = SimpleNamespace(
+            grad="old-grad",
+            main_grad=SimpleNamespace(_local_tensor=local_main_grad),
+        )
+        hsdp_param.offload_to_cpu = False
+        hsdp_param.unsharded_accumulated_grad = ms.Tensor(np.ones((2,), dtype=np.float32))
+        hsdp_param._unsharded_param = SimpleNamespace(grad=None)
+        reduced_grad = ms.Tensor(np.array([2.0, 3.0], dtype=np.float16))
+
+        need_synchronize = MindSporeHSDPParamV2.apply_reduced_grad(hsdp_param, reduced_grad, ms.float16)
+
+        self.assertFalse(need_synchronize)
+        self.assertIsNone(hsdp_param.sharded_param.grad)
+        np.testing.assert_allclose(
+            hsdp_param.sharded_param.main_grad._local_tensor.asnumpy(),
+            np.array([3.0, 4.0], dtype=np.float32),
         )
         self.assertIsNone(hsdp_param.unsharded_accumulated_grad)
 

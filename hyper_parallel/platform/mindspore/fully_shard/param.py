@@ -806,8 +806,10 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         return self._reduce_scatter_output, self.reduce_scatter_handle
 
     def zero_grad(self):
-        """Reset the sharded parameter's gradient to None."""
+        """Reset the sharded parameter's gradient buffers to None."""
         self.sharded_param.grad = None
+        if hasattr(self.sharded_param, "main_grad"):
+            self.sharded_param.main_grad = None
 
     def all_reduce_grad(
         self,
@@ -891,16 +893,27 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         Apply reduced gradient to the sharded parameter.
 
         Reshapes ``reduced_grad`` to match the local shard, optionally
-        offloads to CPU, then accumulates or assigns onto
-        ``self.sharded_param.grad``.
+        offloads to CPU, then accumulates or assigns onto ``grad`` or
+        ``main_grad`` depending on the mixed-precision policy.
         Args:
             reduced_grad (ms.Tensor): Gradient after reduce-scatter
                 and/or all-reduce.
             param_type (Optional[ms.Type]): Target dtype for the gradient.
         """
-        sharded_grad = self.sharded_param.grad
+        if self.mp_policy.apply_grad_on_fp32_main_grad:
+            if not hasattr(self.sharded_param, "main_grad"):
+                self.sharded_param.main_grad = None
+            sharded_grad = self.sharded_param.main_grad
+        else:
+            sharded_grad = self.sharded_param.grad
+
         reduced_grad = reduced_grad.view(self.sharded_size)
-        reduced_grad = _to_dtype_if_needed(reduced_grad, param_type)
+        if (
+            not self.mp_policy.apply_grad_on_fp32_main_grad
+            and param_type is not None
+            and reduced_grad.dtype != param_type
+        ):
+            reduced_grad = reduced_grad.to(param_type)
         to_accumulate_grad = sharded_grad is not None
         need_synchronize = False
         if self.offload_to_cpu:
@@ -910,13 +923,24 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             )
             need_synchronize = True
         if sharded_grad is None:
-            self.sharded_param.grad = self.to_sharded_dtensor(reduced_grad)
+            if self.mp_policy.apply_grad_on_fp32_main_grad:
+                self.sharded_param.main_grad = self.to_sharded_dtensor(reduced_grad)
+                self.sharded_param.grad = None
+            else:
+                self.sharded_param.grad = self.to_sharded_dtensor(reduced_grad)
         else:
-            self.sharded_param.grad._local_tensor += reduced_grad
+            if self.mp_policy.apply_grad_on_fp32_main_grad:
+                self.sharded_param.main_grad._local_tensor += reduced_grad
+                self.sharded_param.grad = None
+            else:
+                self.sharded_param.grad._local_tensor += reduced_grad
 
         if self.unsharded_accumulated_grad_data is not None:
             self.unsharded_accumulated_grad = None
-        elif self.unsharded_param.grad is not None:
+        elif self._unsharded_param is not None and self.unsharded_param.grad is not None:
+            # The direct DTENSOR_COMPAT all-reduce path applies the reduced grad
+            # straight onto sharded_param (main_grad) while _unsharded_param is None,
+            # so guard the unsharded cleanup against that case.
             self.unsharded_param.grad = None
         return need_synchronize
 

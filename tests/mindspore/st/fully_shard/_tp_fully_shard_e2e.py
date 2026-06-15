@@ -236,7 +236,25 @@ def _build_fp32_mp_policy():
     )
 
 
-def _wrap_tp_fully_shard_model(model, tp_mesh, *, mesh, shard_placement_fn=None):
+def _build_fp32_main_grad_mp_policy():
+    """Build a policy that stores fp32-reduced gradients in main_grad."""
+    return MixedPrecisionPolicy(
+        param_dtype=ms.float32,
+        reduce_dtype=ms.float32,
+        output_dtype=ms.float32,
+        cast_forward_inputs=False,
+        apply_grad_on_fp32_main_grad=True,
+    )
+
+
+def _wrap_tp_fully_shard_model(
+    model,
+    tp_mesh,
+    *,
+    mesh,
+    shard_placement_fn=None,
+    mp_policy: MixedPrecisionPolicy | None = None,
+):
     """Apply TP sharding then fully_shard to the test model."""
     x_placements, sharding_plan = _build_tp_sharding_plan(tp_mesh)
     model = shard_module(model, device_mesh=tp_mesh, sharding_plan=sharding_plan)
@@ -245,7 +263,7 @@ def _wrap_tp_fully_shard_model(model, tp_mesh, *, mesh, shard_placement_fn=None)
         mesh=mesh,
         reshard_after_forward=True,
         shard_placement_fn=shard_placement_fn,
-        mp_policy=_build_fp32_mp_policy(),
+        mp_policy=mp_policy or _build_fp32_mp_policy(),
     )
     model.set_reduce_op_type("sum")
     return model, x_placements
@@ -287,18 +305,40 @@ def _zero_param_grads(params):
     """Reset parameter gradients for the next training step."""
     for param in params:
         param.grad = None
+        if hasattr(param, "main_grad"):
+            param.main_grad = None
+
+
+def _get_optimizer_grad(param):
+    """Return the gradient object that should be passed to the optimizer."""
+    main_grad = getattr(param, "main_grad", None)
+    if main_grad is not None:
+        return main_grad
+    return param.grad
+
+
+def _to_local_grad(grad):
+    """Return the local tensor for a regular Tensor or DTensor gradient."""
+    if isinstance(grad, DTensor):
+        return grad.to_local()
+    return grad
 
 
 def _collect_local_grads(params):
-    """Collect parameter gradients as local numpy arrays."""
-    grads = []
+    """Collect parameter gradients as local tensors."""
+    return [_to_local_grad(_get_optimizer_grad(param)) for param in params]
+
+
+def _assert_main_grads(params, expected_dtype) -> None:
+    """Verify main_grad owns the reduced gradients and regular grad is cleared."""
     for param in params:
-        grad = param.grad
-        if isinstance(grad, DTensor):
-            grads.append(grad.to_local())
-        else:
-            grads.append(grad)
-    return grads
+        assert param.grad is None, "Expected regular grad to stay None when main_grad is enabled."
+        main_grad = getattr(param, "main_grad", None)
+        assert main_grad is not None, "Expected main_grad to be materialized."
+        local_main_grad = _to_local_grad(main_grad)
+        assert local_main_grad.dtype == expected_dtype, (
+            f"Expected main_grad dtype {expected_dtype}, got {local_main_grad.dtype}."
+        )
 
 
 def _build_model_state_dict(input_size: int, output_size: int, init_seed: int) -> dict[str, np.ndarray]:
@@ -363,6 +403,8 @@ def _run_tp_fully_shard_training(
     use_empty_weight: bool = False,
     accumulate_grad: bool = False,
     micro_step: int = 4,
+    mp_policy: MixedPrecisionPolicy | None = None,
+    expected_main_grad_dtype=None,
 ):
     """Run TP + fully_shard training and record per-step loss + local gradients."""
     state_dict_np = {
@@ -375,7 +417,12 @@ def _run_tp_fully_shard_training(
             mesh=dp_mesh,
         )
     else:
-        model, x_placements = _wrap_tp_fully_shard_model(model, tp_mesh, mesh=dp_mesh)
+        model, x_placements = _wrap_tp_fully_shard_model(
+            model,
+            tp_mesh,
+            mesh=dp_mesh,
+            mp_policy=mp_policy,
+        )
     optimizer = nn.Adam(model.trainable_params(), learning_rate=0.01)
     dp_idx = _flatten_coordinate(dp_mesh.mesh_shape, dp_mesh.get_coordinate())
     local_x, local_y = _get_local_batch_slice(x, y, dp_mesh.size(), dp_idx)
@@ -409,9 +456,11 @@ def _run_tp_fully_shard_training(
         else:
             loss_value = forward_fn(dist_x, dist_y)
             loss_value.backward(Tensor(1.0 / tp_mesh.size(), ms.float32))
-        grad_list = tuple(param.grad for param in optimizer.parameters)
+        if expected_main_grad_dtype is not None:
+            _assert_main_grads(optimizer.parameters, expected_main_grad_dtype)
+        grad_list = tuple(_get_optimizer_grad(param) for param in optimizer.parameters)
         losses.append(_to_numpy_loss(loss_value))
-        grads.append(tuple(grad.asnumpy().copy() for grad in grad_list))
+        grads.append(tuple(_to_local_grad(grad).asnumpy().copy() for grad in grad_list))
         with SkipDTensorDispatch():
             optimizer(grad_list)
     return losses, grads
@@ -520,6 +569,8 @@ def _assert_loss_and_grad_match(
     use_empty_weight: bool = False,
     accumulate_grad: bool = False,
     micro_step: int = 4,
+    mp_policy: MixedPrecisionPolicy | None = None,
+    expected_main_grad_dtype=None,
 ):
     """Run one TP + fully_shard case and compare distributed vs standalone results."""
     D.init()
@@ -580,6 +631,8 @@ def _assert_loss_and_grad_match(
         use_empty_weight=use_empty_weight,
         accumulate_grad=accumulate_grad,
         micro_step=micro_step,
+        mp_policy=mp_policy,
+        expected_main_grad_dtype=expected_main_grad_dtype,
     )
 
     for step_idx in range(steps):
@@ -1149,6 +1202,23 @@ def test_tp_plus_fully_shard_loss_and_grad_match_standalone():
         label_seed=3,
         init_seed=4,
         tp_size=2,
+    )
+
+
+def test_tp_plus_fully_shard_fp32_main_grad_match_standalone():
+    """TP + fully_shard: fp32-reduce main_grad matches standalone and can drive optimizer steps."""
+    _assert_loss_and_grad_match(
+        case_name="tp2_fully_shard_fp32_main_grad_case_ms",
+        steps=4,
+        batch_size=16,
+        input_size=32,
+        output_size=32,
+        input_seed=102,
+        label_seed=103,
+        init_seed=104,
+        tp_size=2,
+        mp_policy=_build_fp32_main_grad_mp_policy(),
+        expected_main_grad_dtype=ms.float32,
     )
 
 
