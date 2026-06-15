@@ -49,7 +49,7 @@ class Preprocess(nn.Module):
         """Run the two tanh-activated linear layers.
 
         Args:
-            x: The preprocess input tensor.
+            x (Tensor): The preprocess input tensor.
         """
         return torch.tanh(self.l1(torch.tanh(self.l0(x))))
 
@@ -66,7 +66,7 @@ class Body0(nn.Module):
         """Run the tanh-activated body layer.
 
         Args:
-            hidden: The hidden state from the preprocess block.
+            hidden (Tensor): The hidden state from the preprocess block.
         """
         return torch.tanh(self.linear(hidden))
 
@@ -83,7 +83,7 @@ class LastStage(nn.Module):
         """Project the hidden state and reduce to a scalar loss.
 
         Args:
-            hidden: The hidden state from the stage-0 body.
+            hidden (Tensor): The hidden state from the stage-0 body.
         """
         return self.linear(hidden).pow(2).sum()
 
@@ -95,7 +95,7 @@ class _Identity(nn.Module):
         """Return the input unchanged.
 
         Args:
-            x: The preprocess input tensor (shipped without a parameter copy).
+            x (Tensor): The preprocess input tensor (shipped without a parameter copy).
         """
         return x
 
@@ -126,7 +126,7 @@ def _reference_grads(dataload_only=False):
     preprocess, body0, last = _build_modules(dataload_only)
     total = None
     for x in _micro_inputs():
-        loss = last(body0(preprocess(x)))
+        loss = last(body0(preprocess(x)))  # pylint: disable=not-callable
         total = loss if total is None else total + loss
     total.backward()
     return preprocess, body0, last, total.detach()

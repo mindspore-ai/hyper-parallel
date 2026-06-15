@@ -18,6 +18,7 @@ How to run this:
     pytest tests/ut/auto_parallel/sapp_nd/memory_estimation/test_memory_estimation.py
 """
 import os
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import (
     NodeStatEval,
 )
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._bwd_overhead import _BackwardOverhead
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._func_tracer import _FuncTracer
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._ppb import _PPB
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._utils import _Utils
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
@@ -607,3 +609,90 @@ class TestSappNDMemoryEstimation(unittest.TestCase):
         self.assertEqual(overhead.vpp_1f1b_steady_overhead(1, [[1], [4], [2]]), 3)
         ctx.vpp_less_mem = False
         self.assertEqual(overhead.vpp_1f1b_steady_overhead(1, [[1], [4], [2]]), 3)
+
+    def test_func_tracer_helpers(self) -> None:
+        """
+        Feature: TestSappNDMemoryEstimation.
+        Description: Trace a tiny local function and exercise expression substitution.
+        Expectation: Tracing returns the original result and records readable expressions.
+        """
+        tracer = _FuncTracer()
+        holder = SimpleNamespace(offset=2)
+        self.assertTrue(tracer.is_constant_expr("holder.offset"))
+        self.assertFalse(tracer.is_constant_expr("value + holder.offset"))
+        self.assertIn("holder.offset", tracer.scrap_term_symbols("value + holder.offset"))
+        self.assertEqual(tracer.substitute("value + holder.offset", {"value": 3, "holder": holder}), "3 + 2")
+
+        previous_trace = sys.gettrace()
+        try:
+            result = tracer.wrap(_trace_sample)(3, holder)
+        finally:
+            # _FuncTracer deliberately clears tracing; restore pytest-cov's tracer.
+            sys.settrace(previous_trace)
+
+        self.assertEqual(result, 10)
+        self.assertIn(_trace_sample.__code__, tracer.code_trees)
+        self.assertIsNotNone(
+            tracer.fetch_node_from_lineno(_trace_sample.__code__.co_firstlineno + 2, _trace_sample.__code__)
+        )
+
+    def test_evaluator_public_helpers_with_fake_backbone(self) -> None:
+        """
+        Feature: TestSappNDMemoryEstimation.
+        Description: Cover EvaluatorV2 result wrappers without parsing or model search.
+        Expectation: Config restoration, PPB caching, layer accessors and fit checks are deterministic.
+        """
+        evaluator = object.__new__(EvaluatorV2)
+        fake_ccfg = SimpleNamespace(
+            parser=SimpleNamespace(ccfg=None),
+            model_name="unit-model",
+            device_capacity=Memory.from_mb(100),
+            multimodal=False,
+            hooks_dict={},
+        )
+        evaluator._ccfg = fake_ccfg  # pylint: disable=protected-access
+        evaluator._overhead_obj = SimpleNamespace(_ccfg=None)  # pylint: disable=protected-access
+        evaluator.ppb = None
+
+        node_key = (0, 0, 0, LayerType.NOT_REC_LAYER.name[0])
+        insights = [
+            {"Static": 10, "Dynamic": 20, "Node Log": {node_key: {"_param": 4, "_activ": 5, "_comm": 1}}},
+            {"Static": 30, "Dynamic": 25, "Node Log": {}},
+        ]
+        backbone_calls = []
+
+        def fake_backbone(*args: Any) -> tuple:
+            """Return deterministic insight and PPB results."""
+            backbone_calls.append(args)
+            return insights, {"layers": ["unit"]}
+
+        evaluator._estimate_backbone = fake_backbone  # pylint: disable=protected-access
+
+        self.assertEqual(evaluator.estimate_peak(), 55)
+        self.assertEqual(evaluator.estimate_peak_insight(), insights)
+        self.assertEqual(evaluator.static_mem_stage(0), 10)
+        self.assertEqual(evaluator.dynamic_mem_stage(0), 20)
+        self.assertEqual(evaluator.logs_mem_stage(0), insights[0]["Node Log"])
+        self.assertEqual(evaluator.static_mem_layer(LayerType.NOT_REC_LAYER, 0), 4)
+        self.assertEqual(evaluator.dynamic_mem_layer(LayerType.NOT_REC_LAYER, 0), 6)
+
+        self.assertEqual(evaluator.estimate_layer_memory(ppb_format=2), {"layers": ["unit"]})
+        calls_after_first_ppb = len(backbone_calls)
+        self.assertEqual(evaluator.estimate_layer_memory(), {"layers": ["unit"]})
+        self.assertEqual(len(backbone_calls), calls_after_first_ppb)
+
+        self.assertTrue(evaluator.mem_fit(95, tolerance=5))
+        self.assertTrue(evaluator.mem_fit(90, margin=5))
+        self.assertFalse(evaluator.mem_fit(101))
+
+        reset_calls = []
+        evaluator.config_path = "unit.yaml"
+        evaluator.update_config = reset_calls.append
+        evaluator.reset_config()
+        self.assertEqual(reset_calls, ["unit.yaml"])
+
+        hook_calls = []
+        evaluator._ccfg.hooks_dict = {"unit": hook_calls.append}  # pylint: disable=protected-access
+        evaluator.load_hook_cls("hook")
+        self.assertEqual(evaluator.hook_cls, "hook")
+        self.assertIs(hook_calls[0], evaluator)

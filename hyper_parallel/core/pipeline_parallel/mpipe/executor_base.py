@@ -36,7 +36,7 @@ class MPipeTransposeExecutorBase(ABC):
     """Backend-agnostic runtime for the ``MPIPE_*`` steps of MPipe Transpose.
 
     Args:
-        schedule: The :class:`ScheduleMPipeTranspose` instance, providing the
+        schedule (ScheduleMPipeTranspose): The schedule instance, providing the
             per-rank preprocess module, the body stages (for the PP group and
             global-rank mapping), and the transposed micro-batch count.
 
@@ -115,8 +115,8 @@ class MPipeTransposeExecutorBase(ABC):
         """Broadcast the preprocess parameters from stage 0 to all ranks.
 
         Args:
-            step: The ``MPIPE_PARAM_BROADCAST`` schedule step (unused).
-            ctx: The pipeline run context (unused).
+            step (MetaStep): The ``MPIPE_PARAM_BROADCAST`` schedule step (unused).
+            ctx (PipelineContext): The pipeline run context (unused).
         """
         src = self._global_rank(0)
         for tensor in self._broadcast_tensors():
@@ -131,8 +131,8 @@ class MPipeTransposeExecutorBase(ABC):
         for the recompute backward.
 
         Args:
-            step: The schedule step; ``step.micro_index`` selects the micro-batch.
-            ctx: The pipeline run context (``arg_mbs`` / ``kwarg_mbs``).
+            step (MetaStep): The schedule step; ``step.micro_index`` selects the micro-batch.
+            ctx (PipelineContext): The pipeline run context (``arg_mbs`` / ``kwarg_mbs``).
         """
         micro = step.micro_index
         args = self._as_tuple(ctx.arg_mbs[micro])
@@ -152,8 +152,8 @@ class MPipeTransposeExecutorBase(ABC):
         """Send the preprocess output of ``step.micro_index`` to stage 0.
 
         Args:
-            step: The schedule step; ``step.micro_index`` selects the micro-batch.
-            ctx: The pipeline run context; the send handle is appended to it.
+            step (MetaStep): The schedule step; ``step.micro_index`` selects the micro-batch.
+            ctx (PipelineContext): The pipeline run context; the send handle is appended to it.
         """
         micro = step.micro_index
         out = self._contiguous(self._outputs[micro])
@@ -167,8 +167,8 @@ class MPipeTransposeExecutorBase(ABC):
         """Receive a transposed micro-batch's preprocess output into stage 0's input slot.
 
         Args:
-            step: The schedule step; ``step.micro_index`` selects the micro-batch.
-            ctx: The pipeline run context; the received buffer is placed in its ``arg_mbs``.
+            step (MetaStep): The schedule step; ``step.micro_index`` selects the micro-batch.
+            ctx (PipelineContext): The pipeline run context; the received buffer is placed in its ``arg_mbs``.
         """
         micro = step.micro_index
         src = self._global_rank(micro)
@@ -183,8 +183,8 @@ class MPipeTransposeExecutorBase(ABC):
         """Send the preprocess input of ``step.micro_index`` to stage 0 (for recompute).
 
         Args:
-            step: The schedule step; ``step.micro_index`` selects the micro-batch.
-            ctx: The pipeline run context; send handles are appended to it.
+            step (MetaStep): The schedule step; ``step.micro_index`` selects the micro-batch.
+            ctx (PipelineContext): The pipeline run context; send handles are appended to it.
         """
         micro = step.micro_index
         dst = self._global_rank(0)
@@ -197,8 +197,8 @@ class MPipeTransposeExecutorBase(ABC):
         """Receive a transposed micro-batch's preprocess input for the recompute backward.
 
         Args:
-            step: The schedule step; ``step.micro_index`` selects the micro-batch.
-            ctx: The pipeline run context (unused).
+            step (MetaStep): The schedule step; ``step.micro_index`` selects the micro-batch.
+            ctx (PipelineContext): The pipeline run context (unused).
         """
         micro = step.micro_index
         src = self._global_rank(micro)
@@ -217,8 +217,8 @@ class MPipeTransposeExecutorBase(ABC):
         """Recompute the preprocess forward on stage 0 and backprop the body's input grad.
 
         Args:
-            step: The schedule step; ``step.micro_index`` selects the micro-batch.
-            ctx: The pipeline run context; the body's input grad is read from its ``arg_mbs``.
+            step (MetaStep): The schedule step; ``step.micro_index`` selects the micro-batch.
+            ctx (PipelineContext): The pipeline run context; the body's input grad is read from its ``arg_mbs``.
         """
         micro = step.micro_index
         grad = ctx.arg_mbs[micro][0].grad
