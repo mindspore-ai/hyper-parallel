@@ -718,6 +718,13 @@ class _MSAsyncAllGatherFunction(_Function):
         return _move_dim_from_front(output, ctx.gather_dim), None, None, None, None, None, None
 
 
+def _ensure_contiguous(x):
+    """Return a contiguous copy of *x* if not already contiguous."""
+    if not x.is_contiguous() or x.storage_offset() != 0:
+        x = x.contiguous()
+    return x
+
+
 class MindSporePlatform(Platform):
     """MindSpore platform api"""
     Tensor = Tensor
@@ -974,6 +981,7 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def differentiable_all_gather_concat(data, group, concat_size, concat_dim, rank_list=None):
+        data = _ensure_contiguous(data)
         # rank_list is accepted for torch parity; MindSpore keeps the existing group order.
         output, _ = comm_func.all_gather_into_tensor(None, data, group=group)
         if concat_dim == 0:
@@ -987,6 +995,7 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def differentiable_all_to_all(input_data, output_shape, group):
+        input_data = _ensure_contiguous(input_data)
         output_tensor, _ = comm_func.all_to_all_single(
             output_shape,
             input_data,
@@ -1010,11 +1019,13 @@ class MindSporePlatform(Platform):
 
     @staticmethod
     def differentiable_all_reduce(data, op, group):
+        data = _ensure_contiguous(data)
         output, _ = comm_func.all_reduce(data, op, group)
         return output
 
     @staticmethod
     def differentiable_reduce_scatter(data, dev_num, axis, op, group):
+        data = _ensure_contiguous(data)
         if axis > 0:
             data = ms.mint.concat(ms.ops.Split(axis=axis, output_num=dev_num)(data), dim=0)
         output_tensor, _ = comm_func.reduce_scatter_tensor(None, data, 'sum', group)

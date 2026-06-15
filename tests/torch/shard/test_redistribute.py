@@ -22,35 +22,26 @@ REDISTRIBUTE = "redistribute.py"
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
 def test_redistribute_group1():
     """
-    Feature: parallel run case in shard
+    Feature: parallel run case in redistribute
     Description:
         1.test_shard_to_replicate
         2.test_replicate_to_shard
+        3.test_different_mesh
+        4.test_non_contiguous_redistribute
     Expectation: Run success.
     """
     parallel_run([
         TorchCase(REDISTRIBUTE, "test_shard_to_replicate", 11333, 2),
         TorchCase(REDISTRIBUTE, "test_replicate_to_shard", 11334, 2),
-    ])
-
-
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_redistribute_group2():
-    """
-    Feature: parallel run case in shard
-    Description:
-        1.test_different_mesh
-    Expectation: Run success.
-    """
-    parallel_run([
         TorchCase(REDISTRIBUTE, "test_different_mesh", 11335, 2),
+        TorchCase(REDISTRIBUTE, "test_non_contiguous_redistribute", 11336, 2),
     ])
 
 
 @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_redistribute_group2_gloo():
+def test_redistribute_group1_gloo():
     """
-    Feature: parallel run case in shard
+    Feature: parallel run case in redistribute
     Description:
         1.test_different_mesh
     Expectation: Run success.
