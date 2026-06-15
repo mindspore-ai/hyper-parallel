@@ -1,0 +1,3 @@
+__setitem__:
+  distributed_op_class: SetItemDistributedOp
+  distributed_op_file: parallel_setitem

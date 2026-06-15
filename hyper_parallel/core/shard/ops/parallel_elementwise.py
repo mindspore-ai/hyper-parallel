@@ -627,8 +627,8 @@ class AddDistributedOp(ElementWiseWithPartialDistributedOp):
         """
         x1_layout = layouts[0]
         x2_layout = layouts[1]
-        x1_partial = x1_layout.is_partial() if x1_layout is not None else None
-        x2_partial = x2_layout.is_partial() if x2_layout is not None else None
+        x1_partial = x1_layout.is_partial() if x1_layout is not None else False
+        x2_partial = x2_layout.is_partial() if x2_layout is not None else False
 
         if x1_partial != x2_partial:
             scaling_factor = 1

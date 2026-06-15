@@ -1,0 +1,3 @@
+__getitem__:
+  distributed_op_class: GetItemDistributedOp
+  distributed_op_file: parallel_getitem
