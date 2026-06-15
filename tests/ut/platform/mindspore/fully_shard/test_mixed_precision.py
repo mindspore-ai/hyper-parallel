@@ -80,7 +80,6 @@ def _make_state(mp_policy, hsdp_params):
     state.offload_policy = None
     state.hsdp_params = hsdp_params
     state.replicate_params = []
-    MindSporeHSDPStateV2._ignored_allreduce_works = []
     state._reset_sharded_params = True   # Skip the reset_sharded_param branch
     state.is_shard = True                # Match HSDPState.__init__ default
     return state
@@ -555,38 +554,30 @@ class TestReplicateParamGradHandling(unittest.TestCase):
         hsdp_param.zero_grad.assert_called_once_with()
         replicate_param.zero_grad.assert_called_once_with()
 
-    def test_finish_ignored_allreduce_materializes_sharded_grad(self):
+    def test_reduce_params_materializes_replicate_sharded_grad(self):
         """
-        Feature: _finish_ignored_allreduce
-        Description: After all-reduce finishes for replicate_params,
+        Feature: reduce_params
+        Description: After all-reduce finishes for queued replicate_params,
         the reduced local grad should be materialized on sharded_param.grad
-        Expectation: the DTensor grad is assigned and the transient full grad is cleared
+        Expectation: apply_reduced_grad is called with the drained all-reduce output
         """
         state = self._make_state_for_replicate(ms.float32)
+        HSDPState.pre_all_reduce_params.clear()
 
         reduced_grad = MagicMock()
         reduced_grad.dtype = ms.float32
-        reduced_grad.to.return_value = reduced_grad
-        local_grad = MagicMock()
-        sharded_grad_dtensor = MagicMock(spec=DTensor)
-        sharded_grad_dtensor.to_local.return_value = local_grad
-
         param = MagicMock()
-        param.all_reduce_handle = MagicMock()
-        param.offload_to_cpu = False
-        param.sharded_size = (4,)
-        param.sharded_param.grad = None
-        param.to_sharded_dtensor.return_value = sharded_grad_dtensor
-        param.unsharded_accumulated_grad_data = None
+        param.all_reduce_output = MagicMock(return_value=reduced_grad)
+        param.clear_all_reduce_output = MagicMock()
+        param.apply_reduced_grad = MagicMock(return_value=False)
+        HSDPState.pre_all_reduce_params.append((param, ms.float32))
 
-        MindSporeHSDPStateV2._ignored_allreduce_works = [(param, reduced_grad, 2, ms.float32, True)]
+        state.reduce_params()
 
-        state._finish_ignored_allreduce()
-
-        param.all_reduce_handle.wait.assert_called_once_with()
-        reduced_grad.div_.assert_called_once_with(2)
+        param.all_reduce_output.assert_called_once_with()
+        param.clear_all_reduce_output.assert_called_once_with()
         param.apply_reduced_grad.assert_called_once_with(reduced_grad, ms.float32)
-        self.assertEqual(MindSporeHSDPStateV2._ignored_allreduce_works, [])
+        self.assertEqual(HSDPState.pre_all_reduce_params, [])
 
 
 class TestParameterRebinding(unittest.TestCase):
@@ -1282,7 +1273,6 @@ class TestSchedulerBackwardCompatFlow(unittest.TestCase):
 
         scheduler._backward_hook.assert_called_once_with()
         scheduler.hsdp_state.reduce_params.assert_called_once_with()
-        scheduler.hsdp_state._finish_ignored_allreduce.assert_called_once_with()
         self.assertFalse(HSDPSchedulerV2.root_bp_state)
 
     def test_root_backward_hook_keeps_root_state_for_non_root_callback(self):
@@ -1302,7 +1292,6 @@ class TestSchedulerBackwardCompatFlow(unittest.TestCase):
 
         scheduler._backward_hook.assert_called_once_with()
         scheduler.hsdp_state.reduce_params.assert_not_called()
-        scheduler.hsdp_state._finish_ignored_allreduce.assert_not_called()
         self.assertTrue(HSDPSchedulerV2.root_bp_state)
 
 

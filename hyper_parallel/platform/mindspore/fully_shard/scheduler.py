@@ -183,7 +183,6 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
             MindSporeHSDPStateV2.delay_apply_reduce_grads()
             # Step 5: Process any remaining all-reduce params (without fusion)
             self.hsdp_state.reduce_params()
-            self.hsdp_state._finish_ignored_allreduce()
 
     def _backward_hook(self):
         """Execute backward hook."""

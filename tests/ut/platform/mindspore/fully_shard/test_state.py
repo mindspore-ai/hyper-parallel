@@ -74,7 +74,6 @@ def _make_state():
     state.reduce_op_type = ops.ReduceOp.SUM
     state._reduce_dtype = None
     state._orig_dtype = None
-    MindSporeHSDPStateV2._ignored_allreduce_works = []
     MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
     MindSporeHSDPStateV2.pending_all_reduce_groups.clear()
     state._reset_sharded_params = False
@@ -199,38 +198,69 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
 
         state.unshard.assert_called_once_with(async_op=True, unshard_replicate=False)
 
-    @patch("hyper_parallel.platform.mindspore.fully_shard.state.dist.all_reduce")
-    def test_allreduce_replicate_params_uses_layout_group_info(self, mock_all_reduce):
-        """Replicate params should reduce over the layout-driven unsharded group instead of flattening the root mesh."""
+    def test_queue_replicate_params_allreduce_queues_compat_path(self):
+        """Replicate params should use the compat all-reduce queue instead of a deferred finish list."""
         state = _make_state()
-        replicate_param = MagicMock()
-        grad = ms.Tensor(np.ones((2,), dtype=np.float32))
-        replicate_param.unsharded_accumulated_grad = None
-        replicate_param.unsharded_accumulated_grad_data = None
-        replicate_param.unsharded_param = SimpleNamespace(grad=grad)
-        # ``_allreduce_replicate_params`` calls ``.contiguous()`` on the grad
-        # right before ``dist.all_reduce`` to satisfy Ascend HCCL. Use a Mock
-        # whose ``.contiguous()`` returns itself so the existing identity
-        # assertions on the AllReduce input still hold.
-        normalized_grad = MagicMock(name="normalized_grad")
-        normalized_grad.contiguous.return_value = normalized_grad
-        replicate_param.unsharded_grad_data = normalized_grad
-        replicate_param.unsharded_group_info = GroupInfo("group", "layout-group", 4)
+        replicate_param = SimpleNamespace(
+            _unsharded_param=SimpleNamespace(grad=ms.Tensor(np.ones((2,), dtype=np.float32))),
+            unsharded_param=SimpleNamespace(grad=ms.Tensor(np.ones((2,), dtype=np.float32))),
+            unsharded_accumulated_grad=None,
+            sharded_param=SimpleNamespace(requires_grad=True),
+            dp_size=2,
+        )
         state.replicate_params = [replicate_param]
+        state._queue_compat_all_reduce = MagicMock()
 
-        state._allreduce_replicate_params(async_op=True)
+        state._queue_replicate_params_allreduce()
 
-        mock_all_reduce.assert_called_once_with(
-            normalized_grad,
-            group="layout-group",
-            op=ops.ReduceOp.SUM,
-            async_op=True,
+        state._queue_compat_all_reduce.assert_called_once_with(replicate_param)
+
+    def test_queue_replicate_params_allreduce_applies_local_grad_when_dp_size_is_one(self):
+        """Single-replica replicate_params should materialize local grads without all-reduce."""
+        state = _make_state()
+        grad = ms.Tensor(np.full((2,), 3.0, dtype=np.float32))
+        replicate_param = SimpleNamespace(
+            _unsharded_param=SimpleNamespace(grad=grad),
+            unsharded_param=SimpleNamespace(grad=grad),
+            unsharded_accumulated_grad=None,
+            unsharded_grad_data=grad,
+            sharded_param=SimpleNamespace(requires_grad=True),
+            shard_size=1,
+            dp_size=1,
+            gradient_scaling_factor=None,
+            apply_reduced_grad=MagicMock(return_value=False),
         )
-        normalized_grad.contiguous.assert_called_once_with()
-        self.assertEqual(
-            MindSporeHSDPStateV2._ignored_allreduce_works,
-            [(replicate_param, normalized_grad, None)],
+        state.replicate_params = [replicate_param]
+        state._queue_compat_all_reduce = MagicMock()
+
+        state._queue_replicate_params_allreduce()
+
+        state._queue_compat_all_reduce.assert_not_called()
+        replicate_param.apply_reduced_grad.assert_called_once_with(grad, state._orig_dtype)
+
+    def test_queue_replicate_params_allreduce_applies_local_grad_when_all_reduce_disabled(self):
+        """requires_all_reduce=False should still materialize replicate_params grads locally."""
+        state = _make_state()
+        state.requires_all_reduce = False
+        grad = ms.Tensor(np.full((2,), 4.0, dtype=np.float32))
+        replicate_param = SimpleNamespace(
+            _unsharded_param=SimpleNamespace(grad=grad),
+            unsharded_param=SimpleNamespace(grad=grad),
+            unsharded_accumulated_grad=None,
+            unsharded_grad_data=grad,
+            sharded_param=SimpleNamespace(requires_grad=True),
+            shard_size=1,
+            dp_size=8,
+            gradient_scaling_factor=None,
+            apply_reduced_grad=MagicMock(return_value=False),
         )
+        state.replicate_params = [replicate_param]
+        state._queue_compat_all_reduce = MagicMock()
+
+        state._queue_replicate_params_allreduce()
+
+        state._queue_compat_all_reduce.assert_not_called()
+        replicate_param.apply_reduced_grad.assert_called_once_with(grad, state._orig_dtype)
 
     def test_post_backward_uses_sync_reduction_on_layout_driven_sizes(self):
         """post_backward should use layout-driven sizes and waitable sync reductions before applying grads."""
@@ -511,65 +541,131 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         with self.assertRaisesRegex(RuntimeError, "CPU offloading"):
             npu_state._validate_cpu_offload_params()
 
-    def test_finish_ignored_allreduce_waits_and_applies_grad(self):
-        """Ignored replicate reductions should materialize grads and clear pending work."""
+    def test_reduce_params_drains_single_rank_all_reduce_output(self):
+        """rank_size<=1 all-reduce outputs should still drain through reduce_params."""
+        HSDPState.pre_all_reduce_params.clear()
         state = _make_state()
-        state._orig_dtype = "float32"
+        reduced_grad = ms.Tensor(np.full((2,), 5.0, dtype=np.float32))
+        param = SimpleNamespace(
+            all_reduce_output=MagicMock(return_value=reduced_grad),
+            clear_all_reduce_output=MagicMock(),
+            apply_reduced_grad=MagicMock(return_value=False),
+        )
+        HSDPState.pre_all_reduce_params.append((param, ms.float32))
+
+        state.reduce_params()
+
+        param.all_reduce_output.assert_called_once_with()
+        param.clear_all_reduce_output.assert_called_once_with()
+        param.apply_reduced_grad.assert_called_once_with(reduced_grad, ms.float32)
+
+    def test_reduce_params_drains_replicate_compat_queue(self):
+        """Queued replicate all-reduces should be drained through reduce_params."""
+        HSDPState.pre_all_reduce_params.clear()
+        state = _make_state()
         reduced_grad = ms.Tensor(np.full((2,), 8.0, dtype=np.float32))
         param = SimpleNamespace(
-            all_reduce_handle=MagicMock(),
+            all_reduce_output=MagicMock(return_value=reduced_grad),
+            clear_all_reduce_output=MagicMock(),
             apply_reduced_grad=MagicMock(return_value=True),
         )
-        MindSporeHSDPStateV2._ignored_allreduce_works = [(param, reduced_grad, "float32")]
+        HSDPState.pre_all_reduce_params.append((param, "float32"))
 
         with patch.object(MindSporeHSDPStateV2, "_synchronize_current_stream_if_needed") as sync:
-            state._finish_ignored_allreduce()
+            state.reduce_params()
 
-        param.all_reduce_handle.wait.assert_called_once_with()
+        param.all_reduce_output.assert_called_once_with()
+        param.clear_all_reduce_output.assert_called_once_with()
         param.apply_reduced_grad.assert_called_once_with(reduced_grad, "float32")
         sync.assert_called_once_with(True)
-        self.assertEqual(MindSporeHSDPStateV2._ignored_allreduce_works, [])
+        self.assertEqual(HSDPState.pre_all_reduce_params, [])
 
-    @patch("hyper_parallel.platform.mindspore.fully_shard.state.dist.all_reduce")
-    def test_post_backward_defers_replicate_allreduce_until_later_drain(self, mock_all_reduce):
-        """post_backward should issue replicate all-reduce and leave apply for the next drain."""
+    @patch.object(MindSporeHSDPStateV2, "_queue_replicate_params_allreduce")
+    def test_post_backward_queues_replicate_params_allreduce(self, mock_queue_replicate):
+        """post_backward should queue replicate reductions through the Torch-aligned path."""
         HSDPState.pre_reduce_scatter_params.clear()
         HSDPState.pre_all_reduce_params.clear()
         MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
         state = _make_state()
-        state._orig_dtype = "float32"
-        handle = MagicMock()
-        mock_all_reduce.return_value = handle
-        normalized_grad = MagicMock(name="normalized_grad")
-        normalized_grad.contiguous.return_value = normalized_grad
+        state.hsdp_params = []
+
+        state.post_backward()
+
+        mock_queue_replicate.assert_called_once_with()
+
+    def test_post_backward_does_not_double_queue_replicate_params(self):
+        """replicate_params must be queued only via _queue_replicate_params_allreduce."""
+        HSDPState.pre_reduce_scatter_params.clear()
+        HSDPState.pre_all_reduce_params.clear()
+        MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
+        state = _make_state()
         replicate_param = SimpleNamespace(
-            unsharded_accumulated_grad=None,
-            unsharded_accumulated_grad_data=None,
+            enable_fsdp_shard=False,
             _unsharded_param=SimpleNamespace(grad=ms.Tensor(np.ones((2,), dtype=np.float32))),
             unsharded_param=SimpleNamespace(grad=ms.Tensor(np.ones((2,), dtype=np.float32))),
-            unsharded_grad_data=normalized_grad,
-            unsharded_group_info=GroupInfo("group", "layout-group", 4),
-            all_reduce_handle=None,
-            gradient_scaling_factor=None,
-            apply_reduced_grad=MagicMock(return_value=False),
+            unsharded_accumulated_grad=None,
+            sharded_param=SimpleNamespace(requires_grad=True),
+            shard_size=1,
+            dp_size=2,
             accumulate_unsharded_grad_if_needed=MagicMock(),
         )
         state.replicate_params = [replicate_param]
         state.hsdp_params = []
 
+        with patch.object(state, "reduce_params"), \
+             patch.object(state, "_needs_overlap_post_backward_steps", return_value=False), \
+             patch.object(state, "_queue_compat_all_reduce") as mock_compat:
+            state.post_backward()
+
+        mock_compat.assert_called_once_with(replicate_param)
+
+    @patch.object(MindSporeHSDPStateV2, "_run_overlap_post_backward_steps")
+    def test_post_backward_skips_overlap_steps_when_pipeline_idle(self, mock_run_overlap):
+        """Pure TP/compat layers should skip the 4-step overlap scaffold when idle."""
+        HSDPState.pre_reduce_scatter_params.clear()
+        HSDPState.pre_all_reduce_params.clear()
+        MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
+        MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
+        state = _make_state()
+        state.hsdp_params = []
+
         state.post_backward()
 
-        handle.wait.assert_not_called()
-        self.assertEqual(
-            MindSporeHSDPStateV2._ignored_allreduce_works,
-            [(replicate_param, normalized_grad, "float32")],
+        mock_run_overlap.assert_not_called()
+
+    @patch.object(MindSporeHSDPStateV2, "_run_overlap_post_backward_steps")
+    def test_post_backward_runs_overlap_steps_when_pipeline_pending(self, mock_run_overlap):
+        """Pending overlap state from a previous layer must still run the 4-step pipeline."""
+        HSDPState.pre_reduce_scatter_params.clear()
+        HSDPState.pre_all_reduce_params.clear()
+        MindSporeHSDPStateV2.pre_direct_all_reduce_grads = []
+        state = _make_state()
+        state.hsdp_params = []
+        MindSporeHSDPStateV2.pre_all_reduce_groups = [MagicMock()]
+
+        state.post_backward()
+
+        mock_run_overlap.assert_called_once_with()
+
+    def test_needs_overlap_post_backward_steps_for_current_rs_params(self):
+        """A sharded HSDP parameter with pending unsharded grad should require overlap steps."""
+        state = _make_state()
+        hsdp_param = SimpleNamespace(
+            _unsharded_param=SimpleNamespace(grad=ms.Tensor(np.ones((2,), dtype=np.float32))),
+            unsharded_param=SimpleNamespace(grad=ms.Tensor(np.ones((2,), dtype=np.float32))),
+            unsharded_accumulated_grad=None,
+            sharded_param=SimpleNamespace(requires_grad=True),
+            shard_size=4,
+            param_mode=FullyShardParamMode.LOCAL_PARAM,
+            enable_fsdp_shard=True,
+            is_sharded=True,
+            dp_size=2,
         )
+        state.hsdp_params = [hsdp_param]
+        MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
+        HSDPState.pre_reduce_scatter_params.clear()
 
-        state._finish_ignored_allreduce()
-
-        handle.wait.assert_called_once_with()
-        replicate_param.apply_reduced_grad.assert_called_once_with(normalized_grad, "float32")
-        self.assertEqual(MindSporeHSDPStateV2._ignored_allreduce_works, [])
+        self.assertTrue(state._needs_overlap_post_backward_steps())
 
     def test_reduce_params_drains_reduce_scatter_and_all_reduce_queues(self):
         """Queued sharded reductions should be divided, applied, and synchronized."""
@@ -643,7 +739,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         state = _make_state()
         state.param_group = SimpleNamespace(foreach_reduce=MagicMock())
         state.reduce_params = MagicMock()
-        state._allreduce_replicate_params = MagicMock()
+        state._queue_replicate_params_allreduce = MagicMock()
         all_reduce_group = SimpleNamespace(wait_all_reduce_and_apply_grad=MagicMock())
         pre_group = SimpleNamespace(apply_fusion_reduced_grad=MagicMock(), wait_reduce_scatter_and_issue_all_reduce=MagicMock())
         comm_ctx = SimpleNamespace(all_reduce_param_group=all_reduce_group, pre_param_group=pre_group)
@@ -657,7 +753,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         state.param_group.foreach_reduce.assert_called_once_with(
             reduce_scatter_reduce_op=ops.ReduceOp.SUM,
         )
-        state._allreduce_replicate_params.assert_called_once_with()
+        state._queue_replicate_params_allreduce.assert_called_once_with()
         self.assertIsNone(comm_ctx.all_reduce_param_group)
         self.assertIsNone(comm_ctx.pre_param_group)
 
