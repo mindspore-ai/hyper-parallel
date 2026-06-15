@@ -22,9 +22,10 @@ multi-device hardware.
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 import unittest
 import warnings
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
@@ -463,6 +464,223 @@ class TestDistributeModule(unittest.TestCase):
         repl_calls = [c for c in mock_dt.call_args_list if c[0][2] == [Replicate()]]
         self.assertEqual(len(shard_calls), 1)
         self.assertEqual(len(repl_calls), 2)
+
+
+# ============================================================================
+# In-place op contracts: DTensor.copy_ / DTensor.zero_ / DTensor.fill_
+# ============================================================================
+#
+# Verifies the contracts documented on DTensor.copy_:
+#   * type / mesh / placement / shape checks raise synchronously;
+#   * scalar src (numel == 1) relaxes the placement-match requirement;
+#   * matching-placement copies forward to ``_local_tensor.data.copy_``;
+#   * zero_ / fill_ forward to ``_local_tensor.data.zero_/fill_`` and return self.
+
+import pytest
+
+from hyper_parallel.core.dtensor.dtensor import DTensor, _is_broadcastable
+
+
+# Bypass C-level isinstance(self, Tensor) check by invoking the unbound
+# Python function directly. Same workaround as test_dtensor_to.py.
+_copy_fn = DTensor.__dict__["copy_"]
+_zero_fn = DTensor.__dict__["zero_"]
+_fill_fn = DTensor.__dict__["fill_"]
+
+
+def _inplace_numel(shape):
+    n = 1
+    for d in shape:
+        n *= d
+    return n
+
+
+def _inplace_make_self(local_shape=(4, 4), placements=None, mesh="fake_mesh"):
+    """Build a fake ``self`` DTensor (SimpleNamespace) for the unbound method."""
+    if placements is None:
+        placements = (Shard(0),)
+    local = Mock(name="local_tensor")
+    local.shape = local_shape
+    local.numel = Mock(return_value=_inplace_numel(local_shape))
+    return SimpleNamespace(
+        _local_tensor=local,
+        _device_mesh=mesh,
+        _placements=tuple(placements),
+    ), local
+
+
+def _inplace_make_src(local_shape=(4, 4), placements=None, mesh="fake_mesh", numel=None):
+    """Build a fake ``src`` DTensor that passes ``isinstance(src, DTensor)``.
+
+    Uses ``MagicMock(spec=DTensor)`` so the isinstance check returns True
+    without inheriting from the C-level Tensor.
+    """
+    if placements is None:
+        placements = (Shard(0),)
+    src = MagicMock(spec=DTensor)
+    src._local_tensor = Mock(name="src_local")
+    src._local_tensor.shape = local_shape
+    src._local_tensor.numel = Mock(
+        return_value=numel if numel is not None else _inplace_numel(local_shape)
+    )
+    src._device_mesh = mesh
+    src._placements = tuple(placements)
+    return src
+
+
+class TestIsBroadcastable:
+    """Validate the broadcast-compatibility helper."""
+
+    @pytest.mark.parametrize("src, dst", [
+        ((), (4, 4)),
+        ((1,), (4, 4)),
+        ((4,), (4, 4)),
+        ((1, 4), (4, 4)),
+        ((4, 1), (4, 4)),
+        ((4, 4), (4, 4)),
+        ((1, 1), (4, 4)),
+    ])
+    def test_broadcastable(self, src, dst):
+        """_is_broadcastable should return True for broadcast-compatible shapes."""
+        assert _is_broadcastable(src, dst)
+
+    @pytest.mark.parametrize("src, dst", [
+        ((8, 8), (4, 4)),     # different non-1 size
+        ((2, 4), (4, 4)),     # leading dim mismatch
+        ((4, 4, 4), (4, 4)),  # src has more dims
+        ((5,), (4, 4)),       # last dim mismatch
+    ])
+    def test_not_broadcastable(self, src, dst):
+        assert not _is_broadcastable(src, dst)
+
+
+class TestCopySamePlacement:
+    """Happy path: matching mesh + placements + shape."""
+
+    def test_returns_self(self):
+        dst, _ = _inplace_make_self(local_shape=(4, 4), placements=[Shard(0)])
+        src = _inplace_make_src(local_shape=(4, 4), placements=[Shard(0)])
+
+        ret = _copy_fn(dst, src)
+
+        assert ret is dst
+
+    def test_forwards_to_local_copy(self):
+        dst, local = _inplace_make_self(local_shape=(4, 4), placements=[Shard(0)])
+        src = _inplace_make_src(local_shape=(4, 4), placements=[Shard(0)])
+
+        _copy_fn(dst, src, non_blocking=True)
+
+        local.copy_.assert_called_once_with(
+            src._local_tensor, non_blocking=True
+        )
+
+    def test_default_non_blocking_is_false(self):
+        dst, local = _inplace_make_self()
+        src = _inplace_make_src()
+
+        _copy_fn(dst, src)
+
+        _, kwargs = local.copy_.call_args
+        assert kwargs["non_blocking"] is False
+
+
+class TestCopyContractViolations:
+    """Type / mesh / placement / shape contract enforcement."""
+
+    def test_plain_tensor_src_raises_type_error(self):
+        dst, _ = _inplace_make_self()
+        with pytest.raises(TypeError, match="src should be a DTensor"):
+            _copy_fn(dst, object())
+
+    def test_none_src_raises_type_error(self):
+        dst, _ = _inplace_make_self()
+        with pytest.raises(TypeError, match="src should be a DTensor"):
+            _copy_fn(dst, None)
+
+    def test_mesh_mismatch_raises_value_error(self):
+        dst, _ = _inplace_make_self(mesh="mesh_a")
+        src = _inplace_make_src(mesh="mesh_b")
+
+        with pytest.raises(ValueError, match="DeviceMesh"):
+            _copy_fn(dst, src)
+
+    def test_placement_mismatch_non_scalar_raises(self):
+        dst, _ = _inplace_make_self(local_shape=(4, 4), placements=[Shard(0)])
+        # Same local shape but different placement and >1 element — disallowed.
+        src = _inplace_make_src(
+            local_shape=(4, 4), placements=[Replicate()], numel=16
+        )
+
+        with pytest.raises(ValueError, match="src.placements should equal"):
+            _copy_fn(dst, src)
+
+    def test_shape_not_broadcastable_raises(self):
+        dst, _ = _inplace_make_self(local_shape=(4, 4), placements=[Shard(0)])
+        # Same placement so the placement check passes, but shapes differ.
+        src = _inplace_make_src(local_shape=(8, 8), placements=[Shard(0)])
+
+        with pytest.raises(ValueError, match="broadcastable"):
+            _copy_fn(dst, src)
+
+
+class TestCopyScalarBroadcastRelaxation:
+    """Single-element src bypasses placement match."""
+
+    def test_zero_dim_scalar_across_placement(self):
+        dst, local = _inplace_make_self(local_shape=(4, 4), placements=[Shard(0)])
+        src = _inplace_make_src(local_shape=(), placements=[Replicate()], numel=1)
+
+        ret = _copy_fn(dst, src)
+
+        assert ret is dst
+        local.copy_.assert_called_once()
+
+    def test_shape_one_tuple_scalar_across_placement(self):
+        dst, local = _inplace_make_self(local_shape=(4, 4), placements=[Shard(0)])
+        src = _inplace_make_src(local_shape=(1,), placements=[Replicate()], numel=1)
+
+        ret = _copy_fn(dst, src)
+
+        assert ret is dst
+        local.copy_.assert_called_once()
+
+    def test_shape_1_1_scalar_across_placement(self):
+        dst, local = _inplace_make_self(local_shape=(4, 4), placements=[Shard(0)])
+        src = _inplace_make_src(local_shape=(1, 1), placements=[Replicate()], numel=1)
+
+        ret = _copy_fn(dst, src)
+
+        assert ret is dst
+        local.copy_.assert_called_once()
+
+
+class TestZero:
+    """Unit tests for DTensor.zero_."""
+
+    def test_returns_self(self):
+        dst, _ = _inplace_make_self()
+        ret = _zero_fn(dst)
+        assert ret is dst
+
+    def test_forwards_to_local_zero(self):
+        dst, local = _inplace_make_self()
+        _zero_fn(dst)
+        local.zero_.assert_called_once_with()
+
+
+class TestFill:
+    """Unit tests for DTensor.fill_."""
+
+    def test_returns_self(self):
+        dst, _ = _inplace_make_self()
+        ret = _fill_fn(dst, 3.14)
+        assert ret is dst
+
+    def test_forwards_value_to_local_fill(self):
+        dst, local = _inplace_make_self()
+        _fill_fn(dst, 42.0)
+        local.fill_.assert_called_once_with(42.0)
 
 
 if __name__ == "__main__":

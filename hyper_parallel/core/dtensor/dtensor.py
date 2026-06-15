@@ -154,6 +154,24 @@ def _build_layout(
     return result
 
 
+def _is_broadcastable(src_shape: Sequence[int], dst_shape: Sequence[int]) -> bool:
+    """Return True iff ``src_shape`` is broadcastable to ``dst_shape``.
+
+    Standard NumPy / PyTorch right-aligned broadcast rule: ``src`` cannot
+    have more dimensions than ``dst``; each right-aligned dimension pair
+    must be equal, or ``src``'s dimension must be 1.
+    """
+    src_shape = tuple(src_shape)
+    dst_shape = tuple(dst_shape)
+    if len(src_shape) > len(dst_shape):
+        return False
+    for i in range(1, len(src_shape) + 1):
+        s, d = src_shape[-i], dst_shape[-i]
+        if s not in (d, 1):
+            return False
+    return True
+
+
 class DTensor(DTensorBase):
     """
     DTensor - Distributed Tensor
@@ -288,6 +306,80 @@ class DTensor(DTensorBase):
             Tensor: The local tensor shard on this device.
         """
         return self._local_tensor
+
+    def copy_(self, src: "DTensor", non_blocking: bool = False) -> "DTensor":
+        """In-place copy of ``src`` into this DTensor's local shard.
+
+        Delegates to ``Tensor.copy_`` on the underlying local tensors.
+        Follows standard ``Tensor.copy_`` semantics: version counter is
+        bumped and autograd edges are created when grad is enabled.
+
+        Constraints on ``src``:
+            * must be a ``DTensor`` on the same ``DeviceMesh`` as ``self``;
+            * its placements must equal ``self.placements``, OR
+              ``src._local_tensor.numel() == 1`` (single-element broadcast);
+            * its local shape must equal or be broadcastable to
+              ``self._local_tensor.shape``.
+
+        No redistribute / implicit slicing is performed; src dtype is cast
+        to self dtype in-place.
+
+        Args:
+            src (DTensor): Source DTensor satisfying the constraints above.
+            non_blocking (bool): Forwarded to the underlying ``copy_``.
+
+        Returns:
+            DTensor: ``self``.
+
+        Raises:
+            TypeError:  if ``src`` is not a ``DTensor``.
+            ValueError: if mesh, placement, or shape constraint is violated.
+        """
+        if not isinstance(src, DTensor):
+            raise TypeError(
+                f"For DTensor.copy_, src should be a DTensor, but got {type(src).__name__}."
+            )
+        if src._device_mesh is not self._device_mesh:
+            raise ValueError(
+                f"For DTensor.copy_, src and self should share the same DeviceMesh, "
+                f"but got src._device_mesh={src._device_mesh!r}, "
+                f"self._device_mesh={self._device_mesh!r}."
+            )
+
+        placement_eq = tuple(src._placements) == tuple(self._placements)
+        shape_eq = src._local_tensor.shape == self._local_tensor.shape
+        src_is_scalar = src._local_tensor.numel() == 1
+
+        if not placement_eq and not src_is_scalar:
+            raise ValueError(
+                f"For DTensor.copy_, src.placements should equal self.placements "
+                f"or src.numel() should be 1, but got "
+                f"src.placements={src._placements}, "
+                f"self.placements={self._placements}, "
+                f"src.numel()={src._local_tensor.numel()}."
+            )
+        if not shape_eq and not src_is_scalar and not _is_broadcastable(
+            src._local_tensor.shape, self._local_tensor.shape
+        ):
+            raise ValueError(
+                f"For DTensor.copy_, src local shape should be broadcastable to "
+                f"self local shape, but got "
+                f"src.shape={tuple(src._local_tensor.shape)}, "
+                f"self.shape={tuple(self._local_tensor.shape)}."
+            )
+
+        self._local_tensor.copy_(src._local_tensor, non_blocking=non_blocking)
+        return self
+
+    def zero_(self) -> "DTensor":
+        """In-place fill with zeros. Returns ``self``."""
+        self._local_tensor.zero_()
+        return self
+
+    def fill_(self, value) -> "DTensor":
+        """In-place fill with ``value``. Returns ``self``."""
+        self._local_tensor.fill_(value)
+        return self
 
     @property
     def shape(self) -> Tuple[int, ...]:

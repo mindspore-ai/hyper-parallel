@@ -57,33 +57,33 @@ class DTensorBase(Tensor):
         """
         npu_device = "Ascend"
         if isinstance(local_tensor, DTensorBase):
-            device_local_tensor = local_tensor.to_local()
-            if device_local_tensor.device != "meta" and not device_local_tensor.has_init:
-                device_local_tensor = device_local_tensor.to(npu_device)
-            t = Tensor._make_subclass(cls, device_local_tensor)
-            copy_placements = local_tensor.layout.alias_placements if local_tensor.layout else local_tensor.placements
-            t.__init_data__(device_local_tensor, local_tensor.device_mesh, copy_placements)
-            return t
+            src = local_tensor
+            local_tensor = src.to_local()
+            device_mesh = src.device_mesh
+            placements = src._alias_placements()
+        else:
+            if local_tensor is None:
+                raise ValueError(
+                    "DTensorBase: local_tensor must not be None when constructing from a raw tensor."
+                )
+            if device_mesh is None:
+                raise ValueError(
+                    "DTensorBase: device_mesh must be a DeviceMesh instance, got None."
+                )
+            if placements is None:
+                raise ValueError(
+                    "DTensorBase: placements must be a sequence of Placement objects, got None."
+                )
 
-        if local_tensor is None:
-            raise ValueError(
-                "DTensorBase: local_tensor must not be None when constructing from a raw tensor."
-            )
-        if device_mesh is None:
-            raise ValueError(
-                "DTensorBase: device_mesh must be a DeviceMesh instance, got None."
-            )
-        if placements is None:
-            raise ValueError(
-                "DTensorBase: placements must be a sequence of Placement objects, got None."
-            )
-        device_local_tensor = local_tensor
-        if device_local_tensor.device != "meta" and not device_local_tensor.has_init:
-            device_local_tensor = device_local_tensor.to(npu_device)
         if local_tensor.has_init:
             local_tensor.init_device = npu_device
-        t = Tensor._make_subclass(cls, device_local_tensor)
-        t.__init_data__(device_local_tensor, device_mesh, placements)
+        else:
+            dev = local_tensor.device
+            if dev != "meta" and not dev.startswith(npu_device):
+                local_tensor = local_tensor.to(npu_device)
+
+        t = Tensor._make_subclass(cls, local_tensor)
+        t.__init_data__(local_tensor, device_mesh, placements)
         return t
 
     def asnumpy(self):

@@ -319,52 +319,6 @@ class DTensorBase(Tensor):
         """
         return self._local_tensor.numel()
 
-    # ====================== Data operation overrides (sync storage + fix in-place ops) ======================
-    def zero_(self):
-        """Set tensor zeros"""
-        if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
-            # Create new tensor + rebind DTensor (ensure storage sharing)
-            new_local = torch.zeros_like(self._local_tensor, requires_grad=True)
-            # Key: sync DTensor wrapper's storage to new local_tensor
-            super().copy_(new_local)  # sync underlying data
-            self._local_tensor = new_local  # replace internal attribute
-        else:
-            self._local_tensor.zero_()
-            super().zero_()  # sync wrapper's in-place zero
-        return self
-
-    def copy_(self, src: Tensor, non_blocking: bool = False):
-        """Copy data from src tensor"""
-        if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
-            new_local = src.to(self._local_tensor.device, non_blocking=non_blocking).detach().clone()
-            new_local.requires_grad = self._local_tensor.requires_grad
-            super().copy_(new_local)
-            self._local_tensor = new_local
-        else:
-            self._local_tensor.copy_(src, non_blocking=non_blocking)
-            super().copy_(src, non_blocking=non_blocking)
-        return self
-
-    def fill_(self, value):
-        """Fill tensor with value"""
-        if self._local_tensor.requires_grad and self._local_tensor.is_leaf:
-            # Step 1: Create new tensor (non-in-place)
-            new_local = torch.full_like(
-                self._local_tensor,
-                fill_value=value,
-                requires_grad=True,
-                device=self._local_tensor.device
-            )
-            # Step 2: Sync DTensor wrapper's underlying storage to new local_tensor
-            super().copy_(new_local)  # Key: make DTensor wrapper point to new address
-            # Step 3: Replace internal local_tensor (ensure attribute consistency)
-            self._local_tensor = new_local
-        else:
-            # Non-leaf tensor: direct in-place fill + sync wrapper
-            self._local_tensor.fill_(value)
-            super().fill_(value)  # sync DTensor wrapper's fill
-        return self
-
     # ====================== Auxiliary print ======================
     def _alias_placements(self):
         """Return alias_placements from layout, falling back to _placements."""
