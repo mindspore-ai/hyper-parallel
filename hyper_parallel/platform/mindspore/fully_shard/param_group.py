@@ -248,6 +248,7 @@ class HSDPParamGroup:
         self._result = None
         self._reduce_output = None
         self._reduce_op = None
+        self._needs_avg_div = False
         self._reduce_hsdp_params = None
         self._active_replicate_buckets: dict[int, ReplicateBucket] = {}
         self._active_param_flat_offsets: list[int] = []
@@ -536,6 +537,7 @@ class HSDPParamGroup:
         self,
         reduce_scatter_reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.SUM,
         async_op: bool = True,
+        needs_avg_div: bool = False,
     ) -> Optional[ms.Tensor]:
         """Perform fused reduce-scatter and optional bucketed all-reduce."""
         hsdp_params: List[MindSporeHSDPParamV2] = []
@@ -567,6 +569,7 @@ class HSDPParamGroup:
         # Captured here, consumed once in _apply_reduced_grad after all collectives
         # complete. Async paths cross method boundaries, so the field is unavoidable.
         reduce_output = ms.mint.empty((reduce_scatter_output_numel,), dtype=reduce_dtype, device=device)
+        self._needs_avg_div = needs_avg_div
         self._reduce_op = reduce_scatter_reduce_op
         self._reduce_hsdp_params = hsdp_params
         self._active_param_flat_offsets = []
@@ -606,6 +609,8 @@ class HSDPParamGroup:
         if comm_ctx.comm_handle is not None:
             comm_ctx.comm_handle.wait()
             comm_ctx.comm_handle = None
+        if self._needs_avg_div and self._reduce_output is not None and self.shard_world_size > 1:
+            self._reduce_output.div_(self.shard_world_size)
         if not self._active_replicate_buckets:
             self._apply_reduced_grad()
             return
@@ -628,6 +633,8 @@ class HSDPParamGroup:
         for pending in self._pending_all_reduce_handles:
             bucket = self._active_replicate_buckets[pending.bucket_key]
             pending.handle.wait()
+            if self._needs_avg_div and bucket.group_size > 1:
+                bucket.buffer.div_(bucket.group_size)
             self._unpack_bucket_to_reduce_output(bucket)
         self._pending_all_reduce_handles = []
         comm_ctx.all_reduce_handle = None
@@ -638,6 +645,8 @@ class HSDPParamGroup:
         if comm_ctx.comm_handle is not None:
             comm_ctx.comm_handle.wait()
             comm_ctx.comm_handle = None
+        if self._needs_avg_div and self._reduce_output is not None and self.shard_world_size > 1:
+            self._reduce_output.div_(self.shard_world_size)
         for bucket in self._active_replicate_buckets.values():
             packed = self._pack_bucket_from_reduce_output(bucket)
             dist.all_reduce(
@@ -645,6 +654,8 @@ class HSDPParamGroup:
                 group=bucket.group,
                 op=self._reduce_op,
             )
+            if self._needs_avg_div and bucket.group_size > 1:
+                packed.div_(bucket.group_size)
             self._unpack_bucket_to_reduce_output(bucket)
         self._apply_reduced_grad()
 
@@ -665,134 +676,3 @@ class HSDPParamGroup:
         self._active_param_flat_offsets = []
         self._active_replicate_buckets = {}
         self._pending_all_reduce_handles = []
-
-
-class AllReduceParamGroup:
-    """Groups HSDP parameters by replicate group for fused async all-reduce."""
-
-    ALIGNMENT_BYTES = 512
-
-    def __init__(
-        self,
-        replicate_group,
-        hsdp_params: List[MindSporeHSDPParamV2],
-        orig_dtypes: List[Any],
-        reduce_dtype: Any,
-        reduce_op: ops.ReduceOp,
-        mp_policy: Optional[MixedPrecisionPolicy] = None,
-        replicate_world_size: Optional[int] = None,
-    ):
-        self.replicate_group = replicate_group
-        self.hsdp_params = hsdp_params
-        self.orig_dtypes = orig_dtypes
-        self.reduce_dtype = reduce_dtype
-        self.reduce_op = reduce_op
-        self.mp_policy = mp_policy
-        if replicate_world_size is not None:
-            self.replicate_world_size = replicate_world_size
-        elif replicate_group is not None and hasattr(replicate_group, "rank_size"):
-            self.replicate_world_size = replicate_group.rank_size
-        elif hsdp_params:
-            self.replicate_world_size = hsdp_params[0].unsharded_group_info.rank_size
-        else:
-            self.replicate_world_size = 1
-        self.fused_buffer: Optional[ms.Tensor] = None
-        self.param_offsets: List[int] = []
-        self.param_numels: List[int] = []
-        self.all_reduce_handle: Optional[CommHandle] = None
-
-    def compute_aligned_layout(self) -> int:
-        """Compute fused buffer layout with trailing 512-byte alignment."""
-        self.param_offsets = []
-        self.param_numels = []
-        element_size = int(ms.Tensor([], dtype=self.reduce_dtype).itemsize)
-        current_offset = 0
-        for hsdp_param in self.hsdp_params:
-            numel = _shape_numel(hsdp_param.sharded_size)
-            self.param_numels.append(numel)
-            self.param_offsets.append(current_offset)
-            current_offset += numel
-        total_bytes = current_offset * element_size
-        aligned_total_bytes = (
-            (total_bytes + self.ALIGNMENT_BYTES - 1) // self.ALIGNMENT_BYTES
-        ) * self.ALIGNMENT_BYTES
-        return aligned_total_bytes // element_size
-
-    def allocate_fused_buffer(self, device: Any) -> None:
-        """Allocate the fused buffer with computed layout."""
-        total_numel = self.compute_aligned_layout()
-        normalized_device = _normalize_device(device)
-        self.fused_buffer = ms.mint.empty(
-            (total_numel,), dtype=self.reduce_dtype, device=normalized_device
-        )
-        self.fused_buffer.zero_()
-
-    def get_param_buffer_view(self, idx: int) -> ms.Tensor:
-        """Return a flat view for reduce_scatter output of parameter idx."""
-        if self.fused_buffer is None:
-            raise RuntimeError("Fused buffer not allocated. Call allocate_fused_buffer first.")
-        offset = self.param_offsets[idx]
-        numel = self.param_numels[idx]
-        return self.fused_buffer.narrow(0, offset, numel)
-
-    def get_param_grad_view(self, idx: int, target_shape) -> ms.Tensor:
-        """Return a reshaped view of the reduced gradient for parameter idx."""
-        return self.get_param_buffer_view(idx).view(target_shape)
-
-    def accumulate_existing_grads_to_buffer(self) -> None:
-        """Accumulate existing sharded grads into fused_buffer before all-reduce."""
-        if self.fused_buffer is None:
-            return
-        from hyper_parallel.core.dtensor.dtensor import DTensor
-
-        for idx, hsdp_param in enumerate(self.hsdp_params):
-            existing_grad = None
-            if self.mp_policy is not None and self.mp_policy.apply_grad_on_fp32_main_grad:
-                existing_grad = hsdp_param.sharded_param.main_grad
-            else:
-                existing_grad = hsdp_param.sharded_param.grad
-            if existing_grad is not None and not hsdp_param.accumulated_allreduced_grad:
-                if isinstance(existing_grad, DTensor):
-                    existing_grad_local = existing_grad._local_tensor
-                else:
-                    existing_grad_local = existing_grad
-                buffer_view = self.get_param_buffer_view(idx)
-                if existing_grad_local.dtype != self.reduce_dtype:
-                    existing_grad_local = existing_grad_local.to(self.reduce_dtype)
-                buffer_view.add_(existing_grad_local.view_as(buffer_view))
-                if self.mp_policy is not None and self.mp_policy.apply_grad_on_fp32_main_grad:
-                    hsdp_param.sharded_param.main_grad = None
-                else:
-                    hsdp_param.sharded_param.grad = None
-
-    def issue_async_allreduce(self) -> None:
-        """Issue async all_reduce on the fused buffer (SUM for padding correctness)."""
-        if self.fused_buffer is None:
-            raise RuntimeError("Fused buffer not allocated.")
-        self.all_reduce_handle = dist.all_reduce(
-            self.fused_buffer,
-            op=ops.ReduceOp.SUM,
-            group=self.replicate_group,
-            async_op=True,
-        )
-
-    def wait_and_apply_grads(self) -> bool:
-        """Wait for all_reduce and apply gradients to parameters."""
-        if self.all_reduce_handle is not None:
-            self.all_reduce_handle.wait()
-            self.all_reduce_handle = None
-        need_synchronize = False
-        for idx, hsdp_param in enumerate(self.hsdp_params):
-            reduced_grad = self.get_param_grad_view(idx, hsdp_param.sharded_size)
-            # issue_async_allreduce uses SUM (so end-of-buffer padding zeros stay
-            # correct), so an AVG reduce op must divide by the replicate world size
-            # here. The reduce-scatter leg already averaged over the shard axis.
-            if self.reduce_op == ops.ReduceOp.AVG and self.replicate_world_size > 1:
-                reduced_grad = reduced_grad / self.replicate_world_size
-            need_synchronize = (
-                hsdp_param.apply_reduced_grad(reduced_grad, self.orig_dtypes[idx])
-                or need_synchronize
-            )
-            hsdp_param.accumulated_allreduced_grad = True
-        self.fused_buffer = None
-        return need_synchronize
