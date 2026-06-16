@@ -178,10 +178,18 @@ def generate_rank_to_stage_mapping(real_stage_num, stage_num, style='loop'):
     return dict(rank_to_stages)
 
 def iter_leaf_meta_steps(step):
-    """Yield leaf MetaSteps, recursively expanding OVERLAP_F_B containers."""
+    """Yield leaf MetaSteps, recursively expanding OVERLAP containers.
+
+    Both ``OVERLAP_F_B`` and ``OVERLAP_B_F`` carry their real FWD/BWD work in
+    ``sub_steps``; the FSDP unshard/reshard injection pass relies on this to
+    see the FWD/BWD buried inside an overlap. Missing ``OVERLAP_B_F`` here let
+    an overlapped FWD run against a resharded stage → "expected HSDPModule
+    parameters in unsharded state". Mirror the other expansion sites
+    (run/_expand/add_fsdp_*) which already handle both composite types.
+    """
     if step is None:
         return
-    if step.type == MetaStepType.OVERLAP_F_B:
+    if step.type in (MetaStepType.OVERLAP_F_B, MetaStepType.OVERLAP_B_F) and step.sub_steps:
         for sub_step in step.sub_steps:
 
             yield from iter_leaf_meta_steps(sub_step)
