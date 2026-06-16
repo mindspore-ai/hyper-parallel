@@ -1392,7 +1392,9 @@ class TorchPlatform(Platform):
 
     @property
     def checkpoint(self):
-        return torch.utils.checkpoint.checkpoint
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.recompute_session import checkpoint_with_session
+        return checkpoint_with_session
 
     @staticmethod
     def checkpoint_wrapper(module, **checkpoint_kwargs):
@@ -1433,6 +1435,57 @@ class TorchPlatform(Platform):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import AsyncSaveOnCpu
         return AsyncSaveOnCpu(policy_fn, group_swap=group_swap)
+
+    @staticmethod
+    def recompute_handle_collector_ctx():
+        """Context manager that collects recompute handles created in its scope.
+
+        Yields:
+            A list populated with one opaque recompute handle per checkpointed
+            block executed during the forward pass within the context.
+        """
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.recompute_session import _recompute_handle_collector_ctx
+        return _recompute_handle_collector_ctx()
+
+    @staticmethod
+    def recompute_handle(handle, session_id):
+        """Eagerly fire one checkpointed block's forward re-run.
+
+        Args:
+            handle: An opaque recompute handle from
+                :meth:`recompute_handle_collector_ctx`.
+            session_id: Stable key shared by the producing re-run and the
+                consuming backward.
+        """
+        return handle.recompute(session_id)
+
+    @staticmethod
+    def recompute_session_ctx(session_id=None, retain_on_unpack=False):
+        """Context manager binding recompute unpack to a caller-provided session.
+
+        Args:
+            session_id: Stable session key.  If None, a new key is generated.
+            retain_on_unpack: When True, unpack returns recomputed tensors
+                without popping them.  Default: False.
+
+        Returns:
+            A context manager activating the session for its scope.
+        """
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.recompute_session import _recompute_session_ctx
+        return _recompute_session_ctx(session_id=session_id, retain_on_unpack=retain_on_unpack)
+
+    @staticmethod
+    def clear_recompute_session(session_id):
+        """Release retained recompute data for a session.
+
+        Args:
+            session_id: The session key whose cached recompute data is cleared.
+        """
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.recompute_session import _clear_recompute_session
+        return _clear_recompute_session(session_id)
 
     @staticmethod
     def get_element_size(tensor):
