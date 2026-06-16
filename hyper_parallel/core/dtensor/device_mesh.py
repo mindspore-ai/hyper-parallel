@@ -15,7 +15,6 @@
 """device mesh"""
 
 import copy
-import os
 import threading
 from types import TracebackType
 from typing import Any, List, Literal, Optional, Sequence, Type, Union
@@ -206,8 +205,7 @@ class DeviceMesh:
         self._refresh_mesh_view()
         self._set_mesh_dim_names(mesh_dim_names)
         self._initialize_runtime_state(_init_backend)
-        if os.getenv("MS_SIMULATION_LEVEL") is None:
-            self._coordinate_on_dim = self._compute_coordinate_on_dim()
+        self._coordinate_on_dim = self._compute_coordinate_on_dim()
 
     @classmethod
     def _validate_device_type(cls, device_type: str) -> None:

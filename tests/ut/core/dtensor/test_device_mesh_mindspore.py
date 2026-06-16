@@ -279,6 +279,18 @@ class TestDeviceMesh:
         np.testing.assert_array_equal(device_mesh.mesh, mesh)
         assert device_mesh.mesh.shape == (2, 2)
 
+    def test_device_mesh_coordinate_initialization(self, mock_platform):
+        """
+        Feature: ``DeviceMesh`` coordinate initialization in MindSpore simulation mode.
+        Description: Test ``MS_SIMULATION_LEVEL`` does not skip coordinate initialization.
+        Expectation: Run successfully, and ``get_coordinate`` returns the current rank coordinate.
+        """
+        _ = mock_platform
+
+        device_mesh = DeviceMesh("npu", [0, 1, 2, 3], _init_backend=False)
+
+        assert device_mesh.get_coordinate() == (0,)
+
 
 if __name__ == "__main__":
     pytest.main(["-v", __file__])
