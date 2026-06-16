@@ -23,6 +23,7 @@ import re
 import hyper_parallel
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.fully_shard.api import HSDPModule
+from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
 platform = get_platform()
 logger = logging.getLogger(__name__)
 
@@ -266,10 +267,13 @@ class PipelineScheduleRuntime(ABC):
     Args:
         stages (list[PipelineStage], PipelineStage):  PipelineStage used to run_microbatches.
         micro_batch_num (int): The number of micro-batch.
-        args_batch_dim (list, optional): Specify the batch dim of the args.
-            Default ``None``.
-        kwargs_batch_dim (dict, optional): Specify the batch dim of the kwargs.
-            Default ``None``.
+        args_batch_dim (int | BatchDimSpec | list | tuple, optional): Per
+            positional-arg batch dim, indexed by arg position.  Entries may be
+            plain ``int`` (or ``None`` to keep the default); a single-input
+            model may pass a bare ``int``/``BatchDimSpec`` instead of a
+            one-element list (wrapped automatically). Default ``None``.
+        kwargs_batch_dim (dict, optional): Per keyword-arg batch dim, mapping
+            arg name to a plain ``int`` or ``BatchDimSpec``. Default ``None``.
         swap (bool, optional): Whether to inject pipeline activation swap
             control steps. Supported by ``ScheduleGPipe``, ``Schedule1F1B``,
             and ``ScheduleInterleaved1F1B``. Default ``False``.
@@ -310,8 +314,8 @@ class PipelineScheduleRuntime(ABC):
             )
         self.stages = self._check_stages(stages)
         self.micro_batch_num = micro_batch_num
-        self._args_batch_dim = args_batch_dim
-        self._kwargs_batch_dim = kwargs_batch_dim
+        self._args_batch_dim = self._normalize_args_batch_dim(args_batch_dim)
+        self._kwargs_batch_dim = self._normalize_kwargs_batch_dim(kwargs_batch_dim)
         self._output_concat_dim = output_concat_dim
         self.split_micro_batch = platform.micro_batch(self.micro_batch_num,
                                                       self._args_batch_dim, self._kwargs_batch_dim)
@@ -482,6 +486,60 @@ class PipelineScheduleRuntime(ABC):
             args_split, kwargs_split = self.split_micro_batch(args, kwargs)
             return args_split, kwargs_split
         return [[] for _ in range(self.micro_batch_num)], [{} for _ in range(self.micro_batch_num)]
+
+    @staticmethod
+    def _to_spec(elem):
+        """Normalize one batch-dim entry: ``int`` -> ``BatchDimSpec``.
+
+        ``None`` and ``BatchDimSpec`` pass through unchanged.  ``bool`` is
+        rejected even though it is an ``int`` subclass, so ``True``/``False``
+        are not silently read as dims 1/0.
+        """
+        if elem is None or isinstance(elem, BatchDimSpec):
+            return elem
+        if isinstance(elem, int) and not isinstance(elem, bool):
+            return BatchDimSpec(elem)
+        raise TypeError(
+            f"batch-dim entry must be int, BatchDimSpec or None, but got {type(elem)}.")
+
+    @staticmethod
+    def _normalize_args_batch_dim(args_batch_dim):
+        """Accept a plain ``int``/``BatchDimSpec`` or a ``list``/``tuple`` of them.
+
+        ``args_batch_dim`` is a per-arg spec indexed by positional-arg position
+        (see ``_MicroBatch``).  A single-input model can pass a bare ``int`` /
+        ``BatchDimSpec`` instead of the awkward one-element
+        ``BatchDimSpec.from_tuple((0,))``; elements may be plain ``int`` (or
+        ``None`` to keep the default).  Always returns ``None`` or a
+        ``tuple[BatchDimSpec | None]`` so downstream per-arg indexing is
+        unchanged.
+        """
+        if args_batch_dim is None:
+            return None
+        if isinstance(args_batch_dim, BatchDimSpec) or \
+                (isinstance(args_batch_dim, int) and not isinstance(args_batch_dim, bool)):
+            args_batch_dim = (args_batch_dim,)
+        if isinstance(args_batch_dim, (list, tuple)):
+            return tuple(PipelineScheduleRuntime._to_spec(e) for e in args_batch_dim)
+        raise TypeError(
+            f"args_batch_dim must be int, BatchDimSpec or a list/tuple of them, "
+            f"but got {type(args_batch_dim)}.")
+
+    @staticmethod
+    def _normalize_kwargs_batch_dim(kwargs_batch_dim):
+        """Accept plain ``int`` dict values: ``{\"x\": 0}`` -> ``{\"x\": BatchDimSpec(0)}``.
+
+        ``kwargs_batch_dim`` maps each keyword-arg name to its batch dim.
+        Returns ``None`` or a ``dict[str, BatchDimSpec | None]`` so downstream
+        per-key indexing is unchanged.
+        """
+        if kwargs_batch_dim is None:
+            return None
+        if not isinstance(kwargs_batch_dim, dict):
+            raise TypeError(
+                f"kwargs_batch_dim must be a dict[str, int | BatchDimSpec], "
+                f"but got {type(kwargs_batch_dim)}.")
+        return {k: PipelineScheduleRuntime._to_spec(v) for k, v in kwargs_batch_dim.items()}
 
     def _check_stages(self, stages):
         """check stages type."""
