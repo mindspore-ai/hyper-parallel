@@ -449,7 +449,7 @@ def checkpoint_with_session(
     use_reentrant: bool = False,
     **kwargs: Any,
 ) -> Any:
-    """Run *function* inside a checkpointed region that supports recompute sessions.
+    """Run ``function`` inside a checkpointed region that supports recompute sessions.
 
     When a recompute session is active (i.e. ``_recompute_session`` is set),
     this function creates a ``_CheckpointFrame``, saves the inputs, mounts a
@@ -471,7 +471,7 @@ def checkpoint_with_session(
         **kwargs: Keyword arguments forwarded to *function*.
 
     Returns:
-        The output of *function(\*args, \*\*kwargs)*.
+        The output of ``function(*args, **kwargs)``.
 
     Raises:
         ValueError: If ``use_reentrant=True``.
