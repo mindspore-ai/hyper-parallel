@@ -1,13 +1,41 @@
 # HyperParallel
 
-An Ascend SuperPod-affinity distributed parallel acceleration library that simplifies supernode programming and unleashes computational potential.
+An Ascend SuperPod-affinity distributed parallel acceleration library that simplifies supernode programming and
+unleashes computational potential.
 
-HyperParallel provides Ascend SuperPod-affinity distributed parallel acceleration capabilities. Whilst maintaining ease of use, it addresses the architectural characteristics of Ascend SuperPods, including resource pooling, peer-to-peer architecture, hierarchical and diverse network topology, and FP8 low-precision formats. It implements distributed parallelism from cluster level to multi-core parallelism within chips, supports unified pooled management of CPU DRAM and NPU HBM, topology-aware scheduling and communication path planning, and FP8 mixed-precision training amongst other Ascend SuperPod-affinity acceleration capabilities.
+HyperParallel provides Ascend SuperPod-affinity distributed parallel acceleration capabilities. Whilst maintaining ease
+of use, it addresses the architectural characteristics of Ascend SuperPods, including resource pooling, peer-to-peer
+architecture, hierarchical and diverse network topology, and FP8 low-precision formats. It implements distributed
+parallelism from cluster level to multi-core parallelism within chips, supports unified pooled management of CPU DRAM
+and NPU HBM, topology-aware scheduling and communication path planning, and FP8 mixed-precision training amongst other
+Ascend SuperPod-affinity acceleration capabilities.
 Key design principles:
-**Decoupling of Model and System Optimisation**: With the continuous evolution of LLM and multimodal algorithm architectures, performance optimisation techniques have also been advancing. The traditional integrated architecture of algorithm and system optimisation poses challenges for algorithm iteration and long-term system maintenance. Through HyperParallel, we aim to evolve the programming model from system optimisation embedded within model scripts to a decoupled model and system optimisation approach, with implicit injection of parallelism, recomputation, offload and other system optimisations. We support the evolution of parallel paradigms from SPMD to MPMD, further supporting coordinated optimisation of cluster MPMD and multi-core MPMD. We support the evolution of compute-storage relationships from Stateful to Stateless with separated computation and state. This supports large language model training, multimodal large model training, and reinforcement learning capabilities.
-**End-to-End Determinism**: To further ensure training stability and precision reproducibility, HyperParallel supports end-to-end determinism, including high-performance deterministic computation, communication, data preprocessing, and random number determinism, supporting floating-point bitwise alignment. All supported models are validated using determinism. Although there is some performance degradation, we still recommend enabling determinism during training for precision reproducibility, rapid SDC detection, and bug identification.
-**Unified Training and Inference**: As Reasoning RL and Agentic RL tasks become increasingly complex, the training-inference inconsistency problem causing reinforcement learning training convergence difficulties has become more prominent. HyperParallel will explore a unified training-inference architecture, achieving performance optimisation for both training and inference through a single acceleration framework, strengthening training-inference consistency and ensuring RL convergence.
-**Hybrid Dynamic-Static Execution**: Optimisation based on static graphs is an important means of further improving performance. For instance, capabilities such as compute-communication concurrency, memory analysis, and execution sequence orchestration based on static graphs can effectively optimise performance, which are not easily achievable in dynamic graph mode. However, dynamic-to-static compilation support is extremely challenging, and complete dynamic-to-static conversion is not yet achievable. HyperParallel will support partial dynamic-to-static conversion through certain syntax constraints, utilising MindSpore's advanced graph optimisation capabilities to further enhance performance.
+**Decoupling of Model and System Optimisation**: With the continuous evolution of LLM and multimodal algorithm
+architectures, performance optimisation techniques have also been advancing. The traditional integrated architecture of
+algorithm and system optimisation poses challenges for algorithm iteration and long-term system maintenance. Through
+HyperParallel, we aim to evolve the programming model from system optimisation embedded within model scripts to a
+decoupled model and system optimisation approach, with implicit injection of parallelism, recomputation, offload and
+other system optimisations. We support the evolution of parallel paradigms from SPMD to MPMD, further supporting
+coordinated optimisation of cluster MPMD and multi-core MPMD. We support the evolution of compute-storage relationships
+from Stateful to Stateless with separated computation and state. This supports large language model training, multimodal
+large model training, and reinforcement learning capabilities.
+**End-to-End Determinism**: To further ensure training stability and precision reproducibility, HyperParallel supports
+end-to-end determinism, including high-performance deterministic computation, communication, data preprocessing, and
+random number determinism, supporting floating-point bitwise alignment. All supported models are validated using
+determinism. Although there is some performance degradation, we still recommend enabling determinism during training for
+precision reproducibility, rapid SDC detection, and bug identification.
+**Unified Training and Inference**: As Reasoning RL and Agentic RL tasks become increasingly complex, the
+training-inference inconsistency problem causing reinforcement learning training convergence difficulties has become
+more prominent. HyperParallel will explore a unified training-inference architecture, achieving performance optimisation
+for both training and inference through a single acceleration framework, strengthening training-inference consistency
+and ensuring RL convergence.
+**Hybrid Dynamic-Static Execution**: Optimisation based on static graphs is an important means of further improving
+performance. For instance, capabilities such as compute-communication concurrency, memory analysis, and execution
+sequence orchestration based on static graphs can effectively optimise performance, which are not easily achievable in
+dynamic graph mode. However, dynamic-to-static compilation support is extremely challenging, and complete
+dynamic-to-static conversion is not yet achievable. HyperParallel will support partial dynamic-to-static conversion
+through certain syntax constraints, utilising MindSpore's advanced graph optimisation capabilities to further enhance
+performance.
 
 ## Architecture Overview
 
@@ -15,18 +43,23 @@ Key design principles:
 
 ### HyperShard: Programming Model Evolution, System Optimisation Embedded in Model -> Decoupled Model and System Optimisation
 
-- SuperPod Layout: Unified modelling of tensor sharding, device mapping, and communication paths, achieving single-card abstraction for SuperPods;
-- Declarative HSDP/TP/CP/EP: Implicit injection of optimisations such as parallelism, recomputation, and offload into models, achieving decoupling of model code and system optimisation code, improving algorithm development efficiency;
+- SuperPod Layout: Unified modelling of tensor sharding, device mapping, and communication paths, achieving single-card
+  abstraction for SuperPods;
+- Declarative HSDP/TP/CP/EP: Implicit injection of optimisations such as parallelism, recomputation, and offload into
+  models, achieving decoupling of model code and system optimisation code, improving algorithm development efficiency;
 
 ### HyperMPMD: Parallel Paradigm Evolution, SPMD -> Cluster MPMD -> Cluster + Multi-Core MPMD
 
 - Distributed MPMD: Supports heterogeneous model sharding, supports arbitrary device allocation for model slices;
-- Multi-Core MPMD: Intra-chip multi-core MPMD parallelism, combined with core-level memory semantic one-sided communication, enhancing compute-communication overlap and MAC utilisation;
+- Multi-Core MPMD: Intra-chip multi-core MPMD parallelism, combined with core-level memory semantic one-sided
+  communication, enhancing compute-communication overlap and MAC utilisation;
 
 ### HyperOffload: Compute-Storage Relationship Evolution, Stateful -> Stateless Computation-State Separation
 
-- Unified Programming for Remote and Local Tensors: Supports tensor location allocation, hides remote data transfer, improves cluster memory utilisation;
-- Remote Tensor Prefetching and Caching, Full Model Offload: DDP/HSDP+Offload replaces complex parallel modes such as DP/TP/PP/CP/SP/EP, simplifying system design and improving performance;
+- Unified Programming for Remote and Local Tensors: Supports tensor location allocation, hides remote data transfer,
+  improves cluster memory utilisation;
+- Remote Tensor Prefetching and Caching, Full Model Offload: DDP/HSDP+Offload replaces complex parallel modes such as
+  DP/TP/PP/CP/SP/EP, simplifying system design and improving performance;
 
 ## Key Features
 
@@ -126,7 +159,8 @@ Key design principles:
     - [x] gradient scaling factor + clip_grad enhancements
 
 - AutoParallel
-    - [x] Fast-Tuner: Based on profiling information, constructs black-box cost models, automatically generates multi-dimensional hybrid parallel strategies through enumeration, pruning, and search
+    - [x] Fast-Tuner: Based on profiling information, constructs black-box cost models, automatically generates
+      multi-dimensional hybrid parallel strategies through enumeration, pruning, and search
     - [x] SAPP-PPB: Pipeline Parallelism Balancing
     - [x] SAPP-ND: ND Search (memory estimation + performance estimation)
     - [ ] PARADISE
@@ -173,46 +207,81 @@ Key design principles:
 
 ## Installation Guide
 
-Currently only installation from source is supported. You need to execute:
+HyperParallel offers two installation methods:
+
+- **pip installation**: install an already built `hyper-parallel` package and use extras to select runtime deep
+  learning framework dependencies.
+- **source build**: use `python setup.py bdist_wheel` to generate a whl package, and use build switches to decide
+  whether native extensions are compiled.
+
+If you only need to install a released package, prefer `pip install`. If you need to generate a whl package locally or
+customize native extension build options, build from source.
+
+### 1. Install With pip
+
+`pip install` extras only control Python runtime dependencies. They do not control native extension compilation.
+
+| Command                                   | Installed dependencies                                          | Use case                                                                          |
+|-------------------------------------------|-----------------------------------------------------------------|-----------------------------------------------------------------------------------|
+| `pip install hyper-parallel`              | Common dependencies only, no deep learning framework            | You manage framework versions yourself or only use framework-independent features |
+| `pip install 'hyper-parallel[mindspore]'` | Common dependencies + `mindspore>=2.10`                         | Use the MindSpore backend                                                         |
+| `pip install 'hyper-parallel[torch]'`     | Common dependencies + `torch==2.9.1` + `torch-npu==2.9.1`       | Use the default PyTorch 2.9 backend                                               |
+| `pip install 'hyper-parallel[torch26]'`   | Common dependencies + `torch==2.6.0` + `torch-npu==2.6.0.post3` | Use the PyTorch 2.6 backend                                                       |
+| `pip install 'hyper-parallel[torch27]'`   | Common dependencies + `torch==2.7.1` + `torch-npu==2.7.1`       | Use the PyTorch 2.7 backend                                                       |
+| `pip install 'hyper-parallel[torch29]'`   | Common dependencies + `torch==2.9.1` + `torch-npu==2.9.1`       | Explicitly use the PyTorch 2.9 backend                                            |
+| `pip install 'hyper-parallel[all]'`       | Common dependencies + MindSpore + default PyTorch 2.9           | Use both backends in the same environment; PyTorch defaults to 2.9                |
+
+In shells such as zsh, quote package names with extras so `[]` is not treated as a glob pattern.
+
+### 2. Build a Wheel From Source
+
+Building hyper-parallel from source can compile three native modules: `multicore`, `symmetric memory`, and `custom ops`.
+These three modules are triggered by the following scripts:
+
+The three modules are executed as optional build steps in `setup.py`: they are not built by default and are enabled
+only when the corresponding environment variable is set explicitly. If a script fails, a warning is recorded and
+packaging continues. If the target whl requires the corresponding native capability, make sure the required build
+environment is complete.
+
+The build behavior of `multicore`, `symmetric memory`, and `custom ops` can be controlled as follows:
+
+| Module             | Environment variable         | Value        | Build behavior                                                        |
+|--------------------|------------------------------|--------------|-----------------------------------------------------------------------|
+| `multicore`        | `BUILD_MULTICORE_EXTENSION`  | unset or `0` | Skip the entire multicore module                                      |
+| `multicore`        | `BUILD_MULTICORE_EXTENSION`  | `1`          | Build MindSpore multicore only                                        |
+| `multicore`        | `BUILD_MULTICORE_EXTENSION`  | `2`          | Build PyTorch multicore only; ninja is also required if `USE_NINJA=1` |
+| `multicore`        | `BUILD_MULTICORE_EXTENSION`  | `all`        | Build both MindSpore multicore and PyTorch multicore                  |
+| `symmetric memory` | `BUILD_SHMEM_EXTENSION`      | unset or `0` | Skip the entire symmetric memory module                               |
+| `symmetric memory` | `BUILD_SHMEM_EXTENSION`      | `all`        | Build the common library, MindSpore wrapper, and PyTorch wrapper      |
+| `symmetric memory` | `BUILD_SHMEM_EXTENSION`      | `1`          | Build only the common library and MindSpore wrapper                   |
+| `symmetric memory` | `BUILD_SHMEM_EXTENSION`      | `2`          | Build only the common library and PyTorch wrapper                     |
+| `custom ops`       | `BUILD_CUSTOM_OPS_EXTENSION` | unset or `0` | Skip custom ops                                                       |
+| `custom ops`       | `BUILD_CUSTOM_OPS_EXTENSION` | `1`          | Build MindSpore custom ops                                            |
+
+After configuring the desired build behavior, build hyper-parallel from source as follows:
 
 ```bash
 git clone https://gitcode.com/mindspore/hyper-parallel.git
 cd hyper-parallel
 python setup.py bdist_wheel
-# Wheel filename is tagged with the current Python version and CPU arch,
-# e.g. cp310-cp310-linux_aarch64.
 pip install dist/hyper_parallel-*.whl
 ```
 
-General requirements (build + runtime):
+Source build environment requirements for hyper-parallel are as follows:
 
-- Python 3.10, 3.11 or 3.12 (the produced wheel is only installable on the
-  matching minor version)
-- Architecture: linux_aarch64 or linux_x86_64 (wheels ship prebuilt .so files;
-  the tag must match the install host, cross-arch installs are rejected by pip)
-- Host GCC must fall in the [7.3.0, 11.3.0] range (aligned with MindSpore's
-  compile policy)
-- Host glibc must be no older than the build host's glibc. Wheels produced on
-  e.g. OpenEuler 22.03 (glibc 2.34) cannot run on systems with glibc < 2.34;
-  build inside an older release image when targeting legacy hosts.
+| Environment item                | Requirement                                                               | Notes                                                                                                             |
+|---------------------------------|---------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| Python                          | 3.10, 3.11, or 3.12                                                       | The built whl can only be installed into the matching Python minor version                                        |
+| Host GCC                        | [7.3.0, 11.3.0]                                                           | Aligned with MindSpore's compile policy                                                                           |
+| CMake                           | >= 3.18                                                                   | Required for native extension builds                                                                              |
+| CANN toolkit                    | A valid `ASCEND_HOME_PATH` is required when native extensions are enabled | Scripts try to source `/usr/local/Ascend/cann/set_env.sh` automatically                                           |
+| MindSpore                       | >= 2.10                                                                   | Required when `BUILD_CUSTOM_OPS_EXTENSION=1`, `BUILD_MULTICORE_EXTENSION=1/all`, or `BUILD_SHMEM_EXTENSION=all/1` |
+| PyTorch and NPU adapter package | Backend-compatible PyTorch version                                        | Required when `BUILD_MULTICORE_EXTENSION=2/all`, or `BUILD_SHMEM_EXTENSION=all/2`                                 |
 
-Additional build-only tools (needed when producing the wheel; end users
-installing the wheel do NOT need these):
-
-- CMake >= 3.18
-- CANN toolkit (`ASCEND_HOME_PATH` must be set; build scripts try to source
-  `/usr/local/Ascend/cann/set_env.sh` automatically)
-- bisheng compiler (from CANN; used to compile symmetric_memory CCE kernels)
-- MindSpore >= 2.8 (driven by `CustomOpBuilder` at build time to produce
-  custom_ops / multicore .so; also a runtime dep for most users)
-- Optional: when `BUILD_TORCH_EXTENSION=true`, also need PyTorch >= 2.7
-  (CXX11 ABI=1) and torch_npu; when `USE_NINJA=1`, also need ninja
-
-Runtime dependencies:
-
-- Install a deep learning framework
-- Recommended MindSpore version >= 2.8, preferably using the latest MindSpore version, refer to [here](https://atomgit.com/mindspore/mindspore#%E5%AE%89%E8%A3%85)
-- For the PyTorch path, use PyTorch >= 2.7 built with `_GLIBCXX_USE_CXX11_ABI=1` (the default for official wheels).
+> Note: the built whl has requirements on the glibc version of the runtime environment. The glibc version in the
+> installation environment must be no lower than the glibc version in the build environment.
+> If you need to deploy to an older system, build inside an older release image. For example, a whl built on OpenEuler
+> 22.03 (glibc 2.34) cannot run in an environment with glibc < 2.34.
 
 ## Quick Start
 
@@ -242,8 +311,8 @@ with no_init_parameters():
     model = SimpleModel()
 
 # Configure sharding for network input/output/weights
-sharding_plan = { "forward": { "input": (x_layout,), "output": (out_layout,)},
-                "parameter": {"weight": w_layout}}
+sharding_plan = {"forward": {"input": (x_layout,), "output": (out_layout,)},
+                 "parameter": {"weight": w_layout}}
 model = shard_module(model, sharding_plan)
 
 # Can further configure fully_shard
@@ -342,7 +411,8 @@ For details, see the [MOE-FFN Documentation](./hyper_parallel/core/multicore/doc
 4. Create a new Pull Request
 
 If you have any suggestions for HyperParallel, please contact us through issues and we will address them promptly.
-If you are interested in HyperParallel's technology or would like to contribute code, you are welcome to join the [Parallel Training System SIG](https://www.mindspore.cn/sig/Parallel%20Training%20System).
+If you are interested in HyperParallel's technology or would like to contribute code, you are welcome to join
+the [Parallel Training System SIG](https://www.mindspore.cn/sig/Parallel%20Training%20System).
 
 ## License
 

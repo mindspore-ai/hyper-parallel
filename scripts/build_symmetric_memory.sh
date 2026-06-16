@@ -8,6 +8,61 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
+#
+# BUILD_SHMEM_EXTENSION controls symmetric memory build scope:
+#   unset / 0 / skip / none: skip symmetric memory entirely
+#   all: build common library, PyTorch wrapper, and MindSpore wrapper
+#   1 / mindspore / ms: build common library and MindSpore wrapper
+#   2 / torch / pytorch: build common library and PyTorch wrapper
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
+CURRENT_DIR=$(pwd)
+BUILD_DIR=$PROJECT_ROOT/build
+
+PREBUILD_SHMEM="${HYPER_PREBUILD_SHMEM:-true}"
+BUILD_SHMEM_EXTENSION="${BUILD_SHMEM_EXTENSION:-}"
+BUILD_SHMEM_EXTENSION_DISPLAY="${BUILD_SHMEM_EXTENSION:-unset}"
+BUILD_SHMEM_COMMON_LIBRARY=false
+BUILD_SHMEM_TORCH_WRAPPER=false
+BUILD_SHMEM_MS_WRAPPER=false
+
+case "${BUILD_SHMEM_EXTENSION}" in
+    all|ALL|both|BOTH|true|TRUE)
+        BUILD_SHMEM_COMMON_LIBRARY=true
+        BUILD_SHMEM_TORCH_WRAPPER=true
+        BUILD_SHMEM_MS_WRAPPER=true
+        ;;
+    ""|0|skip|SKIP|none|NONE|false|FALSE)
+        ;;
+    1|mindspore|MINDSPORE|ms|MS)
+        BUILD_SHMEM_COMMON_LIBRARY=true
+        BUILD_SHMEM_MS_WRAPPER=true
+        ;;
+    2|torch|TORCH|pytorch|PYTORCH)
+        BUILD_SHMEM_COMMON_LIBRARY=true
+        BUILD_SHMEM_TORCH_WRAPPER=true
+        ;;
+    *)
+        echo "ERROR: Unsupported BUILD_SHMEM_EXTENSION=${BUILD_SHMEM_EXTENSION}."
+        echo "       Use unset/0 to skip, all for all, 1 for MindSpore, or 2 for PyTorch."
+        exit 1
+        ;;
+esac
+
+function clean_shmem_outputs() {
+    rm -rf "$BUILD_DIR/symmetric_memory"
+    rm -rf "$BUILD_DIR/lib/hyper_parallel/lib"
+    rm -rf "$BUILD_DIR/lib/hyper_parallel/platform/torch/symmetric_memory"
+    rm -rf "$BUILD_DIR/lib/hyper_parallel/platform/mindspore/symmetric_memory"
+}
+
+if [[ "${BUILD_SHMEM_COMMON_LIBRARY}" != "true" ]]; then
+    clean_shmem_outputs
+    echo "INFO: symmetric memory build skipped (BUILD_SHMEM_EXTENSION=${BUILD_SHMEM_EXTENSION_DISPLAY})."
+    exit 0
+fi
+
 SET_ENV_FILE="/usr/local/Ascend/cann/set_env.sh"
 if [ -z "${ASCEND_HOME_PATH}" ]; then
     echo "Warning: ASCEND_HOME_PATH is not set. Attempting to source ${SET_ENV_FILE} to set it."
@@ -18,9 +73,6 @@ if [ -z "${ASCEND_HOME_PATH}" ]; then
     fi
 fi
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
-BUILD_DIR=$PROJECT_ROOT/build
 export HP_THIRD_PARTY_DIR="${PROJECT_ROOT}/3rdparty"
 mkdir -p $HP_THIRD_PARTY_DIR
 
@@ -42,8 +94,6 @@ PREBUILD_DIR="./prebuild"
 TAR_FILE="${PREBUILD_DIR}/symmetric_memory.tar.gz"
 SHA256_FILE="${PREBUILD_DIR}/symmetric_memory.tar.gz.sha256"
 DEST_DIR="./build/lib/hyper_parallel"
-
-PREBUILD_SHMEM="${HYPER_PREBUILD_SHMEM:-true}"
 
 # 目标 GCC 版本（可通过环境变量 TARGET_GCC_VERSION 覆盖，当bisheng编译器的头文件版本<7.3.0时会寻找/usr/local下面的对应版本）
 TARGET_GCC_VERSION=${TARGET_GCC_VERSION:-"7.3.0"}
@@ -289,10 +339,23 @@ function build_ms_library() {
     echo "build mindspore library success"
 }
 
+function clean_skipped_wrapper_outputs() {
+    if [[ "${BUILD_SHMEM_TORCH_WRAPPER}" != "true" ]]; then
+        rm -rf "$BUILD_DIR/lib/hyper_parallel/platform/torch/symmetric_memory"
+    fi
+    if [[ "${BUILD_SHMEM_MS_WRAPPER}" != "true" ]]; then
+        rm -rf "$BUILD_DIR/lib/hyper_parallel/platform/mindspore/symmetric_memory"
+    fi
+}
+
 set -e
 
 echo "============================================="
 echo "Prebuild mode: ${PREBUILD_SHMEM} (true=use prebuilt package, false=compile from source)"
+echo "BUILD_SHMEM_EXTENSION: ${BUILD_SHMEM_EXTENSION_DISPLAY}"
+echo "Build common library: ${BUILD_SHMEM_COMMON_LIBRARY}"
+echo "Build PyTorch wrapper: ${BUILD_SHMEM_TORCH_WRAPPER}"
+echo "Build MindSpore wrapper: ${BUILD_SHMEM_MS_WRAPPER}"
 echo "============================================="
 
 # 2. If prebuild mode is enabled
@@ -348,7 +411,19 @@ else
         exit 1
     fi
 fi
-build_torch_library
-build_ms_library
+
+clean_skipped_wrapper_outputs
+
+if [[ "${BUILD_SHMEM_TORCH_WRAPPER}" == "true" ]]; then
+    build_torch_library
+else
+    echo "INFO: PyTorch symmetric memory wrapper skipped (BUILD_SHMEM_EXTENSION=${BUILD_SHMEM_EXTENSION_DISPLAY})."
+fi
+
+if [[ "${BUILD_SHMEM_MS_WRAPPER}" == "true" ]]; then
+    build_ms_library
+else
+    echo "INFO: MindSpore symmetric memory wrapper skipped (BUILD_SHMEM_EXTENSION=${BUILD_SHMEM_EXTENSION_DISPLAY})."
+fi
 
 cd ${CURRENT_DIR}
