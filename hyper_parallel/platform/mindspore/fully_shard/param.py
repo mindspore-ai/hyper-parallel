@@ -188,21 +188,12 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self.reduce_scatter_handle: Optional[CommHandle] = None
         self._all_reduce_output = None
         self.all_reduce_handle: Optional[CommHandle] = None
-        self._accumulated_allreduced_grad = True
         self._post_load_hook_handle = (
             module_info.module.register_load_state_dict_post_hook(
                 lambda *args, **kwargs: self.reset_sharded_param()
             )
         )
         self.gradient_scaling_factor = None
-
-    @property
-    def accumulated_allreduced_grad(self) -> bool:
-        return self._accumulated_allreduced_grad
-
-    @accumulated_allreduced_grad.setter
-    def accumulated_allreduced_grad(self, value: bool) -> None:
-        self._accumulated_allreduced_grad = value
 
     @property
     def uses_param_shard(self) -> bool:
@@ -745,8 +736,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self,
         async_op: bool = True,
         dtype: Optional[ms.Type] = None,
-        reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.SUM,
-        output_buffer: Optional[ms.Tensor] = None,
+        reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.SUM
     ) -> Tuple[ms.Tensor, Optional[CommHandle]]:
         """
         Perform reduce-scatter on gradient to reduce and shard the full gradient.
@@ -755,7 +745,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             async_op: Whether to execute asynchronously.
             dtype: reduce dtype.
             reduce_op: do reduce-scatter avg or sum.
-            output_buffer: Optional pre-allocated output for fused all-reduce groups.
 
         Returns:
             (sharded_grad, handle): Sharded gradient and communication handle.
@@ -786,39 +775,17 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         apply_gradient_scaling_factor(grad_flat, self.gradient_scaling_factor)
         # If parameter is not sharded (below threshold), no reduce-scatter needed
         if not self.is_sharded:
-            if output_buffer is not None:
-                copy_without_bumping_version(output_buffer, grad_flat)
-                self._reduce_scatter_output = output_buffer
-            else:
-                self._reduce_scatter_output = grad_flat
-            self.reduce_scatter_handle = None
-            return self._reduce_scatter_output, None
+            return grad_flat, None
 
         if shard_group is None or shard_group_size <= 1:
-            if output_buffer is not None:
-                copy_without_bumping_version(output_buffer, grad_flat)
-                self._reduce_scatter_output = output_buffer
-            else:
-                self._reduce_scatter_output = grad_flat
-            self.reduce_scatter_handle = None
-            return self._reduce_scatter_output, None
+            # No communication needed
+            return grad_flat, None
 
         # Calculate output size
         output_numel = grad_flat.numel() // shard_group_size
-        if output_buffer is not None:
-            if output_buffer.numel() != output_numel:
-                raise ValueError(
-                    f"output_buffer size mismatch: expected {output_numel}, got {output_buffer.numel()}"
-                )
-            if output_buffer.dtype != reduce_dtype:
-                raise ValueError(
-                    f"output_buffer dtype mismatch: expected {reduce_dtype}, got {output_buffer.dtype}"
-                )
-            self._reduce_scatter_output = output_buffer
-        else:
-            self._reduce_scatter_output = ms.mint.empty(
-                output_numel, dtype=reduce_dtype, device=grad.device.split(":")[0]
-            )
+        self._reduce_scatter_output = ms.mint.empty(
+            output_numel, dtype=reduce_dtype, device=grad.device.split(':')[0]
+        )
 
         # Ascend HCCL DistCommReduceScatter rejects non-contiguous tensors.
         # ``pack_for_reduce_scatter`` on a shard-dim-0 path returns the input
