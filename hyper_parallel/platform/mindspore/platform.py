@@ -1257,13 +1257,38 @@ class MindSporePlatform(Platform):
         """
         input_tensor.requires_grad_()
 
-    def _create_group(self, rank_list):
+    @staticmethod
+    def _normalize_group_options(pg_options: Any) -> Any:
+        if not isinstance(pg_options, dict) or "hccl_config" not in pg_options:
+            return pg_options
+        from mindspore._c_expression import GroupOptions  # pylint: disable=C0415
+
+        options = GroupOptions()
+        options.hccl_config = pg_options["hccl_config"]
+        return options
+
+    @staticmethod
+    def _create_group_with_options(group_name: str, rank_list: list[int], pg_options: Any = None) -> None:
+        """Create a MindSpore communication group with optional backend-specific options."""
+        if pg_options is None:
+            new_group(rank_ids=rank_list, group=group_name)
+            return
+        try:
+            new_group(
+                rank_ids=rank_list,
+                group=group_name,
+                options=MindSporePlatform._normalize_group_options(pg_options),
+            )
+        except (ImportError, RuntimeError, TypeError, ValueError):
+            new_group(rank_ids=rank_list, group=group_name)
+
+    def _create_group(self, rank_list, pg_options: Any = None):
         world_group = self._maybe_reuse_world_group(rank_list)
         if world_group is not None:
             return world_group
 
         group_name = str(tuple(sorted(rank_list)))
-        new_group(rank_ids=rank_list, group=group_name)
+        self._create_group_with_options(group_name, rank_list, pg_options=pg_options)
         EXISTING_COMM_GROUPS[group_name] = group_name
         return group_name
 
@@ -1582,7 +1607,7 @@ class MindSporePlatform(Platform):
     def split_group(parent_pg: Optional[str] = None,
                     split_ranks: Optional[list] = None,
                     timeout: Optional[timedelta] = None,
-                    pg_options: Optional[str] = None,
+                    pg_options: Optional[Any] = None,
                     group_desc: Optional[str] = None,
                     ) -> str:
         """
@@ -1592,7 +1617,8 @@ class MindSporePlatform(Platform):
             parent_pg (str, Optional): A process group which the goal group split from.
             split_ranks (Optional[list]): A list like ``list[list[int]]``.
             timeout (Optional[timedelta]): Timeout for API executed. Default is ``None``.
-            pg_options (Optional[str]): Reserved parameter. Current not take effect.
+            pg_options (Optional[Any]): Backend-specific group options. MindSpore can use
+                ``{"hccl_config": {"hccl_op_expansion_mode": "AIV"}}`` to request AIV mode.
             group_desc (Optional[str]): Description of process group.
 
         Returns:
@@ -1611,7 +1637,7 @@ class MindSporePlatform(Platform):
                 if split_group:
                     return split_group
                 group_name = str(tuple(sorted(split_rank)))
-                new_group(rank_ids=split_rank, group=group_name)
+                MindSporePlatform._create_group_with_options(group_name, split_rank, pg_options=pg_options)
                 EXISTING_COMM_GROUPS[group_name] = group_name
                 return group_name
         raise ValueError(f"Split group invalid rank, the Split_ranks {split_ranks} does not contain current rank"
