@@ -11,6 +11,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 ### HyperShard：模型与系统优化解耦
 
 **DTensor 分布式张量**
+
 - DTensor 基础功能：分布式张量抽象，封装 local shard + DeviceMesh + Placements
 - DTensor redistribute：按需重分布，支持跨 mesh 维度重排布，缓存优化（compact_str + rank_id）
 - DeviceMesh：多维设备拓扑管理，支持 `init_device_mesh` 创建任意形状 mesh
@@ -19,6 +20,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 - `init_parameters` / `init_empty_weights` / `init_on_device`：分片参数初始化工具
 
 **HSDP/FSDP 数据并行**
+
 - `fully_shard`：参数/梯度/优化器状态全切分，降低单卡内存占用
 - `HSDPModule`：混合分片数据并行模块封装
 - `hsdp_sync_stream`：梯度同步流管理
@@ -28,6 +30,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 - MindSpore 参数 hook 迁移与修复
 
 **Shard 分布式算子与张量并行**
+
 - `shard_module`：声明式并行策略接口，通过 sharding_plan 配置输入/输出/参数排布
 - `custom_shard`：自定义并行接入 DTensor 并行流程
 - `DFunction`：自定义分布式 autograd 函数基类，集成 DTensor dispatch 系统
@@ -38,6 +41,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 - MindSpore replicate allreduce overlap
 
 **Tensor Parallel（声明式 TP Styles）**
+
 - `ColwiseParallel`：列切分并行
 - `RowwiseParallel`：行切分并行
 - `SequenceParallel`：序列并行
@@ -46,6 +50,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 - Loss Parallel：TP 训练场景的 loss 并行支持
 
 **Expert Parallel（专家并行）**
+
 - `ExpertParallel`：标准 all-to-all EP，每个 rank 持有 num_experts / ep_degree 个本地专家
 - `TensorParallel`（EP 内）：TP-only 权重切分
 - `ExpertTensorParallel`：EP+TP 二维并行（2-D [ep, tp] mesh）
@@ -55,6 +60,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 - PP+EP 多 micro-batch 状态安全：`DispatchContext` 防止实例共享问题
 
 **Context Parallel（上下文并行）**
+
 - `ContextParallel`：基础上下文并行
 - `AsyncContextParallel`：异步上下文并行
 - DSA 系列：
@@ -68,6 +74,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 ### HyperMPMD：集群 MPMD + 多核 MPMD
 
 **Pipeline Parallel（流水线并行）**
+
 - `PipelineStage`：流水线 stage 封装，支持 dx/dw 计算
 - `Schedule1F1B`：1F1B 调度
 - `ScheduleInterleaved1F1B`：交错 1F1B 调度（VPP）
@@ -87,6 +94,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 - Batch size 校验：MindSpore 后端拒绝 batch size 不整除 micro_batch_num
 
 **MoE 多核并行**
+
 - 多核 MPMD 并行：芯片内多核并行 + 核级内存语义单边通信
 - 基于多核并行优化 MoE 通算掩盖
 - MoE zero-overhead activation storage（内部 score weighting）
@@ -97,6 +105,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 ### HyperOffload：计算状态分离
 
 **Activation Checkpoint / Swap**
+
 - `checkpoint` / `checkpoint_wrapper`：选择性激活重计算（SAC）
 - `swap` / `swap_wrapper` / `swap_tensor_wrapper`：激活 swap（offload to CPU, prefetch on backward）
 - `CheckpointPolicy`：重计算策略配置

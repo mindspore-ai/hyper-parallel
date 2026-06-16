@@ -41,6 +41,7 @@ optimizer = get_hyper_optimizer(
 ```
 
 `get_hyper_optimizer` 内部创建 Muon 和 AdamW 实例，并用 `ChainedOptimizer` 将它们组合。参数分组：
+
 - `muon_params`：Muon 优化的参数组（通常为大型 projection 参数）
 - `adamw_params`：AdamW 优化的参数组（通常为 embedding、bias 等参数）
 - 任一参数组为空列表时，对应优化器不创建

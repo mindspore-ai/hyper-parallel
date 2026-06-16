@@ -41,6 +41,7 @@ balance_result = run_pipeline_balance(
 ```
 
 SAPP-PPB 模块包含：
+
 - `sapp/sapp_solver.py`：搜索求解器
 - `sapp/sapp_pipeline.py`：Pipeline 平衡逻辑
 - `simulator/`：性能模拟器
@@ -68,6 +69,7 @@ result = search.search(
 ```
 
 SAPP-ND 模块包含：
+
 - `memory_estimation/`：内存估算
 - `perf_estimation/`：性能估算
 - `nd/`：ND 搜索算法

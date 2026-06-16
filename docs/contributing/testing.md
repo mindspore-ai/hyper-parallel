@@ -71,6 +71,7 @@ pytest tests/ut/core/activation_checkpoint/
 ## CI 流程
 
 PR 提交时会自动运行：
+
 1. **Lint 检查**：pylint + markdownlint（通过 pre-commit hook）
 2. **Level0 UT**：Gloo CPU backend 基础覆盖
 3. **Codecheck**：静态代码检查（C0116 docstring 等）

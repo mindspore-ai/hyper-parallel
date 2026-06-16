@@ -121,7 +121,7 @@ TP 训练中 loss 计算也可以并行化，避免在 loss 计算时需要 gath
 
 ### MLP (Gate / Up / Down)
 
-```
+```text
 Input (Replicate) ─┬─► gate_proj (ColwiseParallel) ─► Shard(-1)
                     └─► up_proj   (ColwiseParallel) ─► Shard(-1)
                               ↓ element-wise multiply
@@ -130,7 +130,7 @@ Input (Replicate) ─┬─► gate_proj (ColwiseParallel) ─► Shard(-1)
 
 ### Multi-Head Attention
 
-```
+```text
 Input (Replicate) ─► Q/K/V projections (ColwiseParallel) ─► Shard(-1)
                               ↓ attention computation
                         Output projection (RowwiseParallel) ─► Replicate

@@ -72,6 +72,7 @@ python -c "import torch; print(torch.__version__); print(torch._GLIBCXX_USE_CXX1
 **原因**：PP stage index 配置错误，或 micro_batch_num 不匹配。
 
 **解决**：
+
 1. 检查 `PipelineStage(stage_index, stage_num)` 参数是否正确
 2. 确保所有 stage 的 `stage_num` 一致
 3. MindSpore 后端确保 batch_size 整除 micro_batch_num
@@ -119,6 +120,7 @@ init_process_group(backend="hccl")
 ```
 
 检查 HCCL 配置：
+
 - `HCCL_WHITELIST_DISABLE=1`
 - `HCCL_CONNECT_TIMEOUT=1800`
 
