@@ -36,6 +36,7 @@ from hyper_parallel.auto_parallel.sapp_nd.nd import parallelize as Par
 from hyper_parallel.auto_parallel.sapp_nd.nd import global_config as GC
 from hyper_parallel.auto_parallel.sapp_nd.nd.common import arch_hooks as ArchHooks
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyperparallel import (
     CostModelParserHyperparallel,
 )
@@ -344,11 +345,32 @@ class TestSappNDRunND(unittest.TestCase):
         # Redirect matplotlib config dir to a temp path to avoid polluting $HOME
         # and silence the ND logger so that no debug plot/CSV is emitted into
         # the source tree (see `enable_debug` gating in parallelize.py).
-        with tempfile.TemporaryDirectory() as mpl_tmp, \
-                patch.dict(os.environ, {"MPLCONFIGDIR": mpl_tmp}):
-            set_verbose_level(0)
+        memory_call_count = {"count": 0}
+        perf_call_count = {"count": 0}
+        original_memory_estim = Par.ParallelizeLayer.memory_estim
+        original_estimate_performance = Par.estimate_performance
 
-            machine = Hard.Machine(None, "A2")
+        def mostly_fast_memory_estim(runner: Par.ParallelizeLayer, debugger: Any = None) -> float:
+            """Run one real memory estimate, then use a deterministic fitting value."""
+            memory_call_count["count"] += 1
+            if memory_call_count["count"] == 1:
+                return original_memory_estim(runner, debugger)
+            return 1.0
+
+        def mostly_fast_estimate_performance(*args: Any, **kwargs: Any) -> float:
+            """Run one real performance estimate, then avoid repeating expensive formulas."""
+            perf_call_count["count"] += 1
+            if perf_call_count["count"] == 1:
+                return original_estimate_performance(*args, **kwargs)
+            return 2.0
+
+        with tempfile.TemporaryDirectory() as mpl_tmp, \
+                patch.dict(os.environ, {"MPLCONFIGDIR": mpl_tmp}), \
+                patch.object(Par.ParallelizeLayer, "memory_estim", mostly_fast_memory_estim), \
+                patch.object(Par, "estimate_performance", mostly_fast_estimate_performance):
+            set_verbose_level(1)
+
+            machine = Hard.Machine(16, "A2")
             dims = Dim.get_dims(["DP", "MP", "PP", "EP", "MB"])
 
             runner = Par.Parallelize(
@@ -370,6 +392,9 @@ class TestSappNDRunND(unittest.TestCase):
                 top_num=top_k,
                 cache_file=None,
             )
+
+        self.assertGreater(memory_call_count["count"], 1)
+        self.assertGreater(perf_call_count["count"], 1)
 
         self.assertIsInstance(
             scored_space, list,
@@ -1167,3 +1192,278 @@ class TestSappNDRunND(unittest.TestCase):
         self.assertEqual(ms_ccfg.model_name, "multi-unit")
         self.assertFalse(ms_ccfg.multimodal)
         self.assertEqual(ms_ccfg.n_lay, 0)
+
+    def test_cost_model_config_strategy_helpers(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover cost-model copying, validation and strategy mutation with fake parser hooks.
+        Expectation: Strategy fields update consistently without parsing a model config.
+        """
+        parser_calls = []
+        parser = SimpleNamespace(
+            config_shard_emb=lambda: parser_calls.append("embed"),
+            config_dp_tp_exp=lambda cfg: parser_calls.append(("dp_tp", cfg.d, cfg.t)),
+            config_optimizer_shard=lambda cfg: parser_calls.append(("optimizer", cfg.os_max_shard)),
+            config_comm_flag=lambda cfg: parser_calls.append(("comm", cfg.sp)),
+        )
+        cost_cfg = object.__new__(CostModelConfig)
+        cost_cfg.__dict__.update(
+            model_name="unit",
+            multimodal=False,
+            parser=parser,
+            d=2,
+            t=2,
+            p=2,
+            ep=1,
+            cp=1,
+            vp=1,
+            etp=1,
+            m=2,
+            b=2,
+            gbs=8,
+            sp=2,
+            os_max_shard=1,
+            offset=[0, 0],
+            full_rec=[0, 0],
+            sel_rec=[0, 0],
+            pp_sched="1f1b",
+            d_exp=1,
+            t_exp=1,
+            shard_grad_exp=1,
+            shard_grad_non_exp=1,
+            shard_p_os_exp=1,
+            shard_p_os_non_exp=1,
+            shard_embed=1,
+            shard_output_activ=1,
+            shard_recompute_input=1,
+            layer_custom_config=[],
+        )
+
+        self.assertIn("model_name", str(cost_cfg))
+        self.assertEqual(cost_cfg.missing_value, 0)
+        self.assertEqual(cost_cfg.fp_bytes("float16"), 2)
+        self.assertEqual(cost_cfg.fp_bytes("bf32"), 4)
+        self.assertEqual(cost_cfg.fp_bytes(None), 0)
+        self.assertEqual(cost_cfg.strategy_num_devices(), 8)
+        self.assertTrue(cost_cfg.is_consistent_pp_config())
+        self.assertEqual(cost_cfg.count_layers([[[1, 2]], [[3, 4]]]), 2)
+        cost_cfg.print_stages([[[LayerType.EMBEDDING_LAYER]], [[LayerType.OUTPUT_LAYER]]])
+        cost_cfg.print_stages([[[LayerType.EMBEDDING_LAYER]]], spec_stage_id=4)
+        cost_cfg.print_parallelism()
+
+        shallow = copy.copy(cost_cfg)
+        deep = copy.deepcopy(cost_cfg)
+        self.assertIs(shallow.parser, cost_cfg.parser)
+        self.assertIsNot(deep, cost_cfg)
+
+        cost_cfg.set_strategy(
+            dp=4,
+            mp=2,
+            cp=1,
+            ep=2,
+            op=2,
+            etp=1,
+            pp=2,
+            vpp=2,
+            mb=2,
+            mbs=1,
+            offset=[[0, 0], [0, 0]],
+            full_rec=[[0, 0], [0, 0]],
+            sel_rec=[[0, 0], [0, 0]],
+        )
+        self.assertEqual(cost_cfg.get_strategy()["dp"], 4)
+        self.assertEqual(cost_cfg.gbs, 8)
+        self.assertIn("embed", parser_calls)
+
+        cost_cfg.offset = []
+        with self.assertRaises(AttributeError):
+            cost_cfg.set_strategy(dp=2)
+        cost_cfg.offset = [[0, 0], [0, 0]]
+
+        child = copy.copy(cost_cfg)
+        child.model_name = "child"
+        child.multimodal = False
+        multimodal = object.__new__(CostModelConfig)
+        multimodal.__dict__.update(
+            model_name="multi",
+            multimodal=True,
+            mm_ccfgs={"child": child},
+        )
+        multimodal.set_strategy(model_name="child", dp=3)
+        self.assertEqual(multimodal.get_strategy()["child"]["dp"], 3)
+        multimodal.print_parallelism()
+        with self.assertRaises(TypeError):
+            multimodal.set_strategy(model_name="missing", dp=1)
+
+        hook_calls = []
+
+        def original_hook(target: Any) -> None:
+            """Record execution of the original layer hook."""
+            hook_calls.append(("original", target))
+
+        def custom_hook(target: Any) -> None:
+            """Record execution of the injected cost-model hook."""
+            hook_calls.append(("custom", target))
+
+        cost_cfg.layer_custom_config = [(1, original_hook)]
+        cost_cfg.layer_custom_config_callback(custom_hook)
+        wrapped_hook = cost_cfg.layer_custom_config[0][1]
+        wrapped_hook(cost_cfg)
+        evaluator = SimpleNamespace(set_ccfg=lambda hook: hook_calls.append(("set_ccfg", hook)))
+        wrapped_hook(evaluator)
+        self.assertEqual(wrapped_hook.__name__, "original_hook_custom_hook")
+        self.assertTrue(any(call[0] == "set_ccfg" for call in hook_calls))
+
+    def test_parallelize_layer_control_flow_without_estimators(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover ND filtering, generation and ordering with deterministic fakes.
+        Expectation: No multiprocessing, model parsing, memory estimation or performance solver is invoked.
+        """
+        runner = object.__new__(Par.ParallelizeLayer)
+        writes = []
+        config_state = SimpleNamespace(
+            ccfg=SimpleNamespace(),
+            balancing=SimpleNamespace(from_config=True),
+            dimensions=[Dim.DP],
+            set_parallel_config=lambda config: True,
+            write=lambda folder, config: writes.append((folder, config)),
+        )
+        runner.config = config_state
+        runner.machine = SimpleNamespace(number=16, device=Hard.Device_A2)
+        runner.global_batch_size = 8
+        runner.model_name = "unit"
+        runner.enable_debug = False
+        runner.mem_eval = SimpleNamespace(
+            mem_fit=lambda peak: peak < 100,
+            get_strategy=lambda: {},
+        )
+
+        class _ParallelConfig:
+            """Small validity-controlled parallel configuration."""
+
+            def __init__(self, valid: bool = True) -> None:
+                self.valid = valid
+                self.all_dims = [Dim.DP]
+
+            def is_valid(self) -> bool:
+                """Return the configured validity."""
+                return self.valid
+
+            def values(self) -> list:
+                """Return printable dimension values."""
+                return ["2"]
+
+        parallel_config = _ParallelConfig()
+        config_state.moe_valid = lambda config: config.valid
+        config_state.global_batch_size = lambda config: 8
+        runner.filtered_out = lambda config: False
+        self.assertTrue(runner.is_valid(parallel_config))
+        parallel_config.valid = False
+        self.assertFalse(runner.is_valid(parallel_config))
+        parallel_config.valid = True
+        config_state.global_batch_size = lambda config: 4
+        self.assertFalse(runner.is_valid(parallel_config))
+        config_state.global_batch_size = lambda config: 8
+
+        runner.device_loops = lambda space, pool: ({"fit": 10, "large": 200}, 2)
+        self.assertEqual(runner.generate_search_space("out", threads_num=None), [("fit", 10)])
+        self.assertEqual(writes, [("out", "fit")])
+
+        runner.memory_estim = lambda debugger=None: 12
+        config_state.make_parallel_config = lambda *dims: "inside"
+        runner.is_valid = lambda config: True
+        configs, size = runner.inside_loop_nest(({}, 0), None, ((1, 2, 2, 1), (1, 4), (1, 1, 1, True)))
+        self.assertEqual(configs, {"inside": 12})
+        self.assertEqual(size, 1)
+
+        with patch.object(Par, "estimate_performance", side_effect=[3.0, 1.0]):
+            scored, debug_parts = runner.order_search_space(
+                [(_ParallelConfig(), 10), (_ParallelConfig(), 20)],
+                threads_num=None,
+                cache_file=None,
+            )
+        self.assertEqual([entry[2] for entry in scored], [1.0, 3.0])
+        self.assertEqual(debug_parts, [])
+        self.assertEqual(runner.order_search_space([], None, None), ([], []))
+
+        runner.generate_search_space = lambda folder, threads_num: [(_ParallelConfig(), 10)]
+        runner.order_search_space = (
+            lambda space, threads_num, cache_file: ([(space[0][0], 10, 2.0, [])], [])
+        )
+        with patch.object(Par.Debug, "plot_nd") as plot_nd:
+            result = runner.run_generation_to_ordering(None, top_num=1)
+        self.assertEqual(result[0][2], 2.0)
+        plot_nd.assert_not_called()
+        self.assertIn("Top 1 configurations", Par.space_to_string(result, max_num=1, debug_parts=[]))
+
+        wrapper = object.__new__(Par.Parallelize)
+        wrapper.instance = SimpleNamespace(marker="delegated")
+        self.assertEqual(wrapper.marker, "delegated")
+
+        with patch.object(Par, "EvaluatorV2") as evaluator_cls:
+            evaluator_cls.return_value.estimate_peak.return_value = 7
+            self.assertEqual(Par.pool_estimate_memory("config"), 7)
+        with patch.object(Par, "estimate_performance", return_value=9):
+            self.assertEqual(Par.pool_estimate_performance("config", Hard.Device_A2), 9)
+
+    def test_parallelize_profile_ordering_without_estimators(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover profiling-order and CSV wrappers with fake measurements.
+        Expectation: Results are sorted and plotting dispatches without running estimation formulas.
+        """
+        runner = object.__new__(Par.ParallelizeLayer)
+        runner.enable_debug = False
+        runner.machine = SimpleNamespace(device=Hard.Device_A2, number=8)
+        runner.model_name = "unit"
+        runner.global_batch_size = 8
+        runner.config = SimpleNamespace(
+            ccfg=SimpleNamespace(),
+            dimensions=[Dim.DP],
+            set_parallel_config=lambda config: True,
+        )
+        runner.mem_eval = SimpleNamespace(get_strategy=lambda: {"dp": 2})
+        runner.memory_estim = lambda: 32
+
+        class _FakeDebug:
+            """Debug facade with stable accounting entries."""
+
+            def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+                """Initialize deterministic debug values."""
+                self.info = {"compute": 1.0, "total": 2.0, "memory": 3.0}
+
+            def write(self) -> None:
+                """Accept debug CSV writes without touching disk."""
+
+        with patch.object(Par.Debug, "Debug", _FakeDebug), \
+                patch.object(Par, "estimate_performance", return_value=5.0):
+            ordered, parts = runner.order_space_test([("cfg-b", 20), ("cfg-a", 10)], order_by=2)
+            classified, classified_parts = runner.order_space_test_comm_classified(
+                [("cfg-b", 20, 4), ("cfg-a", 10, 2)],
+                order_by=2,
+            )
+
+        self.assertEqual([entry[2] for entry in ordered], [10, 20])
+        self.assertEqual([entry[2] for entry in classified], [10, 20])
+        self.assertEqual(parts, ["compute"])
+        self.assertEqual(classified_parts, ["compute"])
+
+        runner.order_space_test = lambda configs, order_by=2: (configs, ["compute"])
+        runner.order_space_test_comm_classified = (
+            lambda configs, order_by=2: (configs, ["compute"])
+        )
+        with patch.object(Par.Debug, "get_real_data", return_value=([("cfg", 10)], 1)), \
+                patch.object(Par.Debug, "plot_vs_real") as plot_vs_real, \
+                patch.object(Par.Debug, "correlation_topk", return_value=(0.9, 1)), \
+                patch.object(Par.Debug, "get_comm_classified_data", return_value=[("cfg", 10, 2)]), \
+                patch.object(Par.Debug, "plot_vs_real_comm_classified") as plot_vs_real_comm, \
+                patch.object(Par.Debug, "correlation_with_classified_comms", return_value=0.8):
+            self.assertEqual(runner.test_from_csv("profile.csv", "out"), (0.9, 1, 1))
+            self.assertEqual(
+                runner.test_from_csv_comm_classified("profile.csv", "out", plot_idle=True),
+                0.8,
+            )
+
+        plot_vs_real.assert_called_once()
+        plot_vs_real_comm.assert_called_once()

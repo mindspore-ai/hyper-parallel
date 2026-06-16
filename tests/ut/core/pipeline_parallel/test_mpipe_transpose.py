@@ -23,7 +23,6 @@ distributed runtime, GPU, or preprocess module.  Schedules are built via
 import itertools
 import unittest
 
-from tests.common.mark_utils import arg_mark
 from hyper_parallel.core.pipeline_parallel.scheduler import (
     MetaStep,
     MetaStepType,
@@ -122,12 +121,6 @@ def _count(order, step_type, stage_index=None):
 class TestMPipeTransposePrefix(unittest.TestCase):
     """The transpose-phase prefix prepended to each rank's body order."""
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_full_transpose_prefix_per_rank(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering.
@@ -162,12 +155,6 @@ class TestMPipeTransposePrefix(unittest.TestCase):
                 (f"rank {rank} prefix mismatch: "
                  f"expected={expected}, got={schedule.exec_order[rank][:len(expected)]}")
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_short_micro_prefix(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering.
@@ -207,12 +194,6 @@ class TestMPipeTransposePrefix(unittest.TestCase):
             assert _count(schedule.exec_order[rank], MpipeStepType.MPIPE_FWD_SEND) == 0, \
                 f"rank {rank} should issue no MPIPE_FWD_SEND when not transposed"
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_param_broadcast_once_per_rank(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering.
@@ -225,12 +206,6 @@ class TestMPipeTransposePrefix(unittest.TestCase):
                 (f"rank {rank} should have exactly one broadcast, got "
                  f"{_count(schedule.exec_order[rank], MpipeStepType.MPIPE_PARAM_BROADCAST)}")
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_send_recv_counts_balanced(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering.
@@ -256,12 +231,6 @@ class TestMPipeTransposeRank0Patches(unittest.TestCase):
     """Inline preprocess forward (non-transposed) and recompute backward
     (transposed) inserted into stage 0's body order."""
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_transpose_bwd_follows_stage0_bwd(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering.
@@ -282,12 +251,6 @@ class TestMPipeTransposeRank0Patches(unittest.TestCase):
             (f"expected {num_transpose} transpose backwards on stage 0, got "
              f"{_count(order, MpipeStepType.MPIPE_TRANSPOSE_BWD)}")
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_inline_transpose_fwd_precedes_nontransposed_stage0_fwd(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering.
@@ -320,12 +283,6 @@ class TestMPipeTransposeRank0Patches(unittest.TestCase):
             (f"unexpected transpose-forward count on stage 0: "
              f"got {_count(order, MpipeStepType.MPIPE_TRANSPOSE_FWD)}")
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_no_inline_forward_when_all_transposed(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering.
@@ -346,12 +303,6 @@ class TestMPipeTransposeRank0Patches(unittest.TestCase):
 class TestMPipeTransposeExplicitBackward(unittest.TestCase):
     """MindSpore-style path: an explicit recompute backward for every micro-batch."""
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_transpose_bwd_emitted_for_all_micros(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering (MindSpore path).
@@ -373,12 +324,6 @@ class TestMPipeTransposeExplicitBackward(unittest.TestCase):
             (f"explicit-backward should emit one transpose backward per micro-batch, got "
              f"{_count(order, MpipeStepType.MPIPE_TRANSPOSE_BWD)}")
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_torch_path_unaffected(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering (torch path).
@@ -395,12 +340,6 @@ class TestMPipeTransposeDataloadOnly(unittest.TestCase):
     """``T == 0``: only the dataload is transposed — no parameter broadcast,
     no recompute-input transport, and no recompute backward."""
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_no_preprocess_steps_emitted(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering (T=0 dataload-only).
@@ -421,12 +360,6 @@ class TestMPipeTransposeDataloadOnly(unittest.TestCase):
                 assert _count(order, absent) == 0, \
                     f"T=0 rank {rank} should emit no {absent}, got {_count(order, absent)}"
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_dataload_transport_still_present(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering (T=0 dataload-only).
@@ -452,12 +385,6 @@ class TestMPipeTransposeDataloadOnly(unittest.TestCase):
                 (f"T=0 rank {rank} prefix mismatch: "
                  f"expected={expected}, got={schedule.exec_order[rank][:len(expected)]}")
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_body_preserved(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering (T=0 dataload-only).
@@ -485,12 +412,6 @@ class TestMPipeTransposeBodyPreserved(unittest.TestCase):
                 (f"rank {rank}: body order changed after MPipe layering "
                  f"(PP={real_stage_num}, n_local={n_local_stages}, MB={micro_batch_num})")
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_body_preserved_plain(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering.
@@ -499,12 +420,6 @@ class TestMPipeTransposeBodyPreserved(unittest.TestCase):
         """
         self._assert_body_matches(real_stage_num=4, n_local_stages=1, micro_batch_num=4)
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_body_preserved_interleaved(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering.
@@ -513,12 +428,6 @@ class TestMPipeTransposeBodyPreserved(unittest.TestCase):
         """
         self._assert_body_matches(real_stage_num=4, n_local_stages=2, micro_batch_num=8)
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_body_preserved_short_micro(self):
         """
         Feature: MPipe Transpose pipeline schedule ordering.
@@ -531,12 +440,6 @@ class TestMPipeTransposeBodyPreserved(unittest.TestCase):
 class TestMPipeTransposeValidation(unittest.TestCase):
     """Constructor argument validation that runs before any distributed setup."""
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_negative_transpose_layers_rejected(self):
         """
         Feature: MPipe Transpose constructor validation.
@@ -551,12 +454,6 @@ class TestMPipeTransposeValidation(unittest.TestCase):
                 num_transpose_layers=-1,
             )
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_non_int_transpose_layers_rejected(self):
         """
         Feature: MPipe Transpose constructor validation.

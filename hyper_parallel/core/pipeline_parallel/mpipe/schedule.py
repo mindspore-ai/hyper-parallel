@@ -69,8 +69,8 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         stages (list[PipelineStage], PipelineStage): The body pipeline stages.
             Stage 0 must wrap only the layers **after** the preprocess block.
         micro_batch_num (int): The number of micro-batches.
-        preprocess_module: The preprocess block (first ``T`` layers of stage
-            0).  Following Option A, it must exist on **every** rank: on rank 0
+        preprocess_module (Optional[Module]): The preprocess block (first ``T``
+            layers of stage 0).  Following Option A, it must exist on **every** rank: on rank 0
             it holds the trained parameters; on other ranks it is a structural
             copy whose parameters are overwritten each step by the broadcast.
         num_transpose_layers (int): ``T`` — the number of preprocess layers,
@@ -106,17 +106,17 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         """Build an interleaved-1F1B schedule that transposes the preprocess block.
 
         Args:
-            stages: The local pipeline stages (as for :class:`ScheduleInterleaved1F1B`).
-            micro_batch_num: Number of micro-batches per optimizer step.
-            preprocess_module: The block transposed to every rank — the first
-                ``num_transpose_layers`` layers, a visual tower, or a param-free
-                identity for the dataload-only (``T = 0``) mode.
-            num_transpose_layers: ``T`` — the (informational) transposed-layer count.
-            args_batch_dim: Positional-arg batch-dim spec (forwarded to the base).
-            kwargs_batch_dim: Keyword-arg batch-dim spec (forwarded to the base).
-            output_concat_dim: Output concatenation dim (forwarded to the base).
-            overlap_p2p: Whether to overlap P2P (forwarded to the base).
-            swap: Whether to enable activation swapping (forwarded to the base).
+            stages (list): The local pipeline stages (as for :class:`ScheduleInterleaved1F1B`).
+            micro_batch_num (int): Number of micro-batches per optimizer step.
+            preprocess_module (Optional[Module]): The block transposed to every
+                rank — the first ``num_transpose_layers`` layers, a visual tower,
+                or a param-free identity for the dataload-only (``T = 0``) mode.
+            num_transpose_layers (int): ``T`` — the (informational) transposed-layer count.
+            args_batch_dim (Optional[BatchDimSpec]): Positional-arg batch-dim spec (forwarded to the base).
+            kwargs_batch_dim (Optional[BatchDimSpec]): Keyword-arg batch-dim spec (forwarded to the base).
+            output_concat_dim (Optional[int]): Output concatenation dim (forwarded to the base).
+            overlap_p2p (bool): Whether to overlap P2P (forwarded to the base).
+            swap (bool): Whether to enable activation swapping (forwarded to the base).
         """
         if not isinstance(num_transpose_layers, int) or num_transpose_layers < 0:
             raise ValueError(
@@ -215,9 +215,9 @@ class ScheduleMPipeTranspose(ScheduleInterleaved1F1B):
         """Reset the executor's per-step caches, then run the schedule.
 
         Args:
-            arg_mbs: Per-micro-batch positional args.
-            kwarg_mbs: Per-micro-batch keyword args.
-            losses: Mutable list collecting per-step losses.
+            arg_mbs (list): Per-micro-batch positional args.
+            kwarg_mbs (list): Per-micro-batch keyword args.
+            losses (list): Mutable list collecting per-step losses.
         """
         if self._executor is not None:
             self._executor.reset()

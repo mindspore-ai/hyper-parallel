@@ -19,9 +19,11 @@ pytest tests/ut/auto_parallel/sapp_ppb/test_sapp_solver.py
 """
 import os
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pytest
 
 # pylint: disable=C0413,W0212,R0903,E1120
@@ -34,6 +36,7 @@ from hyper_parallel.auto_parallel.sapp_ppb.utils.config import parse_training_co
 from hyper_parallel.auto_parallel.sapp_ppb.simulator.pipeline_builder import PipelineBuilder
 from hyper_parallel.auto_parallel.sapp_ppb.simulator.plot_manager import PlotMgr
 from hyper_parallel.auto_parallel.sapp_ppb.simulator.pp_simulator import PipelineSimulator
+from hyper_parallel.auto_parallel.sapp_ppb.simulator.causal_error import CausalCommError, CausalError
 from hyper_parallel.auto_parallel.sapp_ppb.simulator.sim_block import (
     HeadBlockSim,
     MicroBlockSim,
@@ -495,4 +498,164 @@ manual:
             manager._get_block_indices(blocks, mode="timeline")
         with pytest.raises(ValueError):
             PlotMgr(num_plots=2, subplot_args=[111])
+        plt.close("all")
+
+    def test_solver_pure_helpers_without_solving(self, tmp_path):
+        """Exercise solver result and timing helpers with assigned variables, never CBC."""
+        layers = _make_layers(body_layers=4)
+        pipe = SappPipeline("unit", 2, 2, 128, layers, num_of_interleave=1)
+        pipe.construct_problem(solver="pulp")
+        solver = pipe.problem_
+        body = layers[1]
+
+        for rec in Recompute.TYPE:
+            for stage in range(solver.num_of_stage_):
+                solver.variables_[body.name_][rec][0][stage].varValue = 1
+        for name in (
+                solver.TOTAL_SUM,
+                solver.NEXT_DIFF,
+                solver.MAX_STAGE_TIME,
+                solver.MAX_LAST_CHUNK,
+        ):
+            solver.variables_[name].varValue = 0
+        for name in (solver.CHUNKS_SUM, solver.PREV_DIFF, solver.MEM_OVERHEAD_NAME):
+            for variable in solver.variables_[name]:
+                variable.varValue = 0
+
+        assert SappSolver.compute_forward_in_backward(4, 8) == [3, 1, 1, 3]
+        assert SappSolver.compute_forward_in_backward(4, 2)[:2] == [0, 0]
+        assert SappSolver.compute_lm_forward_in_backward(3) == [0, 1, 2]
+        assert SappSolver.compute_activation_nums(3, 2, 2) == [[2, 2, 2], [2, 2, 1]]
+        assert SappSolver.compute_activation_nums_dual(2, 2, 3) == [[3, 3], [1, 2]]
+        assert SappSolver.compute_less_activation_nums(3, 2) == [[3, 3, 3], [3, 2, 1]]
+        assert SappSolver.compute_less_activation_nums(3, 1) == [[3, 2, 1]]
+
+        assert solver._reserved_stage_positions() == {(0, 0), (0, 1)}
+        solver.dual_ = True
+        assert solver._reserved_stage_positions() == {(0, 0), (1, 0)}
+        assert solver.stage_param_memory(
+            solver.variables_, solver.layers_sorted_, 0, solver.num_of_stage_, solver.num_of_interleave_
+        ).value() > 0
+        solver.dual_ = False
+
+        assert solver.stage_active_memory_per_micro(
+            solver.variables_, solver.layers_sorted_, 0, 0
+        ).value() > 0
+        assert solver.get_simulator_memory_activation()[0][0] > 0
+        assert solver.get_simulator_memory_parameter()[0][0] > 0
+        assert solver.get_simulator_time()[0][0] > 0
+        assert solver.get_simulator_forward_time()[0][0] > 0
+        assert len(solver.get_simulator_recompute_time()[0]) == 2
+        assert "body" in solver.result()
+        assert solver.has_some_memory_info()
+
+        assert solver._max_stage_bound_i_fp(solver.layers_sorted_, 0, 0).value() > 0
+        assert solver._max_stage_bound_i_bp(solver.layers_sorted_, 0, 0).value() > 0
+        assert solver._max_stage_bound_head_tail(solver.layers_sorted_, 0, 0, 0).value() > 0
+        assert solver._total_sum(solver.layers_sorted_).value() > 0
+        assert solver.body_layer_time(solver.PROP_PHASE.FW, body, 0, 0).value() > 0
+        assert solver.body_layer_time(solver.PROP_PHASE.BW, body, 0, 0).value() > 0
+        assert solver.micro_batch_time(solver.PROP_PHASE.FW, solver.layers_sorted_, 0, 0).value() > 0
+        assert solver.micro_batch_time(solver.PROP_PHASE.BW, solver.layers_sorted_, 0, 0).value() > 0
+        assert solver._chunks_sum(solver.layers_sorted_, 0).value() > 0
+        assert "diff_with_prev_stages" in str(
+            solver._prev_diff_sum(solver.layers_sorted_, solver.problem_, 0)
+        )
+        assert "diff_with_next_stages" in str(
+            solver._next_diff_sum(solver.layers_sorted_, solver.problem_)
+        )
+
+        solver.print_results()
+        solver.debug_print_solver_theoretical_memory()
+        solver.dump_problem(str(tmp_path))
+        assert list(tmp_path.glob("problem_unit_*.lp"))
+
+        unused_rec = Recompute.TYPE.SLCT
+        solver.recompute_considered_[unused_rec] = False
+        solver.add_optional_recompute_constraint(solver.problem_, solver.variables_, solver.layers_sorted_)
+        solver.recompute_considered_[unused_rec] = True
+
+    def test_sequence_updates_and_comm_simulation_without_solver(self, tmp_path, monkeypatch):
+        """Cover sequence-pipeline mutation and communication simulation with tiny inputs."""
+        params = {
+            "batch_size": 1,
+            "num_heads": 4,
+            "seq_length": 32,
+            "head_dim": 8,
+            "model_parallel": 2,
+            "hidden_size": 32,
+            "vocab_size": 64,
+        }
+        time_updates = []
+        body = SimpleNamespace(
+            memory_parameter_=10.0,
+            memory_activation_rec_={rec: float(rec.value + 1) for rec in Recompute.TYPE},
+            time_=12.0,
+            forward_time_=4.0,
+            backward_time_rec_={rec: 8.0 for rec in Recompute.TYPE},
+            update_internal_time_for_seqpp=lambda: time_updates.append("body"),
+        )
+        head = SimpleNamespace(
+            memory_parameter_=3.0,
+            time_=3.0,
+            forward_time_=1.0,
+            backward_time_rec_={rec: 2.0 for rec in Recompute.TYPE},
+            update_internal_time_for_seqpp=lambda: time_updates.append("head"),
+        )
+        tail = SimpleNamespace(
+            memory_parameter_=5.0,
+            time_=6.0,
+            forward_time_=2.0,
+            backward_time_rec_={rec: 4.0 for rec in Recompute.TYPE},
+            update_internal_time_for_seqpp=lambda: time_updates.append("tail"),
+        )
+        seq_solver = object.__new__(SappSolver)
+        seq_solver.layers_sorted_ = {
+            Layer.type_enum.BODY: [body],
+            Layer.type_enum.HEAD: [head],
+            Layer.type_enum.TAIL: [tail],
+        }
+        seq_solver.recompute_considered_ = {rec: True for rec in Recompute.TYPE}
+        seq_solver.extracted_training_params_ = params
+        seq_solver.seq_split_num_ = 2
+        seq_solver.num_of_micro_batch_ = 4
+        seq_solver._initialize_seq_pipe_layers()
+        assert seq_solver.num_of_micro_batch_ == 8
+        assert body.memory_parameter_ > 10
+        assert body.memory_activation_rec_[Recompute.TYPE.FULL] is None
+        assert head.memory_parameter_ < 3
+        assert tail.memory_parameter_ < 5
+        assert time_updates == ["body", "head", "tail"]
+
+        simulator = PipelineSimulator(
+            [1, 1],
+            2,
+            comm_time=0.05,
+            block_mem=1,
+            block_mem_par=1,
+        )
+
+        def fake_statistic_info() -> None:
+            """Keep communication scheduling coverage independent of memory aggregation."""
+            simulator.end_time = max(block.end for line in simulator.lines for block in line)
+            simulator.peak_memory = [0, 0]
+            simulator.states["block_mem_list"] = [
+                np.array([[0, 0], [simulator.end_time, 0]]) for _ in range(simulator.pp)
+            ]
+
+        monkeypatch.setattr(simulator, "_statistic_info", fake_statistic_info)
+        simulator.run(comm=True, print_info=False)
+        assert simulator.end_time > 0
+        assert len(simulator.lines) == 2
+        simulator.draw(comm=True, connect=True)
+        output_file = tmp_path / "comm_pipeline.svg"
+        simulator.save(str(output_file), comm=True, connect=True)
+        assert output_file.exists()
+
+        monkeypatch.setattr(plt, "show", lambda: None)
+        simulator.show(comm=True, connect=False)
+        normal_error = CausalError("normal-loop", simulator.blocks, [simulator.blocks[0][0]])
+        comm_error = CausalCommError("comm-loop", simulator.lines, [simulator.lines[0][0]])
+        assert str(normal_error) == "normal-loop"
+        assert str(comm_error) == "comm-loop"
         plt.close("all")

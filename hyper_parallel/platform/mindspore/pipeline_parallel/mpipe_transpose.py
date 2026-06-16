@@ -35,7 +35,9 @@ from hyper_parallel.core.pipeline_parallel.mpipe.executor_base import MPipeTrans
 from hyper_parallel.platform.mindspore.pipeline_parallel.backward import forward_and_gradfn
 
 
-class MPipeTransposeExecutor(MPipeTransposeExecutorBase):
+# This MindSpore backend is exercised by the MindSpore ST gate (msrun), not the
+# torch/CPU coverage job (mindspore isn't importable there) — exclude from coverage.
+class MPipeTransposeExecutor(MPipeTransposeExecutorBase):  # pragma: no cover
     """MindSpore runtime for the ``MPIPE_*`` steps of MPipe Transpose."""
 
     nontransposed_connected = False
