@@ -112,6 +112,14 @@ class HookCoordinator:
         # blocking forever on the 2-party barrier.  Reset by :meth:`enable`
         # at the start of each dual-pipe session.
         self._departed = False
+        # ``_pending_comm`` counts COMM-role arrivals at the current
+        # (not-yet-tripped) rendezvous; ``_round_had_comm`` latches, at barrier
+        # trip, whether the just-formed pairing contained a COMM party. A
+        # COMPUTE+COMPUTE rendezvous has no comm op to order against, so it must
+        # clear the barrier without blocking on the never-set event rather than
+        # deadlock — see :meth:`rendezvous`.
+        self._pending_comm = 0
+        self._round_had_comm = False
 
     def enable(self) -> None:
         """Enable coordination for a new dual-pipe session.
@@ -122,11 +130,23 @@ class HookCoordinator:
         no per-session layer count is needed here.
         """
         with self._state_lock:
-            self._barrier = threading.Barrier(2)
+            self._pending_comm = 0
+            self._round_had_comm = False
+            self._barrier = threading.Barrier(2, action=self._on_barrier_trip)
             self._comm_dispatched = threading.Event()
             self._my_event = threading.local()
             self._departed = False
             self._enabled = True
+
+    def _on_barrier_trip(self) -> None:
+        """Barrier action: runs once, single-threaded, the instant both parties
+        have arrived and before either is released. Latches whether a COMM party
+        is in this pairing so the COMPUTE side can tell, after the barrier,
+        whether there is anything to wait for, then resets the per-round COMM
+        counter for the next rendezvous.
+        """
+        self._round_had_comm = self._pending_comm > 0
+        self._pending_comm = 0
 
     def disable(self) -> None:
         """Disable coordination and unblock any waiting threads.
@@ -212,14 +232,23 @@ class HookCoordinator:
             evt = threading.Event()
             self._comm_dispatched = evt
             self._my_event.evt = evt
+            # Count this COMM arrival so the barrier action can distinguish a
+            # COMM+COMPUTE pairing (order comm-first) from a COMPUTE+COMPUTE one.
+            with self._state_lock:
+                self._pending_comm += 1
 
         try:
             self._barrier.wait()
         except threading.BrokenBarrierError:
             return
 
-        # COMPUTE side: wait for the paired COMM to notify.
-        if role is HookRole.COMPUTE:
+        # COMPUTE side: wait for the paired COMM to notify — but only when a
+        # COMM party was actually in this pairing. A COMPUTE+COMPUTE rendezvous
+        # (e.g. fwd chunk-start paired with a bwd chunk-end after the D_LAST
+        # skip) has no comm op to wait for; blocking on the never-set event
+        # would deadlock, so it clears the barrier and the finished bwd partner
+        # then departs, leaving fwd to run that chunk solo.
+        if role is HookRole.COMPUTE and self._round_had_comm:
             self._comm_dispatched.wait()
 
     def notify_dispatched(self, role: HookRole) -> None:

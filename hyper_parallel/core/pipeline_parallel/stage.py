@@ -234,7 +234,7 @@ class PipelineStage(PipelineStageBase):
 
         raise TypeError(f"Argument dst_stage must be of type None, int, but got {type(dst_stage)}.")
 
-    def _update_layout(self, layout):
+    def _update_layout(self, layout, sender_rank=None):
         """update the received layout.
 
         When ``self.mesh`` is set, resolve ``rank_list`` from the **layout's
@@ -245,7 +245,7 @@ class PipelineStage(PipelineStageBase):
         global-rank arithmetic.
         """
         if self.mesh is not None:
-            rank_list = self._get_layout_rank_list(layout)
+            rank_list = self._get_layout_rank_list(layout, sender_rank)
         else:
             device_num = platform.get_world_size()
             real_stage_num = self.stage_num // self._virtual_chunk_num
@@ -256,7 +256,7 @@ class PipelineStage(PipelineStageBase):
         layout.update_mesh()
         layout.update_compact_str()
 
-    def _get_layout_rank_list(self, layout) -> tuple:
+    def _get_layout_rank_list(self, layout, sender_rank=None) -> tuple:
         """Return the global ranks the given layout spans for this process.
 
         The serialised ``layout.alias_name`` records exactly the mesh dims
@@ -267,8 +267,24 @@ class PipelineStage(PipelineStageBase):
         """
         root = self.mesh.root_mesh
         if root is None or root.ndim <= 1:
-            # PP-only topology: one rank per stage
-            return (platform.get_rank(),)
+            # Flat (1-D world) root: pp_mesh.root_mesh is the world mesh, so the
+            # layout's submesh can't be resolved by name. A PP edge shifts whole
+            # stages by a fixed rank block and the within-stage tile is identical
+            # across stages, so this receiver's submesh is the sender's submesh
+            # (layout.rank_list) shifted by the P2P offset (me - sender_rank).
+            me = platform.get_rank()
+            cur_ranks = tuple(layout.rank_list or ())
+            # The cached layout is reused across microbatches/steps and
+            # _update_layout mutates it in place, so re-resolution must be
+            # idempotent: once it holds this receiver's submesh (contains me),
+            # return as-is rather than shifting again. Sender/receiver live in
+            # disjoint PP stages, so me is only ever in an already-resolved list.
+            if me in cur_ranks:
+                return cur_ranks
+            if sender_rank is not None and cur_ranks:
+                offset = me - sender_rank
+                return tuple(r + offset for r in cur_ranks)
+            return (me,)
         pp_dim_names = set(self.mesh.mesh_dim_names or ())
         layout_dim_names = tuple(
             name for name in (layout.alias_name or ()) if name not in pp_dim_names
@@ -313,7 +329,7 @@ class PipelineStage(PipelineStageBase):
         """
         requires_grad = bool(meta[-1])
         if len(meta) == 4:
-            self._update_layout(meta[2])
+            self._update_layout(meta[2], global_rank)
             buffer = DTensor.from_local(platform.empty(meta[0], dtype=meta[1],
                                                        device=self.device), meta[2].mesh, meta[2].alias_placements)
         else:
