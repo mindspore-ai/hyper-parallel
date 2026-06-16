@@ -9,6 +9,7 @@ HyperParallel 提供 Pipeline Parallel（流水线并行）能力，将模型按
 | GPipe | 所有 micro-batch 先正向再反向 | 较大 |
 | 1F1B | 一个正向紧跟一个反向 | 较小 |
 | VPP (Interleaved 1F1B) | 交错分配，每个 rank 多个 virtual stage | 最小 |
+| MPipe (demo 版本) | 将多模态大模型流水拆分为 Encoder Stage 和 LLM Backbone Stage，并将 Encoder 计算转置到多个 PP rank 上并行执行 | 消除模态 bubble |
 
 ## 接口概览
 
@@ -18,6 +19,7 @@ HyperParallel 提供 Pipeline Parallel（流水线并行）能力，将模型按
 | `Schedule1F1B` | 1F1B 调度 |
 | `ScheduleGPipe` | GPipe 调度 |
 | `ScheduleInterleaved1F1B` | VPP（交错 1F1B）调度 |
+| `ScheduleMPipeTranspose` | MPipe Transpose 调度 |
 | `MetaStep` / `MetaStepType` / `BatchDimSpec` | 调度单元抽象 |
 | `CommComputeOverlap` | 双线程通算掩盖协调器 |
 | `HookCoordinator` / `HookRole` | COMM-first rendezvous 原语 |
@@ -50,6 +52,24 @@ from hyper_parallel import PipelineStage, ScheduleInterleaved1F1B
 # VPP 场景下每个 rank 有多个 virtual stage
 schedule = ScheduleInterleaved1F1B(stages, micro_batch_num=8)
 losses = schedule.run(*inputs)
+```
+
+### 3. MPipe (Transpose) 调度
+
+```python
+from hyper_parallel import PipelineStage, ScheduleMPipeTranspose
+
+# MPipe 将 Encoder 或 dataload-only identity 放到每个 PP rank 上
+stage = PipelineStage(stage_module, stage_index=rank, stage_num=pp_size)
+
+schedule = ScheduleMPipeTranspose(
+    [stage],
+    micro_batch_num=8,
+    preprocess_module=preprocess_module,
+    num_transpose_layers=transpose_layer_num,
+)
+
+losses = schedule.run(local_batch)
 ```
 
 ---
