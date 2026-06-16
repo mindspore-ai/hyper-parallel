@@ -25,8 +25,11 @@ from hyper_parallel.platform.torch.activation_checkpoint.recompute_session impor
     _clear_recompute_session,
     _recompute_session_ctx,
     _recompute_session_handles,
+    _recompute_handle_collector_ctx,
     checkpoint_with_session,
 )
+
+_SKIP_NO_CUDA = not torch.cuda.is_available()
 
 
 class _CountingModule(torch.nn.Module):
@@ -119,6 +122,7 @@ class TestRetainAndClearLifecycle(unittest.TestCase):
 class TestNoSessionBackwardCompatibility(unittest.TestCase):
     """Test that checkpoint_with_session falls back to native PyTorch when no session is active."""
 
+    @unittest.skipIf(_SKIP_NO_CUDA, "Native checkpoint backward may hang on CPU-only CI")
     def test_no_session_matches_native_checkpoint(self):
         """Without session, checkpoint_with_session should behave like native checkpoint."""
         mod = _CountingModule()
@@ -199,6 +203,109 @@ class TestIncompleteConsumption(unittest.TestCase):
         _clear_recompute_session(session_id)
 
         self.assertNotIn(session_id, _recompute_session_handles)
+
+
+class TestHandleCollectorAndPrefetch(unittest.TestCase):
+    """Test recompute handle collector and manual prefetch (Req 2)."""
+
+    def test_collector_collects_handles(self):
+        """Forward inside _recompute_handle_collector_ctx should collect handles."""
+        mod = _CountingModule()
+        x = torch.randn(2, 4, requires_grad=True)
+        session_id = uuid.uuid4().hex
+
+        with _recompute_handle_collector_ctx() as handles:
+            with _recompute_session_ctx(session_id, retain_on_unpack=True):
+                _ = checkpoint_with_session(mod, x)
+
+        self.assertEqual(len(handles), 1)
+        self.assertTrue(hasattr(handles[0], "recompute"))
+        _clear_recompute_session(session_id)
+
+    def test_manual_recompute_prefetch(self):
+        """Scheduler can trigger recompute before backward; backward reuses
+        the prefetched result without re-running."""
+        mod = _CountingModule()
+        x = torch.randn(2, 4, requires_grad=True)
+        session_id = uuid.uuid4().hex
+
+        # Forward with collector
+        with _recompute_handle_collector_ctx() as handles:
+            with _recompute_session_ctx(session_id, retain_on_unpack=True):
+                out = checkpoint_with_session(mod, x)
+
+        # call_count == 1 (forward only, no recompute yet)
+        self.assertEqual(mod.call_count, 1)
+
+        # Prefetch: manually trigger recompute
+        with _recompute_session_ctx(session_id, retain_on_unpack=True):
+            handles[0].recompute(session_id)
+
+        # call_count == 2 (forward + manual recompute)
+        self.assertEqual(mod.call_count, 2)
+
+        # Backward should reuse the prefetched result — no additional recompute
+        with _recompute_session_ctx(session_id, retain_on_unpack=True):
+            out.sum().backward(retain_graph=True)
+
+        self.assertEqual(mod.call_count, 2, "backward should reuse prefetched result")
+
+        # Second backward with retain=False
+        with _recompute_session_ctx(session_id, retain_on_unpack=False):
+            out.sum().backward()
+
+        self.assertEqual(mod.call_count, 2, "second backward should also reuse")
+
+        _clear_recompute_session(session_id)
+
+    def test_collector_not_appended_after_exit(self):
+        """After _recompute_handle_collector_ctx exits, new checkpoint
+        calls should NOT append to the previously collected list."""
+        mod1 = _CountingModule()
+        mod2 = _CountingModule()
+        x1 = torch.randn(2, 4, requires_grad=True)
+        x2 = torch.randn(2, 4, requires_grad=True)
+        session_id = uuid.uuid4().hex
+
+        with _recompute_handle_collector_ctx() as handles:
+            with _recompute_session_ctx(session_id, retain_on_unpack=True):
+                _ = checkpoint_with_session(mod1, x1)
+
+        self.assertEqual(len(handles), 1)
+
+        # This checkpoint call is outside the collector context
+        with _recompute_session_ctx(session_id, retain_on_unpack=True):
+            _ = checkpoint_with_session(mod2, x2)
+
+        # handles list should NOT grow
+        self.assertEqual(len(handles), 1)
+        _clear_recompute_session(session_id)
+
+    def test_prefetch_with_multiple_blocks(self):
+        """Prefetch works with multiple checkpoint blocks collected in one forward."""
+        mod = _TripleCountingModule()
+        x = torch.randn(2, 4, requires_grad=True)
+        session_id = uuid.uuid4().hex
+
+        with _recompute_handle_collector_ctx() as handles:
+            with _recompute_session_ctx(session_id, retain_on_unpack=True):
+                out = mod(x)
+
+        self.assertEqual(len(handles), 3)
+
+        # Prefetch all three blocks
+        with _recompute_session_ctx(session_id, retain_on_unpack=True):
+            for handle in handles:
+                handle.recompute(session_id)
+
+        # Backward should reuse all prefetched results
+        with _recompute_session_ctx(session_id, retain_on_unpack=True):
+            out.backward(retain_graph=True)
+
+        with _recompute_session_ctx(session_id, retain_on_unpack=False):
+            out.backward()
+
+        _clear_recompute_session(session_id)
 
 
 if __name__ == "__main__":

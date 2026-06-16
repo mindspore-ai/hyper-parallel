@@ -369,7 +369,7 @@ class _CheckpointSessionHook(torch.autograd.graph.saved_tensors_hooks):
     """
 
     def __init__(self, frame: _CheckpointFrame) -> None:
-        def pack_hook(x: torch.Tensor) -> _Holder:
+        def pack_hook(x: torch.Tensor) -> _Holder:  # pylint: disable=W0613
             holder = _Holder()
             frame.weak_holders.append(weakref.ref(holder))
             return holder
