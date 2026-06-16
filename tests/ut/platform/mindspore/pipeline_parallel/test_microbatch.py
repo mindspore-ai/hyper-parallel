@@ -45,14 +45,20 @@ from mindspore import context
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.pipeline_parallel.utils import BatchDimSpec
+from hyper_parallel.core.pipeline_parallel.scheduler import PipelineScheduleRuntime
 from hyper_parallel.platform.mindspore.pipeline_parallel._utils import _MicroBatch
 
-pytestmark = pytest.mark.skip(
+# ``_MicroBatch`` exercises ``custom_shard`` collectives, so its tests need a real
+# MindSpore distributed init (HCCL/msrun) and are covered in pipeline-parallel ST.
+# The batch-dim normalization tests at the bottom are pure (no collectives) and run
+# as plain UT, so the skip is scoped to the ``_MicroBatch`` tests only.
+requires_distributed = pytest.mark.skip(
     reason="Microbatch uses ``custom_shard`` collectives; requires MindSpore distributed "
     "init (HCCL/msrun). Covered in pipeline parallel ST.",
 )
 
 
+@requires_distributed
 def test_microbatch_basic_args_only():
     """
     Feature: _microbatch
@@ -86,6 +92,7 @@ def test_microbatch_basic_args_only():
         assert micro_args[1].layout == original_layout2
     return True
 
+@requires_distributed
 def test_microbatch_kwargs_only():
     """
     Feature: _microbatch
@@ -142,6 +149,7 @@ def test_microbatch_kwargs_only():
     for micro_args in args_after_split:
         assert micro_args == []
 
+@requires_distributed
 def test_microbatch_mixed_args_kwargs():
     """
     Feature: _microbatch
@@ -198,6 +206,7 @@ def test_microbatch_mixed_args_kwargs():
         assert micro_kwargs['data1'].shape == (8, batch_size // micro_batch_num, 16)
         assert micro_kwargs['data2'].shape == (batch_size // micro_batch_num,)
 
+@requires_distributed
 def test_microbatch_default_batch_dim():
     """
     Feature: _microbatch
@@ -223,6 +232,7 @@ def test_microbatch_default_batch_dim():
     for micro_args in args_after_split:
         assert micro_args[0].shape == (batch_size // micro_batch_num, 10)
 
+@requires_distributed
 def test_microbatch_partial_batch_dim_spec():
     """
     Feature: _microbatch
@@ -253,6 +263,7 @@ def test_microbatch_partial_batch_dim_spec():
     for micro_args in args_after_split:
         assert len(micro_args) == 2
 
+@requires_distributed
 def test_microbatch_edge_cases():
     """
     Feature: _microbatch
@@ -275,6 +286,119 @@ def test_microbatch_edge_cases():
 
     assert len(args_after_split) == 1
     assert args_after_split[0][0].shape == (batch_size, 10)
+
+
+# --------------------------------------------------------------------------- #
+# Batch-dim normalization (``PipelineScheduleRuntime._normalize_*``).
+# Pure helpers that let a single-input model pass a bare ``int``/``BatchDimSpec``
+# and let list/dict entries be plain ints; no collectives, so plain UT.
+# --------------------------------------------------------------------------- #
+_norm_args = PipelineScheduleRuntime._normalize_args_batch_dim
+_norm_kwargs = PipelineScheduleRuntime._normalize_kwargs_batch_dim
+
+
+def _dims(spec_seq):
+    """Map a tuple of ``BatchDimSpec | None`` to its ``.batch_dim`` ints for asserts."""
+    return tuple(None if s is None else s.batch_dim for s in spec_seq)
+
+
+def test_normalize_args_bare_scalar_wrapped():
+    """
+    Feature: args_batch_dim normalization
+    Description: A single-input model may pass a bare int / BatchDimSpec (no list).
+    Expectation: Wrapped into a one-element tuple of BatchDimSpec.
+    """
+    assert _dims(_norm_args(0)) == (0,)
+    assert _dims(_norm_args(3)) == (3,)
+    assert _dims(_norm_args(BatchDimSpec(2))) == (2,)
+
+
+def test_normalize_args_list_int_and_none():
+    """
+    Feature: args_batch_dim normalization
+    Description: List/tuple entries may be plain int, BatchDimSpec, or None.
+    Expectation: ints become BatchDimSpec, None and BatchDimSpec pass through.
+    """
+    assert _dims(_norm_args([0, 1])) == (0, 1)
+    assert _dims(_norm_args((0, None, BatchDimSpec(2)))) == (0, None, 2)
+    assert _dims(_norm_args([BatchDimSpec(1), 0])) == (1, 0)
+
+
+def test_normalize_args_none_and_empty_and_from_tuple():
+    """
+    Feature: args_batch_dim normalization
+    Description: None / empty stay benign; legacy ``from_tuple`` still works.
+    Expectation: None -> None, [] -> (), from_tuple unchanged.
+    """
+    assert _norm_args(None) is None
+    assert _norm_args([]) == ()
+    assert _dims(_norm_args(BatchDimSpec.from_tuple((0, 1)))) == (0, 1)
+
+
+@pytest.mark.parametrize("bad", [True, False, 1.5, "0", object()])
+def test_normalize_args_rejects_bad_top_type(bad):
+    """
+    Feature: args_batch_dim normalization
+    Description: A non-int/spec/list scalar (incl. bool) is rejected at the top.
+    Expectation: TypeError.
+    """
+    with pytest.raises(TypeError):
+        _norm_args(bad)
+
+
+@pytest.mark.parametrize("seq", [[0, True], [1.5], [BatchDimSpec(0), "x"]])
+def test_normalize_args_rejects_bad_element(seq):
+    """
+    Feature: args_batch_dim normalization
+    Description: A bad element inside the list (incl. bool) is rejected.
+    Expectation: TypeError.
+    """
+    with pytest.raises(TypeError):
+        _norm_args(seq)
+
+
+def test_normalize_kwargs_int_and_spec():
+    """
+    Feature: kwargs_batch_dim normalization
+    Description: Dict values may be plain int or BatchDimSpec.
+    Expectation: ints become BatchDimSpec; legacy from_dict still works.
+    """
+    out = _norm_kwargs({"x": 0, "y": BatchDimSpec(1)})
+    assert {k: v.batch_dim for k, v in out.items()} == {"x": 0, "y": 1}
+    out2 = _norm_kwargs(BatchDimSpec.from_dict({"a": 2}))
+    assert out2["a"].batch_dim == 2
+
+
+def test_normalize_kwargs_none_passthrough():
+    """
+    Feature: kwargs_batch_dim normalization
+    Description: None stays None.
+    Expectation: None -> None.
+    """
+    assert _norm_kwargs(None) is None
+
+
+@pytest.mark.parametrize("bad", [[0], (0,), 0, "x"])
+def test_normalize_kwargs_rejects_non_dict(bad):
+    """
+    Feature: kwargs_batch_dim normalization
+    Description: A non-dict is rejected.
+    Expectation: TypeError.
+    """
+    with pytest.raises(TypeError):
+        _norm_kwargs(bad)
+
+
+@pytest.mark.parametrize("bad", [True, 1.5, "0"])
+def test_normalize_kwargs_rejects_bad_value(bad):
+    """
+    Feature: kwargs_batch_dim normalization
+    Description: A bad dict value (incl. bool) is rejected.
+    Expectation: TypeError.
+    """
+    with pytest.raises(TypeError):
+        _norm_kwargs({"x": bad})
+
 
 if __name__ == "__main__":
     context.set_context(mode=context.GRAPH_MODE)
