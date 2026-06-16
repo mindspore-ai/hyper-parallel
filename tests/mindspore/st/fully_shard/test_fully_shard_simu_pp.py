@@ -21,7 +21,7 @@ from tests.common.parallel_case import MindSporeCase, parallel_run
 _TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_simu_pp.py")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0",
           card_mark="allcards", essential_mark="essential")
 def test_fully_shard_simu_pp_suite():
     """
@@ -32,6 +32,8 @@ def test_fully_shard_simu_pp_suite():
     Expectation: fully_shard loss/grad match the baseline on every rank for both variants.
     """
     parallel_run([
-        MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_implicit_unshard_reshard", 18401, 4, 4),
-        MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_explicit_unshard_no_reshard", 18402, 4, 4),
+        MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_implicit_unshard_reshard",
+                      worker_num=4, local_worker_num=4),
+        MindSporeCase(_TEST_FILE, "test_fully_shard_simu_pp_explicit_unshard_no_reshard",
+                      worker_num=4, local_worker_num=4),
     ])

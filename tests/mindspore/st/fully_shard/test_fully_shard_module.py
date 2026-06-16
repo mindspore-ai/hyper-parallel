@@ -21,16 +21,16 @@ from tests.common.parallel_case import MindSporeCase, parallel_run
 _TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_module.py")
 
 
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_ms_fully_shard_module_suite():
     """
     Feature: parallel run cases in fully_shard module (MindSpore)
     Description:
-        1.test_ms_fully_shard_module_01 — HSDPModule interface methods
-        2.test_fully_shard_module_02 — set_reshard_after_backward/forward recurse on nested model
+        1.test_ms_fully_shard_module_01 — HSDPModule interface methods (2 card).
+        2.test_fully_shard_module_02 — set_reshard_after_backward/forward recurse on nested model (2 card).
     Expectation: Run success.
     """
     parallel_run([
-        MindSporeCase(_TEST_FILE, "test_ms_fully_shard_module_01", 18510, 4, 4),
-        MindSporeCase(_TEST_FILE, "test_fully_shard_module_02", 18511, 4, 4),
+        MindSporeCase(_TEST_FILE, "test_ms_fully_shard_module_01", worker_num=2, local_worker_num=2),
+        MindSporeCase(_TEST_FILE, "test_fully_shard_module_02", worker_num=2, local_worker_num=2),
     ])

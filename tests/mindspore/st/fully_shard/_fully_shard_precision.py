@@ -237,7 +237,7 @@ def run_accumulated_step(data, label, forward_fn, net, sync_grad_on_last_micro_s
 
 
 # Global hyper parameters:
-local_bs = 32
+global_bs = 256  # fixed global batch size matching baseline
 learning_rate = 1e-2
 max_step = 20
 
@@ -254,7 +254,7 @@ def generate_checkpoint():
 
 def run_baseline_standalone(ckpt_path: str):
     """Run standalone single-card training with the same backward path as distributed."""
-    data_set = create_dataset(local_batch_size=local_bs * 8)
+    data_set = create_dataset(local_batch_size=global_bs)
     net = SlimLeNet16()
     param_dict = ms.load_checkpoint(ckpt_path)
     param_not_load, _ = ms.load_param_into_net(net, param_dict)
@@ -308,6 +308,7 @@ def run_fully_shard_multi_card(
     """Run fully_shard multi-card training."""
     dp_size = get_group_size()
     rank_id = get_rank()
+    local_bs = global_bs // dp_size
 
     data_set = create_dataset(
         local_batch_size=local_bs, num_shards=dp_size, shard_id=rank_id)
@@ -421,6 +422,7 @@ def run_fully_shard_multi_card_with_empty_init(
     """Run fully_shard with empty initializer multi-card training."""
     dp_size = get_group_size()
     rank_id = get_rank()
+    local_bs = global_bs // dp_size
     data_set = create_dataset(
         local_batch_size=local_bs, num_shards=dp_size, shard_id=rank_id)
     mp_policy = MixedPrecisionPolicy(
@@ -486,6 +488,7 @@ def run_fully_shard_multi_card_ignored(ckpt_path, mesh):
     """Run fully_shard multi-card training with replicate_params."""
     dp_size = get_group_size()
     rank_id = get_rank()
+    local_bs = global_bs // dp_size
 
     data_set = create_dataset(
         local_batch_size=local_bs, num_shards=dp_size, shard_id=rank_id
@@ -704,6 +707,18 @@ def run_fully_shard_zero_copy_comm_fusion(mesh):
         print("Precision comparison with comm_fusion zero-copy passed!")
 
 
+def _make_dp_mesh():
+    """Create a 1D data-parallel device mesh using the actual world size."""
+    ws = get_group_size()
+    return init_device_mesh(device_type="npu", mesh_shape=(ws,), mesh_dim_names=("dp",))
+
+
+def _make_partial_mesh():
+    """Create a 2D (dp, op) device mesh for partial shard tests."""
+    ws = get_group_size()
+    return init_device_mesh(device_type="npu", mesh_shape=(ws // 2, 2), mesh_dim_names=("dp", "op"))
+
+
 def test_ms_zero3_fully_shard():
     """
     Feature: Compare fully_shard precision with standalone baseline
@@ -711,8 +726,7 @@ def test_ms_zero3_fully_shard():
                  then compare reduced losses on rank 0 only
     Expectation: Losses should match within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard(mesh)
+    run_fully_shard(_make_dp_mesh())
 
 
 def test_ms_zero3_fully_shard_prefetch():
@@ -722,8 +736,7 @@ def test_ms_zero3_fully_shard_prefetch():
                  then compare reduced losses on rank 0 only
     Expectation: Losses should match within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard(mesh, enable_prefetch=True)
+    run_fully_shard(_make_dp_mesh(), enable_prefetch=True)
 
 
 def test_ms_zero3_fully_shard_comm_fusion():
@@ -733,8 +746,7 @@ def test_ms_zero3_fully_shard_comm_fusion():
                  then compare reduced losses on rank 0 only
     Expectation: Losses should match within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard(mesh, enable_comm_fusion=True)
+    run_fully_shard(_make_dp_mesh(), enable_comm_fusion=True)
 
 
 def test_ms_zero3_fully_shard_comm_fusion_prefetch():
@@ -744,8 +756,7 @@ def test_ms_zero3_fully_shard_comm_fusion_prefetch():
                  child-module prefetch enabled, then compare reduced losses on rank 0 only
     Expectation: Losses should match within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard(mesh, enable_prefetch=True, enable_comm_fusion=True)
+    run_fully_shard(_make_dp_mesh(), enable_prefetch=True, enable_comm_fusion=True)
 
 
 def test_ms_zero3_fully_shard_prefetch_recompute():
@@ -755,8 +766,7 @@ def test_ms_zero3_fully_shard_prefetch_recompute():
                  and activation recompute enabled, then compare reduced losses on rank 0 only
     Expectation: Losses should match within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard(mesh, enable_prefetch=True, enable_recompute=True)
+    run_fully_shard(_make_dp_mesh(), enable_prefetch=True, enable_recompute=True)
 
 
 def test_ms_zero3_fully_shard_empty_weight():
@@ -766,8 +776,7 @@ def test_ms_zero3_fully_shard_empty_weight():
                  then compare reduced losses on rank 0 only
     Expectation: Losses should match within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard(mesh, use_empty_weight=True)
+    run_fully_shard(_make_dp_mesh(), use_empty_weight=True)
 
 
 def test_ms_zero3_partial_shard():
@@ -777,8 +786,7 @@ def test_ms_zero3_partial_shard():
                  then compare reduced losses on rank 0 only
     Expectation: Losses should match within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "op"))
-    run_fully_shard(mesh)
+    run_fully_shard(_make_partial_mesh())
 
 
 def test_ms_zero3_partial_shard_prefetch_recompute():
@@ -788,8 +796,7 @@ def test_ms_zero3_partial_shard_prefetch_recompute():
                  prefetch and activation recompute enabled, then compare reduced losses on rank 0 only
     Expectation: Losses should match within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "op"))
-    run_fully_shard(mesh, enable_prefetch=True, enable_recompute=True)
+    run_fully_shard(_make_partial_mesh(), enable_prefetch=True, enable_recompute=True)
 
 
 def test_ms_zero3_fully_shard_replicate_params():
@@ -799,8 +806,7 @@ def test_ms_zero3_fully_shard_replicate_params():
                  then compare reduced losses on rank 0 only
     Expectation: Losses should match within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard_ignored(mesh)
+    run_fully_shard_ignored(_make_dp_mesh())
 
 
 def test_ms_zero3_fully_shard_grad_accum():
@@ -810,8 +816,7 @@ def test_ms_zero3_fully_shard_grad_accum():
                  then compare reduced losses against the large-batch baseline on rank 0 only
     Expectation: Losses should match the large-batch baseline within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard_with_grad_accum(mesh)
+    run_fully_shard_with_grad_accum(_make_dp_mesh())
 
 
 def test_ms_zero3_fully_shard_prefetch_recompute_grad_accum():
@@ -823,8 +828,7 @@ def test_ms_zero3_fully_shard_prefetch_recompute_grad_accum():
                  losses against the large-batch baseline on rank 0 only
     Expectation: Losses should match the large-batch baseline within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard_with_grad_accum(mesh, enable_prefetch=True, enable_recompute=True)
+    run_fully_shard_with_grad_accum(_make_dp_mesh(), enable_prefetch=True, enable_recompute=True)
 
 
 def test_ms_zero1_fully_shard_grad_accum():
@@ -834,8 +838,7 @@ def test_ms_zero1_fully_shard_grad_accum():
                  early micro steps via set_requires_gradient_sync(False), then synchronize on the final micro step
     Expectation: Losses should match the large-batch baseline within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard_zero1_with_manual_grad_sync(mesh)
+    run_fully_shard_zero1_with_manual_grad_sync(_make_dp_mesh())
 
 
 def test_ms_zero3_fully_shard_grad_accum_comm_fusion():
@@ -845,8 +848,7 @@ def test_ms_zero3_fully_shard_grad_accum_comm_fusion():
                  comm_fusion enabled, then compare reduced losses against the large-batch baseline on rank 0 only
     Expectation: Losses should match the large-batch baseline within tolerance
     """
-    mesh = init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=("dp",))
-    run_fully_shard_with_grad_accum_comm_fusion(mesh)
+    run_fully_shard_with_grad_accum_comm_fusion(_make_dp_mesh())
 
 
 def _parse_args():

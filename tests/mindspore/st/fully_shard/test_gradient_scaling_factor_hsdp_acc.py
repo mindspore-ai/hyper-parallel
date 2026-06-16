@@ -13,12 +13,14 @@
 # limitations under the License.
 # ============================================================================
 """Launch MindSpore fully_shard set_gradient_scaling_factor HSDP + grad-acc ST."""
+import os
+
 import pytest
 
 from tests.common.mark_utils import arg_mark
-from tests.mindspore.st.utils import msrun_case
+from tests.common.parallel_case import MindSporeCase, parallel_run
 
-_FILE_NAME = "_test_gradient_scaling_factor_hsdp_acc.py"
+_TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_gradient_scaling_factor_hsdp_acc.py")
 _SKIP_REASON = (
     "Temporarily skipped: the case body passes (verified locally), but MindSpore "
     "msrun workers may core dump during process teardown after replicate_params "
@@ -29,7 +31,7 @@ _SKIP_REASON = (
 
 
 @pytest.mark.skip(reason=_SKIP_REASON)
-@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
 def test_ms_gradient_scaling_factor_hsdp_acc():
     """
     Feature: fully_shard set_gradient_scaling_factor under HSDP + gradient
@@ -39,11 +41,7 @@ def test_ms_gradient_scaling_factor_hsdp_acc():
         including replicate params that only go through all-reduce.
     Expectation: Run success.
     """
-    msrun_case(
-        2,
-        _FILE_NAME,
-        "test_ms_gradient_scaling_factor_hsdp_grad_accumulation",
-        18535,
-        worker_num=4,
-        local_worker_num=4,
-    )
+    parallel_run([
+        MindSporeCase(_TEST_FILE, "test_ms_gradient_scaling_factor_hsdp_grad_accumulation",
+                      worker_num=4, local_worker_num=4),
+    ])

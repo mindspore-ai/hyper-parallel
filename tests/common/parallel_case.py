@@ -118,10 +118,10 @@ def parallel_run(cases: Union[list[TorchCase], list[MindSporeCase]], global_num_
         p.start()
         processes.append(p)
 
-    # wait child process terminates (timeout=900s to prevent infinite hang on distributed deadlock)
+    # wait child process terminates (timeout=420s to prevent infinite hang on distributed deadlock)
     timed_out = []
     for i, p in enumerate(processes):
-        p.join(timeout=900)
+        p.join(timeout=420)
         if p.is_alive():
             try:
                 os.killpg(os.getpgid(p.pid), signal.SIGKILL)
