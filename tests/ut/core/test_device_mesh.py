@@ -47,6 +47,77 @@ from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
 
 
+_AIV_OPTIONS = {"hccl_config": {"hccl_op_expansion_mode": "AIV"}}
+
+
+def _setup_mindspore_device_mesh_mock(mock_platform, world_size=8):
+    """Configure a hardware-free MindSpore platform mock for module-level DeviceMesh tests."""
+    mock_platform.platform_type = PlatformType.MINDSPORE
+    mock_platform.get_rank.return_value = 0
+    mock_platform.get_world_size.return_value = world_size
+    mock_platform.tensor_to_numpy.side_effect = (
+        lambda tensor: tensor.asnumpy() if hasattr(tensor, "asnumpy") else np.array(tensor)
+    )
+    mock_platform.split_group.return_value = MagicMock(name="group")
+
+
+def _pg_options_by_group_call(mock_platform):
+    return [call.kwargs.get("pg_options") for call in mock_platform.split_group.call_args_list]
+
+
+@patch("hyper_parallel.core.dtensor.device_mesh.platform")
+def test_device_mesh_cp_dim_requests_aiv_group_options(mock_platform):
+    """
+    Feature: DeviceMesh CP group options.
+    Description: Initialize a MindSpore mesh with a cp dimension.
+    Expectation: Only the cp dimension is created with AIV HCCL options.
+    """
+    _setup_mindspore_device_mesh_mock(mock_platform)
+    EXISTING_COMM_GROUPS.clear()
+    _DEVICE_MESH_MAP.clear()
+
+    init_device_mesh("npu", (2, 2, 2), mesh_dim_names=("dp", "cp", "tp"))
+
+    assert _pg_options_by_group_call(mock_platform) == [None, _AIV_OPTIONS, None]
+
+
+@patch("hyper_parallel.core.dtensor.device_mesh.platform")
+def test_device_mesh_hybrid_cp_dims_request_aiv_group_options(mock_platform):
+    """
+    Feature: DeviceMesh hybrid CP group options.
+    Description: Unflatten a MindSpore world mesh into co/ds dimensions.
+    Expectation: co and ds group creation both carry AIV HCCL options.
+    """
+    _setup_mindspore_device_mesh_mock(mock_platform, world_size=4)
+    EXISTING_COMM_GROUPS.clear()
+    _DEVICE_MESH_MAP.clear()
+    world_mesh = init_device_mesh("npu", (4,), mesh_dim_names=("world",))
+    mock_platform.split_group.reset_mock()
+
+    world_mesh._unflatten(0, (2, 2), ("co", "ds"))  # pylint: disable=protected-access
+
+    assert _pg_options_by_group_call(mock_platform) == [_AIV_OPTIONS, _AIV_OPTIONS]
+
+
+@patch("hyper_parallel.core.dtensor.device_mesh.platform")
+def test_device_mesh_lazy_cp_group_materialization_requests_aiv_options(mock_platform):
+    """
+    Feature: Deferred DeviceMesh CP group options.
+    Description: Materialize a cp group from a MindSpore mesh created without backend init.
+    Expectation: The lazy group creation carries AIV HCCL options.
+    """
+    _setup_mindspore_device_mesh_mock(mock_platform, world_size=4)
+    EXISTING_COMM_GROUPS.clear()
+    _DEVICE_MESH_MAP.clear()
+    mesh = DeviceMesh("npu", [[0, 1], [2, 3]], mesh_dim_names=("dp", "cp"), _init_backend=False)
+    mock_platform.split_group.reset_mock()
+
+    mesh._materialize_dim_group(1)  # pylint: disable=protected-access
+
+    mock_platform.split_group.assert_called_once()
+    assert mock_platform.split_group.call_args.kwargs["pg_options"] == _AIV_OPTIONS
+
+
 @unittest.skip("Skipped: all TestDeviceMesh cases (full UT session may hit MindSpore/Ascend init on some hosts).")
 class TestDeviceMesh(unittest.TestCase):
     """Unit tests for DeviceMesh class and related functions."""

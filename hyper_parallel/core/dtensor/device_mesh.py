@@ -59,6 +59,7 @@ class _MeshEnv(threading.local):
 _mesh_resources = _MeshEnv()
 
 BackendConfig = Optional[str]
+_CP_MESH_DIM_NAMES = {"cp", "co", "ds"}
 
 
 def _get_sub_rank_list(mesh_shape, mesh_dim_names, rank_list, sub_mesh_dim_names, current_rank):
@@ -103,6 +104,16 @@ def _normalize_backend_value(value: Any) -> BackendConfig:
         backend = value[0]
         if backend is None or isinstance(backend, str):
             return backend
+    return None
+
+
+def _get_cp_pg_options(mesh_dim_names: Optional[tuple[str, ...]], dim: int) -> Optional[dict[str, Any]]:
+    if (
+            platform.platform_type == PlatformType.MINDSPORE
+            and mesh_dim_names
+            and mesh_dim_names[dim] in _CP_MESH_DIM_NAMES
+    ):
+        return {"hccl_config": {"hccl_op_expansion_mode": "AIV"}}
     return None
 
 
@@ -509,7 +520,7 @@ class DeviceMesh:
             if _should_defer_group_init(sub_layout, backend_override[dim]):
                 dim_group_names.append(None)
                 continue
-            group = platform.split_group(split_ranks=split_ranks)
+            group = platform.split_group(split_ranks=split_ranks, pg_options=_get_cp_pg_options(mesh_dim_names, dim))
             DeviceMesh._cache_group_if_needed(group_key, group)
             dim_group_names.append(group_key)
         return dim_group_names
@@ -1320,7 +1331,10 @@ class DeviceMesh:
             return group_key
 
         split_ranks, group_key = DeviceMesh._build_dim_split_ranks(self._layout[mesh_dim], self._rank_map)
-        group = platform.split_group(split_ranks=split_ranks)
+        group = platform.split_group(
+            split_ranks=split_ranks,
+            pg_options=_get_cp_pg_options(self.mesh_dim_names, mesh_dim),
+        )
         DeviceMesh._cache_group_if_needed(group_key, group)
         self._dim_group_names[mesh_dim] = group_key
         return group_key
