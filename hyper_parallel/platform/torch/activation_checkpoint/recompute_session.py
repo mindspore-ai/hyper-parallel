@@ -82,7 +82,7 @@ class _Holder:
     ``_CheckpointFrame.recomputed[key]``.
     """
 
-    __slots__ = ("handles",)
+    __slots__ = ("handles", "__weakref__")
 
     def __init__(self) -> None:
         self.handles: dict[str, Optional[_Handle]] = {}
