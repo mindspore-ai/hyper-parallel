@@ -139,39 +139,46 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         self._hsdp_backward_pre_hook(self.cell, None)
         return grad
 
+    # pylint: disable=W0613
     def _root_backward_hook(self, force_reduce=False):
-        """Finalize the outermost backward and clear recompute state.
+        """Finalize the outermost backward: drain pending reductions and apply grads.
 
-        ``apply_final_reduce`` selects between two cases by whether this unit's
-        forward input was differentiable:
+        The drain is unconditional. Every step below is self-limiting -- the fused
+        groups are ``None``-guarded and ``reduce_params`` / ``_finish_ignored_allreduce``
+        are empty-queue no-ops -- so running them on every invocation never double-applies
+        and preserves the invariant that a parameter's ``.grad`` is either ``None`` or a
+        fully reduced value. This mirrors torch FSDP2, whose wait in
+        ``_root_post_backward_final_callback`` is likewise not gated on the per-group
+        post-backward training state.
 
-        * input ``requires_grad=False`` (the common case): no ``PostBackwardFunction``
-          is inserted, so ``scheduler_state != BACKWARD`` and this hook drains the
-          pending fused reductions and applies the per-parameter gradients.
-        * input ``requires_grad=True`` (a boundary case where the unit is fed a
-          differentiable activation from an enclosing graph): the input's
-          ``PostBackwardFunction`` drives ``scheduler_state == BACKWARD`` and the
-          natural path does not finalize here. ``force_reduce`` lets a caller that
-          owns that backward boundary demand the drain now rather than deferring it.
+        Gating the drain on ``scheduler_state != BACKWARD`` was unsafe for any unit that
+        acts as a root while being fed a differentiable activation: its input's
+        ``PostBackwardFunction`` drives ``scheduler_state == BACKWARD``, so the gate would
+        skip the drain and leak the last module's reduce-scatter into the next optimizer
+        step. This happens when ``fully_shard`` wraps only inner layers and not the root
+        module (each layer becomes its own root yet is fed a grad-requiring activation).
+        PP hit the same boundary and worked around it with ``force_reduce=True`` from
+        ``PipelineStage.execute_reduce_grad``; that call site keeps working -- the drain is
+        simply always performed now. PP per-micro-batch accumulation is unaffected because
+        each chunk's backward sets ``requires_gradient_sync=False``, leaving the reduce
+        queue empty here so this drain is a no-op until the explicit reduce step.
 
-        ``root_bp_state`` (top-level root backward in flight; gates forward prefetch
-        during activation recompute) is independent of the reduce branch and is
-        cleared only by the root module's own hook, keyed on ``_is_root``.
+        ``root_bp_state`` (top-level root backward in flight; gates forward prefetch during
+        activation recompute) is independent of the drain and is cleared only by the root
+        module's own hook, keyed on ``_is_root``.
         """
-        apply_final_reduce = self.scheduler_state != FSDPSchedulerState.BACKWARD
         self._backward_hook()
         if self._is_root:
             HSDPSchedulerV2.root_bp_state = False
-        if apply_final_reduce or force_reduce:
-            comm_ctx = get_comm_ctx()
-            if comm_ctx.all_reduce_param_group is not None:
-                comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
-                comm_ctx.all_reduce_param_group = None
-            if comm_ctx.pre_param_group is not None:
-                comm_ctx.pre_param_group.apply_fusion_reduced_grad()
-                comm_ctx.pre_param_group = None
-            self.hsdp_state.reduce_params()
-            self.hsdp_state._finish_ignored_allreduce()
+        comm_ctx = get_comm_ctx()
+        if comm_ctx.all_reduce_param_group is not None:
+            comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
+            comm_ctx.all_reduce_param_group = None
+        if comm_ctx.pre_param_group is not None:
+            comm_ctx.pre_param_group.apply_fusion_reduced_grad()
+            comm_ctx.pre_param_group = None
+        self.hsdp_state.reduce_params()
+        self.hsdp_state._finish_ignored_allreduce()
 
     def _backward_hook(self):
         """Execute backward hook."""
