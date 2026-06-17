@@ -1067,7 +1067,7 @@ class TestDispatchNew(unittest.TestCase):
             return "py_output"
 
         d = object.__new__(OpDispatcher)
-        result = d._dispatch_new(mock_func, mock_dist_op, ([], {}, cache_values))
+        result = d._dispatch_new(mock_func, mock_dist_op, None, ([], {}, cache_values))
         self.assertEqual(result, "wrapped_output")
         mock_dist_op.infer_layout.assert_called_once()
         mock_dist_op.wrap_output.assert_called_once()
@@ -1101,7 +1101,7 @@ class TestDispatchNew(unittest.TestCase):
             return "should_not_be_called"
 
         d = object.__new__(OpDispatcher)
-        result = d._dispatch_new(mock_func, mock_dist_op, (["arg"], {}, cache_values))
+        result = d._dispatch_new(mock_func, mock_dist_op, None, (["arg"], {}, cache_values))
         mock_dist_op.infer_layout.assert_not_called()
         mock_impl.assert_called_once()
 
@@ -1683,10 +1683,11 @@ class TestWithLayoutInfer(unittest.TestCase):
         prim_obj = MagicMock()
         func = MagicMock(return_value=MagicMock())
 
-        # packed form: (prim_obj, "OpName", (arg1, arg2))
-        result = d._with_layout_infer(func, prim_obj, "UnpackOp", (10, 20))
+        # NOTE: aclop args are now normalized upstream by _normalize_aclop_args.
+        # Pass unpacked real args positionally and _packed_call via keyword.
+        result = d._with_layout_infer(func, 10, 20, _packed_call=(prim_obj, "UnpackOp"))
 
-        # op_impl should be called with the packed form
+        # op_impl should be called with the re-packed form
         func.assert_called_once()
         mock_dtensor_cls.from_local.assert_called_once()
 

@@ -15,10 +15,10 @@
 """parallel_cumsum test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_cumsum import CumsumDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -28,6 +28,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
 op = CumsumDistributedOp("cumsum")
+op_ms = CumsumDistributedOp("CumsumExt")
 
 
 class TestParallelCumsum(unittest.TestCase):
@@ -40,11 +41,13 @@ class TestParallelCumsum(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -83,19 +86,23 @@ class TestParallelCumsum(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(-1,))
+        cache_values = [x_layout, -1]
+        output_layouts, extra_info = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Data parallel cumsum failed. Expected {expected_map}, "
             f"got {output_layout.tensor_map}"
         )
+        assert output_layout is not x_layout, "Cumsum output layout should be a deep copy"
+        assert extra_info is None, f"Cumsum extra_info should be None, got {extra_info}"
         
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (x_layout,), (-1,)) is None, (
+        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x_layout,), (-1,))}"
+            f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -109,13 +116,16 @@ class TestParallelCumsum(unittest.TestCase):
         x_placements = (Replicate(), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(0,))
+        cache_values = [x_layout, 0]
+        output_layouts, extra_info = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (-1, 0)
         assert output_layout.tensor_map == expected_map, (
             f"Tensor parallel cumsum failed. Expected {expected_map}, "
             f"got {output_layout.tensor_map}"
         )
+        assert extra_info is None, f"Cumsum extra_info should be None, got {extra_info}"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cumsum_layout_mixed_parallel(self, mock_platform):
@@ -128,13 +138,16 @@ class TestParallelCumsum(unittest.TestCase):
         x_placements = (Shard(0), Replicate(), Shard(2))
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(1,))
+        cache_values = [x_layout, 1]
+        output_layouts, extra_info = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (2, -1, 0)
         assert output_layout.tensor_map == expected_map, (
             f"Mixed parallel cumsum failed. Expected {expected_map}, "
             f"got {output_layout.tensor_map}"
         )
+        assert extra_info is None, f"Cumsum extra_info should be None, got {extra_info}"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cumsum_layout_negative_dim(self, mock_platform):
@@ -147,13 +160,16 @@ class TestParallelCumsum(unittest.TestCase):
         x_placements = (Replicate(), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(-2,))
+        cache_values = [x_layout, -2]
+        output_layouts, extra_info = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (-1, 0)
         assert output_layout.tensor_map == expected_map, (
             f"Negative dimension cumsum failed. Expected {expected_map}, "
             f"got {output_layout.tensor_map}"
         )
+        assert extra_info is None, f"Cumsum extra_info should be None, got {extra_info}"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cumsum_layout_invalid_sharding_on_cumsum_dim(self, mock_platform):
@@ -166,8 +182,8 @@ class TestParallelCumsum(unittest.TestCase):
         x_placements = (Shard(0), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "Cannot perform sharding on normalized dimension 1"):
-            op.infer_layout((x_layout,), extra_args=(-1,))
+        with self.assertRaisesRegex(ValueError, "sharded dimension"):
+            op.infer_layout([x_layout, -1])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cumsum_layout_dim_out_of_range_positive(self, mock_platform):
@@ -180,8 +196,8 @@ class TestParallelCumsum(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "Dimension 2 out of range for 2-dimensional input tensor"):
-            op.infer_layout((x_layout,), extra_args=(2,))
+        with self.assertRaisesRegex(ValueError, "dimension out of range"):
+            op.infer_layout([x_layout, 2])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cumsum_layout_missing_dim_parameter(self, mock_platform):
@@ -194,11 +210,8 @@ class TestParallelCumsum(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "cumsum requires 'dim' parameter in extra_args"):
-            op.infer_layout((x_layout,), extra_args=None)
-
-        with self.assertRaisesRegex(ValueError, "cumsum requires 'dim' parameter in extra_args"):
-            op.infer_layout((x_layout,), extra_args=(None,))
+        with self.assertRaisesRegex(ValueError, "dimension should be int"):
+            op.infer_layout([x_layout, None])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_cumsum_layout_invalid_dim_type(self, mock_platform):
@@ -211,8 +224,81 @@ class TestParallelCumsum(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "'dim' must be an integer, got <class 'str'>"):
-            op.infer_layout((x_layout,), extra_args=("invalid",))
+        with self.assertRaisesRegex(ValueError, "dimension should be int"):
+            op.infer_layout([x_layout, "invalid"])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_cumsum_partial_input_raises_error(self, mock_platform):
+        """
+        Feature: Cumsum with Partial input
+        Description: Input layout has Partial status
+        Expectation: ValueError raised
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_placements = (Replicate(), Replicate())
+        x_layout = _build_layout(mesh, x_placements, 2)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+
+        with self.assertRaisesRegex(ValueError, "Partial status"):
+            op.infer_layout([x_layout, -1])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_cumsum_preprocess_torch_dtype_in_kwargs(self, mock_platform):
+        """
+        Feature: Cumsum preprocess for PyTorch
+        Description: dtype is keyword-only parameter
+        Expectation: local tensor and dim are positional; dtype is in kwargs
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        mock_tensor.to_local.return_value = MagicMock()
+
+        local_args, local_kwargs, cache_values = op.preprocess(
+            (mock_tensor,),
+            {'dim': -1, 'dtype': 'float32'}
+        )
+
+        assert len(local_args) == 2, (
+            f"For PyTorch 'cumsum', local_args should be (tensor, dim), got {local_args}"
+        )
+        assert local_args[1] == -1, f"dim should be preserved as -1, got {local_args[1]}"
+        assert local_kwargs == {'dtype': 'float32'}, (
+            f"For PyTorch 'cumsum', dtype should be kwargs, got {local_kwargs}"
+        )
+        assert cache_values == [x_layout, -1], f"Unexpected cache_values: {cache_values}"
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_cumsum_preprocess_mindspore_primitive_in_args(self, mock_platform):
+        """
+        Feature: Cumsum preprocess for MindSpore Primitive
+        Description: CumsumExt does not accept kwargs
+        Expectation: dim and dtype are routed to positional args, including dtype=None
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        mock_tensor.to_local.return_value = MagicMock()
+
+        local_args, local_kwargs, cache_values = op_ms.preprocess(
+            (mock_tensor,),
+            {'dim': -1}
+        )
+
+        assert not local_kwargs, (
+            f"For MindSpore 'CumsumExt', local_kwargs should be empty, got {local_kwargs}"
+        )
+        assert len(local_args) == 3, (
+            f"For MindSpore 'CumsumExt', local_args should be (tensor, dim, dtype), got {local_args}"
+        )
+        assert local_args[1:] == (-1, None), (
+            f"MindSpore positional dim/dtype mismatch, got {local_args[1:]}"
+        )
+        assert cache_values == [x_layout, -1], f"Unexpected cache_values: {cache_values}"
 
 
 if __name__ == "__main__":

@@ -13,9 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for element-wise distributed operators"""
-import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import copy
 import numpy as np
 
@@ -29,6 +28,31 @@ from hyper_parallel.core.dtensor.device_mesh import (
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
 
+def _extract_test_input_shapes(extra_args):
+    """Extract input shapes from extra_args dict."""
+    if isinstance(extra_args, dict):
+        return extra_args.get("input_shapes", None)
+    return None
+
+
+def _make_cache_values(layouts, extra_args=None):
+    """Build cache_values for the new preprocess/infer_layout protocol."""
+    return [*layouts, _extract_test_input_shapes(extra_args)]
+
+
+def _infer_output_layout(op, layouts, extra_args=None):
+    """Infer and return the single output layout."""
+    output_layouts, extra_info = op.infer_layout(_make_cache_values(layouts, extra_args))
+    assert extra_info is None
+    return output_layouts[0]
+
+
+def _get_expand_impl(op, func, output_layout, layouts, extra_args=None):
+    """Call get_expand_impl with new-protocol infer_result and cache_values."""
+    cache_values = _make_cache_values(layouts, extra_args)
+    return op.get_expand_impl(func, ((output_layout,), None), cache_values)
+
+
 class TestParallelElementwiseOps(unittest.TestCase):
     """Unit tests for ElementWiseDistributedOp."""
     def setUp(self):
@@ -39,6 +63,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
         self.op = ElementWiseDistributedOp("element_wise")
         self.op_with_partial = AddDistributedOp("element_wise_with_partial")
 
@@ -46,6 +71,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -79,12 +105,21 @@ class TestParallelElementwiseOps(unittest.TestCase):
             op_ = self.op_with_partial
         else:
             op_ = self.op
-        output_layout = op_.infer_layout((x_layout, y_layout), extra_args)
+
+        cache_values = [
+            x_layout,
+            y_layout,
+            extra_args.get("input_shapes"),
+        ]
+
+        infer_result = op_.infer_layout(cache_values)
+        output_layout = infer_result[0][0]
+
         got_map = output_layout.tensor_map
         assert got_map == expected_map, (
             f"Element-wise failed. Expected {expected_map}, got {got_map}"
         )
-        impl = op_.get_expand_impl(None, output_layout, (x_layout, y_layout), extra_args)
+        impl = op_.get_expand_impl(None, infer_result, cache_values)
         if flag:
             assert impl is not None, (
                 f"get_expand_impl test failed. Expected non-None, got {impl}"
@@ -101,12 +136,20 @@ class TestParallelElementwiseOps(unittest.TestCase):
             op_ = self.op_with_partial
         else:
             op_ = self.op
-        output_layout = op_.infer_layout((x_layout,), extra_args)
+
+        cache_values = [
+            x_layout,
+            extra_args.get("input_shapes"),
+        ]
+
+        infer_result = op_.infer_layout(cache_values)
+        output_layout = infer_result[0][0]
+
         got_map = output_layout.tensor_map
         assert got_map == expected_map, (
             f"Element-wise failed. Expected {expected_map}, got {got_map}"
         )
-        impl = op_.get_expand_impl(None, output_layout, (x_layout,), extra_args)
+        impl = op_.get_expand_impl(None, infer_result, cache_values)
         if flag:
             assert impl is not None, (
                 f"get_expand_impl test failed. Expected non-None, got {impl}"
@@ -116,6 +159,37 @@ class TestParallelElementwiseOps(unittest.TestCase):
             assert impl is None, (
                 f"get_expand_impl test failed. Expected None, got {impl}"
             )
+
+    def test_preprocess_unwraps_dtensors_and_builds_cache_values(self):
+        """
+        Feature: Element-wise preprocess
+        Description: DTensor-like inputs are converted to local tensors and cached with layout/shape.
+        Expectation: local args/kwargs use local tensors and cache_values carries layouts first.
+        """
+        x_layout = MagicMock()
+        y_layout = MagicMock()
+        x_local = MagicMock()
+        y_local = MagicMock()
+
+        x_tensor = MagicMock()
+        x_tensor.layout = x_layout
+        x_tensor.shape = (4, 8)
+        x_tensor.to_local.return_value = x_local
+        x_tensor._layout = x_layout
+
+        y_tensor = MagicMock()
+        y_tensor.layout = y_layout
+        y_tensor.shape = (4, 8)
+        y_tensor.to_local.return_value = y_local
+        y_tensor._layout = y_layout
+
+        local_args, local_kwargs, cache_values = self.op.preprocess((x_tensor,), {"other": y_tensor})
+
+        assert local_args == (x_local,)
+        assert local_kwargs == {"other": y_local}
+        assert cache_values[0] is x_layout
+        assert cache_values[1] is y_layout
+        assert cache_values[2] == [(4, 8), (4, 8)]
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_single_input_partial_0(self, mock_platform):
@@ -129,7 +203,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         x_layout.set_partial_by_dev_axis("dp", "sum")
 
         with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
-            self.op.infer_layout((x_layout,), extra_args={"input_shapes": [(4, 8, 16)]})
+            self.op.infer_layout(_make_cache_values((x_layout,), {"input_shapes": [(4, 8, 16)]}))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_single_input_replicate_1(self, mock_platform):
@@ -177,7 +251,9 @@ class TestParallelElementwiseOps(unittest.TestCase):
         x_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
         x_layout.set_partial_by_dev_axis("dp", "sum")
 
-        output_layout = self.op_with_partial.infer_layout((x_layout,), extra_args={"input_shapes": [(4, 8, 16)]})
+        output_layout = _infer_output_layout(
+            self.op_with_partial, (x_layout,), {"input_shapes": [(4, 8, 16)]}
+        )
 
         assert output_layout.partial[mesh.axis_index("dp")] == "sum"
 
@@ -249,7 +325,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         extra_args = {"input_shapes": [(4, 8, 16), (4, 8, 16)]}
 
         with self.assertRaisesRegex(ValueError, "should have same sharding pattern"):
-            self.op.infer_layout((x_layout, y_layout), extra_args=extra_args)
+            self.op.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_sharded_broadcasts_to_replicated_8(self, mock_platform):
@@ -265,7 +341,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         extra_args = {"input_shapes": [(1, 8, 16), (4, 8, 16)]}
 
         with self.assertRaisesRegex(ValueError, "Broadcasting dimension cannot be sharded"):
-            self.op.infer_layout((x_layout, y_layout), extra_args=extra_args)
+            self.op.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_replicated_broadcasts_to_sharded_9(self, mock_platform):
@@ -354,11 +430,11 @@ class TestParallelElementwiseOps(unittest.TestCase):
         y_layout._partial = [None] * len(y_layout._partial)
 
         extra_args = {"input_shapes": [(4, 8, 16), (4, 8, 16)]}
-        output_layout = self.op_with_partial.infer_layout((x_layout, y_layout), extra_args)
+        output_layout = _infer_output_layout(self.op_with_partial, (x_layout, y_layout), extra_args)
 
         assert output_layout.partial[mesh.axis_index("dp")] == "sum"
 
-        impl = self.op_with_partial.get_expand_impl(None, output_layout, (x_layout, y_layout), extra_args)
+        impl = _get_expand_impl(self.op_with_partial, None, output_layout, (x_layout, y_layout), extra_args)
         assert impl is not None, (
             f"get_expand_impl test failed. Expected non-None, got {impl}"
         )
@@ -378,11 +454,11 @@ class TestParallelElementwiseOps(unittest.TestCase):
         y_layout.set_partial_by_dev_axis("dp", "sum")
 
         extra_args = {"input_shapes": [(4, 8, 16), (4, 8, 16)]}
-        output_layout = self.op_with_partial.infer_layout((x_layout, y_layout), extra_args)
+        output_layout = _infer_output_layout(self.op_with_partial, (x_layout, y_layout), extra_args)
 
         assert output_layout.partial[mesh.axis_index("dp")] == "sum"
 
-        impl = self.op_with_partial.get_expand_impl(None, output_layout, (x_layout, y_layout), extra_args)
+        impl = _get_expand_impl(self.op_with_partial, None, output_layout, (x_layout, y_layout), extra_args)
         assert impl is None, (
             f"get_expand_impl test failed. Expected None, got {impl}"
         )
@@ -403,7 +479,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         extra_args = {"input_shapes": [(4, 8, 16), (4, 8, 16)]}
 
         with self.assertRaisesRegex(ValueError, "partial operations should be same"):
-            self.op_with_partial.infer_layout((x_layout, y_layout), extra_args=extra_args)
+            self.op_with_partial.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_shard_with_partial_conflict_16(self, mock_platform):
@@ -420,7 +496,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         extra_args = {"input_shapes": [(4, 8, 16), (4, 8, 16)]}
 
         with self.assertRaisesRegex(ValueError, "Shard and Partial should not coexist on same device axis"):
-            self.op_with_partial.infer_layout((x_layout, y_layout), extra_args=extra_args)
+            self.op_with_partial.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_partial_broadcasts_to_sharded_17(self, mock_platform):
@@ -437,7 +513,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         extra_args = {"input_shapes": [(1, 8, 16), (4, 8, 16)]}
 
         with self.assertRaisesRegex(ValueError, "Shard and Partial should not coexist on same device axis"):
-            self.op_with_partial.infer_layout((x_layout, y_layout), extra_args=extra_args)
+            self.op_with_partial.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_multiple_inputs_18(self, mock_platform):
@@ -454,15 +530,15 @@ class TestParallelElementwiseOps(unittest.TestCase):
         extra_args = {"input_shapes": [(4, 8, 16), (1, 8, 16), (1, 8, 16)]}
         expected_map = (2, -1, -1)
 
-        output_layout = self.op.infer_layout((x_layout, y_layout, z_layout), extra_args=extra_args)
+        output_layout = _infer_output_layout(self.op, (x_layout, y_layout, z_layout), extra_args)
         got_map = output_layout.tensor_map
         assert got_map == expected_map
 
-        assert self.op.get_expand_impl(None, output_layout,
-                                       (x_layout, y_layout, z_layout), extra_args) is None, (
+        assert _get_expand_impl(self.op, None, output_layout,
+                                (x_layout, y_layout, z_layout), extra_args) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"""got {self.op.get_expand_impl(None, output_layout,
-                                           (x_layout, y_layout, z_layout), extra_args)}"""
+            f"""got {_get_expand_impl(self.op, None, output_layout,
+                                    (x_layout, y_layout, z_layout), extra_args)}"""
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -480,7 +556,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         extra_args = {"input_shapes": [(4, 8, 16), (4, 8, 16)]}
 
         with self.assertRaisesRegex(ValueError, "Shard and Partial should not coexist on same device axis"):
-            self.op_with_partial.infer_layout((x_layout, y_layout), extra_args=extra_args)
+            self.op_with_partial.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_incompatible_broadcast_shapes_20(self, mock_platform):
@@ -496,7 +572,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         extra_args = {"input_shapes": [(4, 8, 16), (4, 7, 16)]}
 
         with self.assertRaisesRegex(ValueError, "cannot be broadcast"):
-            self.op_with_partial.infer_layout((x_layout, y_layout), extra_args=extra_args)
+            self.op_with_partial.infer_layout(_make_cache_values((x_layout, y_layout), extra_args))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_1d_to_3d_broadcast_21(self, mock_platform):
@@ -528,7 +604,7 @@ class TestParallelElementwiseOps(unittest.TestCase):
         y_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
 
         with self.assertRaisesRegex(ValueError, "cannot infer layout without shapes"):
-            self.op.infer_layout((x_layout, y_layout), extra_args={})
+            self.op.infer_layout(_make_cache_values((x_layout, y_layout), {}))
 
 
 class TestParallelArithmetic(unittest.TestCase):
@@ -538,11 +614,13 @@ class TestParallelArithmetic(unittest.TestCase):
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
@@ -580,7 +658,7 @@ class TestParallelArithmetic(unittest.TestCase):
         w_layout = _build_layout(mesh, w_placements, 2)
 
         extra_args = {"input_shapes": [(4, 16), (4, 16)]}
-        output_layout = op.infer_layout((x_layout, w_layout), (extra_args))
+        output_layout = _infer_output_layout(op, (x_layout, w_layout), extra_args)
         expected_map = ("dp", "mp")
         assert output_layout.alias_tensor_map == expected_map, (
             f"Data Parallel test failed. Expected {expected_map}, "
@@ -589,9 +667,10 @@ class TestParallelArithmetic(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (x_layout, None, None), (1, True)) is None, (
+        impl = _get_expand_impl(op, None, output_layout, (x_layout, w_layout), extra_args)
+        assert impl is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x_layout, None, None), (1, True))}"
+            f"got {impl}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -609,7 +688,7 @@ class TestParallelArithmetic(unittest.TestCase):
         w_placements = (Shard(0), Replicate())
         w_layout = _build_layout(mesh, w_placements, 2)
         extra_args = {"input_shapes": [(4, 16), (4, 16)]}
-        output_layout = op.infer_layout((x_layout, w_layout), (extra_args))
+        output_layout = _infer_output_layout(op, (x_layout, w_layout), extra_args)
         expected_map = ("dp", "mp")
         assert output_layout.alias_tensor_map == expected_map, (
             f"Data Parallel test failed. Expected {expected_map}, "
@@ -631,7 +710,7 @@ class TestParallelArithmetic(unittest.TestCase):
         w_placements = (Shard(0), Replicate())
         w_layout = _build_layout(mesh, w_placements, 2)
         extra_args = {"input_shapes": [(4, 16), (4, 16)]}
-        output_layout = op.infer_layout((x_layout, w_layout), extra_args)
+        output_layout = _infer_output_layout(op, (x_layout, w_layout), extra_args)
         expected_map = ("dp", "mp")
         assert output_layout.alias_tensor_map == expected_map, (
             f"Data Parallel test failed. Expected {expected_map}, "
@@ -653,7 +732,7 @@ class TestParallelArithmetic(unittest.TestCase):
         w_placements = (Shard(0), Replicate())
         w_layout = _build_layout(mesh, w_placements, 2)
         extra_args = {"input_shapes": [(4, 16), (4, 16)]}
-        output_layout = op.infer_layout((x_layout, w_layout), extra_args)
+        output_layout = _infer_output_layout(op, (x_layout, w_layout), extra_args)
         expected_map = ("dp", "mp")
         assert output_layout.alias_tensor_map == expected_map, (
             f"Data Parallel test failed. Expected {expected_map}, "
@@ -675,7 +754,7 @@ class TestParallelArithmetic(unittest.TestCase):
         w_placements = (Shard(0), Replicate())
         w_layout = _build_layout(mesh, w_placements, 2)
         extra_args = {"input_shapes": [(4, 16), (4, 16)]}
-        output_layout = op.infer_layout((x_layout, w_layout), extra_args)
+        output_layout = _infer_output_layout(op, (x_layout, w_layout), extra_args)
         expected_map = ("dp", "mp")
         assert output_layout.alias_tensor_map == expected_map, (
             f"Data Parallel test failed. Expected {expected_map}, "
@@ -728,7 +807,9 @@ class TestParallelZerosLike(unittest.TestCase):
         placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, placements, 2)
 
-        output_layout = self.op.infer_layout((x_layout,), {})
+        cache_values = [x_layout, None]
+        infer_result = self.op.infer_layout(cache_values)
+        output_layout = infer_result[0][0]
 
         expected_map = (1, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -738,9 +819,8 @@ class TestParallelZerosLike(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test cases, so it is unnecessary to test its return value.
-        assert self.op.get_expand_impl(None, output_layout, (x_layout,), {}) is None, (
-            f"get_expand_impl should return None, "
-            f"got={self.op.get_expand_impl(None, output_layout, (x_layout,), {})}"
+        assert self.op.get_expand_impl(None, infer_result, cache_values) is None, (
+            "get_expand_impl should return None"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -754,7 +834,9 @@ class TestParallelZerosLike(unittest.TestCase):
         placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, placements, 2)
 
-        output_layout = self.op.infer_layout((x_layout,), {})
+        cache_values = [x_layout, None]
+        infer_result = self.op.infer_layout(cache_values)
+        output_layout = infer_result[0][0]
 
         expected_map = (-1, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -774,7 +856,7 @@ class TestParallelZerosLike(unittest.TestCase):
         x_layout.set_partial_by_dev_axis("dp", "sum")
 
         with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
-            self.op.infer_layout((x_layout,), {})
+            self.op.infer_layout([x_layout, None])
 
 
 if __name__ == "__main__":

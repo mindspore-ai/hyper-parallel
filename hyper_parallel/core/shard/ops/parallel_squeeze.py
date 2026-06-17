@@ -13,77 +13,89 @@
 # limitations under the License.
 # ============================================================================
 """
-Distributed implementation for ExpandDims operator.
+Distributed implementation for Squeeze operator.
 """
+from copy import deepcopy
+from typing import Tuple
+
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
+
+
+def _normalize_squeeze_args(x, axis=None):
+    return (x, axis), {}
 
 
 class SqueezeDistributedOp(DistributedOp):
     """Distributed implementation for Squeeze operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        args, _ = _normalize_squeeze_args(*args, **kwargs)
+        input_tensor, axis = args[0], args[1]
+
+        if axis is None:
+            local_args = (input_tensor.to_local(),)
+        else:
+            local_args = (input_tensor.to_local(), axis)
+
+        input_shape = getattr(input_tensor, "shape", None)
+        cache_values = [input_tensor.layout, axis, input_shape]
+        return local_args, {}, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
-        Infer output layout for Squeeze.
+        Infer output layout for Squeeze operator.
+
+        Rules:
+            1. Input must not have Partial status.
+            2. input_shape rank must match input layout rank.
+            3. If axis is None, only size-1 replicated dimensions are removed.
+            4. If axis is specified, every axis must be in range, have size 1, and
+               must not be sharded.
+            5. Output layout removes the squeezed dimensions and preserves the
+               remaining input dimension mappings.
 
         Args:
-            layouts (tuple): Tuple containing input layout.
-            extra_args: Extra arguments containing axis and input_shapes.
-                       Can be dict or list/tuple where last element is input_shapes.
+            cache_values (list): [input_layout, axis, input_shape]
 
         Returns:
-            Layout: Output layout with squeezed dimensions removed.
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If input has Partial status, input_shape is missing, axis
+                is invalid, or a requested squeeze dimension is sharded.
         """
-        if not layouts:
+        if not cache_values:
             raise ValueError(
-                f"For {self.op_name}, layouts should contain at least one input layout, "
-                f"but got empty layouts."
+                f"For {self.op_name}, cache_values should contain input layout, "
+                f"but got empty cache_values."
             )
 
-        x_layout = layouts[0]
+        x_layout = cache_values[0]
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([x_layout])
+
         if x_layout.mesh_shape is None:
             raise ValueError(
                 f"For {self.op_name}, input layout mesh_shape should not be None, "
                 f"but got None."
             )
 
-        axis, input_shape = self._extract_args(extra_args)
+        axis = cache_values[1] if len(cache_values) > 1 else None
+        input_shape = cache_values[2] if len(cache_values) > 2 else None
         if input_shape is None:
             raise ValueError(
-                f"For {self.op_name}, input_shapes should be provided in extra_args, "
+                f"For {self.op_name}, input_shape should be provided in cache_values, "
                 f"but got None."
             )
-
-        return self._compute_squeeze_layout(x_layout, axis, input_shape)
-
-    def _extract_args(self, extra_args):
-        """Extract axis and input_shape from extra_args."""
-        if isinstance(extra_args, dict):
-            input_shapes = extra_args.get("input_shapes", None)
-            axis = extra_args.get("axis", None)
-        elif isinstance(extra_args, (list, tuple)) and extra_args:
-            # Last element is input_shapes
-            input_shapes = extra_args[-1]
-            if not isinstance(input_shapes, (list, tuple)):
-                raise ValueError(
-                    f"For {self.op_name}, input_shapes should be list or tuple, "
-                    f"but got {type(input_shapes)}."
-                )
-            # First element is axis (if available)
-            axis = extra_args[0] if len(extra_args) > 1 else None
-        else:
+        if not isinstance(input_shape, (list, tuple)):
             raise ValueError(
-                f"For {self.op_name}, extra_args should be dict or list/tuple, "
-                f"but got {type(extra_args)}."
+                f"For {self.op_name}, input_shape should be list or tuple, "
+                f"but got {type(input_shape)}."
             )
 
-        # Get input shape (first element of input_shapes)
-        if input_shapes:
-            input_shape = input_shapes[0] if isinstance(input_shapes[0], (list, tuple)) else input_shapes
-        else:
-            input_shape = None
-
-        return axis, input_shape
+        output_layout = self._compute_squeeze_layout(x_layout, axis, input_shape)
+        return ((output_layout,), None)
 
     def _compute_squeeze_layout(self, x_layout, axis, input_shape):
         """Compute the squeezed layout."""
@@ -108,14 +120,7 @@ class SqueezeDistributedOp(DistributedOp):
                 f"but got {axis}."
             )
 
-        # Return scalar layout
-        output_layout = Layout(
-            mesh_shape=x_layout.mesh_shape,
-            alias_name=x_layout.alias_name,
-            rank_list=x_layout.rank_list
-        )
-        output_layout = output_layout()
-        return output_layout
+        return deepcopy(x_layout)
 
     def _validate_input_shape(self, x_layout, input_shape):
         """Validate that input shape matches layout rank."""
@@ -150,6 +155,19 @@ class SqueezeDistributedOp(DistributedOp):
         # Convert axis to list if it's a single integer
         if isinstance(axis, int):
             axis = [axis]
+        elif isinstance(axis, tuple):
+            axis = list(axis)
+        elif not isinstance(axis, list):
+            raise ValueError(
+                f"For {self.op_name}, axis should be int, list or tuple, "
+                f"but got {type(axis)}."
+            )
+
+        if not all(isinstance(ax, int) for ax in axis):
+            raise ValueError(
+                f"For {self.op_name}, every axis value should be int, "
+                f"but got {axis}."
+            )
 
         # Convert negative indices to positive
         axis = [ax if ax >= 0 else ax + in_rank for ax in axis]
@@ -191,6 +209,9 @@ class SqueezeDistributedOp(DistributedOp):
 
     def _create_output_layout(self, x_layout, dims_to_squeeze):
         """Create output layout after squeezing dimensions."""
+        if not dims_to_squeeze:
+            return deepcopy(x_layout)
+
         # Get current alias tensor map
         x_map = list(x_layout.alias_tensor_map)
 

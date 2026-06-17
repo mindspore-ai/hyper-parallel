@@ -16,29 +16,51 @@
 Distributed implementation for Slice operator.
 """
 # pylint: disable=E0402
+from typing import Callable, Optional, Tuple
+
 from .parallel_ops import DistributedOp
 
 
+def _normalize_slice_args(x, begin, end):
+    return (x, begin, end), {}
+
+
 class SliceDistributedOp(DistributedOp):
-    """Distributed implementation for MatMul operator."""
+    """Distributed implementation for Slice operator."""
+
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for Slice operator.
+
+        Args:
+            args (tuple): Input arguments containing x, begin and end.
+            kwargs (dict): Keyword arguments.
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, _ = _normalize_slice_args(*args, **kwargs)
+        input_tensor, begin, end = args
+        local_args = (input_tensor.to_local(), begin, end)
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, begin, end, input_tensor.shape]
+        return local_args, local_kwargs, cache_values
 
     def _is_shard_dim(self, layout):
         """return the shard num in each dim"""
         shard_dim = []
-        dev_mat = layout.mesh_shape
-        tensor_map = layout.tensor_map
-        for dev_idx in tensor_map:
-            if isinstance(dev_idx, (tuple, list)):
+        for axis_name in layout.alias_tensor_map:
+            if axis_name == "None":
+                shard_dim.append(1)
+                continue
+            if isinstance(axis_name, (tuple, list)):
                 shard_num = 1
-                for idx in dev_idx:
-                    if idx != -1 and dev_mat[len(dev_mat) - idx - 1] != 1:
-                        shard_num *= dev_mat[len(dev_mat) - idx - 1]
+                for axis in axis_name:
+                    if axis != "None":
+                        shard_num *= layout.mesh.get_device_num_along_axis(axis)
                 shard_dim.append(shard_num)
-            else:
-                if dev_idx != -1 and dev_mat[len(dev_mat) - dev_idx - 1] != 1:
-                    shard_dim.append(dev_mat[len(dev_mat) - dev_idx - 1])
-                else:
-                    shard_dim.append(1)
+                continue
+            shard_dim.append(layout.mesh.get_device_num_along_axis(axis_name))
         return shard_dim
 
     def _check_layout(self, layout, begin, end, shape):
@@ -54,23 +76,69 @@ class SliceDistributedOp(DistributedOp):
                     f"the begin is {begin}, the end is {end}, the shape is {shape}, layout is {layout.to_dict()}")
         return shard_dim
 
-    def infer_layout(self, layouts, extra_args=None):
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, tuple]:
         """
-        Infer output layout for slice operator. The shard dim must be fully fetched.
+        Infer output layout for Slice operator.
+
+        Rules:
+            1. Input must not have Partial status.
+            2. begin, end and global_shape must have the same rank as input layout.
+            3. Any sharded dimension must be fully fetched.
+            4. Output layout is identical to the input layout.
 
         Args:
-            layouts (Layout): Layout of input x
-            extra_args: (begin, end, global shape)
+            cache_values (list): [input_layout, begin, end, global_shape].
 
         Returns:
-            layout (Layout): the out layout
-            new_begin (tuple): begin after modification
-            new_end (tuple): end after modification
+            tuple: ((output_layout,), (new_begin, new_end)).
+
+        Raises:
+            ValueError: If input has Partial status, arguments rank mismatch, or a sharded
+                dimension is not fully fetched.
         """
-        begin = extra_args[0]
-        end = extra_args[1]
-        global_shape = extra_args[2]
-        shard_dim = self._check_layout(layouts, begin, end, global_shape)
+        layout, begin, end, global_shape = cache_values
+        self._check_partial_inputs([layout])
+
+        if len(begin) != len(end) or len(begin) != len(global_shape):
+            raise ValueError(
+                f"For {self.op_name}, begin, end and global_shape must have the same length, "
+                f"but got begin: {len(begin)}, end: {len(end)}, global_shape: {len(global_shape)}"
+            )
+        if len(begin) != len(layout.alias_tensor_map):
+            raise ValueError(
+                f"For {self.op_name}, slice arguments rank must match input layout rank, "
+                f"but got args rank: {len(begin)} and layout rank: {len(layout.alias_tensor_map)}"
+            )
+
+        shard_dim = self._check_layout((layout,), begin, end, global_shape)
         new_begin = tuple(begin[i] // shard_dim[i] for i in range(len(begin)))
         new_end = tuple(end[i] // shard_dim[i] for i in range(len(end)))
-        return layouts[0], new_begin, new_end
+        return ((layout,), (new_begin, new_end))
+
+    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,
+                        cache_values: list) -> Optional[Callable]:
+        """
+        Return a custom Slice implementation when local begin/end need adjustment.
+
+        Args:
+            func: Original operator callable.
+            infer_result (tuple): ((output_layout,), (new_begin, new_end)) from infer_layout.
+            cache_values (list): [input_layout, begin, end, global_shape].
+
+        Returns:
+            callable | None: expand_impl closure when local slice bounds differ, else None.
+        """
+        if func is None:
+            return None
+
+        begin = cache_values[1]
+        end = cache_values[2]
+        new_begin, new_end = infer_result[1]
+        if begin == new_begin and end == new_end:
+            return None
+
+        def expand_impl(input_tensor: object, *_unused_args: object) -> object:
+            """Call Slice with local slice bounds."""
+            return func(input_tensor, new_begin, new_end)
+
+        return expand_impl

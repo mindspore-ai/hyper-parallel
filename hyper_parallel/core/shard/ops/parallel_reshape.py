@@ -16,11 +16,28 @@
 Distributed implementation for Reshape operator.
 """
 
+from typing import Callable, Optional, Tuple
+
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
 platform = get_platform()
 Tensor = platform.Tensor
+
+
+def _normalize_reshape_args(x, *shape, **kwargs):
+    """Normalize reshape/view arguments into positional args and empty kwargs."""
+    unexpected_kwargs = set(kwargs) - {'shape'}
+    if unexpected_kwargs:
+        unexpected = next(iter(unexpected_kwargs))
+        raise TypeError(f"reshape got an unexpected keyword argument '{unexpected}'.")
+    if shape and 'shape' in kwargs:
+        raise TypeError("reshape got shape from both args and kwargs.")
+    if not shape and 'shape' in kwargs:
+        shape = (kwargs['shape'],)
+    if not shape:
+        raise TypeError("reshape missing required shape argument.")
+    return (x,) + shape, {}
 
 
 def _filter_none_split_tensor_map(tensor_map, mesh_shape):
@@ -152,47 +169,6 @@ class ReshapeDistributedOp(DistributedOp):
                 local_dst_shape.append(dst_shape[idx] // x_mesh_shape[-1 - map_id] if dst_shape[idx] > 0 else -1)
         return output_map, local_dst_shape
 
-    def _parse_shape_args(self, extra_args):
-        """Parse shape arguments from extra_args.
-
-        Args:
-            extra_args: Extra arguments containing shape info
-
-        Returns:
-            tuple: (dst_shape, input_shape)
-        """
-        if self.op_name in ["reshape", "view"]:
-            return self._parse_torch_shape_args(extra_args)
-        return self._parse_mindspore_shape_args(extra_args)
-
-    def _parse_torch_shape_args(self, extra_args):
-        """Parse PyTorch style shape arguments."""
-        if len(extra_args) < 2:
-            raise ValueError(f"{self.op_name} requires output shape and input shape.")
-
-        input_shape = extra_args[-1]
-        shape_args = extra_args[:-1]
-
-        if len(shape_args) == 1:
-            first_arg = shape_args[0]
-            if isinstance(first_arg, (list, tuple)):
-                dst_shape = first_arg
-            elif isinstance(first_arg, Tensor):
-                dst_shape = first_arg.tolist()
-            else:
-                dst_shape = shape_args
-        else:
-            dst_shape = shape_args
-
-        return dst_shape, input_shape
-
-    def _parse_mindspore_shape_args(self, extra_args):
-        """Parse MindSpore style shape arguments."""
-        if len(extra_args) != 2:
-            raise ValueError("Reshape requires output shape and input shape.")
-
-        return extra_args[0], extra_args[1]
-
     def _normalize_shape(self, dst_shape):
         """Normalize dst_shape to list format."""
         if isinstance(dst_shape, Tensor):
@@ -265,25 +241,29 @@ class ReshapeDistributedOp(DistributedOp):
                 if partial_op is not None and i < len(out_layout.alias_name):
                     out_layout.set_partial_by_dev_axis(out_layout.alias_name[i], partial_op)
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layout for reshape operator.
-
-        For reshape operations, data slice on each device after reshape should be same as data slice before reshape.
+        Preprocess arguments for Reshape operator.
 
         Args:
-            layouts (Layout): Layout of input x
-            extra_args:
-                For MindSpore Reshape: (destination shape, original shape)
-                For PyTorch reshape/view: (shape_arg1, shape_arg2, ..., original shape) or (shape_tuple, original shape)
+            args (tuple): Input tensor followed by target shape arguments.
+            kwargs (dict): Keyword arguments.
 
         Returns:
-            tuple: Layout for output tensor
+            tuple: (local_args, local_kwargs, cache_values)
         """
-        x_layout = layouts[0]
-        x_dict = x_layout.to_dict()
+        args, _ = _normalize_reshape_args(*args, **kwargs)
+        input_tensor = args[0]
+        dst_shape = args[1:] if len(args) > 2 else args[1]
 
-        dst_shape, input_shape = self._parse_shape_args(extra_args)
+        local_args = (input_tensor.to_local(), dst_shape)
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, dst_shape, tuple(input_tensor.shape)]
+        return local_args, local_kwargs, cache_values
+
+    def _infer_reshape_layout(self, x_layout, dst_shape, input_shape):
+        """Infer reshape output layout and local destination shape."""
+        x_dict = x_layout.to_dict()
         dst_shape = self._normalize_shape(dst_shape)
 
         x_map = _filter_none_split_tensor_map(x_dict["tensor_map"], x_dict["mesh_shape"])
@@ -307,3 +287,53 @@ class ReshapeDistributedOp(DistributedOp):
         self._apply_partial_status(x_layout, out_layout)
 
         return out_layout, local_dst_shape
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, list]:
+        """
+        Infer output layout for Reshape operator.
+
+        Rules:
+            1. Partial input is allowed and preserved on the output layout.
+            2. Target shape must be a Tensor, tuple, or list.
+            3. Input and output total element counts must match after resolving one dynamic axis.
+            4. Reshape must preserve each device's local data slice; sharded axes can only be
+               split or merged when the shard boundary remains valid.
+            5. Output Partial status follows the input Partial status.
+
+        Args:
+            cache_values (list): [input_layout, dst_shape, input_shape].
+
+        Returns:
+            tuple: ((output_layout,), local_dst_shape)
+
+        Raises:
+            ValueError: If target shape is invalid or the reshape would change sharded slices.
+        """
+        if len(cache_values) != 3:
+            raise ValueError(
+                f"For {self.op_name}, cache_values length should be 3, but got {len(cache_values)}"
+            )
+
+        x_layout, dst_shape, input_shape = cache_values[0], cache_values[1], cache_values[2]
+        if x_layout is None:
+            raise ValueError(f"For {self.op_name}, reshape requires a valid input tensor layout.")
+
+        out_layout, local_dst_shape = self._infer_reshape_layout(x_layout, dst_shape, input_shape)
+        return ((out_layout,), local_dst_shape)
+
+    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,
+                        cache_values: list) -> Optional[Callable]:
+        """Return a closure that calls reshape/view with the inferred local target shape."""
+        del cache_values
+        if func is None:
+            return None
+
+        local_dst_shape = infer_result[1]
+        if local_dst_shape is None:
+            return None
+
+        def expand_impl(x: object, shape: object) -> object:
+            del shape
+            return func(x, local_dst_shape)
+
+        return expand_impl

@@ -15,10 +15,10 @@
 """test ut for parallel slice infer_layout"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_slice import SliceDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -40,11 +40,13 @@ class TestParallelSlice(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -82,18 +84,22 @@ class TestParallelSlice(unittest.TestCase):
         mesh = self._make_2x4_mesh(mock_platform)
         x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
-        output_info = op.infer_layout((x_layout,), ((0, 0), (8, 4), (8, 8)))
-        assert x_layout == output_info[0]
-        assert output_info[1] == (0, 0)
-        assert output_info[2] == (4, 4)
+        cache_values = [x_layout, (0, 0), (8, 4), (8, 8)]
+        output_layouts, extra_info = op.infer_layout(cache_values)
+        assert output_layouts == (x_layout,)
+        assert extra_info[0] == (0, 0)
+        assert extra_info[1] == (4, 4)
 
-        # Since `get_expand_impl` is not overridden, it returns None by default.
-        # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_info, (x_layout,), 
-                                  ((0, 0), (8, 4), (8, 8))) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_info, (x_layout,), ((0, 0), (8, 4), (8, 8)))}"
-        )
+        calls = []
+
+        def fake_slice(x, begin, end):
+            calls.append((x, begin, end))
+            return "sliced"
+
+        impl = op.get_expand_impl(fake_slice, (output_layouts, extra_info), cache_values)
+        assert impl is not None
+        assert impl("local_x", (0, 0), (8, 4)) == "sliced"
+        assert calls == [("local_x", (0, 0), (4, 4))]
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_slice_layout_2(self, mock_platform):
@@ -106,8 +112,28 @@ class TestParallelSlice(unittest.TestCase):
         x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
         with self.assertRaises(ValueError):
-            _ = op.infer_layout((x_layout,), ((0, 0), (4, 4), (8, 8)))
+            _ = op.infer_layout([x_layout, (0, 0), (4, 4), (8, 8)])
 
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_slice_preprocess(self, mock_platform):
+        """
+        Feature: Slice preprocess
+        Description: Verify local args and cache values are built in new dispatch format
+        Expectation: Success
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+        local_tensor = MagicMock()
+        input_tensor = MagicMock()
+        input_tensor.layout = x_layout
+        input_tensor.shape = (8, 8)
+        input_tensor.to_local.return_value = local_tensor
+
+        local_args, local_kwargs, cache_values = op.preprocess((input_tensor, (0, 0), (8, 4)), {})
+
+        assert local_args == (local_tensor, (0, 0), (8, 4))
+        assert not local_kwargs
+        assert cache_values == [x_layout, (0, 0), (8, 4), (8, 8)]
 
 if __name__ == "__main__":
     unittest.main()
