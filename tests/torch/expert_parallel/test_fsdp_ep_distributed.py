@@ -67,9 +67,12 @@ def test_fsdp_ep_three_step_training():
     """
     Feature: FSDP + EP 3-step training convergence.
     Description:
-        4-card setup: 2 FSDP × 2 EP.  Train for 3 steps on the same small batch.
-        Loss should decrease monotonically (overfit verification).
-    Expectation: Run success with loss decreasing.
+        4-card setup: 2 FSDP × 2 EP.  Train standalone and FSDP+EP for 3 steps
+        on the same small batch and verify their loss values match.  The FSDP+EP
+        backward loss is divided by ``world_size`` to compensate for the
+        ep_size × token-duplication of expert gradients and the SUM reduce that
+        fully_shard applies when expert parameters are DTensors.
+    Expectation: FSDP+EP loss matches standalone loss within rtol=1e-3, atol=1e-3.
     """
     _run_group(
         ("test_fsdp_ep_three_step_training_npu", 10502, 4),
