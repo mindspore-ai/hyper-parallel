@@ -13,10 +13,10 @@
 #   - PyTorch NpuExtension (hyper_parallel_mega_moe_pta) — disabled by default
 #
 # BUILD_MULTICORE_EXTENSION controls multicore build scope:
-#   unset / 0: skip multicore entirely
-#   1: build MindSpore multicore
-#   2: build PyTorch multicore
-#   all: build both MindSpore multicore and PyTorch multicore
+#   unset / off: skip multicore entirely
+#   mindspore / ms: build MindSpore multicore
+#   torch / pytorch: build PyTorch multicore
+#   all / both: build both MindSpore multicore and PyTorch multicore
 
 # ── User-configurable flags ────────────────────────────────────────────────────
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
@@ -31,17 +31,17 @@ case "${BUILD_MULTICORE_EXTENSION}" in
         BUILD_MULTICORE_MINDSPORE=true
         BUILD_MULTICORE_TORCH=true
         ;;
-    ""|0|skip|SKIP|none|NONE|false|FALSE)
+    ""|off|OFF)
         ;;
-    1|mindspore|MINDSPORE|ms|MS)
+    mindspore|MINDSPORE|ms|MS)
         BUILD_MULTICORE_MINDSPORE=true
         ;;
-    2|torch|TORCH|pytorch|PYTORCH)
+    torch|TORCH|pytorch|PYTORCH)
         BUILD_MULTICORE_TORCH=true
         ;;
     *)
         echo "ERROR: Unsupported BUILD_MULTICORE_EXTENSION=${BUILD_MULTICORE_EXTENSION}."
-        echo "       Use unset/0 to skip, 1 for MindSpore, 2 for PyTorch, or all for both."
+        echo "       Use unset/off to skip, mindspore for MindSpore, torch for PyTorch, or all for both."
         exit 1
         ;;
 esac

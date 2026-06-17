@@ -4,13 +4,18 @@
 
 HyperParallel提供昇腾超节点亲和的分布式并行加速能力，在保障易用性的前提下，针对昇腾超节点资源池化、对等架构、网路拓扑分层多样、FP8低精格式等架构特点，实现了集群的分布式并行到芯片内多核并行，支持CPU
 DRAM和NPU HBM的池化统一管理，支持拓扑感知调度和通信路径规划，支持FP8混合精度训练等昇腾超节点亲和的加速能力。
+
 关键设计思路:
+
 **模型和系统优化解耦**
-：随着LLM和多模态算法新架构的不断演进，性能优化技术也随之向前持续创新，传统的算法和系统优化融合架构给算法迭代和系统长期维护带来了困难。我们希望通过HyperParallel，支持编程模型从系统优化内嵌到模型脚本演进到模型和系统优化解耦，隐式注入并行、重计算、offload等系统优化；支持并行范式从SPMD演进到MPMD，进一步支持集群MPMD和多核MPMD协同优化；支持存算关系从Stateful演进到Stateless计算状态分离。支持大语言模型、多模态大模型训练及强化学习等能力。
+：随着LLM和多模态算法新架构的不断演进，性能优化技术也随之向前持续创新，传统的算法和系统优化融合架构给算法迭代和系统长期维护带来了困难。通过HyperParallel，支持编程模型从系统优化内嵌到模型脚本演进到模型和系统优化解耦，隐式注入并行、重计算、offload等系统优化；支持并行范式从SPMD演进到MPMD，进一步支持集群MPMD和多核MPMD协同优化；支持存算关系从Stateful演进到Stateless计算状态分离。支持大语言模型、多模态大模型训练及强化学习等能力。
+
 **全流程确定性**
-：为了进一步保障训练稳定性和精度可复现性，HyperParallel支持了全流程的确定性，包括高性能确定性计算、通信、数据预处理、以及随机数的确定性，支持浮点bitwise对齐，所有支持的模型均会用确定性进行验证。虽然有部分的性能劣化，但出于对训练精度可复现性、SDC的快速发现、bug识别，我们仍然建议训练开启确定性。
+：为了进一步保障训练稳定性和精度可复现性，HyperParallel支持了全流程的确定性，包括高性能确定性计算、通信、数据预处理、以及随机数的确定性，支持浮点bitwise对齐，所有支持的模型均会用确定性进行验证。虽然有部分的性能劣化，但出于对训练精度可复现性、SDC的快速发现、bug识别，仍然建议训练开启确定性。
+
 **训推一体**：随着Reasoning RL和Agentic
 RL任务越来越复杂，训推不一致问题导致强化学习训练难以收敛的问题愈发突出。HyperParallel会探索训推一体架构，通过一套加速框架同时实现训练和推理的性能优化，加强训推一致性，保障RL收敛。
+
 **动静混合**
 ：基于静态图的优化是进一步提升性能的重要手段，比如基于静态图的通算并发、内存分析、执行序编排等能力可以有效优化性能，在动态图模式下并不容易实现。但动转静的编译支持难度非常大，目前还不能实现完全的动转静。HyperParallel会通过一些语法的约束，支持局部的动转静，使用MindSpore高阶图优化能力，进一步提升性能。
 
@@ -25,8 +30,8 @@ RL任务越来越复杂，训推不一致问题导致强化学习训练难以收
 
 ### HyperMPMD：并行范式演进，SPMD -> 集群MPMD -> 集群+多核MPMD
 
-- 分布式MPMD：支持异构模型切分，支持模型切片任意分配卡数；<br>
-- 多核MPMD：芯片内多核MPMD并行，结合核级内存语义单边通信，增强通算掩盖和MAC利用率；
+- 集群MPMD：支持异构模型切分，支持模型切片任意分配卡数；<br>
+- 芯片内多核MPMD：芯片内多核MPMD并行，结合核级内存语义单边通信，增强通算掩盖和MAC利用率；
 
 ### HyperOffload：算存关系演进，Stateful -> Stateless计算状态分离
 
@@ -145,7 +150,7 @@ RL任务越来越复杂，训推不一致问题导致强化学习训练难以收
     - [ ] ReduceScatter
     - [ ] 低精通信高精累加
 
-- 故障快恢
+- 故障快速恢复
     - [x] DCP（Distributed Checkpoint）
         - [x] 分布式检查点保存/加载
         - [x] 异步staging保存
@@ -153,7 +158,7 @@ RL任务越来越复杂，训推不一致问题导致强化学习训练难以收
         - [ ] 支持Huggingface格式
         - [ ] 支持不同切分策略倒换
     - [ ] 基础故障恢复流程
-    - [ ] 进程级故障快恢
+    - [ ] 进程级故障快速恢复
     - [ ] 临终遗言
     - [ ] SDC检测
 
@@ -181,7 +186,7 @@ RL任务越来越复杂，训推不一致问题导致强化学习训练难以收
 HyperParallel 提供两种安装方式：
 
 - **pip 安装**：安装已经构建好的 `hyper-parallel` 包，并通过 extras 选择运行时深度学习框架依赖。
-- **源码构建**：使用 `python setup.py bdist_wheel` 生成 whl 包，并按构建开关决定是否编译 native 扩展。
+- **源码构建**：使用 `./build.sh` 生成 whl 包，并按构建参数决定是否编译 native 扩展。
 
 如果只需要安装已发布的包，优先使用 `pip install`。如果需要在本机生成 whl，或需要调整 native 扩展构建配置，再使用源码构建。
 
@@ -203,45 +208,37 @@ zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释�
 
 ### 2. 从源码编译 whl 包
 
-使用源码构建 hyper-parallel 可选择编译 `multicore`、`symmetric memory`、`custom ops` 三个 native 模块。三个模块分别由以下脚本触发：
+基于源码构建 hyper-parallel 可选择编译 `multicore`、`symmetric memory`、`custom ops` 三个 native 模块。
 
-三个模块会在 `setup.py` 中作为 optional build step 执行：默认不编译；只有显式设置对应环境变量时才会启用。
-如果某个脚本失败，会记录 warning 并继续打包。若目标 whl 需要对应 native 能力，应确保对应构建环境完整。
+通过 `build.sh` 构建 whl 支持以下编译参数：
 
-可以通过以下方式控制 `multicore`、`symmetric memory`、`custom ops` 三个模块的编译行为：
+| 参数             | 默认值         | 可选值                                                   | 说明                                                                              |
+|----------------|-------------|-------------------------------------------------------|---------------------------------------------------------------------------------|
+| `--multicore`  | `mindspore` | `off`、`mindspore`、`ms`、`torch`、`pytorch`、`all`、`both` | 控制 multicore 模块编译范围；`ms` 等价于 `mindspore`，`pytorch` 等价于 `torch`，`both` 等价于 `all` |
+| `--shmem`      | `all`       | `off`、`mindspore`、`ms`、`torch`、`pytorch`、`all`、`both` | 控制 symmetric memory 模块编译范围；`all` 同时编译公共库、MindSpore wrapper 和 PyTorch wrapper    |
+| `--custom-ops` | `on`        | `on`、`off`                                            | 控制 MindSpore custom ops 是否编译                                                    |
+| `--strict`     | `on`        | `on`、`off`                                            | 控制 native 模块构建失败时是否终止 whl 构建；`off` 会记录 warning 并继续打包                             |
 
-| 模块                 | 环境变量                         | 取值       | 编译行为                                           |
-|--------------------|------------------------------|----------|------------------------------------------------|
-| `multicore`        | `BUILD_MULTICORE_EXTENSION`  | 不设置或 `0` | 跳过整个 multicore 模块                              |
-| `multicore`        | `BUILD_MULTICORE_EXTENSION`  | `1`      | 只编译 MindSpore multicore                        |
-| `multicore`        | `BUILD_MULTICORE_EXTENSION`  | `2`      | 只编译 PyTorch multicore；如 `USE_NINJA=1` 还需 ninja |
-| `multicore`        | `BUILD_MULTICORE_EXTENSION`  | `all`    | 同时编译 MindSpore multicore 和 PyTorch multicore   |
-| `symmetric memory` | `BUILD_SHMEM_EXTENSION`      | 不设置或 `0` | 跳过整个 symmetric memory 模块                       |
-| `symmetric memory` | `BUILD_SHMEM_EXTENSION`      | `all`    | 编译公共库、MindSpore wrapper、PyTorch wrapper        |
-| `symmetric memory` | `BUILD_SHMEM_EXTENSION`      | `1`      | 只编译公共库和 MindSpore wrapper                      |
-| `symmetric memory` | `BUILD_SHMEM_EXTENSION`      | `2`      | 只编译公共库和 PyTorch wrapper                        |
-| `custom ops`       | `BUILD_CUSTOM_OPS_EXTENSION` | 不设置或 `0` | 跳过 custom ops                                  |
-| `custom ops`       | `BUILD_CUSTOM_OPS_EXTENSION` | `1`      | 编译 MindSpore custom ops                        |
+源码构建 hyper-parallel 环境要求如下：
 
-在配置好对应编译配置后，从源码构建 hyper-parallel 命令如下：
+| 环境项               | 要求                                    | 说明                                                                            |
+|-------------------|---------------------------------------|-------------------------------------------------------------------------------|
+| Python            | 3.10、3.11 或 3.12                      | 构建出的 whl 仅可装到对应 Python 小版本的解释器上                                               |
+| 主机 GCC            | [7.3.0, 11.3.0]                       | 与 MindSpore 编译策略一致                                                            |
+| CMake             | ≥ 3.18                                | native 扩展构建需要                                                                 |
+| CANN 工具链          | 启用 native 扩展时需要可用的 `ASCEND_HOME_PATH` | 脚本会尝试 source `/usr/local/Ascend/cann/set_env.sh`                              |
+| MindSpore         | ≥ 2.10                                | 当 `--custom-ops on`，`--multicore mindspore/all`，或 `--shmem all/mindspore` 时需要 |
+| PyTorch 及 NPU 适配包 | PyTorch 后端对应版本                        | 当 `--multicore torch/all`，或 `--shmem all/torch` 时需要                           |
 
 ```bash
 git clone https://gitcode.com/mindspore/hyper-parallel.git
 cd hyper-parallel
-python setup.py bdist_wheel
+./build.sh
+./build.sh --multicore all --shmem all --custom-ops on
+./build.sh --multicore torch --shmem torch --strict off
+./build.sh --multicore off --shmem off --custom-ops off
 pip install dist/hyper_parallel-*.whl
 ```
-
-源码构建 hyper-parallel 环境要求如下：
-
-| 环境项               | 要求                                    | 说明                                                                                                     |
-|-------------------|---------------------------------------|--------------------------------------------------------------------------------------------------------|
-| Python            | 3.10、3.11 或 3.12                      | 构建出的 whl 仅可装到对应 Python 小版本的解释器上                                                                        |
-| 主机 GCC            | [7.3.0, 11.3.0]                       | 与 MindSpore 编译策略一致                                                                                     |
-| CMake             | ≥ 3.18                                | native 扩展构建需要                                                                                          |
-| CANN 工具链          | 启用 native 扩展时需要可用的 `ASCEND_HOME_PATH` | 脚本会尝试 source `/usr/local/Ascend/cann/set_env.sh`                                                       |
-| MindSpore         | ≥ 2.10                                | 当 `BUILD_CUSTOM_OPS_EXTENSION=1`，`BUILD_MULTICORE_EXTENSION=1/all`，或 `BUILD_SHMEM_EXTENSION=all/1` 时需要 |
-| PyTorch 及 NPU 适配包 | PyTorch 后端对应版本                        | 当 `BUILD_MULTICORE_EXTENSION=2/all`，或 `BUILD_SHMEM_EXTENSION=all/2` 时需要                                |
 
 > 注意事项：构建出的 whl 对运行环境的 glibc 版本有要求，安装环境的 glibc 需不低于编译环境的 glibc 版本。
 > 如需部署到旧系统，请在更老的发布镜像内编译；例如在 OpenEuler 22.03（glibc 2.34）编出的 whl 无法在 glibc < 2.34 的环境运行。

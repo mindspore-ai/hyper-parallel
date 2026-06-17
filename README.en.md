@@ -9,26 +9,31 @@ architecture, hierarchical and diverse network topology, and FP8 low-precision f
 parallelism from cluster level to multi-core parallelism within chips, supports unified pooled management of CPU DRAM
 and NPU HBM, topology-aware scheduling and communication path planning, and FP8 mixed-precision training amongst other
 Ascend SuperPod-affinity acceleration capabilities.
+
 Key design principles:
+
 **Decoupling of Model and System Optimisation**: With the continuous evolution of LLM and multimodal algorithm
 architectures, performance optimisation techniques have also been advancing. The traditional integrated architecture of
-algorithm and system optimisation poses challenges for algorithm iteration and long-term system maintenance. Through
-HyperParallel, we aim to evolve the programming model from system optimisation embedded within model scripts to a
+algorithm and system optimisation poses challenges for algorithm iteration and long-term system maintenance.
+HyperParallel supports evolving the programming model from system optimisation embedded within model scripts to a
 decoupled model and system optimisation approach, with implicit injection of parallelism, recomputation, offload and
-other system optimisations. We support the evolution of parallel paradigms from SPMD to MPMD, further supporting
-coordinated optimisation of cluster MPMD and multi-core MPMD. We support the evolution of compute-storage relationships
-from Stateful to Stateless with separated computation and state. This supports large language model training, multimodal
+other system optimisations. It supports the evolution of parallel paradigms from SPMD to MPMD, further supporting
+coordinated optimisation of cluster MPMD and multi-core MPMD. It supports the evolution of compute-storage relationships
+from Stateful to Stateless with separated computation and state, as well as large language model training, multimodal
 large model training, and reinforcement learning capabilities.
+
 **End-to-End Determinism**: To further ensure training stability and precision reproducibility, HyperParallel supports
 end-to-end determinism, including high-performance deterministic computation, communication, data preprocessing, and
 random number determinism, supporting floating-point bitwise alignment. All supported models are validated using
-determinism. Although there is some performance degradation, we still recommend enabling determinism during training for
-precision reproducibility, rapid SDC detection, and bug identification.
+determinism. Although there is some performance degradation, enabling determinism during training remains recommended
+for precision reproducibility, rapid SDC detection, and bug identification.
+
 **Unified Training and Inference**: As Reasoning RL and Agentic RL tasks become increasingly complex, the
 training-inference inconsistency problem causing reinforcement learning training convergence difficulties has become
 more prominent. HyperParallel will explore a unified training-inference architecture, achieving performance optimisation
 for both training and inference through a single acceleration framework, strengthening training-inference consistency
 and ensuring RL convergence.
+
 **Hybrid Dynamic-Static Execution**: Optimisation based on static graphs is an important means of further improving
 performance. For instance, capabilities such as compute-communication concurrency, memory analysis, and execution
 sequence orchestration based on static graphs can effectively optimise performance, which are not easily achievable in
@@ -50,8 +55,8 @@ performance.
 
 ### HyperMPMD: Parallel Paradigm Evolution, SPMD -> Cluster MPMD -> Cluster + Multi-Core MPMD
 
-- Distributed MPMD: Supports heterogeneous model sharding, supports arbitrary device allocation for model slices;
-- Multi-Core MPMD: Intra-chip multi-core MPMD parallelism, combined with core-level memory semantic one-sided
+- Cluster MPMD: Supports heterogeneous model sharding, supports arbitrary device allocation for model slices;
+- Intra-Chip Multi-Core MPMD: Intra-chip multi-core MPMD parallelism, combined with core-level memory semantic one-sided
   communication, enhancing compute-communication overlap and MAC utilisation;
 
 ### HyperOffload: Compute-Storage Relationship Evolution, Stateful -> Stateless Computation-State Separation
@@ -174,7 +179,7 @@ performance.
     - [ ] ReduceScatter
     - [ ] Low-Precision Communication with High-Precision Accumulation
 
-- Fault Recovery
+- Fast Fault Recovery
     - [x] DCP (Distributed Checkpoint)
         - [x] Distributed checkpoint save/load
         - [x] Async staging save
@@ -182,7 +187,7 @@ performance.
         - [ ] Huggingface Format Support
         - [ ] Different Sharding Strategy Conversion Support
     - [ ] Basic Fault Recovery Workflow
-    - [ ] Process-Level Fast Recovery
+    - [ ] Process-Level Fast Fault Recovery
     - [ ] Last Words (fault-triggered checkpoint saving)
     - [ ] SDC Detection
 
@@ -211,8 +216,8 @@ HyperParallel offers two installation methods:
 
 - **pip installation**: install an already built `hyper-parallel` package and use extras to select runtime deep
   learning framework dependencies.
-- **source build**: use `python setup.py bdist_wheel` to generate a whl package, and use build switches to decide
-  whether native extensions are compiled.
+- **source build**: use `./build.sh` to generate a whl package, and use build arguments to decide whether native
+  extensions are compiled.
 
 If you only need to install a released package, prefer `pip install`. If you need to generate a whl package locally or
 customize native extension build options, build from source.
@@ -236,36 +241,15 @@ In shells such as zsh, quote package names with extras so `[]` is not treated as
 ### 2. Build a Wheel From Source
 
 Building hyper-parallel from source can compile three native modules: `multicore`, `symmetric memory`, and `custom ops`.
-These three modules are triggered by the following scripts:
 
-The three modules are executed as optional build steps in `setup.py`: they are not built by default and are enabled
-only when the corresponding environment variable is set explicitly. If a script fails, a warning is recorded and
-packaging continues. If the target whl requires the corresponding native capability, make sure the required build
-environment is complete.
+Building a whl with `build.sh` supports the following build arguments:
 
-The build behavior of `multicore`, `symmetric memory`, and `custom ops` can be controlled as follows:
-
-| Module             | Environment variable         | Value        | Build behavior                                                        |
-|--------------------|------------------------------|--------------|-----------------------------------------------------------------------|
-| `multicore`        | `BUILD_MULTICORE_EXTENSION`  | unset or `0` | Skip the entire multicore module                                      |
-| `multicore`        | `BUILD_MULTICORE_EXTENSION`  | `1`          | Build MindSpore multicore only                                        |
-| `multicore`        | `BUILD_MULTICORE_EXTENSION`  | `2`          | Build PyTorch multicore only; ninja is also required if `USE_NINJA=1` |
-| `multicore`        | `BUILD_MULTICORE_EXTENSION`  | `all`        | Build both MindSpore multicore and PyTorch multicore                  |
-| `symmetric memory` | `BUILD_SHMEM_EXTENSION`      | unset or `0` | Skip the entire symmetric memory module                               |
-| `symmetric memory` | `BUILD_SHMEM_EXTENSION`      | `all`        | Build the common library, MindSpore wrapper, and PyTorch wrapper      |
-| `symmetric memory` | `BUILD_SHMEM_EXTENSION`      | `1`          | Build only the common library and MindSpore wrapper                   |
-| `symmetric memory` | `BUILD_SHMEM_EXTENSION`      | `2`          | Build only the common library and PyTorch wrapper                     |
-| `custom ops`       | `BUILD_CUSTOM_OPS_EXTENSION` | unset or `0` | Skip custom ops                                                       |
-| `custom ops`       | `BUILD_CUSTOM_OPS_EXTENSION` | `1`          | Build MindSpore custom ops                                            |
-
-After configuring the desired build behavior, build hyper-parallel from source as follows:
-
-```bash
-git clone https://gitcode.com/mindspore/hyper-parallel.git
-cd hyper-parallel
-python setup.py bdist_wheel
-pip install dist/hyper_parallel-*.whl
-```
+| Argument       | Default     | Values                                                                  | Description                                                                                                                   |
+|----------------|-------------|-------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|
+| `--multicore`  | `mindspore` | `off`, `mindspore`, `ms`, `torch`, `pytorch`, `all`, `both`             | Controls the multicore build scope; `ms` is equivalent to `mindspore`, `pytorch` is equivalent to `torch`, and `both` is equivalent to `all` |
+| `--shmem`      | `all`       | `off`, `mindspore`, `ms`, `torch`, `pytorch`, `all`, `both`             | Controls the symmetric memory build scope; `all` builds the common library, MindSpore wrapper, and PyTorch wrapper             |
+| `--custom-ops` | `on`        | `on`, `off`                                                             | Controls whether MindSpore custom ops are built                                                                               |
+| `--strict`     | `on`        | `on`, `off`                                                             | Controls whether native module build failures stop whl building; `off` records a warning and continues packaging              |
 
 Source build environment requirements for hyper-parallel are as follows:
 
@@ -275,8 +259,18 @@ Source build environment requirements for hyper-parallel are as follows:
 | Host GCC                        | [7.3.0, 11.3.0]                                                           | Aligned with MindSpore's compile policy                                                                           |
 | CMake                           | >= 3.18                                                                   | Required for native extension builds                                                                              |
 | CANN toolkit                    | A valid `ASCEND_HOME_PATH` is required when native extensions are enabled | Scripts try to source `/usr/local/Ascend/cann/set_env.sh` automatically                                           |
-| MindSpore                       | >= 2.10                                                                   | Required when `BUILD_CUSTOM_OPS_EXTENSION=1`, `BUILD_MULTICORE_EXTENSION=1/all`, or `BUILD_SHMEM_EXTENSION=all/1` |
-| PyTorch and NPU adapter package | Backend-compatible PyTorch version                                        | Required when `BUILD_MULTICORE_EXTENSION=2/all`, or `BUILD_SHMEM_EXTENSION=all/2`                                 |
+| MindSpore                       | >= 2.10                                                                   | Required when `--custom-ops on`, `--multicore mindspore/all`, or `--shmem all/mindspore`                         |
+| PyTorch and NPU adapter package | Backend-compatible PyTorch version                                        | Required when `--multicore torch/all`, or `--shmem all/torch`                                                     |
+
+```bash
+git clone https://gitcode.com/mindspore/hyper-parallel.git
+cd hyper-parallel
+./build.sh
+./build.sh --multicore all --shmem all --custom-ops on
+./build.sh --multicore torch --shmem torch --strict off
+./build.sh --multicore off --shmem off --custom-ops off
+pip install dist/hyper_parallel-*.whl
+```
 
 > Note: the built whl has requirements on the glibc version of the runtime environment. The glibc version in the
 > installation environment must be no lower than the glibc version in the build environment.

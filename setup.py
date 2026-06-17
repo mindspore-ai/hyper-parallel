@@ -54,15 +54,18 @@ MINDSPORE_REQUIRES = [
 
 NATIVE_BUILD_VALUES = {
     "BUILD_MULTICORE_EXTENSION": {
-        "1", "mindspore", "ms", "2", "torch", "pytorch", "all", "both",
+        "mindspore", "ms", "torch", "pytorch", "all", "both",
     },
     "BUILD_SHMEM_EXTENSION": {
-        "1", "mindspore", "ms", "2", "torch", "pytorch", "all", "both", "true",
+        "mindspore", "ms", "torch", "pytorch", "all", "both",
     },
     "BUILD_CUSTOM_OPS_EXTENSION": {
-        "1", "true", "on", "yes",
+        "on",
     },
 }
+
+STRICT_NATIVE_BUILD_TRUE_VALUES = {"1", "true", "on", "yes"}
+STRICT_NATIVE_BUILD_FALSE_VALUES = {"", "0", "false", "off", "no"}
 
 
 def _check_gcc_version():
@@ -103,6 +106,18 @@ def _should_check_gcc_version() -> bool:
         if env_value in enabled_values:
             return True
     return False
+
+
+def _is_strict_native_build() -> bool:
+    """Return True when optional native build failures should fail wheel building."""
+    env_value = os.environ.get("HYPER_PARALLEL_BUILD_STRICT", "").strip().lower()
+    if env_value in STRICT_NATIVE_BUILD_TRUE_VALUES:
+        return True
+    if env_value in STRICT_NATIVE_BUILD_FALSE_VALUES:
+        return False
+    raise ValueError(
+        "HYPER_PARALLEL_BUILD_STRICT must be one of 1/0, true/false, on/off, or yes/no."
+    )
 
 
 def _read_requirements(requirements_path: str) -> list[str]:
@@ -214,6 +229,9 @@ class BuildPy(build_py):
     """Build py files."""
 
     def run(self):
+        strict_native_build = _is_strict_native_build()
+        if strict_native_build:
+            logger.info("Strict native build mode enabled.")
         if _should_check_gcc_version():
             _check_gcc_version()
         # Native build scripts write .so files into build/lib/hyper_parallel/
@@ -224,9 +242,9 @@ class BuildPy(build_py):
         native_lib_dir = os.path.join(
             os.path.dirname(__file__), 'build', 'lib', 'hyper_parallel')
         shutil.rmtree(native_lib_dir, ignore_errors=True)
-        self._run_shell_script_optional("scripts/build_symmetric_memory.sh")
-        self._run_shell_script_optional("scripts/build_multicore.sh")
-        self._run_shell_script_optional("scripts/build_custom_ops.sh")
+        self._run_shell_script_optional("scripts/build_symmetric_memory.sh", strict=strict_native_build)
+        self._run_shell_script_optional("scripts/build_multicore.sh", strict=strict_native_build)
+        self._run_shell_script_optional("scripts/build_custom_ops.sh", strict=strict_native_build)
         super().run()
         target_lib_dir = os.path.join(self.build_lib, 'hyper_parallel')
         if os.path.isdir(native_lib_dir) and \
@@ -247,7 +265,7 @@ class BuildPy(build_py):
         cmd = ["bash", script_path] + args
         logger.info("Executing: %s", ' '.join(cmd))
         try:
-            result = subprocess.run(cmd, check=True,capture_output=capture_output, text=True)
+            result = subprocess.run(cmd, check=True, capture_output=capture_output, text=True)
             if result.stdout:
                 logger.info("Success: %s", result.stdout)
         except subprocess.CalledProcessError as e:
@@ -255,11 +273,13 @@ class BuildPy(build_py):
             logger.error(error_msg)
             raise RuntimeError(error_msg) from e
 
-    def _run_shell_script_optional(self, script_path, args=None):
+    def _run_shell_script_optional(self, script_path, args=None, strict=False):
         """Execute shell script; log a warning on failure instead of raising."""
         try:
             self._run_shell_script(script_path, args=args)
         except (FileNotFoundError, RuntimeError) as e:
+            if strict:
+                raise
             logger.warning("Optional build step skipped (%s): %s", script_path, e)
 
 
