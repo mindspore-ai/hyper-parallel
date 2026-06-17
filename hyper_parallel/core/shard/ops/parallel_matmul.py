@@ -22,6 +22,72 @@ from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
 
 
+def _propagate_partial_from_inputs(out_layout, x_layout, w_layout):
+    """
+    Propagate Partial status from input layouts to the output layout for matmul-like operations.
+
+    For matmul ``y = x @ w``, the output should inherit Partial state from its inputs in addition
+    to any Partial state induced by the contracting dimension being sharded.
+
+    **Semantic rules for input Partial propagation:**
+
+    +-------------------+----------------------------+----------------------------------------------+
+    | x input           | w / weight                 | output behavior                              |
+    +-------------------+----------------------------+----------------------------------------------+
+    | **Partial(d)**    | **Replicate** (contracting) | **Propagate Partial(d)**.                    |
+    |                   |                            | Distributive law:                             |
+    |                   |                            | ``(x0 + x1) @ w = x0 @ w + x1 @ w``.        |
+    |                   |                            | Output carries Partial(d).                   |
+    +-------------------+----------------------------+----------------------------------------------+
+    | Replicate         | **Partial(d)**             | **Propagate Partial(d)**. Symmetric to above.|
+    +-------------------+----------------------------+----------------------------------------------+
+    | **Partial(d1)**   | **Partial(d2)**, d1 != d2  | **Propagate both**.                          |
+    |                   |                            | Each partial axis is independent;            |
+    |                   |                            | ``(sum over d2)`` applied to x is legal.      |
+    +-------------------+----------------------------+----------------------------------------------+
+    | **Partial(d)**    | **Partial(d)** same axis   | **Error**. Cross-terms ``x0 @ w1`` and       |
+    |                   | same/different ops         | ``x1 @ w0`` cannot be computed locally.      |
+    +-------------------+----------------------------+----------------------------------------------+
+    | **Partial(d)**    | **Shard(d)** on the same   | **Error** naturally raised by                |
+    |                   | device axis in the output  | ``Layout.set_partial_by_dev_axis``:          |
+    |                   | dimension map              | "Partial dim must be replicate."             |
+    +-------------------+----------------------------+----------------------------------------------+
+
+    Args:
+        out_layout (Layout): The partially-built output layout whose ``alias_tensor_map``
+            has already been set (via ``Layout.__call__``).
+        x_layout (Layout): Layout of the first input tensor (activations).
+        w_layout (Layout): Layout of the second input tensor (weight / matrix).
+
+    Raises:
+        ValueError: If both ``x_layout`` and ``w_layout`` have Partial on the same device
+            axis with different reduce operations (e.g. one is 'sum' and the other 'avg').
+    """
+    if x_layout is None or w_layout is None:
+        return
+
+    # Propagate x's partial status to output
+    for dev_idx, op in enumerate(x_layout.partial):
+        if op is not None:
+            out_layout.set_partial_by_dev_axis(
+                x_layout.alias_name[dev_idx], op
+            )
+
+    # Propagate w's partial status to output, checking for conflicts with x's partial
+    for dev_idx, op in enumerate(w_layout.partial):
+        if op is not None:
+            axis_alias = w_layout.alias_name[dev_idx]
+            existing = out_layout.get_partial_by_dev_id(axis_alias)
+            if existing is not None and existing != op:
+                raise ValueError(
+                    f"Cannot propagate Partial from both input layouts: "
+                    f"x has Partial({existing}) on axis '{axis_alias}' while "
+                    f"w has Partial({op}) on the same axis. "
+                    f"Partial on the same axis with different reduce ops for both inputs is invalid."
+                )
+            out_layout.set_partial_by_dev_axis(axis_alias, op)
+
+
 class MatMulExtDistributedOp(DistributedOp):
     """Distributed implementation for MatMul operator."""
     def infer_layout(self, layouts: tuple, extra_args: Optional[tuple] = None) -> tuple:
@@ -34,6 +100,7 @@ class MatMulExtDistributedOp(DistributedOp):
         1. Batch dimensions should have same layout
         2. Contracting dimensions should have same layout
         3. Output dimensions inherit layouts from non-contracting dimensions
+        4. Input Partial status is propagated to the output
 
         Args:
             x_layout (Layout): Layout of input x
@@ -71,7 +138,10 @@ class MatMulExtDistributedOp(DistributedOp):
         )
         out_layout = output_layout(*output_map)
 
-        # Set partial status
+        # Propagate Partial from inputs (e.g., x already has Partial from a prior matmul)
+        _propagate_partial_from_inputs(out_layout, x_layout, w_layout)
+
+        # Set partial status from contracting dimension sharding
         if x_map[contract_dim] != "None":
             if isinstance(x_map[contract_dim], tuple):
                 for axis in x_map[contract_dim]:
@@ -144,6 +214,9 @@ class MatMulDistributedOp(DistributedOp):
         output_map = list(x_map[:-2]) + [x_map[x_input_dim]] + [w_map[w_output_dim]]
         output_layout = output_layout(*output_map)
 
+        # Propagate Partial from inputs (e.g., x already has Partial from a prior matmul)
+        _propagate_partial_from_inputs(output_layout, x_layout, w_layout)
+
         # Set partial status
         if x_map[x_contract_dim] != "None":
             if isinstance(x_map[x_contract_dim], tuple):
@@ -194,7 +267,7 @@ class BaseBatchMatMulDistributedOp(DistributedOp):
             merged_batch.append(self._merge_batch_entry(xb, wb))
         return merged_batch
 
-    def _build_output_layout(self, x_layout, merged_batch, x_n, w_p, x_contract):
+    def _build_output_layout(self, x_layout, w_layout, merged_batch, x_n, w_p, x_contract):
         """Construct output layout from merged dims and set partial status if needed."""
         output_map = tuple(merged_batch) + (x_n, w_p)
 
@@ -204,6 +277,9 @@ class BaseBatchMatMulDistributedOp(DistributedOp):
             rank_list=x_layout.rank_list
         )
         output_layout = output_layout(*output_map)
+
+        # Propagate Partial from inputs
+        _propagate_partial_from_inputs(output_layout, x_layout, w_layout)
 
         # Set partial status
         if x_contract != "None":
@@ -269,7 +345,7 @@ class BatchMatMulExtDistributedOp(BaseBatchMatMulDistributedOp):
         x_n = x_map[-2]
         w_p = w_map[-1]
 
-        return self._build_output_layout(x_layout, merged_batch, x_n, w_p, x_contract)
+        return self._build_output_layout(x_layout, w_layout, merged_batch, x_n, w_p, x_contract)
 
 
 class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
@@ -340,7 +416,7 @@ class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
 
         merged_batch = self._merge_batches(x_map, w_map)
 
-        return self._build_output_layout(x_layout, merged_batch, x_n, w_p, x_contract)
+        return self._build_output_layout(x_layout, w_layout, merged_batch, x_n, w_p, x_contract)
 
 
 def _normalize_linear_args(x, weight, bias=None):
@@ -410,8 +486,6 @@ class LinearDistributedOp(DistributedOp):
         if not x_layout or not w_layout:
             raise ValueError(f"x_layout : {x_layout}, w_layout : {w_layout}")
 
-        self._check_partial_inputs([x_layout, w_layout])
-
         x_mesh_shape = x_layout.mesh_shape
         w_mesh_shape = w_layout.mesh_shape
         if x_mesh_shape != w_mesh_shape:
@@ -456,6 +530,9 @@ class LinearDistributedOp(DistributedOp):
             rank_list=x_layout.rank_list,
         )
         out_layout = output_layout(*output_map)
+
+        # Propagate Partial from inputs (e.g., x already has Partial from a prior matmul)
+        _propagate_partial_from_inputs(out_layout, x_layout, w_layout)
 
         # Set partial status when contracting dimension is sharded
         if x_map[x_contract_dim] != "None":
