@@ -1,0 +1,74 @@
+name: 🗨️ Request for comments (RFC).
+description: Ask for feedback on major architectural changes or design choices.
+title: "[RFC]: "
+labels: ["RFC"]
+type: "RFC"
+
+body:
+- type: textarea
+  attributes:
+    label: 动机（Motivation）.
+    description: >
+      The motivation of the RFC.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: 目标设计.
+    description: >
+      The proposed change of the RFC.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: 需要设计评审DFX建议.
+    description: >
+      对于设计的详细描述。包括设计思路、设计方案、设计细节等。这里的内容会涉及代码设计的方方面面。
+    placeholder: |
+      如果有以下内容，请一并补充：
+      - 替代方案及各方案优缺点比较，包括性能对比、代码复杂度、可维护性等；
+      - 对现有代码的影响范围，包括需要修改的文件、需要修改的函数等；
+      - 详细的实现细节，包括关键算法、数据结构、参数定义等；
+      - 向后兼容性的分析；
+      - 性能影响分析。
+      - 其他RFCs的关联性。
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: 相关的RFCs和API
+    description: >
+      对于此RFC的API定义或其它RFCs的相关性，需要在此处指出该RFC涉及的对外接口定义和与其它RFCs的依赖关系。
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: 完整的反馈期限.
+    description: >
+      The feedback period of the RFC. Usually at least one week.
+  validations:
+    required: false
+- type: textarea
+  attributes:
+    label: CC List.
+    description: >
+      The list of people you want to CC.
+  validations:
+    required: false
+- type: textarea
+  attributes:
+    label: 其他补充说明.
+    description: >
+      Any other things you would like to mention.
+  validations:
+    required: false
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉! The hyper-parallel core team hosts a biweekly RFC review session, while most RFCs can be discussed online, you can optionally sign up for a slot to discuss your RFC online.
+- type: checkboxes
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: "Make sure you already searched for previous [RFCs](https://gitcode.com/mindspore/hyper-parallel/issues?q=is%3Aall+label%3ARFC+sort%3Arecently-updated)."
+        required: true
