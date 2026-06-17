@@ -1082,7 +1082,7 @@ class AllReduceParamGroup:
 
             if existing_grad is not None and not hsdp_param.accumulated_allreduced_grad:
                 # Get DTensor's local_tensor
-                from hyper_parallel.core.dtensor import DTensor
+                from hyper_parallel.core.dtensor.dtensor import DTensor
                 if isinstance(existing_grad, DTensor):
                     existing_grad_local = existing_grad._local_tensor
                 else:

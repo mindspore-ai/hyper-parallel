@@ -359,15 +359,20 @@ class HSDPModule:
             if isinstance(module, HSDPModule):
                 module.hsdp_scheduler.set_reshard_after_backward(reshard_after_backward)
 
-    def set_reduce_op_type(self, reduce_op_type) -> None:
+    def set_reduce_op_type(self, reduce_op_type, recurse: bool = True) -> None:
         """
-        Set reduce_op_type for all gradient reductions in fully_shard.
-
-        Supports ``"avg"`` and ``"sum"``. Local-parameter FSDP/HSDP keeps the
-        historical ``"avg"`` default, while DTensor-based paths default to ``"sum"``.
+        set reduce_op_type for all reduce operations in HSDP
+        support reduce_op_type "avg" and "sum", default is "avg"
         """
-        if hsdp_state := self.hsdp_scheduler.hsdp_state:
-            hsdp_state.set_reduce_op_type(reduce_op_type)
+        self_module = cast(platform.Module, self)
+        if recurse:
+            sub_modules = [m for _, m in platform.get_cells_and_names(self_module)]
+        else:
+            sub_modules = [self_module]
+        for module in sub_modules:
+            if isinstance(module, HSDPModule):
+                if hsdp_state := module.hsdp_scheduler.hsdp_state:
+                    hsdp_state.set_reduce_op_type(reduce_op_type)
 
     def set_gradient_scaling_factor(self, factor=None):
         """
