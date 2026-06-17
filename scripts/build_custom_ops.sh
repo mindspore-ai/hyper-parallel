@@ -15,8 +15,34 @@
 # into a pre-built .so using MindSpore's CustomOpBuilder.build().
 # The output is placed under build/lib/ relative to the custom_ops source dir
 # and is picked up by setup.py's package_data at install time.
+#
+# BUILD_CUSTOM_OPS_EXTENSION controls whether this component is built:
+#   unset / 0: skip custom ops
+#   1: build custom ops
 
 set -e
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
+CUSTOM_OPS_SRC="$PROJECT_ROOT/hyper_parallel/platform/mindspore/custom_ops"
+CUSTOM_OPS_BUILD_DIR="$CUSTOM_OPS_SRC/build"
+BUILD_CUSTOM_OPS_EXTENSION="${BUILD_CUSTOM_OPS_EXTENSION:-}"
+BUILD_CUSTOM_OPS_EXTENSION_DISPLAY="${BUILD_CUSTOM_OPS_EXTENSION:-unset}"
+
+case "${BUILD_CUSTOM_OPS_EXTENSION}" in
+    1|true|TRUE|on|ON|yes|YES)
+        ;;
+    ""|0|false|FALSE|off|OFF|no|NO)
+        rm -rf "$CUSTOM_OPS_BUILD_DIR"
+        echo "INFO: custom ops build skipped (BUILD_CUSTOM_OPS_EXTENSION=${BUILD_CUSTOM_OPS_EXTENSION_DISPLAY})."
+        exit 0
+        ;;
+    *)
+        echo "ERROR: Unsupported BUILD_CUSTOM_OPS_EXTENSION=${BUILD_CUSTOM_OPS_EXTENSION}."
+        echo "       Use unset/0 to skip custom ops, or 1 to build."
+        exit 1
+        ;;
+esac
 
 SET_ENV_FILE="/usr/local/Ascend/cann/set_env.sh"
 if [ -z "${ASCEND_HOME_PATH}" ]; then
@@ -30,15 +56,10 @@ if [ -z "${ASCEND_HOME_PATH}" ]; then
     fi
 fi
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
-
 # Host GCC must be in [7.3.0, 11.3.0] (mindspore-aligned).
 source "${SCRIPT_DIR}/check_gcc_version.sh"
 check_gcc_version || exit 1
 
-CUSTOM_OPS_SRC="$PROJECT_ROOT/hyper_parallel/platform/mindspore/custom_ops"
-CUSTOM_OPS_BUILD_DIR="$CUSTOM_OPS_SRC/build"
 BUILD_TYPE="${CMAKE_BUILD_TYPE:-RELEASE}"
 
 echo "============================================="

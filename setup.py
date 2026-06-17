@@ -33,6 +33,37 @@ ROOT_DIR = os.path.dirname(__file__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+TORCH26_REQUIRES = [
+    "torch==2.6.0",
+    "torch-npu==2.6.0.post3",
+]
+
+TORCH27_REQUIRES = [
+    "torch==2.7.1",
+    "torch-npu==2.7.1",
+]
+
+TORCH29_REQUIRES = [
+    "torch==2.9.1",
+    "torch-npu==2.9.1",
+]
+
+MINDSPORE_REQUIRES = [
+    "mindspore>=2.10",
+]
+
+NATIVE_BUILD_VALUES = {
+    "BUILD_MULTICORE_EXTENSION": {
+        "1", "mindspore", "ms", "2", "torch", "pytorch", "all", "both",
+    },
+    "BUILD_SHMEM_EXTENSION": {
+        "1", "mindspore", "ms", "2", "torch", "pytorch", "all", "both", "true",
+    },
+    "BUILD_CUSTOM_OPS_EXTENSION": {
+        "1", "true", "on", "yes",
+    },
+}
+
 
 def _check_gcc_version():
     """Enforce host GCC in [7.3.0, 11.3.0], aligned with mindspore policy.
@@ -65,6 +96,24 @@ def _check_gcc_version():
         logger.info("GCC %s accepted (target range [7.3.0, 11.3.0]).", out)
 
 
+def _should_check_gcc_version() -> bool:
+    """Return True when at least one native build module is explicitly enabled."""
+    for env_name, enabled_values in NATIVE_BUILD_VALUES.items():
+        env_value = os.environ.get(env_name, "").strip().lower()
+        if env_value in enabled_values:
+            return True
+    return False
+
+
+def _read_requirements(requirements_path: str) -> list[str]:
+    """Read Python requirement lines from a repository-local file."""
+    with open(os.path.join(ROOT_DIR, requirements_path), encoding='utf-8') as file:
+        return [
+            line.strip()
+            for line in file
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
 
 def get_readme_content():
     """Read and return the contents of README.md for use as the package long description."""
@@ -96,15 +145,31 @@ def get_description():
     return f'hyper_parallel platform: {os_info}, cpu: {cpu_info}'
 
 
-def get_install_requires():
+def get_install_requires() -> list[str]:
     """
     Get install requirements.
 
     Returns:
         list, list of dependent packages.
     """
-    with open('requirements.txt', encoding='utf-8') as file:
-        return file.read().strip().splitlines()
+    return _read_requirements('requirements.txt')
+
+
+def get_extra_requires() -> dict[str, list[str]]:
+    """
+    Get optional framework requirements.
+
+    Returns:
+        dict, optional dependency groups keyed by extra name.
+    """
+    return {
+        "torch": list(TORCH29_REQUIRES),
+        "torch26": list(TORCH26_REQUIRES),
+        "torch27": list(TORCH27_REQUIRES),
+        "torch29": list(TORCH29_REQUIRES),
+        "mindspore": list(MINDSPORE_REQUIRES),
+        "all": TORCH29_REQUIRES + MINDSPORE_REQUIRES,
+    }
 
 
 def update_permissions(path):
@@ -149,7 +214,8 @@ class BuildPy(build_py):
     """Build py files."""
 
     def run(self):
-        _check_gcc_version()
+        if _should_check_gcc_version():
+            _check_gcc_version()
         # Native build scripts write .so files into build/lib/hyper_parallel/
         # (a fixed path baked into their CMake install rules). When the wheel
         # is tagged as platform-specific (BinaryDistribution), setuptools'
@@ -286,6 +352,7 @@ if __name__ == '__main__':
         distclass=BinaryDistribution,
         python_requires='>=3.10,<3.13',
         install_requires=get_install_requires(),
+        extras_require=get_extra_requires(),
         classifiers=[
             'Development Status :: 4 - Beta',
             'Environment :: Console',
