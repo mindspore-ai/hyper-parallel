@@ -27,7 +27,7 @@ from hyper_parallel.core.dtensor.device_mesh import (
     _DEVICE_MESH_MAP
 )
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
-from tests.custom_ops.parallel_stack_ext import StackExtDistributedOp
+from tests.ut.core.shard.custom_parallel_ops.parallel_stack_ext import StackExtDistributedOp
 
 op = StackDistributedOp("stack")
 

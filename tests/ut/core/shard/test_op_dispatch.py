@@ -36,7 +36,7 @@ from hyper_parallel.core.shard._op_dispatch import LayoutCacheKey
 
 _TEST_FILE_DIR = Path(__file__).resolve().parent
 _TESTS_ROOT_DIR = _TEST_FILE_DIR.parent.parent.parent.parent
-_CUSTOM_OPS_DIR = _TESTS_ROOT_DIR / "tests" / "custom_ops"
+_CUSTOM_OPS_DIR = _TESTS_ROOT_DIR / "tests" / "ut" / "core" / "shard" / "custom_parallel_ops"
 
 HYPER_PARALLEL_OPS_YAML_DIR = str(_CUSTOM_OPS_DIR)
 HYPER_PARALLEL_OPS_PYTHON_PATH = str(_CUSTOM_OPS_DIR)
