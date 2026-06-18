@@ -17,7 +17,7 @@
 
 from collections import defaultdict
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -26,10 +26,9 @@ from torch.distributed.checkpoint.state_dict import (
     get_optimizer_state_dict,
     set_optimizer_state_dict,
 )
-from hyper_parallel.core.optimizer.dtensor_compat import DTensor, to_local_if_dtensor
+from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
     HSDPGroupAssignment,
-    HSDPCommGroup,
     build_owner_by_size,
     get_multi_dim_logical_info,
     select_owned_records,
@@ -174,31 +173,225 @@ class ChainedOptimizer:
 
 
 class BaseDistributedOptimizer(torch.optim.Optimizer):
-    """Base class for distributed optimizers with HSDP-aware communication.
+    """Base class for distributed optimizers with HSDP-aware topology communication.
 
-    Provides fused hierarchical broadcast for parameter and optimizer state
-    synchronization across replicate groups in HSDP topology.
+    Provides fused hierarchical broadcast for parameters and optimizer states.
     """
 
-    def __init__(self, params: Any, defaults: Dict[str, Any], is_muon: bool) -> None:
+    def __init__(
+            self,
+            params: Any,
+            defaults: Dict[str, Any],
+            is_muon: bool,
+            hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
+    ) -> None:
         super().__init__(params, defaults)
         self.is_muon = is_muon
+        self.hsdp_replica_count = hsdp_replica_count
         self._param_to_broadcast_info: Dict[
             torch.nn.Parameter, Tuple[Tuple[int, ...], Tuple[dist.ProcessGroup, ...]]
         ] = {}
 
+        # Cache: (parent_ranks_tuple, sub_size) -> {sub_idx: sub_pg}
+        self._split_sub_pg_cache: Dict[Tuple[Tuple[int, ...], int], Dict[int, dist.ProcessGroup]] = {}
+
     def _group_dtensor_by_mesh(self):
-        """Group dtensor parameters by mesh topology and shard layout."""
+        """Group DTensor parameters by mesh topology and shard layout."""
         self._hsdp_grouping: Dict[int, Tuple[List, List]] = {}
         for group_key, group in enumerate(self.param_groups):
             no_comm_params, hsdp_groups = group_parameters_for_hsdp(group["params"])
             self._hsdp_grouping[group_key] = (no_comm_params, hsdp_groups)
 
+    def _auto_deduce_replica_count(self) -> Optional[Union[int, Tuple[int, ...]]]:
+        """Deduce hsdp_replica_count based on cluster topology.
+
+        - Intra-node PGs: Full dedup (no split), high bandwidth makes broadcast cheap.
+        - Inter-node PGs: Split at node boundaries to restrict communication domains 
+          within a single node, bypassing cross-node bottlenecks.
+        """
+        devices_per_node = 1
+        if torch.npu.is_available():
+            devices_per_node = torch.npu.device_count()
+        elif torch.cuda.is_available():
+            devices_per_node = torch.cuda.device_count()
+
+        dedup_per_dim: Dict[int, int] = {}
+        needs_split = False
+
+        # group_key, (no_comm_params, hsdp_groups)
+        for _, (_, hsdp_groups) in self._hsdp_grouping.items():
+            for hsdp_group in hsdp_groups:
+                for dim_idx, pg in enumerate(hsdp_group.replicate_pgs):
+                    if pg is None:
+                        continue
+                    pg_size = dist.get_world_size(pg)
+                    if pg_size <= 1:
+                        continue
+
+                    if pg_size > devices_per_node:
+                        # Inter-node: Find largest divisor safe for node boundary
+                        dedup = min(pg_size, devices_per_node)
+                        while pg_size % dedup != 0:
+                            dedup -= 1
+                        needs_split = True
+                    else:
+                        # origin Inter-node
+                        dedup = pg_size
+
+                    # Enforce conservative (smallest) dedup across shared mesh axes
+                    if dim_idx not in dedup_per_dim:
+                        dedup_per_dim[dim_idx] = dedup
+                    else:
+                        dedup_per_dim[dim_idx] = min(dedup_per_dim[dim_idx], dedup)
+
+        if not needs_split:
+            return None
+
+        sorted_dedups = [dedup_per_dim[k] for k in sorted(dedup_per_dim.keys())]
+        if len(sorted_dedups) == 1:
+            return sorted_dedups[0]
+
+        return tuple(sorted_dedups)
+
+    def _split_replicate_groups(self) -> None:
+        """Split replicate ProcessGroups into smaller sub-groups based on hsdp_replica_count."""
+        if self.hsdp_replica_count is None:
+            return
+
+        # Argument validation
+        if isinstance(self.hsdp_replica_count, int):
+            if self.hsdp_replica_count <= 0:
+                raise ValueError(f"hsdp_replica_count must be positive, got {self.hsdp_replica_count}")
+        elif isinstance(self.hsdp_replica_count, tuple):
+            if not self.hsdp_replica_count:
+                raise ValueError("hsdp_replica_count tuple must not be empty")
+            for i, v in enumerate(self.hsdp_replica_count):
+                if not isinstance(v, int) or v <= 0:
+                    raise ValueError(f"hsdp_replica_count[{i}] must be positive, got {v}")
+        else:
+            raise TypeError(f"Unsupported hsdp_replica_count type: {type(self.hsdp_replica_count).__name__}")
+
+        for group_key, (_, hsdp_groups) in self._hsdp_grouping.items():
+            for hsdp_group in hsdp_groups:
+                new_replicate_pgs: List[dist.ProcessGroup] = []
+                for dim_idx, pg in enumerate(hsdp_group.replicate_pgs):
+                    if pg is None:
+                        new_replicate_pgs.append(pg)
+                        continue
+
+                    pg_size = dist.get_world_size(pg)
+                    dedup_size = self._get_dedup_size_for_dim(dim_idx, pg_size)
+
+                    if pg_size <= dedup_size:
+                        new_replicate_pgs.append(pg)
+                        continue
+
+                    if pg_size % dedup_size != 0:
+                        raise ValueError(
+                            f"hsdp_replica_count {dedup_size} must evenly divide replicate group size {pg_size}"
+                        )
+
+                    sub_pg = self._get_or_create_sub_pg(pg, dedup_size)
+                    new_replicate_pgs.append(sub_pg)
+
+                    logger.info_rank0(
+                        "[HSDP Split] group_key=%s, dim_idx=%s, original_size=%s, sub_size=%s",
+                        group_key, dim_idx, pg_size, dedup_size
+                    )
+
+                # replace new sub groups of hsdp groups
+                hsdp_group.replicate_pgs = tuple(new_replicate_pgs)
+
+    def _get_dedup_size_for_dim(self, dim_idx: int, pg_size: int) -> int:
+        """Get the effective dedup size for a specific replicate dimension."""
+        if isinstance(self.hsdp_replica_count, int):
+            return self.hsdp_replica_count
+
+        if dim_idx < len(self.hsdp_replica_count):
+            return self.hsdp_replica_count[dim_idx]
+
+        return pg_size
+
+    def _get_or_create_sub_pg(
+            self,
+            parent_pg: dist.ProcessGroup,
+            sub_size: int,
+    ) -> dist.ProcessGroup:
+        """Retrieve or collectively create a synchronized sub-ProcessGroup."""
+        local_parent_ranks = tuple(sorted(list(dist.get_process_group_ranks(parent_pg))))
+        cache_key = (local_parent_ranks, sub_size)
+
+        # Cache Hit Check
+        if cache_key in self._split_sub_pg_cache:
+            sub_pg_map = self._split_sub_pg_cache[cache_key]
+            for sub_idx, sub_pg in sub_pg_map.items():
+                if sub_pg is not None:
+                    try:
+                        dist.get_rank(group=sub_pg)
+                        return sub_pg
+                    except RuntimeError:
+                        continue
+            raise RuntimeError(f"Current rank not found in cached sub-groups for parent_pg={local_parent_ranks}")
+
+        global_rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        # Global Rendezvous via GPU all_gather_into_tensor (NCCL/HCCL fast-path).
+        # Far more scalable than all_gather_object for large world_size.
+        device = torch.npu.current_device() if torch.npu.is_available() else torch.cuda.current_device()
+        num_parent_ranks = len(local_parent_ranks)
+        local_tensor = torch.tensor(local_parent_ranks, dtype=torch.long, device=device)
+        gathered_tensor = torch.empty((world_size, num_parent_ranks), dtype=torch.long, device=device)
+        dist.all_gather_into_tensor(gathered_tensor.view(-1), local_tensor)
+
+        # Deduplicate: each row is one rank's parent_ranks; convert to
+        # sorted set of tuples for deterministic iteration order.
+        gathered_cpu_list = gathered_tensor.cpu().tolist()
+        unique_all_parent_ranks = sorted(set(
+            tuple(row) for row in gathered_cpu_list
+        ))
+
+        sub_pg_map: Dict[int, dist.ProcessGroup] = {}
+        my_sub_pg: Optional[dist.ProcessGroup] = None
+
+        # Synchronized collective creation loop
+        for parent_ranks in unique_all_parent_ranks:
+            num_sub_groups = len(parent_ranks) // sub_size
+
+            for sub_idx in range(num_sub_groups):
+                sub_ranks = parent_ranks[sub_idx * sub_size: (sub_idx + 1) * sub_size]
+                sub_pg = dist.new_group(sub_ranks)
+
+                # Map results only if this parent ranks list matches the current rank's context
+                if parent_ranks == local_parent_ranks:
+                    if global_rank in sub_ranks:
+                        my_sub_pg = sub_pg
+                        sub_pg_map[sub_idx] = sub_pg
+                    else:
+                        sub_pg_map[sub_idx] = None
+
+        self._split_sub_pg_cache[cache_key] = sub_pg_map
+
+        if my_sub_pg is None:
+            raise RuntimeError(
+                f"Rank {global_rank} not found in any sub-group of parent_pg "
+                f"with ranks {local_parent_ranks} and sub_size={sub_size}"
+            )
+
+        return my_sub_pg
+
     def _build_hsdp_batch(
             self,
-            max_batch_numel: int = 512 * 1024 * 1024,
+            max_batch_numel: Optional[int] = None,
     ) -> None:
         """Split HSDP groups into memory-capped batches for compute-broadcast overlap."""
+        if max_batch_numel is None:
+            broadcast_max_bytes = getattr(
+                self, "replicate_broadcast_max_bytes", 512 * 1024 * 1024,
+            )
+            hsdp_size = self.hsdp_replica_count if self.hsdp_replica_count is not None else 1
+            max_batch_numel = broadcast_max_bytes * hsdp_size if hsdp_size > 1 else float('inf')
+
         self._hsdp_batches: Dict[int, List[Dict]] = {}
 
         for group_key, (_, hsdp_groups) in self._hsdp_grouping.items():
@@ -224,16 +417,19 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
                 for record in sorted_records:
                     p_numel = record.param.numel()
 
-                    if current_batch and current_numel + p_numel > max_batch_numel:
-                        sub_batches.append(current_batch)
-                        current_batch = []
-                        current_numel = 0
-
                     current_batch.append({
                         "record": record,
                         "hsdp_group": hsdp_group,
                     })
                     current_numel += p_numel
+
+                    # Soft limit: allow the bucket to slightly exceed the cap
+                    # so that symmetric structures stay together and fragmentation
+                    # is reduced (same approach as PyTorch FSDP/DDP bucketing).
+                    if current_numel >= max_batch_numel:
+                        sub_batches.append(current_batch)
+                        current_batch = []
+                        current_numel = 0
 
                 if current_batch:
                     sub_batches.append(current_batch)
@@ -246,9 +442,9 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
                     "sub_batches": sub_batches,
                 })
 
-            # Debug: log batch split info.
+            # log batch split info.
             total_sub_batches = sum(len(bg["sub_batches"]) for bg in batch_groups)
-            logger.info(
+            logger.info_rank0(
                 "[HSDP Batch] group_key=%s, num_hsdp_groups=%s, num_batch_groups=%s, "
                 "total_sub_batches=%s, group_numels=%s, max_batch_numel=%s",
                 group_key,
@@ -264,9 +460,9 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
     def _build_sub_batch_assignment(
             self,
             sub_batch_entries: List[Dict],
-            hsdp_group: HSDPCommGroup,
+            hsdp_group: Any,
     ) -> Optional[HSDPGroupAssignment]:
-        """Build HSDPGroupAssignment for one sub-batch and register broadcast info."""
+        """Build an HSDPGroupAssignment for one sub-batch and update broadcast info."""
         records = [e["record"] for e in sub_batch_entries]
         if not records:
             return None
@@ -277,6 +473,22 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             device_mesh,
             hsdp_group.comm_key.replicate_mesh_dims,
         )
+
+        # When hsdp_replica_count is set, remap coordinates into
+        # sub-groups: each original coord maps to (coord % sub_size)
+        # within its sub-group, and the effective group size shrinks.
+        # Supports per-dimension control via Tuple[int, ...].
+        if self.hsdp_replica_count is not None:
+            if isinstance(self.hsdp_replica_count, int):
+                dedup_per_dim = (self.hsdp_replica_count,) * len(replicate_group_ranks)
+            else:
+                dedup_per_dim = self.hsdp_replica_count
+            replicate_group_ranks = tuple(
+                r % dedup_per_dim[i] for i, r in enumerate(replicate_group_ranks)
+            )
+            replicate_sizes = tuple(
+                min(s, dedup_per_dim[i]) for i, s in enumerate(replicate_sizes)
+            )
 
         # Greedy owner assignment on this sub-batch's records.
         owner_by_index = build_owner_by_size(
@@ -320,7 +532,17 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
         return hsdp_assign
 
     def _build_param_broadcast_info(self) -> None:
-        """Build per-batch HSDP assignments and param broadcast reverse mapping."""
+        """Build per-batch HSDP assignments and param broadcast reverse mapping.
+
+        When ``hsdp_replica_count`` is set, replicate coordinates and sizes
+        are remapped so that owner assignment and broadcast happen within
+        sub-groups of size ``hsdp_replica_count`` instead of the full
+        replicate group.
+
+        Sub-group broadcast already covers all ranks (each rank belongs to
+        exactly one sub-group), so param and state broadcast use the same
+        sub-group mapping — no separate full-group path is needed.
+        """
         self._hsdp_assignment_batches: Dict[int, Dict] = {}
         self._param_to_broadcast_info: Dict[
             torch.nn.Parameter, Tuple[Tuple[int, ...], Tuple[dist.ProcessGroup, ...]]
@@ -335,9 +557,7 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
                 sub_batch_assigns: List[HSDPGroupAssignment] = []
 
                 for sub_batch_entries in bg["sub_batches"]:
-                    hsdp_assign = self._build_sub_batch_assignment(
-                        sub_batch_entries, hsdp_group,
-                    )
+                    hsdp_assign = self._build_sub_batch_assignment(sub_batch_entries, hsdp_group)
                     if hsdp_assign is not None:
                         sub_batch_assigns.append(hsdp_assign)
 
@@ -522,9 +742,9 @@ class BaseDistributedOptimizer(torch.optim.Optimizer):
             target: "param" or "state".
             state_keys: State dict keys to broadcast when target="state".
         """
-        device = torch.npu.current_device()
-        alignment = 512  # bytes
+        device = torch.npu.current_device() if torch.npu.is_available() else torch.cuda.current_device()
 
+        alignment = 512  # bytes
         rank_dtype_tensors = self._collect_broadcast_tensors(target, state_keys)
 
         for (src_coord, dtype, replicate_pgs), tensors in rank_dtype_tensors.items():
@@ -681,8 +901,8 @@ class AsyncReplicateBroadcaster:
             async_op: bool = True,
     ) -> None:
         """Pack and broadcast tensors for one broadcast key."""
+        device = torch.npu.current_device() if torch.npu.is_available() else torch.cuda.current_device()
         src_coord, dtype, replicate_pgs = key
-        device = torch.npu.current_device()
         alignment = 512  # bytes
 
         local_coord = tuple(

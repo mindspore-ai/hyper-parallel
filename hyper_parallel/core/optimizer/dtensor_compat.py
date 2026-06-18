@@ -38,8 +38,6 @@ class _NeverMatch:
     __slots__ = ()
 
 
-_NEVER_MATCH = _NeverMatch
-
 # Lazy-export cache
 _LAZY_CACHE: dict = {}
 
@@ -130,7 +128,7 @@ def get_replicate_cls():
 def get_strided_shard_cls():
     """Return the StridedShard placement class. Returns _NEVER_MATCH for 'torch'."""
     if _DTENSOR_BACKEND == "torch":
-        return _NEVER_MATCH
+        return _NeverMatch
 
     from hyper_parallel.core.dtensor.placement_types import StridedShard  # pylint: disable=import-outside-toplevel
     return StridedShard
@@ -154,8 +152,8 @@ def _resolve_dtensor_union():
 def to_local_if_dtensor(tensor: Any) -> Any:
     """Return the local shard if `tensor` is a DTensor, otherwise return as-is."""
     # Use resolver directly for internal module lookups instead of lazy-loaded DTensor
-    _dtensor_type = _LAZY_CACHE.get("DTensor") or _resolve_dtensor_union()
-    return tensor.to_local() if isinstance(tensor, _dtensor_type) else tensor
+    dtensor_type = _LAZY_CACHE.get("DTensor") or _resolve_dtensor_union()
+    return tensor.to_local() if isinstance(tensor, dtensor_type) else tensor
 
 
 # lazy exports
@@ -168,7 +166,7 @@ _LAZY_RESOLVERS = {
 }
 
 
-def __getattr__(name):  # type: ignore[no-untyped-def]
+def __getattr__(name):  # type: ignore[no-untyped-def]  # pylint: disable=invalid-name
     """Resolve module attributes on first access."""
     resolver = _LAZY_RESOLVERS.get(name)
     if resolver is not None:
@@ -180,6 +178,6 @@ def __getattr__(name):  # type: ignore[no-untyped-def]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def __dir__():  # type: ignore[no-untyped-def]
+def __dir__():  # type: ignore[no-untyped-def]  # pylint: disable=invalid-name
     """Include lazy-exported names in dir() for IDE autocomplete."""
     return list(globals().keys()) + list(_LAZY_RESOLVERS.keys())

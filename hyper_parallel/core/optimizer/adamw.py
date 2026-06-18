@@ -38,8 +38,8 @@ def adamw(
     r"""Functional API that performs AdamW algorithm computation.
     See :class:`~torch.optim.AdamW` for details.
     """
-
-    step_tensor = torch.tensor(step, dtype=torch.int64, device=torch.npu.current_device())
+    device = torch.npu.current_device() if torch.npu.is_available() else torch.cuda.current_device()
+    step_tensor = torch.tensor(step, dtype=torch.int64, device=device)
     state_steps = [step_tensor] * len(params)
 
     torch._fused_adamw_(  # pylint: disable=protected-access
