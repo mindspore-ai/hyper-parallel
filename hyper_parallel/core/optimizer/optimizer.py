@@ -26,8 +26,7 @@ from torch.distributed.checkpoint.state_dict import (
     get_optimizer_state_dict,
     set_optimizer_state_dict,
 )
-
-from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.optimizer.dtensor_compat import DTensor, to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
     HSDPGroupAssignment,
     HSDPCommGroup,
@@ -172,11 +171,6 @@ class ChainedOptimizer:
                 param_group['step'] = step
 
         return step
-
-
-def to_local_if_dtensor(tensor: Any) -> torch.Tensor:
-    """Extract the local shard if *tensor* is a DTensor, otherwise return as-is."""
-    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
 class BaseDistributedOptimizer(torch.optim.Optimizer):

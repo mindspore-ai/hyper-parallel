@@ -22,8 +22,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.optimizer.optimizer import AsyncReplicateBroadcaster, BaseDistributedOptimizer, \
-    to_local_if_dtensor
+from hyper_parallel.core.optimizer.optimizer import AsyncReplicateBroadcaster, BaseDistributedOptimizer
+from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
     HSDPGroupAssignment,
     fused_allgather_dtensor_params,
@@ -528,7 +528,7 @@ class Muon(BaseDistributedOptimizer):
         shapes_info = []
 
         for p in p_list:
-            origin_shape = tuple(p.local_shape) if no_shard else tuple(p.shape)
+            origin_shape = tuple(getattr(p, 'local_shape', None) or p.to_local().shape) if no_shard else tuple(p.shape)
             ns_input = ns_inputs[p].view(origin_shape)
 
             is_conv = False

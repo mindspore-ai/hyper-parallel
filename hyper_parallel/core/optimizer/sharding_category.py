@@ -22,10 +22,12 @@ from typing import Dict, List, Sequence, Tuple, Optional, Any
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.dtensor.placement_types import StridedShard, Shard
-
+from hyper_parallel.core.optimizer.dtensor_compat import (
+    DTensor,
+    DeviceMesh,
+    Shard,
+    StridedShard,
+)
 
 @dataclass(frozen=True)
 class ParamLayoutSpec:
@@ -256,7 +258,7 @@ def build_comm_domain_key(shard_spec: ParamShardSpec) -> CommDomainKey:
         mesh_rank_list = tuple(shard_spec.device_mesh.rank_list)
 
     return CommDomainKey(
-        mesh_shape=tuple(shard_spec.device_mesh.mesh_shape),
+        mesh_shape = tuple(getattr(shard_spec.device_mesh, "mesh_shape", None) or shard_spec.device_mesh.mesh.shape),
         mesh_rank_list=mesh_rank_list,
         replicate_mesh_dims=shard_spec.replicate_mesh_dims,
         shard_mesh_dims=shard_spec.shard_mesh_dims,
@@ -271,6 +273,10 @@ def group_parameters_for_hsdp(
     groups: Dict[HSDPGroupKey, HSDPCommGroup] = {}
 
     for param_index, param in enumerate(params):
+        if not isinstance(param, DTensor):
+            no_comm_params.append(param)
+            continue
+
         shard_spec = extract_param_shard_spec(param)
         comm_key = build_comm_domain_key(shard_spec)
 
