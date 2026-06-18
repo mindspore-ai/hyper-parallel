@@ -19,11 +19,13 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE, DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_npu_sparse_flash_attention import (
     SparseFlashAttentionDistributedOp,
     _normalize_sfa_args,
+    _to_local,
+    _to_local_seq_len,
 )
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
@@ -71,6 +73,57 @@ class TestSparseFlashAttentionDistributedOp(unittest.TestCase):
     @staticmethod
     def _get_op_ms():
         return get_distributed_op("SparseFlashAttention")
+
+    # ------------------------------------------------------------------
+    # _to_local / _to_local_seq_len helpers
+    # ------------------------------------------------------------------
+
+    def test_to_local_with_dtensor(self):
+        """
+        Feature: _to_local extracts the local tensor from a DTensor.
+        Expectation: Result is the value returned by to_local().
+        """
+        local_tensor = MagicMock()
+        dt = MagicMock(spec=DTensor)
+        dt.to_local.return_value = local_tensor
+        self.assertIs(_to_local(dt), local_tensor)
+
+    def test_to_local_with_none(self):
+        """
+        Feature: _to_local passes None (optional input not provided) through.
+        Expectation: None is returned.
+        """
+        self.assertIsNone(_to_local(None))
+
+    def test_to_local_rejects_plain_tensor(self):
+        """
+        Feature: _to_local rejects non-DTensor tensor inputs.
+        Description: Every input except actual_seq_lengths must be a DTensor so its
+            layout can be inferred; a plain tensor has no to_local() method.
+        Expectation: AttributeError is raised.
+        """
+        with self.assertRaises(AttributeError):
+            _to_local([1, 2, 3])
+
+    def test_to_local_seq_len_with_dtensor(self):
+        """
+        Feature: _to_local_seq_len extracts the local tensor from a DTensor.
+        Expectation: Result is the value returned by to_local().
+        """
+        local_tensor = MagicMock()
+        dt = MagicMock(spec=DTensor)
+        dt.to_local.return_value = local_tensor
+        self.assertIs(_to_local_seq_len(dt), local_tensor)
+
+    def test_to_local_seq_len_passes_plain_tensor(self):
+        """
+        Feature: _to_local_seq_len passes a non-DTensor actual_seq_lengths through.
+        Description: actual_seq_lengths are network-built and not guaranteed to be
+            DTensors, so a plain tensor is passed through unchanged.
+        Expectation: The same object is returned without modification.
+        """
+        plain = [1, 2, 3]
+        self.assertIs(_to_local_seq_len(plain), plain)
 
     # ------------------------------------------------------------------
     # Helpers

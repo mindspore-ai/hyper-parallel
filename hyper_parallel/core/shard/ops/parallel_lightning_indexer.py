@@ -22,6 +22,7 @@ from .parallel_ops import DistributedOp
 from .parallel_npu_dense_lightning_indexer_softmax_lse import (
     _adjust_bsnd_key,
     _adjust_tnd_seq_lens,
+    _to_local_seq_len,
 )
 
 platform = get_platform()
@@ -159,12 +160,10 @@ class LightningIndexerDistributedOp(DistributedOp):
         query_index, key_index, weights = norm_args[0], norm_args[1], norm_args[2]
         layout_str = local_kwargs['layout_query']  # layout_query
 
-        qlen_kw = local_kwargs.get('actual_seq_lengths_query')
-        klen_kw = local_kwargs.get('actual_seq_lengths_key')
-        if qlen_kw is not None:
-            local_kwargs['actual_seq_lengths_query'] = qlen_kw.to_local()
-        if klen_kw is not None:
-            local_kwargs['actual_seq_lengths_key'] = klen_kw.to_local()
+        local_kwargs['actual_seq_lengths_query'] = _to_local_seq_len(
+            local_kwargs.get('actual_seq_lengths_query'))
+        local_kwargs['actual_seq_lengths_key'] = _to_local_seq_len(
+            local_kwargs.get('actual_seq_lengths_key'))
 
         local_args = (query_index.to_local(), key_index.to_local(), weights.to_local())
 

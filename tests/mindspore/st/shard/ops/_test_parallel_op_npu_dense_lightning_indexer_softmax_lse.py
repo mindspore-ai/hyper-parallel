@@ -174,8 +174,8 @@ def test_softmax_lse_tnd_dp():
     dk = distribute_tensor(Tensor(k_np), mesh, (Shard(0),))
     dw = distribute_tensor(Tensor(w_np), mesh, (Shard(0),))
 
-    dqlen = distribute_tensor(Tensor(_GLOBAL_QLEN, dtype=ms.int32), mesh, (Replicate(),))
-    dklen = distribute_tensor(Tensor(_GLOBAL_KLEN, dtype=ms.int32), mesh, (Replicate(),))
+    dqlen = Tensor(_GLOBAL_QLEN, dtype=ms.int32)
+    dklen = Tensor(_GLOBAL_KLEN, dtype=ms.int32)
 
     out = npu_dense_lightning_indexer_softmax_lse(
         dq, dk, dw,
@@ -209,8 +209,8 @@ def test_softmax_lse_tnd_dp_cp():
     dk = distribute_tensor(Tensor(k_np), mesh, (Shard(0), Replicate()))
     dw = distribute_tensor(Tensor(w_np), mesh, (Shard(0), Shard(0)))
 
-    dqlen = distribute_tensor(Tensor(_GLOBAL_QLEN, dtype=ms.int32), mesh, (Replicate(),))
-    dklen = distribute_tensor(Tensor(_GLOBAL_KLEN, dtype=ms.int32), mesh, (Replicate(),))
+    dqlen = Tensor(_GLOBAL_QLEN, dtype=ms.int32)
+    dklen = Tensor(_GLOBAL_KLEN, dtype=ms.int32)
 
     out = npu_dense_lightning_indexer_softmax_lse(
         dq, dk, dw,
@@ -242,8 +242,8 @@ def test_softmax_lse_tnd_replicated():
     dk = distribute_tensor(Tensor(k_np), mesh, (Replicate(),))
     dw = distribute_tensor(Tensor(w_np), mesh, (Replicate(),))
 
-    dqlen = distribute_tensor(Tensor(_GLOBAL_QLEN, dtype=ms.int32), mesh, (Replicate(),))
-    dklen = distribute_tensor(Tensor(_GLOBAL_KLEN, dtype=ms.int32), mesh, (Replicate(),))
+    dqlen = Tensor(_GLOBAL_QLEN, dtype=ms.int32)
+    dklen = Tensor(_GLOBAL_KLEN, dtype=ms.int32)
 
     out = npu_dense_lightning_indexer_softmax_lse(
         dq, dk, dw,

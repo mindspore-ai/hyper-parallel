@@ -207,6 +207,47 @@ class TestLightningIndexer(unittest.TestCase):
         self.assertEqual(cache_values[3], 'TND',
                          msg=f"cache_values[3] should be 'TND', got {cache_values[3]}")
 
+    @patch("hyper_parallel.core.shard.ops.parallel_lightning_indexer.platform")
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_preprocess_plain_tensor_seq_lens_passthrough_6b(self, mock_mesh_plat, mock_op_plat):
+        """
+        Feature: preprocess accepts non-DTensor actual_seq_lengths_query/key.
+        Description: actual_seq_lengths are plain network-built tensors (not DTensors),
+            which the caller cannot guarantee to wrap as Replicate DTensors.
+        Expectation: they pass through unchanged (no to_local call) while DTensor
+            inputs are still localized.
+        """
+        self._setup_mock_platform(mock_mesh_plat)
+        mock_op_plat.platform_type = PlatformType.PYTORCH
+        mesh = init_device_mesh("npu", (1,), mesh_dim_names=("dp",))
+
+        def _mock_dtensor(layout):
+            dt = MagicMock(spec=DTensor)
+            dt.to_local.return_value = MagicMock()
+            dt.layout = layout
+            return dt
+
+        dtq = _mock_dtensor(_build_layout(mesh, (Replicate(),), 4))
+        dtk = _mock_dtensor(_build_layout(mesh, (Replicate(),), 4))
+        dtw = _mock_dtensor(_build_layout(mesh, (Replicate(),), 3))
+        plain_qlen = object()
+        plain_klen = object()
+
+        op = self._get_op()
+        _, local_kwargs, _ = op.preprocess(
+            (dtq, dtk, dtw),
+            {
+                'layout_query': 'TND',
+                'actual_seq_lengths_query': plain_qlen,
+                'actual_seq_lengths_key': plain_klen,
+            },
+        )
+
+        self.assertIs(local_kwargs['actual_seq_lengths_query'], plain_qlen,
+                      msg="plain actual_seq_lengths_query should pass through unchanged")
+        self.assertIs(local_kwargs['actual_seq_lengths_key'], plain_klen,
+                      msg="plain actual_seq_lengths_key should pass through unchanged")
+
     # ------------------------------------------------------------------
     # infer_layout — BSND
     # ------------------------------------------------------------------

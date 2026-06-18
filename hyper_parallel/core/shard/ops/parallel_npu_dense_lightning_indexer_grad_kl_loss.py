@@ -101,7 +101,22 @@ def _normalize_dense_grad_kl_loss_args(
 
 
 def _to_local(t):
-    """Extract local tensor from DTensor, or pass through non-DTensor values."""
+    """Extract the local tensor from a DTensor input (None passes through).
+
+    Every input except actual_seq_lengths must be a DTensor so its layout can be
+    inferred; passing a plain tensor raises AttributeError here by design.
+    """
+    if t is None:
+        return None
+    return t.to_local()
+
+
+def _to_local_seq_len(t):
+    """Extract the local tensor from an actual_seq_lengths input.
+
+    These are built inside the network and are not guaranteed to be DTensors, so
+    a plain tensor (or None) is passed through unchanged.
+    """
     if isinstance(t, DTensor):
         return t.to_local()
     return t
@@ -227,7 +242,7 @@ class NpuDenseLightningIndexerGradKlLossDistributedOp(DistributedOp):
                 _to_local(norm_args[7]), _to_local(norm_args[8]),
                 scale_value,
                 _to_local(norm_args[10]), _to_local(norm_args[11]),
-                _to_local(norm_args[12]), _to_local(norm_args[13]),
+                _to_local_seq_len(norm_args[12]), _to_local_seq_len(norm_args[13]),
                 layout_str, norm_args[15], norm_args[16], norm_args[17],
             )
             local_kwargs = {}
@@ -242,8 +257,8 @@ class NpuDenseLightningIndexerGradKlLossDistributedOp(DistributedOp):
             local_kwargs = {
                 'query_rope': _to_local(norm_args[10]),
                 'key_rope': _to_local(norm_args[11]),
-                'actual_seq_qlen': _to_local(norm_args[12]),
-                'actual_seq_klen': _to_local(norm_args[13]),
+                'actual_seq_qlen': _to_local_seq_len(norm_args[12]),
+                'actual_seq_klen': _to_local_seq_len(norm_args[13]),
                 'layout': layout_str,
                 'sparse_mode': norm_args[15],
                 'pre_tokens': norm_args[16],
