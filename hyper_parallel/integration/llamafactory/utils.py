@@ -43,9 +43,38 @@ from hyper_parallel.core.fully_shard.utils import (
     MixedPrecisionPolicy,
     OffloadPolicy,
 )
+from hyper_parallel.integration.llamafactory.context_parallel.inputs import (
+    _get_cp_dp_ranks,
+    get_cp_group,
+    get_cp_group_ranks,
+    get_cp_rank,
+    get_dp_rank,
+    shard_inputs_for_cp,
+)
 from hyper_parallel.platform import get_platform
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "HSDP_MODEL_NAME",
+    "HSDP_OPTIMIZER_NAME",
+    "HyperParallelArguments",
+    "_build_device_mesh",
+    "_build_fsdp2_kwargs",
+    "_get_cp_dp_ranks",
+    "_resolve_mp_policy",
+    "fsdp2_prepare_model",
+    "get_cp_group",
+    "get_cp_group_ranks",
+    "get_cp_rank",
+    "get_dp_rank",
+    "shard_inputs_for_cp",
+    "export_to_hf_format",
+    "load_hsdp_model",
+    "load_hsdp_optimizer_and_scheduler",
+    "save_hsdp_checkpoint",
+    "wrap_optimizer_with_skip_dtensor_dispatch",
+]
 
 # ---------------------------------------------------------------------------
 # Config
@@ -71,6 +100,7 @@ class HyperParallelArguments:
     """Minimal HyperParallel configuration needed by the trainer backend."""
 
     tp_size: int = 1
+    cp_size: int = 1
     device_type: str = "auto"
     param_dtype: Optional[str] = None
     reduce_dtype: Optional[str] = None
@@ -87,6 +117,12 @@ class HyperParallelArguments:
                 "Current trainer backend only supports replacing FSDP/fully_shard. "
                 f"Expected tp_size=1, got {self.tp_size}."
             )
+        if not isinstance(self.cp_size, int) or isinstance(self.cp_size, bool) or self.cp_size < 1:
+            raise ValueError(f"cp_size must be a positive integer, got {self.cp_size!r}.")
+        if self.cp_size > 1:
+            world_size = get_platform().get_world_size()
+            if world_size % self.cp_size != 0:
+                raise ValueError(f"world_size ({world_size}) must be divisible by cp_size ({self.cp_size}).")
         if self.param_dtype is not None and self.param_dtype not in _VALID_DTYPES:
             raise ValueError(
                 f"param_dtype must be one of {sorted(_VALID_DTYPES)}, got {self.param_dtype!r}."
@@ -193,6 +229,10 @@ def _build_device_mesh(accelerator, hp_args):
 
     mesh = getattr(accelerator, "torch_device_mesh", None)
     if mesh is not None:
+        cp_size = getattr(hp_args, "cp_size", 1)
+        mesh_dim_names = getattr(mesh, "mesh_dim_names", None) or ()
+        if cp_size > 1 and {"dp", "cp"}.issubset(set(mesh_dim_names)):
+            return mesh[("dp", "cp")]
         fsdp_dim_names = getattr(
             getattr(accelerator, "parallelism_config", None), "fsdp_dim_names", None
         )
@@ -200,9 +240,35 @@ def _build_device_mesh(accelerator, hp_args):
             return mesh[tuple(fsdp_dim_names)]
         return mesh
 
+    cached_mesh = getattr(accelerator, "_hp_device_mesh", None)
+    if cached_mesh is not None:
+        return cached_mesh
+
     device_type = _resolve_device_type(hp_args)
     world_size = get_platform().get_world_size()
-    return init_device_mesh(device_type, (world_size,), mesh_dim_names=("dp",))
+    cp_size = getattr(hp_args, "cp_size", 1)
+    if cp_size > 1:
+        if world_size % cp_size != 0:
+            raise ValueError(f"world_size ({world_size}) must be divisible by cp_size ({cp_size}).")
+        dp_size = world_size // cp_size
+        mesh = init_device_mesh(device_type, (dp_size, cp_size), mesh_dim_names=("dp", "cp"))
+    else:
+        mesh = init_device_mesh(device_type, (world_size,), mesh_dim_names=("dp",))
+
+    setattr(accelerator, "_hp_device_mesh", mesh)
+    return mesh
+
+
+def _resolve_fsdp_mesh(mesh):
+    """Return the mesh that should be used for FSDP parameter sharding."""
+    if mesh is None:
+        return None
+    mesh_dim_names = getattr(mesh, "mesh_dim_names", None) or ()
+    if {"dp", "cp"}.issubset(set(mesh_dim_names)):
+        return mesh[("dp", "cp")].flatten(mesh_dim_name="fsdp")
+    if "dp" in mesh_dim_names:
+        return mesh["dp"]
+    return mesh
 
 
 def _build_mp_policy(hp_args) -> MixedPrecisionPolicy:
@@ -593,7 +659,7 @@ def _collect_replicate_params(model: nn.Module, shard_size: int) -> set:
 
 def _build_fsdp2_kwargs(accelerator, model: nn.Module, hp_args, fsdp2_plugin) -> dict:
     """Build fully_shard kwargs from accelerator and plugin settings."""
-    mesh = _build_device_mesh(accelerator, hp_args)
+    mesh = _resolve_fsdp_mesh(_build_device_mesh(accelerator, hp_args))
     reshard_after_forward = fsdp2_plugin.reshard_after_forward
     if hp_args.reshard_after_forward is not None:
         reshard_after_forward = hp_args.reshard_after_forward
