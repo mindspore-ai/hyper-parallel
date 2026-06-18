@@ -22,13 +22,24 @@ _TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_auto_gra
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
-def test_ms_chunked_output_fully_shard():
+def test_fully_shard_autograd_01():
     """
-    Feature: fully_shard autograd with chunked output (MindSpore)
-    Description: Verify that a fully_shard-wrapped OutputLayer can be called
-        multiple times in a for-loop with results concatenated and a single backward.
-    Expectation: Run success.
+    Feature: fully_shard autograd (MindSpore)
+    Description: Run two fully_shard autograd cases concurrently over an 8-card budget --
+        the first on the front 4 cards, the second on the back 4 cards:
+        - test_chunked_output_fully_shard: a fully_shard-wrapped OutputLayer called multiple
+          times in a for-loop with results concatenated and a single backward.
+        - test_input_requires_grad_fully_shard_grad_parity: fully_shard wraps only inner
+          blocks (root left unwrapped) and the wrapped block is fed an input that requires
+          grad, so its PostBackwardFunction drives scheduler_state==BACKWARD -- the boundary
+          case where the root backward hook must still drain the last reduce-scatter. Each
+          block mixes a sharded Dense (reduce-scatter path) and a replicate_params sub-layer
+          (all-reduce path); grads are compared against a single-card standalone baseline at
+          an equivalent global batch size (sharded all-gathered, replicate compared directly).
+    Expectation: both cases run success; all grads non-None and matching the baseline.
     """
     parallel_run([
-        MindSporeCase(_TEST_FILE, "test_chunked_output_fully_shard", worker_num=2, local_worker_num=2),
+        MindSporeCase(_TEST_FILE, "test_chunked_output_fully_shard", worker_num=4, local_worker_num=4),
+        MindSporeCase(_TEST_FILE, "test_input_requires_grad_fully_shard_grad_parity",
+                      worker_num=4, local_worker_num=4),
     ])
