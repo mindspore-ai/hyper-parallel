@@ -10,10 +10,10 @@
 # -----------------------------------------------------------------------------------------------------------
 #
 # BUILD_SHMEM_EXTENSION controls symmetric memory build scope:
-#   unset / 0 / skip / none: skip symmetric memory entirely
+#   unset / off: skip symmetric memory entirely
 #   all: build common library, PyTorch wrapper, and MindSpore wrapper
-#   1 / mindspore / ms: build common library and MindSpore wrapper
-#   2 / torch / pytorch: build common library and PyTorch wrapper
+#   mindspore / ms: build common library and MindSpore wrapper
+#   torch / pytorch: build common library and PyTorch wrapper
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
@@ -28,24 +28,24 @@ BUILD_SHMEM_TORCH_WRAPPER=false
 BUILD_SHMEM_MS_WRAPPER=false
 
 case "${BUILD_SHMEM_EXTENSION}" in
-    all|ALL|both|BOTH|true|TRUE)
+    all|ALL|both|BOTH)
         BUILD_SHMEM_COMMON_LIBRARY=true
         BUILD_SHMEM_TORCH_WRAPPER=true
         BUILD_SHMEM_MS_WRAPPER=true
         ;;
-    ""|0|skip|SKIP|none|NONE|false|FALSE)
+    ""|off|OFF)
         ;;
-    1|mindspore|MINDSPORE|ms|MS)
+    mindspore|MINDSPORE|ms|MS)
         BUILD_SHMEM_COMMON_LIBRARY=true
         BUILD_SHMEM_MS_WRAPPER=true
         ;;
-    2|torch|TORCH|pytorch|PYTORCH)
+    torch|TORCH|pytorch|PYTORCH)
         BUILD_SHMEM_COMMON_LIBRARY=true
         BUILD_SHMEM_TORCH_WRAPPER=true
         ;;
     *)
         echo "ERROR: Unsupported BUILD_SHMEM_EXTENSION=${BUILD_SHMEM_EXTENSION}."
-        echo "       Use unset/0 to skip, all for all, 1 for MindSpore, or 2 for PyTorch."
+        echo "       Use unset/off to skip, all for all, mindspore for MindSpore, or torch for PyTorch."
         exit 1
         ;;
 esac

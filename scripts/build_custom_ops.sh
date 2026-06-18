@@ -17,8 +17,8 @@
 # and is picked up by setup.py's package_data at install time.
 #
 # BUILD_CUSTOM_OPS_EXTENSION controls whether this component is built:
-#   unset / 0: skip custom ops
-#   1: build custom ops
+#   unset / off: skip custom ops
+#   on: build custom ops
 
 set -e
 
@@ -30,16 +30,16 @@ BUILD_CUSTOM_OPS_EXTENSION="${BUILD_CUSTOM_OPS_EXTENSION:-}"
 BUILD_CUSTOM_OPS_EXTENSION_DISPLAY="${BUILD_CUSTOM_OPS_EXTENSION:-unset}"
 
 case "${BUILD_CUSTOM_OPS_EXTENSION}" in
-    1|true|TRUE|on|ON|yes|YES)
+    on|ON)
         ;;
-    ""|0|false|FALSE|off|OFF|no|NO)
+    ""|off|OFF)
         rm -rf "$CUSTOM_OPS_BUILD_DIR"
         echo "INFO: custom ops build skipped (BUILD_CUSTOM_OPS_EXTENSION=${BUILD_CUSTOM_OPS_EXTENSION_DISPLAY})."
         exit 0
         ;;
     *)
         echo "ERROR: Unsupported BUILD_CUSTOM_OPS_EXTENSION=${BUILD_CUSTOM_OPS_EXTENSION}."
-        echo "       Use unset/0 to skip custom ops, or 1 to build."
+        echo "       Use unset/off to skip custom ops, or on to build."
         exit 1
         ;;
 esac
