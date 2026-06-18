@@ -138,6 +138,11 @@
 # 16. Code static analysis fixes - custom_ops
 "hyper-parallel/hyper_parallel/platform/mindspore/custom_ops/"          "arguments-differ"
 
+# 17. LlamaFactory Context Parallel — Qwen3VL-MoE CP attention keeps the native
+#     forward signature for drop-in class patching; some native-only arguments are
+#     intentionally unused because CP applies RoPE after sequence/head exchange.
+"hyper-parallel/hyper_parallel/integration/llamafactory/context_parallel/models/qwen3_vl/qwen3vl_forward.py" "unused-argument"
+
 # 17. M1 Configurable + dmodule — nested Config, dataclass(kw_only, slots), parallelize forward wrapper
 "hyper-parallel/hyper_parallel/config/"                                   "invalid-name"
 "hyper-parallel/hyper_parallel/config/"                                   "unexpected-keyword-arg"
