@@ -164,7 +164,7 @@ class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
         Description: x1: m-dim (tensor dim 0) sharded by dp (mesh_dim 0),
                          k-dim (tensor dim 1) sharded by tp (mesh_dim 1).
                      x2: k-dim (tensor dim 0) sharded by tp (mesh_dim 1), n-dim Replicate.
-        Expectation: output tensor_map ((1, 0), -1) — m jointly sharded by tp+dp, n Replicate.
+        Expectation: output tensor_map ((1, 0), -1) — m jointly sharded by dp (outer) + tp (inner), n Replicate.
         """
         mesh = self._make_2d_mesh(mock_platform, shape=(2, 4), names=("dp", "tp"))
         # x1 (m, k): m sharded by dp (mesh_dim 0), k sharded by tp (mesh_dim 1)
@@ -178,9 +178,9 @@ class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
         self.assertIsNone(extra)
         # tensor_map uses reversed mesh_dim indexing: value 0 = tp (innermost), value 1 = dp (outermost).
         # ReduceScatter converts k-sharding (tp, value 0) to m-sharding;
-        # combined with dp m-sharding (value 1) → output_m = (0, 1).
-        self.assertEqual(out_layout.tensor_map, ((0, 1), -1),
-                         msg=f"DP+TP mesh: expected ((0, 1), -1), got {out_layout.tensor_map}")
+        # dp m-sharding (value 1) is outer, tp-derived m-sharding (value 0) is inner → output_m = (1, 0).
+        self.assertEqual(out_layout.tensor_map, ((1, 0), -1),
+                         msg=f"DP+TP mesh: expected ((1, 0), -1), got {out_layout.tensor_map}")
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_mrs_x2_n_sharded_6(self, mock_platform):

@@ -13,8 +13,12 @@
 # limitations under the License.
 # ============================================================================
 """test_moe.py"""
+from pathlib import Path
+
 from tests.common.mark_utils import arg_mark
 from tests.mindspore.st.utils import msrun_case
+
+_WORKER = str(Path(__file__).resolve().parent / "mega_moe.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -26,11 +30,10 @@ def test_mega_moe_tp2ep2():
     Expectation: Run success and precision within rtol=atol=2e-3.
     """
     glog_v = 2
-    file_name = "mega_moe.py"
     case_name = "test_mega_moe_tp2ep2"
     master_port = 10200
     worker_num = 2
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num, worker_num)
+    msrun_case(glog_v, _WORKER, case_name, master_port, worker_num, worker_num)
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1", card_mark="allcards", essential_mark="essential")
@@ -42,8 +45,7 @@ def test_mega_moe_grad_tp2ep2():
     Expectation: Run success and precision within rtol=atol=2e-3.
     """
     glog_v = 2
-    file_name = "mega_moe.py"
     case_name = "test_mega_moe_grad_tp2ep2"
     master_port = 10201
     worker_num = 2
-    msrun_case(glog_v, file_name, case_name, master_port, worker_num, worker_num)
+    msrun_case(glog_v, _WORKER, case_name, master_port, worker_num, worker_num)

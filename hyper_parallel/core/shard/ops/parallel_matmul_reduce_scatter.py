@@ -168,7 +168,9 @@ class MatmulReduceScatterDistributedOp(DistributedOp):
           If dp_mesh_dim == -1 (pure TP):
               output_tm[0] = comm_mesh_dim
           Else (TP + DP joint sharding):
-              output_tm[0] = (comm_mesh_dim, dp_mesh_dim)
+              output_tm[0] = (dp_mesh_dim, comm_mesh_dim)
+              dp_mesh_dim is the outer pre-existing sharding; comm_mesh_dim is the
+              inner scatter added by ReduceScatter (within each DP group).
 
           output_tm[1] = x2's n dimension placement
             - trans_x2=False: x2 dim 1 (n) → x2_tm[1]
@@ -200,7 +202,7 @@ class MatmulReduceScatterDistributedOp(DistributedOp):
         if dp_mesh_dim == -1:
             output_m = comm_mesh_dim
         else:
-            output_m = (comm_mesh_dim, dp_mesh_dim)
+            output_m = (dp_mesh_dim, comm_mesh_dim)
 
         n_placement = x2_tm[0] if trans_x2 else x2_tm[1]
 
