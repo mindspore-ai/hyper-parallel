@@ -22,6 +22,7 @@ from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_matmul import (
     MatMulDistributedOp,
+    MatMulExtDistributedOp,
     LinearDistributedOp,
     BatchMatMulDistributedOp,
     BatchMatMulExtDistributedOp,
@@ -46,11 +47,13 @@ class TestParallelMatMul(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -173,6 +176,217 @@ class TestParallelMatMul(unittest.TestCase):
         assert output_layout.tensor_map == expected_map, (
             f"Multi-Shard Tensor Parallel test failed. Expected {expected_map}, "
             f"got {output_layout.tensor_map}"
+        )
+
+    def _make_matmul_ext(self):
+        """Create a MatMulExtDistributedOp instance."""
+        return MatMulExtDistributedOp("MatMulExt")
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_matmul_ext_partial_x_propagated(self, mock_platform):
+        """
+        Feature: MatMulExtDistributedOp propagates Partial from input x.
+        Description: x has Partial on tp axis, w is Replicate. Output should inherit Partial.
+        Expectation: output_layout.partial == [None, 'sum'] on mp axis.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("mp", "sum")
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+
+        op_ext = self._make_matmul_ext()
+        output_layout = op_ext.infer_layout((x_layout, w_layout))
+        expected_partial = [None, 'sum']
+        assert output_layout.partial == expected_partial, (
+            f"Partial propagation from x failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_matmul_ext_partial_w_propagated(self, mock_platform):
+        """
+        Feature: MatMulExtDistributedOp propagates Partial from input w.
+        Description: w has Partial on dp axis, x is Replicate. Output should inherit Partial.
+        Expectation: output_layout.partial == ['sum', None] on dp axis.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        w_layout.set_partial_by_dev_axis("dp", "sum")
+
+        op_ext = self._make_matmul_ext()
+        output_layout = op_ext.infer_layout((x_layout, w_layout))
+        expected_partial = ['sum', None]
+        assert output_layout.partial == expected_partial, (
+            f"Partial propagation from w failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_matmul_ext_partial_both_different_axes(self, mock_platform):
+        """
+        Feature: MatMulExtDistributedOp propagates Partial from both inputs on different axes.
+        Description: x has Partial on mp, w has Partial on dp. Output should have both.
+        Expectation: output_layout.partial == ['sum', 'sum'].
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("mp", "sum")
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        w_layout.set_partial_by_dev_axis("dp", "sum")
+
+        op_ext = self._make_matmul_ext()
+        output_layout = op_ext.infer_layout((x_layout, w_layout))
+        expected_partial = ['sum', 'sum']
+        assert output_layout.partial == expected_partial, (
+            f"Partial propagation from both axes failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_matmul_ext_partial_both_same_axis_different_op_raises(self, mock_platform):
+        """
+        Feature: MatMulExtDistributedOp rejects both inputs Partial on same axis with different ops.
+        Description: x has Partial('sum') on mp, w has Partial('avg') on mp. Should raise.
+        Expectation: ValueError raised.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("mp", "sum")
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        w_layout.set_partial_by_dev_axis("mp", "avg")
+
+        op_ext = self._make_matmul_ext()
+        with self.assertRaisesRegex(ValueError, "Partial on the same axis"):
+            op_ext.infer_layout((x_layout, w_layout))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_matmul_ext_partial_x_plus_contract_dim_same_axis_not_conflict(self, mock_platform):
+        """
+        Feature: MatMulExtDistributedOp with x Partial and contract dim sharded on same axis.
+        Description: x has Partial on mp (same axis as contracting dim). This is a valid
+                     scenario where x was output of a prior matmul that also had contract
+                     dim sharded on mp. Both set the same Partial op, no conflict.
+        Expectation: output_layout.partial == [None, 'sum'].
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("mp", "sum")
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+
+        op_ext = self._make_matmul_ext()
+        output_layout = op_ext.infer_layout((x_layout, w_layout))
+        expected_partial = [None, 'sum']
+        assert output_layout.partial == expected_partial, (
+            f"Partial + contract dim same axis failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_matmul_ext_partial_x_plus_contract_dim_different_axes(self, mock_platform):
+        """
+        Feature: MatMulExtDistributedOp with x Partial on dp and contract dim sharded on mp.
+        Description: Both axes independently produce Partial.
+        Expectation: output_layout.partial == ['sum', 'sum'].
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Shard(0)), 2)
+
+        op_ext = self._make_matmul_ext()
+        output_layout = op_ext.infer_layout((x_layout, w_layout))
+        expected_partial = ['sum', 'sum']
+        assert output_layout.partial == expected_partial, (
+            f"Partial + contract dim different axes failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_matmul_ext_partial_without_contract_sharding(self, mock_platform):
+        """
+        Feature: MatMulExtDistributedOp with Partial x but contract dim not sharded.
+        Description: x has Partial on mp, contract dim is Replicate.
+                     Only input Partial should appear.
+        Expectation: output_layout.partial == [None, 'sum'] and no extra Partial from contract.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("mp", "sum")
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+
+        op_ext = self._make_matmul_ext()
+        output_layout = op_ext.infer_layout((x_layout, w_layout))
+        expected_partial = [None, 'sum']
+        assert output_layout.partial == expected_partial, (
+            f"Partial without contract sharding failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_matmul_ext_partial_x_shard_w_same_axis_output_dim_raises(self, mock_platform):
+        """
+        Feature: MatMulExtDistributedOp rejects Partial x + Shard w on same axis in output dim.
+        Description: x has Partial on 'mp', w is Shard on 'mp' in the output dimension.
+                     Layout.set_partial_by_dev_axis should raise "Partial dim must be replicate".
+        Expectation: ValueError raised with message about Partial dim must be replicate.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("mp", "sum")
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
+
+        op_ext = self._make_matmul_ext()
+        with self.assertRaisesRegex(ValueError, "Partial dim must be replicate"):
+            op_ext.infer_layout((x_layout, w_layout))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_matmul_distributed_partial_x_propagated(self, mock_platform):
+        """
+        Feature: MatMulDistributedOp propagates Partial from input x with transpose.
+        Description: x has Partial on dp, w is Replicate, transpose_a=True.
+                     Input Partial should propagate regardless of transpose.
+        Expectation: output_layout.partial == ['sum', None].
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+
+        output_layout = op.infer_layout((x_layout, w_layout), (True, False))
+        expected_partial = ['sum', None]
+        assert output_layout.partial == expected_partial, (
+            f"MatMulDistributedOp partial x propagation failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_matmul_distributed_partial_w_propagated(self, mock_platform):
+        """
+        Feature: MatMulDistributedOp propagates Partial from input w.
+        Description: w has Partial on mp, x is Replicate, transpose_b=True.
+        Expectation: output_layout.partial == [None, 'sum'].
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        w_layout.set_partial_by_dev_axis("mp", "sum")
+
+        output_layout = op.infer_layout((x_layout, w_layout), (False, True))
+        expected_partial = [None, 'sum']
+        assert output_layout.partial == expected_partial, (
+            f"MatMulDistributedOp partial w propagation failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
         )
 
 
@@ -366,19 +580,26 @@ class TestParallelLinear(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_linear_partial_input_raises_error(self, mock_platform):
+    def test_linear_partial_input_propagated(self, mock_platform):
         """
-        Feature: LinearDistributedOp rejects partial-status inputs.
-        Description: Input x has Partial status set on mp axis; this must be reduced before Linear.
-        Expectation: ValueError is raised with message about Partial status.
+        Feature: LinearDistributedOp propagates Partial from input x.
+        Description: Input x has Partial status set on mp axis; it should be
+                     propagated to the output like other matmul operators.
+        Expectation: output_layout.partial == [None, 'sum'].
         """
         mesh = self._make_2x4_mesh(mock_platform)
         x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
         x_layout.set_partial_by_dev_axis("mp", "sum")
+        _LAYOUT_CACHE.clear()
         w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         cache_values = [x_layout, w_layout, None]
-        with self.assertRaisesRegex(ValueError, "Partial status"):
-            linear_op.infer_layout(cache_values)
+        output_layouts, extra_info = linear_op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
+        expected_partial = [None, 'sum']
+        assert output_layout.partial == expected_partial, (
+            f"Linear partial input propagation failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_linear_weight_not_2d_raises_error(self, mock_platform):
@@ -429,11 +650,13 @@ class TestParallelBatchMatMul(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -503,6 +726,70 @@ class TestParallelBatchMatMul(unittest.TestCase):
             transpose_b=False
         )
 
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_bmm_partial_x_propagated(self, mock_platform):
+        """
+        Feature: BatchMatMulDistributedOp propagates Partial from input x.
+        Description: x has Partial on cp axis, both inputs are Replicate.
+                     Output should inherit Partial.
+        Expectation: output_layout.partial == [None, 'sum', None].
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+        x_layout.set_partial_by_dev_axis("cp", "sum")
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+
+        bmm_op = BatchMatMulDistributedOp("BatchMatMul")
+        output_layout = bmm_op.infer_layout((x_layout, w_layout), (False, False))
+        expected_partial = [None, 'sum', None]
+        assert output_layout.partial == expected_partial, (
+            f"BatchMatMul partial x propagation failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_bmm_partial_x_plus_contract_dim_sharded(self, mock_platform):
+        """
+        Feature: BatchMatMulDistributedOp with x Partial on cp and contract dim sharded on mp.
+        Description: x has Partial on cp (different axis from contract dim sharding on mp).
+                     Output should inherit both.
+        Expectation: output_layout.partial == [None, 'sum', 'sum'].
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(2)), 3)
+        x_layout.set_partial_by_dev_axis("cp", "sum")
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(1)), 3)
+
+        bmm_op = BatchMatMulDistributedOp("BatchMatMul")
+        output_layout = bmm_op.infer_layout((x_layout, w_layout), (False, False))
+        expected_partial = [None, 'sum', 'sum']
+        assert output_layout.partial == expected_partial, (
+            f"BatchMatMul partial x + contract sharding failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_bmm_partial_x_transpose_a_propagated(self, mock_platform):
+        """
+        Feature: BatchMatMulDistributedOp with transpose propagates Partial from x.
+        Description: x has Partial on cp, transpose_a=True. Partial should propagate.
+        Expectation: output_layout.partial == [None, 'sum', None].
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+        x_layout.set_partial_by_dev_axis("cp", "sum")
+        w_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+
+        bmm_op = BatchMatMulDistributedOp("BatchMatMul")
+        output_layout = bmm_op.infer_layout((x_layout, w_layout), (True, False))
+        expected_partial = [None, 'sum', None]
+        assert output_layout.partial == expected_partial, (
+            f"BatchMatMul partial x transpose_a failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
 
 class TestParallelBatchMatMulExt(unittest.TestCase):
     """Unit tests for BatchMatMulExtDistributedOp."""
@@ -510,11 +797,13 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
@@ -620,6 +909,86 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
         w_layout = _build_layout(mesh, (Replicate(), Shard(2), Shard(1)), 3)
 
         self._run_scenario(x_layout, w_layout, expected_map=(2, -1, 1))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_bmm_ext_partial_x_propagated(self, mock_platform):
+        """
+        Feature: BatchMatMulExtDistributedOp propagates Partial from input x.
+        Description: x has Partial on cp axis, w is Replicate. Output should inherit Partial.
+        Expectation: output_layout.partial == [None, 'sum', None] on cp axis.
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+        x_layout.set_partial_by_dev_axis("cp", "sum")
+        w_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+
+        bmm_ext_op = BatchMatMulExtDistributedOp("BatchMatMulExt")
+        output_layout = bmm_ext_op.infer_layout((x_layout, w_layout), None)
+        expected_partial = [None, 'sum', None]
+        assert output_layout.partial == expected_partial, (
+            f"BatchMatMulExt partial x propagation failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_bmm_ext_partial_w_propagated(self, mock_platform):
+        """
+        Feature: BatchMatMulExtDistributedOp propagates Partial from input w.
+        Description: w has Partial on dp axis, x is Replicate. Output should inherit Partial.
+        Expectation: output_layout.partial == ['sum', None, None].
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+        w_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+        w_layout.set_partial_by_dev_axis("dp", "sum")
+
+        bmm_ext_op = BatchMatMulExtDistributedOp("BatchMatMulExt")
+        output_layout = bmm_ext_op.infer_layout((x_layout, w_layout), None)
+        expected_partial = ['sum', None, None]
+        assert output_layout.partial == expected_partial, (
+            f"BatchMatMulExt partial w propagation failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_bmm_ext_partial_x_plus_contract_sharding(self, mock_platform):
+        """
+        Feature: BatchMatMulExtDistributedOp with x Partial on cp and contract dim sharded on mp.
+        Description: x has Partial on cp (different axis from contract dim sharding on mp).
+                     Output should have both.
+        Expectation: output_layout.partial == [None, 'sum', 'sum'].
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(2)), 3)
+        x_layout.set_partial_by_dev_axis("cp", "sum")
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(1)), 3)
+
+        bmm_ext_op = BatchMatMulExtDistributedOp("BatchMatMulExt")
+        output_layout = bmm_ext_op.infer_layout((x_layout, w_layout), None)
+        expected_partial = [None, 'sum', 'sum']
+        assert output_layout.partial == expected_partial, (
+            f"BatchMatMulExt partial x + contract sharding failed. Expected {expected_partial}, "
+            f"got {output_layout.partial}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_bmm_ext_partial_x_shard_w_same_output_axis_raises(self, mock_platform):
+        """
+        Feature: BatchMatMulExtDistributedOp rejects Partial x + Shard w on same axis in output dim.
+        Description: x has Partial on mp, w is Shard on mp in the output column dimension.
+                     set_partial_by_dev_axis should raise "Partial dim must be replicate".
+        Expectation: ValueError raised.
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+        x_layout.set_partial_by_dev_axis("mp", "sum")
+        _LAYOUT_CACHE.clear()
+        w_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(2)), 3)
+
+        bmm_ext_op = BatchMatMulExtDistributedOp("BatchMatMulExt")
+        with self.assertRaisesRegex(ValueError, "Partial dim must be replicate"):
+            bmm_ext_op.infer_layout((x_layout, w_layout), None)
 
 
 if __name__ == "__main__":
