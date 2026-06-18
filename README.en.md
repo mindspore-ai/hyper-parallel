@@ -56,6 +56,8 @@ performance.
 ### HyperMPMD: Parallel Paradigm Evolution, SPMD -> Cluster MPMD -> Cluster + Multi-Core MPMD
 
 - Cluster MPMD: Supports heterogeneous model sharding, supports arbitrary device allocation for model slices;
+- Multimodal MPMD (Mpipe): Supports heterogeneous scheduling for multimodal pipeline parallelism, unlocking SuperPod
+  utilisation for MLLMs;
 - Intra-Chip Multi-Core MPMD: Intra-chip multi-core MPMD parallelism, combined with core-level memory semantic one-sided
   communication, enhancing compute-communication overlap and MAC utilisation;
 
@@ -137,6 +139,9 @@ performance.
         - [ ] ZBV
         - [ ] SeqPP
         - [ ] Different Device Allocation per PP Stage
+    - Mpipe Multimodal Parallelism
+        - [x] Mpipe Transpose Scheduling
+        - [ ] Mpipe Data Reordering
     - Subgraph Partitioning
         - [ ] Multimodal Encoder/Decoder Partitioning to Different Devices
     - Multi-Core Parallelism
@@ -164,11 +169,9 @@ performance.
     - [x] gradient scaling factor + clip_grad enhancements
 
 - AutoParallel
-    - [x] Fast-Tuner: Based on profiling information, constructs black-box cost models, automatically generates
-      multi-dimensional hybrid parallel strategies through enumeration, pruning, and search
-    - [x] SAPP-PPB: Pipeline Parallelism Balancing
     - [x] SAPP-ND: ND Search (memory estimation + performance estimation)
-    - [ ] PARADISE
+    - [x] SAPP-PPB: Pipeline Parallelism Balancing
+    - [ ] SAPP-Omni
 
 - One-Sided Communication
     - [x] Symmetric Memory
