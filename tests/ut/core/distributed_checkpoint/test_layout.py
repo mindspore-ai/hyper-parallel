@@ -21,8 +21,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from tests.common.mark_utils import arg_mark
-
 from hyper_parallel.core.distributed_checkpoint.layout import (
     get_current_layout,
     load_layout,
@@ -62,12 +60,6 @@ class TestLayout(unittest.TestCase):
         self._params_dict_patcher.stop()
 
     @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_get_current_layout_mesh_shape_becomes_device_matrix(self, mock_rank):
         """
         Feature: Distributed checkpoint layout export from a cell.
@@ -109,12 +101,6 @@ class TestLayout(unittest.TestCase):
         mock_rank.assert_called_once()
 
     @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=3)
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_get_current_layout_uses_string_rank_as_key(self, mock_rank):
         """
         Feature: Rank-scoped layout dictionary keys.
@@ -131,12 +117,6 @@ class TestLayout(unittest.TestCase):
         mock_rank.assert_called_once()
 
     @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_get_current_layout_falsy_layout_records_type_and_full_shape(self, mock_rank):
         """
         Feature: Parameters with no usable layout still record dtype and global shape.
@@ -161,12 +141,6 @@ class TestLayout(unittest.TestCase):
 
     @patch("hyper_parallel.core.distributed_checkpoint.layout.logger")
     @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_get_current_layout_logs_params_without_layout_attr(self, mock_rank, mock_logger):
         """
         Feature: Observability for parameters missing a layout attribute.
@@ -191,12 +165,6 @@ class TestLayout(unittest.TestCase):
 
     @patch("hyper_parallel.core.distributed_checkpoint.layout.logger")
     @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_get_current_layout_only_missing_layout_attr_type_and_full_shape(self, mock_rank, mock_logger):
         """
         Feature: Rank layout map when every parameter lacks a layout attribute.
@@ -221,12 +189,6 @@ class TestLayout(unittest.TestCase):
         mock_rank.assert_called_once()
 
     @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_get_current_layout_no_rename_without_mesh_shape(self, mock_rank):
         """
         Feature: Layout export without mesh_shape in to_dict.
@@ -244,12 +206,6 @@ class TestLayout(unittest.TestCase):
         self.assertEqual(out["tensor_map"], (0,))
         mock_rank.assert_called_once()
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_save_layout_success_with_string_path(self):
         """
         Feature: save_layout with a string filesystem path.
@@ -269,12 +225,6 @@ class TestLayout(unittest.TestCase):
                 loaded_data = json.load(f)
             self.assertEqual(loaded_data, layout_dict)
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_save_layout_success_with_path_object(self):
         """
         Feature: save_layout with pathlib.Path.
@@ -290,12 +240,6 @@ class TestLayout(unittest.TestCase):
             with open(file_path, "r", encoding="utf-8") as f:
                 self.assertEqual(json.load(f), layout_dict)
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_load_layout_success(self):
         """
         Feature: load_layout from a string path.
@@ -315,12 +259,6 @@ class TestLayout(unittest.TestCase):
         finally:
             os.unlink(temp_path)
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_load_layout_success_with_path_object(self):
         """
         Feature: load_layout from pathlib.Path.
@@ -336,12 +274,6 @@ class TestLayout(unittest.TestCase):
         finally:
             os.unlink(str(temp_path))
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_load_layout_missing_file_raises(self):
         """
         Feature: load_layout error handling for missing files.
@@ -353,12 +285,6 @@ class TestLayout(unittest.TestCase):
             load_layout(missing)
         self.assertIn(str(missing), str(ctx.exception))
 
-    @arg_mark(
-        plat_marks=["platform_ascend910b"],
-        level_mark="level0",
-        card_mark="onecard",
-        essential_mark="unessential",
-    )
     def test_save_load_layout_roundtrip_preserves_null_entries(self):
         """
         Feature: JSON persistence of rank layout maps containing null parameter entries.
