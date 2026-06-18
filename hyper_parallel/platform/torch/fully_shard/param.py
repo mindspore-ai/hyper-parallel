@@ -25,7 +25,7 @@ from torch import nn
 from torch._prims_common import make_contiguous_strides_for
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
-from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard, StridedShard
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
@@ -441,12 +441,11 @@ class TorchHSDPParamV2(HSDPParamV2):
                 self.sharded_param.main_grad = self.to_sharded_dtensor(reduced_grad)
                 self.sharded_param.grad = None
         else:
-            with SkipDTensorDispatch():
-                if not self.mp_policy.apply_grad_on_fp32_main_grad:
-                    self.sharded_param.grad._local_tensor += reduced_grad
-                else:
-                    self.sharded_param.main_grad._local_tensor += reduced_grad
-                    self.sharded_param.grad = None
+            if not self.mp_policy.apply_grad_on_fp32_main_grad:
+                self.sharded_param.grad._local_tensor += reduced_grad
+            else:
+                self.sharded_param.main_grad._local_tensor += reduced_grad
+                self.sharded_param.grad = None
         if self.unsharded_accumulated_grad_data is not None:
             self.unsharded_accumulated_grad = None
         elif self.unsharded_param.grad is not None:
