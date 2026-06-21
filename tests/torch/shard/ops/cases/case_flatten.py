@@ -1,0 +1,143 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Shard ops cases for ``torch.Tensor.flatten``."""
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+from tests.shard_ops.framework import (
+    CompareSpec,
+    InputSpec,
+    OpShardCase,
+    register,
+)
+
+
+def _flatten_all(x):
+    return x.flatten(0, -1)
+
+
+def _flatten_middle(x):
+    return x.flatten(1, 2)
+
+
+def _flatten_unsharded(x):
+    return x.flatten(1, 2)
+
+
+def _flatten_neg_dims(x):
+    return x.flatten(-2, -1)
+
+
+def _flatten_scalar(x):
+    return x.flatten(0, -1)
+
+
+def _flatten_default(x):
+    return x.flatten()
+
+
+def _flatten_single_dim(x):
+    return x.flatten(1, 1)
+
+
+def _flatten_2d_to_1d(x):
+    return x.flatten(0, 1)
+
+
+register(OpShardCase(
+    name="flatten_ops_all_dims",
+    fn=_flatten_all,
+    inputs=[InputSpec(shape=(8, 4, 6), init="randn", seed=42)],
+    placements=[(Shard(0), Replicate(), Replicate())],
+    compare=CompareSpec.equal(),
+    mesh_shape=(2, 2),
+    mesh_dim_names=("dp", "tp"),
+    tags=("cpu_level0", "npu_level0"),
+))
+
+register(OpShardCase(
+    name="flatten_ops_middle_dims",
+    fn=_flatten_middle,
+    inputs=[InputSpec(shape=(4, 2, 4, 6), init="randn", seed=42)],
+    placements=[(Shard(0), Shard(1), Replicate(), Replicate())],
+    compare=CompareSpec.equal(),
+    mesh_shape=(2, 2),
+    mesh_dim_names=("dp", "tp"),
+    tags=("cpu_level0", "npu_level0"),
+))
+
+register(OpShardCase(
+    name="flatten_ops_unsharded",
+    fn=_flatten_unsharded,
+    inputs=[InputSpec(shape=(8, 4, 6), init="randn", seed=42)],
+    placements=[(Shard(0), Replicate(), Replicate())],
+    compare=CompareSpec.equal(),
+    mesh_shape=(2, 2),
+    mesh_dim_names=("dp", "tp"),
+    tags=("cpu_level0", "npu_level0"),
+))
+
+register(OpShardCase(
+    name="flatten_ops_neg_dims",
+    fn=_flatten_neg_dims,
+    inputs=[InputSpec(shape=(8, 4, 6), init="randn", seed=42)],
+    placements=[(Shard(0), Shard(1), Replicate())],
+    compare=CompareSpec.equal(),
+    mesh_shape=(2, 2),
+    mesh_dim_names=("dp", "tp"),
+    tags=("cpu_level0", "npu_level0"),
+))
+
+register(OpShardCase(
+    name="flatten_ops_scalar",
+    fn=_flatten_scalar,
+    inputs=[InputSpec(shape=(), init="randn", seed=42)],
+    placements=[(Replicate(), Replicate())],
+    compare=CompareSpec.equal(),
+    mesh_shape=(2, 2),
+    mesh_dim_names=("dp", "tp"),
+    tags=("cpu_level0", "npu_level0"),
+))
+
+register(OpShardCase(
+    name="flatten_ops_default",
+    fn=_flatten_default,
+    inputs=[InputSpec(shape=(8, 4, 6), init="randn", seed=42)],
+    placements=[(Shard(0), Replicate(), Replicate())],
+    compare=CompareSpec.equal(),
+    mesh_shape=(2, 2),
+    mesh_dim_names=("dp", "tp"),
+    tags=("cpu_level0", "npu_level0"),
+))
+
+register(OpShardCase(
+    name="flatten_ops_single_dim",
+    fn=_flatten_single_dim,
+    inputs=[InputSpec(shape=(4, 2, 4, 6), init="randn", seed=42)],
+    placements=[(Shard(0), Shard(1), Replicate(), Replicate())],
+    compare=CompareSpec.equal(),
+    mesh_shape=(2, 2),
+    mesh_dim_names=("dp", "tp"),
+    tags=("cpu_level0", "npu_level0"),
+))
+
+register(OpShardCase(
+    name="flatten_ops_2d_to_1d",
+    fn=_flatten_2d_to_1d,
+    inputs=[InputSpec(shape=(8, 4), init="randn", seed=42)],
+    placements=[(Shard(0), Replicate())],
+    compare=CompareSpec.equal(),
+    mesh_shape=(2, 2),
+    mesh_dim_names=("dp", "tp"),
+    tags=("cpu_level0", "npu_level0"),
+))

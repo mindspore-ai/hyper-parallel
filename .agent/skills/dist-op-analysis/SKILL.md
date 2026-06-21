@@ -9,7 +9,7 @@ description: Distributed operator analysis. Analyzes operator interfaces provide
 
 This skill is the entry point of the full workflow. The complete chain is:
 
-```
+```text
 1. /dist-op-analysis   Analyze interfaces → output plan → STOP, wait for human confirmation
          ↓  (human confirms plan)
 2. /dist-op-dev        Read plan → implement → write tests → run tests → fix until all pass
@@ -27,6 +27,7 @@ Steps 3 and 4 are standard for any PR and are not specific to distributed operat
 ## Trigger
 
 The user provides any combination of:
+
 - PyTorch interface (e.g. `torch.nn.functional.linear`)
 - MindSpore mint interface (e.g. `mint.sort`)
 - MindSpore Primitive name (e.g. `SortExt`)
@@ -63,6 +64,7 @@ If `api_def/{op_name}.yaml` does not exist, trace the import path in `mindspore/
 ### 2.2 Primitive Interface Details
 
 Read the Primitive definition from:
+
 - Structure: `mindspore/mindspore/ops/op_def/yaml/{primitive_snake_case}_op.yaml` (args/returns/dtypes)
 - Python kwonlyargs: `mindspore/mindspore/ops/api_def/{op_name}.yaml` (if `kwonlyargs` field exists)
 - Docs: `mindspore/mindspore/ops/op_def/yaml/doc/{primitive_snake_case}_doc.yaml`
@@ -80,10 +82,11 @@ Based on the operator semantics, analyze the following and write them into the p
 1. **Which dimensions are naturally independent** (can be sharded): e.g. batch, head, sequence
 2. **Which dimensions cannot be sharded**: e.g. reduce dim, rotation dim
 3. **Broadcast and shard constraints for auxiliary inputs** (e.g. cos/sin)
-4. **Output layout derivation rule**: deepcopy(input), new layout, or Partial
-5. **Whether `get_expand_impl` is needed**: required when distributed result differs from single-device result
-6. **`cache_values` composition**: Layout objects first, then scalars; only include information that affects layout inference
-7. **Allowed shard scenarios**: list valid scenarios in a table (mesh, tensor_map per input); invalid scenarios are described in the constraint rules section, not in this table
+4. **Derived inputs**: does the op consume tensors derived from primaries via a device op over global info (e.g. attention `sm_max/sm_sum`)? If so, the ST plan must declare them as `derived_inputs` (computed once on full tensors, then sliced) — not faked, not recomputed in-fn. See `.agent/rules/distributed-op-testing.md`.
+5. **Output layout derivation rule**: deepcopy(input), new layout, or Partial
+6. **Whether `get_expand_impl` is needed**: required when distributed result differs from single-device result
+7. **`cache_values` composition**: Layout objects first, then scalars; only include information that affects layout inference
+8. **Allowed shard scenarios**: list valid scenarios in a table (mesh, tensor_map per input); invalid scenarios are described in the constraint rules section, not in this table
 
 ## Step 4: Implementation Design
 
@@ -107,13 +110,14 @@ Evaluate in order and explicitly state the choice and rationale in the plan:
 Key requirements:
 
 - **`_validate_input_layouts`**: only required for new classes using three-phase dispatch; defined as `@staticmethod`, called by `infer_layout` after `_check_partial_inputs`. Performs layout validity checks only (sharding constraints, mesh consistency, etc.) — no derivation.
-- **MindSpore ST**: the Impl file must call the operator via the `mint.{op_name}` interface. Direct use of the Primitive class is forbidden. Users access operators through mint, so ST must validate that path.
-- **PyTorch ST**: if the operator interface is a native torch interface (not `torch_npu`), the Runner must include a `_gloo` variant function.
+- **MindSpore ST**: cases use `ms.mint.xxx()` interface (never call the Primitive directly). Cases are defined in `tests/mindspore/st/shard/ops/cases/case_{op_name}.py` using the declarative `OpShardCase` framework. See `.agent/rules/distributed-op-testing.md` for the full spec.
+- **PyTorch ST**: cases use standard `torch.xxx()` APIs. Cases are defined in `tests/torch/shard/ops/cases/case_{op_name}.py`, same `OpShardCase` pattern.
 
 ## Step 5: Output the Plan
 
 Save the plan to:
-```
+
+```text
 hyper-parallel/.agent/skills/dist-op-analysis/plans/{OpName}_dist_op_plan.md
 ```
 
