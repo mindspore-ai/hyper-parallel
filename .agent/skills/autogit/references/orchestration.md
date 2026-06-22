@@ -64,6 +64,10 @@ same-root-cause failures mean the AI's mental model is wrong — consult.
 
 ## PR description content (fill the template)
 
+**When adding a description to an existing PR, first fetch the PR's current
+description and use it as the template — strictly do NOT modify the template
+content; only fill in the blanks.**
+
 Read JSON analysis + raw diff, fill each section of
 `.gitcode/PULL_REQUEST_TEMPLATE.zh-CN.md`:
 
