@@ -48,7 +48,6 @@ Release Notes 需包含：
 | README.md / README.en.md | 特性 checkbox 更新、新特性章节 |
 | docs/guide/ | 新增特性使用指南、更新已有指南 |
 | docs/api/ | 新增接口说明、更新已有接口参数 |
-| docs/getting_started/ | 版本要求变更、新增依赖 |
 | docs/faq.md | 新增常见问题 |
 | Release Notes | 生成版本变更记录 |
 
