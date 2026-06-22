@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for MatmulReduceScatterDistributedOp."""
-import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -33,13 +32,13 @@ from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 class TestMatmulReduceScatterDistributedOp(unittest.TestCase):
     """Unit tests for MatmulReduceScatterDistributedOp."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Clear global state before each test."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         """Clear global state after each test."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()

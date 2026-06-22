@@ -9,7 +9,7 @@ description: Distributed operator development. Reads a confirmed plan file, impl
 
 The user provides a confirmed plan file or specifies the latest plan:
 
-```
+```text
 /dist-op-dev implement according to .agent/skills/dist-op-analysis/plans/Sort_dist_op_plan.md
 ```
 
@@ -80,17 +80,58 @@ Follow all UT constraints in `.agent/rules/distributed-op-testing.md`.
 
 ### Step 4: Write MindSpore ST (if applicable)
 
-- Runner: `tests/mindspore/st/shard/ops/test_parallel_op_{op_name}.py`
-- Impl: `tests/mindspore/st/shard/ops/_test_parallel_op_{op_name}.py`
+Create `tests/mindspore/st/shard/ops/cases/case_{op_name}.py`. Use the declarative `OpShardCase` framework:
 
-Follow all MindSpore ST constraints in `.agent/rules/distributed-op-testing.md`.
+```python
+import mindspore as ms
+from tests.shard_ops.framework import CompareSpec, InputSpec, OpShardCase, register
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+
+def _op_dp(x):
+    return ms.mint.argsort(x, dim=-1)
+
+register(OpShardCase(
+    name="argsort_ops_dp",
+    fn=_op_dp,
+    inputs=[InputSpec(shape=(8, 16), init="randn", seed=42)],
+    placements=[(Shard(0), Replicate())],
+    compare=CompareSpec.equal(),
+    tags=("npu_level0",),
+))
+```
+
+- Use `ms.mint.xxx()` — never call MindSpore Primitives directly
+- Tags: `("npu_level0",)` (4-card / `(2,2)`) or `("npu_level1",)` (2-card / 8-card) for MindSpore-only cases
+- Cases are auto-discovered via `cases/__init__.py`; no manual import needed
+- **Placement length == mesh ndim**, and if the op needs derived stats use `derived_inputs` — see `.agent/rules/distributed-op-testing.md`
+
+Follow all ST constraints in `.agent/rules/distributed-op-testing.md`.
 
 ### Step 5: Write PyTorch ST (if applicable)
 
-- Runner: `tests/torch/shard/ops/test_parallel_op_{op_name}.py`
-- Impl: `tests/torch/shard/ops/_test_parallel_op_{op_name}.py`
+Create `tests/torch/shard/ops/cases/case_{op_name}.py` — same declarative pattern as MindSpore, but with `torch.xxx()` APIs:
 
-Follow all PyTorch ST constraints in `.agent/rules/distributed-op-testing.md`.
+```python
+import torch
+from tests.shard_ops.framework import CompareSpec, InputSpec, OpShardCase, register
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
+
+def _op_dp(x):
+    return torch.sort(x, dim=-1)
+
+register(OpShardCase(
+    name="sort_ops_2d_dp",
+    fn=_op_dp,
+    inputs=[InputSpec(shape=(8, 16), init="randn", seed=42)],
+    placements=[(Shard(0), Replicate())],
+    compare=CompareSpec.equal(),
+    tags=("cpu_level0", "npu_level0"),
+))
+```
+
+- Tags: `("cpu_level0", "npu_level0")` for Torch cases that run on both backends
+- Use standard `torch.*` APIs (not `torch_npu`)
+- Follow all ST constraints in `.agent/rules/distributed-op-testing.md`
 
 ### Step 6: Run Tests and Fix Until All Pass
 
@@ -106,21 +147,31 @@ npu-smi info >/dev/null 2>&1 && echo "ascend" || echo "no-ascend"
 **Run commands**
 
 ```bash
-# UT (always run, no env vars needed)
+# UT (always run)
 pytest -vs tests/ut/core/shard/ops/test_parallel_{op_name}.py
 
-# Torch gloo ST (run when _gloo variant exists; works without Ascend)
-HYPER_PARALLEL_PLATFORM=torch HYPER_PARALLEL_TEST_DEVICE_TYPE="cpu" \
-pytest -vs tests/torch/shard/ops/test_parallel_op_{op_name}.py -k "_gloo"
+# Torch CPU (gloo) — level0 and level1
+pytest -vs tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_level0
+pytest -vs tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_level1
 
-# Torch Ascend ST (Ascend environment)
-HYPER_PARALLEL_PLATFORM=torch \
-pytest -vs tests/torch/shard/ops/test_parallel_op_{op_name}.py -k "not _gloo"
+# Torch Ascend (hccl) — level0 and level1
+pytest -vs tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_ascend_level0
+pytest -vs tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_ascend_level1
 
-# MindSpore ST (Ascend environment)
+# MindSpore (Ascend only) — level0 and level1
+pytest -vs tests/mindspore/st/shard/ops/test_shard_ops_suite.py::test_shard_ops_ascend_level0
+pytest -vs tests/mindspore/st/shard/ops/test_shard_ops_suite.py::test_shard_ops_ascend_level1
+
+# Fast iteration on your op only — env filter (suite) or CLI (single case)
+HYPER_PARALLEL_SHARD_CASE_FILTER="{op}_ops_*" \
+  pytest tests/torch/shard/ops/test_shard_ops_suite.py::test_shard_ops_cpu_level0 -vs
+python -m tests.shard_ops.framework --case {op}_ops_dp --num-proc 4              # torch
 HYPER_PARALLEL_PLATFORM=mindspore \
-pytest -vs tests/mindspore/st/shard/ops/test_parallel_op_{op_name}.py
+  python -m tests.shard_ops.framework --framework mindspore --device-type npu \
+  --case {op}_ops_dp --num-proc 4                                                # mindspore
 ```
+
+`--num-proc` must equal `math.prod(mesh_shape)`. For MindSpore CLI runs export `HYPER_PARALLEL_PLATFORM=mindspore`.
 
 **Failure handling**
 

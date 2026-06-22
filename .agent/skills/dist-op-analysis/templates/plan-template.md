@@ -3,6 +3,7 @@
 ## 1. 接口分析
 
 ### 接入平台
+
 - 平台范围：PyTorch / MindSpore / 双平台
 - （若单平台）已与用户确认，不接入另一侧。
 
@@ -68,7 +69,7 @@
 **基类选择：**
 
 - 选择：`{BaseClass}`（例：`ElementWiseDistributedOp` / `ReshapeDistributedOp` / 新类继承 `DistributedOp`）
-- 理由：{选择理由，如"纯逐元素，无需自定义 infer_layout" / "需要 _MS_PRIMITIVE_OP_NAMES 路由" / "输出 layout 非逐元素映射"}
+- 理由：{选择理由，如"纯逐元素，无需自定义 infer_layout" / "需要_MS_PRIMITIVE_OP_NAMES 路由" / "输出 layout 非逐元素映射"}
 - 若选择纯 YAML 注册（无新 Python 文件），在此注明，并跳过模块结构部分。
 
 **模块结构（仅三阶段 dispatch 新类需要）：**
@@ -111,22 +112,29 @@
 
 ### 文件四：MindSpore ST（如适用）
 
-- Runner：`tests/mindspore/st/shard/ops/test_parallel_op_{op_name}.py`
-- Impl：`tests/mindspore/st/shard/ops/_test_parallel_op_{op_name}.py`
-- Impl 中使用 `mint.{op_name}` 接口调用（禁止直接使用 Primitive）
+- 用例文件：`tests/mindspore/st/shard/ops/cases/case_{op_name}.py`
+- 使用声明式 `OpShardCase` 框架（`InputSpec`, `CompareSpec`, `register`）
+- 接口使用 `ms.mint.xxx()`（禁止直接使用 Primitive 类）
+- 用例名格式：`{op_name}_ops_{scenario}`
+- tags：4 卡 `(2,2)` → `("npu_level0",)`；2 卡/8 卡 → `("npu_level1",)`
+- **placement 元组长度 == mesh ndim**；若有派生输入用 `derived_inputs`（见 rule）
 
-| 用例名 | 卡数 | mesh | 说明 |
-|-------|------|------|------|
-| `test_{op_name}_data_parallel` | 2 | `(2,)` dp | DP on B，与单机对比 |
+| 用例名 | mesh | placements | 说明 |
+|-------|------|-----------|------|
+| `{op}_ops_dp` | `(2,2)` | `[(Shard(0), Replicate())]` | DP，与单机对比 |
+| `{op}_ops_tp` | `(2,)` | `[(Shard(1),)]` | TP，1D mesh |
 | ... | ... | ... | ... |
+
+> 详见 `.agent/rules/distributed-op-testing.md`
 
 ### 文件五：PyTorch ST（如适用）
 
-- Runner：`tests/torch/shard/ops/test_parallel_op_{op_name}.py`
-  - 含 `_gloo` 变体：是 / 否（torch 原生接口需要）
-- Impl：`tests/torch/shard/ops/_test_parallel_op_{op_name}.py`
+- 用例文件：`tests/torch/shard/ops/cases/case_{op_name}.py`
+- 使用声明式 `OpShardCase` 框架（同上）
+- tags：`("cpu_level0", "npu_level0")`（4 卡）；2 卡/8 卡用 level1
+- **placement 元组长度 == mesh ndim**
 
-| 用例名 | num_proc | 说明 |
-|-------|---------|------|
-| `test_{op_name}_data_parallel` | 4 | DP on B，layout + 数值双验证 |
-| ... | ... | ... |
+| 用例名 | mesh | placements | 说明 |
+|-------|------|-----------|------|
+| `{op}_ops_dp` | `(2,2)` | `[(Shard(0), Replicate())]` | DP，与单机对比 |
+| ... | ... | ... | ... |
