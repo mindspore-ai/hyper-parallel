@@ -65,7 +65,9 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
         feature: _register_post_backward_hook early return.
         """
         t1 = ms.Tensor(np.random.randn(2).astype(np.float32))
+        t1.requires_grad = False
         t2 = ms.Tensor(np.random.randn(3).astype(np.float32))
+        t2.requires_grad = False
 
         args = (t1, t2)
         kwargs = {}
@@ -124,9 +126,9 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
         ng2 = ms.Tensor(np.random.randn(1, 2).astype(np.float32))
         ng2.requires_grad = False
 
-        # Mock apply to return the same input tensors (positions match flattened
-        # args followed by flattened kwargs); the source code then propagates
-        # requires_grad onto the returned tensors.
+        # Mock apply to echo back the grad-requiring tensors it receives; the
+        # scheduler writes them back into their original flattened positions
+        # while no-grad tensors are passed through untouched.
         mock_apply.side_effect = lambda _scheduler, *flat: tuple(flat)
 
         args = (g1, ng1)
@@ -134,7 +136,7 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
 
         out_args, out_kwargs = _call_register_post_backward_hook(self.scheduler, args, kwargs)
 
-        mock_apply.assert_called_once_with(self.scheduler, g1, ng1, g2, ng2)
+        mock_apply.assert_called_once_with(self.scheduler, g1, g2)
         assert out_args[0].requires_grad is True, (
             f"Expected requires_grad=True for args[0], "
             f"got {out_args[0].requires_grad}"
@@ -185,7 +187,7 @@ class TestRegisterPostBackwardHook(unittest.TestCase):
 
         out_args, _ = _call_register_post_backward_hook(self.scheduler, args, kwargs)
 
-        mock_apply.assert_called_once_with(self.scheduler, grad_float, int_tensor, no_grad_float)
+        mock_apply.assert_called_once_with(self.scheduler, grad_float)
         assert out_args[0].requires_grad is True, (
             f"Expected requires_grad=True for float grad tensor, "
             f"got {out_args[0].requires_grad}"

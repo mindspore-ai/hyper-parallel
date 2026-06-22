@@ -160,13 +160,13 @@ class TestMindSporeScheduler(unittest.TestCase):
             MindSporeHSDPSchedulerV2._new_cell_state(scheduler)
 
     @patch("hyper_parallel.platform.mindspore.fully_shard.scheduler.PostBackwardFunction.apply")
-    def test_register_post_backward_hook_wraps_full_pytree(self, mock_apply):
-        """PostBackwardFunction should see the full flattened args/kwargs pytree, not only grad-requiring tensors."""
+    def test_register_post_backward_hook_wraps_only_grad_tensors(self, mock_apply):
+        """PostBackwardFunction should only see grad-requiring tensors, matching the torch backend."""
         scheduler = _make_scheduler()
         grad_tensor = ms.Tensor([1.0], ms.float32)
         grad_tensor.requires_grad = True
         wrapped_tensor = ms.Tensor([2.0], ms.float32)
-        mock_apply.return_value = (wrapped_tensor, "wrapped-b", "wrapped-k")
+        mock_apply.return_value = (wrapped_tensor,)
 
         args, kwargs = MindSporeHSDPSchedulerV2._register_post_backward_hook(
             scheduler,
@@ -174,11 +174,10 @@ class TestMindSporeScheduler(unittest.TestCase):
             kwargs={"kw": "arg-k"},
         )
 
-        mock_apply.assert_called_once_with(scheduler, grad_tensor, "arg-b", "arg-k")
-        self.assertTrue(args[0].requires_grad)
+        mock_apply.assert_called_once_with(scheduler, grad_tensor)
         self.assertEqual(args[0].asnumpy().tolist(), [2.0])
-        self.assertEqual(args[1], "wrapped-b")
-        self.assertEqual(kwargs, {"kw": "wrapped-k"})
+        self.assertEqual(args[1], "arg-b")
+        self.assertEqual(kwargs, {"kw": "arg-k"})
 
     def test_register_post_backward_hook_returns_input_when_grad_disabled_or_absent(self):
         """Backward hook registration should be skipped without grad tracking or grad tensors."""

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore HSDP scheduler"""
+from typing import List
 import mindspore as ms
 from mindspore._c_expression import _DisableMsDispatchMode
 from mindspore.common.api import _pynative_executor
@@ -80,26 +81,23 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         )
 
     def _register_post_backward_hook(self, args, kwargs):
-        """Register backward hook using backward function."""
+        """Wrap forward args/kwargs through PostBackwardFunction to register backward hook."""
         if not _pynative_executor.enable_grad():
             return args, kwargs
         args_list, args_spec = tree_flatten(args)
         kwargs_list, kwargs_spec = tree_flatten(kwargs)
         args_kwargs_list = list(args_list) + list(kwargs_list)
-        if not any(
-            isinstance(obj, ms.Tensor) and getattr(obj, "requires_grad", False)
-            for obj in args_kwargs_list
-        ):
-            return args, kwargs
-        processed_list = list(PostBackwardFunction.apply(self, *args_kwargs_list))
-        for idx, (orig_obj, processed_obj) in enumerate(zip(args_kwargs_list, processed_list)):
-            if isinstance(orig_obj, ms.Tensor) and isinstance(processed_obj, ms.Tensor):
-                try:
-                    processed_obj.requires_grad = bool(getattr(orig_obj, "requires_grad", False))
-                except (AttributeError, RuntimeError, TypeError, ValueError):
-                    pass
-            processed_list[idx] = processed_obj
-        args_kwargs_list = processed_list
+        inp_tensor_indices: List[int] = []
+        inp_tensors: List[ms.Tensor] = []
+        for i, obj in enumerate(args_kwargs_list):
+            if isinstance(obj, ms.Tensor) and obj.requires_grad:
+                inp_tensor_indices.append(i)
+                inp_tensors.append(obj)
+        if len(inp_tensors) == 0:
+            return args, kwargs  # no tensors that require gradients
+        processed_tensors = PostBackwardFunction.apply(self, *inp_tensors)
+        for inp_tensor_idx, processed_tensor in zip(inp_tensor_indices, processed_tensors):
+            args_kwargs_list[inp_tensor_idx] = processed_tensor
         args_list = args_kwargs_list[: len(args_list)]
         kwargs_list = args_kwargs_list[len(args_list):]
         args = tree_unflatten(args_spec, args_list)
