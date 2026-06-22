@@ -49,27 +49,33 @@ class SkipDTensorDispatch():
     """
 
     def __init__(self, no_skip: Optional[Set] = None):
-        self._no_skip_names: Set[str] = set()
+        self._no_skip_names: frozenset = frozenset()
         if no_skip:
+            names = set()
             for op in no_skip:
                 if isinstance(op, str):
-                    self._no_skip_names.add(op)
+                    names.add(op)
                 else:
-                    self._no_skip_names.add(platform.get_op_name(op))
+                    names.add(platform.get_op_name(op))
+            self._no_skip_names = frozenset(names)
+        self._dispatch_token = None
+        self._ops_token = None
 
     def __enter__(self):
         # pylint: disable=C0415
-        from hyper_parallel.core.shard._op_dispatch import disable_dtensor_dispatch, add_no_skip_ops
-        disable_dtensor_dispatch()
+        from hyper_parallel.core.shard._op_dispatch import _dtensor_dispatch_disabled, _no_skip_ops
+        self._dispatch_token = _dtensor_dispatch_disabled.set(True)
         if self._no_skip_names:
-            add_no_skip_ops(self._no_skip_names)
+            self._ops_token = _no_skip_ops.set(_no_skip_ops.get() | self._no_skip_names)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         # pylint: disable=C0415
-        from hyper_parallel.core.shard._op_dispatch import enable_dtensor_dispatch, remove_no_skip_ops
-        if self._no_skip_names:
-            remove_no_skip_ops(self._no_skip_names)
-        enable_dtensor_dispatch()
+        from hyper_parallel.core.shard._op_dispatch import _dtensor_dispatch_disabled, _no_skip_ops
+        if self._ops_token is not None:
+            _no_skip_ops.reset(self._ops_token)
+            self._ops_token = None
+        _dtensor_dispatch_disabled.reset(self._dispatch_token)
+        self._dispatch_token = None
 
 
 # Cache for _build_layout to avoid redundant Layout computations

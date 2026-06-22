@@ -19,8 +19,9 @@ import importlib
 import os
 import sys
 import warnings
+from contextvars import ContextVar
 from itertools import chain
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, FrozenSet, List, Optional
 
 import yaml
 
@@ -74,55 +75,13 @@ def _apply_shard_offset_to_rng_args(args, offset_incr):
             last_int64_idx = i
     return args
 
-_dtensor_dispatch = True
-_no_skip_ops: Set[str] = set()
+_dtensor_dispatch_disabled: ContextVar[bool] = ContextVar('_dtensor_dispatch_disabled', default=False)
+_no_skip_ops: ContextVar[FrozenSet[str]] = ContextVar('_no_skip_ops', default=frozenset())
 
 
-def get_no_skip_ops() -> Set[str]:
+def get_no_skip_ops() -> FrozenSet[str]:
     """Return the set of op names that are exempt from SkipDTensorDispatch."""
-    return _no_skip_ops
-
-
-def add_no_skip_ops(op_names: Set[str]) -> None:
-    """Add op names to the no-skip set so they are always dispatched through DTensor.
-
-    Args:
-        op_names: Set of canonical op name strings to register as no-skip.
-    """
-    global _no_skip_ops
-    _no_skip_ops = _no_skip_ops | op_names
-
-
-def remove_no_skip_ops(op_names: Set[str]) -> None:
-    """Remove op names from the no-skip set.
-
-    Args:
-        op_names: Set of canonical op name strings to remove.
-    """
-    global _no_skip_ops
-    _no_skip_ops = _no_skip_ops - op_names
-
-
-def enable_dtensor_dispatch() -> None:
-    """
-    Enable DTensor dispatch for distributed tensor operations.
-
-    When enabled, tensor operations will be dispatched through the
-    distributed operator dispatcher for layout inference and redistribution.
-    """
-    global _dtensor_dispatch
-    _dtensor_dispatch = True
-
-
-def disable_dtensor_dispatch() -> None:
-    """
-    Disable DTensor dispatch for distributed tensor operations.
-
-    When disabled, tensor operations will bypass the distributed operator
-    dispatcher and use native implementations directly.
-    """
-    global _dtensor_dispatch
-    _dtensor_dispatch = False
+    return _no_skip_ops.get()
 
 
 def get_dtensor_dispatch() -> bool:
@@ -132,7 +91,7 @@ def get_dtensor_dispatch() -> bool:
     Returns:
         bool: True if DTensor dispatch is enabled, False otherwise.
     """
-    return _dtensor_dispatch
+    return not _dtensor_dispatch_disabled.get()
 
 
 class LayoutCacheKey:
