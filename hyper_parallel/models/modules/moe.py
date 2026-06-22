@@ -146,6 +146,7 @@ class TopKRouter(nn.Module):
 
         return router_logits, top_value, top_index
 
+
 class SharedExpertMoE(nn.Module):
     """MoE block with a shared expert summed in (Qwen3.5 / DeepSeek-V3 style).
 

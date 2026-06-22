@@ -194,21 +194,21 @@ def _unpermute(out, original_shape, permuted_indices):
 @dataclass
 class DispatchContext:
     """Intermediate state between token dispatch and combine.
-    
+
     Stored in ``module._ep_dispatch_ctx`` for a single forward pass.
     This solves the instance sharing problem when the same ExpertParallel
     style object is applied to multiple layers:
-    
+
     Example problem (before this fix):
         ep_style = ExpertParallel()
         ep_style.apply(layer1.experts, mesh)  # registers hooks
         ep_style.apply(layer2.experts, mesh)  # reuses same ep_style
-        
+
         # During forward:
         # layer1.dispatch writes to ep_style._state_stack
         # layer2.dispatch pushes to same stack ← INTERLEAVING
         # layer1.combine pops wrong state (LIFO violation)
-    
+
     Solution: Store context per-module, not per-style-instance.
 
     Built by :meth:`AllToAllTokenDispatcher.dispatch` and consumed by
@@ -492,7 +492,7 @@ class ExpertParallel(BaseExpertParallel):
 
         Returns:
             Token tensor in the original token-major layout.
-            
+
         Raises:
             RuntimeError: If dispatch context is not found (dispatch was not called).
         """
@@ -534,7 +534,6 @@ class ExpertParallel(BaseExpertParallel):
             dt = distribute_tensor(src, device_mesh, [Shard(0)])
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
-
 
 
 # ---------------------------------------------------------------------------

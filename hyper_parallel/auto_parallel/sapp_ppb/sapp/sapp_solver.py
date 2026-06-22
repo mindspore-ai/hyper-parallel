@@ -44,6 +44,7 @@ class PipelineMemoryConstraint:
     micro_batch: int
     memory_limit: int
 
+
 class SappSolver:
     """solver for pipeline balance"""
 

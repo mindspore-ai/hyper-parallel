@@ -36,7 +36,9 @@ default_time_limit = 1e10
 # 0: deepseek model; 1: boss model
 model_class = 0
 
+
 # expert input: expert can change per environment
+
 
 class ExpertInput:
     """Expert input configuration for pipeline tuning.
@@ -415,19 +417,19 @@ class InitConfig:
             self.memory.re_comp_mem = self.memory.act_mem
 
         self.memory.layer_mem012 = (
-            (peak_mem[0][7] - peak_mem[0][1])
-            - self.memory.re_comp_mem12 * (peaks[7] - peaks[1])
-        ) / (
-            init_dryrun.layers_stage_vpp[7][0]
-            - init_dryrun.layers_stage_vpp[1][0]
-        )
+                                           (peak_mem[0][7] - peak_mem[0][1])
+                                           - self.memory.re_comp_mem12 * (peaks[7] - peaks[1])
+                                   ) / (
+                                           init_dryrun.layers_stage_vpp[7][0]
+                                           - init_dryrun.layers_stage_vpp[1][0]
+                                   )
         self.memory.layer_mem = (
-            (peak_mem[0][14] - peak_mem[0][9])
-            - self.memory.re_comp_mem * (peaks[14] - peaks[9])
-        ) / (
-            init_dryrun.layers_stage_vpp[14][0]
-            - init_dryrun.layers_stage_vpp[9][0]
-        )
+                                        (peak_mem[0][14] - peak_mem[0][9])
+                                        - self.memory.re_comp_mem * (peaks[14] - peaks[9])
+                                ) / (
+                                        init_dryrun.layers_stage_vpp[14][0]
+                                        - init_dryrun.layers_stage_vpp[9][0]
+                                )
 
         layers_stage = [
             sum(init_dryrun.layers_stage_vpp[stage][vpp] for vpp in range(init_dryrun.init_vpp))
@@ -435,30 +437,30 @@ class InitConfig:
         ]
         if init_dryrun.layers_stage_vpp[0][0] >= 3:
             self.memory.static_mem0 = (
-                peak_mem[1][0]
-                - self.memory.layer_mem012 * 3
-                - self.memory.layer_mem * (layers_stage[0] - 3)
-                - self.memory.re_comp_mem12 * peaks[0] * 3 / layers_stage[0]
-                - self.memory.re_comp_mem * peaks[0] * (layers_stage[0] - 3) / layers_stage[0]
+                    peak_mem[1][0]
+                    - self.memory.layer_mem012 * 3
+                    - self.memory.layer_mem * (layers_stage[0] - 3)
+                    - self.memory.re_comp_mem12 * peaks[0] * 3 / layers_stage[0]
+                    - self.memory.re_comp_mem * peaks[0] * (layers_stage[0] - 3) / layers_stage[0]
             )
         else:
             self.memory.static_mem0 = (
-                peak_mem[1][0]
-                - self.memory.layer_mem012 * init_dryrun.layers_stage_vpp[0][0]
-                - self.memory.layer_mem * (layers_stage[0] - init_dryrun.layers_stage_vpp[0][0])
-                - self.memory.re_comp_mem12 * peaks[0] * init_dryrun.layers_stage_vpp[0][0] / layers_stage[0]
-                - self.memory.re_comp_mem * peaks[0] * (layers_stage[0] - init_dryrun.layers_stage_vpp[0][0])
-                / layers_stage[0]
+                    peak_mem[1][0]
+                    - self.memory.layer_mem012 * init_dryrun.layers_stage_vpp[0][0]
+                    - self.memory.layer_mem * (layers_stage[0] - init_dryrun.layers_stage_vpp[0][0])
+                    - self.memory.re_comp_mem12 * peaks[0] * init_dryrun.layers_stage_vpp[0][0] / layers_stage[0]
+                    - self.memory.re_comp_mem * peaks[0] * (layers_stage[0] - init_dryrun.layers_stage_vpp[0][0])
+                    / layers_stage[0]
             )
         self.memory.static_mem = (
-            peak_mem[1][-2]
-            - self.memory.layer_mem * layers_stage[-2]
-            - self.memory.re_comp_mem * peaks[-2]
+                peak_mem[1][-2]
+                - self.memory.layer_mem * layers_stage[-2]
+                - self.memory.re_comp_mem * peaks[-2]
         )
         self.memory.lm_head_mem = (
-            peak_mem[1][-1]
-            - self.memory.layer_mem * layers_stage[-1]
-            - self.memory.re_comp_mem * peaks[-1]
+                peak_mem[1][-1]
+                - self.memory.layer_mem * layers_stage[-1]
+                - self.memory.re_comp_mem * peaks[-1]
         )
 
     def update_boss_memory(self, peak_mem, init_dryrun: InitDryrun):
@@ -506,29 +508,29 @@ class InitConfig:
         self.memory.select_mem = mem_result[4]
 
         static_mem0 = (
-            peak_mem[1][0]
-            - self.memory.layer_mem012 * init_dryrun.x_type1[0][0]
-            - self.memory.layer_mem * init_dryrun.x_type2[0][0]
-            - self.memory.act_mem12 * peaks.peak_num_act_type1[0]
-            - self.memory.act_mem * peaks.peak_num_act_type2[0]
-            - self.memory.re_comp_mem12 * peaks.peak_num_recompute_type1[0]
-            - self.memory.re_comp_mem * peaks.peak_num_recompute_type2[0]
-            - self.memory.select_mem12 * peaks.peak_num_select_recom_type1[0]
-            - self.memory.select_mem * peaks.peak_num_select_recom_type2[0]
+                peak_mem[1][0]
+                - self.memory.layer_mem012 * init_dryrun.x_type1[0][0]
+                - self.memory.layer_mem * init_dryrun.x_type2[0][0]
+                - self.memory.act_mem12 * peaks.peak_num_act_type1[0]
+                - self.memory.act_mem * peaks.peak_num_act_type2[0]
+                - self.memory.re_comp_mem12 * peaks.peak_num_recompute_type1[0]
+                - self.memory.re_comp_mem * peaks.peak_num_recompute_type2[0]
+                - self.memory.select_mem12 * peaks.peak_num_select_recom_type1[0]
+                - self.memory.select_mem * peaks.peak_num_select_recom_type2[0]
         )
         logger.info(f'static1 = {static1}')
         logger.info(f'static2 = {static2}')
         static_mem = (static2 + static1) / 2
         lm_head_mem = (
-            peak_mem[1][-1]
-            - self.memory.layer_mem012 * init_dryrun.x_type1[0][-1]
-            - self.memory.layer_mem * init_dryrun.x_type2[0][-1]
-            - self.memory.act_mem12 * peaks.peak_num_act_type1[init_dryrun.init_stages - 1]
-            - self.memory.act_mem * peaks.peak_num_act_type2[init_dryrun.init_stages - 1]
-            - self.memory.re_comp_mem12 * peaks.peak_num_recompute_type1[init_dryrun.init_stages - 1]
-            - self.memory.re_comp_mem * peaks.peak_num_recompute_type2[init_dryrun.init_stages - 1]
-            - self.memory.select_mem12 * peaks.peak_num_select_recom_type1[init_dryrun.init_stages - 1]
-            - self.memory.select_mem * peaks.peak_num_select_recom_type2[init_dryrun.init_stages - 1]
+                peak_mem[1][-1]
+                - self.memory.layer_mem012 * init_dryrun.x_type1[0][-1]
+                - self.memory.layer_mem * init_dryrun.x_type2[0][-1]
+                - self.memory.act_mem12 * peaks.peak_num_act_type1[init_dryrun.init_stages - 1]
+                - self.memory.act_mem * peaks.peak_num_act_type2[init_dryrun.init_stages - 1]
+                - self.memory.re_comp_mem12 * peaks.peak_num_recompute_type1[init_dryrun.init_stages - 1]
+                - self.memory.re_comp_mem * peaks.peak_num_recompute_type2[init_dryrun.init_stages - 1]
+                - self.memory.select_mem12 * peaks.peak_num_select_recom_type1[init_dryrun.init_stages - 1]
+                - self.memory.select_mem * peaks.peak_num_select_recom_type2[init_dryrun.init_stages - 1]
         )
         self.memory.static_mem0 = np.round(static_mem0, decimals=1)
         self.memory.static_mem = np.round(static_mem, decimals=1)

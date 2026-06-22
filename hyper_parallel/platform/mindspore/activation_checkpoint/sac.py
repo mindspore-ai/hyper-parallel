@@ -67,6 +67,7 @@ class SelectiveCheckpointContext:
 
 SAC_IGNORED_OPS = {"StopGradient"}
 
+
 class _CachingMindSporeDispatchMode(MsDispatchMode):
     def __init__(self, policy_fn, swap_storage, storage, group_swap=False):
         self.policy_fn = policy_fn

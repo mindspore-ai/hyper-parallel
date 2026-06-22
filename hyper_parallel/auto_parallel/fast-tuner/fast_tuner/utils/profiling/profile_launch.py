@@ -7,6 +7,7 @@ from pathlib import Path
 from fast_tuner.utils.common import GENERAL_TOML
 from fast_tuner.utils.logger import logger
 
+
 class ProfileLaunch:
     """Auto run profile"""
     def __init__(self, profile_configs, para):

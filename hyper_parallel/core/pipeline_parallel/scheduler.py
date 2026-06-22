@@ -144,6 +144,7 @@ class MetaStep:
         """Parse a MetaStep from its string representation."""
         pass
 
+
 def generate_stage_to_rank_mapping(real_stage_num, stage_num, style='loop'):
     """Generate stage to rank mapping for loop or V schedules."""
     if style == 'loop':
@@ -178,6 +179,7 @@ def generate_rank_to_stage_mapping(real_stage_num, stage_num, style='loop'):
         stages.sort()
     return dict(rank_to_stages)
 
+
 def iter_leaf_meta_steps(step):
     """Yield leaf MetaSteps, recursively expanding OVERLAP containers.
 
@@ -196,6 +198,7 @@ def iter_leaf_meta_steps(step):
             yield from iter_leaf_meta_steps(sub_step)
         return
     yield step
+
 
 class PipelineContext:
     """Per-run state handed to a custom execution function (see

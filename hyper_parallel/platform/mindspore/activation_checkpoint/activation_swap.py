@@ -342,6 +342,7 @@ class AsyncSaveOnCpu(ms.saved_tensors_hooks):
 
         # Cache per-context-manager state once to avoid per-tensor singleton lookups.
         swap_manager = SwapManager()
+
         def pack_to_cpu(tensor: ms.Tensor):
             if not base_check_fn(tensor):
                 return tensor
