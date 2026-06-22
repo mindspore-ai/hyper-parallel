@@ -118,6 +118,10 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 
 ---
 
+### Mpipe 多模态并行
+
+- Mpipe VLM 多模态 Transpose 调度
+
 ### Optimizer（优化器）
 
 - `AdamW`：标准 AdamW 优化器
@@ -143,9 +147,8 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 
 ### AutoParallel（自动并行）
 
-- **Fast-Tuner**：基于 profiling 信息构建黑盒代价模型，通过枚举、剪枝、搜索自动生成多维混合并行策略
-- **SAPP-PPB**：Pipeline Parallelism Balancing，自动平衡 pipeline stage 分配
 - **SAPP-ND**：ND 搜索模块，包含内存估算和性能估算
+- **SAPP-PPB**：Pipeline Parallelism Balancing，自动平衡 pipeline stage 分配
 
 ---
 
@@ -221,6 +224,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 - **HSDP Overlap**：全 overlap 模式
 - **Loss Parallel**：TP 训练 loss 并行
 - **gradient_scaling_factor**：梯度缩放因子配置
+- **Mpipe**：多模态流水线并行异构调度
 - **SAPP-PPB / SAPP-ND**：自动 pipeline balance + ND 搜索
 - **LlamaFactory 集成**：activation 优化 + HSDP
 - **Trainer 框架**：LLMTrainer + VLTrainer

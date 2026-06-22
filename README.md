@@ -31,6 +31,7 @@ RL任务越来越复杂，训推不一致问题导致强化学习训练难以收
 ### HyperMPMD：并行范式演进，SPMD -> 集群MPMD -> 集群+多核MPMD
 
 - 集群MPMD：支持异构模型切分，支持模型切片任意分配卡数；<br>
+- 多模态MPMD (Mpipe)：支持多模态流水线并行异构调度，解锁超节点在 MLLM 下的利用率；<br>
 - 芯片内多核MPMD：芯片内多核MPMD并行，结合核级内存语义单边通信，增强通算掩盖和MAC利用率；
 
 ### HyperOffload：算存关系演进，Stateful -> Stateless计算状态分离
@@ -109,6 +110,9 @@ RL任务越来越复杂，训推不一致问题导致强化学习训练难以收
         - [ ] ZBV
         - [ ] SeqPP
         - [ ] 每个PP Stage分配不同卡数
+    - Mpipe 多模态并行
+        - [x] Mpipe Transpose 调度
+        - [ ] Mpipe data-reordering
     - 子图切分
         - [ ] 多模态encoder/decoder切分到不同卡
     - 多核并行
@@ -136,10 +140,9 @@ RL任务越来越复杂，训推不一致问题导致强化学习训练难以收
     - [x] gradient scaling factor + clip_grad增强
 
 - AutoParallel
-    - [x] Fast-Tuner：基于profiling信息，构建黑盒代价模型，通过枚举、剪枝、搜索，自动生成多维混合并行策略
+    - [x] SAPP-ND：ND 搜索（内存估算 + 性能估算）
     - [x] SAPP-PPB：Pipeline Parallelism Balancing
-    - [x] SAPP-ND：ND搜索（内存估算 + 性能估算）
-    - [ ] PARADISE
+    - [ ] SAPP-Omni
 
 - 单边通信
     - [x] Symmetric Memory
