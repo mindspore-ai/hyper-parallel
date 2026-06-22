@@ -66,7 +66,7 @@
 
 # The maintainers of other code directories.
 /.jenkins/ @yangzhenzhang
-/docs/ @yangzhenzhang
+/docs/ @yangzhenzhang @gemini524
 /.gitmodules  @yangzhenzhang
 /requirements.txt  @yangzhenzhang
 /setup.py  @yangzhenzhang
