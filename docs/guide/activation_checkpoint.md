@@ -29,27 +29,36 @@ HyperParallel 提供灵活的激活内存优化机制，包括选择性重计算
 ### 1. 函数式 checkpoint
 
 ```python
-from hyper_parallel.core.activation_checkpoint import checkpoint
+from hyper_parallel.core.activation_checkpoint import checkpoint, CheckpointPolicy
 
-# 基础使用：对整个函数应用 checkpoint
+# 基础使用：将 model.layer 包装为 checkpoint 区域，x 是传给 model.layer 的输入
 output = checkpoint(model.layer, x)
 
-# 带 policy_fn：选择性重计算
-def my_policy(target):
-    if target.is_large_op:
-        return CheckpointPolicy.MUST_RECOMPUTE
-    return CheckpointPolicy.MUST_SAVE
+# 带 policy_fn：选择性保存 / 卸载 / 重计算
+def my_policy(ctx, op, *args, **kwargs):
+    # 返回 MUST_SAVE 表示保存该算子的输出；返回 MUST_SWAP 表示卸载该算子的输出到 HOST 侧；返回 MUST_RECOMPUTE 表示反向时重计算。
+    op_name_attr = getattr(op, "name", None)
+    op_name = op_name_attr() if callable(op_name_attr) else (op_name_attr or str(op))
+    if op_name in {"LayerNormExt", "aten.addmm.default"}:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.MUST_RECOMPUTE
 
 output = checkpoint(model.layer, x, policy_fn=my_policy)
 
-# 带 swap_inputs：将输入也 swap 到 CPU
+# 带 swap_inputs：checkpoint 区域保存的输入也 offload 到 CPU
 output = checkpoint(model.layer, x, swap_inputs=True)
+
+# 带 context_fn：为正向和重计算阶段分别提供上下文管理器
+def context_fn():
+    return forward_context(), recompute_context()
+
+output = checkpoint(model.layer, x, context_fn=context_fn)
 ```
 
 ### 2. 函数式 swap
 
 ```python
-from hyper_parallel.core.activation_checkpoint import swap, CheckpointPolicy
+from hyper_parallel.core.activation_checkpoint import swap, CheckpointPolicy, SwapManager
 
 # 基础使用：将所有中间激活 swap 到 CPU
 output = swap(model.layer, x)
@@ -57,106 +66,127 @@ output = swap(model.layer, x)
 # 带 policy_fn：选择性 swap
 def swap_policy(target):
     if target.is_small_op:
-        return CheckpointPolicy.MUST_SAVE  # 小 op 不 swap
-    return None  # 其余 swap
+        return CheckpointPolicy.MUST_SAVE  # 小 tensor 不 swap
+    return CheckpointPolicy.MUST_SWAP  # 其余 swap
 
 output = swap(model.layer, x, policy_fn=swap_policy)
+
+# 使用 swap 功能时，需要注册层间的 offload / prefetch 关系（可以不是相邻层）
+SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 ```
 
-### 3. 模块级 wrapper
+### 3. 声明式接口
 
 ```python
-from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper, swap_wrapper
+from hyper_parallel.core.activation_checkpoint import (
+    CheckpointPolicy,
+    SwapManager,
+    checkpoint_wrapper,
+    swap_wrapper,
+)
 
-# 用 checkpoint_wrapper 替换模块
-model.layer = checkpoint_wrapper(model.layer, policy="full")
+# 以下示例展示不同用法；不要对同一个模块重复嵌套 wrapper。
 
-# 用 swap_wrapper 替换模块
-model.layer = swap_wrapper(model.layer, offload_to="cpu")
+# 用 checkpoint_wrapper 替换模块：该模块每次 forward 都会进入 checkpoint 区域
+model.layers[0] = checkpoint_wrapper(model.layers[0])
 
-# 组合使用：部分层用 checkpoint，部分层用 swap
+# checkpoint_wrapper 支持与 checkpoint 相同的关键字参数，例如 policy_fn、swap_inputs、group_swap
+def recompute_policy(ctx, op, *args, **kwargs):
+    return CheckpointPolicy.MUST_RECOMPUTE
+
+model.layers[1] = checkpoint_wrapper(model.layers[1], policy_fn=recompute_policy)
+
+# 用 swap_wrapper 替换模块：模块 forward 中保存的中间激活会按策略 offload 到 CPU
+def tensor_swap_policy(tensor):
+    if tensor.numel() < 1024:
+        return CheckpointPolicy.MUST_SAVE  # 小 tensor 保留在设备侧
+    return CheckpointPolicy.MUST_SWAP
+
+model.layers[2] = swap_wrapper(model.layers[2], policy_fn=tensor_swap_policy)
+
+# 组合使用：从尚未包装过的模型开始，对不同层选择一种 wrapper
 for i, layer in enumerate(model.layers):
     if i % 2 == 0:
         model.layers[i] = checkpoint_wrapper(layer)
     else:
         model.layers[i] = swap_wrapper(layer)
+
+# 使用 swap 功能时，需要注册层间的 offload / prefetch 关系（可以不是相邻层）
+SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
+
+# checkpoint_wrapper 和 swap_wrapper 既可以包裹 nn.Module / Cell，也可以包裹普通 func。
+# 包裹 func 时，返回值仍然是可调用对象，调用方式与原函数保持一致。
+def block_func(x):
+    return model.block(x)
+
+ckpt_block_func = checkpoint_wrapper(block_func)
+swap_block_func = swap_wrapper(block_func)
+
+ckpt_output = ckpt_block_func(x)
+swap_output = swap_block_func(x)
 ```
 
-### 4. CheckpointPolicy 精细控制
+### 4. 单 tensor 卸载
+
+`swap_tensor_wrapper` 适用于只想卸载某几个明确的大激活 tensor。它需要在模块的 `forward` / `construct` 内部调用，会把其中符合条件的 tensor 注册到当前 swap group 中，等待后续 offload / prefetch 调度。
 
 ```python
-from hyper_parallel.core.activation_checkpoint import checkpoint, CheckpointPolicy, SwapManager
+import torch.nn as nn
 
-# MUST_SWAP 策略：配合 SwapManager 使用
-def detailed_policy(target):
-    if target.name == "large_attention":
-        return CheckpointPolicy.MUST_SWAP   # swap 到 CPU
-    elif target.name == "small_proj":
-        return CheckpointPolicy.MUST_RECOMPUTE  # 重计算
-    return CheckpointPolicy.MUST_SAVE  # 保存
+from hyper_parallel.core.activation_checkpoint import SwapManager, swap_tensor_wrapper
 
-manager = SwapManager()
-output = checkpoint(model.layer, x, policy_fn=detailed_policy)
-```
+class TransformerBlock(nn.Module):
+    def forward(self, x):
+        attn_out, _ = self.attn(x, x, x)
+        attn_out = swap_tensor_wrapper(attn_out, tag="attn_out")
 
-### 5. Group Swap（批量 swap 融合）
+        x = x + attn_out
+        x = self.norm1(x)
+        x = swap_tensor_wrapper(x, tag="norm1_out")
 
-```python
-# 开启 group_swap：多个 swap 操作合并为批量 DMA 传输
-output = swap(model.layer, x, group_swap=True)
-output = checkpoint(model.layer, x, policy_fn=my_policy, group_swap=True)
-```
+        x = x + self.ffn(x)
+        return self.norm2(x)
 
-Group Swap 将多个小 tensor 的 DMA 传输合并为一次批量传输，减少 DMA launch overhead，提升 swap 效率。每个 group 限制为 32 MiB，保持 DMA chunk 大粒度同时避免单次传输过大。
-
-### 6. 与 LlamaFactory 集成
-
-```python
-# LlamaFactory 已集成 activation recompute & swap
-# 参考 examples/ 中的集成示例
+# 使用 swap_tensor_wrapper 时，同样需要注册层间的 offload / prefetch 关系（可以不是相邻层）
+SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 ```
 
 ---
 
 ## 与其他并行策略组合
 
-### FSDP + Activation Checkpoint
+### FSDP + Activation Checkpoint / Activation Swap
 
 ```python
 from hyper_parallel import fully_shard, init_device_mesh
 from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
 
 mesh = init_device_mesh("npu", (dp_size,), mesh_dim_names=("dp",))
-model = fully_shard(model, mesh=mesh)
 
-# 对 FSDP 分片后的子模块应用 checkpoint
+# 先对需要的子模块应用 checkpoint_wrapper 或 swap_wrapper，使 wrapper 位于 FSDP 边界内部
 model.transformer.layer = checkpoint_wrapper(model.transformer.layer)
+
+# 再应用 FSDP，让 FSDP 包住已经 checkpoint 的模块
+model = fully_shard(model, mesh=mesh)
 ```
 
-### TP + Activation Swap
+### TP + Activation Checkpoint / Activation Swap
 
 ```python
 from hyper_parallel import ColwiseParallel, RowwiseParallel, parallelize_module, init_device_mesh
-from hyper_parallel.core.activation_checkpoint import swap_wrapper
+from hyper_parallel.core.activation_checkpoint import SwapManager, swap_wrapper
 
 tp_mesh = init_device_mesh("npu", (tp_size,), mesh_dim_names=("tp",))
+
+# 先应用 TP
 parallelize_module(model, tp_mesh, tp_plan)
 
-# TP 场景下 swap 更有效：每个 rank 只需 swap 1/tp_size 的激活
-model.transformer.layer = swap_wrapper(model.transformer.layer)
-```
+# 再对需要的层或子模块应用 checkpoint_wrapper 或 swap_wrapper
+for i, layer in enumerate(model.layers):
+    model.layers[i].attn = swap_wrapper(layer.attn)
 
-### PP + Activation Swap
-
-Pipeline Parallel 场景下 Activation Swap 特别有价值：每个 stage 只需保存自己 stage 的激活，swap 后 NPU HBM 几乎只保存当前 micro-batch 的计算状态。
-
-```python
-from hyper_parallel import PipelineStage, Schedule1F1B
-from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper, swap_wrapper
-
-# PP stage 内部使用 checkpoint + swap
-for layer in stage_model.layers:
-    stage_model.layers[layer] = swap_wrapper(stage_model.layers[layer])
+# 使用 swap 时，需要注册层间的 offload / prefetch 关系（可以不是相邻层）
+SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 ```
 
 ---
@@ -165,8 +195,7 @@ for layer in stage_model.layers:
 
 1. **小 tensor 不要 swap**：swap 的 DMA 启动开销对于小 tensor（如 bias）可能超过收益，用 `policy_fn` 过滤
 2. **优先对大激活层使用 swap**：Attention 输出、MLP 中间激活等大 tensor 最适合 swap
-3. **Group Swap**：开启 `group_swap=True` 可减少 DMA 次数，提升整体效率
-4. **Checkpoint vs Swap 选择**：
+3. **Checkpoint vs Swap 选择**：
    - 计算密集层（如 softmax）：用 checkpoint，重计算开销可接受
    - 内存密集层（如大型 MLP）：用 swap，DMA 传输开销更低
-5. **协同配置**：混合使用 checkpoint 和 swap 可最大化内存节省并最小化计算/传输开销
+4. **协同配置**：混合使用 checkpoint 和 swap 可最大化内存节省并最小化计算/传输开销
