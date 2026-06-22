@@ -515,46 +515,47 @@ class TestUnwrapArgsAndKwargs(unittest.TestCase):
 class TestOpDispatchSimpleFunctions(unittest.TestCase):
     """
     Feature: Module-level toggle functions and LayoutCacheKey/Manager methods.
-    Description: Cover get/add/remove_no_skip_ops, enable/disable_dtensor_dispatch,
-                 LayoutCacheKey.__eq__/__repr__, and LayoutCacheManager accessors.
-    Expectation: State changes are visible; repr format correct; cache cleared.
+    Description: Cover SkipDTensorDispatch (including nesting), get_no_skip_ops,
+                 get_dtensor_dispatch, LayoutCacheKey.__eq__/__repr__, and
+                 LayoutCacheManager accessors.
+    Expectation: State changes are visible; nesting is safe; repr format correct; cache cleared.
     """
 
-    def setUp(self):
-        from hyper_parallel.core.shard import _op_dispatch
-        self._saved_no_skip = frozenset(_op_dispatch._no_skip_ops)
-        self._saved_dispatch = _op_dispatch._dtensor_dispatch
-
-    def tearDown(self):
-        from hyper_parallel.core.shard import _op_dispatch
-        _op_dispatch._no_skip_ops = set(self._saved_no_skip)
-        _op_dispatch._dtensor_dispatch = self._saved_dispatch
-
-    def test_get_no_skip_ops_returns_set(self):
-        """get_no_skip_ops returns the current no-skip set."""
+    def test_get_no_skip_ops_returns_frozenset(self):
+        """get_no_skip_ops returns the current no-skip frozenset."""
         from hyper_parallel.core.shard._op_dispatch import get_no_skip_ops
         result = get_no_skip_ops()
-        self.assertIsInstance(result, (set, frozenset))
+        self.assertIsInstance(result, frozenset)
 
-    def test_add_and_remove_no_skip_ops(self):
-        """add_no_skip_ops / remove_no_skip_ops mutate the global set."""
-        from hyper_parallel.core.shard._op_dispatch import (
-            add_no_skip_ops, remove_no_skip_ops, get_no_skip_ops,
-        )
-        add_no_skip_ops({"_TestOp_coverage"})
-        self.assertIn("_TestOp_coverage", get_no_skip_ops())
-        remove_no_skip_ops({"_TestOp_coverage"})
+    def test_skip_dtensor_dispatch_context_manager(self):
+        """SkipDTensorDispatch sets dispatch state via ContextVar and restores on exit."""
+        from hyper_parallel.core.shard._op_dispatch import get_dtensor_dispatch, get_no_skip_ops
+        from hyper_parallel.core.dtensor.dtensor import SkipDTensorDispatch
+        self.assertTrue(get_dtensor_dispatch())
+        with SkipDTensorDispatch(no_skip={"_TestOp_coverage"}):
+            self.assertFalse(get_dtensor_dispatch())
+            self.assertIn("_TestOp_coverage", get_no_skip_ops())
+        self.assertTrue(get_dtensor_dispatch())
         self.assertNotIn("_TestOp_coverage", get_no_skip_ops())
 
-    def test_enable_disable_dtensor_dispatch(self):
-        """enable/disable_dtensor_dispatch toggle the global flag."""
-        from hyper_parallel.core.shard._op_dispatch import (
-            enable_dtensor_dispatch, disable_dtensor_dispatch, get_dtensor_dispatch,
-        )
-        disable_dtensor_dispatch()
-        self.assertFalse(get_dtensor_dispatch())
-        enable_dtensor_dispatch()
+    def test_skip_dtensor_dispatch_nested(self):
+        """Nested SkipDTensorDispatch correctly restores state at each level."""
+        from hyper_parallel.core.shard._op_dispatch import get_dtensor_dispatch, get_no_skip_ops
+        from hyper_parallel.core.dtensor.dtensor import SkipDTensorDispatch
         self.assertTrue(get_dtensor_dispatch())
+        with SkipDTensorDispatch(no_skip={"op_a"}):
+            self.assertFalse(get_dtensor_dispatch())
+            self.assertIn("op_a", get_no_skip_ops())
+            with SkipDTensorDispatch(no_skip={"op_b"}):
+                self.assertFalse(get_dtensor_dispatch())
+                self.assertIn("op_a", get_no_skip_ops())
+                self.assertIn("op_b", get_no_skip_ops())
+            # inner exit should not re-enable dispatch or remove outer's no_skip ops
+            self.assertFalse(get_dtensor_dispatch())
+            self.assertIn("op_a", get_no_skip_ops())
+            self.assertNotIn("op_b", get_no_skip_ops())
+        self.assertTrue(get_dtensor_dispatch())
+        self.assertEqual(get_no_skip_ops(), frozenset())
 
     def test_layout_cache_key_eq_and_repr(self):
         """LayoutCacheKey.__eq__ compares tuples; __repr__ includes class name."""
