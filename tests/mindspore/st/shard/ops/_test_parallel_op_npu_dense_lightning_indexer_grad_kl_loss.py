@@ -356,8 +356,8 @@ def test_grad_kl_loss_tnd_dp():
     qr = distribute_tensor(Tensor(qr_np), mesh, (Shard(0),))
     kr = distribute_tensor(Tensor(kr_np), mesh, (Shard(0),))
 
-    dqlen = distribute_tensor(Tensor(_GLOBAL_QLEN, dtype=ms.int32), mesh, (Replicate(),))
-    dklen = distribute_tensor(Tensor(_GLOBAL_KLEN, dtype=ms.int32), mesh, (Replicate(),))
+    dqlen = Tensor(_GLOBAL_QLEN, dtype=ms.int32)
+    dklen = Tensor(_GLOBAL_KLEN, dtype=ms.int32)
 
     results = npu_dense_lightning_indexer_grad_kl_loss(
         q, k, qi, ki, w, sm_max, sm_sum, sm_max_idx, sm_sum_idx, SCALE,
@@ -401,8 +401,8 @@ def test_grad_kl_loss_tnd_dp_cp():
     qr = distribute_tensor(Tensor(qr_np), mesh, (Shard(0), Shard(0)))
     kr = distribute_tensor(Tensor(kr_np), mesh, (Shard(0), Replicate()))
 
-    dqlen = distribute_tensor(Tensor(_GLOBAL_QLEN, dtype=ms.int32), mesh, (Replicate(),))
-    dklen = distribute_tensor(Tensor(_GLOBAL_KLEN, dtype=ms.int32), mesh, (Replicate(),))
+    dqlen = Tensor(_GLOBAL_QLEN, dtype=ms.int32)
+    dklen = Tensor(_GLOBAL_KLEN, dtype=ms.int32)
 
     results = npu_dense_lightning_indexer_grad_kl_loss(
         q, k, qi, ki, w, sm_max, sm_sum, sm_max_idx, sm_sum_idx, SCALE,
@@ -448,8 +448,8 @@ def test_grad_kl_loss_tnd_replicated():
     qr = distribute_tensor(Tensor(qr_np), mesh, (Replicate(),))
     kr = distribute_tensor(Tensor(kr_np), mesh, (Replicate(),))
 
-    dqlen = distribute_tensor(Tensor(_GLOBAL_QLEN, dtype=ms.int32), mesh, (Replicate(),))
-    dklen = distribute_tensor(Tensor(_GLOBAL_KLEN, dtype=ms.int32), mesh, (Replicate(),))
+    dqlen = Tensor(_GLOBAL_QLEN, dtype=ms.int32)
+    dklen = Tensor(_GLOBAL_KLEN, dtype=ms.int32)
 
     results = npu_dense_lightning_indexer_grad_kl_loss(
         q, k, qi, ki, w, sm_max, sm_sum, sm_max_idx, sm_sum_idx, SCALE,

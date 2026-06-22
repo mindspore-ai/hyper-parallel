@@ -96,7 +96,22 @@ def _normalize_sfa_args(
 
 
 def _to_local(t):
-    """Extract local tensor from DTensor, or pass through non-DTensor values."""
+    """Extract the local tensor from a DTensor input (None passes through).
+
+    Every input except actual_seq_lengths must be a DTensor so its layout can be
+    inferred; passing a plain tensor raises AttributeError here by design.
+    """
+    if t is None:
+        return None
+    return t.to_local()
+
+
+def _to_local_seq_len(t):
+    """Extract the local tensor from an actual_seq_lengths input.
+
+    These are built inside the network and are not guaranteed to be DTensors, so
+    a plain tensor (or None) is passed through unchanged.
+    """
     if isinstance(t, DTensor):
         return t.to_local()
     return t
@@ -194,8 +209,8 @@ class SparseFlashAttentionDistributedOp(DistributedOp):
         )
         local_kwargs = {
             'block_table': _to_local(norm_args[5]),
-            'actual_seq_lengths_query': _to_local(norm_args[6]),
-            'actual_seq_lengths_kv': _to_local(norm_args[7]),
+            'actual_seq_lengths_query': _to_local_seq_len(norm_args[6]),
+            'actual_seq_lengths_kv': _to_local_seq_len(norm_args[7]),
             'query_rope': _to_local(norm_args[8]),
             'key_rope': _to_local(norm_args[9]),
             'sparse_block_size': norm_args[10],

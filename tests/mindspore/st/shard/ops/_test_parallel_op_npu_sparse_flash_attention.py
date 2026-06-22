@@ -555,8 +555,8 @@ def test_sfa_tnd_replicated():
     dq_rope = distribute_tensor(_np_to_bf16(q_rope_np), mesh, (Replicate(),))
     dk_rope = distribute_tensor(_np_to_bf16(k_rope_np), mesh, (Replicate(),))
 
-    d_actual_seq_q = distribute_tensor(actual_seq_q, mesh, (Replicate(),))
-    d_actual_seq_kv = distribute_tensor(actual_seq_kv, mesh, (Replicate(),))
+    d_actual_seq_q = actual_seq_q
+    d_actual_seq_kv = actual_seq_kv
 
     dsi = _get_sparse_indices_tnd(dq_idx, dk_idx, dw, d_actual_seq_q, d_actual_seq_kv, SPARSE_COUNT_TND)
 
@@ -597,8 +597,8 @@ def test_sfa_tnd_dp():
     dq_rope = distribute_tensor(_np_to_bf16(q_rope_np), mesh, (Shard(0),))
     dk_rope = distribute_tensor(_np_to_bf16(k_rope_np), mesh, (Shard(0),))
 
-    d_actual_seq_q = distribute_tensor(actual_seq_q, mesh, (Replicate(),))
-    d_actual_seq_kv = distribute_tensor(actual_seq_kv, mesh, (Replicate(),))
+    d_actual_seq_q = actual_seq_q
+    d_actual_seq_kv = actual_seq_kv
 
     dsi = _get_sparse_indices_tnd(dq_idx, dk_idx, dw, d_actual_seq_q, d_actual_seq_kv, SPARSE_COUNT_TND)
 
@@ -639,8 +639,8 @@ def test_sfa_tnd_cp():
     dq_rope = distribute_tensor(_np_to_bf16(q_rope_np), mesh, (Shard(0),))
     dk_rope = distribute_tensor(_np_to_bf16(k_rope_np), mesh, (Replicate(),))
 
-    d_actual_seq_q = distribute_tensor(actual_seq_q, mesh, (Replicate(),))
-    d_actual_seq_kv = distribute_tensor(actual_seq_kv, mesh, (Replicate(),))
+    d_actual_seq_q = actual_seq_q
+    d_actual_seq_kv = actual_seq_kv
 
     dsi = _get_sparse_indices_tnd(dq_idx, dk_idx, dw, d_actual_seq_q, d_actual_seq_kv, SPARSE_COUNT_TND)
 
@@ -685,8 +685,8 @@ def test_sfa_tnd_dp_cp():
     dq_rope = distribute_tensor(_np_to_bf16(q_rope_np), mesh, (Shard(0), Shard(0)))
     dk_rope = distribute_tensor(_np_to_bf16(k_rope_np), mesh, (Shard(0), Replicate()))
 
-    d_actual_seq_q = distribute_tensor(actual_seq_q, mesh, (Replicate(),))
-    d_actual_seq_kv = distribute_tensor(actual_seq_kv, mesh, (Replicate(),))
+    d_actual_seq_q = actual_seq_q
+    d_actual_seq_kv = actual_seq_kv
 
     dsi = _get_sparse_indices_tnd(dq_idx, dk_idx, dw, d_actual_seq_q, d_actual_seq_kv, SPARSE_COUNT_TND)
 

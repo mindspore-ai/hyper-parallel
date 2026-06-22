@@ -25,6 +25,7 @@ from hyper_parallel.core.shard.ops.parallel_npu_dense_lightning_indexer_grad_kl_
     NpuDenseLightningIndexerGradKlLossDistributedOp,
     _normalize_dense_grad_kl_loss_args,
     _to_local,
+    _to_local_seq_len,
 )
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh, _DEVICE_MESH_MAP
@@ -142,15 +143,44 @@ class TestNpuDenseLightningIndexerGradKlLoss(unittest.TestCase):
         dt.to_local.assert_called_once()
         self.assertIs(result, local_tensor, msg=f"Expected local tensor, got {result}")
 
-    def test_to_local_with_non_dtensor_6(self):
+    def test_to_local_with_none_6(self):
         """
-        Feature: _to_local passes through non-DTensor values unchanged.
-        Description: Pass a plain Python object (e.g. a list or scalar).
+        Feature: _to_local passes None (optional input not provided) through.
+        Description: Pass None.
+        Expectation: None is returned.
+        """
+        self.assertIsNone(_to_local(None), msg="None should pass through _to_local")
+
+    def test_to_local_rejects_plain_tensor_6b(self):
+        """
+        Feature: _to_local rejects non-DTensor tensor inputs.
+        Description: Every input except actual_seq_lengths must be a DTensor so its
+            layout can be inferred; a plain tensor has no to_local() method.
+        Expectation: AttributeError is raised.
+        """
+        with self.assertRaises(AttributeError):
+            _to_local([1, 2, 3])
+
+    def test_to_local_seq_len_with_dtensor_6c(self):
+        """
+        Feature: _to_local_seq_len extracts the local tensor from a DTensor.
+        Expectation: Result is the value returned by to_local().
+        """
+        local_tensor = MagicMock()
+        dt = MagicMock(spec=DTensor)
+        dt.to_local.return_value = local_tensor
+        self.assertIs(_to_local_seq_len(dt), local_tensor)
+
+    def test_to_local_seq_len_passes_plain_tensor_6d(self):
+        """
+        Feature: _to_local_seq_len passes a non-DTensor actual_seq_lengths through.
+        Description: actual_seq_lengths are network-built and not guaranteed to be
+            DTensors, so a plain tensor is passed through unchanged.
         Expectation: The same object is returned without modification.
         """
         plain = [1, 2, 3]
-        result = _to_local(plain)
-        self.assertIs(result, plain, msg=f"Non-DTensor should pass through unchanged, got {result}")
+        self.assertIs(_to_local_seq_len(plain), plain,
+                      msg=f"plain actual_seq_lengths should pass through, got {plain}")
 
     # ------------------------------------------------------------------
     # YAML registration

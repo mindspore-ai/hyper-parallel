@@ -16,6 +16,7 @@
 import copy
 from typing import Callable, Optional, Tuple
 
+from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
@@ -24,6 +25,18 @@ from .parallel_ops import DistributedOp
 platform = get_platform()
 
 _MAX_INT64 = 9223372036854775807
+
+
+def _to_local_seq_len(t):
+    """Extract the local tensor from an actual_seq_lengths input.
+
+    These are built inside the network and are not guaranteed to be DTensors, so
+    a plain tensor (or None) is passed through unchanged. All other inputs must be
+    DTensors (they go through ``.to_local()`` directly) so their layout can be inferred.
+    """
+    if isinstance(t, DTensor):
+        return t.to_local()
+    return t
 
 # Maps layout_str -> tensor role -> {dim_index: dim_label} for replicated-dim checks.
 # 'q' = query_index, 'k' = key_index, 'w' = weights.
@@ -201,12 +214,8 @@ class NpuDenseLightningIndexerSoftmaxLseDistributedOp(DistributedOp):
         query_index, key_index, weights = norm_args[0], norm_args[1], norm_args[2]
         layout_str = norm_args[5]
 
-        qlen_arg = norm_args[3]
-        klen_arg = norm_args[4]
-        if qlen_arg is not None:
-            qlen_arg = qlen_arg.to_local()
-        if klen_arg is not None:
-            klen_arg = klen_arg.to_local()
+        qlen_arg = _to_local_seq_len(norm_args[3])
+        klen_arg = _to_local_seq_len(norm_args[4])
 
         if platform.platform_type == PlatformType.MINDSPORE:
             local_args = (
