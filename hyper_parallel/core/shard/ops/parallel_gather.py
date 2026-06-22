@@ -386,6 +386,11 @@ class GatherNdDistributedOp(DistributedOp):
         """
         Preprocess arguments for GatherNd operator.
 
+        NOTE: aclop packed-args normalization (for MindSpore aclop operators
+        that pack args as ``(prim, name, (real_args...))``) is handled
+        upstream in ``OpDispatcher._dispatch_layout_infer`` via
+        ``_normalize_aclop_args``. This method receives clean unpacked args.
+
         Args:
             args (tuple): Input arguments (input, indices).
             kwargs (dict): Keyword arguments.
@@ -393,19 +398,11 @@ class GatherNdDistributedOp(DistributedOp):
         Returns:
             tuple: (local_args, local_kwargs, cache_values)
         """
-        packed_call = None
-        if len(args) == 3 and isinstance(args[1], str) and isinstance(args[2], (tuple, list)):
-            packed_call = (args[0], args[1])
-            args = tuple(args[2])
-
         args, _ = _normalize_gathernd_args(*args, **kwargs)
         input_tensor, indices = args[0], args[1]
         local_input = input_tensor.to_local() if hasattr(input_tensor, "_layout") else input_tensor
         local_indices = indices.to_local()
-        if packed_call is not None:
-            local_args = (packed_call[0], packed_call[1], (local_input, local_indices))
-        else:
-            local_args = (local_input, local_indices)
+        local_args = (local_input, local_indices)
         local_kwargs = {}
         cache_values = [
             input_tensor.layout if hasattr(input_tensor, "_layout") else None,

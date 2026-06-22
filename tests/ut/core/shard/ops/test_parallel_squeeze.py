@@ -13,12 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """parallel_squeeze test"""
-import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_squeeze import SqueezeDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -38,12 +37,14 @@ class TestParallelSqueeze(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
         self.op = SqueezeDistributedOp("Squeeze")
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -73,12 +74,9 @@ class TestParallelSqueeze(unittest.TestCase):
 
     def _run_scenario(self, x_layout, expected_map, axis, input_shape):
         """Infer layout of Squeeze operator"""
-        if axis is not None:
-            extra_args = [axis, [input_shape]]
-        else:
-            extra_args = [[input_shape]]
-
-        output_layout = self.op.infer_layout((x_layout,), extra_args)
+        cache_values = [x_layout, axis, input_shape]
+        output_layouts, extra_info = self.op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         actual_map = output_layout.tensor_map
         assert actual_map == expected_map, (
             f"Squeeze failed. Expected {expected_map}, got {actual_map}"
@@ -86,10 +84,34 @@ class TestParallelSqueeze(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert self.op.get_expand_impl(None, output_layout, (x_layout,), extra_args) is None, (
+        infer_result = (output_layouts, extra_info)
+        assert self.op.get_expand_impl(None, infer_result, cache_values) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {self.op.get_expand_impl(None, output_layout, (x_layout,), extra_args)}"
+            f"got {self.op.get_expand_impl(None, infer_result, cache_values)}"
         )
+
+    def test_squeeze_preprocess(self):
+        """
+        Feature: preprocess.
+        Description: convert DTensor inputs to local args and collect layout, axis, and shape cache.
+        Expectation: local args are positional and kwargs are empty.
+        """
+        x_layout = MagicMock()
+        local_tensor = MagicMock()
+        input_tensor = MagicMock()
+        input_tensor.layout = x_layout
+        input_tensor.shape = (8, 1, 4)
+        input_tensor.to_local.return_value = local_tensor
+
+        local_args, local_kwargs, cache_values = self.op.preprocess((input_tensor,), {})
+        assert local_args == (local_tensor,)
+        assert not local_kwargs
+        assert cache_values == [x_layout, None, (8, 1, 4)]
+
+        local_args, local_kwargs, cache_values = self.op.preprocess((input_tensor, 1), {})
+        assert local_args == (local_tensor, 1)
+        assert not local_kwargs
+        assert cache_values == [x_layout, 1, (8, 1, 4)]
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_squeeze_data_parallel_1(self, mock_platform):
@@ -301,13 +323,16 @@ class TestParallelSqueeze(unittest.TestCase):
         x_layout = _build_layout(mesh, (Shard(0), Shard(1), Shard(2)), 3)
 
         with self.assertRaises(ValueError):
-            self.op.infer_layout((x_layout,), [])
+            self.op.infer_layout([])
 
         with self.assertRaises(ValueError):
-            self.op.infer_layout((x_layout,), [1])
+            self.op.infer_layout([x_layout, 1])
 
         with self.assertRaises(ValueError):
-            self.op.infer_layout((x_layout,), None)
+            self.op.infer_layout([x_layout, None, None])
+
+        with self.assertRaises(ValueError):
+            self.op.infer_layout([x_layout, None, 1])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_squeeze_scalar_with_axis_17(self, mock_platform):
@@ -321,7 +346,7 @@ class TestParallelSqueeze(unittest.TestCase):
         input_shape = []
 
         with self.assertRaises(ValueError):
-            self.op.infer_layout((x_layout,), [0, [input_shape]])
+            self.op.infer_layout([x_layout, 0, input_shape])
 
 
 if __name__ == "__main__":

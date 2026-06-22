@@ -17,7 +17,42 @@ Distributed implementation for Element-wise operator.
 """
 
 import copy
+from typing import Callable, Optional, Tuple
+
 from .parallel_ops import DistributedOp
+
+
+def _unwrap_local_value(value):
+    """Convert DTensor-like values to local tensors while preserving containers."""
+    if hasattr(value, "_layout"):
+        return value.to_local()
+    if isinstance(value, tuple):
+        return tuple(_unwrap_local_value(item) for item in value)
+    if isinstance(value, list):
+        return [_unwrap_local_value(item) for item in value]
+    return value
+
+
+def _collect_layout_and_shape(value):
+    """Collect layout and shape from one argument for layout inference cache."""
+    layout = value.layout if hasattr(value, "_layout") else None
+    shape = value.shape if hasattr(value, "shape") else None
+    return layout, shape
+
+
+def _build_elementwise_cache_values(args, kwargs):
+    """Build cache_values from the real element-wise input arguments."""
+    input_layouts = []
+    input_shapes = []
+    for value in args:
+        layout, shape = _collect_layout_and_shape(value)
+        input_layouts.append(layout)
+        input_shapes.append(shape)
+    for value in kwargs.values():
+        layout, shape = _collect_layout_and_shape(value)
+        input_layouts.append(layout)
+        input_shapes.append(shape)
+    return [*input_layouts, input_shapes]
 
 
 class ElementWiseDistributedOp(DistributedOp):
@@ -31,28 +66,51 @@ class ElementWiseDistributedOp(DistributedOp):
         op_name (str): Name of the operator to register.
     """
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for element-wise operators.
+
+        NOTE: aclop packed-args normalization (for MindSpore aclop operators
+        like Mod, StopGradient that pack args as ``(prim, name, (real_args...))``)
+        is handled upstream in ``OpDispatcher._dispatch_layout_infer`` via
+        ``_normalize_aclop_args``. This method receives clean unpacked args.
+
+        Args:
+            args (tuple): Positional arguments passed to the operator.
+            kwargs (dict): Keyword arguments passed to the operator.
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        local_kwargs = {key: _unwrap_local_value(value) for key, value in kwargs.items()}
+
+        local_args = tuple(_unwrap_local_value(arg) for arg in args)
+        cache_values = _build_elementwise_cache_values(args, kwargs)
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layouts for element-wise operations with broadcasting support.
 
-        For element-wise operations:
-        - Supports broadcasting following NumPy broadcasting rules
-        - All inputs must have compatible shapes for broadcasting
-        - Output will have the broadcasted shape and appropriate sharding strategy
-        - Handles both simple and complex sharding patterns (including tuple-type tensor_maps)
+        Rules:
+            1. Inputs must not have Partial status unless the operator explicitly allows it.
+            2. Input shapes must be broadcast-compatible when shape information is available.
+            3. Broadcasting dimensions cannot be sharded.
+            4. Non-broadcast sharding patterns must be compatible across inputs.
+            5. Output layout uses the merged sharding strategy and merged Partial status.
 
         Args:
-            layouts (tuple): Tuple of layouts for input tensors
-            extra_args: Extra arguments for the operation. It can be:
-                        - dict containing 'input_shapes'
-                        - list/tuple where the last element is input_shapes (WithShape path)
+            cache_values (list): [input_layout_0, ..., input_layout_n, input_shapes].
 
         Returns:
-            Layout: Layout for output tensor with merged sharding strategy.
+            tuple: ((output_layout,), None)
 
         Raises:
             ValueError: If input layouts are not compatible for broadcasting.
         """
+        layouts = tuple(cache_values[:-1])
+        input_shapes = cache_values[-1] if cache_values else None
+
         if not layouts:
             return None
 
@@ -61,23 +119,19 @@ class ElementWiseDistributedOp(DistributedOp):
         if not valid_layouts:
             return None
 
-        # Check partial inputs - ElementWiseDistributedOp does not support partial by default
-        # This check is performed after basic layout validation
         if not self._allow_partial_inputs:
             self._check_partial_inputs(layouts)
 
         if len(valid_layouts) == 1:
-            return valid_layouts[0]
-
-        input_shapes = self._extract_input_shapes(extra_args)
+            return ((copy.deepcopy(valid_layouts[0]),), None)
 
         if not input_shapes:
-            return self._handle_no_input_shapes(valid_layouts)
+            return ((self._handle_no_input_shapes(valid_layouts),), None)
 
         aligned_layouts, aligned_shapes = self._align_layouts_and_shapes(layouts, input_shapes)
 
         if len(aligned_layouts) <= 1 or len(aligned_layouts) != len(aligned_shapes):
-            return valid_layouts[0]
+            return ((copy.deepcopy(valid_layouts[0]),), None)
 
         output_shape = self._compute_output_shape(aligned_shapes)
         merged_tensor_map, merged_partial = self._merge_all_layouts(
@@ -89,20 +143,22 @@ class ElementWiseDistributedOp(DistributedOp):
 
         self._check_all_inputs_broadcasts_and_partial(aligned_layouts, aligned_shapes, output_shape)
 
-        return self._create_output_layout(aligned_layouts[0], merged_tensor_map, merged_partial)
+        output_layout = self._create_output_layout(aligned_layouts[0], merged_tensor_map, merged_partial)
+        return ((output_layout,), None)
 
     def _handle_no_input_shapes(self, valid_layouts):
         """
         Handle the case when input shapes are not available.
         """
         first_layout = valid_layouts[0]
+        first_alias_map = first_layout.alias_tensor_map
         for layout in valid_layouts[1:]:
-            if layout.tensor_map != first_layout.tensor_map:
+            if layout.alias_tensor_map != first_alias_map:
                 raise ValueError(
                     f"For {self.op_name}, cannot infer layout without shapes: "
-                    f"mismatched tensor_map {first_layout.tensor_map} vs {layout.tensor_map}."
+                    f"mismatched alias_tensor_map {first_alias_map} vs {layout.alias_tensor_map}."
                 )
-        return first_layout
+        return copy.deepcopy(first_layout)
 
     def _align_layouts_and_shapes(self, layouts, input_shapes):
         """
@@ -168,24 +224,6 @@ class ElementWiseDistributedOp(DistributedOp):
             )
 
         return merged_tensor_map, merged_partial
-
-    def _extract_input_shapes(self, extra_args):
-        """
-        Extract input_shapes from extra_args.
-
-        Compatible with:
-          - dict: {"input_shapes": [...]}
-          - list/tuple (WithShape dispatcher): extra_args = [..., input_shapes]
-        """
-        if isinstance(extra_args, dict):
-            return extra_args.get("input_shapes", None)
-
-        if isinstance(extra_args, (list, tuple)) and extra_args:
-            maybe_shapes = extra_args[-1]
-            if isinstance(maybe_shapes, (list, tuple)):
-                return maybe_shapes
-
-        return None
 
     def _merge_partial_status(self, partial1, partial2, merged_tensor_map, tensor_map1, tensor_map2, layouts):
         """
@@ -312,61 +350,6 @@ class ElementWiseDistributedOp(DistributedOp):
                     f"For {self.op_name}, {input_name} has Partial status and broadcasts. "
                     f"Should be without Partial status for broadcasting without communication"
                 )
-
-    def _merge_tensor_maps_without_shape(self, layout1, layout2):
-        """
-        Merge tensor_maps without shape information (for broadcasting scenarios).
-
-        Merging rules without shape:
-        - If both dimensions are not sharded: use -1
-        - If one is sharded and one is not: use the sharded one (assume broadcasting)
-        - If both are sharded: they must be identical, otherwise raise error
-
-        Args:
-            layout1: Layout of the first input
-            layout2: Layout of the second input
-
-        Returns:
-            tuple: Merged tensor_map
-
-        Raises:
-            ValueError: If sharding strategies conflict
-        """
-        map1 = layout1.tensor_map if layout1.tensor_map else tuple()
-        map2 = layout2.tensor_map if layout2.tensor_map else tuple()
-
-        # Align ranks by padding with -1
-        max_len = max(len(map1), len(map2))
-        padded_map1 = (-1,) * (max_len - len(map1)) + map1
-        padded_map2 = (-1,) * (max_len - len(map2)) + map2
-
-        merged_map = []
-        for i, (m1, m2) in enumerate(zip(padded_map1, padded_map2)):
-            m1_axis = self._normalize_tensor_map_element(m1)
-            m2_axis = self._normalize_tensor_map_element(m2)
-
-            m1_axis_for_compare = frozenset(m1_axis)
-            m2_axis_for_compare = frozenset(m2_axis)
-
-            m1_is_sharded = bool(m1_axis)
-            m2_is_sharded = bool(m2_axis)
-
-            if not m1_is_sharded and not m2_is_sharded:
-                merged_map.append(-1)
-            elif not m1_is_sharded:
-                merged_map.append(self._denormalize_tensor_map_element(m2_axis))
-            elif not m2_is_sharded:
-                merged_map.append(self._denormalize_tensor_map_element(m1_axis))
-            else:
-                if m1_axis_for_compare != m2_axis_for_compare:
-                    raise ValueError(
-                        f"For {self.op_name}, inputs should have same sharding pattern, "
-                        f"but got confilcting sharding at dimension {i}, "
-                        f"input1 shaded on {m1_axis} and input2 shaded on {m2_axis}."
-                    )
-                merged_map.append(self._denormalize_tensor_map_element(m1_axis))
-
-        return tuple(merged_map)
 
     def _broadcast_shapes(self, shape1, shape2):
         """
@@ -621,33 +604,65 @@ class AddDistributedOp(ElementWiseWithPartialDistributedOp):
     which is useful for operations like gradient accumulation where partial
     results need to be preserved through the computation graph.
     """
-    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layout for Add operator.
+
+        Rules:
+            1. Follow element-wise broadcasting and sharding merge rules.
+            2. Partial status is allowed and propagated.
+            3. Propagated Partial status must be "sum" or None.
+
+        Args:
+            cache_values (list): [input_layout_0, ..., input_layout_n, input_shapes].
+
+        Returns:
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If propagated Partial status is not "sum" or None.
+        """
+        infer_result = super().infer_layout(cache_values)
+        if infer_result is None:
+            return infer_result
+
+        output_layout = infer_result[0][0]
+        for i, partial_type in enumerate(output_layout.partial):
+            if partial_type is not None and partial_type != "sum":
+                raise ValueError(
+                    f"For {self.op_name}, inputs partial status should be 'sum' or None, "
+                    f"but got {partial_type} at index {i}."
+                )
+
+        return infer_result
+
+    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,
+                        cache_values: list) -> Optional[Callable]:
         """
         Get expand implementation for the operator
         """
+        layouts = tuple(cache_values[:-1])
         x1_layout = layouts[0]
         x2_layout = layouts[1]
         x1_partial = x1_layout.is_partial() if x1_layout is not None else False
         x2_partial = x2_layout.is_partial() if x2_layout is not None else False
 
-        if x1_partial != x2_partial:
-            scaling_factor = 1
-            for i, partial_type in enumerate(infer_result.partial):
-                if partial_type == "sum":
-                    scaling_factor *= infer_result.mesh_shape[i]
-                elif partial_type is not None:
-                    raise ValueError(
-                        f"For {self.op_name}, inputs partial status should be 'sum' or None, "
-                        f"but got {partial_type} at index {i}."
-                    )
+        if x1_partial == x2_partial:
+            return None
 
-            # use expand_impl only when one of x1 and x2 is with partial placement.
-            def expand_impl1(x1, x2):
-                add_out = func(x1 / scaling_factor, x2)
-                return add_out
+        output_layout = infer_result[0][0]
+        scaling_factor = 1
+        for i, partial_type in enumerate(output_layout.partial):
+            if partial_type == "sum":
+                scaling_factor *= output_layout.mesh_shape[i]
 
-            def expand_impl2(x1, x2):
-                add_out = func(x1, x2 / scaling_factor)
-                return add_out
-            return expand_impl1 if not x1_partial else expand_impl2
-        return None
+        # use expand_impl only when one of x1 and x2 is with partial placement.
+        def _expand_impl1(x1, x2, *args, **kwargs):
+            add_out = func(x1 / scaling_factor, x2, *args, **kwargs)
+            return add_out
+
+        def _expand_impl2(x1, x2, *args, **kwargs):
+            add_out = func(x1, x2 / scaling_factor, *args, **kwargs)
+            return add_out
+
+        return _expand_impl1 if not x1_partial else _expand_impl2

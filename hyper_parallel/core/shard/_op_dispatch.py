@@ -237,6 +237,7 @@ class OpDispatcher:
             "normal_", "uniform_", "bernoulli", "bernoulli_",
             "native_dropout", "rand", "rand_like", "randn",
             "randn_like", "randint_like", "kaiming_uniform_",
+            "multinomial",
         }
         # Only mint random op support
         # MindSpore use the actual kernel name.
@@ -397,14 +398,15 @@ class OpDispatcher:
 
         return input_layouts, extra_args, input_args, input_kwargs, cache_key_values
 
-    def _with_layout_infer(self, func: callable, *args, **kwargs) -> Tensor:
-        """_with_layout_infer"""
+    def _with_layout_infer(self, func: callable, *args, _packed_call=None, **kwargs) -> Tensor:
+        """_with_layout_infer
+
+        NOTE: aclop packed args are already normalized upstream by
+        ``_dispatch_layout_infer`` via ``_normalize_aclop_args``. The
+        ``_packed_call`` kwarg carries the ``(prim, name)`` tuple when the
+        op uses aclop format, or ``None`` otherwise.
+        """
         func_name = platform.get_op_name(func)
-        packed_call = None
-        if(func_name in self.unpack_ops and len(args) == 3 and
-            isinstance(args[1], str) and isinstance(args[2],(tuple,list))):
-            packed_call = (args[0], args[1])
-            args = tuple(args[2])
 
         input_layouts, extra_args, input_args, input_kwargs, cache_key_values = \
             OpDispatcher._process_args_and_kwargs(args, kwargs)
@@ -428,10 +430,7 @@ class OpDispatcher:
         if op_impl is None:
             op_impl = func
 
-        if packed_call is not None:
-            py_output = op_impl(packed_call[0], packed_call[1], tuple(input_args), **input_kwargs)
-        else:
-            py_output = op_impl(*input_args, **input_kwargs)
+        py_output = OpDispatcher._call_op_impl(op_impl, _packed_call, input_args, input_kwargs)
 
         if isinstance(py_output, (tuple, list)):
             output = ()
@@ -489,8 +488,14 @@ class OpDispatcher:
 
         return DTensor.from_local(py_output, output_layout.mesh, output_layout.alias_placements)
 
-    def _with_layout_infer_with_tuple_expand(self, func: callable, *args, **kwargs) -> Tensor:
-        """_with_layout_infer_with_tuple_expand"""
+    def _with_layout_infer_with_tuple_expand(self, func: callable, *args, _packed_call=None, **kwargs) -> Tensor:
+        """_with_layout_infer_with_tuple_expand
+
+        NOTE: aclop packed args are already normalized upstream by
+        ``_dispatch_layout_infer`` via ``_normalize_aclop_args``. The
+        ``_packed_call`` kwarg carries the ``(prim, name)`` tuple when the
+        op uses aclop format, or ``None`` otherwise.
+        """
         expanded_args = []
         input_args = []
         for arg in args:
@@ -530,7 +535,7 @@ class OpDispatcher:
         if op_impl is None:
             op_impl = func
 
-        py_output = op_impl(*input_args, **input_kwargs)
+        py_output = OpDispatcher._call_op_impl(op_impl, _packed_call, input_args, input_kwargs)
         return distribute_op.wrap_output(py_output, output_layout)
 
     @staticmethod
@@ -663,15 +668,15 @@ class OpDispatcher:
 
         return input_layouts, input_shapes, extra_args, input_args, input_kwargs, cache_key_values
 
-    def _with_layout_infer_with_shape(self, func: callable, *args, **kwargs) -> Tensor:
-        """_with_layout_infer_with_shape"""
+    def _with_layout_infer_with_shape(self, func: callable, *args, _packed_call=None, **kwargs) -> Tensor:
+        """_with_layout_infer_with_shape
+
+        NOTE: aclop packed args are already normalized upstream by
+        ``_dispatch_layout_infer`` via ``_normalize_aclop_args``. The
+        ``_packed_call`` kwarg carries the ``(prim, name)`` tuple when the
+        op uses aclop format, or ``None`` otherwise.
+        """
         func_name = platform.get_op_name(func)
-        packed_call = None
-        # Packed fallback args for some ops (e.g. Mod: (prim_obj, "Mod", (x, y))).
-        if (func_name in self.unpack_ops and len(args) == 3 and
-            isinstance(args[1], str) and isinstance(args[2], (tuple, list))):
-            packed_call = (args[0], args[1])
-            args = tuple(args[2])
 
         (input_layouts, input_shapes, extra_args, input_args,
         input_kwargs, cache_key_values) = OpDispatcher._process_args_and_kwargs_with_shape(args, kwargs)
@@ -697,10 +702,7 @@ class OpDispatcher:
         if op_impl is None:
             op_impl = func
 
-        if packed_call is not None:
-            py_output = op_impl(packed_call[0], packed_call[1], tuple(input_args), **input_kwargs)
-        else:
-            py_output = op_impl(*input_args, **input_kwargs)
+        py_output = OpDispatcher._call_op_impl(op_impl, _packed_call, input_args, input_kwargs)
 
         # set output layout
         if isinstance(py_output, (tuple, list)):
@@ -827,7 +829,7 @@ class OpDispatcher:
         local_kwargs = {k: v.to_local() if isinstance(v, DTensor) else v for k, v in kwargs.items()}
         first_local_arg = first_arg.to_local()
 
-        if self._rng_tracker is None and is_rng_supported_mesh():
+        if self._rng_tracker is None and is_rng_supported_mesh(first_arg.device_mesh):
             self._rng_tracker = OffsetBasedRNGTracker()
 
         maybe_user_generator = local_kwargs.pop("generator", None)
@@ -856,6 +858,8 @@ class OpDispatcher:
                     local_args = _apply_shard_offset_to_rng_args(local_args, offset_incr)
                 local_results = op_call(*local_args, **local_kwargs)
         else:
+            if maybe_user_generator is not None:
+                local_kwargs["generator"] = maybe_user_generator
             local_results = op_call(*local_args, **local_kwargs)
 
         return self._wrap_random_result(op_name, local_results, first_arg, args, kwargs)
@@ -1097,6 +1101,58 @@ class OpDispatcher:
                 f"(not recommended for large vocabulary), use logits.full_tensor() explicitly."
             )
 
+    @staticmethod
+    def _normalize_aclop_args(op_name: str, unpack_ops: list, args: tuple) -> tuple:
+        """
+        Normalize aclop-packed arguments for MindSpore backend operators.
+
+        NOTE: This handles MindSpore aclop operators whose kernel signature packs
+        arguments as ``(prim, op_name_str, (real_arg0, real_arg1, ...))``. The
+        ``prim`` and ``op_name_str`` are preserved as ``packed_call`` for the
+        final kernel invocation, while the real tensor arguments are extracted
+        for layout inference and preprocessing.
+
+        **aclop is planned for deprecation.** Once aclop is fully removed, this
+        normalization and the associated ``unpack_ops`` list can be deleted.
+
+        Args:
+            op_name (str): Canonical operator name.
+            unpack_ops (list): List of op names that may use aclop packed format.
+            args (tuple): Raw positional arguments from the op call.
+
+        Returns:
+            tuple: ``(packed_call, normalized_args)``
+                - **packed_call**: ``(prim, op_name_str)`` tuple for kernel
+                  invocation, or ``None`` if no unpacking was performed.
+                - **normalized_args**: The real tensor arguments (unpacked if
+                  the packed format was detected, otherwise the original args).
+        """
+        if op_name in unpack_ops and len(args) == 3 and \
+            isinstance(args[1], str) and isinstance(args[2], (tuple, list)):
+            return (args[0], args[1]), tuple(args[2])
+        return None, args
+
+    @staticmethod
+    def _call_op_impl(op_impl: callable, packed_call, args, kwargs: dict):
+        """Invoke *op_impl* with optional aclop packed-call wrapping.
+
+        When *packed_call* is not ``None`` the MindSpore aclop kernel expects
+        ``(prim, op_name, (arg0, arg1, ...))``.  Otherwise *args* are spread
+        as positional arguments in the usual way.
+
+        Args:
+            op_impl: The op implementation callable.
+            packed_call: ``(prim, op_name)`` tuple or ``None``.
+            args: Local tensor arguments (list or tuple).
+            kwargs: Keyword arguments dict.
+
+        Returns:
+            Result of the *op_impl* invocation.
+        """
+        if packed_call is not None:
+            return op_impl(packed_call[0], packed_call[1], tuple(args), **kwargs)
+        return op_impl(*args, **kwargs)
+
     def _dispatch_layout_infer(
         self, op_name: str, op_call: callable, args: tuple, kwargs: dict
     ):
@@ -1148,25 +1204,39 @@ class OpDispatcher:
         cache_manager = LayoutCacheManager.get_instance()
         distribute_op = cache_manager.distributed_op(op_name)
 
+        # Normalize aclop-packed args before any per-op processing.
+        # This allows all distributed op classes (ElementWiseDistributedOp,
+        # GatherNdDistributedOp, etc.) to receive clean unpacked args,
+        # avoiding duplicated unpack logic in each class's preprocess.
+        packed_call, args = self._normalize_aclop_args(op_name, getattr(self, 'unpack_ops', []), args)
+
         result = distribute_op.preprocess(args, kwargs)
         if result is not None:
-            return self._dispatch_new(op_call, distribute_op, result)
+            return self._dispatch_new(op_call, distribute_op, packed_call, result)
 
         suffix = self.layout_infer_ops[op_name].get('infer_layout_suffix', '')
         if not suffix:
-            return self._with_layout_infer(op_call, *args, **kwargs)
+            return self._with_layout_infer(op_call, *args, _packed_call=packed_call, **kwargs)
+
+        if suffix == 'WithShape':
+            return self._with_layout_infer_with_shape(op_call, *args, _packed_call=packed_call, **kwargs)
+
+        if suffix == 'WithTupleExpand':
+            return self._with_layout_infer_with_tuple_expand(op_call, *args, _packed_call=packed_call, **kwargs)
 
         handler_name = self._suffix_dispatch.get(suffix)
         if handler_name is None:
             raise RuntimeError(f"Operator {op_name} specified wrong suffix in parallel yaml.")
         return getattr(self, handler_name)(op_call, *args, **kwargs)
 
-    def _dispatch_new(self, func, distribute_op, result) -> Tensor:
+    def _dispatch_new(self, func, distribute_op, packed_call, result) -> Tensor:
         """New dispatch flow using preprocess result.
 
         Args:
             func: Original function.
             distribute_op: Distributed operation instance.
+            packed_call: (prim, op_name_str) tuple for aclop kernel invocation,
+                or None for regular ops.
             result: Preprocessed result (local_args, local_kwargs, cache_values).
 
         Returns:
@@ -1188,7 +1258,7 @@ class OpDispatcher:
             op_layout_cache[cache_key] = (infer_result, op_impl)
         output_layouts, _ = infer_result
         op_impl = func if op_impl is None else op_impl
-        py_output = op_impl(*local_args, **local_kwargs)
+        py_output = OpDispatcher._call_op_impl(op_impl, packed_call, local_args, local_kwargs)
         return distribute_op.wrap_output(py_output, output_layouts)
 
     def dispatch(self, op_call: callable, args: tuple, kwargs: dict) -> object:

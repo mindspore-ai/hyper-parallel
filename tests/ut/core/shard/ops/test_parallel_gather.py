@@ -439,19 +439,25 @@ class TestParallelGatherNd(unittest.TestCase):
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_gathernd_preprocess_packed_call(self, mock_platform):
-        """Verify GatherNd preprocess preserves MindSpore packed fallback calls."""
+        """Verify GatherNd preprocess receives clean unpacked args.
+
+        NOTE: aclop packed-args normalization now happens upstream in
+        ``OpDispatcher._dispatch_layout_infer`` via ``_normalize_aclop_args``.
+        The re-packing for the kernel call is handled by ``_dispatch_new``.
+        This test validates that ``preprocess`` works correctly with
+        the already-unpacked (input, indices) args.
+        """
         mesh = self._make_1d_mesh(mock_platform, world_size=8)
         input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         indices_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
         input_tensor = _MockDTensor(input_layout, local_value="input", shape=(16, 64))
         indices = _MockDTensor(indices_layout, local_value="indices", shape=(16, 2))
-        prim = object()
 
         local_args, local_kwargs, cache_values = self.op.preprocess(
-            (prim, "GatherNd", (input_tensor, indices)), {}
+            (input_tensor, indices), {}
         )
 
-        assert local_args == (prim, "GatherNd", ("input", "indices"))
+        assert local_args == ("input", "indices")
         assert not local_kwargs
         assert cache_values == [input_layout, indices_layout, (16, 64), (16, 2)]
 

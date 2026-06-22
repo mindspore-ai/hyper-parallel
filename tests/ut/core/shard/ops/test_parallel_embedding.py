@@ -18,7 +18,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, Partial
 from hyper_parallel.core.shard.ops.parallel_embedding import EmbeddingDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -41,11 +41,13 @@ class TestParallelEmbedding(unittest.TestCase):
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, world_size=8):
         """Configure common mock-platform attributes."""
@@ -79,13 +81,15 @@ class TestParallelEmbedding(unittest.TestCase):
         weight_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
         for op in embedding_ops:
-            output_layout = op.infer_layout((input_layout, weight_layout))
+            cache_values = [input_layout, weight_layout]
+            output_layouts, _ = op.infer_layout(cache_values)
+            output_layout = output_layouts[0]
             # Expected map: input(1, -1) + weight_embed(-1) = (1, -1, -1)
             expected_map = (1, -1, -1)
             self.assertEqual(output_layout.tensor_map, expected_map, f"Op {op.op_name} failed")
             self.assertFalse(output_layout.is_partial())
             # Implementation should be native (None) for DP
-            self.assertIsNone(op.get_expand_impl(None, output_layout, (input_layout, weight_layout), None))
+            self.assertIsNone(op.get_expand_impl(None, (output_layouts, None), cache_values))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_embedding_column_parallel(self, mock_platform):
@@ -101,13 +105,15 @@ class TestParallelEmbedding(unittest.TestCase):
         weight_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
 
         for op in embedding_ops:
-            output_layout = op.infer_layout((input_layout, weight_layout))
+            cache_values = [input_layout, weight_layout]
+            output_layouts, _ = op.infer_layout(cache_values)
+            output_layout = output_layouts[0]
             # Expected map: input(1, -1) + weight_embed(0) = (1, -1, 0)
             expected_map = (1, -1, 0)
             self.assertEqual(output_layout.tensor_map, expected_map, f"Op {op.op_name} failed")
 
             # CP requires wrapper to intercept max_norm
-            impl = op.get_expand_impl(None, output_layout, (input_layout, weight_layout), None)
+            impl = op.get_expand_impl(None, (output_layouts, None), cache_values)
             self.assertTrue(callable(impl))
             with self.assertRaisesRegex(ValueError, "Column-Parallel.*does not support `max_norm`"):
                 impl(MagicMock(), MagicMock(), max_norm=1.0)
@@ -125,7 +131,8 @@ class TestParallelEmbedding(unittest.TestCase):
         weight_layout = _build_layout(mesh, (Replicate(), Shard(0)), 2)
 
         for op in embedding_ops:
-            output_layout = op.infer_layout((input_layout, weight_layout))
+            output_layouts, _ = op.infer_layout([input_layout, weight_layout])
+            output_layout = output_layouts[0]
             # Expected map: input(1, -1) + weight_embed(-1) = (1, -1, -1)
             self.assertEqual(output_layout.tensor_map, (1, -1, -1))
             self.assertTrue(output_layout.is_partial())
@@ -148,7 +155,8 @@ class TestParallelEmbedding(unittest.TestCase):
         weight_layout = _build_layout(mesh, (Replicate(), Shard(0), Shard(1)), 2)
 
         for op in embedding_ops:
-            output_layout = op.infer_layout((input_layout, weight_layout))
+            output_layouts, _ = op.infer_layout([input_layout, weight_layout])
+            output_layout = output_layouts[0]
             # Expected map: input(2, -1) + weight_embed(0) = (2, -1, 0)
             expected_map = (2, -1, 0)
             self.assertEqual(output_layout.tensor_map, expected_map)
@@ -169,7 +177,8 @@ class TestParallelEmbedding(unittest.TestCase):
         weight_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
         for op in embedding_ops:
-            output_layout = op.infer_layout((input_layout, weight_layout))
+            output_layouts, _ = op.infer_layout([input_layout, weight_layout])
+            output_layout = output_layouts[0]
             self.assertEqual(output_layout.tensor_map, (-1, 0, -1))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -183,8 +192,8 @@ class TestParallelEmbedding(unittest.TestCase):
         input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
         for op in embedding_ops:
-            with self.assertRaisesRegex(ValueError, "requires both input and weight layouts"):
-                op.infer_layout((input_layout,))
+            with self.assertRaisesRegex(ValueError, "cache_values length should be 2"):
+                op.infer_layout([input_layout])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_embedding_partial_conflict_error(self, mock_platform):
@@ -200,7 +209,7 @@ class TestParallelEmbedding(unittest.TestCase):
 
         for op in embedding_ops:
             with self.assertRaisesRegex(ValueError, "Partial dim must be replicate"):
-                op.infer_layout((input_layout, weight_layout))
+                op.infer_layout([input_layout, weight_layout])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_embedding_row_parallel_params_validation(self, mock_platform):
@@ -214,8 +223,9 @@ class TestParallelEmbedding(unittest.TestCase):
         weight_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
         for op in embedding_ops:
-            output_layout = op.infer_layout((input_layout, weight_layout))
-            impl = op.get_expand_impl(None, output_layout, (input_layout, weight_layout), None)
+            cache_values = [input_layout, weight_layout]
+            output_layouts, _ = op.infer_layout(cache_values)
+            impl = op.get_expand_impl(None, (output_layouts, None), cache_values)
 
             with self.assertRaisesRegex(ValueError, "Row-Parallel.*does not support `scale_grad_by_freq=True`"):
                 impl(MagicMock(), MagicMock(), scale_grad_by_freq=True)
@@ -234,7 +244,8 @@ class TestParallelEmbedding(unittest.TestCase):
         weight_layout = _build_layout(mesh, (Shard(0), Shard(1)), 2)
 
         for op in embedding_ops:
-            output_layout = op.infer_layout((input_layout, weight_layout))
+            output_layouts, _ = op.infer_layout([input_layout, weight_layout])
+            output_layout = output_layouts[0]
             # Input map (-1, -1) + weight_embed(0) = (-1, -1, 0)
             self.assertEqual(output_layout.tensor_map, (-1, -1, 0))
             self.assertTrue(output_layout.is_partial())
@@ -255,7 +266,8 @@ class TestParallelEmbedding(unittest.TestCase):
         weight_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
 
         for op in embedding_ops:
-            output_layout = op.infer_layout((input_layout, weight_layout))
+            output_layouts, _ = op.infer_layout([input_layout, weight_layout])
+            output_layout = output_layouts[0]
             # Expected map: (1, -1, -1, 0)
             self.assertEqual(output_layout.tensor_map, (1, -1, -1, 0))
 
@@ -272,9 +284,39 @@ class TestParallelEmbedding(unittest.TestCase):
         weight_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
         for op in embedding_ops:
-            output_layout = op.infer_layout((input_layout, weight_layout))
+            output_layouts, _ = op.infer_layout([input_layout, weight_layout])
+            output_layout = output_layouts[0]
             # Expected map: (1, 0, -1)
             self.assertEqual(output_layout.tensor_map, (1, 0, -1))
+
+    def test_embedding_preprocess_routes_platform_args(self):
+        """
+        Feature: New dispatch preprocessing.
+        Description: Convert DTensor inputs to local tensors and cache layouts.
+        Expectation: PyTorch embedding keeps sparse while MindSpore Embedding drops it.
+        """
+        input_layout = MagicMock()
+        weight_layout = MagicMock()
+        input_tensor = MagicMock()
+        input_tensor.layout = input_layout
+        input_tensor.to_local.return_value = "local_input"
+        weight_tensor = MagicMock()
+        weight_tensor.layout = weight_layout
+        weight_tensor.to_local.return_value = "local_weight"
+
+        local_args, local_kwargs, cache_values = EmbeddingDistributedOp("embedding").preprocess(
+            (input_tensor, weight_tensor), {}
+        )
+        self.assertEqual(local_args, ("local_input", "local_weight", None, None, 2.0, False, False))
+        self.assertEqual(local_kwargs, {})
+        self.assertEqual(cache_values, [input_layout, weight_layout])
+
+        local_args, local_kwargs, cache_values = EmbeddingDistributedOp("Embedding").preprocess(
+            (input_tensor, weight_tensor), {}
+        )
+        self.assertEqual(local_args, ("local_input", "local_weight", None, None, 2.0, False))
+        self.assertEqual(local_kwargs, {})
+        self.assertEqual(cache_values, [input_layout, weight_layout])
 
 
 
@@ -290,8 +332,9 @@ class TestParallelEmbedding(unittest.TestCase):
         weight_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2) # Column Parallel
 
         for op in embedding_ops:
-            output_layout = op.infer_layout((input_layout, weight_layout))
-            impl = op.get_expand_impl(MagicMock(), output_layout, (input_layout, weight_layout), None)
+            cache_values = [input_layout, weight_layout]
+            output_layouts, _ = op.infer_layout(cache_values)
+            impl = op.get_expand_impl(MagicMock(), (output_layouts, None), cache_values)
 
             # Should not raise ValueError for scale_grad_by_freq
             try:
@@ -310,10 +353,12 @@ class TestEmbeddingRowParallelImpl(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_row_parallel_max_norm_raises(self, mock_platform):
@@ -330,9 +375,10 @@ class TestEmbeddingRowParallelImpl(unittest.TestCase):
         weight_layout = _build_layout(mesh, (Shard(0),), 2)
 
         for embedding_op in embedding_ops:
-            output_layout = embedding_op.infer_layout((input_layout, weight_layout))
+            cache_values = [input_layout, weight_layout]
+            output_layouts, _ = embedding_op.infer_layout(cache_values)
             impl = embedding_op.get_expand_impl(
-                MagicMock(), output_layout, (input_layout, weight_layout), None
+                MagicMock(), (output_layouts, None), cache_values
             )
             with self.assertRaisesRegex(ValueError, "Row-Parallel.*does not support.*max_norm"):
                 impl(MagicMock(), MagicMock(), max_norm=1.0)

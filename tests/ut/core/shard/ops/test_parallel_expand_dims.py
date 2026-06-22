@@ -15,10 +15,10 @@
 """parallel_expand_dims test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_expand_dims import ExpandDimsDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -38,12 +38,14 @@ class TestParallelExpandDims(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
         self.op = ExpandDimsDistributedOp("ExpandDims")
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -67,14 +69,18 @@ class TestParallelExpandDims(unittest.TestCase):
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=mesh_dim_names)
 
     def _run_scenario(self, x_layout, expected_map, extra_args):
-        """Infer layout of ExpandDims operator"""
-        output_layout = self.op.infer_layout((x_layout,), extra_args)
+        """Infer layout of ExpandDims operator."""
+        axis = extra_args[0] if isinstance(extra_args, (tuple, list)) else extra_args
+        cache_values = [x_layout, axis]
+        output_layouts, extra_info = self.op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         assert output_layout.tensor_map == expected_map, (
             f"ExpandDims failed. Expected {expected_map}, got {output_layout.tensor_map}"
         )
-        assert self.op.get_expand_impl(None, output_layout, (x_layout,), extra_args) is None, (
+        assert extra_info is None, f"ExpandDims extra_info should be None, got {extra_info}"
+        assert self.op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
             f"ExpandDims get_expand_impl failed. Expected None, "
-            f"got {self.op.get_expand_impl(None, output_layout, (x_layout,), extra_args)}"
+            f"got {self.op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -206,7 +212,34 @@ class TestParallelExpandDims(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 3)
 
         with self.assertRaisesRegex(ValueError, "out of range for input rank"):
-            self.op.infer_layout((x_layout,), [5])
+            self.op.infer_layout([x_layout, 5])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_expanddims_partial_input_raises_error(self, mock_platform):
+        """Verify ExpandDims rejects inputs with Partial status."""
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+
+        with self.assertRaisesRegex(ValueError, "Partial status"):
+            self.op.infer_layout([x_layout, 1])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_expanddims_preprocess(self, mock_platform):
+        """Verify preprocess converts DTensor input to local args and cache values."""
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 3)
+
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        local_tensor = MagicMock()
+        mock_tensor.to_local.return_value = local_tensor
+
+        local_args, local_kwargs, cache_values = self.op.preprocess((mock_tensor, 1), {})
+
+        assert local_args == (local_tensor, 1)
+        assert not local_kwargs
+        assert cache_values == [x_layout, 1]
 
 
 class TestParallelExpandDimsView(unittest.TestCase):
@@ -216,12 +249,14 @@ class TestParallelExpandDimsView(unittest.TestCase):
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
         self.op = ExpandDimsDistributedOp("ExpandDimsView")
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
@@ -240,13 +275,17 @@ class TestParallelExpandDimsView(unittest.TestCase):
 
     def _run_scenario(self, x_layout, expected_map, extra_args):
         """Infer layout of ExpandDimsView operator."""
-        output_layout = self.op.infer_layout((x_layout,), extra_args)
+        axis = extra_args[0] if isinstance(extra_args, (tuple, list)) else extra_args
+        cache_values = [x_layout, axis]
+        output_layouts, extra_info = self.op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         assert output_layout.tensor_map == expected_map, (
             f"ExpandDimsView failed. Expected {expected_map}, got {output_layout.tensor_map}"
         )
-        assert self.op.get_expand_impl(None, output_layout, (x_layout,), extra_args) is None, (
+        assert extra_info is None, f"ExpandDimsView extra_info should be None, got {extra_info}"
+        assert self.op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
             f"ExpandDimsView get_expand_impl failed. Expected None, "
-            f"got {self.op.get_expand_impl(None, output_layout, (x_layout,), extra_args)}"
+            f"got {self.op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -378,7 +417,34 @@ class TestParallelExpandDimsView(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 3)
 
         with self.assertRaisesRegex(ValueError, "out of range for input rank"):
-            self.op.infer_layout((x_layout,), [5])
+            self.op.infer_layout([x_layout, 5])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_expanddims_partial_input_raises_error(self, mock_platform):
+        """Verify ExpandDims rejects inputs with Partial status."""
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+
+        with self.assertRaisesRegex(ValueError, "Partial status"):
+            self.op.infer_layout([x_layout, 1])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_expanddims_preprocess(self, mock_platform):
+        """Verify preprocess converts DTensor input to local args and cache values."""
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 3)
+
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        local_tensor = MagicMock()
+        mock_tensor.to_local.return_value = local_tensor
+
+        local_args, local_kwargs, cache_values = self.op.preprocess((mock_tensor, 1), {})
+
+        assert local_args == (local_tensor, 1)
+        assert not local_kwargs
+        assert cache_values == [x_layout, 1]
 
 
 if __name__ == "__main__":

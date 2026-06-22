@@ -15,10 +15,10 @@
 """parallel_reshape test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, Partial
 from hyper_parallel.core.shard.ops.parallel_reshape import ReshapeDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -42,11 +42,13 @@ class TestParallelReshape(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -79,6 +81,47 @@ class TestParallelReshape(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(8,), mesh_dim_names=(mesh_dim_name,))
 
+    def _infer_reshape(self, reshape_op, x_layout, dst_shape, src_shape):
+        """Infer reshape layout using the new cache_values calling convention."""
+        output_layouts, local_dst_shape = reshape_op.infer_layout([x_layout, dst_shape, src_shape])
+        return output_layouts[0], local_dst_shape
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_reshape_preprocess_builds_cache_values(self, mock_platform):
+        """
+        Feature: ReshapeDistributedOp preprocess.
+        Description: Verify that preprocess converts DTensor input to local tensor and caches layout/shape metadata.
+        Expectation: local args, kwargs, and cache values follow the new dispatch convention.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
+        local_tensor = MagicMock()
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        mock_tensor.shape = (8, 4)
+        mock_tensor.to_local.return_value = local_tensor
+
+        local_args, local_kwargs, cache_values = op.preprocess((mock_tensor, (4, 8)), {})
+
+        assert local_args == (local_tensor, (4, 8))
+        assert not local_kwargs
+        assert cache_values == [x_layout, (4, 8), (8, 4)]
+
+    def test_reshape_get_expand_impl_uses_local_shape(self):
+        """
+        Feature: ReshapeDistributedOp get_expand_impl.
+        Description: Verify that the wrapper replaces global target shape with inferred local target shape.
+        Expectation: Underlying function receives local_dst_shape.
+        """
+        infer_result = ((MagicMock(),), [2, 8])
+
+        def fake_reshape(x, shape):
+            return x, shape
+
+        impl = op.get_expand_impl(fake_reshape, infer_result, [MagicMock(), (4, 8), (8, 4)])
+
+        assert impl("local_x", (4, 8)) == ("local_x", [2, 8])
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_reshape_layout_not_change_sharded_axis(self, mock_platform):
         """
@@ -91,7 +134,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (1024, 512, 512)
         dst_shape = (1024, 2, 256, 512)
 
-        output_layout, local_dst_shape = op.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op, x_layout, dst_shape, src_shape)
         expected_map = (1, -1, -1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Reshape do not change sharded axis failed. Expected {expected_map}, "
@@ -103,11 +146,10 @@ class TestParallelReshape(unittest.TestCase):
             f"got {local_dst_shape}"
         )
 
-        # Since `get_expand_impl` is not overridden, it returns None by default.
-        # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (x_layout,), (dst_shape, src_shape)) is None, (
+        # If func is None in a unit-level call, no runtime wrapper is needed.
+        assert op.get_expand_impl(None, ((output_layout,), local_dst_shape), [x_layout, dst_shape, src_shape]) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x_layout,), (dst_shape, src_shape))}"
+            f"got {op.get_expand_impl(None, ((output_layout,), local_dst_shape), [x_layout, dst_shape, src_shape])}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -122,7 +164,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (4, 4, 8)
         dst_shape = (16, 8)
 
-        output_layout, local_dst_shape = op.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op, x_layout, dst_shape, src_shape)
         expected_map = (1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Reshape do not change sharded axis failed. Expected {expected_map}, "
@@ -146,7 +188,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (32, 128)
         dst_shape = (4, 8, 128)
 
-        output_layout, local_dst_shape = op.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op, x_layout, dst_shape, src_shape)
         expected_map = (1, -1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Reshape do not change sharded axis failed. Expected {expected_map}, "
@@ -170,7 +212,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (32, 6, 128, 28, 10)
         dst_shape = (4, 8, 2, 384, 280)
 
-        output_layout, local_dst_shape = op.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op, x_layout, dst_shape, src_shape)
         expected_map = (0, -1, 2, -1, 1)
         assert output_layout.tensor_map == expected_map, (
             f"Reshape do not change sharded axis failed. Expected {expected_map}, "
@@ -195,7 +237,7 @@ class TestParallelReshape(unittest.TestCase):
         dst_shape = (4, 8, 12, 4)
 
         with self.assertRaises(ValueError):
-            _, _ = op.infer_layout((x_layout,), (dst_shape, src_shape))
+            _, _ = self._infer_reshape(op, x_layout, dst_shape, src_shape)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_reshape_layout_can_not_reshape2(self, mock_platform):
@@ -210,7 +252,7 @@ class TestParallelReshape(unittest.TestCase):
         dst_shape = (4, 8, 2, 42)
 
         with self.assertRaises(ValueError):
-            _, _ = op.infer_layout((x_layout,), (dst_shape, src_shape))
+            _, _ = self._infer_reshape(op, x_layout, dst_shape, src_shape)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_reshape_layout_dynamic_shape1(self, mock_platform):
@@ -224,7 +266,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (1024, -1, 256, 512)
         dst_shape = (1024, -1, 512)
 
-        output_layout, local_dst_shape = op.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op, x_layout, dst_shape, src_shape)
         expected_map = (1, -1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Reshape do not change sharded axis failed. Expected {expected_map}, "
@@ -248,7 +290,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (1024, -1, 512)
         dst_shape = (1024, -1, 256, 512)
 
-        output_layout, local_dst_shape = op.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op, x_layout, dst_shape, src_shape)
         expected_map = (1, -1, -1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Reshape do not change sharded axis failed. Expected {expected_map}, "
@@ -272,7 +314,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (-1, 256, 512)
         dst_shape = (-1, 512)
 
-        output_layout, local_dst_shape = op.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op, x_layout, dst_shape, src_shape)
         expected_map = (1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Reshape do not change sharded axis failed. Expected {expected_map}, "
@@ -297,7 +339,7 @@ class TestParallelReshape(unittest.TestCase):
         dst_shape = (-1, 256, 512)
 
         with self.assertRaises(ValueError):
-            _, _ = op.infer_layout((x_layout,), (dst_shape, src_shape))
+            _, _ = self._infer_reshape(op, x_layout, dst_shape, src_shape)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_torch_reshape_basic_split(self, mock_platform):
@@ -312,7 +354,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (32, 64)
         dst_shape = (32, 16, 4)
 
-        output_layout, local_dst_shape = op_torch.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op_torch, x_layout, dst_shape, src_shape)
 
         expected_map = (1, 0, -1)
 
@@ -338,7 +380,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (32, 64)
         dst_shape = (32, -1)
 
-        output_layout, local_dst_shape = op_torch.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op_torch, x_layout, dst_shape, src_shape)
 
         expected_map = (1, 0)
         assert output_layout.tensor_map == expected_map
@@ -360,11 +402,11 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (16, 4, 8)
         dst_shape = (64, 8)
 
-        output_layout, _ = op_torch.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, _ = self._infer_reshape(op_torch, x_layout, dst_shape, src_shape)
         assert output_layout.tensor_map == (1, 0)
 
         dst_shape_2 = (16, 2, 2, 8)
-        output_layout_2, _ = op_torch.infer_layout((x_layout,), (dst_shape_2, src_shape))
+        output_layout_2, _ = self._infer_reshape(op_torch, x_layout, dst_shape_2, src_shape)
         assert output_layout_2.tensor_map == (1, -1, -1, 0)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -379,8 +421,8 @@ class TestParallelReshape(unittest.TestCase):
 
         dst_shape = (32, 64)
 
-        with self.assertRaisesRegex(ValueError, "reshape requires output shape and input shape."):
-            op_torch.infer_layout((x_layout,), (dst_shape,))
+        with self.assertRaisesRegex(ValueError, "cache_values length"):
+            op_torch.infer_layout([x_layout, dst_shape])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_torch_reshape_fail_mismatch_total_size(self, mock_platform):
@@ -396,7 +438,7 @@ class TestParallelReshape(unittest.TestCase):
         dst_shape = (20, 20)
 
         with self.assertRaises(ValueError):
-            op_torch.infer_layout((x_layout,), (dst_shape, src_shape))
+            self._infer_reshape(op_torch, x_layout, dst_shape, src_shape)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_view_layout_flatten_contiguous(self, mock_platform):
@@ -412,7 +454,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (32, 16, 8)
         dst_shape = (32, 128)
 
-        output_layout, local_dst_shape = op_view.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op_view, x_layout, dst_shape, src_shape)
 
         expected_map = (1, 0)
         assert output_layout.tensor_map == expected_map, (
@@ -436,7 +478,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (32, 128)
         dst_shape = (32, 16, 8)
 
-        output_layout, local_dst_shape = op_view.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op_view, x_layout, dst_shape, src_shape)
 
         expected_map = (1, 0, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -459,7 +501,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (8, 4, 16)
         dst_shape = (8, -1)
 
-        output_layout, local_dst_shape = op_view.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op_view, x_layout, dst_shape, src_shape)
 
         expected_map = (1, 0)
         assert output_layout.tensor_map == expected_map
@@ -481,7 +523,7 @@ class TestParallelReshape(unittest.TestCase):
         dst_shape = (10, 30)
 
         with self.assertRaisesRegex(ValueError, "total elements number"):
-            op_view.infer_layout((x_layout,), (dst_shape, src_shape))
+            self._infer_reshape(op_view, x_layout, dst_shape, src_shape)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_reshape_with_partial_basic(self, mock_platform):
@@ -498,7 +540,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (8, 16)
         dst_shape = (4, 4, 8)
 
-        output_layout, _ = op.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, _ = self._infer_reshape(op, x_layout, dst_shape, src_shape)
 
         assert output_layout.is_partial(), "Output layout should preserve partial status"
         assert output_layout.get_partial_by_dev_id("dp") == "sum", (
@@ -518,7 +560,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (8, 16)
         dst_shape = (1, -1, 16)
 
-        output_layout, _ = op.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, _ = self._infer_reshape(op, x_layout, dst_shape, src_shape)
 
         assert output_layout.is_partial(), "Output layout should preserve partial status"
         assert output_layout.get_partial_by_dev_id("mp") == "sum", (
@@ -538,7 +580,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (4, 8)
         dst_shape = (2, 16)
 
-        output_layout, _ = op.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, _ = self._infer_reshape(op, x_layout, dst_shape, src_shape)
 
         assert output_layout.is_partial(), "Output layout should preserve partial status"
         assert output_layout.get_partial_by_dev_id("dp") == "sum"
@@ -558,9 +600,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (4, 8)
         dst_shape = (2, 16)
 
-        output_layout, _ = op_torch.infer_layout(
-            (x_layout,), (dst_shape, src_shape)
-        )
+        output_layout, _ = self._infer_reshape(op_torch, x_layout, dst_shape, src_shape)
 
         assert output_layout.is_partial(), "Output layout should preserve partial status"
         assert output_layout.get_partial_by_dev_id("dp") == "sum"
@@ -577,7 +617,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (2,)
         dst_shape = (-1,)
 
-        output_layout, local_dst_shape = op_torch.infer_layout((x_layout,), (dst_shape, src_shape))
+        output_layout, local_dst_shape = self._infer_reshape(op_torch, x_layout, dst_shape, src_shape)
         expected_map = (-1,)
         assert output_layout.tensor_map == expected_map, (
             f"Replicate 1D reshape to self failed. Expected {expected_map}, "
@@ -603,9 +643,7 @@ class TestParallelReshape(unittest.TestCase):
         src_shape = (4, 8)
         dst_shape = (2, 16)
 
-        output_layout, _ = op_view.infer_layout(
-            (x_layout,), (dst_shape, src_shape)
-        )
+        output_layout, _ = self._infer_reshape(op_view, x_layout, dst_shape, src_shape)
 
         assert output_layout.is_partial(), "Output layout should preserve partial status"
         assert output_layout.get_partial_by_dev_id("dp") == "sum"
