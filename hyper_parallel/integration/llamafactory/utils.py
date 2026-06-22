@@ -72,9 +72,64 @@ __all__ = [
     "export_to_hf_format",
     "load_hsdp_model",
     "load_hsdp_optimizer_and_scheduler",
+    "patch_llamafactory_fp32_upcast",
     "save_hsdp_checkpoint",
     "wrap_optimizer_with_skip_dtensor_dispatch",
 ]
+
+
+# LlamaFactory upcasts trainable params to fp32 on the host before FSDP wraps the
+# model. FSDP2 re-upcasts them post-shard anyway, so the pre-shard upcast is
+# redundant -- and with cpu_ram_efficient_loading it faults the whole model into
+# host memory on every rank (host peak ~ N*M). We patch the two tuning-setup
+# functions to skip it under FSDP.
+
+_LLAMAFACTORY_UPCAST_PATCHED = False
+
+
+def _should_defer_host_fp32_upcast(model) -> bool:
+    """True when FSDP2 will re-upcast trainable params to fp32 after wrapping."""
+    from transformers.integrations.fsdp import is_fsdp_enabled  # pylint: disable=C0415
+
+    if not is_fsdp_enabled():
+        return False
+    return getattr(model, "dtype", None) in (torch.float16, torch.bfloat16)
+
+
+def _skip_host_upcast_under_fsdp(orig, fn_name):
+    """Wrap a LlamaFactory tuning-setup fn, forcing its fp32-upcast flag off under FSDP."""
+
+    @functools.wraps(orig)
+    def wrapper(model, finetuning_args, is_trainable, cast_trainable_params_to_fp32):
+        if cast_trainable_params_to_fp32 and _should_defer_host_fp32_upcast(model):
+            cast_trainable_params_to_fp32 = False
+            if dist.is_available() and dist.is_initialized() and dist.get_rank() == 0:
+                logger.info("[HP] FSDP detected; deferring %s fp32 upcast to post-shard.", fn_name)
+        return orig(model, finetuning_args, is_trainable, cast_trainable_params_to_fp32)
+
+    return wrapper
+
+
+def patch_llamafactory_fp32_upcast() -> None:
+    """Install the FSDP fp32-upcast deferral patch. Idempotent; no-op without LlamaFactory.
+
+    Called from HyperParallelArguments.from_finetuning_args so the patch is in place
+    before LlamaFactory's load_model runs.
+    """
+    global _LLAMAFACTORY_UPCAST_PATCHED
+    if _LLAMAFACTORY_UPCAST_PATCHED:
+        return
+    try:
+        from llamafactory.model import adapter as lf_adapter  # pylint: disable=C0415
+    except ImportError:
+        return
+
+    for fn_name in ("_setup_full_tuning", "_setup_freeze_tuning"):
+        orig = getattr(lf_adapter, fn_name, None)
+        if orig is not None:
+            setattr(lf_adapter, fn_name, _skip_host_upcast_under_fsdp(orig, fn_name))
+
+    _LLAMAFACTORY_UPCAST_PATCHED = True
 
 # ---------------------------------------------------------------------------
 # Config
@@ -171,6 +226,8 @@ class HyperParallelArguments:
     @classmethod
     def from_finetuning_args(cls, finetuning_args) -> "HyperParallelArguments":
         """Extract HyperParallel arguments from LlamaFactory finetuning args."""
+        # Install the host-memory patch before LlamaFactory's load_model runs.
+        patch_llamafactory_fp32_upcast()
         raw = getattr(finetuning_args, "hyper_parallel_args", None)
         if raw is None:
             hp_args = cls()
