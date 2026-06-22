@@ -17,13 +17,13 @@
 
 import math
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.core.optimizer.optimizer import AsyncReplicateBroadcaster, BaseDistributedOptimizer, \
-    to_local_if_dtensor
+from hyper_parallel.core.optimizer.optimizer import AsyncReplicateBroadcaster, BaseDistributedOptimizer
+from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
     HSDPGroupAssignment,
     fused_allgather_dtensor_params,
@@ -111,7 +111,8 @@ class Muon(BaseDistributedOptimizer):
             matched_adamw_rms: float = 0.2,
             momentum: float = 0.95,
             nesterov: bool = True,
-            ns_steps: int = 5
+            ns_steps: int = 5,
+            hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
     ):
         defaults = {
             "lr": lr,
@@ -121,16 +122,27 @@ class Muon(BaseDistributedOptimizer):
             "nesterov": nesterov,
             "ns_steps": ns_steps,
         }
-        super().__init__(params, defaults, is_muon=True)
+        super().__init__(params, defaults, is_muon=True, hsdp_replica_count=hsdp_replica_count)
 
         self._group_dtensor_by_mesh()
+        deduced_count = self._auto_deduce_replica_count()
+        if deduced_count is None:
+            self.hsdp_replica_count = None
+        elif self.hsdp_replica_count is None:
+            self.hsdp_replica_count = deduced_count
+        self._split_replicate_groups()
         self._build_hsdp_batch()
         self._build_param_broadcast_info()
         self._classify_parameters_for_step()
 
     @torch.no_grad()
     def step(self, closure=None) -> Optional[float]:
-        """Perform a single optimization step."""
+        """
+        Perform a single optimization step.
+        De-duplication is controlled by the caller: ``param_to_ns_input`` should already contain only the owned 
+        params (via ``hsdp_assign.owned_params``). The caller is responsible for broadcasting the updated params to 
+        replica peers via ``AsyncReplicateBroadcaster.flush_group``.
+        """
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -190,7 +202,6 @@ class Muon(BaseDistributedOptimizer):
 
                 # Compute momentum for this assignment's owned params only.
                 ns_inputs = self._update_muon_momentum(group, hsdp_assign.owned_params)
-
                 if not hsdp_assign.is_shard:
                     if ns_inputs:
                         self._process_unshard_params(group, ns_inputs)
@@ -217,7 +228,6 @@ class Muon(BaseDistributedOptimizer):
         self.unshard_params_by_group: Dict[int, List] = {}
         self.shard_params_by_group: Dict[int, List] = {}
         self.shard_assignments_by_group: Dict[int, List[HSDPGroupAssignment]] = {}
-
         # Per group: record.index -> shard coord that computes NS.
         self._shard_compute_coord: Dict[int, Dict[int, Tuple[int, ...]]] = {}
 
@@ -326,8 +336,16 @@ class Muon(BaseDistributedOptimizer):
                     sub_batch, param_to_ns_input, lr, rms, ns_steps, no_shard=True
                 )
 
-                for p in sub_batch:
-                    self._apply_local_update(p, updates_dict[p], lr, weight_decay, adjusted_lr)
+                # Fused batched apply — all params in the same sub_batch share
+                # the same adjusted_lr, so we can use foreach ops.
+                local_params = [to_local_if_dtensor(p.data) for p in sub_batch]
+                local_updates = [updates_dict[p].view(lp.shape) for p, lp in zip(sub_batch, local_params)]
+
+                if weight_decay != 0.0:
+                    # pylint: disable=protected-access
+                    torch._foreach_mul_(local_params, 1 - lr * weight_decay)
+                # pylint: disable=protected-access
+                torch._foreach_add_(local_params, local_updates, alpha=-adjusted_lr)
 
     def _gather_and_compute_shard_updates(
             self,
@@ -408,7 +426,7 @@ class Muon(BaseDistributedOptimizer):
     ) -> None:
         """Process sharded params with greedy shard-group compute assignment."""
         platform = get_platform()
-        device = torch.npu.current_device()
+        device = torch.npu.current_device() if torch.npu.is_available() else torch.cuda.current_device()
 
         lr = group["lr"]
         weight_decay = group["weight_decay"]
@@ -528,7 +546,7 @@ class Muon(BaseDistributedOptimizer):
         shapes_info = []
 
         for p in p_list:
-            origin_shape = tuple(p.local_shape) if no_shard else tuple(p.shape)
+            origin_shape = tuple(getattr(p, 'local_shape', None) or p.to_local().shape) if no_shard else tuple(p.shape)
             ns_input = ns_inputs[p].view(origin_shape)
 
             is_conv = False
@@ -575,20 +593,6 @@ class Muon(BaseDistributedOptimizer):
             adjusted_lr = adjust_lr_wd_for_muon(lr, rms, ref_shape)
 
         return updates_dict, adjusted_lr
-
-    def _apply_local_update(
-            self,
-            param: torch.nn.Parameter,
-            update: torch.Tensor,
-            lr: float,
-            weight_decay: float,
-            adjusted_lr: float,
-    ) -> None:
-        """Apply weight decay and parameter update in-place."""
-        local_param = to_local_if_dtensor(param.data)
-        update_to_apply = update.view(local_param.shape)
-        local_param.mul_(1 - lr * weight_decay)
-        local_param.add_(update_to_apply, alpha=-adjusted_lr)
 
     def _fused_broadcast_and_apply(
             self,

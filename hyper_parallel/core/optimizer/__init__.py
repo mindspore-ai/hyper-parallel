@@ -62,6 +62,7 @@ def get_hyper_optimizer(
             'muon_momentum': 0.95, 
             'muon_ns_steps': 5,
             'muon_nesterov': True,
+            'muon_hsdp_replica_count': 2
         }
 
         optimizer = get_hyper_optimizer(
@@ -82,7 +83,7 @@ def get_hyper_optimizer(
     allowed_keys_adamw = inspect.signature(AdamW.__init__).parameters.keys() - {'self', 'params'}
     filtered_adamw_config = {k: v for k, v in adamw_config.items() if k in allowed_keys_adamw}
     if excluded_adamw_keys := adamw_config.keys() - allowed_keys_adamw:
-        logger.info("Excluded adamw config: %s", list(excluded_adamw_keys))
+        logger.info_rank0("Excluded adamw config: %s", list(excluded_adamw_keys))
 
     # 1.2 muon
     muon_raw = muon_kwargs or {}
@@ -93,18 +94,18 @@ def get_hyper_optimizer(
     allowed_keys_muon = inspect.signature(Muon.__init__).parameters.keys() - {'self', 'params'}
     filtered_muon_config = {k: v for k, v in muon_config.items() if k in allowed_keys_muon}
     if excluded_muon_keys := muon_config.keys() - allowed_keys_muon:
-        logger.info("Excluded muon config: %s", list(excluded_muon_keys))
+        logger.info_rank0("Excluded muon config: %s", list(excluded_muon_keys))
 
     # 2. Optimizer Creation
     optimizers = {}
 
     if adamw_params:
         optimizers["adamw"] = AdamW(adamw_params, **filtered_adamw_config)
-        logger.info("Using adamw config: %s", filtered_adamw_config)
+        logger.info_rank0("Using adamw config: %s", filtered_adamw_config)
 
     if muon_params:
         optimizers["muon"] = Muon(muon_params, **filtered_muon_config)
-        logger.info("Using muon config: %s", filtered_muon_config)
+        logger.info_rank0("Using muon config: %s", filtered_muon_config)
 
     flatten = bool(adamw_params and muon_params)
 
