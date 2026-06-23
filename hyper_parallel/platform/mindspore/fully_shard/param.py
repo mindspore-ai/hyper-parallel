@@ -66,7 +66,7 @@ def _to_dtype_if_needed(
     tensor: ms.Tensor, dtype: Optional[ms.Type]
 ) -> ms.Tensor:
     """Cast tensor to the given dtype if it differs from current dtype."""
-    if dtype is not None and tensor.dtype != dtype:
+    if isinstance(dtype, ms.Type) and tensor.dtype != dtype:
         return tensor.to(dtype)
     return tensor
 
@@ -188,12 +188,21 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self.reduce_scatter_handle: Optional[CommHandle] = None
         self._all_reduce_output = None
         self.all_reduce_handle: Optional[CommHandle] = None
+        self._accumulated_allreduced_grad = True
         self._post_load_hook_handle = (
             module_info.module.register_load_state_dict_post_hook(
                 lambda *args, **kwargs: self.reset_sharded_param()
             )
         )
         self.gradient_scaling_factor = None
+
+    @property
+    def accumulated_allreduced_grad(self) -> bool:
+        return self._accumulated_allreduced_grad
+
+    @accumulated_allreduced_grad.setter
+    def accumulated_allreduced_grad(self, value: bool) -> None:
+        self._accumulated_allreduced_grad = value
 
     @property
     def uses_param_shard(self) -> bool:
@@ -557,6 +566,15 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         """Return the underlying local tensor of the sharded DTensor parameter."""
         return cast(DTensor, self.sharded_param)._local_tensor
 
+    def _sharded_param_storage_dtype(self) -> Optional[ms.Type]:
+        """Return the dtype of the sharded parameter's on-device storage."""
+        if not hasattr(self.sharded_param, "dtype"):
+            return None
+        dtype = self.sharded_param.dtype
+        if isinstance(dtype, ms.Type):
+            return dtype
+        return None
+
     @property
     def shard_world_size(self) -> int:
         """Get the world size for shard dimension."""
@@ -736,7 +754,8 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         self,
         async_op: bool = True,
         dtype: Optional[ms.Type] = None,
-        reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.SUM
+        reduce_op: Optional[ops.ReduceOp] = ops.ReduceOp.AVG,
+        output_buffer: Optional[ms.Tensor] = None,
     ) -> Tuple[ms.Tensor, Optional[CommHandle]]:
         """
         Perform reduce-scatter on gradient to reduce and shard the full gradient.
@@ -745,6 +764,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             async_op: Whether to execute asynchronously.
             dtype: reduce dtype.
             reduce_op: do reduce-scatter avg or sum.
+            output_buffer: Optional pre-allocated output for fused all-reduce groups.
 
         Returns:
             (sharded_grad, handle): Sharded gradient and communication handle.
@@ -775,17 +795,39 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         apply_gradient_scaling_factor(grad_flat, self.gradient_scaling_factor)
         # If parameter is not sharded (below threshold), no reduce-scatter needed
         if not self.is_sharded:
-            return grad_flat, None
+            if output_buffer is not None:
+                copy_without_bumping_version(output_buffer, grad_flat)
+                self._reduce_scatter_output = output_buffer
+            else:
+                self._reduce_scatter_output = grad_flat
+            self.reduce_scatter_handle = None
+            return self._reduce_scatter_output, None
 
         if shard_group is None or shard_group_size <= 1:
-            # No communication needed
-            return grad_flat, None
+            if output_buffer is not None:
+                copy_without_bumping_version(output_buffer, grad_flat)
+                self._reduce_scatter_output = output_buffer
+            else:
+                self._reduce_scatter_output = grad_flat
+            self.reduce_scatter_handle = None
+            return self._reduce_scatter_output, None
 
         # Calculate output size
         output_numel = grad_flat.numel() // shard_group_size
-        self._reduce_scatter_output = ms.mint.empty(
-            output_numel, dtype=reduce_dtype, device=grad.device.split(':')[0]
-        )
+        if output_buffer is not None:
+            if output_buffer.numel() != output_numel:
+                raise ValueError(
+                    f"output_buffer size mismatch: expected {output_numel}, got {output_buffer.numel()}"
+                )
+            if output_buffer.dtype != reduce_dtype:
+                raise ValueError(
+                    f"output_buffer dtype mismatch: expected {reduce_dtype}, got {output_buffer.dtype}"
+                )
+            self._reduce_scatter_output = output_buffer
+        else:
+            self._reduce_scatter_output = ms.mint.empty(
+                output_numel, dtype=reduce_dtype, device=grad.device.split(":")[0]
+            )
 
         # Ascend HCCL DistCommReduceScatter rejects non-contiguous tensors.
         # ``pack_for_reduce_scatter`` on a shard-dim-0 path returns the input
@@ -854,6 +896,8 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             apply_gradient_scaling_factor(grad, self.gradient_scaling_factor)
         reduce_group_info = self.unsharded_group_info
         if reduce_group_info.rank_size <= 1:
+            self._all_reduce_output = grad
+            self.all_reduce_handle = None
             return grad, None
         reduce_group = reduce_group_info.group
         if reduce_group is None:
@@ -908,12 +952,13 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             sharded_grad = self.sharded_param.grad
 
         reduced_grad = reduced_grad.view(self.sharded_size)
-        if (
-            not self.mp_policy.apply_grad_on_fp32_main_grad
-            and param_type is not None
-            and reduced_grad.dtype != param_type
-        ):
-            reduced_grad = reduced_grad.to(param_type)
+        if not self.mp_policy.apply_grad_on_fp32_main_grad:
+            # Cast to state-level orig dtype first, then align with the sharded param's
+            # actual storage dtype (issue #215: fp32 reduced grad vs bf16 master weights).
+            reduced_grad = _to_dtype_if_needed(reduced_grad, param_type)
+            reduced_grad = _to_dtype_if_needed(
+                reduced_grad, self._sharded_param_storage_dtype()
+            )
         to_accumulate_grad = sharded_grad is not None
         need_synchronize = False
         if self.offload_to_cpu:
