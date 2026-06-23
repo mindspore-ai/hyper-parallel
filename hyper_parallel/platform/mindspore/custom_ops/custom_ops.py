@@ -21,10 +21,14 @@
 from hyper_parallel.platform.mindspore.custom_ops.custom_op_impl import (
     NpuDenseLightningIndexerGradKlLossDFunction,
     NpuDenseLightningIndexerSoftmaxLseDFunction,
+    NpuLightningIndexerDFunction,
     NpuMhcPostDFunction,
     NpuMhcPreClampSinkhornDFunction,
     NpuMhcPreSinkhornDFunction,
+    NpuSparseFlashMlaDFunction,
     NpuSparseLightningIndexerGradKlLossDFunction,
+    NpuSparseLightningIndexerKlLossGradDFunction,
+    npu_sparse_flash_mla_grad as _npu_sparse_flash_mla_grad,
 )
 
 
@@ -59,3 +63,25 @@ class MindSporeCustomOps:
     @staticmethod
     def npu_mhc_pre_clamp_sinkhorn(*args, **kwargs):
         return NpuMhcPreClampSinkhornDFunction.apply(*args, **kwargs)
+
+    @staticmethod
+    def npu_lightning_indexer(*args, **kwargs):
+        """Sparse-attention preprocessing (top-K key selection) via custom NPU operator."""
+        return NpuLightningIndexerDFunction.apply(*args, **kwargs)
+
+    @staticmethod
+    def npu_sparse_flash_mla(*args, **kwargs):
+        """MLA sparse attention (forward + grad + metadata) via custom NPU operator."""
+        return NpuSparseFlashMlaDFunction.apply(*args, **kwargs)
+
+    @staticmethod
+    def npu_sparse_flash_mla_grad(*args, **kwargs):
+        """Raw MLA sparse-attention backward kernel — returns 6 outputs including
+        ``ori/cmp_softmax_l1_norm``.  Stateless passthrough for use inside a
+        network-defined custom backward (no autograd)."""
+        return _npu_sparse_flash_mla_grad(*args, **kwargs)
+
+    @staticmethod
+    def npu_sparse_lightning_indexer_kl_loss_grad(*args, **kwargs):
+        """Sparse lightning indexer KL-loss gradient via custom NPU operator."""
+        return NpuSparseLightningIndexerKlLossGradDFunction.apply(*args, **kwargs)

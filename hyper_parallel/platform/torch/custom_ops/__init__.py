@@ -68,3 +68,32 @@ class TorchCustomOps:
         raise NotImplementedError(
             "npu_mhc_pre_clamp_sinkhorn is not supported on the PyTorch platform."
         )
+
+    @staticmethod
+    def npu_lightning_indexer(*args, **kwargs):
+        """NPU lightning indexer operator; not supported on PyTorch."""
+        raise NotImplementedError(
+            "npu_lightning_indexer is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_sparse_flash_mla(*args, **kwargs):
+        """NPU sparse flash MLA operator; not supported on PyTorch."""
+        raise NotImplementedError(
+            "npu_sparse_flash_mla is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_sparse_flash_mla_grad(*args, **kwargs):
+        """NPU sparse flash MLA backward kernel; not supported on PyTorch."""
+        raise NotImplementedError(
+            "npu_sparse_flash_mla_grad is not supported on the PyTorch platform."
+        )
+
+    @staticmethod
+    def npu_sparse_lightning_indexer_kl_loss_grad(*args, **kwargs):
+        """NPU sparse lightning indexer KL loss grad operator; not supported on PyTorch."""
+        raise NotImplementedError(
+            "npu_sparse_lightning_indexer_kl_loss_grad is not supported "
+            "on the PyTorch platform."
+        )
