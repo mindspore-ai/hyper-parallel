@@ -16,6 +16,7 @@
 from hyper_parallel.core.tensor_parallel.api import parallelize_module
 from hyper_parallel.core.tensor_parallel.style import (
     ColwiseParallel,
+    NoParallel,
     ParallelStyle,
     PrepareModuleInput,
     PrepareModuleInputOutput,
@@ -26,6 +27,7 @@ from hyper_parallel.core.tensor_parallel.style import (
 
 __all__ = [
     "ColwiseParallel",
+    "NoParallel",
     "ParallelStyle",
     "PrepareModuleInput",
     "PrepareModuleInputOutput",
