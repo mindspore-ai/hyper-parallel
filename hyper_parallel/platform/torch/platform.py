@@ -406,6 +406,29 @@ def _ensure_contiguous(x):
     return x
 
 
+class _TorchBatchP2PWork:
+    """Single ``.wait()`` handle wrapping the per-op works returned by
+    ``torch.distributed.batch_isend_irecv``.
+
+    Torch returns one ``Work`` per op in the batch (the ops are coalesced
+    onto one comm stream), whereas the platform contract — and the scheduler
+    that consumes it — expects a single handle covering the whole batch so
+    the wait can be deferred to one consumption point (mirroring MindSpore's
+    single packaging ``CommHandle``).  Waiting this handle waits every
+    underlying op.
+    """
+
+    __slots__ = ("_works",)
+
+    def __init__(self, works):
+        self._works = works
+
+    def wait(self):
+        for work in self._works:
+            if work is not None:
+                work.wait()
+
+
 # pylint: disable=C0103
 class TorchPlatform(Platform):
     """Torch platform api"""
@@ -966,6 +989,35 @@ class TorchPlatform(Platform):
     @staticmethod
     def irecv(tensor, src=None, group=None, tag=0):
         return dist.irecv(tensor, src, group, tag)
+
+    @staticmethod
+    def p2p_op(op_type, tensor, peer, group=None):
+        # torch's P2POp takes the op callable (dist.isend / dist.irecv), not
+        # the "isend"/"irecv" string the stage specs builders emit.
+        if op_type == "isend":
+            op = dist.isend
+        elif op_type == "irecv":
+            op = dist.irecv
+        else:
+            raise ValueError(
+                f"p2p_op op_type must be 'isend' or 'irecv', but got {op_type!r}."
+            )
+        return dist.P2POp(op, tensor, peer, group)
+
+    @staticmethod
+    def batch_isend_irecv(p2p_ops):
+        """Launch a peer-batched P2P group as one coalesced op.
+
+        ``torch.distributed.batch_isend_irecv`` coalesces the ops onto one
+        comm stream and returns one ``Work`` per op; we wrap them in a single
+        ``.wait()`` handle so a send and a recv to the same peer overlap on
+        the duplex link and the caller can defer the whole batch's wait to one
+        consumption point.
+        """
+        if not p2p_ops:
+            return None
+        works = dist.batch_isend_irecv(p2p_ops)
+        return _TorchBatchP2PWork(works) if works else None
 
     @staticmethod
     def p2p_exchange(tensor, peer_rank: int, group=None):

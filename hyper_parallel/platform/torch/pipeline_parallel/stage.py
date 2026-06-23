@@ -169,6 +169,8 @@ class PipelineStageBase:
             recv_args = [recv_info.buffer for recv_info in self.grad_recv_info[micro_index]]
 
         fwd_output = self.fwd_cache.pop(micro_index)
+        if self.is_last_stage:
+            self.fwd_outputs_cache.pop(micro_index, None)
         local_output = self._filter_grad_outputs(fwd_output)
 
         if not local_output:
