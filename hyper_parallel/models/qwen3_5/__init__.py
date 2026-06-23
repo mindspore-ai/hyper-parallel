@@ -70,9 +70,18 @@ def _resolve_overrides(model_cfg) -> dict:
 
 def _build(cfg) -> Qwen3_5ForCausalLM:
     """Construct the dense Qwen3.5 model from a ``HyperTrainerConfig``."""
+    return Qwen3_5ForCausalLM(_build_config(cfg))
+
+
+def _build_config(cfg) -> Qwen3_5Config:
+    """Construct only the ``Qwen3_5Config`` from a ``HyperTrainerConfig``.
+
+    Returns the model-specific config object without building the full
+    model. Used by the SAPP-ND Hyper YAML parser for memory estimation.
+    """
     overrides = _resolve_overrides(getattr(cfg, "model", None))
-    config = Qwen3_5Config(**overrides) if overrides else Qwen3_5Config()
-    return Qwen3_5ForCausalLM(config)
+    return Qwen3_5Config(**overrides) if overrides else Qwen3_5Config()
+
 
 register_spec(
     "qwen3_5",
