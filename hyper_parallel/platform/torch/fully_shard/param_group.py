@@ -958,6 +958,23 @@ class AllReduceParamGroup:
 
     ALIGNMENT_BYTES = 512  # 512-byte alignment requirement
 
+    @staticmethod
+    def _resolve_reduce_dtype(
+        reduce_dtype: Optional[torch.dtype],
+        hsdp_params: List["TorchHSDPParamV2"],
+        orig_dtypes: List[torch.dtype],
+    ) -> Optional[torch.dtype]:
+        """Resolve None reduce_dtype to match ``reduce_scatter_grad``'s ``dtype or grad.dtype``."""
+        if reduce_dtype is not None:
+            return reduce_dtype
+        for hsdp_param in hsdp_params:
+            if getattr(hsdp_param, "unsharded_accumulated_grad", None) is not None:
+                return hsdp_param.unsharded_accumulated_grad_data.dtype
+            unsharded_param = getattr(hsdp_param, "unsharded_param", None)
+            if unsharded_param is not None and getattr(unsharded_param, "grad", None) is not None:
+                return hsdp_param.unsharded_grad_data.dtype
+        return orig_dtypes[0] if orig_dtypes else None
+
     def __init__(
         self,
         replicate_group: dist.ProcessGroup,
@@ -970,7 +987,7 @@ class AllReduceParamGroup:
         self.replicate_group = replicate_group
         self.hsdp_params = hsdp_params
         self.orig_dtypes = orig_dtypes
-        self.reduce_dtype = reduce_dtype
+        self.reduce_dtype = self._resolve_reduce_dtype(reduce_dtype, hsdp_params, orig_dtypes)
         self.reduce_op = reduce_op
         self.mp_policy = mp_policy
         self.replicate_world_size = replicate_group.size() if replicate_group else 1
