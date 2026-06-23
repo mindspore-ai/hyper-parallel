@@ -41,6 +41,10 @@ _CUSTOM_OP_SOURCES = [
     os.path.join(_CC_DIR, "mhc_pre_sinkhorn_backward.cc"),
     os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn.cc"),
     os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn_backward.cc"),
+    os.path.join(_CC_DIR, "lightning_indexer_v2.cc"),
+    os.path.join(_CC_DIR, "sparse_flash_mla.cc"),
+    os.path.join(_CC_DIR, "sparse_flash_mla_grad.cc"),
+    os.path.join(_CC_DIR, "sparse_lightning_indexer_kl_loss_grad.cc"),
 ]
 _MHC_PRE_CLAMP_NONE_GRADS = (None,) * 7
 
@@ -462,3 +466,259 @@ class NpuMhcPreClampSinkhornDFunction(DFunction):  # pylint: disable=W0221
             tensors[7], tensors[8], tensors[9], tensors[10], tensors[11], tensors[12],
             ctx.hc_eps, ctx.clamp_min, ctx.clamp_max)
         return tuple(grads[:4]) + _MHC_PRE_CLAMP_NONE_GRADS
+
+
+class NpuLightningIndexerDFunction(DFunction):  # pylint: disable=W0221
+    """DFunction wrapper for npu_lightning_indexer.
+
+    The underlying kernel handles all cmp_ratio values (1 / 4 / 128) directly.
+    Forward-only: indexer gradients are produced by the network's explicit
+    ``sparse_lightning_indexer_kl_loss_grad`` call.
+
+    Signature mirrors the torch-extension ``lightning_indexer`` benchmark:
+    positional ``(query, key, weights, sparse_count)`` (``sparse_count`` is
+    benchmark ``topk``); the two layouts are merged into a single ``layout``
+    (the kernel is fed identical ``layout_q`` / ``layout_k``).
+    """
+
+    _op_name = "npu_lightning_indexer"
+
+    @staticmethod
+    def forward(ctx, query, key, weights, sparse_count,
+                cu_seq_lens_q=None, cu_seq_lens_k=None, cmp_residual_k=None,
+                block_table=None, layout="BSND",
+                sparse_mode=0, cmp_ratio=1, return_value=False):
+        """Forward pass: call the custom kernel for all cmp_ratios.
+
+        Remaining benchmark kwargs (seqused_q/k, output_idx_offset, metadata,
+        max_seqlen_q) are presently unused by the external API and pinned to
+        ``None`` / ``-1``.
+
+        Returns:
+            tuple[Tensor, Tensor]: (sparse_indices, sparse_values).
+        """
+        return _custom_ops.npu_lightning_indexer_v2(
+            query, key, weights, sparse_count,
+            cu_seq_lens_q, cu_seq_lens_k,
+            None, None, cmp_residual_k, block_table, None, None, -1,
+            layout, layout, sparse_mode, cmp_ratio, return_value)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """No-op backward — indexer gradients come from kl_loss_grad."""
+        return (None,) * 12
+
+
+class NpuSparseFlashMlaDFunction(DFunction):  # pylint: disable=W0221
+    """DFunction wrapper for the MLA sparse-attention kernel.
+
+    Forward runs ``npu_sparse_flash_mla`` (the kernel derives its metadata from
+    the tensor shapes internally); backward runs ``npu_sparse_flash_mla_grad``.
+    """
+
+    _op_name = "npu_sparse_flash_mla"
+
+    @staticmethod
+    def forward(ctx,  # pylint: disable=too-many-arguments,too-many-locals,too-many-statements
+                query, ori_kv, cmp_kv,
+                cu_seq_lens_q, cu_seq_lens_ori_kv, cu_seq_lens_cmp_kv,
+                ori_sparse_indices, cmp_sparse_indices, sinks,
+                softmax_scale, cmp_ratio, ori_mask_mode, cmp_mask_mode,
+                ori_win_left, ori_win_right,
+                layout_q, layout_kv,
+                cmp_residual_kv=None, seqused_ori_kv=None, seqused_cmp_kv=None,
+                seqused_q=None):
+        """Forward pass: runs MLA sparse attention (metadata computed in-kernel).
+
+        Args:
+            ctx: Autograd context.
+            query: Query tensor.  dtype bfloat16/float16.
+            ori_kv: Original KV tensor; None when absent.
+            cmp_kv: Compressed KV tensor; None when absent.
+            cu_seq_lens_q: Cumulative query seq lengths (TND); None for BSND.
+            cu_seq_lens_ori_kv: Cumulative ori_kv seq lengths; None for PA_ND.
+            cu_seq_lens_cmp_kv: Cumulative cmp_kv seq lengths; None for PA_ND.
+            ori_sparse_indices: Sparse indices for ori_kv; None = band mode.
+            cmp_sparse_indices: Sparse indices for cmp_kv (int32 Tensor).
+            sinks: Attention-sink tensor (float32); None when absent.
+            softmax_scale: Softmax scaling factor (float).
+            cmp_ratio: KV compression ratio (int).
+            ori_mask_mode: Mask mode for q×ori_kv (default 4=band).
+            cmp_mask_mode: Mask mode for q×cmp_kv (default 3=rightDownCausal).
+            ori_win_left: Band-mask left window (default 127).
+            ori_win_right: Band-mask right window (default 0).
+            layout_q: Q data layout — 'BSND' or 'TND'.
+            layout_kv: KV data layout — 'PA_ND' or 'BSND'.
+
+        Returns:
+            tuple[Tensor, Tensor]: (attention_out, softmax_lse).
+        """
+        if cmp_ratio != 4:
+            cmp_sparse_indices = None
+
+        # The kernel computes its metadata internally.  topk_value_mode=1;
+        # return_softmax_lse is forced True internally so the backward always
+        # receives a valid LSE (a stale/zero LSE makes the grad kernel explode);
+        # the external return value is gated separately by the wrapper's own
+        # return_softmax_lse flag, independent of this.
+        result = _custom_ops.npu_sparse_flash_mla(
+            query, ori_kv, cmp_kv, ori_sparse_indices, cmp_sparse_indices,
+            None, None,                       # ori_block_table, cmp_block_table
+            cu_seq_lens_q, cu_seq_lens_ori_kv, cu_seq_lens_cmp_kv,
+            seqused_q, seqused_ori_kv, seqused_cmp_kv,   # seq_used_q, seq_used_ori_kv, seq_used_cmp_kv
+            cmp_residual_kv, None, None,            # cmp_residual_kv, ori_topk_length, cmp_topk_length
+            sinks,
+            softmax_scale, cmp_ratio, ori_mask_mode, cmp_mask_mode,
+            ori_win_left, ori_win_right, layout_q, layout_kv, 1, True,
+        )
+        attention_out, softmax_lse = result[0], result[1]
+
+        ctx.has_ori_kv = ori_kv is not None
+        ctx.has_cmp_kv = cmp_kv is not None
+        ctx.has_sinks = sinks is not None
+        ctx.has_ori_sparse = ori_sparse_indices is not None
+        ctx.has_cmp_sparse = cmp_sparse_indices is not None
+        ctx.has_cu_q = cu_seq_lens_q is not None
+        ctx.has_cu_ori_kv = cu_seq_lens_ori_kv is not None
+        ctx.has_cu_cmp_kv = cu_seq_lens_cmp_kv is not None
+        ctx.has_cmp_residual = cmp_residual_kv is not None
+        # metadata is NOT saved for backward: the grad kernel asserts metadata
+        # must be nullptr and re-derives its own tiling internally.  cmp_residual_kv
+        # IS saved — the grad kernel requires it for CFA/SCFA with cmp_mask_mode=3.
+        ctx.save_for_backward(*[t for t in [
+            query, ori_kv, cmp_kv, sinks, ori_sparse_indices, cmp_sparse_indices,
+            cu_seq_lens_q, cu_seq_lens_ori_kv, cu_seq_lens_cmp_kv,
+            attention_out, softmax_lse, cmp_residual_kv,
+        ] if t is not None])
+        ctx.softmax_scale = softmax_scale
+        ctx.cmp_ratio = cmp_ratio
+        ctx.ori_mask_mode = ori_mask_mode
+        ctx.cmp_mask_mode = cmp_mask_mode
+        ctx.ori_win_left = ori_win_left
+        ctx.ori_win_right = ori_win_right
+        ctx.layout_q = layout_q
+        ctx.layout_kv = layout_kv
+        return attention_out, softmax_lse
+
+    @staticmethod
+    def backward(ctx, grad_attention_out, grad_softmax_lse):  # pylint: disable=unused-argument
+        """Backward pass: calls npu_sparse_flash_mla_grad kernel."""
+        it = iter(ctx.saved_tensors)
+        q = next(it)
+        ori_kv = next(it) if ctx.has_ori_kv else None
+        cmp_kv = next(it) if ctx.has_cmp_kv else None
+        sinks = next(it) if ctx.has_sinks else None
+        ori_sparse_indices = next(it) if ctx.has_ori_sparse else None
+        cmp_sparse_indices = next(it) if ctx.has_cmp_sparse else None
+        cu_seq_lens_q = next(it) if ctx.has_cu_q else None
+        cu_seq_lens_ori_kv = next(it) if ctx.has_cu_ori_kv else None
+        cu_seq_lens_cmp_kv = next(it) if ctx.has_cu_cmp_kv else None
+        attention_out = next(it)
+        softmax_lse = next(it)
+        cmp_residual_kv = next(it) if ctx.has_cmp_residual else None
+        # metadata MUST be None: the grad kernel asserts it is nullptr and
+        # re-derives tiling internally.  cmp_residual_kv is passed through —
+        # required for CFA/SCFA (cmp_ratio!=1) with cmp_mask_mode=3.
+        grads = _custom_ops.npu_sparse_flash_mla_grad(
+            q, grad_attention_out, attention_out, softmax_lse,
+            ori_kv, cmp_kv, ori_sparse_indices, cmp_sparse_indices,
+            cu_seq_lens_q, cu_seq_lens_ori_kv, cu_seq_lens_cmp_kv,
+            None, None, None,                 # seq_used_q, seq_used_ori_kv, seq_used_cmp_kv
+            cmp_residual_kv, None, None,       # cmp_residual_kv, ori_topk_length, cmp_topk_length
+            sinks, None,                      # sinks, metadata(None → grad kernel self-derives)
+            ctx.softmax_scale, ctx.cmp_ratio, ctx.ori_mask_mode, ctx.cmp_mask_mode,
+            ctx.ori_win_left, ctx.ori_win_right, ctx.layout_q, ctx.layout_kv,
+        )
+        d_query = grads[0]
+        d_ori_kv = grads[1] if ori_kv is not None else None
+        d_cmp_kv = grads[2] if cmp_kv is not None else None
+        d_sinks = grads[3] if sinks is not None else None
+        # grads[4], grads[5] = ori/cmp_softmax_l1_norm — discarded here.
+        # 21 positional forward args (ctx excluded):
+        # query, ori_kv, cmp_kv, cu_seq_lens_q, cu_seq_lens_ori_kv, cu_seq_lens_cmp_kv,
+        # ori_sparse_indices, cmp_sparse_indices, sinks,
+        # softmax_scale, cmp_ratio, ori_mask_mode, cmp_mask_mode, ori_win_left, ori_win_right,
+        # layout_q, layout_kv, cmp_residual_kv, seqused_ori_kv, seqused_cmp_kv, seqused_q
+        return (d_query, d_ori_kv, d_cmp_kv,
+                None, None, None,
+                None, None, d_sinks,
+                None, None, None, None, None, None,
+                None, None, None, None, None, None)
+
+
+def npu_sparse_flash_mla_grad(*args, **kwargs):
+    """Raw ``sparse_flash_mla_grad`` kernel passthrough (stateless, no autograd).
+
+    Runs the same backward kernel as ``NpuSparseFlashMlaDFunction.backward``, but
+    returns its full 6-tuple so a network-defined custom backward can also
+    consume ``ori/cmp_softmax_l1_norm`` (the main-attention target distribution
+    ``p`` for the Lightning-Indexer KL loss).  Intended to be called from inside
+    another custom function's ``backward`` (autograd already off); it builds no
+    graph.  ``metadata`` must be ``None`` — the grad kernel re-derives its own
+    tiling internally.
+
+    Returns:
+        tuple[Tensor, ...]: ``(d_query, d_ori_kv, d_cmp_kv, d_sinks,
+        ori_softmax_l1_norm, cmp_softmax_l1_norm)``.
+    """
+    return _custom_ops.npu_sparse_flash_mla_grad(*args, **kwargs)
+
+
+class NpuSparseLightningIndexerKlLossGradDFunction(DFunction):  # pylint: disable=W0221
+    """DFunction wrapper for ``npu_sparse_lightning_indexer_kl_loss_grad``.
+
+    The kernel takes the pre-computed main-attention target distribution
+    ``attn_softmax_l1_norm`` and produces ``(dq, dk, dw, softmax_out)`` — the
+    gradients w.r.t. ``query``/``key``/``weights`` plus the indexer-branch
+    softmax; it neither recomputes the main attention nor outputs a loss.
+    Metadata is computed inside the kernel from the tensor shapes.  Backward
+    propagates ``(dq, dk, dw)`` to those inputs.
+    """
+
+    _op_name = "npu_sparse_lightning_indexer_kl_loss_grad"
+
+    @staticmethod
+    def forward(ctx, query, key, weights, sparse_indices, attn_softmax_l1_norm,
+                cu_seq_lens_q, cu_seq_lens_k, seqused_q, seqused_k, cmp_residual_k,
+                layout, mask_mode, cmp_ratio):
+        """Forward pass: runs the KL-loss grad kernel (metadata computed in-kernel).
+
+        Args:
+            ctx: Autograd context.
+            query: Lightning Indexer query (q̃). dtype bfloat16/float16.
+            key: Lightning Indexer key (k̃). dtype bfloat16/float16.
+            weights: Lightning Indexer weight coefficient (w).
+            sparse_indices: Sorted token indices (int32).
+            attn_softmax_l1_norm: Main-attention target distribution p (float32),
+                pre-computed by the main-attention branch.
+            cu_seq_lens_q: Cumulative query sequence lengths; None for BSND.
+            cu_seq_lens_k: Cumulative key sequence lengths; None for BSND.
+            seqused_q: Used query sequence lengths; None when absent.
+            seqused_k: Used key sequence lengths; None when absent.
+            cmp_residual_k: Optional compressed-KV residual.
+            layout: Data layout format — 'BSND' or 'TND'.
+            mask_mode: Sparse mask mode (only 3 supported).
+            cmp_ratio: KV compression ratio.
+
+        Returns:
+            tuple[Tensor, Tensor, Tensor, Tensor]:
+                (d_query, d_key, d_weights, softmax_out).
+        """
+        # The kernel computes its metadata internally.
+        result = _custom_ops.npu_sparse_lightning_indexer_kl_loss_grad(
+            query, key, weights, sparse_indices, attn_softmax_l1_norm,
+            cu_seq_lens_q, cu_seq_lens_k, seqused_q, seqused_k, cmp_residual_k,
+            layout, layout, mask_mode, cmp_ratio,
+        )
+        ctx.save_for_backward(result[0], result[1], result[2])
+        return result
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        """Backward: propagate the fused gradients to query/key/weights inputs."""
+        d_query, d_key, d_weights = _ensure_contiguous(*ctx.saved_tensors)
+        # 13 positional forward args: query, key, weights, sparse_indices,
+        # attn_softmax_l1_norm, cu_seq_lens_q, cu_seq_lens_k, seqused_q, seqused_k,
+        # cmp_residual_k, layout, mask_mode, cmp_ratio.
+        return (d_query, d_key, d_weights,
+                None, None, None, None, None, None, None, None, None, None)
