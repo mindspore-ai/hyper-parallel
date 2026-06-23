@@ -197,6 +197,18 @@ def test_context_parallel_cache_merge_local_validates_shard_growth():
     assert torch.equal(cache.past_key_values[0][0], before)
 
 
+def test_context_parallel_initial_local_merge_requires_global_seq_len():
+    """
+    Feature: CP KV cache local decode
+    Description: Initial local cache merge cannot infer global length in CP mode.
+    Expectation: Missing global_seq_len raises ValueError when world_size > 1.
+    """
+    cache = ContextParallelKVCache(rank=0, world_size=2)
+
+    with pytest.raises(ValueError, match="global_seq_len"):
+        cache.merge_local(_past(3))
+
+
 def test_context_parallel_cache_update_local_validates_metadata():
     """
     Feature: CP KV cache local update

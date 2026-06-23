@@ -57,9 +57,7 @@ def top_p_sample(
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
     sorted_probs = F.softmax(sorted_logits / temperature, dim=-1)
     cumulative = sorted_probs.cumsum(dim=-1)
-    remove = cumulative > top_p
-    remove[..., 1:] = remove[..., :-1].clone()
-    remove[..., 0] = False
+    remove = cumulative - sorted_probs > top_p
     filtered = sorted_logits.masked_fill(remove, float("-inf"))
     probs = F.softmax(filtered / temperature, dim=-1)
     sampled = torch.multinomial(probs, num_samples=1)

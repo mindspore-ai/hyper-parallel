@@ -214,6 +214,8 @@ class ContextParallelKVCache(KVCache):
             return
         new_values = self._detach_and_validate(past_key_values)
         if self.past_key_values is None:
+            if global_seq_len is None and self.world_size > 1:
+                raise ValueError("global_seq_len is required for initial CP local cache")
             inferred_global = (
                 self.shard_info.global_seq_len + new_values[0][0].shape[-2]
                 if global_seq_len is None and new_values
