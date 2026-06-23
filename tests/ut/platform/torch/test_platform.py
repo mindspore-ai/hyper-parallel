@@ -334,6 +334,45 @@ class TestTorchPlatformCore(unittest.TestCase):
         expected = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
         self.assertTrue(torch.allclose(output, expected))
 
+    @mock.patch('torch.distributed.P2POp')
+    def test_p2p_op_maps_op_type_string_to_callable(self, mock_p2p_op):
+        """p2p_op should translate the 'isend'/'irecv' string to the dist callable."""
+        tensor = torch.tensor([1.0, 2.0])
+        mock_group = MagicMock()
+        sentinel = MagicMock()
+        mock_p2p_op.return_value = sentinel
+
+        send_desc = TorchPlatform.p2p_op("isend", tensor, 3, mock_group)
+        self.assertIs(send_desc, sentinel)
+        mock_p2p_op.assert_called_with(torch.distributed.isend, tensor, 3, mock_group)
+
+        TorchPlatform.p2p_op("irecv", tensor, 5)
+        mock_p2p_op.assert_called_with(torch.distributed.irecv, tensor, 5, None)
+
+    def test_p2p_op_rejects_unknown_op_type(self):
+        """p2p_op should raise on an op_type other than 'isend'/'irecv'."""
+        with self.assertRaises(ValueError):
+            TorchPlatform.p2p_op("scatter", torch.tensor([1.0]), 0)
+
+    def test_batch_isend_irecv_empty_returns_none(self):
+        """An empty op list should short-circuit to None (no launch)."""
+        self.assertIsNone(TorchPlatform.batch_isend_irecv([]))
+
+    @mock.patch('torch.distributed.batch_isend_irecv')
+    def test_batch_isend_irecv_wraps_works_into_single_wait_handle(self, mock_batch):
+        """The returned handle's wait() should wait every per-op work once."""
+        work_a, work_b = MagicMock(), MagicMock()
+        mock_batch.return_value = [work_a, work_b]
+
+        ops = [MagicMock(), MagicMock()]
+        handle = TorchPlatform.batch_isend_irecv(ops)
+        mock_batch.assert_called_once_with(ops)
+
+        work_a.wait.assert_not_called()
+        handle.wait()
+        work_a.wait.assert_called_once_with()
+        work_b.wait.assert_called_once_with()
+
     def test_differentiable_async_allgather_wait_immediate_backward(self):
         """Async all-gather wait should return a real gradient when handle_box is None."""
         x = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
