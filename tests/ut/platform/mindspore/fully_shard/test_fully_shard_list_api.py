@@ -277,11 +277,13 @@ class TestHSDPModuleInterfaceMindSpore(unittest.TestCase):
         handle.wait()
         handle.wait()
 
-    def test_reshard_and_reduce_op_delegate_to_state(self):
+    @patch("hyper_parallel.core.fully_shard.api.platform.get_cells_and_names")
+    def test_reshard_and_reduce_op_delegate_to_state(self, mock_cells):
         """State operations should be routed through the current scheduler."""
         state = MagicMock()
         module = self.FakeHSDPModule()
         module.hsdp_scheduler.hsdp_state = state
+        mock_cells.return_value = [("", module)]
 
         module.reshard()
         module.set_reduce_op_type("sum")

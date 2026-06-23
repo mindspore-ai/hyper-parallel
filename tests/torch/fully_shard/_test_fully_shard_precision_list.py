@@ -101,8 +101,11 @@ def _one_step_hp_list_unit(mesh: DeviceMesh):
     x = standalone_x.npu()
     model.zero_grad()
     loss = model(x)
-    # Match ``_test_fully_shard_precision`` grad shard check: default backward on loss.
-    loss.backward()
+    # Match ``_test_fully_shard_precision`` grad shard check:
+    # scale backward by 1/world_size so reduce-scatter SUM matches standalone grad.
+    repeat_num = len(mesh.rank_list)
+    backward_input = torch.tensor(1.0 / repeat_num)
+    loss.backward(backward_input)
     g = model.block.lin1.weight.grad
     assert isinstance(g, DTensor), type(g)
     return loss.detach(), g.data.clone()
@@ -110,7 +113,6 @@ def _one_step_hp_list_unit(mesh: DeviceMesh):
 
 def _compare_against_standalone(mesh: DeviceMesh) -> None:
     """Assert distributed list-unit step matches standalone loss and ``lin1`` grad local shard."""
-    init_dist()
     rank, _ = init_dist()
     shard_size = mesh.mesh_shape[-1]
     standalone_loss, standalone_grad = _one_step_standalone_list_unit()
