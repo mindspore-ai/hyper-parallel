@@ -65,11 +65,48 @@ def _resolve_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
+def _compare_cache_no_cache_logits(model, input_ids, generated_ids, max_steps: int):
+    steps = min(max_steps, generated_ids.size(1))
+    if steps <= 0:
+        return []
+
+    values = []
+    context_ids = input_ids
+    cache_outputs = model(input_ids=context_ids, use_cache=True)
+    past_key_values = cache_outputs.past_key_values
+    cache_logits = cache_outputs.logits[:, -1, :]
+
+    for step in range(steps):
+        no_cache_outputs = model(input_ids=context_ids, use_cache=False)
+        no_cache_logits = no_cache_outputs.logits[:, -1, :]
+        similarity = torch.nn.functional.cosine_similarity(
+            cache_logits.float(),
+            no_cache_logits.float(),
+            dim=-1,
+        )
+        values.extend(similarity.detach().cpu().tolist())
+
+        next_token = generated_ids[:, step:step + 1]
+        context_ids = torch.cat([context_ids, next_token], dim=-1)
+        if step == steps - 1:
+            break
+        cache_outputs = model(
+            input_ids=next_token,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        past_key_values = cache_outputs.past_key_values
+        cache_logits = cache_outputs.logits[:, -1, :]
+    return values
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Local HF model path or model id")
     parser.add_argument("--prompt", default="Hello, my name is")
     parser.add_argument("--max-new-tokens", type=int, default=8)
+    parser.add_argument("--logits-compare-steps", type=int, default=16)
+    parser.add_argument("--logits-cosine-threshold", type=float, default=0.999)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--output", default=None)
@@ -80,6 +117,8 @@ def main():
     args = parse_args()
     if args.max_new_tokens <= 0:
         raise ValueError("max-new-tokens must be positive")
+    if args.logits_compare_steps < 0:
+        raise ValueError("logits-compare-steps must be >= 0")
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -133,12 +172,28 @@ def main():
                 use_cache=False,
             ),
         )
+        generated_ids = hyper_cache_output[:, input_ids.shape[1]:]
+        logits_cosine = _compare_cache_no_cache_logits(
+            model,
+            input_ids,
+            generated_ids,
+            args.logits_compare_steps,
+        )
 
+    logits_cosine_min = min(logits_cosine) if logits_cosine else None
     result = {
         "model": args.model,
         "prompt": args.prompt,
         "device": str(device),
         "max_new_tokens": args.max_new_tokens,
+        "logits_compare_steps": min(args.logits_compare_steps, generated_ids.size(1)),
+        "logits_cosine_similarity": logits_cosine,
+        "logits_cosine_min": logits_cosine_min,
+        "logits_cosine_threshold": args.logits_cosine_threshold,
+        "logits_cosine_pass": (
+            logits_cosine_min is None
+            or logits_cosine_min >= args.logits_cosine_threshold
+        ),
         "hf_text": tokenizer.decode(hf_output[0], skip_special_tokens=True),
         "hyper_cache_text": tokenizer.decode(hyper_cache_output[0], skip_special_tokens=True),
         "hyper_no_cache_text": tokenizer.decode(hyper_no_cache_output[0], skip_special_tokens=True),
@@ -166,6 +221,8 @@ def main():
         raise AssertionError("hyper generate cache output differs from HuggingFace generate")
     if not result["hyper_cache_vs_no_cache_ids_match"]:
         raise AssertionError("hyper generate cache and no-cache outputs differ")
+    if not result["logits_cosine_pass"]:
+        raise AssertionError("cache/no-cache logits cosine similarity is below threshold")
 
 
 if __name__ == "__main__":
