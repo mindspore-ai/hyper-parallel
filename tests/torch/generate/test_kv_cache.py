@@ -15,6 +15,7 @@
 """KV cache tests."""
 import pytest
 import torch
+from torch.nn import functional as F
 
 from hyper_parallel.infer import (
     ContextParallelKVCache,
@@ -115,6 +116,36 @@ def test_generate_cache_and_no_cache_outputs_match():
     no_cache_output = generate(NoCacheLengthLM(vocab_size=32), input_ids, config)
 
     assert torch.equal(cache_output, no_cache_output)
+
+
+def test_cache_and_no_cache_decode_logits_cosine_similarity():
+    """
+    Feature: cache and no-cache decode consistency
+    Description: Compare next-step logits from cached and full-sequence decode.
+    Expectation: Cosine similarity is close to 1.0 for deterministic logits.
+    """
+    input_ids = torch.tensor([[7, 8, 9]])
+    next_token = torch.tensor([[3]])
+
+    cache_model = CacheLengthLM(vocab_size=32)
+    no_cache_model = NoCacheLengthLM(vocab_size=32)
+
+    prefill = cache_model(input_ids=input_ids, use_cache=True)
+    cached_decode = cache_model(
+        input_ids=next_token,
+        past_key_values=prefill["past_key_values"],
+        use_cache=True,
+    )
+    no_cache_decode = no_cache_model(
+        input_ids=torch.cat([input_ids, next_token], dim=-1),
+        use_cache=False,
+    )
+
+    cached_logits = cached_decode["logits"][:, -1, :]
+    no_cache_logits = no_cache_decode["logits"][:, -1, :]
+    similarity = F.cosine_similarity(cached_logits, no_cache_logits, dim=-1)
+
+    assert torch.all(similarity > 0.9999)
 
 
 def test_sequence_shard_info_handles_uneven_lengths():
