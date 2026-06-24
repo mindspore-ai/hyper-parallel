@@ -33,6 +33,7 @@ class GenerationConfig:
     pad_token_id: int = 0
     repetition_penalty: float = 1.0
     use_cache: bool = True
+    # context_logits_rank is local to context_process_group.
     context_logits_rank: Optional[Any] = None
     context_process_group: Optional[Any] = None
     gather_logits: bool = False
@@ -107,7 +108,10 @@ def gather_context_parallel_logits(logits: torch.Tensor, config: GenerationConfi
         dtype=torch.long,
     )
     if owner.ndim == 0:
-        return stacked[int(owner.item())]
+        owner_rank = int(owner.item())
+        if owner_rank < 0 or owner_rank >= world_size:
+            raise ValueError("context_logits_rank contains an invalid rank")
+        return stacked[owner_rank]
     if owner.shape != (logits.shape[0],):
         raise ValueError("context_logits_rank must be a scalar or a batch-sized tensor")
     if torch.any((owner < 0) | (owner >= world_size)):
@@ -125,6 +129,22 @@ def gather_tensor_parallel_logits(logits: torch.Tensor, config: GenerationConfig
     world_size = dist.get_world_size(group=config.logits_process_group)
     if world_size == 1:
         return logits
+    gather_dim = logits.ndim + config.logits_gather_dim
+    if gather_dim < 0 or gather_dim >= logits.ndim:
+        raise ValueError("logits_gather_dim is out of range for logits")
+    local_shard = torch.tensor(
+        [logits.shape[gather_dim]],
+        device=logits.device,
+        dtype=torch.long,
+    )
+    shard_sizes = [torch.empty_like(local_shard) for _ in range(world_size)]
+    dist.all_gather(shard_sizes, local_shard, group=config.logits_process_group)
+    shard_sizes = torch.cat(shard_sizes)
+    if torch.any(shard_sizes != shard_sizes[0]):
+        raise ValueError(
+            "tensor-parallel logits gather requires equal local vocab shard sizes; "
+            "pad vocab shards before generation",
+        )
     gathered = [torch.empty_like(logits) for _ in range(world_size)]
     dist.all_gather(gathered, logits, group=config.logits_process_group)
     return torch.cat(gathered, dim=config.logits_gather_dim)

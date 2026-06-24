@@ -96,7 +96,9 @@ class KVCache:
 
     @property
     def is_empty(self) -> bool:
-        return self.past_key_values is None
+        return self.past_key_values is None or (
+            isinstance(self.past_key_values, list) and len(self.past_key_values) == 0
+        )
 
     def clear(self) -> None:
         """Drop all cached tensors."""
@@ -109,7 +111,8 @@ class KVCache:
         if self._is_opaque_cache(past_key_values):
             self.past_key_values = past_key_values
             return
-        self.past_key_values = self._detach_and_validate(past_key_values)
+        values = self._detach_and_validate(past_key_values)
+        self.past_key_values = None if not values else values
 
     def merge(self, past_key_values: Optional[Iterable]) -> None:
         """Append incremental key/value tensors on the sequence dimension."""
@@ -119,6 +122,8 @@ class KVCache:
             self.past_key_values = past_key_values
             return
         new_values = self._detach_and_validate(past_key_values)
+        if not new_values:
+            return
         if self.past_key_values is None:
             self.past_key_values = new_values
             return

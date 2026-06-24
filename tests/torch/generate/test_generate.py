@@ -26,6 +26,7 @@ from hyper_parallel.infer import (
     gather_tensor_parallel_logits,
     generate,
     greedy_sample,
+    sample_next_token,
     top_k_sample,
     top_p_sample,
 )
@@ -54,6 +55,13 @@ class StrictNoCacheLM(NoCacheLengthLM):
 
     def forward(self, input_ids, position_ids=None, attention_mask=None):
         del position_ids, attention_mask
+        return super().forward(input_ids, use_cache=False)
+
+
+class InputOnlyLM(NoCacheLengthLM):
+    """No-cache model whose forward only accepts input_ids."""
+
+    def forward(self, input_ids):
         return super().forward(input_ids, use_cache=False)
 
 
@@ -130,6 +138,26 @@ def test_sampler_helpers():
     assert adjusted[0, 3] == 1.5
 
 
+def test_sample_next_token_applies_top_k_before_top_p():
+    """
+    Feature: sampler composition
+    Description: Sampling with top-k and top-p first limits candidates by top-k.
+    Expectation: Tokens outside top-k are not passed to multinomial sampling.
+    """
+    logits = torch.tensor([[9.0, 8.0, 7.0, 6.0]])
+    config = GenerationConfig(
+        do_sample=True,
+        top_k=2,
+        top_p=0.999,
+        eos_token_id=None,
+    )
+
+    for seed in range(20):
+        torch.manual_seed(seed)
+        sampled = sample_next_token(logits, torch.tensor([[0]]), config)
+        assert sampled.item() in {0, 1}
+
+
 def test_generate_greedy_with_kv_cache():
     """
     Feature: greedy generation with KV cache
@@ -174,6 +202,21 @@ def test_generate_strict_no_cache_model_omits_cache_kwargs():
     """
     out = generate(
         StrictNoCacheLM(vocab_size=32),
+        torch.tensor([[7, 8]]),
+        GenerationConfig(max_new_tokens=2, do_sample=False, eos_token_id=None),
+    )
+
+    assert out.tolist() == [[7, 8, 2, 3]]
+
+
+def test_generate_input_only_model_omits_unsupported_kwargs():
+    """
+    Feature: forward signature filtering
+    Description: Models without optional kwargs should receive only supported args.
+    Expectation: Generation succeeds without TypeError from unsupported kwargs.
+    """
+    out = generate(
+        InputOnlyLM(vocab_size=32),
         torch.tensor([[7, 8]]),
         GenerationConfig(max_new_tokens=2, do_sample=False, eos_token_id=None),
     )
@@ -340,6 +383,32 @@ def test_context_parallel_logits_gather_selects_owner_rank(monkeypatch):
     assert gathered.argmax(dim=-1).tolist() == [2]
 
 
+def test_context_parallel_logits_gather_rejects_invalid_scalar_owner(monkeypatch):
+    """
+    Feature: context-parallel logits handoff validation
+    Description: Scalar owner rank is local to the CP process group.
+    Expectation: Invalid scalar owner rank raises a clear ValueError.
+    """
+    import hyper_parallel.infer.utils as utils
+
+    def fake_all_gather(output_tensors, tensor, group=None):
+        del group
+        output_tensors[0].copy_(tensor)
+        output_tensors[1].copy_(tensor)
+
+    logits = torch.zeros(1, 3)
+    monkeypatch.setattr(utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(utils.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(utils.dist, "all_gather", fake_all_gather)
+
+    with pytest.raises(ValueError, match="invalid rank"):
+        gather_context_parallel_logits(
+            logits,
+            GenerationConfig(context_logits_rank=-1),
+        )
+
+
 def test_context_parallel_logits_gather_supports_batch_owner_ranks(monkeypatch):
     """
     Feature: context-parallel batch logits handoff
@@ -367,6 +436,35 @@ def test_context_parallel_logits_gather_supports_batch_owner_ranks(monkeypatch):
     assert gathered.argmax(dim=-1).tolist() == [1, 2]
 
 
+def test_tensor_parallel_logits_gather_rejects_uneven_vocab_shards(monkeypatch):
+    """
+    Feature: tensor-parallel logits gather validation
+    Description: Uneven vocab shard sizes cannot be gathered with all_gather.
+    Expectation: A clear ValueError is raised before tensor all_gather.
+    """
+    import hyper_parallel.infer.utils as utils
+
+    def fake_all_gather(output_tensors, tensor, group=None):
+        del group
+        if tensor.numel() == 1:
+            output_tensors[0].fill_(tensor.item())
+            output_tensors[1].fill_(tensor.item() + 1)
+            return
+        raise AssertionError("tensor all_gather should not run for uneven shards")
+
+    logits = torch.zeros(1, 3)
+    monkeypatch.setattr(utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(utils.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(utils.dist, "all_gather", fake_all_gather)
+
+    with pytest.raises(ValueError, match="equal local vocab shard sizes"):
+        gather_tensor_parallel_logits(
+            logits,
+            GenerationConfig(gather_logits=True),
+        )
+
+
 def test_generate_greedy_uses_gathered_tensor_parallel_logits(monkeypatch):
     """
     Feature: tensor-parallel greedy sampling
@@ -385,6 +483,10 @@ def test_generate_greedy_uses_gathered_tensor_parallel_logits(monkeypatch):
 
     def fake_all_gather(output_tensors, tensor, group=None):
         del group
+        if tensor.numel() == 1:
+            output_tensors[0].copy_(tensor)
+            output_tensors[1].copy_(tensor)
+            return
         output_tensors[0].copy_(tensor)
         shard = tensor.new_full(tensor.shape, -1000)
         shard[:, 2] = 1000

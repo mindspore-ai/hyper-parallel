@@ -15,13 +15,7 @@
 """Autoregressive generation utilities."""
 
 from hyper_parallel.infer.generation import generate
-from hyper_parallel.infer.kv_cache import (
-    ContextParallelKVCache,
-    KVCache,
-    SequenceShardInfo,
-    get_sequence_shard_info,
-    shard_past_key_values,
-)
+from hyper_parallel.infer.kv_cache import KVCache
 from hyper_parallel.infer.mixin import GenerateMixin
 from hyper_parallel.infer.sampler import (
     apply_repetition_penalty,
@@ -45,20 +39,16 @@ __all__ = [
     "GenerationConfig",
     "GenerateMixin",
     "KVCache",
-    "ContextParallelKVCache",
-    "SequenceShardInfo",
     "apply_logits_processors",
     "apply_repetition_penalty",
     "build_causal_mask",
     "build_position_ids",
     "gather_context_parallel_logits",
     "gather_tensor_parallel_logits",
-    "get_sequence_shard_info",
     "generate",
     "greedy_sample",
     "prepare_logits_for_sampling",
     "sample_next_token",
-    "shard_past_key_values",
     "should_stop_generation",
     "top_k_sample",
     "top_p_sample",

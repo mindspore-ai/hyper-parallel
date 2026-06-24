@@ -119,8 +119,7 @@ Context-parallel prefill can select final-token logits from the rank that owns
 the global last prompt token by setting `context_logits_rank` and passing the
 context-parallel process group through `context_process_group`. This keeps
 sampling decisions identical across ranks after sequence-sharded prefill.
-`ContextParallelKVCache` tracks contiguous sequence shards and validates local
-decode growth for CP cache handoff. Model-specific CP forward paths still need
-to return K/V tensors consistent with that shard metadata. For models that
-already return full replicated logits on each rank, the single-process API can
-be used directly without enabling logits gathering.
+CP KV cache helpers remain internal until they are wired into model-specific
+parallel generate paths. For models that already return full replicated logits
+on each rank, the single-process API can be used directly without enabling
+logits gathering.

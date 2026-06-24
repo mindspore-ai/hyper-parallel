@@ -18,11 +18,13 @@ import torch
 from torch.nn import functional as F
 
 from hyper_parallel.infer import (
-    ContextParallelKVCache,
     GenerationConfig,
     KVCache,
-    SequenceShardInfo,
     generate,
+)
+from hyper_parallel.infer.kv_cache import (
+    ContextParallelKVCache,
+    SequenceShardInfo,
     get_sequence_shard_info,
     shard_past_key_values,
 )
@@ -40,6 +42,57 @@ class OpaqueCache:
 
     def get_seq_length(self):
         return 1
+
+
+class TinyAttentionCacheLM(torch.nn.Module):
+    """Small causal-attention model with KV cache support."""
+
+    def __init__(self, vocab_size: int = 64):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.hidden_size = vocab_size
+        self.embedding = torch.nn.Embedding(vocab_size, self.hidden_size)
+        self.lm_head = torch.nn.Linear(self.hidden_size, vocab_size, bias=False)
+        with torch.no_grad():
+            self.embedding.weight.zero_()
+            self.lm_head.weight.zero_()
+            for token_id in range(vocab_size):
+                scale = 20.0 if token_id == 7 else 1.0
+                self.embedding.weight[token_id, token_id] = scale
+                self.lm_head.weight[token_id, token_id] = 1.0
+
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        attention_mask=None,
+        past_key_values=None,
+        use_cache=True,
+        **kwargs,
+    ):
+        del position_ids, kwargs
+        hidden = self.embedding(input_ids)
+        key = hidden.unsqueeze(1)
+        value = key
+        if past_key_values is not None:
+            past_key, past_value = past_key_values[0]
+            key = torch.cat([past_key, key], dim=-2)
+            value = torch.cat([past_value, value], dim=-2)
+        query = torch.ones_like(hidden).unsqueeze(1)
+        scores = torch.matmul(query, key.transpose(-1, -2)) / (self.hidden_size ** 0.5)
+        if attention_mask is not None:
+            scores = scores + attention_mask.to(dtype=scores.dtype)
+        probs = torch.softmax(scores, dim=-1)
+        context = torch.matmul(probs, value).squeeze(1)
+        projected = self.lm_head(context)
+        logits = input_ids.new_full(
+            input_ids.shape + (self.vocab_size,),
+            -1000,
+            dtype=torch.float32,
+        )
+        logits.copy_(projected)
+        past = [(key.detach(), value.detach())] if use_cache else None
+        return {"logits": logits, "past_key_values": past}
 
 
 def test_cache_update_detaches_tensors():
@@ -71,6 +124,20 @@ def test_cache_update_preserves_opaque_cache_object():
     cache.update(opaque)
 
     assert cache.past_key_values is opaque
+
+
+def test_cache_update_normalizes_empty_list_to_empty_cache():
+    """
+    Feature: KV cache update
+    Description: Some model backends may return an empty cache list.
+    Expectation: Empty lists are treated as no available cache.
+    """
+    cache = KVCache()
+
+    cache.update([])
+
+    assert cache.is_empty
+    assert cache.past_key_values is None
 
 
 def test_cache_merge_appends_sequence_dimension():
@@ -114,6 +181,37 @@ def test_generate_cache_and_no_cache_outputs_match():
 
     cache_output = generate(CacheLengthLM(vocab_size=32), input_ids, config)
     no_cache_output = generate(NoCacheLengthLM(vocab_size=32), input_ids, config)
+
+    assert torch.equal(cache_output, no_cache_output)
+
+
+def test_left_padded_attention_cache_decode_matches_no_cache_decode():
+    """
+    Feature: left-padded KV cache decode
+    Description: Cached attention decode should keep padding keys masked after prefill.
+    Expectation: Cache and no-cache outputs match for left-padded batches.
+    """
+    input_ids = torch.tensor([[7, 7, 1], [0, 7, 1]])
+    attention_mask = torch.tensor([[0, 0, 1], [0, 1, 1]])
+    base_config = {
+        "max_new_tokens": 3,
+        "do_sample": False,
+        "eos_token_id": None,
+        "pad_token_id": 0,
+    }
+
+    cache_output = generate(
+        TinyAttentionCacheLM(vocab_size=64),
+        input_ids,
+        GenerationConfig(**base_config, use_cache=True),
+        attention_mask=attention_mask,
+    )
+    no_cache_output = generate(
+        TinyAttentionCacheLM(vocab_size=64),
+        input_ids,
+        GenerationConfig(**base_config, use_cache=False),
+        attention_mask=attention_mask,
+    )
 
     assert torch.equal(cache_output, no_cache_output)
 

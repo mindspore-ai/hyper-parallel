@@ -63,10 +63,9 @@ def _model_forward(
         for param in parameters.values()
     )
     if not accepts_kwargs:
-        if "past_key_values" not in parameters:
-            kwargs.pop("past_key_values")
-        if "use_cache" not in parameters:
-            kwargs.pop("use_cache")
+        for name in list(kwargs):
+            if name not in parameters:
+                kwargs.pop(name)
     return forward(**kwargs)
 
 
@@ -82,6 +81,27 @@ def _resolve_mask_dtype(model, config: GenerationConfig) -> torch.dtype:
             if tensor.is_floating_point():
                 return tensor.dtype
     return torch.float32
+
+
+def _build_decode_key_mask(
+    attention_mask: Optional[torch.Tensor],
+    dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    if attention_mask is None:
+        return None
+    if attention_mask.ndim != 2:
+        raise ValueError("attention_mask must have shape (batch, seq)")
+    batch_size, seq_len = attention_mask.shape
+    mask = torch.zeros(
+        batch_size,
+        1,
+        1,
+        seq_len,
+        device=attention_mask.device,
+        dtype=dtype,
+    )
+    padding = attention_mask == 0
+    return mask.masked_fill(padding.view(batch_size, 1, 1, seq_len), float("-inf"))
 
 
 def _prompt_lengths(input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor]):
@@ -213,11 +233,12 @@ def generate(
             if use_cached_decode:
                 decode_input = next_tokens
                 decode_pos = prompt_lengths + generated_counts - 1
+                decode_mask = _build_decode_key_mask(current_attention_mask, mask_dtype)
                 outputs = _model_forward(
                     model,
                     input_ids=decode_input,
                     position_ids=decode_pos.view(-1, 1),
-                    attention_mask=None,
+                    attention_mask=decode_mask,
                     past_key_values=cache.past_key_values,
                     use_cache=True,
                 )

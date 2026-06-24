@@ -19,6 +19,14 @@ from torch.nn import functional as F
 from hyper_parallel.infer.utils import GenerationConfig
 
 
+def _filter_top_k(logits: torch.Tensor, top_k: int) -> torch.Tensor:
+    if top_k <= 0 or top_k >= logits.size(-1):
+        return logits
+    values, _ = torch.topk(logits, k=top_k, dim=-1)
+    threshold = values[:, -1:].contiguous()
+    return logits.masked_fill(logits < threshold, float("-inf"))
+
+
 def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     """Select the highest-logit token for each batch item."""
     if logits.ndim != 2:
@@ -34,13 +42,10 @@ def top_k_sample(
     """Sample from the top-k logits."""
     if logits.ndim != 2:
         raise ValueError("logits must have shape (batch, vocab)")
-    if top_k <= 0 or top_k >= logits.size(-1):
-        probs = F.softmax(logits / temperature, dim=-1)
-        return torch.multinomial(probs, num_samples=1)
-    values, indices = torch.topk(logits, k=top_k, dim=-1)
-    probs = F.softmax(values / temperature, dim=-1)
+    filtered = _filter_top_k(logits, top_k)
+    probs = F.softmax(filtered / temperature, dim=-1)
     sampled = torch.multinomial(probs, num_samples=1)
-    return indices.gather(dim=-1, index=sampled)
+    return sampled
 
 
 def top_p_sample(
@@ -97,6 +102,8 @@ def sample_next_token(
     )
     if not config.do_sample:
         return greedy_sample(logits)
+    logits = _filter_top_k(logits, config.top_k)
     if config.top_p < 1.0:
         return top_p_sample(logits, top_p=config.top_p, temperature=config.temperature)
-    return top_k_sample(logits, top_k=config.top_k, temperature=config.temperature)
+    probs = F.softmax(logits / config.temperature, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
