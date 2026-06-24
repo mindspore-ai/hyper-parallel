@@ -2,7 +2,7 @@
 
 昇腾超节点亲和的分布式并行加速库，简化超节点编程，释放算力潜能。
 
-HyperParallel提供昇腾超节点亲和的分布式并行加速能力，在保障易用性的前提下，针对昇腾超节点资源池化、对等架构、网路拓扑分层多样、FP8低精格式等架构特点，实现了集群的分布式并行到芯片内多核并行，支持CPU
+HyperParallel提供昇腾超节点亲和的分布式并行加速能力，在保障易用性的前提下，针对昇腾超节点资源池化、对等架构、网络拓扑分层多样、FP8低精格式等架构特点，实现了集群的分布式并行到芯片内多核并行，支持CPU
 DRAM和NPU HBM的池化统一管理，支持拓扑感知调度和通信路径规划，支持FP8混合精度训练等昇腾超节点亲和的加速能力。
 
 关键设计思路:
@@ -119,7 +119,7 @@ RL任务越来越复杂，训推不一致问题导致强化学习训练难以收
         - [ ] 多核并行 - O0
         - [ ] 多核并行 - O1
         - [x] 基于多核并行优化MoE通算掩盖
-        - [ ] 基于多核并行优化PP 1B1F通算掩盖
+        - [ ] 基于多核并行优化PP 1F1B通算掩盖
 
 - HyperOffload
     - [x] Activation Checkpoint（checkpoint / checkpoint_wrapper / CheckpointPolicy）
@@ -186,65 +186,7 @@ RL任务越来越复杂，训推不一致问题导致强化学习训练难以收
 
 ## 安装教程
 
-HyperParallel 提供两种安装方式：
-
-- **pip 安装**：安装已经构建好的 `hyper-parallel` 包，并通过 extras 选择运行时深度学习框架依赖。
-- **源码构建**：使用 `./build.sh` 生成 whl 包，并按构建参数决定是否编译 native 扩展。
-
-如果只需要安装已发布的包，优先使用 `pip install`。如果需要在本机生成 whl，或需要调整 native 扩展构建配置，再使用源码构建。
-
-### 1. 使用 pip 安装
-
-`pip install` 的 extras 只控制 Python 运行时依赖，不控制 native 扩展的编译。
-
-| 命令                                        | 安装内容                                             | 适用场景                          |
-|-------------------------------------------|--------------------------------------------------|-------------------------------|
-| `pip install hyper-parallel`              | 仅安装通用依赖，不安装深度学习框架                                | 已自行管理框架版本，或只使用不依赖框架的能力        |
-| `pip install 'hyper-parallel[mindspore]'` | 通用依赖 + `mindspore>=2.10`                         | 使用 MindSpore 后端               |
-| `pip install 'hyper-parallel[torch]'`     | 通用依赖 + `torch==2.9.1` + `torch-npu==2.9.1`       | 使用默认 PyTorch 2.9 后端           |
-| `pip install 'hyper-parallel[torch26]'`   | 通用依赖 + `torch==2.6.0` + `torch-npu==2.6.0.post3` | 使用 PyTorch 2.6 后端             |
-| `pip install 'hyper-parallel[torch27]'`   | 通用依赖 + `torch==2.7.1` + `torch-npu==2.7.1`       | 使用 PyTorch 2.7 后端             |
-| `pip install 'hyper-parallel[torch29]'`   | 通用依赖 + `torch==2.9.1` + `torch-npu==2.9.1`       | 显式使用 PyTorch 2.9 后端           |
-| `pip install 'hyper-parallel[all]'`       | 通用依赖 + MindSpore + 默认 PyTorch 2.9                | 同一环境需要同时使用两种后端，PyTorch 默认 2.9 |
-
-zsh 等 shell 下建议给带 extras 的包名加引号，避免 `[]` 被解释为通配符。
-
-### 2. 从源码编译 whl 包
-
-基于源码构建 hyper-parallel 可选择编译 `multicore`、`symmetric memory`、`custom ops` 三个 native 模块。
-
-通过 `build.sh` 构建 whl 支持以下编译参数：
-
-| 参数             | 默认值         | 可选值                                                   | 说明                                                                              |
-|----------------|-------------|-------------------------------------------------------|---------------------------------------------------------------------------------|
-| `--multicore`  | `mindspore` | `off`、`mindspore`、`ms`、`torch`、`pytorch`、`all`、`both` | 控制 multicore 模块编译范围；`ms` 等价于 `mindspore`，`pytorch` 等价于 `torch`，`both` 等价于 `all` |
-| `--shmem`      | `all`       | `off`、`mindspore`、`ms`、`torch`、`pytorch`、`all`、`both` | 控制 symmetric memory 模块编译范围；`all` 同时编译公共库、MindSpore wrapper 和 PyTorch wrapper    |
-| `--custom-ops` | `on`        | `on`、`off`                                            | 控制 MindSpore custom ops 是否编译                                                    |
-| `--strict`     | `on`        | `on`、`off`                                            | 控制 native 模块构建失败时是否终止 whl 构建；`off` 会记录 warning 并继续打包                             |
-
-源码构建 hyper-parallel 环境要求如下：
-
-| 环境项               | 要求                                    | 说明                                                                            |
-|-------------------|---------------------------------------|-------------------------------------------------------------------------------|
-| Python            | 3.10、3.11 或 3.12                      | 构建出的 whl 仅可装到对应 Python 小版本的解释器上                                               |
-| 主机 GCC            | [7.3.0, 11.3.0]                       | 与 MindSpore 编译策略一致                                                            |
-| CMake             | ≥ 3.18                                | native 扩展构建需要                                                                 |
-| CANN 工具链          | 启用 native 扩展时需要可用的 `ASCEND_HOME_PATH` | 脚本会尝试 source `/usr/local/Ascend/cann/set_env.sh`                              |
-| MindSpore         | ≥ 2.10                                | 当 `--custom-ops on`，`--multicore mindspore/all`，或 `--shmem all/mindspore` 时需要 |
-| PyTorch 及 NPU 适配包 | PyTorch 后端对应版本                        | 当 `--multicore torch/all`，或 `--shmem all/torch` 时需要                           |
-
-```bash
-git clone https://gitcode.com/mindspore/hyper-parallel.git
-cd hyper-parallel
-./build.sh
-./build.sh --multicore all --shmem all --custom-ops on
-./build.sh --multicore torch --shmem torch --strict off
-./build.sh --multicore off --shmem off --custom-ops off
-pip install dist/hyper_parallel-*.whl
-```
-
-> 注意事项：构建出的 whl 对运行环境的 glibc 版本有要求，安装环境的 glibc 需不低于编译环境的 glibc 版本。
-> 如需部署到旧系统，请在更老的发布镜像内编译；例如在 OpenEuler 22.03（glibc 2.34）编出的 whl 无法在 glibc < 2.34 的环境运行。
+完整安装方式、源码构建参数和环境要求见 [安装指南](docs/installation.md)。
 
 ## 快速开始
 
@@ -261,32 +203,36 @@ model = fully_shard(model, mesh=mesh)
 
 ```python
 from mindspore.nn.utils import no_init_parameters
-from hyper_parallel import DTensor, Layout, fully_shard, init_device_mesh, init_parameters, shard_module
+from hyper_parallel import DTensor, fully_shard, init_device_mesh, init_parameters, shard_module
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
-# 定义张量排布
-layout = Layout((dp, mp), ("dp", "mp"))
-x_layout = layout("dp", "mp")
-w_layout = layout("mp", "None")
-out_layout = layout()
+# 定义设备网格和 placement
+mesh = init_device_mesh(device_type="npu", mesh_shape=(dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+x_placement = (Shard(0), Shard(1))
+w_placement = (Replicate(), Shard(0))
+out_placement = (Shard(0), Replicate())
 
 # 网络权重延后初始化
 with no_init_parameters():
     model = SimpleModel()
 
 # 对网络输入/输出/权重做切分配置
-sharding_plan = {"forward": {"input": (x_layout,), "output": (out_layout,)},
-                 "parameter": {"weight": w_layout}}
-model = shard_module(model, sharding_plan)
+sharding_plan = ShardingPlan(
+    input_plan={"input": x_placement},
+    output_plan={"output": out_placement},
+    plan={"weight": w_placement},
+)
+model = shard_module(model, device_mesh=mesh, sharding_plan=sharding_plan)
 
 # 可以进一步配置fully_shard
-mesh = init_device_mesh(device_type="npu", mesh_shape=(dp, 1), mesh_dim_names=("dp", "tp"))
 model = fully_shard(model, mesh=mesh["dp"])
 
 # 权重分片初始化
 model = init_parameters(model)
 
 # 执行
-x = DTensor.from_local(local_x, x_layout)
+x = DTensor.from_local(local_x, mesh, x_placement)
 run_model(x, model)
 ```
 
@@ -315,7 +261,8 @@ parallelize_module(
 4. 使用 `PipelineStage` 和 `PipelineSchedule` 进行流水线并行
 
 ```python
-from hyper_parallel import PipelineStage, Schedule1F1B
+from hyper_parallel import DTensor
+from hyper_parallel.core.pipeline_parallel import PipelineStage, Schedule1F1B
 
 # 将切分后的module封装成PipelineStage
 stage = PipelineStage(split_model, stage_index, stage_num=4)
@@ -324,7 +271,7 @@ stage = PipelineStage(split_model, stage_index, stage_num=4)
 schedule = Schedule1F1B(stage, micro_batch_num=8)
 
 # 执行
-x = DTensor.from_local(local_x, x_layout)
+x = DTensor.from_local(local_x, input_mesh, input_placements)
 schedule.run(x)
 ```
 
@@ -347,8 +294,8 @@ optimizer = get_hyper_optimizer(
 ```python
 from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper, swap_wrapper
 
-model.layer = checkpoint_wrapper(model.layer, policy="full")
-model.layer = swap_wrapper(model.layer, offload_to="cpu")
+model.layers[0] = checkpoint_wrapper(model.layers[0])
+model.layers[1] = swap_wrapper(model.layers[1])
 ```
 
 7. 使用基于多核并行的MoE通算掩盖算子
@@ -358,8 +305,7 @@ model.layer = swap_wrapper(model.layer, offload_to="cpu")
 ## 文档
 
 - [文档中心](./docs/index.md) — 文档索引与导航
-- [快速开始](./docs/getting_started/quick_start.md) — 设计理念、最小示例
-- [安装指南](./docs/getting_started/installation.md) — 源码构建、依赖安装
+- [安装指南](docs/installation.md) — 源码构建、依赖安装
 - [特性使用指南](./docs/guide/) — 10 个核心特性使用指南
 - [API参考](./docs/api/api_reference.md) — 按特性模块组织的接口说明
 - [FAQ与故障排查](./docs/faq.md) — 常见问题与解决方案

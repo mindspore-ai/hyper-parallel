@@ -148,7 +148,7 @@ performance.
         - [ ] Multi-Core Parallelism - O0
         - [ ] Multi-Core Parallelism - O1
         - [x] MoE Compute-Communication Overlap Optimisation Based on Multi-Core Parallelism
-        - [ ] PP 1B1F Compute-Communication Overlap Optimisation Based on Multi-Core Parallelism
+        - [ ] PP 1F1B Compute-Communication Overlap Optimisation Based on Multi-Core Parallelism
 
 - HyperOffload
     - [x] Activation Checkpoint (checkpoint / checkpoint_wrapper / CheckpointPolicy)
@@ -295,32 +295,36 @@ model = fully_shard(model, mesh=mesh)
 
 ```python
 from mindspore.nn.utils import no_init_parameters
-from hyper_parallel import DTensor, Layout, fully_shard, init_device_mesh, init_parameters, shard_module
+from hyper_parallel import DTensor, fully_shard, init_device_mesh, init_parameters, shard_module
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
+from hyper_parallel.core.shard.sharding_plan import ShardingPlan
 
-# Define tensor layout
-layout = Layout((dp, mp), ("dp", "mp"))
-x_layout = layout("dp", "mp")
-w_layout = layout("mp", "None")
-out_layout = layout()
+# Define device mesh and placement
+mesh = init_device_mesh(device_type="npu", mesh_shape=(dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+x_placement = (Shard(0), Shard(1))
+w_placement = (Replicate(), Shard(0))
+out_placement = (Shard(0), Replicate())
 
-# Delayed network weight initialisation
+# Delayed network weight initialization
 with no_init_parameters():
     model = SimpleModel()
 
 # Configure sharding for network input/output/weights
-sharding_plan = {"forward": {"input": (x_layout,), "output": (out_layout,)},
-                 "parameter": {"weight": w_layout}}
-model = shard_module(model, sharding_plan)
+sharding_plan = ShardingPlan(
+    input_plan={"input": x_placement},
+    output_plan={"output": out_placement},
+    plan={"weight": w_placement},
+)
+model = shard_module(model, device_mesh=mesh, sharding_plan=sharding_plan)
 
 # Can further configure fully_shard
-mesh = init_device_mesh(device_type="npu", mesh_shape=(dp, 1), mesh_dim_names=("dp", "tp"))
 model = fully_shard(model, mesh=mesh["dp"])
 
-# Sharded weight initialisation
+# Sharded weight initialization
 model = init_parameters(model)
 
 # Execute
-x = DTensor.from_local(local_x, x_layout)
+x = DTensor.from_local(local_x, mesh, x_placement)
 run_model(x, model)
 ```
 
@@ -349,7 +353,8 @@ parallelize_module(
 4. Use `PipelineStage` and `PipelineSchedule` for pipeline parallelism
 
 ```python
-from hyper_parallel import PipelineStage, Schedule1F1B
+from hyper_parallel import DTensor
+from hyper_parallel.core.pipeline_parallel import PipelineStage, Schedule1F1B
 
 # Wrap the partitioned module into PipelineStage
 stage = PipelineStage(split_model, stage_index, stage_num=4)
@@ -358,7 +363,7 @@ stage = PipelineStage(split_model, stage_index, stage_num=4)
 schedule = Schedule1F1B(stage, micro_batch_num=8)
 
 # Execute
-x = DTensor.from_local(local_x, x_layout)
+x = DTensor.from_local(local_x, input_mesh, input_placements)
 schedule.run(x)
 ```
 
@@ -381,8 +386,8 @@ optimizer = get_hyper_optimizer(
 ```python
 from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper, swap_wrapper
 
-model.layer = checkpoint_wrapper(model.layer, policy="full")
-model.layer = swap_wrapper(model.layer, offload_to="cpu")
+model.layers[0] = checkpoint_wrapper(model.layers[0])
+model.layers[1] = swap_wrapper(model.layers[1])
 ```
 
 7. Use MoE Compute-Communication Overlap Optimisation Based on Multi-Core Parallelism
@@ -392,8 +397,7 @@ For details, see the [MOE-FFN Documentation](./hyper_parallel/core/multicore/doc
 ## Documentation
 
 - [Docs Hub](./docs/index.md) - Documentation index and navigation
-- [Quick Start](./docs/getting_started/quick_start.md) - Design principles, minimal example
-- [Installation Guide](./docs/getting_started/installation.md) - Source build, dependencies
+- [Installation Guide](docs/installation.md) - Source build, dependencies
 - [Feature Guides](./docs/guide/) - 10 core feature usage guides
 - [API Reference](./docs/api/api_reference.md) - Interface descriptions organised by feature module
 - [FAQ & Troubleshooting](./docs/faq.md) - Common issues and solutions
