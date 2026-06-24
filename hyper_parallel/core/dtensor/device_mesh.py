@@ -736,6 +736,7 @@ class DeviceMesh:
 
         self._sub_mesh_cache[sub_mesh_dim_names] = sub_mesh
         self.sub_mesh.append(sub_mesh)
+        _register_device_mesh(sub_mesh)
         return sub_mesh
 
     def get_group(self, mesh_dim: Optional[Union[int, str]] = None):
@@ -1065,6 +1066,7 @@ class DeviceMesh:
             concat_dim_group_backends,
             concat_dim_group_sources,
         )
+        _register_device_mesh(res_mesh)
         return res_mesh
 
     _concatenate = concatenate
@@ -1124,6 +1126,7 @@ class DeviceMesh:
         root_mesh.add_flatten_mapping(mesh_dim_name, res_flattened_mesh)
         root_mesh._sub_mesh_cache[(mesh_dim_name,)] = res_flattened_mesh  # pylint: disable=W0212
         root_mesh.sub_mesh.append(res_flattened_mesh)
+        _register_device_mesh(res_flattened_mesh)
 
         return res_flattened_mesh
 
@@ -1172,6 +1175,7 @@ class DeviceMesh:
             )
             res_mesh._dim_group_names = dim_group_names  # pylint: disable=W0212
 
+        _register_device_mesh(res_mesh)
         return res_mesh
 
     def _flatten(self, mesh_dim_name: Optional[str] = None, backend_override: Any = None) -> 'DeviceMesh':
@@ -1439,6 +1443,32 @@ class DeviceMesh:
 _DEVICE_MESH_MAP = {}
 
 
+def _device_mesh_map_key(
+        mesh_shape: tuple[int, ...],
+        mesh_dim_names: Union[tuple[str, ...], list[str], None],
+        rank_list: tuple[int, ...],
+) -> int:
+    mesh_dim_names = tuple(mesh_dim_names) if mesh_dim_names else None
+    return hash((tuple(mesh_shape), mesh_dim_names, tuple(rank_list)))
+
+
+def _register_device_mesh(mesh: DeviceMesh) -> DeviceMesh:
+    """Register a DeviceMesh in the global cache without dropping root metadata."""
+    map_key = _device_mesh_map_key(mesh.mesh_shape, mesh.mesh_dim_names, mesh.rank_list)
+    existing = _DEVICE_MESH_MAP.get(map_key)
+    if existing is None:
+        _DEVICE_MESH_MAP[map_key] = mesh
+        return mesh
+
+    if existing.root_mesh is None and mesh.root_mesh is not None:
+        if existing is mesh._get_root_mesh():  # pylint: disable=protected-access
+            return existing
+        _DEVICE_MESH_MAP[map_key] = mesh
+        return mesh
+
+    return existing
+
+
 def _create_device_mesh(device_type: str,
                         mesh_shape: tuple[int, ...],
                         *,
@@ -1448,11 +1478,11 @@ def _create_device_mesh(device_type: str,
     """Create or reuse a cached DeviceMesh with the requested topology."""
     mesh = np.array(rank_list).reshape(mesh_shape)
     mesh_dim_names = tuple(mesh_dim_names) if mesh_dim_names else None
-    map_key = hash((mesh_shape, mesh_dim_names, rank_list))
+    map_key = _device_mesh_map_key(mesh_shape, mesh_dim_names, rank_list)
     if map_key not in _DEVICE_MESH_MAP:
-        _DEVICE_MESH_MAP[map_key] = DeviceMesh(device_type, mesh,
-                                               mesh_dim_names=mesh_dim_names,
-                                               _init_backend=init_backend)
+        _register_device_mesh(
+            DeviceMesh(device_type, mesh, mesh_dim_names=mesh_dim_names, _init_backend=init_backend)
+        )
     return _DEVICE_MESH_MAP.get(map_key, None)
 
 
