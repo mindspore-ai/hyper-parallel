@@ -30,6 +30,33 @@ HYPER_PARALLEL_PLATFORM_MINDSPORE = "mindspore"
 HYPER_PARALLEL_PLATFORM_TORCH = "torch"
 
 
+class AsyncHandle:
+    """Idempotent wait handle for an async collective operation.
+
+    Wraps the async tensor returned by
+    :meth:`Platform.differentiable_all_to_all_single_async` and provides a
+    :meth:`wait` method that is safe to call multiple times.
+    """
+
+    def __init__(self, async_tensor) -> None:
+        self._tensor = async_tensor
+        self._waited = False
+
+    def wait(self):
+        """Wait for the async collective to complete.
+
+        Idempotent — the first call blocks until the collective finishes;
+        subsequent calls are no-ops.
+
+        Returns:
+            The now-materialised result tensor.
+        """
+        if not self._waited:
+            get_platform().wait_async_tensor(self._tensor)
+            self._waited = True
+        return self._tensor
+
+
 class PlatformType(Enum):
     """Enumeration class for AI framework platform types.
 
@@ -808,6 +835,30 @@ class Platform:
         """
         raise NotImplementedError(
             "Platform subclasses must implement differentiable_all_to_all_single_async"
+        )
+
+    @staticmethod
+    def wait_async_tensor(tensor):
+        """Wait for an async collective tensor to become materialised.
+
+        Intended for use with :class:`AsyncHandle` so that callers can
+        wait on an async all-to-all result without importing framework-specific
+        modules directly.  The call is **idempotent** — waiting on an already-
+        completed tensor is a no-op.
+
+        Args:
+            tensor: An async collective tensor (e.g. PyTorch
+                ``AsyncCollectiveTensor``) whose values have not yet been
+                fully written by the remote ranks.
+
+        Returns:
+            The same *tensor*, now guaranteed to be fully materialised.
+
+        Raises:
+            NotImplementedError: Must be implemented by platform subclasses.
+        """
+        raise NotImplementedError(
+            "Platform subclasses must implement wait_async_tensor"
         )
 
     @staticmethod

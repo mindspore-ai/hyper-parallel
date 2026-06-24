@@ -26,6 +26,9 @@ Port allocation:
   10486  EP local-shard input: grouped_mm kernel (4 cards, 4 experts)
   10487  EP local-shard input: top_k=1 (4 cards, 4 experts)
   10488  EP local-shard input: shared expert (4 cards, 4 experts)
+  10489  EP async combine + shared expert (4 cards, 4 experts)
+  10490  EP async combine, no shared expert (4 cards, 4 experts)
+  10491  EP async combine + shared expert + grouped_mm (4 cards, 4 experts)
 """
 from pathlib import Path
 
@@ -186,4 +189,52 @@ def test_ep_local_shard_shared_expert():
     """
     _run_group(
         ("test_ep_local_shard_shared_expert_npu", 10488, 4),
+    )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="unessential")
+def test_ep_async_combine_shared_expert():
+    """
+    Feature: ExpertParallel async combine with shared expert overlap.
+    Description:
+        4-card EP with 4 experts + shared expert, async_combine=True.
+        Verifies that async combine produces numerically identical results to
+        synchronous combine when shared expert is present.
+    Expectation: Run success.
+    """
+    _run_group(
+        ("test_ep_async_combine_shared_expert_npu", 10489, 4),
+    )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="unessential")
+def test_ep_async_combine_no_shared_expert():
+    """
+    Feature: ExpertParallel async combine without shared expert (degradation check).
+    Description:
+        4-card EP with 4 experts (no shared expert), async_combine=True.
+        Verifies that async_combine=True produces identical results to the
+        synchronous path when there is no shared expert to overlap with.
+    Expectation: Run success.
+    """
+    _run_group(
+        ("test_ep_async_combine_no_shared_expert_npu", 10490, 4),
+    )
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="unessential")
+def test_ep_async_combine_shared_expert_grouped_mm():
+    """
+    Feature: ExpertParallel async combine with shared expert and grouped_mm kernel.
+    Description:
+        4-card EP with 4 experts + shared expert, async_combine=True,
+        use_grouped_mm=True. Verifies that async combine works correctly with
+        the npu_grouped_matmul kernel.
+    Expectation: Run success.
+    """
+    _run_group(
+        ("test_ep_async_combine_shared_expert_grouped_mm_npu", 10491, 4),
     )

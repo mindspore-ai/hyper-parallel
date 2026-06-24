@@ -13,4 +13,4 @@
 # limitations under the License.
 # ============================================================================
 "platform api"
-from hyper_parallel.platform.platform import get_platform
+from hyper_parallel.platform.platform import AsyncHandle, get_platform

@@ -1103,6 +1103,23 @@ class TorchPlatform(Platform):
         return _AsyncA2ALazyBwd.apply(input_tensor, output_splits, input_splits, group)
 
     @staticmethod
+    def wait_async_tensor(tensor):
+        """Wait for an async collective tensor to become materialised.
+
+        Idempotent — calling on an already-waited tensor is a no-op.
+
+        Args:
+            tensor: ``AsyncCollectiveTensor`` whose device-side values may
+                not yet be ready.
+
+        Returns:
+            The same *tensor*, now fully materialised.
+        """
+        from torch.distributed._functional_collectives import wait_tensor  # pylint: disable=C0415
+        wait_tensor(tensor)
+        return tensor
+
+    @staticmethod
     def differentiable_async_allgather_wait(x, work, out_perm, group, world_size, gather_dim,
                                             handle_box=None):
         """Wait async all-gather handle and reconstruct result (differentiable)."""

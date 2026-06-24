@@ -40,6 +40,7 @@ from hyper_parallel.core.expert_parallel.expert_parallel import (
     TensorParallel,
     ExpertTensorParallel,
 )
+from hyper_parallel.platform import AsyncHandle
 
 
 # ---------------------------------------------------------------------------
@@ -968,6 +969,381 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
 
         # Verify ["ep"] was accessed on the 2-D mesh for combine too
         full_mesh.__getitem__.assert_called_once_with("ep")
+
+
+# ---------------------------------------------------------------------------
+# C5: AsyncHandle (from platform), combine_start/combine_wait, score_before_experts guard
+# ---------------------------------------------------------------------------
+
+class TestAsyncHandle(unittest.TestCase):
+    """Unit tests for :class:`AsyncHandle`."""
+
+    def test_wait_calls_platform_once(self):
+        """
+        Feature: AsyncHandle.wait idempotency
+        Description: First wait calls platform.wait_async_tensor; second wait is a no-op.
+        Expectation: platform.wait_async_tensor called exactly once.
+        """
+        mock_tensor = MagicMock()
+        handle = AsyncHandle(mock_tensor)
+
+        with patch("hyper_parallel.platform.platform.get_platform") as mock_get_plat:
+            mock_plat = mock_get_plat.return_value
+            mock_plat.wait_async_tensor.return_value = mock_tensor
+            result1 = handle.wait()
+            result2 = handle.wait()
+
+        self.assertEqual(mock_plat.wait_async_tensor.call_count, 1,
+                         "wait_async_tensor should be called exactly once")
+        self.assertIs(result1, mock_tensor)
+        self.assertIs(result2, mock_tensor)
+
+    def test_wait_returns_tensor(self):
+        """
+        Feature: AsyncHandle.wait return value
+        Description: wait returns the wrapped async tensor after materialisation.
+        Expectation: return value is the same tensor object.
+        """
+        real_tensor = torch.randn(4)
+        handle = AsyncHandle(real_tensor)
+
+        with patch("hyper_parallel.platform.platform.get_platform") as mock_get_plat:
+            mock_plat = mock_get_plat.return_value
+            mock_plat.wait_async_tensor.side_effect = lambda t: t
+            result = handle.wait()
+
+        self.assertIs(result, real_tensor)
+
+
+class TestCombineStartWait(unittest.TestCase):
+    """Unit tests for :meth:`AllToAllTokenDispatcher.combine_start` and :meth:`combine_wait`."""
+
+    def setUp(self) -> None:
+        self.ep_size = 2
+        self.num_local_experts = 2
+        self.dim = 8
+        self.counts_out = torch.tensor([3, 2, 1, 4])
+        self.total_tokens = int(self.counts_out.sum())
+        self.num_tokens_per_expert_in = torch.tensor([3, 2, 1, 4])
+        self.routed_input = torch.randn(self.total_tokens, self.dim)
+        self.mock_mesh = _make_mock_device_mesh(self.ep_size)
+        self.module = _make_mock_module()
+
+    def _configure_platform(self, mock_platform):
+        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
+        mock_platform.differentiable_all_to_all_single.side_effect = (
+            lambda inp, *_args, **_kw: inp
+        )
+        mock_platform.arange.side_effect = torch.arange
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_combine_start_returns_handle(self, mock_platform):
+        """
+        Feature: combine_start return types
+        Description: combine_start returns an AsyncHandle.
+        Expectation: handle is AsyncHandle.
+        """
+        self._configure_platform(mock_platform)
+        mock_platform.differentiable_all_to_all_single_async.side_effect = (
+            lambda inp, *_args, **_kw: inp
+        )
+
+        _, _, ctx = AllToAllTokenDispatcher.dispatch(
+            module=None,
+            inputs=(self.routed_input, self.num_tokens_per_expert_in),
+            device_mesh=self.mock_mesh,
+        )
+        expert_output = torch.randn(self.total_tokens, self.dim)
+        handle = AllToAllTokenDispatcher.combine_start(
+            expert_output, self.mock_mesh, ctx
+        )
+
+        self.assertIsInstance(handle, AsyncHandle)
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_combine_start_wait_round_trip(self, mock_platform):
+        """
+        Feature: combine_start + combine_wait round-trip (OV-01)
+        Description: Output of combine_start→combine_wait matches synchronous combine().
+        Expectation: numerical equality with sync combine output.
+        """
+        self._configure_platform(mock_platform)
+        mock_platform.differentiable_all_to_all_single_async.side_effect = (
+            lambda inp, *_args, **_kw: inp
+        )
+
+        _, _, ctx = AllToAllTokenDispatcher.dispatch(
+            module=None,
+            inputs=(self.routed_input, self.num_tokens_per_expert_in),
+            device_mesh=self.mock_mesh,
+        )
+        expert_output = torch.randn(self.total_tokens, self.dim)
+
+        # Sync path
+        combined_sync = AllToAllTokenDispatcher.combine(
+            module=None,
+            routed_output=expert_output,
+            device_mesh=self.mock_mesh,
+            ctx=ctx,
+        )
+
+        # Async path
+        handle = AllToAllTokenDispatcher.combine_start(
+            expert_output, self.mock_mesh, ctx
+        )
+        with patch("hyper_parallel.core.expert_parallel.expert_parallel.platform") as mock_plat2:
+            mock_plat2.wait_async_tensor.side_effect = lambda t: t
+            combined_async = AllToAllTokenDispatcher.combine_wait(handle)
+
+        self.assertTrue(
+            torch.allclose(combined_async, combined_sync, atol=1e-6),
+            f"Async combine output differs from sync: max diff="
+            f"{(combined_async - combined_sync).abs().max():.2e}"
+        )
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_combine_start_calls_async_a2a(self, mock_platform):
+        """
+        Feature: combine_start uses differentiable_all_to_all_single_async
+        Description: combine_start must call the async variant, not the sync one.
+        Expectation: differentiable_all_to_all_single_async called once.
+        """
+        self._configure_platform(mock_platform)
+        mock_platform.differentiable_all_to_all_single_async.side_effect = (
+            lambda inp, *_args, **_kw: inp
+        )
+
+        _, _, ctx = AllToAllTokenDispatcher.dispatch(
+            module=None,
+            inputs=(self.routed_input, self.num_tokens_per_expert_in),
+            device_mesh=self.mock_mesh,
+        )
+        expert_output = torch.randn(self.total_tokens, self.dim)
+        AllToAllTokenDispatcher.combine_start(expert_output, self.mock_mesh, ctx)
+
+        mock_platform.differentiable_all_to_all_single_async.assert_called_once()
+
+
+class TestExpertParallelAsyncCombine(unittest.TestCase):
+    """Unit tests for ExpertParallel(async_combine=True) / ExpertTensorParallel."""
+
+    def setUp(self) -> None:
+        self.ep_size = 2
+        self.num_local_experts = 2
+        self.dim = 8
+        self.counts_out = torch.tensor([3, 2, 1, 4])
+        self.total_tokens = int(self.counts_out.sum())
+        self.num_tokens_per_expert_in = torch.tensor([3, 2, 1, 4])
+        self.routed_input = torch.randn(self.total_tokens, self.dim)
+        self.mock_mesh = _make_mock_device_mesh(self.ep_size)
+        self.module = _make_mock_module()
+
+    def _configure_platform(self, mock_platform):
+        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
+        mock_platform.differentiable_all_to_all_single.side_effect = (
+            lambda inp, *_args, **_kw: inp
+        )
+        mock_platform.differentiable_all_to_all_single_async.side_effect = (
+            lambda inp, *_args, **_kw: inp
+        )
+        mock_platform.wait_async_tensor.side_effect = lambda t: t
+        mock_platform.arange.side_effect = torch.arange
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_async_combine_no_shared_expert_degradation(self, mock_platform):
+        """
+        Feature: async_combine=True without shared_expert (OV-02)
+        Description: When async_combine=True, output should match sync path numerically.
+        Expectation: combined output is allclose to sync ExpertParallel output.
+        """
+        self._configure_platform(mock_platform)
+        ep_sync = ExpertParallel(async_combine=False)
+        ep_async = ExpertParallel(async_combine=True)
+
+        # Sync path
+        module_sync = _make_mock_module()
+        ep_sync._token_dispatch(
+            module_sync,
+            (self.routed_input, self.num_tokens_per_expert_in),
+            self.mock_mesh,
+        )
+        expert_output = torch.randn(self.total_tokens, self.dim)
+        combined_sync = ep_sync._token_combine(module_sync, expert_output, self.mock_mesh)
+
+        # Async path
+        module_async = _make_mock_module()
+        ep_async._token_dispatch(
+            module_async,
+            (self.routed_input, self.num_tokens_per_expert_in),
+            self.mock_mesh,
+        )
+        combined_async = ep_async._token_combine(module_async, expert_output, self.mock_mesh)
+
+        self.assertTrue(
+            torch.allclose(combined_async, combined_sync, atol=1e-6),
+            f"async_combine output differs from sync: max diff="
+            f"{(combined_async - combined_sync).abs().max():.2e}"
+        )
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_async_combine_stores_handle_on_module(self, mock_platform):
+        """
+        Feature: async_combine=True stores handle on module
+        Description: After _token_combine with async_combine, the module has
+            _ep_combine_handle attribute.
+        Expectation: attribute exists and has correct type.
+        """
+        self._configure_platform(mock_platform)
+        ep_async = ExpertParallel(async_combine=True)
+
+        ep_async._token_dispatch(
+            self.module,
+            (self.routed_input, self.num_tokens_per_expert_in),
+            self.mock_mesh,
+        )
+        expert_output = torch.randn(self.total_tokens, self.dim)
+        ep_async._token_combine(self.module, expert_output, self.mock_mesh)
+
+        self.assertTrue(hasattr(self.module, "_ep_combine_handle"))
+        self.assertIsInstance(self.module._ep_combine_handle, AsyncHandle)
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_sync_combine_does_not_store_handle(self, mock_platform):
+        """
+        Feature: async_combine=False does not store handle
+        Description: Sync path should not set _ep_combine_handle.
+        Expectation: attribute is absent after sync combine.
+        """
+        self._configure_platform(mock_platform)
+        ep_sync = ExpertParallel(async_combine=False)
+
+        ep_sync._token_dispatch(
+            self.module,
+            (self.routed_input, self.num_tokens_per_expert_in),
+            self.mock_mesh,
+        )
+        expert_output = torch.randn(self.total_tokens, self.dim)
+        ep_sync._token_combine(self.module, expert_output, self.mock_mesh)
+
+        self.assertFalse(hasattr(self.module, "_ep_combine_handle"))
+
+
+class TestScoreBeforeExpertsGuard(unittest.TestCase):
+    """Unit tests for score_before_experts=False rejection with EP (review fix)."""
+
+    def test_ep_rejects_score_after_dispatch(self):
+        """
+        Feature: EP rejects score_before_experts=False (OV-04 / review xuxinglei3)
+        Description: When EP size > 1 and scores are provided as input[2],
+            _token_dispatch must raise ValueError.
+        Expectation: ValueError with message about score_before_experts.
+        """
+        ep = ExpertParallel()
+        mock_mesh = _make_mock_device_mesh(ep_size=2)
+        module = _make_mock_module()
+        scores = torch.randn(10, 4)
+
+        with self.assertRaisesRegex(ValueError, "score_before_experts"):
+            ep._token_dispatch(
+                module,
+                (torch.randn(10, 8), torch.tensor([3, 2, 1, 4]), scores),
+                mock_mesh,
+            )
+
+    def test_ep_allows_no_scores(self):
+        """
+        Feature: EP allows inputs without scores
+        Description: When inputs has only 2 elements (no scores), dispatch proceeds.
+        Expectation: no exception raised.
+        """
+        ep = ExpertParallel()
+        mock_mesh = _make_mock_device_mesh(ep_size=2)
+        module = _make_mock_module()
+
+        with patch("hyper_parallel.core.expert_parallel.expert_parallel.platform") as mock_plat:
+            counts_out = torch.tensor([3, 2, 1, 4])
+            mock_plat.all_to_all_single.return_value = (counts_out, None)
+            mock_plat.differentiable_all_to_all_single.side_effect = (
+                lambda inp, *_args, **_kw: inp
+            )
+            mock_plat.arange.side_effect = torch.arange
+
+            # Only 2 inputs — no scores, should succeed
+            ep._token_dispatch(
+                module,
+                (torch.randn(10, 8), torch.tensor([3, 2, 1, 4])),
+                mock_mesh,
+            )
+
+    def test_ep_allows_none_scores(self):
+        """
+        Feature: EP allows inputs with None scores
+        Description: When inputs[2] is None, dispatch proceeds normally.
+        Expectation: no exception raised.
+        """
+        ep = ExpertParallel()
+        mock_mesh = _make_mock_device_mesh(ep_size=2)
+        module = _make_mock_module()
+
+        with patch("hyper_parallel.core.expert_parallel.expert_parallel.platform") as mock_plat:
+            counts_out = torch.tensor([3, 2, 1, 4])
+            mock_plat.all_to_all_single.return_value = (counts_out, None)
+            mock_plat.differentiable_all_to_all_single.side_effect = (
+                lambda inp, *_args, **_kw: inp
+            )
+            mock_plat.arange.side_effect = torch.arange
+
+            ep._token_dispatch(
+                module,
+                (torch.randn(10, 8), torch.tensor([3, 2, 1, 4]), None),
+                mock_mesh,
+            )
+
+    def test_ep_size_1_allows_scores(self):
+        """
+        Feature: EP size=1 allows scores (no cross-rank reordering)
+        Description: When ep_size=1, no all-to-all reordering occurs so scores
+            remain valid. Dispatch should not raise.
+        Expectation: no exception raised.
+        """
+        ep = ExpertParallel()
+        mock_mesh = _make_mock_device_mesh(ep_size=1)
+        module = _make_mock_module()
+        scores = torch.randn(10, 4)
+
+        with patch("hyper_parallel.core.expert_parallel.expert_parallel.platform") as mock_plat:
+            counts_out = torch.tensor([3, 2, 1, 4])
+            mock_plat.all_to_all_single.return_value = (counts_out, None)
+            mock_plat.differentiable_all_to_all_single.side_effect = (
+                lambda inp, *_args, **_kw: inp
+            )
+            mock_plat.arange.side_effect = torch.arange
+
+            ep._token_dispatch(
+                module,
+                (torch.randn(10, 8), torch.tensor([3, 2, 1, 4]), scores),
+                mock_mesh,
+            )
+
+    def test_etp_rejects_score_after_dispatch(self):
+        """
+        Feature: ExpertTensorParallel also rejects score_before_experts=False
+        Description: Same guard as ExpertParallel but using the EP sub-mesh size.
+        Expectation: ValueError with message about score_before_experts.
+        """
+        etp = ExpertTensorParallel()
+        ep_submesh = _make_mock_device_mesh(ep_size=2)
+        full_mesh = MagicMock()
+        full_mesh.__getitem__ = MagicMock(return_value=ep_submesh)
+        module = _make_mock_module()
+        scores = torch.randn(10, 4)
+
+        with self.assertRaisesRegex(ValueError, "score_before_experts"):
+            etp._token_dispatch(
+                module,
+                (torch.randn(10, 8), torch.tensor([3, 2, 1, 4]), scores),
+                full_mesh,
+            )
 
 
 if __name__ == "__main__":
