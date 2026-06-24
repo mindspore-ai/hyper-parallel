@@ -47,7 +47,9 @@ trust_remote_code: true
 use_v1_kernels: true
 flash_attn: fa2
 
+### enable hyper parallel FSDP
 use_hyper_parallel: true
+### enable hyper parallel CP
 hyper_parallel_cp_size: 2
 
 ### method
