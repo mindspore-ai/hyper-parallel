@@ -116,7 +116,7 @@ class Conv3dDistributedOp(DistributedOp):
         ]
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         """
         Infer output layout for Conv3d operator.
 
@@ -199,7 +199,7 @@ class Conv3dDistributedOp(DistributedOp):
 
         return (output_layout,), None
 
-    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,
+    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,  # pylint: disable=W0221
                         cache_values: list) -> Optional[Callable]:
         """
         Get expand implementation for the operator.

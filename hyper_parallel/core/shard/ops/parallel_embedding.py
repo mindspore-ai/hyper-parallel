@@ -62,7 +62,7 @@ class EmbeddingDistributedOp(DistributedOp):
         cache_values = [input_tensor.layout, weight_tensor.layout]
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         """
         Infer output layout for Embedding operator.
 
@@ -193,7 +193,7 @@ class EmbeddingDistributedOp(DistributedOp):
 
         return local_input, mask_int
 
-    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,
+    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,  # pylint: disable=W0221
                         cache_values: list) -> Optional[Callable]:
         """
         Returns the execution implementation wrapper.

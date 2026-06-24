@@ -76,7 +76,7 @@ class SliceDistributedOp(DistributedOp):
                     f"the begin is {begin}, the end is {end}, the shape is {shape}, layout is {layout.to_dict()}")
         return shard_dim
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, tuple]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, tuple]:  # pylint: disable=W0221
         """
         Infer output layout for Slice operator.
 
@@ -115,7 +115,7 @@ class SliceDistributedOp(DistributedOp):
         new_end = tuple(end[i] // shard_dim[i] for i in range(len(end)))
         return ((layout,), (new_begin, new_end))
 
-    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,
+    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,  # pylint: disable=W0221
                         cache_values: list) -> Optional[Callable]:
         """
         Return a custom Slice implementation when local begin/end need adjustment.
