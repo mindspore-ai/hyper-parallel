@@ -43,10 +43,14 @@ _BATCH, _S, _N1, _N1IDX, _HEAD_DIM, _ROPE_DIM = 4, 128, 64, 64, 128, 64
 _SCALE = 1.0 / (_HEAD_DIM ** 0.5)
 _GLOBAL_QLEN = np.array([128, 256, 384, 512], dtype=np.int32)
 _GLOBAL_KLEN = np.array([128, 256, 384, 512], dtype=np.int32)
+# qlen/klen: plain Tensor (not a DTensor), used directly by the derived precompute
+# and the op fn (not distributed).
+_QLEN_T = ms.Tensor(_GLOBAL_QLEN, ms.int32)
+_KLEN_T = ms.Tensor(_GLOBAL_KLEN, ms.int32)
 
 
 # --- derived-input helpers: sm_max / sm_sum from FlashAttentionScore ---
-# Primary order is (q, k, qi, ki, w, qr, kr); for TND additionally (qlen, klen).
+# Primary order is (q, k, qi, ki, w, qr, kr); qlen/klen are plain Tensors (globals).
 
 def _fa(q, k, layout="BSND"):
     if layout == "TND":
@@ -83,17 +87,17 @@ def _sm_sum_idx_bsnd(_q, _k, qi, ki, w, *_):  # pylint: disable=C0103
     return npu_dense_lightning_indexer_softmax_lse(qi, ki, w)[1]
 
 
-def _sm_max_idx_tnd(_q, _k, qi, ki, w, _qr, _kr, qlen, klen):  # pylint: disable=C0103
+def _sm_max_idx_tnd(_q, _k, qi, ki, w, _qr, _kr):  # pylint: disable=C0103
     return npu_dense_lightning_indexer_softmax_lse(
-        qi, ki, w, actual_seq_qlen=qlen, actual_seq_klen=klen, layout='TND')[0]
+        qi, ki, w, actual_seq_qlen=_QLEN_T, actual_seq_klen=_KLEN_T, layout='TND')[0]
 
 
-def _sm_sum_idx_tnd(_q, _k, qi, ki, w, _qr, _kr, qlen, klen):  # pylint: disable=C0103
+def _sm_sum_idx_tnd(_q, _k, qi, ki, w, _qr, _kr):  # pylint: disable=C0103
     return npu_dense_lightning_indexer_softmax_lse(
-        qi, ki, w, actual_seq_qlen=qlen, actual_seq_klen=klen, layout='TND')[1]
+        qi, ki, w, actual_seq_qlen=_QLEN_T, actual_seq_klen=_KLEN_T, layout='TND')[1]
 
 
-# --- op under test: fn(q,k,qi,ki,w,qr,kr, sm_max,sm_sum,sm_max_idx,sm_sum_idx[, qlen,klen]) ---
+# --- op under test: fn(q,k,qi,ki,w,qr,kr, sm_max,sm_sum,sm_max_idx,sm_sum_idx) ---
 
 def _grad_kl_loss_bsnd(q, k, qi, ki, w, qr, kr, sm_max, sm_sum, sm_max_idx, sm_sum_idx):
     return npu_dense_lightning_indexer_grad_kl_loss(
@@ -101,12 +105,12 @@ def _grad_kl_loss_bsnd(q, k, qi, ki, w, qr, kr, sm_max, sm_sum, sm_max_idx, sm_s
         query_rope=qr, key_rope=kr)
 
 
-def _grad_kl_loss_tnd(q, k, qi, ki, w, qr, kr, qlen, klen,
+def _grad_kl_loss_tnd(q, k, qi, ki, w, qr, kr,
                       sm_max, sm_sum, sm_max_idx, sm_sum_idx):
     return npu_dense_lightning_indexer_grad_kl_loss(
         q, k, qi, ki, w, sm_max, sm_sum, sm_max_idx, sm_sum_idx, _SCALE,
         query_rope=qr, key_rope=kr,
-        actual_seq_qlen=qlen, actual_seq_klen=klen, layout='TND')
+        actual_seq_qlen=_QLEN_T, actual_seq_klen=_KLEN_T, layout='TND')
 
 
 def _bsnd_inputs():
@@ -131,8 +135,6 @@ def _tnd_inputs():
         InputSpec(shape=(t, _N1IDX), init="randn", dtype="float16", seed=46),
         InputSpec(shape=(t, _N1, _ROPE_DIM), init="randn", dtype="float16", seed=51),
         InputSpec(shape=(t, _N1, _ROPE_DIM), init="randn", dtype="float16", seed=52),
-        InputSpec(shape=(4,), dtype="int32", data=_GLOBAL_QLEN),
-        InputSpec(shape=(4,), dtype="int32", data=_GLOBAL_KLEN),
     ]
 
 
@@ -144,14 +146,13 @@ _BSND_DP_CP = [
     (Shard(0), Replicate()), (Shard(0), Shard(1)),
     (Shard(0), Shard(1)), (Shard(0), Replicate()),
 ]
-# TND primary placements: q..kr (7) + qlen,klen (2 replicate).
-_TND_REPL = [(Replicate(),)] * 9
-_TND_DP = [(Shard(0),)] * 7 + [(Replicate(),), (Replicate(),)]
+# TND primary placements: q..kr (7). qlen/klen are plain Tensors, not distributed.
+_TND_REPL = [(Replicate(),)] * 7
+_TND_DP = [(Shard(0),)] * 7
 _TND_DP_CP = [
     (Shard(0), Shard(0)), (Shard(0), Replicate()), (Shard(0), Shard(0)),
     (Shard(0), Replicate()), (Shard(0), Shard(0)),
     (Shard(0), Shard(0)), (Shard(0), Replicate()),
-    (Replicate(), Replicate()), (Replicate(), Replicate()),
 ]
 
 

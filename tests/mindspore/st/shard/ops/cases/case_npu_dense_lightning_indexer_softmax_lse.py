@@ -14,6 +14,7 @@
 # ============================================================================
 """Shard ops cases for ``npu_dense_lightning_indexer_softmax_lse``."""
 import numpy as np
+import mindspore as ms
 
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.custom_ops.experimental import npu_dense_lightning_indexer_softmax_lse
@@ -26,6 +27,9 @@ from tests.shard_ops.framework import (
 
 _GLOBAL_QLEN = np.array([128, 256, 384, 512], dtype=np.int32)
 _GLOBAL_KLEN = np.array([128, 256, 384, 512], dtype=np.int32)
+# qlen/klen: plain Tensor (not a DTensor), passed via extra_inputs (not distributed).
+_QLEN_T = ms.Tensor(_GLOBAL_QLEN, ms.int32)
+_KLEN_T = ms.Tensor(_GLOBAL_KLEN, ms.int32)
 
 
 def _softmax_lse_bsnd(q, k, w):
@@ -119,16 +123,13 @@ register(OpShardCase(
         InputSpec(shape=(512, 32, 128), init="randn", dtype="float16", seed=42),
         InputSpec(shape=(512, 1, 128), init="randn", dtype="float16", seed=43),
         InputSpec(shape=(512, 32), init="randn", dtype="float16", seed=44),
-        InputSpec(shape=(4,), dtype="int32", data=_GLOBAL_QLEN),
-        InputSpec(shape=(4,), dtype="int32", data=_GLOBAL_KLEN),
     ],
     placements=[
         (Replicate(),),
         (Replicate(),),
         (Replicate(),),
-        (Replicate(),),
-        (Replicate(),),
     ],
+    extra_inputs=[_QLEN_T, _KLEN_T],
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
@@ -142,16 +143,13 @@ register(OpShardCase(
         InputSpec(shape=(512, 32, 128), init="randn", dtype="float16", seed=42),
         InputSpec(shape=(512, 1, 128), init="randn", dtype="float16", seed=43),
         InputSpec(shape=(512, 32), init="randn", dtype="float16", seed=44),
-        InputSpec(shape=(4,), dtype="int32", data=_GLOBAL_QLEN),
-        InputSpec(shape=(4,), dtype="int32", data=_GLOBAL_KLEN),
     ],
     placements=[
         (Shard(0),),
         (Shard(0),),
         (Shard(0),),
-        (Replicate(),),
-        (Replicate(),),
     ],
+    extra_inputs=[_QLEN_T, _KLEN_T],
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
@@ -165,16 +163,13 @@ register(OpShardCase(
         InputSpec(shape=(512, 32, 128), init="randn", dtype="float16", seed=42),
         InputSpec(shape=(512, 1, 128), init="randn", dtype="float16", seed=43),
         InputSpec(shape=(512, 32), init="randn", dtype="float16", seed=44),
-        InputSpec(shape=(4,), dtype="int32", data=_GLOBAL_QLEN),
-        InputSpec(shape=(4,), dtype="int32", data=_GLOBAL_KLEN),
     ],
     placements=[
         (Shard(0), Shard(0)),
         (Shard(0), Replicate()),
         (Shard(0), Shard(0)),
-        (Replicate(), Replicate()),
-        (Replicate(), Replicate()),
     ],
+    extra_inputs=[_QLEN_T, _KLEN_T],
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
