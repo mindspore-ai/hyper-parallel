@@ -46,6 +46,7 @@ __all__ = [
     "PrepareModuleInput",
     "PrepareModuleInputOutput",
     "PrepareModuleOutput",
+    "NoParallel",
 ]
 
 
@@ -795,4 +796,168 @@ class PrepareModuleInputOutput(ParallelStyle):
             f"output_layouts={p_out.output_layouts}, "
             f"desired_output_layouts={p_out.desired_output_layouts}, "
             f"use_local_output={p_out.use_local_output})"
+        )
+
+
+class NoParallel(ParallelStyle):
+    """Replicate module parameters without sharding, while maintaining DTensor semantics.
+
+    Matches ``torchtitan.distributed.tensor_parallel.NoParallel``: parameters and buffers
+    are converted to fully replicated :class:`DTensor`, and I/O hooks ensure tensor
+    conversion and layout alignment at module boundaries.
+
+    Use this style for modules that must perform identical computations across TP ranks,
+    such as:
+
+    - MoE Router/Gate modules
+    - Normalization layers when sequence parallel is disabled
+    - Any module that should not shard weights but needs DTensor compatibility
+
+    Keyword Args:
+        input_layout (Placement, optional):
+            Layout used to annotate the first positional input if it is a plain tensor.
+            Defaults to ``Replicate()``.
+        output_layout (Placement, optional):
+            Target layout for the module output. If the output :class:`DTensor` has a
+            different placement, it will be redistributed. Defaults to ``Replicate()``.
+        desired_input_layout (Placement, optional):
+            Final layout for the first input after annotation/redistribution.
+            Defaults to ``Replicate()``. If different from ``input_layout``, a
+            redistribution is performed.
+        use_local_output (bool, optional):
+            If ``True``, convert the output :class:`DTensor` back to a local
+            tensor via ``to_local()``. Defaults to ``True``.
+
+    Example::
+
+        >>> from hyper_parallel import parallelize_module, NoParallel, init_device_mesh
+        >>> model = Transformer(...)
+        >>> tp_mesh = init_device_mesh("npu", (8,), mesh_dim_names=("tp",))
+        >>> parallelize_module(model, tp_mesh, {
+        ...     "router": NoParallel(),
+        ...     "norm": SequenceParallel() if use_sp else NoParallel(),
+        ... })
+    """
+
+    def __init__(
+        self,
+        *,
+        input_layout: Optional[Placement] = None,
+        output_layout: Optional[Placement] = None,
+        desired_input_layout: Optional[Placement] = None,
+        use_local_output: bool = True,
+    ) -> None:
+        super().__init__()
+        self.input_layout = input_layout or Replicate()
+        self.output_layout = output_layout or Replicate()
+        self.desired_input_layout = desired_input_layout or Replicate()
+        self.use_local_output = use_local_output
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"input_layout={self.input_layout}, "
+            f"output_layout={self.output_layout}, "
+            f"desired_input_layout={self.desired_input_layout}, "
+            f"use_local_output={self.use_local_output})"
+        )
+
+    @staticmethod
+    def _prepare_input_fn(
+        input_layout: Placement,
+        desired_input_layout: Placement,
+        inputs: Tuple[Any, ...],
+        device_mesh: DeviceMesh,
+    ) -> Any:
+        """Annotate and redistribute the first positional input.
+
+        If the first input is a plain tensor, wrap it as a :class:`DTensor` with
+        ``input_layout``. If the resulting :class:`DTensor` placements differ from
+        ``(desired_input_layout,)``, redistribute to the desired layout.
+
+        Args:
+            input_layout: Layout for :meth:`DTensor.from_local` annotation.
+            desired_input_layout: Target layout after redistribution.
+            inputs: Tuple of module forward inputs.
+            device_mesh: Device mesh for tensor distribution.
+
+        Returns:
+            Tuple of the first input (possibly converted/redistributed) followed by
+            any remaining positional inputs.
+        """
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor, DTensor):
+            input_tensor = DTensor.from_local(
+                input_tensor, device_mesh, (input_layout,)
+            )
+
+        if tuple(input_tensor.placements) != (desired_input_layout,):
+            input_tensor = input_tensor.redistribute(
+                device_mesh, (desired_input_layout,)
+            )
+
+        return (input_tensor, *inputs[1:])
+
+    @staticmethod
+    def _prepare_output_fn(
+        output_layout: Placement,
+        use_local_output: bool,
+        outputs: DTensor,
+        device_mesh: DeviceMesh,
+    ) -> Any:
+        """Redistribute output and optionally convert to local tensor.
+
+        If the output :class:`DTensor` placement differs from ``output_layout``,
+        redistribute it. If ``use_local_output`` is ``True``, convert the output
+        to a local tensor via ``to_local()``.
+
+        Args:
+            output_layout: Target output layout.
+            use_local_output: If ``True``, convert output to local tensor.
+            outputs: Module forward output (:class:`DTensor`).
+            device_mesh: Device mesh for redistribution.
+
+        Returns:
+            The output (possibly redistributed and/or converted to local tensor).
+        """
+        if tuple(outputs.placements) != (output_layout,):
+            outputs = outputs.redistribute(device_mesh, (output_layout,))
+
+        if use_local_output:
+            return outputs.to_local()
+        return outputs
+
+    def apply(self, module: Module, device_mesh: DeviceMesh) -> Module:
+        """Apply no-parallel style: replicate params/buffers and attach I/O hooks.
+
+        Args:
+            module: Any ``nn.Module`` or MindSpore ``Cell`` to wrap.
+            device_mesh: 1-D device mesh for tensor parallelism.
+
+        Returns:
+            The module with replicated :class:`DTensor` parameters and I/O hooks attached.
+        """
+
+        def input_fn(forward_module, forward_inputs, mesh):
+            return self._prepare_input_fn(
+                self.input_layout,
+                self.desired_input_layout,
+                forward_inputs,
+                mesh,
+            )
+
+        def output_fn(forward_module, forward_outputs, mesh):
+            return self._prepare_output_fn(
+                self.output_layout,
+                self.use_local_output,
+                forward_outputs,
+                mesh,
+            )
+
+        return distribute_module(
+            module,
+            device_mesh,
+            partition_fn=None,
+            input_fn=input_fn,
+            output_fn=output_fn,
         )
