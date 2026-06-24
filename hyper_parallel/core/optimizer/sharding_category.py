@@ -16,10 +16,10 @@
 """Category parameter with dtensor."""
 
 import itertools
+import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Tuple, Optional, Any
+from typing import Dict, List, Sequence, Tuple, Optional
 
-import torch
 import torch.distributed as dist
 
 from hyper_parallel.core.optimizer.dtensor_compat import (
@@ -28,6 +28,9 @@ from hyper_parallel.core.optimizer.dtensor_compat import (
     Shard,
     StridedShard,
 )
+
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class ParamLayoutSpec:
@@ -143,6 +146,30 @@ class ParamRecord:
 
     index: int
     param: DTensor
+    shard_meta: Optional["ParamShardMeta"] = None
+
+
+@dataclass(frozen=True)
+class ParamShardStageMeta:
+    """Per-stage shard metadata for uneven all-gather and slicing."""
+
+    tensor_dim: int
+    shard_size: int
+    cur_rank_in_shard_group: int
+    rank_shapes: Tuple[Tuple[int, ...], ...]
+    split_sizes: Tuple[int, ...]
+    pad_shape: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ParamShardMeta:
+    """Runtime shard metadata for one DTensor parameter."""
+
+    global_shape: Tuple[int, ...]
+    global_numel: int
+    local_shape: Tuple[int, ...]
+    local_numel: int
+    stage_metas: Tuple[ParamShardStageMeta, ...]
 
 
 @dataclass
@@ -258,7 +285,7 @@ def build_comm_domain_key(shard_spec: ParamShardSpec) -> CommDomainKey:
         mesh_rank_list = tuple(shard_spec.device_mesh.rank_list)
 
     return CommDomainKey(
-        mesh_shape = tuple(getattr(shard_spec.device_mesh, "mesh_shape", None) or shard_spec.device_mesh.mesh.shape),
+        mesh_shape=tuple(getattr(shard_spec.device_mesh, "mesh_shape", None) or shard_spec.device_mesh.mesh.shape),
         mesh_rank_list=mesh_rank_list,
         replicate_mesh_dims=shard_spec.replicate_mesh_dims,
         shard_mesh_dims=shard_spec.shard_mesh_dims,
@@ -345,22 +372,44 @@ class HSDPGroupAssignment:
         """Check if a given record is owned by the current replicate group rank."""
         return self.owner_rank_coord(record) == self.replicate_group_ranks
 
+    @staticmethod
+    def _format_device_mesh(device_mesh: Optional[DeviceMesh]) -> Optional[str]:
+        """Format device mesh as DeviceMesh((name=size, ...)) for debug logs."""
+        if device_mesh is None:
+            return None
+
+        mesh_shape = tuple(getattr(device_mesh, "mesh_shape", None) or device_mesh.mesh.shape)
+        mesh_dim_names = getattr(device_mesh, "mesh_dim_names", None)
+
+        if mesh_dim_names:
+            dims_desc = ", ".join(
+                f"{name}={size}" for name, size in zip(mesh_dim_names, mesh_shape)
+            )
+        else:
+            dims_desc = ", ".join(
+                f"dim_{idx}={size}" for idx, size in enumerate(mesh_shape)
+            )
+
+        return f"DeviceMesh(({dims_desc}))"
+
     def __str__(self) -> str:
         shard_ranks = [list(dist.get_process_group_ranks(pg)) for pg in self.shard_pgs if pg is not None]
         replicate_ranks = [list(dist.get_process_group_ranks(pg)) for pg in self.replicate_pgs if pg is not None]
 
         owned_names = [getattr(p, "model_name", f"p_{i}") for i, p in enumerate(self.owned_params)]
         all_names = [getattr(p, "model_name", f"p_{i}") for i, p in enumerate(self.all_params)]
+        device_mesh = self.all_records[0].param.device_mesh if self.all_records else None
+        device_mesh_str = self._format_device_mesh(device_mesh)
 
         return (
             f"HSDPGroupAssignment( \n"
             f"owned_params={owned_names}, \n"
             f"all_params={all_names}, \n"
-            f"replicate_group_ranks={self.replicate_group_ranks}, \n"
+            f"replicate_pg_ranks={replicate_ranks}, \n"
             f"replicate_sizes={self.replicate_sizes}, \n"
             f"is_shard={self.is_shard}, \n"
             f"shard_pg_ranks={shard_ranks}, \n"
-            f"replicate_pg_ranks={replicate_ranks}, \n"
+            f"device_mesh={device_mesh_str}, \n"
             f"layout_spec={self.layout_spec}) \n"
         )
 
@@ -438,255 +487,3 @@ def select_owned_records(
         record for record in records
         if owner_by_index.get(record.index) == replicate_group_ranks
     ]
-
-
-def chunk_update_by_layout(
-        global_update: torch.Tensor,
-        param: "DTensor",
-        layout_spec: "ParamLayoutSpec",
-) -> torch.Tensor:
-    """Slice a full update back to the local shard using narrow."""
-    if not hasattr(param, "device_mesh") or layout_spec is None or not layout_spec.shard_axes:
-        return global_update
-
-    device_mesh = param.device_mesh
-    mesh_coordinates = device_mesh.get_coordinate()
-
-    shard_axes = layout_spec.shard_axes
-    local_update = global_update
-
-    # Apply each shard axis in order. `narrow` returns a view and avoids
-    # creating all chunks when only the local rank's chunk is needed.
-    for mesh_dim, tensor_dim in shard_axes:
-        num_chunks = device_mesh.size(mesh_dim)
-
-        if num_chunks <= 1:
-            continue
-
-        local_rank = mesh_coordinates[mesh_dim]
-        chunk_size = local_update.size(tensor_dim) // num_chunks
-
-        local_update = local_update.narrow(tensor_dim, local_rank * chunk_size, chunk_size)
-
-    # Non-dim0 slicing may produce a non-contiguous view.
-    if not local_update.is_contiguous():
-        local_update = local_update.contiguous()
-
-    return local_update
-
-
-def _get_or_alloc_buffer(
-        cache: Optional[Dict],
-        key: Any,
-        numel: int,
-        dtype: torch.dtype,
-        device: torch.device,
-) -> torch.Tensor:
-    """Return a cached buffer with at least `numel` elements."""
-    if cache is not None and key in cache:
-        buf = cache[key]
-        if buf.numel() >= numel:
-            return buf
-        buf = torch.empty(numel, dtype=dtype, device=device)
-        cache[key] = buf
-        return buf
-
-    buf = torch.empty(numel, dtype=dtype, device=device)
-    if cache is not None:
-        cache[key] = buf
-    return buf
-
-
-def _early_return_tensors(
-        local_tensors: List[torch.Tensor],
-        keep_indices: Optional[set],
-) -> List[Optional[torch.Tensor]]:
-    """Return tensors directly when no communication is needed."""
-    if keep_indices is None:
-        return list(local_tensors)
-    return [t if i in keep_indices else None for i, t in enumerate(local_tensors)]
-
-
-def _prepare_gather_inputs(
-        current_tensors: List[torch.Tensor],
-        tensor_dim: int,
-        alignment_elements: int,
-) -> Tuple[List[torch.Tensor], List[Tuple[int, int, int, Tuple[int, ...]]], int]:
-    """Move shard dim to dim0 and compute padding metadata.
-
-    Returns:
-        (gather_inputs, param_meta, total_padded_numel)
-        param_meta item: (offset, actual_numel, padded_numel, rest_shape)
-    """
-    gather_inputs: List[torch.Tensor] = []
-    param_meta: List[Tuple[int, int, int, Tuple[int, ...]]] = []
-    total_padded_numel = 0
-
-    for t in current_tensors:
-        tensor_dim_norm = tensor_dim % t.dim()
-
-        # Put shard dim at dim0 so all-gather can concatenate along dim0.
-        if tensor_dim_norm == 0 and t.is_contiguous():
-            gi = t
-        else:
-            gi = t.movedim(tensor_dim_norm, 0).contiguous()
-
-        actual_numel = gi.numel()
-        padded_numel = ((actual_numel + alignment_elements - 1) // alignment_elements) * alignment_elements
-
-        gather_inputs.append(gi)
-        param_meta.append((total_padded_numel, actual_numel, padded_numel, tuple(gi.shape[1:])))
-        total_padded_numel += padded_numel
-
-    return gather_inputs, param_meta, total_padded_numel
-
-
-def _pack_and_allgather(
-        gather_inputs: List[torch.Tensor],
-        param_meta: List[Tuple[int, int, int, Tuple[int, ...]]],
-        total_padded_numel: int,
-        axis_idx: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        shard_pg: dist.ProcessGroup,
-        shard_size: int,
-        buffer_cache: Optional[Dict],
-) -> torch.Tensor:
-    """Pack local shards into one buffer, all-gather, return gathered view.
-
-    Returns:
-        gathered_view with shape [shard_size, total_padded_numel]
-    """
-    cache_key = ("fused_allgather", axis_idx, dtype, device)
-    pack_buffer = _get_or_alloc_buffer(
-        buffer_cache, cache_key, total_padded_numel,
-        dtype, device,
-    )[:total_padded_numel]
-
-    # Copy only real data. Padding is not zeroed because it is never read.
-    for gi, (offset, actual_numel, _, _) in zip(gather_inputs, param_meta):
-        pack_buffer[offset:offset + actual_numel].copy_(gi.view(-1))
-
-    gathered_numel = total_padded_numel * shard_size
-    cache_key_out = ("fused_allgather_out", axis_idx, dtype, device)
-    gathered_buffer = _get_or_alloc_buffer(
-        buffer_cache, cache_key_out, gathered_numel,
-        dtype, device,
-    )[:gathered_numel]
-
-    dist.all_gather_into_tensor(gathered_buffer, pack_buffer, group=shard_pg)
-
-    # Rank-major layout: [rank0_pack | rank1_pack | ...]
-    return gathered_buffer.view(shard_size, total_padded_numel)
-
-
-def _unpack_gathered_results(
-        gathered_view: torch.Tensor,
-        gather_inputs: List[torch.Tensor],
-        param_meta: List[Tuple[int, int, int, Tuple[int, ...]]],
-        current_tensors: List[torch.Tensor],
-        tensor_dim: int,
-        shard_size: int,
-        n_params: int,
-        is_last_axis: bool,
-        keep_indices: Optional[set],
-) -> List[Optional[torch.Tensor]]:
-    """Slice gathered buffer back to per-parameter full tensors."""
-    new_tensors: List[Optional[torch.Tensor]] = []
-    for i in range(n_params):
-        # Only the final output can be skipped.
-        # Earlier axis results may be needed by the next shard-axis gather.
-        if is_last_axis and keep_indices is not None and i not in keep_indices:
-            new_tensors.append(None)
-            continue
-
-        offset, actual_numel, _, rest_shape = param_meta[i]
-        dim0_size = gather_inputs[i].shape[0]
-
-        # Pick this parameter from every rank.
-        # This slice is usually non-contiguous because data is rank-major.
-        param_slice = gathered_view[:, offset:offset + actual_numel]
-
-        # Materialize as contiguous: [rank0_param | rank1_param | ...]
-        param_data = param_slice.contiguous()
-
-        # Restore full tensor with gathered dim0.
-        result = param_data.view(dim0_size * shard_size, *rest_shape)
-
-        # Move dim0 back to the original shard dimension.
-        tensor_dim_norm = tensor_dim % current_tensors[i].dim()
-        if tensor_dim_norm == 0:
-            new_tensors.append(result)
-        else:
-            new_tensors.append(result.movedim(0, tensor_dim_norm))
-
-    return new_tensors
-
-
-def fused_allgather_dtensor_params(
-        local_tensors: List[torch.Tensor],
-        shard_pgs: Sequence[dist.ProcessGroup],
-        layout_spec: ParamLayoutSpec,
-        buffer_cache: Optional[Dict] = None,
-        keep_indices: Optional[set] = None,
-) -> List[Optional[torch.Tensor]]:
-    """Fuse many parameter shards into one all-gather per shard axis.
-
-    Flow:
-      1. Move shard dim to dim0 if needed.
-      2. Pack all local shards into one flat buffer.
-      3. Run one all-gather on the packed buffer.
-      4. Slice gathered buffer back to per-parameter full tensors.
-      5. On the last shard axis, only unpack `keep_indices`.
-    """
-    if not shard_pgs or not local_tensors:
-        return _early_return_tensors(local_tensors, keep_indices)
-
-    n_params = len(local_tensors)
-    device = local_tensors[0].device
-    dtype = local_tensors[0].dtype
-    alignment_bytes = 512
-    element_size = local_tensors[0].element_size()
-    alignment_elements = max(1, alignment_bytes // element_size)
-
-    # Keep only real shard axes that need communication.
-    active_axes = []
-    for axis_idx, ((_, tensor_dim), shard_pg) in enumerate(zip(layout_spec.shard_axes, shard_pgs)):
-        if shard_pg is None:
-            continue
-        shard_size = dist.get_world_size(shard_pg)
-        if shard_size <= 1:
-            continue
-        active_axes.append((axis_idx, tensor_dim, shard_pg, shard_size))
-
-    if not active_axes:
-        return _early_return_tensors(local_tensors, keep_indices)
-
-    # After each shard axis, this becomes the partially gathered result.
-    current_tensors: List[torch.Tensor] = list(local_tensors)
-
-    for active_pos, (axis_idx, tensor_dim, shard_pg, shard_size) in enumerate(active_axes):
-        is_last_axis = active_pos == len(active_axes) - 1
-
-        gather_inputs, param_meta, total_padded_numel = _prepare_gather_inputs(
-            current_tensors, tensor_dim, alignment_elements,
-        )
-
-        gathered_view = _pack_and_allgather(
-            gather_inputs, param_meta, total_padded_numel,
-            axis_idx, dtype, device, shard_pg, shard_size, buffer_cache,
-        )
-
-        new_tensors = _unpack_gathered_results(
-            gathered_view, gather_inputs, param_meta,
-            current_tensors, tensor_dim, shard_size,
-            n_params, is_last_axis, keep_indices,
-        )
-
-        if is_last_axis:
-            return new_tensors
-
-        # Safe because keep_indices is only applied on the last axis.
-        current_tensors = new_tensors  # type: ignore[assignment]
-
-    return current_tensors

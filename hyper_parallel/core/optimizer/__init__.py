@@ -21,13 +21,16 @@ from typing import Any, Dict, List, Optional
 
 from torch import nn
 
+import hyper_parallel.core.optimizer.utils  # noqa: F401 - install rank0 logging helpers on logging.Logger
+
 from hyper_parallel.core.optimizer.adamw import AdamW
 from hyper_parallel.core.optimizer.lr_scheduler import get_hyper_lr_scheduler
 from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
+from hyper_parallel.core.optimizer.dtensor_compat import detect_dtensor_backend
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 __all__ = ['get_hyper_optimizer', 'get_hyper_lr_scheduler']
 
@@ -49,6 +52,8 @@ def get_hyper_optimizer(
         adamw_kwargs: Dedicated configurations dict for AdamW.
 
     Example:
+        from hyper_parallel.core.optimizer import get_hyper_optimizer
+
         _adamw_legacy = {
             'adamw_lr': 1e-3, 
             'adamw_weight_decay': 1e-2, 
@@ -57,10 +62,11 @@ def get_hyper_optimizer(
             'fused': True
         }
         _muon_legacy = {
-            'muon_lr': 2e-2, 
-            'muon_weight_decay': 0.1, 
-            'muon_momentum': 0.95, 
+            'muon_lr': 2e-2,
+            'muon_weight_decay': 0.1,
+            'muon_momentum': 0.95,
             'muon_ns_steps': 5,
+            'muon_ns_variant': 'asym5',
             'muon_nesterov': True,
             'muon_hsdp_replica_count': 2
         }
@@ -71,7 +77,9 @@ def get_hyper_optimizer(
             adamw_params=adamw_groups,
             adamw_kwargs=_adamw_legacy,
             muon_kwargs=_muon_legacy,
-        )        
+        )
+
+        optimizer.step()
     """
     # 1. Arguments Preparation
     # 1.1 adamw
@@ -98,7 +106,9 @@ def get_hyper_optimizer(
 
     # 2. Optimizer Creation
     optimizers = {}
+    detect_dtensor_backend(adamw_params, muon_params)
 
+    # build optimizer
     if adamw_params:
         optimizers["adamw"] = AdamW(adamw_params, **filtered_adamw_config)
         logger.info_rank0("Using adamw config: %s", filtered_adamw_config)
