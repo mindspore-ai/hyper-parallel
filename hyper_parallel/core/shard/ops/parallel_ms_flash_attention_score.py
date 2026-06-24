@@ -19,6 +19,7 @@
 import copy
 import warnings
 
+from dataclasses import dataclass
 from typing import List, Tuple, Optional
 from hyper_parallel.core.shard.ops.parallel_npu_flash_attention_score import (  # pylint: disable=C0415
     _get_lb_override,
@@ -83,6 +84,20 @@ def _resolve_input_layout(input_layout) -> str:
     if isinstance(input_layout, int) and input_layout in INPUT_LAYOUT_INT_TO_STR:
         return INPUT_LAYOUT_INT_TO_STR[input_layout]
     return str(input_layout)
+
+
+@dataclass
+class MsTndLayoutContext:
+    """Groups TND layout adjustment parameters to reduce argument count."""
+    sparse_mode: int
+    pre_tokens: int
+    next_tokens: int
+    actual_seq_qlen: Optional[List[int]]
+    actual_seq_kvlen: Optional[List[int]]
+    seq_split_num: int
+    split_id: int
+    kv_seq_split_num: int
+    is_dynamic: bool
 
 
 class FlashAttentionScoreDistributedOp(DistributedOp):
@@ -688,15 +703,7 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
         query_layout: Layout,
         key_layout: Optional[Layout],
         input_layout: str,
-        sparse_mode: int,
-        pre_tokens: int,
-        next_tokens: int,
-        actual_seq_qlen: Optional[List[int]],
-        actual_seq_kvlen: Optional[List[int]],
-        seq_split_num: int,
-        split_id: int,
-        kv_seq_split_num: int,
-        is_dynamic: bool,
+        tnd_ctx: MsTndLayoutContext,
     ) -> Tuple:
         """Adjust parameters for TND layout including CP and DP modes."""
         batch_split_num, s1_split_num = self._calculate_tnd_split_params(
@@ -704,26 +711,26 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
         )
 
         if s1_split_num > 1:
-            if is_dynamic:
-                if sparse_mode != SPARSE_RIGHT_DOWN_CAUSAL:
+            if tnd_ctx.is_dynamic:
+                if tnd_ctx.sparse_mode != SPARSE_RIGHT_DOWN_CAUSAL:
                     raise ValueError(
                         f"TND layout with context parallelism "
                         f"(s1_split_num={s1_split_num} > 1) requires "
                         f"sparse_mode={SPARSE_RIGHT_DOWN_CAUSAL}, "
-                        f"but got {sparse_mode}"
+                        f"but got {tnd_ctx.sparse_mode}"
                     )
             else:
-                query_global_t = query.shape[0] * seq_split_num
-                key_global_t = key.shape[0] * kv_seq_split_num
+                query_global_t = query.shape[0] * tnd_ctx.seq_split_num
+                key_global_t = key.shape[0] * tnd_ctx.kv_seq_split_num
                 self._validate_tnd_cp_requirements(
                     query_layout, key_layout, input_layout,
-                    sparse_mode,
+                    tnd_ctx.sparse_mode,
                     batch_split_num, s1_split_num,
                     (query_global_t, *query.shape[1:]),
                     (key_global_t, *key.shape[1:])
                 )
         else:
-            if not is_dynamic and query.shape[0] != key.shape[0]:
+            if not tnd_ctx.is_dynamic and query.shape[0] != key.shape[0]:
                 raise ValueError(
                     f"TND layout with DP-only (s1_split_num=1) requires "
                     f"Query and Key to have the same local T-dimension, "
@@ -734,21 +741,21 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
                     f"s1_split_num: {s1_split_num}"
                 )
 
-        if actual_seq_qlen is None or actual_seq_kvlen is None:
+        if tnd_ctx.actual_seq_qlen is None or tnd_ctx.actual_seq_kvlen is None:
             raise ValueError(
                 "When using TND layout with sequence parallelism, "
                 "actual_seq_qlen and actual_seq_kvlen must be provided."
             )
 
-        kv_is_sharded = kv_seq_split_num > 1
+        kv_is_sharded = tnd_ctx.kv_seq_split_num > 1
         adjusted_actual_seq_qlen, adjusted_actual_seq_kvlen = (
             self._adjust_actual_seq_len_for_tnd_cp(
-                query, key, actual_seq_qlen, actual_seq_kvlen,
-                split_id, kv_is_sharded
+                query, key, tnd_ctx.actual_seq_qlen, tnd_ctx.actual_seq_kvlen,
+                tnd_ctx.split_id, kv_is_sharded
             )
         )
 
-        return (sparse_mode, pre_tokens, next_tokens,
+        return (tnd_ctx.sparse_mode, tnd_ctx.pre_tokens, tnd_ctx.next_tokens,
                 adjusted_actual_seq_qlen, adjusted_actual_seq_kvlen)
 
     def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
@@ -768,9 +775,11 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
             key_layout_check = layouts[1]
             value_layout_check = layouts[2]
 
-            if (key_layout_check is not None and value_layout_check is not None and
+            has_valid_layouts = (key_layout_check is not None and value_layout_check is not None)
+            has_tensor_maps = has_valid_layouts and (
                 hasattr(key_layout_check, 'tensor_map') and
-                hasattr(value_layout_check, 'tensor_map')):
+                hasattr(value_layout_check, 'tensor_map'))
+            if has_tensor_maps:
                 if key_layout_check.tensor_map != value_layout_check.tensor_map:
                     raise ValueError(
                         f"Key and Value must have identical sharding strategies.\n"
@@ -786,7 +795,7 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
             self._to_python_scalar(extra_args[EA_INPUT_LAYOUT])
         )
 
-        def expanded_impl(
+        def expanded_impl(  # pylint: disable=R0913
             query, key, value,
             real_shift, drop_mask, padding_mask, attn_mask, prefix,
             actual_seq_qlen, actual_seq_kvlen,
@@ -879,11 +888,15 @@ class FlashAttentionScoreDistributedOp(DistributedOp):
                      adjusted_actual_seq_qlen,
                      adjusted_actual_seq_kvlen) = self._adjust_tnd_layout_params(
                         query, key, query_layout, key_layout,
-                        input_layout, sparse_mode,
-                        pre_tokens, next_tokens,
-                        actual_seq_qlen, actual_seq_kvlen,
-                        seq_split_num, split_id,
-                        kv_seq_split_num, is_dynamic,
+                        input_layout,
+                        MsTndLayoutContext(
+                            sparse_mode=sparse_mode, pre_tokens=pre_tokens,
+                            next_tokens=next_tokens,
+                            actual_seq_qlen=actual_seq_qlen,
+                            actual_seq_kvlen=actual_seq_kvlen,
+                            seq_split_num=seq_split_num, split_id=split_id,
+                            kv_seq_split_num=kv_seq_split_num, is_dynamic=is_dynamic,
+                        ),
                     )
 
             result = func(

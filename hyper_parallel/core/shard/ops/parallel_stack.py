@@ -58,13 +58,14 @@ class StackDistributedOp(DistributedOp):
 
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, cache_values):
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layout based on cache values for torch.stack.
 
         All validation logic (e.g., empty checks, layout consistency,
         and dimension bounds) is handled here.
         """
+        cache_values = layouts
         layouts = cache_values[:-1]
         dim = cache_values[-1]
 
