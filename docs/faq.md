@@ -73,7 +73,7 @@ python -c "import torch; print(torch.__version__); print(torch._GLIBCXX_USE_CXX1
 
 **解决**：
 
-1. 检查 `PipelineStage(stage_index, stage_num)` 参数是否正确
+1. 检查 `PipelineStage(submodule, stage_index, stage_num)` 参数是否正确
 2. 确保所有 stage 的 `stage_num` 一致
 3. MindSpore 后端确保 batch_size 整除 micro_batch_num
 
@@ -90,10 +90,12 @@ python -c "import torch; print(torch.__version__); print(torch._GLIBCXX_USE_CXX1
 **解决**：使用 `policy_fn` 过滤小 tensor，只 swap 大激活。
 
 ```python
+from hyper_parallel.core.activation_checkpoint import CheckpointPolicy
+
 def swap_policy(target):
     if target.numel() < 1024:
-        return CheckpointPolicy.MUST_SAVE  # 小 tensor 不 swap
-    return None
+        return CheckpointPolicy.MUST_SAVE   # 小 tensor 不 swap，保留在设备上
+    return CheckpointPolicy.MUST_SWAP       # 大激活 offload 到 host
 ```
 
 ### Q: Context Parallel 在 MindSpore 上不工作
@@ -152,6 +154,8 @@ init_process_group(backend="hccl")
 **解决**：确保使用 `fully_shard` 后再创建 optimizer。FSDP 会自动将 optimizer 状态分片。
 
 ```python
+from hyper_parallel.core.optimizer import get_hyper_optimizer
+
 model = fully_shard(model, mesh=mesh)  # 先 FSDP
 optimizer = get_hyper_optimizer(...)    # 后创建 optimizer
 ```
