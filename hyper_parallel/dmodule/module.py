@@ -18,8 +18,9 @@ Layers inherit from :class:`Module`, declare ``Config`` with ``param_init`` and
 :class:`~hyper_parallel.dmodule.sharding.ShardingConfig`, then call
 :meth:`Module.init_states` and :meth:`Module.parallelize`.
 """
-
 from __future__ import annotations
+
+__all__ = ["Module"]
 
 import inspect
 import logging
@@ -35,6 +36,11 @@ from hyper_parallel.config.configurable import Configurable, enforce_module_conf
 from hyper_parallel.dmodule.sharding import ShardingConfig, resolve_placements
 
 logger = logging.getLogger(__name__)
+
+_FORWARD_POSITIONAL_KINDS = (
+    inspect.Parameter.POSITIONAL_ONLY,
+    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+)
 platform = get_platform()
 _PlatformModule = platform.Module
 
@@ -235,12 +241,7 @@ class Module(_PlatformModule, Configurable):
         self._pos_arg_list = [
             p.name
             for p in sig.parameters.values()
-            if p.kind
-            in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            )
-            and p.name != "self"
+            if p.kind in _FORWARD_POSITIONAL_KINDS and p.name != "self"
         ]
         return self._pos_arg_list
 
@@ -290,7 +291,7 @@ class Module(_PlatformModule, Configurable):
             raise ValueError("DeviceMesh must have mesh_dim_names for parallelize()")
 
         self._shard_states(tp_mesh, sc, mesh_axis_names)
-        self._cache_pos_arg_names()
+        _ = self._cache_pos_arg_names()
         unbound_forward = type(self).forward
 
         def forward_with_redistribution(*args, **kwargs):
@@ -472,6 +473,3 @@ def __getattr__(name: str):
         globals()[name] = cls
         return cls
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-__all__ = ["Module"]

@@ -17,10 +17,17 @@
 Mirrors ``examples/torch/llama3/parallelize.py``: embedding row-wise + sequence axis shard,
 sequence-parallel norms, Colwise/Rowwise ``Dense`` pairs for attention and SwiGLU.
 """
+# pylint: disable=C0413
 from __future__ import annotations
+
+import os
+
+os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "mindspore")
 
 from mindspore import nn
 from mindspore.communication import get_group_size
+
+from model import Llama3Model
 
 from hyper_parallel import (
     ColwiseParallel,
@@ -33,8 +40,6 @@ from hyper_parallel import (
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.platform import get_platform
-
-from model import Llama3Model
 
 
 def parallelize_llama3(

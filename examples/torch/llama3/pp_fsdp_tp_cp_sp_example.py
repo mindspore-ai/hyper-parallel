@@ -53,25 +53,12 @@ Constraints:
 * ``seq_len % cp == 0``; ``(seq_len // cp) % tp == 0``.
 * batch size divisible by PP micro-batch count.
 """
-# pylint: disable=C0413
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 import torch.distributed as dist
-
-from hyper_parallel import ContextParallel, DTensor, SkipDTensorDispatch, fully_shard, init_device_mesh
-from hyper_parallel.core.dtensor.placement_types import Replicate
-from hyper_parallel.core.pipeline_parallel.scheduler import Schedule1F1B
 
 from demo_utils import init_dist, train_steps
 from model import Llama3DemoConfig
@@ -81,6 +68,10 @@ from pipeline import (
     build_pipeline_stage,
     split_batch_dim0,
 )
+
+from hyper_parallel import ContextParallel, DTensor, SkipDTensorDispatch, fully_shard, init_device_mesh
+from hyper_parallel.core.dtensor.placement_types import Replicate
+from hyper_parallel.core.pipeline_parallel.scheduler import Schedule1F1B
 
 _ENV_DEFAULTS = {
     "LLAMA3_PP_SIZE": "2",
@@ -171,6 +162,22 @@ def _validate_demo_constraints(
     return seq_per_cp
 
 
+def _should_log_step_loss(
+    is_last: bool,
+    tp_mesh,
+    cp_rank: int,
+    fsdp_mesh,
+) -> bool:
+    """Return whether this rank should print the per-step loss summary."""
+    if not is_last:
+        return False
+    if tp_mesh.get_local_rank() != 0:
+        return False
+    if cp_rank != 0:
+        return False
+    return fsdp_mesh.get_local_rank() == 0
+
+
 def _build_scheduled_stage(
     cfg: Llama3DemoConfig,
     *,
@@ -254,7 +261,7 @@ def _run_training_loop(
         with SkipDTensorDispatch():
             optimizer.step()
 
-        if is_last and tp_mesh.get_local_rank() == 0 and cp_rank == 0 and fsdp_mesh.get_local_rank() == 0:
+        if _should_log_step_loss(is_last, tp_mesh, cp_rank, fsdp_mesh):
             mean_loss = sum(
                 loss.item() if not hasattr(loss, "to_local") else loss.to_local().item()
                 for loss in losses

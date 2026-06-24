@@ -57,25 +57,13 @@ Requirements:
     * ``num_experts`` must be divisible by ``MOE_EP_SIZE``.
     * ``n_layers`` must be >= ``MOE_PP_SIZE``.
 """
-# pylint: disable=C0413
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-
-from hyper_parallel import init_device_mesh
-from hyper_parallel.core.pipeline_parallel.scheduler import Schedule1F1B
 
 from demo_utils import init_dist
 from model import MoEDemoConfig, MoEDemoModel
@@ -87,6 +75,9 @@ from pipeline import (
     extract_stage_state_dict,
     split_batch_dim0,
 )
+
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.pipeline_parallel.scheduler import Schedule1F1B
 
 
 SEED_MODEL = 42

@@ -148,7 +148,7 @@ class ParallelInput:
                     profile_list = csv_result[config_str]
                 else:
                     profile_list = []
-                # TODO: profiling parse input to be confirmed, e.g. rank
+                # Note: profiling parse input to be confirmed, e.g. rank
                 profile_info = ProfileInfo(args.profile_data_dir, profile_list)
                 input_args = self.get_args_info(para, config_file)
                 pipeline_input_config = PipelineInputConfig(profile_info, config_file, input_args)
