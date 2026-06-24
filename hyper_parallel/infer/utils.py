@@ -33,6 +33,13 @@ class GenerationConfig:
     pad_token_id: int = 0
     repetition_penalty: float = 1.0
     use_cache: bool = True
+    prefix_past_key_values: Optional[Any] = None
+    prefix_attention_mask: Optional[torch.Tensor] = None
+    prefix_sequence_shard_info: Optional[Any] = None
+    prefix_cache_length: Optional[int] = None
+    context_parallel_cache: bool = False
+    context_parallel_rank: Optional[int] = None
+    context_parallel_world_size: Optional[int] = None
     # context_logits_rank is local to context_process_group.
     context_logits_rank: Optional[Any] = None
     context_process_group: Optional[Any] = None
@@ -54,6 +61,34 @@ class GenerationConfig:
             raise ValueError("top_p must be in (0, 1]")
         if self.repetition_penalty <= 0:
             raise ValueError("repetition_penalty must be > 0")
+        if self.prefix_past_key_values is None:
+            if self.prefix_attention_mask is not None:
+                raise ValueError("prefix_attention_mask requires prefix_past_key_values")
+            if self.prefix_sequence_shard_info is not None:
+                raise ValueError("prefix_sequence_shard_info requires prefix_past_key_values")
+            if self.prefix_cache_length is not None:
+                raise ValueError("prefix_cache_length requires prefix_past_key_values")
+        else:
+            if not self.use_cache:
+                raise ValueError("prefix_past_key_values requires use_cache=True")
+            if self.prefix_cache_length is not None and self.prefix_cache_length < 0:
+                raise ValueError("prefix_cache_length must be >= 0")
+            if self.prefix_sequence_shard_info is not None and not self.context_parallel_cache:
+                raise ValueError("prefix_sequence_shard_info requires context_parallel_cache=True")
+        if self.context_parallel_cache and not self.use_cache:
+            raise ValueError("context_parallel_cache requires use_cache=True")
+        if (self.context_parallel_rank is None) != (self.context_parallel_world_size is None):
+            raise ValueError(
+                "context_parallel_rank and context_parallel_world_size must be set together",
+            )
+        if self.context_parallel_world_size is not None:
+            if self.context_parallel_world_size <= 0:
+                raise ValueError("context_parallel_world_size must be > 0")
+            if (
+                self.context_parallel_rank < 0
+                or self.context_parallel_rank >= self.context_parallel_world_size
+            ):
+                raise ValueError("context_parallel_rank must be in [0, context_parallel_world_size)")
         if self.logits_gather_dim >= 0:
             raise ValueError("logits_gather_dim must be negative")
         if self.mask_dtype is not None and not isinstance(self.mask_dtype, torch.dtype):

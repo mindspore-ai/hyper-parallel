@@ -119,7 +119,38 @@ Context-parallel prefill can select final-token logits from the rank that owns
 the global last prompt token by setting `context_logits_rank` and passing the
 context-parallel process group through `context_process_group`. This keeps
 sampling decisions identical across ranks after sequence-sharded prefill.
-CP KV cache helpers remain internal until they are wired into model-specific
-parallel generate paths. For models that already return full replicated logits
-on each rank, the single-process API can be used directly without enabling
-logits gathering.
+
+Context-parallel KV cache decode is available as an opt-in path by setting
+`GenerationConfig(context_parallel_cache=True)`. The model forward may either
+return a full prefill cache, which `generate` shards into a
+`ContextParallelKVCache`, or return a local cache together with
+`sequence_shard_info`. During cached decode, CP-aware models must accept the
+local `past_key_values`, the current `sequence_shard_info`, and
+`global_seq_len`, then return updated local K/V tensors plus the next
+`sequence_shard_info`.
+
+Contiguous prefix cache reuse is supported by passing
+`prefix_past_key_values` and `prefix_attention_mask` in `GenerationConfig`.
+The prefix cache is treated as a continuous history immediately before
+`input_ids`; returned token ids contain only `input_ids` and newly generated
+tokens, not the reused prefix tokens. For CP prefix cache, callers may pass a
+full prefix cache or a local prefix cache with `prefix_sequence_shard_info`.
+
+Supported CP cache boundary:
+
+- contiguous sequence shards only;
+- append-only decode positions;
+- contiguous prefix cache reuse before `input_ids`;
+- `context_logits_rank` is local to `context_process_group`;
+- packed/non-contiguous cache layouts are not part of this generic generate
+  path because they require explicit per-token position or segment metadata
+  and model-side attention support.
+
+Run the end-to-end CP cache check with:
+
+```bash
+python -m torch.distributed.run --nproc_per_node=2 examples/generate/cp_generate_check.py
+```
+
+For models that already return full replicated logits on each rank, the
+single-process API can be used directly without enabling logits gathering.

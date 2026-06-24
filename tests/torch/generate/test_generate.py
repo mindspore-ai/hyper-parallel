@@ -85,6 +85,22 @@ def test_generation_config_validation():
         GenerationConfig(top_p=0)
     with pytest.raises(ValueError, match="top_k"):
         GenerationConfig(top_k=-1)
+    with pytest.raises(ValueError, match="prefix_attention_mask"):
+        GenerationConfig(prefix_attention_mask=torch.ones(1, 1))
+    with pytest.raises(ValueError, match="use_cache"):
+        GenerationConfig(prefix_past_key_values=[], prefix_cache_length=0, use_cache=False)
+    with pytest.raises(ValueError, match="prefix_cache_length"):
+        GenerationConfig(prefix_past_key_values=[], prefix_cache_length=-1)
+    with pytest.raises(ValueError, match="use_cache"):
+        GenerationConfig(context_parallel_cache=True, use_cache=False)
+    with pytest.raises(ValueError, match="set together"):
+        GenerationConfig(context_parallel_cache=True, context_parallel_rank=0)
+    with pytest.raises(ValueError, match="context_parallel_rank"):
+        GenerationConfig(
+            context_parallel_cache=True,
+            context_parallel_rank=2,
+            context_parallel_world_size=2,
+        )
     with pytest.raises(ValueError, match="logits_processor"):
         GenerationConfig(logits_processor=[object()])
     with pytest.raises(ValueError, match="mask_dtype"):
@@ -222,6 +238,24 @@ def test_generate_input_only_model_omits_unsupported_kwargs():
     )
 
     assert out.tolist() == [[7, 8, 2, 3]]
+
+
+def test_context_parallel_cache_requires_rank_world_or_dist():
+    """
+    Feature: context-parallel cache setup
+    Description: CP cache needs either explicit rank metadata or torch.distributed.
+    Expectation: Missing rank metadata raises a clear ValueError.
+    """
+    with pytest.raises(ValueError, match="context_parallel_cache requires"):
+        generate(
+            CacheLengthLM(vocab_size=32),
+            torch.tensor([[7, 8]]),
+            GenerationConfig(
+                max_new_tokens=1,
+                eos_token_id=None,
+                context_parallel_cache=True,
+            ),
+        )
 
 
 def test_generate_preserves_internal_type_error():

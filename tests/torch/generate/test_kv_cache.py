@@ -31,9 +31,9 @@ from hyper_parallel.infer.kv_cache import (
 from tests.torch.generate.stub_model import CacheLengthLM, NoCacheLengthLM
 
 
-def _past(seq_len: int, requires_grad: bool = False):
-    key = torch.ones(2, 3, seq_len, 4, requires_grad=requires_grad)
-    value = torch.ones(2, 3, seq_len, 4, requires_grad=requires_grad)
+def _past(seq_len: int, requires_grad: bool = False, batch_size: int = 2):
+    key = torch.ones(batch_size, 3, seq_len, 4, requires_grad=requires_grad)
+    value = torch.ones(batch_size, 3, seq_len, 4, requires_grad=requires_grad)
     return [(key, value)]
 
 
@@ -214,6 +214,87 @@ def test_left_padded_attention_cache_decode_matches_no_cache_decode():
     )
 
     assert torch.equal(cache_output, no_cache_output)
+
+
+def test_prefix_cache_reuse_matches_full_prompt_generation():
+    """
+    Feature: prefix cache reuse
+    Description: Continue generation from a contiguous prefix KV cache.
+    Expectation: Reused prefix cache matches full prompt generation after the prefix.
+    """
+    prefix_ids = torch.tensor([[7, 2], [3, 7]])
+    prefix_mask = torch.ones_like(prefix_ids)
+    suffix_ids = torch.tensor([[1], [1]])
+    suffix_mask = torch.ones_like(suffix_ids)
+    config_kwargs = {
+        "max_new_tokens": 3,
+        "do_sample": False,
+        "eos_token_id": None,
+        "pad_token_id": 0,
+    }
+    prefix_model = TinyAttentionCacheLM(vocab_size=64)
+    prefix_outputs = prefix_model(
+        input_ids=prefix_ids,
+        attention_mask=torch.zeros(2, 1, 2, 2),
+        use_cache=True,
+    )
+
+    reused = generate(
+        TinyAttentionCacheLM(vocab_size=64),
+        suffix_ids,
+        GenerationConfig(
+            **config_kwargs,
+            prefix_past_key_values=prefix_outputs["past_key_values"],
+            prefix_attention_mask=prefix_mask,
+        ),
+        attention_mask=suffix_mask,
+    )
+    full = generate(
+        TinyAttentionCacheLM(vocab_size=64),
+        torch.cat([prefix_ids, suffix_ids], dim=-1),
+        GenerationConfig(**config_kwargs),
+        attention_mask=torch.cat([prefix_mask, suffix_mask], dim=-1),
+    )
+
+    assert torch.equal(reused, full[:, prefix_ids.shape[-1]:])
+
+
+def test_prefix_cache_reuse_requires_model_cache_output():
+    """
+    Feature: prefix cache reuse validation
+    Description: Prefix reuse cannot fall back to no-cache recompute without prefix ids.
+    Expectation: Missing updated model cache raises a clear ValueError.
+    """
+    with pytest.raises(ValueError, match="prefix_past_key_values"):
+        generate(
+            NoCacheLengthLM(vocab_size=32),
+            torch.tensor([[1]]),
+            GenerationConfig(
+                max_new_tokens=1,
+                eos_token_id=None,
+                prefix_past_key_values=_past(2, batch_size=1),
+                prefix_attention_mask=torch.ones(1, 2),
+            ),
+        )
+
+
+def test_prefix_cache_batch_size_must_match_input_ids():
+    """
+    Feature: prefix cache validation
+    Description: Prefix cache batch size should match the new prompt batch size.
+    Expectation: Mismatch raises a clear ValueError before model forward.
+    """
+    with pytest.raises(ValueError, match="batch size"):
+        generate(
+            TinyAttentionCacheLM(vocab_size=64),
+            torch.tensor([[1]]),
+            GenerationConfig(
+                max_new_tokens=1,
+                eos_token_id=None,
+                prefix_past_key_values=_past(2),
+                prefix_attention_mask=torch.ones(1, 2),
+            ),
+        )
 
 
 def test_cache_and_no_cache_decode_logits_cosine_similarity():

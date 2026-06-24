@@ -17,8 +17,9 @@ import inspect
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 
-from hyper_parallel.infer.kv_cache import KVCache
+from hyper_parallel.infer.kv_cache import ContextParallelKVCache, KVCache
 from hyper_parallel.infer.sampler import sample_next_token
 from hyper_parallel.infer.utils import (
     GenerationConfig,
@@ -44,6 +45,8 @@ def _model_forward(
     attention_mask: Optional[torch.Tensor],
     past_key_values,
     use_cache: bool,
+    sequence_shard_info=None,
+    global_seq_len: Optional[int] = None,
 ):
     kwargs = {
         "input_ids": input_ids,
@@ -51,6 +54,8 @@ def _model_forward(
         "attention_mask": attention_mask,
         "past_key_values": past_key_values,
         "use_cache": use_cache,
+        "sequence_shard_info": sequence_shard_info,
+        "global_seq_len": global_seq_len,
     }
     forward = getattr(model, "forward", model)
     try:
@@ -67,6 +72,143 @@ def _model_forward(
             if name not in parameters:
                 kwargs.pop(name)
     return forward(**kwargs)
+
+
+def _resolve_context_parallel_rank_world(config: GenerationConfig) -> tuple[int, int]:
+    if config.context_parallel_rank is not None:
+        return config.context_parallel_rank, config.context_parallel_world_size
+    if not dist.is_available() or not dist.is_initialized():
+        raise ValueError(
+            "context_parallel_cache requires initialized torch.distributed "
+            "or explicit context_parallel_rank/context_parallel_world_size",
+        )
+    return (
+        dist.get_rank(group=config.context_process_group),
+        dist.get_world_size(group=config.context_process_group),
+    )
+
+
+def _init_cache(config: GenerationConfig) -> KVCache:
+    if not config.context_parallel_cache:
+        return KVCache()
+    rank, world_size = _resolve_context_parallel_rank_world(config)
+    return ContextParallelKVCache(rank=rank, world_size=world_size)
+
+
+def _cache_shard_info(cache: KVCache):
+    return cache.shard_info if isinstance(cache, ContextParallelKVCache) else None
+
+
+def _cache_seq_len(past_key_values) -> Optional[int]:
+    if past_key_values is None:
+        return None
+    if hasattr(past_key_values, "get_seq_length") and not isinstance(
+        past_key_values, (list, tuple),
+    ):
+        return int(past_key_values.get_seq_length())
+    values = KVCache._detach_and_validate(past_key_values)
+    if not values:
+        return 0
+    return int(values[0][0].shape[-2])
+
+
+def _cache_batch_size(past_key_values) -> Optional[int]:
+    if past_key_values is None:
+        return None
+    if hasattr(past_key_values, "get_seq_length") and not isinstance(
+        past_key_values, (list, tuple),
+    ):
+        return None
+    values = KVCache._detach_and_validate(past_key_values)
+    if not values:
+        return None
+    return int(values[0][0].shape[0])
+
+
+def _resolve_prefix_length(config: GenerationConfig) -> int:
+    if config.prefix_past_key_values is None:
+        return 0
+    candidates = []
+    if config.prefix_cache_length is not None:
+        candidates.append(int(config.prefix_cache_length))
+    if config.prefix_attention_mask is not None:
+        candidates.append(int(config.prefix_attention_mask.shape[-1]))
+    if config.prefix_sequence_shard_info is not None:
+        candidates.append(int(config.prefix_sequence_shard_info.global_seq_len))
+    seq_len = _cache_seq_len(config.prefix_past_key_values)
+    if seq_len is not None and config.prefix_sequence_shard_info is None:
+        candidates.append(seq_len)
+    if not candidates:
+        raise ValueError(
+            "prefix_past_key_values requires prefix_cache_length for opaque caches",
+        )
+    prefix_len = candidates[0]
+    if any(length != prefix_len for length in candidates):
+        raise ValueError("prefix cache length metadata is inconsistent")
+    return prefix_len
+
+
+def _prepare_prefix_attention_mask(
+    config: GenerationConfig,
+    input_ids: torch.Tensor,
+    device,
+) -> tuple[Optional[torch.Tensor], int]:
+    prefix_len = _resolve_prefix_length(config)
+    if prefix_len == 0:
+        return None, 0
+    cache_batch_size = _cache_batch_size(config.prefix_past_key_values)
+    if cache_batch_size is not None and cache_batch_size != input_ids.size(0):
+        raise ValueError("prefix cache batch size must match input_ids batch size")
+    prefix_attention_mask = config.prefix_attention_mask
+    if prefix_attention_mask is None:
+        return torch.ones(
+            input_ids.size(0),
+            prefix_len,
+            device=device,
+            dtype=torch.long,
+        ), prefix_len
+    if prefix_attention_mask.ndim != 2:
+        raise ValueError("prefix_attention_mask must have shape (batch, prefix_seq)")
+    if prefix_attention_mask.shape != (input_ids.size(0), prefix_len):
+        raise ValueError("prefix_attention_mask batch/sequence length mismatch")
+    return prefix_attention_mask.to(device=device), prefix_len
+
+
+def _init_cache_with_prefix(config: GenerationConfig) -> tuple[KVCache, int]:
+    cache = _init_cache(config)
+    prefix_len = _resolve_prefix_length(config)
+    if prefix_len == 0:
+        return cache, prefix_len
+    if isinstance(cache, ContextParallelKVCache):
+        if config.prefix_sequence_shard_info is None:
+            cache.update_full(config.prefix_past_key_values)
+        else:
+            cache.update_local(
+                config.prefix_past_key_values,
+                config.prefix_sequence_shard_info,
+            )
+        return cache, prefix_len
+    cache.update(config.prefix_past_key_values)
+    return cache, prefix_len
+
+
+def _update_cache(cache: KVCache, outputs) -> None:
+    past_key_values = _get_output(outputs, "past_key_values")
+    if not isinstance(cache, ContextParallelKVCache):
+        cache.update(past_key_values)
+        return
+    if past_key_values is None:
+        return
+    sequence_shard_info = _get_output(outputs, "sequence_shard_info")
+    if sequence_shard_info is not None:
+        cache.update_local(past_key_values, sequence_shard_info)
+        return
+    if cache.is_empty:
+        cache.update_full(past_key_values)
+        return
+    raise ValueError(
+        "context-parallel cached decode requires model output sequence_shard_info",
+    )
 
 
 def _resolve_mask_dtype(model, config: GenerationConfig) -> torch.dtype:
@@ -102,6 +244,72 @@ def _build_decode_key_mask(
     )
     padding = attention_mask == 0
     return mask.masked_fill(padding.view(batch_size, 1, 1, seq_len), float("-inf"))
+
+
+def _combined_attention_mask(
+    prefix_attention_mask: Optional[torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if prefix_attention_mask is None:
+        return attention_mask
+    if attention_mask is None:
+        return prefix_attention_mask
+    return torch.cat([prefix_attention_mask, attention_mask], dim=-1)
+
+
+def _build_prefill_mask(
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    prefix_attention_mask: Optional[torch.Tensor],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if prefix_attention_mask is None:
+        return build_causal_mask(input_ids, attention_mask, dtype=dtype)
+    batch_size, query_len = input_ids.shape
+    prefix_len = prefix_attention_mask.shape[-1]
+    device = input_ids.device
+    if attention_mask is None:
+        attention_mask = torch.ones(
+            batch_size,
+            query_len,
+            device=device,
+            dtype=prefix_attention_mask.dtype,
+        )
+    if attention_mask.shape != input_ids.shape:
+        raise ValueError("attention_mask must match input_ids shape")
+    mask = torch.zeros(
+        batch_size,
+        1,
+        query_len,
+        prefix_len + query_len,
+        device=device,
+        dtype=dtype,
+    )
+    causal = torch.triu(
+        torch.full((query_len, query_len), float("-inf"), device=device, dtype=dtype),
+        diagonal=1,
+    )
+    mask[:, :, :, prefix_len:] = causal.view(1, 1, query_len, query_len)
+    current_padding = attention_mask == 0
+    current_key_padding = torch.cat([prefix_attention_mask == 0, current_padding], dim=-1)
+    mask = mask.masked_fill(
+        current_key_padding.view(batch_size, 1, 1, prefix_len + query_len),
+        float("-inf"),
+    )
+    mask = mask.masked_fill(current_padding.view(batch_size, 1, query_len, 1), 0.0)
+    return mask
+
+
+def _build_prefill_position_ids(
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    prefix_attention_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    position_ids = build_position_ids(input_ids, attention_mask)
+    if prefix_attention_mask is None:
+        return position_ids
+    prefix_lengths = prefix_attention_mask.long().sum(dim=-1).view(-1, 1)
+    return position_ids + prefix_lengths
 
 
 def _prompt_lengths(input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor]):
@@ -170,7 +378,14 @@ def generate(
     try:
         mask_dtype = _resolve_mask_dtype(model, config)
         sequences = input_ids.clone()
+        prefix_attention_mask, prefix_len = _prepare_prefix_attention_mask(
+            config,
+            input_ids,
+            input_ids.device,
+        )
         current_attention_mask = attention_mask.clone() if attention_mask is not None else None
+        if prefix_attention_mask is not None and current_attention_mask is None:
+            current_attention_mask = torch.ones_like(sequences, dtype=torch.long)
         initial_attention_mask = (
             current_attention_mask.clone()
             if current_attention_mask is not None
@@ -184,11 +399,21 @@ def generate(
             input_ids.size(0), device=input_ids.device, dtype=torch.bool,
         )
 
-        cache = KVCache()
-        position_ids = build_position_ids(sequences, current_attention_mask)
-        prefill_mask = build_causal_mask(
+        prefix_valid_lengths = (
+            prefix_attention_mask.long().sum(dim=-1)
+            if prefix_attention_mask is not None
+            else torch.zeros(input_ids.size(0), device=input_ids.device, dtype=torch.long)
+        )
+        cache, prefix_len = _init_cache_with_prefix(config)
+        position_ids = _build_prefill_position_ids(
             sequences,
             current_attention_mask,
+            prefix_attention_mask,
+        )
+        prefill_mask = _build_prefill_mask(
+            sequences,
+            current_attention_mask,
+            prefix_attention_mask,
             dtype=mask_dtype,
         )
         outputs = _model_forward(
@@ -196,13 +421,20 @@ def generate(
             input_ids=sequences,
             position_ids=position_ids,
             attention_mask=prefill_mask,
-            past_key_values=None,
+            past_key_values=None if cache.is_empty else cache.past_key_values,
             use_cache=config.use_cache,
+            sequence_shard_info=_cache_shard_info(cache),
+            global_seq_len=prefix_len + sequences.shape[-1],
         )
         logits = _get_output(outputs, "logits")
         if logits is None:
             raise ValueError("model output must contain logits")
-        cache.update(_get_output(outputs, "past_key_values"))
+        if (
+            config.prefix_past_key_values is not None
+            and _get_output(outputs, "past_key_values") is None
+        ):
+            raise ValueError("prefix_past_key_values requires model to return past_key_values")
+        _update_cache(cache, outputs)
         use_cached_decode = config.use_cache and not cache.is_empty
 
         for step in range(config.max_new_tokens):
@@ -221,6 +453,10 @@ def generate(
                 current_attention_mask,
                 next_tokens,
             )
+            model_attention_mask = _combined_attention_mask(
+                prefix_attention_mask,
+                current_attention_mask,
+            )
             if config.eos_token_id is not None:
                 unfinished = unfinished & (next_tokens.squeeze(-1) != config.eos_token_id)
                 if not unfinished.any():
@@ -232,8 +468,8 @@ def generate(
 
             if use_cached_decode:
                 decode_input = next_tokens
-                decode_pos = prompt_lengths + generated_counts - 1
-                decode_mask = _build_decode_key_mask(current_attention_mask, mask_dtype)
+                decode_pos = prefix_valid_lengths + prompt_lengths + generated_counts - 1
+                decode_mask = _build_decode_key_mask(model_attention_mask, mask_dtype)
                 outputs = _model_forward(
                     model,
                     input_ids=decode_input,
@@ -241,13 +477,20 @@ def generate(
                     attention_mask=decode_mask,
                     past_key_values=cache.past_key_values,
                     use_cache=True,
+                    sequence_shard_info=_cache_shard_info(cache),
+                    global_seq_len=prefix_len + sequences.shape[-1],
                 )
-                cache.update(_get_output(outputs, "past_key_values"))
+                _update_cache(cache, outputs)
             else:
-                decode_pos = build_position_ids(sequences, current_attention_mask)
-                decode_mask = build_causal_mask(
+                decode_pos = _build_prefill_position_ids(
                     sequences,
                     current_attention_mask,
+                    prefix_attention_mask,
+                )
+                decode_mask = _build_prefill_mask(
+                    sequences,
+                    current_attention_mask,
+                    prefix_attention_mask,
                     dtype=mask_dtype,
                 )
                 outputs = _model_forward(
@@ -257,6 +500,8 @@ def generate(
                     attention_mask=decode_mask,
                     past_key_values=None,
                     use_cache=False,
+                    sequence_shard_info=_cache_shard_info(cache),
+                    global_seq_len=prefix_len + sequences.shape[-1],
                 )
             logits = _get_output(outputs, "logits")
             if logits is None:
