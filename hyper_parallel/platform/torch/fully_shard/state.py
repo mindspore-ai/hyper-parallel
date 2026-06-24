@@ -19,6 +19,7 @@ from typing import Optional, List
 from collections import defaultdict
 import torch
 
+from hyper_parallel.tools.logging import get_logger
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     FullyShardParamMode,
@@ -31,6 +32,8 @@ from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 from hyper_parallel.platform.torch.fully_shard.param import TorchHSDPParamV2
 from hyper_parallel.platform.torch.fully_shard.pack_utils import build_rs_plan
 from hyper_parallel.platform.torch.fully_shard.param_group import get_comm_ctx, HSDPParamGroup, AllReduceParamGroup
+
+logger = get_logger("FSDP")
 
 
 def _to_dtype_if_needed(
@@ -293,6 +296,7 @@ class TorchHSDPStateV2(HSDPState):
 
     def post_backward_for_comm_fusion(self):
         """post_backward_for_comm_fusion."""
+        logger.debug("post_backward module=%s mode=comm_fusion enter", self)
         # Replicate-only params still use the non-fused compat all-reduce path.
         # Drain any pending side-path reductions before advancing the fused
         # param-group pipeline for sharded params.
@@ -303,13 +307,16 @@ class TorchHSDPStateV2(HSDPState):
         comm_ctx = get_comm_ctx()
         # Phase 2: apply grads for the param group whose all_reduce is done
         if comm_ctx.all_reduce_param_group is not None:
+            logger.debug("post_backward module=%s wait=comm_fusion_all_reduce", self)
             comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
             comm_ctx.all_reduce_param_group = None
         # Phase 1: wait reduce_scatter, issue async all_reduce for previous layer
         if comm_ctx.pre_param_group is not None:
+            logger.debug("post_backward module=%s wait=comm_fusion_reduce_scatter", self)
             comm_ctx.pre_param_group.wait_reduce_scatter_and_issue_all_reduce()
             comm_ctx.pre_param_group = None
         if self.param_group is not None:
+            logger.debug("post_backward module=%s launch=comm_fusion_reduce_scatter", self)
             self.param_group.foreach_reduce(
                 reduce_scatter_reduce_op=self.reduce_op_type,
             )
@@ -321,6 +328,11 @@ class TorchHSDPStateV2(HSDPState):
             if not self._has_pending_unsharded_grad(hsdp_param):
                 continue
             reduce_op = self._resolve_reduce_op(hsdp_param)
+            logger.debug(
+                "post_backward module=%s launch=replicate_all_reduce param=%s",
+                self,
+                hsdp_param,
+            )
             self._queue_compat_all_reduce(hsdp_param, reduce_op)
 
     def _resolve_default_reduce_op(self):
@@ -345,6 +357,11 @@ class TorchHSDPStateV2(HSDPState):
 
     def _queue_reduce_scatter_then_all_reduce(self, hsdp_param, reduce_op):
         """Queue the standard FSDP/HSDP reduction path."""
+        logger.debug(
+            "post_backward module=%s launch=reduce_scatter param=%s",
+            self,
+            hsdp_param,
+        )
         hsdp_param.reduce_scatter_grad(
             dtype=self._reduce_dtype,
             reduce_op=reduce_op,
@@ -363,6 +380,11 @@ class TorchHSDPStateV2(HSDPState):
             dtype=self._reduce_dtype,
             reduce_op=reduce_op,
         )
+        logger.debug(
+            "post_backward module=%s launch=all_reduce param=%s",
+            self,
+            hsdp_param,
+        )
         HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
 
     def _queue_compat_all_reduce(self, hsdp_param, reduce_op):
@@ -374,6 +396,11 @@ class TorchHSDPStateV2(HSDPState):
         hsdp_param.all_reduce_grad(
             dtype=self._reduce_dtype,
             reduce_op=reduce_op,
+        )
+        logger.debug(
+            "post_backward module=%s launch=compat_all_reduce param=%s",
+            self,
+            hsdp_param,
         )
         HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
 
@@ -402,6 +429,11 @@ class TorchHSDPStateV2(HSDPState):
         apply_gradient_scaling_factor(reduced_grad, hsdp_param.gradient_scaling_factor)
         handle = None
         if hsdp_param.unsharded_group_info.group is not None and hsdp_param.dp_size > 1:
+            logger.debug(
+                "post_backward module=%s launch=direct_compat_all_reduce param=%s",
+                self,
+                hsdp_param,
+            )
             handle = torch.distributed.all_reduce(
                 reduced_grad,
                 op=reduce_op,
@@ -412,6 +444,13 @@ class TorchHSDPStateV2(HSDPState):
 
     def post_backward(self, *unused):  # pylint: disable=unused-argument
         """Reduce gradients and reshard parameters after backward."""
+        logger.debug(
+            "post_backward module=%s enter reduce_grads=%s comm_fusion=%s reshard_after_backward=%s",
+            self,
+            self.reduce_grads,
+            self.comm_fusion,
+            self.reshard_after_backward,
+        )
         for hsdp_param in self._iter_managed_params():
             hsdp_param.accumulate_unsharded_grad_if_needed()
         if not self.reduce_grads:
@@ -482,6 +521,11 @@ class TorchHSDPStateV2(HSDPState):
         # Handle params that don't need all_reduce (FSDP or single replica)
         if None in groups_by_comm:
             for hsdp_param in groups_by_comm[None]:
+                logger.debug(
+                    "post_backward module=%s launch=reduce_scatter param=%s all_reduce=False",
+                    self,
+                    hsdp_param,
+                )
                 hsdp_param.reduce_scatter_grad(
                     dtype=self._reduce_dtype,
                     reduce_op=self._resolve_reduce_op()
@@ -508,6 +552,11 @@ class TorchHSDPStateV2(HSDPState):
             group.allocate_fused_buffer(self.device)
 
             # Issue reduce_scatter with output directly into fused buffer views
+            logger.debug(
+                "post_backward module=%s launch=fused_reduce_scatter group_params=%s",
+                self,
+                hsdp_params,
+            )
             for idx, hsdp_param in enumerate(hsdp_params):
                 buffer_view = group.get_param_buffer_view(idx)
                 hsdp_param.reduce_scatter_grad(
@@ -532,6 +581,11 @@ class TorchHSDPStateV2(HSDPState):
             prev_groups = list(TorchHSDPStateV2.pre_all_reduce_groups)
             TorchHSDPStateV2.pre_all_reduce_groups.clear()
             for prev_group in prev_groups:
+                logger.debug(
+                    "post_backward module=%s wait=fused_reduce_scatter group_params=%s",
+                    self,
+                    prev_group.hsdp_params,
+                )
                 for hsdp_param in prev_group.hsdp_params:
                     hsdp_param.reduce_scatter_output()
                     hsdp_param.clear_reduce_scatter_output()
@@ -553,6 +607,11 @@ class TorchHSDPStateV2(HSDPState):
         """
         for prev_group in prev_groups:
             prev_group.accumulate_existing_grads_to_buffer()
+            logger.debug(
+                "post_backward module=%s launch=fused_all_reduce group_params=%s",
+                self,
+                prev_group.hsdp_params,
+            )
             prev_group.issue_async_allreduce()
             # Move to pending queue for root_backward_hook to process
             TorchHSDPStateV2.pending_all_reduce_groups.append(prev_group)
@@ -567,6 +626,11 @@ class TorchHSDPStateV2(HSDPState):
         need_synchronize = False
         while HSDPState.pre_reduce_scatter_params:
             pre_hsdp_param, pre_orig_dtype = HSDPState.pre_reduce_scatter_params.pop(0)
+            logger.debug(
+                "post_backward module=%s wait=reduce_scatter param=%s",
+                self,
+                pre_hsdp_param,
+            )
             reduced_grad = pre_hsdp_param.reduce_scatter_output()
             pre_hsdp_param.clear_reduce_scatter_output()
             need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype) or need_synchronize
@@ -595,6 +659,10 @@ class TorchHSDPStateV2(HSDPState):
         need_synchronize = False
 
         for group in cls.pending_all_reduce_groups:
+            logger.debug(
+                "post_backward wait=pending_fused_all_reduce group_params=%s",
+                group.hsdp_params,
+            )
             need_synchronize = group.wait_and_apply_grads() or need_synchronize
 
         cls.pending_all_reduce_groups.clear()
@@ -617,6 +685,11 @@ class TorchHSDPStateV2(HSDPState):
         need_synchronize = False
         while HSDPState.pre_reduce_scatter_params:
             pre_hsdp_param, pre_orig_dtype = HSDPState.pre_reduce_scatter_params.pop(0)
+            logger.debug(
+                "post_backward module=%s wait=reduce_scatter param=%s",
+                self,
+                pre_hsdp_param,
+            )
             reduced_grad = pre_hsdp_param.reduce_scatter_output()
             pre_hsdp_param.clear_reduce_scatter_output()
             need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype) or need_synchronize
@@ -654,6 +727,11 @@ class TorchHSDPStateV2(HSDPState):
         need_synchronize = False
         while HSDPState.pre_all_reduce_params:
             pre_hsdp_param, pre_orig_dtype = HSDPState.pre_all_reduce_params.pop(0)
+            logger.debug(
+                "post_backward module=%s wait=all_reduce param=%s",
+                self,
+                pre_hsdp_param,
+            )
             reduced_grad = pre_hsdp_param.all_reduce_output()
             pre_hsdp_param.clear_all_reduce_output()
             need_synchronize = pre_hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype) or need_synchronize
@@ -661,6 +739,7 @@ class TorchHSDPStateV2(HSDPState):
         while TorchHSDPStateV2.pre_direct_all_reduce_grads:
             handle, reduced_grad, target_grad = TorchHSDPStateV2.pre_direct_all_reduce_grads.pop(0)
             if handle is not None:
+                logger.debug("post_backward module=%s wait=direct_compat_all_reduce", self)
                 handle.wait()
             if reduced_grad is not target_grad:
                 if reduced_grad.dtype != target_grad.dtype:

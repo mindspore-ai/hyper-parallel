@@ -17,6 +17,7 @@ from typing import Optional
 import mindspore as ms
 from mindspore import ops
 import mindspore.mint.distributed as dist
+from hyper_parallel.tools.logging import get_logger
 from hyper_parallel.core.fully_shard.hsdp_state import HSDPState
 from hyper_parallel.core.fully_shard.hsdp_utils import (
     _get_param_module_infos,
@@ -30,6 +31,8 @@ from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_wi
 from hyper_parallel.platform.mindspore.fully_shard.param_group import HSDPParamGroup, get_comm_ctx
 from hyper_parallel.platform.mindspore.utils import normalize_runtime_device
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
+
+logger = get_logger("FSDP")
 
 
 def _to_dtype_if_needed(
@@ -338,6 +341,11 @@ class MindSporeHSDPStateV2(HSDPState):
             reduce_group_size = reduce_group_info.rank_size if reduce_group_info is not None else 1
 
             if reduce_group is not None and reduce_group_size > 1:
+                logger.debug(
+                    "post_backward module=%s launch=replicate_all_reduce param=%s",
+                    self,
+                    param,
+                )
                 # Ascend HCCL DistCommAllReduce rejects non-contiguous tensors;
                 # reduced_grad here may still be a view from the no-reduce path
                 # of ``unsharded_grad_data`` / ``_to_local_unsharded_grad``.
@@ -369,6 +377,11 @@ class MindSporeHSDPStateV2(HSDPState):
                 MindSporeHSDPStateV2._ignored_allreduce_works.pop(0)
             )
             if param.all_reduce_handle:
+                logger.debug(
+                    "post_backward module=%s wait=replicate_all_reduce param=%s",
+                    self,
+                    param,
+                )
                 param.all_reduce_handle.wait()
             self._div_if_needed(reduced_grad, reduce_group_size, need_div)
             need_synchronize = (
@@ -383,6 +396,11 @@ class MindSporeHSDPStateV2(HSDPState):
         need_synchronize = False
         while HSDPState.pre_reduce_scatter_params:
             hsdp_param, pre_orig_dtype, need_div = HSDPState.pre_reduce_scatter_params.pop(0)
+            logger.debug(
+                "post_backward module=%s wait=reduce_scatter param=%s",
+                self,
+                hsdp_param,
+            )
             reduced_grad = hsdp_param.reduce_scatter_output()
             self._div_if_needed(reduced_grad, hsdp_param.shard_world_size, need_div)
             hsdp_param.clear_reduce_scatter_output()
@@ -393,6 +411,11 @@ class MindSporeHSDPStateV2(HSDPState):
 
         while HSDPState.pre_all_reduce_params:
             hsdp_param, pre_orig_dtype, need_div = HSDPState.pre_all_reduce_params.pop(0)
+            logger.debug(
+                "post_backward module=%s wait=all_reduce param=%s",
+                self,
+                hsdp_param,
+            )
             reduced_grad = hsdp_param.all_reduce_output()
             self._div_if_needed(reduced_grad, hsdp_param.replicate_world_size, need_div)
             hsdp_param.clear_all_reduce_output()
@@ -405,6 +428,7 @@ class MindSporeHSDPStateV2(HSDPState):
                 MindSporeHSDPStateV2.pre_direct_all_reduce_grads.pop(0)
             )
             if handle is not None:
+                logger.debug("post_backward module=%s wait=direct_compat_all_reduce", self)
                 handle.wait()
             self._div_if_needed(reduced_grad, reduce_group_size, need_div)
             if hsdp_param.mp_policy.apply_grad_on_fp32_main_grad:
@@ -420,16 +444,20 @@ class MindSporeHSDPStateV2(HSDPState):
 
     def post_backward_for_comm_fusion(self):
         """Drive the fused gradient-reduction pipeline for sharded params."""
+        logger.debug("post_backward module=%s mode=comm_fusion enter", self)
         self.reduce_params()
         self._finish_ignored_allreduce()
         comm_ctx = get_comm_ctx()
         if comm_ctx.all_reduce_param_group is not None:
+            logger.debug("post_backward module=%s wait=comm_fusion_all_reduce", self)
             comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
             comm_ctx.all_reduce_param_group = None
         if comm_ctx.pre_param_group is not None:
+            logger.debug("post_backward module=%s wait=comm_fusion_reduce_scatter", self)
             comm_ctx.pre_param_group.wait_reduce_scatter_and_issue_all_reduce()
             comm_ctx.pre_param_group = None
         if self.param_group is not None:
+            logger.debug("post_backward module=%s launch=comm_fusion_reduce_scatter", self)
             self.param_group.foreach_reduce(
                 reduce_scatter_reduce_op=self.reduce_op_type,
                 needs_avg_div=self._need_div,
@@ -449,6 +477,11 @@ class MindSporeHSDPStateV2(HSDPState):
 
     def _queue_reduce_scatter_then_all_reduce(self, hsdp_param):
         """Queue the standard FSDP/HSDP reduction path."""
+        logger.debug(
+            "post_backward module=%s launch=reduce_scatter param=%s",
+            self,
+            hsdp_param,
+        )
         hsdp_param.reduce_scatter_grad(
             async_op=True,
             dtype=self._reduce_dtype,
@@ -471,6 +504,11 @@ class MindSporeHSDPStateV2(HSDPState):
             async_op=True,
             reduce_op=self.reduce_op_type,
         )
+        logger.debug(
+            "post_backward module=%s launch=all_reduce param=%s",
+            self,
+            hsdp_param,
+        )
         HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype, self._need_div))
 
     def _queue_compat_all_reduce(self, hsdp_param):
@@ -483,6 +521,11 @@ class MindSporeHSDPStateV2(HSDPState):
             dtype=self._reduce_dtype,
             async_op=True,
             reduce_op=self.reduce_op_type,
+        )
+        logger.debug(
+            "post_backward module=%s launch=compat_all_reduce param=%s",
+            self,
+            hsdp_param,
         )
         HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype, self._need_div))
 
@@ -519,6 +562,11 @@ class MindSporeHSDPStateV2(HSDPState):
         if reduce_group_size > 1:
             if reduce_group is None:
                 raise RuntimeError("Expected a valid unsharded all-reduce group when rank_size > 1")
+            logger.debug(
+                "post_backward module=%s launch=direct_compat_all_reduce param=%s",
+                self,
+                hsdp_param,
+            )
             handle = dist.all_reduce(
                 reduced_grad,
                 group=reduce_group,
@@ -530,7 +578,13 @@ class MindSporeHSDPStateV2(HSDPState):
         )
 
     def post_backward(self, *_):
-        """Post-backward hook that accumulates, reduces, and reshards gradients for all managed parameters."""
+        logger.debug(
+            "post_backward module=%s enter reduce_grads=%s comm_fusion=%s reshard_after_backward=%s",
+            self,
+            self.reduce_grads,
+            self.comm_fusion,
+            self.reshard_after_backward,
+        )
         for hsdp_param in self._iter_managed_params():
             hsdp_param.accumulate_unsharded_grad_if_needed()
         if not self.reduce_grads:
@@ -554,6 +608,11 @@ class MindSporeHSDPStateV2(HSDPState):
                 elif self._should_run_all_reduce(hsdp_param):
                     self._queue_compat_all_reduce(hsdp_param)
                 else:
+                    logger.debug(
+                        "post_backward module=%s apply=no_comm_grad param=%s",
+                        self,
+                        hsdp_param,
+                    )
                     # No-communication path (shard_size == 1, no all-reduce):
                     # this leg owns the scaling since the grad never goes through
                     # reduce_scatter_grad / all_reduce_grad.

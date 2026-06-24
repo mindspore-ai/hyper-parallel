@@ -64,6 +64,21 @@ class HSDPParamV2:
     HSDP parameter.
     """
 
+    def __repr__(self) -> str:
+        """Stable debug name used in log lines.
+
+        Prefers the parameter FQN (assigned by the root forward pre-hook); before
+        that, falls back to the owning module class plus param name and object id.
+        Logging's ``%s`` calls this lazily -- only when a record is emitted.
+        """
+        fqn = getattr(self, "_param_fqn", None)
+        if fqn:
+            return str(fqn)
+        module_info = getattr(self, "_module_info", None)
+        if module_info is not None:
+            return f"{module_info.module.__class__.__name__}.{module_info.param_name}@{id(self):x}"
+        return f"{self.__class__.__name__}@{id(self):x}"
+
     def __init__(
         self,
         param,

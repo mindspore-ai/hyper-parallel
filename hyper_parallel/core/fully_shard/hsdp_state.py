@@ -18,6 +18,9 @@ from typing import Any, List, Tuple, Union
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2
 from hyper_parallel.core.fully_shard.hsdp_utils import HSDPConfigV2, ShardedState
+from hyper_parallel.tools.logging import get_logger
+
+logger = get_logger("FSDP")
 
 platform = get_platform()
 
@@ -61,6 +64,17 @@ class HSDPState:
         self.is_replicate_shard = True
         self.module_name = None
 
+    def __repr__(self) -> str:
+        """Stable debug name used in log lines.
+
+        ``module_name`` is only assigned by the root forward pre-hook, so fall
+        back to the managed module class and object id before names are set.
+        Logging's ``%s`` calls this lazily -- only when a record is emitted.
+        """
+        if self.module_name:
+            return str(self.module_name)
+        return f"{self.cell.__class__.__name__}@{id(self.cell):x}"
+
     def _init_hsdp_params(self):
         """init hsdp parameters for cell"""
         raise NotImplementedError("HSDPState subclasses must implement _init_hsdp_params")
@@ -82,6 +96,13 @@ class HSDPState:
 
     def shard(self, shard_replicate: bool = True):
         """change parameters to sharded state"""
+        logger.debug(
+            "action=reshard module=%s shard_params=%s replicate_params=%s shard_replicate=%s",
+            self,
+            self.sharded_hsdp_params,
+            self.replicate_params,
+            shard_replicate,
+        )
         if not self.is_shard:
             for param in self.sharded_hsdp_params:
                 param.to_sharded()
@@ -93,6 +114,14 @@ class HSDPState:
 
     def unshard(self, async_op=False, unshard_replicate: bool = True):
         """change parameters to unsharded state"""
+        logger.debug(
+            "action=unshard module=%s async_op=%s shard_params=%s replicate_params=%s unshard_replicate=%s",
+            self,
+            async_op,
+            self.sharded_hsdp_params,
+            self.replicate_params,
+            unshard_replicate,
+        )
         if not self.is_shard and (not unshard_replicate or not self.is_replicate_shard):
             if unshard_replicate:
                 self._assert_replicate_params_unsharded()
@@ -115,10 +144,24 @@ class HSDPState:
 
     def prefetch(self, unshard_replicate: bool = True):
         """prefetch unsharded parameters"""
+        logger.debug(
+            "action=prefetch module=%s shard_params=%s replicate_params=%s unshard_replicate=%s",
+            self,
+            self.sharded_hsdp_params,
+            self.replicate_params,
+            unshard_replicate,
+        )
         self.unshard(async_op=True, unshard_replicate=unshard_replicate)
 
     def wait_for_unshard(self, wait_for_replicate: bool = True):
         """wait for all unshard parameters"""
+        logger.debug(
+            "action=wait_unshard module=%s shard_params=%s replicate_params=%s wait_for_replicate=%s",
+            self,
+            self.sharded_hsdp_params,
+            self.replicate_params,
+            wait_for_replicate,
+        )
         if not self.is_shard and (not wait_for_replicate or not self.is_replicate_shard):
             if wait_for_replicate:
                 self._assert_replicate_params_unsharded()
