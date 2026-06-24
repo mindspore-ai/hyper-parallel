@@ -23,7 +23,6 @@ directly to the Ascend NPU custom C++ kernel.  When inputs are ``DTensor``
 objects the call is automatically routed through the registered
 ``DistributedOp`` for layout inference and re-distribution.
 """
+__all__ = ["MindSporeCustomOps"]
 
 from hyper_parallel.platform.mindspore.custom_ops.custom_ops import MindSporeCustomOps  # noqa: F401
-
-__all__ = ["MindSporeCustomOps"]

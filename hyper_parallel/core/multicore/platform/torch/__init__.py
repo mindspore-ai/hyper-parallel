@@ -66,6 +66,8 @@ libs will not be found via ``GetOpApiFuncAddr``.  The only reliable fix is to
 set ``ASCEND_CUSTOM_OPP_PATH`` at the shell level (or at the very top of the
 Python entry-point script) **before** any ``import torch_npu``.
 """
+__all__ = ["mega_moe", "mega_moe_grad"]
+
 import ctypes
 import os
 import re as _re
@@ -317,6 +319,3 @@ def mega_moe_grad(
         runtime_config, all_event_counters,
         rank_id, ep, expert_num, hidden_size, seq_size,
     )
-
-
-__all__ = ["mega_moe", "mega_moe_grad"]
