@@ -304,7 +304,10 @@ class NpuDenseLightningIndexerGradKlLossDistributedOp(DistributedOp):
         w_tm = w_layout.tensor_map
         tms = {'q': (q_tm, 'query_index'), 'k': (k_tm, 'key_index'), 'w': (w_tm, 'weights')}
         for role, dims in _REPLICATED_DIMS.get(layout_str, {}).items():
-            tm, tensor_name = tms[role]
+            tm_entry = tms.get(role)
+            if tm_entry is None:
+                continue
+            tm, tensor_name = tm_entry
             for dim, label in dims.items():
                 if tm[dim] != -1:
                     raise ValueError(

@@ -26,6 +26,14 @@ Provides token permutation helpers and four parallel styles that compose with
 - :class:`ExpertTensorParallel` — combined EP + TP on a 2-D mesh ``[ep, tp]``;
   weights are doubly sharded, dispatch uses the EP sub-mesh.
 """
+__all__ = [
+    "AllToAllTokenDispatcher",
+    "BaseExpertParallel",
+    "ExpertParallel",
+    "TensorParallel",
+    "ExpertTensorParallel",
+]
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, List, Tuple
@@ -45,14 +53,6 @@ from hyper_parallel.platform import get_platform
 
 platform = get_platform()
 Module = platform.Module
-
-__all__ = [
-    "AllToAllTokenDispatcher",
-    "BaseExpertParallel",
-    "ExpertParallel",
-    "TensorParallel",
-    "ExpertTensorParallel",
-]
 
 
 # ---------------------------------------------------------------------------

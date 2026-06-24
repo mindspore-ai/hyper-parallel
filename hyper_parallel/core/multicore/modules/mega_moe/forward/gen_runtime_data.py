@@ -40,12 +40,12 @@ from hyper_parallel.core.multicore.scheduler.config import (
 )
 from hyper_parallel.core.multicore.scheduler.scheduler import revise_task_queue
 from hyper_parallel.core.multicore.tasks.utils import add_terminate, add_dynamic_data
-from .tiling_tables import (
+from hyper_parallel.core.multicore.modules.mega_moe.forward.tiling_tables import (
     get_up_proj_tiling_bytes,
     get_down_proj_tiling_bytes,
     get_swiglu_tiling_bytes,
 )
-from .graph import build_forward_graph
+from hyper_parallel.core.multicore.modules.mega_moe.forward.graph import build_forward_graph
 
 
 def parse_args():

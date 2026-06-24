@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore custom kernel implementations and DFunction wrappers."""
+import importlib
 import os
 import sys
 
@@ -51,7 +52,7 @@ def _build_custom_ops():
 
 
 try:
-    _custom_ops = __import__(_MS_EXTENSION_NAME)
+    _custom_ops = importlib.import_module(_MS_EXTENSION_NAME)
 except ImportError:
     # Source-tree development: .so not pre-built; JIT-compile from local .cc files.
     _custom_ops = _build_custom_ops()

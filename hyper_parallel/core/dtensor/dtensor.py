@@ -345,36 +345,37 @@ class DTensor(DTensorBase):
             raise TypeError(
                 f"For DTensor.copy_, src should be a DTensor, but got {type(src).__name__}."
             )
-        if src._device_mesh is not self._device_mesh:
+        src_local = src.to_local()
+        if src.device_mesh is not self._device_mesh:
             raise ValueError(
                 f"For DTensor.copy_, src and self should share the same DeviceMesh, "
-                f"but got src._device_mesh={src._device_mesh!r}, "
+                f"but got src.device_mesh={src.device_mesh!r}, "
                 f"self._device_mesh={self._device_mesh!r}."
             )
 
-        placement_eq = tuple(src._placements) == tuple(self._placements)
-        shape_eq = src._local_tensor.shape == self._local_tensor.shape
-        src_is_scalar = src._local_tensor.numel() == 1
+        placement_eq = tuple(src.placements) == tuple(self._placements)
+        shape_eq = src_local.shape == self._local_tensor.shape
+        src_is_scalar = src_local.numel() == 1
 
         if not placement_eq and not src_is_scalar:
             raise ValueError(
                 f"For DTensor.copy_, src.placements should equal self.placements "
                 f"or src.numel() should be 1, but got "
-                f"src.placements={src._placements}, "
+                f"src.placements={src.placements}, "
                 f"self.placements={self._placements}, "
-                f"src.numel()={src._local_tensor.numel()}."
+                f"src.numel()={src_local.numel()}."
             )
         if not shape_eq and not src_is_scalar and not _is_broadcastable(
-            src._local_tensor.shape, self._local_tensor.shape
+            src_local.shape, self._local_tensor.shape
         ):
             raise ValueError(
                 f"For DTensor.copy_, src local shape should be broadcastable to "
                 f"self local shape, but got "
-                f"src.shape={tuple(src._local_tensor.shape)}, "
+                f"src.shape={tuple(src_local.shape)}, "
                 f"self.shape={tuple(self._local_tensor.shape)}."
             )
 
-        self._local_tensor.copy_(src._local_tensor, non_blocking=non_blocking)
+        self._local_tensor.copy_(src_local, non_blocking=non_blocking)
         return self
 
     def zero_(self) -> "DTensor":
