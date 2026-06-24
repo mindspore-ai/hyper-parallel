@@ -271,8 +271,10 @@ class ScaledDotProductAttentionDistributedOp(DistributedOp):
             key_layout = layouts[1]
             value_layout = layouts[2]
 
-            if (key_layout is not None and value_layout is not None and
-                hasattr(key_layout, 'tensor_map') and hasattr(value_layout, 'tensor_map')):
+            has_valid_layouts = (key_layout is not None and value_layout is not None)
+            has_tensor_maps = has_valid_layouts and (
+                hasattr(key_layout, 'tensor_map') and hasattr(value_layout, 'tensor_map'))
+            if has_tensor_maps:
                 if key_layout.tensor_map != value_layout.tensor_map:
                     raise ValueError(
                         f"Key and Value must have identical sharding strategies.\n"

@@ -22,7 +22,40 @@ from .parallel_ops import DistributedOp
 class ChunkViewDistributedOp(DistributedOp):
     """Distributed implementation for ChunkView operator."""
 
-    def infer_layout(self, layouts, extra_args):
+    @staticmethod
+    def _parse_extra_args(extra_args):
+        """Parse and validate extra_args, returning (chunks, dim, input_shape)."""
+        if len(extra_args) < 1:
+            raise ValueError("chunk_view requires 'chunks' in extra_args.")
+
+        chunks = extra_args[0]
+        dim = extra_args[1] if len(extra_args) > 2 else 0
+        input_shapes = extra_args[-1] if len(extra_args) > 1 else None
+
+        if not isinstance(chunks, int):
+            raise TypeError(f"chunks must be an integer, got {type(chunks)}")
+        if chunks < 1:
+            raise ValueError(f"chunks must be greater than 0, got {chunks}")
+        if not isinstance(dim, int):
+            raise TypeError(f"dim must be an integer, got {type(dim)}")
+
+        if input_shapes:
+            input_shape = input_shapes[0] if isinstance(input_shapes[0], (list, tuple)) else input_shapes
+        else:
+            input_shape = None
+
+        return chunks, dim, input_shape
+
+    @staticmethod
+    def _calculate_output_count(dim_size, chunks):
+        """Calculate the number of output chunks based on dimension size."""
+        if dim_size == 0:
+            return chunks
+        split_size = (dim_size + chunks - 1) // chunks
+        output_num = max((dim_size + split_size - 1) // split_size, 1)
+        return min(output_num, chunks)
+
+    def infer_layout(self, layouts, extra_args=None):
         """
         Infer output layouts for ChunkView operator.
 
@@ -46,26 +79,8 @@ class ChunkViewDistributedOp(DistributedOp):
             raise ValueError("chunk_view requires a valid input tensor layout.")
 
         input_layout = layouts[0]
+        chunks, dim, input_shape = self._parse_extra_args(extra_args)
 
-        if len(extra_args) < 1:
-            raise ValueError("chunk_view requires 'chunks' in extra_args.")
-
-        chunks = extra_args[0]
-        input_shapes = extra_args[-1] if len(extra_args) > 1 else None
-        dim = extra_args[1] if len(extra_args) > 2 else 0
-
-        if input_shapes:
-            input_shape = input_shapes[0] if isinstance(input_shapes[0], (list, tuple)) else input_shapes
-        else:
-            input_shape = None
-
-        if not isinstance(chunks, int):
-            raise TypeError(f"chunks must be an integer, got {type(chunks)}")
-
-        if chunks < 1:
-            raise ValueError(f"chunks must be greater than 0, got {chunks}")
-        if not isinstance(dim, int):
-            raise TypeError(f"dim must be an integer, got {type(dim)}")
         tensor_map = input_layout.tensor_map
         input_dim = len(tensor_map)
 
@@ -78,19 +93,8 @@ class ChunkViewDistributedOp(DistributedOp):
         if tensor_map[dim] != -1:
             raise ValueError(f"Cannot split tensor at sharded axis[{dim}], layout: {input_layout}")
 
-        if input_shapes:
-            input_shape = input_shapes[0] if isinstance(input_shapes[0], (list, tuple)) else input_shapes
-        else:
-            input_shape = None
-
         if input_shape is not None:
-            dim_size = input_shape[dim]
-            if dim_size == 0:
-                output_num = chunks
-            else:
-                split_size = (dim_size + chunks - 1) // chunks
-                output_num = max((dim_size + split_size - 1) // split_size, 1)
-                output_num = min(output_num, chunks)
+            output_num = self._calculate_output_count(input_shape[dim], chunks)
         else:
             output_num = chunks
 

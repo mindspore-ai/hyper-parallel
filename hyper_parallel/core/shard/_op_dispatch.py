@@ -295,13 +295,14 @@ class OpDispatcher:
                 os.path.join(os.path.dirname(os.path.realpath(__file__)), "../")
             )
 
-    def _extend_sys_path(self, env_python_path: Optional[str]):
+    @staticmethod
+    def _extend_sys_path(env_python_path: Optional[str]):
         if not env_python_path:
             return
         python_paths = env_python_path.split(":")
         for path in python_paths:
             if path and os.path.isdir(path) and path not in sys.path:
-                sys.path.insert(0, path)
+                sys.path.append(path)
 
     def _register_distributed_ops(self):
         for op_name, config in self.layout_infer_ops.items():
@@ -472,7 +473,8 @@ class OpDispatcher:
                 input_layouts.append(layout)
         return cache_key_values, input_layouts, extra_args
 
-    def _pack_infer_output(self, py_output, output_layout):
+    @staticmethod
+    def _pack_infer_output(py_output, output_layout):
         """Helper to pack py_output into DTensors using output_layout."""
         if isinstance(py_output, (tuple, list)):
             if not isinstance(output_layout, (tuple, list)):
