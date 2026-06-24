@@ -57,15 +57,12 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+    sys.path.append(str(_ROOT))
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 import torch.distributed as dist
-
-from hyper_parallel import ContextParallel, SkipDTensorDispatch, fully_shard, init_device_mesh
-from hyper_parallel.core.pipeline_parallel.scheduler import Schedule1F1B
 
 from demo_utils import init_dist, train_steps
 from model import Llama3DemoConfig
@@ -74,6 +71,9 @@ from pipeline import (
     build_pipeline_stage,
     split_batch_dim0,
 )
+
+from hyper_parallel import ContextParallel, SkipDTensorDispatch, fully_shard, init_device_mesh
+from hyper_parallel.core.pipeline_parallel.scheduler import Schedule1F1B
 
 _ENV_DEFAULTS = {
     "LLAMA3_PP_SIZE": "2",
