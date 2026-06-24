@@ -231,6 +231,8 @@ class PipelineStageBase:
             self.bwd_cache[micro_index] = input_grads
         self._clear_recv_buffer(self.grad_recv_info, micro_index)
         self._clear_recv_buffer(self.args_recv_info, micro_index)
+        if self.is_last_stage:
+            self.fwd_outputs_cache.pop(micro_index, None)
 
     def backward_input_one_chunk(self, micro_index):
         """dx-only backward; keeps grad_fn alive in cache for the paired dw call.
@@ -321,6 +323,8 @@ class PipelineStageBase:
                 platform.clear_recompute_session(session_id)
             self._clear_recv_buffer(self.grad_recv_info, micro_index)
             self._clear_recv_buffer(self.args_recv_info, micro_index)
+            if self.is_last_stage:
+                self.fwd_outputs_cache.pop(micro_index, None)
 
     def _construct_backward_func(self):
         """construct backward func."""

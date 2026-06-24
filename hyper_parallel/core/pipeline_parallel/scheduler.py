@@ -582,9 +582,16 @@ class PipelineScheduleRuntime(ABC):
 
     def run(self, *args, **kwargs):
         """schedule run."""
-        split_args, split_kwargs = self.split_microbatches(args, kwargs)
         losses = []
-        self.run_microbatches(split_args, split_kwargs, losses)
+        try:
+            split_args, split_kwargs = self.split_microbatches(args, kwargs)
+            self.run_microbatches(split_args, split_kwargs, losses)
+        finally:
+            # An exception unwinds past run_microbatches' end-of-iteration send
+            # drain, leaving in-flight isend/irecv handles un-waited. Wait them
+            # here so the comm contract holds on the error path too. No-op on the
+            # normal path. See _drain_inflight_p2p.
+            self._drain_inflight_p2p()
         return losses
 
     def sync_shared_parameters_grad(self):
@@ -606,6 +613,26 @@ class PipelineScheduleRuntime(ABC):
         for handle in handles:
             if handle is not None:
                 handle.wait()
+
+    def _drain_inflight_p2p(self):
+        """Wait every P2P handle still in flight — error-path cleanup.
+
+        run_microbatches waits its deferred sends only in the end-of-iteration
+        drain; an exception mid-iteration unwinds past that drain, leaving issued
+        isend/irecv handles un-waited in ``_send_handles`` and the recv caches
+        (the ``CommHandle destroyed without calling wait()`` warning). run()'s
+        finally calls this so every handle is still ``wait()``-ed — honoring the
+        comm contract — on the error path too, and pops them so a later run()
+        does not re-wait stale handles (the recv caches are never reset per run).
+        No-op on the normal path: the drain already emptied ``_send_handles`` and
+        every cached recv was consumed.
+        """
+        while self._send_handles:
+            self._wait_p2p(self._send_handles.pop())
+        while self.fwd_handle_cache:
+            self._wait_p2p(self.fwd_handle_cache.popitem()[1])
+        while self.bwd_handle_cache:
+            self._wait_p2p(self.bwd_handle_cache.popitem()[1])
 
     def _batched_issue(self, specs):
         """Launch same-peer P2P ``specs`` as one ``batch_isend_irecv`` group.
