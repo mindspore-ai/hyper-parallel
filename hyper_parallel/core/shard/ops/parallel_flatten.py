@@ -104,7 +104,9 @@ class FlattenDistributedOp(ReshapeDistributedOp):
         if end_dim < 0:
             end_dim += ndim
 
-        if start_dim < 0 or start_dim >= ndim or end_dim < 0 or end_dim >= ndim:
+        start_dim_invalid = start_dim < 0 or start_dim >= ndim
+        end_dim_invalid = end_dim < 0 or end_dim >= ndim
+        if start_dim_invalid or end_dim_invalid:
             raise ValueError(
                 f"For {self.op_name}, dimension out of range "
                 f"(start_dim={start_dim}, end_dim={end_dim}, ndim={ndim})."
