@@ -252,23 +252,24 @@ class FileSystemWriter(StorageWriter):
             metadata (Metadata): Checkpoint metadata to update.
             results (list[list[WriteResult]]): Write results from all ranks (or single rank when use_collectives=False).
         """
-        should_save = self.use_collectives and self.is_coordinator or not self.use_collectives
+        should_save = not self.use_collectives or (self.use_collectives and self.is_coordinator)
+        if not should_save:
+            return
 
-        if should_save:
-            # Build storage_data: map MetadataIndex -> StorageInfo
-            storage_md: dict[MetadataIndex, StorageInfo] = {}
-            for wr_list in results:
-                for wr in wr_list:
-                    storage_md[wr.index] = wr.storage_data
-            metadata.storage_data = storage_md
+        # Build storage_data: map MetadataIndex -> StorageInfo
+        storage_md: dict[MetadataIndex, StorageInfo] = {}
+        for wr_list in results:
+            for wr in wr_list:
+                storage_md[wr.index] = wr.storage_data
+        metadata.storage_data = storage_md
 
-            # Save metadata file
-            if self.use_collectives:
-                metadata_file = self.checkpoint_dir / METADATA_FILE_NAME
-            else:
-                metadata_file = self.checkpoint_dir / f".rank{self.rank}_metadata"
-            with open(metadata_file, "wb") as f:
-                pickle.dump(metadata, f)
+        # Save metadata file
+        if self.use_collectives:
+            metadata_file = self.checkpoint_dir / METADATA_FILE_NAME
+        else:
+            metadata_file = self.checkpoint_dir / f"{self.rank}{METADATA_FILE_NAME}"
+        with open(metadata_file, "wb") as f:
+            pickle.dump(metadata, f)
 
 
 def _copy_tensor_to_target(
@@ -453,7 +454,7 @@ class FileSystemReader(StorageReader):
         """
         rank = kwargs.get("rank")
         if rank is not None:
-            metadata_file = self.checkpoint_dir / f".rank{rank}_metadata"
+            metadata_file = self.checkpoint_dir / f"{rank}{METADATA_FILE_NAME}"
         else:
             metadata_file = self.checkpoint_dir / METADATA_FILE_NAME
 
