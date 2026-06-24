@@ -32,6 +32,8 @@ __all__ = [
     "BytesStorageMetadata",
     "ChunkStorageMetadata",
     "TensorProperties",
+    "CHUNK_INFO",
+    "ChunkInfo",
     # Planner interfaces
     "SavePlanner",
     "LoadPlanner",
@@ -81,6 +83,8 @@ from hyper_parallel.core.distributed_checkpoint.metadata import (
     MetadataIndex,
     TensorProperties,
     TensorStorageMetadata,
+    CHUNK_INFO,
+    ChunkInfo
 )
 
 # Planner interfaces and data structures
