@@ -118,6 +118,91 @@ def test_device_mesh_lazy_cp_group_materialization_requests_aiv_options(mock_pla
     assert mock_platform.split_group.call_args.kwargs["pg_options"] == _AIV_OPTIONS
 
 
+@patch("hyper_parallel.core.dtensor.device_mesh.platform")
+def test_device_mesh_view_cache_prefers_rooted_mesh_for_layout_rebuild(mock_platform):
+    """
+    Feature: DeviceMesh global cache for rooted views.
+    Description: Rebuild a Layout from an unflatten/sliced view after a rootless cache entry exists.
+    Expectation: Layout reuses the rooted view mesh so later concatenate sees a shared root.
+    """
+    _setup_mindspore_device_mesh_mock(mock_platform, world_size=8)
+    EXISTING_COMM_GROUPS.clear()
+    _DEVICE_MESH_MAP.clear()
+
+    mesh_shape = (1, 1, 2, 4)
+    mesh_dim_names = ("pp", "dp_replicate", "fsdp", "tp")
+    rootless_dense_mesh = _create_device_mesh(
+        "npu",
+        mesh_shape,
+        mesh_dim_names=mesh_dim_names,
+        rank_list=tuple(range(8)),
+        init_backend=False,
+    )
+    rootless_tp_mesh = _create_device_mesh(
+        "npu",
+        (4,),
+        mesh_dim_names=("tp",),
+        rank_list=(0, 1, 2, 3),
+        init_backend=False,
+    )
+    world_mesh = init_device_mesh("npu", (8,), mesh_dim_names=("world",))
+    dense_mesh = world_mesh._unflatten(  # pylint: disable=protected-access
+        0,
+        mesh_shape,
+        mesh_dim_names,
+        backend_override={"pp": "fake", "tp": "fake"},
+    )
+    tp_mesh = dense_mesh["tp"]
+
+    rebuilt_dense_layout = Layout(
+        dense_mesh.mesh_shape,
+        dense_mesh.mesh_dim_names,
+        rank_list=dense_mesh.rank_list,
+        init_backend=False,
+    )
+    rebuilt_layout = Layout(
+        tp_mesh.mesh_shape,
+        tp_mesh.mesh_dim_names,
+        rank_list=tp_mesh.rank_list,
+        init_backend=False,
+    )
+    fsdp_tp_mesh = DeviceMesh.concatenate([dense_mesh["fsdp"], rebuilt_layout.mesh])
+
+    assert rootless_dense_mesh.root_mesh is None
+    assert rootless_tp_mesh.root_mesh is None
+    assert rebuilt_dense_layout.mesh is dense_mesh
+    assert rebuilt_dense_layout.mesh.root_mesh is world_mesh
+    assert rebuilt_layout.mesh is tp_mesh
+    assert rebuilt_layout.mesh.root_mesh is world_mesh
+    assert fsdp_tp_mesh.mesh_dim_names == ("fsdp", "tp")
+    assert fsdp_tp_mesh.to_hash() == dense_mesh[("fsdp", "tp")].to_hash()
+
+
+@patch("hyper_parallel.core.dtensor.device_mesh.platform")
+def test_device_mesh_view_cache_keeps_root_mesh_when_view_matches_root_key(mock_platform):
+    """
+    Feature: DeviceMesh global cache for root-equivalent views.
+    Description: Concatenate all root dimensions and then rebuild the root Layout.
+    Expectation: The original root mesh remains the cached mesh for the root key.
+    """
+    _setup_mindspore_device_mesh_mock(mock_platform, world_size=4)
+    EXISTING_COMM_GROUPS.clear()
+    _DEVICE_MESH_MAP.clear()
+
+    root_mesh = init_device_mesh("npu", (2, 2), mesh_dim_names=("dp", "tp"))
+    concat_mesh = DeviceMesh.concatenate([root_mesh["dp"], root_mesh["tp"]])
+    rebuilt_layout = Layout(
+        root_mesh.mesh_shape,
+        root_mesh.mesh_dim_names,
+        rank_list=root_mesh.rank_list,
+        init_backend=False,
+    )
+
+    assert concat_mesh.root_mesh is root_mesh
+    assert concat_mesh.to_hash() == root_mesh.to_hash()
+    assert rebuilt_layout.mesh is root_mesh
+
+
 @unittest.skip("Skipped: all TestDeviceMesh cases (full UT session may hit MindSpore/Ascend init on some hosts).")
 class TestDeviceMesh(unittest.TestCase):
     """Unit tests for DeviceMesh class and related functions."""
