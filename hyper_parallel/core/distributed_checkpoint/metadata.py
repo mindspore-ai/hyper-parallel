@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
 
+CHUNK_INFO = "chunk_info"
+
 @dataclass(frozen=True)
 class MetadataIndex:
     """
@@ -45,6 +47,21 @@ class ChunkStorageMetadata:
     """
     offsets: tuple
     sizes: tuple
+
+
+@dataclass(frozen=True)
+class ChunkInfo:
+    """
+    Info for a tensor chunk.
+
+    Represents a portion of a distributed tensor stored in the checkpoint.
+
+    Attributes:
+        chunk: Offsets in the global tensor for each dimension.
+        global_shape: Sizes of the chunk for each dimension.
+    """
+    chunk: ChunkStorageMetadata
+    global_shape: tuple
 
 
 @dataclass(frozen=True)

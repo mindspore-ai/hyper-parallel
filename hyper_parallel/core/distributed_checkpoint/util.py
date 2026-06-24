@@ -19,7 +19,12 @@ from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Any, Union
 
-from hyper_parallel.core.distributed_checkpoint.metadata import ChunkStorageMetadata, MetadataIndex
+from hyper_parallel.core.distributed_checkpoint.metadata import (
+    ChunkStorageMetadata,
+    MetadataIndex,
+    CHUNK_INFO,
+    ChunkInfo
+)
 from hyper_parallel.core.distributed_checkpoint.planner import SavePlan, WriteItem
 from hyper_parallel.core.distributed_checkpoint.reshard import infer_slice_area_by_rank
 from hyper_parallel.core.dtensor.dtensor import DTensor
@@ -156,6 +161,12 @@ def create_chunk_list_for_tensor(obj: Union[Tensor, DTensor]) -> list[ChunkStora
         return [ChunkStorageMetadata(offsets=offsets, sizes=sizes)]
 
     if isinstance(obj, Tensor):
+        # handle Tensor with shard information
+        if hasattr(obj, CHUNK_INFO):
+            if not isinstance(getattr(obj, CHUNK_INFO), ChunkInfo):
+                raise ValueError("The attr CHUNK_INFO should be a ChunkInfo instance")
+            chunk = getattr(obj, CHUNK_INFO).chunk
+            return [chunk]
         # platform.Tensor has exactly one chunk in metadata (full tensor)
         shape = tuple(obj.shape)
         return [ChunkStorageMetadata(offsets=(0,) * len(shape), sizes=shape)]
