@@ -144,11 +144,9 @@ def _post_compute_anchor(order, index, leaf_step=None):
 
     for next_index in range(index + 1, fallback_anchor + 1):
         next_step = order[next_index]
-        if (
-                next_step is not None
-                and next_step.type == send_type
-                and next_step.stage_index == step.stage_index
-                and next_step.micro_index == step.micro_index):
+        next_valid = (next_step is not None and next_step.type == send_type
+                   and next_step.stage_index == step.stage_index and next_step.micro_index == step.micro_index)
+        if next_valid:
             return next_index
     return fallback_anchor
 

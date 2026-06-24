@@ -596,8 +596,56 @@ class MindSporeHSDPParamV2(HSDPParamV2):
                 f"Expected sharded_state in {states}, got {self.sharded_state}"
             )
 
+    def _is_same_sharded_local_tensor(self, local_tensor: ms.Tensor) -> bool:
+        """Whether the cached flat shard view already points to the ``local_tensor`` storage."""
+        if not isinstance(self._sharded_param_data, ms.Tensor):
+            return False
+        cached_storage = self._sharded_param_data.untyped_storage()
+        local_storage = local_tensor.untyped_storage()
+        # when sharding param with shape (1, ...) over 2 ranks
+        # local_tensor on rank 1 can be size 0, data_ptr() can be 0
+        return (
+            cached_storage.data_ptr() > 0
+            and cached_storage.data_ptr() == local_storage.data_ptr()
+        )
+
+    def _validate_sharded_local_tensor_shape(self, local_tensor: ms.Tensor) -> None:
+        """Validate that a replaced local tensor still matches the expected shard shape."""
+        if local_tensor.shape != self.sharded_size:
+            raise AssertionError(
+                f"Expected sharded_size to be {self.sharded_size}, got {local_tensor.shape}"
+            )
+
+    def _pin_sharded_local_tensor_if_needed(self, local_tensor: ms.Tensor) -> Tuple[ms.Tensor, bool]:
+        """Pin the local tensor memory when CPU offload requires it."""
+        if self.pin_memory and not local_tensor.is_pinned():
+            return local_tensor.to("cpu").pin_memory(), True
+        return local_tensor, False
+
+    def _assert_sharded_param_is_dtensor(self) -> None:
+        """Assert that ``self.sharded_param`` is backed by a DTensor."""
+        if not isinstance(self.sharded_param, DTensor):
+            raise AssertionError(f"Expected DTensor, got {type(self.sharded_param)}")
+
+    def _refresh_sharded_local_tensor_view(
+        self,
+        local_tensor: ms.Tensor,
+        shard_dim: int,
+        length: int,
+    ) -> None:
+        """Refresh ``self.sharded_param`` to point to a local tensor view."""
+        # Only change the local tensor object if needed
+        with _no_grad():
+            local_view = local_tensor.narrow(dim=shard_dim, start=0, length=length)
+        set_requires_grad_if_needed(self.sharded_param, local_view)
+        self.sharded_param._local_tensor = local_view
+        if not self.sharded_param._local_tensor.is_contiguous():
+            raise AssertionError(
+                "Expected sharded_param._local_tensor to be contiguous"
+            )
+
     def reset_sharded_param(self) -> None:
-        """Reset sharded param after load_state_dict."""
+        """Reset the sharded param after ``load_state_dict``."""
         module_info = self._module_info
         new_param = getattr(module_info.module, module_info.param_name)
         if new_param is not self.sharded_param:
@@ -614,7 +662,6 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         local_tensor = new_param._local_tensor if isinstance(new_param, DTensor) else new_param
         if local_tensor.is_meta:
             return
-        updated_local_tensor = False
         # local_tensor can be padded twice
         # 1st time in fully_shard(model)
         # 2nd time in model(input) lazy_init
@@ -622,41 +669,18 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         # 2nd time shouldn't be no-op if people call model.load_state_dict(...) before lazy_init
         # this makes it possible for trainer to call `sd = model.state_dict()` before the training loop
         # and use `sd` without calling .state_dict() per iteration
-        same_local_tensor = False
-        if isinstance(self._sharded_param_data, ms.Tensor):
-            same_local_tensor = (
-                # when sharding param with shape (1, ...) over 2 ranks
-                # local_tensor on rank 1 can be size 0, data_ptr() can be 0
-                self._sharded_param_data.untyped_storage().data_ptr() > 0
-                and self._sharded_param_data.untyped_storage().data_ptr()
-                == local_tensor.untyped_storage().data_ptr()
-            )
-        sharded_size = self.sharded_size
+        same_local_tensor = self._is_same_sharded_local_tensor(local_tensor)
         shard_dim = self.hsdp_placement.dim
         length = local_tensor.shape[shard_dim] if local_tensor.numel() > 0 else 0
         if not same_local_tensor:
-            if local_tensor.shape != sharded_size:
-                raise AssertionError(
-                    f"Expected sharded_size to be {sharded_size}, got {local_tensor.shape}"
-                )
-            updated_local_tensor = True
-        if self.pin_memory and not local_tensor.is_pinned():
-            local_tensor = local_tensor.to("cpu").pin_memory()
-            updated_local_tensor = True
+            self._validate_sharded_local_tensor_shape(local_tensor)
+        local_tensor, pinned_local_tensor = self._pin_sharded_local_tensor_if_needed(local_tensor)
+        updated_local_tensor = not same_local_tensor or pinned_local_tensor
         if not same_local_tensor:
             self._sharded_param_data = local_tensor.view(-1)
-        if not isinstance(self.sharded_param, DTensor):
-            raise AssertionError(f"Expected DTensor, got {type(self.sharded_param)}")
+        self._assert_sharded_param_is_dtensor()
         if updated_local_tensor:
-            # Only change the local tensor object if needed
-            with _no_grad():
-                local_view = local_tensor.narrow(dim=shard_dim, start=0, length=length)
-            set_requires_grad_if_needed(self.sharded_param, local_view)
-            self.sharded_param._local_tensor = local_view
-            if not self.sharded_param._local_tensor.is_contiguous():
-                raise AssertionError(
-                    "Expected sharded_param._local_tensor to be contiguous"
-                )
+            self._refresh_sharded_local_tensor_view(local_tensor, shard_dim, length)
         self._sharding_spec = cast(DTensor, self.sharded_param).layout
 
     def _get_unsharded_param_data(self, async_op: bool = False) -> Tuple[ms.Tensor, Optional[CommHandle]]:

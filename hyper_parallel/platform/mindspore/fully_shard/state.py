@@ -672,4 +672,4 @@ class MindSporeHSDPStateV2(HSDPState):
                 f"Unsupported reduce op type {reduce_op_type}, "
                 f"supported types are {list(fsdp_support_reduce_op.keys())}")
         reduce_op: str = reduce_op_type.lower().strip()
-        self.reduce_op_type = fsdp_support_reduce_op[reduce_op]
+        self.reduce_op_type = fsdp_support_reduce_op.get(reduce_op)
