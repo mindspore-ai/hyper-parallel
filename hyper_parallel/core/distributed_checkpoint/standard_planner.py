@@ -19,12 +19,24 @@ import pickle
 from typing import Any, Optional, Union
 
 from hyper_parallel.core.distributed_checkpoint.metadata import (
-    Metadata, MetadataIndex, ChunkStorageMetadata,
-    TensorStorageMetadata, TensorProperties, BytesStorageMetadata
+    CHUNK_INFO,
+    Metadata,
+    MetadataIndex,
+    ChunkStorageMetadata,
+    ChunkInfo,
+    TensorStorageMetadata,
+    TensorProperties,
+    BytesStorageMetadata
 )
 from hyper_parallel.core.distributed_checkpoint.planner import (
-    SavePlan, SavePlanner, LoadPlan, LoadPlanner,
-    WriteItem, WriteItemType, ReadItem, LoadItemType
+    SavePlan,
+    SavePlanner,
+    LoadPlan,
+    LoadPlanner,
+    WriteItem,
+    WriteItemType,
+    ReadItem,
+    LoadItemType
 )
 from hyper_parallel.core.distributed_checkpoint.reshard import infer_slice_area_by_rank, infer_intersection
 from hyper_parallel.core.distributed_checkpoint.util import (
@@ -35,7 +47,8 @@ from hyper_parallel.core.distributed_checkpoint.util import (
     flatten_state_dict,
     set_element,
 )
-from hyper_parallel.core.dtensor.dtensor import DTensor, Layout
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 
 platform = get_platform()
@@ -185,19 +198,25 @@ class StandardSavePlanner(SavePlanner):
                 # Create write item for platform.Tensor: build single chunk with tensor's own size
                 dtype_str = str(obj.dtype) if hasattr(obj, 'dtype') else 'unknown'
                 properties = TensorProperties(dtype=dtype_str)
+                # handle Tensor with shard information
+                if hasattr(obj, CHUNK_INFO):
+                    if not isinstance(getattr(obj, CHUNK_INFO), ChunkInfo):
+                        raise ValueError("The attr CHUNK_INFO should be a ChunkInfo instance")
+                    chunk = getattr(obj, CHUNK_INFO).chunk
                 # Single chunk covering the whole tensor (offsets=0, sizes=shape)
-                chunk = ChunkStorageMetadata(
-                    offsets=(0,) * len(obj.shape),
-                    sizes=obj.shape,
-                )
-                index = MetadataIndex(fqn=fqn, offset=(0,) * len(obj.shape), index=None)
+                else:
+                    chunk = ChunkStorageMetadata(
+                        offsets=(0,) * len(obj.shape),
+                        sizes=obj.shape,
+                    )
+                index = MetadataIndex(fqn=fqn, offset=chunk.offsets, index=None)
                 write_item = WriteItem(
                     index=index,
                     type=WriteItemType.TENSOR,
                     tensor_data={
                         'chunk': chunk,
                         'properties': properties,
-                        'size': obj.shape,
+                        'size': getattr(obj, CHUNK_INFO).global_shape if hasattr(obj, CHUNK_INFO) else obj.shape,
                     }
                 )
                 items.append(write_item)
@@ -300,14 +319,14 @@ class StandardSavePlanner(SavePlanner):
         """
         return plan
 
-    def get_cached_result(self) -> Optional[tuple[SavePlan, Metadata]]:
+    def get_cached(self) -> Optional[CachedSaveResult]:
         """Return cached finalized plan and metadata when plan caching is enabled."""
-        if not self._enable_plan_caching:
+        if (
+            not self._enable_plan_caching
+            or self._cached_plans_key not in StandardSavePlanner._cached_save_result
+        ):
             return None
-        cached_result = StandardSavePlanner._cached_save_result.get(self._cached_plans_key)
-        if cached_result is None:
-            return None
-        return cached_result.final_plan, cached_result.metadata
+        return StandardSavePlanner._cached_save_result[self._cached_plans_key]
 
     def cache_result(self, final_plan: SavePlan, metadata: Metadata) -> None:
         """Store finalized plan and metadata in the class-level planner cache."""
@@ -456,7 +475,8 @@ class StandardLoadPlanner(LoadPlanner):
                 continue
             md = self.metadata.state_dict_metadata[fqn]
             if isinstance(md, TensorStorageMetadata):
-                obj_size = getattr(obj, "shape", None)
+                obj_size = getattr(obj, CHUNK_INFO).global_shape if hasattr(obj, CHUNK_INFO) \
+                    else getattr(obj, "shape", None)
                 if obj_size is None or md.size != tuple(obj_size):
                     raise ValueError(
                         f"Size mismatch between saved {md.size} and current: {obj_size} for {fqn}",

@@ -125,9 +125,11 @@ def _save_impl(
         use_collectives=use_collectives
     )
 
-    cached = planner.get_cached_result() if isinstance(planner, StandardSavePlanner) else None
-    if cached is not None:
-        final_plan, metadata = cached
+    cached_res = planner.get_cached() if hasattr(planner, 'get_cached') else None
+    if cached_res:
+        # Get final plan and metadata from cache
+        final_plan, metadata = cached_res.final_plan, cached_res.metadata
+
     else:
         # Build local plan
         local_plan = planner.build_local_plan()
@@ -148,7 +150,8 @@ def _save_impl(
 
         # Finalize and cache plan
         final_plan = planner.finalize_plan(central_plan)
-        if isinstance(planner, StandardSavePlanner):
+        # Add final plan and metadata to the cache
+        if hasattr(planner, 'cache_result'):
             planner.cache_result(final_plan, metadata)
 
     # Write data
@@ -380,16 +383,12 @@ def load(
     is_coordinator = rank == 0
 
     # Load metadata
-    if use_collectives:
-        try:
-            metadata = storage_reader.load_metadata()
-        except FileNotFoundError:
-            # Fallback to rank-local metadata (e.g. checkpoint saved with use_collectives=False)
-            metadata = storage_reader.load_metadata(rank=rank)
-            use_collectives = False
-    else:
-        # Load rank-local metadata directly (no cross-rank interaction)
+    try:
+        metadata = storage_reader.load_metadata()
+    except FileNotFoundError:
+        # Fallback to rank-local metadata (e.g. checkpoint saved with use_collectives=False)
         metadata = storage_reader.load_metadata(rank=rank)
+        use_collectives = False
 
     # Configure planner
     planner.configure_planner(
