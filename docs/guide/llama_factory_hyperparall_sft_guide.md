@@ -14,19 +14,19 @@
 
 框架与依赖
 
-| **框架**      | **版本**    | **代码**                                           |
-|---------------|-------------|----------------------------------------------------|
-| LlamaFactory  | master      | <https://github.com/hiyouga/LlamaFactory>          |
+| **框架**      | **版本**    | **代码**                                            |
+|--------------|-------------|---------------------------------------------------|
+| LlamaFactory | master      | <https://github.com/hiyouga/LlamaFactory>         |
 | HyperParallel | master      | <https://gitcode.com/mindspore/hyper-parallel.git> |
-| Transformers  | 4.57.1      |                                                    |
-| Accelerate    | 1.11.0      |                                                    |
-| torch         | 2.7.1       |                                                    |
-| torch\_npu    | 2.7.1.post4 | torch\_npu按对应版本安装，此处仅为参考             |
-| torchvision   | 0.22.1      |                                                    |
-| torchaudio    | 2.7.1       |                                                    |
-| trl           | 0.24.0      |                                                    |
-| datasets      | 4.0.0       |                                                    |
-| peft          | 0.18.0      |                                                    |
+| Transformers | 4.57.1      |                                                   |
+| Accelerate   | 1.11.0      |                                                   |
+| torch        | 2.7.1       |                                                   |
+| torch_npu    | 2.7.1.post4 | torch_npu按对应版本安装，此处仅为参考                           |
+| torchvision  | 0.22.1      |                                                   |
+| torchaudio   | 2.7.1       |                                                   |
+| trl          | 0.24.0      |                                                   |
+| datasets     | 4.0.0       |                                                   |
+| peft         | 0.18.0      |                                                   |
 
 ## yaml配置
 
@@ -84,13 +84,11 @@ bf16: true
 ddp_timeout: 180000000
 resume_from_checkpoint: null
 seed: 1234
-
-# packing: true
 ```
 
 ## 启动命令
 
-先下载模型权重，将yaml文件中model\_path替换为上述文件夹路径。
+先下载模型权重，将yaml文件中model_path替换为上述文件夹路径。
 
 accelerate config:
 
@@ -141,9 +139,9 @@ accelerate launch --config_file examples/accelerate/fsdp2_config.yaml src/train.
 
 -   BF16
 
--   per\_device\_batch\_size=1
+-   per_device_batch_size=1
 
--   cutoff\_len=16384
+-   cutoff_len=16384
 
 ![Torch FSDP 与 Hyper FSDP 精度对比](../images/llama_factory_hyperparall_sft_guide_image1.png)
 
@@ -161,27 +159,27 @@ accelerate launch --config_file examples/accelerate/fsdp2_config.yaml src/train.
 
 -   BF16
 
--   per\_device\_batch\_size=1
+-   per_device_batch_size=1
 
--   cutoff\_len=16384
+-   cutoff_len=16384
 
 ![Hyper FSDP + CP 精度](../images/llama_factory_hyperparall_sft_guide_image2.png)
 
 ### Hyper FSDP/Hyper FSDP + CP精度对比
 
-**Model:** Qwen3-VL-30B-A3B-Instruct(num\_hidden\_layers=24)
+**Model:** Qwen3-VL-30B-A3B-Instruct(num_hidden_layers=24)
 
 **Configuration:**
 
--   Baseline 8 NPU FSDP, ours 8NPU FSDP + CP\_SIZE 2
+-   Baseline 8 NPU FSDP, ours 8NPU FSDP + CP_SIZE 2
 
 -   16 cards
 
 -   BF16
 
--   per\_device\_batch\_size=1
+-   per_device_batch_size=1
 
--   cutoff\_len=16384
+-   cutoff_len=16384
 
 ![Hyper FSDP 与 Hyper FSDP + CP 精度对比](../images/llama_factory_hyperparall_sft_guide_image3.png)
 
