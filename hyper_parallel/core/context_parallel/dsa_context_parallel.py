@@ -49,6 +49,8 @@ Module = platform.Module
 
 
 _SUPPORTED_LAYOUTS = ("BSND", "TND")
+_SUPPORTED_LOSS_VARIANTS = ("sparse", "dense")
+_DEFAULT_ARG_INDEX = object()
 
 
 def _is_tensor_or_dtensor(value: Any) -> bool:
@@ -68,6 +70,19 @@ def _to_sequence_replicate(value: Any, device_mesh: DeviceMesh, seq_dim: int) ->
     if not _is_tensor_or_dtensor(value):
         return value
     return _to_cp_dtensor(value, device_mesh, (Shard(seq_dim),), (Replicate(),), seq_dim)
+
+
+def _to_query_stats_shard(value: Any, device_mesh: DeviceMesh, stats_seq_dim: int) -> Any:
+    """Annotate query-side softmax stats as sharded on their sequence dimension."""
+    if not _is_tensor_or_dtensor(value):
+        return value
+    return _to_cp_dtensor(
+        value,
+        device_mesh,
+        (Shard(stats_seq_dim),),
+        (Shard(stats_seq_dim),),
+        stats_seq_dim,
+    )
 
 
 def _maybe_replace_arg(args: list, index: Optional[int], fn) -> None:
@@ -108,6 +123,24 @@ def _validate_layout_and_mode(style_name: str, layout: str, mode: str) -> tuple[
     if mode != "colossal":
         raise ValueError(f"{style_name} currently supports only mode='colossal'.")
     return layout, 1 if layout == "BSND" else 0
+
+
+def _validate_loss_variant(loss_variant: str) -> str:
+    """Return normalized DSA indexer-loss variant."""
+    loss_variant = loss_variant.lower()
+    if loss_variant not in _SUPPORTED_LOSS_VARIANTS:
+        raise ValueError(f"loss_variant must be one of {_SUPPORTED_LOSS_VARIANTS}, but got {loss_variant!r}.")
+    return loss_variant
+
+
+def _query_stats_seq_dim(layout: str) -> int:
+    """Return the sequence dimension used by query-side softmax stats."""
+    return 2 if layout == "BSND" else 1
+
+
+def _default_arg_index(index: Any, default: Optional[int]) -> Optional[int]:
+    """Resolve optional positional index defaults while preserving explicit None."""
+    return default if index is _DEFAULT_ARG_INDEX else index
 
 
 def _finalize_output(value: Any, use_local_output: bool, output_layout=None, seq_dim: Optional[int] = None) -> Any:
@@ -409,14 +442,20 @@ class DSAIndexerLossContextParallel(ParallelStyle):
     """Colossal-style CP hook for a DSA indexer-loss kernel boundary.
 
     This style targets a hookable module/cell whose forward signature is shaped
-    like ``(query, key, query_index, key_index, weights, topk_indices,
-    softmax_max, softmax_sum, query_rope, key_rope, ...)``.  The boundary is
-    expected to start after MF has already done local-only bookkeeping such as
-    ``stop_gradient`` and ``split``.
+    like the sparse indexer-loss variant by default:
+    ``(query, key, query_index, key_index, weights, topk_indices,
+    softmax_max, softmax_sum, query_rope, key_rope, ...)``.  Set
+    ``loss_variant="dense"`` for the dense loss signature:
+    ``(query, key, query_index, key_index, weights, softmax_max, softmax_sum,
+    softmax_max_index, softmax_sum_index, scale_value, query_rope, key_rope,
+    ...)``.  The boundary is expected to start after MF has already done
+    local-only bookkeeping such as ``stop_gradient`` and ``split``.
 
     Placements:
     - ``query``, ``query_index``, ``weights``, ``topk_indices`` and
       ``query_rope`` are annotated as ``Shard(seq)``;
+    - ``softmax_max``, ``softmax_sum`` and dense index softmax stats are
+      annotated as query-side stats sharded on their stats sequence dimension;
     - ``key``, ``key_index`` and ``key_rope`` are all-gathered to
       ``Replicate()``.
     """
@@ -426,43 +465,64 @@ class DSAIndexerLossContextParallel(ParallelStyle):
             *,
             layout: str = "BSND",
             mode: str = "colossal",
+            loss_variant: str = "sparse",
             query_index: Optional[int] = 0,
             key_index: Optional[int] = 1,
             query_indexer_index: Optional[int] = 2,
             key_indexer_index: Optional[int] = 3,
             weights_index: Optional[int] = 4,
-            topk_index: Optional[int] = 5,
-            query_rope_index: Optional[int] = 8,
-            key_rope_index: Optional[int] = 9,
+            topk_index: Optional[int] = _DEFAULT_ARG_INDEX,
+            softmax_max_index: Optional[int] = _DEFAULT_ARG_INDEX,
+            softmax_sum_index: Optional[int] = _DEFAULT_ARG_INDEX,
+            softmax_max_indexer_index: Optional[int] = _DEFAULT_ARG_INDEX,
+            softmax_sum_indexer_index: Optional[int] = _DEFAULT_ARG_INDEX,
+            query_rope_index: Optional[int] = _DEFAULT_ARG_INDEX,
+            key_rope_index: Optional[int] = _DEFAULT_ARG_INDEX,
             query_kwarg_name: Optional[str] = None,
             key_kwarg_name: Optional[str] = None,
             query_indexer_kwarg_name: Optional[str] = None,
             key_indexer_kwarg_name: Optional[str] = None,
             weights_kwarg_name: Optional[str] = None,
             topk_kwarg_name: Optional[str] = None,
+            softmax_max_kwarg_name: Optional[str] = None,
+            softmax_sum_kwarg_name: Optional[str] = None,
+            softmax_max_indexer_kwarg_name: Optional[str] = None,
+            softmax_sum_indexer_kwarg_name: Optional[str] = None,
             query_rope_kwarg_name: Optional[str] = None,
             key_rope_kwarg_name: Optional[str] = None,
             use_local_output: bool = False,
     ) -> None:
         super().__init__()
         layout, seq_dim = _validate_layout_and_mode(self.__class__.__name__, layout, mode)
+        loss_variant = _validate_loss_variant(loss_variant)
+        is_dense = loss_variant == "dense"
         self.layout = layout
         self.mode = mode
+        self.loss_variant = loss_variant
         self.seq_dim = seq_dim
+        self.stats_seq_dim = _query_stats_seq_dim(layout)
         self.query_index = query_index
         self.key_index = key_index
         self.query_indexer_index = query_indexer_index
         self.key_indexer_index = key_indexer_index
         self.weights_index = weights_index
-        self.topk_index = topk_index
-        self.query_rope_index = query_rope_index
-        self.key_rope_index = key_rope_index
+        self.topk_index = _default_arg_index(topk_index, None if is_dense else 5)
+        self.softmax_max_index = _default_arg_index(softmax_max_index, 5 if is_dense else 6)
+        self.softmax_sum_index = _default_arg_index(softmax_sum_index, 6 if is_dense else 7)
+        self.softmax_max_indexer_index = _default_arg_index(softmax_max_indexer_index, 7 if is_dense else None)
+        self.softmax_sum_indexer_index = _default_arg_index(softmax_sum_indexer_index, 8 if is_dense else None)
+        self.query_rope_index = _default_arg_index(query_rope_index, 10 if is_dense else 8)
+        self.key_rope_index = _default_arg_index(key_rope_index, 11 if is_dense else 9)
         self.query_kwarg_name = query_kwarg_name
         self.key_kwarg_name = key_kwarg_name
         self.query_indexer_kwarg_name = query_indexer_kwarg_name
         self.key_indexer_kwarg_name = key_indexer_kwarg_name
         self.weights_kwarg_name = weights_kwarg_name
         self.topk_kwarg_name = topk_kwarg_name
+        self.softmax_max_kwarg_name = softmax_max_kwarg_name
+        self.softmax_sum_kwarg_name = softmax_sum_kwarg_name
+        self.softmax_max_indexer_kwarg_name = softmax_max_indexer_kwarg_name
+        self.softmax_sum_indexer_kwarg_name = softmax_sum_indexer_kwarg_name
         self.query_rope_kwarg_name = query_rope_kwarg_name
         self.key_rope_kwarg_name = key_rope_kwarg_name
         self.use_local_output = use_local_output
@@ -471,6 +531,7 @@ class DSAIndexerLossContextParallel(ParallelStyle):
         return (
             f"{self.__class__.__name__}("
             f"layout={self.layout!r}, mode={self.mode!r}, "
+            f"loss_variant={self.loss_variant!r}, "
             f"use_local_output={self.use_local_output})"
         )
 
@@ -533,6 +594,9 @@ class DSAIndexerLossContextParallel(ParallelStyle):
         def shard(value: Any) -> Any:
             return self._shard_query_side(value, cp_mesh)
 
+        def stats_shard(value: Any) -> Any:
+            return _to_query_stats_shard(value, cp_mesh, self.stats_seq_dim)
+
         return [
             _ParamSpec(self.query_index, self.query_kwarg_name, shard),
             _ParamSpec(self.key_index, self.key_kwarg_name, replicate_fn_map["key"]),
@@ -540,6 +604,10 @@ class DSAIndexerLossContextParallel(ParallelStyle):
             _ParamSpec(self.key_indexer_index, self.key_indexer_kwarg_name, replicate_fn_map["key_indexer"]),
             _ParamSpec(self.weights_index, self.weights_kwarg_name, shard),
             _ParamSpec(self.topk_index, self.topk_kwarg_name, shard),
+            _ParamSpec(self.softmax_max_index, self.softmax_max_kwarg_name, stats_shard),
+            _ParamSpec(self.softmax_sum_index, self.softmax_sum_kwarg_name, stats_shard),
+            _ParamSpec(self.softmax_max_indexer_index, self.softmax_max_indexer_kwarg_name, stats_shard),
+            _ParamSpec(self.softmax_sum_indexer_index, self.softmax_sum_indexer_kwarg_name, stats_shard),
             _ParamSpec(self.query_rope_index, self.query_rope_kwarg_name, shard),
             _ParamSpec(self.key_rope_index, self.key_rope_kwarg_name, replicate_fn_map["key_rope"]),
         ]
