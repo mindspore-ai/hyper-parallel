@@ -16,18 +16,7 @@
 
 Run (see README for ``msrun`` launcher flags; world size must match TP degree).
 """
-# pylint: disable=C0413
 from __future__ import annotations
-
-import os
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 import mindspore as ms
 from mindspore import communication as dist
@@ -35,13 +24,13 @@ from mindspore import mint, nn, ops
 from mindspore._c_expression import NoFallbackGuard
 from mindspore.communication import get_group_size, get_rank
 
+from model import Llama3DemoConfig, Llama3Model
+from parallelize import broadcast_state_dict_from_rank0, build_tp_mesh, parallelize_llama3
+
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
 
-from model import Llama3DemoConfig, Llama3Model
-
 enable_mindspore_backward_compat()
-from parallelize import broadcast_state_dict_from_rank0, build_tp_mesh, parallelize_llama3
 
 
 def _zero_grad(cell: nn.Cell) -> None:

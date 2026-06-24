@@ -90,7 +90,7 @@ class ProfileParser:
         # [dp, tp, pp, dmratio, bfratio, re_grow_ratio, hratio, moe_fw]
         profile_result = []
         dense_flag = False
-        # TODO: para.YAML_PATH implementation to be modified
+        # Note: para.YAML_PATH implementation to be modified
         if self.para.YAML_PATH:
             for result in profile_configs_results:
                 profile_dir = result[-1]
@@ -282,7 +282,7 @@ class ProfileParser:
             logger.error(f'extract by loaded_data fail: {e}')
             return [], []
 
-    # TODO: to be modified
+    # Note: to be modified
     def stage_anal(self, pp, stage):  # assuming we profiled 2 steps w/ micro = 32
         """
         Docstring for stage_anal
@@ -502,7 +502,7 @@ class ProfileParser:
         i = 0
         for rank_folder in folders:
             logger.info(f"parsing: {rank_folder}")
-            # TODO: para.YAML_PATH branch to be modified
+            # Note: para.YAML_PATH branch to be modified
             if self.para.YAML_PATH:
                 self.load_profile_by_dir(rank_folder)
                 self.stage_anal(pp, i)

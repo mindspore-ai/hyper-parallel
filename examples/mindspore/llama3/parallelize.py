@@ -22,6 +22,8 @@ from __future__ import annotations
 from mindspore import nn
 from mindspore.communication import get_group_size
 
+from model import Llama3Model
+
 from hyper_parallel import (
     ColwiseParallel,
     PrepareModuleInput,
@@ -33,8 +35,6 @@ from hyper_parallel import (
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.platform import get_platform
-
-from model import Llama3Model
 
 
 def parallelize_llama3(

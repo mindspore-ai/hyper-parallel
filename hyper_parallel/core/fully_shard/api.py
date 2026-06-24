@@ -479,34 +479,73 @@ def _validate_module_for_fully_shard(
         _check_module_valid(platform_type, module)
 
 
-def _check_hsdp_input_valid(platform_type, module, shard_size, threshold, optimizer_level, enable_grad_accumulation,
-                            grad_scale, reduce_dtype, comm_async, comm_fusion, bucket_size):
-    """check hsdp input valid"""
-    _check_module_valid(platform_type, module)
+HsdpValidationOptions = namedtuple(
+    "HsdpValidationOptions",
+    [
+        "shard_size",
+        "threshold",
+        "optimizer_level",
+        "enable_grad_accumulation",
+        "grad_scale",
+        "reduce_dtype",
+        "comm_async",
+        "comm_fusion",
+        "bucket_size",
+    ],
+)
+
+
+def _validate_hsdp_shard_size(shard_size: int) -> None:
     if not isinstance(shard_size, int) or (shard_size <= 0 and shard_size != -1):
         raise ValueError(f"shard_size must be a positive integer, but got {shard_size}.")
+
+
+def _validate_hsdp_threshold(threshold: int) -> None:
     if not isinstance(threshold, int) or threshold < 0:
         raise ValueError(f"threshold must be a positive integer or 0, but got {threshold}.")
+
+
+def _validate_hsdp_optimizer_level(optimizer_level: str) -> None:
     if optimizer_level not in ["level1", "level2", "level3"]:
-        raise ValueError(f"Optimizer level should in ['level1', 'level2', 'level3'], but got {optimizer_level}.")
-    if not isinstance(enable_grad_accumulation, bool):
-        raise ValueError(f"enable_grad_accumulation must be bool but got {enable_grad_accumulation}.")
-    if not isinstance(grad_scale, float):
-        raise ValueError(f"grad_scale must be float but got {grad_scale}.")
+        raise ValueError(
+            f"Optimizer level should in ['level1', 'level2', 'level3'], but got {optimizer_level}."
+        )
+
+
+def _validate_hsdp_reduce_dtype(platform_type: PlatformType, reduce_dtype) -> None:
     if platform_type == PlatformType.MINDSPORE:
         from mindspore._c_expression.typing import Type
         if reduce_dtype is not None and not isinstance(reduce_dtype, Type):
             raise ValueError(f"reduce_dtype must be mindspore.dtype but got {reduce_dtype}.")
-    else:
-        import torch
-        if reduce_dtype is not None and not isinstance(reduce_dtype, torch.dtype):
-            raise ValueError(f"reduce_dtype must be torch.dtype but got {reduce_dtype}.")
-    if not isinstance(comm_async, bool):
-        raise ValueError(f"comm_async must be bool but got {comm_async}.")
-    if not isinstance(comm_fusion, bool):
-        raise ValueError(f"comm_fusion must be bool but got {comm_fusion}.")
-    if not isinstance(bucket_size, int) or (bucket_size < 0 and bucket_size != -1):
-        raise ValueError(f"bucket_size must be a positive integer or 0, but got {bucket_size}.")
+        return
+    import torch
+    if reduce_dtype is not None and not isinstance(reduce_dtype, torch.dtype):
+        raise ValueError(f"reduce_dtype must be torch.dtype but got {reduce_dtype}.")
+
+
+def _check_hsdp_input_valid(platform_type, module, options: HsdpValidationOptions):
+    """check hsdp input valid"""
+    _check_module_valid(platform_type, module)
+    _validate_hsdp_shard_size(options.shard_size)
+    _validate_hsdp_threshold(options.threshold)
+    _validate_hsdp_optimizer_level(options.optimizer_level)
+    if not isinstance(options.enable_grad_accumulation, bool):
+        raise ValueError(
+            f"enable_grad_accumulation must be bool but got {options.enable_grad_accumulation}."
+        )
+    if not isinstance(options.grad_scale, float):
+        raise ValueError(f"grad_scale must be float but got {options.grad_scale}.")
+    _validate_hsdp_reduce_dtype(platform_type, options.reduce_dtype)
+    if not isinstance(options.comm_async, bool):
+        raise ValueError(f"comm_async must be bool but got {options.comm_async}.")
+    if not isinstance(options.comm_fusion, bool):
+        raise ValueError(f"comm_fusion must be bool but got {options.comm_fusion}.")
+    if not isinstance(options.bucket_size, int) or (
+        options.bucket_size < 0 and options.bucket_size != -1
+    ):
+        raise ValueError(
+            f"bucket_size must be a positive integer or 0, but got {options.bucket_size}."
+        )
 
 
 def _get_device_from_mesh(mesh: DeviceMesh):

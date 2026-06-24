@@ -431,6 +431,7 @@ class DeviceMesh:
         exc_val: Optional[BaseException],
         exc_tb: Optional[TracebackType],
     ) -> None:
+        del self
         _mesh_resources.mesh_stack.pop()
 
     @staticmethod

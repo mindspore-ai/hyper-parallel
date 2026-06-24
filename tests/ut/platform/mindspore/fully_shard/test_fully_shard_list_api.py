@@ -40,6 +40,7 @@ from hyper_parallel.core.fully_shard.api import (
     HSDPModule,
     _UnshardHandle,
     _check_hsdp_input_valid,
+    HsdpValidationOptions,
     _check_strict_keys,
     _get_device_from_mesh,
     _get_root_modules,
@@ -211,21 +212,19 @@ class TestCoreApiHelpersMindSpore(unittest.TestCase):
     def test_check_hsdp_input_valid_rejects_invalid_options(self):
         """Input validation should reject invalid scalar options before setup."""
         cell = ms_nn.Dense(4, 4)
-        valid_args = {
-            "platform_type": PlatformType.MINDSPORE,
-            "module": cell,
-            "shard_size": 1,
-            "threshold": 0,
-            "optimizer_level": "level1",
-            "enable_grad_accumulation": False,
-            "grad_scale": 1.0,
-            "reduce_dtype": None,
-            "comm_async": False,
-            "comm_fusion": False,
-            "bucket_size": 0,
-        }
+        valid_args = HsdpValidationOptions(
+            shard_size=1,
+            threshold=0,
+            optimizer_level="level1",
+            enable_grad_accumulation=False,
+            grad_scale=1.0,
+            reduce_dtype=None,
+            comm_async=False,
+            comm_fusion=False,
+            bucket_size=0,
+        )
 
-        _check_hsdp_input_valid(**valid_args)
+        _check_hsdp_input_valid(PlatformType.MINDSPORE, cell, valid_args)
         for key, value in [
             ("shard_size", 0),
             ("threshold", -1),
@@ -237,10 +236,9 @@ class TestCoreApiHelpersMindSpore(unittest.TestCase):
             ("comm_fusion", 0),
             ("bucket_size", -2),
         ]:
-            bad_args = dict(valid_args)
-            bad_args[key] = value
+            bad_args = valid_args._replace(**{key: value})
             with self.subTest(key=key), self.assertRaises(ValueError):
-                _check_hsdp_input_valid(**bad_args)
+                _check_hsdp_input_valid(PlatformType.MINDSPORE, cell, bad_args)
 
 
 class TestHSDPModuleInterfaceMindSpore(unittest.TestCase):

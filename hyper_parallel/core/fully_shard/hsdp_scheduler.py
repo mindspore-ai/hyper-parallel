@@ -261,7 +261,8 @@ class HSDPSchedulerV2:
             self._fsdp_group_post_pending.clear()
 
     # pylint: disable=W0613
-    def _grouped_forward_pre_hook_skip(self, cell, args, kwargs):
+    @staticmethod
+    def _grouped_forward_pre_hook_skip(cell, args, kwargs):
         """Return value when grouped pre-forward should not run (first module already did).
 
         Default matches MindSpore Cell forward pre-hooks (explicit ``(args, kwargs)``).
@@ -269,7 +270,8 @@ class HSDPSchedulerV2:
         """
         return args, kwargs
 
-    def _grouped_forward_post_hook_skip(self, outputs):
+    @staticmethod
+    def _grouped_forward_post_hook_skip(outputs):
         """Return value when grouped post-forward is deferred to a later module in the group.
 
         Default returns ``outputs`` (MindSpore). ``TorchHSDPSchedulerV2`` overrides to ``None``.
