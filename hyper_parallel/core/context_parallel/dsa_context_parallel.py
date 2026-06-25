@@ -147,14 +147,16 @@ def _dtensor_to_local_reducing_partial(value: Any) -> Any:
 def _register_boundary_hooks(module: Module, pre_hook, use_local_output: bool, seq_dim: int) -> None:
     """Register a DSA boundary pre-hook and its public output conversion hook."""
     platform.register_forward_pre_hook(module, pre_hook, with_kwargs=True)
-    module.register_forward_hook(
-        lambda _module, _args, outputs: _finalize_output(
+    def _finalize_output_hook(hook_module, hook_args, outputs):
+        del hook_args
+        return _finalize_output(
             outputs,
             use_local_output,
-            _pop_output_layout(_module),
+            _pop_output_layout(hook_module),
             seq_dim,
         )
-    )
+
+    module.register_forward_hook(_finalize_output_hook)
 
 
 def _record_query_output_layout(module: Module, value: Any, cp_mesh: DeviceMesh, seq_dim: int) -> None:
