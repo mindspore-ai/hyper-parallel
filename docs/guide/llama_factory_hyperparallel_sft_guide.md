@@ -2,13 +2,13 @@
 
 ## 版本及示例
 
-**请严格按照给出的版本进行实验，已发现torch/torch-npu/cann/机器(910B/910C)有较严格的对应关系。**
+**请严格按照给出的版本进行实验，已发现torch/torch-npu/cann/机器有较严格的对应关系。**
 
 基础环境
 
 | **项目** | **配置**  |
 |----------|-----------|
-| 计算设备 | 昇腾 910C |
+| 计算设备 | 昇腾 910c |
 | CANN     | 8.5.2     |
 | Python   | 3.11.10   |
 
@@ -145,7 +145,7 @@ accelerate launch --config_file examples/accelerate/fsdp2_config.yaml src/train.
 
 - cutoff_len=16384
 
-![Torch FSDP 与 Hyper FSDP 精度对比](../images/llama_factory_hyperparall_sft_guide_image1.png)
+![Torch FSDP 与 Hyper FSDP 精度对比](../images/llama_factory_hyperparallel_sft_guide_image1.png)
 
 ### Hyper FSDP + CP精度
 
@@ -165,7 +165,7 @@ accelerate launch --config_file examples/accelerate/fsdp2_config.yaml src/train.
 
 - cutoff_len=16384
 
-![Hyper FSDP + CP 精度](../images/llama_factory_hyperparall_sft_guide_image2.png)
+![Hyper FSDP + CP 精度](../images/llama_factory_hyperparallel_sft_guide_image2.png)
 
 ### Hyper FSDP/Hyper FSDP + CP精度对比
 
@@ -183,7 +183,7 @@ accelerate launch --config_file examples/accelerate/fsdp2_config.yaml src/train.
 
 - cutoff_len=16384
 
-![Hyper FSDP 与 Hyper FSDP + CP 精度对比](../images/llama_factory_hyperparall_sft_guide_image3.png)
+![Hyper FSDP 与 Hyper FSDP + CP 精度对比](../images/llama_factory_hyperparallel_sft_guide_image3.png)
 
 ## 性能
 
