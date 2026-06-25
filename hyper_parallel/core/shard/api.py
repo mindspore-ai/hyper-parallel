@@ -346,7 +346,9 @@ def _register_local_tensor_hook(cell: Module, return_local_tensor_list: List[str
         cell_dict[name] = sub_cell
 
     for cell_name in return_local_tensor_list:
-        register_cell = cell_dict[cell_name]
+        register_cell = cell_dict.get(cell_name)
+        if register_cell is None:
+            raise KeyError(f"Cannot find cell {cell_name!r} in sharded cell.")
         register_cell.register_forward_hook(hook_func)
 
 

@@ -809,10 +809,18 @@ class Layout:
         if not isinstance(other, Layout):
             return False
 
-        if (self.mesh_shape != other.mesh_shape or
-                self.alias_name != other.alias_name or
-                self.partial != other.partial or
-                self.rank_list != other.rank_list):
+        same_layout_attrs = (
+            self.mesh_shape,
+            self.alias_name,
+            self.partial,
+            self.rank_list,
+        ) == (
+            other.mesh_shape,
+            other.alias_name,
+            other.partial,
+            other.rank_list,
+        )
+        if not same_layout_attrs:
             return False
 
         if self._tensor_map is None or other.tensor_map is None:

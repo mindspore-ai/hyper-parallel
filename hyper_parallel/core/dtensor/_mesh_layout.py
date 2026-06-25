@@ -274,14 +274,14 @@ class _MeshLayout:
         merged_shapes: list[IntTuple] = []
         merged_strides: list[IntTuple] = []
         for shape, stride in zip(coalesced_shapes, coalesced_strides):
-            if (
-                merged_shapes
+            can_merge_scalar_axis = (
+                bool(merged_shapes)
                 and _is_int(merged_shapes[-1])
                 and _is_int(merged_strides[-1])
                 and _is_int(shape)
                 and _is_int(stride)
-                and merged_strides[-1] == stride * shape
-            ):
+            )
+            if can_merge_scalar_axis and merged_strides[-1] == stride * shape:
                 merged_shapes[-1] *= shape
                 merged_strides[-1] = stride
             else:

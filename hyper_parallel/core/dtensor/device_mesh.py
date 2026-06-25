@@ -939,12 +939,13 @@ class DeviceMesh:
                 candidate = anchor_mesh[mesh_dim_names]
             except (KeyError, ValueError, RuntimeError, NotImplementedError):
                 continue
-            if (
-                    candidate.device_type == mesh.device_type
-                    and candidate.mesh_shape == mesh.mesh_shape
-                    and candidate.rank_list == mesh.rank_list
-                    and candidate._flatten_rank_map == flatten_rank_map  # pylint: disable=protected-access
-            ):
+            candidate_attrs = (
+                candidate.device_type == mesh.device_type,
+                candidate.mesh_shape == mesh.mesh_shape,
+                candidate.rank_list == mesh.rank_list,
+                candidate._flatten_rank_map == flatten_rank_map,  # pylint: disable=protected-access
+            )
+            if all(candidate_attrs):
                 return candidate
         return None
 
