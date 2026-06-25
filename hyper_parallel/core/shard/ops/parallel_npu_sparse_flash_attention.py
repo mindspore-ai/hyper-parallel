@@ -287,7 +287,10 @@ class SparseFlashAttentionDistributedOp(DistributedOp):
             'si': (si_tm, 'sparse_indices'),
         }
         for role, dims in _REPLICATED_DIMS.get(layout_str, {}).items():
-            tm, tensor_name = tms[role]
+            tm_entry = tms.get(role)
+            if tm_entry is None:
+                continue
+            tm, tensor_name = tm_entry
             for dim, label in dims.items():
                 if tm[dim] != -1:
                     raise ValueError(

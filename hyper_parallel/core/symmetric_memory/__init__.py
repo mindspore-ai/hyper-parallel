@@ -13,6 +13,25 @@
 # limitations under the License.
 # ============================================================================
 """Symmetric memory module for hyper-parallel."""
+__all__ = [
+    "is_shmem_available",
+    "empty",
+    "rendezvous",
+    "set_signal_pad_size",
+    "get_signal_pad_size",
+    "barrier",
+    "shmem_put",
+    "shmem_get",
+    "shmem_wait_for_signal",
+    "shmem_put_with_signal",
+    "shmem_signal_op",
+    "shmem_allgather",
+    "shmem_alltoall",
+    "fused_all_gather_matmul",
+    "fused_matmul_reduce_scatter",
+    # "overlap_launch_all_to_all_v",
+]
+
 import os
 import pathlib
 from hyper_parallel.platform import get_platform
@@ -275,23 +294,3 @@ def fused_matmul_reduce_scatter(x1, x2, symm_tensor, signal, reduce_op):
     output: Output matrix with shape (m / rank_size, n).
     """
     return _symm_handler.fused_matmul_reduce_scatter(x1, x2, symm_tensor, signal, reduce_op)
-
-
-__all__ = [
-    "is_shmem_available",
-    "empty",
-    "rendezvous",
-    "set_signal_pad_size",
-    "get_signal_pad_size",
-    "barrier",
-    "shmem_put",
-    "shmem_get",
-    "shmem_wait_for_signal",
-    "shmem_put_with_signal",
-    "shmem_signal_op",
-    "shmem_allgather",
-    "shmem_alltoall",
-    "fused_all_gather_matmul",
-    "fused_matmul_reduce_scatter",
-    # "overlap_launch_all_to_all_v",
-]

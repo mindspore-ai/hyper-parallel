@@ -37,6 +37,8 @@ Vendor library resolution order (highest priority first):
   3. ``CANN_VENDOR_LIBDIR``  (legacy single-lib fallback)
   4. Auto-detect from ``prebuild/mega_moe/vendors/``
 """
+__all__ = ["mega_moe", "mega_moe_grad"]
+
 import ctypes
 import os
 import re
@@ -208,6 +210,3 @@ def mega_moe_grad(
         runtime_config, all_event_counters,
         rank_id, ep, expert_num, hidden_size, seq_size,
     )
-
-
-__all__ = ["mega_moe", "mega_moe_grad"]

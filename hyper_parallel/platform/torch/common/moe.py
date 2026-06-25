@@ -24,15 +24,6 @@ Distributed collectives are handled by
 :mod:`hyper_parallel.core.expert_parallel.expert_parallel`; this module
 contains only single-device computation.
 """
-import math
-from typing import Any, Optional, Tuple
-
-import torch
-from torch import nn
-import torch.nn.functional as F
-
-from hyper_parallel.core.dtensor.dtensor import DTensor
-
 __all__ = [
     "FeedForward",
     "GroupedExperts",
@@ -41,6 +32,15 @@ __all__ = [
     "MoEAuxLossAutoScaler",
     "update_expert_bias",
 ]
+
+import math
+from typing import Any, Optional, Tuple
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+from hyper_parallel.core.dtensor.dtensor import DTensor
 
 
 # ---------------------------------------------------------------------------
