@@ -1,7 +1,7 @@
 ---
 name: pipeline-dev-expert
 description: Deep expert on pipeline parallelism — stage scheduling, micro-batch handling, buffer management.
-model: opus
+model: default
 tools:
   - Read
   - Grep

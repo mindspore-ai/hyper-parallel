@@ -401,6 +401,7 @@ For details, see the [MOE-FFN Documentation](./hyper_parallel/core/multicore/doc
 - [Feature Guides](./docs/guide/) - 10 core feature usage guides
 - [API Reference](./docs/api/api_reference.md) - Interface descriptions organised by feature module
 - [FAQ & Troubleshooting](./docs/faq.md) - Common issues and solutions
+- [AI-Assisted Development](./AGENTS.md) - AI-assisted development capabilities
 - [Contributing](./docs/contributing/) - Dev environment, testing, release process
 - [Release Notes](./hyper_parallel_v1.0.0_release_notes.md) - Version change records
 
