@@ -1128,6 +1128,14 @@ class Qwen3VLMoeModel(nn.Module):
         """Return the language model decoder layer list."""
         return self.language_model.layers
 
+    def get_input_embeddings(self):
+        """Text token embedding accessor (restores upstream's missing method)."""
+        return self.language_model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        """Set the text token embedding."""
+        self.language_model.embed_tokens = value
+
     def get_vision_position_ids(
         self,
         start_position: int,
