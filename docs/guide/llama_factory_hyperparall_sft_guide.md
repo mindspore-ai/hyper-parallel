@@ -40,7 +40,7 @@
 # Change `num_processes` in fsdp2_config.yaml to 16 in A3
 
 ### model
-model_name_or_path: /home/ma-user/work/bucket-910c-6055/yushi/qwen30b_vl
+model_name_or_path: /path/to/Qwen3-VL-30B-A3B-Instruct
 image_max_pixels: 262144
 video_max_pixels: 16384
 trust_remote_code: true
@@ -135,15 +135,15 @@ accelerate launch --config_file examples/accelerate/fsdp2_config.yaml src/train.
 
 **Configuration:**
 
--   Basline torch FSDP, ours hyper FSDP
+- Basline torch FSDP, ours hyper FSDP
 
--   16 cards
+- 16 cards
 
--   BF16
+- BF16
 
--   per_device_batch_size=1
+- per_device_batch_size=1
 
--   cutoff_len=16384
+- cutoff_len=16384
 
 ![Torch FSDP 与 Hyper FSDP 精度对比](../images/llama_factory_hyperparall_sft_guide_image1.png)
 
@@ -153,17 +153,17 @@ accelerate launch --config_file examples/accelerate/fsdp2_config.yaml src/train.
 
 **Configuration:**
 
--   Hyper FSDP + CP
+- Hyper FSDP + CP
 
--   16 cards
+- 16 cards
 
--   CP size 2
+- CP size 2
 
--   BF16
+- BF16
 
--   per_device_batch_size=1
+- per_device_batch_size=1
 
--   cutoff_len=16384
+- cutoff_len=16384
 
 ![Hyper FSDP + CP 精度](../images/llama_factory_hyperparall_sft_guide_image2.png)
 
@@ -173,15 +173,15 @@ accelerate launch --config_file examples/accelerate/fsdp2_config.yaml src/train.
 
 **Configuration:**
 
--   Baseline 8 NPU FSDP, ours 8NPU FSDP + CP_SIZE 2
+- Baseline 8 NPU FSDP, ours 8NPU FSDP + CP_SIZE 2
 
--   16 cards
+- 16 cards
 
--   BF16
+- BF16
 
--   per_device_batch_size=1
+- per_device_batch_size=1
 
--   cutoff_len=16384
+- cutoff_len=16384
 
 ![Hyper FSDP 与 Hyper FSDP + CP 精度对比](../images/llama_factory_hyperparall_sft_guide_image3.png)
 
