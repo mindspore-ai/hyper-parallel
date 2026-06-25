@@ -182,11 +182,11 @@ class TestSwapWrapper(unittest.TestCase):
         self.assertTrue(np.allclose(result.asnumpy(), np.array([3], np.float32)))
 
     def test_rejects_overlapping_wrap(self):
-        """Wrapping an already wrapped cell should raise a ValueError."""
+        """Wrapping an already wrapped cell should warn."""
         cell = _TinyCell()
         swap_wrapper(cell)
 
-        with self.assertRaisesRegex(ValueError, "already wrapped"):
+        with self.assertWarnsRegex(UserWarning, "already wrapped"):
             swap_wrapper(cell)
 
     def test_forwards_attributes_and_strips_parameter_prefix(self):

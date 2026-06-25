@@ -279,6 +279,7 @@ def apply_recompute(model, mode):
         model.layers[0].norm1 = checkpoint_wrapper(model.layers[0].norm1, policy_fn=policy_fn)
         model.layers[1].ffn1.matmul = checkpoint_wrapper(model.layers[1].ffn1.matmul, policy_fn=policy_fn)
         model.layers[2].ffn2.reshape = checkpoint_wrapper(model.layers[2].ffn2.reshape, policy_fn=policy_fn)
+        model.layers[3] = checkpoint_wrapper(model.layers[3], policy_fn=policy_fn)
 
     elif mode == "funcsave":
         def policy_fn(ctx, op, *args, **kwargs):  # pylint: disable=W0613
@@ -300,18 +301,6 @@ def apply_recompute(model, mode):
         for i in range(len(model.layers) - 1):
             SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 
-    elif mode == "overlap_1":
-        model.layers[1].ffn1.matmul = checkpoint_wrapper(model.layers[1].ffn1.matmul)
-        model.layers[1].ffn1 = checkpoint_wrapper(model.layers[1].ffn1)
-
-    elif mode == "overlap_2":
-        model.layers[1].ffn1 = checkpoint_wrapper(model.layers[1].ffn1)
-        model.layers[1].ffn1.matmul = checkpoint_wrapper(model.layers[1].ffn1.matmul)
-
-    elif mode == "overlap_3":
-        model.layers[2].ffn2.reshape = checkpoint_wrapper(model.layers[2].ffn2.reshape)
-        model.layers[2].ffn2 = swap_wrapper(model.layers[2].ffn2)
-
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -319,25 +308,11 @@ def apply_recompute(model, mode):
 
 
 # ---------------------------------------------------------------------------
-# Test case
+# Test helpers
 # ---------------------------------------------------------------------------
 
-def test_ac_memory_comparison():
-    """
-    Feature: Activation Checkpointing and Swapping Memory Behavior
-    Description: Compare peak memory usage across four modes:
-                 'none' (baseline), 'recompute' (full activation checkpointing),
-                 'save' (partial activation saving), and 'swap' (fine-grained tensor swapping).
-                 Validates that losses are numerically identical at every training step
-                 and that peak memory follows the expected hierarchy:
-                 NONE > SAVE > RECOMPUTE ≈ SWAP.
-    Expectation: All modes produce consistent losses (within 1e-4 tolerance),
-                 the memory usage trend is satisfied, and no OOM occurs.
-    """
-    print("Starting memory and time comparison: none vs recompute vs save vs swap")
-    train_steps = 3
-
-    modes = ["none", "recompute", "funcrecompute", "save", "funcsave", "swap", "funcswap"]
+def _run_modes_with_report(modes, train_steps):
+    """Run all modes and print a concise comparison table."""
     results = {}
 
     for mode in modes:
@@ -357,12 +332,15 @@ def test_ac_memory_comparison():
         r = results[mode]
         print(f"{mode.upper():<12} | {r['peak_mem_gb']:<15.5f} | {r['time_sec']:<10.5f} | {r['losses'][-1]:<12.4f}")
 
-    # loss consistency assertion
+    return results
+
+
+def _assert_losses_match_none(results, modes, train_steps, tol=1e-4):
+    """Assert all requested modes match the none baseline losses."""
     base_losses = results["none"]["losses"]
-    tol = 1e-4
     for step in range(train_steps):
         base_val = base_losses[step]
-        for mode in ["recompute", "funcrecompute", "save", "funcsave", "swap", "funcswap"]:
+        for mode in modes:
             val = results[mode]["losses"][step]
             diff = abs(val - base_val)
             assert diff < tol, (
@@ -371,19 +349,72 @@ def test_ac_memory_comparison():
             )
     print(f"\nAll {train_steps} steps: losses are consistent across modes (tol={tol}).")
 
+
+# ---------------------------------------------------------------------------
+# Test case
+# ---------------------------------------------------------------------------
+
+def test_basic_ac_memory_comparison():
+    """
+    Feature: Activation Checkpointing and Swapping Memory Behavior
+    Description: Compare peak memory usage across basic modes:
+                 'none' (baseline), 'recompute' (full activation checkpointing),
+                 'save' (partial activation saving), and 'swap' (fine-grained tensor swapping).
+                 Validates that losses are numerically identical at every training step
+                 and that peak memory follows the expected hierarchy:
+                 NONE > RECOMPUTE ≈ SWAP.
+    Expectation: All modes produce consistent losses (within 1e-4 tolerance),
+                 the memory usage trend is satisfied, and no OOM occurs.
+    """
+    print("Starting basic memory and time comparison: none vs recompute vs save vs swap")
+    train_steps = 3
+    modes = ["none", "recompute", "save", "swap"]
+    results = _run_modes_with_report(modes, train_steps)
+    _assert_losses_match_none(results, ["recompute", "save", "swap"], train_steps)
+
     # memory hierarchy assertion: none > recompute ≈ swap
     mem_none = results["none"]["peak_mem_gb"]
     mem_recompute = results["recompute"]["peak_mem_gb"]
     mem_swap = results["swap"]["peak_mem_gb"]
 
     assert mem_none > mem_recompute, \
-        f"Expected SAVE ({mem_none:.5f} GB) > RECOMPUTE ({mem_recompute:.5f} GB)"
-    print(f"Verified: SAVE ({mem_none:.5f}) > RECOMPUTE ({mem_recompute:.5f})")
+        f"Expected NONE ({mem_none:.5f} GB) > RECOMPUTE ({mem_recompute:.5f} GB)"
+    print(f"Verified: NONE ({mem_none:.5f}) > RECOMPUTE ({mem_recompute:.5f})")
 
     tol_mem = 0.15
     assert abs(mem_recompute - mem_swap) < tol_mem, \
         f"Expected RECOMPUTE ({mem_recompute:.5f} GB) ≈ SWAP ({mem_swap:.5f} GB)"
     print(f"Verified: RECOMPUTE ({mem_recompute:.5f}) ≈ SWAP ({mem_swap:.5f}) within {tol_mem:.2f} GB")
+
+
+def test_func_ac_memory_comparison():
+    """
+    Feature: Function-level Activation Checkpointing and Swapping Memory Behavior
+    Description: Compare peak memory usage across function-level modes:
+                 'none' (baseline), 'funcrecompute', 'funcsave', and 'funcswap'.
+                 Validates that losses are numerically identical at every training step
+                 and that function-level recompute/swap reduce peak memory against none.
+    Expectation: All modes produce consistent losses (within 1e-4 tolerance),
+                 none uses more peak memory than function-level recompute and swap,
+                 and no OOM occurs.
+    """
+    print("Starting function-level memory and time comparison: none vs funcrecompute vs funcsave vs funcswap")
+    train_steps = 3
+    modes = ["none", "funcrecompute", "funcsave", "funcswap"]
+    results = _run_modes_with_report(modes, train_steps)
+    _assert_losses_match_none(results, ["funcrecompute", "funcsave", "funcswap"], train_steps)
+
+    mem_none = results["none"]["peak_mem_gb"]
+    mem_funcrecompute = results["funcrecompute"]["peak_mem_gb"]
+    mem_funcswap = results["funcswap"]["peak_mem_gb"]
+
+    assert mem_none > mem_funcrecompute, \
+        f"Expected NONE ({mem_none:.5f} GB) > FUNCRECOMPUTE ({mem_funcrecompute:.5f} GB)"
+    print(f"Verified: NONE ({mem_none:.5f}) > FUNCRECOMPUTE ({mem_funcrecompute:.5f})")
+
+    assert mem_none > mem_funcswap, \
+        f"Expected NONE ({mem_none:.5f} GB) > FUNCSWAP ({mem_funcswap:.5f} GB)"
+    print(f"Verified: NONE ({mem_none:.5f}) > FUNCSWAP ({mem_funcswap:.5f})")
 
 
 def test_group_swap_correctness_and_memory():
@@ -494,8 +525,251 @@ def test_inplace_modification():
     assert "In-place modification happened" in str(exc_info.value)
 
 
-@pytest.mark.parametrize("mode", ["overlap_1", "overlap_2", "overlap_3"])
-def test_overlap_wrapper(mode):
-    with pytest.raises(ValueError) as exc_info:
-        apply_recompute(SimpleTransformer(vocab_size=32000, dim=512, depth=4), mode)
-    assert "Wrapping overlapping module regions is not allowed" in str(exc_info.value)
+class _OverlapTransformerBlock(nn.Cell):
+    """Small transformer-style block used for wrapper overlap detection."""
+
+    def __init__(self, dim=4, hidden_dim=8):
+        super().__init__()
+        self.norm1 = mint.nn.LayerNorm((dim,))
+        self.qkv = nn.Dense(dim, dim * 3)
+        self.out_proj = nn.Dense(dim * 3, dim)
+        self.norm2 = mint.nn.LayerNorm((dim,))
+        self.ffn1 = nn.Dense(dim, hidden_dim)
+        self.ffn2 = nn.Dense(hidden_dim, dim)
+
+        def local_activation(x):
+            return ms.ops.relu(x)
+
+        self.local_activation = local_activation
+        self.framework_mul = mint.mul
+
+    def scale(self, x):
+        return x * 2
+
+    def construct(self, x):
+        residual = x
+        x = self.norm1(x)
+        x = self.out_proj(self.qkv(x))
+        x = residual + x
+        residual = x
+        x = self.norm2(x)
+        x = self.local_activation(self.ffn1(x))
+        x = self.framework_mul(x, Tensor(np.array(1.0, np.float32)))
+        return residual + self.ffn2(x)
+
+
+class _OverlapTransformerNet(nn.Cell):
+    """Three-block net used to validate nested wrapper overlap detection."""
+
+    def __init__(self, dim=4, depth=3):
+        super().__init__()
+        self.embed = nn.Dense(dim, dim)
+        self.blocks = nn.CellList([_OverlapTransformerBlock(dim=dim) for _ in range(depth)])
+        self.norm = mint.nn.LayerNorm((dim,))
+        self.head = nn.Dense(dim, dim)
+
+        def root_activation(x):
+            return ms.ops.relu(x)
+
+        self.root_activation = root_activation
+        self.framework_mul = mint.mul
+
+    def scale(self, x):
+        return x * 2
+
+    def construct(self, x):
+        x = self.embed(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.root_activation(x)
+        x = self.norm(x)
+        return self.head(x)
+
+
+def _overlap_same_cell_twice():
+    net = _OverlapTransformerNet()
+    checkpoint_wrapper(net.blocks[0].ffn1)
+    checkpoint_wrapper(net.blocks[0].ffn1)
+
+
+def _overlap_checkpoint_then_swap_same_cell():
+    net = _OverlapTransformerNet()
+    checkpoint_wrapper(net.blocks[0].ffn1)
+    swap_wrapper(net.blocks[0].ffn1)
+
+
+def _overlap_leaf_then_parent():
+    net = _OverlapTransformerNet()
+    net.blocks[0].ffn1 = checkpoint_wrapper(net.blocks[0].ffn1)
+    checkpoint_wrapper(net)
+
+
+def _overlap_parent_then_leaf():
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.blocks[0].ffn1)
+
+
+def _overlap_block_then_parent():
+    net = _OverlapTransformerNet()
+    net.blocks[1] = checkpoint_wrapper(net.blocks[1])
+    checkpoint_wrapper(net)
+
+
+def _overlap_parent_then_block():
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.blocks[1])
+
+
+def _overlap_leaf_then_block():
+    net = _OverlapTransformerNet()
+    net.blocks[1].ffn1 = checkpoint_wrapper(net.blocks[1].ffn1)
+    checkpoint_wrapper(net.blocks[1])
+
+
+def _overlap_block_then_leaf():
+    net = _OverlapTransformerNet()
+    wrapped_block = checkpoint_wrapper(net.blocks[1])
+    checkpoint_wrapper(wrapped_block.ffn1)
+
+
+def _allowed_func_then_parent():
+    net = _OverlapTransformerNet()
+    net.blocks[0] = checkpoint_wrapper(net.blocks[0].ffn1.matmul)
+    net.blocks[1] = swap_wrapper(net.blocks[0])
+
+
+def _allowed_parent_then_func():
+    net = _OverlapTransformerNet()
+    net.blocks[1] = swap_wrapper(net.blocks[0])
+    net.blocks[0] = checkpoint_wrapper(net.blocks[0].ffn1.matmul)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        _overlap_same_cell_twice,
+        _overlap_checkpoint_then_swap_same_cell,
+        _overlap_leaf_then_parent,
+        _overlap_parent_then_leaf,
+        _overlap_block_then_parent,
+        _overlap_parent_then_block,
+        _overlap_leaf_then_block,
+        _overlap_block_then_leaf,
+        _allowed_func_then_parent,
+        _allowed_parent_then_func,
+    ],
+)
+def test_wrapper_overlap_detection_cases(case):
+    """Overlapping wrapper regions should warn consistently."""
+    with pytest.warns(UserWarning, match="Wrapping overlapping module regions is not allowed"):
+        case()
+
+
+def _allowed_distinct_sibling_cells():
+    net = _OverlapTransformerNet()
+    net.blocks[0].ffn1 = checkpoint_wrapper(net.blocks[0].ffn1)
+    net.blocks[0].ffn2 = swap_wrapper(net.blocks[0].ffn2)
+
+
+def _allowed_distinct_blocks():
+    net = _OverlapTransformerNet()
+    net.blocks[0] = checkpoint_wrapper(net.blocks[0])
+    net.blocks[1] = swap_wrapper(net.blocks[1])
+
+
+def _allowed_distinct_func():
+    net = _OverlapTransformerNet()
+    net.blocks[0] = checkpoint_wrapper(net.blocks[0].ffn1.matmul)
+    net.blocks[1] = swap_wrapper(net.blocks[1].ffn1.matmul)
+
+
+def _allowed_distinct_block_callables():
+    net = _OverlapTransformerNet()
+    net.blocks[0].local_activation = checkpoint_wrapper(net.blocks[0].local_activation)
+    net.blocks[1].local_activation = swap_wrapper(net.blocks[1].local_activation)
+
+
+def _allowed_framework_function_reuse():
+    checkpoint_wrapper(mint.mul)
+    swap_wrapper(mint.mul)
+
+
+def _allowed_framework_function_attr_after_parent_wrap():
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.blocks[0].framework_mul)
+    checkpoint_wrapper(wrapped.blocks[1].framework_mul)
+
+
+def _allowed_root_framework_function_attr_after_parent_wrap():
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.framework_mul)
+
+
+def _allowed_bound_method_reuse():
+    net = _OverlapTransformerNet()
+    checkpoint_wrapper(net.blocks[0].scale)
+    swap_wrapper(net.blocks[0].scale)
+
+
+def _allowed_root_bound_method_reuse():
+    net = _OverlapTransformerNet()
+    checkpoint_wrapper(net.scale)
+    swap_wrapper(net.scale)
+
+
+def _allowed_callable_attr_then_parent():
+    net = _OverlapTransformerNet()
+    net.blocks[2].local_activation = checkpoint_wrapper(net.blocks[2].local_activation)
+    checkpoint_wrapper(net.blocks[2])
+
+
+def _allowed_parent_then_callable_attr():
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net.blocks[2])
+    checkpoint_wrapper(wrapped.local_activation)
+
+
+def _allowed_root_callable_attr_then_parent():
+    net = _OverlapTransformerNet()
+    net.root_activation = checkpoint_wrapper(net.root_activation)
+    checkpoint_wrapper(net)
+
+
+def _allowed_parent_then_root_callable_attr():
+    net = _OverlapTransformerNet()
+    wrapped = checkpoint_wrapper(net)
+    checkpoint_wrapper(wrapped.root_activation)
+
+
+def _allowed_diff_callables():
+    net = _OverlapTransformerNet()
+    net.blocks[1].local_activation = checkpoint_wrapper(net.blocks[1].local_activation)
+    net.blocks[2].local_activation = checkpoint_wrapper(net.blocks[2].local_activation)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        _allowed_distinct_sibling_cells,
+        _allowed_distinct_blocks,
+        _allowed_distinct_func,
+        _allowed_distinct_block_callables,
+        _allowed_framework_function_reuse,
+        _allowed_framework_function_attr_after_parent_wrap,
+        _allowed_root_framework_function_attr_after_parent_wrap,
+        _allowed_bound_method_reuse,
+        _allowed_root_bound_method_reuse,
+        _allowed_callable_attr_then_parent,
+        _allowed_parent_then_callable_attr,
+        _allowed_root_callable_attr_then_parent,
+        _allowed_parent_then_root_callable_attr,
+        _allowed_diff_callables,
+    ],
+)
+def test_wrapper_non_overlapping_allowed_cases(case):
+    """Non-overlapping or explicitly exempt callable configurations should be allowed."""
+    case()

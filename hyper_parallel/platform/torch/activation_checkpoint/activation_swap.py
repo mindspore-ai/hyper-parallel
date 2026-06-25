@@ -61,6 +61,11 @@ class FuncModule(nn.Module):
         return self._fn(*args, **kwargs)
 
 
+def _is_callable_exempt_from_overlap_check(callable_obj: Callable) -> bool:
+    """Return True for callables that cannot be reliably overlap-tracked by object marks."""
+    return isinstance(callable_obj, (types.FunctionType, types.BuiltinFunctionType, types.MethodType))
+
+
 def _iter_wrappable_callable_attrs(module: nn.Module) -> Iterator[tuple[str, Callable]]:
     """Yield public per-instance callable attributes not registered as child modules.
 
@@ -75,7 +80,7 @@ def _iter_wrappable_callable_attrs(module: nn.Module) -> Iterator[tuple[str, Cal
     for attr_name, attr_value in vars(module).items():
         if attr_name.startswith("_") or isinstance(attr_value, nn.Module):
             continue
-        if isinstance(attr_value, (types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
+        if _is_callable_exempt_from_overlap_check(attr_value):
             continue
         if callable(attr_value):
             yield attr_name, attr_value
@@ -92,11 +97,13 @@ def _get_wrapped_callable(module: nn.Module) -> Optional[Callable]:
     wrapped_module = getattr(module, _SWAP_WRAPPED_MODULE, None)
     if isinstance(wrapped_module, FuncModule):
         return getattr(wrapped_module, "_fn", None)
+    if isinstance(module, FuncModule):
+        return getattr(module, "_fn", None)
     return None
 
 
 def _raise_callable_already_wrapped(callable_obj: Callable) -> None:
-    raise ValueError(
+    warnings.warn(
         f"Callable '{callable_obj.__class__.__name__}' is already wrapped. "
         "Wrapping overlapping module regions is not allowed."
     )
@@ -109,8 +116,10 @@ def _check_callable_attr_not_wrapped(owner: nn.Module, attr_name: str, attr_valu
 
 
 def _check_and_mark_callable(callable_obj: Callable) -> None:
+    if _is_callable_exempt_from_overlap_check(callable_obj):
+        return
     if getattr(callable_obj, '_is_wrapped', False):
-        raise ValueError(
+        warnings.warn(
             f"Callable '{callable_obj.__class__.__name__}' or one of its ancestors is already wrapped. "
             "Wrapping overlapping module regions is not allowed."
         )
@@ -120,18 +129,20 @@ def _check_and_mark_callable(callable_obj: Callable) -> None:
 def _check_and_mark_wrapped(module: nn.Module) -> None:
     """Validate no wrapping overlap, then mark module and all descendants as wrapped."""
     if getattr(module, '_is_wrapped', False):
-        raise ValueError(
+        warnings.warn(
             f"Module '{module.__class__.__name__}' or one of its ancestors is already wrapped. "
             "Wrapping overlapping module regions is not allowed."
         )
     for submodule in module.modules():
         if submodule is module:
             continue
+        wrapped_callable = _get_wrapped_callable(submodule)
+        if wrapped_callable is not None and _is_callable_exempt_from_overlap_check(wrapped_callable):
+            continue
         if getattr(submodule, '_is_wrapped', False):
-            wrapped_callable = _get_wrapped_callable(submodule)
             if wrapped_callable is not None:
                 _raise_callable_already_wrapped(wrapped_callable)
-            raise ValueError(
+            warnings.warn(
                 f"Submodule '{getattr(submodule, '_swap_wrapped_module', submodule).__class__.__name__}' of "
                 f"'{module.__class__.__name__}' is already wrapped. "
                 "Wrapping overlapping module regions is not allowed."
