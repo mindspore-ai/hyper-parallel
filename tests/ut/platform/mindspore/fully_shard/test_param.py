@@ -805,6 +805,7 @@ class TestMindSporeParam(unittest.TestCase):
 
         self.assertIs(reduced_grad, grad)
         self.assertIsNone(handle)
+        self.assertIs(hsdp_param._all_reduce_output, grad)
 
     def test_all_reduce_grad_rejects_missing_group_for_multi_rank(self):
         """Multi-rank all-reduce requires a concrete process group."""
@@ -834,6 +835,27 @@ class TestMindSporeParam(unittest.TestCase):
         hsdp_param.to_sharded_dtensor.assert_called_once()
         self.assertEqual(hsdp_param.sharded_param.grad, "dtensor-grad")
         self.assertIsNone(hsdp_param._unsharded_param.grad)
+
+    def test_apply_reduced_grad_aligns_to_sharded_storage_dtype(self):
+        """Issue #215: align reduced grad dtype with sharded param storage before writeback."""
+        hsdp_param = _new_hsdp_param_v2()
+        hsdp_param.sharded_size = (4,)
+        hsdp_param.sharded_param = SimpleNamespace(dtype=ms.bfloat16, grad=None)
+        hsdp_param.offload_to_cpu = False
+        hsdp_param.unsharded_accumulated_grad = None
+        hsdp_param._unsharded_param = SimpleNamespace(grad="old-unsharded-grad")
+        captured = {}
+
+        def _capture_dtensor(tensor):
+            captured["dtype"] = tensor.dtype
+            return "dtensor-grad"
+
+        hsdp_param.to_sharded_dtensor = _capture_dtensor
+        reduced_grad = ms.Tensor(np.ones((4,), dtype=np.float32))
+
+        MindSporeHSDPParamV2.apply_reduced_grad(hsdp_param, reduced_grad, ms.float32)
+
+        self.assertEqual(captured["dtype"], ms.bfloat16)
 
     def test_apply_reduced_grad_accumulates_existing_local_grad(self):
         """Existing sharded DTensor grads should accumulate in-place on the local tensor."""

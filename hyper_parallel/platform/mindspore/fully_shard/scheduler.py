@@ -145,12 +145,12 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
         """Finalize the outermost backward: drain pending reductions and apply grads.
 
         The drain is unconditional. Every step below is self-limiting -- the fused
-        groups are ``None``-guarded and ``reduce_params`` / ``_finish_ignored_allreduce``
-        are empty-queue no-ops -- so running them on every invocation never double-applies
-        and preserves the invariant that a parameter's ``.grad`` is either ``None`` or a
-        fully reduced value. This mirrors torch FSDP2, whose wait in
-        ``_root_post_backward_final_callback`` is likewise not gated on the per-group
-        post-backward training state.
+        groups are ``None``-guarded and ``reduce_params`` is an empty-queue no-op
+        when there is no pending work -- so running them on every invocation never
+        double-applies and preserves the invariant that a parameter's ``.grad`` is
+        either ``None`` or a fully reduced value. This mirrors torch FSDP2, whose
+        wait in ``_root_post_backward_final_callback`` is likewise not gated on the
+        per-group post-backward training state.
 
         Gating the drain on ``scheduler_state != BACKWARD`` was unsafe for any unit that
         acts as a root while being fed a differentiable activation: its input's
@@ -187,12 +187,23 @@ class MindSporeHSDPSchedulerV2(HSDPSchedulerV2):
             )
             comm_ctx.pre_param_group.apply_fusion_reduced_grad()
             comm_ctx.pre_param_group = None
+        # Step 1: Wait for previous reduce-scatter groups and get them for all-reduce
+        prev_groups = self.hsdp_state._wait_prev_reduce_scatter()
+        # Step 2: Accumulate and issue async all-reduce for previous groups
+        for group in prev_groups:
+            group.accumulate_existing_grads_to_buffer()
+            group.issue_async_allreduce()
+            MindSporeHSDPStateV2.pending_all_reduce_groups.append(group)
+        # Step 3: Wait/apply any remaining reduce-scatter for pure FSDP params
+        self.hsdp_state.reduce_scattered_params()
+        # Step 4: Wait for pending all-reduce groups and apply grads
+        MindSporeHSDPStateV2.delay_apply_reduce_grads()
+        # Step 5: Process any remaining all-reduce params (without fusion)
         logger.debug(
             "hook=root_backward_hook action=reduce_params module=%s",
             self.hsdp_state,
         )
         self.hsdp_state.reduce_params()
-        self.hsdp_state._finish_ignored_allreduce()
 
     def _backward_hook(self):
         """Execute backward hook."""

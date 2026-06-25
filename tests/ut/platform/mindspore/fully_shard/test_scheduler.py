@@ -18,6 +18,7 @@
 
 import os
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -38,6 +39,10 @@ from hyper_parallel.core.fully_shard.hsdp_scheduler import HSDPSchedulerV2
 from hyper_parallel.core.fully_shard.hsdp_utils import FSDPSchedulerState
 from hyper_parallel.platform.mindspore.fully_shard import scheduler as scheduler_mod
 from hyper_parallel.platform.mindspore.fully_shard.scheduler import MindSporeHSDPSchedulerV2
+from tests.ut.platform.mindspore.fully_shard.conftest import (
+    MindSporeFullyShardUnitTest,
+    UT_RUNTIME_DEVICE,
+)
 
 
 def _make_scheduler():
@@ -45,7 +50,7 @@ def _make_scheduler():
     scheduler = object.__new__(MindSporeHSDPSchedulerV2)
     scheduler.modules = []
     scheduler.platform = "platform"
-    scheduler.device = "npu"
+    scheduler.device = UT_RUNTIME_DEVICE
     scheduler.config = SimpleNamespace(mesh=None)
     scheduler.mesh = None
     scheduler._get_managed_params = MagicMock(return_value=[])
@@ -66,11 +71,8 @@ class FakeMesh:
         return self._mesh_hash
 
 
-class TestMindSporeScheduler(unittest.TestCase):
+class TestMindSporeScheduler(MindSporeFullyShardUnitTest):
     """Test scheduler compatibility-mode mesh resolution and hook wrapping."""
-
-    def tearDown(self):
-        HSDPSchedulerV2.root_bp_state = False
 
     def test_zero_grad_register_hooks_and_platform_validation(self):
         """Small delegating methods should use existing state/platform extension points."""
@@ -257,7 +259,6 @@ class TestMindSporeScheduler(unittest.TestCase):
         all_reduce_group.wait_all_reduce_and_apply_grad.assert_called_once_with()
         pre_group.apply_fusion_reduced_grad.assert_called_once_with()
         scheduler.hsdp_state.reduce_params.assert_called_once_with()
-        scheduler.hsdp_state._finish_ignored_allreduce.assert_called_once_with()
         self.assertFalse(HSDPSchedulerV2.root_bp_state)
 
         scheduler.scheduler_state = FSDPSchedulerState.BACKWARD
@@ -273,34 +274,39 @@ class TestMindSporeScheduler(unittest.TestCase):
         scheduler._forward_pre_hook = MagicMock(name="forward_pre_hook")
         scheduler._forward_hook = MagicMock(name="forward_hook")
 
-        scheduler._fsdp_group_post_pending = None
-        MindSporeHSDPSchedulerV2._register_forward_backward_hooks(scheduler)
-        pre_hook = module.register_forward_pre_hook.call_args.args[0]
-        post_hook = module.register_forward_hook.call_args.args[0]
-        self.assertTrue(callable(pre_hook))
-        self.assertTrue(callable(post_hook))
-        self.assertEqual(module.register_forward_pre_hook.call_args.kwargs, {"with_kwargs": True})
-        pre_hook("cell", "args", "kwargs")
-        post_hook("cell", "args", "output")
-        scheduler._forward_pre_hook.assert_called_once_with("cell", "args", "kwargs")
-        scheduler._forward_hook.assert_called_once_with("cell", "args", "output")
+        # Avoid _DisableMsDispatchMode touching a polluted MindSpore runtime after
+        # param_group tests that create real ms.Tensor buffers.
+        with patch.object(scheduler_mod, "_DisableMsDispatchMode", side_effect=nullcontext):
+            scheduler._fsdp_group_post_pending = None
+            MindSporeHSDPSchedulerV2._register_forward_backward_hooks(scheduler)
+            pre_hook = module.register_forward_pre_hook.call_args.args[0]
+            post_hook = module.register_forward_hook.call_args.args[0]
+            self.assertTrue(callable(pre_hook))
+            self.assertTrue(callable(post_hook))
+            self.assertEqual(module.register_forward_pre_hook.call_args.kwargs, {"with_kwargs": True})
+            pre_hook("cell", "args", "kwargs")
+            post_hook("cell", "args", "output")
+            scheduler._forward_pre_hook.assert_called_once_with("cell", "args", "kwargs")
+            scheduler._forward_hook.assert_called_once_with("cell", "args", "output")
 
-        grouped_module = SimpleNamespace(register_forward_pre_hook=MagicMock(), register_forward_hook=MagicMock())
-        scheduler.modules = [grouped_module]
-        scheduler._fsdp_group_post_pending = set()
-        scheduler._grouped_forward_pre_hook = MagicMock(name="grouped_forward_pre_hook")
-        grouped_forward_post_hook = MagicMock(name="grouped_forward_post_hook")
-        scheduler._make_grouped_forward_post_hook = MagicMock(return_value=grouped_forward_post_hook)
-        MindSporeHSDPSchedulerV2._register_forward_backward_hooks(scheduler)
-        grouped_pre_hook = grouped_module.register_forward_pre_hook.call_args.args[0]
-        self.assertTrue(callable(grouped_pre_hook))
-        self.assertEqual(grouped_module.register_forward_pre_hook.call_args.kwargs, {"with_kwargs": True})
-        grouped_pre_hook("cell", "args", "kwargs")
-        scheduler._grouped_forward_pre_hook.assert_called_once_with("cell", "args", "kwargs")
-        grouped_post_hook = grouped_module.register_forward_hook.call_args.args[0]
-        grouped_post_hook("cell", "args", "output")
-        scheduler._make_grouped_forward_post_hook.assert_called_once_with(grouped_module)
-        grouped_forward_post_hook.assert_called_once_with("cell", "args", "output")
+            grouped_module = SimpleNamespace(
+                register_forward_pre_hook=MagicMock(), register_forward_hook=MagicMock()
+            )
+            scheduler.modules = [grouped_module]
+            scheduler._fsdp_group_post_pending = set()
+            scheduler._grouped_forward_pre_hook = MagicMock(name="grouped_forward_pre_hook")
+            grouped_forward_post_hook = MagicMock(name="grouped_forward_post_hook")
+            scheduler._make_grouped_forward_post_hook = MagicMock(return_value=grouped_forward_post_hook)
+            MindSporeHSDPSchedulerV2._register_forward_backward_hooks(scheduler)
+            grouped_pre_hook = grouped_module.register_forward_pre_hook.call_args.args[0]
+            self.assertTrue(callable(grouped_pre_hook))
+            self.assertEqual(grouped_module.register_forward_pre_hook.call_args.kwargs, {"with_kwargs": True})
+            grouped_pre_hook("cell", "args", "kwargs")
+            scheduler._grouped_forward_pre_hook.assert_called_once_with("cell", "args", "kwargs")
+            grouped_post_hook = grouped_module.register_forward_hook.call_args.args[0]
+            grouped_post_hook("cell", "args", "output")
+            scheduler._make_grouped_forward_post_hook.assert_called_once_with(grouped_module)
+            grouped_forward_post_hook.assert_called_once_with("cell", "args", "output")
 
 
 class TestCoreScheduler(unittest.TestCase):
