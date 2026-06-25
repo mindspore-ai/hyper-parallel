@@ -13,16 +13,16 @@
 # limitations under the License.
 # ============================================================================
 """Expert Parallelism: MoE modules and EP distributed strategies."""
-from hyper_parallel.core.expert_parallel.expert_parallel import (
-    BaseExpertParallel,
-    ExpertParallel,
-    TensorParallel,
-    ExpertTensorParallel,
-)
-
 __all__ = [
     "BaseExpertParallel",
     "ExpertParallel",
     "TensorParallel",
     "ExpertTensorParallel",
 ]
+
+from hyper_parallel.core.expert_parallel.expert_parallel import (
+    BaseExpertParallel,
+    ExpertParallel,
+    TensorParallel,
+    ExpertTensorParallel,
+)

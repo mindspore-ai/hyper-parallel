@@ -13,14 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Common PyTorch model building blocks shared across HyperParallel features."""
-from hyper_parallel.platform.torch.common.moe import (
-    FeedForward,
-    GroupedExperts,
-    TokenChoiceTopKRouter,
-    MoE,
-    update_expert_bias,
-)
-
 __all__ = [
     "FeedForward",
     "GroupedExperts",
@@ -28,3 +20,11 @@ __all__ = [
     "MoE",
     "update_expert_bias",
 ]
+
+from hyper_parallel.platform.torch.common.moe import (
+    FeedForward,
+    GroupedExperts,
+    TokenChoiceTopKRouter,
+    MoE,
+    update_expert_bias,
+)

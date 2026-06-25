@@ -44,14 +44,14 @@ from hyper_parallel.core.multicore.scheduler.scheduler import (
     revise_task_queue, revise_gmm_task_queue_bwd,
 )
 from hyper_parallel.core.multicore.tasks.utils import add_terminate, add_dynamic_data
-from .tiling_tables import (
+from hyper_parallel.core.multicore.modules.mega_moe.backward.tiling_tables import (
     get_act_grad_tiling_bytes,
     get_gate_grad_tiling_bytes,
     get_w1_grad_tiling_bytes,
     get_w2_grad_tiling_bytes,
     get_swiglu_grad_tiling_bytes,
 )
-from .graph import build_backward_graph
+from hyper_parallel.core.multicore.modules.mega_moe.backward.graph import build_backward_graph
 
 
 def parse_args():

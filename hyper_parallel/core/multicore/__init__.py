@@ -13,6 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """MoE-FFN multicore operator entry point with platform dispatch."""
+__all__ = ["mega_moe", "mega_moe_grad"]
+
 from hyper_parallel.platform import get_platform
 
 _platform = get_platform()
@@ -71,6 +73,3 @@ def mega_moe_grad(
         runtime_config, all_event_counters,
         rank_id, ep, expert_num, hidden_size, seq_size,
     )
-
-
-__all__ = ["mega_moe", "mega_moe_grad"]

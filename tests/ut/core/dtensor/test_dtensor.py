@@ -525,6 +525,12 @@ def _inplace_make_src(local_shape=(4, 4), placements=None, mesh="fake_mesh", num
     )
     src._device_mesh = mesh
     src._placements = tuple(placements)
+    # copy_() reads src through public accessors (device_mesh / placements /
+    # to_local); mirror the protected-member values onto them so the mock stays
+    # consistent with the public API.
+    src.device_mesh = mesh
+    src.placements = tuple(placements)
+    src.to_local = Mock(return_value=src._local_tensor)
     return src
 
 
