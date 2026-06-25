@@ -101,24 +101,22 @@ commit.
 
 - `/test`
 
-This command can trigger:
+This command delegates to `autogit test` and runs the test stage:
 
-- `code-style` checks
-- `pylint`
-- other lint checks
-- `pytest`
+- `pytest` on `tests/ut`
 
-It is the most direct repository-level verification entry for a normal
-developer.
+Lint checks (`code-style`, `pylint`, Markdown lint) are handled separately
+through `autogit check` or the `pre-commit` git hook, not by `/test`. It is
+the most direct repository-level test entry for a normal developer.
 
 ### 2.2 Supporting Capabilities
 
 The AI agent can also use:
 
 - `autogit check`
-  for lint-only checking
+  for lint-only checking (skill subcommand)
 - `code-verifier`
-  for lint and test verification assistance
+  for lint and test verification assistance (specialized agent, not a skill)
 
 ### 2.3 What Is Checked
 
