@@ -14,21 +14,7 @@
 # ============================================================================
 """HyperParallel integration APIs for LlamaFactory."""
 
-from hyper_parallel.core.fully_shard.api import HSDPModule, hsdp_sync_stream
-from hyper_parallel.core.utils import clip_grad_norm_
-from hyper_parallel.integration.llamafactory.activation import (
-    find_transformer_blocks,
-    setup_activation_optimization,
-)
-from hyper_parallel.integration.llamafactory.utils import (
-    HyperParallelArguments,
-    export_to_hf_format,
-    fsdp2_prepare_model,
-    load_hsdp_model,
-    load_hsdp_optimizer_and_scheduler,
-    save_hsdp_checkpoint,
-    wrap_optimizer_with_skip_dtensor_dispatch,
-)
+# pylint: disable=wrong-import-position
 
 __all__ = [
     "HSDPModule",
@@ -44,3 +30,19 @@ __all__ = [
     "setup_activation_optimization",
     "wrap_optimizer_with_skip_dtensor_dispatch",
 ]
+
+from hyper_parallel.core.fully_shard.api import HSDPModule, hsdp_sync_stream
+from hyper_parallel.core.utils import clip_grad_norm_
+from hyper_parallel.integration.llamafactory.activation import (
+    find_transformer_blocks,
+    setup_activation_optimization,
+)
+from hyper_parallel.integration.llamafactory.utils import (
+    HyperParallelArguments,
+    export_to_hf_format,
+    fsdp2_prepare_model,
+    load_hsdp_model,
+    load_hsdp_optimizer_and_scheduler,
+    save_hsdp_checkpoint,
+    wrap_optimizer_with_skip_dtensor_dispatch,
+)
