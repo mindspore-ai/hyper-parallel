@@ -247,14 +247,13 @@ class TestMindSporeParamGroup(unittest.TestCase):
 
     def test_build_active_replicate_buckets_groups_params_by_process_group(self):
         """Active all-reduce buckets should group params by their replicate process group."""
-        group = _new_param_group()
         params = [
             SimpleNamespace(unsharded_group_info=SimpleNamespace(group="rep-a", rank_size=2), replicate_world_size=2, sharded_size=(2,)),
             SimpleNamespace(unsharded_group_info=SimpleNamespace(group="rep-a", rank_size=2), replicate_world_size=2, sharded_size=(3,)),
             SimpleNamespace(unsharded_group_info=SimpleNamespace(group=None, rank_size=1), replicate_world_size=1, sharded_size=(5,)),
         ]
 
-        buckets = HSDPParamGroup._build_active_replicate_buckets(group, params)
+        buckets = HSDPParamGroup._build_active_replicate_buckets(params)
         bucket = next(iter(buckets.values()))
 
         self.assertEqual(bucket.param_indices, [0, 1])
