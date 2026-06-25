@@ -141,9 +141,9 @@ def _install_swap_tensor_backward_hooks(module, input, output):  # pylint: disab
 
     # Register on first requires_grad output tensor
     flat_outputs, _ = tree_flatten(output)
-    for o in flat_outputs:
-        if isinstance(o, torch.Tensor) and o.requires_grad:
-            o.register_hook(_pre_backward)
+    for output_tensor in flat_outputs:
+        if isinstance(output_tensor, torch.Tensor) and output_tensor.requires_grad:
+            output_tensor.register_hook(_pre_backward)
             break
 
     # Register on first requires_grad input tensor

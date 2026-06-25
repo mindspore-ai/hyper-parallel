@@ -516,14 +516,56 @@ def _localize_optimizer_state(optim_sd: dict) -> dict:
     return {"state": new_state, "param_groups": optim_sd.get("param_groups", [])}
 
 
+def _get_optimizer_param_by_idx(optimizer) -> dict[int, torch.nn.Parameter]:
+    """Map optimizer state indices to the current optimizer parameters."""
+    param_by_idx: dict[int, torch.nn.Parameter] = {}
+    param_idx = 0
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            param_by_idx[param_idx] = param
+            param_idx += 1
+    return param_by_idx
+
+
+def _get_optimizer_param_device(param):
+    """Return the target device for a tensor restored into an optimizer state."""
+    if isinstance(param, DTensor):
+        return param.to_local().device
+    return param.device
+
+
+def _restore_optimizer_state_value(current_state, key, param, saved_val) -> None:
+    """Restore one optimizer state entry while preserving existing tensor objects."""
+    current_val = current_state.get(key)
+    if current_val is None:
+        if isinstance(saved_val, torch.Tensor):
+            current_state[key] = saved_val.to(_get_optimizer_param_device(param))
+        else:
+            current_state[key] = saved_val
+        return
+
+    if isinstance(current_val, DTensor):
+        local = current_val.to_local()
+        local.copy_(saved_val.to(local.device))
+    elif isinstance(current_val, torch.Tensor):
+        current_val.copy_(saved_val.to(current_val.device))
+    else:
+        current_state[key] = saved_val
+
+
+def _restore_optimizer_param_groups(optimizer, saved_sd: dict) -> None:
+    """Restore non-parameter optimizer group options from a saved state dict."""
+    for saved_group, current_group in zip(
+        saved_sd.get("param_groups", []), optimizer.param_groups
+    ):
+        for key, val in saved_group.items():
+            if key != "params":
+                current_group[key] = val
+
+
 def _load_local_optimizer_state(optimizer, saved_sd: dict) -> None:
     """Copy saved local optimizer state into the optimizer's current state."""
-    param_by_idx: dict[int, torch.nn.Parameter] = {}
-    idx = 0
-    for group in optimizer.param_groups:
-        for p in group["params"]:
-            param_by_idx[idx] = p
-            idx += 1
+    param_by_idx = _get_optimizer_param_by_idx(optimizer)
 
     for param_idx, saved_state in saved_sd.get("state", {}).items():
         param_idx = int(param_idx) if isinstance(param_idx, str) else param_idx
@@ -532,31 +574,9 @@ def _load_local_optimizer_state(optimizer, saved_sd: dict) -> None:
             continue
         current_state = optimizer.state[param]
         for key, saved_val in saved_state.items():
-            current_val = current_state.get(key)
-            if current_val is None:
-                if isinstance(saved_val, torch.Tensor):
-                    device = (
-                        param.to_local().device
-                        if isinstance(param, DTensor)
-                        else param.device
-                    )
-                    current_state[key] = saved_val.to(device)
-                else:
-                    current_state[key] = saved_val
-            elif isinstance(current_val, DTensor):
-                local = current_val.to_local()
-                local.copy_(saved_val.to(local.device))
-            elif isinstance(current_val, torch.Tensor):
-                current_val.copy_(saved_val.to(current_val.device))
-            else:
-                current_state[key] = saved_val
+            _restore_optimizer_state_value(current_state, key, param, saved_val)
 
-    for saved_group, current_group in zip(
-        saved_sd.get("param_groups", []), optimizer.param_groups
-    ):
-        for key, val in saved_group.items():
-            if key != "params":
-                current_group[key] = val
+    _restore_optimizer_param_groups(optimizer, saved_sd)
 
 
 # ---------------------------------------------------------------------------
@@ -1047,7 +1067,7 @@ def fsdp2_prepare_model(accelerator, model: nn.Module, hp_args) -> nn.Module:
     _setup_prefetch(model)
 
     if fsdp2_plugin.cpu_ram_efficient_loading:
-        fsdp2_load_full_state_dict(accelerator, model, original_sd)
+        model = fsdp2_load_full_state_dict(accelerator, model, original_sd)
 
     # Activation wrapping after loading: the loading path is identical to
     # the non-activation case, avoiding interaction between CheckpointWrapper's
