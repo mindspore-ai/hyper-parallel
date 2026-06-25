@@ -272,7 +272,8 @@ class HSDPParamGroup:
             return None
         return replicate_groups[0]
 
-    def _build_active_replicate_buckets(self, hsdp_params):
+    @staticmethod
+    def _build_active_replicate_buckets(hsdp_params):
         buckets: dict[int, ReplicateBucket] = {}
         for idx, hsdp_param in enumerate(hsdp_params):
             group_info = getattr(hsdp_param, "unsharded_group_info", None)

@@ -475,9 +475,10 @@ class SwapGroup:
         def _try_pack(x):
             if not isinstance(x, SwapTensor):
                 return x
-            if (not x.group_swap or x._state != SwapTensor.STATE_DEVICE or x._keep_on_device or x.is_slice_tensor
-                    or x._duplicate_swap or x.storage_size >= _GROUP_SWAP_MAX_BULK_COPY_BYTES
-                    or not x.val.is_contiguous()):
+            no_pack = (not x.group_swap or x._state != SwapTensor.STATE_DEVICE or x._keep_on_device
+                       or x.is_slice_tensor or x._duplicate_swap or x.storage_size >= _GROUP_SWAP_MAX_BULK_COPY_BYTES
+                       or not x.val.is_contiguous())
+            if no_pack:
                 return x
             if x.storage_size != x.val.untyped_storage().size():
                 raise RuntimeError(

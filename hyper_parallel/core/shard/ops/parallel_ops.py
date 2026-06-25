@@ -119,7 +119,8 @@ class DistributedOp:
         """
         return None
 
-    def wrap_output(self, py_output, output_layouts):
+    @staticmethod
+    def wrap_output(py_output, output_layouts):
         """Wrap local outputs into DTensors according to inferred layouts.
 
         Subclasses may override this when a specific operator needs custom

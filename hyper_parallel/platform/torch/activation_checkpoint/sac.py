@@ -76,7 +76,9 @@ def _maybe_detach(x, any_ret_has_alias_info):
     # For case 1, it is not enough to check whether x has differentiable dtype
     # because non-differentiable dtype can have non-nullptr AutogradMeta, e.g.
     # when the tensor is a view.
-    if isinstance(x, torch.Tensor) and (x.is_floating_point() or x.is_complex() or any_ret_has_alias_info):
+    need_detach = (isinstance(x, torch.Tensor)
+                   and (x.is_floating_point() or x.is_complex() or any_ret_has_alias_info))
+    if need_detach:
         with torch._C._SetExcludeDispatchKeyGuard(torch._C.DispatchKey.ADInplaceOrView, False):
             # Ensure that view performed beneath autograd properly propagates
             # version counter. TODO: Use reentrant_dispatch instead of
@@ -158,11 +160,11 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
 
         out = func(*args, **kwargs)
 
-        any_ret_has_alias_info = any(ret.alias_info is not None for ret in func._schema.returns)
+        has_alias = any(ret.alias_info is not None for ret in func._schema.returns)
 
         if policy in (CheckpointPolicy.MUST_SAVE, CheckpointPolicy.PREFER_SAVE):
             self.storage[func].append(
-                tree_map(lambda x: _VersionWrapper(_maybe_detach(x, any_ret_has_alias_info)), out)
+                tree_map(lambda x: _VersionWrapper(_maybe_detach(x, has_alias)), out)
             )
         elif policy == CheckpointPolicy.MUST_SWAP:  # patch code
             if not self.add_to_storage:
@@ -173,10 +175,7 @@ class _CachingTorchDispatchMode(TorchDispatchMode):
             funcname = f"{self._group_prefix}{func}"
             group_swap = self.group_swap
             entries = tree_map(
-                lambda x: _SwapCacheEntry(
-                    _maybe_detach(x, any_ret_has_alias_info), funcname, group_swap=group_swap
-                ),
-                out,
+                lambda x: _SwapCacheEntry(_maybe_detach(x, has_alias), funcname, group_swap=group_swap), out,
             )
             self.storage[func].append(tree_map(lambda x: x.save, entries))
             self.swap_storage[func].append(tree_map(lambda x: x.swap, entries))
