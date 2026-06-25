@@ -1,7 +1,7 @@
 ---
 name: fsdp-dev-expert
 description: Deep expert on HyperParallel fully_shard internals across Torch and MindSpore, including scheduler flow, parameter lifecycle, gradient reduction, and debugging.
-model: opus
+model: default
 tools:
   - Read
   - Grep

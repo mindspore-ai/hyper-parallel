@@ -1,7 +1,7 @@
 ---
 name: tensor-dev-expert
 description: Deep expert on HyperParallel declarative module parallelism — parallelize_module, ParallelStyle, mesh context, and integration with DTensor and context parallel.
-model: opus
+model: default
 tools:
   - Read
   - Grep
