@@ -47,7 +47,7 @@ class ExpandDimsDistributedOp(DistributedOp):
         cache_values = [input_tensor.layout, axis]
         return local_args, {}, cache_values
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         """
         Infer output layout for ExpandDims operator.
 

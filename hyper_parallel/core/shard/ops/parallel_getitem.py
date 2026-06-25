@@ -75,11 +75,47 @@ def _is_advanced_elem(k) -> bool:
     return False
 
 
+def _build_key_element_descriptor(k, op_name="__getitem__"):
+    """Build a descriptor tuple for a single key element.
+
+    Args:
+        k: A single key element (int, slice, None, Ellipsis, list, Tensor).
+        op_name: Operator name for error messages.
+
+    Returns:
+        tuple: A descriptor tuple for this element.
+
+    Raises:
+        ValueError: If the key element type is unsupported.
+    """
+    if k is None:
+        return ("none",)
+    if k is Ellipsis:
+        return ("ellipsis",)
+    if isinstance(k, int):
+        return ("int", k)
+    if isinstance(k, slice):
+        return ("slice", k.start, k.stop, k.step)
+    if isinstance(k, list):
+        return ("idx_list_len", len(k))
+    if isinstance(k, Tensor) and k.ndim == 0 and not _is_bool_tensor(k):
+        return ("int", int(k.item()))
+    if isinstance(k, Tensor):
+        shape = tuple(k.shape)
+        if isinstance(k, DTensor):
+            alias = tuple(k.layout.alias_tensor_map)
+            return ("idx_tensor", shape, alias)
+        return ("idx_tensor", shape)
+    raise ValueError(
+        f"For {op_name}, unsupported index type: {type(k).__name__}."
+    )
+
+
 def _key_cache_descriptor(key, op_name="__getitem__"):
     """Convert raw key to hashable (desc, kind) for cache_values.
 
     The descriptor captures only what affects layout derivation:
-    int value, slice bounds, list length, tensor shape/dtype.
+    int value, slice bounds, list length, and tensor shape.
     Exact list/tensor contents are not preserved — only shape matters for layout.
 
     Args:
@@ -106,32 +142,7 @@ def _key_cache_descriptor(key, op_name="__getitem__"):
     has_advanced = any(_is_advanced_elem(k) for k in key)
     kind = _ADVANCED if has_advanced else _BASIC
 
-    desc = []
-    for k in key:
-        if k is None:
-            desc.append(("none",))
-        elif k is Ellipsis:
-            desc.append(("ellipsis",))
-        elif isinstance(k, int):
-            desc.append(("int", k))
-        elif isinstance(k, slice):
-            desc.append(("slice", k.start, k.stop, k.step))
-        elif isinstance(k, list):
-            desc.append(("idx_list_len", len(k)))
-        elif isinstance(k, Tensor) and k.ndim == 0 and not _is_bool_tensor(k):
-            desc.append(("int", int(k.item())))
-        elif isinstance(k, Tensor):
-            shape = tuple(k.shape)
-            if isinstance(k, DTensor):
-                alias = tuple(k.layout.alias_tensor_map)
-                desc.append(("idx_tensor", shape, alias))
-            else:
-                desc.append(("idx_tensor", shape))
-        else:
-            raise ValueError(
-                f"For {op_name}, unsupported index type: {type(k).__name__}."
-            )
-
+    desc = [_build_key_element_descriptor(k, op_name) for k in key]
     return tuple(desc), kind
 
 
@@ -421,7 +432,7 @@ class GetItemDistributedOp(DistributedOp):
                     action, alias_map, op_name
                 )
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         """Infer output layout for __getitem__.
 
         Rules:
@@ -518,6 +529,37 @@ class GetItemDistributedOp(DistributedOp):
         return out_layout
 
     @staticmethod
+    def _compute_advanced_index_info(expanded_actions, op_name):
+        """Analyze advanced indexing actions for output layout derivation.
+
+        Returns:
+            (advanced_positions, advanced_pos_set, are_consecutive, b_ndim)
+        """
+        advanced_actions = []
+        for i, action in enumerate(expanded_actions):
+            if action[0] in ("idx_list", "idx_tensor"):
+                advanced_actions.append((i, action))
+
+        index_shapes = []
+        for _, action in advanced_actions:
+            if action[0] == "idx_list":
+                index_shapes.append((len(action[1]),))
+            elif action[0] == "idx_tensor":
+                index_shapes.append(tuple(action[1]["shape"]))
+
+        bcast_shape = _broadcast_shapes(index_shapes, op_name=op_name)
+        b_ndim = len(bcast_shape) if bcast_shape else 0
+
+        advanced_positions = [pos for pos, _ in advanced_actions]
+        advanced_pos_set = set(advanced_positions)
+        are_consecutive = (
+            len(advanced_positions) > 0
+            and advanced_positions == list(range(advanced_positions[0],
+                                                 advanced_positions[-1] + 1))
+        )
+        return advanced_positions, advanced_pos_set, are_consecutive, b_ndim
+
+    @staticmethod
     def _infer_advanced_output_layout(self_layout, expanded_actions, op_name="__getitem__"):
         """Derive output layout for advanced indexing.
 
@@ -538,31 +580,8 @@ class GetItemDistributedOp(DistributedOp):
         alias_map = self_layout.alias_tensor_map
         mesh = self_layout.mesh
 
-        # Identify advanced indices and record their positions
-        advanced_actions = []
-        for i, action in enumerate(expanded_actions):
-            if action[0] in ("idx_list", "idx_tensor"):
-                advanced_actions.append((i, action))
-
-        # Compute broadcast shape B of all index tensors
-        index_shapes = []
-        for _, action in advanced_actions:
-            if action[0] == "idx_list":
-                index_shapes.append((len(action[1]),))
-            elif action[0] == "idx_tensor":
-                index_shapes.append(tuple(action[1]["shape"]))
-
-        bcast_shape = _broadcast_shapes(index_shapes, op_name=op_name)
-        b_ndim = len(bcast_shape) if bcast_shape else 0
-
-        # Determine if advanced indices are consecutive in expanded_actions
-        advanced_positions = [pos for pos, _ in advanced_actions]
-        advanced_pos_set = set(advanced_positions)
-        are_consecutive = (
-            len(advanced_positions) > 0
-            and advanced_positions == list(range(advanced_positions[0],
-                                                 advanced_positions[-1] + 1))
-        )
+        advanced_positions, advanced_pos_set, are_consecutive, b_ndim = \
+            GetItemDistributedOp._compute_advanced_index_info(expanded_actions, op_name)
 
         def _append_non_advanced(action):
             """Append output alias for a non-advanced action (newaxis, slice, int)."""
@@ -572,30 +591,21 @@ class GetItemDistributedOp(DistributedOp):
                 out_alias.append(alias_map[action[4]])
             # int: dimension removed, skip
 
-        # Build output alias map by walking expanded_actions positionally
         out_alias = []
 
         if are_consecutive and advanced_positions:
             first_adv_pos = advanced_positions[0]
             last_adv_pos = advanced_positions[-1]
 
-            # Actions before the advanced block
             for i in range(first_adv_pos):
                 _append_non_advanced(expanded_actions[i])
-
-            # B dims replace the advanced block (all Replicate)
             for _ in range(b_ndim):
                 out_alias.append("None")
-
-            # Actions after the advanced block
             for i in range(last_adv_pos + 1, len(expanded_actions)):
                 _append_non_advanced(expanded_actions[i])
         else:
-            # Non-consecutive: B goes at position 0
             for _ in range(b_ndim):
                 out_alias.append("None")
-
-            # All non-advanced actions follow in original order
             for i, action in enumerate(expanded_actions):
                 if i in advanced_pos_set:
                     continue
@@ -604,7 +614,6 @@ class GetItemDistributedOp(DistributedOp):
         out_layout = Layout.from_device_mesh(mesh)
         out_layout = out_layout(*out_alias)
 
-        # Copy partial state from input
         _copy_partial_state(self_layout, out_layout)
         out_layout.tensor_map_to_placement()
         out_layout.update_compact_str()

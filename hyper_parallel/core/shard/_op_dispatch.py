@@ -399,7 +399,8 @@ class OpDispatcher:
 
         return input_layouts, extra_args, input_args, input_kwargs, cache_key_values
 
-    def _with_layout_infer(self, func: callable, *args, _packed_call=None, **kwargs) -> Tensor:
+    @staticmethod
+    def _with_layout_infer(func: callable, *args, _packed_call=None, **kwargs) -> Tensor:
         """_with_layout_infer
 
         NOTE: aclop packed args are already normalized upstream by
@@ -409,49 +410,20 @@ class OpDispatcher:
         """
         func_name = platform.get_op_name(func)
 
-        input_layouts, extra_args, input_args, input_kwargs, cache_key_values = \
+        input_layouts, extra_args, input_args, input_kwargs, cache_values = \
             OpDispatcher._process_args_and_kwargs(args, kwargs)
-        cache_key = LayoutCacheKey(cache_key_values)
-        cache_manager = LayoutCacheManager.get_instance()
-        layout_cache = cache_manager.get_layout_cache()
-        if func_name not in layout_cache:
-            layout_cache[func_name] = {}
+        cache_key = LayoutCacheKey(cache_values)
 
-        op_layout_cache = layout_cache[func_name]
+        output_layout, op_impl, _ = OpDispatcher._lookup_or_infer_layout(
+            func, func_name, cache_key, input_layouts, extra_args
+        )
 
-        distribute_op = cache_manager.distributed_op(func_name)
-        if cache_key in op_layout_cache:
-            output_layout, op_impl = op_layout_cache[cache_key]
-        else:
-            all_args = (input_layouts, extra_args)
-            output_layout = distribute_op.infer_layout(*all_args)
-            op_impl = distribute_op.get_expand_impl(func, output_layout, input_layouts, extra_args)
-            op_layout_cache[cache_key] = (output_layout, op_impl)
-
-        if op_impl is None:
-            op_impl = func
-
+        op_impl = func if op_impl is None else op_impl
         py_output = OpDispatcher._call_op_impl(op_impl, _packed_call, input_args, input_kwargs)
+        return OpDispatcher._pack_infer_output(py_output, output_layout)
 
-        if isinstance(py_output, (tuple, list)):
-            output = ()
-            if isinstance(output_layout, (tuple, list)):
-                if len(py_output) == len(output_layout):
-                    for i, output_item in enumerate(py_output):
-                        output += (DTensor.from_local(
-                            output_item, output_layout[i].mesh,
-                            output_layout[i].alias_placements),)
-                else:
-                    raise RuntimeError(f"Output tuple size ({len(py_output)}) "
-                                       f"does not match layout tuple size ({len(output_layout)})")
-            else:
-                raise RuntimeError("Output is a tuple but layout is not")
-            return output
-
-        return DTensor.from_local(
-            py_output, output_layout.mesh, output_layout.alias_placements)
-
-    def _extract_single_arg_layout(self, expanded_args, kwargs_value):
+    @staticmethod
+    def _extract_single_arg_layout(expanded_args, kwargs_value):
         """Helper to extract layout and cache info for a single argument."""
         cache_key_values = []
         input_layouts = []
@@ -490,13 +462,13 @@ class OpDispatcher:
 
         return DTensor.from_local(py_output, output_layout.mesh, output_layout.alias_placements)
 
-    def _with_layout_infer_with_tuple_expand(self, func: callable, *args, _packed_call=None, **kwargs) -> Tensor:
-        """_with_layout_infer_with_tuple_expand
+    @staticmethod
+    def _expand_tuple_args(args: tuple) -> tuple:
+        """Expand tuple/list arguments for tuple element-wise ops.
 
-        NOTE: aclop packed args are already normalized upstream by
-        ``_dispatch_layout_infer`` via ``_normalize_aclop_args``. The
-        ``_packed_call`` kwarg carries the ``(prim, name)`` tuple when the
-        op uses aclop format, or ``None`` otherwise.
+        Returns:
+            (expanded_args, input_args): Flat list of DTensors for layout extraction
+            and list of local-tensor tuples/values for kernel invocation.
         """
         expanded_args = []
         input_args = []
@@ -504,22 +476,23 @@ class OpDispatcher:
             if isinstance(arg, (tuple, list)):
                 expanded_args.extend(arg)
                 # pylint: disable=R1728
-                input_args.append(tuple(item.to_local() if hasattr(item, "_layout") else item for item in arg))
+                input_args.append(tuple(
+                    item.to_local() if hasattr(item, "_layout") else item for item in arg
+                ))
             else:
                 expanded_args.append(arg)
                 input_args.append(arg.to_local() if isinstance(arg, DTensor) else arg)
+        return expanded_args, input_args
 
-        # Process kwargs into local tensors
-        input_kwargs = {k: (v.to_local() if isinstance(v, DTensor) else v) for k, v in kwargs.items()}
+    @staticmethod
+    def _lookup_or_infer_layout(func, func_name, cache_key, input_layouts, extra_args):
+        """Look up cached layout or compute via distributed op.
 
-        # Extract layouts for positional args
-        cache_key_values, input_layouts, extra_args = self._extract_single_arg_layout(expanded_args, kwargs.values())
-
-        cache_key = LayoutCacheKey(cache_key_values)
-
+        Returns:
+            (output_layout, op_impl, distribute_op)
+        """
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
-        func_name = platform.get_op_name(func)
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
 
@@ -529,14 +502,47 @@ class OpDispatcher:
         if cache_key in op_layout_cache:
             output_layout, op_impl = op_layout_cache[cache_key]
         else:
-            all_args = (input_layouts, extra_args)
-            output_layout = distribute_op.infer_layout(*all_args)
+            output_layout = distribute_op.infer_layout(input_layouts, extra_args)
             op_impl = distribute_op.get_expand_impl(func, output_layout, input_layouts, extra_args)
             op_layout_cache[cache_key] = (output_layout, op_impl)
 
-        if op_impl is None:
-            op_impl = func
+        return output_layout, op_impl, distribute_op
 
+    @staticmethod
+    def _prepare_tuple_expand_args(args, kwargs):
+        """Prepare arguments for tuple-expand layout inference.
+
+        Returns:
+            (input_args, input_kwargs, input_layouts, extra_args, cache_key)
+        """
+        expanded_args, input_args = OpDispatcher._expand_tuple_args(args)
+        input_kwargs = {
+            key: value.to_local() if isinstance(value, DTensor) else value
+            for key, value in kwargs.items()
+        }
+        cache_values, input_layouts, extra_args = OpDispatcher._extract_single_arg_layout(
+            expanded_args, kwargs.values()
+        )
+        return input_args, input_kwargs, input_layouts, extra_args, LayoutCacheKey(cache_values)
+
+    def _with_layout_infer_with_tuple_expand(self, func: callable, *args, _packed_call=None, **kwargs) -> Tensor:
+        """_with_layout_infer_with_tuple_expand
+
+        NOTE: aclop packed args are already normalized upstream by
+        ``_dispatch_layout_infer`` via ``_normalize_aclop_args``. The
+        ``_packed_call`` kwarg carries the ``(prim, name)`` tuple when the
+        op uses aclop format, or ``None`` otherwise.
+        """
+        input_args, input_kwargs, input_layouts, extra_args, cache_key = (
+            self._prepare_tuple_expand_args(args, kwargs)
+        )
+        func_name = platform.get_op_name(func)
+
+        output_layout, op_impl, distribute_op = OpDispatcher._lookup_or_infer_layout(
+            func, func_name, cache_key, input_layouts, extra_args
+        )
+
+        op_impl = func if op_impl is None else op_impl
         py_output = OpDispatcher._call_op_impl(op_impl, _packed_call, input_args, input_kwargs)
         return distribute_op.wrap_output(py_output, output_layout)
 
@@ -670,7 +676,20 @@ class OpDispatcher:
 
         return input_layouts, input_shapes, extra_args, input_args, input_kwargs, cache_key_values
 
-    def _with_layout_infer_with_shape(self, func: callable, *args, _packed_call=None, **kwargs) -> Tensor:
+    @staticmethod
+    def _prepare_with_shape_args(args, kwargs):
+        """Prepare arguments and cache key for WithShape operators.
+
+        Returns:
+            (layouts, extra_args, local_args, local_kwargs, cache_key)
+        """
+        processed = OpDispatcher._process_args_and_kwargs_with_shape(args, kwargs)
+        layouts, shapes, extra_args, local_args, local_kwargs, cache_values = processed
+        extra_args.append(shapes)
+        return layouts, extra_args, local_args, local_kwargs, LayoutCacheKey(cache_values)
+
+    @staticmethod
+    def _with_layout_infer_with_shape(func: callable, *args, _packed_call=None, **kwargs) -> Tensor:
         """_with_layout_infer_with_shape
 
         NOTE: aclop packed args are already normalized upstream by
@@ -678,52 +697,18 @@ class OpDispatcher:
         ``_packed_call`` kwarg carries the ``(prim, name)`` tuple when the
         op uses aclop format, or ``None`` otherwise.
         """
+        prepared = OpDispatcher._prepare_with_shape_args(args, kwargs)
+        layouts, extra_args, local_args, local_kwargs, cache_key = prepared
         func_name = platform.get_op_name(func)
 
-        (input_layouts, input_shapes, extra_args, input_args,
-        input_kwargs, cache_key_values) = OpDispatcher._process_args_and_kwargs_with_shape(args, kwargs)
-        cache_key = LayoutCacheKey(cache_key_values)
+        infer_result = OpDispatcher._lookup_or_infer_layout(
+            func, func_name, cache_key, layouts, extra_args
+        )
+        output_layout, op_impl = infer_result[:2]
 
-        cache_manager = LayoutCacheManager.get_instance()
-        layout_cache = cache_manager.get_layout_cache()
-        if func_name not in layout_cache:
-            layout_cache[func_name] = {}
-
-        op_layout_cache = layout_cache[func_name]
-
-        distribute_op = cache_manager.distributed_op(func_name)
-        if cache_key in op_layout_cache:
-            output_layout, op_impl = op_layout_cache[cache_key]
-        else:
-            extra_args.append(input_shapes)
-            all_args = (input_layouts, extra_args)
-            output_layout = distribute_op.infer_layout(*all_args)
-            op_impl = distribute_op.get_expand_impl(func, output_layout, input_layouts, extra_args)
-            op_layout_cache[cache_key] = (output_layout, op_impl)
-
-        if op_impl is None:
-            op_impl = func
-
-        py_output = OpDispatcher._call_op_impl(op_impl, _packed_call, input_args, input_kwargs)
-
-        # set output layout
-        if isinstance(py_output, (tuple, list)):
-            output = ()
-            if isinstance(output_layout, (tuple, list)):
-                if len(py_output) == len(output_layout):
-                    for i, output_item in enumerate(py_output):
-                        output += (DTensor.from_local(
-                            output_item, output_layout[i].mesh,
-                            output_layout[i].alias_placements),)
-                else:
-                    raise RuntimeError(f"Output tuple size ({len(py_output)}) "
-                                       f"does not match layout tuple size ({len(output_layout)})")
-            else:
-                raise RuntimeError("Output is a tuple but layout is not")
-            return output
-
-        return DTensor.from_local(
-            py_output, output_layout.mesh, output_layout.alias_placements)
+        op_impl = func if op_impl is None else op_impl
+        py_output = OpDispatcher._call_op_impl(op_impl, _packed_call, local_args, local_kwargs)
+        return OpDispatcher._pack_infer_output(py_output, output_layout)
 
     def _with_layout_infer_slice(self, func: callable, *args) -> Tensor:
         """_with_layout_infer_slice"""
@@ -1129,10 +1114,19 @@ class OpDispatcher:
                 - **normalized_args**: The real tensor arguments (unpacked if
                   the packed format was detected, otherwise the original args).
         """
-        if op_name in unpack_ops and len(args) == 3 and \
-            isinstance(args[1], str) and isinstance(args[2], (tuple, list)):
+        if OpDispatcher._is_aclop_packed(op_name, unpack_ops, args):
             return (args[0], args[1]), tuple(args[2])
         return None, args
+
+    @staticmethod
+    def _is_aclop_packed(op_name: str, unpack_ops: list, args: tuple) -> bool:
+        """Check if arguments use aclop packed format."""
+        return (
+            op_name in unpack_ops
+            and len(args) == 3
+            and isinstance(args[1], str)
+            and isinstance(args[2], (tuple, list))
+        )
 
     @staticmethod
     def _call_op_impl(op_impl: callable, packed_call, args, kwargs: dict):
@@ -1231,7 +1225,8 @@ class OpDispatcher:
             raise RuntimeError(f"Operator {op_name} specified wrong suffix in parallel yaml.")
         return getattr(self, handler_name)(op_call, *args, **kwargs)
 
-    def _dispatch_new(self, func, distribute_op, packed_call, result) -> Tensor:
+    @staticmethod
+    def _dispatch_new(func, distribute_op, packed_call, result) -> Tensor:
         """New dispatch flow using preprocess result.
 
         Args:
@@ -1247,21 +1242,33 @@ class OpDispatcher:
         local_args, local_kwargs, cache_values = result
         cache_key = LayoutCacheKey.from_cache_values(cache_values)
         func_name = platform.get_op_name(func)
+
+        infer_result, op_impl = OpDispatcher._lookup_or_infer_layout_new(
+            func, func_name, cache_key, cache_values, distribute_op
+        )
+
+        op_impl = func if op_impl is None else op_impl
+        py_output = OpDispatcher._call_op_impl(op_impl, packed_call, local_args, local_kwargs)
+        return distribute_op.wrap_output(py_output, infer_result[0])
+
+    @staticmethod
+    def _lookup_or_infer_layout_new(func, func_name, cache_key, cache_values, distribute_op):
+        """Look up cached layout or compute via distributed op (new three-phase API).
+
+        Returns:
+            (infer_result, op_impl)
+        """
         cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
         op_layout_cache = layout_cache[func_name]
         if cache_key in op_layout_cache:
-            infer_result, op_impl = op_layout_cache[cache_key]
-        else:
-            infer_result = distribute_op.infer_layout(cache_values)
-            op_impl = distribute_op.get_expand_impl(func, infer_result, cache_values)
-            op_layout_cache[cache_key] = (infer_result, op_impl)
-        output_layouts, _ = infer_result
-        op_impl = func if op_impl is None else op_impl
-        py_output = OpDispatcher._call_op_impl(op_impl, packed_call, local_args, local_kwargs)
-        return distribute_op.wrap_output(py_output, output_layouts)
+            return op_layout_cache[cache_key]
+        infer_result = distribute_op.infer_layout(cache_values)
+        op_impl = distribute_op.get_expand_impl(func, infer_result, cache_values)
+        op_layout_cache[cache_key] = (infer_result, op_impl)
+        return infer_result, op_impl
 
     def dispatch(self, op_call: callable, args: tuple, kwargs: dict) -> object:
         """Route an op call through the appropriate DTensor dispatch path.

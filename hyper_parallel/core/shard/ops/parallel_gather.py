@@ -56,7 +56,7 @@ class IndexSelectDistributedOp(DistributedOp):
         cache_values = [input_tensor.layout, index.layout, dim]
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         """
         Infer output layouts for Index Select operations.
 
@@ -130,7 +130,7 @@ class IndexSelectDistributedOp(DistributedOp):
 
         return ((output_layout,), None)
 
-    def get_expand_impl(self, func, infer_result, cache_values):
+    def get_expand_impl(self, func, infer_result, cache_values):  # pylint: disable=W0221
         """
         Get the expanded execution implementation for Index Select.
         """
@@ -227,7 +227,7 @@ class GatherDDistributedOp(DistributedOp):
         cache_values = [input_tensor.layout, index.layout, dim]
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         """
         Infer output layouts for GatherD operations.
 
@@ -310,7 +310,7 @@ class GatherDDistributedOp(DistributedOp):
         output_layout.update_compact_str()
         return ((output_layout,), None)
 
-    def get_expand_impl(self, func, infer_result, cache_values):
+    def get_expand_impl(self, func, infer_result, cache_values):  # pylint: disable=W0221
         """
         Returns the execution implementation wrapper for distributed GatherD.
         
@@ -412,7 +412,7 @@ class GatherNdDistributedOp(DistributedOp):
         ]
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         """
         Infer output layout for GatherNd.
 
