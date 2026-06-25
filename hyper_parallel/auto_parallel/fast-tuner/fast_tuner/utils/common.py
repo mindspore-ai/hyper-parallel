@@ -127,7 +127,7 @@ def generate_dryrun_yaml(destination_file, config, para):
         # set recompute to true
         yaml_data['recompute_config']['recompute'] = True
 
-        # TODO: adapt for tnd
+        # Note: adapt for tnd
         yaml_data['train_dataset']['data_loader']['dataset_dir'] = para.DATASET
 
 
@@ -211,7 +211,7 @@ def generate_profile_shell(destination_file, config, para):
         configs['FIRST_K_DENSE_RAPLACE'] = 3
     else:
         configs['EP'] = 0  # or EP not needed here
-        # TODO: should read NPUS_PER_NODE, currently hardcoded as 8
+        # Note: should read NPUS_PER_NODE, currently hardcoded as 8
     profile_need_rank_num = configs['DP'] * configs['TP'] * configs['PP']
     if profile_need_rank_num < para.RANK_NUM:
         configs['NNODES'] = profile_need_rank_num // 8
@@ -244,7 +244,7 @@ def generate_profile_shell(destination_file, config, para):
         f"--profile-ranks {profile_ranks} "  # ensure space between params
         f"--profile-save-path {output_dir}"
     )
-    # TODO: adapt to existing args content
+    # Note: adapt to existing args content
     if configs['EP'] == 0:
         mem_args = (
             "--use-distributed-optimizer "

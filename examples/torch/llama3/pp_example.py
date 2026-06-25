@@ -27,23 +27,11 @@ Optional environment variables:
 * ``LLAMA3_PP_SIZE`` — pipeline width (default ``2``). Must equal ``world_size``.
 * ``LLAMA3_DEVICE_TYPE`` — ``npu`` or ``cuda`` (default ``npu``).
 """
-# pylint: disable=C0413
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
-
-from hyper_parallel import init_device_mesh
-from hyper_parallel.core.pipeline_parallel.scheduler import Schedule1F1B
 
 from demo_utils import init_dist, train_steps
 from model import Llama3DemoConfig
@@ -53,6 +41,9 @@ from pipeline import (
     count_llama3_parameters,
     split_batch_dim0,
 )
+
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.pipeline_parallel.scheduler import Schedule1F1B
 
 
 def _pp_size_from_env(world: int) -> int:

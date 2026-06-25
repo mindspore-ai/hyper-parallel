@@ -34,24 +34,11 @@ Requirements:
     * ``n_heads`` / ``n_kv_heads`` divisible by ``LLAMA3_TP_SIZE``.
     * ``seq_len`` divisible by ``LLAMA3_TP_SIZE`` (sequence parallel).
 """
-# pylint: disable=C0413
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
-
-from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
-from hyper_parallel.core.dtensor.placement_types import Replicate
-from hyper_parallel.core.pipeline_parallel.scheduler import Schedule1F1B
 
 from demo_utils import init_dist, train_steps
 from model import Llama3DemoConfig
@@ -61,6 +48,10 @@ from pipeline import (
     build_pipeline_stage,
     split_batch_dim0,
 )
+
+from hyper_parallel import DTensor, SkipDTensorDispatch, init_device_mesh
+from hyper_parallel.core.dtensor.placement_types import Replicate
+from hyper_parallel.core.pipeline_parallel.scheduler import Schedule1F1B
 
 
 def _parallel_sizes_from_env(world: int) -> tuple[int, int]:
