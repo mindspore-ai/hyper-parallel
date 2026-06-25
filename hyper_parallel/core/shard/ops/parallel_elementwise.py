@@ -88,7 +88,7 @@ class ElementWiseDistributedOp(DistributedOp):
         cache_values = _build_elementwise_cache_values(args, kwargs)
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         """
         Infer output layouts for element-wise operations with broadcasting support.
 
@@ -604,7 +604,7 @@ class AddDistributedOp(ElementWiseWithPartialDistributedOp):
     which is useful for operations like gradient accumulation where partial
     results need to be preserved through the computation graph.
     """
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         """
         Infer output layout for Add operator.
 
@@ -636,7 +636,7 @@ class AddDistributedOp(ElementWiseWithPartialDistributedOp):
 
         return infer_result
 
-    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,
+    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,  # pylint: disable=W0221
                         cache_values: list) -> Optional[Callable]:
         """
         Get expand implementation for the operator

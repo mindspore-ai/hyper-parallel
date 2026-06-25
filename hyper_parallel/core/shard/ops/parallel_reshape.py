@@ -288,7 +288,7 @@ class ReshapeDistributedOp(DistributedOp):
 
         return out_layout, local_dst_shape
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, list]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, list]:  # pylint: disable=W0221
         """
         Infer output layout for Reshape operator.
 
@@ -321,7 +321,7 @@ class ReshapeDistributedOp(DistributedOp):
         out_layout, local_dst_shape = self._infer_reshape_layout(x_layout, dst_shape, input_shape)
         return ((out_layout,), local_dst_shape)
 
-    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,
+    def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,  # pylint: disable=W0221
                         cache_values: list) -> Optional[Callable]:
         """Return a closure that calls reshape/view with the inferred local target shape."""
         del cache_values
