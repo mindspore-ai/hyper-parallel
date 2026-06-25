@@ -462,6 +462,29 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertTrue(torch.equal(out.to_local(), producer_key.to_local()))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_async_slot_wait_uses_consumer_value_as_backward_anchor(self, mock_mesh_platform):
+        """Async DSA wait should attach autograd to the hook-wrapped consumer value."""
+        mesh = self._make_cp_mesh(mock_mesh_platform)
+        slot = _AsyncSequenceReplicateSlot(mesh, seq_dim=1)
+        producer_local = torch.ones(2, 4, 1, 16)
+        consumer_value = torch.full_like(producer_local, 7.0)
+        gathered = torch.full_like(producer_local, 3.0)
+        work = MagicMock()
+        out_perm = torch.empty_like(producer_local)
+        slot._slots.setdefault("key", []).append(slot._make_slot(producer_local, producer_local, work, out_perm))
+
+        with patch(
+                "hyper_parallel.core.context_parallel.async_dsa_context_parallel.platform"
+                ".differentiable_async_allgather_wait",
+                return_value=gathered,
+        ) as mock_wait:
+            out = slot.wait("key", consumer_value)
+
+        self.assertTrue(torch.equal(out.to_local(), gathered))
+        self.assertIs(mock_wait.call_args.args[0], consumer_value)
+        self.assertIsNot(mock_wait.call_args.args[0], producer_local)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_async_sparse_attention_waits_prelaunched_handoffs(self, mock_mesh_platform):
         """Async sparse FA CP should wait producer hooks for key/value/key_rope."""
         mesh = self._make_cp_mesh(mock_mesh_platform)
