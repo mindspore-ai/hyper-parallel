@@ -61,7 +61,7 @@ class TupleElementWiseDistributedOp(DistributedOp):
 
         return tuple(local_args), local_kwargs, cache_values
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         """
         Infer output layouts for element-wise operations.
 

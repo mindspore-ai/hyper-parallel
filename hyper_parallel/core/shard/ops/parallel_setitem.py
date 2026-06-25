@@ -267,9 +267,6 @@ class SetItemDistributedOp(DistributedOp):
     def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """Preprocess arguments for __setitem__.
 
-        Converts raw key to hashable descriptor for cache, unwraps DTensors
-        to local tensors, and builds value descriptor.
-
         Args:
             args: (self_tensor, key, value)
             kwargs: Empty dict for __setitem__.
@@ -277,78 +274,96 @@ class SetItemDistributedOp(DistributedOp):
         Returns:
             tuple: (local_args, local_kwargs, cache_values)
         """
-        norm_args, _ = _normalize___setitem___args(*args, **kwargs)
+        norm_args = _normalize___setitem___args(*args, **kwargs)[0]
         self_t, key, value = norm_args
 
+        local_key, key_cache, lhs_shape, lhs_layout = self._preprocess_setitem_key(
+            self_t, key, self.op_name
+        )
+
+        local_value, value_desc = self._preprocess_setitem_value(
+            value, key_cache[3], lhs_shape, lhs_layout, key_cache[0].mesh, self.op_name,
+        )
+
+        cache_values = key_cache + [value_desc, lhs_shape]
+        return ((self_t.to_local(), local_key, local_value), {}, cache_values)
+
+    @staticmethod
+    def _preprocess_setitem_key(self_t, key, op_name):
+        """Process key and compute LHS metadata for __setitem__ preprocess.
+
+        Args:
+            self_t: The self DTensor.
+            key: Raw indexing key.
+            op_name: Operator name for error messages.
+
+        Returns:
+            tuple: (local_key, key_cache, lhs_shape, lhs_layout)
+                key_cache is [self_layout, key_desc, global_shape, kind].
+        """
         self_layout = self_t.layout
         global_shape = tuple(self_t.shape)
-
-        # raw key -> hashable descriptor for cache
-        key_desc, kind = _key_cache_descriptor(key, op_name=self.op_name)
-
-        # Unwrap key for local execution
+        key_desc, kind = _key_cache_descriptor(key, op_name=op_name)
         local_key = _unwrap_key_for_local(key)
+        key_cache = [self_layout, key_desc, global_shape, kind]
 
-        # Compute LHS slice shape and layout (before processing value,
-        # so we can use broadcast-aware sharding for plain tensor values).
         if kind == _BOOL_MASK:
-            expanded_actions = None
-            lhs_shape = None
-            lhs_layout = None
-        else:
-            expanded_actions = _descriptor_to_expanded_actions(
-                key_desc, len(global_shape), op_name=self.op_name
-            )
-            lhs_shape = _compute_lhs_shape(
-                global_shape, expanded_actions, kind, op_name=self.op_name
-            )
-            lhs_layout = _compute_lhs_layout(
-                self_layout, expanded_actions, kind, op_name=self.op_name
-            )
+            return local_key, key_cache, None, None
 
-        # Unwrap value
+        expanded_actions = _descriptor_to_expanded_actions(
+            key_desc, len(global_shape), op_name=op_name
+        )
+        lhs_shape = _compute_lhs_shape(global_shape, expanded_actions, kind, op_name=op_name)
+        lhs_layout = _compute_lhs_layout(self_layout, expanded_actions, kind, op_name=op_name)
+
+        return local_key, key_cache, lhs_shape, lhs_layout
+
+    @staticmethod
+    def _preprocess_setitem_value(value, kind, lhs_shape, lhs_layout, self_mesh, op_name):
+        """Process the value argument for __setitem__ preprocess.
+
+        Handles DTensor unwrapping, plain-tensor broadcast validation and sharding,
+        and scalar passthrough.
+
+        Args:
+            value: The raw value tensor (DTensor, Tensor, or scalar).
+            kind: "basic", "advanced", or "bool_mask".
+            lhs_shape: Computed LHS slice shape (tuple).
+            lhs_layout: Computed LHS slice Layout.
+            self_mesh: DeviceMesh of the self tensor.
+            op_name: Operator name for error messages.
+
+        Returns:
+            (local_value, value_desc): Processed local tensor and cache descriptor.
+        """
         if isinstance(value, DTensor):
             value_shape = tuple(value.shape)
             local_value = value.to_local()
             if not value_shape:
-                value_desc = None  # 0-D DTensor treated as scalar
-            else:
-                value_desc = ("dtensor", value.layout, value_shape)
-        elif isinstance(value, Tensor):
-            value_desc = ("plain_tensor", tuple(value.shape))
+                return local_value, None  # 0-D DTensor treated as scalar
+            return local_value, ("dtensor", value.layout, value_shape)
 
+        if isinstance(value, Tensor):
+            value_desc = ("plain_tensor", tuple(value.shape))
             if value.ndim > 0 and kind != _BOOL_MASK:
-                # Validate broadcast compatibility before sharding
-                _validate_value_broadcast(
-                    self.op_name, tuple(value.shape), lhs_shape
-                )
+                _validate_value_broadcast(op_name, tuple(value.shape), lhs_shape)
                 # pylint: disable=C0415
                 from hyper_parallel.core.dtensor.layout import _get_slice_tensor_by_layout
-                # Build value layout adjusted for broadcast dims
                 value_layout = _build_broadcast_value_layout(
-                    self_layout.mesh, lhs_layout, tuple(value.shape), lhs_shape
+                    self_mesh, lhs_layout, tuple(value.shape), lhs_shape
                 )
-                # If broadcasting adds leading dims, reshape value to match
-                # layout ndim before sharding.
                 ndim_diff = len(lhs_shape) - value.ndim
                 if ndim_diff > 0:
                     padded_value = value.reshape((1,) * ndim_diff + tuple(value.shape))
                 else:
                     padded_value = value
                 local_value = _get_slice_tensor_by_layout(padded_value, value_layout)
-            else:
-                local_value = value
-        else:
-            local_value = value
-            value_desc = None
+                return local_value, value_desc
+            return value, value_desc
 
-        local_args = (self_t.to_local(), local_key, local_value)
-        local_kwargs = {}
+        return value, None
 
-        cache_values = [self_layout, key_desc, global_shape, kind, value_desc, lhs_shape]
-        return local_args, local_kwargs, cache_values
-
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         """Infer output layout for __setitem__.
 
         __setitem__ is in-place, so output layout equals self layout.
@@ -396,90 +411,72 @@ class SetItemDistributedOp(DistributedOp):
 
     @staticmethod
     def _validate_input_layouts(self_layout, expanded_actions, global_shape, kind, value_desc, lhs_shape):
-        """Validate sharding constraints for __setitem__.
-
-        Rules:
-            1. self must not be in Partial status.
-            2. BoolTensor mask indexing is not supported.
-            3. Any dimension being written must be replicated.
-            4. slice step must be None or 1.
-            5. Advanced index tensors must be replicated.
-            6. RHS DTensor must have mesh consistent with self and
-               broadcast-compatible layout (non-broadcast dims match LHS
-               layout, broadcast dims must be Replicate).
-            7. RHS Tensor/scalar must be broadcastable to LHS slice shape.
-            8. Output layout equals self_layout (in-place).
-
-        Args:
-            self_layout: Layout of self tensor.
-            expanded_actions: Expanded key actions.
-            global_shape: Global shape of self tensor.
-            kind: "basic", "advanced", or "bool_mask".
-            value_desc: Descriptor of RHS value.
-            lhs_shape: Expected LHS slice shape.
-
-        Raises:
-            ValueError: If any constraint is violated.
-        """
+        """Validate sharding constraints for __setitem__."""
         op_name = "__setitem__"
 
-        # Reuse __getitem__ validation for LHS key
         GetItemDistributedOp._validate_input_layouts(  # pylint: disable=W0212
             self_layout, expanded_actions, global_shape, kind, op_name=op_name
         )
 
-        # Validate RHS value
         if value_desc is None:
-            return  # scalars always valid
+            return
 
         val_kind = value_desc[0]
-
         if val_kind == "plain_tensor":
-            val_shape = value_desc[1]
-            _validate_value_broadcast(op_name, val_shape, lhs_shape)
-
+            _validate_value_broadcast(op_name, value_desc[1], lhs_shape)
         elif val_kind == "dtensor":
-            val_layout = value_desc[1]
-            val_shape = value_desc[2]
-
-            # Check broadcast compatibility
-            _validate_value_broadcast(op_name, val_shape, lhs_shape)
-
-            # Check mesh consistency via to_hash() (DeviceMesh has no __eq__,
-            # and copy.deepcopy in layout construction breaks identity checks).
-            if val_layout.mesh.to_hash() != self_layout.mesh.to_hash():
-                raise ValueError(
-                    f"For {op_name}, value DTensor must be on same mesh as self, "
-                    f"but got mesh {val_layout.mesh_shape} "
-                    f"vs {self_layout.mesh_shape}."
-                )
-
-            # Check layout: non-broadcast dims must match LHS layout;
-            # broadcast dims (value size 1, LHS size > 1) must be Replicate.
-            expected_layout = _compute_lhs_layout(
-                self_layout, expanded_actions, kind, op_name=op_name
+            SetItemDistributedOp._validate_dtensor_value(
+                self_layout, expanded_actions, kind, value_desc[1], value_desc[2], lhs_shape, op_name,
+            )
+        else:
+            raise ValueError(
+                f"For {op_name}, unsupported value descriptor kind: {val_kind}."
             )
 
-            ndim_diff = len(lhs_shape) - len(val_shape)
-            val_alias = val_layout.alias_tensor_map
-            expected_alias = expected_layout.alias_tensor_map
-            for i, v_size in enumerate(val_shape):
-                e_size = lhs_shape[ndim_diff + i]
-                v_alias = val_alias[i]
-                e_alias = expected_alias[ndim_diff + i]
+    @staticmethod
+    def _validate_dtensor_value(
+            self_layout, expanded_actions, kind, val_layout, val_shape, lhs_shape, op_name):
+        """Validate DTensor RHS mesh and layout."""
+        _validate_value_broadcast(op_name, val_shape, lhs_shape)
 
-                if v_size == 1 and e_size > 1:
-                    # Broadcast dim: value placement must be Replicate
-                    if v_alias != "None":
-                        raise ValueError(
-                            f"For {op_name}, value broadcast dim {i} (size {v_size}) "
-                            f"must be Replicate, but got {v_alias}."
-                        )
-                elif v_alias != e_alias:
+        if val_layout.mesh.to_hash() != self_layout.mesh.to_hash():
+            raise ValueError(
+                f"For {op_name}, value DTensor must be on same mesh as self, "
+                f"but got mesh {val_layout.mesh_shape} "
+                f"vs {self_layout.mesh_shape}."
+            )
+
+        expected_layout = _compute_lhs_layout(
+            self_layout, expanded_actions, kind, op_name=op_name
+        )
+        SetItemDistributedOp._validate_value_layout(
+            val_layout, expected_layout, val_shape, lhs_shape, op_name,
+        )
+
+    @staticmethod
+    def _validate_value_layout(val_layout, expected_layout, val_shape, lhs_shape, op_name):
+        """Validate RHS DTensor placement against expected LHS placement."""
+        ndim_diff = len(lhs_shape) - len(val_shape)
+        val_alias = val_layout.alias_tensor_map
+        expected_alias = expected_layout.alias_tensor_map
+
+        for i, v_size in enumerate(val_shape):
+            lhs_index = ndim_diff + i
+            e_size = lhs_shape[lhs_index]
+            v_alias = val_alias[i]
+            e_alias = expected_alias[lhs_index]
+
+            if v_size == 1 and e_size > 1:
+                if v_alias != "None":
                     raise ValueError(
-                        f"For {op_name}, value layout mismatch at dim {i}: "
-                        f"expected {e_alias}, but got {v_alias}."
+                        f"For {op_name}, value broadcast dim {i} (size {v_size}) "
+                        f"must be Replicate, but got {v_alias}."
                     )
+            elif v_alias != e_alias:
+                raise ValueError(
+                    f"For {op_name}, value layout mismatch at dim {i}: "
+                    f"expected {e_alias}, but got {v_alias}."
+                )
 
     def wrap_output(self, py_output: Any, output_layouts: tuple) -> None:
         """Override wrap_output for __setitem__.
