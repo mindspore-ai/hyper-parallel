@@ -13,7 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """HSDP cell state"""
-from typing import Any, List, Tuple, Union
+from typing import List, Tuple, Union
 
 from hyper_parallel.platform import get_platform
 from hyper_parallel.core.fully_shard.hsdp_param import HSDPParamV2

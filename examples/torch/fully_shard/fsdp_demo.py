@@ -17,16 +17,18 @@
 This script shows how to use fully_shard for distributed training.
 Run with: torchrun --nproc_per_node=8 fsdp_demo.py
 """
-# pylint: disable=C0413
 import os
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 from torch import nn
 import torch.distributed as dist
 
-from hyper_parallel import init_device_mesh, SkipDTensorDispatch
-from hyper_parallel.core.fully_shard.api import fully_shard
+# hyper_parallel selects its backend from HYPER_PARALLEL_PLATFORM at import time,
+# so the environment must be configured before importing it.
+os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
+
+from hyper_parallel import init_device_mesh, SkipDTensorDispatch  # pylint: disable=C0413
+from hyper_parallel.core.fully_shard.api import fully_shard  # pylint: disable=C0413
 
 
 def init_dist():
@@ -37,7 +39,6 @@ def init_dist():
     torch.npu.set_device(rank)
     device_id = rank % 8
     torch.npu.set_device(device_id)
-    return rank, device_id
 
 
 class SimpleTransformer(nn.Module):
@@ -54,8 +55,8 @@ class SimpleTransformer(nn.Module):
     def forward(self, src):
         """Pass input through transformer encoder layers and apply layer normalization."""
         out = src
-        for l in self.layers:
-            out = l(out)
+        for enc_layer in self.layers:
+            out = enc_layer(out)
         return self.norm(out)
 
 

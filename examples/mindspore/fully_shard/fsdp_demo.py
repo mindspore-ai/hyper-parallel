@@ -17,17 +17,19 @@
 This script shows how to use fully_shard for distributed training.
 Run with: msrun --worker_num=8 --local_worker_num=8 --log_dir=msrun_log --join=True fsdp_demo.py
 """
-# pylint: disable=C0413
 import os
-os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
 
 from mindspore import nn
 from mindspore import communication as dist
 from mindspore._c_expression import NoFallbackGuard
 from mindspore import mint
 
-from hyper_parallel import init_device_mesh
-from hyper_parallel.core.fully_shard.api import fully_shard
+# hyper_parallel selects its backend from HYPER_PARALLEL_PLATFORM at import time,
+# so the environment must be configured before importing it.
+os.environ["HYPER_PARALLEL_PLATFORM"] = "mindspore"
+
+from hyper_parallel import init_device_mesh  # pylint: disable=C0413
+from hyper_parallel.core.fully_shard.api import fully_shard  # pylint: disable=C0413
 
 
 class MultiLayerNets(nn.Cell):
