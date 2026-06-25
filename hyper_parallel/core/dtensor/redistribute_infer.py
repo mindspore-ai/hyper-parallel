@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -642,7 +642,9 @@ class RedistributionOperatorInfer:
             - ("all_split", (dim, size, group))
             - ("all_to_all", (split_dim, concat_dim, size, group))
         """
-        self.infer_redistribution_operator()
+        if self.infer_redistribution_operator() != Status.SUCCESS:
+            raise RuntimeError("infer redistribution operator failed.")
+
         ops_list = []
         for op in self.operator_list_:
             if op[0] == CONCAT_BY_AXIS:

@@ -776,13 +776,9 @@ class DeviceMesh:
             group_key = str(tuple(sorted(group_ranks)))
             if not platform.get_created_group(group_ranks):
                 EXISTING_COMM_GROUPS[group_key] = group
-            if (
-                    isinstance(mesh, Tensor) and mesh.tolist() != group_ranks
-            ) or (
-                    mesh is not None
-                    and not isinstance(mesh, Tensor)
-                    and mesh != group_ranks
-            ):
+            tensor_type_mesh_invalid = isinstance(mesh, Tensor) and mesh.tolist() != group_ranks
+            not_tensor_type_mesh_invalid = mesh is not None and not isinstance(mesh, Tensor) and mesh != group_ranks
+            if tensor_type_mesh_invalid or not_tensor_type_mesh_invalid:
                 raise ValueError(
                     f"Invalid mesh_shape {str(mesh)} for 1D group with ranks {group_ranks}"
                 )
