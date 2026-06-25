@@ -38,9 +38,9 @@ class TraceMinimalCacheSavePlanner(StandardSavePlanner):
         self.cache_write_keys: list[str] = []
         self.cache_hit_keys: list[str] = []
 
-    def get_cached_result(self) -> Any:
+    def get_cached(self) -> Any:
         """Trace whether the planner cache is missed or hit for the current key."""
-        cached = super().get_cached_result()
+        cached = super().get_cached()
         if cached is None:
             self.cache_miss_count += 1
         else:
