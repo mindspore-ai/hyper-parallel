@@ -22,7 +22,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from hyper_parallel.core.distributed_checkpoint.layout import (
+    combine_layout,
     get_current_layout,
+    get_global_layout,
     load_layout,
     save_layout,
 )
@@ -303,6 +305,57 @@ class TestLayout(unittest.TestCase):
             loaded = load_layout(path)
         self.assertEqual(loaded, layout_dict)
         self.assertIsNone(loaded["0"]["bias"])
+
+    def test_combine_layout_merges_rank_files(self):
+        """
+        Feature: combine_layout merges per-rank layout JSON files.
+        Description: Write two .layout files with distinct rank keys.
+        Expectation: Combined dict contains both rank entries.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_layout({"0": {"w": {"type": "float32", "full_shape": [2]}}}, Path(tmpdir) / "a.layout")
+            save_layout({"1": {"w": {"type": "float32", "full_shape": [2]}}}, Path(tmpdir) / "b.layout")
+            combined = combine_layout(tmpdir)
+            self.assertEqual(set(combined.keys()), {"0", "1"})
+
+    def test_combine_layout_duplicate_rank_raises(self):
+        """
+        Feature: combine_layout duplicate rank detection.
+        Description: Two layout files both define rank key "0".
+        Expectation: ValueError is raised for duplicate rank_id.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_layout({"0": {"w": {}}}, Path(tmpdir) / "a.layout")
+            save_layout({"0": {"b": {}}}, Path(tmpdir) / "b.layout")
+            with self.assertRaises(ValueError) as ctx:
+                combine_layout(tmpdir)
+            self.assertIn("rank_id", str(ctx.exception))
+
+    @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.all_gather_object")
+    @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_world_size", return_value=2)
+    @patch("hyper_parallel.core.distributed_checkpoint.layout.platform.get_rank", return_value=0)
+    def test_get_global_layout_gathers_all_ranks(self, mock_rank, mock_world_size, mock_all_gather):
+        """
+        Feature: get_global_layout cross-rank aggregation.
+        Description: Mock all_gather_object to simulate two rank layout dicts.
+        Expectation: Returned dict merges layouts from all ranks.
+        """
+        local = {"0": {"w": {"type": "float32", "full_shape": [2]}}}
+        remote = {"1": {"w": {"type": "float32", "full_shape": [2]}}}
+
+        def _gather(out_list, local_obj):
+            out_list[0] = local_obj
+            out_list[1] = remote
+
+        mock_all_gather.side_effect = _gather
+        mock_cell = MagicMock()
+        mock_cell.parameters_and_names.return_value = []
+
+        global_layout = get_global_layout(mock_cell)
+        self.assertEqual(set(global_layout.keys()), {"0", "1"})
+        mock_rank.assert_called()
+        mock_world_size.assert_called_once()
+        mock_all_gather.assert_called_once()
 
 
 if __name__ == "__main__":
