@@ -802,9 +802,8 @@ class PrepareModuleInputOutput(ParallelStyle):
 class NoParallel(ParallelStyle):
     """Replicate module parameters without sharding, while maintaining DTensor semantics.
 
-    Matches ``torchtitan.distributed.tensor_parallel.NoParallel``: parameters and buffers
-    are converted to fully replicated :class:`DTensor`, and I/O hooks ensure tensor
-    conversion and layout alignment at module boundaries.
+    Parameters and buffers are converted to fully replicated :class:`DTensor`, and I/O
+    hooks ensure tensor conversion and layout alignment at module boundaries.
 
     Use this style for modules that must perform identical computations across TP ranks,
     such as:
