@@ -1,7 +1,7 @@
 ---
 name: activation-dev
 description: Expert on LlamaFactory + HyperParallel activation recompute & swap integration — checkpoint_wrapper, SwapManager, policy_fn, and FSDP2 ordering constraints.
-model: opus
+model: default
 tools:
   - Read
   - Grep

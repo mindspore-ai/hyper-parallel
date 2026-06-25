@@ -1,7 +1,7 @@
 ---
 name: code-reviewer
 description: Code reviewer specializing in distributed system correctness. Performs post-change review focusing on stream sync, memory safety, cross-platform consistency, and DTensor invariants.
-model: sonnet
+model: default
 tools:
   - Read
   - Grep

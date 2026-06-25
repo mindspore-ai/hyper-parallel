@@ -1,7 +1,7 @@
 ---
 name: ep-dev-expert
 description: Deep expert on HyperParallel expert parallelism — MoE building blocks, ExpertParallel styles, token dispatch/combine, and integration with DTensor, TP, FSDP, and pipeline parallelism.
-model: opus
+model: default
 tools:
   - Read
   - Grep
