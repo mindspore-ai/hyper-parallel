@@ -209,9 +209,11 @@ class LoggingCallback(Callback):
 
         tokens_per_sec = None
         if self.report_throughput:
-            # Prefer real per-step token count stashed by train_step.
-            tokens = getattr(self.trainer, '_last_global_tokens',
-                             self._tokens_per_step_est)
+            # Prefer real per-step token count stashed by train_step; fall back
+            # to the estimate until the first step sets it (declared None).
+            tokens = getattr(self.trainer, '_last_global_tokens', None)
+            if tokens is None:
+                tokens = self._tokens_per_step_est
             tokens_per_sec = tokens / elapsed
             metrics["tokens_per_sec"] = f"{tokens_per_sec:,.0f}"
 

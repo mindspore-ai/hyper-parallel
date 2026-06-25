@@ -34,6 +34,13 @@ Mirrors the upstream ``Qwen3_5ForConditionalGeneration`` text architecture
 Text-only forward; any ``model.visual.*`` keys in a HF checkpoint are
 dropped by :mod:`hyper_parallel.models.qwen3_5.checkpoint`.
 """
+
+__all__ = [
+    "Qwen3_5Config",
+    "Qwen3_5Decoder",
+    "Qwen3_5ForCausalLM",
+]
+
 # pylint: disable=C0103  # HF transformers class-name convention (Qwen3_5*)
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -380,9 +387,3 @@ class Qwen3_5ForCausalLM(nn.Module):
                 reduction="mean",
             )
         return {"loss": loss, "logits": logits}
-
-__all__ = [
-    "Qwen3_5Config",
-    "Qwen3_5Decoder",
-    "Qwen3_5ForCausalLM",
-]

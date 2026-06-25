@@ -19,6 +19,15 @@ architecture (vision tower, DeepStack visual injection, MoE text decoder).
 """
 from __future__ import annotations
 
+__all__ = [
+    "Qwen3VLMoeTextConfig",
+    "Qwen3VLMoeVisionConfig",
+    "Qwen3VLMoeConfig",
+    "Qwen3VLMoeForCausalLM",
+    "Qwen3VLMoeForConditionalGeneration",
+    "Qwen3VLMoeTextDecoder",
+]
+
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -1217,7 +1226,9 @@ class Qwen3VLMoeModel(nn.Module):
                     )
                     current_pos += text_len
                 else:
-                    grid = next(grid_iters[modality_type])
+                    # modality_type is 1 (image) or 2 (video) — both static keys
+                    # of grid_iters, so .get() is equivalent to indexing here.
+                    grid = next(grid_iters.get(modality_type))
                     pos_parts.append(
                         self.get_vision_position_ids(
                             current_pos, grid, 1, spatial_merge_size,
@@ -1436,12 +1447,3 @@ class Qwen3VLMoeForConditionalGeneration(nn.Module):
                 ignore_index=-100,
             )
         return {"loss": loss, "logits": logits}
-
-__all__ = [
-    "Qwen3VLMoeTextConfig",
-    "Qwen3VLMoeVisionConfig",
-    "Qwen3VLMoeConfig",
-    "Qwen3VLMoeForCausalLM",
-    "Qwen3VLMoeForConditionalGeneration",
-    "Qwen3VLMoeTextDecoder",
-]
