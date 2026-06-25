@@ -15,6 +15,8 @@
 """HF Qwen3-VL-MoE checkpoint loader for hyper native models."""
 from __future__ import annotations
 
+__all__ = ["load_hf_qwen3_vl_moe_state_dict"]
+
 import json
 import logging
 import os
@@ -115,5 +117,3 @@ def load_hf_qwen3_vl_moe_state_dict(
         len(hyper_sd), skipped,
     )
     return hyper_sd
-
-__all__ = ["load_hf_qwen3_vl_moe_state_dict"]

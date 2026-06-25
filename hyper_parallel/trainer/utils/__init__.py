@@ -13,14 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Trainer utility helpers (logging, etc.)."""
-from hyper_parallel.trainer.utils.logging import (
-    init_logger,
-    get_logger,
-    info_rank0,
-    warning_rank0,
-    info_once,
-    warning_once,
-)
 
 __all__ = [
     "init_logger",
@@ -30,3 +22,12 @@ __all__ = [
     "info_once",
     "warning_once",
 ]
+
+from hyper_parallel.trainer.utils.logging import (
+    init_logger,
+    get_logger,
+    info_rank0,
+    warning_rank0,
+    info_once,
+    warning_once,
+)

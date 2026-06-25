@@ -20,6 +20,9 @@ full visual-tower handling + AC / FSDP / Prefetch pipeline. TP and EP are
 explicitly rejected (the generic ``ParallelStyle``-based path produces
 incorrect numerics for grouped experts and visual blocks).
 """
+
+__all__ = ["parallelize_qwen3_vl_moe"]
+
 import logging
 
 import torch
@@ -227,5 +230,3 @@ def parallelize_qwen3_vl_moe(model, mesh, cfg):
     _apply_ac(model, cfg)
     _apply_fsdp(model, mesh, cfg)
     return model
-
-__all__ = ["parallelize_qwen3_vl_moe"]

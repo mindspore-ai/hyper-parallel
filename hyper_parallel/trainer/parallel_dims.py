@@ -52,6 +52,8 @@ User experience:
 """
 from __future__ import annotations
 
+__all__ = ["ParallelDims"]
+
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -447,5 +449,3 @@ class ParallelDims:
             f"cp={self.cp} tp={self.tp} pp={self.pp} ep={self.ep} "
             f"etp={self.etp} | dp={self.dp_size} world={self.world_size}"
         )
-
-__all__ = ["ParallelDims"]

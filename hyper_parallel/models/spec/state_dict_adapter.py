@@ -19,6 +19,9 @@ to know any model name. The adapter owns the HF-specific tensor renaming and
 expert-fusion splitting; the trainer keeps the generic wrap-stripping +
 shape-validation + ``load_state_dict`` flow.
 """
+
+__all__ = ["StateDictAdapter"]
+
 from typing import Dict, Optional, Protocol, runtime_checkable
 
 import torch
@@ -72,6 +75,3 @@ class StateDictAdapter(Protocol):
             A dict of HF-named tensors for ``safetensors.save_file()`` or
             ``torch.save()``. Inverse of ``load_hf_state_dict``.
         """
-
-
-__all__ = ["StateDictAdapter"]

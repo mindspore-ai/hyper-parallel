@@ -21,6 +21,9 @@ generic ``ParallelStyle``-based path produces incorrect numerics for grouped
 experts, and full EP requires per-model dispatch/combine wiring that lives
 here, not in a shared helper).
 """
+
+__all__ = ["parallelize_qwen3_5_moe"]
+
 import logging
 
 import torch
@@ -47,6 +50,33 @@ def _apply_ac(model, cfg) -> None:
     for i, layer in enumerate(layers):
         model.layers[i] = checkpoint_wrapper(layer)
     logger.info_rank0("AC applied to %d Qwen3.5-MoE layers (mode=%s)", len(layers), ac_mode)
+
+
+def _compute_shard_overrides(model, world_size):
+    """Build shard-dim overrides and replicate set for a given world size.
+
+    Override default Shard(0) to Shard(1) for params whose dim-0 isn't
+    divisible by world_size but a later dim is (e.g. ``shared_expert_gate.weight``
+    shape ``(1, hidden)``). Params that fit neither dim fall back to the
+    ``replicate_params`` route. Behavior-identical to the inline block.
+    """
+    shard_dim_overrides: dict = {}
+    replicate_params = set()
+    if world_size > 1:
+        for _, param in model.named_parameters():
+            if param.dim() == 0:
+                continue
+            if param.size(0) % world_size == 0:
+                continue
+            shardable_dim = next(
+                (d for d in range(1, param.dim()) if param.size(d) % world_size == 0),
+                None,
+            )
+            if shardable_dim is not None:
+                shard_dim_overrides[id(param)] = shardable_dim
+            else:
+                replicate_params.add(param)
+    return shard_dim_overrides, replicate_params
 
 
 def _apply_fsdp(model, mesh, cfg) -> None:
@@ -99,22 +129,7 @@ def _apply_fsdp(model, mesh, cfg) -> None:
         world_size = dp_mesh.size() if hasattr(dp_mesh, "size") else 1
     except (AttributeError, RuntimeError):
         world_size = 1
-    shard_dim_overrides: dict = {}
-    replicate_params = set()
-    if world_size > 1:
-        for _, param in model.named_parameters():
-            if param.dim() == 0:
-                continue
-            if param.size(0) % world_size == 0:
-                continue
-            shardable_dim = next(
-                (d for d in range(1, param.dim()) if param.size(d) % world_size == 0),
-                None,
-            )
-            if shardable_dim is not None:
-                shard_dim_overrides[id(param)] = shardable_dim
-            else:
-                replicate_params.add(param)
+    shard_dim_overrides, replicate_params = _compute_shard_overrides(model, world_size)
     if shard_dim_overrides:
         overrides = shard_dim_overrides
 
@@ -165,5 +180,3 @@ def parallelize_qwen3_5_moe(
     _apply_ac(model, cfg)
     _apply_fsdp(model, mesh, cfg)
     return model
-
-__all__ = ["parallelize_qwen3_5_moe"]

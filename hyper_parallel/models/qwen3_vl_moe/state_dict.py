@@ -13,6 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """HF ↔ hyper state-dict adapter for the Qwen3-VL-MoE model."""
+
+__all__ = ["Qwen3VLMoeStateDictAdapter"]
+
 from typing import Dict, Optional
 
 import torch
@@ -23,8 +26,8 @@ from hyper_parallel.models.qwen3_vl_moe.checkpoint import load_hf_qwen3_vl_moe_s
 class Qwen3VLMoeStateDictAdapter:
     """Load/save adapter registered on the ``qwen3_vl_moe`` ModelSpec."""
 
+    @staticmethod
     def load_hf_state_dict(
-        self,
         weights_path: str,
         model_config,
         dtype: Optional[torch.dtype] = None,
@@ -40,8 +43,8 @@ class Qwen3VLMoeStateDictAdapter:
             dtype=dtype,
         )
 
+    @staticmethod
     def save_hf_state_dict(
-        self,
         state_dict: Dict[str, torch.Tensor],
         model_config,
     ) -> Dict[str, torch.Tensor]:
@@ -54,5 +57,3 @@ class Qwen3VLMoeStateDictAdapter:
             elif key.startswith(("embed_tokens.", "layers.", "norm.")):
                 hf_sd[f"model.language_model.{key}"] = tensor
         return hf_sd
-
-__all__ = ["Qwen3VLMoeStateDictAdapter"]
