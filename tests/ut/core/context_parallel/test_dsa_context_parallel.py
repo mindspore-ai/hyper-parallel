@@ -547,6 +547,8 @@ class TestDsaContextParallel(unittest.TestCase):
             )
         self.assertTrue(torch.equal(out[1].to_local(), key))
         self.assertTrue(torch.equal(out[3].to_local(), key_index))
+        self.assertEqual(out[6].placements, (Shard(2),))
+        self.assertEqual(out[7].placements, (Shard(2),))
         self.assertTrue(torch.equal(out[9].to_local(), key_rope))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -579,10 +581,112 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out[3].placements, (Replicate(),))
         self.assertEqual(out[4].placements, (Shard(1),))
         self.assertEqual(out[5].placements, (Shard(1),))
-        self.assertIs(out[6], softmax_max)
-        self.assertIs(out[7], softmax_sum)
+        self.assertEqual(out[6].placements, (Shard(2),))
+        self.assertEqual(out[7].placements, (Shard(2),))
         self.assertEqual(out[8].placements, (Shard(1),))
         self.assertEqual(out[9].placements, (Replicate(),))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_dense_indexer_loss_boundary_inputs_are_rewritten(self, mock_mesh_platform):
+        """Dense indexer-loss should shard query-side softmax stats without treating them as topk."""
+        mesh = self._make_cp_mesh(mock_mesh_platform)
+        style = DSAIndexerLossContextParallel(
+            layout="BSND",
+            loss_variant="dense",
+            use_local_output=False,
+        )
+        module = _IdentityModule()
+
+        query = torch.randn(2, 4, 8, 16)
+        key = torch.randn(2, 4, 1, 16)
+        query_index = torch.randn(2, 4, 8, 16)
+        key_index = torch.randn(2, 4, 1, 16)
+        weights = torch.randn(2, 4, 8)
+        softmax_max = torch.randn(2, 1, 8, 1)
+        softmax_sum = torch.randn(2, 1, 8, 1)
+        softmax_max_index = torch.randn(2, 1, 8, 1)
+        softmax_sum_index = torch.randn(2, 1, 8, 1)
+        q_rope = torch.randn(2, 4, 8, 8)
+        k_rope = torch.randn(2, 4, 1, 8)
+
+        with _patch_torch_dist_rank():
+            style.apply(module, mesh)
+            out = module(
+                query, key, query_index, key_index, weights,
+                softmax_max, softmax_sum, softmax_max_index, softmax_sum_index,
+                1.0, q_rope, k_rope,
+            )
+        self.assertEqual(out[0].placements, (Shard(1),))
+        self.assertEqual(out[1].placements, (Replicate(),))
+        self.assertEqual(out[2].placements, (Shard(1),))
+        self.assertEqual(out[3].placements, (Replicate(),))
+        self.assertEqual(out[4].placements, (Shard(1),))
+        self.assertEqual(out[5].placements, (Shard(2),))
+        self.assertEqual(out[6].placements, (Shard(2),))
+        self.assertEqual(out[7].placements, (Shard(2),))
+        self.assertEqual(out[8].placements, (Shard(2),))
+        self.assertEqual(out[9], 1.0)
+        self.assertEqual(out[10].placements, (Shard(1),))
+        self.assertEqual(out[11].placements, (Replicate(),))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_tnd_indexer_loss_stats_use_query_stats_sequence_dim(self, mock_mesh_platform):
+        """TND indexer-loss stats should shard on their T dimension."""
+        mesh = self._make_cp_mesh(mock_mesh_platform)
+        style = DSAIndexerLossContextParallel(layout="TND", use_local_output=False)
+        module = _IdentityModule()
+
+        query = torch.randn(8, 4, 16)
+        key = torch.randn(1, 4, 16)
+        query_index = torch.randn(8, 4, 16)
+        key_index = torch.randn(1, 4, 16)
+        weights = torch.randn(8, 4)
+        topk = torch.randint(0, 4, (8, 1, 2), dtype=torch.int32)
+        softmax_max = torch.randn(1, 8, 1)
+        softmax_sum = torch.randn(1, 8, 1)
+        q_rope = torch.randn(8, 4, 8)
+        k_rope = torch.randn(1, 4, 8)
+
+        with _patch_torch_dist_rank():
+            style.apply(module, mesh)
+            out = module(
+                query, key, query_index, key_index, weights,
+                topk, softmax_max, softmax_sum, q_rope, k_rope
+            )
+        self.assertEqual(out[0].placements, (Shard(0),))
+        self.assertEqual(out[5].placements, (Shard(0),))
+        self.assertEqual(out[6].placements, (Shard(1),))
+        self.assertEqual(out[7].placements, (Shard(1),))
+        self.assertEqual(out[8].placements, (Shard(0),))
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_indexer_loss_stats_preserve_existing_tp_layout(self, mock_mesh_platform):
+        """Query-side softmax stats should enter CP on composed CP+TP mesh."""
+        cp_mesh, tp_mesh = self._make_cp_tp_meshes(mock_mesh_platform)
+        style = DSAIndexerLossContextParallel(layout="BSND", use_local_output=False)
+        module = _IdentityModule()
+
+        query = torch.randn(2, 4, 8, 16)
+        key = torch.randn(2, 4, 1, 16)
+        query_index = torch.randn(2, 4, 8, 16)
+        key_index = torch.randn(2, 4, 1, 16)
+        weights = torch.randn(2, 4, 8)
+        topk = torch.randint(0, 4, (2, 4, 1, 2), dtype=torch.int32)
+        softmax_max = DTensor.from_local(torch.randn(2, 2, 8, 1), tp_mesh, (Shard(1),))
+        softmax_sum = DTensor.from_local(torch.randn(2, 2, 8, 1), tp_mesh, (Shard(1),))
+        q_rope = torch.randn(2, 4, 8, 8)
+        k_rope = torch.randn(2, 4, 1, 8)
+
+        with _patch_torch_dist_rank():
+            style.apply(module, cp_mesh)
+            out = module(
+                query, key, query_index, key_index, weights,
+                topk, softmax_max, softmax_sum, q_rope, k_rope
+            )
+        self.assertEqual(out[6].device_mesh.mesh_dim_names, ("cp", "tp"))
+        self.assertEqual(out[6].placements, (Shard(2), Shard(1)))
+        self.assertEqual(out[7].device_mesh.mesh_dim_names, ("cp", "tp"))
+        self.assertEqual(out[7].placements, (Shard(2), Shard(1)))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_indexer_loss_boundary_kwargs_are_rewritten(self, mock_mesh_platform):
@@ -596,6 +700,8 @@ class TestDsaContextParallel(unittest.TestCase):
             key_indexer_index=None,
             weights_index=None,
             topk_index=None,
+            softmax_max_index=None,
+            softmax_sum_index=None,
             query_rope_index=None,
             key_rope_index=None,
             query_kwarg_name="query",
@@ -604,6 +710,8 @@ class TestDsaContextParallel(unittest.TestCase):
             key_indexer_kwarg_name="key_index",
             weights_kwarg_name="weights",
             topk_kwarg_name="topk",
+            softmax_max_kwarg_name="softmax_max",
+            softmax_sum_kwarg_name="softmax_sum",
             query_rope_kwarg_name="query_rope",
             key_rope_kwarg_name="key_rope",
             use_local_output=False,
@@ -616,6 +724,8 @@ class TestDsaContextParallel(unittest.TestCase):
         key_index = torch.randn(2, 4, 1, 16)
         weights = torch.randn(2, 4, 8)
         topk = torch.randint(0, 4, (2, 4, 1, 2), dtype=torch.int32)
+        softmax_max = torch.randn(2, 4, 8, 1)
+        softmax_sum = torch.randn(2, 4, 8, 1)
         q_rope = torch.randn(2, 4, 8, 8)
         k_rope = torch.randn(2, 4, 1, 8)
 
@@ -628,6 +738,8 @@ class TestDsaContextParallel(unittest.TestCase):
                 key_index=key_index,
                 weights=weights,
                 topk=topk,
+                softmax_max=softmax_max,
+                softmax_sum=softmax_sum,
                 query_rope=q_rope,
                 key_rope=k_rope,
             )
@@ -638,6 +750,8 @@ class TestDsaContextParallel(unittest.TestCase):
         self.assertEqual(out_kwargs["key_index"].placements, (Replicate(),))
         self.assertEqual(out_kwargs["weights"].placements, (Shard(1),))
         self.assertEqual(out_kwargs["topk"].placements, (Shard(1),))
+        self.assertEqual(out_kwargs["softmax_max"].placements, (Shard(2),))
+        self.assertEqual(out_kwargs["softmax_sum"].placements, (Shard(2),))
         self.assertEqual(out_kwargs["query_rope"].placements, (Shard(1),))
         self.assertEqual(out_kwargs["key_rope"].placements, (Replicate(),))
 
