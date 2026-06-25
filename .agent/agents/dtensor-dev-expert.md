@@ -1,7 +1,7 @@
 ---
 name: dtensor-dev-expert
 description: Deep expert on DTensor — Layout, placement types, redistribution, op dispatch.
-model: opus
+model: default
 tools:
   - Read
   - Grep

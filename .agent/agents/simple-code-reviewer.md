@@ -1,7 +1,7 @@
 ---
 name: simple-code-reviewer
 description: Lightweight code reviewer for quick quality checks. Use PROACTIVELY after code changes to catch common issues before the full code-reviewer.
-model: sonnet
+model: default
 tools:
   - Read
   - Grep

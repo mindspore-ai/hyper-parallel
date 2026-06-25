@@ -1,7 +1,7 @@
 ---
 name: code-verifier
 description: Code verification agent. Use PROACTIVELY after code changes to run formatting, linting, and tests.
-model: haiku
+model: default
 tools:
   - Read
   - Grep

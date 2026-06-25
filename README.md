@@ -309,6 +309,7 @@ model.layers[1] = swap_wrapper(model.layers[1])
 - [特性使用指南](./docs/guide/) — 10 个核心特性使用指南
 - [API参考](./docs/api/api_reference.md) — 按特性模块组织的接口说明
 - [FAQ与故障排查](./docs/faq.md) — 常见问题与解决方案
+- [AI辅助开发](./AGENTS.md) — AI辅助开发能力说明
 - [社区贡献](./docs/contributing/) — 开发环境、测试规范、发布流程
 - [Release Notes](./hyper_parallel_v1.0.0_release_notes.md) — 版本变更记录
 

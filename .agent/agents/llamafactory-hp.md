@@ -1,7 +1,7 @@
 ---
 name: llamafactory-hp
 description: Background guide for the LlamaFactory integration that uses HyperParallel as an Accelerate-compatible FSDP2 backend.
-model: opus
+model: default
 tools:
   - Read
   - Grep
