@@ -36,7 +36,7 @@ register(OpShardCase(
     compare=CompareSpec.equal(),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level0", "npu_level1"),
 ))
 
 register(OpShardCase(
@@ -47,7 +47,7 @@ register(OpShardCase(
     compare=CompareSpec.equal(),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level0", "npu_level1"),
 ))
 
 register(OpShardCase(
@@ -58,5 +58,5 @@ register(OpShardCase(
     compare=CompareSpec.equal(),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level0"),
+    tags=("cpu_level0", "npu_level1"),
 ))
