@@ -299,9 +299,9 @@ class MindSporeHSDPStateV2(HSDPState):
         if hsdp_params_not_on_cpu:
             raise RuntimeError(
                 "HSDP parameters should be materialized on CPU when enabling CPU offloading. "
-                "For example, load a CPU state dict before training. "
                 "Found following parameters on non-CPU device: "
                 f"{[(p._param_fqn, p.sharded_param.device) for p in hsdp_params_not_on_cpu]}\n"
+                "MindSpore backend will support this feature in future version."
             )
 
     def _validate_no_meta_params(self):
