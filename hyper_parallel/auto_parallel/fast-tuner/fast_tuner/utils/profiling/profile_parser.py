@@ -24,8 +24,6 @@ from fast_tuner.utils.logger import logger
 from fast_tuner.ndsearch.para_for_nd_search import ParaForNd
 from fast_tuner.ndsearch.memory_model import compute_weight_and_optimizer_memory
 
-encoding = 'utf-8'
-
 
 def find_file_by_name(directory, filename):
     """Recursively search for a file by name under the given directory.
@@ -49,8 +47,8 @@ def median_mean(durs):
     if len(durs) == 0:
         logger.info("get durs no values")
         return 0
-    median_durs = durs[len(durs)//4:len(durs) - len(durs)//4]
-    return round(statistics.mean(median_durs)/1000, 3)
+    median_durs = durs[len(durs) // 4:len(durs) - len(durs) // 4]
+    return round(statistics.mean(median_durs) / 1000, 3)
 
 
 class ProfileParser:
@@ -164,16 +162,17 @@ class ProfileParser:
             print(f"write CSV file fail: {e}")
 
     def load_profile(self, file, rk):
-        """Read profile file trace view"""        
+        """Read profile file trace view"""
         path = os.path.abspath('.\\profile_info') + '\\' + str(file)
-        path = find_file_by_name(path + '\\rank_' + str(rk), 'trace_view.json')
-        with open(path, 'r', encoding=encoding) as f:
+        rank_dir = os.path.join(path, f"rank_{rk}")
+        path = find_file_by_name(rank_dir, 'trace_view.json')
+        with open(path, 'r', encoding='utf-8') as f:
             self.profile_data = json.load(f)
 
     def load_profile_by_dir(self, rank_dir):
         """Read profile file kernel details from folder"""
         path = find_file_by_name(rank_dir, 'trace_view.json')
-        with open(path, 'r', encoding=encoding) as f:
+        with open(path, 'r', encoding='utf-8') as f:
             self.profile_data = json.load(f)
 
     def load_profile_by_kernel(self, file):
@@ -183,7 +182,7 @@ class ProfileParser:
             logger.error(f"can not find kernel details file {file}")
             return False
         logger.info(f'path of kernel_details is {path}')
-        with open(path, 'r', encoding=encoding) as f:
+        with open(path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             self.profile_data = list(reader)
         return True
@@ -191,8 +190,10 @@ class ProfileParser:
     def load_profile_no_recompute(self, file, rk):
         """Read profile file without recompute ops"""
         path = os.path.abspath('.\\profile_info') + '\\' + str(file)
-        path = find_file_by_name(path + '\\rank_' + str(rk) + '_norecomp' , 'trace_view.json')
-        with open(path, 'r', encoding=encoding) as f:
+        no_recomp_dir = os.path.join(path, f'rank_{rk}_norecomp')
+        with open(path, 'r', encoding='utf-8') as f:
+            path = find_file_by_name(no_recomp_dir, 'trace_view.json')
+        with open(path, 'r', encoding='utf-8') as f:
             self.profile_data = json.load(f)
 
     def refresh(self):
@@ -292,13 +293,13 @@ class ProfileParser:
         :param stage: Description
         """
         atts, grad_atts = self.extract_atts_by_kernel()
-        layers, xlayers = len(grad_atts) // 64,  2 * len(grad_atts) // 64
-        warm_up = (pp-1-stage) * layers
-        atts = atts[warm_up:32*xlayers - warm_up] + atts[32*xlayers + warm_up:32*xlayers + 32*xlayers-warm_up]
-        grad_atts = (grad_atts[warm_up:32*layers - warm_up]
-                     + grad_atts[32*layers + warm_up:32*layers + 32*layers-warm_up])
-        att_chunks = [atts[xlayers*i:xlayers*(i+1)] for i in range(len(atts)//xlayers-1)]
-        grad_chunks = [grad_atts[layers*i:layers*(i+1)] for i in range(len(grad_atts)//layers-1)]
+        layers, xlayers = len(grad_atts) // 64, 2 * len(grad_atts) // 64
+        warm_up = (pp - 1 - stage) * layers
+        atts = atts[warm_up:32 * xlayers - warm_up] + atts[32 * xlayers + warm_up:32 * xlayers + 32 * xlayers - warm_up]
+        grad_atts = (grad_atts[warm_up:32 * layers - warm_up]
+                     + grad_atts[32 * layers + warm_up:32 * layers + 32 * layers - warm_up])
+        att_chunks = [atts[xlayers * i:xlayers * (i + 1)] for i in range(len(atts) // xlayers - 1)]
+        grad_chunks = [grad_atts[layers * i:layers * (i + 1)] for i in range(len(grad_atts) // layers - 1)]
         if pp == 2:
             self.pp2_analysis(att_chunks, grad_chunks, layers, pp, stage)
         else:
@@ -650,8 +651,8 @@ class ProfileMemParser:
         self.profile_mem_data = None
         self.input_args = input_args
         self.para = para
-        self.peak_memory_usage = 0.0      # MB
-        self.static_memory_usage = 0.0    # MB
+        self.peak_memory_usage = 0.0  # MB
+        self.static_memory_usage = 0.0  # MB
 
     def write_mem_info_to_txt(self, config, mem_info):
         '''
@@ -705,8 +706,6 @@ class ProfileMemParser:
             mem_info.act_mem0 = dynamic_mem_layer
             mem_info.act_mem12 = dynamic_mem_layer
             mem_info.act_mem = dynamic_mem_layer
-
-
 
     def manage_mem_infos(self, need_cumlate=True):
         """
