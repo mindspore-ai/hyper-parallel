@@ -38,28 +38,19 @@ Environment:
 Constraints: ``seq_len % cp == 0``, ``(seq_len // cp) % tp == 0``, and ``n_heads`` / ``n_kv_heads``
 divisible by ``tp``.
 """
-# pylint: disable=C0413
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from hyper_parallel import ContextParallel, SkipDTensorDispatch, init_device_mesh
-
 from demo_utils import init_dist, train_steps
 from model import Llama3DemoConfig, Llama3Model
 from parallelize import broadcast_state_dict_from_rank0, parallelize_llama3
+
+from hyper_parallel import ContextParallel, SkipDTensorDispatch, init_device_mesh
 
 
 def _tp_cp_sizes_from_env(world: int) -> tuple[int, int]:

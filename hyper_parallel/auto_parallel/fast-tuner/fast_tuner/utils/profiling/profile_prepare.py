@@ -172,7 +172,7 @@ def trans_config_satisfy_rank_num(mem_prune_space, para, input_args):
         if trans_config is not None and trans_config not in profile_configs:
             profile_configs.append(trans_config)
     logger.info(f"profile configs len: {len(profile_configs)} by {rank_num} devices")
-    # TODO: add comment for filter logic
+    # Note: add comment for filter logic
     if len(profile_configs) > 10:
         # pp <= 16
         profile_configs = [cand for cand in profile_configs if cand[2] <= 16]
@@ -225,7 +225,7 @@ def budget_profile_config_generator(config, para, available_devices):
         return basic_config
     if para.SHELL_PATH:
         if len(config) < 4:
-            # TODO: llama family models to be adapted
+            # Note: llama family models to be adapted
             basic_config = decide_pp_dp_llama(config, available_devices)
         else:
             basic_config = decide_dp(config, available_devices)

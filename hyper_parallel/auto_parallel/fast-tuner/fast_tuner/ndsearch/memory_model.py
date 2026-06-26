@@ -115,7 +115,7 @@ def filter_oom(search_space, input_args, para):
     """
     filter evaluate oom configs
     """
-    # TODO: Check if dryrun return value differs, may need handling here.
+    # Note: Check if dryrun return value differs, may need handling here.
     if para.DRYRUN:
         # generate configs for dryrun
         care_part_configs = select_dry_config(search_space, input_args)

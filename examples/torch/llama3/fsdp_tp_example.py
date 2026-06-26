@@ -32,27 +32,18 @@ Requirements:
     * ``n_heads`` and ``n_kv_heads`` divisible by ``LLAMA3_TP_SIZE``.
     * Sequence length divisible by TP size (sequence parallel).
 """
-# pylint: disable=C0413
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 import torch.nn.functional as F
 
-from hyper_parallel import SkipDTensorDispatch, fully_shard, init_device_mesh
-
 from demo_utils import init_dist, train_steps
 from model import Llama3DemoConfig, Llama3Model
 from parallelize import broadcast_state_dict_from_rank0, parallelize_llama3
+
+from hyper_parallel import SkipDTensorDispatch, fully_shard, init_device_mesh
 
 
 def _tp_size_from_env(world: int) -> int:

@@ -14,7 +14,9 @@ This directory mirrors ``examples/torch/llama3`` for **MindSpore on Ascend NPU**
 
 ## Requirements
 
-See ``examples/README.md`` for MindSpore / CANN / HyperParallel versions. Set ``HYPER_PARALLEL_PLATFORM=mindspore`` (the example script sets this before importing HyperParallel).
+See ``examples/README.md`` for MindSpore / CANN / HyperParallel versions.
+
+Before launching examples, export ``HYPER_PARALLEL_PLATFORM=mindspore`` (or ``unset HYPER_PARALLEL_PLATFORM`` if your shell still has ``torch`` from a prior session). HyperParallel reads this variable at import time.
 
 Source your Ascend or virtualenv activation script before running.
 
@@ -33,6 +35,7 @@ From this directory:
 
 ```bash
 cd examples/mindspore/llama3
+export HYPER_PARALLEL_PLATFORM=mindspore
 
 msrun --worker_num=2 --local_worker_num=2 --log_dir=./msrun_log --join=True tensor_parallel_example.py
 ```
@@ -40,16 +43,19 @@ msrun --worker_num=2 --local_worker_num=2 --log_dir=./msrun_log --join=True tens
 If the default **8118** port is in use, specify a free port explicitly, for example:
 
 ```bash
+export HYPER_PARALLEL_PLATFORM=mindspore
 msrun --worker_num=2 --local_worker_num=2 --master_addr=127.0.0.1 --master_port=29501 --log_dir=./msrun_log --join=True tensor_parallel_example.py
 ```
 
 From the repo root:
 
 ```bash
+export HYPER_PARALLEL_PLATFORM=mindspore
 msrun --worker_num=2 --local_worker_num=2 --log_dir=./msrun_log --join=True examples/mindspore/llama3/tensor_parallel_example.py
 ```
 
 ```bash
+export HYPER_PARALLEL_PLATFORM=mindspore
 msrun --worker_num=2 --local_worker_num=2 --master_addr=127.0.0.1 --master_port=29501 --log_dir=./msrun_log --join=True examples/mindspore/llama3/tensor_parallel_example.py
 ```
 
@@ -62,6 +68,7 @@ Adjust ``worker_num`` / ``local_worker_num`` to match available NPUs and the des
 示例：4 卡、``TP=2``、``DP=2``：
 
 ```bash
+export HYPER_PARALLEL_PLATFORM=mindspore
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
 export HCCL_IF_BASE_PORT=64000
 export HCCL_NPU_SOCKET_PORT_RANGE=64000-65000

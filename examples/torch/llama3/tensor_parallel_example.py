@@ -25,27 +25,16 @@ Requirements:
 The layout follows ``torchtitan/models/llama3/parallelize.py`` ``apply_tp`` (embedding
 row-wise + sequence-parallel norms + Colwise/Rowwise linears).
 """
-# pylint: disable=C0413
 from __future__ import annotations
-
-import os
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 import torch.nn.functional as F
 
-from hyper_parallel import SkipDTensorDispatch
-
 from demo_utils import init_dist, train_steps
 from model import Llama3DemoConfig, Llama3Model
 from parallelize import broadcast_state_dict_from_rank0, build_tp_mesh, parallelize_llama3
+
+from hyper_parallel import SkipDTensorDispatch
 
 
 def main() -> None:

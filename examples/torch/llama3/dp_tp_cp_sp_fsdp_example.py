@@ -56,22 +56,15 @@ Constraints:
 * ``seq_len`` divisible by ``cp``; ``(seq_len // cp)`` divisible by ``tp`` (sequence parallel
   shards the local CP window evenly across TP ranks).
 """
-# pylint: disable=C0413
 from __future__ import annotations
-
-import os
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).resolve().parent
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+from demo_utils import init_dist, read_positive_int, train_steps
+from model import Llama3DemoConfig, Llama3Model
+from parallelize import broadcast_state_dict_from_rank0, parallelize_llama3
 
 from hyper_parallel import (
     ContextParallel,
@@ -79,10 +72,6 @@ from hyper_parallel import (
     fully_shard,
     init_device_mesh,
 )
-
-from demo_utils import init_dist, read_positive_int, train_steps
-from model import Llama3DemoConfig, Llama3Model
-from parallelize import broadcast_state_dict_from_rank0, parallelize_llama3
 
 
 _ENV_DEFAULTS = {

@@ -31,6 +31,7 @@ from torch import nn
 
 from hyper_parallel.core.fully_shard.api import (
     _check_hsdp_input_valid,
+    HsdpValidationOptions,
     _get_root_modules,
     _get_device_from_mesh,
     _normalize_replicate_params,
@@ -277,26 +278,23 @@ class TestCoreApiHelpersTorch(unittest.TestCase):
     def test_check_hsdp_input_valid_torch_rejects_invalid_dtype_and_comm_options(self):
         """Torch input validation should enforce dtype and scalar option contracts."""
         module = SimpleLinear(4, 4)
-        valid_args = {
-            "platform_type": PlatformType.PYTORCH,
-            "module": module,
-            "shard_size": 1,
-            "threshold": 0,
-            "optimizer_level": "level1",
-            "enable_grad_accumulation": False,
-            "grad_scale": 1.0,
-            "reduce_dtype": torch.float32,
-            "comm_async": False,
-            "comm_fusion": False,
-            "bucket_size": 0,
-        }
+        valid_args = HsdpValidationOptions(
+            shard_size=1,
+            threshold=0,
+            optimizer_level="level1",
+            enable_grad_accumulation=False,
+            grad_scale=1.0,
+            reduce_dtype=torch.float32,
+            comm_async=False,
+            comm_fusion=False,
+            bucket_size=0,
+        )
 
-        _check_hsdp_input_valid(**valid_args)
+        _check_hsdp_input_valid(PlatformType.PYTORCH, module, valid_args)
         for key, value in [("reduce_dtype", "float32"), ("comm_async", 0), ("comm_fusion", 0), ("bucket_size", -2)]:
-            bad_args = dict(valid_args)
-            bad_args[key] = value
+            bad_args = valid_args._replace(**{key: value})
             with self.subTest(key=key), self.assertRaises(ValueError):
-                _check_hsdp_input_valid(**bad_args)
+                _check_hsdp_input_valid(PlatformType.PYTORCH, module, bad_args)
 
     @patch("hyper_parallel.core.fully_shard.api.platform")
     def test_get_device_from_mesh_uses_torch_device_handle(self, mock_platform):
