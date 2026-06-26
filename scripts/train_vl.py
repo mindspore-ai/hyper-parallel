@@ -14,13 +14,14 @@
 # ============================================================================
 """VL training entry point."""
 from hyper_parallel.trainer.utils import init_logger
-
-init_logger()
-
-# pylint: disable=wrong-import-position  # init_logger() must run first
 from hyper_parallel.trainer.config import HyperTrainerConfig, parse_args
 from hyper_parallel.trainer.utils.discovery import discover_model_spec
 from hyper_parallel.trainer.vl_trainer import VLTrainer
+
+# Configure the root logger before training. Module-level loggers in the
+# imports above resolve their handler lazily (at first emit, which happens
+# during training), so doing this after the imports keeps the same format.
+init_logger()
 
 if __name__ == "__main__":
     args = parse_args(HyperTrainerConfig)

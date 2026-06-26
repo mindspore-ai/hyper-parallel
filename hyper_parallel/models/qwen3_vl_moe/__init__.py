@@ -13,6 +13,15 @@
 # limitations under the License.
 # ============================================================================
 """Qwen3-VL-MoE model registration."""
+
+__all__ = [
+    "Qwen3VLMoeConfig",
+    "Qwen3VLMoeTextConfig",
+    "Qwen3VLMoeVisionConfig",
+    "Qwen3VLMoeForCausalLM",
+    "Qwen3VLMoeForConditionalGeneration",
+]
+
 import json
 import os
 
@@ -207,11 +216,3 @@ register_spec(
         state_dict_adapter=Qwen3VLMoeStateDictAdapter,
     ),
 )
-
-__all__ = [
-    "Qwen3VLMoeConfig",
-    "Qwen3VLMoeTextConfig",
-    "Qwen3VLMoeVisionConfig",
-    "Qwen3VLMoeForCausalLM",
-    "Qwen3VLMoeForConditionalGeneration",
-]

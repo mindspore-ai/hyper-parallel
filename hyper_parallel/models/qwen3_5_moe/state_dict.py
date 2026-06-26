@@ -18,6 +18,9 @@ Splits HF's fused per-expert tensors into hyper's per-expert layout so
 ``BaseTrainer._load_weights`` can stay generic. Registered on the
 ``qwen3_5_moe`` ModelSpec.
 """
+
+__all__ = ["Qwen3_5MoeStateDictAdapter"]
+
 # pylint: disable=C0103  # HF transformers class-name convention (Qwen3_5*)
 import re
 from typing import Dict, Optional
@@ -30,8 +33,8 @@ from hyper_parallel.models.qwen3_5_moe.checkpoint import load_hf_qwen3_5_moe_sta
 class Qwen3_5MoeStateDictAdapter:
     """State-dict adapter for Qwen3.5-MoE (35B-A3B and friends)."""
 
+    @staticmethod
     def load_hf_state_dict(
-        self,
         weights_path: str,
         model_config,
         dtype: Optional[torch.dtype] = None,
@@ -46,8 +49,8 @@ class Qwen3_5MoeStateDictAdapter:
             dtype=dtype,
         )
 
+    @staticmethod
     def save_hf_state_dict(
-        self,
         state_dict: Dict[str, torch.Tensor],
         model_config,
     ) -> Dict[str, torch.Tensor]:
@@ -80,5 +83,3 @@ class Qwen3_5MoeStateDictAdapter:
                 hf_sd[key] = tensor
 
         return hf_sd
-
-__all__ = ["Qwen3_5MoeStateDictAdapter"]

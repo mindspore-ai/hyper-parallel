@@ -253,7 +253,8 @@ class WandbConfig:
 class ProfileConfig:
     """``train.profile.*`` — torch.profiler schedule ().
 
-    Schedule semantics: wait → warmup → active."""
+    Schedule semantics: wait → warmup → active.
+    """
     enabled: bool = False
     output_dir: str = "profiler_traces"
     wait_steps: int = 1
@@ -488,7 +489,7 @@ def _deep_update(source: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str,
     """Recursively update source dict with overrides dict."""
     for key, value in overrides.items():
         if isinstance(value, dict) and isinstance(source.get(key), dict):
-            _deep_update(source[key], value)
+            source[key] = _deep_update(source[key], value)
         else:
             source[key] = value
     return source
