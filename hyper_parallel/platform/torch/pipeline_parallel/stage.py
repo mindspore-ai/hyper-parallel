@@ -13,10 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """pipeline stage"""
+import contextlib
+
 import torch
 import torch.distributed as dist
 
 import hyper_parallel
+from hyper_parallel.platform import get_platform
 
 
 class PipelineStageBase:
@@ -48,11 +51,13 @@ class PipelineStageBase:
         self.stage_index = stage_index
         self.stage_num = stage_num
         self.fwd_outputs_cache = {}
+        self.recompute_handles: dict = {}
         self.last_stage_outputs = None  # Initialized in forward_one_chunk()
 
     def clear_cache(self):
         """clear cache."""
         self.fwd_outputs_cache.clear()
+        self.recompute_handles.clear()
         self.bwd_cache.clear()
         self._meta_cache.clear()
 
@@ -103,7 +108,12 @@ class PipelineStageBase:
                 raise RuntimeError(f"The exec order is wrong. The corresponding forward calculation \
                                     is executed before the Receive operation. micro is {micro_index}.")
         composite_kwargs = kwargs or {}
-        out = self.submodule(*composite_args, **composite_kwargs)
+        if self._has_backward:
+            with get_platform().recompute_handle_collector_ctx() as handles:
+                out = self.submodule(*composite_args, **composite_kwargs)
+            self.recompute_handles[micro_index] = handles
+        else:
+            out = self.submodule(*composite_args, **composite_kwargs)
         out_tuple = out if isinstance(out, tuple) else (out,)
         self.fwd_cache[micro_index] = out_tuple
         self.fwd_outputs_cache[micro_index] = out_tuple
@@ -143,6 +153,25 @@ class PipelineStageBase:
                        if recv_info.requires_grad]
         self.bwd_cache[micro_index] = input_grads
 
+    def recompute_one_chunk(self, micro_index):
+        """Re-run checkpointed blocks for *micro_index* ahead of backward.
+
+        Fires each recompute handle collected during forward under a stable
+        per-chunk session, materialising and caching activations so the
+        matching :meth:`backward_one_chunk` reuses them instead of re-running.
+
+        No-op when the chunk has no checkpointed blocks.
+        """
+        if not self._has_backward:
+            return
+        handles = self.recompute_handles.get(micro_index)
+        if not handles:
+            return
+        session_id = (self.stage_index, micro_index)
+        with get_platform().recompute_session_ctx(session_id=session_id, retain_on_unpack=True):
+            for handle in handles:
+                get_platform().recompute_handle(handle, session_id)
+
     def backward_one_chunk(self, micro_index):
         """Execution a backward function.
 
@@ -164,6 +193,13 @@ class PipelineStageBase:
             if isinstance(mod, hyper_parallel.HSDPModule):
                 mod.set_reshard_after_backward(False)
                 mod.set_requires_gradient_sync(False)
+        handles = self.recompute_handles.pop(micro_index, None)
+        platform = get_platform()
+        session_id = (self.stage_index, micro_index)
+        session_ctx = (
+            platform.recompute_session_ctx(session_id=session_id, retain_on_unpack=False)
+            if handles else contextlib.nullcontext()
+        )
         recv_args = []
         if micro_index in self.grad_recv_info:
             recv_args = [recv_info.buffer for recv_info in self.grad_recv_info[micro_index]]
@@ -175,12 +211,17 @@ class PipelineStageBase:
 
         if not local_output:
             # Nothing to backprop through (e.g. all forward outputs detached).
+            self.recompute_handles.pop(micro_index, None)
             self._clear_recv_buffer(self.grad_recv_info, micro_index)
             self._clear_recv_buffer(self.args_recv_info, micro_index)
             return
 
         grad_tensors = self._build_last_stage_sens() if self.is_last_stage else recv_args
-        torch.autograd.backward(local_output, grad_tensors=grad_tensors)
+        with session_ctx:
+            torch.autograd.backward(local_output, grad_tensors=grad_tensors)
+
+        if handles:
+            platform.clear_recompute_session(session_id)
 
         if not self.is_first_stage:
             self._populate_bwd_cache(micro_index)
