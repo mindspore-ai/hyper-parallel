@@ -125,6 +125,9 @@ class _CheckpointFrame:
         self.early_stop: bool = early_stop
         self.forward_completed: bool = False
         self.ignore_saved_mismatch: bool = False
+        self.preserve_rng_state: bool = True
+        self.fwd_cpu_rng_state: Optional[torch.Tensor] = None
+        self.fwd_device_rng_states: dict[str, torch.Tensor] = {}
 
     # -- Input management ----------------------------------------------------
 
@@ -180,9 +183,10 @@ class _RecomputeHandle:
         args, kwargs = frame.get_inputs()
 
         try:
+            rng_ctx = _RngStateCtx(frame, session_id)
             with _RecomputationSessionHook(
                 weakref.ref(frame), session_id
-            ), torch.autograd.enable_grad():
+            ), rng_ctx, torch.autograd.enable_grad():
                 self._recompute_fn(*args, **kwargs)
         except _StopRecomputationError:
             pass
@@ -433,6 +437,28 @@ class _CheckpointSessionHook(torch.autograd.graph.saved_tensors_hooks):
         super().__init__(pack_hook, unpack_hook)
 
 
+class _RngStateCtx:
+    """Context manager that saves and restores RNG state for recomputation."""
+    def __init__(self, frame, session_id):
+        self._frame = frame
+        self._session_id = session_id
+
+    def __enter__(self):
+        frame = self._frame
+        if not frame.preserve_rng_state:
+            return
+        fwd_cpu = frame.fwd_cpu_rng_state
+        if fwd_cpu is not None:
+            torch.set_rng_state(fwd_cpu)
+        for device_type, state in frame.fwd_device_rng_states.items():
+            mod = getattr(torch, device_type, None)
+            if mod is not None and hasattr(mod, 'set_rng_state'):
+                mod.set_rng_state(state)
+
+    def __exit__(self, *exc_info):
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Entry function
 # ---------------------------------------------------------------------------
@@ -447,6 +473,7 @@ def checkpoint_with_session(
     *args: Any,
     context_fn: Optional[Callable[[], Tuple[Any, Any]]] = None,
     use_reentrant: bool = False,
+    preserve_rng_state: bool = True,
     **kwargs: Any,
 ) -> Any:
     """Run ``function`` inside a checkpointed region that supports recompute sessions.
@@ -468,6 +495,9 @@ def checkpoint_with_session(
         use_reentrant: Must be ``False``.  ``True`` raises ``ValueError``
             because session-based checkpointing requires the non-reentrant
             path.
+        preserve_rng_state: If ``True``, save and restore RNG state during
+            recomputation so random ops (dropout etc.) produce deterministic
+            gradients.  Default ``True``.
         **kwargs: Keyword arguments forwarded to *function*.
 
     Returns:
@@ -503,6 +533,18 @@ def checkpoint_with_session(
 
     frame = _CheckpointFrame(recompute_fn, early_stop=True)
     frame.save_inputs(*args, **kwargs)
+    frame.preserve_rng_state = preserve_rng_state
+    if preserve_rng_state:
+        frame.fwd_cpu_rng_state = torch.get_rng_state()
+        device_states = {}
+        for device_type in ('cuda', 'npu'):
+            mod = getattr(torch, device_type, None)
+            if mod is not None and hasattr(mod, 'is_available') and mod.is_available():
+                try:
+                    device_states[device_type] = mod.get_rng_state()
+                except (RuntimeError, AttributeError):
+                    pass
+        frame.fwd_device_rng_states = device_states
 
     handle = _RecomputeHandle(frame, recompute_fn, early_stop=True)
 

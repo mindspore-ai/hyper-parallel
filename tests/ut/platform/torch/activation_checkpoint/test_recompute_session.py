@@ -307,6 +307,55 @@ class TestHandleCollectorAndPrefetch(unittest.TestCase):
 
         _clear_recompute_session(session_id)
 
+class TestRngPreservation(unittest.TestCase):
+    """Test that RNG state is preserved during session recomputation."""
+
+    def test_rng_preserved_in_recompute(self):
+        """Dropout in a checkpoint block should produce same mask after recompute."""
+        torch.manual_seed(42)
+
+        dropout = torch.nn.Dropout(0.5)
+        x = torch.randn(8, 16, requires_grad=True)
+        session_id = uuid.uuid4().hex
+
+        def fn(x):
+            return dropout(x)
+
+        with _recompute_session_ctx(session_id=session_id, retain_on_unpack=True):
+            out = checkpoint_with_session(fn, x)
+            for handle in _recompute_session_handles.get(session_id, ()):
+                handle.recompute(session_id)
+
+        with _recompute_session_ctx(session_id=session_id, retain_on_unpack=False):
+            out.sum().backward()
+
+        self.assertIsNotNone(x.grad)
+        self.assertTrue(torch.isfinite(x.grad).all())
+        _clear_recompute_session(session_id)
+
+    def test_preserve_rng_state_false(self):
+        """When preserve_rng_state=False, the RNG is NOT saved but no crash."""
+        torch.manual_seed(42)
+
+        dropout = torch.nn.Dropout(0.5)
+        x = torch.randn(8, 16, requires_grad=True)
+        session_id = uuid.uuid4().hex
+
+        def fn(x):
+            return dropout(x)
+
+        with _recompute_session_ctx(session_id=session_id, retain_on_unpack=True):
+            out = checkpoint_with_session(fn, x, preserve_rng_state=False)
+            for handle in _recompute_session_handles.get(session_id, ()):
+                handle.recompute(session_id)
+
+        with _recompute_session_ctx(session_id=session_id, retain_on_unpack=False):
+            out.sum().backward()
+
+        self.assertIsNotNone(x.grad)
+        self.assertTrue(torch.isfinite(x.grad).all())
+        _clear_recompute_session(session_id)
+
 
 if __name__ == "__main__":
     unittest.main()
