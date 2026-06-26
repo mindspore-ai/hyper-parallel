@@ -17,6 +17,9 @@
 Owns the model-specific HF tensor renaming so ``BaseTrainer._load_weights``
 can stay generic. Registered on the ``qwen3_5`` ModelSpec.
 """
+
+__all__ = ["Qwen3_5StateDictAdapter"]
+
 # pylint: disable=C0103  # HF transformers class-name convention (Qwen3_5*)
 from typing import Dict, Optional
 
@@ -28,8 +31,8 @@ from hyper_parallel.models.qwen3_5.checkpoint import load_hf_qwen3_5_state_dict
 class Qwen3_5StateDictAdapter:
     """State-dict adapter for the dense Qwen3.5 family (Base + Instruct)."""
 
+    @staticmethod
     def load_hf_state_dict(
-        self,
         weights_path: str,
         model_config,
         dtype: Optional[torch.dtype] = None,
@@ -41,8 +44,8 @@ class Qwen3_5StateDictAdapter:
             dtype=dtype,
         )
 
+    @staticmethod
     def save_hf_state_dict(
-        self,
         state_dict: Dict[str, torch.Tensor],
         model_config,
     ) -> Dict[str, torch.Tensor]:
@@ -65,5 +68,3 @@ class Qwen3_5StateDictAdapter:
             else:
                 hf_sd[key] = tensor
         return hf_sd
-
-__all__ = ["Qwen3_5StateDictAdapter"]

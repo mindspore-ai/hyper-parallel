@@ -39,7 +39,7 @@ left for future work.
 import functools
 import math
 import warnings
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -67,6 +67,13 @@ _GradGroupKey = Tuple[Optional[int], Tuple[int, ...]]
 
 # (mesh_dim_index, dist.ReduceOp, needs_manual_avg)
 _PartialReduceInfo = Tuple[int, "dist.ReduceOp", bool]
+
+# Result of _build_grad_groups; tuple-unpacking compatible with prior 7-tuple.
+_GradGroups = namedtuple(
+    "_GradGroups",
+    "grad_groups all_grads norm_grads key_per_grad mesh_cache device "
+    "has_dtensor_grad",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -756,7 +763,7 @@ def _build_grad_groups(  # pylint: disable=R0914
             grad_groups[key].append(local_grad)
             norm_grads.append(local_grad)
 
-    return (
+    return _GradGroups(
         grad_groups, all_grads, norm_grads, key_per_grad,
         mesh_cache, device, has_dtensor_grad,
     )
@@ -777,13 +784,10 @@ def _clip_grads_with_norm_(
             [all_grads],
         )
         for (device, dtype), ([device_grads], _) in grouped_grads.items():
-            if (
-                foreach is None
-                and _has_foreach_support(device_grads, device)
-            ) or (
-                foreach
-                and _device_has_foreach_support(device)
-            ):
+            use_foreach = (
+                foreach is None and _has_foreach_support(device_grads, device)
+            ) or (foreach and _device_has_foreach_support(device))
+            if use_foreach:
                 torch._foreach_mul_(  # pylint: disable=W0212
                     device_grads,
                     clip_coef_clamped.to(device=device, dtype=dtype),

@@ -19,6 +19,9 @@ file owns Qwen3.5's full TP / AC / FSDP / Prefetch pipeline. There is no
 shared "default_parallelize" template — each model implements its own
 ``parallelize_<name>`` from torch / hyper primitives directly.
 """
+
+__all__ = ["parallelize_qwen3_5"]
+
 import logging
 
 import torch
@@ -115,5 +118,3 @@ def parallelize_qwen3_5(model: Qwen3_5ForCausalLM, mesh, cfg) -> Qwen3_5ForCausa
     _apply_ac(model, cfg)
     _apply_fsdp(model, mesh, cfg)
     return model
-
-__all__ = ["parallelize_qwen3_5"]

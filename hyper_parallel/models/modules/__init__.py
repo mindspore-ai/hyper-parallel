@@ -18,17 +18,6 @@ Each model in ``hyper_parallel.models.<name>`` declares its own ``_tp_plan``
 and ``parallelize_<name>`` from these primitives — there is no global
 default parallel plan. Inspired by torchtitan ``models/common/``.
 """
-from hyper_parallel.models.modules.attention import GroupQueryAttention
-from hyper_parallel.models.modules.feed_forward import SwiGLUMLP
-from hyper_parallel.models.modules.linear_attention import GatedDeltaNet
-from hyper_parallel.models.modules.moe import MoE, MoEExperts, SharedExpertMoE, TopKRouter
-from hyper_parallel.models.modules.rmsnorm import RMSNorm, RMSNormGated
-from hyper_parallel.models.modules.rope import (
-    MultiModalRotaryEmbedding,
-    RotaryEmbedding,
-    apply_rotary_pos_emb,
-    rotate_half,
-)
 
 __all__ = [
     "GroupQueryAttention",
@@ -45,3 +34,15 @@ __all__ = [
     "apply_rotary_pos_emb",
     "rotate_half",
 ]
+
+from hyper_parallel.models.modules.attention import GroupQueryAttention
+from hyper_parallel.models.modules.feed_forward import SwiGLUMLP
+from hyper_parallel.models.modules.linear_attention import GatedDeltaNet
+from hyper_parallel.models.modules.moe import MoE, MoEExperts, SharedExpertMoE, TopKRouter
+from hyper_parallel.models.modules.rmsnorm import RMSNorm, RMSNormGated
+from hyper_parallel.models.modules.rope import (
+    MultiModalRotaryEmbedding,
+    RotaryEmbedding,
+    apply_rotary_pos_emb,
+    rotate_half,
+)

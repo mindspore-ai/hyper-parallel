@@ -111,6 +111,33 @@ class BaseTrainer:
     lr_scheduler: Optional["LRScheduler"] = None
     train_dataloader: Optional["DataLoader"] = None
     mesh: Optional["DeviceMesh"] = None
+    device = None
+    parallel_dims = None
+    _dp_group_info = None
+    tokenizer = None
+    processor = None
+    data_transform = None
+    train_dataset = None
+    collate_fn = None
+    _grad_accum = None
+    model_fwd_context = None
+    grad_scaler = None
+    model_bwd_context = None
+    logging_callback = None
+    checkpoint_callback = None
+    hf_export_callback = None
+    eval_callback = None
+    profiler_callback = None
+    wandb_callback = None
+    tensorboard_callback = None
+    progress_callback = None
+    moe_monitor_callback = None
+    gradient_health_callback = None
+    memory_monitor_callback = None
+    gc_callback = None
+    user_callbacks: list = None
+    sampler = None
+    _last_global_tokens = None
 
     def __init__(self, args):
         # Only early-bound fields live here; the rest is built via
@@ -661,7 +688,8 @@ class BaseTrainer:
 
         self.model_bwd_context = nullcontext()
 
-    def _make_amp_context(self, param_dtype_str: str):
+    @staticmethod
+    def _make_amp_context(param_dtype_str: str):
         """Build the AMP forward context. Backend-specific.
 
         This is the SOLE method in the trainer that touches the backend AMP
@@ -1059,7 +1087,7 @@ class BaseTrainer:
             if self.state.global_step >= self.state.max_steps:
                 break
             self.state.epoch = epoch
-            if hasattr(self, 'sampler'):
+            if self.sampler is not None:
                 self.sampler.set_epoch(epoch)
             self.on_epoch_begin()
 
@@ -1398,7 +1426,10 @@ class BaseTrainer:
             real_name = logical_to_real.get(hf_name)
             if real_name is None:
                 continue
-            tgt = tuple(real_to_param[real_name].shape)
+            param = real_to_param.get(real_name)
+            if param is None:
+                continue
+            tgt = tuple(param.shape)
             src = tuple(hf_tensor.shape)
             if src == tgt:
                 valid_sd[real_name] = hf_tensor

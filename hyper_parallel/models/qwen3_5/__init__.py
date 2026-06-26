@@ -22,6 +22,13 @@ via YAML ``model.*`` (universal fields) or ``model.config_overrides`` for
 Qwen-specific ones; everything else falls through to the 0.8B-Base
 defaults baked into :class:`Qwen3_5Config`.
 """
+
+__all__ = [
+    "Qwen3_5Config",
+    "Qwen3_5Decoder",
+    "Qwen3_5ForCausalLM",
+]
+
 from hyper_parallel.models.qwen3_5.model import (
     Qwen3_5Config,
     Qwen3_5Decoder,
@@ -83,9 +90,3 @@ register_spec(
         state_dict_adapter=Qwen3_5StateDictAdapter,
     ),
 )
-
-__all__ = [
-    "Qwen3_5Config",
-    "Qwen3_5Decoder",
-    "Qwen3_5ForCausalLM",
-]
