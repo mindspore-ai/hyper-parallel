@@ -163,3 +163,4 @@
 "hyper-parallel/tests/torch/dist_module/"                               "missing-function-docstring"
 "hyper-parallel/tests/torch/dist_module/"                               "unused-import"
 "hyper-parallel/hyper_parallel/core/pipeline_parallel/scheduler.py"     "unnecessary-pass"
+"hyper-parallel/tests/ut/platform/torch/activation_checkpoint/test_recompute_session.py"                     "trailing-newlines"

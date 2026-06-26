@@ -447,12 +447,22 @@ class _CheckpointSessionHook(torch.autograd.graph.saved_tensors_hooks):
 
 
 class _RngStateCtx:
-    """Context manager that saves and restores RNG state for recomputation."""
-    def __init__(self, frame, session_id):
+    """Restore the forward-time RNG state during recomputation.
+
+    On enter, sets the CPU and device (cuda/npu) RNG states that were
+    captured during the original forward pass of *frame*.
+
+    Args:
+        frame: The ``_CheckpointFrame`` whose saved RNG states to restore.
+        session_id: Session key (used for future extensions).
+    """
+    def __init__(self, frame: _CheckpointFrame, session_id: str) -> None:
+        """Initialize the RNG state context."""
         self._frame = frame
         self._session_id = session_id
 
-    def __enter__(self):
+    def __enter__(self) -> None:
+        """Restore CPU and device RNG states if preservation is enabled."""
         frame = self._frame
         if not frame.preserve_rng_state:
             return
@@ -464,8 +474,9 @@ class _RngStateCtx:
             if mod is not None and hasattr(mod, 'set_rng_state'):
                 mod.set_rng_state(state)
 
-    def __exit__(self, *exc_info):
-        pass
+    def __exit__(self, *exc_info: Any) -> None:
+        """No-op on exit."""
+        return None
 
 
 # ---------------------------------------------------------------------------
