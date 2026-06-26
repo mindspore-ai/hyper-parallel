@@ -88,7 +88,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level1"),
+    tags=("cpu_level0", "npu_level0"),
 ))
 
 register(OpShardCase(
@@ -113,7 +113,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level1"),
+    tags=("cpu_level0", "npu_level0"),
 ))
 
 register(OpShardCase(
@@ -137,7 +137,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level1"),
+    tags=("cpu_level0", "npu_level0"),
 ))
 
 register(OpShardCase(
@@ -149,7 +149,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level1"),
+    tags=("cpu_level0", "npu_level0"),
 ))
 
 register(OpShardCase(
@@ -161,7 +161,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level1"),
+    tags=("cpu_level0", "npu_level0"),
 ))
 
 register(OpShardCase(
@@ -173,7 +173,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level1"),
+    tags=("cpu_level0", "npu_level0"),
 ))
 
 register(OpShardCase(
@@ -185,7 +185,7 @@ register(OpShardCase(
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
-    tags=("cpu_level0", "npu_level1"),
+    tags=("cpu_level0", "npu_level0"),
 ))
 
 register(OpShardCase(

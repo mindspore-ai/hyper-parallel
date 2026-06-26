@@ -39,7 +39,7 @@ register(OpShardCase(
     inputs=[InputSpec(shape=(8, 16), init="randn", seed=42)],
     placements=[(Shard(0), Replicate())],
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
-    tags=("cpu_level0", "npu_level1"),
+    tags=("cpu_level0", "npu_level0"),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
     ))
@@ -51,7 +51,7 @@ register(OpShardCase(
     inputs=[InputSpec(shape=(8, 16), init="randn", seed=42)],
     placements=[(Shard(0), Replicate())],
     compare=CompareSpec.allclose(rtol=1e-4, atol=1e-4),
-    tags=("cpu_level0", "npu_level1"),
+    tags=("cpu_level0", "npu_level0"),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
     ))
