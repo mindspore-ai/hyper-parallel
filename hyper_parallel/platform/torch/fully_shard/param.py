@@ -751,27 +751,34 @@ class TorchHSDPParamV2(HSDPParamV2):
                 f"Expected sharded_state in {states}, got {self.sharded_state}"
             )
 
-    def reset_sharded_param(self) -> None:
-        """Reset sharded param after load_state_dict."""
+    def _resolve_reset_param(self):
+        """Resolve the (possibly swapped) module param for ``reset_sharded_param``.
+
+        Refreshes ``self.sharded_param`` for the DTensor case and returns the
+        current module parameter for the caller to re-shard.
+        """
         module_info = self._module_info
         new_param = getattr(module_info.module, module_info.param_name)
-        if new_param is not self.sharded_param:
-            # Ensure object identity is preserved after parameter conversion.
-            if torch.__future__.get_swap_module_params_on_conversion():
-                raise AssertionError(
-                    f"Expects swap_tensors to preserve object but got {new_param} "
-                    f"instead of {self.sharded_param}"
-                )
-            if isinstance(new_param, DTensor):
-                self.sharded_param = new_param
-                if not getattr(self.sharded_param, "_hsdp_param_initialized", None):
-                    # reset _hsdp_param_initialized flag.
-                    self.sharded_param._hsdp_param_initialized = True
-            elif isinstance(new_param, torch.Tensor):
-                # if new_param is Tensor, don't change 'self.sharded_param' ref
-                # just update self.sharded_param._local_tensor and self.sharded_param_data.
-                pass
+        if new_param is self.sharded_param:
+            return new_param
+        # Ensure object identity is preserved after parameter conversion.
+        if torch.__future__.get_swap_module_params_on_conversion():
+            raise AssertionError(
+                f"Expects swap_tensors to preserve object but got {new_param} "
+                f"instead of {self.sharded_param}"
+            )
+        if isinstance(new_param, DTensor):
+            self.sharded_param = new_param
+            if not getattr(self.sharded_param, "_hsdp_param_initialized", None):
+                # reset _hsdp_param_initialized flag.
+                self.sharded_param._hsdp_param_initialized = True
+        # If new_param is a plain Tensor, keep the existing 'self.sharded_param' ref;
+        # only its _local_tensor / _sharded_param_data are refreshed below.
+        return new_param
 
+    def reset_sharded_param(self) -> None:
+        """Reset sharded param after load_state_dict."""
+        new_param = self._resolve_reset_param()
         local_tensor = new_param._local_tensor if isinstance(new_param, DTensor) else new_param
         if local_tensor.is_meta:
             return

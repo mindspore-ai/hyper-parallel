@@ -371,7 +371,8 @@ class HSDPModule:
             sub_modules = [self_module]
         for module in sub_modules:
             if isinstance(module, HSDPModule):
-                if hsdp_state := module.hsdp_scheduler.hsdp_state:
+                hsdp_state = module.hsdp_scheduler.hsdp_state
+                if hsdp_state:
                     hsdp_state.set_reduce_op_type(reduce_op_type)
 
     def set_gradient_scaling_factor(self, factor=None):
@@ -410,7 +411,8 @@ class HSDPModule:
                     f"gradient_scaling_factor must be None, float, int or a 1-element Tensor, "
                     f"but got {type(factor).__name__}."
                 )
-        if hsdp_state := self.hsdp_scheduler.hsdp_state:
+        hsdp_state = self.hsdp_scheduler.hsdp_state
+        if hsdp_state:
             hsdp_state.set_gradient_scaling_factor(factor)
 
 

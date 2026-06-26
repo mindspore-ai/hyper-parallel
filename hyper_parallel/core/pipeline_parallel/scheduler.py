@@ -687,7 +687,7 @@ class PipelineScheduleRuntime(ABC):
         if handles:
             self._wait_p2p(handles)
 
-    def send_fwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> list:
+    def send_fwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> None:
         """Send this stage's forward output for ``micro_index`` to the next stage."""
         handles = (self._batched_issue(stage.fwd_send_specs(micro_index))
                    if self._batch_p2p else stage.exec_fwd_send_ops(micro_index)) or []
@@ -697,9 +697,8 @@ class PipelineScheduleRuntime(ABC):
             self._send_handles.append(handles)
         else:
             self._wait_p2p(handles)
-        return handles
 
-    def send_bwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> list:
+    def send_bwd(self, stage: "hyper_parallel.PipelineStage", micro_index: int) -> None:
         """Send this stage's input-gradient for ``micro_index`` to the previous stage.
 
         Driven by the scheduler's ``BWD_SEND`` step. It pops the input grad that
@@ -714,7 +713,6 @@ class PipelineScheduleRuntime(ABC):
             self._send_handles.append(handles)
         else:
             self._wait_p2p(handles)
-        return handles
 
     def _arm_boundary(self, step):
         """Register ``step`` for the stage after-forward hook; return its key.
