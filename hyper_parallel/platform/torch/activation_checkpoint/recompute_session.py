@@ -60,11 +60,12 @@ class _RecomputeSession:
             without popping them so that a later backward can consume them.
     """
 
-    __slots__ = ("session_id", "retain_on_unpack")
+    __slots__ = ("session_id", "retain_on_unpack", "_handle_refs")
 
     def __init__(self, session_id: str, retain_on_unpack: bool = False) -> None:
         self.session_id = session_id
         self.retain_on_unpack = retain_on_unpack
+        self._handle_refs: list = []  # strong refs to prevent GC
 
 
 class _Handle:
@@ -226,6 +227,10 @@ _recompute_handle_collector: ContextVar[Optional[list]] = ContextVar(
     "_recompute_handle_collector", default=None
 )
 
+# Strong references to _RecomputeHandle objects keyed by session_id.
+# Prevents GC of handles in lazy-session (no-collector) paths.
+_recompute_session_handle_refs: dict[str, list] = {}
+
 
 # ---------------------------------------------------------------------------
 # Context managers
@@ -282,6 +287,8 @@ def _clear_recompute_session(session_id: str) -> None:
     Pops all handles from the session registry and calls
     ``clear_session(session_id)`` on each, freeing cached tensors.
 
+    Also drops the session's strong references so handles can be GC'd.
+
     Args:
         session_id: The session key whose cached recompute data is cleared.
     """
@@ -289,6 +296,8 @@ def _clear_recompute_session(session_id: str) -> None:
     if handles is not None:
         for handle in list(handles):
             handle.clear_session(session_id)
+    # Drop strong refs held by _recompute_session_handle_refs.
+    _recompute_session_handle_refs.pop(session_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +559,9 @@ def checkpoint_with_session(
 
     # Register handle in the session-wide registry.
     _recompute_session_handles[session.session_id].add(handle)
+    # Keep a strong reference so the handle is not garbage-collected
+    # between forward and clear_recompute_session.
+    _recompute_session_handle_refs.setdefault(session.session_id, []).append(handle)
 
     # Also register in the collector if one is active.
     collector = _recompute_handle_collector.get()

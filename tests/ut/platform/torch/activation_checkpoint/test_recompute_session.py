@@ -357,5 +357,65 @@ class TestRngPreservation(unittest.TestCase):
         _clear_recompute_session(session_id)
 
 
+
+class TestHandleLifecycle(unittest.TestCase):
+    """Test that recompute handles are not GC'd before clear_recompute_session."""
+
+    def test_handle_survives_without_collector(self):
+        """Without a collector, the handle should stay alive until clear."""
+        torch.manual_seed(42)
+
+        x = torch.randn(2, 4, requires_grad=True)
+        session_id = uuid.uuid4().hex
+
+        dropout = torch.nn.Dropout(0.5)
+        def fn(x):
+            return dropout(x)
+
+        with _recompute_session_ctx(session_id=session_id, retain_on_unpack=True):
+            out = checkpoint_with_session(fn, x)
+
+        import gc
+        gc.collect()
+
+        handles_set = _recompute_session_handles.get(session_id, set())
+        self.assertGreater(len(handles_set), 0,
+                           "Handle was garbage collected without collector")
+
+        with _recompute_session_ctx(session_id=session_id, retain_on_unpack=False):
+            out.sum().backward()
+
+        self.assertIsNotNone(x.grad)
+        self.assertTrue(torch.isfinite(x.grad).all())
+        _clear_recompute_session(session_id)
+
+    def test_clear_drops_strong_ref(self):
+        """After clear_recompute_session + GC, handles are freed."""
+        session_id = uuid.uuid4().hex
+        x = torch.randn(2, 4, requires_grad=True)
+
+        def fn(x):
+            return x * 2
+
+        with _recompute_session_ctx(session_id=session_id):
+            out = checkpoint_with_session(fn, x)
+
+        # Handles should be alive in the WeakSet even after GC.
+        import gc
+        gc.collect()
+        self.assertGreater(len(_recompute_session_handles.get(session_id, set())), 0,
+                           "Handle was GC'd before clear")
+
+        with _recompute_session_ctx(session_id=session_id):
+            out.sum().backward()
+
+        _clear_recompute_session(session_id)
+
+        # After clear, the WeakSet entry is gone.
+        gc.collect()
+        self.assertEqual(len(_recompute_session_handles.get(session_id, set())), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
