@@ -769,11 +769,12 @@ class TorchHSDPStateV2(HSDPState):
             "sum": torch.distributed.ReduceOp.SUM,
             "avg": torch.distributed.ReduceOp.AVG,
         }
-        if reduce_op_type not in fsdp_support_reduce_op:
+        reduce_op = reduce_op_type.lower().strip() if isinstance(reduce_op_type, str) else reduce_op_type
+        reduce_op_value = fsdp_support_reduce_op.get(reduce_op)
+        if reduce_op_value is None:
             raise ValueError(
                 f"Unsupported reduce op type {reduce_op_type}, "
                 f"supported types are {list(fsdp_support_reduce_op.keys())}"
             )
-        reduce_op: str = reduce_op_type.lower().strip()
-        self._user_reduce_op_type = fsdp_support_reduce_op[reduce_op]
+        self._user_reduce_op_type = reduce_op_value
         self.reduce_op_type = self._user_reduce_op_type

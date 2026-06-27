@@ -307,13 +307,15 @@ class TorchHSDPParamV2(HSDPParamV2):
         if any(placement.is_partial() for placement in grad.placements):
             grad = grad.reduce_partial()
 
-        if (
+        mesh_mismatch = (
             self._orig_dtensor_mesh is not None
             and grad.device_mesh.to_hash() != self._orig_dtensor_mesh.to_hash()
-        ) or (
+        )
+        placement_mismatch = (
             self._orig_dtensor_placements is not None
             and tuple(grad.placements) != tuple(self._orig_dtensor_placements)
-        ):
+        )
+        if mesh_mismatch or placement_mismatch:
             grad = grad.redistribute(self._orig_dtensor_mesh, self._orig_dtensor_placements)
         return grad.to_local()
 
