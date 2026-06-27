@@ -33,7 +33,7 @@ class DFunction(platform.Function):
 | Input type | Route |
 |-----------|-------|
 | Plain `Tensor` | `super().apply()` — platform autograd, single-device path |
-| At least one `DTensor` | `_OP_DISPATCHER.dispatch()` — layout inference + DTensor wrapping |
+| At least one `DTensor` | `dispatch()` — layout inference + DTensor wrapping |
 
 **`_op_name`** must be set when DTensor inputs are expected.  It must match the
 `op_name` passed to a registered `DistributedOp` subclass.  Omitting `_op_name`
@@ -41,8 +41,8 @@ while passing a `DTensor` raises `ValueError`.
 
 **`forward(ctx, *args)`** operates on **local** tensors.  When the distributed
 path is taken, the dispatcher extracts the local shard from each input `DTensor`
-and passes it here.  Non-tensor positional arguments are forwarded unchanged via
-the `preprocess` → `_dispatch_new` path (see `DistributedOp.preprocess`).
+and passes it here.  Non-tensor positional arguments are forwarded to `forward`
+unchanged (see `DistributedOp.preprocess`).
 
 **`backward(ctx, *grad_outputs)`** likewise operates on local tensors.  It is
 identical to a standard `torch.autograd.Function.backward` or MindSpore's
@@ -52,17 +52,17 @@ identical to a standard `torch.autograd.Function.backward` or MindSpore's
 
 ### `DistributedOp`
 
-Base class for layout inference and optional pre/post-processing.
+Base class for local-tensor extraction and layout inference.
 
 ```python
 class DistributedOp:
     def __init__(self, op_name: str): ...
 
-    def preprocess(self, args: tuple, kwargs: dict) -> None | tuple: ...
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple: ...
 
-    def infer_layout(self, layouts_or_cache, extra_args=None) -> Layout | tuple: ...
+    def infer_layout(self, cache_values: list) -> tuple: ...
 
-    def get_expand_impl(self, func, infer_result, layouts, extra_args=None) -> None | Callable: ...
+    def get_expand_impl(self, func, infer_result, cache_values) -> None | Callable: ...
 ```
 
 Instantiating a `DistributedOp` subclass **automatically registers** it under
@@ -71,34 +71,23 @@ to the corresponding `DFunction.apply`.
 
 #### `preprocess(args, kwargs)`
 
-Optional.  Called once before layout inference on the **first** dispatch (cached
-thereafter).  Returns either:
+Parses the call arguments, extracts the local tensors, and builds the layout
+cache key.  Called once before layout inference on the **first** dispatch (cached
+thereafter).  Returns `(local_args, local_kwargs, cache_values)`:
 
-- `None` — fall through to the legacy dispatch path.
-- `(local_args, local_kwargs, cache_values)` — take the new dispatch path.
+- `local_args` / `local_kwargs` — the local-tensor positional / keyword arguments
+  passed to the user's `forward` (input `DTensor`s already `to_local`'d).
+  Non-tensor positional arguments are forwarded here unchanged.
+- `cache_values` — an ordered list of values used as the layout cache key
+  (typically `Layout` objects plus scalars such as `bool`, `int`).
 
-`local_args` / `local_kwargs` are the local-tensor positional / keyword arguments
-to pass to the user's `forward`.  `cache_values` is an ordered list of values used
-as the layout cache key (typically `Layout` objects plus scalars such as `bool`,
-`int`).
+#### `infer_layout(cache_values)`
 
-Use `preprocess` when:
+Computes the output layout(s) from `cache_values` and returns
+`(out_layouts_tuple, None)`.  For multi-output ops, `out_layouts_tuple` holds one
+`Layout` per output.
 
-- Non-tensor positional arguments must be forwarded to `forward`.
-- Finer control over what ends up in `local_args` is needed.
-
-#### `infer_layout(layouts_or_cache, extra_args=None)`
-
-Computes the output layout(s).
-
-| Dispatch path | Signature |
-|--------------|-----------|
-| Legacy (no `preprocess`) | `infer_layout(input_layouts: tuple, extra_args: list) -> Layout` |
-| New (`preprocess` returned a tuple) | `infer_layout(cache_values: list) -> (out_layouts_tuple, None)` |
-
-For multi-output ops, return a tuple of `Layout` objects.
-
-#### `get_expand_impl(func, infer_result, layouts, extra_args=None)`
+#### `get_expand_impl(func, infer_result, cache_values)`
 
 Optional.  Returns `None` (default) or a callable that replaces the default
 `func(*local_args)` call.  Use this to modify how local arguments are combined
@@ -121,8 +110,14 @@ class MyAddDistOp(DistributedOp):
     def __init__(self):
         super().__init__("MyAdd")
 
-    def infer_layout(self, layouts, extra_args=None):
-        return layouts[0]  # element-wise: output layout = first input layout
+    def preprocess(self, args, kwargs):
+        x, y = args[0], args[1]
+        local_args = (x.to_local(), y.to_local())
+        cache_values = [x.layout, y.layout]
+        return local_args, {}, cache_values
+
+    def infer_layout(self, cache_values):
+        return ((cache_values[0],), None)  # element-wise: output layout = first input layout
 
 MyAddDistOp()  # instantiation registers the op
 
@@ -156,18 +151,24 @@ result_dist = MyAdd.apply(x_dist, y_dist)  # returns DTensor
 
 ## Usage Patterns
 
-### Pattern 1: Element-wise op (legacy dispatch path)
+### Pattern 1: Element-wise op
 
-No `preprocess` override — simplest case.  `infer_layout` receives the list of
-input `Layout` objects and returns the output `Layout`.
+The simplest case: the output keeps the first input's layout.  The non-tensor
+`scale` argument is forwarded to `forward` through `local_args`.
 
 ```python
 class _ScaleDistOp(DistributedOp):
     def __init__(self):
         super().__init__("Scale")
 
-    def infer_layout(self, layouts, extra_args=None):
-        return layouts[0]   # scale is element-wise
+    def preprocess(self, args, kwargs):
+        x, scale = args[0], args[1]
+        local_args = (x.to_local(), scale)   # non-tensor scale forwarded here
+        cache_values = [x.layout]
+        return local_args, {}, cache_values
+
+    def infer_layout(self, cache_values):
+        return ((cache_values[0],), None)   # scale is element-wise
 
 _ScaleDistOp()
 
@@ -186,16 +187,12 @@ class ScaleFunc(DFunction):
         return grad * ctx.scale, None  # None for the non-tensor scale
 ```
 
-> **Note:** Non-tensor positional arguments (e.g. `scale`) are **not** forwarded
-> to `forward` on the legacy dispatch path.  Either pass them as `kwargs`, or use
-> the new dispatch path by implementing `preprocess`.
-
 ---
 
-### Pattern 2: Column-parallel Linear (new dispatch path via `preprocess`)
+### Pattern 2: Column-parallel Linear
 
-Implement `preprocess` to extract local tensors and build `cache_values`.
-`infer_layout` then receives `cache_values` and returns `(out_layouts_tuple, None)`.
+`infer_layout` receives `cache_values` and returns `(out_layouts_tuple, None)`,
+deriving the output layout from the input and weight layouts.
 
 ```python
 class LinColDistOp(DistributedOp):
@@ -328,20 +325,18 @@ calling `retain_grad()` once before the forward is sufficient.
 
 ```text
 DFunction.apply(dtensor1, ...)
-  │  has_dtensor=True
+  │  at least one DTensor input
   ▼
-_OP_DISPATCHER.dispatch(local_callable, args, kwargs)
+dispatch(local_callable, args, kwargs)
   │
-  ├─ preprocess() defined?
-  │    Yes → _dispatch_new:  local_args, cache_values → infer_layout(cache_values)
-  │    No  → _with_layout_infer: to_local() each DTensor → infer_layout(layouts)
-  │
-  ├─ get_expand_impl() → op_impl  (None → use local_callable directly)
+  ├─ preprocess(args, kwargs)        → local_args, cache_values
+  ├─ infer_layout(cache_values)      → output layouts
+  ├─ get_expand_impl() → op_impl     (None → use local_callable directly)
   │
   └─ py_output = op_impl(*local_args)
        │
        └─ local_callable(*local_args)
-            │  has_dtensor=False
+            │  no DTensor input
             └─ super().apply(*local_args)   ← platform autograd, no recursion
                  └─ MyFunc.forward(ctx, local_tensor1, ...)
 ```
@@ -353,8 +348,8 @@ _OP_DISPATCHER.dispatch(local_callable, args, kwargs)
 1. `_op_name` must be set on the `DFunction` subclass and match the registered
    `DistributedOp` exactly.
 2. Each `op_name` can have only one registered `DistributedOp` instance at a time.
-3. Non-tensor positional arguments are **not** forwarded to `forward` on the legacy
-   dispatch path.  Use `kwargs` or implement `preprocess` instead.
+3. `cache_values` must include every value that affects layout inference so the
+   layout cache key stays correct.
 4. When using `get_expand_impl` and the output has partial status, call
    `result.reduce_partial()` before redistribution.
 5. Both `forward` and `backward` **must** operate on local tensors — do not call

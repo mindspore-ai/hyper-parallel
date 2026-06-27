@@ -9,7 +9,7 @@ HyperParallel 提供芯片内多核 MPMD 并行能力，结合核级内存语义
 - **O0**：通过框架层 host CPU 侧的调度，支持 cube、vector、单边通信算子分核执行
 - **O1**：调度下沉到 AICore，支持 cube、vector、单边通信算子分核执行，进一步提升性能
 
-当前已实现基于多核并行优化 MoE 通算掩盖。
+当前已基于多核并行实现 MoE 通算掩盖（Multicore MoE-FFN）：将 MoE-FFN 的五个算子（AllToAll-Dispatch、GMM1、SwiGLU、GMM2、AllToAll-Combine）融合为一个 kernel，由 AIC（AI Cube）和 AIV（AI Vector）核同时执行，实现通信与计算的细粒度重叠。
 
 ## 接口概览
 
@@ -30,19 +30,18 @@ HyperParallel 提供芯片内多核 MPMD 并行能力，结合核级内存语义
 
 ### MoE 多核通算掩盖
 
-基于多核并行优化 MoE FFN 的通算掩盖，将 dispatch（A2A）和 expert compute 在不同核上并发执行：
+基于多核并行优化 MoE FFN 的通算掩盖，将 dispatch（AllToAll）与 expert compute（GMM）在不同核上并发执行。调度配置（RuntimeConfig）按 rank 离线生成后，通过 `mc.mega_moe` / `mc.mega_moe_grad` 调用正反向算子：
 
 ```python
-# 详见 hyper_parallel/core/multicore/doc/README.md
+import hyper_parallel.core.multicore as mc
+
+# 正向：融合 dispatch → up_proj → swiglu → down_proj → combine
+mc.mega_moe(...)
+# 反向
+mc.mega_moe_grad(...)
 ```
 
-### MHC pre clamp sinkhorn custom op
-
-新增的 MHC pre clamp sinkhorn 自定义算子，用于 MoE 路由优化：
-
-```python
-# 用于 MoE 模型的路由权重计算和负载均衡
-```
+完整的参数说明、RuntimeConfig 生成方式与编译步骤见下方详细文档。
 
 ---
 
@@ -50,13 +49,13 @@ HyperParallel 提供芯片内多核 MPMD 并行能力，结合核级内存语义
 
 完整的 MoE-FFN 多核并行说明文档：
 
-[MOE-FFN 说明](../hyper_parallel/core/multicore/doc/README.md)
+[MOE-FFN 说明](../../hyper_parallel/core/multicore/doc/README.md)
 
 ---
 
 ## 性能建议
 
-1. **dispatch ↔ compute 掩盖**：MoE 的 all-to-all dispatch 与 expert compute 在不同核上并发，是最核心的掩盖收益
+1. **dispatch ↔ compute 掩盖**：MoE 的 AllToAll dispatch 与 expert compute 在不同核上并发，是最核心的掩盖收益
 2. **单边通信**：基于内存语义的单边通信（Symmetric Memory）避免传统集合通信的同步开销
-3. **MHC 算子优化**：使用 MHC pre clamp sinkhorn 算子优化 MoE 路由计算
+3. **RATR 通信重排**：通过 Rank-Aware Tile Reordering 将 AllToAll 流量在时间轴上均匀分散，避免多源 Rank 同时涌向同一目标，降低尾延迟
 4. **O0 vs O1**：O0 通过 host CPU 调度，O1 调度下沉到 AICore，性能更高但实现难度更大
