@@ -21,6 +21,28 @@ import torch
 PastKeyValues = List[Tuple[torch.Tensor, torch.Tensor]]
 
 
+def _validate_pair_shapes(key: torch.Tensor, value: torch.Tensor) -> None:
+    """Validate one key/value cache tensor pair."""
+    if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
+        raise ValueError("key and value must be tensors")
+    if key.ndim != 4 or value.ndim != 4:
+        raise ValueError("key and value must have shape (batch, heads, seq, dim)")
+    if key.shape != value.shape:
+        raise ValueError("key and value batch/heads/seq/dim dimensions must match")
+
+
+def detach_and_validate_past_key_values(past_key_values: Iterable) -> PastKeyValues:
+    """Return detached tuple KV tensors after validating their shapes."""
+    values = []
+    for item in past_key_values:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError("each cache entry must be a (key, value) pair")
+        key, value = item
+        _validate_pair_shapes(key, value)
+        values.append((key.detach(), value.detach()))
+    return values
+
+
 @dataclass(frozen=True)
 class SequenceShardInfo:
     """Sequence range held by one context-parallel rank."""
@@ -33,6 +55,7 @@ class SequenceShardInfo:
 
     @property
     def local_seq_len(self) -> int:
+        """Return the sequence length stored by this rank."""
         return self.end - self.start
 
 
@@ -68,7 +91,7 @@ def shard_past_key_values(
     global_seq_len: Optional[int] = None,
 ) -> Tuple[PastKeyValues, SequenceShardInfo]:
     """Shard full past key values on the sequence dimension for CP cache."""
-    values = KVCache._detach_and_validate(past_key_values)
+    values = detach_and_validate_past_key_values(past_key_values)
     if not values:
         seq_len = 0 if global_seq_len is None else global_seq_len
     else:
@@ -96,6 +119,7 @@ class KVCache:
 
     @property
     def is_empty(self) -> bool:
+        """Check whether no usable KV cache is stored."""
         return self.past_key_values is None or (
             isinstance(self.past_key_values, list) and len(self.past_key_values) == 0
         )
@@ -145,23 +169,11 @@ class KVCache:
 
     @classmethod
     def _detach_and_validate(cls, past_key_values: Iterable) -> PastKeyValues:
-        values = []
-        for item in past_key_values:
-            if not isinstance(item, (tuple, list)) or len(item) != 2:
-                raise ValueError("each cache entry must be a (key, value) pair")
-            key, value = item
-            cls._validate_pair_shapes(key, value)
-            values.append((key.detach(), value.detach()))
-        return values
+        return detach_and_validate_past_key_values(past_key_values)
 
     @staticmethod
     def _validate_pair_shapes(key: torch.Tensor, value: torch.Tensor) -> None:
-        if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
-            raise ValueError("key and value must be tensors")
-        if key.ndim != 4 or value.ndim != 4:
-            raise ValueError("key and value must have shape (batch, heads, seq, dim)")
-        if key.shape != value.shape:
-            raise ValueError("key and value batch/heads/seq/dim dimensions must match")
+        _validate_pair_shapes(key, value)
 
     @staticmethod
     def _is_opaque_cache(past_key_values) -> bool:

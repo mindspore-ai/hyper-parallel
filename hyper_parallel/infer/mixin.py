@@ -21,6 +21,7 @@ class GenerateMixin:
     """Mixin that forwards to :func:`hyper_parallel.infer.generate`."""
 
     def generate(self, input_ids, generation_config=None, attention_mask=None, **kwargs):
+        """Generate token ids with the common HyperParallel generation loop."""
         return generate(
             self,
             input_ids=input_ids,

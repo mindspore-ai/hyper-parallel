@@ -41,6 +41,7 @@ class OpaqueCache:
     """HF-style cache object with its own sequence-length API."""
 
     def get_seq_length(self):
+        """Return the cached sequence length."""
         return 1
 
 
@@ -70,6 +71,7 @@ class TinyAttentionCacheLM(torch.nn.Module):
         use_cache=True,
         **kwargs,
     ):
+        """Run causal attention with tuple KV cache."""
         del position_ids, kwargs
         hidden = self.embedding(input_ids)
         key = hidden.unsqueeze(1)

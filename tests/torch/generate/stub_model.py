@@ -35,6 +35,7 @@ class CacheLengthLM(nn.Module):
         use_cache=True,
         **kwargs,
     ):
+        """Run deterministic forward with an optional tuple KV cache."""
         del position_ids, attention_mask, kwargs
         past_len = 0
         if past_key_values is not None:

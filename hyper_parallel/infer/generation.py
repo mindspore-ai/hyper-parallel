@@ -19,7 +19,11 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
-from hyper_parallel.infer.kv_cache import ContextParallelKVCache, KVCache
+from hyper_parallel.infer.kv_cache import (
+    ContextParallelKVCache,
+    KVCache,
+    detach_and_validate_past_key_values,
+)
 from hyper_parallel.infer.sampler import sample_next_token
 from hyper_parallel.infer.utils import (
     GenerationConfig,
@@ -33,6 +37,7 @@ from hyper_parallel.infer.utils import (
 
 
 def _get_output(outputs, name: str):
+    """Read an output field from dict-like or object-like model outputs."""
     if isinstance(outputs, dict):
         return outputs.get(name)
     return getattr(outputs, name, None)
@@ -48,6 +53,7 @@ def _model_forward(
     sequence_shard_info=None,
     global_seq_len: Optional[int] = None,
 ):
+    """Call model.forward with only the keyword arguments it accepts."""
     kwargs = {
         "input_ids": input_ids,
         "position_ids": position_ids,
@@ -100,32 +106,35 @@ def _cache_shard_info(cache: KVCache):
 
 
 def _cache_seq_len(past_key_values) -> Optional[int]:
+    """Resolve cached sequence length from tuple or opaque HF-style cache."""
     if past_key_values is None:
         return None
     if hasattr(past_key_values, "get_seq_length") and not isinstance(
         past_key_values, (list, tuple),
     ):
         return int(past_key_values.get_seq_length())
-    values = KVCache._detach_and_validate(past_key_values)
+    values = detach_and_validate_past_key_values(past_key_values)
     if not values:
         return 0
     return int(values[0][0].shape[-2])
 
 
 def _cache_batch_size(past_key_values) -> Optional[int]:
+    """Resolve cache batch size when cache tensors are inspectable."""
     if past_key_values is None:
         return None
     if hasattr(past_key_values, "get_seq_length") and not isinstance(
         past_key_values, (list, tuple),
     ):
         return None
-    values = KVCache._detach_and_validate(past_key_values)
+    values = detach_and_validate_past_key_values(past_key_values)
     if not values:
         return None
     return int(values[0][0].shape[0])
 
 
 def _resolve_prefix_length(config: GenerationConfig) -> int:
+    """Validate and resolve reusable prefix cache length."""
     if config.prefix_past_key_values is None:
         return 0
     candidates = []
@@ -153,6 +162,7 @@ def _prepare_prefix_attention_mask(
     input_ids: torch.Tensor,
     device,
 ) -> tuple[Optional[torch.Tensor], int]:
+    """Prepare a 2-D attention mask for reusable prefix cache."""
     prefix_len = _resolve_prefix_length(config)
     if prefix_len == 0:
         return None, 0
@@ -175,6 +185,7 @@ def _prepare_prefix_attention_mask(
 
 
 def _init_cache_with_prefix(config: GenerationConfig) -> tuple[KVCache, int]:
+    """Create the generation cache and preload prefix cache when present."""
     cache = _init_cache(config)
     prefix_len = _resolve_prefix_length(config)
     if prefix_len == 0:
@@ -193,6 +204,7 @@ def _init_cache_with_prefix(config: GenerationConfig) -> tuple[KVCache, int]:
 
 
 def _update_cache(cache: KVCache, outputs) -> None:
+    """Update normal or context-parallel KV cache from model outputs."""
     past_key_values = _get_output(outputs, "past_key_values")
     if not isinstance(cache, ContextParallelKVCache):
         cache.update(past_key_values)
@@ -229,6 +241,7 @@ def _build_decode_key_mask(
     attention_mask: Optional[torch.Tensor],
     dtype: torch.dtype,
 ) -> Optional[torch.Tensor]:
+    """Build additive key padding mask for one-token cached decode."""
     if attention_mask is None:
         return None
     if attention_mask.ndim != 2:
@@ -263,6 +276,7 @@ def _build_prefill_mask(
     prefix_attention_mask: Optional[torch.Tensor],
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    """Build the prefill causal mask, including optional prefix keys."""
     if prefix_attention_mask is None:
         return build_causal_mask(input_ids, attention_mask, dtype=dtype)
     batch_size, query_len = input_ids.shape
@@ -305,6 +319,7 @@ def _build_prefill_position_ids(
     attention_mask: Optional[torch.Tensor],
     prefix_attention_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
+    """Build position ids for prefill with optional prefix offset."""
     position_ids = build_position_ids(input_ids, attention_mask)
     if prefix_attention_mask is None:
         return position_ids
@@ -313,6 +328,7 @@ def _build_prefill_position_ids(
 
 
 def _prompt_lengths(input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor]):
+    """Count valid prompt tokens per batch row."""
     if attention_mask is None:
         return torch.full(
             (input_ids.size(0),),
@@ -330,6 +346,7 @@ def _finalize_sequences(
     generated_counts: torch.Tensor,
     pad_token_id: int,
 ) -> torch.Tensor:
+    """Strip left padding and right-pad finalized generated sequences."""
     rows = []
     max_len = 0
     for batch_idx in range(sequences.size(0)):
@@ -369,6 +386,7 @@ def _finalize_zero_new_tokens(
     attention_mask: Optional[torch.Tensor],
     config: GenerationConfig,
 ) -> torch.Tensor:
+    """Finalize left-padded prompts when no new tokens are requested."""
     prompt_lengths = _prompt_lengths(input_ids, attention_mask)
     generated_counts = torch.zeros(
         input_ids.size(0),
@@ -390,6 +408,7 @@ def _prepare_generation_context(
     attention_mask: Optional[torch.Tensor],
     config: GenerationConfig,
 ):
+    """Create the mutable generation context used by the decode loop."""
     mask_dtype = _resolve_mask_dtype(model, config)
     sequences = input_ids.clone()
     prefix_attention_mask, prefix_len = _prepare_prefix_attention_mask(
@@ -435,6 +454,7 @@ def _prefill(
     config: GenerationConfig,
     context: dict,
 ):
+    """Run the initial full-prompt forward pass."""
     position_ids = _build_prefill_position_ids(
         context["sequences"],
         context["current_attention_mask"],
@@ -471,6 +491,7 @@ def _finalize_prefill_outputs(
     context: dict,
     outputs,
 ) -> tuple[torch.Tensor, bool]:
+    """Validate prefill output and decide whether cached decode can be used."""
     logits = _required_logits(outputs)
     if (
         config.prefix_past_key_values is not None
@@ -482,6 +503,7 @@ def _finalize_prefill_outputs(
 
 
 def _append_next_token(context: dict, next_tokens: torch.Tensor, config: GenerationConfig):
+    """Append sampled tokens and advance per-row generation metadata."""
     if config.eos_token_id is not None:
         next_tokens = torch.where(
             context["unfinished"].view(-1, 1),
@@ -509,6 +531,7 @@ def _should_finish_generation(
     config: GenerationConfig,
     step: int,
 ) -> bool:
+    """Check EOS, custom stopping criteria, and max token limit."""
     if config.eos_token_id is not None and not context["unfinished"].any():
         return True
     if should_stop_generation(context["sequences"], logits, config):
@@ -518,11 +541,11 @@ def _should_finish_generation(
 
 def _decode(
     model,
-    config: GenerationConfig,
     context: dict,
     next_tokens: torch.Tensor,
     use_cached_decode: bool,
 ):
+    """Run one cached or no-cache decode step."""
     model_attention_mask = _combined_attention_mask(
         context["prefix_attention_mask"],
         context["current_attention_mask"],
@@ -609,7 +632,7 @@ def generate(
             if _should_finish_generation(context, next_logits, config, step):
                 break
 
-            outputs = _decode(model, config, context, next_tokens, use_cached_decode)
+            outputs = _decode(model, context, next_tokens, use_cached_decode)
             if use_cached_decode:
                 _update_cache(context["cache"], outputs)
             logits = _required_logits(outputs)

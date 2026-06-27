@@ -55,6 +55,7 @@ class FullTinyAttentionLM(nn.Module):
         use_cache=True,
         **kwargs,
     ):
+        """Run full-cache attention forward."""
         del position_ids, kwargs
         hidden = self.embedding(input_ids)
         key = hidden.unsqueeze(1)
@@ -124,6 +125,7 @@ class ContextParallelTinyAttentionLM(FullTinyAttentionLM):
         }
 
     def _gather_full_cache(self, past_key_values, sequence_shard_info):
+        """Gather local CP cache shards into full-sequence cache."""
         if sequence_shard_info is None:
             raise ValueError("sequence_shard_info is required for CP cached decode")
         local_key, local_value = past_key_values[0]
@@ -186,6 +188,7 @@ def _parse_args():
 
 
 def main():
+    """Run the distributed CP generate check."""
     args = _parse_args()
     if not dist.is_initialized():
         dist.init_process_group(backend=args.backend)

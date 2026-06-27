@@ -14,6 +14,7 @@
 # ============================================================================
 """Generate micro-benchmark."""
 import argparse
+import importlib
 import json
 import sys
 import time
@@ -28,12 +29,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from hyper_parallel.infer import (
-    GenerationConfig,
-    build_causal_mask,
-    build_position_ids,
-    generate,
-)
+_infer = importlib.import_module("hyper_parallel.infer")
+GenerationConfig = _infer.GenerationConfig
+build_causal_mask = _infer.build_causal_mask
+build_position_ids = _infer.build_position_ids
+generate = _infer.generate
 
 
 class CacheLengthLM(nn.Module):
@@ -54,6 +54,7 @@ class CacheLengthLM(nn.Module):
         use_cache=True,
         **kwargs,
     ):
+        """Run deterministic forward with optional cache output."""
         del position_ids, attention_mask, kwargs
         batch_size, seq_len = input_ids.shape
         past_len = 0
@@ -95,6 +96,7 @@ def _resolve_device(name: str) -> torch.device:
 
 
 def _run_case(args, device: torch.device, use_cache: bool) -> dict:
+    """Measure one full generate case."""
     model = CacheLengthLM(vocab_size=args.vocab_size, use_cache=use_cache).to(device)
     input_ids = (
         torch.arange(args.prompt_len, device=device, dtype=torch.long)
@@ -138,6 +140,7 @@ def _run_case(args, device: torch.device, use_cache: bool) -> dict:
 
 
 def _measure_prefill(args, device: torch.device) -> dict:
+    """Measure the standalone prefill forward path."""
     model = CacheLengthLM(vocab_size=args.vocab_size, use_cache=True).to(device)
     input_ids = (
         torch.arange(args.prompt_len, device=device, dtype=torch.long)
@@ -182,6 +185,7 @@ def _measure_prefill(args, device: torch.device) -> dict:
 
 
 def parse_args():
+    """Parse benchmark command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--prompt-len", type=int, default=32)
@@ -215,6 +219,7 @@ def _validate_args(args) -> None:
 
 
 def main():
+    """Run the generate benchmark and optionally write JSON output."""
     args = parse_args()
     _validate_args(args)
     device = _resolve_device(args.device)

@@ -14,6 +14,7 @@
 # ============================================================================
 """Compare hyper generate output with HuggingFace greedy generate."""
 import argparse
+import importlib
 import json
 import sys
 from pathlib import Path
@@ -24,7 +25,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from hyper_parallel.infer import GenerationConfig, generate
+_infer = importlib.import_module("hyper_parallel.infer")
+GenerationConfig = _infer.GenerationConfig
+generate = _infer.generate
 
 
 class HFGenerateAdapter(torch.nn.Module):
@@ -42,6 +45,7 @@ class HFGenerateAdapter(torch.nn.Module):
         past_key_values=None,
         use_cache=True,
     ):
+        """Forward inputs to a HuggingFace causal LM."""
         del attention_mask
         outputs = self.model(
             input_ids=input_ids,
@@ -66,6 +70,7 @@ def _resolve_device(name: str) -> torch.device:
 
 
 def _compare_cache_no_cache_logits(model, input_ids, generated_ids, max_steps: int):
+    """Compare cache and no-cache decode logits with cosine similarity."""
     steps = min(max_steps, generated_ids.size(1))
     if steps <= 0:
         return []
@@ -101,6 +106,7 @@ def _compare_cache_no_cache_logits(model, input_ids, generated_ids, max_steps: i
 
 
 def parse_args():
+    """Parse alignment check command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Local HF model path or model id")
     parser.add_argument("--prompt", default="Hello, my name is")
@@ -121,13 +127,14 @@ def _validate_args(args) -> None:
 
 
 def _load_model_and_tokenizer(args, device):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    """Load the HuggingFace baseline model and tokenizer."""
+    transformers = importlib.import_module("transformers")
 
-    tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.model,
         trust_remote_code=args.trust_remote_code,
     )
-    model = AutoModelForCausalLM.from_pretrained(
+    model = transformers.AutoModelForCausalLM.from_pretrained(
         args.model,
         trust_remote_code=args.trust_remote_code,
     ).to(device)
@@ -135,7 +142,8 @@ def _load_model_and_tokenizer(args, device):
     return model, tokenizer, HFGenerateAdapter(model)
 
 
-def _run_alignment(args, model, adapter, tokenizer, input_ids, pad_token_id, eos_token_id):
+def _run_alignment(args, model, adapter, input_ids, pad_token_id, eos_token_id):
+    """Run HF generate, hyper cache generate, and hyper no-cache generate."""
     hf_output = model.generate(
         input_ids=input_ids,
         max_new_tokens=args.max_new_tokens,
@@ -184,6 +192,7 @@ def _build_result(
     logits_cosine,
     device,
 ):
+    """Build the JSON result for the alignment check."""
     hf_output, hyper_cache_output, hyper_no_cache_output = outputs
     generated_ids = hyper_cache_output[:, input_ids.shape[1]:]
     logits_cosine_min = min(logits_cosine) if logits_cosine else None
@@ -232,6 +241,7 @@ def _check_result(result) -> None:
 
 
 def main():
+    """Run HuggingFace and HyperParallel generate alignment."""
     args = parse_args()
     _validate_args(args)
     device = _resolve_device(args.device)
@@ -244,9 +254,7 @@ def main():
     eos_token_id = tokenizer.eos_token_id
 
     with torch.no_grad():
-        outputs = _run_alignment(
-            args, model, adapter, tokenizer, input_ids, pad_token_id, eos_token_id,
-        )
+        outputs = _run_alignment(args, model, adapter, input_ids, pad_token_id, eos_token_id)
     result = _build_result(args, tokenizer, input_ids, outputs[:3], outputs[3], device)
     text = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
     print(text)

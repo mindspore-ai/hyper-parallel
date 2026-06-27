@@ -30,6 +30,7 @@ from hyper_parallel.infer import (
     top_k_sample,
     top_p_sample,
 )
+from hyper_parallel.infer import utils as infer_utils
 from hyper_parallel.models.qwen3_5 import Qwen3_5Config, Qwen3_5ForCausalLM
 from hyper_parallel.models.qwen3_5_moe import (
     Qwen3_5MoeConfig,
@@ -42,33 +43,46 @@ class MixinLengthLM(GenerateMixin, CacheLengthLM):
     """CacheLengthLM with a model.generate method."""
 
 
-class MixinQwen3_5ForCausalLM(GenerateMixin, Qwen3_5ForCausalLM):
+class MixinQwen35ForCausalLM(GenerateMixin, Qwen3_5ForCausalLM):
     """Project Qwen3.5 model with a model.generate method."""
 
 
-class MixinQwen3_5MoeForCausalLM(GenerateMixin, Qwen3_5MoeForCausalLM):
+class MixinQwen35MoeForCausalLM(GenerateMixin, Qwen3_5MoeForCausalLM):
     """Project Qwen3.5-MoE model with a model.generate method."""
 
 
-class StrictNoCacheLM(NoCacheLengthLM):
+class StrictNoCacheLM(torch.nn.Module):
     """No-cache model without cache-related forward kwargs."""
 
+    def __init__(self, vocab_size: int = 32):
+        """Create the wrapped no-cache stub."""
+        super().__init__()
+        self.model = NoCacheLengthLM(vocab_size=vocab_size)
+
     def forward(self, input_ids, position_ids=None, attention_mask=None):
+        """Forward without cache kwargs."""
         del position_ids, attention_mask
-        return super().forward(input_ids, use_cache=False)
+        return self.model(input_ids, use_cache=False)
 
 
-class InputOnlyLM(NoCacheLengthLM):
+class InputOnlyLM(torch.nn.Module):
     """No-cache model whose forward only accepts input_ids."""
 
+    def __init__(self, vocab_size: int = 32):
+        """Create the wrapped no-cache stub."""
+        super().__init__()
+        self.model = NoCacheLengthLM(vocab_size=vocab_size)
+
     def forward(self, input_ids):
-        return super().forward(input_ids, use_cache=False)
+        """Forward with only input_ids."""
+        return self.model(input_ids, use_cache=False)
 
 
 class InternalTypeErrorLM(CacheLengthLM):
     """Model that raises TypeError from inside forward."""
 
     def forward(self, *args, **kwargs):
+        """Raise the same TypeError regardless of input."""
         raise TypeError("internal model bug")
 
 
@@ -416,18 +430,17 @@ def test_context_parallel_logits_gather_selects_owner_rank(monkeypatch):
     Description: The final-token owner rank supplies logits to all ranks.
     Expectation: Gathered logits come from the configured CP owner rank.
     """
-    import hyper_parallel.infer.utils as utils
-
     def fake_all_gather(output_tensors, tensor, group=None):
+        """Fill gathered logits from two fake ranks."""
         del tensor, group
         output_tensors[0].copy_(torch.tensor([[0.0, 4.0, 1.0]]))
         output_tensors[1].copy_(torch.tensor([[0.0, 1.0, 7.0]]))
 
     logits = torch.zeros(1, 3)
-    monkeypatch.setattr(utils.dist, "is_available", lambda: True)
-    monkeypatch.setattr(utils.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(utils.dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(utils.dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(infer_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(infer_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(infer_utils.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(infer_utils.dist, "all_gather", fake_all_gather)
 
     gathered = gather_context_parallel_logits(
         logits,
@@ -443,18 +456,17 @@ def test_context_parallel_logits_gather_rejects_invalid_scalar_owner(monkeypatch
     Description: Scalar owner rank is local to the CP process group.
     Expectation: Invalid scalar owner rank raises a clear ValueError.
     """
-    import hyper_parallel.infer.utils as utils
-
     def fake_all_gather(output_tensors, tensor, group=None):
+        """Fill gathered tensors with invalid owner rank values."""
         del group
         output_tensors[0].copy_(tensor)
         output_tensors[1].copy_(tensor)
 
     logits = torch.zeros(1, 3)
-    monkeypatch.setattr(utils.dist, "is_available", lambda: True)
-    monkeypatch.setattr(utils.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(utils.dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(utils.dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(infer_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(infer_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(infer_utils.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(infer_utils.dist, "all_gather", fake_all_gather)
 
     with pytest.raises(ValueError, match="invalid rank"):
         gather_context_parallel_logits(
@@ -469,18 +481,17 @@ def test_context_parallel_logits_gather_supports_batch_owner_ranks(monkeypatch):
     Description: Different batch items can use different CP owner ranks.
     Expectation: Output rows are selected per batch item.
     """
-    import hyper_parallel.infer.utils as utils
-
     def fake_all_gather(output_tensors, tensor, group=None):
+        """Fill gathered logits from two fake ranks."""
         del tensor, group
         output_tensors[0].copy_(torch.tensor([[0.0, 5.0, 1.0], [0.0, 6.0, 1.0]]))
         output_tensors[1].copy_(torch.tensor([[0.0, 1.0, 7.0], [0.0, 1.0, 8.0]]))
 
     logits = torch.zeros(2, 3)
-    monkeypatch.setattr(utils.dist, "is_available", lambda: True)
-    monkeypatch.setattr(utils.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(utils.dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(utils.dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(infer_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(infer_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(infer_utils.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(infer_utils.dist, "all_gather", fake_all_gather)
 
     gathered = gather_context_parallel_logits(
         logits,
@@ -496,9 +507,8 @@ def test_tensor_parallel_logits_gather_rejects_uneven_vocab_shards(monkeypatch):
     Description: Uneven vocab shard sizes cannot be gathered with all_gather.
     Expectation: A clear ValueError is raised before tensor all_gather.
     """
-    import hyper_parallel.infer.utils as utils
-
     def fake_all_gather(output_tensors, tensor, group=None):
+        """Report uneven local vocab shard sizes."""
         del group
         if tensor.numel() == 1:
             output_tensors[0].fill_(tensor.item())
@@ -507,10 +517,10 @@ def test_tensor_parallel_logits_gather_rejects_uneven_vocab_shards(monkeypatch):
         raise AssertionError("tensor all_gather should not run for uneven shards")
 
     logits = torch.zeros(1, 3)
-    monkeypatch.setattr(utils.dist, "is_available", lambda: True)
-    monkeypatch.setattr(utils.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(utils.dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(utils.dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(infer_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(infer_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(infer_utils.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(infer_utils.dist, "all_gather", fake_all_gather)
 
     with pytest.raises(ValueError, match="equal local vocab shard sizes"):
         gather_tensor_parallel_logits(
@@ -525,10 +535,9 @@ def test_generate_greedy_uses_gathered_tensor_parallel_logits(monkeypatch):
     Description: Vocab-sharded logits are gathered before selecting next tokens.
     Expectation: Greedy can select a token from a later gathered vocab shard.
     """
-    import hyper_parallel.infer.utils as utils
-
     class ShardedLogitsLM(CacheLengthLM):
         def forward(self, *args, **kwargs):
+            """Return a local vocab shard whose global winner is on rank 1."""
             output = super().forward(*args, **kwargs)
             logits = output["logits"].new_full(output["logits"].shape[:-1] + (4,), -1000)
             logits[:, -1, 1] = 1.0
@@ -536,6 +545,7 @@ def test_generate_greedy_uses_gathered_tensor_parallel_logits(monkeypatch):
             return output
 
     def fake_all_gather(output_tensors, tensor, group=None):
+        """Gather shard-size probes and fake tensor-parallel logits."""
         del group
         if tensor.numel() == 1:
             output_tensors[0].copy_(tensor)
@@ -546,10 +556,10 @@ def test_generate_greedy_uses_gathered_tensor_parallel_logits(monkeypatch):
         shard[:, 2] = 1000
         output_tensors[1].copy_(shard)
 
-    monkeypatch.setattr(utils.dist, "is_available", lambda: True)
-    monkeypatch.setattr(utils.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(utils.dist, "get_world_size", lambda group=None: 2)
-    monkeypatch.setattr(utils.dist, "all_gather", fake_all_gather)
+    monkeypatch.setattr(infer_utils.dist, "is_available", lambda: True)
+    monkeypatch.setattr(infer_utils.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(infer_utils.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(infer_utils.dist, "all_gather", fake_all_gather)
 
     out = generate(
         ShardedLogitsLM(vocab_size=8),
@@ -616,7 +626,7 @@ def test_generate_mixin_with_project_qwen3_5_model():
         mrope_section=[2, 1, 1],
         layer_types=["full_attention"],
     )
-    model = MixinQwen3_5ForCausalLM(config)
+    model = MixinQwen35ForCausalLM(config)
     input_ids = torch.tensor([[1, 2, 3]])
 
     out = model.generate(
@@ -687,7 +697,7 @@ def test_generate_mixin_with_project_qwen3_5_moe_model():
         moe_intermediate_size=8,
         shared_expert_intermediate_size=8,
     )
-    model = MixinQwen3_5MoeForCausalLM(config)
+    model = MixinQwen35MoeForCausalLM(config)
     input_ids = torch.tensor([[1, 2, 3]])
 
     out = model.generate(
