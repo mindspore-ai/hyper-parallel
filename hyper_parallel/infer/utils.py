@@ -51,6 +51,18 @@ class GenerationConfig:
     stopping_criteria: Optional[List[Callable]] = None
 
     def __post_init__(self):
+        self._validate_sampling()
+        self._validate_prefix()
+        self._validate_context_parallel()
+        if self.logits_gather_dim >= 0:
+            raise ValueError("logits_gather_dim must be negative")
+        if self.mask_dtype is not None and not isinstance(self.mask_dtype, torch.dtype):
+            raise ValueError("mask_dtype must be a torch.dtype")
+        self._validate_callables(self.logits_processor, "logits_processor")
+        self._validate_callables(self.stopping_criteria, "stopping_criteria")
+
+    def _validate_sampling(self) -> None:
+        """Validate scalar sampling and stopping options."""
         if self.max_new_tokens < 0:
             raise ValueError("max_new_tokens must be >= 0")
         if self.temperature <= 0:
@@ -61,6 +73,9 @@ class GenerationConfig:
             raise ValueError("top_p must be in (0, 1]")
         if self.repetition_penalty <= 0:
             raise ValueError("repetition_penalty must be > 0")
+
+    def _validate_prefix(self) -> None:
+        """Validate optional prefix cache metadata."""
         if self.prefix_past_key_values is None:
             if self.prefix_attention_mask is not None:
                 raise ValueError("prefix_attention_mask requires prefix_past_key_values")
@@ -75,6 +90,9 @@ class GenerationConfig:
                 raise ValueError("prefix_cache_length must be >= 0")
             if self.prefix_sequence_shard_info is not None and not self.context_parallel_cache:
                 raise ValueError("prefix_sequence_shard_info requires context_parallel_cache=True")
+
+    def _validate_context_parallel(self) -> None:
+        """Validate context-parallel cache and logits metadata."""
         if self.context_parallel_cache and not self.use_cache:
             raise ValueError("context_parallel_cache requires use_cache=True")
         if (self.context_parallel_rank is None) != (self.context_parallel_world_size is None):
@@ -89,12 +107,6 @@ class GenerationConfig:
                 or self.context_parallel_rank >= self.context_parallel_world_size
             ):
                 raise ValueError("context_parallel_rank must be in [0, context_parallel_world_size)")
-        if self.logits_gather_dim >= 0:
-            raise ValueError("logits_gather_dim must be negative")
-        if self.mask_dtype is not None and not isinstance(self.mask_dtype, torch.dtype):
-            raise ValueError("mask_dtype must be a torch.dtype")
-        self._validate_callables(self.logits_processor, "logits_processor")
-        self._validate_callables(self.stopping_criteria, "stopping_criteria")
 
     @staticmethod
     def _validate_callables(values: Optional[List[Callable]], field_name: str) -> None:

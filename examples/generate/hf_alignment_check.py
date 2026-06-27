@@ -113,16 +113,16 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def _validate_args(args) -> None:
     if args.max_new_tokens <= 0:
         raise ValueError("max-new-tokens must be positive")
     if args.logits_compare_steps < 0:
         raise ValueError("logits-compare-steps must be >= 0")
 
+
+def _load_model_and_tokenizer(args, device):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    device = _resolve_device(args.device)
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
         trust_remote_code=args.trust_remote_code,
@@ -132,56 +132,66 @@ def main():
         trust_remote_code=args.trust_remote_code,
     ).to(device)
     model.eval()
-    adapter = HFGenerateAdapter(model)
+    return model, tokenizer, HFGenerateAdapter(model)
 
-    encoded = tokenizer(args.prompt, return_tensors="pt")
-    input_ids = encoded["input_ids"].to(device)
-    pad_token_id = tokenizer.pad_token_id
-    if pad_token_id is None:
-        pad_token_id = tokenizer.eos_token_id or 0
-    eos_token_id = tokenizer.eos_token_id
 
-    with torch.no_grad():
-        hf_output = model.generate(
-            input_ids=input_ids,
+def _run_alignment(args, model, adapter, tokenizer, input_ids, pad_token_id, eos_token_id):
+    hf_output = model.generate(
+        input_ids=input_ids,
+        max_new_tokens=args.max_new_tokens,
+        do_sample=False,
+        use_cache=True,
+        pad_token_id=pad_token_id,
+        eos_token_id=eos_token_id,
+    )
+    hyper_cache_output = generate(
+        adapter,
+        input_ids,
+        GenerationConfig(
             max_new_tokens=args.max_new_tokens,
             do_sample=False,
-            use_cache=True,
-            pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
-        )
-        hyper_cache_output = generate(
-            adapter,
-            input_ids,
-            GenerationConfig(
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                eos_token_id=eos_token_id,
-                pad_token_id=pad_token_id,
-                use_cache=True,
-            ),
-        )
-        hyper_no_cache_output = generate(
-            adapter,
-            input_ids,
-            GenerationConfig(
-                max_new_tokens=args.max_new_tokens,
-                do_sample=False,
-                eos_token_id=eos_token_id,
-                pad_token_id=pad_token_id,
-                use_cache=False,
-            ),
-        )
-        generated_ids = hyper_cache_output[:, input_ids.shape[1]:]
-        logits_cosine = _compare_cache_no_cache_logits(
-            model,
-            input_ids,
-            generated_ids,
-            args.logits_compare_steps,
-        )
+            pad_token_id=pad_token_id,
+            use_cache=True,
+        ),
+    )
+    hyper_no_cache_output = generate(
+        adapter,
+        input_ids,
+        GenerationConfig(
+            max_new_tokens=args.max_new_tokens,
+            do_sample=False,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            use_cache=False,
+        ),
+    )
+    generated_ids = hyper_cache_output[:, input_ids.shape[1]:]
+    logits_cosine = _compare_cache_no_cache_logits(
+        model,
+        input_ids,
+        generated_ids,
+        args.logits_compare_steps,
+    )
+    return hf_output, hyper_cache_output, hyper_no_cache_output, logits_cosine
 
+
+def _build_result(
+    args,
+    tokenizer,
+    input_ids,
+    outputs,
+    logits_cosine,
+    device,
+):
+    hf_output, hyper_cache_output, hyper_no_cache_output = outputs
+    generated_ids = hyper_cache_output[:, input_ids.shape[1]:]
     logits_cosine_min = min(logits_cosine) if logits_cosine else None
-    result = {
+    logits_cosine_pass = (
+        logits_cosine_min is None
+        or logits_cosine_min >= args.logits_cosine_threshold
+    )
+    return {
         "model": args.model,
         "prompt": args.prompt,
         "device": str(device),
@@ -190,10 +200,7 @@ def main():
         "logits_cosine_similarity": logits_cosine,
         "logits_cosine_min": logits_cosine_min,
         "logits_cosine_threshold": args.logits_cosine_threshold,
-        "logits_cosine_pass": (
-            logits_cosine_min is None
-            or logits_cosine_min >= args.logits_cosine_threshold
-        ),
+        "logits_cosine_pass": logits_cosine_pass,
         "hf_text": tokenizer.decode(hf_output[0], skip_special_tokens=True),
         "hyper_cache_text": tokenizer.decode(hyper_cache_output[0], skip_special_tokens=True),
         "hyper_no_cache_text": tokenizer.decode(hyper_no_cache_output[0], skip_special_tokens=True),
@@ -211,10 +218,9 @@ def main():
         "hyper_cache_ids": hyper_cache_output[0].detach().cpu().tolist(),
         "hyper_no_cache_ids": hyper_no_cache_output[0].detach().cpu().tolist(),
     }
-    text = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
-    print(text)
-    if args.output:
-        Path(args.output).write_text(text + "\n", encoding="utf-8")
+
+
+def _check_result(result) -> None:
     if result["generated_new_tokens"] <= 0:
         raise AssertionError("model did not generate new tokens")
     if not result["hf_vs_hyper_cache_ids_match"]:
@@ -223,6 +229,30 @@ def main():
         raise AssertionError("hyper generate cache and no-cache outputs differ")
     if not result["logits_cosine_pass"]:
         raise AssertionError("cache/no-cache logits cosine similarity is below threshold")
+
+
+def main():
+    args = parse_args()
+    _validate_args(args)
+    device = _resolve_device(args.device)
+    model, tokenizer, adapter = _load_model_and_tokenizer(args, device)
+    encoded = tokenizer(args.prompt, return_tensors="pt")
+    input_ids = encoded["input_ids"].to(device)
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id or 0
+    eos_token_id = tokenizer.eos_token_id
+
+    with torch.no_grad():
+        outputs = _run_alignment(
+            args, model, adapter, tokenizer, input_ids, pad_token_id, eos_token_id,
+        )
+    result = _build_result(args, tokenizer, input_ids, outputs[:3], outputs[3], device)
+    text = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+    print(text)
+    if args.output:
+        Path(args.output).write_text(text + "\n", encoding="utf-8")
+    _check_result(result)
 
 
 if __name__ == "__main__":

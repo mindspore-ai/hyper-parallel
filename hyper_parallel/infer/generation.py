@@ -352,6 +352,224 @@ def _finalize_sequences(
     return output
 
 
+def _validate_generate_inputs(
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+) -> None:
+    if input_ids.ndim != 2:
+        raise ValueError("input_ids must have shape (batch, seq)")
+    if attention_mask is not None and attention_mask.shape != input_ids.shape:
+        raise ValueError("attention_mask must match input_ids shape")
+    if attention_mask is not None and torch.any(attention_mask.long().sum(dim=-1) == 0):
+        raise ValueError("attention_mask rows must contain at least one valid token")
+
+
+def _finalize_zero_new_tokens(
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    config: GenerationConfig,
+) -> torch.Tensor:
+    prompt_lengths = _prompt_lengths(input_ids, attention_mask)
+    generated_counts = torch.zeros(
+        input_ids.size(0),
+        device=input_ids.device,
+        dtype=torch.long,
+    )
+    return _finalize_sequences(
+        input_ids.clone(),
+        initial_attention_mask=attention_mask,
+        prompt_lengths=prompt_lengths,
+        generated_counts=generated_counts,
+        pad_token_id=config.pad_token_id,
+    )
+
+
+def _prepare_generation_context(
+    model,
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    config: GenerationConfig,
+):
+    mask_dtype = _resolve_mask_dtype(model, config)
+    sequences = input_ids.clone()
+    prefix_attention_mask, prefix_len = _prepare_prefix_attention_mask(
+        config,
+        input_ids,
+        input_ids.device,
+    )
+    current_attention_mask = attention_mask.clone() if attention_mask is not None else None
+    if prefix_attention_mask is not None and current_attention_mask is None:
+        current_attention_mask = torch.ones_like(sequences, dtype=torch.long)
+    prompt_lengths = _prompt_lengths(input_ids, current_attention_mask)
+    prefix_valid_lengths = (
+        prefix_attention_mask.long().sum(dim=-1)
+        if prefix_attention_mask is not None
+        else torch.zeros(input_ids.size(0), device=input_ids.device, dtype=torch.long)
+    )
+    cache, prefix_len = _init_cache_with_prefix(config)
+    return {
+        "mask_dtype": mask_dtype,
+        "sequences": sequences,
+        "prefix_attention_mask": prefix_attention_mask,
+        "current_attention_mask": current_attention_mask,
+        "initial_attention_mask": (
+            current_attention_mask.clone()
+            if current_attention_mask is not None
+            else None
+        ),
+        "prompt_lengths": prompt_lengths,
+        "generated_counts": torch.zeros(
+            input_ids.size(0), device=input_ids.device, dtype=torch.long,
+        ),
+        "unfinished": torch.ones(
+            input_ids.size(0), device=input_ids.device, dtype=torch.bool,
+        ),
+        "prefix_valid_lengths": prefix_valid_lengths,
+        "cache": cache,
+        "prefix_len": prefix_len,
+    }
+
+
+def _prefill(
+    model,
+    config: GenerationConfig,
+    context: dict,
+):
+    position_ids = _build_prefill_position_ids(
+        context["sequences"],
+        context["current_attention_mask"],
+        context["prefix_attention_mask"],
+    )
+    attention_mask = _build_prefill_mask(
+        context["sequences"],
+        context["current_attention_mask"],
+        context["prefix_attention_mask"],
+        dtype=context["mask_dtype"],
+    )
+    cache = context["cache"]
+    return _model_forward(
+        model,
+        input_ids=context["sequences"],
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        past_key_values=None if cache.is_empty else cache.past_key_values,
+        use_cache=config.use_cache,
+        sequence_shard_info=_cache_shard_info(cache),
+        global_seq_len=context["prefix_len"] + context["sequences"].shape[-1],
+    )
+
+
+def _required_logits(outputs) -> torch.Tensor:
+    logits = _get_output(outputs, "logits")
+    if logits is None:
+        raise ValueError("model output must contain logits")
+    return logits
+
+
+def _finalize_prefill_outputs(
+    config: GenerationConfig,
+    context: dict,
+    outputs,
+) -> tuple[torch.Tensor, bool]:
+    logits = _required_logits(outputs)
+    if (
+        config.prefix_past_key_values is not None
+        and _get_output(outputs, "past_key_values") is None
+    ):
+        raise ValueError("prefix_past_key_values requires model to return past_key_values")
+    _update_cache(context["cache"], outputs)
+    return logits, config.use_cache and not context["cache"].is_empty
+
+
+def _append_next_token(context: dict, next_tokens: torch.Tensor, config: GenerationConfig):
+    if config.eos_token_id is not None:
+        next_tokens = torch.where(
+            context["unfinished"].view(-1, 1),
+            next_tokens,
+            torch.full_like(next_tokens, config.pad_token_id),
+        )
+    context["sequences"] = torch.cat([context["sequences"], next_tokens], dim=-1)
+    context["generated_counts"] = (
+        context["generated_counts"] + context["unfinished"].long()
+    )
+    context["current_attention_mask"] = append_attention_mask(
+        context["current_attention_mask"],
+        next_tokens,
+    )
+    if config.eos_token_id is not None:
+        context["unfinished"] = (
+            context["unfinished"] & (next_tokens.squeeze(-1) != config.eos_token_id)
+        )
+    return next_tokens
+
+
+def _should_finish_generation(
+    context: dict,
+    logits: torch.Tensor,
+    config: GenerationConfig,
+    step: int,
+) -> bool:
+    if config.eos_token_id is not None and not context["unfinished"].any():
+        return True
+    if should_stop_generation(context["sequences"], logits, config):
+        return True
+    return step == config.max_new_tokens - 1
+
+
+def _decode(
+    model,
+    config: GenerationConfig,
+    context: dict,
+    next_tokens: torch.Tensor,
+    use_cached_decode: bool,
+):
+    model_attention_mask = _combined_attention_mask(
+        context["prefix_attention_mask"],
+        context["current_attention_mask"],
+    )
+    if use_cached_decode:
+        decode_pos = (
+            context["prefix_valid_lengths"]
+            + context["prompt_lengths"]
+            + context["generated_counts"]
+            - 1
+        )
+        return _model_forward(
+            model,
+            input_ids=next_tokens,
+            position_ids=decode_pos.view(-1, 1),
+            attention_mask=_build_decode_key_mask(
+                model_attention_mask,
+                context["mask_dtype"],
+            ),
+            past_key_values=context["cache"].past_key_values,
+            use_cache=True,
+            sequence_shard_info=_cache_shard_info(context["cache"]),
+            global_seq_len=context["prefix_len"] + context["sequences"].shape[-1],
+        )
+    decode_pos = _build_prefill_position_ids(
+        context["sequences"],
+        context["current_attention_mask"],
+        context["prefix_attention_mask"],
+    )
+    decode_mask = _build_prefill_mask(
+        context["sequences"],
+        context["current_attention_mask"],
+        context["prefix_attention_mask"],
+        dtype=context["mask_dtype"],
+    )
+    return _model_forward(
+        model,
+        input_ids=context["sequences"],
+        position_ids=decode_pos,
+        attention_mask=decode_mask,
+        past_key_values=None,
+        use_cache=False,
+        sequence_shard_info=_cache_shard_info(context["cache"]),
+        global_seq_len=context["prefix_len"] + context["sequences"].shape[-1],
+    )
+
+
 @torch.no_grad()
 def generate(
     model,
@@ -363,167 +581,44 @@ def generate(
     """Generate token ids from a causal language model."""
     if kwargs:
         raise TypeError(f"Unexpected generate kwargs: {sorted(kwargs)}")
-    if input_ids.ndim != 2:
-        raise ValueError("input_ids must have shape (batch, seq)")
     config = generation_config or GenerationConfig()
-    if attention_mask is not None and attention_mask.shape != input_ids.shape:
-        raise ValueError("attention_mask must match input_ids shape")
-    if attention_mask is not None and torch.any(attention_mask.long().sum(dim=-1) == 0):
-        raise ValueError("attention_mask rows must contain at least one valid token")
+    _validate_generate_inputs(input_ids, attention_mask)
     if config.max_new_tokens == 0:
-        prompt_lengths = _prompt_lengths(input_ids, attention_mask)
-        generated_counts = torch.zeros(
-            input_ids.size(0),
-            device=input_ids.device,
-            dtype=torch.long,
-        )
-        return _finalize_sequences(
-            input_ids.clone(),
-            initial_attention_mask=attention_mask,
-            prompt_lengths=prompt_lengths,
-            generated_counts=generated_counts,
-            pad_token_id=config.pad_token_id,
-        )
+        return _finalize_zero_new_tokens(input_ids, attention_mask, config)
 
     was_training = getattr(model, "training", False)
     model.eval()
     try:
-        mask_dtype = _resolve_mask_dtype(model, config)
-        sequences = input_ids.clone()
-        prefix_attention_mask, prefix_len = _prepare_prefix_attention_mask(
+        context = _prepare_generation_context(model, input_ids, attention_mask, config)
+        outputs = _prefill(model, config, context)
+        logits, use_cached_decode = _finalize_prefill_outputs(
             config,
-            input_ids,
-            input_ids.device,
+            context,
+            outputs,
         )
-        current_attention_mask = attention_mask.clone() if attention_mask is not None else None
-        if prefix_attention_mask is not None and current_attention_mask is None:
-            current_attention_mask = torch.ones_like(sequences, dtype=torch.long)
-        initial_attention_mask = (
-            current_attention_mask.clone()
-            if current_attention_mask is not None
-            else None
-        )
-        prompt_lengths = _prompt_lengths(input_ids, current_attention_mask)
-        generated_counts = torch.zeros(
-            input_ids.size(0), device=input_ids.device, dtype=torch.long,
-        )
-        unfinished = torch.ones(
-            input_ids.size(0), device=input_ids.device, dtype=torch.bool,
-        )
-
-        prefix_valid_lengths = (
-            prefix_attention_mask.long().sum(dim=-1)
-            if prefix_attention_mask is not None
-            else torch.zeros(input_ids.size(0), device=input_ids.device, dtype=torch.long)
-        )
-        cache, prefix_len = _init_cache_with_prefix(config)
-        position_ids = _build_prefill_position_ids(
-            sequences,
-            current_attention_mask,
-            prefix_attention_mask,
-        )
-        prefill_mask = _build_prefill_mask(
-            sequences,
-            current_attention_mask,
-            prefix_attention_mask,
-            dtype=mask_dtype,
-        )
-        outputs = _model_forward(
-            model,
-            input_ids=sequences,
-            position_ids=position_ids,
-            attention_mask=prefill_mask,
-            past_key_values=None if cache.is_empty else cache.past_key_values,
-            use_cache=config.use_cache,
-            sequence_shard_info=_cache_shard_info(cache),
-            global_seq_len=prefix_len + sequences.shape[-1],
-        )
-        logits = _get_output(outputs, "logits")
-        if logits is None:
-            raise ValueError("model output must contain logits")
-        if (
-            config.prefix_past_key_values is not None
-            and _get_output(outputs, "past_key_values") is None
-        ):
-            raise ValueError("prefix_past_key_values requires model to return past_key_values")
-        _update_cache(cache, outputs)
-        use_cached_decode = config.use_cache and not cache.is_empty
 
         for step in range(config.max_new_tokens):
             next_logits = prepare_logits_for_sampling(logits[:, -1, :], config)
-            next_logits = apply_logits_processors(sequences, next_logits, config)
-            next_tokens = sample_next_token(next_logits, sequences, config)
-            if config.eos_token_id is not None:
-                next_tokens = torch.where(
-                    unfinished.view(-1, 1),
-                    next_tokens,
-                    torch.full_like(next_tokens, config.pad_token_id),
-                )
-            sequences = torch.cat([sequences, next_tokens], dim=-1)
-            generated_counts = generated_counts + unfinished.long()
-            current_attention_mask = append_attention_mask(
-                current_attention_mask,
-                next_tokens,
+            next_logits = apply_logits_processors(
+                context["sequences"],
+                next_logits,
+                config,
             )
-            model_attention_mask = _combined_attention_mask(
-                prefix_attention_mask,
-                current_attention_mask,
-            )
-            if config.eos_token_id is not None:
-                unfinished = unfinished & (next_tokens.squeeze(-1) != config.eos_token_id)
-                if not unfinished.any():
-                    break
-            if should_stop_generation(sequences, next_logits, config):
-                break
-            if step == config.max_new_tokens - 1:
+            next_tokens = sample_next_token(next_logits, context["sequences"], config)
+            next_tokens = _append_next_token(context, next_tokens, config)
+            if _should_finish_generation(context, next_logits, config, step):
                 break
 
+            outputs = _decode(model, config, context, next_tokens, use_cached_decode)
             if use_cached_decode:
-                decode_input = next_tokens
-                decode_pos = prefix_valid_lengths + prompt_lengths + generated_counts - 1
-                decode_mask = _build_decode_key_mask(model_attention_mask, mask_dtype)
-                outputs = _model_forward(
-                    model,
-                    input_ids=decode_input,
-                    position_ids=decode_pos.view(-1, 1),
-                    attention_mask=decode_mask,
-                    past_key_values=cache.past_key_values,
-                    use_cache=True,
-                    sequence_shard_info=_cache_shard_info(cache),
-                    global_seq_len=prefix_len + sequences.shape[-1],
-                )
-                _update_cache(cache, outputs)
-            else:
-                decode_pos = _build_prefill_position_ids(
-                    sequences,
-                    current_attention_mask,
-                    prefix_attention_mask,
-                )
-                decode_mask = _build_prefill_mask(
-                    sequences,
-                    current_attention_mask,
-                    prefix_attention_mask,
-                    dtype=mask_dtype,
-                )
-                outputs = _model_forward(
-                    model,
-                    input_ids=sequences,
-                    position_ids=decode_pos,
-                    attention_mask=decode_mask,
-                    past_key_values=None,
-                    use_cache=False,
-                    sequence_shard_info=_cache_shard_info(cache),
-                    global_seq_len=prefix_len + sequences.shape[-1],
-                )
-            logits = _get_output(outputs, "logits")
-            if logits is None:
-                raise ValueError("model output must contain logits")
+                _update_cache(context["cache"], outputs)
+            logits = _required_logits(outputs)
 
         return _finalize_sequences(
-            sequences,
-            initial_attention_mask=initial_attention_mask,
-            prompt_lengths=prompt_lengths,
-            generated_counts=generated_counts,
+            context["sequences"],
+            initial_attention_mask=context["initial_attention_mask"],
+            prompt_lengths=context["prompt_lengths"],
+            generated_counts=context["generated_counts"],
             pad_token_id=config.pad_token_id,
         )
     finally:
