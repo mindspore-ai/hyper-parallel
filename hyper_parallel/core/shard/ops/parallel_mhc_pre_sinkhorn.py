@@ -26,6 +26,19 @@ _HC_MULT_DEFAULT = 4
 _NUM_ITERS_DEFAULT = 20
 _HC_EPS_DEFAULT = 1e-6
 _NORM_EPS_DEFAULT = 1e-6
+_MHC_PRE_CLAMP_ARG_NAMES = (
+    "x", "phi", "alpha", "bias", "hc_mult", "num_iters",
+    "hc_eps", "norm_eps", "out_flag", "clamp_min", "clamp_max",
+)
+_MHC_PRE_CLAMP_DEFAULTS = {
+    "hc_mult": _HC_MULT_DEFAULT,
+    "num_iters": _NUM_ITERS_DEFAULT,
+    "hc_eps": _HC_EPS_DEFAULT,
+    "norm_eps": _NORM_EPS_DEFAULT,
+    "out_flag": True,
+    "clamp_min": 0.0,
+    "clamp_max": 0.0,
+}
 
 
 def _normalize_mhc_pre_sinkhorn_args(
@@ -60,24 +73,25 @@ def _normalize_mhc_pre_sinkhorn_args(
     ), {}
 
 
-def _normalize_mhc_pre_clamp_sinkhorn_args(
-        x,
-        phi,
-        alpha,
-        bias,
-        hc_mult=_HC_MULT_DEFAULT,
-        num_iters=_NUM_ITERS_DEFAULT,
-        hc_eps=_HC_EPS_DEFAULT,
-        norm_eps=_NORM_EPS_DEFAULT,
-        out_flag=True,
-        clamp_min=0.0,
-        clamp_max=0.0):
+def _normalize_mhc_pre_clamp_sinkhorn_args(*args, **kwargs):
     """Normalize npu_mhc_pre_clamp_sinkhorn arguments."""
-    return (
-        x, phi, alpha, bias,
-        hc_mult, num_iters, hc_eps, norm_eps, out_flag,
-        clamp_min, clamp_max,
-    ), {}
+    values = dict(_MHC_PRE_CLAMP_DEFAULTS)
+    if len(args) > len(_MHC_PRE_CLAMP_ARG_NAMES):
+        raise TypeError(
+            f"npu_mhc_pre_clamp_sinkhorn expected at most {len(_MHC_PRE_CLAMP_ARG_NAMES)} arguments"
+        )
+    for name, value in zip(_MHC_PRE_CLAMP_ARG_NAMES, args):
+        values[name] = value
+    for name, value in kwargs.items():
+        if name not in _MHC_PRE_CLAMP_ARG_NAMES:
+            raise TypeError(f"npu_mhc_pre_clamp_sinkhorn got an unexpected keyword argument '{name}'")
+        if name in _MHC_PRE_CLAMP_ARG_NAMES[:len(args)]:
+            raise TypeError(f"npu_mhc_pre_clamp_sinkhorn got multiple values for argument '{name}'")
+        values[name] = value
+    missing = [name for name in _MHC_PRE_CLAMP_ARG_NAMES[:4] if name not in values]
+    if missing:
+        raise TypeError(f"npu_mhc_pre_clamp_sinkhorn missing required arguments: {missing}")
+    return tuple(values[name] for name in _MHC_PRE_CLAMP_ARG_NAMES), {}
 
 
 # Validation rules table for npu_mhc_pre_sinkhorn
@@ -197,8 +211,9 @@ class NpuMhcPreSinkhornDistributedOp(DistributedOp):
         ]
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
-        x_layout, phi_layout, alpha_layout, bias_layout = cache_values
+    def infer_layout(self, layouts: list, extra_args=None) -> Tuple[tuple, None]:
+        del extra_args
+        x_layout, phi_layout, alpha_layout, bias_layout = layouts
 
         self._check_partial_inputs([x_layout, phi_layout, alpha_layout, bias_layout])
 
@@ -277,8 +292,9 @@ class NpuMhcPreClampSinkhornDistributedOp(DistributedOp):
         ]
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
-        x_layout, phi_layout, alpha_layout, bias_layout = cache_values
+    def infer_layout(self, layouts: list, extra_args=None) -> Tuple[tuple, None]:
+        del extra_args
+        x_layout, phi_layout, alpha_layout, bias_layout = layouts
 
         self._check_partial_inputs([x_layout, phi_layout, alpha_layout, bias_layout])
         _validate_input_layouts_mhc_pre_sinkhorn(

@@ -65,6 +65,7 @@ class TorchCustomOps:
 
     @staticmethod
     def npu_mhc_pre_clamp_sinkhorn(*args, **kwargs):
+        """Clamped NPU MHC pre-Sinkhorn operator; not supported on PyTorch."""
         raise NotImplementedError(
             "npu_mhc_pre_clamp_sinkhorn is not supported on the PyTorch platform."
         )
