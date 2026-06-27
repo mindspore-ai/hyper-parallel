@@ -24,6 +24,106 @@ platform = get_platform()
 Tensor = platform.Tensor
 
 
+def _process_custom_shard_inputs(args, in_placements, redistribute_inputs, device_mesh):
+    """Process input arguments for custom_shard, redistributing DTensors as needed.
+
+    Args:
+        args: Positional arguments to the wrapped function.
+        in_placements: Expected placements for each input (None entries = non-tensor).
+        redistribute_inputs: Whether to redistribute inputs to required placements.
+        device_mesh: Device mesh for redistribution.
+
+    Returns:
+        tuple: (local_args, contain_distributed_arg, args_layout_queue)
+
+    Raises:
+        RuntimeError: If a DTensor arg is found but in_placements is None.
+        TypeError: If a DTensor arg has None in_placements entry, or a non-DTensor
+                   arg has a non-None in_placements entry.
+    """
+    local_args = []
+    contain_distributed_arg = False
+    args_layout = queue.Queue(len(args))
+
+    for i, arg in enumerate(args):
+        if isinstance(arg, DTensor):
+            if in_placements is None:
+                raise RuntimeError("Found Tensor input but in_placements is None")
+
+            required_in_placement = in_placements[i]
+            if required_in_placement is None:
+                raise TypeError(
+                    f"Tensor input at position {i} requires Placement, "
+                    "but corresponding in_placements entry is None!"
+                )
+
+            if redistribute_inputs:
+                arg = arg.redistribute(device_mesh, required_in_placement)
+
+            args_layout.put(arg.layout)
+            local_tensor = arg.to_local()
+            local_args.append(local_tensor)
+            contain_distributed_arg = True
+        else:
+            if in_placements is not None and in_placements[i] is not None:
+                raise TypeError(
+                    f"Non-DTensor input at position {i} requires None in_placements, "
+                    f"but received {in_placements[i]}!"
+                )
+            local_args.append(arg)
+
+    return local_args, contain_distributed_arg, args_layout
+
+
+def _wrap_custom_shard_outputs(out, out_placements, contain_distributed_arg, device_mesh):
+    """Wrap output tensors as DTensors using the specified placements.
+
+    Args:
+        out: Raw output(s) from the wrapped function.
+        out_placements: Placements for each output tensor.
+        contain_distributed_arg: Whether any input was a DTensor.
+        device_mesh: Device mesh for DTensor construction.
+
+    Returns:
+        DTensor or tuple of DTensors, or the raw output if no distributed args.
+
+    Raises:
+        TypeError: If a tensor output has None out_placements, or a non-tensor
+                   output has non-None out_placements.
+        ValueError: If output count doesn't match out_placements count.
+    """
+    if not contain_distributed_arg:
+        return out
+
+    out_is_tuple = isinstance(out, tuple)
+    out_tuple = (out,) if not out_is_tuple else out
+
+    if len(out_tuple) != len(out_placements):
+        raise ValueError(
+            f"Output count {len(out_tuple)} does not match "
+            f"out_placements count {len(out_placements)}!"
+        )
+
+    dist_output = []
+    for item, out_placement in zip(out_tuple, out_placements):
+        if isinstance(item, Tensor):
+            if out_placement is None:
+                raise TypeError(
+                    "Tensor output requires non-None out_placements!"
+                )
+            dist_output.append(
+                DTensor.from_local(item, device_mesh=device_mesh, placements=out_placement)
+            )
+        else:
+            if out_placement is not None:
+                raise TypeError(
+                    f"Non-tensor output requires None out_placements, got {out_placement}!"
+                )
+            dist_output.append(item)
+
+    return dist_output[0] if not out_is_tuple else tuple(dist_output)
+
+
 def custom_shard(
         func: Callable,
         device_mesh: DeviceMesh,
@@ -63,69 +163,10 @@ def custom_shard(
                     f"the number of input args {len(args)}!"
                 )
 
-        local_args = []
-        contain_distributed_arg = False
-
-        args_layout = queue.Queue(len(args))
-        for i, arg in enumerate(args):
-            if isinstance(arg, DTensor):
-                if in_placements is None:
-                    raise RuntimeError("Found Tensor input but in_placements is None")
-
-                required_in_placement = in_placements[i]
-                if required_in_placement is None:
-                    raise TypeError(
-                        f"Tensor input at position {i} requires Placement, "
-                        "but corresponding in_placements entry is None!"
-                    )
-
-                if redistribute_inputs:
-                    arg = arg.redistribute(device_mesh, required_in_placement)
-
-                args_layout.put(arg.layout)
-                local_tensor = arg.to_local()
-                local_args.append(local_tensor)
-                contain_distributed_arg = True
-
-            else:
-                if in_placements is not None and in_placements[i] is not None:
-                    raise TypeError(
-                        f"Non-DTensor input at position {i} requires None in_placements, "
-                        f"but received {in_placements[i]}!"
-                    )
-                local_args.append(arg)
-
+        local_args, contain_distributed_arg, _ = _process_custom_shard_inputs(
+            args, in_placements, redistribute_inputs, device_mesh
+        )
         out = func(*local_args, **kwargs)
-
-        if not contain_distributed_arg:
-            return out
-
-        out_is_tuple = isinstance(out, tuple)
-        out_tuple = (out,) if not out_is_tuple else out
-
-        if len(out_tuple) != len(out_placements):
-            raise ValueError(
-                f"Output count {len(out_tuple)} does not match "
-                f"out_placements count {len(out_placements)}!"
-            )
-
-        dist_output = []
-        for item, out_placement in zip(out_tuple, out_placements):
-            if isinstance(item, Tensor):
-                if out_placement is None:
-                    raise TypeError(
-                        "Tensor output requires non-None out_placements!"
-                    )
-                dist_output.append(
-                    DTensor.from_local(item, device_mesh=device_mesh, placements=out_placement)
-                )
-            else:
-                if out_placement is not None:
-                    raise TypeError(
-                        f"Non-tensor output requires None out_placements, got {out_placement}!"
-                    )
-                dist_output.append(item)
-
-        return dist_output[0] if not out_is_tuple else tuple(dist_output)
+        return _wrap_custom_shard_outputs(out, out_placements, contain_distributed_arg, device_mesh)
 
     return wrapped

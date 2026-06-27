@@ -318,8 +318,11 @@ class RedistributionOperatorInfer:
         if not isinstance(out_dim, tuple):
             return False
 
-        if ((not isinstance(in_dim, tuple) and in_dim == out_dim[0]) or
-                (isinstance(in_dim, tuple) and in_dim == out_dim[:len(in_dim)])):
+        in_dim_matches_out_prefix = (
+            (not isinstance(in_dim, tuple) and in_dim == out_dim[0]) or
+            (isinstance(in_dim, tuple) and in_dim == out_dim[:len(in_dim)])
+        )
+        if in_dim_matches_out_prefix:
 
             if isinstance(in_dim, tuple):
                 out_dim_rest = out_dim[-1] if len(out_dim[len(in_dim):]) == 1 else out_dim[len(in_dim):]

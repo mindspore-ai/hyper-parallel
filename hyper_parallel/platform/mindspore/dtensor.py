@@ -139,9 +139,7 @@ class DTensorBase(Tensor):
         obj.__dict__.update(filtered_dict)
         return obj
 
-    # pylint: disable=W0211
-    # pylint: disable=W0102
-    # pylint: disable=C0415
+    # pylint: disable=W0211, W0102, C0415, G.NAM.05
     def __fallback__(self, func, args={}, kwargs=None):
         if kwargs is None:
             kwargs = {}

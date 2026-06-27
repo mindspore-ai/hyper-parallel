@@ -168,7 +168,8 @@ class LayoutCacheManager:
         """
         return self.layout_cache
 
-    def distributed_op(self, op_name: str) -> Any:
+    @staticmethod
+    def distributed_op(op_name: str) -> Any:
         """
         Get the distributed operation implementation by name.
 
