@@ -366,12 +366,24 @@ def generate(
     if input_ids.ndim != 2:
         raise ValueError("input_ids must have shape (batch, seq)")
     config = generation_config or GenerationConfig()
-    if config.max_new_tokens == 0:
-        return input_ids.clone()
     if attention_mask is not None and attention_mask.shape != input_ids.shape:
         raise ValueError("attention_mask must match input_ids shape")
     if attention_mask is not None and torch.any(attention_mask.long().sum(dim=-1) == 0):
         raise ValueError("attention_mask rows must contain at least one valid token")
+    if config.max_new_tokens == 0:
+        prompt_lengths = _prompt_lengths(input_ids, attention_mask)
+        generated_counts = torch.zeros(
+            input_ids.size(0),
+            device=input_ids.device,
+            dtype=torch.long,
+        )
+        return _finalize_sequences(
+            input_ids.clone(),
+            initial_attention_mask=attention_mask,
+            prompt_lengths=prompt_lengths,
+            generated_counts=generated_counts,
+            pad_token_id=config.pad_token_id,
+        )
 
     was_training = getattr(model, "training", False)
     model.eval()

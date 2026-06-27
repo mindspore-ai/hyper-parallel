@@ -310,6 +310,26 @@ def test_generate_batch_left_padding():
     assert out.tolist() == [[4, 5, 4, 5, 0, 0], [7, 8, 9, 10, 4, 5]]
 
 
+def test_generate_zero_new_tokens_strips_left_padding():
+    """
+    Feature: zero-token generation
+    Description: Left-padded prompts are finalized even when no new token is generated.
+    Expectation: Output is stripped and right-padded consistently with decode output.
+    """
+    model = NoCacheLengthLM(vocab_size=32)
+    input_ids = torch.tensor([[0, 0, 4, 5], [7, 8, 9, 10]])
+    attention_mask = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+
+    out = generate(
+        model,
+        input_ids,
+        GenerationConfig(max_new_tokens=0, eos_token_id=None, pad_token_id=0),
+        attention_mask=attention_mask,
+    )
+
+    assert out.tolist() == [[4, 5, 0, 0], [7, 8, 9, 10]]
+
+
 def test_generate_top_k_seeded_output_is_valid():
     """
     Feature: top-k generation
