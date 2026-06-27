@@ -84,6 +84,20 @@ def _group_loss_for_logging(local_loss_sum: torch.Tensor, cp_num_items: torch.Te
     return group_loss_sum / torch.clamp(cp_num_items.to(group_loss_sum.device), min=1)
 
 
+def _should_use_original_loss(
+    logits,
+    labels,
+    shift_labels: Optional[torch.Tensor],
+    cp_size: int,
+) -> bool:
+    """Return whether inputs should fall back to the original loss implementation."""
+    if shift_labels is not None or cp_size <= 1:
+        return True
+    if not isinstance(logits, torch.Tensor) or not isinstance(labels, torch.Tensor):
+        return True
+    return logits.dim() < 3 or labels.dim() < 2
+
+
 def _wrap_loss_function(original_loss_function, cp_rank: int, cp_size: int, cp_group=None):
     """Patch only token alignment/normalization before delegating to the original loss."""
 
@@ -97,14 +111,7 @@ def _wrap_loss_function(original_loss_function, cp_rank: int, cp_size: int, cp_g
         shift_labels: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        if (
-            shift_labels is not None
-            or cp_size <= 1
-            or not isinstance(logits, torch.Tensor)
-            or not isinstance(labels, torch.Tensor)
-            or logits.dim() < 3
-            or labels.dim() < 2
-        ):
+        if _should_use_original_loss(logits, labels, shift_labels, cp_size):
             return original_loss_function(
                 logits=logits,
                 labels=labels,
