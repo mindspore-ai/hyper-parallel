@@ -150,6 +150,11 @@ class Platform:
         )
 
     @staticmethod
+    def get_swap_optimizer():
+        """Return the active backend's optimizer-state swap wrapper class."""
+        raise NotImplementedError("Platform subclasses must implement get_swap_optimizer")
+
+    @staticmethod
     def get_rank():
         """Get the rank of the current process in the default process group.
 

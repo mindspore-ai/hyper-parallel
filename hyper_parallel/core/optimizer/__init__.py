@@ -24,24 +24,37 @@ from torch import nn
 import hyper_parallel.core.optimizer.utils  # noqa: F401 - install rank0 logging helpers on logging.Logger
 
 from hyper_parallel.core.optimizer.adamw import AdamW
-from hyper_parallel.core.optimizer.lr_scheduler import get_hyper_lr_scheduler
+from hyper_parallel.core.optimizer.lr_scheduler import get_hyper_lr_scheduler as _get_hyper_lr_scheduler
 from hyper_parallel.core.optimizer.muon import Muon
 from hyper_parallel.core.optimizer.optimizer import ChainedOptimizer
 from hyper_parallel.core.optimizer.dtensor_compat import detect_dtensor_backend
+from hyper_parallel.core.optimizer.swap_optimizer import SwapOptimizer, SwapOptimizerConfig, swap_optimizer
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-__all__ = ['get_hyper_optimizer', 'get_hyper_lr_scheduler']
+__all__ = [
+    'SwapOptimizer',
+    'SwapOptimizerConfig',
+    'get_hyper_optimizer',
+    'get_hyper_lr_scheduler',
+    'swap_optimizer',
+]
+
+
+def get_hyper_lr_scheduler(*args: Any, **kwargs: Any) -> Any:
+    """Create the HyperParallel LR scheduler."""
+    return _get_hyper_lr_scheduler(*args, **kwargs)
 
 
 def get_hyper_optimizer(
-        model: nn.Module,
+        model: Any,
         muon_params: List[Dict[str, Any]],
         adamw_params: List[Dict[str, Any]],
         muon_kwargs: Optional[Dict[str, Any]] = None,
         adamw_kwargs: Optional[Dict[str, Any]] = None,
-) -> ChainedOptimizer:
+) -> Any:
     """Create a chained Muon + AdamW optimizer.
 
     Args:

@@ -758,6 +758,14 @@ class MindSporePlatform(Platform):
             self._custom_ops_cls = MindSporeCustomOps
         return self._custom_ops_cls
 
+    @staticmethod
+    def get_swap_optimizer():
+        """Return the MindSpore optimizer-state swap wrapper class."""
+        from hyper_parallel.platform.mindspore.swap_optimizer.swap_optimizer import (  # pylint: disable=import-outside-toplevel
+            get_swap_optimizer,
+        )
+        return get_swap_optimizer()
+
     def __init__(self):
         # Ensure MindSpore ``nn.Cell.to_empty`` is patched as soon as the
         # MindSpore platform instance is created.

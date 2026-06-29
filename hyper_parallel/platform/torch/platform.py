@@ -462,6 +462,14 @@ class TorchPlatform(Platform):
         return self._custom_ops_cls
 
     @staticmethod
+    def get_swap_optimizer():
+        """Return the Torch optimizer-state swap wrapper class."""
+        from hyper_parallel.platform.torch.swap_optimizer.swap_optimizer import (  # pylint: disable=import-outside-toplevel
+            get_swap_optimizer,
+        )
+        return get_swap_optimizer()
+
+    @staticmethod
     def is_linear_module(module) -> bool:
         """Check whether *module* is a ``torch.nn.Linear`` instance."""
         return isinstance(module, nn.Linear)
