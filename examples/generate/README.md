@@ -1,8 +1,9 @@
 # Generate example
 
 This directory contains a minimal validation path for
-`hyper_parallel.infer`. The example covers greedy/top-k generation,
-KV-cache decode, no-cache fallback, and a small performance baseline script.
+`hyper_parallel.infer`. The example covers greedy/top-k/top-p generation,
+KV-cache decode, no-cache fallback, HuggingFace alignment, and a small
+performance baseline script.
 
 ## Functional tests
 
@@ -13,7 +14,7 @@ python -m pytest tests/torch/generate -q
 Expected result:
 
 ```text
-33 passed
+44 passed
 ```
 
 ## Python API
@@ -52,6 +53,7 @@ Run a small deterministic baseline:
 
 ```bash
 python examples/generate/benchmark_generate.py \
+  --device npu \
   --batch-size 4 \
   --prompt-len 32 \
   --max-new-tokens 64 \
@@ -90,6 +92,52 @@ Example output fields:
 ```
 
 Use the same command and hardware when comparing future generate changes.
+
+## HuggingFace alignment
+
+Run a real causal-LM alignment check with a local HuggingFace model:
+
+```bash
+export MODEL_PATH=/data/models/Qwen3-4B-Instruct-2507
+
+python examples/generate/hf_alignment_check.py \
+  --model "$MODEL_PATH" \
+  --prompt "用一段话简单介绍Mindspore。" \
+  --max-new-tokens 128 \
+  --logits-compare-steps 128 \
+  --device npu \
+  --trust-remote-code \
+  --output /tmp/generate_hf_alignment_128.json
+```
+
+The helper runs HuggingFace greedy `model.generate(...)`,
+`hyper_parallel.infer.generate(..., use_cache=True)`, and
+`hyper_parallel.infer.generate(..., use_cache=False)` on the same prompt. It
+fails if:
+
+- HuggingFace ids and HyperParallel cache ids differ;
+- HyperParallel cache and no-cache ids differ;
+- cache/no-cache decode logits cosine similarity falls below the configured
+  threshold.
+
+The output JSON should contain the following validation fields:
+
+```json
+{
+  "prompt": "用一段话简单介绍Mindspore。",
+  "generated_new_tokens": 128,
+  "hf_vs_hyper_cache_ids_match": true,
+  "hyper_cache_vs_no_cache_ids_match": true,
+  "logits_compare_steps": 128,
+  "logits_cosine_min": 0.9996622800827026,
+  "logits_cosine_pass": true,
+  "logits_cosine_threshold": 0.999
+}
+```
+
+The same JSON also includes decoded `hf_text`, `hyper_cache_text`, and
+`hyper_no_cache_text` fields, which can be inspected to confirm the generated
+text for the prompt.
 
 ## Project model smoke
 
