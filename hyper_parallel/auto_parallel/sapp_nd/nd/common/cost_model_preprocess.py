@@ -224,8 +224,10 @@ class CostModelConfig(PartitionGenerator):
         ):
             self.__maybe_set_int(target_ccfg, attr, value)
         target_ccfg.sp = target_ccfg.t
-        if op and isinstance(op, int):
+        if op is not None and isinstance(op, int):
             target_ccfg.os_max_shard = op
+            # Sync has_op with os_max_shard: op<=1 means no optimizer sharding
+            target_ccfg.has_op = op > 1
         target_ccfg.gbs = target_ccfg.b * target_ccfg.d * target_ccfg.m
         logger.debug(
             "in ccfg: DP = %d, TP = %d, EP = %d, CP = %d, "

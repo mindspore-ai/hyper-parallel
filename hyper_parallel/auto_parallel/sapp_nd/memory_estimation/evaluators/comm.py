@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
@@ -29,14 +30,8 @@ class EvalLayerComm:
     @staticmethod
     def dp_comm_non_exp(ccfg: CostModelConfig, ctx: Context) -> float:
         """DP/OP comm for non-expert parameters"""
-        non_exp, _ = ctx.eval.num_p(ccfg, ctx)
+        non_exp, _, _ = ctx.eval.num_p(ccfg, ctx)
         dp_comm_non_exp = 0
-        # Level 0-1-2 :
-        # Either GradAR
-        # Or GradRS + ParamAG
-        # Level 3
-        # GradRS + FWD ParamAG + BWD ParamAG
-
         # Non expert ZeRO LvL 2
         if ccfg.comm_d_non_exp == 2:
             dp_comm_non_exp += non_exp / (ccfg.cp * ccfg.t)
@@ -49,14 +44,11 @@ class EvalLayerComm:
     @staticmethod
     def dp_comm_exp(ccfg: CostModelConfig, ctx: Context) -> float:
         """DP/OP comm for expert parameters"""
-        _, exp_param_size = ctx.eval.num_p(ccfg, ctx)
+        _, routed, shared = ctx.eval.num_p(ccfg, ctx)
+        exp_param_size = routed + shared
+        if exp_param_size == 0:
+            return 0
         dp_comm_exp = 0
-        # Level 0-1-2 :
-        # Either GradAR
-        # Or GradRS + ParamAG
-        # Level 3
-        # GradRS + FWD ParamAG + BWD ParamAG
-
         # Expert ZeRO LvL 2
         if ccfg.comm_d_exp == 2:
             dp_comm_exp += exp_param_size / (ccfg.cp * ccfg.t_exp * ccfg.ep)
@@ -71,19 +63,15 @@ class EvalLayerComm:
         """DP/OP comm sum"""
         non_exp = EvalLayerComm.dp_comm_non_exp(ccfg, ctx)
         exp = EvalLayerComm.dp_comm_exp(ccfg, ctx)
-        # Log purpose
         return non_exp + exp
 
     @staticmethod
     def tp_comm_non_exp(ccfg: CostModelConfig, ctx: Context, mb: int) -> float:
         """TP comm for non-expert parameters"""
-        # 0.5 gather for Attn/FFn
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
         tp_comm_non_exp = 0.25 * ccfg.n_gather
         tp_comm_non_exp *= ccfg.s * ccfg.b * ccfg.h * mb
         if ccfg.n_exp > 1:
-            # Analysis from IRs and peak CSVs:
-            # Parameters quantity estimation approach
             tp_comm_non_exp = (
                 0.25
                 * ccfg.n_gather
@@ -103,21 +91,20 @@ class EvalLayerComm:
     @staticmethod
     def tp_comm_exp(ccfg: CostModelConfig, ctx: Context, mb: int) -> float:
         """TP comm for expert parameters"""
-        # 0.5 for FWD gather only
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
         tp_comm_exp = 0.25 * ccfg.n_gather
         tp_comm_exp *= ccfg.s * ccfg.b * ccfg.hff * mb
         if ccfg.n_exp > 1:
-            # Analysis from IRs and peak CSVs:
-            # Parameters quantity estimation approach
+            # Routed experts use hff_exp, shared experts use hff
+            routed_comm = ccfg.n_exp / ccfg.ep * ccfg.hff_exp
+            shared_comm = ccfg.n_shared_exp * ccfg.hff
             tp_comm_exp = (
                 0.25
                 * ccfg.n_gather
                 * ccfg.h
-                * ccfg.hff
                 * ccfg.bytes_compute
                 * ccfg.n_ffMM
-                * (ccfg.n_exp / ccfg.ep + ccfg.n_shared_exp)
+                * (routed_comm + shared_comm)
             )
         res = (
             EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.gather)
@@ -130,7 +117,6 @@ class EvalLayerComm:
     @staticmethod
     def tp_comm_layer(ccfg: CostModelConfig, ctx: Context, mb: int) -> float:
         """TP comm sum"""
-        # Log purpose
         non_exp = EvalLayerComm.tp_comm_non_exp(ccfg, ctx, mb)
         exp = EvalLayerComm.tp_comm_exp(ccfg, ctx, mb)
         return non_exp + exp
@@ -141,10 +127,8 @@ class EvalLayerComm:
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
         rec_factor = EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.gather) * int(
             ccfg.p == 1
-        )  # [HYPOTHESIS]
+        )
         if ccfg.cp_algo in ["colossalai_cp", "hybird_cp"]:
-            # FW Ring P2P + BW Ring P2P
-            # KV transfers, can be recomputed
             return (
                 ccfg.comm_cp
                 * 2
@@ -154,7 +138,6 @@ class EvalLayerComm:
                 / (ccfg.t)
             )
         if ccfg.cp_algo == "ulysses_cp":
-            # FW + BW All2Alls
             return (
                 ccfg.comm_cp
                 * 2
@@ -169,8 +152,6 @@ class EvalLayerComm:
     def cp_comm_exp(ccfg: CostModelConfig, _) -> float:
         """CP comm for expert parameters"""
         if ccfg.cp_algo in ["colossalai_cp", "hybird_cp", "ulysses_cp"]:
-            # FW Ring P2P + BW Ring P2P
-            # or FW + BW All2Alls
             res = ccfg.comm_cp * 2 * ccfg.s * ccfg.b * ccfg.n_ffMM * ccfg.hff
             return res / ccfg.t
         return 0
@@ -183,14 +164,72 @@ class EvalLayerComm:
         return non_exp + exp
 
     @staticmethod
-    def ep_comm_layer(ccfg: CostModelConfig, _, mb: int) -> float:
-        """EP comm"""
-        # [HYPOTHESIS]
-        a2a = (
-            ccfg.comm_ep
-            * (mb * (ccfg.n_chosen_exp) * ccfg.s * ccfg.b * ccfg.h)
-            / (ccfg.cp * ccfg.t)
-        )
-        # print("a2a",a2a,ccfg.comm_ep)
-        res = a2a * 2
-        return res
+    def ep_comm_layer_balanced(
+        ccfg: CostModelConfig, ctx: Context, mb: int  # pylint: disable=unused-argument
+    ) -> float:
+        """EP comm for balanced token distribution (byte volume).
+
+        Uses (ep-1)/ep correction: only (ep-1)/ep fraction of local tokens
+        actually cross rank boundaries in an all-to-all dispatch/combine pair.
+        Result is in bytes (like TP activation comm), unlike CP/DP which are
+        in element counts (parameter comm).
+        """
+        if ccfg.ep <= 1 or ccfg.comm_ep == 0:
+            return 0
+        t_local = mb * ccfg.n_chosen_exp * ccfg.s * ccfg.b / ccfg.cp
+        t_cross = t_local * (ccfg.ep - 1) / ccfg.ep
+        return t_cross * ccfg.h * ccfg.bytes_compute * 2 * ccfg.comm_ep
+
+    @staticmethod
+    def ep_comm_layer_imbalanced(
+        ccfg: CostModelConfig, ctx: Context, mb: int
+    ) -> float:
+        """EP comm for imbalanced (skewed) token distribution (byte volume).
+
+        Uses max(rank_tokens) to bound communication volume.
+        Normalized with (ep-1)/ep cross-rank factor and mb scaling,
+        so it reduces to balanced when token distribution is uniform.
+        Falls back to balanced when tokens_per_expert is empty
+        or n_exp not divisible by ep.
+
+        tokens_per_expert: global per-expert token count per microbatch
+            (all EP ranks combined, before all-to-all dispatch; None = balanced).
+            Under uniform distribution, each rank's share equals
+            n_chosen_exp * s * b / (cp * t), matching t_local in the balanced formula.
+
+        Result is in bytes (like TP activation comm), unlike CP/DP which are
+        in element counts (parameter comm).
+        """
+        if ccfg.ep <= 1 or ccfg.comm_ep == 0:
+            return 0
+        tokens = ccfg.tokens_per_expert
+        if not tokens:
+            return EvalLayerComm.ep_comm_layer_balanced(ccfg, ctx, mb)
+        if ccfg.n_exp % ccfg.ep != 0:
+            logger.warning(
+                "n_exp=%d not divisible by ep=%d, falling back to balanced",
+                ccfg.n_exp,
+                ccfg.ep,
+            )
+            return EvalLayerComm.ep_comm_layer_balanced(ccfg, ctx, mb)
+        experts_per_rank = ccfg.n_exp // ccfg.ep
+        rank_tokens = []
+        for r in range(ccfg.ep):
+            rank_sum = sum(
+                tokens[r * experts_per_rank + i] for i in range(experts_per_rank)
+            )
+            rank_tokens.append(rank_sum)
+        max_inbound = max(rank_tokens)
+        # max_inbound: per-rank inbound tokens for one microbatch
+        # multiply by mb for the full pipeline stage, by (ep-1)/ep for cross-rank fraction
+        t_cross = max_inbound * mb * (ccfg.ep - 1) / ccfg.ep
+        return t_cross * ccfg.h * ccfg.bytes_compute * 2 * ccfg.comm_ep
+
+    @staticmethod
+    def ep_comm_layer(ccfg: CostModelConfig, ctx: Context, mb: int) -> float:
+        """EP comm dispatcher: balanced or imbalanced based on tokens_per_expert."""
+        if ccfg.ep <= 1 or ccfg.comm_ep == 0:
+            return 0
+        if ccfg.tokens_per_expert is not None:
+            return EvalLayerComm.ep_comm_layer_imbalanced(ccfg, ctx, mb)
+        return EvalLayerComm.ep_comm_layer_balanced(ccfg, ctx, mb)

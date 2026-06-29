@@ -93,6 +93,7 @@ class _CostModVar:
     n_shared_exp: float = 0
     cap_fact: float = 0
     etp: float = 0
+    tokens_per_expert: list = None  # global per-expert token count per microbatch (all EP ranks combined, before all-to-all); None = balanced
 
     # ZeRO
     shard_p_os_non_exp_partial: float = 0
@@ -101,6 +102,7 @@ class _CostModVar:
     shard_p_os_exp_partial: float = 0
     shard_p_os_exp: float = 0
     shard_grad_exp: float = 0
+    shard_grad_exp_partial: float = 0
 
     # comm flag
     comm_d_non_exp: float = 0

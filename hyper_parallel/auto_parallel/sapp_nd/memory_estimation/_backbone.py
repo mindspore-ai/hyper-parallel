@@ -145,6 +145,21 @@ class _Backbone:
             grad = self._ctx.eval.stat.grad(self._ccfg, self._ctx)
             res = p + ost + grad
             self._ctx.save2log("_param", res)
+            # Log routed/shared expert param breakdown for MoE layers
+            if self._ccfg.n_exp > 1 and self.is_regular_layer(self._ctx.current_node):
+                result = self._ctx.eval.num_p(self._ccfg, self._ctx)
+                if isinstance(result, tuple) and len(result) == 3:
+                    _, routed_exp_p, shared_exp_p = result
+                    routed_exp_mem = (
+                        routed_exp_p / self._ccfg.ep
+                        * self._ccfg.bytes_p / self._ccfg.shard_p_os_exp
+                    )
+                    shared_exp_mem = (
+                        shared_exp_p
+                        * self._ccfg.bytes_p / self._ccfg.shard_p_os_exp_partial
+                    )
+                    self._ctx.save2log("routed_exp_param", routed_exp_mem)
+                    self._ctx.save2log("shared_exp_param", shared_exp_mem)
             return p + ost + grad
         return 0
 
@@ -181,6 +196,8 @@ class _Backbone:
             }
             comm_mem = {}
             for k, fun in vars(comm_eval_field).items():
+                if fun is None:
+                    continue
                 sig_param = inspect.signature(fun).parameters.values()
                 if (
                     # any(

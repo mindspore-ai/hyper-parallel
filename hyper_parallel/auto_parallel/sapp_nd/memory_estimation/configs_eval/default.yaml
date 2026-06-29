@@ -41,6 +41,8 @@ nodes_mem_comp :
             dp : dp_comm_layer
             tp : tp_comm_layer
             ep : ep_comm_layer
+            ep_balanced : ep_comm_layer_balanced
+            ep_imbalanced : ep_comm_layer_imbalanced
             cp : cp_comm_layer
     -
       name : SEL_REC_LAYER
@@ -67,8 +69,10 @@ base_arch_mem_comp :
     qkv : attn_qkv_activations
     score : attn_score_activations
     proj : attn_proj_activations
-  feedforward : 
+  feedforward :
     num_param_fun : num_params_ffn
+    routed_num_fun : num_params_routed_expert
+    shared_num_fun : num_params_shared_expert
     activation : ffn_activations
     moe_activ : ffn_moe_activations
   norm : 

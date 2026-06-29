@@ -30,75 +30,63 @@ class EvalBody:
     @staticmethod
     def num_params_layer(
         ccfg: CostModelConfig, ctx: Context
-    ) -> Tuple[float, float]:
-        """Parameters count"""
-        return (
-            ctx.attn_num_p(ccfg, ctx) + ctx.norm_num_p(ccfg, ctx),
-            ctx.ffn_num_p(ccfg, ctx),
-        )
+    ) -> Tuple[float, float, float]:
+        """Parameters count.
+
+        Returns a 3-tuple (non_exp, routed, shared):
+          - non_exp: attention + norm params (and dense FFN if n_exp==1)
+          - routed:  routed expert params (0 if n_exp==1)
+          - shared:  shared expert params  (0 if n_shared_exp==0 or no pointer)
+        """
+        non_exp = ctx.attn_num_p(ccfg, ctx) + ctx.norm_num_p(ccfg, ctx)
+        routed = 0.0
+        shared = 0.0
+        if ccfg.n_exp == 1:
+            non_exp += ctx.ffn_num_p(ccfg, ctx)
+        else:
+            if ctx.ffn_routed_num_p is not None:
+                routed = ctx.ffn_routed_num_p(ccfg, ctx)
+            if ctx.ffn_shared_num_p is not None:
+                shared = ctx.ffn_shared_num_p(ccfg, ctx)
+        return (non_exp, routed, shared)
 
     @staticmethod
     def stat_p_layer(ccfg: CostModelConfig, ctx: Context) -> float:
         """model param"""
-        non_exp_p, exp_p = ctx.eval.num_p(ccfg, ctx)
-        # Expert
-        # Partial DP for shared exp, Full DP for routed exp
-        b_p_exp = (
-            ccfg.n_exp
-            / (ccfg.n_exp + ccfg.n_shared_exp)
-            * ccfg.bytes_p
-            / ccfg.shard_p_os_exp
-            + ccfg.n_shared_exp
-            / (ccfg.n_exp + ccfg.n_shared_exp)
-            * ccfg.bytes_p
-            / ccfg.shard_p_os_exp_partial
-        )
+        non_exp_p, routed_p, shared_p = ctx.eval.num_p(ccfg, ctx)
+        # Routed experts: EP sharding
+        routed_mem = routed_p / ccfg.ep * ccfg.bytes_p / ccfg.shard_p_os_exp
+        # Shared experts: partial DP sharding
+        shared_mem = shared_p * ccfg.bytes_p / ccfg.shard_p_os_exp_partial
         # Non expert
-        b_p_non_exp = ccfg.bytes_p / ccfg.shard_p_os_non_exp_partial
-        return exp_p * b_p_exp + non_exp_p * b_p_non_exp
+        non_exp_mem = non_exp_p * ccfg.bytes_p / ccfg.shard_p_os_non_exp_partial
+        return non_exp_mem + routed_mem + shared_mem
 
     @staticmethod
     def stat_os_layer(ccfg: CostModelConfig, ctx: Context) -> float:
         """optim state"""
         if ctx.swap_os:
             return 0
-        non_exp_p, exp_p = ctx.eval.num_p(ccfg, ctx)
-        # Expert
-        # Partial DP for shared exp, Full DP for routed exp
-        b_os_exp = (
-            ccfg.n_exp
-            / (ccfg.n_exp + ccfg.n_shared_exp)
-            * 2
-            * ccfg.bytes_os
-            / ccfg.shard_p_os_exp
-            + ccfg.n_shared_exp
-            / (ccfg.n_exp + ccfg.n_shared_exp)
-            * 2
-            * ccfg.bytes_os
-            / ccfg.shard_p_os_exp_partial
-        )
+        non_exp_p, routed_p, shared_p = ctx.eval.num_p(ccfg, ctx)
+        # Routed experts
+        routed_mem = routed_p / ccfg.ep * 2 * ccfg.bytes_os / ccfg.shard_p_os_exp
+        # Shared experts
+        shared_mem = shared_p * 2 * ccfg.bytes_os / ccfg.shard_p_os_exp_partial
         # Non expert
-        b_os_non_exp = 2 * ccfg.bytes_os / ccfg.shard_p_os_non_exp_partial
-        return exp_p * b_os_exp + non_exp_p * b_os_non_exp
+        non_exp_mem = non_exp_p * 2 * ccfg.bytes_os / ccfg.shard_p_os_non_exp_partial
+        return non_exp_mem + routed_mem + shared_mem
 
     @staticmethod
     def stat_grad_layer(ccfg: CostModelConfig, ctx: Context) -> float:
         """gradients"""
-        non_exp_p, exp_p = ctx.eval.num_p(ccfg, ctx)
-        # Expert
-        # Partial DP for shared exp, Full DP for routed exp
-        b_grad_exp = (
-            ccfg.n_exp
-            / (ccfg.n_exp + ccfg.n_shared_exp)
-            * ccfg.bytes_grad
-            / ccfg.shard_grad_exp
-            + ccfg.n_shared_exp
-            / (ccfg.n_exp + ccfg.n_shared_exp)
-            * ccfg.bytes_grad
-        )
+        non_exp_p, routed_p, shared_p = ctx.eval.num_p(ccfg, ctx)
+        # Routed experts
+        routed_mem = routed_p / ccfg.ep * ccfg.bytes_grad / ccfg.shard_grad_exp
+        # Shared experts: use shard_grad_exp_partial (independent of os sharding)
+        shared_mem = shared_p * ccfg.bytes_grad / ccfg.shard_grad_exp_partial
         # Non expert
-        b_grad_non_exp = ccfg.bytes_grad / ccfg.shard_grad_non_exp
-        return exp_p * b_grad_exp + non_exp_p * b_grad_non_exp
+        non_exp_mem = non_exp_p * ccfg.bytes_grad / ccfg.shard_grad_non_exp
+        return non_exp_mem + routed_mem + shared_mem
 
     # No recompute and select recompute
 
@@ -136,20 +124,11 @@ class EvalBody:
         ccfg: CostModelConfig, ctx: Context
     ) -> float:
         """special case with gradient clipping"""
-        non_exp_p, exp_p = ctx.eval.num_p(ccfg, ctx)
+        non_exp_p, routed_p, shared_p = ctx.eval.num_p(ccfg, ctx)
         grad_clip_mem = (
-            exp_p
-            * (
-                ccfg.n_exp
-                / (ccfg.n_exp + ccfg.n_shared_exp)
-                * ccfg.bytes_os
-                / ccfg.shard_p_os_exp
-                + ccfg.n_shared_exp
-                / (ccfg.n_exp + ccfg.n_shared_exp)
-                * ccfg.bytes_os
-                / ccfg.shard_p_os_exp_partial
-            )
-            + non_exp_p
+            non_exp_p
+            + routed_p / ccfg.ep * ccfg.bytes_os / ccfg.shard_p_os_exp
+            + shared_p * ccfg.bytes_os / ccfg.shard_p_os_exp_partial
         )
         grad_clip_mem *= ccfg.bytes_os / ccfg.shard_p_os_non_exp_partial
         grad_clip_mem *= int(ccfg.has_clip)

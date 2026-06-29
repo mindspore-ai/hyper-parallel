@@ -168,6 +168,17 @@ class EvalFFn:
         return experts_param_size
 
     @staticmethod
+    def num_params_routed_expert(ccfg: CostModelConfig, _) -> float:
+        """Routed expert parameters count (with ETP correction)"""
+        hff_sliced = ccfg.hff_exp / max(ccfg.etp, 1)
+        return ccfg.n_exp * max(ccfg.n_ffMM, ccfg.n_ffBMM) * (hff_sliced * ccfg.h + hff_sliced)
+
+    @staticmethod
+    def num_params_shared_expert(ccfg: CostModelConfig, _) -> float:
+        """Shared expert parameters count"""
+        return ccfg.n_shared_exp * max(ccfg.n_ffMM, ccfg.n_ffBMM) * (ccfg.hff * ccfg.h + ccfg.hff)
+
+    @staticmethod
     def ffn_activations(ccfg: CostModelConfig, ctx: Context) -> float:
         """ "Activations count"""
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER

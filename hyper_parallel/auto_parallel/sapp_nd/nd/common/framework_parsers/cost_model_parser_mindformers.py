@@ -265,9 +265,12 @@ class CostModelParserMindformers(_CostModelParser):
             raise AttributeError("bytes_compute not positive")
 
         # Optimizer parallel factors
-        self.ccfg.os_max_shard = (
-            self.ccfg.op_weight_shard if self.ccfg.op_weight_shard else (self.ccfg.d * self.ccfg.t)
-        )
+        if self.ccfg.op_weight_shard:
+            self.ccfg.os_max_shard = self.ccfg.op_weight_shard
+        elif self.ccfg.has_op:
+            self.ccfg.os_max_shard = self.ccfg.d * self.ccfg.t
+        else:
+            self.ccfg.os_max_shard = 1
         self.config_optimizer_shard(self.ccfg)
 
         # Other factors
