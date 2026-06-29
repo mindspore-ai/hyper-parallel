@@ -54,11 +54,6 @@ Usage::
     from hyper_parallel.tools.logging import logger
     logger.set_level("FSDP", "DEBUG")
 """
-import logging
-import os
-import sys
-from typing import Dict, Optional, Union
-
 __all__ = [
     "HP_LOG_CONFIG_ENV",
     "configure",
@@ -68,6 +63,11 @@ __all__ = [
     "set_format",
     "set_level",
 ]
+
+import logging
+import os
+import sys
+from typing import Dict, Optional, Union
 
 # Env var that enables/levels components, e.g. "FSDP:INFO,DTensor:DEBUG".
 HP_LOG_CONFIG_ENV = "HP_LOG_CONFIG"
@@ -156,10 +156,11 @@ def _canonical_component(component: str) -> str:
         return canonical
     if component not in _warned_unknown:
         _warned_unknown.add(component)
-        sys.stderr.write(
-            f"[HP][logging] unknown component {component!r}; known components: "
-            f"{', '.join(_KNOWN_COMPONENTS)}. It still works but won't match a "
-            f"registered component -- check for a typo (e.g. 'FDSP' vs 'FSDP').\n"
+        logging.getLogger(__name__).warning(
+            "unknown component %r; known components: %s. It still works but won't "
+            "match a registered component -- check for a typo (e.g. 'FDSP' vs 'FSDP').",
+            component,
+            ", ".join(_KNOWN_COMPONENTS),
         )
     return component
 
@@ -244,7 +245,7 @@ def configure(spec: str) -> None:
     Example: ``configure("FSDP:INFO,DTensor:DEBUG")``.
     """
     for component, level in _parse_config(spec).items():
-        set_level(component, level)
+        _ = set_level(component, level)
 
 
 def set_format(fmt: Optional[str] = None, datefmt: Optional[str] = None) -> None:
