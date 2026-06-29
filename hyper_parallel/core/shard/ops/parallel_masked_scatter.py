@@ -16,13 +16,48 @@
 Distributed implementation for MaskedScatter operator.
 """
 
+from typing import Tuple
+
 from .parallel_ops import DistributedOp
+
+
+def _normalize_masked_scatter_args(input_tensor, mask, source):
+    return (input_tensor, mask, source), {}
 
 
 class MaskedScatterDistributedOp(DistributedOp):
     """Distributed implementation for torch.Tensor.masked_scatter."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for MaskedScatter operator.
+
+        torch.masked_scatter(input, mask, source) takes three positional tensor inputs
+        with no keyword-only parameters.
+
+        Args:
+            args (tuple): Positional arguments (input, mask, source).
+            kwargs (dict): Keyword arguments (none expected).
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, kwargs = _normalize_masked_scatter_args(*args, **kwargs)
+        input_tensor, mask, source = args[0], args[1], args[2]
+        local_args = (
+            input_tensor.to_local(),
+            mask.to_local(),
+            source.to_local(),
+        )
+        local_kwargs = {}
+        cache_values = [
+            input_tensor.layout,
+            mask.layout,
+            source.layout,
+        ]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layout for torch.Tensor.masked_scatter.
 
@@ -41,20 +76,25 @@ class MaskedScatterDistributedOp(DistributedOp):
             Therefore, this implementation enforces that all inputs (input, mask, source)
             must be fully Replicated (Unsharded).
 
+        Rules:
+            1. Inputs must not have Partial status.
+            2. All inputs (input, mask, source) must be fully Replicated — no dimension may be sharded.
+            3. Output layout follows the input layout.
+
         Args:
-            layouts (tuple): Layouts of inputs. Expected:
-                layouts[0] (Layout): Input tensor layout.
-                layouts[1] (Layout): Mask tensor layout.
-                layouts[2] (Layout): Source tensor layout.
-            extra_args (dict): Additional arguments.
+            cache_values (list): [input_layout, mask_layout, source_layout]
 
         Returns:
-            Layout: Output tensor layout (same as input).
+            tuple: ((output_layout,), None)
 
         Raises:
             ValueError: If any input tensor is sharded.
         """
-        # Check partial status via base class
+        input_layout = cache_values[0]
+        mask_layout = cache_values[1]
+        source_layout = cache_values[2]
+
+        layouts = [input_layout, mask_layout, source_layout]
         if not self._allow_partial_inputs:
             self._check_partial_inputs(layouts)
 
@@ -63,17 +103,15 @@ class MaskedScatterDistributedOp(DistributedOp):
             if layout is None:
                 continue
 
-            # Check tensor_map for sharding
-            # -1 indicates un-sharded (Replicated).
-            # Any integer >= 0 or tuple (for interleaved) indicates sharding.
-            for dim_map in layout.tensor_map:
-                if dim_map != -1:
+            # Use alias_tensor_map for sharding checks — it handles StridedShard tuple mappings.
+            # "None" means Replicated; anything else indicates sharding.
+            for dim_alias in layout.alias_tensor_map:
+                if dim_alias != "None":
                     raise ValueError(
-                        f"Operation {self.op_name}: Input {i} (Layout: {layout}) is sharded. "
+                        f"For {self.op_name}, input {i} is sharded (Layout: {layout}). "
                         f"masked_scatter currently only supports fully Replicated (Unsharded) tensors "
                         f"due to sequential dependency on source elements."
                     )
 
         # Output layout follows input layout (which we verified is Replicated/None)
-        # Note: Must return a single Layout object, not a tuple, because the op returns a single Tensor.
-        return layouts[0]
+        return ((input_layout,), None)

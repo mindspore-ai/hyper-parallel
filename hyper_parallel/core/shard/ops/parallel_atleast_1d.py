@@ -16,37 +16,76 @@
 Distributed implementation for atleast_1d operator.
 """
 
+from typing import Tuple
+
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
+
+
+def _normalize_atleast_1d_args(*tensors):
+    return tensors, {}
 
 
 class Atleast1DDistributedOp(DistributedOp):
     """Distributed implementation for torch.atleast_1d."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layout for torch.atleast_1d.
+        Preprocess arguments for atleast_1d operator.
 
-        PyTorch semantics:
-          - If a single tensor is provided, a single tensor is returned.
-          - If multiple tensors are provided, a tuple of tensors is returned.
-          - 0-dimensional tensors are converted to 1-dimensional tensors.
-          - 1-dimensional or higher tensors are preserved.
-
-        Distributed Rule:
-          - If 0D -> 1D: The new dimension is unsharded (-1).
-          - If ND -> ND (N >= 1): The layout remains unchanged.
+        torch.atleast_1d(*tensors) takes a variable number of tensor inputs.
+        All arguments are positional tensors with no keyword-only parameters.
 
         Args:
-            layouts (list or tuple): Layouts of input tensors.
-            extra_args (tuple): Additional arguments (usually empty for atleast_1d).
+            args (tuple): Positional arguments (tensors).
+            kwargs (dict): Keyword arguments (none expected).
 
         Returns:
-            Layout or tuple[Layout]: Output tensor layout(s).
+            tuple: (local_args, local_kwargs, cache_values)
         """
+        args, kwargs = _normalize_atleast_1d_args(*args, **kwargs)
+        tensors = args
+
+        local_args = tuple(
+            t.to_local() if hasattr(t, 'to_local') else t
+            for t in tensors
+        )
+        local_kwargs = {}
+
+        cache_values = [
+            t.layout if hasattr(t, 'layout') else None
+            for t in tensors
+        ]
+
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layouts for atleast_1d operator.
+
+        Rules:
+            1. Inputs must not have Partial status.
+            2. For 0D → 1D: the newly created dimension is unsharded (-1).
+            3. For 1D or higher: the layout is preserved unchanged.
+            4. If a single tensor is provided, a single Layout is returned.
+               If multiple tensors are provided, a tuple of Layouts is returned.
+
+        Args:
+            cache_values (list): List of Layout objects (one per input tensor).
+                None entries represent non-DTensor inputs and produce None outputs.
+
+        Returns:
+            tuple: ((output_layout_or_tuple,), None)
+
+        Raises:
+            ValueError: If no inputs are provided or any input has Partial status.
+        """
+        layouts = cache_values
+
         if not layouts:
             raise ValueError(
-                f"Operation {self.op_name}: atleast_1d requires at least one input tensor layout."
+                f"For {self.op_name}, at least one input tensor is required, "
+                f"but got an empty input list."
             )
 
         # Check partial inputs (atleast_1d does not support partial)
@@ -98,6 +137,6 @@ class Atleast1DDistributedOp(DistributedOp):
         # If there's only one input, return a single Layout.
         # If there are multiple inputs, return a tuple of Layouts.
         if len(output_layouts) == 1:
-            return output_layouts[0]
+            return ((output_layouts[0],), None)
 
-        return tuple(output_layouts)
+        return (tuple(output_layouts), None)

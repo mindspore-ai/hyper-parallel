@@ -18,7 +18,7 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_one_hot_ext import OneHotExtDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -34,11 +34,13 @@ class TestParallelOneHotExt(unittest.TestCase):
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
@@ -55,10 +57,11 @@ class TestParallelOneHotExt(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=("dp", "cp", "mp"))
 
-    def _run_scenario(self, indices_layout, expected_map, extra_args, flag = False):
+    def _run_scenario(self, cache_values, expected_map):
         """Infer layout of OneHotExt operator"""
         op = OneHotExtDistributedOp("OneHotExt")
-        output_layout = op.infer_layout((indices_layout,), extra_args)
+        infer_result = op.infer_layout(cache_values)
+        output_layout = infer_result[0][0]
         assert output_layout.tensor_map == expected_map, (
             f"OneHotExt failed. Expected {expected_map}, got {output_layout.tensor_map}"
         )
@@ -74,9 +77,8 @@ class TestParallelOneHotExt(unittest.TestCase):
         indices_layout = _build_layout(mesh, (Shard(0),), 1)
 
         self._run_scenario(
-            indices_layout,
+            cache_values=[indices_layout, None, None, 32, -1],
             expected_map=(2, -1),
-            extra_args=[32, None, None, -1],
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -90,9 +92,8 @@ class TestParallelOneHotExt(unittest.TestCase):
         indices_layout = _build_layout(mesh, (Shard(0),), 1)
 
         self._run_scenario(
-            indices_layout,
+            cache_values=[indices_layout, None, None, 32, 0],
             expected_map=(-1, 2),
-            extra_args=[32, None, None, 0],
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -106,9 +107,8 @@ class TestParallelOneHotExt(unittest.TestCase):
         indices_layout = _build_layout(mesh, (Shard(0),), 1)
 
         self._run_scenario(
-            indices_layout,
+            cache_values=[indices_layout, None, None, 32, 1],
             expected_map=(2, -1),
-            extra_args=[32, None, None, 1],
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -122,9 +122,8 @@ class TestParallelOneHotExt(unittest.TestCase):
         indices_layout = _build_layout(mesh, (Replicate(),), 1)
 
         self._run_scenario(
-            indices_layout,
+            cache_values=[indices_layout, None, None, 32, -1],
             expected_map=(-1, -1),
-            extra_args=[32, None, None, -1],
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -138,9 +137,8 @@ class TestParallelOneHotExt(unittest.TestCase):
         indices_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
 
         self._run_scenario(
-            indices_layout,
+            cache_values=[indices_layout, None, None, 64, -1],
             expected_map=(2, -1, -1),
-            extra_args=[64, None, None, -1],
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -154,9 +152,8 @@ class TestParallelOneHotExt(unittest.TestCase):
         indices_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 3)
 
         self._run_scenario(
-            indices_layout,
+            cache_values=[indices_layout, None, None, 16, -1],
             expected_map=(2, -1, -1, -1),
-            extra_args=[16, None, None, -1],
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -171,7 +168,7 @@ class TestParallelOneHotExt(unittest.TestCase):
 
         op = OneHotExtDistributedOp("OneHotExt")
         with self.assertRaises(ValueError):
-            _ = op.infer_layout((indices_layout,), [64, None, None, 0])
+            op.infer_layout([indices_layout, None, None, 64, 0])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_one_hot_ext_2d_not_data_parallel_should_raise_8(self, mock_platform):
@@ -185,7 +182,7 @@ class TestParallelOneHotExt(unittest.TestCase):
 
         op = OneHotExtDistributedOp("OneHotExt")
         with self.assertRaises(ValueError):
-            _ = op.infer_layout((indices_layout,), [64, None, None, -1])
+            op.infer_layout([indices_layout, None, None, 64, -1])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_one_hot_ext_axis_out_of_range_should_raise_9(self, mock_platform):
@@ -199,7 +196,7 @@ class TestParallelOneHotExt(unittest.TestCase):
 
         op = OneHotExtDistributedOp("OneHotExt")
         with self.assertRaises(ValueError):
-            _ = op.infer_layout((indices_layout,), [32, None, None, 2])
+            op.infer_layout([indices_layout, None, None, 32, 2])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_one_hot_ext_num_classes_invalid_should_raise_10(self, mock_platform):
@@ -213,7 +210,7 @@ class TestParallelOneHotExt(unittest.TestCase):
 
         op = OneHotExtDistributedOp("OneHotExt")
         with self.assertRaises(ValueError):
-            _ = op.infer_layout((indices_layout,), [-2, None, None, -1])
+            op.infer_layout([indices_layout, None, None, -2, -1])
 
 
 class TestOneHotExtValidationPaths(unittest.TestCase):
@@ -226,10 +223,12 @@ class TestOneHotExtValidationPaths(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, world_size=8):
         mock_platform.get_rank.return_value = 0
@@ -238,19 +237,11 @@ class TestOneHotExtValidationPaths(unittest.TestCase):
             lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
         )
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_infer_layout_empty_layouts_returns_none(self, mock_platform):
-        """Empty layouts tuple returns None without error."""
-        op = OneHotExtDistributedOp("OneHotExt_empty")
-        result = op.infer_layout((), [32, None, None, -1])
-        self.assertIsNone(result)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_infer_layout_none_index_layout_raises(self, mock_platform):
-        """None as indices layout raises ValueError."""
+    def test_infer_layout_none_indices_layout(self):
+        """None as indices layout in cache_values raises ValueError."""
         op = OneHotExtDistributedOp("OneHotExt_none")
         with self.assertRaises(ValueError):
-            op.infer_layout((None,), [32, None, None, -1])
+            op.infer_layout([None, None, None, 32, -1])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_infer_layout_partial_index_layout_raises(self, mock_platform):
@@ -264,8 +255,9 @@ class TestOneHotExtValidationPaths(unittest.TestCase):
         indices_layout.set_partial_by_dev_axis("dp", "sum")
 
         op = OneHotExtDistributedOp("OneHotExt_partial")
+        cache_values = [indices_layout, None, None, 32, -1]
         with self.assertRaises(ValueError):
-            op.infer_layout((indices_layout,), [32, None, None, -1])
+            op.infer_layout(cache_values)
 
     def test_validate_num_classes_non_int_raises_type_error(self):
         """_validate_num_classes with non-int raises TypeError."""
@@ -283,7 +275,8 @@ class TestOneHotExtValidationPaths(unittest.TestCase):
         )
         indices_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 1)
         op = OneHotExtDistributedOp("OneHotExt_no_shard")
-        result = op.get_expand_impl(None, None, (indices_layout,), None)
+        cache_values = [indices_layout, None, None, -1, -1]
+        result = op.get_expand_impl(None, None, cache_values)
         self.assertIsNone(result)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -296,7 +289,8 @@ class TestOneHotExtValidationPaths(unittest.TestCase):
         )
         indices_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 1)
         op = OneHotExtDistributedOp("OneHotExt_sharded")
-        result = op.get_expand_impl(None, None, (indices_layout,), None)
+        cache_values = [indices_layout, None, None, -1, -1]
+        result = op.get_expand_impl(None, None, cache_values)
         self.assertTrue(callable(result))
 
     def test_validate_indices_dtype_non_int64_raises(self):

@@ -13,12 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """parallel_masked_scatter test"""
-import os
 import unittest
 from unittest.mock import patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_masked_scatter import MaskedScatterDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -32,7 +31,7 @@ op = MaskedScatterDistributedOp("masked_scatter")
 
 class TestParallelMaskedScatter(unittest.TestCase):
     """Unit tests for MaskedScatterDistributedOp."""
-    def setUp(self):
+    def setUp(self) -> None:
         """Set up test fixtures before each test method.
 
         Clears global caches to ensure test isolation and initializes
@@ -40,11 +39,13 @@ class TestParallelMaskedScatter(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -77,6 +78,12 @@ class TestParallelMaskedScatter(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=8)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2), mesh_dim_names=mesh_dim_names)
 
+    def _call_infer_layout(self, input_layout, mask_layout, source_layout):
+        """Helper to call infer_layout with cache_values format."""
+        cache_values = [input_layout, mask_layout, source_layout]
+        output_layouts, _ = op.infer_layout(cache_values)
+        return output_layouts[0]
+
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_success(self, mock_platform):
         """
@@ -95,7 +102,7 @@ class TestParallelMaskedScatter(unittest.TestCase):
         source_placements = (Replicate(),)
         source_layout = _build_layout(mesh, source_placements, 1)
 
-        output_layout = op.infer_layout((input_layout, mask_layout, source_layout))
+        output_layout = self._call_infer_layout(input_layout, mask_layout, source_layout)
 
         expected_map = (-1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -104,11 +111,10 @@ class TestParallelMaskedScatter(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (input_layout, mask_layout, source_layout), 
-                                       extra_args=None) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"""got {op.get_expand_impl(None, output_layout, (input_layout, mask_layout, source_layout),
-                                           extra_args=None)}"""
+        cache_values = [input_layout, mask_layout, source_layout]
+        assert op.get_expand_impl(None, ((output_layout,), None), cache_values) is None, (
+            f"get_expand_impl should return None, "
+            f"got {op.get_expand_impl(None, ((output_layout,), None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -126,8 +132,9 @@ class TestParallelMaskedScatter(unittest.TestCase):
         mask_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         source_layout = _build_layout(mesh, (Replicate(),), 1)
 
-        with self.assertRaisesRegex(ValueError, r"(?s)Input 0 .* is sharded"):
-            op.infer_layout((input_layout, mask_layout, source_layout))
+        cache_values = [input_layout, mask_layout, source_layout]
+        with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_fail_sharded_mask(self, mock_platform):
@@ -145,8 +152,9 @@ class TestParallelMaskedScatter(unittest.TestCase):
 
         source_layout = _build_layout(mesh, (Replicate(),), 1)
 
-        with self.assertRaisesRegex(ValueError, r"(?s)Input 1 .* is sharded"):
-            op.infer_layout((input_layout, mask_layout, source_layout))
+        cache_values = [input_layout, mask_layout, source_layout]
+        with self.assertRaisesRegex(ValueError, r"input 1 is sharded"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_fail_sharded_source(self, mock_platform):
@@ -163,8 +171,9 @@ class TestParallelMaskedScatter(unittest.TestCase):
         source_placements = (Shard(0),)
         source_layout = _build_layout(mesh, source_placements, 1)
 
-        with self.assertRaisesRegex(ValueError, r"(?s)Input 2 .* is sharded"):
-            op.infer_layout((input_layout, mask_layout, source_layout))
+        cache_values = [input_layout, mask_layout, source_layout]
+        with self.assertRaisesRegex(ValueError, r"input 2 is sharded"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_success_scalar(self, mock_platform):
@@ -177,9 +186,12 @@ class TestParallelMaskedScatter(unittest.TestCase):
 
         scalar_layout = _build_layout(mesh, (), 0)
 
-        output_layout = op.infer_layout((scalar_layout, scalar_layout, scalar_layout))
+        output_layout = self._call_infer_layout(scalar_layout, scalar_layout, scalar_layout)
 
-        assert output_layout.to_dict()["tensor_map"] == (), "Expected scalar output (empty tensor_map)"
+        assert output_layout.to_dict()["tensor_map"] == (), (
+            f"Expected scalar output (empty tensor_map), got {output_layout.to_dict()['tensor_map']}"
+        )
+        # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_success_high_dim2(self, mock_platform):
@@ -195,10 +207,13 @@ class TestParallelMaskedScatter(unittest.TestCase):
 
         layout_1d = _build_layout(mesh, (Replicate(),), 1)
 
-        output_layout = op.infer_layout((layout_4d, layout_4d, layout_1d))
+        output_layout = self._call_infer_layout(layout_4d, layout_4d, layout_1d)
 
         expected_map = (-1, -1, -1, -1)
-        assert output_layout.to_dict()["tensor_map"] == expected_map
+        assert output_layout.to_dict()["tensor_map"] == expected_map, (
+            f"Expected (-1, -1, -1, -1), got {output_layout.to_dict()['tensor_map']}"
+        )
+        # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_success_mixed_ranks(self, mock_platform):
@@ -212,10 +227,13 @@ class TestParallelMaskedScatter(unittest.TestCase):
         layout_3d = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
         layout_1d = _build_layout(mesh, (Replicate(),), 1)
 
-        output_layout = op.infer_layout((layout_3d, layout_3d, layout_1d))
+        output_layout = self._call_infer_layout(layout_3d, layout_3d, layout_1d)
 
         expected_map = (-1, -1, -1)
-        assert output_layout.to_dict()["tensor_map"] == expected_map
+        assert output_layout.to_dict()["tensor_map"] == expected_map, (
+            f"Expected (-1, -1, -1), got {output_layout.to_dict()['tensor_map']}"
+        )
+        # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_fail_shard_last_dim(self, mock_platform):
@@ -232,8 +250,9 @@ class TestParallelMaskedScatter(unittest.TestCase):
         mask_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         source_layout = _build_layout(mesh, (Replicate(),), 1)
 
-        with self.assertRaisesRegex(ValueError, r"(?s)Input 0 .* is sharded"):
-            op.infer_layout((input_layout, mask_layout, source_layout))
+        cache_values = [input_layout, mask_layout, source_layout]
+        with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_success_1d_mesh(self, mock_platform):
@@ -247,8 +266,11 @@ class TestParallelMaskedScatter(unittest.TestCase):
         layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         source = _build_layout(mesh, (Replicate(),), 1)
 
-        output_layout = op.infer_layout((layout, layout, source))
-        assert output_layout.to_dict()["tensor_map"] == (-1, -1)
+        output_layout = self._call_infer_layout(layout, layout, source)
+        assert output_layout.to_dict()["tensor_map"] == (-1, -1), (
+            f"Expected (-1, -1), got {output_layout.to_dict()['tensor_map']}"
+        )
+        # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_success_3d_mesh(self, mock_platform):
@@ -262,8 +284,11 @@ class TestParallelMaskedScatter(unittest.TestCase):
         layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         source = _build_layout(mesh, (Replicate(),), 1)
 
-        output_layout = op.infer_layout((layout, layout, source))
-        assert output_layout.to_dict()["tensor_map"] == (-1, -1)
+        output_layout = self._call_infer_layout(layout, layout, source)
+        assert output_layout.to_dict()["tensor_map"] == (-1, -1), (
+            f"Expected (-1, -1), got {output_layout.to_dict()['tensor_map']}"
+        )
+        # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_fail_multiple_sharded(self, mock_platform):
@@ -278,27 +303,9 @@ class TestParallelMaskedScatter(unittest.TestCase):
         mask_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
         source_layout = _build_layout(mesh, (Replicate(),), 1)
 
-        with self.assertRaisesRegex(ValueError, r"(?s)Input 0 .* is sharded"):
-            op.infer_layout((input_layout, mask_layout, source_layout))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_masked_scatter_ignore_extra_args(self, mock_platform):
-        """
-        Feature: MaskedScatter ignoring extra args
-        Description: Verify that passing extra arguments doesn't break inference
-        Expectation: Success
-        """
-        mesh = self._make_2x4_mesh(mock_platform)
-
-        layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-        source = _build_layout(mesh, (Replicate(),), 1)
-
-        output_layout = op.infer_layout(
-            (layout, layout, source),
-            extra_args={"some_arg": 123}
-        )
-
-        assert output_layout.to_dict()["tensor_map"] == (-1, -1)
+        cache_values = [input_layout, mask_layout, source_layout]
+        with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_success_scalar_inputs(self, mock_platform):
@@ -311,9 +318,12 @@ class TestParallelMaskedScatter(unittest.TestCase):
 
         scalar_layout = _build_layout(mesh, (), 0)
 
-        output_layout = op.infer_layout((scalar_layout, scalar_layout, scalar_layout))
+        output_layout = self._call_infer_layout(scalar_layout, scalar_layout, scalar_layout)
 
-        assert output_layout.to_dict()["tensor_map"] == ()
+        assert output_layout.to_dict()["tensor_map"] == (), (
+            f"Expected scalar output (empty tensor_map), got {output_layout.to_dict()['tensor_map']}"
+        )
+        # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_success_1d_tensors(self, mock_platform):
@@ -326,9 +336,12 @@ class TestParallelMaskedScatter(unittest.TestCase):
 
         layout_1d = _build_layout(mesh, (Replicate(),), 1)
 
-        output_layout = op.infer_layout((layout_1d, layout_1d, layout_1d))
+        output_layout = self._call_infer_layout(layout_1d, layout_1d, layout_1d)
 
-        assert output_layout.to_dict()["tensor_map"] == (-1,)
+        assert output_layout.to_dict()["tensor_map"] == (-1,), (
+            f"Expected (-1,), got {output_layout.to_dict()['tensor_map']}"
+        )
+        # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_success_source_broadcast(self, mock_platform):
@@ -342,9 +355,12 @@ class TestParallelMaskedScatter(unittest.TestCase):
         layout_3d = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
         layout_source = _build_layout(mesh, (Replicate(),), 1)
 
-        output_layout = op.infer_layout((layout_3d, layout_3d, layout_source))
+        output_layout = self._call_infer_layout(layout_3d, layout_3d, layout_source)
 
-        assert output_layout.to_dict()["tensor_map"] == (-1, -1, -1)
+        assert output_layout.to_dict()["tensor_map"] == (-1, -1, -1), (
+            f"Expected (-1, -1, -1), got {output_layout.to_dict()['tensor_map']}"
+        )
+        # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_success_high_dim(self, mock_platform):
@@ -358,9 +374,12 @@ class TestParallelMaskedScatter(unittest.TestCase):
         placements = (Replicate(),) * 5
         layout_5d = _build_layout(mesh, placements, 5)
 
-        output_layout = op.infer_layout((layout_5d, layout_5d, layout_5d))
+        output_layout = self._call_infer_layout(layout_5d, layout_5d, layout_5d)
 
-        assert output_layout.to_dict()["tensor_map"] == (-1, -1, -1, -1, -1)
+        assert output_layout.to_dict()["tensor_map"] == (-1, -1, -1, -1, -1), (
+            f"Expected (-1, -1, -1, -1, -1), got {output_layout.to_dict()['tensor_map']}"
+        )
+        # No need to verify get_expand_impl here - already verified in test_masked_scatter_success
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_fail_1d_mesh_sharded(self, mock_platform):
@@ -374,8 +393,9 @@ class TestParallelMaskedScatter(unittest.TestCase):
         input_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
         replicated_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
-        with self.assertRaisesRegex(ValueError, r"(?s)Input 0 .* is sharded"):
-            op.infer_layout((input_layout, replicated_layout, replicated_layout))
+        cache_values = [input_layout, replicated_layout, replicated_layout]
+        with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_fail_3d_mesh_sharded_inner(self, mock_platform):
@@ -389,8 +409,9 @@ class TestParallelMaskedScatter(unittest.TestCase):
         input_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
         replicated_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
-        with self.assertRaisesRegex(ValueError, r"(?s)Input 0 .* is sharded"):
-            op.infer_layout((input_layout, replicated_layout, replicated_layout))
+        cache_values = [input_layout, replicated_layout, replicated_layout]
+        with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_fail_last_dim_sharding(self, mock_platform):
@@ -406,8 +427,9 @@ class TestParallelMaskedScatter(unittest.TestCase):
 
         layout_ok = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
-        with self.assertRaisesRegex(ValueError, r"(?s)Input 0 .* is sharded"):
-            op.infer_layout((input_layout, layout_ok, layout_ok))
+        cache_values = [input_layout, layout_ok, layout_ok]
+        with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_fail_sharded_mask_only(self, mock_platform):
@@ -422,8 +444,9 @@ class TestParallelMaskedScatter(unittest.TestCase):
         mask_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
         source_layout = _build_layout(mesh, (Replicate(),), 1)
 
-        with self.assertRaisesRegex(ValueError, r"(?s)Input 1 .* is sharded"):
-            op.infer_layout((input_layout, mask_layout, source_layout))
+        cache_values = [input_layout, mask_layout, source_layout]
+        with self.assertRaisesRegex(ValueError, r"input 1 is sharded"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_masked_scatter_fail_multiple_bad_inputs(self, mock_platform):
@@ -437,27 +460,9 @@ class TestParallelMaskedScatter(unittest.TestCase):
         bad_layout_2d = _build_layout(mesh, (Shard(0), Replicate()), 2)
         bad_layout_1d = _build_layout(mesh, (Shard(0),), 1)
 
-        with self.assertRaisesRegex(ValueError, r"(?s)Input 0 .* is sharded"):
-            op.infer_layout((bad_layout_2d, bad_layout_2d, bad_layout_1d))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_masked_scatter_ignore_extra_args2(self, mock_platform):
-        """
-        Feature: MaskedScatter robustness with extra_args
-        Description: Verify that passing unknown extra arguments does not cause failure.
-        Expectation: Success.
-        """
-        mesh = self._make_2x4_mesh(mock_platform)
-
-        layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-        source = _build_layout(mesh, (Replicate(),), 1)
-
-        output_layout = op.infer_layout(
-            (layout, layout, source),
-            extra_args={"some_flag": True, "value": 100}
-        )
-
-        assert output_layout.to_dict()["tensor_map"] == (-1, -1)
+        cache_values = [bad_layout_2d, bad_layout_2d, bad_layout_1d]
+        with self.assertRaisesRegex(ValueError, r"input 0 is sharded"):
+            op.infer_layout(cache_values)
 
 
 if __name__ == "__main__":

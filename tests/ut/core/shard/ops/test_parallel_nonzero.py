@@ -15,10 +15,10 @@
 """parallel_nonzero test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_nonzero import NonzeroDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -32,7 +32,7 @@ op = NonzeroDistributedOp("nonzero")
 
 class TestParallelNonzero(unittest.TestCase):
     """Unit tests for NonzeroDistributedOp."""
-    def setUp(self):
+    def setUp(self) -> None:
         """Set up test fixtures before each test method.
 
         Clears global caches to ensure test isolation and initializes
@@ -40,11 +40,13 @@ class TestParallelNonzero(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -83,19 +85,30 @@ class TestParallelNonzero(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,))
+        cache_values = [x_layout, False]
+        infer_result = op.infer_layout(cache_values)
+        output_layouts, extra_info = infer_result
+
+        assert extra_info is None, (
+            f"Nonzero extra_info should be None, got {extra_info}"
+        )
+        assert not isinstance(output_layouts, tuple) or len(output_layouts) == 1, (
+            f"Expected a single output layout for as_tuple=False, "
+            f"got {output_layouts}"
+        )
+        output_layout = output_layouts[0]
 
         expected_map = (-1, -1)
-        assert not isinstance(output_layout, tuple)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"Basic nonzero failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+            f"Basic nonzero failed. Expected {expected_map}, "
+            f"got {output_layout.to_dict()['tensor_map']}"
         )
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
-        # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (x_layout,), None) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x_layout,), None)}"
+        # The same applies to other test cases, so it is unnecessary to test its return value.
+        assert op.get_expand_impl(None, infer_result, cache_values) is None, (
+            f"get_expand_impl should return None for {op.op_name}, "
+            f"got {op.get_expand_impl(None, infer_result, cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -110,16 +123,25 @@ class TestParallelNonzero(unittest.TestCase):
         x_placements = (Replicate(), Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layouts = op.infer_layout((x_layout,), extra_args=(True,))
+        cache_values = [x_layout, True]
+        infer_result = op.infer_layout(cache_values)
+        output_layouts, extra_info = infer_result
+
+        assert extra_info is None, (
+            f"Nonzero extra_info should be None, got {extra_info}"
+        )
+        assert isinstance(output_layouts, tuple), (
+            "Expected output to be a tuple of layouts"
+        )
+        assert len(output_layouts) == 3, (
+            f"Expected 3 layouts for a 3D input, got {len(output_layouts)}"
+        )
 
         expected_map = (-1,)
-
-        assert isinstance(output_layouts, tuple), "Expected output to be a tuple of layouts"
-        assert len(output_layouts) == 3, "Expected 3 layouts for a 3D input"
-
         for i, out_layout in enumerate(output_layouts):
             assert out_layout.to_dict()["tensor_map"] == expected_map, (
-                f"Tuple output {i} layout mismatch. Expected {expected_map}, got {out_layout.to_dict()['tensor_map']}"
+                f"Tuple output {i} layout mismatch. Expected {expected_map}, "
+                f"got {out_layout.to_dict()['tensor_map']}"
             )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -135,8 +157,22 @@ class TestParallelNonzero(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
         x_layout._partial = [None] * len(x_layout._partial)
 
-        with self.assertRaisesRegex(ValueError, "input tensor must be fully replicated"):
-            op.infer_layout((x_layout,))
+        cache_values = [x_layout, False]
+        with self.assertRaisesRegex(ValueError, "input tensor should be fully replicated"):
+            op.infer_layout(cache_values)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_nonzero_layout_invalid_none_input(self, mock_platform):
+        """
+        Feature: Nonzero with None input layout
+        Description: Attempt to run nonzero with a None input layout.
+        Expectation: ValueError raised with clear message.
+        """
+        self._make_2x4_mesh(mock_platform)
+
+        cache_values = [None, False]
+        with self.assertRaisesRegex(ValueError, "input_layout should be a valid Layout"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_nonzero_layout_invalid_partial_input(self, mock_platform):
@@ -150,8 +186,74 @@ class TestParallelNonzero(unittest.TestCase):
         x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         x_layout.set_partial_by_dev_axis("dp", "sum")
 
+        cache_values = [x_layout, False]
         with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
-            op.infer_layout((x_layout,))
+            op.infer_layout(cache_values)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_nonzero_preprocess_basic(self, mock_platform):
+        """
+        Feature: NonzeroDistributedOp preprocess routes as_tuple into kwargs.
+        Description: torch.nonzero declares as_tuple as keyword-only (after *);
+                     op_name is 'nonzero'. Verifies local_kwargs receives as_tuple,
+                     local_args contains the to_local'd tensor, and cache_values
+                     contains layout and as_tuple.
+        Expectation: local_kwargs has 'as_tuple'; cache_values has layout and as_tuple.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_placements = (Replicate(), Replicate())
+        x_layout = _build_layout(mesh, x_placements, 2)
+
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        mock_tensor.to_local.return_value = MagicMock()
+
+        local_args, local_kwargs, cache_values = op.preprocess((mock_tensor,), {})
+
+        assert local_kwargs == {'as_tuple': False}, (
+            f"For torch.nonzero, local_kwargs should be {{'as_tuple': False}}, "
+            f"got local_kwargs={local_kwargs}"
+        )
+        assert len(local_args) == 1, (
+            f"For torch.nonzero, local_args should have 1 element, "
+            f"got {len(local_args)}"
+        )
+        assert cache_values[0] is x_layout, (
+            f"cache_values[0] should be the input layout, "
+            f"got {cache_values[0]}"
+        )
+        assert cache_values[1] is False, (
+            f"cache_values[1] should be False (default as_tuple), "
+            f"got {cache_values[1]}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_nonzero_preprocess_as_tuple_true(self, mock_platform):
+        """
+        Feature: NonzeroDistributedOp preprocess with as_tuple=True.
+        Description: When as_tuple=True is passed, it should be preserved in
+                     local_kwargs and cache_values.
+        Expectation: local_kwargs and cache_values reflect as_tuple=True.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_placements = (Replicate(), Replicate())
+        x_layout = _build_layout(mesh, x_placements, 2)
+
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        mock_tensor.to_local.return_value = MagicMock()
+
+        local_args, local_kwargs, cache_values = op.preprocess(
+            (mock_tensor,), {'as_tuple': True}
+        )
+
+        assert local_kwargs == {'as_tuple': True}, (
+            f"For torch.nonzero with as_tuple=True, local_kwargs should be "
+            f"{{'as_tuple': True}}, got local_kwargs={local_kwargs}"
+        )
+        assert cache_values[1] is True, (
+            f"cache_values[1] should be True, got {cache_values[1]}"
+        )
 
 
 if __name__ == "__main__":

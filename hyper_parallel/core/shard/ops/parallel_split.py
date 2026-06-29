@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,260 +16,450 @@
 Distributed implementation for Split operator.
 """
 
+import copy
 import math
+from typing import Tuple
+
 from .parallel_ops import DistributedOp
+
+
+def _normalize_split_with_size_args(x, split_sections, dim):
+    return (x, split_sections, dim), {}
+
+
+def _normalize_split_args(x, split_size_or_sections, dim=0):
+    return (x, split_size_or_sections, dim), {}
+
+
+def _normalize_split_tensor_args(x, split_size, dim):
+    return (x, split_size, dim), {}
+
+
+def _normalize_tensor_split_args(x, indices_or_sections, dim=0):
+    return (x, indices_or_sections, dim), {}
 
 
 class SplitWithSizeDistributedOp(DistributedOp):
     """Distributed implementation for SplitWithSize operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layouts for Split operator.
-
-        Rules:
-        1. Shared axis can not be split.
+        Preprocess arguments for SplitWithSize operator.
 
         Args:
-            layouts (Layout): Layout of input tensor
-            extra_args (list): split size or sections, axis, input shape
+            args (tuple): Input arguments (input, split_sections, dim).
+            kwargs (dict): Keyword arguments (empty for this operator).
 
         Returns:
-            tuple: Layouts for output tensors
+            tuple: (local_args, local_kwargs, cache_values)
         """
-
-        input_layout = layouts[0]
-        axis = extra_args[1]
-        # Check shared axis can not be split.
-        tensor_map = input_layout.tensor_map
-        if tensor_map[axis] != -1:
-            raise ValueError(f"Can not split tensor at sharded axis[{axis}], layout: {input_layout}")
-
-        split_sections = extra_args[0]
+        args, kwargs = _normalize_split_with_size_args(*args, **kwargs)
+        input_tensor, split_sections, dim = args
         output_num = len(split_sections)
-        output_layouts = (input_layout,) * output_num
-        return output_layouts
+        local_args = (input_tensor.to_local(), split_sections, dim)
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, dim, output_num]
+        return local_args, local_kwargs, cache_values
+
+    # pylint: disable=W0237
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layouts for SplitWithSize operator.
+
+        Rules:
+            1. Input must not have Partial status.
+            2. The split dimension must not be sharded.
+
+        Args:
+            cache_values (list): [input_layout, dim, output_num]
+
+        Returns:
+            tuple: ((output_layouts,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
+        """
+        layout = cache_values[0]
+        dim = cache_values[1]
+        output_num = cache_values[2]
+
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([layout])
+
+        in_tensor_map = layout.alias_tensor_map
+        ndim = len(in_tensor_map)
+
+        if dim < 0:
+            dim = ndim + dim
+        if not 0 <= dim < ndim:
+            raise ValueError(
+                f"For {self.op_name}, dimension should be in range [0, {ndim}), "
+                f"but got {dim}."
+            )
+
+        if in_tensor_map[dim] != "None":
+            raise ValueError(
+                f"For {self.op_name}, can not split tensor at sharded axis[{dim}], "
+                f"but got layout: {layout}."
+            )
+
+        return (tuple(copy.deepcopy(layout) for _ in range(output_num)), None)
 
 
 class SplitWithSizeViewDistributedOp(DistributedOp):
     """Distributed implementation for SplitWithSizeView operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for SplitWithSizeView operator.
+
+        Args:
+            args (tuple): Input arguments (input, split_sections, dim).
+            kwargs (dict): Keyword arguments (empty for this operator).
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, kwargs = _normalize_split_with_size_args(*args, **kwargs)
+        input_tensor, split_sections, dim = args
+        output_num = len(split_sections)
+        local_args = (input_tensor.to_local(), split_sections, dim)
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, dim, output_num]
+        return local_args, local_kwargs, cache_values
+
+    # pylint: disable=W0237
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layouts for SplitWithSizeView operator.
 
         Rules:
-        1. Shared axis can not be split.
+            1. Input must not have Partial status.
+            2. The split dimension must not be sharded.
 
         Args:
-            layouts (Layout): Layout of input tensor
-            extra_args (list): split size or sections, axis, input shape
+            cache_values (list): [input_layout, dim, output_num]
 
         Returns:
-            tuple: Layouts for output tensors
+            tuple: ((output_layouts,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
         """
+        layout = cache_values[0]
+        dim = cache_values[1]
+        output_num = cache_values[2]
 
-        input_layout = layouts[0]
-        axis = extra_args[1]
-        # Check shared axis can not be split.
-        tensor_map = input_layout.tensor_map
-        if tensor_map[axis] != -1:
-            raise ValueError(f"Can not split tensor at sharded axis[{axis}], layout: {input_layout}")
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([layout])
 
-        split_sections = extra_args[0]
-        output_num = len(split_sections)
-        output_layouts = (input_layout,) * output_num
-        return output_layouts
+        in_tensor_map = layout.alias_tensor_map
+        ndim = len(in_tensor_map)
+
+        if dim < 0:
+            dim = ndim + dim
+        if not 0 <= dim < ndim:
+            raise ValueError(
+                f"For {self.op_name}, dimension should be in range [0, {ndim}), "
+                f"but got {dim}."
+            )
+
+        if in_tensor_map[dim] != "None":
+            raise ValueError(
+                f"For {self.op_name}, can not split tensor at sharded axis[{dim}], "
+                f"but got layout: {layout}."
+            )
+
+        return (tuple(copy.deepcopy(layout) for _ in range(output_num)), None)
 
 
 class SplitDistributedOp(DistributedOp):
-    """Distributed implementation for Split operator."""
+    """Distributed implementation for Split operator (MindSpore Split and torch.split)."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for Split operator.
+
+        Args:
+            args (tuple): Input arguments (input, split_size_or_sections[, dim]).
+            kwargs (dict): Keyword arguments (may contain dim).
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, kwargs = _normalize_split_args(*args, **kwargs)
+        input_tensor, split_size_or_sections, dim = args
+
+        if isinstance(split_size_or_sections, int):
+            output_num = math.ceil(input_tensor.shape[dim] / split_size_or_sections)
+        else:
+            output_num = len(split_size_or_sections)
+
+        local_args = (input_tensor.to_local(), split_size_or_sections, dim)
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, dim, output_num]
+        return local_args, local_kwargs, cache_values
+
+    # pylint: disable=W0237
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layouts for Split operator.
 
         Rules:
-        1. Shared axis can not be split.
-        2. Default: dim = 0 if not specified.
+            1. Input must not have Partial status.
+            2. The split dimension must not be sharded.
+            3. dim must be within the valid range of input dimensions.
 
         Args:
-            layouts (Layout): Layout of input tensor
-            extra_args (list): split size or sections, axis, input shape. Expected:
-                extra_args[0]: split_size (required)
-                extra_args[1]: axis (optional)
-                extra_args[2][0]: input_shape
+            cache_values (list): [input_layout, dim, output_num]
 
         Returns:
-            tuple: Layouts for output tensors
+            tuple: ((output_layouts,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
         """
+        layout = cache_values[0]
+        dim = cache_values[1]
+        output_num = cache_values[2]
 
-        if not layouts or layouts[0] is None:
-            raise ValueError("split requires a valid input tensor layout.")
-        input_layout = layouts[0]
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([layout])
 
-        if len(extra_args) == 2:
-            split_size = extra_args[0]
-            axis = 0 # default
-            input_shape = extra_args[1][0]
-        elif len(extra_args) == 3:
-            split_size = extra_args[0]
-            axis = extra_args[1]
-            input_shape = extra_args[2][0]
-        else:
-            raise ValueError("Split ops extra_args requires 'axis' and contains 'output_num' optionally.")
+        in_tensor_map = layout.alias_tensor_map
+        ndim = len(in_tensor_map)
 
-        tensor_map = input_layout.tensor_map
-        input_dim = len(tensor_map)
-        if axis < 0:
-            axis = input_dim + axis
-        if not 0 <= axis < input_dim:
-            raise ValueError(f"Dimension out of range (expected [0, {input_dim}), got {axis}).")
+        if dim < 0:
+            dim = ndim + dim
+        if not 0 <= dim < ndim:
+            raise ValueError(
+                f"For {self.op_name}, dimension should be in range [0, {ndim}), "
+                f"but got {dim}."
+            )
 
-        # Check shared axis can not be split.
-        if tensor_map[axis] != -1:
-            raise ValueError(f"Can not split tensor at sharded axis[{axis}], layout: {input_layout}")
+        if in_tensor_map[dim] != "None":
+            raise ValueError(
+                f"For {self.op_name}, can not split tensor at sharded axis[{dim}], "
+                f"but got layout: {layout}."
+            )
 
-        output_num = 1
-        if isinstance(split_size, int):
-            output_num = math.ceil(input_shape[axis] / split_size)
-        elif isinstance(split_size, (list, tuple)):
-            output_num = len(split_size)
-
-        output_layouts = (input_layout,) * output_num
-        return output_layouts
+        return (tuple(copy.deepcopy(layout) for _ in range(output_num)), None)
 
 
 class SplitTensorDistributedOp(DistributedOp):
     """Distributed implementation for SplitTensor operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layouts for Split operator.
-
-        Rules:
-        1. Shared axis can not be split.
+        Preprocess arguments for SplitTensor operator.
 
         Args:
-            layouts (Layout): Layout of input tensor
-            extra_args (list): split size or sections, axis, input shape
+            args (tuple): Input arguments (input, split_size, dim).
+            kwargs (dict): Keyword arguments (empty for this operator).
 
         Returns:
-            tuple: Layouts for output tensors
+            tuple: (local_args, local_kwargs, cache_values)
         """
+        args, kwargs = _normalize_split_tensor_args(*args, **kwargs)
+        input_tensor, split_size, dim = args
+        output_num = math.ceil(input_tensor.shape[dim] / split_size)
+        local_args = (input_tensor.to_local(), split_size, dim)
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, dim, output_num]
+        return local_args, local_kwargs, cache_values
 
-        input_layout = layouts[0]
-        axis = extra_args[1]
-        # Check shared axis can not be split.
-        tensor_map = input_layout.tensor_map
-        if tensor_map[axis] != -1:
-            raise ValueError(f"Can not split tensor at sharded axis[{axis}], layout: {input_layout}")
+    # pylint: disable=W0237
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layouts for SplitTensor operator.
 
-        split_size = extra_args[0]
-        input_shape = extra_args[2][0]
-        output_num = input_shape[axis] // split_size
-        if input_shape[axis] % split_size != 0:
-            output_num += 1
+        Rules:
+            1. Input must not have Partial status.
+            2. The split dimension must not be sharded.
 
-        output_layouts = (input_layout,) * output_num
-        return output_layouts
+        Args:
+            cache_values (list): [input_layout, dim, output_num]
+
+        Returns:
+            tuple: ((output_layouts,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
+        """
+        layout = cache_values[0]
+        dim = cache_values[1]
+        output_num = cache_values[2]
+
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([layout])
+
+        in_tensor_map = layout.alias_tensor_map
+        ndim = len(in_tensor_map)
+
+        if dim < 0:
+            dim = ndim + dim
+        if not 0 <= dim < ndim:
+            raise ValueError(
+                f"For {self.op_name}, dimension should be in range [0, {ndim}), "
+                f"but got {dim}."
+            )
+
+        if in_tensor_map[dim] != "None":
+            raise ValueError(
+                f"For {self.op_name}, can not split tensor at sharded axis[{dim}], "
+                f"but got layout: {layout}."
+            )
+
+        return (tuple(copy.deepcopy(layout) for _ in range(output_num)), None)
 
 
 class SplitTensorViewDistributedOp(DistributedOp):
     """Distributed implementation for SplitTensorView operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for SplitTensorView operator.
+
+        Args:
+            args (tuple): Input arguments (input, split_size, dim).
+            kwargs (dict): Keyword arguments (empty for this operator).
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, kwargs = _normalize_split_tensor_args(*args, **kwargs)
+        input_tensor, split_size, dim = args
+        output_num = math.ceil(input_tensor.shape[dim] / split_size)
+        local_args = (input_tensor.to_local(), split_size, dim)
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, dim, output_num]
+        return local_args, local_kwargs, cache_values
+
+    # pylint: disable=W0237
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layouts for SplitTensorView operator.
 
         Rules:
-        1. Shared axis can not be split.
+            1. Input must not have Partial status.
+            2. The split dimension must not be sharded.
 
         Args:
-            layouts (Layout): Layout of input tensor
-            extra_args (list): split size or sections, axis, input shape
+            cache_values (list): [input_layout, dim, output_num]
 
         Returns:
-            tuple: Layouts for output tensors
+            tuple: ((output_layouts,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
         """
+        layout = cache_values[0]
+        dim = cache_values[1]
+        output_num = cache_values[2]
 
-        input_layout = layouts[0]
-        axis = extra_args[1]
-        # Check shared axis can not be split.
-        tensor_map = input_layout.tensor_map
-        if tensor_map[axis] != -1:
-            raise ValueError(f"Can not split tensor at sharded axis[{axis}], layout: {input_layout}")
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([layout])
 
-        split_size = extra_args[0]
-        input_shape = extra_args[2][0]
-        output_num = input_shape[axis] // split_size
-        if input_shape[axis] % split_size != 0:
-            output_num += 1
+        in_tensor_map = layout.alias_tensor_map
+        ndim = len(in_tensor_map)
 
-        output_layouts = (input_layout,) * output_num
-        return output_layouts
+        if dim < 0:
+            dim = ndim + dim
+        if not 0 <= dim < ndim:
+            raise ValueError(
+                f"For {self.op_name}, dimension should be in range [0, {ndim}), "
+                f"but got {dim}."
+            )
+
+        if in_tensor_map[dim] != "None":
+            raise ValueError(
+                f"For {self.op_name}, can not split tensor at sharded axis[{dim}], "
+                f"but got layout: {layout}."
+            )
+
+        return (tuple(copy.deepcopy(layout) for _ in range(output_num)), None)
 
 
 class TensorSplitDistributedOp(DistributedOp):
     """Distributed implementation for tensor_split operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layouts for tensor_split operator.
-
-        Rules:
-        1. Shared (sharded) axis cannot be split.
-        2. Default: dim = 0 if not specified.
+        Preprocess arguments for tensor_split operator.
 
         Args:
-            layouts (list): Layout of the input tensor.
-            extra_args (list): Extracted non-tensor arguments and input shapes. Expected:
-                extra_args[0]: indices_or_sections (int, tuple, list, or 1D tensor)
-                extra_args[1]: dim (optional, default is 0)
-                extra_args[-1]: input_shapes (list containing the shape of the input tensor)
+            args (tuple): Input arguments (input, indices_or_sections[, dim]).
+            kwargs (dict): Keyword arguments (may contain dim).
 
         Returns:
-            tuple: Layouts for the output tensors
+            tuple: (local_args, local_kwargs, cache_values)
         """
-        if not layouts or layouts[0] is None:
-            raise ValueError("tensor_split requires a valid input tensor layout.")
+        args, kwargs = _normalize_tensor_split_args(*args, **kwargs)
+        input_tensor, indices_or_sections, dim = args
 
-        input_layout = layouts[0]
-
-        # Parse extra_args based on the dispatcher's WithShape suffix rules
-        if len(extra_args) == 1:
-            indices_or_sections = extra_args[0]
-            dim = 0  # default
-        elif len(extra_args) == 2:
-            indices_or_sections = extra_args[0]
-            dim = extra_args[1]
-        else:
-            raise ValueError("tensor_split ops extra_args requires 'indices_or_sections' and optionally 'dim'.")
-
-        tensor_map = input_layout.tensor_map
-        input_dim = len(tensor_map)
-
-        # Handle negative dimensions
-        if dim < 0:
-            dim = input_dim + dim
-
-        if not 0 <= dim < input_dim:
-            raise ValueError(f"Dimension out of range (expected [0, {input_dim}), got {dim}).")
-
-        # Check: shared (sharded) axis cannot be split
-        if tensor_map[dim] != -1:
-            raise ValueError(f"Cannot perform tensor_split on sharded axis[{dim}], layout: {input_layout}")
-
-        # Calculate the number of output tensors based on PyTorch's tensor_split rules
         if isinstance(indices_or_sections, int):
             output_num = indices_or_sections
         elif isinstance(indices_or_sections, (list, tuple)):
             output_num = len(indices_or_sections) + 1
         elif hasattr(indices_or_sections, "shape") and len(indices_or_sections.shape) == 1:
-            # Handle 1D Tensor case
             output_num = indices_or_sections.shape[0] + 1
         else:
-            raise TypeError("tensor_split: indices_or_sections must be an integer, list, tuple, or 1D tensor.")
+            raise TypeError(
+                f"For {self.op_name}, indices_or_sections must be an integer, "
+                f"list, tuple, or 1D tensor."
+            )
 
-        output_layouts = (input_layout,) * output_num
-        return output_layouts
+        local_indices = indices_or_sections
+        if hasattr(indices_or_sections, "_layout"):
+            local_indices = indices_or_sections.to_local()
+
+        local_args = (input_tensor.to_local(), local_indices, dim)
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, dim, output_num]
+        return local_args, local_kwargs, cache_values
+
+    # pylint: disable=W0237
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layouts for tensor_split operator.
+
+        Rules:
+            1. Input must not have Partial status.
+            2. The split dimension must not be sharded.
+            3. dim must be within the valid range of input dimensions.
+
+        Args:
+            cache_values (list): [input_layout, dim, output_num]
+
+        Returns:
+            tuple: ((output_layouts,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
+        """
+        layout = cache_values[0]
+        dim = cache_values[1]
+        output_num = cache_values[2]
+
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([layout])
+
+        in_tensor_map = layout.alias_tensor_map
+        ndim = len(in_tensor_map)
+
+        if dim < 0:
+            dim = ndim + dim
+        if not 0 <= dim < ndim:
+            raise ValueError(
+                f"For {self.op_name}, dimension should be in range [0, {ndim}), "
+                f"but got {dim}."
+            )
+
+        if in_tensor_map[dim] != "None":
+            raise ValueError(
+                f"For {self.op_name}, can not split tensor at sharded axis[{dim}], "
+                f"but got layout: {layout}."
+            )
+
+        return (tuple(copy.deepcopy(layout) for _ in range(output_num)), None)
+    

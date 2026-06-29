@@ -13,12 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """parallel_unbind test"""
-import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_unbind import UnbindDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -32,7 +31,7 @@ op = UnbindDistributedOp("unbind")
 
 class TestParallelUnbind(unittest.TestCase):
     """Unit tests for UnbindDistributedOp."""
-    def setUp(self):
+    def setUp(self) -> None:
         """Set up test fixtures before each test method.
 
         Clears global caches to ensure test isolation and initializes
@@ -40,11 +39,13 @@ class TestParallelUnbind(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -84,10 +85,15 @@ class TestParallelUnbind(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
         input_shape = (3, 8)
 
-        output_layouts = op.infer_layout((x_layout,), extra_args=(0, [input_shape]))
+        cache_values = [x_layout, input_shape, 0]
+        output_layouts, _ = op.infer_layout(cache_values)
 
-        assert isinstance(output_layouts, tuple)
-        assert len(output_layouts) == 3
+        assert isinstance(output_layouts, tuple), (
+            f"Expected tuple of layouts, got {type(output_layouts)}"
+        )
+        assert len(output_layouts) == 3, (
+            f"Expected 3 output layouts, got {len(output_layouts)}"
+        )
 
         expected_map = (0,)
         for layout in output_layouts:
@@ -97,9 +103,9 @@ class TestParallelUnbind(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layouts, (x_layout,), (0, [input_shape])) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layouts, (x_layout,), (0, [input_shape]))}"
+        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
+            f"get_expand_impl should return None, "
+            f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -114,9 +120,12 @@ class TestParallelUnbind(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
         input_shape = (4, 4)
 
-        output_layouts = op.infer_layout((x_layout,), extra_args=(1, [input_shape]))
+        cache_values = [x_layout, input_shape, 1]
+        output_layouts, _ = op.infer_layout(cache_values)
 
-        assert len(output_layouts) == 4
+        assert len(output_layouts) == 4, (
+            f"Expected 4 output layouts, got {len(output_layouts)}"
+        )
 
         expected_map = (1,)
         for layout in output_layouts:
@@ -136,9 +145,12 @@ class TestParallelUnbind(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 3)
         input_shape = (2, 4, 8)
 
-        output_layouts = op.infer_layout((x_layout,), extra_args=(-1, [input_shape]))
+        cache_values = [x_layout, input_shape, -1]
+        output_layouts, _ = op.infer_layout(cache_values)
 
-        assert len(output_layouts) == 8
+        assert len(output_layouts) == 8, (
+            f"Expected 8 output layouts, got {len(output_layouts)}"
+        )
 
         expected_map = (2, 1)
         for layout in output_layouts:
@@ -158,8 +170,9 @@ class TestParallelUnbind(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
         input_shape = (4, 4)
 
+        cache_values = [x_layout, input_shape, 0]
         with self.assertRaisesRegex(ValueError, "Unbinding a sharded dimension is not supported"):
-            op.infer_layout((x_layout,), extra_args=(0, [input_shape]))
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_unbind_layout_dim_out_of_range(self, mock_platform):
@@ -173,8 +186,71 @@ class TestParallelUnbind(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 2)
         input_shape = (4, 4)
 
-        with self.assertRaisesRegex(ValueError, "Dimension out of range"):
-            op.infer_layout((x_layout,), extra_args=(2, [input_shape]))
+        cache_values = [x_layout, input_shape, 2]
+        with self.assertRaisesRegex(ValueError, "dimension out of range"):
+            op.infer_layout(cache_values)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_unbind_preprocess(self, mock_platform):
+        """
+        Feature: Unbind preprocess
+        Description: Verify preprocess correctly extracts layout, shape, and dim into cache_values
+            and converts DTensor inputs to local tensors.
+        Expectation: local_args contains local tensors, cache_values has [layout, shape, dim].
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_placements = (Replicate(), Shard(1))
+        x_layout = _build_layout(mesh, x_placements, 2)
+
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        mock_tensor.shape = (3, 8)
+        mock_local = MagicMock()
+        mock_tensor.to_local.return_value = mock_local
+
+        local_args, local_kwargs, cache_values = op.preprocess((mock_tensor, 0), {})
+
+        assert local_args[0] is mock_local, (
+            f"Expected to_local result in local_args[0], got {local_args[0]}"
+        )
+        assert local_args[1] == 0, (
+            f"Expected dim=0 in local_args[1], got {local_args[1]}"
+        )
+        assert not local_kwargs, (
+            f"Expected empty local_kwargs, got {local_kwargs}"
+        )
+        assert cache_values[0] is x_layout, (
+            f"Expected layout in cache_values[0], got {cache_values[0]}"
+        )
+        assert cache_values[1] == (3, 8), (
+            f"Expected shape (3, 8) in cache_values[1], got {cache_values[1]}"
+        )
+        assert cache_values[2] == 0, (
+            f"Expected dim=0 in cache_values[2], got {cache_values[2]}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_unbind_preprocess_default_dim(self, mock_platform):
+        """
+        Feature: Unbind preprocess with default dim
+        Description: Verify preprocess defaults dim to 0 when not provided.
+        Expectation: cache_values[2] defaults to 0.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_placements = (Replicate(), Shard(1))
+        x_layout = _build_layout(mesh, x_placements, 2)
+
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        mock_tensor.shape = (3, 8)
+        mock_local = MagicMock()
+        mock_tensor.to_local.return_value = mock_local
+
+        local_args, local_kwargs, cache_values = op.preprocess((mock_tensor,), {})
+
+        assert cache_values[2] == 0, (
+            f"Expected default dim=0 in cache_values[2], got {cache_values[2]}"
+        )
 
 
 if __name__ == "__main__":
