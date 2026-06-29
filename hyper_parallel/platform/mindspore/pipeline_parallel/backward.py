@@ -257,6 +257,7 @@ class GradFunction:
         # Storage for intermediate gradients captured during dx computation
         self._saved_intermediates = []
         self.aux_inputs_data = None
+        self.aux_kwargs_data = None
         self.aux_weights_data = None
 
     def _clear_res(self):
@@ -327,7 +328,8 @@ class GradFunction:
                     if slot not in keep_slots:
                         intermediate._set_next_edge(slot, None)  # pylint: disable=protected-access
 
-    def _process_weight_group(self, weight_group, grad_node_to_weight, keep_graph):
+    @staticmethod
+    def _process_weight_group(weight_group, grad_node_to_weight, keep_graph):
         """Process a single weight group and compute gradients."""
         grad_edges = []
         grad_outputs = []
