@@ -13,17 +13,17 @@
 # limitations under the License.
 # ============================================================================
 """parallel_max_dim test"""
-import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
+
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_reduce import MaxDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
-    _DEVICE_MESH_MAP
+    _DEVICE_MESH_MAP,
 )
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
@@ -32,19 +32,18 @@ op = MaxDistributedOp("MaxDim")
 
 class TestParallelMaxDim(unittest.TestCase):
     """Unit tests for MaxDimDistributedOp."""
-    def setUp(self):
-        """Set up test fixtures before each test method.
 
-        Clears global caches to ensure test isolation and initializes
-        the platform for testing.
-        """
+    def setUp(self) -> None:
+        """Clear global caches before each test to ensure isolation."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
-        """Clean up after each test method."""
+    def tearDown(self) -> None:
+        """Restore global cache state after each test."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -80,10 +79,11 @@ class TestParallelMaxDim(unittest.TestCase):
         Expectation: Success, output layout correctly reduced
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate(), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 3)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 3)
 
-        values_layout, index_layout = op.infer_layout((x_layout, None, None), (1, True))
+        cache_values = [x_layout, 1, True]
+        output_layouts, _ = op.infer_layout(cache_values)
+        values_layout, index_layout = output_layouts
 
         expected_map = (1, -1, -1)
         assert values_layout.tensor_map == expected_map, (
@@ -95,9 +95,9 @@ class TestParallelMaxDim(unittest.TestCase):
             f"got {index_layout.tensor_map}"
         )
 
-        assert op.get_expand_impl(None, (values_layout, index_layout), (x_layout, None, None), (1, True)) is None, (
+        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, (values_layout, index_layout), (x_layout, None, None), (1, True))}"
+            f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -108,10 +108,11 @@ class TestParallelMaxDim(unittest.TestCase):
         Expectation: Success, output layout correctly reduced
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Replicate(), Shard(1), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 3)
+        x_layout = _build_layout(mesh, (Replicate(), Shard(1), Replicate()), 3)
 
-        values_layout, index_layout = op.infer_layout((x_layout, None, None), (0, True))
+        cache_values = [x_layout, 0, True]
+        output_layouts, _ = op.infer_layout(cache_values)
+        values_layout, index_layout = output_layouts
 
         expected_map = (-1, 0, -1)
         assert values_layout.tensor_map == expected_map, (
@@ -131,10 +132,11 @@ class TestParallelMaxDim(unittest.TestCase):
         Expectation: Success, output layout correctly reduced
         """
         mesh = self._make_2x2x2_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate(), Shard(2))
-        x_layout = _build_layout(mesh, x_placements, 3)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate(), Shard(2)), 3)
 
-        values_layout, index_layout = op.infer_layout((x_layout, None, None), (1, True))
+        cache_values = [x_layout, 1, True]
+        output_layouts, _ = op.infer_layout(cache_values)
+        values_layout, index_layout = output_layouts
 
         expected_map = (2, -1, 0)
         assert values_layout.tensor_map == expected_map, (
@@ -154,10 +156,11 @@ class TestParallelMaxDim(unittest.TestCase):
         Expectation: Success, output layout correctly reduced
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Replicate(), Replicate(), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 3)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
 
-        values_layout, index_layout = op.infer_layout((x_layout, None, None), (0, True))
+        cache_values = [x_layout, 0, True]
+        output_layouts, _ = op.infer_layout(cache_values)
+        values_layout, index_layout = output_layouts
 
         expected_map = (-1, -1, -1)
         assert values_layout.tensor_map == expected_map, (
@@ -177,10 +180,11 @@ class TestParallelMaxDim(unittest.TestCase):
         Expectation: Success, output layout correctly reduced
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate(), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 3)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 3)
 
-        values_layout, index_layout = op.infer_layout((x_layout, None, None), (-1, True))
+        cache_values = [x_layout, -1, True]
+        output_layouts, _ = op.infer_layout(cache_values)
+        values_layout, index_layout = output_layouts
 
         expected_map = (1, -1, -1)
         assert values_layout.tensor_map == expected_map, (
@@ -200,10 +204,11 @@ class TestParallelMaxDim(unittest.TestCase):
         Expectation: Success, output layout has reduced dimension removed
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate(), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 3)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 3)
 
-        values_layout, index_layout = op.infer_layout((x_layout, None, None), (1, False))
+        cache_values = [x_layout, 1, False]
+        output_layouts, _ = op.infer_layout(cache_values)
+        values_layout, index_layout = output_layouts
 
         expected_map = (1, -1)
         assert values_layout.tensor_map == expected_map, (
@@ -215,7 +220,6 @@ class TestParallelMaxDim(unittest.TestCase):
             f"got {index_layout.tensor_map}"
         )
 
-
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_max_dim_3d_tensor(self, mock_platform):
         """
@@ -224,10 +228,11 @@ class TestParallelMaxDim(unittest.TestCase):
         Expectation: Success
         """
         mesh = self._make_2x2x2_mesh(mock_platform)
-        x_placements = (Shard(0), Shard(1), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 3)
+        x_layout = _build_layout(mesh, (Shard(0), Shard(1), Replicate()), 3)
 
-        values_layout, index_layout = op.infer_layout((x_layout, None, None), (2, True))
+        cache_values = [x_layout, 2, True]
+        output_layouts, _ = op.infer_layout(cache_values)
+        values_layout, index_layout = output_layouts
 
         expected_map = (2, 1, -1)
         assert values_layout.tensor_map == expected_map, (
@@ -243,15 +248,16 @@ class TestParallelMaxDim(unittest.TestCase):
     def test_max_dim_invalid_dim_type(self, mock_platform):
         """
         Feature: MaxDim invalid dim type
-        Description: Pass non-integer dim
+        Description: Pass a string as dim
         Expectation: Raise TypeError
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate(), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 3)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 3)
 
-        with self.assertRaisesRegex(TypeError, "The `dim` argument should not be a `Tensor` or a `str`"):
-            op.infer_layout((x_layout, None, None), ("invalid", True))
+        with self.assertRaisesRegex(
+            TypeError, "should be `None`, `int`"
+        ):
+            op.infer_layout([x_layout, "invalid", True])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_max_dim_dim_out_of_range(self, mock_platform):
@@ -261,39 +267,24 @@ class TestParallelMaxDim(unittest.TestCase):
         Expectation: Raise ValueError
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate(), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 3)
+        x_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 3)
 
         with self.assertRaisesRegex(ValueError, "Invalid reduce axis index"):
-            op.infer_layout((x_layout, None, None), (10, True))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_max_dim_invalid_layouts_count(self, mock_platform):
-        """
-        Feature: MaxDim invalid layouts count
-        Description: Pass wrong number of layouts
-        Expectation: Raise ValueError
-        """
-        mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate(), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 3)
-
-        with self.assertRaisesRegex(ValueError, "requires at least one input layout"):
-            op.infer_layout((), (1, True))
-
+            op.infer_layout([x_layout, 10, True])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_max_dim_none_input_layout(self, mock_platform):
         """
         Feature: MaxDim None input layout
-        Description: Pass None as input layout
-        Expectation: Raise ValueError
+        Description: Pass None as cache_values[0]
+        Expectation: Raise ValueError (mesh_shape is None)
         """
-        mesh = self._make_2x4_mesh(mock_platform)
+        self._setup_mock_platform(mock_platform, world_size=8)
 
-        with self.assertRaisesRegex(ValueError, "requires at least one input layout"):
-            op.infer_layout((None, None, None), (1, True))
+        with self.assertRaisesRegex(ValueError, "input layout cannot be None"):
+            op.infer_layout([None, 1, True])
 
 
 if __name__ == "__main__":
     unittest.main()
+    

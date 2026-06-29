@@ -15,10 +15,10 @@
 """parallel_split test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_split import (
     SplitDistributedOp,
@@ -43,6 +43,7 @@ class TestParallelSplit(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
         self.split_op = SplitDistributedOp("split")
         self.torch_split_op = SplitDistributedOp("split")
         self.split_with_size_op = SplitWithSizeDistributedOp("split_with_size")
@@ -52,6 +53,7 @@ class TestParallelSplit(unittest.TestCase):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -89,19 +91,25 @@ class TestParallelSplit(unittest.TestCase):
         mesh = self._make_2x2x2_mesh(mock_platform)
         input_layout = _build_layout(mesh, (Replicate(), Shard(0), Shard(2)), 3)
         axis = 1
-        split_size = 2
-        input_shape = ((12, 16, 20), None)
-        extra_args = [split_size, axis, input_shape]
+        # split_size=2, input_shape=(12, 16, 20), output_num = ceil(16/2) = 8
+        cache_values = [input_layout, axis, 8]
 
-        output_layouts = self.split_op.infer_layout([input_layout], extra_args)
-        assert len(output_layouts) == 8
-        assert all(layout.tensor_map == input_layout.tensor_map for layout in output_layouts)
+        infer_result = self.split_op.infer_layout(cache_values)
+        output_layouts = infer_result[0]
+        assert len(output_layouts) == 8, (
+            f"Expected 8 output layouts, got {len(output_layouts)}"
+        )
+        assert all(layout.tensor_map == input_layout.tensor_map for layout in output_layouts), (
+            f"Output tensor_map should match "
+            f"input_tensor_map={input_layout.tensor_map}, "
+            f"got {[l.tensor_map for l in output_layouts]}"
+        )
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert self.split_op.get_expand_impl(None, output_layouts, [input_layout], extra_args) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"got {self.split_op.get_expand_impl(None, output_layouts, [input_layout], extra_args)}"
+        assert self.split_op.get_expand_impl(None, infer_result, cache_values) is None, (
+            f"get_expand_impl should return None, "
+            f"got {self.split_op.get_expand_impl(None, infer_result, cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -114,43 +122,43 @@ class TestParallelSplit(unittest.TestCase):
         mesh = self._make_2x2x2_mesh(mock_platform)
         input_layout = _build_layout(mesh, (Replicate(), Shard(0), Shard(1)), 3)
         axis = 0
-        split_size = 2
-        input_shape = ((12, 16, 20), None)
-        extra_args = [split_size, axis, input_shape]
+        cache_values = [input_layout, axis, 8]
 
-        with self.assertRaisesRegex(ValueError, "Can not split tensor at sharded axis"):
-            self.split_op.infer_layout([input_layout], extra_args)
+        with self.assertRaisesRegex(ValueError, "can not split tensor at sharded axis"):
+            self.split_op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_infer_layout_axis_out_of_range(self, mock_platform):
         """
         Feature: Test axis out of range
         Description: Test axis out of range
-        Expectation: Success
+        Expectation: ValueError is raised
         """
         mesh = self._make_2x2x2_mesh(mock_platform)
         input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         axis = 5
-        split_size = 2
-        input_shape = ((12, 16, 20), None)
-        extra_args = [split_size, axis, input_shape]
+        cache_values = [input_layout, axis, 2]
 
-        with self.assertRaisesRegex(ValueError, "Dimension out of range"):
-            self.split_op.infer_layout([input_layout], extra_args)
+        with self.assertRaisesRegex(ValueError, "dimension should be in range"):
+            self.split_op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_infer_layout_insufficient_extra_args(self, mock_platform):
+    def test_infer_layout_default_dim(self, mock_platform):
         """
-        Feature: Test missing extra_arg
-        Description: Test missing extra_arg
-        Expectation: Success
+        Feature: Split operator layout inference with default dim
+        Description: When dim is not explicitly provided, it defaults to 0
+        Expectation: Split works correctly on dim=0
         """
         mesh = self._make_2x2x2_mesh(mock_platform)
         input_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
-        extra_args = [0]
+        axis = 0
+        cache_values = [input_layout, axis, 6]
 
-        with self.assertRaisesRegex(ValueError, "Split ops extra_args requires 'axis' and contains 'output_num' optionally."):
-            self.split_op.infer_layout([input_layout], extra_args)
+        infer_result = self.split_op.infer_layout(cache_values)
+        output_layouts = infer_result[0]
+        assert len(output_layouts) == 6, (
+            f"Expected 6 output layouts, got {len(output_layouts)}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_infer_layout_with_size(self, mock_platform):
@@ -162,13 +170,20 @@ class TestParallelSplit(unittest.TestCase):
         mesh = self._make_2x2x2_mesh(mock_platform)
         input_layout = _build_layout(mesh, (Replicate(), Shard(1), Replicate()), 3)
         axis = 2
-        split_size_or_sections = [2, 3, 3]
-        extra_args = [split_size_or_sections, axis]
+        split_sections = [2, 3, 3]
+        cache_values = [input_layout, axis, len(split_sections)]
 
-        output_layouts = self.split_with_size_op.infer_layout([input_layout], extra_args)
+        infer_result = self.split_with_size_op.infer_layout(cache_values)
+        output_layouts = infer_result[0]
 
-        assert len(output_layouts) == len(split_size_or_sections)
-        assert all(layout.tensor_map == input_layout.tensor_map for layout in output_layouts)
+        assert len(output_layouts) == len(split_sections), (
+            f"Expected {len(split_sections)} output layouts, got {len(output_layouts)}"
+        )
+        assert all(layout.tensor_map == input_layout.tensor_map for layout in output_layouts), (
+            f"Output tensor_map should match "
+            f"input_tensor_map={input_layout.tensor_map}, "
+            f"got {[l.tensor_map for l in output_layouts]}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_infer_layout_with_size_invalid_axis(self, mock_platform):
@@ -180,11 +195,10 @@ class TestParallelSplit(unittest.TestCase):
         mesh = self._make_2x2x2_mesh(mock_platform)
         input_layout = _build_layout(mesh, (Replicate(), Shard(1), Replicate()), 3)
         axis = 1
-        split_size_or_sections = [2, 3, 3]
-        extra_args = [split_size_or_sections, axis]
+        cache_values = [input_layout, axis, 3]
 
-        with self.assertRaises(ValueError):
-            self.split_with_size_op.infer_layout([input_layout], extra_args)
+        with self.assertRaisesRegex(ValueError, "can not split tensor at sharded axis"):
+            self.split_with_size_op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_split_tensor_infer_layout_with_remainder(self, mock_platform):
@@ -196,15 +210,20 @@ class TestParallelSplit(unittest.TestCase):
         mesh = self._make_2x2x2_mesh(mock_platform)
         input_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(2)), 3)
         axis = 1
-        split_size = 3
-        input_shape = [5, 7, 9]
-        extra_args = [split_size, axis, [input_shape, ]]
+        # split_size=3, input_shape[1]=7, output_num = 7//3 + 1 = 3
+        cache_values = [input_layout, axis, 3]
 
-        output_layouts = self.split_tensor_op.infer_layout([input_layout], extra_args)
+        infer_result = self.split_tensor_op.infer_layout(cache_values)
+        output_layouts = infer_result[0]
 
-        expected_output_num = input_shape[axis] // split_size + 1
-        assert len(output_layouts) == expected_output_num
-        assert all(layout.tensor_map == input_layout.tensor_map for layout in output_layouts)
+        assert len(output_layouts) == 3, (
+            f"Expected 3 output layouts, got {len(output_layouts)}"
+        )
+        assert all(layout.tensor_map == input_layout.tensor_map for layout in output_layouts), (
+            f"Output tensor_map should match "
+            f"input_tensor_map={input_layout.tensor_map}, "
+            f"got {[l.tensor_map for l in output_layouts]}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_split_tensor_infer_layout_with_remainder_invalid_axis(self, mock_platform):
@@ -216,18 +235,12 @@ class TestParallelSplit(unittest.TestCase):
         mesh = self._make_2x2x2_mesh(mock_platform)
         input_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(2)), 3)
         axis = 2
-        split_size = 3
-        input_shape = [5, 7, 9]
-        extra_args = [split_size, axis, [input_shape, ]]
+        cache_values = [input_layout, axis, 3]
 
-        with self.assertRaises(ValueError):
-            self.split_tensor_op.infer_layout([input_layout], extra_args)
+        with self.assertRaisesRegex(ValueError, "can not split tensor at sharded axis"):
+            self.split_tensor_op.infer_layout(cache_values)
 
 
-class MockTensor:
-    """Mock class to simulate a 1D Tensor for testing indices_or_sections."""
-    def __init__(self, shape):
-        self.shape = shape
 
 
 tensor_split_op = TensorSplitDistributedOp("tensor_split")
@@ -240,11 +253,13 @@ class TestParallelTensorSplit(unittest.TestCase):
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
@@ -277,19 +292,26 @@ class TestParallelTensorSplit(unittest.TestCase):
         x_placements = (Replicate(), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layouts = tensor_split_op.infer_layout((x_layout,), extra_args=(3,))
+        cache_values = [x_layout, 0, 3]
+        infer_result = tensor_split_op.infer_layout(cache_values)
+        output_layouts = infer_result[0]
 
-        assert len(output_layouts) == 3, f"Expected 3 output layouts, got {len(output_layouts)}"
+        assert len(output_layouts) == 3, (
+            f"Expected 3 output layouts, got {len(output_layouts)}"
+        )
         for out_layout in output_layouts:
-            assert out_layout.to_dict()["tensor_map"] == x_layout.to_dict()["tensor_map"], (
-                "Output layout should be identical to the input layout."
+            expected_tm = x_layout.to_dict()["tensor_map"]
+            actual_tm = out_layout.to_dict()["tensor_map"]
+            assert actual_tm == expected_tm, (
+                f"Output layout should be identical to the input layout, "
+                f"expected={expected_tm}, got={actual_tm}"
             )
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert tensor_split_op.get_expand_impl(None, output_layouts, (x_layout,), (3,)) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"got {tensor_split_op.get_expand_impl(None, output_layouts, (x_layout,), (3,))}"
+        assert tensor_split_op.get_expand_impl(None, infer_result, cache_values) is None, (
+            f"get_expand_impl should return None, "
+            f"got {tensor_split_op.get_expand_impl(None, infer_result, cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -303,9 +325,13 @@ class TestParallelTensorSplit(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layouts = tensor_split_op.infer_layout((x_layout,), extra_args=([1, 3], 1))
+        cache_values = [x_layout, 1, 3]
+        infer_result = tensor_split_op.infer_layout(cache_values)
+        output_layouts = infer_result[0]
 
-        assert len(output_layouts) == 3, f"Expected 3 output layouts, got {len(output_layouts)}"
+        assert len(output_layouts) == 3, (
+            f"Expected 3 output layouts, got {len(output_layouts)}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_tensor_split_negative_dim(self, mock_platform):
@@ -318,9 +344,13 @@ class TestParallelTensorSplit(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layouts = tensor_split_op.infer_layout((x_layout,), extra_args=(2, -1))
+        cache_values = [x_layout, -1, 2]
+        infer_result = tensor_split_op.infer_layout(cache_values)
+        output_layouts = infer_result[0]
 
-        assert len(output_layouts) == 2, f"Expected 2 output layouts, got {len(output_layouts)}"
+        assert len(output_layouts) == 2, (
+            f"Expected 2 output layouts, got {len(output_layouts)}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_tensor_split_1d_tensor(self, mock_platform):
@@ -333,10 +363,13 @@ class TestParallelTensorSplit(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        mock_tensor = MockTensor(shape=(4,))
-        output_layouts = tensor_split_op.infer_layout((x_layout,), extra_args=(mock_tensor, 0))
+        cache_values = [x_layout, 0, 5]
+        infer_result = tensor_split_op.infer_layout(cache_values)
+        output_layouts = infer_result[0]
 
-        assert len(output_layouts) == 5, f"Expected 5 output layouts, got {len(output_layouts)}"
+        assert len(output_layouts) == 5, (
+            f"Expected 5 output layouts, got {len(output_layouts)}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_tensor_split_sharded_dim_error(self, mock_platform):
@@ -349,23 +382,23 @@ class TestParallelTensorSplit(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, r"Cannot perform tensor_split on sharded axis\[0\]"):
-            tensor_split_op.infer_layout((x_layout,), extra_args=(2, 0))
+        cache_values = [x_layout, 0, 2]
+        with self.assertRaisesRegex(ValueError, r"can not split tensor at sharded axis\[0\]"):
+            tensor_split_op.infer_layout(cache_values)
 
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_tensor_split_invalid_type_error(self, mock_platform):
+    def test_tensor_split_invalid_type_error(self):
         """
         Feature: Error handling for invalid indices_or_sections type
         Description: Pass a string type as indices_or_sections.
-        Expectation: TypeError is raised.
+        Expectation: TypeError is raised from preprocess.
         """
-        mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Replicate(), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 2)
+        mock_input = MagicMock()
+        mock_input.to_local.return_value = "local_tensor"
+        mock_input.layout = MagicMock()
 
-        error_msg = "tensor_split: indices_or_sections must be an integer, list, tuple, or 1D tensor."
+        error_msg = "indices_or_sections must be an integer"
         with self.assertRaisesRegex(TypeError, error_msg):
-            tensor_split_op.infer_layout((x_layout,), extra_args=("invalid_string", 0))
+            tensor_split_op.preprocess((mock_input, "invalid_string"), {})
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_tensor_split_out_of_bounds_dim(self, mock_platform):
@@ -378,9 +411,11 @@ class TestParallelTensorSplit(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, r"Dimension out of range \(expected \[0, 2\), got 2\)."):
-            tensor_split_op.infer_layout((x_layout,), extra_args=(2, 2))
+        cache_values = [x_layout, 2, 2]
+        with self.assertRaisesRegex(ValueError, r"dimension should be in range \[0, 2\), but got 2."):
+            tensor_split_op.infer_layout(cache_values)
 
 
 if __name__ == "__main__":
     unittest.main()
+    

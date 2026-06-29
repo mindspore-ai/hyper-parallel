@@ -16,14 +16,48 @@
 Distributed implementation for Isin operator.
 """
 
-from hyper_parallel.core.dtensor.layout import Layout
+import copy
+from typing import Tuple
+
 from .parallel_ops import DistributedOp
+
+
+def _normalize_isin_args(elements, test_elements, assume_unique=False, invert=False):
+    return (elements, test_elements), {'assume_unique': assume_unique, 'invert': invert}
 
 
 class IsinDistributedOp(DistributedOp):
     """Distributed implementation for torch.isin."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for Isin operator.
+
+        Args:
+            args (tuple): Input arguments (elements, test_elements).
+            kwargs (dict): Keyword arguments (assume_unique, invert).
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, kwargs = _normalize_isin_args(*args, **kwargs)
+        elements, test_elements = args[0], args[1]
+        assume_unique = kwargs['assume_unique']
+        invert = kwargs['invert']
+
+        local_args = (
+            elements.to_local(),
+            test_elements.to_local() if hasattr(test_elements, '_layout') else test_elements,
+        )
+        local_kwargs = {'assume_unique': assume_unique, 'invert': invert}
+
+        cache_values = [
+            elements.layout,
+            test_elements.layout if hasattr(test_elements, '_layout') else None,
+        ]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layout for torch.isin(elements, test_elements, ...)
 
@@ -31,55 +65,45 @@ class IsinDistributedOp(DistributedOp):
           - Returns boolean tensor with SAME SHAPE as `elements`
           - Each element is tested against ALL values in `test_elements`, so requires GLOBAL view of `test_elements`
 
+        Rules:
+            1. elements must have a valid DTensor layout.
+            2. elements must not have Partial status.
+            3. If test_elements is a DTensor, it must be fully unsharded (replicated across all dimensions)
+               and must not have Partial status.
+            4. If test_elements is a plain Tensor or scalar, no sharding validation is needed.
+            5. Output layout is identical to elements layout.
+
         Args:
-            layouts (tuple): Layouts of inputs. Expected:
-                layouts[0] (Layout): Layout of `elements` tensor (required).
-                layouts[1] (Layout): Layout of `test_elements` tensor (required).
-            extra_args: No need.
+            cache_values (list): [elements_layout, test_elements_layout_or_None]
 
         Returns:
-            Layout: Output layout identical to `elements` layout (boolean tensor with same sharding).
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
         """
-        # Validate elements layout
-        if not layouts or layouts[0] is None:
+        if not cache_values or cache_values[0] is None:
             raise ValueError(
-                f"Operation {self.op_name}: 'elements' requires a valid tensor layout."
-            )
-        elements_layout = layouts[0]
-
-        # Validate test_elements layout
-        if len(layouts) < 2 or layouts[1] is None:
-            raise ValueError(
-                f"Operation {self.op_name}: 'test_elements' requires a valid tensor layout."
-            )
-        test_elements_layout = layouts[1]
-
-        # test_elements must be unsharded
-        if not all(shard_way == -1 for shard_way in test_elements_layout.tensor_map):
-            raise ValueError(
-                f"Operation {self.op_name}: 'test_elements' must be unsharded. "
-                f"Current tensor_map: {test_elements_layout.tensor_map}."
+                f"For {self.op_name}, 'elements' requires a valid tensor layout, "
+                f"but got {cache_values[0] if cache_values else None}."
             )
 
-        mesh_shape = elements_layout.mesh_shape
-        alias_name = elements_layout.alias_name
-        rank_list = elements_layout.rank_list
-        tensor_map = elements_layout.tensor_map
+        elements_layout = cache_values[0]
+        test_elements_layout = cache_values[1] if len(cache_values) >= 2 else None
 
-        def idx_to_alias(idx, aliases):
-            if idx == -1:
-                return "None"
-            return aliases[len(aliases) - idx - 1]
+        if not self._allow_partial_inputs:
+            check_layouts = [elements_layout]
+            if test_elements_layout is not None:
+                check_layouts.append(test_elements_layout)
+            self._check_partial_inputs(check_layouts)
 
-        output_map_aliases = tuple(
-            idx_to_alias(idx, alias_name) for idx in tensor_map
-        )
+        # test_elements must be unsharded if it is a DTensor
+        if test_elements_layout is not None:
+            alias_map = test_elements_layout.alias_tensor_map
+            if not all(entry == "None" for entry in alias_map):
+                raise ValueError(
+                    f"For {self.op_name}, 'test_elements' must be unsharded, "
+                    f"but got alias_tensor_map: {alias_map}."
+                )
 
-        output_layout = Layout(
-            mesh_shape=mesh_shape,
-            alias_name=alias_name,
-            rank_list=rank_list
-        )
-        output_layout = output_layout(*output_map_aliases)
-
-        return output_layout
+        return ((copy.deepcopy(elements_layout),), None)

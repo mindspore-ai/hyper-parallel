@@ -16,69 +16,91 @@
 Distributed implementation for Nonzero operator.
 """
 
+from typing import Tuple
+
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
+
+
+def _normalize_nonzero_args(x, as_tuple=False):
+    return (x,), {'as_tuple': as_tuple}
 
 
 class NonzeroDistributedOp(DistributedOp):
     """Distributed implementation for torch.nonzero."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layout for torch.nonzero.
-
-        PyTorch semantics:
-          - Returns a tensor containing the indices of all non-zero elements.
-          - If as_tuple=False (default): Returns a 2-D tensor of shape (z, n),
-            where z is the number of non-zero elements and n is the input dimension.
-          - If as_tuple=True: Returns a tuple of 1-D tensors, one for each dimension.
-
-        Distributed semantics:
-          - Because the output shape depends dynamically on the input data,
-            the input tensor MUST be fully replicated (unsharded) across the mesh.
-            Otherwise, each rank would produce a different local shape.
-          - The output layout will also be fully replicated.
+        Preprocess arguments for Nonzero operator.
 
         Args:
-            layouts (tuple): Layouts of inputs. Expected:
-                layouts[0] (Layout): Input tensor layout (required).
-            extra_args (list): Contains additional kwargs/args like 'as_tuple'.
+            args (tuple): Input arguments, first element is the input tensor.
+            kwargs (dict): Keyword arguments (as_tuple).
 
         Returns:
-            Layout or tuple[Layout]: Replicated output layout(s) matching PyTorch's
-                                     as_tuple return signature.
+            tuple: (local_args, local_kwargs, cache_values)
         """
-        # =====================================================================
-        # FIX: Explicitly enforce the base class's partial status guardrail
-        # =====================================================================
-        if not self._allow_partial_inputs:
-            self._check_partial_inputs(layouts)
+        args, kwargs = _normalize_nonzero_args(*args, **kwargs)
+        input_tensor = args[0]
+        as_tuple = kwargs['as_tuple']
 
-        if not layouts or layouts[0] is None:
+        local_args = (input_tensor.to_local(),)
+        local_kwargs = {'as_tuple': as_tuple}
+
+        cache_values = [input_tensor.layout, as_tuple]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layouts for Nonzero operator.
+
+        Rules:
+            1. Input must not have Partial status.
+            2. Input must be fully replicated (all dimensions mapped to "None").
+               nonzero produces data-dependent output shapes, which would differ
+               across sharded ranks.
+            3. If as_tuple=True: returns a tuple of 1D replicated layouts, one per
+               input dimension.
+            4. If as_tuple=False: returns a single 2D replicated layout.
+
+        Args:
+            cache_values (list): [input_layout, as_tuple]
+
+        Returns:
+            tuple: ((output_layout(s),), None)
+
+        Raises:
+            ValueError: If input has Partial status or is sharded.
+        """
+        input_layout = cache_values[0]
+        as_tuple = cache_values[1]
+
+        if input_layout is None:
             raise ValueError(
-                f"Operation {self.op_name}: nonzero requires a valid input tensor layout."
+                f"For {self.op_name}, input_layout should be a valid Layout, but got None."
             )
 
-        input_layout = layouts[0]
-        in_tensor_map = input_layout.tensor_map
-        input_ndim = len(in_tensor_map)
+        # Rule 1: Input must not have Partial status
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([input_layout])
 
-        # Rule 1: Input must be fully replicated due to data-dependent dynamic shapes
-        for dim_sharding in in_tensor_map:
-            if dim_sharding != -1:
+        if not isinstance(as_tuple, bool):
+            raise ValueError(
+                f"For {self.op_name}, as_tuple should be bool, but got {type(as_tuple)}."
+            )
+
+        alias_map = input_layout.alias_tensor_map
+        input_ndim = len(alias_map)
+
+        # Rule 2: Input must be fully replicated due to data-dependent dynamic shapes
+        for dim, dim_sharding in enumerate(alias_map):
+            if dim_sharding != "None":
                 raise ValueError(
-                    f"Operation {self.op_name}: input tensor must be fully replicated "
-                    f"(unsharded). nonzero produces dynamic shapes that depend on data values, "
+                    f"For {self.op_name}, input tensor should be fully replicated, "
+                    f"but got dim {dim} mapped to {dim_sharding}. "
+                    f"nonzero produces dynamic shapes that depend on data values, "
                     f"which causes shape mismatches across ranks if the tensor is sharded."
                 )
-
-        # Rule 2: Parse 'as_tuple' from extra_args (defaults to False)
-        as_tuple = False
-        if extra_args:
-            for arg in extra_args:
-                if isinstance(arg, bool):
-                    as_tuple = arg
-                    break
 
         mesh_shape = input_layout.mesh_shape
         alias_name = input_layout.alias_name
@@ -91,15 +113,12 @@ class NonzeroDistributedOp(DistributedOp):
                 alias_name=alias_name,
                 rank_list=rank_list
             )
-            # Replicated layout maps all dimensions to "None"
             alias_map = tuple("None" for _ in range(ndim))
             return layout(*alias_map)
 
-        # Rule 3: Construct the return layout based on as_tuple flag
+        # Rule 3 & 4: Construct the return layout based on as_tuple flag
         if as_tuple:
-            # Returns a tuple of 1D tensors, one for each dimension in the input
             out_layout = _create_replicated_layout(1)
-            return tuple(out_layout for _ in range(input_ndim))
+            return (tuple(out_layout for _ in range(input_ndim)), None)
 
-        # Default: Returns a single 2D tensor of shape (z, n)
-        return _create_replicated_layout(2)
+        return ((_create_replicated_layout(2),), None)
