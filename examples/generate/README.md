@@ -62,34 +62,22 @@ python examples/generate/benchmark_generate.py \
   --output /tmp/generate_baseline.json
 ```
 
-The JSON output records latency and generated-token throughput for:
+The JSON output records latency and token throughput for:
 
 - `prefill`: prompt-only forward latency.
 - `with_cache`: model returns `past_key_values`; decode uses single-token steps.
 - `no_cache`: model does not return `past_key_values`; decode recomputes the
   whole sequence.
 
-Example output fields:
+Key output fields:
 
-```json
-{
-  "batch_size": 4,
-  "prompt_len": 32,
-  "max_new_tokens": 64,
-  "prefill": {
-    "mean_seconds": 0.0034,
-    "tokens_per_second": 37647.0
-  },
-  "with_cache": {
-    "mean_seconds": 0.0123,
-    "tokens_per_second": 20813.0
-  },
-  "no_cache": {
-    "mean_seconds": 0.0456,
-    "tokens_per_second": 5614.0
-  }
-}
-```
+- top-level: `device`, `batch_size`, `prompt_len`, `max_new_tokens`,
+  `vocab_size`, `warmup`, `repeat`.
+- `prefill`: `mean_seconds`, `min_seconds`, `max_seconds`,
+  `tokens_per_second`.
+- `with_cache` and `no_cache`: `calls`, `first_call`, `last_call`,
+  `output_shape`, `mean_seconds`, `min_seconds`, `max_seconds`,
+  `tokens_per_second`.
 
 Use the same command and hardware when comparing future generate changes.
 

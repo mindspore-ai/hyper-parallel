@@ -206,6 +206,8 @@ def _validate_args(args) -> None:
         raise ValueError("prompt-len must be positive")
     if args.max_new_tokens <= 0:
         raise ValueError("max-new-tokens must be positive")
+    if args.vocab_size <= 0:
+        raise ValueError("vocab-size must be positive")
     if args.warmup < 0:
         raise ValueError("warmup must be >= 0")
     if args.warmup == 0:
