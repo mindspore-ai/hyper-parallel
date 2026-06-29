@@ -12,26 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Launch MindSpore fully_shard set_gradient_scaling_factor HSDP + grad-acc ST."""
+"""Launch MindSpore fully_shard replicate_params ST."""
 import os
 
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import MindSporeCase, parallel_run
 
-_TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_gradient_scaling_factor_hsdp_acc.py")
+_TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_replicate_params.py")
 
 
 @arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
-def test_ms_gradient_scaling_factor_hsdp_acc():
+def test_ms_fully_shard_replicate_params():
     """
-    Feature: fully_shard set_gradient_scaling_factor under HSDP + gradient
-        accumulation + replicate_params (pure all-reduce path), MindSpore.
-    Description: Launch a 4-card msrun case on a 2x2 HSDP mesh; verify the scaling
-        factor scales every parameter's accumulated gradient exactly once,
-        including replicate params that only go through all-reduce.
-    Expectation: Run success.
+    Feature: fully_shard replicate_params precision and TP DTensor state (MindSpore).
+    Description: Run the replicate-weights/sharded-biases precision case (with prefetch + mixed-state check)
+                 and the TP-sharded DTensor replicate-state case together in one 8-card wave.
+    Expectation: Replicate grads match the full reference, sharded grads match the shard, DTensor state stays visible.
     """
     parallel_run([
-        MindSporeCase(_TEST_FILE, "test_ms_gradient_scaling_factor_hsdp_grad_accumulation",
+        MindSporeCase(_TEST_FILE, "test_ms_fully_shard_with_replicate_params",
+                      worker_num=4, local_worker_num=4),
+        MindSporeCase(_TEST_FILE, "test_ms_fully_shard_replicate_dtensor_state",
                       worker_num=4, local_worker_num=4),
     ])

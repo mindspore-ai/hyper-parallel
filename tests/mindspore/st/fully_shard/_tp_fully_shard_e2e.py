@@ -1190,21 +1190,6 @@ def _assert_pure_tp_replicate_grad_managed_by_fully_shard(
     )
 
 
-def test_tp_plus_fully_shard_loss_and_grad_match_standalone():
-    """TP + fully_shard: compare local loss/grad against standalone on a square case."""
-    _assert_loss_and_grad_match(
-        case_name="tp2_fully_shard_case_ms",
-        steps=12,
-        batch_size=16,
-        input_size=32,
-        output_size=32,
-        input_seed=2,
-        label_seed=3,
-        init_seed=4,
-        tp_size=2,
-    )
-
-
 def test_tp_plus_fully_shard_fp32_main_grad_match_standalone():
     """TP + fully_shard: fp32-reduce main_grad matches standalone and can drive optimizer steps."""
     _assert_loss_and_grad_match(
@@ -1238,7 +1223,7 @@ def test_tp_plus_fully_shard_same_dim_non_dim0_match_standalone():
 
 
 def test_tp_plus_fully_shard_empty_weight_match_standalone():
-    """TP + fully_shard: compare empty-init load path against standalone."""
+    """TP + fully_shard: empty-init load path vs standalone (also covers the basic loss/grad case)."""
     _assert_loss_and_grad_match(
         case_name="tp2_empty_weight_case_ms",
         steps=4,

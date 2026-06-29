@@ -1,0 +1,38 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Shared precision-comparison helpers for fully_shard ST (model-agnostic).
+
+A distributed fully_shard run holds, on each rank, the dim-0 shard of every parameter
+gradient. To check it against a single-card reference (the full, unsharded gradient),
+slice the reference along dim 0 by the rank's shard coordinate and compare. These helpers
+capture that mapping and the Tensor/DTensor-to-numpy conversion so every precision test
+(whatever its model) shares them.
+"""
+import numpy as np
+
+
+def assert_shard_matches_reference(case_name, rank, what, reference_full, local_shard,
+                                   shard_size, shard_coord, rtol=1e-4, atol=1e-5):
+    """Assert a rank's local shard equals the dim-0 slice of the single-card reference tensor."""
+    chunk = reference_full.shape[0] // shard_size
+    expected = reference_full[shard_coord * chunk: (shard_coord + 1) * chunk]
+    assert np.allclose(expected, local_shard, rtol=rtol, atol=atol), (
+        f"{case_name}, rank {rank}, {what}: expected slice {expected}, got {local_shard}"
+    )
+
+
+def _to_numpy(value):
+    """Tensor / DTensor -> numpy; a DTensor returns its local shard."""
+    return value.to_local().asnumpy() if hasattr(value, "to_local") else value.asnumpy()
