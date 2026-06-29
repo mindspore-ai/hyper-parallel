@@ -123,7 +123,7 @@ def _make_args(loss_aggregation="token_weighted", max_grad_norm=1.0):
     )
 
 
-def _build_trainer(model, *, args=None):
+def _build_trainer(model, *, args=None, stub_step_hooks=True):
     """Construct a ``BaseTrainer`` bypassing ``_setup`` — wires the fields
     ``train_step`` / ``forward_backward_step`` actually read.
     """
@@ -142,9 +142,10 @@ def _build_trainer(model, *, args=None):
     trainer.lr_scheduler = None
     trainer.parallel_dims = types.SimpleNamespace(dp_size=1)
     trainer._dp_group_info = types.SimpleNamespace(rank_size=1)
-    # Stub the per-step callback hooks so we don't need a full callback wiring.
-    trainer.on_substep_end = MagicMock()
-    trainer.on_pre_optimizer_step = MagicMock()
+    if stub_step_hooks:
+        # Stub the per-step callback hooks so we don't need a full callback wiring.
+        trainer.on_substep_end = MagicMock()
+        trainer.on_pre_optimizer_step = MagicMock()
     return trainer
 
 

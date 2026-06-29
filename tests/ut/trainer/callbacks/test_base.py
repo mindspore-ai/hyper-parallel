@@ -31,12 +31,13 @@ hardware or external deps and is exercised via integration tests.
 """
 # pylint: disable=protected-access
 import os
+import tempfile
 import types
 import unittest
 from unittest.mock import MagicMock, patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
-
+import torch
 from hyper_parallel.trainer.base import TrainerState
 from hyper_parallel.trainer.callbacks import base as cb_mod
 from hyper_parallel.trainer.callbacks.base import (
@@ -45,23 +46,32 @@ from hyper_parallel.trainer.callbacks.base import (
     GradientHealthCallback,
     LoggingCallback,
     ProgressCallback,
+    TrainingStateMonitorCallback,
 )
 
 
 def _make_trainer(*, log_cfg=None, train_cfg=None, data_cfg=None, debug_cfg=None,
-                  lr_scheduler=None):
+                  monitor_cfg=None, lr_scheduler=None, model=None):
     """Build a SimpleNamespace ``trainer`` shaped like ``BaseTrainer`` from the callbacks' POV."""
+    if train_cfg is None:
+        train_cfg = types.SimpleNamespace(global_batch_size=4)
+    if monitor_cfg is not None:
+        train_cfg.monitor = monitor_cfg
+    if debug_cfg is not None:
+        train_cfg.debug = debug_cfg
     args = types.SimpleNamespace(
         logging=log_cfg,
-        train=train_cfg or types.SimpleNamespace(global_batch_size=4),
+        train=train_cfg,
         data=data_cfg or types.SimpleNamespace(max_seq_len=8),
         debug=debug_cfg,
+        monitor=monitor_cfg,
     )
     return types.SimpleNamespace(
         args=args,
         lr_scheduler=lr_scheduler,
         _last_global_tokens=None,
         dispatch_log_event=None,
+        model=model,
     )
 
 
@@ -196,11 +206,94 @@ class TestGradientHealthCallback(unittest.TestCase):
         self.assertIn("Non-finite grad_norm", str(ctx.exception))
 
     def test_inf_grad_does_not_raise_on_non_rank_zero(self):
-        """Non-rank-0 must NOT raise on non-finite grad — only rank-0 raises; NCCL tears down the rest."""
+        """Non-rank-0 must not raise on non-finite grad; rank 0 reports the user-facing error."""
         cb = self._build()
         with patch.object(cb_mod, "platform") as mock_platform:
             mock_platform.get_rank.return_value = 3
             cb.on_pre_optimizer_step(TrainerState(), grad_norm=float("inf"))  # no raise
+
+
+class TestTrainingStateMonitorCallback(unittest.TestCase):
+    """Local loss / grad scalar monitors are rank-local and target-aware."""
+
+    def _build(self, *, monitor_cfg, model):
+        trainer = _make_trainer(monitor_cfg=monitor_cfg, model=model)
+        return TrainingStateMonitorCallback(trainer)
+
+    @staticmethod
+    def _monitor_cfg(tmp, **overrides):
+        """Build monitor config with test-friendly defaults."""
+        cfg = types.SimpleNamespace(
+            monitor_on=True,
+            dump_path=tmp,
+            step_interval=1,
+            target=None,
+            invert=False,
+            local_loss_format=None,
+            device_local_loss_format=None,
+            local_norm_format=None,
+            device_local_norm_format=None,
+        )
+        for key, value in overrides.items():
+            setattr(cfg, key, value)
+        return cfg
+
+    def test_local_loss_is_recorded_from_substep_info(self):
+        """Raw micro-batch loss is converted to a scalar and cached for the current step."""
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor_cfg = self._monitor_cfg(
+                tmp,
+                local_loss_format=["log"],
+            )
+            cb = self._build(monitor_cfg=monitor_cfg, model=torch.nn.Linear(1, 1))
+            state = TrainerState()
+            state.global_step = 1
+            with patch.object(cb_mod, "platform") as mock_platform:
+                mock_platform.get_rank.return_value = 0
+                cb.on_train_begin(state)
+                cb.on_substep_end(state, raw_loss=torch.tensor(2.0), micro_step=0)
+        self.assertEqual(cb.last_local_loss, 2.0)
+
+    def test_local_norm_stats_are_target_aware(self):
+        """``target`` limits local grad stats to matching parameter names."""
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor_cfg = self._monitor_cfg(
+                tmp,
+                target=["0.weight"],
+                local_norm_format=["log"],
+                device_local_norm_format=["log"],
+            )
+            model = torch.nn.Sequential(torch.nn.Linear(2, 1, bias=False))
+            cb = self._build(monitor_cfg=monitor_cfg, model=model)
+            state = TrainerState()
+            state.global_step = 1
+            with patch.object(cb_mod, "platform") as mock_platform:
+                mock_platform.get_rank.return_value = 0
+                cb.on_train_begin(state)
+                model(torch.tensor([[1.0, 2.0]])).sum().backward()
+                cb.on_pre_optimizer_step(state, grad_norm=1.0)
+        self.assertGreater(cb.last_local_grad_norm, 0.0)
+
+    def test_target_invert_excludes_param_from_local_norm_stats(self):
+        """``invert=True`` excludes matching params from local grad scalar recording."""
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor_cfg = self._monitor_cfg(
+                tmp,
+                target=["0.weight"],
+                invert=True,
+                local_norm_format=["log"],
+                device_local_norm_format=["log"],
+            )
+            model = torch.nn.Sequential(torch.nn.Linear(2, 1, bias=False))
+            cb = self._build(monitor_cfg=monitor_cfg, model=model)
+            state = TrainerState()
+            state.global_step = 1
+            with patch.object(cb_mod, "platform") as mock_platform:
+                mock_platform.get_rank.return_value = 0
+                cb.on_train_begin(state)
+                model(torch.tensor([[1.0, 2.0]])).sum().backward()
+                cb.on_pre_optimizer_step(state, grad_norm=1.0)
+        self.assertEqual(cb.last_local_grad_norm, 0.0)
 
 
 class TestGCCallback(unittest.TestCase):

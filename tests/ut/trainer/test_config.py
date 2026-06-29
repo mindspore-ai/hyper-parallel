@@ -48,6 +48,7 @@ from hyper_parallel.trainer.config import (
     DataConfig,
     HyperTrainerConfig,
     ModelConfig,
+    MonitorConfig,
     TrainConfig,
     _coerce_cli_value,
     _deep_update,
@@ -233,6 +234,14 @@ class TestHyperTrainerConfigPostInit(unittest.TestCase):
         self.assertIsInstance(cfg.train.accelerator, AcceleratorConfig)
         self.assertEqual(cfg.train.accelerator.moe_token_dispatcher_type, "all_to_all")
         self.assertEqual(cfg.train.accelerator.npu_nums_per_device, 8)
+
+    def test_monitor_defaults(self):
+        """Monitor scalar-output config defaults are disabled and non-invasive."""
+        cfg = HyperTrainerConfig()
+        self.assertIsInstance(cfg.train.monitor, MonitorConfig)
+        self.assertFalse(cfg.train.monitor.monitor_on)
+        self.assertEqual(cfg.train.monitor.dump_path, "./dump")
+        self.assertEqual(cfg.train.monitor.step_interval, 1)
 
 
 class TestParseArgs(unittest.TestCase):

@@ -66,6 +66,7 @@ from hyper_parallel.trainer.callbacks.base import (
     WandbCallback,
     ProgressCallback,
     MoEMonitorCallback,
+    TrainingStateMonitorCallback,
     GradientHealthCallback,
     GCCallback,
     TensorBoardCallback,
@@ -100,6 +101,7 @@ class TrainerState:
         self.epoch: int = 0
         self.max_steps: int = max_steps
         self.log_history: list = []
+        self.substep_info: Dict[str, Any] = {}
 
 
 class BaseTrainer:
@@ -1021,6 +1023,7 @@ class BaseTrainer:
         self.progress_callback = ProgressCallback(self)
         self.moe_monitor_callback = MoEMonitorCallback(self)
         # Health + operability (no-ops unless enabled in cfg.train.debug / .memory_monitor).
+        self.training_state_monitor_callback = TrainingStateMonitorCallback(self)
         self.gradient_health_callback = GradientHealthCallback(self)
         self.memory_monitor_callback = MemoryMonitorCallback(self)
         self.gc_callback = GCCallback(self)
@@ -1031,6 +1034,7 @@ class BaseTrainer:
         logger.info_rank0(
             "Callbacks initialized: logging, checkpoint, hf_export, eval, "
             "profiler, wandb, tensorboard, progress, moe_monitor, "
+            "training_state_monitor, " 
             "gradient_health, memory_monitor, gc"
         )
 
@@ -1073,6 +1077,7 @@ class BaseTrainer:
             self.checkpoint_callback,
             self.hf_export_callback,
             self.moe_monitor_callback,
+            self.training_state_monitor_callback,
             self.gradient_health_callback,
             self.memory_monitor_callback,
             self.gc_callback,
@@ -1098,6 +1103,7 @@ class BaseTrainer:
         # Memory monitor first so it captures the truly-initial peak.
         self.memory_monitor_callback.on_train_begin(self.state)
         self.moe_monitor_callback.on_train_begin(self.state)
+        self.training_state_monitor_callback.on_train_begin(self.state)
         self.profiler_callback.on_train_begin(self.state)
         self.wandb_callback.on_train_begin(self.state)
         self.tensorboard_callback.on_train_begin(self.state)
@@ -1113,6 +1119,7 @@ class BaseTrainer:
         self.checkpoint_callback.on_train_end(self.state)
         self.hf_export_callback.on_train_end(self.state)
         self.progress_callback.on_train_end(self.state)
+        self.training_state_monitor_callback.on_train_end(self.state)
         self.tensorboard_callback.on_train_end(self.state)
         self.wandb_callback.on_train_end(self.state)
         self.profiler_callback.on_train_end(self.state)
@@ -1127,18 +1134,27 @@ class BaseTrainer:
 
     def on_step_end(self, loss=None, grad_norm=None):
         """Dispatch on_step_end to all callbacks (built-ins + user)."""
+        self.training_state_monitor_callback.on_step_end(
+            self.state, loss=loss, grad_norm=grad_norm,
+        )
         for cb in self._all_callbacks():
+            if cb is self.training_state_monitor_callback:
+                continue
             cb.on_step_end(self.state, loss=loss, grad_norm=grad_norm)
 
     def on_substep_end(self):
         """Dispatch on_substep_end (after each micro-batch forward/backward)."""
         self.moe_monitor_callback.on_substep_end(self.state)
+        self.training_state_monitor_callback.on_substep_end(self.state)
         for cb in self.user_callbacks:
             cb.on_substep_end(self.state)
 
     def on_pre_optimizer_step(self, grad_norm=None):
         """Dispatch on_pre_optimizer_step (after grad clip, before optimizer.step)."""
         # Health check runs FIRST so a NaN aborts before the logger misleads.
+        self.training_state_monitor_callback.on_pre_optimizer_step(
+            self.state, grad_norm=grad_norm,
+        )
         self.gradient_health_callback.on_pre_optimizer_step(
             self.state, grad_norm=grad_norm,
         )
@@ -1437,6 +1453,10 @@ class BaseTrainer:
             total_loss_sum += loss_value * micro_tokens
             total_loss_arith_sum += loss_value
             total_tokens_local += micro_tokens
+            self.state.substep_info = {
+                "raw_loss": loss_value,
+                "micro_tokens": micro_tokens,
+            }
             self.on_substep_end()
         return total_loss_sum, total_loss_arith_sum, total_tokens_local
 
