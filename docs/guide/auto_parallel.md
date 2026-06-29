@@ -62,6 +62,8 @@ ND 的输出会给出满足内存约束的候选配置和排序结果，并生�
 
 SAPP-PPB 用于 Pipeline Parallel stage 负载均衡。它读取每类 layer 在不同重计算或 swap 策略下的耗时和内存信息，以及 PP stage 数、micro-batch 数、interleave 数、调度策略等流水线配置，然后构造整数线性规划问题，由求解器返回 layer 分配、offset 和 recompute 配置，并可通过 simulator 查看流水线效果。
 
+> **说明**：PPB 中的 `recompute` 指 PP stage 级的重计算策略搜索，与 `hyper_parallel.core.activation_checkpoint` 中的 Activation Checkpoint / Swap API 是不同层面的配置，可组合使用但语义独立。
+
 ```bash
 python hyper_parallel/auto_parallel/sapp_ppb/run_pipeline_balance.py \
     -m llama2_70b \

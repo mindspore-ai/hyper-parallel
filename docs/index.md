@@ -17,11 +17,12 @@
 | [PP 流水线并行](./guide/pipeline_parallel.md) | PipelineStage、Schedule、overlap_b_f、PP+FSDP、P2P prefetch、 Mpipe |
 | [CP 上下文并行](./guide/context_parallel.md) | ContextParallel、AsyncContextParallel、DSA 系列 |
 | [EP 专家并行](./guide/expert_parallel.md) | ExpertParallel、MoE 构建模块、负载均衡 |
-| [Activation Checkpoint / Swap](./guide/activation_checkpoint.md) | checkpoint_wrapper、swap_wrapper、协同配置 |
+| [Activation Checkpoint / Swap](./guide/activation_checkpoint.md) | checkpoint_wrapper、swap_wrapper、swap_tensor_wrapper、协同配置 |
 | [Optimizer](./guide/optimizer.md) | AdamW、Muon、ChainedOptimizer、学习率调度器 |
 | [DCP 分布式检查点](./guide/distributed_checkpoint.md) | 检查点保存/加载、异步 staging、离线转换 |
 | [自动并行](./guide/auto_parallel.md) | SAPP-ND、SAPP-PPB |
 | [MoE 多核并行](./guide/multicore_moe.md) | 多核 MPMD、MoE 通算掩盖 |
+| [LlamaFactory + HyperParallel SFT 训练](./guide/llama_factory_hyperparallel_sft_guide.md) | 基于 LlamaFactory 和 HyperParallel 的 SFT 配置、启动、精度与性能验证 |
 
 ## API 参考
 

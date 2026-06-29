@@ -40,6 +40,8 @@ pytest tests/ut/core/shard/
 
 # 仅运行 activation_checkpoint UT
 pytest tests/ut/core/activation_checkpoint/
+pytest tests/ut/platform/torch/activation_checkpoint/
+pytest tests/ut/platform/mindspore/activation_checkpoint/
 ```
 
 ## 测试标记
