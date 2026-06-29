@@ -354,12 +354,14 @@ class HSDPParamV2:
 
         orig_dtensor_mesh = getattr(self, "_orig_dtensor_mesh", None)
         orig_dtensor_placements = getattr(self, "_orig_dtensor_placements", None)
-        if (
+        mesh_mismatch = (
             orig_dtensor_mesh is not None
             and grad.device_mesh.to_hash() != orig_dtensor_mesh.to_hash()
-        ) or (
+        )
+        placement_mismatch = (
             orig_dtensor_placements is not None
             and tuple(grad.placements) != tuple(orig_dtensor_placements)
-        ):
+        )
+        if mesh_mismatch or placement_mismatch:
             grad = grad.redistribute(orig_dtensor_mesh, orig_dtensor_placements)
         return grad.to_local()

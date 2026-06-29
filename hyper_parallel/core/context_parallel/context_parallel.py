@@ -766,7 +766,7 @@ class ContextParallel(ParallelStyle):
             return out
 
         if isinstance(outputs, (tuple, list)):
-            return type(outputs)(_process(o) for o in outputs)
+            return type(outputs)(_process(item) for item in outputs)
         return _process(outputs)
 
     def _post_hook_hybrid(self, module, inputs, outputs, hybrid_cp_mesh, ds_submesh):  # pylint: disable=unused-argument
@@ -800,7 +800,7 @@ class ContextParallel(ParallelStyle):
             return seq_local
 
         if isinstance(outputs, (tuple, list)):
-            return type(outputs)(_process(o) for o in outputs)
+            return type(outputs)(_process(item) for item in outputs)
         return _process(outputs)
 
     def _post_hook_colossal(self, module, inputs, outputs, co_submesh):  # pylint: disable=unused-argument
@@ -813,7 +813,7 @@ class ContextParallel(ParallelStyle):
             )
 
         if isinstance(outputs, (tuple, list)):
-            return type(outputs)(_process(o) for o in outputs)
+            return type(outputs)(_process(item) for item in outputs)
         return _process(outputs)
 
     # ------------------------------------------------------------------

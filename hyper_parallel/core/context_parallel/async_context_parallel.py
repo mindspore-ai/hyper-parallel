@@ -821,20 +821,20 @@ class AsyncContextParallel(ContextParallel):
         """Reverse head→seq gather on ds_submesh; returns local tensor."""
         output_layout = _pop_output_layout(module)
 
-        def _process(o):
-            if isinstance(o, (Tensor, DTensor)):
-                if isinstance(o, DTensor) and not _is_cp_composed_dtensor(o, ds_submesh):
-                    o = o.to_local()
+        def _process(output_item):
+            if isinstance(output_item, (Tensor, DTensor)):
+                if isinstance(output_item, DTensor) and not _is_cp_composed_dtensor(output_item, ds_submesh):
+                    output_item = output_item.to_local()
                 seq_dtensor = _gather_head_to_seq(
-                    o, ds_submesh, self.seq_dim, self.head_dim
+                    output_item, ds_submesh, self.seq_dim, self.head_dim
                 )
                 return _finalize_ata_output(
                     seq_dtensor, output_layout, ds_submesh, self.seq_dim, self.use_local_output
                 )
-            return o
+            return output_item
 
         if isinstance(output, (tuple, list)):
-            return type(output)(_process(o) for o in output)
+            return type(output)(_process(item) for item in output)
         return _process(output)
 
     # ------------------------------------------------------------------

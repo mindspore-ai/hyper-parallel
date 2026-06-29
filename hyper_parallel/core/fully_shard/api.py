@@ -716,10 +716,12 @@ def fully_shard(
     if mesh is not None:
         device = _get_device_from_mesh(mesh)
     else:
-        compat_mesh = next(
-            (dtensor_mesh for param in params if (dtensor_mesh := get_dtensor_managed_mesh(param)) is not None),
-            None,
-        )
+        compat_mesh = None
+        for param in params:
+            dtensor_mesh = get_dtensor_managed_mesh(param)
+            if dtensor_mesh is not None:
+                compat_mesh = dtensor_mesh
+                break
         if compat_mesh is None:
             raise ValueError("fully_shard could not resolve a DTensor mesh for compatibility mode.")
         device = _get_device_from_mesh(compat_mesh)
