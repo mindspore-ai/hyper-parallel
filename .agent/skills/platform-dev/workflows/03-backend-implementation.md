@@ -63,7 +63,7 @@ For feature-specific code (FSDP, HSDP, Pipeline, Activation Checkpoint):
 | **FSDP** | `state.py`, `param.py`, `scheduler.py`, `hook_function.py` | State manages lifecycle; Param holds per-param metadata; Scheduler handles shard/unshard timing; Hooks register forward/backward hooks |
 | **HSDP** | Same as FSDP + `grad_hook.py`, `async_grad_hook.py` | Extends FSDP with gradient all-reduce across replicate dimension |
 | **Pipeline** | `stage.py`, `_utils.py` | Stage defines pipeline stage; Utils handle micro-batch chunking |
-| **Activation** | `sac.py`, `activation_swap.py` | SAC for selective recompute; Swap for CPU offload |
+| **Activation** | `sac.py`, `activation_swap.py`, `checkpoint_wrapper.py` | SAC for selective recompute; Swap for CPU offload; implement in **both** `platform/torch/` and `platform/mindspore/` |
 
 ### 3.4 DTensorBase Extension
 

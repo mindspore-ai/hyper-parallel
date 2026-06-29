@@ -280,39 +280,45 @@ def create_sub_groups(rank_list):
 
 ---
 
-## Activation Checkpoint (Torch Only)
+## Activation Checkpoint & Swap (Torch + MindSpore)
+
+Public API: `hyper_parallel.core.activation_checkpoint` — platform code under
+`platform/torch/activation_checkpoint/` and `platform/mindspore/activation_checkpoint/`.
 
 ### Selective Activation Checkpoint (SAC)
 
 ```text
 Forward Pass:
-    For each op:
-        if policy(op) == SAVE: save activation
-        if policy(op) == RECOMPUTE: skip saving
+    For each op (via TorchDispatchMode / MindSpore SAC):
+        if policy(ctx, op, ...) == MUST_SAVE: save activation
+        if policy == MUST_RECOMPUTE: skip saving
+        if policy == MUST_SWAP: offload via SwapManager (no recompute on backward)
 
 Backward Pass:
     For each op:
         if saved: use saved activation
         if recompute: re-execute forward op
+        if swapped: reload from host (wait_load)
 ```
 
 ### Activation Swap (CPU Offload)
 
 ```text
 Forward Pass:
-    Activation saved → async D2H copy to CPU (non_blocking)
+    Activation saved → async D2H copy to CPU (copy_stream)
     Record event on compute stream
 
 Backward Pass:
-    Prefetch: async H2D copy back to GPU
-    Wait for event → use activation
-    Free CPU buffer
+    Prefetch: async H2D copy back to device
+    wait_load → use activation
+    wait_offload / release_group_storage → free buffers
 ```
 
 **Key Classes:**
-- `AsyncSaveOnCpu` — saved_tensors_hooks context manager
-- `ActivationWrapper` — module wrapper base class
-- `ActivationPolicy.SAVE` vs `ActivationPolicy.SWAP`
+- `AsyncSaveOnCpu` — `saved_tensors_hooks` context manager (`swap` / `swap_wrapper`)
+- `ActivationWrapper` — module wrapper base (`CheckpointWrapper`, `SwapWrapper`)
+- `SwapManager` — singleton group scheduler (`set_forward_prefetch_layer`, offload/load)
+- `CheckpointPolicy.MUST_SAVE` vs `CheckpointPolicy.MUST_SWAP`
 
 ---
 
