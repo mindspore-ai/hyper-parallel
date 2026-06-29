@@ -49,7 +49,7 @@ from hyper_parallel.core.dtensor.dtensor import (
 )
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.tensor_parallel.style import ParallelStyle
-from hyper_parallel.platform import get_platform
+from hyper_parallel.platform import AsyncHandle, get_platform
 
 platform = get_platform()
 Module = platform.Module
@@ -221,6 +221,7 @@ class DispatchContext:
     output_splits: List[int]
     input_shape: Tuple[int, ...]
     permuted_indices: Any
+
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +420,57 @@ class AllToAllTokenDispatcher:
         )
         return combined
 
+    @staticmethod
+    def combine_start(routed_output, device_mesh, ctx):
+        """Launch async combine all-to-all without waiting for completion.
+
+        Splits the combine into two phases so that the caller can overlap
+        the a2a communication with independent computation (e.g. a shared
+        expert forward pass).  The caller must later call
+        :meth:`combine_wait` or ``handle.wait()`` to obtain the final
+        result.
+
+        Step 1 (synchronous, local): expert-major → rank-major unpermute.
+        Step 2 (asynchronous, cross-rank): reverse all-to-all.
+
+        Args:
+            routed_output: Expert output tensor in expert-major order,
+                shape ``[sum(local_counts), dim]``.
+            device_mesh: EP device mesh (1-D).
+            ctx: :class:`DispatchContext` previously returned by
+                :meth:`dispatch`.
+
+        Returns:
+            :class:`AsyncHandle` carrying the state needed by
+            :meth:`combine_wait`.
+        """
+        ep_group = device_mesh.get_group()
+
+        # expert-major → rank-major (local, no communication)
+        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices)
+
+        # async reverse all-to-all (output/input splits are swapped)
+        combined_async = platform.differentiable_all_to_all_single_async(
+            unpermuted,
+            ctx.output_splits,
+            ctx.input_splits,
+            group=ep_group,
+        )
+
+        return AsyncHandle(combined_async)
+
+    @staticmethod
+    def combine_wait(handle):
+        """Wait for the async combine all-to-all to complete.
+
+        Args:
+            handle: :class:`AsyncHandle` returned by :meth:`combine_start`.
+
+        Returns:
+            Combined tensor in the original token-major layout.
+        """
+        return handle.wait()
+
 
 # ---------------------------------------------------------------------------
 # ExpertParallel — standard all-to-all EP
@@ -442,15 +494,28 @@ class ExpertParallel(BaseExpertParallel):
     ``platform.all_to_all_single`` — no direct ``torch.distributed`` calls.
 
     Args:
-        None
+        async_combine: When ``True``, the combine all-to-all is launched
+            asynchronously so that the caller (e.g. :class:`MoE`) can
+            overlap it with shared-expert computation.  When ``False``
+            (default), combine is fully synchronous — no overlap, identical
+            to the baseline.
 
     Example::
         >>> ep_style = ExpertParallel()
         >>> sharded_experts = ep_style.apply(experts_module, ep_device_mesh)
+        >>> # With async combine for shared-expert overlap:
+        >>> ep_style = ExpertParallel(async_combine=True)
+        >>> sharded_experts = ep_style.apply(experts_module, ep_device_mesh)
     """
 
-    def __init__(self) -> None:
-        """Initialize ExpertParallel."""
+    def __init__(self, async_combine: bool = False) -> None:
+        """Initialize ExpertParallel.
+
+        Args:
+            async_combine: If ``True``, use asynchronous combine all-to-all
+                to overlap communication with shared-expert computation.
+        """
+        self.async_combine = async_combine
 
     def _token_dispatch(self, module: Module, inputs, device_mesh: DeviceMesh):
         """Dispatch tokens to their assigned ranks via all-to-all.
@@ -461,12 +526,33 @@ class ExpertParallel(BaseExpertParallel):
 
         Args:
             module: The ``GroupedExperts`` module.
-            inputs: Tuple ``(routed_input, num_tokens_per_expert)``.
+            inputs: Tuple ``(routed_input, num_tokens_per_expert)`` or
+                ``(routed_input, num_tokens_per_expert, scores)``.
             device_mesh: EP device mesh (1-D).
 
         Returns:
             Tuple ``(permuted_local_input, local_token_counts)``.
+
+        Raises:
+            ValueError: If ``score_before_experts=False`` (scores passed as
+                a positional argument) and EP degree > 1.  After dispatch,
+                the token order changes but scores remain in the pre-dispatch
+                order, causing a silent correctness bug.
         """
+        ep_size = device_mesh.size()
+        # When EP reorders tokens across ranks, scores (if provided) would
+        # no longer align with the dispatched token order.  The caller must
+        # use score_before_experts=True so that scores are multiplied in
+        # before dispatch.
+        if ep_size > 1 and len(inputs) > 2 and inputs[2] is not None:
+            raise ValueError(
+                "ExpertParallel does not support score_before_experts=False "
+                "when ep_size > 1.  After all-to-all dispatch the token order "
+                "changes but scores remain in the pre-dispatch order, causing "
+                "incorrect routing weights.  Set score_before_experts=True in "
+                "MoE so that scores are multiplied before dispatch."
+            )
+
         permuted, local_counts, ctx = (
             AllToAllTokenDispatcher.dispatch(module, inputs, device_mesh)
         )
@@ -481,9 +567,14 @@ class ExpertParallel(BaseExpertParallel):
     def _token_combine(self, module: Module, routed_output, device_mesh: DeviceMesh):
         """Gather expert outputs back to the originating ranks via all-to-all.
 
-        Reads :class:`DispatchContext` from module attribute set by
-        :meth:`_token_dispatch` and delegates to
-        :meth:`AllToAllTokenDispatcher.combine`.
+        When ``async_combine=True``, launches the combine all-to-all
+        asynchronously and returns an :class:`AsyncCollectiveTensor`.  The
+        actual device-side wait is deferred until the downstream consumer
+        (e.g. MoE unpermutation) first reads the tensor, enabling overlap
+        with shared-expert computation.
+
+        When ``async_combine=False`` (default), uses the synchronous
+        :meth:`AllToAllTokenDispatcher.combine` — identical to the baseline.
 
         Args:
             module: The ``GroupedExperts`` module.
@@ -491,7 +582,9 @@ class ExpertParallel(BaseExpertParallel):
             device_mesh: EP device mesh (1-D).
 
         Returns:
-            Token tensor in the original token-major layout.
+            Token tensor in the original token-major layout.  When
+            ``async_combine=True``, this may be an async collective tensor
+            whose values are not yet materialised.
 
         Raises:
             RuntimeError: If dispatch context is not found (dispatch was not called).
@@ -510,6 +603,18 @@ class ExpertParallel(BaseExpertParallel):
         # are captured by autograd graph and don't need the attribute. But in
         # MindSpore PyNative mode, deleting the attribute may break backward.
         # The context will be overwritten on the next forward call.
+
+        if self.async_combine:
+            handle = AllToAllTokenDispatcher.combine_start(
+                routed_output, device_mesh, ctx
+            )
+            # Store on module for external inspection / advanced use cases.
+            # pylint: disable=W0212
+            module._ep_combine_handle = handle
+            # Return the async tensor.  The first non-view access by the
+            # downstream consumer (e.g. MoE unpermutation) will trigger the
+            # implicit wait, overlapping with shared_expert computation.
+            return handle.wait()
 
         return AllToAllTokenDispatcher.combine(
             module, routed_output, device_mesh, ctx,
@@ -623,12 +728,22 @@ class ExpertTensorParallel(ExpertParallel):
       so that token routing uses EP-group collectives, not the full 2-D mesh.
 
     Args:
-        None
+        async_combine: Forwarded to :class:`ExpertParallel`.  When ``True``,
+            the combine all-to-all is launched asynchronously for
+            shared-expert overlap.
 
     Example::
         >>> etp_style = ExpertTensorParallel()
         >>> sharded = etp_style.apply(experts_module, ep_tp_2d_mesh)
     """
+
+    def __init__(self, async_combine: bool = False) -> None:
+        """Initialize ExpertTensorParallel.
+
+        Args:
+            async_combine: If ``True``, use asynchronous combine all-to-all.
+        """
+        super().__init__(async_combine=async_combine)
 
     def _token_dispatch(self, module: Module, inputs, device_mesh: DeviceMesh):
         """Dispatch tokens using only the EP sub-mesh.
@@ -640,17 +755,35 @@ class ExpertTensorParallel(ExpertParallel):
 
         Returns:
             Transformed inputs for local expert computation.
+
+        Raises:
+            ValueError: If ``score_before_experts=False`` and EP degree > 1.
         """
+        ep_mesh = device_mesh["ep"]
+        # Same score_before_experts check as ExpertParallel, but using
+        # the EP sub-mesh size.
+        ep_size = ep_mesh.size()
+        if ep_size > 1 and len(inputs) > 2 and inputs[2] is not None:
+            raise ValueError(
+                "ExpertTensorParallel does not support score_before_experts=False "
+                "when ep_size > 1.  After all-to-all dispatch the token order "
+                "changes but scores remain in the pre-dispatch order, causing "
+                "incorrect routing weights.  Set score_before_experts=True in "
+                "MoE so that scores are multiplied before dispatch."
+            )
+
         permuted, local_counts, ctx = (
-            AllToAllTokenDispatcher.dispatch(module, inputs, device_mesh["ep"])
+            AllToAllTokenDispatcher.dispatch(module, inputs, ep_mesh)
         )
-        # Store context in module attribute for _token_combine to read.
         # pylint: disable=W0212
         module._ep_dispatch_ctx = ctx
         return permuted, local_counts
 
     def _token_combine(self, module: Module, routed_output, device_mesh: DeviceMesh):
         """Combine tokens using only the EP sub-mesh.
+
+        When ``async_combine=True``, launches the combine all-to-all
+        asynchronously via :meth:`AllToAllTokenDispatcher.combine_start`.
 
         Args:
             module: The ``GroupedExperts`` module.
@@ -659,8 +792,10 @@ class ExpertTensorParallel(ExpertParallel):
 
         Returns:
             Token tensor in the original token-major layout.
+
+        Raises:
+            RuntimeError: If dispatch context is not found.
         """
-        # Read dispatch context from module attribute set by _token_dispatch.
         # pylint: disable=W0212
         ctx = getattr(module, "_ep_dispatch_ctx", None)
         if ctx is None:
@@ -670,13 +805,18 @@ class ExpertTensorParallel(ExpertParallel):
                 "or the context was already consumed by a previous combine call."
             )
 
-        # Note: Do NOT delete the context here. In PyTorch, the tensors in ctx
-        # are captured by autograd graph and don't need the attribute. But in
-        # MindSpore PyNative mode, deleting the attribute may break backward.
-        # The context will be overwritten on the next forward call.
+        ep_mesh = device_mesh["ep"]
+
+        if self.async_combine:
+            handle = AllToAllTokenDispatcher.combine_start(
+                routed_output, ep_mesh, ctx
+            )
+            # pylint: disable=W0212
+            module._ep_combine_handle = handle
+            return handle.wait()
 
         return AllToAllTokenDispatcher.combine(
-            module, routed_output, device_mesh["ep"], ctx,
+            module, routed_output, ep_mesh, ctx,
         )
 
     def _partition_fn(

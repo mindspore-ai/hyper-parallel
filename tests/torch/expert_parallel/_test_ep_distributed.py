@@ -392,6 +392,7 @@ def _run_local_shard_ep(
     seed_input: int,
     use_grouped_mm: bool = False,
     shared_expert_hidden: int = 0,
+    async_combine: bool = False,
     rtol: float = 1e-3,
     atol: float = 1e-3,
 ) -> None:
@@ -428,6 +429,8 @@ def _run_local_shard_ep(
         use_grouped_mm: Enable grouped matmul kernel in EP model.
         shared_expert_hidden: If > 0, add a shared FeedForward with this
             hidden dimension.
+        async_combine: If ``True``, use ``ExpertParallel(async_combine=True)``
+            to overlap combine all-to-all with shared-expert computation.
         rtol: Relative tolerance for comparison.
         atol: Absolute tolerance for comparison.
     """
@@ -455,7 +458,7 @@ def _run_local_shard_ep(
         top_k=top_k, use_grouped_mm=use_grouped_mm,
         shared_expert=deepcopy(shared_ep) if shared_ep else None,
     ).to(device)
-    ExpertParallel().apply(ep_moe.experts, mesh)
+    ExpertParallel(async_combine=async_combine).apply(ep_moe.experts, mesh)
 
     # Global input — identical on all ranks (same seed).
     torch.manual_seed(seed_input)
@@ -638,4 +641,103 @@ def test_ep_local_shard_shared_expert_npu():
         dim=64, hidden_dim=128, num_experts=world_size, top_k=2,
         bs=4, slen=16, seed_model=54, seed_input=204,
         shared_expert_hidden=128,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test: EP async combine with shared expert (4 ranks, 4 experts, top_k=2)
+# ---------------------------------------------------------------------------
+
+def test_ep_async_combine_shared_expert_npu():
+    """
+    Feature: ExpertParallel async combine with shared expert overlap.
+    Description:
+        1. Standalone MoE (4 experts + shared expert) runs on full global sequence.
+        2. EP MoE with async_combine=True receives each rank's local slice.
+        3. EP output must match the corresponding slice of standalone output.
+        4. EP gradient must match the corresponding slice of standalone gradient.
+    Expectation: Outputs and gradients match within rtol=1e-3, atol=1e-3.
+
+    Configuration:
+        - num_proc: 4
+        - num_experts: 4 (one per rank), top_k: 2
+        - shared_expert hidden_dim: 128
+        - async_combine: True
+        - dim: 64, hidden_dim: 128, batch_size: 4, slen: 16
+    """
+    rank, device_id = init_dist()
+    world_size = dist.get_world_size()
+    device = torch.device(f"npu:{device_id}")
+    _run_local_shard_ep(
+        rank=rank, world_size=world_size, device=device,
+        dim=64, hidden_dim=128, num_experts=world_size, top_k=2,
+        bs=4, slen=16, seed_model=60, seed_input=210,
+        shared_expert_hidden=128, async_combine=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test: EP async combine without shared expert (4 ranks, 4 experts, top_k=2)
+# ---------------------------------------------------------------------------
+
+def test_ep_async_combine_no_shared_expert_npu():
+    """
+    Feature: ExpertParallel async combine without shared expert (degradation check).
+    Description:
+        1. Standalone MoE (4 experts, no shared expert) runs on full global sequence.
+        2. EP MoE with async_combine=True receives each rank's local slice.
+        3. EP output must match the corresponding slice of standalone output.
+        4. When no shared_expert is present, async_combine should produce
+           identical results to synchronous combine (no performance regression).
+    Expectation: Outputs and gradients match within rtol=1e-3, atol=1e-3.
+
+    Configuration:
+        - num_proc: 4
+        - num_experts: 4 (one per rank), top_k: 2
+        - async_combine: True
+        - dim: 64, hidden_dim: 128, batch_size: 4, slen: 16
+    """
+    rank, device_id = init_dist()
+    world_size = dist.get_world_size()
+    device = torch.device(f"npu:{device_id}")
+    _run_local_shard_ep(
+        rank=rank, world_size=world_size, device=device,
+        dim=64, hidden_dim=128, num_experts=world_size, top_k=2,
+        bs=4, slen=16, seed_model=61, seed_input=211,
+        async_combine=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test: EP async combine + shared expert + grouped_mm (4 ranks, 4 experts)
+# ---------------------------------------------------------------------------
+
+def test_ep_async_combine_shared_expert_grouped_mm_npu():
+    """
+    Feature: ExpertParallel async combine with shared expert and grouped_mm kernel.
+    Description:
+        1. Standalone for-loop MoE (4 experts + shared expert) runs on full global
+           sequence as reference.
+        2. EP MoE with async_combine=True + use_grouped_mm=True receives each
+           rank's local slice.
+        3. EP output must match the corresponding slice of standalone output
+           within relaxed tolerance (grouped_mm has lower numerical precision).
+    Expectation: Outputs and gradients match within rtol=1e-2, atol=1e-2.
+
+    Configuration:
+        - num_proc: 4
+        - num_experts: 4 (one per rank), top_k: 2
+        - shared_expert hidden_dim: 128
+        - async_combine: True, use_grouped_mm: True
+        - dim: 64, hidden_dim: 128, batch_size: 4, slen: 16
+    """
+    rank, device_id = init_dist()
+    world_size = dist.get_world_size()
+    device = torch.device(f"npu:{device_id}")
+    _run_local_shard_ep(
+        rank=rank, world_size=world_size, device=device,
+        dim=64, hidden_dim=128, num_experts=world_size, top_k=2,
+        bs=4, slen=16, seed_model=62, seed_input=212,
+        use_grouped_mm=True, shared_expert_hidden=128,
+        async_combine=True, rtol=1e-2, atol=1e-2,
     )
