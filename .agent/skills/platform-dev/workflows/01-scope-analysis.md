@@ -37,7 +37,7 @@ For feature-specific changes, also read the relevant submodule:
 |---------|-------------|-----------------|
 | FSDP / HSDP | `platform/torch/fully_shard/*.py` + `core/fully_shard/hsdp_*.py` | `platform/mindspore/fully_shard/*.py` + same `core/fully_shard/` |
 | Pipeline | `platform/torch/pipeline_parallel/*.py` | `platform/mindspore/pipeline_parallel/*.py` |
-| Activation | `platform/torch/activation_checkpoint/*.py` | N/A (not yet implemented) |
+| Activation | `platform/torch/activation_checkpoint/*.py` | `platform/mindspore/activation_checkpoint/*.py` |
 | DTensor | `platform/torch/dtensor.py` | `platform/mindspore/dtensor.py` |
 
 ### 1.3 Check Cross-Platform Impact

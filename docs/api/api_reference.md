@@ -832,9 +832,11 @@ get_hyper_lr_scheduler(
 
 ## Activation Checkpoint / Swap
 
+> PyTorch 与 MindSpore 后端均已实现。公共 API 位于 `hyper_parallel.core.activation_checkpoint`。
+
 ### `checkpoint`
 
-函数式激活重计算。
+函数式激活重计算（`use_reentrant=False`）。
 
 ```python
 checkpoint(
@@ -842,8 +844,7 @@ checkpoint(
     *args,
     swap_inputs: bool = False,
     policy_fn: Optional[Callable] = None,
-    context_fn: Optional[Callable] = None,
-    group_swap: bool = False,
+    context_fn: Optional[Callable[[], Tuple[object, object]]] = None,
     **kwargs,
 )
 ```
@@ -852,24 +853,22 @@ checkpoint(
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `function` | `callable` | — | 要 checkpoint 的函数 |
-| `swap_inputs` | `bool` | `False` | 是否将输入 swap 到 CPU |
-| `policy_fn` | `callable` | `None` | 逐 tensor 重计算策略 |
-| `context_fn` | `callable` | `None` | 上下文工厂（forward_ctx, recompute_ctx） |
-| `group_swap` | `bool` | `False` | 是否启用 swap 融合 |
+| `function` | `callable` | — | 要 checkpoint 的函数或模块 |
+| `swap_inputs` | `bool` | `False` | 是否将 checkpoint 保存的输入 offload 到 CPU |
+| `policy_fn` | `callable` | `None` | SAC 逐算子策略：`(ctx, op, *args, **kwargs) -> CheckpointPolicy` |
+| `context_fn` | `callable` | `None` | 返回 `(forward_ctx, recompute_ctx)` 的无参工厂；可与 `policy_fn` 组合 |
 
 ---
 
 ### `swap`
 
-函数式激活 swap。
+函数式激活 swap（不重计算）。须在使用时调用 `SwapManager.set_forward_prefetch_layer` 建立层间预取关系。
 
 ```python
 swap(
     function,
     *args,
     policy_fn: Optional[Callable] = None,
-    group_swap: bool = False,
     **kwargs,
 )
 ```
@@ -878,53 +877,57 @@ swap(
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `function` | `callable` | — | 要 swap 的函数 |
-| `policy_fn` | `callable` | `None` | 逐 tensor swap 策略 |
-| `group_swap` | `bool` | `False` | 是否启用 swap 融合 |
+| `function` | `callable` | — | 要 swap 的函数或模块 |
+| `policy_fn` | `callable` | `None` | 逐 tensor 策略：`(tensor) -> CheckpointPolicy`；仅 `MUST_SAVE` / `MUST_SWAP` 有效 |
 
 ---
 
 ### `checkpoint_wrapper`
 
-模块级 checkpoint 装饰器。
+模块级 checkpoint 装饰器（`CheckpointWrapper`，继承 `ActivationWrapper`）。
 
 ```python
-checkpoint_wrapper(module, policy="full", ...)
+checkpoint_wrapper(module, **checkpoint_kwargs) -> CheckpointWrapper
 ```
+
+`checkpoint_kwargs` 与 `checkpoint` 一致，例如 `policy_fn`、`swap_inputs`。
 
 ---
 
 ### `swap_wrapper`
 
-模块级 swap 装饰器。
+模块级纯 swap 装饰器（不重计算）。
 
 ```python
-swap_wrapper(module, offload_to="cpu", ...)
+swap_wrapper(
+    module,
+    policy_fn: Optional[Callable] = None,
+) -> SwapWrapper
 ```
 
 ---
 
 ### `swap_tensor_wrapper`
 
-单 tensor swap 装饰器。
+在 `forward`/`construct` 内将指定 tensor 注册到当前 swap group。
 
 ```python
-swap_tensor_wrapper(...)
+swap_tensor_wrapper(target, tag: Optional[str] = None)
 ```
 
 ---
 
 ### `CheckpointPolicy`
 
-重计算策略枚举。
+重计算 / swap 策略枚举。
 
 ```python
 class CheckpointPolicy(enum.Enum):
-    MUST_SAVE = 0        # 必须保存
+    MUST_SAVE = 0        # 必须保存（留在设备）
     PREFER_SAVE = 1      # 优先保存
     MUST_RECOMPUTE = 2   # 必须重计算
     PREFER_RECOMPUTE = 3 # 优先重计算
-    MUST_SWAP = 4        # 必须 swap（需要 SwapManager）
+    MUST_SWAP = 4        # offload 到 HOST，反向 reload（需 SwapManager）
 ```
 
 ---
@@ -935,10 +938,11 @@ Swap 分组管理器（单例）。
 
 ```python
 class SwapManager:
-    def add_storage(self, group_name: str, storage: Storage) -> None
-    def ensure_group(self, group_name: str) -> None
+    def set_forward_prefetch_layer(self, first_layer, second_layer) -> None
     def launch_offload(self, group_name: str, copy_stream=None) -> None
-    def protect_alias_tensors(self, group_name: str, tensors: Any) -> None
+    def wait_offload(self, group_name: str) -> None
+    def launch_load(self, group_name: str, copy_stream=None) -> None
+    def wait_load(self, group_name: str) -> None
 ```
 
 ---

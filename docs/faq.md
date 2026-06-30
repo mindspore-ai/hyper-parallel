@@ -83,19 +83,26 @@ python -c "import torch; print(torch.__version__); print(torch._GLIBCXX_USE_CXX1
 
 **解决**：确保 FWD/BWD chunk 层数一致。不一致时需要在装钩时按短边对齐。
 
-### Q: Activation Swap 后精度下降
+### Q: Activation Swap 后精度下降或行为异常
 
-**原因**：小 tensor 的 DMA 启动开销大于收益，且可能引入精度损失。
+**常见原因**：
 
-**解决**：使用 `policy_fn` 过滤小 tensor，只 swap 大激活。
+- 未设置 swap 预取（须调用 `SwapManager.set_forward_prefetch_layer`），或在 PP 场景使用 swap，导致 offload 未按预期执行。
+- 小 tensor 的 DMA 开销大于收益，或 `policy_fn` 误配。
+- 未在 compute stream 访问前调用 `wait_load` / `wait_offload`（见 [Activation Checkpoint 指南](./guide/activation_checkpoint.md)）。
+
+**解决**：使用 `policy_fn` 过滤小 tensor，只 swap 大激活；并确保层间 prefetch 链已注册。
 
 ```python
-from hyper_parallel.core.activation_checkpoint import CheckpointPolicy
+from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager
 
-def swap_policy(target):
-    if target.numel() < 1024:
+def swap_policy(tensor):
+    if tensor.numel() < 1024:
         return CheckpointPolicy.MUST_SAVE   # 小 tensor 不 swap，保留在设备上
     return CheckpointPolicy.MUST_SWAP       # 大激活 offload 到 host
+
+for i in range(len(model.layers) - 1):
+    SwapManager().set_forward_prefetch_layer(model.layers[i], model.layers[i + 1])
 ```
 
 ### Q: Context Parallel 在 MindSpore 上不工作

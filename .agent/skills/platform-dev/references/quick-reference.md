@@ -119,16 +119,21 @@
 
 ## MindSpore Unsupported Features (raise NotImplementedError)
 
-These features are not yet implemented in MindSpore backend:
+These features are not yet implemented in the MindSpore backend:
 
 | Feature | Torch Location | Status |
 |---------|---------------|--------|
-| `ckpt_wrapper()` | torch activation checkpoint | Not supported |
-| `create_selective_checkpoint_contexts()` | SAC | Not yet implemented |
-| `async_save_on_cpu()` | Activation swap | Not yet implemented |
 | `clip_grad_norm_()` | Gradient clipping | Not yet implemented |
 | `get_model_state_dict()` | State dict | Not yet implemented |
-| `noop_context_fn` | Checkpoint contexts | Not supported |
+
+**Activation Checkpoint / Swap** is implemented on both backends:
+
+| Feature | Torch | MindSpore |
+|---------|-------|-----------|
+| `checkpoint_wrapper` / `ckpt_wrapper` | `platform/torch/activation_checkpoint/` | `platform/mindspore/activation_checkpoint/` |
+| `create_selective_checkpoint_contexts()` (SAC) | `sac.py` | `sac.py` |
+| `async_save_on_cpu()` / swap | `activation_swap.py` | `activation_swap.py` |
+| `noop_context_fn` | `torch.utils.checkpoint` | MindSpore recompute contexts |
 
 ---
 
