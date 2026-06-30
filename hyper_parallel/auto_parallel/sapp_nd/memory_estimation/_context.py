@@ -47,10 +47,15 @@ class NodeStatEval:
 
     def __repr__(self):
         return (
-            f"stat.p={self.p.__qualname__}, "
-            f"stat.os={self.os.__qualname__}, "
-            f"stat.grad={self.grad.__qualname__}"
+            f"stat.p={_qname(self.p)}, "
+            f"stat.os={_qname(self.os)}, "
+            f"stat.grad={_qname(self.grad)}"
         )
+
+
+def _qname(attr):
+    """Safe qualname accessor for __repr__ — handles None and non-callable values."""
+    return getattr(attr, "__qualname__", str(attr))
 
 
 @dataclass
@@ -61,13 +66,15 @@ class NodeCommEval:
     tp: Any
     cp: Any
     ep: Any
+    ep_balanced: Any = None
+    ep_imbalanced: Any = None
 
     def __repr__(self):
         return (
-            f"dyn.comm.dp={self.dp.__qualname__}, "
-            f"dyn.comm.tp={self.tp.__qualname__}, "
-            f"dyn.comm.cp={self.cp.__qualname__}, "
-            f"dyn.comm.ep={self.ep.__qualname__}"
+            f"dyn.comm.dp={_qname(self.dp)}, "
+            f"dyn.comm.tp={_qname(self.tp)}, "
+            f"dyn.comm.cp={_qname(self.cp)}, "
+            f"dyn.comm.ep={_qname(self.ep)}"
         )
 
 
@@ -79,7 +86,7 @@ class NodeDynEval:
     comm: NodeCommEval
 
     def __repr__(self):
-        return f"dyn.activation={self.activation.__qualname__}, " f"{str(self.comm)}"
+        return f"dyn.activation={_qname(self.activation)}, " f"{str(self.comm)}"
 
 
 @dataclass
@@ -118,6 +125,7 @@ class Context:
         self.attn_num_p, self.attn_qkv_activ = None, None
         self.attn_score_activ, self.attn_proj_activ = None, None
         self.ffn_num_p, self.ffn_activ, self.ffn_moe_activ = None, None, None
+        self.ffn_routed_num_p, self.ffn_shared_num_p = None, None
         self.norm_num_p, self.norm_activ = None, None
         self.pp_micro_eval = {}
         self.head_node, self.tail_node = None, None

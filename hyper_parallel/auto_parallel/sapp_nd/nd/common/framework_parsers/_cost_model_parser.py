@@ -55,17 +55,20 @@ class _CostModelParser(ABC):
         # Expert params
         ccfg.shard_p_os_exp_partial = math.gcd(
             ccfg.n_exp,
-            (ccfg.os_max_shard if ccfg.has_op else 1) * ccfg.t_exp * ccfg.ep,
+            (ccfg.os_max_shard if ccfg.has_op else 1) * ccfg.t_exp,
         )
         ccfg.shard_p_os_exp = (
-            ((ccfg.d_exp * ccfg.ep) if ccfg.has_op else ccfg.ep)
-            * ccfg.cp
-            * ccfg.t_exp
+            (ccfg.d_exp if ccfg.has_op else 1) * ccfg.cp * ccfg.t_exp
         )
         ccfg.shard_grad_exp = (
             ccfg.shard_p_os_exp
             if ccfg.has_grad_shard
-            else (ccfg.t_exp * ccfg.ep)
+            else ccfg.t_exp
+        )
+        ccfg.shard_grad_exp_partial = (
+            ccfg.shard_p_os_exp_partial
+            if ccfg.has_grad_shard
+            else ccfg.t_exp
         )
 
     # def config_op_level(self, ccfg, strategy):

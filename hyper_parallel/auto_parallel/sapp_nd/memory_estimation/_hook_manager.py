@@ -150,6 +150,8 @@ class _HookManager(_Backbone):
         dyn_tp_comm = kwargs.get("dyn_tp_comm", c_comm)
         dyn_cp_comm = kwargs.get("dyn_cp_comm", c_comm)
         dyn_ep_comm = kwargs.get("dyn_ep_comm", c_comm)
+        dyn_ep_comm_balanced = kwargs.get("dyn_ep_comm_balanced", None)
+        dyn_ep_comm_imbalanced = kwargs.get("dyn_ep_comm_imbalanced", None)
         if not self.__is_valid_eval_func(dyn_dp_comm):
             dyn_dp_comm = self._ctx.node_eval[target_node].dyn.comm.dp
         if not self.__is_valid_eval_func(dyn_tp_comm):
@@ -161,11 +163,23 @@ class _HookManager(_Backbone):
         comm_cls_obj = cls_obj
         if self.is_regular_layer(target_node):
             comm_cls_obj = EvalLayerComm
+        ep_balanced = (
+            self.__custom_getattr(comm_cls_obj, dyn_ep_comm_balanced)
+            if self.__is_valid_eval_func(dyn_ep_comm_balanced)
+            else None
+        )
+        ep_imbalanced = (
+            self.__custom_getattr(comm_cls_obj, dyn_ep_comm_imbalanced)
+            if self.__is_valid_eval_func(dyn_ep_comm_imbalanced)
+            else None
+        )
         return NodeCommEval(
             self.__custom_getattr(comm_cls_obj, dyn_dp_comm),
             self.__custom_getattr(comm_cls_obj, dyn_tp_comm),
             self.__custom_getattr(comm_cls_obj, dyn_cp_comm),
             self.__custom_getattr(comm_cls_obj, dyn_ep_comm),
+            ep_balanced=ep_balanced,
+            ep_imbalanced=ep_imbalanced,
         )
 
     def set_head_eval_fun(self, *arg, **kwarg):
@@ -228,6 +242,19 @@ class _HookManager(_Backbone):
         if self.__is_valid_eval_func(moe_activ):
             self._ctx.ffn_moe_activ = self.__custom_getattr(
                 EvalFFn, moe_activ, MemType.FFN_ACTIV
+            )
+
+    def set_expert_param_eval_fun(
+        self, routed_num_p: Any = None, shared_num_p: Any = None
+    ) -> None:
+        """overwrite expert param count formulas for routed/shared breakdown"""
+        if self.__is_valid_eval_func(routed_num_p):
+            self._ctx.ffn_routed_num_p = self.__custom_getattr(
+                EvalFFn, routed_num_p
+            )
+        if self.__is_valid_eval_func(shared_num_p):
+            self._ctx.ffn_shared_num_p = self.__custom_getattr(
+                EvalFFn, shared_num_p
             )
 
     def set_norm_eval_fun(self, num_p: Any = None, activation=None):
@@ -360,6 +387,17 @@ class _HookManager(_Backbone):
         # body
         for b in self.eval_cfg.nodes_mem_comp.body:
             b_cfg = Config(b)
+            comm_cfg = b_cfg.dyn_fun.comm
+            comm_kwargs = {
+                "dyn_dp_comm": comm_cfg.dp,
+                "dyn_tp_comm": comm_cfg.tp,
+                "dyn_cp_comm": comm_cfg.cp,
+                "dyn_ep_comm": comm_cfg.ep,
+            }
+            if hasattr(comm_cfg, "ep_balanced"):
+                comm_kwargs["dyn_ep_comm_balanced"] = comm_cfg.ep_balanced
+            if hasattr(comm_cfg, "ep_imbalanced"):
+                comm_kwargs["dyn_ep_comm_imbalanced"] = comm_cfg.ep_imbalanced
             self.set_body_eval_fun(
                 lay_type=b_cfg.name,
                 num_p=b_cfg.num_param_fun,
@@ -367,10 +405,7 @@ class _HookManager(_Backbone):
                 stat_os=b_cfg.stat_fun.os,
                 stat_grad=b_cfg.stat_fun.grad,
                 dyn_activ=b_cfg.dyn_fun.activation,
-                dyn_dp_comm=b_cfg.dyn_fun.comm.dp,
-                dyn_tp_comm=b_cfg.dyn_fun.comm.tp,
-                dyn_cp_comm=b_cfg.dyn_fun.comm.cp,
-                dyn_ep_comm=b_cfg.dyn_fun.comm.ep,
+                **comm_kwargs,
             )
 
         # pp micro factor
@@ -390,6 +425,10 @@ class _HookManager(_Backbone):
             self.eval_cfg.base_arch_mem_comp.feedforward.num_param_fun,
             self.eval_cfg.base_arch_mem_comp.feedforward.activation,
             self.eval_cfg.base_arch_mem_comp.feedforward.moe_activ,
+        )
+        self.set_expert_param_eval_fun(
+            routed_num_p=self.eval_cfg.base_arch_mem_comp.feedforward.routed_num_fun,
+            shared_num_p=self.eval_cfg.base_arch_mem_comp.feedforward.shared_num_fun,
         )
         self.set_norm_eval_fun(
             self.eval_cfg.base_arch_mem_comp.norm.num_param_fun,
