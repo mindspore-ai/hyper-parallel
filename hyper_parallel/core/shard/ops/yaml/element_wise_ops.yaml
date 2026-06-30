@@ -105,3 +105,9 @@ EmptyLike:
 
 dropout:
   dist_op_name: _torch_dropout_dist_op
+
+SoftplusExt:
+  dist_op_name: _softplus_ext_dist_op
+
+Sqrt:
+  dist_op_name: _sqrt_dist_op

@@ -859,5 +859,248 @@ class TestParallelZerosLike(unittest.TestCase):
             self.op.infer_layout([x_layout, None])
 
 
+class TestParallelSoftplusExt(unittest.TestCase):
+    """Unit tests for ElementWiseDistributedOp used by SoftplusExt."""
+
+    def setUp(self):
+        """Clear global caches and initialise platform before each test."""
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+        self.op = ElementWiseDistributedOp("SoftplusExt")
+
+    def tearDown(self):
+        """Restore global state after each test."""
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+
+    def _setup_mock_platform(self, mock_platform, world_size=8):
+        """Configure minimal mock-platform attributes needed by init_device_mesh."""
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
+
+    def _make_2x4_mesh(self, mock_platform):
+        """Return a 2x4 (dp, mp) mesh with mocked backend."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        return init_device_mesh(
+            device_type="npu",
+            mesh_shape=(2, 4),
+            mesh_dim_names=("dp", "mp"),
+            init_backend=False,
+        )
+
+    def test_preprocess_unwraps_dtensor_for_softplus(self):
+        """
+        Feature: SoftplusExt preprocess
+        Description: DTensor input is converted to local tensor and cached with layout/shape.
+        Expectation: local args use local tensor and cache_values carries layout.
+        """
+        x_layout = MagicMock()
+        x_local = MagicMock()
+        x_tensor = MagicMock()
+        x_tensor.layout = x_layout
+        x_tensor.shape = (4, 8)
+        x_tensor.to_local.return_value = x_local
+        x_tensor._layout = x_layout
+
+        local_args, local_kwargs, cache_values = self.op.preprocess((x_tensor,), {})
+
+        assert local_args == (x_local,)
+        assert local_kwargs == {}
+        assert cache_values[0] is x_layout
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_softplus_ext_data_parallel(self, mock_platform):
+        """
+        Feature: SoftplusExt data parallel
+        Description: Input sharded on batch dim; output layout must match input.
+        Expectation: Success
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        placements = (Shard(0), Replicate())
+        x_layout = _build_layout(mesh, placements, 2)
+
+        cache_values = [x_layout, None]
+        infer_result = self.op.infer_layout(cache_values)
+        output_layout = infer_result[0][0]
+
+        expected_map = (1, -1)
+        assert output_layout.tensor_map == expected_map, (
+            f"SoftplusExt data parallel layout mismatch: "
+            f"expected={expected_map}, got={output_layout.tensor_map}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_softplus_ext_all_replicated(self, mock_platform):
+        """
+        Feature: SoftplusExt all replicated
+        Description: Fully replicated input; output must also be fully replicated.
+        Expectation: Success
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        placements = (Replicate(), Replicate())
+        x_layout = _build_layout(mesh, placements, 2)
+
+        cache_values = [x_layout, None]
+        infer_result = self.op.infer_layout(cache_values)
+        output_layout = infer_result[0][0]
+
+        expected_map = (-1, -1)
+        assert output_layout.tensor_map == expected_map, (
+            f"SoftplusExt all-replicated layout mismatch: "
+            f"expected={expected_map}, got={output_layout.tensor_map}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_softplus_ext_partial_input_raises(self, mock_platform):
+        """
+        Feature: SoftplusExt partial input error
+        Description: Input with Partial status must be rejected.
+        Expectation: ValueError is raised
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+
+        with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
+            self.op.infer_layout([x_layout, None])
+
+
+class TestParallelSqrt(unittest.TestCase):
+    """Unit tests for ElementWiseDistributedOp used by Sqrt."""
+
+    def setUp(self):
+        """Clear global caches and initialise platform before each test."""
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+        self.op = ElementWiseDistributedOp("Sqrt")
+
+    def tearDown(self):
+        """Restore global state after each test."""
+        EXISTING_COMM_GROUPS.clear()
+        _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
+
+    def _setup_mock_platform(self, mock_platform, world_size=8):
+        """Configure minimal mock-platform attributes needed by init_device_mesh."""
+        mock_platform.get_rank.return_value = 0
+        mock_platform.get_world_size.return_value = world_size
+        mock_platform.tensor_to_numpy.side_effect = (
+            lambda t: t.numpy() if hasattr(t, "numpy") else np.array(t)
+        )
+
+    def _make_2x4_mesh(self, mock_platform):
+        """Return a 2x4 (dp, mp) mesh with mocked backend."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        return init_device_mesh(
+            device_type="npu",
+            mesh_shape=(2, 4),
+            mesh_dim_names=("dp", "mp"),
+            init_backend=False,
+        )
+
+    def test_preprocess_unwraps_dtensor_for_sqrt(self):
+        """
+        Feature: Sqrt preprocess
+        Description: DTensor input is converted to local tensor and cached with layout/shape.
+        Expectation: local args use local tensor and cache_values carries layout.
+        """
+        x_layout = MagicMock()
+        x_local = MagicMock()
+        x_tensor = MagicMock()
+        x_tensor.layout = x_layout
+        x_tensor.shape = (4, 8)
+        x_tensor.to_local.return_value = x_local
+        x_tensor._layout = x_layout
+
+        local_args, local_kwargs, cache_values = self.op.preprocess((x_tensor,), {})
+
+        assert local_args == (x_local,)
+        assert local_kwargs == {}
+        assert cache_values[0] is x_layout
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sqrt_data_parallel(self, mock_platform):
+        """
+        Feature: Sqrt data parallel
+        Description: Input sharded on batch dim; output layout must match input.
+        Expectation: Success
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        placements = (Shard(0), Replicate())
+        x_layout = _build_layout(mesh, placements, 2)
+
+        cache_values = [x_layout, None]
+        infer_result = self.op.infer_layout(cache_values)
+        output_layout = infer_result[0][0]
+
+        expected_map = (1, -1)
+        assert output_layout.tensor_map == expected_map, (
+            f"Sqrt data parallel layout mismatch: "
+            f"expected={expected_map}, got={output_layout.tensor_map}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sqrt_all_replicated(self, mock_platform):
+        """
+        Feature: Sqrt all replicated
+        Description: Fully replicated input; output must also be fully replicated.
+        Expectation: Success
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        placements = (Replicate(), Replicate())
+        x_layout = _build_layout(mesh, placements, 2)
+
+        cache_values = [x_layout, None]
+        infer_result = self.op.infer_layout(cache_values)
+        output_layout = infer_result[0][0]
+
+        expected_map = (-1, -1)
+        assert output_layout.tensor_map == expected_map, (
+            f"Sqrt all-replicated layout mismatch: "
+            f"expected={expected_map}, got={output_layout.tensor_map}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sqrt_model_parallel(self, mock_platform):
+        """
+        Feature: Sqrt model parallel
+        Description: Input sharded on column dim; output layout must match input.
+        Expectation: Success
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        placements = (Replicate(), Shard(1))
+        x_layout = _build_layout(mesh, placements, 2)
+
+        cache_values = [x_layout, None]
+        infer_result = self.op.infer_layout(cache_values)
+        output_layout = infer_result[0][0]
+
+        expected_map = (-1, 0)
+        assert output_layout.tensor_map == expected_map, (
+            f"Sqrt model parallel layout mismatch: "
+            f"expected={expected_map}, got={output_layout.tensor_map}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sqrt_partial_input_raises(self, mock_platform):
+        """
+        Feature: Sqrt partial input error
+        Description: Input with Partial status must be rejected.
+        Expectation: ValueError is raised
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+
+        with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
+            self.op.infer_layout([x_layout, None])
+
+
 if __name__ == "__main__":
     unittest.main()
