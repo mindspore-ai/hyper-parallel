@@ -144,8 +144,10 @@ class AcceleratorConfig:
       ``dp_shard`` (FSDP inner). Pass ``dp_shard=-1`` to auto-fill from
       ``world_size / (dp_replicate * cp * tp * pp)``.
 
-    For MoE: ``etp`` controls expert TP. Must equal ``tp`` or ``1``
-    ( rule).
+    For MoE: ``etp`` controls expert TP. Must equal ``tp`` or ``1``.
+    ``moe_token_dispatcher_type`` selects the EP token exchange algorithm.
+    ``npu_nums_per_device`` is the inner-EP degree for the deredundency
+    dispatcher; ``oep`` is inferred as ``ep // npu_nums_per_device``.
     """
     dp: Optional[int] = None
     dp_replicate: int = 1
@@ -155,6 +157,8 @@ class AcceleratorConfig:
     pp: int = 1
     ep: int = 1
     etp: int = 1
+    moe_token_dispatcher_type: str = "all_to_all"
+    npu_nums_per_device: int = 8
     zero_stage: int = 0
     reshard_after_forward: bool = True
     async_cp: bool = False

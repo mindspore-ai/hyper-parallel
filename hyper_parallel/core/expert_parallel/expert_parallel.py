@@ -28,6 +28,7 @@ Provides token permutation helpers and four parallel styles that compose with
 """
 __all__ = [
     "AllToAllTokenDispatcher",
+    "DeredundencyTokenDispatcher",
     "BaseExpertParallel",
     "ExpertParallel",
     "TensorParallel",
@@ -36,7 +37,7 @@ __all__ = [
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.dtensor import (
@@ -223,9 +224,193 @@ class DispatchContext:
     permuted_indices: Any
 
 
+@dataclass
+class DeredundencyDispatchContext(DispatchContext):
+    """State shared by deredundency dispatch and combine.
+
+    The inherited split and permutation fields describe the inner-EP
+    all-to-all.  The extra fields describe the OEP shared token view and the
+    whiteboard scatter used before the final reduce-scatter combine.
+    """
+
+    dispatch_indices: Optional[object] = None
+    router_coeff: Optional[object] = None
+    gathered_shape: Optional[tuple] = None
+    oep_size: int = 1
+
+
+
+@dataclass(frozen=True)
+class _DeredundencyMeshInfo:
+    """Resolved mesh metadata for two-stage deredundency token exchange."""
+
+    oep_group: object
+    iep_group: object
+    oep_size: int
+    iep_size: int
+    outer_rank: int
+    inner_rank: int
+
+
+def _get_deredundency_mesh_info(device_mesh: DeviceMesh) -> _DeredundencyMeshInfo:
+    """Resolve ``oep`` / ``iep`` groups from a 1-D or 2-D EP mesh."""
+    ndim = getattr(device_mesh, "ndim", 1)
+    if not isinstance(ndim, int):
+        ndim = 1
+    if ndim == 1:
+        return _DeredundencyMeshInfo(
+            oep_group=None,
+            iep_group=device_mesh.get_group(),
+            oep_size=1,
+            iep_size=device_mesh.size(),
+            outer_rank=0,
+            inner_rank=device_mesh.get_local_rank(),
+        )
+    if ndim != 2:
+        raise ValueError(
+            "DeredundencyTokenDispatcher expects a 1-D EP mesh or a 2-D "
+            f"[oep, iep] EP mesh, but got ndim={ndim}."
+        )
+
+    mesh_dim_names = getattr(device_mesh, "mesh_dim_names", None) or ()
+    oep_dim = mesh_dim_names.index("oep") if "oep" in mesh_dim_names else 0
+    iep_dim = mesh_dim_names.index("iep") if "iep" in mesh_dim_names else 1
+    if oep_dim == iep_dim:
+        raise ValueError("DeredundencyTokenDispatcher requires distinct oep and iep mesh dimensions.")
+
+    return _DeredundencyMeshInfo(
+        oep_group=device_mesh.get_group(oep_dim),
+        iep_group=device_mesh.get_group(iep_dim),
+        oep_size=device_mesh.size(oep_dim),
+        iep_size=device_mesh.size(iep_dim),
+        outer_rank=device_mesh.get_local_rank(oep_dim),
+        inner_rank=device_mesh.get_local_rank(iep_dim),
+    )
+
+
+def _generate_deredundency_dispatch_indices(
+    tokens_per_expert_by_source,
+    expert_start: int,
+    iep_size: int,
+    num_local_experts: int,
+):
+    """Generate gather-view indices ordered by IEP destination rank.
+
+    ``tokens_per_expert_by_source`` is shaped ``[oep_size, num_experts]`` and
+    describes each source rank's expert-major routed buffer after the OEP
+    all-gather.  The returned indices select the current outer expert range
+    and order it as ``[iep_dst, local_expert, oep_source]`` so each IEP
+    destination chunk keeps local-expert blocks contiguous for the later
+    rank-major → expert-major permutation.
+    """
+    oep_size = tokens_per_expert_by_source.shape[0]
+    experts_per_outer = iep_size * num_local_experts
+    expert_end = expert_start + experts_per_outer
+
+    source_totals = tokens_per_expert_by_source.sum(dim=1)
+    source_offsets = source_totals.cumsum(0) - source_totals
+    expert_offsets = (
+        tokens_per_expert_by_source.cumsum(dim=1)
+        - tokens_per_expert_by_source
+        + source_offsets.view(oep_size, 1)
+    )
+
+    selected_counts = tokens_per_expert_by_source[:, expert_start:expert_end].view(
+        oep_size, iep_size, num_local_experts,
+    )
+    selected_offsets = expert_offsets[:, expert_start:expert_end].view(
+        oep_size, iep_size, num_local_experts,
+    )
+    counts_by_destination = selected_counts.permute(1, 2, 0).contiguous()
+    offsets_by_destination = selected_offsets.permute(1, 2, 0).contiguous()
+
+    block_counts = counts_by_destination.view(-1)
+    token_counts_by_destination_expert = selected_counts.sum(dim=0).contiguous().view(-1)
+    total = int(block_counts.sum())
+    if total == 0:
+        return block_counts.new_zeros(0, dtype=block_counts.dtype).long(), token_counts_by_destination_expert
+
+    block_starts = offsets_by_destination.view(-1).repeat_interleave(block_counts)
+    block_offsets = block_counts.cumsum(0) - block_counts
+    block_offsets_per_token = block_offsets.repeat_interleave(block_counts)
+    intra = platform.arange(0, total, device=tokens_per_expert_by_source.device) - block_offsets_per_token
+
+    return (block_starts + intra).long(), token_counts_by_destination_expert
+
+
+def _scale_by_router_coeff(tokens, router_coeff):
+    """Scale routed expert outputs by optional router coefficients."""
+    if router_coeff is None:
+        return tokens
+    if router_coeff.shape[0] != tokens.shape[0]:
+        raise ValueError(
+            "router_coeff length must match routed token count, got "
+            f"{router_coeff.shape[0]} and {tokens.shape[0]}."
+        )
+    coeff = router_coeff
+    if len(coeff.shape) == 1 and len(tokens.shape) > 1:
+        coeff = coeff.reshape((-1,) + (1,) * (len(tokens.shape) - 1))
+    return tokens * coeff
+
+
+def _scatter_add_first_dim(src, indices, output_shape):
+    """Scatter-add rows of ``src`` into a zero tensor along dim 0."""
+    result = src.new_zeros(*output_shape)
+    if len(src.shape) == 1:
+        scatter_indices = indices
+    else:
+        scatter_indices = indices.reshape((-1,) + (1,) * (len(src.shape) - 1)).expand(
+            -1, *src.shape[1:],
+        )
+    if hasattr(result, "scatter_add"):
+        return result.scatter_add(0, scatter_indices, src)
+    if hasattr(result, "index_add"):
+        return result.index_add(0, indices, src)
+    raise RuntimeError(
+        "DeredundencyTokenDispatcher.combine requires tensor scatter_add or "
+        "index_add support for exdispatch_idx accumulation."
+    )
+
+
+class _DeredundencyCombineHandle(AsyncHandle):
+    """Async handle that finishes deredundency combine post-processing."""
+
+    def __init__(
+        self,
+        async_tensor: object,
+        mesh_info: _DeredundencyMeshInfo,
+        ctx: DeredundencyDispatchContext,
+    ) -> None:
+        super().__init__(async_tensor)
+        self._mesh_info = mesh_info
+        self._ctx = ctx
+        self._combined: Optional[object] = None
+
+    def wait(self) -> object:
+        """Wait for IEP a2a, then finish OEP scatter/reduce combine once."""
+        if self._combined is None:
+            outer_output = super().wait()
+            weighted_output = _scale_by_router_coeff(outer_output, self._ctx.router_coeff)
+            combine_whiteboard = _scatter_add_first_dim(
+                weighted_output,
+                self._ctx.dispatch_indices,
+                self._ctx.gathered_shape,
+            )
+            if self._ctx.oep_size == 1:
+                self._combined = combine_whiteboard
+            else:
+                self._combined = platform.differentiable_reduce_scatter(
+                    combine_whiteboard,
+                    self._ctx.oep_size,
+                    0,
+                    "sum",
+                    self._mesh_info.oep_group,
+                )
+        return self._combined
+
 
 # ---------------------------------------------------------------------------
-# AllToAllTokenDispatcher — token dispatch/combine via all-to-all
+# BaseExpertParallel — abstract base for all-to-all EP strategies
 # ---------------------------------------------------------------------------
 
 class BaseExpertParallel(ParallelStyle, ABC):
@@ -473,6 +658,305 @@ class AllToAllTokenDispatcher:
 
 
 # ---------------------------------------------------------------------------
+# DeredundencyTokenDispatcher — token dispatch via OEP all-gather + IEP all-to-all
+# ---------------------------------------------------------------------------
+
+class DeredundencyTokenDispatcher:
+    """Token dispatch/combine via OEP all-gather plus IEP all-to-all.
+
+    This dispatcher keeps the same public contract as
+    :class:`AllToAllTokenDispatcher`, but decomposes the global EP all-to-all
+    into the deredundency flow described in
+    ``docs/moe_alltoall_deredundency_token_permutation.md``:
+
+    1. Form a shared token/count view across the OEP group.
+    2. Select only the current outer expert range.
+    3. Send selected tokens to concrete local-expert ranks inside the IEP
+       group.
+    4. Sort received tokens into local expert-major order.
+
+    For a 2-D mesh, dimension ``"oep"`` / ``0`` is the outer group and
+    ``"iep"`` / ``1`` is the inner group.  A 1-D mesh is treated as
+    ``oep_size == 1`` and degenerates to the standard all-to-all data flow.
+    """
+
+    @staticmethod
+    def _oep_gather_for_dispatch(
+        num_tokens_per_expert,
+        routed_input,
+        router_coeff,
+        mesh_info: _DeredundencyMeshInfo,
+    ) -> tuple:
+        """All-gather token counts and routed input across the OEP group.
+
+        Args:
+            num_tokens_per_expert: Token count per expert ``[num_experts]``.
+            routed_input: Routed token tensor ``[total_tokens, dim]``.
+            router_coeff: Optional router coefficients ``[total_tokens]``.
+            mesh_info: Resolved OEP/IEP mesh descriptor.
+
+        Returns:
+            Tuple ``(gathered_counts, gathered_routed, gathered_router_coeff)``
+            where ``gathered_counts`` has shape ``[oep_size, num_experts]``,
+            ``gathered_routed`` has shape ``[oep_size * total_tokens, dim]``,
+            and ``gathered_router_coeff`` is the gathered coefficients or None.
+
+        Raises:
+            ValueError: If routed token counts differ across OEP ranks.
+        """
+        if mesh_info.oep_size == 1:
+            gathered_counts = num_tokens_per_expert.view(1, num_tokens_per_expert.shape[0])
+            return gathered_counts, routed_input, router_coeff
+
+        gathered_counts, handle = platform.all_gather_single(
+            num_tokens_per_expert,
+            output_shape=[mesh_info.oep_size * num_tokens_per_expert.shape[0]],
+            group=mesh_info.oep_group,
+            async_op=True,
+        )
+        if handle is not None:
+            handle.wait()
+        gathered_counts = gathered_counts.view(mesh_info.oep_size, num_tokens_per_expert.shape[0])
+        source_token_totals = gathered_counts.sum(dim=1).tolist()
+        if any(total != routed_input.shape[0] for total in source_token_totals):
+            raise ValueError(
+                "DeredundencyTokenDispatcher requires equal routed token "
+                "counts within each OEP group because the shared token view "
+                f"uses all-gather, got totals {source_token_totals}."
+            )
+        gathered_routed = platform.differentiable_all_gather_concat(
+            routed_input, mesh_info.oep_group, mesh_info.oep_size, 0,
+        )
+        if router_coeff is None:
+            gathered_router_coeff = None
+        else:
+            gathered_router_coeff = platform.differentiable_all_gather_concat(
+                router_coeff, mesh_info.oep_group, mesh_info.oep_size, 0,
+            )
+        return gathered_counts, gathered_routed, gathered_router_coeff
+
+    @staticmethod
+    def dispatch(module: Module, inputs: tuple, device_mesh: DeviceMesh) -> tuple:
+        """Dispatch tokens using OEP all-gather and IEP all-to-all.
+
+        Args:
+            module: The ``GroupedExperts`` module (unused here).
+            inputs: Tuple ``(routed_input, num_tokens_per_expert)`` where
+                ``routed_input`` has shape ``[total_tokens, dim]`` and
+                ``num_tokens_per_expert`` has shape ``[num_experts]``.
+            device_mesh: 1-D EP mesh or 2-D ``[oep, iep]`` EP mesh.
+
+        Returns:
+            Tuple ``(permuted_local_input, local_token_counts, ctx)`` with the
+            same meaning as :meth:`AllToAllTokenDispatcher.dispatch`.
+
+        Raises:
+            ValueError: If the expert count is not divisible by the full EP
+                size represented by the deredundency mesh.
+        """
+        del module
+        routed_input, num_tokens_per_expert = inputs[0], inputs[1]
+        router_coeff = inputs[2] if len(inputs) > 2 else None
+        if router_coeff is not None and router_coeff.shape[0] != routed_input.shape[0]:
+            raise ValueError(
+                "router_coeff length must match routed_input token count, got "
+                f"{router_coeff.shape[0]} and {routed_input.shape[0]}."
+            )
+        mesh_info = _get_deredundency_mesh_info(device_mesh)
+        ep_size = mesh_info.oep_size * mesh_info.iep_size
+        if num_tokens_per_expert.shape[0] % ep_size != 0:
+            raise ValueError(
+                "num_tokens_per_expert length must be divisible by the full "
+                f"EP size {ep_size}, got {num_tokens_per_expert.shape[0]}."
+            )
+        num_local_experts = num_tokens_per_expert.shape[0] // ep_size
+        experts_per_outer = mesh_info.iep_size * num_local_experts
+        expert_start = mesh_info.outer_rank * experts_per_outer
+
+        gathered_counts, gathered_routed, gathered_router_coeff = (
+            DeredundencyTokenDispatcher._oep_gather_for_dispatch(
+                num_tokens_per_expert, routed_input, router_coeff, mesh_info,
+            )
+        )
+
+        dispatch_indices, node_counts_per_expert = _generate_deredundency_dispatch_indices(
+            gathered_counts,
+            expert_start,
+            mesh_info.iep_size,
+            num_local_experts,
+        )
+        iep_input_splits = node_counts_per_expert.view(mesh_info.iep_size, num_local_experts).sum(dim=1).tolist()
+
+        iep_counts_out, handle = platform.all_to_all_single(
+            node_counts_per_expert,
+            output_shape=[node_counts_per_expert.shape[0]],
+            group=mesh_info.iep_group,
+            async_op=True,
+        )
+        if handle is not None:
+            handle.wait()
+        iep_output_splits = iep_counts_out.view(mesh_info.iep_size, num_local_experts).sum(dim=1).tolist()
+
+        outer_routed_input = gathered_routed[dispatch_indices]
+        outer_router_coeff = (
+            None if gathered_router_coeff is None else gathered_router_coeff[dispatch_indices]
+        )
+        dispatched = platform.differentiable_all_to_all_single(
+            outer_routed_input,
+            iep_input_splits,
+            iep_output_splits,
+            group=mesh_info.iep_group,
+        )
+
+        input_shape, permuted, permuted_indices, local_counts = _permute(
+            dispatched, iep_counts_out, mesh_info.iep_size, num_local_experts,
+        )
+        ctx = DeredundencyDispatchContext(
+            input_splits=iep_input_splits,
+            output_splits=iep_output_splits,
+            input_shape=input_shape,
+            permuted_indices=permuted_indices,
+            dispatch_indices=dispatch_indices,
+            router_coeff=outer_router_coeff,
+            gathered_shape=gathered_routed.shape,
+            oep_size=mesh_info.oep_size,
+        )
+        return permuted, local_counts, ctx
+
+    @staticmethod
+    def combine(module: Module, routed_output: object, device_mesh: DeviceMesh,
+                ctx: DeredundencyDispatchContext) -> object:
+        """Gather expert outputs back to the originating ranks.
+
+        Args:
+            module: The ``GroupedExperts`` module (unused).
+            routed_output: Expert output tensor in expert-major order.
+            device_mesh: 1-D EP mesh or 2-D ``[oep, iep]`` EP mesh.
+            ctx: Context returned by :meth:`dispatch`.
+
+        Returns:
+            Token tensor in the original source-rank routed order.
+        """
+        del module
+        mesh_info = _get_deredundency_mesh_info(device_mesh)
+        DeredundencyTokenDispatcher._validate_combine_mesh(mesh_info, ctx)
+
+        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices)
+        outer_output = platform.differentiable_all_to_all_single(
+            unpermuted,
+            ctx.output_splits,
+            ctx.input_splits,
+            group=mesh_info.iep_group,
+        )
+
+        weighted_output = _scale_by_router_coeff(outer_output, ctx.router_coeff)
+        combine_whiteboard = _scatter_add_first_dim(
+            weighted_output, ctx.dispatch_indices, ctx.gathered_shape,
+        )
+        if ctx.oep_size == 1:
+            return combine_whiteboard
+
+        return platform.differentiable_reduce_scatter(
+            combine_whiteboard,
+            ctx.oep_size,
+            0,
+            "sum",
+            mesh_info.oep_group,
+        )
+
+    @staticmethod
+    def _validate_combine_mesh(
+        mesh_info: _DeredundencyMeshInfo,
+        ctx: DeredundencyDispatchContext,
+    ) -> None:
+        """Validate that dispatch context and combine mesh are compatible."""
+        if mesh_info.oep_size != ctx.oep_size:
+            raise ValueError(
+                "DeredundencyTokenDispatcher.combine received a context for "
+                f"oep_size={ctx.oep_size}, but the mesh resolves to oep_size={mesh_info.oep_size}."
+            )
+
+    @staticmethod
+    def combine_start(
+        routed_output: object,
+        device_mesh: DeviceMesh,
+        ctx: DeredundencyDispatchContext,
+    ) -> AsyncHandle:
+        """Launch async IEP combine all-to-all and defer deredundency post-processing.
+
+        The local expert-major → rank-major unpermute is performed
+        synchronously.  The reverse IEP all-to-all is launched asynchronously,
+        and :meth:`combine_wait` finishes router weighting, whiteboard
+        scatter-add, and optional OEP reduce-scatter after the async output is
+        materialised.
+
+        Args:
+            routed_output: Expert output tensor in expert-major order.
+            device_mesh: 1-D EP mesh or 2-D ``[oep, iep]`` EP mesh.
+            ctx: Context returned by :meth:`dispatch`.
+
+        Returns:
+            :class:`AsyncHandle` carrying the pending IEP a2a and deredundency
+            combine state.
+        """
+        mesh_info = _get_deredundency_mesh_info(device_mesh)
+        DeredundencyTokenDispatcher._validate_combine_mesh(mesh_info, ctx)
+
+        unpermuted = _unpermute(routed_output, ctx.input_shape, ctx.permuted_indices)
+        outer_output_async = platform.differentiable_all_to_all_single_async(
+            unpermuted,
+            ctx.output_splits,
+            ctx.input_splits,
+            group=mesh_info.iep_group,
+        )
+        return _DeredundencyCombineHandle(outer_output_async, mesh_info, ctx)
+
+    @staticmethod
+    def combine_wait(handle: AsyncHandle) -> object:
+        """Wait for async deredundency combine and return the final tensor.
+
+        Args:
+            handle: :class:`AsyncHandle` returned by :meth:`combine_start`.
+
+        Returns:
+            Token tensor in the original source-rank routed order.
+        """
+        return handle.wait()
+
+
+_TOKEN_DISPATCHERS = {
+    "all_to_all": AllToAllTokenDispatcher,
+    "deredundency": DeredundencyTokenDispatcher,
+}
+
+
+def _resolve_token_dispatcher(token_dispatcher: str):
+    """Resolve a token dispatcher name to its implementation class."""
+    try:
+        return _TOKEN_DISPATCHERS[token_dispatcher]
+    except KeyError as exc:
+        supported = "', '".join(sorted(_TOKEN_DISPATCHERS))
+        raise ValueError(
+            f"token_dispatcher must be one of '{supported}', got {token_dispatcher!r}."
+        ) from exc
+
+
+def _get_flattened_ep_mesh(device_mesh: DeviceMesh) -> DeviceMesh:
+    """Return a 1-D EP mesh, flattening a 2-D deredundency mesh if needed."""
+    if getattr(device_mesh, "ndim", 1) == 1:
+        return device_mesh
+    mesh_dim_names = getattr(device_mesh, "mesh_dim_names", None) or ()
+    if "ep" in mesh_dim_names or "ep" in device_mesh.get_flatten_mapping():
+        return device_mesh["ep"]
+    if set(mesh_dim_names) == {"oep", "iep"}:
+        return device_mesh.flatten("ep")
+    raise ValueError(
+        "Deredundency ExpertParallel expects a 1-D EP mesh or a 2-D "
+        "[oep, iep] mesh when partitioning expert weights."
+    )
+
+
+# ---------------------------------------------------------------------------
 # ExpertParallel — standard all-to-all EP
 # ---------------------------------------------------------------------------
 
@@ -493,7 +977,13 @@ class ExpertParallel(BaseExpertParallel):
     All collectives use ``platform.differentiable_all_to_all_single`` /
     ``platform.all_to_all_single`` — no direct ``torch.distributed`` calls.
 
+    The token dispatcher is selectable. ``"all_to_all"`` uses
+    :class:`AllToAllTokenDispatcher`; ``"deredundency"`` uses
+    :class:`DeredundencyTokenDispatcher`.
+
     Args:
+        token_dispatcher: Token dispatch strategy. Supported values are
+            ``"all_to_all"`` and ``"deredundency"``.
         async_combine: When ``True``, the combine all-to-all is launched
             asynchronously so that the caller (e.g. :class:`MoE`) can
             overlap it with shared-expert computation.  When ``False``
@@ -508,21 +998,29 @@ class ExpertParallel(BaseExpertParallel):
         >>> sharded_experts = ep_style.apply(experts_module, ep_device_mesh)
     """
 
-    def __init__(self, async_combine: bool = False) -> None:
+    def __init__(self, token_dispatcher: Union[str, bool] = "all_to_all", async_combine: bool = False) -> None:
         """Initialize ExpertParallel.
 
         Args:
+            token_dispatcher: Token dispatch strategy. Supported values are
+                ``"all_to_all"`` and ``"deredundency"``.
             async_combine: If ``True``, use asynchronous combine all-to-all
                 to overlap communication with shared-expert computation.
         """
+        if isinstance(token_dispatcher, bool):
+            async_combine = token_dispatcher
+            token_dispatcher = "all_to_all"
+        self._dispatch_ctx: Optional[DispatchContext] = None
         self.async_combine = async_combine
+        self._token_dispatcher_name = token_dispatcher
+        self._token_dispatcher = _resolve_token_dispatcher(token_dispatcher)
 
     def _token_dispatch(self, module: Module, inputs, device_mesh: DeviceMesh):
         """Dispatch tokens to their assigned ranks via all-to-all.
 
-        Delegates to :meth:`AllToAllTokenDispatcher.dispatch`, stores the
-        returned :class:`DispatchContext` on the module attribute for the
-        matching :meth:`_token_combine` call.
+        Delegates to the configured token dispatcher and stores the
+        returned :class:`DispatchContext` on the instance for the matching
+        :meth:`_token_combine` call.
 
         Args:
             module: The ``GroupedExperts`` module.
@@ -554,7 +1052,7 @@ class ExpertParallel(BaseExpertParallel):
             )
 
         permuted, local_counts, ctx = (
-            AllToAllTokenDispatcher.dispatch(module, inputs, device_mesh)
+            self._token_dispatcher.dispatch(module, inputs, device_mesh)
         )
         # Store context in module attribute for _token_combine to read.
         # Using module attribute ensures each module has its own context,
@@ -605,7 +1103,7 @@ class ExpertParallel(BaseExpertParallel):
         # The context will be overwritten on the next forward call.
 
         if self.async_combine:
-            handle = AllToAllTokenDispatcher.combine_start(
+            handle = self._token_dispatcher.combine_start(
                 routed_output, device_mesh, ctx
             )
             # Store on module for external inspection / advanced use cases.
@@ -616,9 +1114,15 @@ class ExpertParallel(BaseExpertParallel):
             # implicit wait, overlapping with shared_expert computation.
             return handle.wait()
 
-        return AllToAllTokenDispatcher.combine(
+        return self._token_dispatcher.combine(
             module, routed_output, device_mesh, ctx,
         )
+
+    def _partition_mesh(self, device_mesh: DeviceMesh) -> DeviceMesh:
+        """Return the mesh used to shard expert weights."""
+        if self._token_dispatcher_name == "deredundency":
+            return _get_flattened_ep_mesh(device_mesh)
+        return device_mesh
 
     def _partition_fn(
         self, name: str, module: Module, device_mesh: DeviceMesh
@@ -631,12 +1135,13 @@ class ExpertParallel(BaseExpertParallel):
             device_mesh: EP device mesh.
         """
         del name
+        partition_mesh = self._partition_mesh(device_mesh)
         for key, param in _distribute_module_iter_params(module):
             if param is None:
                 continue
             src = _distribute_module_param_source(param)
             requires_grad = bool(getattr(param, "requires_grad", True))
-            dt = distribute_tensor(src, device_mesh, [Shard(0)])
+            dt = distribute_tensor(src, partition_mesh, [Shard(0)])
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
 
@@ -680,9 +1185,8 @@ class TensorParallel(ParallelStyle):
             self._partition_fn,
         )
 
-    def _partition_fn(
-        self, name: str, module: Module, device_mesh: DeviceMesh
-    ) -> None:
+    @staticmethod
+    def _partition_fn(name: str, module: Module, device_mesh: DeviceMesh) -> None:
         """Shard expert weights column-wise (w1/w3) or row-wise (w2).
 
         ``GroupedExperts`` weight layout is ``[num_experts, out_dim, in_dim]``
@@ -728,6 +1232,8 @@ class ExpertTensorParallel(ExpertParallel):
       so that token routing uses EP-group collectives, not the full 2-D mesh.
 
     Args:
+        token_dispatcher: Token dispatch strategy. Supported values are
+            ``"all_to_all"`` and ``"deredundency"``.
         async_combine: Forwarded to :class:`ExpertParallel`.  When ``True``,
             the combine all-to-all is launched asynchronously for
             shared-expert overlap.
@@ -737,13 +1243,23 @@ class ExpertTensorParallel(ExpertParallel):
         >>> sharded = etp_style.apply(experts_module, ep_tp_2d_mesh)
     """
 
-    def __init__(self, async_combine: bool = False) -> None:
+    def __init__(self, token_dispatcher: Union[str, bool] = "all_to_all", async_combine: bool = False) -> None:
         """Initialize ExpertTensorParallel.
 
         Args:
             async_combine: If ``True``, use asynchronous combine all-to-all.
         """
-        super().__init__(async_combine=async_combine)
+        super().__init__(token_dispatcher=token_dispatcher, async_combine=async_combine)
+
+    def _dispatch_mesh(self, device_mesh: DeviceMesh) -> DeviceMesh:
+        """Return the mesh used for token dispatch in ETP."""
+        if self._token_dispatcher_name == "deredundency":
+            raise NotImplementedError(
+                "ExpertTensorParallel does not yet support "
+                "token_dispatcher='deredundency'. Use ExpertParallel with a "
+                "[oep, iep] mesh, or add [oep, iep, tp] mesh handling first."
+            )
+        return device_mesh["ep"]
 
     def _token_dispatch(self, module: Module, inputs, device_mesh: DeviceMesh):
         """Dispatch tokens using only the EP sub-mesh.
@@ -754,7 +1270,7 @@ class ExpertTensorParallel(ExpertParallel):
             device_mesh: 2-D device mesh with dims ``("ep", "tp")``.
 
         Returns:
-            Transformed inputs for local expert computation.
+            Transformed inputs for local expert computation.\
 
         Raises:
             ValueError: If ``score_before_experts=False`` and EP degree > 1.
@@ -772,10 +1288,12 @@ class ExpertTensorParallel(ExpertParallel):
                 "MoE so that scores are multiplied before dispatch."
             )
 
+        dispatch_mesh = self._dispatch_mesh(device_mesh)
         permuted, local_counts, ctx = (
-            AllToAllTokenDispatcher.dispatch(module, inputs, ep_mesh)
+            self._token_dispatcher.dispatch(module, inputs, dispatch_mesh)
         )
         # pylint: disable=W0212
+        # Store context in module attribute for _token_combine to read.
         module._ep_dispatch_ctx = ctx
         return permuted, local_counts
 
@@ -783,7 +1301,7 @@ class ExpertTensorParallel(ExpertParallel):
         """Combine tokens using only the EP sub-mesh.
 
         When ``async_combine=True``, launches the combine all-to-all
-        asynchronously via :meth:`AllToAllTokenDispatcher.combine_start`.
+        asynchronously via :meth:`self._token_dispatcher.combine_start`.
 
         Args:
             module: The ``GroupedExperts`` module.
@@ -797,6 +1315,7 @@ class ExpertTensorParallel(ExpertParallel):
             RuntimeError: If dispatch context is not found.
         """
         # pylint: disable=W0212
+        # Read dispatch context from module attribute set by _token_dispatch.
         ctx = getattr(module, "_ep_dispatch_ctx", None)
         if ctx is None:
             raise RuntimeError(
@@ -805,18 +1324,23 @@ class ExpertTensorParallel(ExpertParallel):
                 "or the context was already consumed by a previous combine call."
             )
 
-        ep_mesh = device_mesh["ep"]
+        # Note: Do NOT delete the context here. In PyTorch, the tensors in ctx
+        # are captured by autograd graph and don't need the attribute. But in
+        # MindSpore PyNative mode, deleting the attribute may break backward.
+        # The context will be overwritten on the next forward call.
+
+        dispatch_mesh = self._dispatch_mesh(device_mesh)
 
         if self.async_combine:
-            handle = AllToAllTokenDispatcher.combine_start(
-                routed_output, ep_mesh, ctx
+            handle = self._token_dispatcher.combine_start(
+                routed_output, dispatch_mesh, ctx
             )
             # pylint: disable=W0212
             module._ep_combine_handle = handle
             return handle.wait()
 
-        return AllToAllTokenDispatcher.combine(
-            module, routed_output, ep_mesh, ctx,
+        return self._token_dispatcher.combine(
+            module, routed_output, dispatch_mesh, ctx,
         )
 
     def _partition_fn(

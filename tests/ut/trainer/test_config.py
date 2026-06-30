@@ -231,6 +231,8 @@ class TestHyperTrainerConfigPostInit(unittest.TestCase):
         self.assertIsInstance(cfg.data, DataConfig)
         self.assertIsInstance(cfg.train, TrainConfig)
         self.assertIsInstance(cfg.train.accelerator, AcceleratorConfig)
+        self.assertEqual(cfg.train.accelerator.moe_token_dispatcher_type, "all_to_all")
+        self.assertEqual(cfg.train.accelerator.npu_nums_per_device, 8)
 
 
 class TestParseArgs(unittest.TestCase):
@@ -304,6 +306,32 @@ class TestParseArgs(unittest.TestCase):
         sys.argv = ["prog", "/no/such/file.yaml"]
         cfg = parse_args(HyperTrainerConfig)
         self.assertEqual(cfg.model.name, "qwen3_5")  # default
+
+    def test_moe_token_dispatcher_yaml_plus_cli_override(self):
+        """EP dispatcher config is loaded from YAML and can be overridden by CLI."""
+        with tempfile.TemporaryDirectory() as tmp:
+            yaml_path = os.path.join(tmp, "cfg.yaml")
+            self._write_yaml(
+                """
+                train:
+                  accelerator:
+                    ep: 4
+                    moe_token_dispatcher_type: all_to_all
+                    npu_nums_per_device: 8
+                """,
+                yaml_path,
+            )
+            sys.argv = [
+                "prog",
+                yaml_path,
+                "--train.accelerator.moe_token_dispatcher_type=deredundency",
+                "--train.accelerator.npu_nums_per_device=2",
+            ]
+            cfg = parse_args(HyperTrainerConfig)
+
+        self.assertEqual(cfg.train.accelerator.ep, 4)
+        self.assertEqual(cfg.train.accelerator.moe_token_dispatcher_type, "deredundency")
+        self.assertEqual(cfg.train.accelerator.npu_nums_per_device, 2)
 
     def test_invalid_bool_string_in_cli_raises(self):
         """An unrecognised bool alias on a bool field must surface a ValueError.

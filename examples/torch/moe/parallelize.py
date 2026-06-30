@@ -39,16 +39,19 @@ from hyper_parallel.core.expert_parallel.expert_parallel import ExpertParallel
 def parallelize_moe_ep(
     model: nn.Module,
     ep_mesh: DeviceMesh,
+    token_dispatcher: str = "all_to_all",
 ) -> nn.Module:
     """Apply Expert Parallelism to all MoE feed-forward expert modules.
 
     Each ``layer.feed_forward.experts`` (:class:`GroupedExperts`) is sharded
     with :class:`ExpertParallel` — expert weights are split on dim 0 and
-    tokens are routed via differentiable all-to-all.
+    tokens are routed via the selected dispatcher.
 
     Args:
         model: :class:`MoEDemoModel` instance.
         ep_mesh: 1-D DeviceMesh with mesh_dim_name ``"ep"``.
+        token_dispatcher: EP token exchange strategy. Supported values are
+            ``"all_to_all"`` and ``"deredundency"``.
 
     Returns:
         The same ``model`` instance after in-place parallelization.
@@ -64,7 +67,9 @@ def parallelize_moe_ep(
         )
 
     for layer in model.layers:
-        ExpertParallel().apply(layer.feed_forward.experts, ep_mesh)
+        ExpertParallel(token_dispatcher=token_dispatcher).apply(
+            layer.feed_forward.experts, ep_mesh,
+        )
 
     return model
 

@@ -25,7 +25,7 @@
 5. Convenience properties + ``summary`` string shape.
 6. ``build_mesh`` invokes ``init_device_mesh`` with the canonical dim order
    and wires the ``"fsdp" / "dp" / "loss"`` flatten aliases for each
-   parallel composition (1D-FSDP, HSDP, HSDP+CP).
+   parallel composition (1D-FSDP, HSDP, HSDP+CP, deredundency EP).
 
 ``build_mesh`` is exercised against a fake ``init_device_mesh`` so the test
 runs without distributed init.
@@ -92,6 +92,8 @@ class TestConstructionAndValidation(unittest.TestCase):
             ParallelDims(dp_replicate=0, world_size=1)
         with self.assertRaises(ValueError):
             ParallelDims(tp=-2, world_size=1)
+        with self.assertRaises(ValueError):
+            ParallelDims(npu_nums_per_device=0, world_size=1)
 
     def test_dp_shard_zero_is_invalid(self):
         """``dp_shard`` may be -1 (auto) or >=1, never 0."""
@@ -139,6 +141,23 @@ class TestConstructionAndValidation(unittest.TestCase):
         # etp == 1 is fine.
         ParallelDims(tp=2, ep=2, etp=1, world_size=4)
 
+    def test_moe_token_dispatcher_must_be_known(self):
+        """Unsupported EP token dispatcher names must fail at config validation."""
+        with self.assertRaisesRegex(ValueError, "moe_token_dispatcher_type"):
+            ParallelDims(moe_token_dispatcher_type="unknown", world_size=1)
+
+    def test_deredundency_npu_nums_per_device_must_divide_ep(self):
+        """Deredundency requires ``ep`` to split cleanly into ``oep * npu_nums_per_device``."""
+        with self.assertRaisesRegex(ValueError, "must be divisible by"):
+            ParallelDims(
+                ep=4,
+                npu_nums_per_device=3,
+                moe_token_dispatcher_type="deredundency",
+                world_size=4,
+            )
+
+        ParallelDims(ep=4, npu_nums_per_device=2, moe_token_dispatcher_type="deredundency", world_size=4)
+
     def test_ulysses_must_divide_cp(self):
         """``ulysses_degree`` must be <= cp and divide cp."""
         with self.assertRaises(ValueError):
@@ -171,6 +190,18 @@ class TestFromConfig(unittest.TestCase):
         cfg = types.SimpleNamespace(tp=2, ep=2, dp=1)
         pd = ParallelDims.from_config(cfg, world_size=4)
         self.assertEqual(pd.etp, 2, f"etp must default to tp=2, got {pd.etp}")
+
+    def test_moe_dispatcher_and_npu_nums_per_device_are_read_from_config(self):
+        """``from_config`` carries EP token dispatcher fields into ``ParallelDims``."""
+        cfg = types.SimpleNamespace(
+            dp=1,
+            ep=4,
+            moe_token_dispatcher_type="deredundency",
+            npu_nums_per_device=2,
+        )
+        pd = ParallelDims.from_config(cfg, world_size=4)
+        self.assertEqual(pd.moe_token_dispatcher_type, "deredundency")
+        self.assertEqual(pd.npu_nums_per_device, 2)
 
 
 class TestValidateAgainstModel(unittest.TestCase):
@@ -244,7 +275,14 @@ class TestConvenienceAndSummary(unittest.TestCase):
         """``summary`` must surface the parallel-dim factors and world size."""
         pd = ParallelDims(dp_shard=2, tp=2, world_size=4)
         summary = pd.summary()
-        for token in ("dp_replicate=1", "dp_shard=2", "tp=2", "world=4"):
+        for token in (
+            "dp_replicate=1",
+            "dp_shard=2",
+            "tp=2",
+            "moe_token_dispatcher_type=all_to_all",
+            "npu_nums_per_device=8",
+            "world=4",
+        ):
             self.assertIn(token, summary, (
                 f"summary must contain '{token}', got {summary!r}"
             ))
@@ -289,6 +327,36 @@ class TestBuildMesh(unittest.TestCase):
             ("dp_replicate", "dp_shard", "ep", "cp", "tp"),
             f"canonical order broken, got {calls['mesh_dim_names']!r}",
         )
+
+    def test_deredundency_ep_mesh_splits_oep_iep_and_registers_ep_alias(self):
+        """Deredundency materializes ``oep``/``iep`` and flattens them as ``ep``."""
+        fake_init, calls = self._make_fake_init()
+        pd = ParallelDims(
+            ep=4,
+            npu_nums_per_device=2,
+            moe_token_dispatcher_type="deredundency",
+            world_size=4,
+        )
+        with patch("hyper_parallel.trainer.parallel_dims.init_device_mesh", fake_init):
+            mesh = pd.build_mesh("npu")
+        self.assertEqual(calls["mesh_shape"], (2, 2))
+        self.assertEqual(calls["mesh_dim_names"], ("oep", "iep"))
+        self.assertIn((("oep", "iep"), "ep"), mesh.flatten_calls)
+
+    def test_deredundency_ep_mesh_keeps_singleton_oep_axis(self):
+        """Deredundency keeps ``oep`` even when its degree is 1 for dispatcher groups."""
+        fake_init, calls = self._make_fake_init()
+        pd = ParallelDims(
+            ep=4,
+            npu_nums_per_device=4,
+            moe_token_dispatcher_type="deredundency",
+            world_size=4,
+        )
+        with patch("hyper_parallel.trainer.parallel_dims.init_device_mesh", fake_init):
+            mesh = pd.build_mesh("npu")
+        self.assertEqual(calls["mesh_shape"], (1, 4))
+        self.assertEqual(calls["mesh_dim_names"], ("oep", "iep"))
+        self.assertIn((("oep", "iep"), "ep"), mesh.flatten_calls)
 
     def test_pure_fsdp_registers_fsdp_dp_loss_aliases(self):
         """Pure 1D FSDP (only ``dp_shard``) registers ``fsdp``/``dp``/``loss`` all pointing at dp_shard."""
