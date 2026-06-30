@@ -21,8 +21,9 @@ from typing import Any, Callable, Optional, Sequence, Set, Tuple, Union
 import numpy as np
 
 from hyper_parallel.core.dtensor.device_mesh import _mesh_resources
+from hyper_parallel.core.dtensor._collective_utils import mesh_broadcast, mesh_scatter
 from hyper_parallel.core.dtensor.layout import Layout, DeviceMesh, _get_slice_tensor_by_layout
-from hyper_parallel.core.dtensor.placement_types import Placement, Replicate
+from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Replicate, StridedShard
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
 from hyper_parallel.core.utils import compute_local_shape_and_global_offset
@@ -509,10 +510,61 @@ class DTensor(DTensorBase):
         return out.to_local()
 
 
+def _normalize_shard_dim(dim: int, ndim: int) -> int:
+    return dim + ndim if dim < 0 else dim
+
+
+def _distribute_tensor_with_communication(
+    tensor: Tensor,
+    device_mesh: DeviceMesh,
+    placements: Sequence[Placement],
+    src_data_rank: int,
+) -> Tensor:
+    """Scatter/broadcast a logical global tensor along mesh dimensions (PyTorch parity)."""
+    local = tensor
+    if len(placements) < device_mesh.ndim:
+        raise ValueError(
+            f"placements length ({len(placements)}) must be at least device_mesh.ndim "
+            f"({device_mesh.ndim}) when src_data_rank is set"
+        )
+    for mesh_dim in range(device_mesh.ndim):
+        placement = placements[mesh_dim]
+        if isinstance(placement, StridedShard):
+            raise NotImplementedError(
+                "distribute_tensor with src_data_rank does not support StridedShard yet; "
+                "pass src_data_rank=None for local-only sharding."
+            )
+        if placement.is_shard():
+            shard_dim = _normalize_shard_dim(placement.dim, local.ndim)
+            num_chunks = device_mesh.size(mesh_dim)
+            if num_chunks <= 0:
+                raise ValueError(f"invalid mesh dim size {num_chunks} on mesh_dim={mesh_dim}")
+            chunks = tuple(local.chunk(num_chunks, dim=shard_dim))
+            if not chunks:
+                raise ValueError(f"cannot shard dim {shard_dim} into {num_chunks} chunks")
+            output = platform.empty_like(chunks[0])
+            local = mesh_scatter(output, chunks, device_mesh, mesh_dim, group_src=src_data_rank)
+        elif placement.is_replicate() or placement.is_partial():
+            local = mesh_broadcast(local, device_mesh, mesh_dim, group_src=src_data_rank)
+            if isinstance(placement, Partial):
+                warnings.warn(
+                    f"Partial placement {placement} during distribute_tensor: "
+                    "broadcast only; partial partition is not applied yet.",
+                    stacklevel=3,
+                )
+        else:
+            raise RuntimeError(
+                f"unsupported placement {placement} on device mesh dimension {mesh_dim}"
+            )
+    return local
+
+
 def distribute_tensor(
     tensor: Tensor,
     device_mesh: DeviceMesh,
-    placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]]
+    placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]],
+    *,
+    src_data_rank: Optional[int] = None,
 ) -> DTensor:
     """
     Distribute a global tensor to the device mesh according to the placements.
@@ -531,9 +583,11 @@ def distribute_tensor(
         DTensor: A new DTensor with the local shard on each rank.
 
     Note:
-        This method assumes all ranks have the same global tensor. It slices
-        the tensor locally without communication. If ranks have different
-        data, use `from_local` instead.
+        When ``src_data_rank`` is an ``int`` (e.g. ``0``), shard/replicate
+        placements use scatter/broadcast from the source rank on each mesh axis,
+        matching PyTorch ``distribute_tensor``. When ``src_data_rank=None``
+        (default), each rank slices its local tensor without communication
+        (legacy Hyper behavior; all ranks must hold the same global data).
 
     Example:
         >>> mesh = init_device_mesh(device_type="npu", mesh_shape=(2, 2), mesh_dim_names=("dp", "tp"))
@@ -542,7 +596,12 @@ def distribute_tensor(
         >>> dtensor = distribute_tensor(global_tensor, mesh, ("dp", "None"))
     """
     layout = _build_layout(device_mesh, placements, len(tensor.shape))
-    local_tensor = _get_slice_tensor_by_layout(tensor, layout)
+    if src_data_rank is None:
+        local_tensor = _get_slice_tensor_by_layout(tensor, layout)
+    else:
+        local_tensor = _distribute_tensor_with_communication(
+            tensor, device_mesh, layout.placements, src_data_rank
+        )
     return DTensor(local_tensor, device_mesh, layout.alias_placements)
 
 

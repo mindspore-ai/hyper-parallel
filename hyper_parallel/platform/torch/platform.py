@@ -645,6 +645,11 @@ class TorchPlatform(Platform):
         return dist.get_global_rank(group, group_rank)
 
     @staticmethod
+    def get_group_rank(group):
+        """Return this process's rank within *group*."""
+        return dist.get_group_rank(group, dist.get_rank())
+
+    @staticmethod
     def get_world_size():
         """
         Get the total number of processes in the distributed group.
@@ -977,10 +982,21 @@ class TorchPlatform(Platform):
         return data, handle
 
     @staticmethod
-    def broadcast(data, src, group=None, async_op=False):
+    def broadcast(data, src=None, group=None, async_op=False, group_src=None):
+        if group_src is not None:
+            src = dist.get_global_rank(group, group_src)
         handle = dist.broadcast(data, src, group, async_op)
-        if async_op:
+        if async_op and handle is not None:
             handle.wait()
+
+    @staticmethod
+    def scatter(output, scatter_list, src=None, group=None, async_op=False, group_src=None):
+        if group_src is not None:
+            src = dist.get_global_rank(group, group_src)
+        handle = dist.scatter(output, scatter_list, src=src, group=group, async_op=async_op)
+        if async_op and handle is not None:
+            handle.wait()
+        return output
 
     @staticmethod
     def isend(tensor, dst=None, group=None, tag=0):

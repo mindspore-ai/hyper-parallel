@@ -172,6 +172,11 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement get_global_rank")
 
     @staticmethod
+    def get_group_rank(group):
+        """Return this process's rank within *group*."""
+        raise NotImplementedError("Platform subclasses must implement get_group_rank")
+
+    @staticmethod
     def get_world_size():
         """Get the total number of processes in the default process group.
 
@@ -505,19 +510,14 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement all_reduce")
 
     @staticmethod
-    def broadcast(data, src, group, async_op=False):
-        """Broadcast tensor from source rank to all ranks in group.
-
-        Args:
-            data: The tensor to broadcast (only valid on source rank).
-            src (int): The source rank to broadcast from.
-            group: The process group for collective communication.
-            async_op (bool): If True, returns a work handle for async operation.
-
-        Returns:
-            The broadcasted tensor, or a tuple of (tensor, handle) if async_op is True.
-        """
+    def broadcast(data, src=None, group=None, async_op=False, group_src=None):
+        """Broadcast tensor from source rank to all ranks in group."""
         raise NotImplementedError("Platform subclasses must implement broadcast")
+
+    @staticmethod
+    def scatter(output, scatter_list, src=None, group=None, async_op=False, group_src=None):
+        """Scatter tensor list from source rank to all ranks in group."""
+        raise NotImplementedError("Platform subclasses must implement scatter")
 
     @staticmethod
     def isend(tensor, dst=None, group=None, tag=0):
