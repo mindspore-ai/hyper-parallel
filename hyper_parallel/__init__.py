@@ -16,6 +16,8 @@
 
 __all__ = ["get_platform", "DFunction", "fully_shard", "hsdp_sync_stream", "HSDPModule", "DTensor",
            "Layout", "DeviceMesh", "init_device_mesh", "get_current_mesh", "distribute_module",
+           "distribute_tensor", "ones", "zeros", "empty", "full", "rand", "randn",
+           "Shard", "Replicate", "Partial", "Placement",
            "init_parameters", "init_empty_weights", "init_on_device",
            "shard_module", "custom_shard", "parallelize_value_and_grad", "SkipDTensorDispatch",
            "MetaStep", "MetaStepType", "BatchDimSpec", "PipelineStage", "ScheduleInterleaved1F1B",
@@ -34,7 +36,19 @@ from hyper_parallel.platform import get_platform
 from hyper_parallel.core.shard.dfunction import DFunction
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, _mesh_resources, init_device_mesh
-from hyper_parallel.core.dtensor.dtensor import DTensor, SkipDTensorDispatch, distribute_module
+from hyper_parallel.core.dtensor.dtensor import (
+    DTensor,
+    SkipDTensorDispatch,
+    distribute_module,
+    distribute_tensor,
+    ones,
+    zeros,
+    empty,
+    full,
+    rand,
+    randn,
+)
+from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, Partial, Placement
 from hyper_parallel.core.dtensor.parameter_init import init_parameters
 from hyper_parallel.core.dtensor.init_weights import init_empty_weights, init_on_device
 from hyper_parallel.core.shard.api import shard_module

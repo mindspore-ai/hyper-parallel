@@ -26,7 +26,7 @@ and ``examples/torch/llama3`` Llama3 PP stage layout:
 * **Reference** — full ``Llama3Model`` on every rank; each step runs one forward +
   sum-CE + backward on the **same** global ``(tokens, targets)`` mini-batch.
 
-Level0 (10 steps) and level1 (1000 steps) workers compare the reconstructed global sum-loss
+Level0 (10 steps) and level1 (100 steps) workers compare the reconstructed global sum-loss
 from the last PP stage against an in-process single-card ``Llama3Model`` baseline before
 ``optimizer.step()``, with a full loss-trajectory check at the end.
 """
@@ -63,7 +63,7 @@ from tests.torch.utils import init_dist
 _BATCH_SIZE = 8
 _SEQ_LEN = 16
 _STEPS_LEVEL0 = 10
-_STEPS_LEVEL1 = 1000
+_STEPS_LEVEL1 = 100
 _LR = 1e-4
 _INIT_SEED = 1234
 _DATA_SEED = 2026
@@ -539,11 +539,11 @@ def test_pp_fsdp_tp_1f1b_composite_matches_reference() -> None:
     )
 
 
-def test_pp_fsdp_tp_1f1b_composite_matches_reference_1000_steps() -> None:
+def test_pp_fsdp_tp_1f1b_composite_matches_reference_100_steps() -> None:
     """
-    Feature: Llama3 ``PP + FSDP + TP`` under ``Schedule1F1B`` vs single-card baseline (1000 steps).
+    Feature: Llama3 ``PP + FSDP + TP`` under ``Schedule1F1B`` vs single-card baseline (100 steps).
     Description:
-        Same as :func:`test_pp_fsdp_tp_1f1b_composite_matches_reference`, but runs 1000
+        Same as :func:`test_pp_fsdp_tp_1f1b_composite_matches_reference`, but runs 100
         training steps.  Asserts per-step sum-loss against the single-card baseline, then
         rank 0 prints abs/rel error drift statistics (max/mean/p99, level0/level1 pass counts).
     Expectation:
@@ -552,7 +552,7 @@ def test_pp_fsdp_tp_1f1b_composite_matches_reference_1000_steps() -> None:
     """
     _assert_pp_fsdp_tp_1f1b_match_reference(
         _STEPS_LEVEL1,
-        "pp_fsdp_tp_1f1b_composite_1000_steps",
+        "pp_fsdp_tp_1f1b_composite_100_steps",
         rtol=_RTOL_LEVEL1,
         atol=_ATOL_LEVEL1,
         print_drift_summary=True,

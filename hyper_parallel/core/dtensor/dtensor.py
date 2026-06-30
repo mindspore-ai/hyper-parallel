@@ -249,7 +249,11 @@ class DTensor(DTensorBase):
     def from_local(
         local_tensor: Tensor,
         device_mesh: DeviceMesh,
-        placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]]
+        placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]],
+        *,
+        run_check: bool = False,
+        shape: Optional[Tuple[int, ...]] = None,
+        stride: Optional[Tuple[int, ...]] = None,
     ) -> 'DTensor':
         """
         Create a DTensor from a local tensor with device mesh and placements.
@@ -262,6 +266,13 @@ class DTensor(DTensorBase):
                 - Alias strings (e.g., ``("dp", "None")`` or
                   ``(("dp", "tp"), "None")``), length must equal the number
                   of tensor dimensions.
+            run_check (bool, optional): When ``True``, perform cross-rank metadata
+                checks and broadcast replicate placements from the mesh source rank.
+                Default: ``False``.
+            shape (tuple[int, ...], optional): Global DTensor shape hint for uneven
+                sharding when ``run_check=True``. Reserved for future use.
+            stride (tuple[int, ...], optional): Global stride hint. Reserved for
+                future use together with ``shape``.
 
         Returns:
             DTensor: A new DTensor instance.
@@ -272,6 +283,17 @@ class DTensor(DTensorBase):
             >>> dtensor = DTensor.from_local(local_tensor, mesh, [Shard(0), Replicate()])
             >>> dtensor = DTensor.from_local(local_tensor, mesh, ("dp", "None"))
         """
+        if run_check:
+            # pylint: disable=C0415
+            from hyper_parallel.core.dtensor._from_local_utils import run_from_local_checks
+            layout = _build_layout(device_mesh, placements, len(local_tensor.shape))
+            run_from_local_checks(
+                local_tensor,
+                device_mesh,
+                layout.placements,
+                shape=shape,
+                stride=stride,
+            )
         return DTensor(local_tensor, device_mesh, placements)
 
     @staticmethod
@@ -853,6 +875,8 @@ def _dtensor_init_helper(
         size,
         device_mesh,
         placements,
+        *,
+        rng_tracked: bool = False,
         **kwargs,
 ) -> DTensor:
     """
@@ -863,6 +887,8 @@ def _dtensor_init_helper(
             dtype: Data type of the tensor.
             device: Target device for the tensor.
             requires_grad: Whether the tensor requires gradient.
+            rng_tracked: When ``True``, initialize via :class:`OffsetBasedRNGTracker`
+                so shard/replicate random semantics match PyTorch DTensor factories.
 
         Returns:
             DTensor: The initialized distributed tensor.
@@ -876,6 +902,23 @@ def _dtensor_init_helper(
     if init_op is platform.full:
         fill_value = kwargs.pop("fill_value", 0)
         local_tensor = init_op(local_shape, fill_value, **kwargs)
+    elif rng_tracked:
+        # pylint: disable=C0415
+        from hyper_parallel.core.dtensor.random import is_rng_supported_mesh, OffsetBasedRNGTracker
+        from hyper_parallel.core.shard._op_dispatch import _OP_DISPATCHER
+
+        layout = _build_layout(device_mesh, placements, len(local_shape))
+        if is_rng_supported_mesh(device_mesh):
+            if _OP_DISPATCHER._rng_tracker is None:
+                _OP_DISPATCHER._rng_tracker = OffsetBasedRNGTracker(run_state_sync=False)
+            with _OP_DISPATCHER._rng_tracker._distribute_region(
+                device_mesh,
+                layout.placements,
+                size,
+            ):
+                local_tensor = init_op(local_shape, **kwargs)
+        else:
+            local_tensor = init_op(local_shape, **kwargs)
     else:
         local_tensor = init_op(local_shape, **kwargs)
 
@@ -1003,4 +1046,62 @@ def zeros(
         size,
         device_mesh=device_mesh,
         placements=placements,
+    )
+
+
+def rand(
+    size,
+    device_mesh,
+    placements,
+    **kwargs,
+) -> DTensor:
+    """
+    Returns a :class:`DTensor` filled with random numbers from a uniform
+    distribution on ``[0, 1)``.
+
+    Args:
+        size: Global output shape.
+        device_mesh: :class:`DeviceMesh` for the distributed layout.
+        placements: Per-mesh-dimension :class:`Placement` values.
+        **kwargs: Forwarded to the platform ``rand`` call (for example ``dtype``).
+
+    Returns:
+        A :class:`DTensor` object on each rank.
+    """
+    return _dtensor_init_helper(
+        platform.rand,
+        size,
+        device_mesh=device_mesh,
+        placements=placements,
+        rng_tracked=True,
+        **kwargs,
+    )
+
+
+def randn(
+    size,
+    device_mesh,
+    placements,
+    **kwargs,
+) -> DTensor:
+    """
+    Returns a :class:`DTensor` filled with random numbers from a normal
+    distribution with mean ``0`` and variance ``1``.
+
+    Args:
+        size: Global output shape.
+        device_mesh: :class:`DeviceMesh` for the distributed layout.
+        placements: Per-mesh-dimension :class:`Placement` values.
+        **kwargs: Forwarded to the platform ``randn`` call (for example ``dtype``).
+
+    Returns:
+        A :class:`DTensor` object on each rank.
+    """
+    return _dtensor_init_helper(
+        platform.randn,
+        size,
+        device_mesh=device_mesh,
+        placements=placements,
+        rng_tracked=True,
+        **kwargs,
     )
