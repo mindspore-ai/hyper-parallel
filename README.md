@@ -300,7 +300,7 @@ model.layers[1] = swap_wrapper(model.layers[1])
 
 7. 使用基于多核并行的MoE通算掩盖算子
 
-详见[MOE-FFN说明](./hyper_parallel/core/multicore/doc/README.md)。
+详见[MoE 多核并行使用指南](./docs/guide/multicore_moe.md)。
 
 ## 文档
 
