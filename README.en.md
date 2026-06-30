@@ -392,7 +392,7 @@ model.layers[1] = swap_wrapper(model.layers[1])
 
 7. Use MoE Compute-Communication Overlap Optimisation Based on Multi-Core Parallelism
 
-For details, see the [MOE-FFN Documentation](./hyper_parallel/core/multicore/doc/README.md).
+For details, see the [MoE Multi-Core Parallelism Guide](./docs/guide/multicore_moe.md).
 
 ## Documentation
 

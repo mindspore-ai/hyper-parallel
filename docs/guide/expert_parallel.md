@@ -112,7 +112,7 @@ moe = MoE(
     hidden_dim=14336,
     num_experts=8,
     top_k=2,
-    score_before_experts=True,  # True: pre-scale input; False: internal weighting (zero-overhead)
+    score_before_experts=True,  # True: pre-scale input; False: internal weighting
     load_balance_coeff=0.01,    # 启用 aux loss 时设置
     use_grouped_mm=False,
 )
@@ -136,15 +136,6 @@ update_expert_bias(moe, lr=1e-3, num_recomputations=1)
 # aux loss 自动注入到 router 权重梯度
 # scalar loss 值可通过 output._load_balance_loss 获取
 loss_value = output._load_balance_loss
-```
-
-### zero-overhead activation storage
-
-当 `score_before_experts=False` 时，路由权重在 GroupedExperts 内部应用，实现零开销激活存储：
-
-```python
-moe = MoE(dim=4096, hidden_dim=14336, num_experts=8, top_k=2, score_before_experts=False)
-# 路由权重内部应用，activation checkpointing 时只需存储 act_weighted 而非 act + scores
 ```
 
 ---

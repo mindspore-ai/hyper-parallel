@@ -37,7 +37,7 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 - `parallelize_value_and_grad`：并行化的值与梯度计算
 - `SkipDTensorDispatch`：梯度 hook 中绕过 DTensor dispatch，直接操作 local tensor
 - 分布式算子注册（YAML registry + Python impl）
-- 分布式算子列表：AllGatherMatmul / MatmulReduceScatter (MC2)、RotaryPositionEmbedding、Detach、StopGradient 等
+- 分布式算子列表：AllGatherMatmul / MatmulReduceScatter (MC2)、RotaryPositionEmbedding 等
 - MindSpore replicate allreduce overlap
 
 **Tensor Parallel（声明式 TP Styles）**
@@ -96,9 +96,8 @@ HyperParallel v1.0.0 是项目的首个正式发布版本，标志着从快速�
 **MoE 多核并行**
 
 - 多核 MPMD 并行：芯片内多核并行 + 核级内存语义单边通信
-- 基于多核并行优化 MoE 通算掩盖
-- MoE zero-overhead activation storage（内部 score weighting）
-- MHC pre clamp sinkhorn custom op
+- 基于多核并行优化 MoE 通算掩盖：将 AllToAll-Dispatch / GMM1 / SwiGLU / GMM2 / AllToAll-Combine 融合为单 kernel，AIC 与 AIV 核细粒度重叠
+- RATR（Rank-Aware Tile Reordering）：AllToAll Tile 重排，离线生成、运行时零开销
 
 ---
 
