@@ -32,7 +32,7 @@ class Layer:
     time_ (float): total time that a layer take
 
     Optional (auto-compute) parameter:
-    forward_time_ (float): forward time for the layer (1/3 of time)
+    forward_time_ (float): forward time for the layer (auto-derived from ``time_`` when not provided)
     backward_time_rec_ (dict[Recompute.Type, float]): backward time (2/3 of time) per recomputation
     recompute_considered_: dict[Recompute.Type, bool] set recomputations when considered
 
@@ -65,7 +65,7 @@ class Layer:
         ltype: type_enum = type_enum.UNKNOWN,
         nb_layer: int = 0,
         time: float = 0.0,
-        forward_time: float = 0.0,
+        forward_time: Optional[float] = None,
         backward_time_rec: Optional[Dict[Recompute.TYPE, float]] = None,
         backward_coef_rec: Optional[Dict[Recompute.TYPE, float]] = None,
         memory_parameter: float = 0.0,
@@ -79,7 +79,8 @@ class Layer:
             ltype (Layer.type_enum): HEAD / BODY / TAIL / UNKNOWN classification.
             nb_layer (int): Number of such layers present in the model.
             time (float): Total time (forward + backward) for one layer.
-            forward_time (float, optional): Optional forward time, otherwise derived from ``time``. Default: ``0.0``.
+            forward_time (Optional[float], optional): Optional forward time; ``None`` means
+                derive from ``time`` via :meth:`compute_internal_time`. Default: ``None``.
             backward_time_rec (Optional[Dict[Recompute.TYPE, float]], optional): Per-recomputation-type backward
                 times (``None`` -> zeros). Default: ``None``.
             backward_coef_rec (Optional[Dict[Recompute.TYPE, float]], optional): Per-recomputation-type overhead

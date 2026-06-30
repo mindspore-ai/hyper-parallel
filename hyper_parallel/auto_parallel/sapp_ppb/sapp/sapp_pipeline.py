@@ -46,6 +46,7 @@ class SappPipeline:
             optimization_level: int = 1,
             extracted_training_params: Optional[Dict[str, int]] = None,
             seq_split_num: int = 1,
+            use_backward_time: bool = False,
     ) -> None:
         """Cache pipeline parameters and index the input ``layers`` by HEAD / BODY / TAIL.
 
@@ -78,6 +79,7 @@ class SappPipeline:
         self.optimization_level = optimization_level
         self.extracted_training_params_ = extracted_training_params
         self.seq_split_num_ = seq_split_num
+        self.use_backward_time_ = use_backward_time
         self.seqpipe_ = self.seq_split_num_ > 1
         # logger.output("seq chunk: %s",self.seq_split_num_)
 
@@ -91,6 +93,11 @@ class SappPipeline:
             Layer.type_enum.TAIL: filter_layer_type(layers,
                                                     Layer.type_enum.TAIL),
         }
+
+    @property
+    def simulator(self):
+        """Pipeline simulator instance (available after :meth:`simulate`)."""
+        return self._simulator
 
     def has_some_memory_info(self) -> bool:
         """Check if there is all information for memory constraint."""
@@ -247,9 +254,12 @@ class SappPipeline:
                                 layer.backward_time_rec_[r])
 
         for head in self.layers_sorted_[Layer.type_enum.HEAD]:
-            time[0][0] += head.time_
+            time[0][0] += head.forward_time_ + head.backward_time_rec_[Recompute.TYPE.NONE]
         for tail in self.layers_sorted_[Layer.type_enum.TAIL]:
-            time[interleave_num - 1][self.num_of_stage_ - 1] += tail.time_
+            time[interleave_num - 1][self.num_of_stage_ - 1] += (
+                tail.forward_time_
+                + tail.backward_time_rec_[Recompute.TYPE.NONE]
+            )
         return time
 
     def get_manual_fw_time(
@@ -269,9 +279,33 @@ class SappPipeline:
                             time[i][s] += each_layer_per_recompute[layer][r][i][s] * (
                                 layer.forward_time_)
         for head in self.layers_sorted_[Layer.type_enum.HEAD]:
-            time[0][0] += head.time_
+            time[0][0] += head.forward_time_
         for tail in self.layers_sorted_[Layer.type_enum.TAIL]:
-            time[interleave_num - 1][self.num_of_stage_ - 1] += tail.time_
+            time[interleave_num - 1][self.num_of_stage_ - 1] += tail.forward_time_
+        return time
+
+    def get_manual_backward_time(
+            self,
+            each_layer_per_recompute: Dict[Layer, Dict[Recompute.TYPE, List[List[int]]]],
+            interleave_num: int = 1) -> List[List[float]]:
+        """Return the per-stage backward time for a user-supplied layer assignment."""
+        time = []
+        for i in range(interleave_num):
+            time.append([])
+            for s in range(self.num_of_stage_):
+                time[i].append(0)
+                for layer in self.layers_sorted_[Layer.type_enum.BODY]:
+                    for r in Recompute.TYPE:
+                        if (r not in Recompute.get_unused_list(each_layer_per_recompute[layer])
+                            and each_layer_per_recompute[layer][r][i][s] > 0):
+                            time[i][s] += each_layer_per_recompute[layer][r][i][s] * (
+                                layer.backward_time_rec_[r])
+        for head in self.layers_sorted_[Layer.type_enum.HEAD]:
+            time[0][0] += head.backward_time_rec_[Recompute.TYPE.NONE]
+        for tail in self.layers_sorted_[Layer.type_enum.TAIL]:
+            time[interleave_num - 1][self.num_of_stage_ - 1] += (
+                tail.backward_time_rec_[Recompute.TYPE.NONE]
+            )
         return time
 
     def get_manual_recompute_time(
@@ -313,10 +347,11 @@ class SappPipeline:
             time_no_rec[interleave][stage] += layer_num * layer.backward_time_rec_[Recompute.TYPE.NONE]
 
     def simulate(self, show: bool = True, file_name: Optional[str] = None,
-                 sub_fig: Optional[plt.Figure] = None) -> float:
+                 sub_fig: Optional[plt.Figure] = None, comm_time: float = 0.0) -> float:
         """Run the simulator on the solved schedule and return its estimated total time."""
         forward_time = self.get_fw_time()
         recompute_overhead = self.get_recompute_time()
+        backward_time = self.problem_.get_simulator_backward_time() if self.use_backward_time_ else 0
         stage_mem_par = 0
         stage_mem_act = 0
         if self.has_some_memory_info():
@@ -329,9 +364,11 @@ class SappPipeline:
             stage_mem_par,
             stage_mem_act,
             self.constant_memory_,
-            show,
-            file_name,
-            sub_fig
+            backward_time=backward_time,
+            show=show,
+            file_name=file_name,
+            sub_fig=sub_fig,
+            comm_time=comm_time,
         )
 
     def simulate_naive(self, layers: List[Layer], output_folder: str) -> None:
@@ -656,6 +693,12 @@ class SappPipeline:
                                                interleave_num)
         recompute_overhead = self.get_manual_recompute_time(
             each_layer_per_recompute, interleave_num)
+        backward_time = (
+            self.get_manual_backward_time(
+                each_layer_per_recompute, interleave_num)
+            if self.use_backward_time_
+            else 0
+        )
         stage_mem_par = 0
         stage_mem_act = 0
         if self.has_some_memory_info():
@@ -671,10 +714,12 @@ class SappPipeline:
             recompute_overhead,
             stage_mem_par,
             stage_mem_act,
-            self.constant_memory_,
-            show,
-            file_name,
-            sub_fig
+            constant_mem=self.constant_memory_,
+            backward_time=backward_time,
+            show=show,
+            file_name=file_name,
+            sub_fig=sub_fig,
+            comm_time=0.0,
         )
 
     def simulation(
@@ -684,23 +729,28 @@ class SappPipeline:
             stage_mem_par: Union[int, List[List[float]]] = 0,
             stage_mem_act: Union[int, List[List[float]]] = 0,
             constant_mem: int = 0,
+            backward_time: Union[int, List[List[float]]] = 0,
             show: bool = True,
             file_name: Optional[str] = None,
             sub_fig: Optional[plt.Figure] = None,
+            comm_time: float = 0.0,
     ) -> float:
         """Run the low-level :class:`PipelineSimulator` and return its reported end time."""
+        use_comm = comm_time > 0.0
         if self.has_some_memory_info():
             logger.output(
                 "PipelineSimulator(\n\t%s, %s,"
                 "\n\tblock_mem_act=%s,"
                 "\n\tblock_mem_par=%s,"
                 "\n\tlayer_recompute=%s,"
+                "\n\tbackward_time=%s,"
                 "\n\tless_memory=%s )",
                 forward_time,
                 self.num_of_micro_batch_,
                 stage_mem_act,
                 stage_mem_par,
                 recompute_overhead,
+                backward_time,
                 self.vpp_less_memory_,
             )
 
@@ -708,32 +758,39 @@ class SappPipeline:
             simulator = sim.PipelineSimulator(
                 forward_time,
                 self.num_of_micro_batch_,
+                comm_time=comm_time,
                 block_mem=stage_mem_act,
                 block_mem_par=stage_mem_par,
                 constant_mem=constant_mem,
                 layer_recompute=recompute_overhead,
+                backward_time=backward_time,
                 method=sim_method,
                 sub_fig=sub_fig
             )
         else:
             logger.output(
                 "PipelineSimulator(\n\t%s, %s,"
-                "\n\tlayer_recompute=%s)"
+                "\n\tlayer_recompute=%s,"
+                "\n\tbackward_time=%s,"
                 "\n\tless_memory=%s )",
                 forward_time,
                 self.num_of_micro_batch_,
                 recompute_overhead,
+                backward_time,
                 self.vpp_less_memory_,
             )
             simulator = sim.PipelineSimulator(
                 forward_time,
                 self.num_of_micro_batch_,
+                comm_time=comm_time,
                 layer_recompute=recompute_overhead,
+                backward_time=backward_time,
                 less_memory=self.vpp_less_memory_,
                 sub_fig=sub_fig
             )
 
-        simulator.run(comm=False)
+        simulator.run(comm=use_comm)
+        self._simulator = simulator
         if file_name:
             simulator.save(file_name)
         if show:
