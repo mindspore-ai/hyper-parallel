@@ -15,10 +15,10 @@
 """parallel_ms_flash_attention_score unit test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_ms_flash_attention_score import (
     FlashAttentionScoreDistributedOp,
@@ -43,11 +43,13 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
@@ -89,26 +91,27 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=32)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 2, 4), mesh_dim_names=("dp", "sp", "mp", "pp"))
 
-    def _make_extra_args(self, head_num=16, input_layout="BSH", sparse_mode=0):
-        """Build extra_args matching MS pyboost scalar parameter order."""
-        return [head_num, 1.0, 0.125, 2147483647, 2147483647, 0,
-                input_layout, sparse_mode]
+    def _make_cache_values(self, q_layout, k_layout, v_layout, input_layout="BSH"):
+        """Build cache_values matching the new 4-element format."""
+        return [q_layout, k_layout, v_layout, input_layout]
 
     def _run_scenario(self, mock_platform, q_placements, k_placements, v_placements,
-                      ndim, expected_out_map, extra_args, expect_expand_impl=True):
+                      ndim, expected_out_map, input_layout="BSH", expect_expand_impl=True):
         """Infer layout and verify attention output tensor_map and get_expand_impl."""
         mesh = self._make_2x2x2_mesh(mock_platform)
         q_layout = _build_layout(mesh, q_placements, ndim)
         k_layout = _build_layout(mesh, k_placements, ndim)
         v_layout = _build_layout(mesh, v_placements, ndim)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), extra_args)
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout)
+        infer_result = op.infer_layout(cache_values)
+        output_layouts = infer_result[0]
         attention_out_layout = output_layouts[ATTENTION_OUT_IDX]
         assert attention_out_layout.tensor_map == expected_out_map, (
             f"Expected {expected_out_map}, got {attention_out_layout.tensor_map}"
         )
 
-        impl = op.get_expand_impl(None, output_layouts, (q_layout, k_layout, v_layout), extra_args)
+        impl = op.get_expand_impl(None, infer_result, cache_values)
         if expect_expand_impl:
             assert callable(impl), f"Expected callable, got {type(impl)}"
         else:
@@ -127,7 +130,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (-1, -1, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -143,7 +147,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (2, -1, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -159,7 +164,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (-1, -1, 0)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -176,7 +182,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, kv_placements, 3)
         v_layout = _build_layout(mesh, kv_placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (-1, 1, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -192,7 +199,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (2, -1, 0)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -209,15 +217,16 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, kv_placements, 3)
         v_layout = _build_layout(mesh, kv_placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (2, 1, 0)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_flash_attention_kv_different_layout_7(self, mock_platform):
         """
-        Feature: Error handling for K/V inconsistent tensor_map in get_expand_impl.
+        Feature: Error handling for K/V inconsistent tensor_map in infer_layout.
         Description: Key and Value have different tensor_map (sp sharding mismatch).
-        Expectation: infer_layout succeeds, get_expand_impl raises ValueError.
+        Expectation: infer_layout raises ValueError for K/V inconsistency.
         """
         mesh = self._make_2x2x2_mesh(mock_platform)
         q_placements = (Shard(0), Shard(1), Shard(2))
@@ -227,11 +236,9 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, k_placements, 3)
         v_layout = _build_layout(mesh, v_placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
-        assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (2, 1, 0)
-
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
         with self.assertRaisesRegex(ValueError, "Key and Value must have identical sharding"):
-            op.get_expand_impl(None, output_layouts, (q_layout, k_layout, v_layout), self._make_extra_args())
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_flash_attention_bnsd_layout_8(self, mock_platform):
@@ -246,7 +253,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 4)
         v_layout = _build_layout(mesh, placements, 4)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="BNSD"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="BNSD")
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (1, 0, -1, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -262,7 +270,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="SBH"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="SBH")
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (-1, -1, 0)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -278,14 +287,15 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 4)
         v_layout = _build_layout(mesh, placements, 4)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="BSND"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="BSND")
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (1, -1, 0, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_flash_attention_sparse_mode_0_11(self, mock_platform):
         """
         Feature: Layout inference with sparse_mode=0.
-        Description: defaultMask mode passed via extra_args.
+        Description: defaultMask mode — sparse_mode does not affect layout inference.
         Expectation: Layout inference succeeds normally.
         """
         mesh = self._make_2x2x2_mesh(mock_platform)
@@ -294,7 +304,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(sparse_mode=0))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (2, -1, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -311,7 +322,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, kv_placements, 3)
         v_layout = _build_layout(mesh, kv_placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(sparse_mode=2))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (-1, 0, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -328,7 +340,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, kv_placements, 3)
         v_layout = _build_layout(mesh, kv_placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(sparse_mode=3))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (-1, 0, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -344,7 +357,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(sparse_mode=4))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (0, -1, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -360,7 +374,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
 
         assert len(output_layouts) == 4, f"Expected 4 output layouts, got {len(output_layouts)}"
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (2, -1, 0)
@@ -378,7 +393,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
 
         softmax_max = output_layouts[SOFTMAX_MAX_IDX]
         softmax_sum = output_layouts[SOFTMAX_SUM_IDX]
@@ -406,7 +422,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (2, 1, 0)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -423,7 +440,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (-1, -1, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -440,7 +458,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, kv_placements, 4)
         v_layout = _build_layout(mesh, kv_placements, 4)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(head_num=32))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (3, 2, 1, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -456,7 +475,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 4)
         v_layout = _build_layout(mesh, placements, 4)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="BNSD"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="BNSD")
+        output_layouts, _ = op.infer_layout(cache_values)
 
         attention_out = output_layouts[ATTENTION_OUT_IDX]
         softmax_max = output_layouts[SOFTMAX_MAX_IDX]
@@ -479,7 +499,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="SBH"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="SBH")
+        output_layouts, _ = op.infer_layout(cache_values)
 
         attention_out = output_layouts[ATTENTION_OUT_IDX]
         softmax_max = output_layouts[SOFTMAX_MAX_IDX]
@@ -502,7 +523,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="TND"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="TND")
+        output_layouts, _ = op.infer_layout(cache_values)
 
         attention_out = output_layouts[ATTENTION_OUT_IDX]
         softmax_max = output_layouts[SOFTMAX_MAX_IDX]
@@ -526,7 +548,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, kv_placements, 3)
         v_layout = _build_layout(mesh, kv_placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
 
         attention_out = output_layouts[ATTENTION_OUT_IDX]
         softmax_max = output_layouts[SOFTMAX_MAX_IDX]
@@ -549,7 +572,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
 
         softmax_max = output_layouts[SOFTMAX_MAX_IDX]
         softmax_sum = output_layouts[SOFTMAX_SUM_IDX]
@@ -572,7 +596,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, kv_placements, 3)
         v_layout = _build_layout(mesh, kv_placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="TND"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="TND")
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (1, 0, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -590,7 +615,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, kv_placements, 3)
         v_layout = _build_layout(mesh, kv_placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="TND"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="TND")
+        output_layouts, _ = op.infer_layout(cache_values)
 
         attention_out = output_layouts[ATTENTION_OUT_IDX]
         softmax_max = output_layouts[SOFTMAX_MAX_IDX]
@@ -614,7 +640,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, kv_placements, 4)
         v_layout = _build_layout(mesh, kv_placements, 4)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="BSND"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="BSND")
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (2, 1, 0, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -631,7 +658,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, kv_placements, 4)
         v_layout = _build_layout(mesh, kv_placements, 4)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="BNSD"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="BNSD")
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (2, 0, 1, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -647,7 +675,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (1, 0, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -663,7 +692,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (0, -1, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -679,7 +709,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (-1, -1, 0)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -697,7 +728,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, kv_placements, 3)
         v_layout = _build_layout(mesh, kv_placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="SBH"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="SBH")
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (1, -1, 0)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -713,14 +745,15 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(head_num=1))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        output_layouts, _ = op.infer_layout(cache_values)
         assert output_layouts[ATTENTION_OUT_IDX].tensor_map == (1, -1, 0)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_flash_attention_invalid_input_layout_34(self, mock_platform):
         """
         Feature: Graceful handling for unsupported input_layout string.
-        Description: extra_args specifies an unsupported input_layout.
+        Description: cache_values specifies an unsupported input_layout "INVALID".
         Expectation: Layout inference completes without error; attention_out matches query.
         """
         mesh = self._make_4x2_mesh(mock_platform)
@@ -729,7 +762,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="INVALID"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="INVALID")
+        output_layouts, _ = op.infer_layout(cache_values)
 
         attention_out = output_layouts[ATTENTION_OUT_IDX]
         assert attention_out.tensor_map == q_layout.tensor_map
@@ -737,8 +771,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_flash_attention_missing_extra_args_35(self, mock_platform):
         """
-        Feature: Error handling for missing extra_args.
-        Description: extra_args is empty, missing required head_num and input_layout.
+        Feature: Error handling for insufficient cache_values.
+        Description: cache_values has fewer than 4 elements.
         Expectation: Raises an appropriate error.
         """
         mesh = self._make_4x2_mesh(mock_platform)
@@ -748,14 +782,14 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         v_layout = _build_layout(mesh, placements, 3)
 
         with self.assertRaises((IndexError, TypeError, ValueError, RuntimeError)):
-            op.infer_layout((q_layout, k_layout, v_layout), [])
+            op.infer_layout([q_layout, k_layout, v_layout])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_flash_attention_ndim_mismatch_layout_36(self, mock_platform):
         """
         Feature: Graceful handling for tensor ndim vs input_layout mismatch.
-        Description: 3D tensor with BNSD (4D) input_layout in extra_args.
-        Expectation: Layout inference completes without error; output has 3D tensor_map.
+        Description: 3D tensor with BNSD (4D) input_layout in cache_values.
+        Expectation: Layout inference completes normally; output has 3D tensor_map.
         """
         mesh = self._make_4x2_mesh(mock_platform)
         placements = (Shard(0), Shard(2))
@@ -763,7 +797,8 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_layouts = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="BNSD"))
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="BNSD")
+        output_layouts, _ = op.infer_layout(cache_values)
 
         attention_out = output_layouts[ATTENTION_OUT_IDX]
         assert len(attention_out.tensor_map) == 3
@@ -772,7 +807,7 @@ class TestMsFlashAttentionScore(unittest.TestCase):
     def test_flash_attention_integer_input_layout_37(self, mock_platform):
         """
         Feature: Layout inference with integer input_layout enum.
-        Description: extra_args specifies input_layout as integer 0 (BSH).
+        Description: cache_values specifies input_layout as integer 0 (BSH).
         Expectation: Equivalent to passing "BSH" string.
         """
         mesh = self._make_4x2_mesh(mock_platform)
@@ -781,16 +816,18 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        output_int = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout=0))
-        output_str = op.infer_layout((q_layout, k_layout, v_layout), self._make_extra_args(input_layout="BSH"))
+        cache_values_int = self._make_cache_values(q_layout, k_layout, v_layout, input_layout=0)
+        cache_values_str = self._make_cache_values(q_layout, k_layout, v_layout, input_layout="BSH")
+        output_int, _ = op.infer_layout(cache_values_int)
+        output_str, _ = op.infer_layout(cache_values_str)
 
         assert output_int[ATTENTION_OUT_IDX].tensor_map == output_str[ATTENTION_OUT_IDX].tensor_map
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_flash_attention_query_layout_none_38(self, mock_platform):
         """
-        Feature: get_expand_impl returns None when query layout is None.
-        Description: Query layout is None, which causes get_expand_impl to return None.
+        Feature: infer_layout raises error and get_expand_impl returns None when query layout is None.
+        Description: Query layout is None, which causes infer_layout to raise ValueError.
         Expectation: infer_layout raises ValueError, get_expand_impl returns None.
         """
         mesh = self._make_4x2_mesh(mock_platform)
@@ -798,12 +835,85 @@ class TestMsFlashAttentionScore(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 3)
         v_layout = _build_layout(mesh, placements, 3)
 
-        with self.assertRaisesRegex(ValueError, "Query layout cannot be None"):
-            op.infer_layout((None, k_layout, v_layout), self._make_extra_args())
+        cache_values = self._make_cache_values(None, k_layout, v_layout)
+        with self.assertRaisesRegex(ValueError, "query layout cannot be None"):
+            op.infer_layout(cache_values)
 
-        impl = op.get_expand_impl(None, None, (None, k_layout, v_layout), self._make_extra_args())
-        assert impl is None
+        assert op.get_expand_impl(None, None, cache_values) is None
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_flash_attention_preprocess(self, mock_platform):
+        """
+        Feature: preprocess builds correct local_args, local_kwargs, and cache_values.
+        Description: Preprocess with mock DTensors verifies to_local() and cache_values construction.
+        Expectation: local_args has 18 elements, local_kwargs is empty, cache_values has 4 elements.
+        """
+        mesh = self._make_4x2_mesh(mock_platform)
+        placements = (Shard(0), Replicate())
+        q_layout = _build_layout(mesh, placements, 3)
+        k_layout = _build_layout(mesh, placements, 3)
+        v_layout = _build_layout(mesh, placements, 3)
+
+        mock_q = MagicMock()
+        mock_q.layout = q_layout
+        mock_q.to_local.return_value = MagicMock()
+        mock_k = MagicMock()
+        mock_k.layout = k_layout
+        mock_k.to_local.return_value = MagicMock()
+        mock_v = MagicMock()
+        mock_v.layout = v_layout
+        mock_v.to_local.return_value = MagicMock()
+
+        args = (
+            mock_q, mock_k, mock_v,
+            None, None, None, None, None,
+            None, None,
+            16, 1.0, 0.125, 2147483647, 2147483647,
+            0, "BSH", 0,
+        )
+        local_args, local_kwargs, cache_values = op.preprocess(args, {})
+
+        assert len(local_args) == 18, (
+            f"local_args should have 18 elements, got {len(local_args)}"
+        )
+        assert not local_kwargs, (
+            f"local_kwargs should be empty, got {local_kwargs}"
+        )
+        assert len(cache_values) == 4, (
+            f"cache_values should have 4 elements (3 layouts + input_layout), got {len(cache_values)}"
+        )
+        assert cache_values[0] is q_layout, (
+            f"cache_values[0] should be query_layout, got {cache_values[0]}"
+        )
+        assert cache_values[1] is k_layout, (
+            f"cache_values[1] should be key_layout, got {cache_values[1]}"
+        )
+        assert cache_values[2] is v_layout, (
+            f"cache_values[2] should be value_layout, got {cache_values[2]}"
+        )
+        assert cache_values[3] == "BSH", (
+            f"cache_values[3] should be input_layout='BSH', got {cache_values[3]}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_flash_attention_get_expand_impl_returns_callable(self, mock_platform):
+        """
+        Feature: get_expand_impl returns a callable when query_layout is valid.
+        Description: Verify that get_expand_impl returns a callable closure for valid layouts.
+        Expectation: Returns a callable.
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        placements = (Shard(0), Replicate(), Replicate())
+        q_layout = _build_layout(mesh, placements, 3)
+        k_layout = _build_layout(mesh, placements, 3)
+        v_layout = _build_layout(mesh, placements, 3)
+
+        cache_values = self._make_cache_values(q_layout, k_layout, v_layout)
+        infer_result = op.infer_layout(cache_values)
+        impl = op.get_expand_impl(None, infer_result, cache_values)
+        assert callable(impl), f"Expected callable, got {type(impl)}"
 
 
 if __name__ == "__main__":
     unittest.main()
+    

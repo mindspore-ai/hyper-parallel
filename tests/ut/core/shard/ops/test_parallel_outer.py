@@ -11,13 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# ============================================================================
 """parallel_outer test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_outer import OuterDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -31,15 +33,17 @@ op = OuterDistributedOp("outer")
 
 class TestParallelOuter(unittest.TestCase):
     """Unit tests for OuterDistributedOp."""
-    def setUp(self):
+    def setUp(self) -> None:
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
@@ -71,7 +75,9 @@ class TestParallelOuter(unittest.TestCase):
         x1_layout = _build_layout(mesh, x1_placements, 1)
         x2_layout = _build_layout(mesh, x2_placements, 1)
 
-        output_layout = op.infer_layout((x1_layout, x2_layout))
+        cache_values = [x1_layout, x2_layout]
+        output_layouts, extra_info = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (-1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -81,9 +87,9 @@ class TestParallelOuter(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (x1_layout, x2_layout), None) is None, (
+        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x1_layout, x2_layout), None)}"
+            f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -101,13 +107,17 @@ class TestParallelOuter(unittest.TestCase):
         x2_placements = (Replicate(), Shard(0))
         x2_layout = _build_layout(mesh, x2_placements, 1)
 
-        output_layout = op.infer_layout((x1_layout, x2_layout))
+        cache_values = [x1_layout, x2_layout]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (1, 0)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
             f"Orthogonal sharding failed. Expected {expected_map}, "
             f"got {output_layout.to_dict()['tensor_map']}"
         )
+        # No need to verify get_expand_impl here - already verified in
+        # test_outer_layout_inference_both_replicated
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_outer_layout_inference_partial_sharding(self, mock_platform):
@@ -124,7 +134,9 @@ class TestParallelOuter(unittest.TestCase):
         x2_placements = (Replicate(), Replicate())
         x2_layout = _build_layout(mesh, x2_placements, 1)
 
-        output_layout = op.infer_layout((x1_layout, x2_layout))
+        cache_values = [x1_layout, x2_layout]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (1, -1)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
@@ -144,8 +156,10 @@ class TestParallelOuter(unittest.TestCase):
         placements = (Shard(0), Replicate())
         layout = _build_layout(mesh, placements, 1)
 
-        with self.assertRaisesRegex(ValueError, "the two inputs cannot be sharded on the same device mesh dimension"):
-            op.infer_layout((layout, layout))
+        with self.assertRaisesRegex(
+            ValueError, "should not be sharded on the same device mesh dimension"
+        ):
+            op.infer_layout([layout, layout])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_outer_layout_invalid_not_1d_tensor(self, mock_platform):
@@ -162,14 +176,16 @@ class TestParallelOuter(unittest.TestCase):
         x2_placements = (Replicate(), Replicate())
         x2_layout = _build_layout(mesh, x2_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "requires exactly 1-D tensors as inputs"):
-            op.infer_layout((x1_layout, x2_layout))
+        with self.assertRaisesRegex(
+            ValueError, "should be exactly 1-D tensors"
+        ):
+            op.infer_layout([x1_layout, x2_layout])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_outer_layout_invalid_num_inputs(self, mock_platform):
+    def test_outer_layout_invalid_none_layout(self, mock_platform):
         """
-        Feature: Validate number of inputs
-        Description: Attempt to compute outer product without exactly two layouts.
+        Feature: Validate non-None layouts
+        Description: Attempt to compute outer product with a None layout.
         Expectation: ValueError is raised.
         """
         mesh = self._make_2x4_mesh(mock_platform)
@@ -177,11 +193,71 @@ class TestParallelOuter(unittest.TestCase):
         x1_placements = (Replicate(), Replicate())
         x1_layout = _build_layout(mesh, x1_placements, 1)
 
-        with self.assertRaisesRegex(ValueError, "requires exactly 2 input layouts"):
-            op.infer_layout((x1_layout,))
+        with self.assertRaisesRegex(
+            ValueError, "both inputs should be DTensors with valid layouts"
+        ):
+            op.infer_layout([x1_layout, None])
 
-        with self.assertRaisesRegex(ValueError, "requires exactly 2 input layouts"):
-            op.infer_layout((x1_layout, x1_layout, x1_layout))
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_outer_layout_invalid_partial_input(self, mock_platform):
+        """
+        Feature: Validate no Partial inputs
+        Description: Attempt to compute outer product with a Partial input.
+        Expectation: ValueError is raised.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+
+        x1_placements = (Replicate(), Replicate())
+        x1_layout = _build_layout(mesh, x1_placements, 1)
+        x1_layout.set_partial_by_dev_axis("dp", "sum")
+
+        x2_placements = (Replicate(), Replicate())
+        x2_layout = _build_layout(mesh, x2_placements, 1)
+
+        with self.assertRaisesRegex(
+            ValueError, "has Partial status which is not allowed"
+        ):
+            op.infer_layout([x1_layout, x2_layout])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_outer_preprocess(self, mock_platform):
+        """
+        Feature: Preprocess for Outer operator
+        Description: Verify preprocess converts DTensor inputs to local and builds cache_values.
+        Expectation: local_args contain local tensors, cache_values contain layouts.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+
+        x1_placements = (Shard(0), Replicate())
+        x2_placements = (Replicate(), Shard(0))
+
+        x1_layout = _build_layout(mesh, x1_placements, 1)
+        x2_layout = _build_layout(mesh, x2_placements, 1)
+
+        mock_local1 = MagicMock()
+        mock_local2 = MagicMock()
+        mock_dtensor1 = MagicMock()
+        mock_dtensor1.layout = x1_layout
+        mock_dtensor1.to_local.return_value = mock_local1
+        mock_dtensor2 = MagicMock()
+        mock_dtensor2.layout = x2_layout
+        mock_dtensor2.to_local.return_value = mock_local2
+
+        local_args, local_kwargs, cache_values = op.preprocess(
+            (mock_dtensor1, mock_dtensor2), {}
+        )
+
+        assert local_args == (mock_local1, mock_local2), (
+            f"Expected local_args to be ({mock_local1}, {mock_local2}), "
+            f"got {local_args}"
+        )
+        assert not local_kwargs, (
+            f"Expected local_kwargs to be empty, got {local_kwargs}"
+        )
+        assert cache_values == [x1_layout, x2_layout], (
+            f"Expected cache_values to be [{x1_layout}, {x2_layout}], "
+            f"got {cache_values}"
+        )
 
 
 if __name__ == "__main__":

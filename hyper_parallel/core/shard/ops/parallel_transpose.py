@@ -16,87 +16,154 @@
 Distributed implementation for Transpose operator.
 """
 
+from typing import Tuple
+
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
+
+
+def _normalize_transpose_args(*args):
+    """Normalize transpose arguments to consistent positional args.
+
+    All transpose / permute / TransposeView / TransposeExtView interfaces pass parameters
+    positionally, so args are returned as-is with empty kwargs.
+
+    Args:
+        *args: Positional arguments from the op call.
+
+    Returns:
+        tuple: (args, {}) — all parameters as positional args, kwargs empty.
+    """
+    return args, {}
 
 
 class TransposeDistributedOp(DistributedOp):
     """Distributed implementation for Transpose operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for Transpose operator.
+
+        Args:
+            args (tuple): Input arguments, first element is the input tensor.
+            kwargs (dict): Keyword arguments (always empty for transpose ops).
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, _ = _normalize_transpose_args(*args)
+        input_tensor = args[0]
+
+        if self.op_name in ("Transpose", "permute", "TransposeView"):
+            axis = args[1]
+            local_args = (input_tensor.to_local(), axis)
+            local_kwargs = {}
+            cache_values = [input_tensor.layout, axis]
+        elif self.op_name in ("transpose", "TransposeExtView"):
+            dim0, dim1 = args[1], args[2]
+            local_args = (input_tensor.to_local(), dim0, dim1)
+            local_kwargs = {}
+            cache_values = [input_tensor.layout, dim0, dim1]
+        else:
+            raise ValueError(
+                f"For TransposeDistributedOp, unsupported op_name: {self.op_name}. "
+                f"Expected 'Transpose', 'transpose', 'permute', "
+                f"'TransposeView', or 'TransposeExtView'."
+            )
+
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layout for Transpose operator.
 
         Based on the op_name initialized in the base class, this method switches behavior:
-        1. op_name == 'Transpose', 'permute' or "TransposeView": Implements MindSpore Transpose behavior
-        or PyTorch permute behavior.
-           - extra_args expected: (perm,) where perm is a tuple of indices.
-           - Rules: Output layout is determined by input layout and permutation.
-        2. op_name == 'transpose': Implements PyTorch transpose behavior.
-           - extra_args expected: (dim0, dim1) where dim0 and dim1 are integers.
-           - Rules: Output layout is determined by swapping the specified dimensions in input layout.
+        1. op_name == 'Transpose', 'permute' or 'TransposeView': axis-based permutation.
+           - cache_values: [input_layout, axis] where axis is a tuple of indices.
+           - Rules: Output tensor_map is permuted according to axis.
+        2. op_name == 'transpose' or 'TransposeExtView': dim-based swap.
+           - cache_values: [input_layout, dim0, dim1] where dim0 and dim1 are integers.
+           - Rules: Output tensor_map has the two dimensions swapped.
+
+        Rules:
+            1. Input must not have Partial status.
+            2. For axis-based: axis must be a valid permutation of [0, ndim-1].
+            3. For dim-based: dim0 and dim1 must be integers within [-ndim, ndim-1].
+            4. Output layout inherits mesh info from input, with tensor_map permuted accordingly.
 
         Args:
-            layouts (tuple): Layouts of input tensor.
-            extra_args (tuple): Arguments for the operator.
+            cache_values (list): [input_layout, ...] where the remaining elements depend on op_name.
 
         Returns:
-            Layout: Layout for output tensor.
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
         """
-        layout = layouts[0]
+        layout = cache_values[0]
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([layout])
+
         in_tensor_map = layout.alias_tensor_map
         ndim = len(in_tensor_map)
-        out_tensor_map = None
 
         if self.op_name in ("Transpose", "permute", "TransposeView"):
-            # MindSpore style: Transpose(input, input_perm)
-            # extra_args should contain a single element: the permutation tuple
-            if not extra_args or not isinstance(extra_args[0], (list, tuple)):
-                raise ValueError(f"For 'Transpose', expected permutation tuple in extra_args, got {extra_args}")
+            axis = cache_values[1]
 
-            axis = extra_args[0]
+            if not isinstance(axis, (list, tuple)):
+                raise ValueError(
+                    f"For {self.op_name}, axis should be a list or tuple, "
+                    f"but got {type(axis)}."
+                )
 
             if len(in_tensor_map) != len(axis):
-                raise ValueError(f"Input tensor shape and permutation must have the same size. "
-                                 f"Got {len(in_tensor_map)} and {len(axis)}")
+                raise ValueError(
+                    f"For {self.op_name}, input tensor shape and permutation "
+                    f"must have the same size. "
+                    f"Got {len(in_tensor_map)} and {len(axis)}."
+                )
 
             # check if axis is a permutation
             seen = set()
             for v in axis:
+                if not isinstance(v, int):
+                    raise ValueError(
+                        f"For {self.op_name}, axis elements must be integers, "
+                        f"but got {type(v)}."
+                    )
                 if v < 0 or v >= ndim or v in seen:
-                    raise ValueError(f"Invalid permutation {axis} for rank {ndim}")
+                    raise ValueError(
+                        f"For {self.op_name}, invalid permutation {axis} for rank {ndim}."
+                    )
                 seen.add(v)
 
             out_tensor_map = tuple(in_tensor_map[i] for i in axis)
 
-        elif self.op_name in ("transpose", "TransposeExtView"):
-            # PyTorch style: transpose(input, dim0, dim1)
-            # extra_args should contain two elements: dim0 and dim1
-            if len(extra_args) != 2:
-                raise ValueError(f"For 'transpose', expected (dim0, dim1), got {extra_args}")
-
-            dim0, dim1 = extra_args
+        else:
+            dim0, dim1 = cache_values[1], cache_values[2]
 
             if not isinstance(dim0, int) or not isinstance(dim1, int):
-                raise ValueError(f"Dimensions must be integers, got {dim0}, {dim1}")
+                raise ValueError(
+                    f"For {self.op_name}, dimensions must be integers, "
+                    f"but got {type(dim0)} and {type(dim1)}."
+                )
 
-            # Handle negative indices
             if dim0 < 0:
                 dim0 += ndim
             if dim1 < 0:
                 dim1 += ndim
 
-            # Validate dimensions
             if not (0 <= dim0 < ndim and 0 <= dim1 < ndim):
-                raise ValueError(f"Transpose dimensions out of bounds: ({dim0}, {dim1}) for rank {ndim}")
+                raise ValueError(
+                    f"For {self.op_name}, transpose dimensions out of bounds: "
+                    f"({dim0}, {dim1}) for rank {ndim}."
+                )
 
-            # Swap the dimensions in the tensor map
             out_tensor_map_list = list(in_tensor_map)
-            out_tensor_map_list[dim0], out_tensor_map_list[dim1] = out_tensor_map_list[dim1], out_tensor_map_list[dim0]
+            out_tensor_map_list[dim0], out_tensor_map_list[dim1] = (
+                out_tensor_map_list[dim1], out_tensor_map_list[dim0]
+            )
             out_tensor_map = tuple(out_tensor_map_list)
-
-        else:
-            raise ValueError(f"Unsupported op_name: {self.op_name}. Expected 'Transpose' , 'transpose' or 'permute'.")
 
         output_layout = Layout(
             mesh_shape=layout.mesh_shape,
@@ -104,4 +171,5 @@ class TransposeDistributedOp(DistributedOp):
             rank_list=layout.rank_list
         )
 
-        return output_layout(*out_tensor_map)
+        return ((output_layout(*out_tensor_map),), None)
+    

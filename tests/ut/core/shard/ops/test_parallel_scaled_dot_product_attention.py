@@ -18,7 +18,7 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout, Layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE, Layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_scaled_dot_product_attention import (
     ScaledDotProductAttentionDistributedOp,
@@ -38,11 +38,13 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
@@ -71,7 +73,10 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
 
     def _run_scenario(self, q_layout, k_layout, v_layout, expected_out_map):
         """Infer layout and verify attention output tensor_map."""
-        output_layout = op.infer_layout((q_layout, k_layout, v_layout), [])
+        cache_values = [q_layout, k_layout, v_layout]
+        output_layouts, extra_info = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
+        assert extra_info is None, f"extra_info should be None, got {extra_info}"
         assert output_layout.tensor_map == expected_out_map, (
             f"Expected {expected_out_map}, got {output_layout.tensor_map}"
         )
@@ -164,18 +169,19 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         self._run_scenario(q_layout, k_layout, v_layout, (2, 0, 1, -1))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_sdpa_kv_different_layout_7(self, mock_platform):
+    def test_sdpa_kv_different_layout_raises_7(self, mock_platform):
         """
-        Feature: Layout inference with different KV sharding.
-        Description: Key has sp sharding but Value does not.
-        Expectation: Layout inference succeeds based on query layout.
+        Feature: Layout inference rejects different KV sharding.
+        Description: Key has mp sharding but Value does not.
+        Expectation: ValueError raised.
         """
         mesh = self._make_2x2x2_mesh(mock_platform)
-        q_layout = _build_layout(mesh, (Shard(0), Shard(2), Shard(1)), 4)
-        k_layout = _build_layout(mesh, (Shard(0), Shard(2), Shard(1)), 4)
-        v_layout = _build_layout(mesh, (Shard(0), Replicate(), Shard(1)), 4)
+        q_layout = _build_layout(mesh, (Shard(0), Shard(2), Replicate(), Replicate()), 4)
+        k_layout = _build_layout(mesh, (Shard(0), Shard(2), Replicate(), Replicate()), 4)
+        v_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate(), Replicate()), 4)
 
-        self._run_scenario(q_layout, k_layout, v_layout, (2, 0, 1, -1))
+        with self.assertRaisesRegex(ValueError, "Key and Value must have identical"):
+            op.infer_layout([q_layout, k_layout, v_layout])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_sdpa_dp_mp_2d_mesh_8(self, mock_platform):
@@ -248,7 +254,8 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         k_layout = _build_layout(mesh, placements, 4)
         v_layout = _build_layout(mesh, placements, 4)
 
-        output_layout = op.infer_layout((q_layout, k_layout, v_layout), [])
+        output_layouts, _ = op.infer_layout([q_layout, k_layout, v_layout])
+        output_layout = output_layouts[0]
 
         assert isinstance(output_layout, Layout), "Should return a single Layout"
         assert output_layout.tensor_map == (1, 0, -1, -1)
@@ -265,7 +272,8 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         k_layout = _build_layout(mesh, (Shard(0), Shard(1)), 4)
         v_layout = _build_layout(mesh, (Shard(0), Shard(1)), 4)
 
-        output_layout = op.infer_layout((q_layout, k_layout, v_layout), [])
+        output_layouts, _ = op.infer_layout([q_layout, k_layout, v_layout])
+        output_layout = output_layouts[0]
 
         tensor_map = output_layout.tensor_map
         assert tensor_map[3] == -1, "Head dim (dim 3) should not be sharded"
@@ -304,17 +312,18 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
     def test_sdpa_output_matches_query_layout_16(self, mock_platform):
         """
         Feature: Output layout always matches query layout.
-        Description: Verify that the output tensor_map is identical to query tensor_map.
+        Description: Verify that the output tensor_map is identical to query tensor_map
+            when Q, K, V have consistent sharding.
         Expectation: Output tensor_map equals query tensor_map.
         """
         mesh = self._make_2x2x2_mesh(mock_platform)
         q_layout = _build_layout(mesh, (Shard(0), Shard(2), Shard(1)), 4)
-        k_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 4)
-        v_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(1)), 4)
+        k_layout = _build_layout(mesh, (Shard(0), Replicate(), Shard(1)), 4)
+        v_layout = _build_layout(mesh, (Shard(0), Replicate(), Shard(1)), 4)
 
-        output_layout = op.infer_layout((q_layout, k_layout, v_layout), [])
+        output_layouts, _ = op.infer_layout([q_layout, k_layout, v_layout])
 
-        assert output_layout.tensor_map == q_layout.tensor_map, (
+        assert output_layouts[0].tensor_map == q_layout.tensor_map, (
             "Output tensor_map should match query tensor_map"
         )
 
@@ -360,8 +369,198 @@ class TestParallelScaledDotProductAttention(unittest.TestCase):
         k_layout = _build_layout(mesh, (Replicate(),), 4)
         v_layout = _build_layout(mesh, (Replicate(),), 4)
 
-        with self.assertRaisesRegex(ValueError, "Query layout cannot be None"):
-            op.infer_layout((None, k_layout, v_layout), [])
+        with self.assertRaisesRegex(ValueError, "query layout should not be None"):
+            op.infer_layout([None, k_layout, v_layout])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_kv_seq_sharding_not_supported_20(self, mock_platform):
+        """
+        Feature: Error handling when KV sequence is sharded alongside query sequence.
+        Description: Query seq sharded on sp, KV seq also sharded on sp.
+        Expectation: NotImplementedError raised.
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        placements = (Replicate(), Shard(2), Replicate())
+        q_layout = _build_layout(mesh, placements, 4)
+        k_layout = _build_layout(mesh, placements, 4)
+        v_layout = _build_layout(mesh, placements, 4)
+
+        with self.assertRaisesRegex(NotImplementedError, "KV sequence sharding"):
+            op.infer_layout([q_layout, k_layout, v_layout])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_kv_seq_sharding_query_replicated_21(self, mock_platform):
+        """
+        Feature: Error handling when KV seq is sharded while query seq is replicated.
+        Description: Query replicated, KV seq sharded on sp.
+        Expectation: NotImplementedError raised (KV seq sharding unsupported unconditionally).
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        q_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 4)
+        k_layout = _build_layout(mesh, (Replicate(), Shard(2), Replicate()), 4)
+        v_layout = _build_layout(mesh, (Replicate(), Shard(2), Replicate()), 4)
+
+        with self.assertRaisesRegex(NotImplementedError, "KV sequence sharding"):
+            op.infer_layout([q_layout, k_layout, v_layout])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_partial_key_raises_22(self, mock_platform):
+        """
+        Feature: Error handling when Key has Partial status.
+        Description: Query and Value are replicated, Key has Partial(sum).
+        Expectation: ValueError raised.
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        q_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 4)
+        k_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 4)
+        k_layout.set_partial_by_dev_axis("dp", "sum")
+        v_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 4)
+
+        with self.assertRaisesRegex(ValueError, "Partial status"):
+            op.infer_layout([q_layout, k_layout, v_layout])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_mesh_mismatch_raises_23(self, mock_platform):
+        """
+        Feature: Error handling when K/V mesh differs from Query mesh.
+        Description: Query on (2,2,2) mesh, Key on (4,2) mesh.
+        Expectation: ValueError raised.
+        """
+        mesh_q = self._make_2x2x2_mesh(mock_platform)
+        q_layout = _build_layout(mesh_q, (Replicate(), Replicate(), Replicate()), 4)
+
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh_kv = init_device_mesh(
+            device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp")
+        )
+        k_layout = _build_layout(mesh_kv, (Replicate(), Replicate()), 4)
+        v_layout = _build_layout(mesh_kv, (Replicate(), Replicate()), 4)
+
+        with self.assertRaisesRegex(ValueError, "mesh must match"):
+            op.infer_layout([q_layout, k_layout, v_layout])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_batch_sharded_q_plain_kv_raises_24(self, mock_platform):
+        """
+        Feature: Mixed DTensor/plain Tensor validation.
+        Description: DTensor Q with batch sharding, plain K/V.
+        Expectation: ValueError raised (batch/head must not be sharded with plain K/V).
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        q_layout = _build_layout(mesh, (Shard(0), Replicate(), Replicate()), 4)
+        with self.assertRaisesRegex(ValueError, "batch and head dimensions must not be sharded"):
+            op.infer_layout([q_layout, None, None])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_head_sharded_q_plain_kv_raises_25(self, mock_platform):
+        """
+        Feature: Mixed DTensor/plain Tensor validation.
+        Description: DTensor Q with head sharding, plain K/V.
+        Expectation: ValueError raised (batch/head must not be sharded with plain K/V).
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        q_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(1)), 4)
+        with self.assertRaisesRegex(ValueError, "batch and head dimensions must not be sharded"):
+            op.infer_layout([q_layout, None, None])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_seq_sharded_q_plain_kv_success_26(self, mock_platform):
+        """
+        Feature: Mixed DTensor/plain Tensor validation.
+        Description: DTensor Q with seq sharding (SP), plain K/V.
+        Expectation: infer_layout succeeds, output preserves seq sharding.
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        q_layout = _build_layout(mesh, (Replicate(), Shard(2), Replicate()), 4)
+        output_layouts, extra_info = op.infer_layout([q_layout, None, None])
+        output_layout = output_layouts[0]
+        assert extra_info is None, f"extra_info should be None, got {extra_info}"
+        assert output_layout.tensor_map == (-1, -1, 1, -1), (
+            f"Expected (-1, -1, 1, -1), got {output_layout.tensor_map}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_replicated_q_plain_kv_success_27(self, mock_platform):
+        """
+        Feature: Mixed DTensor/plain Tensor validation.
+        Description: DTensor Q fully replicated, plain K/V.
+        Expectation: infer_layout succeeds, output is replicated.
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        q_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 4)
+        output_layouts, extra_info = op.infer_layout([q_layout, None, None])
+        output_layout = output_layouts[0]
+        assert extra_info is None, f"extra_info should be None, got {extra_info}"
+        assert output_layout.tensor_map == (-1, -1, -1, -1), (
+            f"Expected (-1, -1, -1, -1), got {output_layout.tensor_map}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_asymmetric_kv_raises_28(self, mock_platform):
+        """
+        Feature: Mixed DTensor/plain Tensor validation.
+        Description: K is DTensor, V is plain Tensor — asymmetric K/V.
+        Expectation: ValueError raised (K/V must both be DTensor or both plain).
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        q_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 4)
+        k_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 4)
+        with self.assertRaisesRegex(ValueError, "Key and Value must both be DTensors"):
+            op.infer_layout([q_layout, k_layout, None])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_asymmetric_kv_reverse_raises_29(self, mock_platform):
+        """
+        Feature: Mixed DTensor/plain Tensor validation.
+        Description: K is plain Tensor, V is DTensor — asymmetric K/V.
+        Expectation: ValueError raised (K/V must both be DTensor or both plain).
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        q_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 4)
+        v_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 4)
+        with self.assertRaisesRegex(ValueError, "Key and Value must both be DTensors"):
+            op.infer_layout([q_layout, None, v_layout])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_ndim_mismatch_raises_30(self, mock_platform):
+        """
+        Feature: ndim validation.
+        Description: Q and V are 4D, but K is 3D.
+        Expectation: ValueError raised (Q/K/V must have the same rank).
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        q_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 4)
+        k_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
+        v_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 4)
+        with self.assertRaisesRegex(ValueError, "must have the same rank"):
+            op.infer_layout([q_layout, k_layout, v_layout])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_ndim_invalid_raises_31(self, mock_platform):
+        """
+        Feature: ndim validation.
+        Description: Q is 2D (invalid for SDPA).
+        Expectation: ValueError raised (only 3D or 4D supported).
+        """
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh = init_device_mesh(device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("dp", "mp"))
+        q_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        with self.assertRaisesRegex(ValueError, "only 3D or 4D inputs are supported"):
+            op.infer_layout([q_layout, q_layout, q_layout])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_sdpa_dim_sharding_not_supported_32(self, mock_platform):
+        """
+        Feature: D-dimension sharding prohibition.
+        Description: Q with the last embedding dimension sharded.
+        Expectation: NotImplementedError raised.
+        """
+        mesh = self._make_2x2x2_mesh(mock_platform)
+        q_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(3)), 4)
+        k_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(3)), 4)
+        v_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(3)), 4)
+        with self.assertRaisesRegex(NotImplementedError, "sharding the last embedding dimension"):
+            op.infer_layout([q_layout, k_layout, v_layout])
 
 
 class TestSdpaHelperMethods(unittest.TestCase):
@@ -375,10 +574,12 @@ class TestSdpaHelperMethods(unittest.TestCase):
     def setUp(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, world_size=8):
         mock_platform.get_rank.return_value = 0
@@ -428,12 +629,23 @@ class TestSdpaHelperMethods(unittest.TestCase):
         mesh = init_device_mesh(
             device_type="npu", mesh_shape=(8,), mesh_dim_names=("mp",)
         )
-        layout = _build_layout(mesh, (Replicate(),), 4)
-        dims = op._get_dims(layout)
+        q_layout = _build_layout(mesh, (Replicate(),), 4)
+        dims = op._get_dims(q_layout)
         self.assertEqual(dims["batch"], 0)
         self.assertEqual(dims["head"], 1)
         self.assertEqual(dims["seq"], 2)
         self.assertEqual(dims["dim"], 3)
+
+    def test_get_dims_non_3d_defaults_to_4d(self):
+        """_get_dims returns 4D mapping when tensor_map is not length 3."""
+        from unittest.mock import MagicMock
+        mock_layout = MagicMock()
+        mock_layout.tensor_map = (None, None, None, None, None)
+        dims = op._get_dims(mock_layout)
+        self.assertEqual(dims, {"batch": 0, "head": 1, "seq": 2, "dim": 3})
+        mock_layout.tensor_map = None
+        dims = op._get_dims(mock_layout)
+        self.assertEqual(dims, {"batch": 0, "head": 1, "seq": 2, "dim": 3})
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_get_dim_split_num_no_alias_tensor_map(self, mock_platform):
@@ -513,21 +725,21 @@ class TestSdpaHelperMethods(unittest.TestCase):
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_get_expand_impl_none_query_returns_none(self, mock_platform):
         """get_expand_impl with None query layout returns None."""
-        result = op.get_expand_impl(None, None, (None,), {})
+        result = op.get_expand_impl(None, None, [None])
         self.assertIsNone(result)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_get_expand_impl_key_value_mismatch_raises(self, mock_platform):
-        """get_expand_impl raises ValueError when Key and Value have different tensor_maps."""
+    def test_infer_layout_key_value_mismatch_raises(self, mock_platform):
+        """infer_layout raises ValueError when Key and Value have different tensor_maps."""
         self._setup_mock_platform(mock_platform, world_size=8)
         mesh = init_device_mesh(
             device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp")
         )
-        q_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        q_layout = _build_layout(mesh, (Shard(0), Replicate()), 4)
         k_layout = _build_layout(mesh, (Shard(0), Replicate()), 4)
-        v_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
+        v_layout = _build_layout(mesh, (Replicate(), Shard(1)), 4)
         with self.assertRaisesRegex(ValueError, "Key and Value must have identical"):
-            op.get_expand_impl(None, None, (q_layout, k_layout, v_layout), {})
+            op.infer_layout([q_layout, k_layout, v_layout])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_get_expand_impl_returns_callable(self, mock_platform):
@@ -539,7 +751,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
         q_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
         k_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
         v_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
-        impl = op.get_expand_impl(lambda *a, **k: "result", None, (q_layout, k_layout, v_layout), {})
+        impl = op.get_expand_impl(lambda *a, **k: "result", None, [q_layout, k_layout, v_layout])
         self.assertTrue(callable(impl))
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -560,7 +772,7 @@ class TestSdpaHelperMethods(unittest.TestCase):
             func_calls.append(kwargs)
             return "attention_output"
 
-        impl = op.get_expand_impl(mock_func, None, (q_layout, k_layout, v_layout), {})
+        impl = op.get_expand_impl(mock_func, None, [q_layout, k_layout, v_layout])
         query_mock = MagicMock()
         key_mock = MagicMock()
         value_mock = MagicMock()
@@ -569,9 +781,8 @@ class TestSdpaHelperMethods(unittest.TestCase):
         self.assertEqual(len(func_calls), 1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_get_expand_impl_callable_q_k_mismatch_in_impl_raises(self, mock_platform):
-        """expanded_impl raises ValueError when Q/K layouts mismatch on non-seq dims."""
-        from unittest.mock import MagicMock
+    def test_infer_layout_q_k_sharding_mismatch_raises(self, mock_platform):
+        """infer_layout raises ValueError when Q/K sharding mismatch on non-seq dims."""
         self._setup_mock_platform(mock_platform, world_size=8)
         mesh = init_device_mesh(
             device_type="npu", mesh_shape=(2, 4), mesh_dim_names=("dp", "mp")
@@ -580,11 +791,8 @@ class TestSdpaHelperMethods(unittest.TestCase):
         k_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
         v_layout = _build_layout(mesh, (Replicate(), Replicate()), 4)
 
-        impl = op.get_expand_impl(
-            lambda *a, **k: "result", None, (q_layout, k_layout, v_layout), {}
-        )
-        with self.assertRaises(ValueError):
-            impl(MagicMock(), MagicMock(), MagicMock())
+        with self.assertRaisesRegex(ValueError, "identical batch sharding"):
+            op.infer_layout([q_layout, k_layout, v_layout])
 
     def test_get_split_info_no_alias_tensor_map_returns_defaults(self):
         """_get_split_info returns all-1 defaults when alias_tensor_map is None."""
@@ -674,20 +882,29 @@ class TestSdpaHelperMethods(unittest.TestCase):
             func_calls.append(1)
             return torch.zeros(2, 4, 2, 64)
 
-        impl = op.get_expand_impl(mock_func, None, (q_layout, k_layout, v_layout), {})
+        impl = op.get_expand_impl(mock_func, None, [q_layout, k_layout, v_layout])
         query = torch.randn(2, 4, 2, 64)
         key = torch.randn(2, 4, 8, 64)
         value = torch.randn(2, 4, 8, 64)
         impl(query, key, value)
         self.assertEqual(len(func_calls), 1)
 
-    def test_validate_sharding_consistency_none_tensor_map_returns(self):
-        """_validate_sharding_consistency skips when q_tm or k_tm is None."""
+    def test_validate_sharding_consistency_none_alias_tensor_map_returns(self):
+        """_validate_sharding_consistency returns silently when alias_tensor_map is None."""
         from unittest.mock import MagicMock
         mock_q = MagicMock()
-        mock_q.tensor_map = None
+        mock_q.alias_tensor_map = None
         mock_k = MagicMock()
-        mock_k.tensor_map = ("something",)
+        mock_k.alias_tensor_map = ("something",)
+        op._validate_sharding_consistency(mock_q, mock_k, {"batch": 0})
+
+    def test_validate_sharding_consistency_both_none_alias_tensor_map_returns(self):
+        """_validate_sharding_consistency skips when both alias_tensor_maps are None."""
+        from unittest.mock import MagicMock
+        mock_q = MagicMock()
+        mock_q.alias_tensor_map = None
+        mock_k = MagicMock()
+        mock_k.alias_tensor_map = None
         op._validate_sharding_consistency(mock_q, mock_k, {"batch": 0})
 
 
