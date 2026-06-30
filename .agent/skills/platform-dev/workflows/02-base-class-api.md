@@ -56,7 +56,7 @@ Place the new method near related methods. Categories in `platform.py`:
 | Module manipulation | `get_cells_and_names()`, `search_parameter_by_name()` |
 | Device/RNG | `device()`, `manual_seed()`, `get_rng_state()` |
 | Gradient | `set_grad_reduce_handle()`, `wait_grad_handle()`, `clip_grad_norm_()` |
-| Checkpoint | `checkpoint`, `ckpt_wrapper()`, `async_save_on_cpu()` |
+| Checkpoint / Swap | `checkpoint`, `checkpoint_wrapper`, `swap`, `swap_wrapper`, `swap_tensor_wrapper` |
 | Hooks | `register_forward_pre_hook()`, `register_full_backward_hook()` |
 
 ### 2.3 Consider Backward Compatibility
