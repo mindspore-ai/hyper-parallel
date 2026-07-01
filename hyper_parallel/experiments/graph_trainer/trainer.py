@@ -30,6 +30,7 @@ from torch.fx import GraphModule
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.nn.utils import stateless
 
+from hyper_parallel.compile_debug import maybe_wrap_compile_backend
 from hyper_parallel.experiments.graph_trainer.config import GraphTrainerConfig
 from hyper_parallel.experiments.graph_trainer.graph_debug import (
     CollectiveGraphSummary,
@@ -185,9 +186,10 @@ class SimpleGraphTrainer:
         if self.config.compile_backend is None:
             self.callable_graph = graph_module
         else:
+            backend = maybe_wrap_compile_backend(self.config.compile_backend, "graph_trainer_train_step")
             self.callable_graph = torch.compile(
                 graph_module,
-                backend=self.config.compile_backend,
+                backend=backend,
                 fullgraph=self.config.fullgraph,
             )
         return graph_module

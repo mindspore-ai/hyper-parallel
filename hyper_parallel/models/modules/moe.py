@@ -56,6 +56,15 @@ class MoEExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
+        return self._forward_dynamic_routing(hidden_states, top_k_index, top_k_weights)
+
+    @torch._dynamo.disable
+    def _forward_dynamic_routing(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
         # Buffer + sum(dim=1) uses fp32-internal accumulation, more stable
         # than ``index_add_`` (atomic add in output dtype).
         """Forward pass."""

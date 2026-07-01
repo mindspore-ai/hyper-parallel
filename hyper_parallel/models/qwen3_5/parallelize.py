@@ -20,15 +20,42 @@ shared "default_parallelize" template — each model implements its own
 ``parallelize_<name>`` from torch / hyper primitives directly.
 """
 import logging
+import os
 
 import torch
 
 from hyper_parallel import fully_shard
 from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
+from hyper_parallel.compile_debug import maybe_wrap_compile_backend
 from hyper_parallel.models.qwen3_5.model import Qwen3_5ForCausalLM
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag_enabled(name: str) -> bool:
+    """Return whether an environment feature flag is enabled."""
+    return os.environ.get(name, "0").lower() in ("1", "true", "on", "yes")
+
+
+def _apply_compile(model) -> None:
+    """Compile Qwen3.5 decoder blocks for temporary inductor probing."""
+    if not _env_flag_enabled("HYPER_QWEN_BLOCK_COMPILE"):
+        return
+    if not hasattr(model, "layers"):
+        logger.warning("Qwen3.5 block compile enabled but model has no .layers; skipping.")
+        return
+
+    backend = os.environ.get("HYPER_QWEN_BLOCK_COMPILE_BACKEND", "inductor")
+    backend = maybe_wrap_compile_backend(backend, "qwen3_5_block")
+    fullgraph = _env_flag_enabled("HYPER_QWEN_BLOCK_COMPILE_FULLGRAPH")
+    layers = list(model.layers)
+    for layer in layers:
+        layer.compile(backend=backend, fullgraph=fullgraph)
+    logger.info_rank0(
+        "torch.compile applied to %d Qwen3.5 layers: backend=%s fullgraph=%s",
+        len(layers), backend, fullgraph,
+    )
 
 
 def _apply_ac(model, cfg) -> None:
@@ -113,6 +140,7 @@ def parallelize_qwen3_5(model: Qwen3_5ForCausalLM, mesh, cfg) -> Qwen3_5ForCausa
         raise NotImplementedError("Qwen3.5 dense has no experts; set parallel.ep=1.")
 
     _apply_ac(model, cfg)
+    _apply_compile(model)
     _apply_fsdp(model, mesh, cfg)
     return model
 

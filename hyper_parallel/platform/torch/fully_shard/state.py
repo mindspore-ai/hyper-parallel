@@ -268,7 +268,7 @@ class TorchHSDPStateV2(HSDPState):
 
     def lazy_init(self):
         """Deferred initialization: reset sharded params, validate devices, and set mixed-precision dtypes."""
-        if self.is_shard and not self._reset_sharded_params:
+        if not self._reset_sharded_params:  # PR633: also reset at dp_shard==1 so params re-wrap (no meta/is_leaf crash)
             for hsdp_param in self.hsdp_params:
                 hsdp_param.reset_sharded_param()
             self._reset_sharded_params = True

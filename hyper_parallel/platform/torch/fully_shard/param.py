@@ -812,7 +812,7 @@ class TorchHSDPParamV2(HSDPParamV2):
         if updated_local_tensor:
             # Only change the local tensor object if needed
             with torch.no_grad():
-                local_view = local_tensor.narrow(dim=shard_dim, start=0, length=length)
+                local_view = local_tensor.narrow(dim=shard_dim, start=0, length=length).detach()  # PR633: detach breaks the view so optimizer is_leaf check passes
             set_requires_grad_if_needed(self.sharded_param, local_view)
             self.sharded_param._local_tensor = local_view
             if not self.sharded_param._local_tensor.is_contiguous():

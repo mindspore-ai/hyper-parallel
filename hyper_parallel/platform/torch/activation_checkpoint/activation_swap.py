@@ -128,14 +128,9 @@ def _check_and_mark_wrapped(module: nn.Module) -> None:
         if submodule is module:
             continue
         if getattr(submodule, '_is_wrapped', False):
-            wrapped_callable = _get_wrapped_callable(submodule)
-            if wrapped_callable is not None:
-                _raise_callable_already_wrapped(wrapped_callable)
-            raise ValueError(
-                f"Submodule '{getattr(submodule, '_swap_wrapped_module', submodule).__class__.__name__}' of "
-                f"'{module.__class__.__name__}' is already wrapped. "
-                "Wrapping overlapping module regions is not allowed."
-            )
+            # tolerate submodules shared across AC-wrapped layers (e.g. the
+            # single MultiModalRotaryEmbedding shared by every text decoder layer)
+            continue
     for submodule in module.modules():
         for attr_name, attr_value in _iter_wrappable_callable_attrs(submodule):
             _check_callable_attr_not_wrapped(submodule, attr_name, attr_value)

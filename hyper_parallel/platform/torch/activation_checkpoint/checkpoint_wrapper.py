@@ -15,6 +15,7 @@
 """Activation checkpoint wrapper implementation for PyTorch."""
 from typing import Any, Callable, Union
 
+import torch
 from torch import nn
 
 from hyper_parallel.platform.torch.activation_checkpoint.activation_swap import ActivationWrapper
@@ -48,6 +49,8 @@ class CheckpointWrapper(ActivationWrapper):
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self._do_checkpoint(self._wrapped_module, *args, **kwargs)
+
+    forward = torch._dynamo.disable(forward)
 
 
 def ckpt_wrapper(module: Union[nn.Module, Callable], **checkpoint_kwargs: Any) -> CheckpointWrapper:
