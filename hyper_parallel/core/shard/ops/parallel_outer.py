@@ -16,103 +16,110 @@
 Distributed implementation for Outer operator.
 """
 
+from typing import Tuple
+
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
+
+
+def _normalize_outer_args(vec1, vec2):
+    return (vec1, vec2), {}
+
+
+def _get_alias_shard_set(dim_alias):
+    if isinstance(dim_alias, str):
+        return {dim_alias} if dim_alias != "None" else set()
+    return set(dim_alias)
 
 
 class OuterDistributedOp(DistributedOp):
     """Distributed implementation for torch.outer."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layout for torch.outer.
+        Preprocess arguments for Outer operator.
+
+        Args:
+            args (tuple): Input arguments (input, vec2).
+            kwargs (dict): Keyword arguments (unused for outer).
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values) where local_args contains
+                local tensors for input and vec2, and cache_values contains their layouts.
+        """
+        args, kwargs = _normalize_outer_args(*args, **kwargs)
+        input_tensor, vec2_tensor = args[0], args[1]
+        local_args = (input_tensor.to_local(), vec2_tensor.to_local())
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, vec2_tensor.layout]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layout for Outer operator.
 
         PyTorch semantics:
           - Computes the outer product of two 1-D tensors.
           - If input is of size N and vec2 is of size M, the output is of size (N, M).
           - Input tensors must be 1-D.
 
-        Distributed semantics:
-          - The 0-th dimension of the output inherits the layout of input.
-          - The 1-st dimension of the output inherits the layout of vec2.
-          - The two inputs cannot be sharded along the same device mesh dimension.
+        Rules:
+            1. Inputs must not have Partial status.
+            2. Exactly two input layouts are required, both must be non-None.
+            3. Both inputs must be exactly 1-D.
+            4. The two inputs cannot be sharded along the same device mesh dimension.
+            5. Output dim 0 inherits the sharding of input; output dim 1 inherits the sharding of vec2.
 
         Args:
-            layouts (tuple): Layouts of inputs. Expected:
-                layouts[0] (Layout): Layout of the first 1-D tensor (input).
-                layouts[1] (Layout): Layout of the second 1-D tensor (vec2).
-            extra_args (tuple, optional): Unused for outer.
+            cache_values (list): [input_layout, vec2_layout]
 
         Returns:
-            Layout: The 2-D output tensor layout.
-        """
-        if not layouts or len(layouts) != 2:
-            raise ValueError(
-                f"Operation {self.op_name}: requires exactly 2 input layouts."
-            )
+            tuple: ((output_layout,), None)
 
-        layout1, layout2 = layouts[0], layouts[1]
+        Raises:
+            ValueError: If any rule above is violated.
+        """
+        layout1, layout2 = cache_values[0], cache_values[1]
 
         if layout1 is None or layout2 is None:
             raise ValueError(
-                f"Operation {self.op_name}: requires both inputs to have valid layouts."
+                f"For {self.op_name}, both inputs should be DTensors with valid layouts, "
+                f"but got layout1={layout1}, layout2={layout2}."
             )
 
-        map1 = layout1.tensor_map
-        map2 = layout2.tensor_map
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([layout1, layout2])
 
-        if len(map1) != 1 or len(map2) != 1:
+        alias_map1 = layout1.alias_tensor_map
+        alias_map2 = layout2.alias_tensor_map
+
+        if len(alias_map1) != 1 or len(alias_map2) != 1:
             raise ValueError(
-                f"Operation {self.op_name}: requires exactly 1-D tensors as inputs, "
-                f"but got {len(map1)}-D and {len(map2)}-D."
+                f"For {self.op_name}, both inputs should be exactly 1-D tensors, "
+                f"but got {len(alias_map1)}-D and {len(alias_map2)}-D."
             )
 
-        dim0_map = map1[0]
-        dim1_map = map2[0]
+        dim0_alias = alias_map1[0]
+        dim1_alias = alias_map2[0]
 
-        # Helper to extract all sharded mesh dimensions for a tensor dimension
-        def _get_flattened_map(dim_map):
-            if isinstance(dim_map, int):
-                return {dim_map} if dim_map != -1 else set()
-            return set(dim_map)
+        set1 = _get_alias_shard_set(dim0_alias)
+        set2 = _get_alias_shard_set(dim1_alias)
 
-        set1 = _get_flattened_map(dim0_map)
-        set2 = _get_flattened_map(dim1_map)
-
-        # Ensure the two 1D tensors are not sharded on the same mesh dimension
         if set1.intersection(set2):
             raise ValueError(
-                f"Operation {self.op_name}: the two inputs cannot be sharded on the "
-                f"same device mesh dimension. Conflict on mesh index: {set1.intersection(set2)}"
+                f"For {self.op_name}, the two inputs should not be sharded on the "
+                f"same device mesh dimension, "
+                f"but got conflict on mesh dimension(s): {set1.intersection(set2)}."
             )
 
-        # Build output tensor map: (input_dim, vec2_dim)
-        output_map = [dim0_map, dim1_map]
-
-        # Construct output layout
-        mesh_shape = layout1.mesh_shape
-        alias_name = layout1.alias_name
-        rank_list = layout1.rank_list
-
-        def idx_to_alias(idx_item, aliases):
-            # Handles both single int and nested tuple mapping
-            if isinstance(idx_item, int):
-                if idx_item == -1:
-                    return "None"
-                return aliases[len(aliases) - idx_item - 1]
-            # Handle multi-axis sharding (tuple)
-            return tuple(
-                "None" if sub_idx == -1 else aliases[len(aliases) - sub_idx - 1]
-                for sub_idx in idx_item
-            )
-
-        output_alias_map = tuple(idx_to_alias(idx, alias_name) for idx in output_map)
+        output_alias_map = (dim0_alias, dim1_alias)
 
         output_layout = Layout(
-            mesh_shape=mesh_shape,
-            alias_name=alias_name,
-            rank_list=rank_list
+            mesh_shape=layout1.mesh_shape,
+            alias_name=layout1.alias_name,
+            rank_list=layout1.rank_list,
         )
-
         output_layout = output_layout(*output_alias_map)
-        return output_layout
+
+        return ((output_layout,), None)
+    

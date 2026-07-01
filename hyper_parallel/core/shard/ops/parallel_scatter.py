@@ -16,87 +16,126 @@
 Distributed implementation for Scatter operator.
 """
 
+from typing import Tuple
+
 from .parallel_ops import DistributedOp
+
+
+def _normalize_scatter_args(input_tensor, dim, index, src):
+    return (input_tensor, dim, index, src), {}
 
 
 class ScatterDistributedOp(DistributedOp):
     """Distributed implementation for torch.scatter."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layout for scatter.
+        Preprocess arguments for Scatter operator.
 
         Args:
-            layouts (tuple): Layouts of inputs. Expected order for scatter(input, dim, index, src):
-                layouts[0]: input (DTensor)
-                layouts[1]: dim (None, as it's int)
-                layouts[2]: index (DTensor)
-                layouts[3]: src (DTensor or None if scalar)
-            extra_args (list): Contains non-tensor arguments.
-                extra_args[0]: dim (int)
-                extra_args[1]: src (if src is scalar)
+            args (tuple): Input arguments (input, dim, index, src).
+            kwargs (dict): Keyword arguments (unused for scatter).
 
         Returns:
-            Layout: Output has same layout as input.
+            tuple: (local_args, local_kwargs, cache_values) where local_args contains
+                local tensors and cache_values contains layouts plus dim.
         """
-        # 1. Check partial status
+        args, kwargs = _normalize_scatter_args(*args, **kwargs)
+        input_tensor, dim, index_tensor, src = args
+
+        input_local = input_tensor.to_local()
+        index_local = index_tensor.to_local() if hasattr(index_tensor, '_layout') else index_tensor
+        src_local = src.to_local() if hasattr(src, '_layout') else src
+        local_args = (input_local, dim, index_local, src_local)
+        local_kwargs = {}
+
+        cache_values = [
+            input_tensor.layout,
+            dim,
+            index_tensor.layout if hasattr(index_tensor, '_layout') else None,
+            src.layout if hasattr(src, '_layout') else None,
+        ]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layout for Scatter operator.
+
+        Rules:
+            1. Input must not have Partial status.
+            2. Input must be a DTensor with a valid layout.
+            3. dim must be an integer within the valid range [-ndim, ndim-1].
+            4. The scatter dimension must be replicated (not sharded).
+            5. Index layout must match input layout (if index is a DTensor).
+            6. Src layout must match input layout (if src is a DTensor).
+            7. Output layout is identical to input layout.
+
+        Args:
+            cache_values (list): [input_layout, dim, index_layout, src_layout]
+                where index_layout and src_layout may be None.
+
+        Returns:
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
+        """
         if not self._allow_partial_inputs:
-            self._check_partial_inputs(layouts)
+            self._check_partial_inputs([cache_values[0]])
 
-        if not layouts or layouts[0] is None:
+        input_layout = cache_values[0]
+        if input_layout is None:
             raise ValueError(
-                f"Operation {self.op_name}: scatter requires a valid input tensor layout."
+                f"For {self.op_name}, input should be a DTensor with a valid layout, "
+                f"but got None."
             )
 
-        input_layout = layouts[0]
-        input_map = input_layout.tensor_map
-        ndim = len(input_map)
-
-        # 2. Extract and Validate 'dim'
-        if not extra_args or len(extra_args) < 1:
-            raise ValueError(
-                f"Operation {self.op_name}: scatter requires 'dim' parameter in extra_args."
-            )
-
-        dim = extra_args[0]
+        dim = cache_values[1]
         if not isinstance(dim, int):
-            raise ValueError(f"Operation {self.op_name}: 'dim' must be an integer.")
+            raise ValueError(
+                f"For {self.op_name}, dim should be an integer, "
+                f"but got {type(dim)}."
+            )
 
-        # Normalize dim
+        alias_map = input_layout.alias_tensor_map
+        ndim = len(alias_map)
+
         if dim < 0:
             dim += ndim
 
         if dim < 0 or dim >= ndim:
             raise ValueError(
-                f"Operation {self.op_name}: dim {dim} is out of bounds for tensor with {ndim} dimensions."
+                f"For {self.op_name}, dim should be in range [{-ndim}, {ndim - 1}], "
+                f"but got {cache_values[1]}."
             )
 
-        # 3. Rule: Scatter dimension cannot be sharded
-        if input_map[dim] != -1:
+        # Scatter dimension must be replicated
+        dim_alias = alias_map[dim]
+        if dim_alias != "None":
             raise ValueError(
-                f"Operation {self.op_name}: Scatter along sharded dimension {dim} is not supported. "
-                "The target dimension must be Replicated (unsharded)."
+                f"For {self.op_name}, scatter dim should be replicated, "
+                f"but dim {cache_values[1]} is mapped to {dim_alias}."
             )
 
-        # 4. Rule: Index layout must match Input layout
-        if len(layouts) > 2:
-            index_layout = layouts[2]
-            if index_layout is not None:
-                if index_layout.tensor_map != input_map:
-                    raise ValueError(
-                        f"Operation {self.op_name}: Index tensor layout {index_layout.tensor_map} "
-                        f"must match input tensor layout {input_map}."
-                    )
+        # Index layout must match input layout
+        index_layout = cache_values[2]
+        if index_layout is not None:
+            index_alias = index_layout.alias_tensor_map
+            if index_alias != alias_map:
+                raise ValueError(
+                    f"For {self.op_name}, index layout should match input layout, "
+                    f"but got {index_alias} vs {alias_map}."
+                )
 
-        # 5. Rule: Src layout must match Input layout (if src is a tensor)
-        if len(layouts) > 3:
-            src_layout = layouts[3]
-            if src_layout is not None:
-                if src_layout.tensor_map != input_map:
-                    raise ValueError(
-                        f"Operation {self.op_name}: Src tensor layout {src_layout.tensor_map} "
-                        f"must match input tensor layout {input_map}."
-                    )
+        # Src layout must match input layout
+        src_layout = cache_values[3]
+        if src_layout is not None:
+            src_alias = src_layout.alias_tensor_map
+            if src_alias != alias_map:
+                raise ValueError(
+                    f"For {self.op_name}, src layout should match input layout, "
+                    f"but got {src_alias} vs {alias_map}."
+                )
 
-        # Output layout is the same as input layout (scatter modifies input or returns shape of input)
-        return input_layout
+        return ((input_layout,), None)
+    
