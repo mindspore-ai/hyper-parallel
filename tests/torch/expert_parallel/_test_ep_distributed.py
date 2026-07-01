@@ -665,9 +665,10 @@ def test_ep_async_combine_shared_expert_npu():
         - async_combine: True
         - dim: 64, hidden_dim: 128, batch_size: 4, slen: 16
     """
-    rank, device_id = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"npu:{device_id}")
+    device = torch.device(_DEVICE_TYPE)
     _run_local_shard_ep(
         rank=rank, world_size=world_size, device=device,
         dim=64, hidden_dim=128, num_experts=world_size, top_k=2,
@@ -697,9 +698,10 @@ def test_ep_async_combine_no_shared_expert_npu():
         - async_combine: True
         - dim: 64, hidden_dim: 128, batch_size: 4, slen: 16
     """
-    rank, device_id = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"npu:{device_id}")
+    device = torch.device(_DEVICE_TYPE)
     _run_local_shard_ep(
         rank=rank, world_size=world_size, device=device,
         dim=64, hidden_dim=128, num_experts=world_size, top_k=2,
@@ -731,9 +733,10 @@ def test_ep_async_combine_shared_expert_grouped_mm_npu():
         - async_combine: True, use_grouped_mm: True
         - dim: 64, hidden_dim: 128, batch_size: 4, slen: 16
     """
-    rank, device_id = init_dist()
+    init_backend(_DEVICE_TYPE)
+    rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"npu:{device_id}")
+    device = torch.device(_DEVICE_TYPE)
     _run_local_shard_ep(
         rank=rank, world_size=world_size, device=device,
         dim=64, hidden_dim=128, num_experts=world_size, top_k=2,
