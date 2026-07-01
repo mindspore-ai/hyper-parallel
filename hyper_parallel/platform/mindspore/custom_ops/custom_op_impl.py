@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore custom kernel implementations and DFunction wrappers."""
+from dataclasses import dataclass
 import importlib
 import os
 import sys
@@ -41,6 +42,55 @@ _CUSTOM_OP_SOURCES = [
     os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn.cc"),
     os.path.join(_CC_DIR, "mhc_pre_clamp_sinkhorn_backward.cc"),
 ]
+_MHC_PRE_CLAMP_NONE_GRADS = (None,) * 7
+
+
+@dataclass(frozen=True)
+class _MhcPreClampArgs:
+    """Bound arguments for npu_mhc_pre_clamp_sinkhorn."""
+
+    x: ms.Tensor
+    phi: ms.Tensor
+    alpha: ms.Tensor
+    bias: ms.Tensor
+    hc_mult: int
+    num_iters: int
+    hc_eps: float
+    norm_eps: float
+    out_flag: bool
+    clamp_min: float
+    clamp_max: float
+
+
+def _bind_mhc_pre_clamp_args(args, kwargs):
+    """Bind npu_mhc_pre_clamp_sinkhorn arguments with Python defaults."""
+    names = (
+        "x", "phi", "alpha", "bias", "hc_mult", "num_iters",
+        "hc_eps", "norm_eps", "out_flag", "clamp_min", "clamp_max",
+    )
+    values = {
+        "hc_mult": 4,
+        "num_iters": 20,
+        "hc_eps": 1e-6,
+        "norm_eps": 1e-6,
+        "out_flag": True,
+        "clamp_min": 0.0,
+        "clamp_max": 0.0,
+    }
+    if len(args) > len(names):
+        raise TypeError(f"npu_mhc_pre_clamp_sinkhorn expected at most {len(names)} arguments")
+    for name, value in zip(names, args):
+        values[name] = value
+    for name, value in kwargs.items():
+        if name in values and name in names[:len(args)]:
+            raise TypeError(f"npu_mhc_pre_clamp_sinkhorn got multiple values for argument '{name}'")
+        if name not in names:
+            raise TypeError(f"npu_mhc_pre_clamp_sinkhorn got an unexpected keyword argument '{name}'")
+        values[name] = value
+    missing = [name for name in names[:4] if name not in values]
+    if missing:
+        raise TypeError(f"npu_mhc_pre_clamp_sinkhorn missing required arguments: {missing}")
+    return _MhcPreClampArgs(*(values[name] for name in names))
 
 
 def _build_custom_ops():
@@ -380,37 +430,35 @@ class NpuMhcPreClampSinkhornDFunction(DFunction):  # pylint: disable=W0221
     _op_name = "npu_mhc_pre_clamp_sinkhorn"
 
     @staticmethod
-    def forward(ctx, x, phi, alpha, bias, hc_mult, num_iters, hc_eps, norm_eps,
-                out_flag, clamp_min, clamp_max):
+    def forward(ctx, *args, **kwargs):
         """Forward pass: delegates to the clamp-enabled Ascend custom kernel."""
+        bound = _bind_mhc_pre_clamp_args(args, kwargs)
         result = _custom_ops.npu_mhc_pre_clamp_sinkhorn(
-            x, phi, alpha, bias, hc_mult, num_iters, hc_eps, norm_eps,
-            out_flag, clamp_min, clamp_max
+            bound.x, bound.phi, bound.alpha, bound.bias,
+            bound.hc_mult, bound.num_iters, bound.hc_eps, bound.norm_eps,
+            bound.out_flag, bound.clamp_min, bound.clamp_max
         )
         _, _, _, h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits = result
-        ctx.save_for_backward(x, phi, alpha, bias,
+        ctx.save_for_backward(bound.x, bound.phi, bound.alpha, bound.bias,
                               h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits)
-        ctx.hc_eps = hc_eps
-        ctx.clamp_min = clamp_min
-        ctx.clamp_max = clamp_max
+        ctx.hc_eps = bound.hc_eps
+        ctx.clamp_min = bound.clamp_min
+        ctx.clamp_max = bound.clamp_max
         return result
 
     @staticmethod
     def backward(ctx, *grad_outputs):
         """Backward pass: calls npu_mhc_pre_clamp_sinkhorn_backward kernel."""
-        x, phi, alpha, bias, h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits = ctx.saved_tensors
-        (grad_h_in, grad_h_post, grad_h_res,
-         x, phi, alpha, bias,
-         h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits) = _ensure_contiguous(
+        tensors = _ensure_contiguous(
             grad_outputs[0], grad_outputs[1], grad_outputs[2],
-            x, phi, alpha, bias,
-            h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits)
-        n = grad_h_post.shape[-1]
-        grad_h_res = ms.ops.reshape(grad_h_res, tuple(grad_h_res.shape[:-1]) + (n, n))
+            *ctx.saved_tensors
+        )
+        n = tensors[1].shape[-1]
+        grad_h_res = ms.ops.reshape(tensors[2], tuple(tensors[2].shape[:-1]) + (n, n))
 
         grads = _custom_ops.npu_mhc_pre_clamp_sinkhorn_backward(
-            grad_h_in, grad_h_post, grad_h_res,
-            x, phi, alpha, bias,
-            h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits,
+            tensors[0], tensors[1], grad_h_res,
+            tensors[3], tensors[4], tensors[5], tensors[6],
+            tensors[7], tensors[8], tensors[9], tensors[10], tensors[11], tensors[12],
             ctx.hc_eps, ctx.clamp_min, ctx.clamp_max)
-        return grads[0], grads[1], grads[2], grads[3], None, None, None, None, None, None, None
+        return tuple(grads[:4]) + _MHC_PRE_CLAMP_NONE_GRADS

@@ -58,4 +58,5 @@ class MindSporeCustomOps:
 
     @staticmethod
     def npu_mhc_pre_clamp_sinkhorn(*args, **kwargs):
+        """Apply the clamped NPU MHC pre-Sinkhorn custom operator."""
         return NpuMhcPreClampSinkhornDFunction.apply(*args, **kwargs)
