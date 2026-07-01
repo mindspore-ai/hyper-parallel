@@ -37,6 +37,8 @@ class ModelSpec:
             When ``None``, hyper's DTensor-aware ``clip_grad_norm_`` is used.
         pipelining_fn: Optional PP setup ``(model, mesh, cfg) -> (schedule, stages)``.
         state_dict_adapter: Optional class for HF ↔ hyper weight key translation.
+        prepare_batch_fn: Optional model-specific transform ``(batch, model) -> batch``
+            applied before token counting and forward.
 
     Example:
         Standard transformer (uses defaults, ~15 lines to register)::
@@ -66,3 +68,4 @@ class ModelSpec:
     clip_grad_fn: Optional[Callable] = None
     pipelining_fn: Optional[Callable] = None
     state_dict_adapter: Optional[Type] = None
+    prepare_batch_fn: Optional[Callable] = None

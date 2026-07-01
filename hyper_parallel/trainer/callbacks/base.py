@@ -160,7 +160,10 @@ class LoggingCallback(Callback):
 
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
-        log_cfg = getattr(trainer.args, 'logging', None)
+        train_cfg = getattr(trainer.args, 'train', None)
+        log_cfg = getattr(train_cfg, 'logging', None)
+        if log_cfg is None:
+            log_cfg = getattr(trainer.args, 'logging', None)
         self.log_steps = getattr(log_cfg, 'log_steps', 10) if log_cfg else 10
         self.report_global_loss = (
             getattr(log_cfg, 'report_global_loss', False) if log_cfg else False
@@ -261,7 +264,10 @@ class CheckpointCallback(Callback):
 
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
-        ckpt_cfg = getattr(trainer.args, 'checkpoint', None)
+        train_cfg = getattr(trainer.args, 'train', None)
+        ckpt_cfg = getattr(train_cfg, 'checkpoint', None)
+        if ckpt_cfg is None:
+            ckpt_cfg = getattr(trainer.args, 'checkpoint', None)
         self.save_steps = getattr(ckpt_cfg, 'save_steps', 0) if ckpt_cfg else 0
         self.output_dir = (
             getattr(ckpt_cfg, 'output_dir', 'outputs') if ckpt_cfg else 'outputs'
@@ -477,7 +483,10 @@ class SafetensorsExportCallback(Callback):
 
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
-        ckpt_cfg = getattr(trainer.args, 'checkpoint', None)
+        train_cfg = getattr(trainer.args, 'train', None)
+        ckpt_cfg = getattr(train_cfg, 'checkpoint', None)
+        if ckpt_cfg is None:
+            ckpt_cfg = getattr(trainer.args, 'checkpoint', None)
         self.enabled = getattr(ckpt_cfg, 'save_hf_weights', False) if ckpt_cfg else False
         self.save_steps = getattr(ckpt_cfg, 'save_steps', 0) if ckpt_cfg else 0
         self.output_dir = getattr(ckpt_cfg, 'output_dir', 'outputs') if ckpt_cfg else 'outputs'
