@@ -91,13 +91,11 @@ std::vector<ms::Tensor> npu_mhc_pre_clamp_sinkhorn(const ms::Tensor &x, const ms
     GenResultTensors(x, num_iters);
   int hc_mult_value = static_cast<int>(hc_mult);
   int num_iters_value = static_cast<int>(num_iters);
-  auto runner = std::make_shared<ms::pynative::AclnnOpRunner>("MhcPreClampSinkhorn");
-  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnMhcPreClampSinkhorn, x, phi, alpha, bias, hc_mult_value,
-                                          num_iters_value, hc_eps, norm_eps, out_flag, clamp_min, clamp_max, h_in,
-                                          h_post, h_res, h_pre, hc_before_norm, inv_rms, sum_out, norm_out,
-                                          h_res_logits));
-  runner->Run({x, phi, alpha, bias},
-              {h_in, h_post, h_res, h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits});
+  ms::TensorToDevice(x, phi, alpha, bias);
+  ms::TensorAllocate({h_in, h_post, h_res, h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits});
+  MS_DISPATCH_ACLNN(aclnnMhcPreClampSinkhorn, x, phi, alpha, bias, hc_mult_value, num_iters_value, hc_eps, norm_eps,
+                    out_flag, clamp_min, clamp_max, h_in, h_post, h_res, h_pre, hc_before_norm, inv_rms, sum_out,
+                    norm_out, h_res_logits);
   return {h_in, h_post, h_res, h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits};
 }
 

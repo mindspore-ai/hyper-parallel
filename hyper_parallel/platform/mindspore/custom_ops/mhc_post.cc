@@ -26,11 +26,12 @@ ms::Tensor GenResultTensor(const ms::Tensor &x) { return ms::Tensor(x.data_type(
 std::vector<ms::Tensor> npu_mhc_post(const ms::Tensor &x, const ms::Tensor &h_res, const ms::Tensor &h_out,
                                      const ms::Tensor &h_post) {
   auto out = GenResultTensor(x);
-  auto runner = std::make_shared<ms::pynative::AclnnOpRunner>("MhcPost");
-  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnMhcPost, x, h_res, h_out, h_post, out));
-  runner->Run({x, h_res, h_out, h_post}, {out});
+  ms::TensorToDevice(x, h_res, h_out, h_post);
+  ms::TensorAllocate(out);
+  MS_DISPATCH_ACLNN(aclnnMhcPost, x, h_res, h_out, h_post, out);
   return {out};
 }
 
+// cppcheck-suppress syntaxError
 MS_CUSTOM_OPS_EXTENSION_MODULE(m) { m.def("npu_mhc_post", PYBOOST_CALLER(1, custom::npu_mhc_post)); }
 }  // namespace custom

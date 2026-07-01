@@ -37,13 +37,13 @@ std::vector<ms::Tensor> npu_mhc_post_backward(const ms::Tensor &grad_y, const ms
                                               const ms::Tensor &h_res, const ms::Tensor &h_out,
                                               const ms::Tensor &h_post) {
   auto [grad_x, grad_h_res, grad_h_out, grad_h_post] = GenResultTensors(x, h_res, h_out, h_post);
-  auto runner = std::make_shared<ms::pynative::AclnnOpRunner>("MhcPostBackward");
-  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnMhcPostBackward, grad_y, x, h_res, h_out, h_post, grad_x, grad_h_res,
-                                          grad_h_out, grad_h_post));
-  runner->Run({grad_y, x, h_res, h_out, h_post}, {grad_x, grad_h_res, grad_h_out, grad_h_post});
+  ms::TensorToDevice(grad_y, x, h_res, h_out, h_post);
+  ms::TensorAllocate({grad_x, grad_h_res, grad_h_out, grad_h_post});
+  MS_DISPATCH_ACLNN(aclnnMhcPostBackward, grad_y, x, h_res, h_out, h_post, grad_x, grad_h_res, grad_h_out, grad_h_post);
   return {grad_x, grad_h_res, grad_h_out, grad_h_post};
 }
 
+// cppcheck-suppress syntaxError
 MS_CUSTOM_OPS_EXTENSION_MODULE(m) {
   m.def("npu_mhc_post_backward", PYBOOST_CALLER(4, custom::npu_mhc_post_backward));
 }
