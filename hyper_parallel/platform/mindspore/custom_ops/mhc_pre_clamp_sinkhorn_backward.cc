@@ -39,13 +39,12 @@ std::vector<ms::Tensor> npu_mhc_pre_clamp_sinkhorn_backward(
   const ms::Tensor &hc_before_norm, const ms::Tensor &inv_rms, const ms::Tensor &sum_out, const ms::Tensor &norm_out,
   const ms::Tensor &h_res_logits, double hc_eps, double clamp_min, double clamp_max) {
   auto [grad_x, grad_phi, grad_alpha, grad_bias] = GenResultTensors(x, phi, alpha, bias);
-  auto runner = std::make_shared<ms::pynative::AclnnOpRunner>("MhcPreClampSinkhornBackward");
-  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnMhcPreClampSinkhornBackward, grad_h_in, grad_h_post, grad_h_res, x, phi,
-                                          alpha, bias, h_pre, hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits,
-                                          hc_eps, clamp_min, clamp_max, grad_x, grad_phi, grad_alpha, grad_bias));
-  runner->Run({grad_h_in, grad_h_post, grad_h_res, x, phi, alpha, bias, h_pre, hc_before_norm, inv_rms, sum_out,
-               norm_out, h_res_logits},
-              {grad_x, grad_phi, grad_alpha, grad_bias});
+  ms::TensorToDevice(grad_h_in, grad_h_post, grad_h_res, x, phi, alpha, bias, h_pre, hc_before_norm, inv_rms, sum_out,
+                     norm_out, h_res_logits);
+  ms::TensorAllocate({grad_x, grad_phi, grad_alpha, grad_bias});
+  MS_DISPATCH_ACLNN(aclnnMhcPreClampSinkhornBackward, grad_h_in, grad_h_post, grad_h_res, x, phi, alpha, bias, h_pre,
+                    hc_before_norm, inv_rms, sum_out, norm_out, h_res_logits, hc_eps, clamp_min, clamp_max, grad_x,
+                    grad_phi, grad_alpha, grad_bias);
   return {grad_x, grad_phi, grad_alpha, grad_bias};
 }
 

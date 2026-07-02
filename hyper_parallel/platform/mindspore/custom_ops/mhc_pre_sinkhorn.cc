@@ -57,14 +57,14 @@ std::vector<ms::Tensor> npu_mhc_pre_sinkhorn(const ms::Tensor &x, const ms::Tens
     GenResultTensors(x, num_iters);
   int hc_mult_value = static_cast<int>(hc_mult);
   int num_iters_value = static_cast<int>(num_iters);
-  auto runner = std::make_shared<ms::pynative::AclnnOpRunner>("MhcPreSinkhorn");
-  runner->SetLaunchFunc(LAUNCH_ACLNN_FUNC(aclnnMhcPreSinkhorn, x, phi, alpha, bias, hc_mult_value, num_iters_value,
-                                          hc_eps, norm_eps, out_flag, h_in, h_post, h_res, h_pre, hc_before_norm,
-                                          inv_rms, sum_out, norm_out));
-  runner->Run({x, phi, alpha, bias}, {h_in, h_post, h_res, h_pre, hc_before_norm, inv_rms, sum_out, norm_out});
+  ms::TensorToDevice(x, phi, alpha, bias);
+  ms::TensorAllocate({h_in, h_post, h_res, h_pre, hc_before_norm, inv_rms, sum_out, norm_out});
+  MS_DISPATCH_ACLNN(aclnnMhcPreSinkhorn, x, phi, alpha, bias, hc_mult_value, num_iters_value, hc_eps, norm_eps,
+                    out_flag, h_in, h_post, h_res, h_pre, hc_before_norm, inv_rms, sum_out, norm_out);
   return {h_in, h_post, h_res, h_pre, hc_before_norm, inv_rms, sum_out, norm_out};
 }
 
+// cppcheck-suppress syntaxError
 MS_CUSTOM_OPS_EXTENSION_MODULE(m) {
   m.def("npu_mhc_pre_sinkhorn", PYBOOST_CALLER(8, custom::npu_mhc_pre_sinkhorn));
 }
