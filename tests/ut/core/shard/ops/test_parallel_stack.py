@@ -293,7 +293,7 @@ class TestParallelStack(unittest.TestCase):
         # Input cache values matching different layouts from different tensors
         cache_values = [layout1, layout2, 0]
 
-        with self.assertRaisesRegex(ValueError, "All input tensors must have the same layout"):
+        with self.assertRaisesRegex(ValueError, "all input tensors must have the same layout"):
             op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -313,12 +313,12 @@ class TestParallelStack(unittest.TestCase):
 
         # For a 2D tensor, valid dims for stack are [-3, 2]. Pass 3.
         cache_values_pos = [x_layout, 3]
-        with self.assertRaisesRegex(ValueError, "Dimension out of range"):
+        with self.assertRaisesRegex(ValueError, "dimension out of range"):
             op.infer_layout(cache_values_pos)
 
         # For a 2D tensor, valid dims for stack are [-3, 2]. Pass -4.
         cache_values_neg = [x_layout, -4]
-        with self.assertRaisesRegex(ValueError, "Dimension out of range"):
+        with self.assertRaisesRegex(ValueError, "dimension out of range"):
             op.infer_layout(cache_values_neg)
 
 class TestParallelStackExt(unittest.TestCase):

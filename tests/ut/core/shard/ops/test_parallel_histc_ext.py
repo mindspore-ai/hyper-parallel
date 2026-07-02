@@ -16,17 +16,17 @@
 Unit tests for HistcExtDistributedOp.
 """
 
-import os
 import unittest
 from unittest.mock import patch
+
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _LAYOUT_CACHE, _build_layout
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_histc_ext import HistcExtDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
     init_device_mesh,
-    _DEVICE_MESH_MAP
+    _DEVICE_MESH_MAP,
 )
 from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
@@ -36,15 +36,17 @@ op = HistcExtDistributedOp("HistcExt")
 class TestHistcExt(unittest.TestCase):
     """Unit tests for HistcExtDistributedOp."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
@@ -63,7 +65,7 @@ class TestHistcExt(unittest.TestCase):
             device_type="npu",
             mesh_shape=(2, 4),
             mesh_dim_names=("dp", "mp"),
-            init_backend=False
+            init_backend=False,
         )
 
     def _make_8_mesh(self, mock_platform, mesh_dim_name="dp"):
@@ -73,7 +75,7 @@ class TestHistcExt(unittest.TestCase):
             device_type="npu",
             mesh_shape=(8,),
             mesh_dim_names=(mesh_dim_name,),
-            init_backend=False
+            init_backend=False,
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -83,8 +85,9 @@ class TestHistcExt(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        extra_args = (100, 0, 3)
-        output_layout = op.infer_layout((x_layout,), extra_args)
+        cache_values = [x_layout, 100, 0, 3]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         assert output_layout.tensor_map == (-1,), (
             f"Data Parallel test failed. Expected (-1,), "
@@ -99,11 +102,12 @@ class TestHistcExt(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-        # impl = op.get_expand_impl(None, output_layout, (x_layout,), extra_args)
-        # assert callable(impl), (
-        #     f"get_expand_impl should return callable for sharded input, "
-        #     f"got {type(impl)}"
-        # )
+        # Since get_expand_impl is not overridden, it returns None by default.
+        # The same applies to other test methods, so it is unnecessary to test its return value elsewhere.
+        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
+            f"get_expand_impl should return None for HistcExt, "
+            f"but got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_histc_ext_model_parallel_success(self, mock_platform):
@@ -112,8 +116,9 @@ class TestHistcExt(unittest.TestCase):
         x_placements = (Replicate(), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        extra_args = (50, 0, 10)
-        output_layout = op.infer_layout((x_layout,), extra_args)
+        cache_values = [x_layout, 50, 0, 10]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         assert output_layout.tensor_map == (-1,), (
             f"Model Parallel test failed. Expected (-1,), "
@@ -128,12 +133,6 @@ class TestHistcExt(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-        # impl = op.get_expand_impl(None, output_layout, (x_layout,), extra_args)
-        # assert callable(impl), (
-        #     f"get_expand_impl should return callable for sharded input, "
-        #     f"got {type(impl)}"
-        # )
-
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_histc_ext_hybrid_parallel_success(self, mock_platform):
         """Test HistcExt with hybrid parallel sharding."""
@@ -141,8 +140,9 @@ class TestHistcExt(unittest.TestCase):
         x_placements = (Shard(0), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        extra_args = (200, -5, 5)
-        output_layout = op.infer_layout((x_layout,), extra_args)
+        cache_values = [x_layout, 200, -5, 5]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         assert output_layout.tensor_map == (-1,), (
             f"Hybrid Parallel test failed. Expected (-1,), "
@@ -157,12 +157,6 @@ class TestHistcExt(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-        # impl = op.get_expand_impl(None, output_layout, (x_layout,), extra_args)
-        # assert callable(impl), (
-        #     f"get_expand_impl should return callable for sharded input, "
-        #     f"got {type(impl)}"
-        # )
-
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_histc_ext_all_replicated(self, mock_platform):
         """Test HistcExt with all replicated input."""
@@ -170,8 +164,9 @@ class TestHistcExt(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        extra_args = (100, 0, 3)
-        output_layout = op.infer_layout((x_layout,), extra_args)
+        cache_values = [x_layout, 100, 0, 3]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         assert output_layout.tensor_map == (-1,), (
             f"All Replicated test failed. Expected (-1,), "
@@ -182,11 +177,6 @@ class TestHistcExt(unittest.TestCase):
             "Output should not have partial state when input is replicated"
         )
 
-        # assert op.get_expand_impl(None, output_layout, (x_layout,), extra_args) is None, (
-        #     f"get_expand_impl should return None for replicated input, "
-        #     f"got {op.get_expand_impl(None, output_layout, (x_layout,), extra_args)}"
-        # )
-
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_histc_ext_3d_tensor(self, mock_platform):
         """Test HistcExt with 3D tensor input."""
@@ -194,8 +184,9 @@ class TestHistcExt(unittest.TestCase):
         x_placements = (Shard(0), Shard(2))
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        extra_args = (100, 0, 3)
-        output_layout = op.infer_layout((x_layout,), extra_args)
+        cache_values = [x_layout, 100, 0, 3]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         assert output_layout.tensor_map == (-1,), (
             f"3D tensor test failed. Expected (-1,), "
@@ -206,12 +197,6 @@ class TestHistcExt(unittest.TestCase):
             "Output should have partial state for 3D sharded input"
         )
 
-        # impl = op.get_expand_impl(None, output_layout, (x_layout,), extra_args)
-        # assert callable(impl), (
-        #     f"get_expand_impl should return callable for 3D sharded input, "
-        #     f"got {type(impl)}"
-        # )
-
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_histc_ext_single_mesh_dim(self, mock_platform):
         """Test HistcExt with single mesh dimension."""
@@ -219,8 +204,9 @@ class TestHistcExt(unittest.TestCase):
         x_placements = (Shard(0),)
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        extra_args = (100, 0, 3)
-        output_layout = op.infer_layout((x_layout,), extra_args)
+        cache_values = [x_layout, 100, 0, 3]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         assert output_layout.tensor_map == (-1,), (
             f"Single mesh dimension test failed. Expected (-1,), "
@@ -235,21 +221,28 @@ class TestHistcExt(unittest.TestCase):
             f"got {output_layout.partial}"
         )
 
-        # impl = op.get_expand_impl(None, output_layout, (x_layout,), extra_args)
-        # assert callable(impl), (
-        #     f"get_expand_impl should return callable for sharded input, "
-        #     f"got {type(impl)}"
-        # )
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_histc_ext_partial_input_raises_error(self, mock_platform):
+        """Test error when input has Partial status."""
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_placements = (Replicate(), Replicate())
+        x_layout = _build_layout(mesh, x_placements, 2)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+        cache_values = [x_layout, 100, 0, 3]
+
+        with self.assertRaisesRegex(ValueError, "Partial status"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_histc_ext_default_parameters(self, mock_platform):
-        """Test HistcExt with default parameters."""
+        """Test HistcExt with default parameters (bins=100, min=0, max=0)."""
         mesh = self._make_2x4_mesh(mock_platform)
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        extra_args = ()
-        output_layout = op.infer_layout((x_layout,), extra_args)
+        cache_values = [x_layout, 100, 0, 0]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         assert output_layout.tensor_map == (-1,), (
             f"Default parameters test failed. Expected (-1,), "
@@ -260,21 +253,16 @@ class TestHistcExt(unittest.TestCase):
             "Output should have partial state with default parameters"
         )
 
-        # impl = op.get_expand_impl(None, output_layout, (x_layout,), extra_args)
-        # assert callable(impl), (
-        #     f"get_expand_impl should return callable with default parameters, "
-        #     f"got {type(impl)}"
-        # )
-
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_histc_ext_partial_bins_parameter(self, mock_platform):
-        """Test HistcExt with only bins parameter."""
+        """Test HistcExt with custom bins and default min/max."""
         mesh = self._make_2x4_mesh(mock_platform)
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        extra_args = (50,)
-        output_layout = op.infer_layout((x_layout,), extra_args)
+        cache_values = [x_layout, 50, 0, 0]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         assert output_layout.tensor_map == (-1,), (
             f"Partial bins parameter test failed. Expected (-1,), "
@@ -285,35 +273,13 @@ class TestHistcExt(unittest.TestCase):
             "Output should have partial state with partial parameters"
         )
 
-        # impl = op.get_expand_impl(None, output_layout, (x_layout,), extra_args)
-        # assert callable(impl), (
-        #     f"get_expand_impl should return callable with partial parameters, "
-        #     f"got {type(impl)}"
-        # )
-
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_histc_ext_invalid_input_layout_failure(self, mock_platform):
         """Test error when input layout is None."""
         self._setup_mock_platform(mock_platform, world_size=8)
 
-        with self.assertRaisesRegex(ValueError, "Input layout cannot be None"):
-            op.infer_layout((None,), (100, 0, 3))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_histc_ext_empty_layouts_failure(self, mock_platform):
-        """Test error when layouts is empty."""
-        self._setup_mock_platform(mock_platform, world_size=8)
-
-        with self.assertRaisesRegex(ValueError, "requires at least one input layout"):
-            op.infer_layout((), (100, 0, 3))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_histc_ext_none_layouts_failure(self, mock_platform):
-        """Test error when layouts is None."""
-        self._setup_mock_platform(mock_platform, world_size=8)
-
-        with self.assertRaisesRegex(ValueError, "requires at least one input layout"):
-            op.infer_layout(None, (100, 0, 3))
+        with self.assertRaisesRegex(ValueError, "input layout should not be None"):
+            op.infer_layout([None, 100, 0, 3])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_histc_ext_invalid_bins_type_failure(self, mock_platform):
@@ -322,8 +288,8 @@ class TestHistcExt(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "bins must be an integer"):
-            op.infer_layout((x_layout,), ("100", 0, 3))
+        with self.assertRaisesRegex(ValueError, "bins should be an integer"):
+            op.infer_layout([x_layout, "100", 0, 3])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_histc_ext_invalid_bins_value_failure(self, mock_platform):
@@ -332,11 +298,11 @@ class TestHistcExt(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "bins must be a positive integer"):
-            op.infer_layout((x_layout,), (0, 0, 3))
+        with self.assertRaisesRegex(ValueError, "bins should be a positive integer"):
+            op.infer_layout([x_layout, 0, 0, 3])
 
-        with self.assertRaisesRegex(ValueError, "bins must be a positive integer"):
-            op.infer_layout((x_layout,), (-10, 0, 3))
+        with self.assertRaisesRegex(ValueError, "bins should be a positive integer"):
+            op.infer_layout([x_layout, -10, 0, 3])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_histc_ext_invalid_min_max_failure(self, mock_platform):
@@ -345,8 +311,9 @@ class TestHistcExt(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "min must be less than or equal to max"):
-            op.infer_layout((x_layout,), (100, 5, 3))
+        with self.assertRaisesRegex(ValueError, "min should be less than or equal to max"):
+            op.infer_layout([x_layout, 100, 5, 3])
+
 
 if __name__ == '__main__':
     unittest.main()
