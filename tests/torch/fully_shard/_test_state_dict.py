@@ -38,7 +38,7 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions
 
 from hyper_parallel import init_device_mesh, SkipDTensorDispatch
 from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.fully_shard.api import fully_shard, get_model_state_dict
+from hyper_parallel.core.fully_shard.api import fully_shard, get_model_state_dict, set_model_state_dict
 from hyper_parallel.platform.torch.fully_shard.state import _to_dtype_if_needed
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from tests.torch.common_net import FullyShardTestNet
@@ -548,3 +548,161 @@ def test_t11_meta_load_backward():
     _train_step(model, x)
 
     print(f"[rank{_rank()}] T11 PASS: 8-card meta init -> load -> backward")
+
+
+# =====================================================================
+# T12 (4-card): set_model_state_dict + full_state_dict=True
+# =====================================================================
+def test_t12_set_model_sd_full():
+    """set_model_state_dict with full_state_dict=True: scatter + load + train."""
+    init_dist()
+    torch.manual_seed(42 + _rank())
+    model_a = _make_model(4)
+    x = torch.randn(BATCH, HIDDEN).npu()
+    _train_step(model_a, x)
+    fwd_a = _forward_val(model_a, x)
+
+    opts = StateDictOptions(full_state_dict=True)
+    sd_full = get_model_state_dict(model_a, options=opts)
+
+    model_b = _make_model(4)
+    set_model_state_dict(model_b, sd_full, options=opts)
+
+    _assert_fwd_match(fwd_a, _forward_val(model_b, x), "full set")
+    _assert_all_dtensor(model_b, "full set")
+
+    # Continue training must work
+    for _ in range(2):
+        _train_step(model_b, x)
+    _assert_all_dtensor(model_b, "full set after train")
+
+    print(f"[rank{_rank()}] T12 PASS: set full_state_dict")
+
+
+# =====================================================================
+# T13 (4-card): set_model_state_dict + full_state_dict + cpu_offload
+# =====================================================================
+def test_t13_set_model_sd_full_cpu():
+    """cpu_offload=True must place scattered shards on NPU, not CPU.
+
+    Uses the *real* rank0-only output of
+    ``get_model_state_dict(full_state_dict=True, cpu_offload=True)`` (rank0 gets
+    a full CPU state dict, every other rank gets ``{}``). Because
+    ``broadcast_from_rank0`` is not implemented yet, rank0 manually broadcasts
+    each full tensor to the other ranks so the setter can scatter on every rank.
+    This mirrors what the eventual broadcast implementation will do and avoids
+    faking the cpu_offload scenario by holding a full tensor on every rank.
+    """
+    init_dist()
+    torch.manual_seed(42 + _rank())
+    num_cards = 4
+    model_a = _make_model(num_cards)
+    x = torch.randn(BATCH, HIDDEN).npu()
+    _train_step(model_a, x)
+    fwd_a = _forward_val(model_a, x)
+
+    # Real getter output: rank0 -> full CPU dict, non-rank0 -> {}.
+    opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    sd_cpu = get_model_state_dict(model_a, options=opts)
+
+    # Manually broadcast rank0's full CPU tensors to every rank so that each
+    # rank can scatter locally (stand-in for broadcast_from_rank0).
+    # Rank0 sends the key list and per-key shapes; other ranks allocate buffers.
+    # The default backend (HCCL) cannot broadcast CPU tensors, so the broadcast
+    # happens on NPU and the result is moved back to CPU to exercise the
+    # cpu_offload scatter path (CPU input -> NPU shard).
+    if _rank() == 0:
+        meta_list = [[(key, tuple(val.shape)) for key, val in sd_cpu.items()]]
+    else:
+        meta_list = [None]
+    dist.broadcast_object_list(meta_list, src=0)
+
+    sd_full = {}
+    for key, shape in meta_list[0]:
+        if _rank() == 0:
+            t_npu = sd_cpu[key].clone().npu()
+        else:
+            t_npu = torch.empty(*shape, device="npu")
+        dist.broadcast(t_npu, src=0)
+        sd_full[key] = t_npu.cpu()
+
+    model_b = _make_model(num_cards)
+    set_model_state_dict(
+        model_b, sd_full,
+        options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+    )
+
+    # Critical: every parameter must be on NPU after cpu_offload set.
+    for name, p in model_b.named_parameters():
+        assert isinstance(p, DTensor), f"'{name}' should be DTensor"
+        assert p.to_local().is_npu, (
+            f"'{name}' should be on NPU after cpu_offload set, "
+            f"got {p.to_local().device}"
+        )
+
+    _assert_fwd_match(fwd_a, _forward_val(model_b, x), "cpu_offload set")
+
+    # Training must work after cpu_offload load.
+    for _ in range(2):
+        _train_step(model_b, x)
+    _assert_all_dtensor(model_b, "cpu_offload after train")
+
+    print(f"[rank{_rank()}] T13 PASS: set cpu_offload (device verified)")
+
+
+# =====================================================================
+# T14 (4-card): set_model_state_dict + sharded (full_state_dict=False)
+# =====================================================================
+def test_t14_set_model_sd_sharded():
+    """set_model_state_dict with default (sharded) mode: passthrough load."""
+    init_dist()
+    torch.manual_seed(42 + _rank())
+    model_a = _make_model(4)
+    x = torch.randn(BATCH, HIDDEN).npu()
+    _train_step(model_a, x)
+    fwd_a = _forward_val(model_a, x)
+
+    sd = get_model_state_dict(model_a)
+
+    model_b = _make_model(4)
+    set_model_state_dict(model_b, sd)
+
+    _assert_fwd_match(fwd_a, _forward_val(model_b, x), "sharded set")
+    _assert_all_dtensor(model_b, "sharded set")
+
+    print(f"[rank{_rank()}] T14 PASS: set sharded")
+
+
+# =====================================================================
+# T15 (4-card): get -> set -> get roundtrip consistency
+# =====================================================================
+def test_t15_get_set_roundtrip():
+    """Roundtrip: get → set → get produces identical shards and forward."""
+    init_dist()
+    torch.manual_seed(42 + _rank())
+    model_a = _make_model(4)
+    x = torch.randn(BATCH, HIDDEN).npu()
+    _train_step(model_a, x)
+    fwd_a = _forward_val(model_a, x)
+
+    # Sharded roundtrip
+    sd_shard = get_model_state_dict(model_a)
+    model_b = _make_model(4)
+    set_model_state_dict(model_b, sd_shard)
+    sd_shard_b = get_model_state_dict(model_b)
+    for key in sd_shard:
+        a_local = sd_shard[key].to_local().clone()
+        b_local = sd_shard_b[key].to_local().clone()
+        assert torch.equal(a_local, b_local), (
+            f"shard roundtrip mismatch on '{key}'"
+        )
+    _assert_fwd_match(fwd_a, _forward_val(model_b, x), "sharded roundtrip")
+
+    # Full roundtrip
+    sd_full = get_model_state_dict(model_a, options=StateDictOptions(full_state_dict=True))
+    model_c = _make_model(4)
+    set_model_state_dict(model_c, sd_full, options=StateDictOptions(full_state_dict=True))
+    _assert_fwd_match(fwd_a, _forward_val(model_c, x), "full roundtrip")
+    _assert_all_dtensor(model_c, "full roundtrip")
+
+    print(f"[rank{_rank()}] T15 PASS: get→set roundtrip (sharded + full)")

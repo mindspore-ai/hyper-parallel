@@ -1469,9 +1469,40 @@ class MindSporePlatform(Platform):
         return _MicroBatch(micro_batch_num, args_batch_dim, kwargs_batch_dim)
 
     @staticmethod
-    def get_model_state_dict(model, *, options=None):
+    def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
+        """Get the state dictionary of a model (not yet supported on MindSpore).
+
+        Args:
+            model: The model to extract state from.
+            options: Optional configuration for state dict extraction.
+
+        Returns:
+            dict: The state dictionary containing model parameters and buffers.
+
+        Raises:
+            NotImplementedError: MindSpore support is not yet implemented.
+        """
         raise NotImplementedError(
             "get_model_state_dict is not yet supported on MindSpore"
+        )
+
+    @staticmethod
+    def set_model_state_dict(model: Any, model_state_dict: dict[str, Any], *, options: Any = None) -> None:
+        """Set the state dictionary of a model (not yet supported on MindSpore).
+
+        Args:
+            model: The model to load state into.
+            model_state_dict: The state dict to load into the model.
+            options: Optional configuration for state dict loading.
+
+        Returns:
+            None.
+
+        Raises:
+            NotImplementedError: MindSpore support is not yet implemented.
+        """
+        raise NotImplementedError(
+            "set_model_state_dict is not yet supported on MindSpore"
         )
 
     @staticmethod

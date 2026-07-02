@@ -111,6 +111,19 @@ class TestTorchStateDictUtils(unittest.TestCase):
                 ),
             )
 
+        # broadcast_from_rank0=True with full_state_dict=True -> NotImplementedError
+        # (cross-rank broadcast not implemented yet)
+        with self.assertRaisesRegex(NotImplementedError, "broadcast_from_rank0=True is not supported"):
+            state_dict_utils.get_model_state_dict(
+                model,
+                options=SimpleNamespace(
+                    broadcast_from_rank0=True,
+                    full_state_dict=True,
+                    cpu_offload=False,
+                    ignore_frozen_params=False,
+                ),
+            )
+
         result = state_dict_utils.get_model_state_dict(
             model,
             options=SimpleNamespace(
@@ -155,6 +168,202 @@ class TestTorchStateDictUtils(unittest.TestCase):
 
         self.assertEqual(full, mock_gather.return_value)
         self.assertEqual(offloaded, mock_offload.return_value)
+
+    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.distribute_tensor")
+    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.DTensor", FakeDTensor)
+    def test_scatter_model_state_dict_distributes_plain_tensor_to_dtensor_shard(self, mock_distribute):
+        """Scatter should slice plain tensors into DTensor shards and pass DTensors through."""
+        target_dt = FakeDTensor(torch.tensor([1.0]))
+        target_plain = torch.tensor([2.0])
+        model = MagicMock()
+        model.state_dict.return_value = {"dt": target_dt, "plain": target_plain}
+        scattered_dt = FakeDTensor(torch.tensor([3.0]))
+        mock_distribute.return_value = scattered_dt
+
+        result = state_dict_utils._scatter_model_state_dict(
+            model,
+            {"dt": torch.tensor([9.0]), "plain": torch.tensor([2.0]), "missing": torch.tensor([0.0])},
+            cpu_offload=False,
+            strict=False,
+        )
+
+        # plain -> DTensor branch: distribute_tensor was called, result kept.
+        mock_distribute.assert_called_once()
+        self.assertIs(result["dt"], scattered_dt)
+        # DTensor target with DTensor input: passed through as-is.
+        # plain target: kept as-is.
+        self.assertTrue(torch.equal(result["plain"], torch.tensor([2.0])))
+        # missing key (target is None): skipped.
+        self.assertNotIn("missing", result)
+
+    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.distribute_tensor")
+    @patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.DTensor", FakeDTensor)
+    def test_scatter_model_state_dict_strict_raises_on_unexpected_keys(self, mock_distribute):
+        """Scatter with strict=True must raise on keys absent from the model."""
+        target_dt = FakeDTensor(torch.tensor([1.0]))
+        model = MagicMock()
+        model.state_dict.return_value = {"dt": target_dt}
+        mock_distribute.return_value = FakeDTensor(torch.tensor([3.0]))
+
+        with self.assertRaisesRegex(ValueError, "Unexpected key"):
+            state_dict_utils._scatter_model_state_dict(
+                model,
+                {"dt": torch.tensor([9.0]), "bogus": torch.tensor([0.0])},
+                cpu_offload=False,
+                strict=True,
+            )
+
+        # strict=False should silently drop the unexpected key.
+        result = state_dict_utils._scatter_model_state_dict(
+            model,
+            {"dt": torch.tensor([9.0]), "bogus": torch.tensor([0.0])},
+            cpu_offload=False,
+            strict=False,
+        )
+        self.assertNotIn("bogus", result)
+
+    def test_scatter_model_state_dict_moves_shard_to_target_device_when_cpu_offload(self):
+        # pylint: disable=missing-public-type-hints,missing-public-docstring,unused-argument
+        """cpu_offload=True should move the shard onto the target param's device, not CPU."""
+        to_calls = []
+
+        class _DeviceTrackedLocal:
+            """Records .to(device) calls so we can assert the destination device."""
+            def __init__(self, tensor):
+                self._tensor = tensor
+            def to(self, device):
+                to_calls.append(device)
+                return self._tensor
+
+        target_device = torch.device("meta")
+
+        class _BaseDTensor:
+            """Common base so both target and scatter fakes pass isinstance checks."""
+            @staticmethod
+            def from_local(local, mesh, placements):
+                return local
+
+        class _TargetDTensor(_BaseDTensor):
+            """Fake DTensor that looks like a real model parameter."""
+            def __init__(self, local):
+                self._local_tensor = SimpleNamespace(device=target_device)
+                self.device_mesh = "mesh"
+                self.layout = SimpleNamespace(alias_placements=("shard",))
+            @staticmethod
+            def from_local(local, mesh, placements):
+                return local
+
+        class _ScatterDTensor(_BaseDTensor):
+            """Fake DTensor whose to_local() returns a device-tracked object."""
+            def __init__(self, local):
+                self._local = local
+                self.device_mesh = "mesh"
+                self.layout = SimpleNamespace(alias_placements=("shard",))
+            def to_local(self):
+                return _DeviceTrackedLocal(self._local)
+
+        target_dt = _TargetDTensor(torch.tensor([0.0]))
+        model = MagicMock()
+        model.state_dict.return_value = {"w": target_dt}
+
+        with patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.DTensor", _BaseDTensor), \
+             patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils.distribute_tensor",
+                   return_value=_ScatterDTensor(torch.tensor([1.0]))):
+            state_dict_utils._scatter_model_state_dict(
+                model, {"w": torch.tensor([1.0])}, cpu_offload=True, strict=False,
+            )
+
+        # The shard must have been moved onto the target device, not left on CPU.
+        self.assertIn(target_device, to_calls)
+        self.assertFalse(any(str(d) == "cpu" for d in to_calls),
+                         f"shard should not be moved to CPU, got .to() calls: {to_calls}")
+
+    def test_set_model_state_dict_validates_broadcast_and_loads(self):
+        """Setter should validate broadcast/full consistency and dispatch scatter vs passthrough."""
+        model = MagicMock()
+        model.state_dict.return_value = {"w": torch.tensor([1.0])}
+        model.named_parameters.return_value = []
+
+        # broadcast_from_rank0=True with full_state_dict=False -> ValueError
+        with self.assertRaisesRegex(ValueError, "full_state_dict must be True"):
+            state_dict_utils.set_model_state_dict(
+                model, {"w": torch.tensor([1.0])},
+                options=SimpleNamespace(
+                    broadcast_from_rank0=True, full_state_dict=False,
+                    cpu_offload=False, ignore_frozen_params=False, strict=True,
+                ),
+            )
+
+        # broadcast_from_rank0=True with full_state_dict=True -> NotImplementedError
+        # (cross-rank broadcast not implemented yet)
+        with self.assertRaisesRegex(NotImplementedError, "broadcast_from_rank0=True is not supported"):
+            state_dict_utils.set_model_state_dict(
+                model, {"w": torch.tensor([1.0])},
+                options=SimpleNamespace(
+                    broadcast_from_rank0=True, full_state_dict=True,
+                    cpu_offload=False, ignore_frozen_params=False, strict=True,
+                ),
+            )
+
+        # full_state_dict=True -> scatter path
+        with patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils._scatter_model_state_dict",
+                   return_value={"w": torch.tensor([1.0])}) as mock_scatter:
+            state_dict_utils.set_model_state_dict(
+                model, {"w": torch.tensor([1.0])},
+                options=SimpleNamespace(
+                    broadcast_from_rank0=False, full_state_dict=True,
+                    cpu_offload=False, ignore_frozen_params=False, strict=True,
+                ),
+            )
+            mock_scatter.assert_called_once_with(
+                model, {"w": torch.tensor([1.0])}, False, True,
+            )
+            model.load_state_dict.assert_called_once_with(
+                {"w": torch.tensor([1.0])}, strict=True, assign=True,
+            )
+
+        # full_state_dict=False -> passthrough (no scatter)
+        model.reset_mock()
+        with (patch("hyper_parallel.platform.torch.fully_shard.state_dict_utils._scatter_model_state_dict")
+              as mock_scatter):
+            state_dict_utils.set_model_state_dict(
+                model, {"w": torch.tensor([1.0])},
+                options=SimpleNamespace(
+                    broadcast_from_rank0=False, full_state_dict=False,
+                    cpu_offload=False, ignore_frozen_params=False, strict=False,
+                ),
+            )
+            mock_scatter.assert_not_called()
+            model.load_state_dict.assert_called_once_with(
+                {"w": torch.tensor([1.0])}, strict=False, assign=True,
+            )
+
+    def test_set_model_state_dict_ignore_frozen_is_noop(self):
+        """ignore_frozen_params=True must NOT filter the input on the setter path (upstream parity)."""
+        model = MagicMock()
+        model.state_dict.return_value = {"w": torch.tensor([1.0])}
+        model.named_parameters.return_value = [("w", SimpleNamespace(requires_grad=False))]
+
+        captured = {}
+
+        def _capture_load(state_dict, strict, assign):
+            captured["state_dict"] = state_dict
+            captured["strict"] = strict
+            captured["assign"] = assign
+
+        model.load_state_dict.side_effect = _capture_load
+
+        state_dict_utils.set_model_state_dict(
+            model, {"w": torch.tensor([1.0])},
+            options=SimpleNamespace(
+                broadcast_from_rank0=False, full_state_dict=False,
+                cpu_offload=False, ignore_frozen_params=True, strict=True,
+            ),
+        )
+
+        # The frozen key 'w' must still be present (no filtering on the setter path).
+        self.assertIn("w", captured["state_dict"])
+        self.assertTrue(captured["assign"])
 
 
 if __name__ == "__main__":

@@ -911,7 +911,7 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement parameters_dict")
 
     @staticmethod
-    def get_model_state_dict(model, *, options=None):
+    def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
         """Get the state dictionary of a model.
 
         Args:
@@ -920,9 +920,31 @@ class Platform:
 
         Returns:
             dict: The state dictionary containing model parameters and buffers.
+
+        Raises:
+            NotImplementedError: Platform subclasses must implement this method.
         """
         raise NotImplementedError(
             "Platform subclasses must implement get_model_state_dict"
+        )
+
+    @staticmethod
+    def set_model_state_dict(model: Any, model_state_dict: dict[str, Any], *, options: Any = None) -> None:
+        """Set the state dictionary of a model.
+
+        Args:
+            model: The model to load state into.
+            model_state_dict: The state dict to load into the model.
+            options: Optional configuration for state dict loading.
+
+        Returns:
+            None.
+
+        Raises:
+            NotImplementedError: Platform subclasses must implement this method.
+        """
+        raise NotImplementedError(
+            "Platform subclasses must implement set_model_state_dict"
         )
 
     @staticmethod

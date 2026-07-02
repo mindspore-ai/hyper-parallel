@@ -65,3 +65,35 @@ def test_state_dict_group3():
         TorchCase(_TEST_STATE_DICT, "test_t11_meta_load_backward", 12381, 4),
         TorchCase(_TEST_STATE_DICT, "test_t10_to_dtype_if_needed", 12402, 1),
     ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_state_dict_group4():
+    """
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_t12_set_model_sd_full
+        2.test_t13_set_model_sd_full_cpu
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(_TEST_STATE_DICT, "test_t12_set_model_sd_full", 12382, 4),
+        TorchCase(_TEST_STATE_DICT, "test_t13_set_model_sd_full_cpu", 12383, 4),
+    ])
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="allcards", essential_mark="essential")
+def test_state_dict_group5():
+    """
+    Feature: parallel run case in fully_shard
+    Description:
+        1.test_t14_set_model_sd_sharded
+        2.test_t15_get_set_roundtrip
+    Expectation: Run success.
+    """
+    parallel_run([
+        TorchCase(_TEST_STATE_DICT, "test_t14_set_model_sd_sharded", 12384, 4),
+        TorchCase(_TEST_STATE_DICT, "test_t15_get_set_roundtrip", 12385, 4),
+    ])

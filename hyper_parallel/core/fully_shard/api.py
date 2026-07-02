@@ -748,13 +748,45 @@ def fully_shard(
     return arg_module
 
 
-def get_model_state_dict(model, *, options=None):
+def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
     """Get model state dict with platform-specific implementation.
 
     Delegates to the platform-specific implementation at runtime.
     Users import from here instead of platform internals.
+
+    Args:
+        model: The model whose state dict to retrieve.
+        options: Optional :class:`StateDictOptions` controlling gathering
+            (``full_state_dict``), offloading (``cpu_offload``) and frozen
+            parameter filtering (``ignore_frozen_params``).
+
+    Returns:
+        The model state dict. By default values are sharded DTensors; when
+        ``full_state_dict=True`` values are full Tensors (CPU on rank 0 only
+        when ``cpu_offload=True``).
     """
     return platform.get_model_state_dict(model, options=options)
+
+
+def set_model_state_dict(model: Any, model_state_dict: dict[str, Any], *, options: Any = None) -> None:
+    """Set model state dict with platform-specific implementation.
+
+    Delegates to the platform-specific implementation at runtime. Full tensors
+    are scattered into DTensor shards matching the model's layout before the
+    in-place load.
+
+    Args:
+        model: The model to load state into.
+        model_state_dict: State dict to load. Values may be plain (global)
+            tensors when ``full_state_dict=True`` or sharded DTensors otherwise.
+        options: Optional :class:`StateDictOptions` controlling scattering
+            (``full_state_dict``), device placement (``cpu_offload``) and
+            strictness (``strict``).
+
+    Returns:
+        None.
+    """
+    return platform.set_model_state_dict(model, model_state_dict, options=options)
 
 
 def hsdp_sync_stream():
