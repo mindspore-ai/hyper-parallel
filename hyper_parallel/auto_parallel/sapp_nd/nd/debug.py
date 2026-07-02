@@ -115,12 +115,11 @@ class Debug:
         if self.enable:
             self.parallel_dimensions = parallel_dimensions
             self.info = {p: 0 for p in info_type}
-            self.output_file = (
-                os.path.dirname(os.path.abspath(__file__))
-                + "/output/"
-                + output_file
+            self.output_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "output",
+                output_file,
             )
-
     def is_enabled(self):
         """Check whether debugging is enabled"""
         return self.enable
@@ -220,7 +219,7 @@ def gen_colors(categories):
         "IDLE": idle_color,
         "COMPUTATION": pastel(compute_color, -0.2),
     }
-    return [col_d[cat] for cat in categories]
+    return [col_d.get(cat) for cat in categories]
 
 
 def set_twin_handles(ax1, data_frame, dbg_cols):
@@ -548,9 +547,7 @@ def get_comm_classified_data(csv_f, plot_idle=False):
                     logger.info("d = %s, v = %s", component, value_str)
                     dim = Dim.get_dim(component)
                     config.append((dim, dim.from_str(value_str)))
-            comm_wait_time_classified["BUBBLE"] = comm_wait_time_classified[
-                str(RealParts.PP_WAIT)
-            ]
+            comm_wait_time_classified["BUBBLE"] = comm_wait_time_classified.get(str(RealParts.PP_WAIT))
             if plot_idle:
                 comm_wait_time_classified["IDLE"] = time - total_wait
                 logger.info(
@@ -567,8 +564,7 @@ def get_comm_classified_data(csv_f, plot_idle=False):
 def estimation_in_real_parts(
     estimations_in_real_components, estimations, score
 ):
-    """Transform the estimation components into
-    the RealParts components for comparison with real time"""
+    """Transform the estimation components into the RealParts components for comparison with real time"""
     estimations_in_real_components[RealParts.TOTAL].append(score)
     estimations_in_real_components[RealParts.COMP].append(
         estimations[PerfParts.FW_COMPUTE.value - 1]
@@ -595,8 +591,7 @@ def estimation_in_real_parts(
 
 
 def real_in_parts(parts, real, time):
-    """Transform the real time components into
-    the RealParts components for comparison with estimation"""
+    """Transform the real time components into the RealParts components for comparison with estimation"""
     parts[RealParts.TOTAL].append(time)
     for part in RealParts:
         if part not in {RealParts.TOTAL, RealParts.IDLE}:
@@ -620,8 +615,7 @@ def real_in_parts(parts, real, time):
 
 
 def correlation_with_classified_comms(configs_estimated):
-    """Computes correlation and distance
-    between components time & estimation"""
+    """Computes correlation and distance between components time & estimation."""
     score_classified = {}
     time_classified = {}
     distances = {}
@@ -725,8 +719,7 @@ def get_correl_i(part, data_i):
 
 
 def print_part_x_file(data, fun):
-    """prints a metric computed by fun for
-    each couple (part, file)"""
+    """Prints a metric computed by fun for each couple (part, file)"""
     msg = ""
     for part in RealParts:
         if part is not RealParts.IDLE:

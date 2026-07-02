@@ -36,13 +36,16 @@ class CostModelParserHyperparallel(_CostModelParser):
             self.__parse_toml()
         else:
             now = time.time()
-            sys.path.insert(0, os.path.expanduser("~"))
+            home_path = os.path.expanduser("~")
+            if home_path not in sys.path:
+                sys.path.append(home_path)
             spec_torch = importlib.util.find_spec("torch")
             spec_torchtitan = importlib.util.find_spec("torchtitan")
             if spec_torch is not None and spec_torchtitan is not None:
                 # existing torchtitan package
                 spec_path = spec_torchtitan.submodule_search_locations[0]
-                sys.path.insert(0, spec_path)
+                if spec_path not in sys.path:
+                    sys.path.append(spec_path)
                 try:
                     logger.info(
                         "found torchtitan package from homedir: %s",
@@ -115,14 +118,11 @@ class CostModelParserHyperparallel(_CostModelParser):
             for k in tree_get_spec.body[0].value.keywords
             if k.arg == "model_args"
         )
-        var_tree = next(
-            node
-            for node in ast.walk(tree)
-            if (
-                isinstance(node, ast.Assign)
-                and node.targets[0].id == var_model_args
-            )
-        )
+        var_tree = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and node.targets[0].id == var_model_args:
+                var_tree = node
+                break
         # fetch dict of hyperparameters according to flavor
         params = {}
         for k, v in zip(var_tree.value.keys, var_tree.value.values):

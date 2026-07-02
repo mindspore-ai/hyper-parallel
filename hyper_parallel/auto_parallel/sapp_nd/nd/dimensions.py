@@ -200,12 +200,9 @@ class Dimensions:
     def global_batch_size(self):
         """Compute the global batch size"""
         gbs = self.dims_val[DP] * self.dims_val[MBS]
-        if (
-            self.has_dim(PP)
-            and self.dims_val[PP] > 1
-            and self.has_dim(MBN)
-            and self.dims_val[MBN] > 1
-        ):
+        has_pp = self.has_dim(PP) and self.dims_val[PP] > 1
+        has_mbn = self.has_dim(MBN) and self.dims_val[MBN] > 1
+        if has_pp and has_mbn:
             gbs *= self.dims_val[MBN]
         return gbs
 

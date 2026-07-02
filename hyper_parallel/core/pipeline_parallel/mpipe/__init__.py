@@ -21,8 +21,9 @@ defines its own :class:`MpipeStepType` steps (kept out of the core
 ``PipelineScheduleRuntime.register_custom_function``, so the core scheduler
 carries no MPipe-specific code.
 """
+
+__all__ = ["MpipeStepType", "MPipeTransposeExecutorBase", "ScheduleMPipeTranspose"]
+
 from hyper_parallel.core.pipeline_parallel.mpipe.step_types import MpipeStepType
 from hyper_parallel.core.pipeline_parallel.mpipe.executor_base import MPipeTransposeExecutorBase
 from hyper_parallel.core.pipeline_parallel.mpipe.schedule import ScheduleMPipeTranspose
-
-__all__ = ["MpipeStepType", "MPipeTransposeExecutorBase", "ScheduleMPipeTranspose"]

@@ -18,7 +18,7 @@ import os.path
 import argparse
 from fast_tuner.utils.logger import logger
 from fast_tuner.pipeline_conductor import math_model, pp_util
-from fast_tuner.pipeline_conductor.start_service import InitConfig, ExpertInput, HIGHS_NAME, pipeline_output_file
+from fast_tuner.pipeline_conductor.start_service import InitConfig, ExpertInput, HIGHS_NAME, PIPELINE_OUTPUT_FILE
 from fast_tuner.pipeline_conductor import solution
 from fast_tuner.pipeline_conductor import fitting
 from fast_tuner.utils.ppc_input import ParallelInput
@@ -78,7 +78,7 @@ def pipeline_proc(pipeline_input: ParallelInput):
     DryRun.dryrun_lim = pipeline_input.dryrun_lim
     ExpertInput.is_dryrun = pipeline_input.dryrun
     ExpertInput.is_double_check = pipeline_input.check
-    result_csv = ResultCsv(pipeline_input.output_path, pipeline_output_file)
+    result_csv = ResultCsv(pipeline_input.output_path, PIPELINE_OUTPUT_FILE)
     num_all = len(pipeline_input.candidate_configs)
     num_cur = 0
     for candidate in pipeline_input.candidate_configs:

@@ -27,14 +27,14 @@ from fast_tuner.pipeline_conductor import dryrun, pp_util
 from fast_tuner.pipeline_conductor import micro
 from fast_tuner.pipeline_conductor.memory import Memory
 
-pipeline_output_file = 'pipeline_output'
-init_dryrun_file = 'init_dryrun'
-double_check_dryrun_filename = 'double_check_dryrun'
+PIPELINE_OUTPUT_FILE = 'pipeline_output'
+INIT_DRYRUN_FILE = 'init_dryrun'
+DOUBLE_CHECK_DRYRUN_FILENAME = 'double_check_dryrun'
 HIGHS_NAME = 'HIGHS'
-default_low_mem = False
-default_time_limit = 1e10
+DEFAULT_LOW_MEM= False
+DEFAULT_TIME_LIMIT= 1e10
 # 0: deepseek model; 1: boss model
-model_class = 0
+MODEL_CLASS = 0
 
 
 # expert input: expert can change per environment
@@ -51,14 +51,14 @@ class ExpertInput:
     model_args = None
 
     solver_name = HIGHS_NAME
-    llm_class = model_class
-    time_limit = int(default_time_limit)
+    llm_class = MODEL_CLASS
+    time_limit = int(DEFAULT_TIME_LIMIT)
 
     is_dryrun = True
     is_double_check = False
     fit_level = 0
 
-    low_mem = default_low_mem
+    low_mem = DEFAULT_LOW_MEM
     layer_ratio = 0.3
     backward_ratio = 2
     sr_ratio = 0.33
@@ -70,9 +70,9 @@ class ExpertInput:
     head_loss = 1.493
     recompute_ratio = 0.246
 
-    output_file = pipeline_output_file
+    output_file = PIPELINE_OUTPUT_FILE
     output_file_dir = os.path.join(os.getcwd(), output_file)
-    double_check_dryrun_filename = double_check_dryrun_filename
+    double_check_dryrun_filename = DOUBLE_CHECK_DRYRUN_FILENAME
 
     def __init__(self, config_file, ms_adapter_file):
         """Initialize ExpertInput instance."""
@@ -140,7 +140,7 @@ class InitDryrun:
 
         self.config_file = expert_input_obj.config_file
         self.ms_adapter_file = expert_input_obj.ms_adapter_file
-        self.dryrun_output = init_dryrun_file
+        self.dryrun_output = INIT_DRYRUN_FILE
 
     def deepseek_build_offset(self):
         """Build offset configuration for DeepSeek model."""

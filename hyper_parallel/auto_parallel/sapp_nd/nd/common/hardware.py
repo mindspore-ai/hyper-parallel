@@ -32,7 +32,8 @@ class Type:
         self.name = name
         self.level_bound_number = bounds
         self.level_bandwidth = bandwidths
-        assert len(bounds) == len(bandwidths)
+        if len(bounds) != len(bandwidths):
+            raise ValueError("bounds and bandwidths must have the same length")
         self.levels = len(bounds)
 
     def __str__(self):
@@ -148,8 +149,7 @@ class Machine:
             self.number = num
 
     def pipeline_bound(self):
-        """Return pipeline bound from hardware topology because
-        As pipeline may currently not cross hierarchy levels"""
+        """Return pipeline bound from hardware topology because as pipeline may currently not cross hierarchy levels"""
         max_bound = 1
         devices = self.number
         while devices > 1:
@@ -231,8 +231,7 @@ def unique_factors(factors):
 
 
 def highest_power_of_2_divisor(divisor_of):
-    """Compute the highest number that is both
-    a divisor of 'divisor_of' and a power of 2"""
+    """Compute the highest number that is both a divisor of 'divisor_of' and a power of 2"""
     divisor = 1
     factors = prime_factors(divisor_of)
     for f in factors:

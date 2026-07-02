@@ -177,14 +177,26 @@ class SappPipeline:
             for inter in range(interleave_num):
                 memory_active.append([])
                 for stage in range(self.num_of_stage_):
-                    memory_active[inter].append(sum(
-                        each_layer_per_recompute[layer][rec][inter][stage] *
-                        layer.memory_activation_rec_[rec]
-                        for layer in self.layers_sorted_[Layer.type_enum.BODY]
-                        for rec in Recompute.TYPE
-                        if rec not in Recompute.get_unused_list(each_layer_per_recompute[layer])
-                        and each_layer_per_recompute[layer][rec][inter][stage] > 0))
+                    memory_activation = 0
+                    for layer in self.layers_sorted_[Layer.type_enum.BODY]:
+                        memory_activation += self._get_layer_memory_activation(
+                            each_layer_per_recompute, layer, inter, stage
+                        )
+                    memory_active[inter].append(memory_activation)
         return memory_active
+
+    @staticmethod
+    def _get_layer_memory_activation(each_layer_per_recompute, layer, interleave, stage):
+        """Calculate activation memory for one layer at one pipeline position."""
+        memory_activation = 0
+        unused_recompute_list = Recompute.get_unused_list(each_layer_per_recompute[layer])
+        for rec in Recompute.TYPE:
+            if rec in unused_recompute_list:
+                continue
+            value = each_layer_per_recompute[layer][rec][interleave][stage]
+            if value > 0:
+                memory_activation += value * layer.memory_activation_rec_[rec]
+        return memory_activation
 
     def get_manual_memory_parameter(
             self,
@@ -194,13 +206,19 @@ class SappPipeline:
         memory_param_stage = [0] * self.num_of_stage_
         for inter in range(interleave_num):
             for stage in range(self.num_of_stage_):
-                memory_param_stage[stage] += sum(
-                    each_layer_per_recompute[layer][rec][inter][stage] *
-                    layer.memory_parameter_ for rec in Recompute.TYPE
-                    for layer in self.layers_sorted_[Layer.type_enum.BODY]
-                    if layer.memory_parameter_ is not None
-                    and rec not in Recompute.get_unused_list(each_layer_per_recompute[layer])
-                    and each_layer_per_recompute[layer][rec][inter][stage] > 0)
+                for rec in Recompute.TYPE:
+                    for layer in self.layers_sorted_[Layer.type_enum.BODY]:
+                        if layer.memory_parameter_ is None:
+                            continue
+
+                        if rec in Recompute.get_unused_list(each_layer_per_recompute[layer]):
+                            continue
+
+                        value = each_layer_per_recompute[layer][rec][inter][stage]
+                        if value <= 0:
+                            continue
+
+                        memory_param_stage[stage] += value * layer.memory_parameter_
         for head in self.layers_sorted_[Layer.type_enum.HEAD]:
             if head.memory_parameter_ is not None:
                 memory_param_stage[0] += head.memory_parameter_
@@ -379,7 +397,18 @@ class SappPipeline:
             fig = plt.figure(figsize=(24, 8))
             sub_figs = fig.subfigures(1, 2, wspace=0.07)
             sub_figs[0].suptitle('Automatic', fontsize='x-large')
-            self.simulate(show=False, file_name=os.path.join(output_folder, "Auto_" + file_name), sub_fig=sub_figs[0])
+            try:
+                simulate_result = self.simulate(
+                    show=False,
+                    file_name=os.path.join(output_folder, "Auto_" + file_name),
+                    sub_fig=sub_figs[0],
+                )
+            except Exception:
+                logger.exception("Failed to simulate auto pipeline.")
+                raise
+
+            if simulate_result is None:
+                raise RuntimeError("simulate() returned None.")
 
             sub_figs[1].suptitle('Manual', fontsize='x-large')
             self.simulate_yaml(yaml_data, False, interleave_num, full_file_name, sub_figs[1])

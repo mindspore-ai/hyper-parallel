@@ -69,6 +69,7 @@ class ModelInfo:
         """Record HEAD/BODY/TAIL timing and initialise the stage-constant memory to 0."""
         self.name = model_name
         self.stage_const_mem = 0
+        self.to_json_ = None
         self.layers_description = []
         self.layers_description.append(
             LayersDescription(Layer.type_enum.HEAD, head_time, 1, model_name)
@@ -115,13 +116,33 @@ class ModelInfo:
             json.dump(self.to_json_, json_file, indent=4)
 
 
+def _as_list(value: Union[str, List[str]]) -> List[str]:
+    """Wrap a bare string in a single-element list, leaving other values unchanged."""
+    return [value] if isinstance(value, str) else value
+
+
+def _accumulate_layer_times(cost_list: Dict[str, float], predefined_layers: Dict[str, int],
+                            head_time: float, body_time: float, tail_time: float
+                            ) -> Tuple[float, float, float]:
+    """Add each measured layer cost to the HEAD/TAIL/BODY total based on its marker."""
+    for layer, time in cost_list.items():
+        marker = predefined_layers.get(layer)
+        if marker == 0:
+            head_time += time
+        elif marker == -1:
+            tail_time += time
+        else:
+            body_time += time
+    return head_time, body_time, tail_time
+
+
 def time_parser(file_name: str, model_name: str) -> Tuple[float, float, float]:
     """Parse the HEAD/BODY/TAIL timing values from a SAPP-PPB YAML config file."""
     if file_name is None:
         logger.error("input file cannot be none")
         raise ValueError("input file cannot be none")
 
-    if not file_name.endswith("yaml") and not file_name.endswith("yml"):
+    if not file_name.endswith(("yaml", "yml")):
         logger.error("Only accept yaml as input format")
         raise ValueError(f"Only accept yaml as input format. not {file_name}")
 
@@ -139,40 +160,33 @@ def time_parser(file_name: str, model_name: str) -> Tuple[float, float, float]:
         head_time = cfg_dict["time_config"].get("head")
         body_time = cfg_dict["time_config"].get("body")
         tail_time = cfg_dict["time_config"].get("tail")
-        if all(key in cfg_dict["time_config"] for key in ["head", "body", "tail"]):
+        if {"head", "body", "tail"}.issubset(cfg_dict["time_config"]):
             return head_time, body_time, tail_time
 
     if cfg_dict.get("profiling_config"):
         head_layers = cfg_dict["profiling_config"].get("head_layers", ["LlamaEmbedding"])
         body_layers = cfg_dict["profiling_config"].get("body_layers", ["LLamaDecodeLayer"])
         tail_layers = cfg_dict["profiling_config"].get("tail_layers", ["lm_head-Linear", "LlamaRMSNorm"])
-        if isinstance(head_layers, str):
-            head_layers = [head_layers]
-        if isinstance(tail_layers, str):
-            tail_layers = [tail_layers]
-        if isinstance(body_layers, str):
-            body_layers = [body_layers]
+        head_layers = _as_list(head_layers)
+        tail_layers = _as_list(tail_layers)
+        body_layers = _as_list(body_layers)
 
         num_layer = cfg_dict["pipeline_config"]["num_layer"]
         micro_batch_num = cfg_dict["profiling_config"]["micro_batch_num"]
         timeline_folder_path = cfg_dict["profiling_config"]["folder_path"]
-        layer_list = {"pre_defined_layer": {}, "auto_partition_layer": {}}
-        for layer in head_layers:
-            layer_list["pre_defined_layer"].update({layer: 0})
-        for layer in tail_layers:
-            layer_list["pre_defined_layer"].update({layer: -1})
-        for layer in body_layers:
-            layer_list["auto_partition_layer"].update({layer: num_layer})
+        layer_list = {
+            "pre_defined_layer": {
+                **dict.fromkeys(head_layers, 0),
+                **dict.fromkeys(tail_layers, -1),
+            },
+            "auto_partition_layer": dict.fromkeys(body_layers, num_layer),
+        }
         analyzer = ComputationAnalyzer(timeline_folder_path, model_name, micro_batch_num, layer_list)
         cost_list = analyzer.layer_with_cost_list
         logger.info(cost_list)
-        for layer, time in cost_list.items():
-            if layer in layer_list["pre_defined_layer"] and layer_list["pre_defined_layer"][layer] == 0:
-                head_time += time
-            elif layer in layer_list["pre_defined_layer"] and layer_list["pre_defined_layer"][layer] == -1:
-                tail_time += time
-            else:
-                body_time += time
+        head_time, body_time, tail_time = _accumulate_layer_times(
+            cost_list, layer_list["pre_defined_layer"], head_time, body_time, tail_time
+        )
 
     logger.info("head_time: %s, body_time: %s, tail_time: %s", head_time, body_time, tail_time)
 
