@@ -216,13 +216,13 @@ class PipelineStageBase:
         with session_ctx:
             if self.is_first_stage:
                 sens = self._build_padded_sens(micro_index)
-                _ = grad_fn(sens=sens)
+                grad_fn.accumulate_grad(sens=sens)
             else:
                 if self.is_last_stage:
                     sens = self.get_last_stage_sens(self.last_stage_outputs)
                 else:
                     sens = self._build_padded_sens(micro_index)
-                _ = grad_fn(sens=sens)
+                grad_fn.accumulate_grad(sens=sens)
         if handles:
             platform.clear_recompute_session(session_id)
         if not self.is_first_stage:
@@ -312,7 +312,7 @@ class PipelineStageBase:
             with session_ctx:
                 if self.is_first_stage:
                     sens = self._build_padded_sens(micro_index)
-                    _ = grad_fn(sens=sens)
+                    grad_fn.accumulate_grad(sens=sens)
                 else:
                     if not grad_fn._saved_intermediates:  # pylint: disable=protected-access
                         raise RuntimeError(

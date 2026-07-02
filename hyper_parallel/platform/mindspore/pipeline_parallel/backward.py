@@ -467,6 +467,28 @@ class GradFunction:
                     grads[input_size:])
         return grads[:input_size], grads[input_size:]
 
+    def accumulate_grad(self, sens=None, keep_graph=False):
+        """
+        Compute gradients and let MindSpore autograd accumulate them on leaf tensors.
+
+        Pipeline execution does not consume returned weight gradients; HSDP consumes
+        parameter ``.grad`` fields through post-backward hooks.  Using
+        ``accumulate_grad=True`` avoids materializing a Python tuple containing all
+        parameter gradients for the whole backward chunk.
+        """
+        input_tensors, input_size = self._collect_input_tensors()
+        output_tensors, sens = self._prepare_output_and_sens(sens)
+        run_backward(
+            output_tensors, sens, keep_graph, keep_graph,
+            input_tensors, allow_unreachable=True, accumulate_grad=True
+        )
+        input_grads = tuple(getattr(tensor, "_grad", None) for tensor in input_tensors[:input_size])
+        if not keep_graph:
+            self._clear_res()
+        if input_size == 0:
+            return ()
+        return self._format_input_grads(input_grads, input_size)
+
     def compute_input_grad(self, sens=None):
         """
         Compute gradients with respect to inputs only (dx).

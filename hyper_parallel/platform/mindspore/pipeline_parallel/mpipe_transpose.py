@@ -66,4 +66,4 @@ class MPipeTransposeExecutor(MPipeTransposeExecutorBase):  # pragma: no cover
         weights = tuple(self._preprocess.trainable_params())
         _, grad_fn = forward_and_gradfn(
             self._preprocess, *inputs, weights=weights, grad_position=None, **kwargs)
-        grad_fn(sens=grad)
+        grad_fn.accumulate_grad(sens=grad)
