@@ -51,11 +51,13 @@ class TensorRedistribution:
             "all_to_all": self._construct_all_to_all
         }
 
-    def _construct_reshape(self, x, *args):
+    @staticmethod
+    def _construct_reshape(x, *args):
         """args: (*shape)"""
         return x.view(args)
 
-    def _construct_all_concat(self, x, *args):
+    @staticmethod
+    def _construct_all_concat(x, *args):
         """args: (*rank_list, concat_dim)"""
         rank_list = args[0:-1]
         concat_dim = args[-1]
@@ -64,7 +66,8 @@ class TensorRedistribution:
         return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
 
 
-    def _construct_strided_slice(self, x, *args):
+    @staticmethod
+    def _construct_strided_slice(x, *args):
         """args: (begin, end, strides)"""
         dims = len(args) // 3
         return platform.construct_strided_slice(x, args[0: dims], args[dims: 2 * dims], args[2 * dims:])
@@ -86,7 +89,8 @@ class TensorRedistribution:
         idx = rank_list.index(self.rank_id)
         return platform.chunk(x, split_dim, split_size, idx)
 
-    def _construct_all_to_all(self, x, *args):
+    @staticmethod
+    def _construct_all_to_all(x, *args):
         """args: (split_dim, concat_dim, permute_size, group)"""
         split_dim, concat_dim, split_count, rank_list = args
         group = platform.create_group(rank_list)
@@ -166,7 +170,8 @@ class TensorRedistribution:
             result = result.view(final_shape)
         return result
 
-    def _apply_eazy_redistribute(self, src_layout, dst_layout):
+    @staticmethod
+    def _apply_eazy_redistribute(src_layout, dst_layout):
         """_apply_eazy_redistribute"""
         if (src_layout.mesh_shape != dst_layout.mesh_shape or
                 src_layout.rank_list != dst_layout.rank_list):
@@ -267,7 +272,8 @@ class TensorRedistribution:
             x = x.squeeze(0)
         return x
 
-    def _reduce_scatter_along_dev_dim_with_axis(self, x, axis, op, layout, dev_dim):
+    @staticmethod
+    def _reduce_scatter_along_dev_dim_with_axis(x, axis, op, layout, dev_dim):
         """Do reduce_scatter at specified axis along dev_dim."""
         dev_num = layout.mesh_shape[layout.alias_name.index(dev_dim)]
         group = layout.get_comm_group_by_axis(dev_dim)
@@ -311,10 +317,12 @@ class TensorRedistribution:
         # 2. If multiple split, the dev axis split outer will be execute first.
         #    e.g. ("cp", "tp"), will execute reduce_scatter along "cp" before "tp"
         # 3. Lower dev_id execute before higher dev_id
-        sorted_pending_reduce_op_list = \
-            sorted(pending_reduce_op_list, key=lambda reduce_pair: (reduce_pair[0] != "ReduceScatter",
-                                                                    dev_map_order.get(reduce_pair[2], 0),
-                                                                    to_layout.mesh.axis_id(reduce_pair[2])))
+        def _reduce_pair_sort_key(reduce_pair):
+            return (reduce_pair[0] != "ReduceScatter",
+                    dev_map_order.get(reduce_pair[2], 0),
+                    to_layout.mesh.axis_id(reduce_pair[2]))
+
+        sorted_pending_reduce_op_list = sorted(pending_reduce_op_list, key=_reduce_pair_sort_key)
 
         output_alias_tensor_map = list(from_layout.alias_tensor_map)
         for reduce_op_pair in sorted_pending_reduce_op_list:

@@ -47,7 +47,7 @@ class DTensorBase(Tensor):
         t.__init_data__(local_tensor, device_mesh, placements)
         return t
 
-    # pylint: disable=W0613
+    # pylint: disable=W0613, G.NAM.05
     @classmethod
     def __torch_function__(
         cls,
