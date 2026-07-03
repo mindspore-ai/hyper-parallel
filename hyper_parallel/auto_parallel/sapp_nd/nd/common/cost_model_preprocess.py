@@ -86,14 +86,14 @@ class CostModelConfig(PartitionGenerator):
         for chunk in stage:
             chunk_lay_occ = []
             if chunk:
-                l, count = chunk[0], 1
+                layer, count = chunk[0], 1
                 for lay_id in range(1, len(chunk)):
-                    if chunk[lay_id] == l:
+                    if chunk[lay_id] == layer:
                         count += 1
                     else:
-                        chunk_lay_occ += [f"{count}{l.name[0]}"]
-                        l, count = chunk[lay_id], 1
-                chunk_lay_occ += [f"{count}{l.name[0]}"]
+                        chunk_lay_occ += [f"{count}{layer.name[0]}"]
+                        layer, count = chunk[lay_id], 1
+                chunk_lay_occ += [f"{count}{layer.name[0]}"]
             stage_layers += [chunk_lay_occ]
         logger.info("stage _%s : %s", stage_id, stage_layers)
 
@@ -109,7 +109,7 @@ class CostModelConfig(PartitionGenerator):
 
     def count_layers(self, stages):
         """Count non-embedding and non-output layers in generated stages."""
-        return sum(sum(len(l) for l in c) for c in stages) - 2
+        return sum(sum(len(layer) for layer in chunk) for chunk in stages) - 2
 
     def print_parallelism(self):
         """strategy pretty printer"""

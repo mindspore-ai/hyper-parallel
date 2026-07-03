@@ -257,7 +257,7 @@ class ComputationAnalyzer:
         for obj in self.auto_partition_layer_objects:
             for auto_partition_layer_name in self.auto_partition_layer_name_list:
                 # if auto_partition_layer_name in obj["name"]:
-                if re.search(r"\b" + re.escape(auto_partition_layer_name), obj["name"]):
+                if re.search(rf"\b{re.escape(auto_partition_layer_name)}", obj["name"]):
                     layer_with_computation_time_list[auto_partition_layer_name] += (
                         float(obj["dur"]) / 1000)
         return layer_with_computation_time_list

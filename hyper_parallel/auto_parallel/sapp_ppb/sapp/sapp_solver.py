@@ -26,11 +26,11 @@ from hyper_parallel.auto_parallel.sapp_ppb.utils.layer import Layer
 from hyper_parallel.auto_parallel.sapp_ppb.utils.logger import logger
 
 # seqpipe const
-tensor_float_16 = 2
-tensor_float_32 = 4
+TENSOR_FLOAT_16 = 2
+TENSOR_FLOAT_32 = 4
 const_from_byte_to_mb = 1024 * 1024
 # llama intermideate_size
-llama_intermideate_size = 11008
+LLAMA_INTERMEDIATE_SIZE = 11008
 
 
 @dataclass
@@ -361,14 +361,14 @@ class SappSolver:
         # cp = extracted_training_params['context_parallel']
         # 2*Kv add
         # cp?
-        kv_update_mem_byte = 2 * ((tensor_float_16 * batch_size * heads * seq_length * head_dim) / (mp))
+        kv_update_mem_byte = 2 * ((TENSOR_FLOAT_16 * batch_size * heads * seq_length * head_dim) / (mp))
         kv_update_mem = kv_update_mem_byte / const_from_byte_to_mb
         # Attention Key,Value
         # cp?
-        key_mem_byte = (tensor_float_16 * batch_size * heads * seq_length * head_dim) / (mp)
+        key_mem_byte = (TENSOR_FLOAT_16 * batch_size * heads * seq_length * head_dim) / (mp)
         key_mem = key_mem_byte / const_from_byte_to_mb
         # cp?
-        value_mem_byte = (tensor_float_16 * batch_size * heads * seq_length * head_dim) / (mp)
+        value_mem_byte = (TENSOR_FLOAT_16 * batch_size * heads * seq_length * head_dim) / (mp)
         value_mem = value_mem_byte / const_from_byte_to_mb
 
         seq_memory_activation = (original_memory_activation - key_mem - value_mem) / seq_split_num + kv_update_mem
@@ -385,7 +385,7 @@ class SappSolver:
         mp = extracted_training_params['model_parallel']
         # cp = extracted_training_params['context_parallel']
         # cp?
-        kv_cache_parameter_mem_byte = 4 * (tensor_float_16 * batch_size * heads * seq_length * head_dim / (mp))
+        kv_cache_parameter_mem_byte = 4 * (TENSOR_FLOAT_16 * batch_size * heads * seq_length * head_dim / (mp))
         kv_cache_parameter_mem = kv_cache_parameter_mem_byte / const_from_byte_to_mb
         seq_memory_parameter = original_memory_parameter + kv_cache_parameter_mem
         return seq_memory_parameter
@@ -403,20 +403,20 @@ class SappSolver:
         if mp > 1:
             # comm operator Mem (recv+reduceScatter)
             # cp?
-            comm_operator_mem_byte = 2 * (tensor_float_16 * batch_size * seq_length * hidden_size / (mp))
+            comm_operator_mem_byte = 2 * (TENSOR_FLOAT_16 * batch_size * seq_length * hidden_size / (mp))
             comm_operator_mem = comm_operator_mem_byte / const_from_byte_to_mb
             # StridedSliceGrad Operator Mem
-            stridslice_operator_mem_byte = tensor_float_16 * batch_size * seq_length * hidden_size
+            stridslice_operator_mem_byte = TENSOR_FLOAT_16 * batch_size * seq_length * hidden_size
             stridslice_operator_mem = stridslice_operator_mem_byte / const_from_byte_to_mb
             seq_head_cost = original_head_cost - (1 - 1 / seq_split_num) * (comm_operator_mem + stridslice_operator_mem)
         else:
             # comm operator Mem (recv)
             # cp?
-            comm_operator_mem_byte = tensor_float_16 * batch_size * seq_length * hidden_size / (mp)
+            comm_operator_mem_byte = TENSOR_FLOAT_16 * batch_size * seq_length * hidden_size / (mp)
             comm_operator_mem = comm_operator_mem_byte / const_from_byte_to_mb
             # Grad/MatMul // Grad/Mul Operator Mem
             # cp?
-            mul_operator_mem_byte = 1 * (tensor_float_16 * batch_size * seq_length * llama_intermideate_size / (mp))
+            mul_operator_mem_byte = 1 * (TENSOR_FLOAT_16 * batch_size * seq_length * LLAMA_INTERMEDIATE_SIZE / (mp))
             mul_operator_mem = mul_operator_mem_byte / const_from_byte_to_mb
             seq_head_cost = original_head_cost - (1 - 1 / seq_split_num) * (comm_operator_mem + mul_operator_mem)
         return seq_head_cost
@@ -433,7 +433,7 @@ class SappSolver:
         # cp = extracted_training_params['context_parallel']
         # Memory extra introduced by loss op:
         # cp?
-        loss_operator_mem_byte = tensor_float_32 * batch_size * seq_length * vocab_size / (mp)
+        loss_operator_mem_byte = TENSOR_FLOAT_32 * batch_size * seq_length * vocab_size / (mp)
         loss_operator_mem = loss_operator_mem_byte / const_from_byte_to_mb
         # New tail Cost = Old tail Cost - (3-3/k)M + (k-1)(M/k)
         seq_tail_cost = original_tail_cost - (3 - 3 / seq_split_num) * loss_operator_mem + (
@@ -458,11 +458,19 @@ class SappSolver:
             for s in range(self.num_of_stage_):
                 if (i, s) in reserved_positions:
                     continue
-                prob += (lpSolver.lpSum(variables[
-                    sorted_layers[Layer.type_enum.BODY][ll].name_][rec][i][s]
-                    for rec in Recompute.TYPE
-                    if self.recompute_considered_[rec]
-                    for ll in range(layer_type_num)) >= 1)
+                terms = []
+                for rec in Recompute.TYPE:
+                    if not self.recompute_considered_[rec]:
+                        continue
+
+                    for ll in range(layer_type_num):
+                        terms.append(
+                            variables[
+                                sorted_layers[Layer.type_enum.BODY][ll].name_
+                            ][rec][i][s]
+                        )
+
+                prob += lpSolver.lpSum(terms) >= 1
         return prob
 
     def _reserved_stage_positions(self):
@@ -513,21 +521,25 @@ class SappSolver:
 
     def _current_layer_sum(self, variables, layer, interleave, stage_range):
         """Sum current interleave variables over a stage range."""
-        return lpSolver.lpSum(
-            variables[layer][rec][interleave][stage]
-            for rec in Recompute.TYPE
-            if self.recompute_considered_[rec]
-            for stage in stage_range
-        )
+        terms = []
+        for rec in Recompute.TYPE:
+            if not self.recompute_considered_[rec]:
+                continue
+
+            for stage in stage_range:
+                terms.append(variables[layer][rec][interleave][stage])
+
+        return lpSolver.lpSum(terms)
 
     def _previous_layer_sum(self, variables, layer, interleave):
         """Sum variables from previous interleaves."""
-        return lpSolver.lpSum(
-            variables[layer][rec][prev_interleave][stage]
-            for rec in Recompute.TYPE if self.recompute_considered_[rec]
-            for prev_interleave in range(interleave)
-            for stage in range(self.num_of_stage_)
-        )
+        terms = []
+        for rec in Recompute.TYPE:
+            if self.recompute_considered_[rec]:
+                for prev_interleave in range(interleave):
+                    for stage in range(self.num_of_stage_):
+                        terms.append(variables[layer][rec][prev_interleave][stage])
+        return lpSolver.lpSum(terms)
 
     def _add_frontier_upper_bounds(self, prob, variables, sorted_layers):
         """Prevent previous body layer types after each multimodal frontier."""
@@ -907,13 +919,16 @@ class SappSolver:
                 memory_active.append([])
                 for stage in range(self.num_of_stage_):
                     memory_active[inter].append(0)
-                    memory_active[inter][stage] = sum(
-                        self.variables_.get(layer.name_)[rec][inter][stage].varValue
-                        * layer.memory_activation_rec_[rec]
-                        for rec in Recompute.TYPE
-                        if self.recompute_considered_[rec]
-                        for layer in self.layers_sorted_[Layer.type_enum.BODY]
-                    )
+                    memory_activation = 0
+                    for rec in Recompute.TYPE:
+                        if not self.recompute_considered_[rec]:
+                            continue
+
+                        for layer in self.layers_sorted_[Layer.type_enum.BODY]:
+                            var_value = self.variables_.get(layer.name_)[rec][inter][stage].varValue
+                            memory_activation += var_value * layer.memory_activation_rec_[rec]
+
+                    memory_active[inter][stage] = memory_activation
         return memory_active
 
     def get_simulator_memory_parameter(self) -> list[float]:
@@ -922,11 +937,7 @@ class SappSolver:
         if self.has_some_memory_info():
             for inter in range(self.num_of_interleave_):
                 for stage in range(self.num_of_stage_):
-                    memory_param_stage[stage] += sum(
-                        self.variables_.get(layer.name_)[rec][inter][stage].varValue
-                        * layer.memory_parameter_
-                        for rec in Recompute.TYPE if self.recompute_considered_[rec]
-                        for layer in self.layers_sorted_[Layer.type_enum.BODY])
+                    memory_param_stage[stage] += self._get_stage_parameter_memory(inter, stage)
 
         for head in self.layers_sorted_[Layer.type_enum.HEAD]:
             if head.memory_parameter_ is not None:
@@ -937,6 +948,19 @@ class SappSolver:
                                    1] += tail.memory_parameter_
         memory_param = [memory_param_stage] * self.num_of_interleave_
         return memory_param
+
+    def _get_stage_parameter_memory(self, interleave, stage):
+        """Calculate BODY-layer parameter memory for one pipeline position."""
+        total = 0
+        for rec in Recompute.TYPE:
+            if not self.recompute_considered_[rec]:
+                continue
+
+            for layer in self.layers_sorted_[Layer.type_enum.BODY]:
+                if layer.memory_parameter_ is not None:
+                    var_value = self.variables_.get(layer.name_)[rec][interleave][stage].varValue
+                    total += var_value * layer.memory_parameter_
+        return total
 
     def get_simulator_time(self) -> list[float]:
         """Give the time per stage for simulator."""
@@ -1204,14 +1228,41 @@ class SappSolver:
         # Var to Minimize
         prob += pipeline_total_time
 
-        self.add_total_nb_layer_constraint(prob, self.variables_, layers_sorted)
+        result = self.add_total_nb_layer_constraint(prob, self.variables_, layers_sorted)
+        if result is None:
+            raise RuntimeError("add_total_nb_layer_constraint() returned None.")
         # Add if dual to the original layer order constraint
-        self.add_stage_nb_layer_constraint(prob, self.variables_, layers_sorted)
-        self.add_multimodal_sequence_constraint(prob, self.variables_, layers_sorted)
+        try:
+            prob = self.add_stage_nb_layer_constraint(
+                prob, self.variables_, layers_sorted
+            )
+        except Exception:
+            logger.exception("Failed to add stage number layer constraint.")
+            raise
+        try:
+            result = self.add_multimodal_sequence_constraint(prob, self.variables_, layers_sorted)
+        except Exception:
+            logger.exception("Failed to add multimodal sequence constraint.")
+            raise
+
         #self.add_stage_nb_layer_constraint_dual(prob, self.variables_, layers_sorted)
         #self.add_multimodal_sequence_constraint_dual(prob, self.variables_, layers_sorted)
-        self.add_multimodal_recompute_constraint(prob, self.variables_, layers_sorted)
-        self.add_performance_constraint(prob, layers_sorted, pipeline_total_time)
+        try:
+            result = self.add_multimodal_recompute_constraint(prob, self.variables_, layers_sorted)
+            if result is None:
+                raise RuntimeError("add_multimodal_recompute_constraint() returned None.")
+        except Exception:
+            logger.exception("Failed to add multimodal recompute constraint.")
+            raise
+
+        try:
+            result = self.add_performance_constraint(prob, layers_sorted, pipeline_total_time)
+            if result is None:
+                raise RuntimeError("add_performance_constraint() returned None.")
+            prob = result
+        except Exception:
+            logger.exception("Failed to add performance constraint.")
+            raise
 
         constraint = PipelineMemoryConstraint(
             prob=prob,

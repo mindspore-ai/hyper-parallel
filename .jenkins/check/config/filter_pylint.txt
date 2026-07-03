@@ -163,3 +163,9 @@
 "hyper-parallel/tests/torch/dist_module/"                               "missing-function-docstring"
 "hyper-parallel/tests/torch/dist_module/"                               "unused-import"
 "hyper-parallel/hyper_parallel/core/pipeline_parallel/scheduler.py"     "unnecessary-pass"
+
+
+
+# 18. SAPP ND templates / demos
+"hyper-parallel/hyper_parallel/auto_parallel/sapp_nd/memory_estimation/demo.py"              "locally-disabled"
+"hyper-parallel/hyper_parallel/auto_parallel/sapp_nd/memory_estimation/hooks/template.py"    "locally-disabled"

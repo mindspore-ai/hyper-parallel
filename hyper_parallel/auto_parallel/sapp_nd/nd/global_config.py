@@ -130,11 +130,10 @@ class GlobalConfig:
         for dim in self.dimensions:
             dims.append((dim, kwargs.get(dim.lname())))
 
-        if (
-            Dim.MBN not in self.dimensions
-            and Dim.PP in self.dimensions
-            and (Dim.DP in self.dimensions or Dim.MBS in self.dimensions)
-        ):
+        has_mbn_not_in = Dim.MBN not in self.dimensions
+        has_pp_in = Dim.PP in self.dimensions
+        has_dp_or_mbs_in = Dim.DP in self.dimensions or Dim.MBS in self.dimensions
+        if has_mbn_not_in and has_pp_in and has_dp_or_mbs_in:
             dims.append((Dim.MBN, kwargs.get(Dim.MBN.lname())))
             self.dimensions.append(Dim.MBN)
         return Dim.Dimensions(dims, all_dims=self.dimensions)
@@ -239,12 +238,9 @@ class GlobalConfig:
         else:
             exp_gcd = dp
 
-        if (
-            self.ccfg.dc_kv
-            and self.ccfg.dc_kv > 1
-            and self.ccfg.dhr
-            and self.ccfg.dhr > 1
-        ):
+        dc_kv_valid = self.ccfg.dc_kv and self.ccfg.dc_kv > 1
+        dhr_valid = self.ccfg.dhr and self.ccfg.dhr > 1
+        if dc_kv_valid and dhr_valid:
             att_gcd = gcd(self.ccfg.h, self.ccfg.dc_kv + self.ccfg.dhr)
         else:
             att_gcd = self.ccfg.h

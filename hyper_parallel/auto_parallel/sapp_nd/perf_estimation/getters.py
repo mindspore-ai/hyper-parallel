@@ -22,7 +22,8 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.logger import perf_logger as logger
 # Configs are updated depending on the type of the transformer layer
 def get_layer_custom_configs(cfg):
     """Stores each configuration along with how many layers are affected by it
-    in ascending order of execution in a forward pass"""
+    in ascending order of execution in a forward pass
+    """
 
     if cfg.layer_custom_config is None or any(
         func is None for (_, func) in cfg.layer_custom_config

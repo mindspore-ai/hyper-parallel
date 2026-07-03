@@ -254,7 +254,8 @@ def estimate_pipeline(cfg, stage_perfs, stage_focused=None, debugger=None):
     non_steady_perf = 0
     steady_perf = 0
     if cfg.p == 1:
-        assert len(stage_perfs) == 1
+        if len(stage_perfs) != 1:
+            raise ValueError("Expected exactly one stage performance")
         steady_perf = sum_time * cfg.m
     elif cfg.vp == 1:
         non_steady_perf = sum_time
@@ -474,7 +475,8 @@ def apply_regression_coefficients(coeffs, debugger, old_perf):
     """
     compute_ratio = coeffs.get("COMPUTE")
     for part, raw in list(debugger.info.items()):
-        if part in (PerfParts.TOTAL, PerfParts.MEMORY): continue
+        if part in (PerfParts.TOTAL, PerfParts.MEMORY):
+            continue
         if part in (PerfParts.FW_COMPUTE,
                    PerfParts.BW_COMPUTE,
                    PerfParts.RECOMPUTE):
@@ -487,7 +489,8 @@ def apply_regression_coefficients(coeffs, debugger, old_perf):
     max_idx = max(p.value for p in PerfParts) -1
     estimations = [0.0] * max_idx
     for part in PerfParts:
-        if part in (PerfParts.TOTAL, PerfParts.MEMORY): continue
+        if part in (PerfParts.TOTAL, PerfParts.MEMORY):
+            continue
         estimations[part.value - 1] = debugger.info.get(part) or 0.0
 
     real_buckets = {rp: [] for rp in RealParts}
@@ -505,9 +508,19 @@ def apply_regression_coefficients(coeffs, debugger, old_perf):
     return perf
 
 
-# performance estimation
-def estimate_performance(*args, **kwargs):
-    """main estimation"""
+def _resolve_estimate_args(args, kwargs):
+    """Resolve positional/keyword inputs for estimate_performance.
+
+    Returns:
+        Tuple of (cfg, stages, extra_custom_func, ccfg, debugger,
+        device_type, memory).
+    """
+    cfg_input = args[0]
+    cfg = (
+        cfg_input
+        if isinstance(cfg_input, CostModelConfig)
+        else CostModelConfig(cfg_input)
+    )
     stages = kwargs.get("stages", args[1] if len(args) > 1 else None)
     extra_custom_func = kwargs.get(
         "extra_custom_func", args[2] if len(args) > 2 else None
@@ -518,12 +531,43 @@ def estimate_performance(*args, **kwargs):
         "device_type", args[5] if len(args) > 5 else Hard.device_map["A2"]
     )
     memory = kwargs.get("memory", args[6] if len(args) > 6 else None)
+    return cfg, stages, extra_custom_func, ccfg, debugger, device_type, memory
 
-    # cfg = CostModelConfig(args[0])
-    if isinstance(args[0], CostModelConfig):
-        cfg = args[0]
-    else:
-        cfg = CostModelConfig(args[0])
+
+def _finalize_perf(perf, cache_file, debugger, memory):
+    """Apply cached regression coefficients and record debug info.
+
+    Returns:
+        The final performance value.
+    """
+    coeffs = None
+    cache = False
+    if cache_file is not None:
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            coeffs = json.load(f)
+        cache = True
+
+    if debugger and debugger.is_enabled():
+        if cache:
+            perf = apply_regression_coefficients(coeffs, debugger, perf)
+        debugger.info[PerfParts.TOTAL] = perf
+        if memory is not None:
+            debugger.info[PerfParts.MEMORY] = memory
+    return perf
+
+
+# performance estimation
+def estimate_performance(*args, **kwargs):
+    """main estimation"""
+    (
+        cfg,
+        stages,
+        extra_custom_func,
+        ccfg,
+        debugger,
+        device_type,
+        memory,
+    ) = _resolve_estimate_args(args, kwargs)
 
     # Process custom model config
     if extra_custom_func:
@@ -536,12 +580,6 @@ def estimate_performance(*args, **kwargs):
     if not stages:
         logger.info("stage partitions are generated")
         stages = cfg.generate_partitions_vpp()
-
-    # print(f"DP = {cfg.d}; MP = {cfg.t}; EP = {cfg.ep}; PP = {cfg.p}")
-
-    # print(list(map(list,
-    # zip(*list(map(lambda x: list(map(len, x)),stages))))))
-    # print(stages)
 
     cfg.n = cfg.d * cfg.t * cfg.p
     cfg.n_headCast = 1
@@ -601,20 +639,7 @@ def estimate_performance(*args, **kwargs):
     logger.info("PerfEst: perf %s", perf)
 
     cache_file = kwargs.get("cache_file")
-    coeffs = None
-    cache = False
-    if cache_file is not None:
-        with open(cache_file, 'r', encoding='utf-8') as f:
-            coeffs = json.load(f)
-        cache = True
-
-    if debugger and debugger.is_enabled():
-        if cache:
-            perf = apply_regression_coefficients(coeffs, debugger, perf)
-        debugger.info[PerfParts.TOTAL] = perf
-        if memory is not None:
-            debugger.info[PerfParts.MEMORY] = memory
-    return perf  # / cfg.gbs
+    return _finalize_perf(perf, cache_file, debugger, memory)  # / cfg.gbs
 
 # TO-DO
 # Fix More Memory

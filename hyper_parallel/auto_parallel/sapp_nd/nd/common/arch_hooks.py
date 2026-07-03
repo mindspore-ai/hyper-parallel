@@ -24,8 +24,14 @@ class CWrap:
 
     def __init__(self, e) -> None:
         self.ccfg = e
-        self.set_ccfg = lambda hook: hook(self.ccfg)
-        self.get_model_name = lambda: self.ccfg.model_name
+
+    def set_ccfg(self, hook):
+        """Apply a hook to the wrapped config object."""
+        return hook(self.ccfg)
+
+    def get_model_name(self):
+        """Return model name from the wrapped config."""
+        return self.ccfg.model_name
 
     def reset(self, e):
         """Replace the wrapped config object."""

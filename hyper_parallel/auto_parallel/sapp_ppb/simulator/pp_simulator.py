@@ -141,6 +141,10 @@ class PipelineSimulator:
 
         self._build_block() # create connection among compute blocks
         self._build_comm_block() # create comm blocks for each compute block
+        self.peak_memory = None
+        self.end_time = None
+        self.lines = None
+        self.canvas = None
 
     def run(self, comm: bool = True, print_info: bool = True) -> "PipelineSimulator":
         """Run simulation to schedule the pipeline.
@@ -202,14 +206,18 @@ class PipelineSimulator:
     def show(self, comm: bool = True, connect: bool = None,
              file_name: str = None) -> "PipelineSimulator":
         """Draw the pipeline and display/save it via the canvas."""
-        self.draw(comm, connect)
+        draw_result = self.draw(comm, connect)
+        if draw_result is None:
+            raise RuntimeError("draw() returned None.")
         self.canvas.show(file_name)
         return self
 
     def save(self, file_name: str, comm: bool = True,
              connect: bool = None) -> "PipelineSimulator":
         """Draw the pipeline and save it to ``file_name``."""
-        self.draw(comm, connect)
+        draw_result = self.draw(comm, connect)
+        if draw_result is None:
+            raise RuntimeError("draw() returned None.")
         self.canvas.save(file_name)
         return self
 
@@ -477,7 +485,14 @@ class PipelineSimulator:
                     continue
                 i_b = lines[p].index(block)
                 i_bn = lines[p].index(self.blocks[p][b + 1])
-                self._process_swap(block, lines, p, b, i_b, i_bn)
+                try:
+                    swap_processed = self._process_swap(block, lines, p, b, i_b, i_bn)
+                except (ValueError, IndexError) as error:
+                    raise RuntimeError(
+                        "Failed to process swap in pipeline simulator."
+                    ) from error
+                if not swap_processed:
+                    continue
         return lines
 
     def vpp_send_delay(self, lines: list[list[BlockSim]]) -> list[list[BlockSim]]:

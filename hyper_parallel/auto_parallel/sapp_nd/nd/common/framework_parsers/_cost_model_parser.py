@@ -139,12 +139,9 @@ class _CostModelParser(ABC):
             if ccfg.t_exp * ccfg.ep > ccfg.d * ccfg.t:
                 ccfg.t_exp = 1
 
-        if (
-            ccfg.d_exp < 1
-            or ccfg.t_exp < 1
-            or ccfg.hff_exp < 1
-            or ccfg.n_exp < 1
-        ):
+        exp_group1_invalid = ccfg.d_exp < 1 or ccfg.t_exp < 1
+        exp_group2_invalid = ccfg.hff_exp < 1 or ccfg.n_exp < 1
+        if exp_group1_invalid or exp_group2_invalid:
             raise TypeError(
                 f"MoE parsing error: d_exp({ccfg.d_exp})/t_exp({ccfg.t_exp})/"
                 f"hff_exp({ccfg.hff_exp})/n_exp({ccfg.n_exp})/"

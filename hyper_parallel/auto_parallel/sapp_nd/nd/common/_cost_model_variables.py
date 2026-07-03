@@ -162,15 +162,11 @@ class _CostModVar:
                     with open(spec.origin, "r", encoding="utf-8") as mf:
                         source = mf.read()
                         tree = ast.parse(source)
-                        mod_cls = next(
-                            (
-                                node
-                                for node in ast.walk(tree)
-                                if isinstance(node, ast.ClassDef)
-                                and node.name == module_name
-                            ),
-                            None,
-                        )
+                        mod_cls = None
+                        for node in ast.walk(tree):
+                            if isinstance(node, ast.ClassDef) and node.name == module_name:
+                                mod_cls = node
+                                break
                         if mod_cls:
                             target_mod_path = mod_path
                             break

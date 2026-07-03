@@ -395,7 +395,7 @@ def estimate_from_mem_comm(*args, **kwargs):
         comm[Dim.CP] *= max(1, param["cfg"].cp // dev_per_node)
 
         comm[Dim.TP] /= 2 # TO REMOVE: FOR RUIWEN TEST ONLY
-        comm[Dim.DP] = 0 #/= 10 # TO REMOVE: FOR RUIWEN TEST ONLY
+        comm[Dim.DP] = 0 # /= 10 # TO REMOVE: FOR RUIWEN TEST ONLY
 
         if param["device_type"].name == "A3":
             logger.info("A3 ratio")
