@@ -105,7 +105,63 @@ def _assert_comm_fusion_state(net, enabled):
         assert found_fused_group, "expected at least one fused param_group when comm_fusion=True"
 
 
-def _build_fully_shard_net(state_dict, mesh, *, recompute, comm_fusion):
+def _tensor_storage_info(tensor):
+    """Return raw storage pointer and byte size for a MindSpore tensor."""
+    storage = tensor.untyped_storage()
+    return storage.data_ptr(), storage.size()
+
+
+def _assert_comm_fusion_flat_buffer_memory(net, optimizer):
+    """Verify comm_fusion keeps each sharded parameter storage in its flat buffer."""
+    modules = [net, net.dense_relu_sequential[0], net.dense_relu_sequential[2], net.dense_relu_sequential[4]]
+    optimizer_param_ids = {id(param) for param in optimizer.parameters}
+    found_flat_buffer = False
+
+    ms.runtime.synchronize()
+    allocated = ms.runtime.memory_allocated()
+    for mod in modules:
+        state = mod.hsdp_scheduler.hsdp_state
+        param_group = getattr(state, "param_group", None)
+        if param_group is None or not state.hsdp_params:
+            continue
+        flat_buffer = param_group._flat_param_buffer  # pylint: disable=protected-access
+        if flat_buffer is None:
+            continue
+
+        found_flat_buffer = True
+        flat_ptr, flat_nbytes = _tensor_storage_info(flat_buffer)
+        unique_storage_nbytes = {flat_ptr: flat_nbytes}
+        non_flat_storages = []
+        for hsdp_param in state.hsdp_params:
+            param_fqn = getattr(hsdp_param, "_param_fqn", "<unknown>")
+            if id(hsdp_param.sharded_param) not in optimizer_param_ids:
+                raise AssertionError(f"Optimizer does not hold managed parameter {param_fqn}.")
+
+            local_tensor = hsdp_param.sharded_param._local_tensor  # pylint: disable=protected-access
+            checked_tensors = (
+                ("_sharded_param_data", hsdp_param._sharded_param_data),  # pylint: disable=protected-access
+                ("sharded_param._local_tensor", local_tensor),
+                ("sharded_param", hsdp_param.sharded_param),
+            )
+            for label, tensor in checked_tensors:
+                storage_ptr, storage_nbytes = _tensor_storage_info(tensor)
+                unique_storage_nbytes[storage_ptr] = storage_nbytes
+                if storage_ptr != flat_ptr:
+                    non_flat_storages.append((param_fqn, label, storage_ptr, storage_nbytes))
+
+        param_storage_nbytes = sum(unique_storage_nbytes.values())
+        if non_flat_storages or param_storage_nbytes != flat_nbytes:
+            raise AssertionError(
+                "MindSpore comm_fusion zero-copy should leave managed sharded parameter storage backed only by "
+                f"flat_param_buffer after fully_shard. memory_allocated={allocated}, "
+                f"flat_param_buffer_nbytes={flat_nbytes}, managed_param_storage_nbytes={param_storage_nbytes}, "
+                f"unique_storage_nbytes={unique_storage_nbytes}, non_flat_storages={non_flat_storages}."
+            )
+
+    assert found_flat_buffer, "expected at least one flat_param_buffer when comm_fusion=True"
+
+
+def _build_fully_shard_net(state_dict, mesh, *, recompute, comm_fusion, comm_fusion_zero_copy=None):
     """Build a fully_shard SlimLeNet16 matching the reference via init_empty_weights + in-process load."""
     mp_policy = MixedPrecisionPolicy(param_dtype=ms.float32, reduce_dtype=ms.float32,
                                      output_dtype=ms.float32, cast_forward_inputs=False)
@@ -113,8 +169,20 @@ def _build_fully_shard_net(state_dict, mesh, *, recompute, comm_fusion):
         net = SlimLeNet16()
     with ms.DeviceCtx("meta"):
         for idx in (0, 2, 4):
-            fully_shard(net.dense_relu_sequential[idx], mesh=mesh, mp_policy=mp_policy, comm_fusion=comm_fusion)
-        fully_shard(net, mesh=mesh, mp_policy=mp_policy, comm_fusion=comm_fusion)
+            fully_shard(
+                net.dense_relu_sequential[idx],
+                mesh=mesh,
+                mp_policy=mp_policy,
+                comm_fusion=comm_fusion,
+                comm_fusion_zero_copy=comm_fusion_zero_copy,
+            )
+        fully_shard(
+            net,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            comm_fusion=comm_fusion,
+            comm_fusion_zero_copy=comm_fusion_zero_copy,
+        )
     _assert_comm_fusion_state(net, comm_fusion)
     net.load_state_dict(state_dict, strict=True)
     net.set_reduce_op_type("sum")
@@ -122,6 +190,22 @@ def _build_fully_shard_net(state_dict, mesh, *, recompute, comm_fusion):
     if recompute:
         _apply_recompute(net)
     return net
+
+
+def _assert_comm_fusion_zero_copy_lazy_init_memory(state_dict, mesh, rank_slice):
+    """Exercise MindSpore comm_fusion zero-copy lazy init and assert flat-buffer storage ownership."""
+    zero_copy_net = _build_fully_shard_net(
+        state_dict,
+        mesh,
+        recompute=False,
+        comm_fusion=True,
+        comm_fusion_zero_copy=True,
+    )
+    zero_copy_optimizer = nn.SGD(zero_copy_net.trainable_params(), learning_rate=_LR)
+    images, labels = _step_batch(0, get_group_size())
+    _fully_shard_backward(zero_copy_net, images[rank_slice], labels[rank_slice])
+    _assert_comm_fusion_flat_buffer_memory(zero_copy_net, zero_copy_optimizer)
+    zero_copy_net.zero_grad()
 
 
 def _step_batch(step, world_size):
@@ -186,6 +270,9 @@ def run_precision_case(*, case_name, hsdp=False, recompute=False, comm_fusion=Fa
 
     local_bs = _GLOBAL_BS // world_size
     rank_slice = slice(rank * local_bs, (rank + 1) * local_bs)
+    if comm_fusion and not hsdp and not recompute:
+        _assert_comm_fusion_zero_copy_lazy_init_memory(state_dict, mesh, rank_slice)
+
     for step in range(_NUM_STEPS):
         images, labels = _step_batch(step, world_size)
         fsdp_loss, fsdp_grads = _fully_shard_backward(fsdp_net, images[rank_slice], labels[rank_slice])

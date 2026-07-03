@@ -90,7 +90,66 @@ def get_standalone_result(step, acc_grad=False):  # pylint: disable=unused-argum
     return standalone_loss, standalone_grad
 
 
-def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):  # pylint: disable=unused-argument
+def _tensor_storage_info(tensor):
+    """Return the raw TensorImpl storage pointer and byte size."""
+    with getattr(torch, "_C").DisableTorchFunctionSubclass():
+        storage = tensor.untyped_storage()
+        storage_nbytes = storage.nbytes() if hasattr(storage, "nbytes") else storage.size()
+        return storage.data_ptr(), storage_nbytes
+
+
+def _assert_comm_fusion_flat_buffer_memory(model, optimizer):
+    """Verify comm_fusion keeps managed sharded parameter storage in the flat buffer."""
+    state = model.hsdp_scheduler.hsdp_state
+    param_group = state.param_group
+    if param_group is None:
+        raise AssertionError("comm_fusion should create an HSDPParamGroup.")
+    flat_buffer = param_group._flat_param_buffer  # pylint: disable=protected-access
+    if flat_buffer is None:
+        raise AssertionError("comm_fusion zero-copy should create a flat parameter buffer.")
+
+    torch.npu.synchronize()
+    allocated = torch.npu.memory_allocated()
+    flat_ptr, flat_nbytes = _tensor_storage_info(flat_buffer)
+    optimizer_param_ids = {
+        id(param)
+        for group in optimizer.param_groups
+        for param in group["params"]
+    }
+    unique_storage_nbytes = {flat_ptr: flat_nbytes}
+    non_flat_storages = []
+
+    for hsdp_param in state.hsdp_params:
+        param_fqn = getattr(hsdp_param, "_param_fqn", "<unknown>")
+        if id(hsdp_param.sharded_param) not in optimizer_param_ids:
+            raise AssertionError(f"Optimizer does not hold managed parameter {param_fqn}.")
+
+        checked_tensors = (
+            ("_sharded_param_data", hsdp_param._sharded_param_data),  # pylint: disable=protected-access
+            ("sharded_param._local_tensor", hsdp_param.sharded_param._local_tensor),  # pylint: disable=protected-access
+            ("sharded_param", hsdp_param.sharded_param),
+        )
+        for label, tensor in checked_tensors:
+            storage_ptr, storage_nbytes = _tensor_storage_info(tensor)
+            unique_storage_nbytes[storage_ptr] = storage_nbytes
+            if storage_ptr != flat_ptr:
+                non_flat_storages.append((param_fqn, label, storage_ptr, storage_nbytes))
+
+    param_storage_nbytes = sum(unique_storage_nbytes.values())
+    if non_flat_storages or param_storage_nbytes != flat_nbytes:
+        raise AssertionError(
+            "comm_fusion zero-copy should leave managed sharded parameter storage backed only by "
+            f"flat_param_buffer after fully_shard. memory_allocated={allocated}, "
+            f"flat_param_buffer_nbytes={flat_nbytes}, managed_param_storage_nbytes={param_storage_nbytes}, "
+            f"unique_storage_nbytes={unique_storage_nbytes}, non_flat_storages={non_flat_storages}."
+        )
+
+
+def get_fully_shard_result(
+        step,
+        acc_grad=False,
+        check_comm_fusion_memory=False,
+        **fsdp_kwargs):  # pylint: disable=unused-argument
     """
     Get results from HSDP (Hybrid Sharded Data Parallel) distributed training.
 
@@ -109,6 +168,8 @@ def get_fully_shard_result(step, acc_grad=False, **fsdp_kwargs):  # pylint: disa
     # when loss is sum and DTensor not used, set grad comm type to sum for single-card precision compare
     dist_model.set_reduce_op_type("sum")
     dist_optimizer = optim.SGD(dist_model.parameters(), lr=0.01)
+    if check_comm_fusion_memory:
+        _assert_comm_fusion_flat_buffer_memory(dist_model, dist_optimizer)
     mesh: DeviceMesh = fsdp_kwargs['mesh']
     acc_epoch = 2
     acc_step = 4
@@ -237,14 +298,19 @@ def shard_param_data_parallel_prefetch_recompute(acc_grad=False, **fsdp_kwargs):
                        0.001, 0.001)
 
 
-def shard_param_data_parallel(acc_grad=False, **fsdp_kwargs):
+def shard_param_data_parallel(acc_grad=False, check_comm_fusion_memory=False, **fsdp_kwargs):
     """shard param data parallel"""
     rank, _ = init_dist()
     step = 4
     mesh: DeviceMesh = fsdp_kwargs['mesh']
     shard_size = mesh.mesh_shape[-1]
     standalone_loss, standalone_grad = get_standalone_result(step, acc_grad=acc_grad)
-    dist_loss, dist_grad = get_fully_shard_result(step, acc_grad=acc_grad, **fsdp_kwargs)
+    dist_loss, dist_grad = get_fully_shard_result(
+        step,
+        acc_grad=acc_grad,
+        check_comm_fusion_memory=check_comm_fusion_memory,
+        **fsdp_kwargs,
+    )
 
     assert np.allclose(standalone_loss.cpu().detach().numpy(),
                        dist_loss.cpu().detach().numpy(),
@@ -330,7 +396,7 @@ def test_zero3_fully_shard_comm_fusion():
     mp_policy = MixedPrecisionPolicy()
     fsdp_kwargs = _get_standard_fully_shard_kwargs(mp_policy)
     fsdp_kwargs["comm_fusion"] = True
-    shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)
+    shard_param_data_parallel(acc_grad=False, check_comm_fusion_memory=True, **fsdp_kwargs)
 
 
 def test_zero3_partial_shard_comm_fusion():
@@ -346,4 +412,4 @@ def test_zero3_partial_shard_comm_fusion():
     hsdp_mesh = init_device_mesh(device_type="npu", mesh_shape=(2, op_size), mesh_dim_names=("dp", "op"))
     fsdp_kwargs['mesh'] = hsdp_mesh
     fsdp_kwargs["comm_fusion"] = True
-    shard_param_data_parallel(acc_grad=False, **fsdp_kwargs)
+    shard_param_data_parallel(acc_grad=False, check_comm_fusion_memory=True, **fsdp_kwargs)
