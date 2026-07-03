@@ -1,4 +1,5 @@
-# Alignment-regression config: validated 1c↔FSDP4 byte-equal on 20-step preset_pt loss; num_hidden_layers=1 keeps run small for the 35B-A3B MoE shape.
+# Alignment-regression config: validated 1c↔FSDP4 byte-equal on 20-step preset_pt loss.
+# num_hidden_layers=1 keeps run small for the 35B-A3B MoE shape.
 model:
   name: qwen3_5_moe
   weights_path: /path/to/Qwen3.5-35B-A3B-Base
@@ -25,6 +26,8 @@ train:
 
   accelerator:
     dp_shard: 4
+    moe_token_dispatcher_type: all_to_all
+    npu_nums_per_device: 8
     comm_fusion: true
 
   optimizer:

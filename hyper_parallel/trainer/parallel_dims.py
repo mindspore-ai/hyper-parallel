@@ -76,6 +76,8 @@ class ParallelDims:
         pp: Pipeline parallel degree.
         ep: Expert parallel degree (MoE only).
         etp: Expert tensor parallel degree. Must equal ``tp`` or ``1``.
+        moe_token_dispatcher_type: Expert token exchange strategy.
+        npu_nums_per_device: Inner expert-parallel degree for deredundency dispatch.
         ulysses_degree: Ulysses sub-degree inside ``cp``. ``None`` means
             "pure Ulysses (degree == cp)".
         world_size: Total number of ranks.
@@ -88,6 +90,8 @@ class ParallelDims:
     pp: int = 1
     ep: int = 1
     etp: int = 1
+    moe_token_dispatcher_type: str = "all_to_all"
+    npu_nums_per_device: int = 8
     ulysses_degree: Optional[int] = None
     world_size: int = 1
     # Cached after build_mesh.
@@ -121,6 +125,8 @@ class ParallelDims:
             pp=getattr(parallel_cfg, 'pp', 1),
             ep=getattr(parallel_cfg, 'ep', 1),
             etp=getattr(parallel_cfg, 'etp', getattr(parallel_cfg, 'tp', 1)),
+            moe_token_dispatcher_type=getattr(parallel_cfg, 'moe_token_dispatcher_type', 'all_to_all'),
+            npu_nums_per_device=getattr(parallel_cfg, 'npu_nums_per_device', 8),
             ulysses_degree=getattr(parallel_cfg, 'ulysses_degree', None),
             world_size=world_size,
         )
@@ -137,9 +143,26 @@ class ParallelDims:
             ("pp", self.pp),
             ("ep", self.ep),
             ("etp", self.etp),
+            ("npu_nums_per_device", self.npu_nums_per_device),
         ):
             if value < 1:
                 raise ValueError(f"Parallel degree {name}={value} must be >= 1")
+
+        if self.moe_token_dispatcher_type not in ("all_to_all", "deredundency"):
+            raise ValueError(
+                "moe_token_dispatcher_type must be 'all_to_all' or 'deredundency', "
+                f"got {self.moe_token_dispatcher_type!r}"
+            )
+
+        if (
+            self.moe_token_dispatcher_type == "deredundency"
+            and self.ep % self.npu_nums_per_device != 0
+        ):
+            raise ValueError(
+                f"ep={self.ep} must be divisible by "
+                f"npu_nums_per_device={self.npu_nums_per_device} when "
+                "moe_token_dispatcher_type='deredundency'."
+            )
 
         if self.dp_shard < -1 or self.dp_shard == 0:
             raise ValueError(
@@ -273,9 +296,13 @@ class ParallelDims:
         """Build the DeviceMesh with canonical dim order and named flatten aliases.
 
         Order of base dims: ``dp_replicate → dp_shard → ep → cp → tp → pp``.
-        Only base dims with degree > 1 are materialized; if all are 1, a 1D
-        ``dp_shard`` mesh of the world is created so the FSDP code path runs
-        unchanged on single-card.
+        For deredundency EP, ``ep`` is materialized as ``oep → iep`` and
+        flattened back under the ``"ep"`` alias.
+        Only base dims with degree > 1 are materialized, except deredundency
+        EP keeps both ``oep`` and ``iep`` axes when ``ep > 1`` so the token
+        dispatcher can form its two communication groups. If all dims are 1,
+        a 1D ``dp_shard`` mesh of the world is created so the FSDP code path
+        runs unchanged on single-card.
 
         After construction, the following flatten aliases are registered on
         the root mesh so callers can reach them with ``mesh["fsdp"]`` /
@@ -296,15 +323,13 @@ class ParallelDims:
         """
         dims = []
         names = []
-        for name, size in (
-            ("dp_replicate", self.dp_replicate),
-            ("dp_shard", self.dp_shard),
-            ("ep", self.ep),
-            ("cp", self.cp),
-            ("tp", self.tp),
-            ("pp", self.pp),
-        ):
-            if size > 1:
+        for name, size in self._mesh_dim_specs():
+            force_materialize = (
+                self.moe_token_dispatcher_type == "deredundency"
+                and self.ep > 1
+                and name in ("oep", "iep")
+            )
+            if size > 1 or force_materialize:
                 dims.append(size)
                 names.append(name)
 
@@ -323,6 +348,23 @@ class ParallelDims:
             tuple(dims), tuple(names),
         )
         return self._device_mesh
+
+    def _mesh_dim_specs(self) -> tuple[tuple[str, int], ...]:
+        """Return mesh dimension specs in canonical order."""
+        ep_specs = (("ep", self.ep),)
+        if self.moe_token_dispatcher_type == "deredundency":
+            ep_specs = (
+                ("oep", self.ep // self.npu_nums_per_device),
+                ("iep", self.npu_nums_per_device),
+            )
+        return (
+            ("dp_replicate", self.dp_replicate),
+            ("dp_shard", self.dp_shard),
+            *ep_specs,
+            ("cp", self.cp),
+            ("tp", self.tp),
+            ("pp", self.pp),
+        )
 
     def _register_flatten_aliases(self, base_names) -> None:
         """Register named flatten aliases on the root mesh.
@@ -372,6 +414,13 @@ class ParallelDims:
         has_replicate = "dp_replicate" in base_names
         has_shard = "dp_shard" in base_names
         has_cp = "cp" in base_names
+        has_oep = "oep" in base_names
+        has_iep = "iep" in base_names
+
+        # Deredundency materializes EP as ``oep`` × ``iep`` but callers keep
+        # using the stable full-EP alias ``mesh["ep"]``.
+        if has_oep and has_iep:
+            _flatten_unique(("oep", "iep"), "ep")
 
         # ``fsdp`` — the axis ``fully_shard`` actually shards along.
         if has_shard:
@@ -447,5 +496,6 @@ class ParallelDims:
         return (
             f"dp_replicate={self.dp_replicate} dp_shard={self.dp_shard} "
             f"cp={self.cp} tp={self.tp} pp={self.pp} ep={self.ep} "
-            f"etp={self.etp} | dp={self.dp_size} world={self.world_size}"
+            f"etp={self.etp} moe_token_dispatcher_type={self.moe_token_dispatcher_type} "
+            f"npu_nums_per_device={self.npu_nums_per_device} | dp={self.dp_size} world={self.world_size}"
         )

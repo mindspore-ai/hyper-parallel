@@ -1,4 +1,6 @@
-# Alignment-regression config: validated 1c↔FSDP4 ≤0.005 step-loss diff (≤1 bf16 ULP at small-loss reporting precision); text num_hidden_layers=4 + frozen visual tower, vl_dummy synthetic batches.
+# Alignment-regression config: validated 1c↔FSDP4 ≤0.005 step-loss diff
+# (≤1 bf16 ULP at small-loss reporting precision); text num_hidden_layers=4
+# + frozen visual tower, vl_dummy synthetic batches.
 model:
   name: qwen3_vl_moe
   weights_path: /path/to/Qwen3-VL-30B-A3B-Instruct
@@ -28,6 +30,8 @@ train:
 
   accelerator:
     dp_shard: 4
+    moe_token_dispatcher_type: all_to_all
+    npu_nums_per_device: 8
     comm_fusion: true
 
   optimizer:
