@@ -17,7 +17,6 @@ import io
 import logging
 import os
 import unittest
-from contextlib import redirect_stderr
 
 import hyper_parallel.tools.logging as hp_logging
 from hyper_parallel.tools.logging import (
@@ -153,14 +152,14 @@ class TestHyperParallelLogging(unittest.TestCase):
     def test_unknown_component_still_works_but_warns_once(self):
         """A typo'd component is usable (never blocked) and warns exactly once."""
         hp_logging._warned_unknown.discard("FDSP")
-        buf = io.StringIO()
-        with redirect_stderr(buf):
+        with self.assertLogs("hyper_parallel.tools.logging", level="WARNING") as cm:
             log1 = get_logger("FDSP")
             log2 = get_logger("FDSP")  # second call must not warn again
         self.assertEqual(log1.name, "hyper_parallel.FDSP")  # still works
         self.assertIs(log1, log2)
-        self.assertEqual(buf.getvalue().count("unknown component"), 1)
-        self.assertIn("FDSP", buf.getvalue())
+        self.assertEqual(len(cm.output), 1)  # warns exactly once
+        self.assertIn("unknown component", cm.output[0])
+        self.assertIn("FDSP", cm.output[0])
 
 
 if __name__ == "__main__":
