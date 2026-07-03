@@ -220,6 +220,10 @@ class TestTorchHSDPParamGroup(unittest.TestCase):
         """Param groups should initialize uniform dtypes and flat buffers."""
         param_a = _fake_param([1.0, 2.0])
         param_b = _fake_param([3.0, 4.0])
+        param_a_obj = param_a.sharded_param
+        param_b_obj = param_b.sharded_param
+        old_a_ptr = param_a._sharded_param_data.untyped_storage().data_ptr()
+        old_b_ptr = param_b._sharded_param_data.untyped_storage().data_ptr()
         group = _new_param_group([param_a, param_b], enable_zero_copy=True)
 
         HSDPParamGroup._init_mp_dtypes(group)
@@ -228,6 +232,34 @@ class TestTorchHSDPParamGroup(unittest.TestCase):
         self.assertEqual(group._orig_dtype, torch.float32)
         self.assertTrue(group._is_flat_buffer_valid())
         self.assertEqual(group._flat_param_buffer.numel(), 4)
+        self.assertIs(param_a.sharded_param, param_a_obj)
+        self.assertIs(param_b.sharded_param, param_b_obj)
+        self.assertNotEqual(param_a._sharded_param_data.untyped_storage().data_ptr(), old_a_ptr)
+        self.assertNotEqual(param_b._sharded_param_data.untyped_storage().data_ptr(), old_b_ptr)
+        self.assertEqual(
+            param_a._sharded_param_data.untyped_storage().data_ptr(),
+            group._flat_param_buffer.untyped_storage().data_ptr(),
+        )
+        self.assertEqual(
+            param_b._sharded_param_data.untyped_storage().data_ptr(),
+            group._flat_param_buffer.untyped_storage().data_ptr(),
+        )
+        self.assertEqual(
+            param_a.sharded_param._local_tensor.untyped_storage().data_ptr(),
+            group._flat_param_buffer.untyped_storage().data_ptr(),
+        )
+        self.assertEqual(
+            param_b.sharded_param._local_tensor.untyped_storage().data_ptr(),
+            group._flat_param_buffer.untyped_storage().data_ptr(),
+        )
+        self.assertEqual(
+            param_a.sharded_param.data.untyped_storage().data_ptr(),
+            group._flat_param_buffer.untyped_storage().data_ptr(),
+        )
+        self.assertEqual(
+            param_b.sharded_param.data.untyped_storage().data_ptr(),
+            group._flat_param_buffer.untyped_storage().data_ptr(),
+        )
 
     def test_constructor_resolves_mesh_groups_and_optional_flat_buffer(self):
         """Constructor should derive shard/replicate groups from mesh metadata."""
