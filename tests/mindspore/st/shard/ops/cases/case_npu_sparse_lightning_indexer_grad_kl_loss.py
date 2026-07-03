@@ -38,6 +38,9 @@ _BATCH, _S, _N1, _N1IDX, _N2, _HEAD_DIM, _DIDX, _ROPE_DIM, _TOPK = 4, 128, 64, 6
 _SCALE = 1.0 / (_HEAD_DIM ** 0.5)
 _GLOBAL_QLEN = np.array([128, 256, 384, 512], dtype=np.int32)
 _GLOBAL_KLEN = np.array([128, 256, 384, 512], dtype=np.int32)
+# qlen/klen: plain Tensor (not a DTensor), used directly by the op fn (not distributed).
+_QLEN_T = ms.Tensor(_GLOBAL_QLEN, ms.int32)
+_KLEN_T = ms.Tensor(_GLOBAL_KLEN, ms.int32)
 
 
 def _build_si(layout):
@@ -99,17 +102,17 @@ def _sm_sum_tnd(q, k, *_):
     return ms.mint.permute(out, (1, 0, 2, 3)).reshape(1, _BATCH * _S, _N1)
 
 
-# --- op under test: fn(q,k,qi,ki,w,si,qr,kr[,qlen,klen], sm_max,sm_sum) ---
+# --- op under test: fn(q,k,qi,ki,w,si,qr,kr, sm_max,sm_sum) ---
 
 def _grad_kl_loss_bsnd(q, k, qi, ki, w, si, qr, kr, sm_max, sm_sum):
     return npu_sparse_lightning_indexer_grad_kl_loss(
         q, k, qi, ki, w, si, sm_max, sm_sum, _SCALE, query_rope=qr, key_rope=kr)
 
 
-def _grad_kl_loss_tnd(q, k, qi, ki, w, si, qr, kr, qlen, klen, sm_max, sm_sum):
+def _grad_kl_loss_tnd(q, k, qi, ki, w, si, qr, kr, sm_max, sm_sum):
     return npu_sparse_lightning_indexer_grad_kl_loss(
         q, k, qi, ki, w, si, sm_max, sm_sum, _SCALE, query_rope=qr, key_rope=kr,
-        actual_seq_qlen=qlen, actual_seq_klen=klen, layout='TND')
+        actual_seq_qlen=_QLEN_T, actual_seq_klen=_KLEN_T, layout='TND')
 
 
 def _bsnd_inputs():
@@ -136,8 +139,6 @@ def _tnd_inputs():
         InputSpec(shape=(t, _N2, _TOPK), dtype="int32", data=_SI_TND),
         InputSpec(shape=(t, _N1, _ROPE_DIM), init="randn", dtype="float16", seed=51),
         InputSpec(shape=(t, _N2, _ROPE_DIM), init="randn", dtype="float16", seed=52),
-        InputSpec(shape=(4,), dtype="int32", data=_GLOBAL_QLEN),
-        InputSpec(shape=(4,), dtype="int32", data=_GLOBAL_KLEN),
     ]
 
 
@@ -149,13 +150,12 @@ _BSND_DP_CP = [
     (Shard(0), Replicate()), (Shard(0), Shard(1)), (Shard(0), Shard(1)),
     (Shard(0), Shard(1)), (Shard(0), Replicate()),
 ]
-_TND_REPL = [(Replicate(),)] * 10
-_TND_DP = [(Shard(0),)] * 8 + [(Replicate(),), (Replicate(),)]
+_TND_REPL = [(Replicate(),)] * 8
+_TND_DP = [(Shard(0),)] * 8
 _TND_DP_CP = [
     (Shard(0), Shard(0)), (Shard(0), Replicate()), (Shard(0), Shard(0)),
     (Shard(0), Replicate()), (Shard(0), Shard(0)), (Shard(0), Shard(0)),
     (Shard(0), Shard(0)), (Shard(0), Replicate()),
-    (Replicate(), Replicate()), (Replicate(), Replicate()),
 ]
 
 

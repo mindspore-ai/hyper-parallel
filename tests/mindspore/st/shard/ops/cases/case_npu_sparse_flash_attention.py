@@ -14,6 +14,7 @@
 # ============================================================================
 """Shard ops cases for ``npu_sparse_flash_attention`` (MindSpore)."""
 import numpy as np
+import mindspore as ms
 from mindspore import ops
 from mindspore.ops import sparse_flash_attention
 
@@ -29,6 +30,8 @@ _SCALE_VALUE = 0.135234
 _SPARSE_COUNT_BASIC = 8
 _SPARSE_COUNT_CP = 128
 _TND_SEQ_LENS = np.arange(1, 129, dtype=np.int32) * 8
+# actual_seq_len: plain Tensor (not a DTensor), passed via extra_inputs (not distributed).
+_SEQ_LEN_T = ms.Tensor(_TND_SEQ_LENS, ms.int32)
 
 
 def _sfa_bsnd_basic(q, k, v, q_idx, k_idx, w, q_rope, k_rope):
@@ -201,8 +204,6 @@ register(OpShardCase(
         InputSpec(shape=(1024, 8), init="randn", dtype="bfloat16", seed=47),
         InputSpec(shape=(1024, 8, 64), init="randn", dtype="bfloat16", seed=48),
         InputSpec(shape=(1024, 1, 64), init="randn", dtype="bfloat16", seed=49),
-        InputSpec(shape=(128,), dtype="int32", data=_TND_SEQ_LENS),
-        InputSpec(shape=(128,), dtype="int32", data=_TND_SEQ_LENS),
     ],
     placements=[
         (Replicate(),),
@@ -213,9 +214,8 @@ register(OpShardCase(
         (Replicate(),),
         (Replicate(),),
         (Replicate(),),
-        (Replicate(),),
-        (Replicate(),),
     ],
+    extra_inputs=[_SEQ_LEN_T, _SEQ_LEN_T],
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
@@ -234,8 +234,6 @@ register(OpShardCase(
         InputSpec(shape=(1024, 8), init="randn", dtype="bfloat16", seed=47),
         InputSpec(shape=(1024, 8, 64), init="randn", dtype="bfloat16", seed=48),
         InputSpec(shape=(1024, 1, 64), init="randn", dtype="bfloat16", seed=49),
-        InputSpec(shape=(128,), dtype="int32", data=_TND_SEQ_LENS),
-        InputSpec(shape=(128,), dtype="int32", data=_TND_SEQ_LENS),
     ],
     placements=[
         (Shard(0),),
@@ -246,9 +244,8 @@ register(OpShardCase(
         (Shard(0),),
         (Shard(0),),
         (Shard(0),),
-        (Replicate(),),
-        (Replicate(),),
     ],
+    extra_inputs=[_SEQ_LEN_T, _SEQ_LEN_T],
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
@@ -267,8 +264,6 @@ register(OpShardCase(
         InputSpec(shape=(1024, 8), init="randn", dtype="bfloat16", seed=47),
         InputSpec(shape=(1024, 8, 64), init="randn", dtype="bfloat16", seed=48),
         InputSpec(shape=(1024, 1, 64), init="randn", dtype="bfloat16", seed=49),
-        InputSpec(shape=(128,), dtype="int32", data=_TND_SEQ_LENS),
-        InputSpec(shape=(128,), dtype="int32", data=_TND_SEQ_LENS),
     ],
     placements=[
         (Shard(0),),
@@ -279,9 +274,8 @@ register(OpShardCase(
         (Shard(0),),
         (Shard(0),),
         (Replicate(),),
-        (Replicate(),),
-        (Replicate(),),
     ],
+    extra_inputs=[_SEQ_LEN_T, _SEQ_LEN_T],
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
@@ -300,8 +294,6 @@ register(OpShardCase(
         InputSpec(shape=(1024, 8), init="randn", dtype="bfloat16", seed=47),
         InputSpec(shape=(1024, 8, 64), init="randn", dtype="bfloat16", seed=48),
         InputSpec(shape=(1024, 1, 64), init="randn", dtype="bfloat16", seed=49),
-        InputSpec(shape=(128,), dtype="int32", data=_TND_SEQ_LENS),
-        InputSpec(shape=(128,), dtype="int32", data=_TND_SEQ_LENS),
     ],
     placements=[
         (Shard(0), Shard(0)),
@@ -312,9 +304,8 @@ register(OpShardCase(
         (Shard(0), Shard(0)),
         (Shard(0), Shard(0)),
         (Shard(0), Replicate()),
-        (Replicate(), Replicate()),
-        (Replicate(), Replicate()),
     ],
+    extra_inputs=[_SEQ_LEN_T, _SEQ_LEN_T],
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
