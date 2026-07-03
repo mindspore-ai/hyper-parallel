@@ -96,6 +96,75 @@ def train_steps(model: nn.Module, optimizer: optim.Optimizer, input_list: List[T
         )
 
 
+def _reset_module_parameters(model: nn.Module) -> None:
+    """Reset all modules that define ``reset_parameters``."""
+    for module in model.modules():
+        if hasattr(module, "reset_parameters"):
+            module.reset_parameters()
+
+
+def _build_meta_init_model(hidden_size: int, mesh, *, comm_fusion: bool) -> nn.Module:
+    """Build a meta-initialized fully_shard model and materialize it on NPU."""
+    with torch.device("meta"):
+        model = MetaInitNet(hidden_size)
+
+    model = fully_shard(
+        model,
+        mesh=mesh,
+        reshard_after_forward=True,
+        mp_policy=_make_mp_policy(),
+        comm_fusion=comm_fusion,
+    )
+    model.to_empty(device="npu")
+    torch.manual_seed(20260701)
+    _reset_module_parameters(model)
+    model.set_reduce_op_type("sum")
+    return model
+
+
+def _local_param_snapshot(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Clone the current local tensor for every named parameter."""
+    snapshot = {}
+    for name, param in model.named_parameters():
+        if isinstance(param, DTensor):
+            snapshot[name] = param._local_tensor.detach().clone()  # pylint: disable=W0212
+        else:
+            snapshot[name] = param.detach().clone()
+    return snapshot
+
+
+def _train_and_snapshot(model: nn.Module, input_list: List[Tuple[Tensor, ...]]):
+    """Train a model for the given inputs and return losses plus local params."""
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    losses = []
+    for inputs in input_list:
+        optimizer.zero_grad()
+        loss = model(*inputs)
+        losses.append(loss.detach().clone())
+        loss.backward()
+        after_fwd_bwd_params = list(model.parameters())
+        opt_params = [p for group in optimizer.param_groups for p in group["params"]]
+        optimizer.step()
+        assert {id(p) for p in opt_params} == {id(p) for p in after_fwd_bwd_params}
+    return losses, _local_param_snapshot(model)
+
+
+def _assert_comm_fusion_flat_buffer_aliases(model: nn.Module) -> None:
+    """Verify lazy init created a flat buffer and all sharded views alias it."""
+    state = model.hsdp_scheduler.hsdp_state
+    param_group = state.param_group
+    assert param_group is not None, "comm_fusion should create an HSDPParamGroup"
+    assert param_group._flat_param_buffer is not None  # pylint: disable=protected-access
+    flat_storage_ptr = param_group._flat_param_buffer.untyped_storage().data_ptr()  # pylint: disable=protected-access
+    for hsdp_param in state.hsdp_params:
+        local_tensor = hsdp_param.sharded_param._local_tensor  # pylint: disable=protected-access
+        sharded_param_data = getattr(hsdp_param, "_sharded_param_data")
+        assert local_tensor.untyped_storage().data_ptr() == flat_storage_ptr
+        assert sharded_param_data.untyped_storage().data_ptr() == flat_storage_ptr
+        with getattr(torch, "_C").DisableTorchFunctionSubclass():
+            assert hsdp_param.sharded_param.untyped_storage().data_ptr() == flat_storage_ptr
+
+
 # ---------------------------------------------------------------------------
 # Test cases
 # ---------------------------------------------------------------------------
@@ -131,6 +200,38 @@ def test_fully_shard_meta_init():
     with SkipDTensorDispatch():
         train_steps(model, optimizer, input_list)
 
+
+def test_fully_shard_meta_init_comm_fusion_matches_nonfusion():
+    """
+    Feature: deferred initialization with comm_fusion zero-copy.
+    Description: Build two meta-initialized fully_shard models, one using the
+        per-parameter path and one using comm_fusion. Materialize via to_empty,
+        trigger lazy_init on first forward, then compare losses and local shards.
+    Expectation: comm_fusion matches non-fusion numerically and all sharded
+        parameter views alias the fused flat buffer after lazy initialization.
+    """
+    rank, _ = init_dist()
+    hidden_size = 32
+    world_size = dist.get_world_size()
+    mesh = init_device_mesh(device_type="npu", mesh_shape=(world_size,), mesh_dim_names=("dp",))
+
+    torch.manual_seed(20260702 + rank)
+    input_list = [(torch.rand(4, hidden_size).npu(),) for _ in range(2)]
+    no_fusion_model = _build_meta_init_model(hidden_size, mesh, comm_fusion=False)
+    fusion_model = _build_meta_init_model(hidden_size, mesh, comm_fusion=True)
+
+    with SkipDTensorDispatch():
+        no_fusion_losses, no_fusion_params = _train_and_snapshot(no_fusion_model, input_list)
+        fusion_losses, fusion_params = _train_and_snapshot(fusion_model, input_list)
+
+    for no_fusion_loss, fusion_loss in zip(no_fusion_losses, fusion_losses):
+        torch.testing.assert_close(fusion_loss.cpu(), no_fusion_loss.cpu(), rtol=1e-5, atol=1e-5)
+    assert fusion_params.keys() == no_fusion_params.keys()
+    for name, fusion_param in fusion_params.items():
+        torch.testing.assert_close(fusion_param.cpu(), no_fusion_params[name].cpu(), rtol=1e-5, atol=1e-5)
+    _assert_comm_fusion_flat_buffer_aliases(fusion_model)
+
+
 def test_fully_shard_init_empty_weights_with_prefetch():
     """
     Feature: init_empty_weights + fully_shard + prefetch
@@ -164,10 +265,12 @@ def test_fully_shard_init_empty_weights_with_prefetch():
     # Materialize: replaces each meta _local_tensor with a real torch.empty tensor.
     for p in model.parameters():
         if isinstance(p, DTensor):
-            local = p._local_tensor  # pylint: disable=W0212
+            local = getattr(p, "_local_tensor")
             if local.is_meta:
-                p._local_tensor = torch.empty(  # pylint: disable=W0212
-                    local.shape, dtype=local.dtype, device=device,requires_grad=p._local_tensor.requires_grad
+                setattr(
+                    p,
+                    "_local_tensor",
+                    torch.empty(local.shape, dtype=local.dtype, device=device, requires_grad=local.requires_grad),
                 )
 
     # reset_parameters() fills values in-place; _local_tensor objects must not change.
@@ -194,7 +297,7 @@ def test_fully_shard_init_empty_weights_with_prefetch():
         hsdp_state = get_hsdp_state(module)
         if hsdp_state is None:
             continue
-        for hsdp_param in hsdp_state._iter_managed_params():
+        for hsdp_param in getattr(hsdp_state, "_iter_managed_params")():
             fqn = getattr(hsdp_param, "_param_fqn", None)
             assert fqn is not None, (
                 f"_param_fqn not assigned for a parameter in module {type(module).__name__}"

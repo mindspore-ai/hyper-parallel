@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -239,8 +239,11 @@ class DTensorBase(Tensor):
     def data(self, value):
         """Set the underlying tensor data, extracting the local shard if a DTensor is given."""
         local_value = value.to_local() if isinstance(value, DTensorBase) else value
-        Tensor.data.__set__(self, local_value)
-        Tensor.data.__set__(self._local_tensor, local_value)
+        # Tensor.data.__set__ on a Tensor subclass otherwise enters __torch_function__
+        # and only rebinds _local_tensor through DTensor dispatch.
+        with getattr(torch, "_C").DisableTorchFunctionSubclass():
+            Tensor.data.__set__(self, local_value)
+            Tensor.data.__set__(self._local_tensor, local_value)
 
     @property
     def dtype(self) -> torch.dtype:
