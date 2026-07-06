@@ -22,16 +22,17 @@ Tests compare:
 import os
 
 import numpy as np
+import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-from hyper_parallel import init_device_mesh  # pylint: disable=C0413
-from hyper_parallel.core.dtensor.dtensor import DTensor  # pylint: disable=C0413
-from hyper_parallel.core.dtensor.placement_types import Shard  # pylint: disable=C0413
-from hyper_parallel.core.tensor_parallel import loss_parallel, is_loss_parallel_active  # pylint: disable=C0413
+from hyper_parallel import init_device_mesh
+from hyper_parallel.core.dtensor.dtensor import DTensor
+from hyper_parallel.core.dtensor.placement_types import Shard
+from hyper_parallel.core.tensor_parallel import loss_parallel, is_loss_parallel_active
 
 
 np.random.seed(42)
@@ -40,6 +41,8 @@ _BATCH_SIZE = 2
 _SEQ_LEN = 4
 _VOCAB_SIZE = 16
 _HIDDEN_SIZE = 8
+
+_SKIP_REASON = "loss_parallel CE dispatch disabled on r1.0.0"
 
 
 def setup_module():
@@ -73,6 +76,7 @@ def _simple_linear_layer_torch(x: torch.Tensor, weight: torch.Tensor,
 class TestLossParallelAccuracyPyTorch:
     """Accuracy tests for loss_parallel functionality (PyTorch backend)."""
 
+    @pytest.mark.skip(reason=_SKIP_REASON)
     def test_single_vs_multi_card_loss_parity(self):
         """Compare single-card loss vs multi-card loss_parallel loss.
 
@@ -153,6 +157,7 @@ class TestLossParallelAccuracyPyTorch:
 
         print(f"[Rank {dist.get_rank()}] Context manager tests passed")
 
+    @pytest.mark.skip(reason=_SKIP_REASON)
     def test_gradient_correctness_with_loss_parallel(self):
         """Verify gradients are correct when using loss_parallel context.
 
@@ -192,6 +197,7 @@ class TestLossParallelAccuracyPyTorch:
         print(f"[Rank {rank}] Gradient test passed")
 
 
+@pytest.mark.skip(reason=_SKIP_REASON)
 def test_single_vs_multi_card_loss_parity():
     """Wrapper for pytest."""
     TestLossParallelAccuracyPyTorch().test_single_vs_multi_card_loss_parity()
@@ -202,6 +208,7 @@ def test_loss_parallel_context_correctness():
     TestLossParallelAccuracyPyTorch().test_loss_parallel_context_correctness()
 
 
+@pytest.mark.skip(reason=_SKIP_REASON)
 def test_gradient_correctness_with_loss_parallel():
     """Wrapper for pytest."""
     TestLossParallelAccuracyPyTorch().test_gradient_correctness_with_loss_parallel()

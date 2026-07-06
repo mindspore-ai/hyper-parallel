@@ -24,6 +24,8 @@ from hyper_parallel.core.tensor_parallel._ce_op_registry import (
     DECOMPOSED_CE_OP_NAMES,
 )
 
+_SKIP_REASON = "loss_parallel CE dispatch disabled on r1.0.0"
+
 
 class TestDecomposedCEOpRegistry:
     """Test the separation of CE entry points and decomposed ops."""
@@ -98,6 +100,7 @@ class TestDecomposedCEOpDispatchError:
         dispatcher._check_decomposed_ce_op_in_loss_parallel("nll_loss", (), {})
         dispatcher._check_decomposed_ce_op_in_loss_parallel("log_softmax", (), {})
 
+    @pytest.mark.skip(reason=_SKIP_REASON)
     def test_check_raises_with_sharded_dtensor_in_context(self):
         """Check should raise ValueError with Shard(-1) DTensor in context."""
         import os

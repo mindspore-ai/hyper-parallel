@@ -20,10 +20,13 @@ import pytest
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
+_SKIP_REASON = "loss_parallel CE dispatch disabled on r1.0.0"
+
 
 class TestCEOpWithoutLossParallelContext:
     """Test that CE ops with Shard(-1) logits raise error outside loss_parallel context."""
 
+    @pytest.mark.skip(reason=_SKIP_REASON)
     def test_cross_entropy_with_sharded_logits_without_context_raises_error(self):
         """cross_entropy with Shard(-1) logits should raise error outside loss_parallel."""
         import torch
@@ -95,6 +98,7 @@ class TestCEOpWithoutLossParallelContext:
         assert loss is not None
         assert loss.item() >= 0
 
+    @pytest.mark.skip(reason=_SKIP_REASON)
     def test_error_message_contains_backward_hint(self):
         """Error message should mention that backward also needs to be in context."""
         import torch
@@ -114,6 +118,7 @@ class TestCEOpWithoutLossParallelContext:
         error_msg = str(exc_info.value)
         assert "loss.backward()" in error_msg
 
+    @pytest.mark.skip(reason=_SKIP_REASON)
     def test_gather_not_called_on_error(self):
         """Verify that full_tensor() is not called when error is raised."""
         import torch
@@ -148,6 +153,7 @@ class TestCEOpWithoutLossParallelContext:
 class TestCEOpCheckLogic:
     """Test the internal check logic."""
 
+    @pytest.mark.skip(reason=_SKIP_REASON)
     def test_check_raises_for_cross_entropy_with_shard_minus1(self):
         """Check should raise for cross_entropy with Shard(-1)."""
         import torch

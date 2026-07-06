@@ -20,6 +20,7 @@ Tests compare:
   - Multi-card with loss_parallel (TP=4, vocab sharded)
 """
 import numpy as np
+import pytest
 
 import mindspore as ms
 import mindspore.communication.management as D
@@ -39,6 +40,8 @@ _SEQ_LEN = 4
 _VOCAB_SIZE = 16
 _HIDDEN_SIZE = 8
 _TP_SIZE = 2
+
+_SKIP_REASON = "loss_parallel CE dispatch disabled on r1.0.0"
 
 
 def setup_module():
@@ -75,7 +78,6 @@ def _distributed_cross_entropy_dtensor(logits_dtensor: DTensor, targets: Tensor)
     Returns:
         loss: Scalar tensor
     """
-    # pylint: disable=C0415
     from hyper_parallel.platform.mindspore.loss_parallel_ops import distributed_cross_entropy
 
     return distributed_cross_entropy(
@@ -105,6 +107,7 @@ def _simple_linear_layer(x: Tensor, weight: Parameter, bias: Parameter = None) -
 class TestLossParallelAccuracy:
     """Accuracy tests for loss_parallel functionality."""
 
+    @pytest.mark.skip(reason=_SKIP_REASON)
     def test_single_vs_multi_card_loss_parity(self):
         """Compare single-card loss vs multi-card loss_parallel loss.
 
@@ -188,6 +191,7 @@ class TestLossParallelAccuracy:
 
         print(f"[Rank {D.get_rank()}] Context manager tests passed")
 
+    @pytest.mark.skip(reason=_SKIP_REASON)
     def test_gradient_correctness_with_loss_parallel(self):
         """Verify gradients are correct when using loss_parallel context.
 
@@ -226,6 +230,7 @@ class TestLossParallelAccuracy:
         print(f"[Rank {rank}] Gradient test passed (loss computation verified)")
 
 
+@pytest.mark.skip(reason=_SKIP_REASON)
 def test_single_vs_multi_card_loss_parity():
     """Wrapper for pytest."""
     TestLossParallelAccuracy().test_single_vs_multi_card_loss_parity()
@@ -236,6 +241,7 @@ def test_loss_parallel_context_correctness():
     TestLossParallelAccuracy().test_loss_parallel_context_correctness()
 
 
+@pytest.mark.skip(reason=_SKIP_REASON)
 def test_gradient_correctness_with_loss_parallel():
     """Wrapper for pytest."""
     TestLossParallelAccuracy().test_gradient_correctness_with_loss_parallel()
