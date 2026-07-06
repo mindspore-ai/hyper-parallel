@@ -1313,11 +1313,32 @@ class MindSporePlatform(Platform):
         return data, handle
 
     @staticmethod
-    def broadcast(data, src, group=None, async_op=False):
+    def broadcast(data, src=None, group=None, async_op=False, group_src=None):
+        if group_src is not None:
+            ranks = MindSporePlatform.get_process_group_ranks(group)
+            src = ranks[group_src]
         handle = dist.broadcast(data, src, group, async_op)
         if async_op:
             handle.wait()
         return data
+
+    @staticmethod
+    def scatter(output, scatter_list, src=None, group=None, async_op=False, group_src=None):
+        group_name = group if isinstance(group, str) else getattr(group, "group_name", group)
+        if group_src is not None:
+            ranks = MindSporePlatform.get_process_group_ranks(group)
+            src = ranks[group_src]
+        if scatter_list is None:
+            # MindSpore mint.scatter validates scatter_list on every rank; PyTorch passes None on receivers.
+            rank_size = get_group_size(group_name)
+            scatter_list = [output] * rank_size
+        else:
+            scatter_list = [c.contiguous() if hasattr(c, "is_contiguous") and not c.is_contiguous() else c
+                            for c in scatter_list]
+        handle = dist.scatter(output, scatter_list, src, group_name, async_op=async_op)
+        if async_op and handle is not None:
+            handle.wait()
+        return output
 
     @staticmethod
     def reduce_scatter_tensor(data, group_info, async_op=False):
@@ -1647,6 +1668,10 @@ class MindSporePlatform(Platform):
     def get_group_local_rank(group=None) -> int:
         """get group local rank id."""
         return dist.get_group_rank(group, MindSporePlatform.get_rank())
+
+    @staticmethod
+    def get_group_rank(group=None) -> int:
+        return MindSporePlatform.get_group_local_rank(group)
 
     @staticmethod
     def no_grad():

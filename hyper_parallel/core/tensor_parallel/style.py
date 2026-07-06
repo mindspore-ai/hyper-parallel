@@ -158,7 +158,7 @@ class ColwiseParallel(ParallelStyle):
                 continue
             src = _distribute_module_param_source(param)
             requires_grad = bool(getattr(param, "requires_grad", True))
-            dt = distribute_tensor(src, device_mesh, [Shard(0)])
+            dt = distribute_tensor(src, device_mesh, [Shard(0)], src_data_rank=self.src_data_rank)
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
 
@@ -169,7 +169,7 @@ class ColwiseParallel(ParallelStyle):
                 continue
             src = _distribute_module_param_source(param)
             requires_grad = bool(getattr(param, "requires_grad", True))
-            dt = distribute_tensor(src, device_mesh, [Shard(1)])
+            dt = distribute_tensor(src, device_mesh, [Shard(1)], src_data_rank=self.src_data_rank)
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
 
@@ -318,7 +318,7 @@ class RowwiseParallel(ParallelStyle):
             src = _distribute_module_param_source(param)
             requires_grad = bool(getattr(param, "requires_grad", True))
             placement = [Shard(1)] if key == "weight" else [Replicate()]
-            dt = distribute_tensor(src, device_mesh, placement)
+            dt = distribute_tensor(src, device_mesh, placement, src_data_rank=self.src_data_rank)
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
 
@@ -329,7 +329,7 @@ class RowwiseParallel(ParallelStyle):
                 continue
             src = _distribute_module_param_source(param)
             requires_grad = bool(getattr(param, "requires_grad", True))
-            dt = distribute_tensor(src, device_mesh, [Shard(0)])
+            dt = distribute_tensor(src, device_mesh, [Shard(0)], src_data_rank=self.src_data_rank)
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
 
