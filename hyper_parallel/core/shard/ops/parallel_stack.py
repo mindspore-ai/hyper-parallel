@@ -93,6 +93,9 @@ class StackDistributedOp(DistributedOp):
                 f"For {self.op_name}, stack requires at least one input DTensor."
             )
 
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs(valid_layouts)
+
         # Reference layout to validate consistency across all input tensors
         base_layout = valid_layouts[0]
         for layout in valid_layouts[1:]:

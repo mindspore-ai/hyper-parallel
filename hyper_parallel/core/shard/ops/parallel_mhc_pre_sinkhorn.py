@@ -211,9 +211,8 @@ class NpuMhcPreSinkhornDistributedOp(DistributedOp):
         ]
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, layouts: list, extra_args=None) -> Tuple[tuple, None]:
-        del extra_args
-        x_layout, phi_layout, alpha_layout, bias_layout = layouts
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        x_layout, phi_layout, alpha_layout, bias_layout = cache_values
 
         self._check_partial_inputs([x_layout, phi_layout, alpha_layout, bias_layout])
 
@@ -292,9 +291,8 @@ class NpuMhcPreClampSinkhornDistributedOp(DistributedOp):
         ]
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, layouts: list, extra_args=None) -> Tuple[tuple, None]:
-        del extra_args
-        x_layout, phi_layout, alpha_layout, bias_layout = layouts
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        x_layout, phi_layout, alpha_layout, bias_layout = cache_values
 
         self._check_partial_inputs([x_layout, phi_layout, alpha_layout, bias_layout])
         _validate_input_layouts_mhc_pre_sinkhorn(

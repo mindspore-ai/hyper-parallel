@@ -127,7 +127,8 @@ class TestStackExtDispatch(unittest.TestCase):
         d1._layout = base_layout
         d1.to_local.return_value = local_tensor1
 
-        output_layout = dist_op.infer_layout((d0.layout, d1.layout), (0,))
+        output_layouts, _ = dist_op.infer_layout([(d0.layout, d1.layout), 0])
+        output_layout = output_layouts[0]
 
         assert output_layout is not None
         assert tuple(output_layout.to_dict()["tensor_map"]) == (-1, -1, -1)
@@ -160,7 +161,8 @@ class TestStackExtDispatch(unittest.TestCase):
         d1.layout = base_layout
         d1._layout = base_layout
 
-        output_layout = dist_op.infer_layout((d0.layout, d1.layout), (0,))
+        output_layouts, _ = dist_op.infer_layout([(d0.layout, d1.layout), 0])
+        output_layout = output_layouts[0]
 
         assert output_layout is not None
         assert tuple(output_layout.to_dict()["tensor_map"]) == (-1, -1, -1)
@@ -303,17 +305,6 @@ class TestNewDispatchFlow(unittest.TestCase):
         _, kwargs2, cv2 = result2
         assert kwargs1 == kwargs2, "Normalized kwargs should match"
         assert cv1[1] == cv2[1], "Normalized cache_values dim should match"
-
-    def test_dispatch_falls_back_to_legacy_when_preprocess_returns_none(self):
-        """Test that dispatch falls back to legacy preprocess when new preprocess returns None."""
-        from hyper_parallel.core.shard.ops.parallel_ops import DistributedOp
-
-        class DummyOp(DistributedOp):
-            def infer_layout(self, layouts, extra_args=None):
-                return layouts[0]
-
-        op = DummyOp("dummy")
-        assert op.preprocess((1, 2), {"a": 3}) is None, "Default preprocess should return None for non-DTensor inputs"
 
 class TestUnwrapArgsAndKwargs(unittest.TestCase):
     """
@@ -627,337 +618,19 @@ class TestOpDispatcherSetupYamlDir(unittest.TestCase):
         self.assertEqual(stub.yaml_dir, "shard/ops/yaml")
 
 
-class TestOpDispatcherProcessArgs(unittest.TestCase):
-    """
-    Feature: OpDispatcher._process_args_and_kwargs
-    Description: Static method that categorises positional/keyword args into
-                 input_layouts, extra_args, input_args, input_kwargs, cache_key_values.
-    Expectation: None args get None layout; scalars go to extra_args and input_args;
-                 layout-carrying mocks land in input_layouts; DTensors call to_local().
-    """
-
-    def setUp(self):
-        EXISTING_COMM_GROUPS.clear()
-        _DEVICE_MESH_MAP.clear()
-
-    def tearDown(self):
-        EXISTING_COMM_GROUPS.clear()
-        _DEVICE_MESH_MAP.clear()
-
-    def test_none_arg(self):
-        """None positional arg → None layout, no extra_args entry."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-        layouts, extra, in_args, in_kw, keys = OpDispatcher._process_args_and_kwargs(
-            [None], {}
-        )
-        self.assertEqual(layouts, [None])
-        self.assertEqual(extra, [])
-        self.assertEqual(in_args, [None])
-        self.assertEqual(keys, [])
-
-    def test_scalar_int_arg(self):
-        """Integer positional arg (no _layout) → string cache key, in extra_args."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-        layouts, extra, in_args, in_kw, keys = OpDispatcher._process_args_and_kwargs(
-            [42], {}
-        )
-        self.assertEqual(layouts, [None])
-        self.assertEqual(extra, [42])
-        self.assertIn("42", keys)
-
-    def test_mock_tensor_with_layout_attr(self):
-        """Arg with _layout attr (non-DTensor mock) → layout extracted, appended to input_args."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_layout = MagicMock()
-        mock_layout.compact_str = "mock_compact"
-        mock_arg = MagicMock()
-        mock_arg._layout = mock_layout
-        mock_arg.layout = mock_layout
-        del mock_arg.__class__  # ensures isinstance(mock_arg, DTensor) is False
-
-        layouts, extra, in_args, in_kw, keys = OpDispatcher._process_args_and_kwargs(
-            [mock_arg], {}
-        )
-        self.assertEqual(layouts[0], mock_layout)
-        self.assertIn("mock_compact", keys[0])
-
-    def test_none_kwarg(self):
-        """None keyword arg → None layout, no extra_args entry."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-        layouts, extra, in_args, in_kw, keys = OpDispatcher._process_args_and_kwargs(
-            [], {"k": None}
-        )
-        self.assertIn(None, layouts)
-        self.assertEqual(extra, [])
-
-    def test_scalar_kwarg(self):
-        """Integer keyword arg (no _layout) → string cache key, in extra_args."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-        layouts, extra, in_args, in_kw, keys = OpDispatcher._process_args_and_kwargs(
-            [], {"x": 99}
-        )
-        self.assertIn(None, layouts)
-        self.assertEqual(extra, [99])
-        self.assertIn("99", keys)
-
-    def test_mock_tensor_kwarg_with_layout(self):
-        """Kwarg with _layout attr → layout extracted."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_layout = MagicMock()
-        mock_layout.compact_str = "kw_compact"
-        mock_val = MagicMock()
-        mock_val._layout = mock_layout
-        mock_val.layout = mock_layout
-        del mock_val.__class__
-
-        layouts, extra, in_args, in_kw, keys = OpDispatcher._process_args_and_kwargs(
-            [], {"x": mock_val}
-        )
-        self.assertEqual(layouts[0], mock_layout)
-        self.assertIn("kw_compact", keys[0])
-
-    def test_mixed_args(self):
-        """Mix of None, scalar, and layout-bearing args processed correctly."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_layout = MagicMock()
-        mock_layout.compact_str = "mix"
-        mock_arg = MagicMock()
-        mock_arg._layout = mock_layout
-        mock_arg.layout = mock_layout
-        del mock_arg.__class__
-
-        layouts, extra, in_args, in_kw, keys = OpDispatcher._process_args_and_kwargs(
-            [None, 7, mock_arg], {}
-        )
-        self.assertEqual(len(layouts), 3)
-        self.assertIsNone(layouts[0])
-        self.assertIsNone(layouts[1])
-        self.assertEqual(layouts[2], mock_layout)
-        self.assertIn(7, extra)
-        self.assertIn("7", keys)
-
-
-class TestOpDispatcherProcessArgsWithShape(unittest.TestCase):
-    """
-    Feature: OpDispatcher._process_args_and_kwargs_with_shape
-    Description: Like _process_args_and_kwargs but also collects input shapes.
-    Expectation: Shape collected for args with shape attr; None for those without.
-    """
-
-    def test_none_arg_shape_is_none(self):
-        """None arg → None in input_shapes."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-        layouts, shapes, extra, in_args, in_kw, keys = (
-            OpDispatcher._process_args_and_kwargs_with_shape([None], {})
-        )
-        self.assertIsNone(shapes[0])
-
-    def test_scalar_no_shape_attr(self):
-        """Scalar without shape attr → None in input_shapes."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-        layouts, shapes, extra, in_args, in_kw, keys = (
-            OpDispatcher._process_args_and_kwargs_with_shape([42], {})
-        )
-        self.assertIsNone(shapes[0])
-
-    def test_arg_with_shape_attr(self):
-        """Arg with shape attr → shape collected and added to cache keys."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_arg = MagicMock()
-        del mock_arg._layout
-        del mock_arg.__class__
-        mock_arg.shape = (4, 8)
-
-        layouts, shapes, extra, in_args, in_kw, keys = (
-            OpDispatcher._process_args_and_kwargs_with_shape([mock_arg], {})
-        )
-        self.assertEqual(shapes[0], (4, 8))
-        self.assertIn("(4, 8)", keys)
-
-    def test_layout_arg_with_shape(self):
-        """Layout-bearing arg with shape → both compact_str and shape in keys."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_layout = MagicMock()
-        mock_layout.compact_str = "layout_key"
-        mock_arg = MagicMock()
-        mock_arg._layout = mock_layout
-        mock_arg.layout = mock_layout
-        mock_arg.shape = (2, 4)
-        del mock_arg.__class__
-
-        layouts, shapes, extra, in_args, in_kw, keys = (
-            OpDispatcher._process_args_and_kwargs_with_shape([mock_arg], {})
-        )
-        self.assertEqual(layouts[0], mock_layout)
-        self.assertEqual(shapes[0], (2, 4))
-        self.assertIn("layout_key", keys[0])
-        self.assertIn("(2, 4)", keys)
-
-    def test_none_kwarg_shape_is_none(self):
-        """None kwarg → None shape."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-        layouts, shapes, extra, in_args, in_kw, keys = (
-            OpDispatcher._process_args_and_kwargs_with_shape([], {"k": None})
-        )
-        self.assertIn(None, layouts)
-
-    def test_kwarg_with_shape_attr(self):
-        """Kwarg with shape attr → shape in input_shapes."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_val = MagicMock()
-        del mock_val._layout
-        del mock_val.__class__
-        mock_val.shape = (3, 3)
-
-        layouts, shapes, extra, in_args, in_kw, keys = (
-            OpDispatcher._process_args_and_kwargs_with_shape([], {"x": mock_val})
-        )
-        self.assertIn((3, 3), shapes)
-
-    def test_kwarg_layout_with_shape(self):
-        """Kwarg with layout and shape → both collected."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_layout = MagicMock()
-        mock_layout.compact_str = "kw_layout"
-        mock_val = MagicMock()
-        mock_val._layout = mock_layout
-        mock_val.layout = mock_layout
-        mock_val.shape = (6,)
-        del mock_val.__class__
-
-        layouts, shapes, extra, in_args, in_kw, keys = (
-            OpDispatcher._process_args_and_kwargs_with_shape([], {"x": mock_val})
-        )
-        self.assertEqual(layouts[0], mock_layout)
-        self.assertIn((6,), shapes)
-
-
-class TestOpDispatcherHelpers(unittest.TestCase):
-    """
-    Feature: OpDispatcher._extract_single_arg_layout and _pack_infer_output
-    Description: Helper methods for tuple-expand and pack-output dispatch paths.
-    Expectation: Layouts extracted correctly; output packed as DTensor.
-    """
-
-    def setUp(self):
-        EXISTING_COMM_GROUPS.clear()
-        _DEVICE_MESH_MAP.clear()
-
-    def tearDown(self):
-        EXISTING_COMM_GROUPS.clear()
-        _DEVICE_MESH_MAP.clear()
-
-    def test_extract_single_arg_layout_none_and_scalar(self):
-        """None and scalar args → None layout and string cache key respectively."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        dispatcher = object.__new__(OpDispatcher)
-        keys, layouts, extra = dispatcher._extract_single_arg_layout(
-            [None, 5], []
-        )
-        self.assertIn(None, layouts)
-        self.assertIn(5, extra)
-        self.assertIn("5", keys)
-
-    def test_extract_single_arg_layout_with_layout_attr(self):
-        """Arg with _layout → layout added to input_layouts, compact_str to keys."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_layout = MagicMock()
-        mock_layout.compact_str = "extract_test"
-        mock_arg = MagicMock()
-        mock_arg._layout = mock_layout
-        mock_arg.layout = mock_layout
-
-        dispatcher = object.__new__(OpDispatcher)
-        keys, layouts, extra = dispatcher._extract_single_arg_layout(
-            [mock_arg], []
-        )
-        self.assertEqual(layouts[0], mock_layout)
-        self.assertIn("extract_test", keys[0])
-        self.assertEqual(extra, [])
-
-    def test_extract_with_kwargs_values(self):
-        """kwargs_value iterable is chained with expanded_args."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        dispatcher = object.__new__(OpDispatcher)
-        keys, layouts, extra = dispatcher._extract_single_arg_layout(
-            [], [None, 7]
-        )
-        self.assertIn(None, layouts)
-        self.assertIn(7, extra)
-
-    def test_pack_infer_output_single_scalar_raises(self):
-        """_pack_infer_output with tuple py_output but non-tuple layout raises."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_layout = MagicMock()
-        dispatcher = object.__new__(OpDispatcher)
-        with self.assertRaises(RuntimeError):
-            dispatcher._pack_infer_output((np.zeros((2,)), np.zeros((2,))), mock_layout)
-
-    def test_pack_infer_output_size_mismatch_raises(self):
-        """_pack_infer_output with mismatched tuple/list sizes raises RuntimeError."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_layout = MagicMock()
-        dispatcher = object.__new__(OpDispatcher)
-        with self.assertRaises(RuntimeError):
-            dispatcher._pack_infer_output(
-                (np.zeros((2,)), np.zeros((2,))), [mock_layout]
-            )
-
-    @patch("hyper_parallel.core.shard._op_dispatch.DTensor")
-    def test_pack_infer_output_single_output(self, mock_dtensor_cls):
-        """_pack_infer_output calls DTensor.from_local for single output."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_layout = MagicMock()
-        mock_dtensor_cls.from_local.return_value = MagicMock(spec=DTensor)
-
-        dispatcher = object.__new__(OpDispatcher)
-        result = dispatcher._pack_infer_output(np.zeros((4,)), mock_layout)
-        mock_dtensor_cls.from_local.assert_called_once()
-        self.assertIsNotNone(result)
-
-    @patch("hyper_parallel.core.shard._op_dispatch.DTensor")
-    def test_pack_infer_output_tuple_output(self, mock_dtensor_cls):
-        """_pack_infer_output wraps each element of a tuple via DTensor.from_local."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_layout = MagicMock()
-        mock_dtensor_cls.from_local.side_effect = lambda item, mesh, pl: MagicMock(spec=DTensor)
-
-        dispatcher = object.__new__(OpDispatcher)
-        result = dispatcher._pack_infer_output(
-            (np.zeros((2,)), np.zeros((3,))), [mock_layout, mock_layout]
-        )
-        self.assertIsInstance(result, tuple)
-        self.assertEqual(len(result), 2)
-        self.assertEqual(mock_dtensor_cls.from_local.call_count, 2)
-
-
 class TestDispatchLayoutInfer(unittest.TestCase):
     """
     Feature: OpDispatcher._dispatch_layout_infer routing paths.
-    Description: Routes to error, preprocess, no-suffix, unknown-suffix, valid-suffix.
-    Expectation: RuntimeError for unregistered/unknown-suffix; correct delegation otherwise.
+    Description: Routes to error for unregistered ops; uses three-phase dispatch
+                 (preprocess → _dispatch_new) for registered ops.
+    Expectation: RuntimeError for unregistered ops or when preprocess returns None.
     """
 
-    def _make_dispatcher(self, layout_infer_ops=None, suffix_dispatch=None):
+    def _make_dispatcher(self, layout_infer_ops=None):
         """Create a bare OpDispatcher-like object."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
         d = object.__new__(OpDispatcher)
         d.layout_infer_ops = layout_infer_ops or {}
-        d._suffix_dispatch = suffix_dispatch or {}
         return d
 
     def test_unregistered_op_raises(self):
@@ -984,8 +657,8 @@ class TestDispatchLayoutInfer(unittest.TestCase):
         d._dispatch_new.assert_called_once()
 
     @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
-    def test_no_suffix_calls_with_layout_infer(self, mock_cache_cls):
-        """Op with no suffix calls _with_layout_infer."""
+    def test_preprocess_returns_none_raises(self, mock_cache_cls):
+        """preprocess returning None raises RuntimeError (three-phase dispatch required)."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
 
         mock_dist_op = MagicMock()
@@ -993,49 +666,9 @@ class TestDispatchLayoutInfer(unittest.TestCase):
         mock_cache_cls.get_instance.return_value.distributed_op.return_value = mock_dist_op
 
         d = self._make_dispatcher(layout_infer_ops={"TestOp": {}})
-        d._with_layout_infer = MagicMock(return_value="infer_result")
 
-        def func():
-            return None
-
-        result = d._dispatch_layout_infer("TestOp", func, (1,), {})
-        self.assertEqual(result, "infer_result")
-        d._with_layout_infer.assert_called_once()
-
-    @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
-    def test_unknown_suffix_raises(self, mock_cache_cls):
-        """Op with unknown suffix raises RuntimeError."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_dist_op = MagicMock()
-        mock_dist_op.preprocess.return_value = None
-        mock_cache_cls.get_instance.return_value.distributed_op.return_value = mock_dist_op
-
-        d = self._make_dispatcher(
-            layout_infer_ops={"TestOp": {"infer_layout_suffix": "UnknownSuffix"}},
-            suffix_dispatch={}
-        )
         with self.assertRaises(RuntimeError):
-            d._dispatch_layout_infer("TestOp", lambda: None, (), {})
-
-    @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
-    def test_valid_suffix_calls_handler(self, mock_cache_cls):
-        """Op with valid suffix calls the corresponding handler."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_dist_op = MagicMock()
-        mock_dist_op.preprocess.return_value = None
-        mock_cache_cls.get_instance.return_value.distributed_op.return_value = mock_dist_op
-
-        d = self._make_dispatcher(
-            layout_infer_ops={"TestOp": {"infer_layout_suffix": "Reshape"}},
-            suffix_dispatch={"Reshape": "_with_layout_infer_reshape"}
-        )
-        d._with_layout_infer_reshape = MagicMock(return_value="reshape_result")
-
-        result = d._dispatch_layout_infer("TestOp", lambda: None, (), {})
-        self.assertEqual(result, "reshape_result")
-        d._with_layout_infer_reshape.assert_called_once()
+            d._dispatch_layout_infer("TestOp", lambda: None, (1,), {})
 
 
 class TestDispatchNew(unittest.TestCase):
@@ -1377,52 +1010,6 @@ class TestDispatchRandomInplaceReturnsSelf(unittest.TestCase):
         self.assertEqual(result, "new_wrapper")
 
 
-class TestProcessArgsWithDTensor(unittest.TestCase):
-    """
-    Feature: OpDispatcher._process_args_and_kwargs DTensor branches.
-    Description: When args/kwargs are DTensor instances, to_local() is called.
-    Expectation: to_local() result used in input_args/input_kwargs.
-    """
-
-    def test_dtensor_positional_arg_calls_to_local(self):
-        """DTensor positional arg → to_local() added to input_args (line 388)."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_layout = MagicMock()
-        mock_layout.compact_str = "dtensor_pos"
-
-        mock_arg = MagicMock()
-        mock_arg.__class__ = DTensor  # isinstance(mock_arg, DTensor) → True
-        mock_arg._layout = mock_layout
-        mock_arg.layout = mock_layout
-        mock_local = MagicMock()
-        mock_arg.to_local.return_value = mock_local
-
-        _, _, in_args, _, _ = OpDispatcher._process_args_and_kwargs([mock_arg], {})
-
-        mock_arg.to_local.assert_called_once()
-        self.assertIs(in_args[0], mock_local)
-
-    def test_dtensor_kwarg_calls_to_local(self):
-        """DTensor keyword arg → to_local() stored in input_kwargs (line 409)."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_layout = MagicMock()
-        mock_layout.compact_str = "dtensor_kw"
-
-        mock_val = MagicMock()
-        mock_val.__class__ = DTensor
-        mock_val._layout = mock_layout
-        mock_val.layout = mock_layout
-        mock_local = MagicMock()
-        mock_val.to_local.return_value = mock_local
-
-        _, _, _, in_kw, _ = OpDispatcher._process_args_and_kwargs([], {"x": mock_val})
-
-        mock_val.to_local.assert_called_once()
-        self.assertIs(in_kw["x"], mock_local)
-
-
 class TestRegisterSingleDistributedOp(unittest.TestCase):
     """
     Feature: OpDispatcher._register_single_distributed_op branching.
@@ -1506,191 +1093,6 @@ class TestLoadYamlDictErrors(unittest.TestCase):
                     f.write(yaml_content)
             with self.assertRaises((ValueError, Exception)):
                 OpDispatcher.safe_load_yaml_from_dir(stub)
-
-
-class TestWithLayoutInfer(unittest.TestCase):
-    """
-    Feature: OpDispatcher._with_layout_infer dispatch paths.
-    Description: Cover cache-miss/hit, scalar/tuple output, unpack_ops, and error paths.
-    Expectation: DTensor.from_local called for single output; tuple wrapping for multi-output;
-                 RuntimeError for layout/output shape mismatch.
-    """
-
-    def _make_dispatcher(self, unpack_ops=None):
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-        d = object.__new__(OpDispatcher)
-        d.unpack_ops = unpack_ops or set()
-        return d
-
-    @patch("hyper_parallel.core.shard._op_dispatch.DTensor")
-    @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_cache_miss_single_scalar_output(self, mock_platform, mock_cache_cls, mock_dtensor_cls):
-        """Cache miss with scalar args and single output calls DTensor.from_local once."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_platform.get_op_name.return_value = "TestOp_single"
-        mock_output_layout = MagicMock()
-
-        mock_cache = MagicMock()
-        mock_cache_cls.get_instance.return_value = mock_cache
-        mock_cache.get_layout_cache.return_value = {}
-
-        mock_dist_op = MagicMock()
-        mock_cache.distributed_op.return_value = mock_dist_op
-        mock_dist_op.infer_layout.return_value = mock_output_layout
-        mock_dist_op.get_expand_impl.return_value = None
-
-        mock_dtensor_cls.from_local.return_value = MagicMock()
-
-        d = self._make_dispatcher()
-        func = MagicMock(return_value=MagicMock())
-        result = d._with_layout_infer(func, 42)
-
-        mock_dist_op.infer_layout.assert_called_once()
-        mock_dtensor_cls.from_local.assert_called_once()
-
-    @patch("hyper_parallel.core.shard._op_dispatch.DTensor")
-    @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_cache_hit_skips_infer_layout(self, mock_platform, mock_cache_cls, mock_dtensor_cls):
-        """Cache hit reuses cached layout and op_impl without calling infer_layout."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-        # LayoutCacheKey is re-imported here because _reload_op_dispatch_with_env_str may have
-        # reloaded the module, making the module-level LayoutCacheKey a stale class definition
-        # that no longer matches what OpDispatcher uses internally.
-        from hyper_parallel.core.shard._op_dispatch import LayoutCacheKey  # pylint: disable=W0404,W0621
-
-        mock_platform.get_op_name.return_value = "TestOp_hit"
-        mock_output_layout = MagicMock()
-
-        func = MagicMock(return_value=MagicMock())
-        mock_op_impl = MagicMock(return_value=MagicMock())
-        cache_key = LayoutCacheKey(["42"])
-        op_cache = {"TestOp_hit": {cache_key: (mock_output_layout, mock_op_impl)}}
-
-        mock_cache = MagicMock()
-        mock_cache_cls.get_instance.return_value = mock_cache
-        mock_cache.get_layout_cache.return_value = op_cache
-
-        mock_dist_op = MagicMock()
-        mock_cache.distributed_op.return_value = mock_dist_op
-
-        mock_dtensor_cls.from_local.return_value = MagicMock()
-
-        d = self._make_dispatcher()
-        d._with_layout_infer(func, 42)
-
-        mock_dist_op.infer_layout.assert_not_called()
-        mock_op_impl.assert_called_once()
-
-    @patch("hyper_parallel.core.shard._op_dispatch.DTensor")
-    @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_tuple_output_with_list_layout(self, mock_platform, mock_cache_cls, mock_dtensor_cls):
-        """Tuple output with matching list layout → tuple of DTensors returned."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_platform.get_op_name.return_value = "TestOp_tuple"
-        layout1, layout2 = MagicMock(), MagicMock()
-
-        mock_cache = MagicMock()
-        mock_cache_cls.get_instance.return_value = mock_cache
-        mock_cache.get_layout_cache.return_value = {}
-
-        mock_dist_op = MagicMock()
-        mock_cache.distributed_op.return_value = mock_dist_op
-        mock_dist_op.infer_layout.return_value = [layout1, layout2]
-        mock_dist_op.get_expand_impl.return_value = None
-
-        mock_dtensor_cls.from_local.side_effect = lambda item, mesh, pl: MagicMock()
-
-        d = self._make_dispatcher()
-        func = MagicMock(return_value=(MagicMock(), MagicMock()))
-        result = d._with_layout_infer(func, 1, 2)
-
-        self.assertIsInstance(result, tuple)
-        self.assertEqual(len(result), 2)
-        self.assertEqual(mock_dtensor_cls.from_local.call_count, 2)
-
-    @patch("hyper_parallel.core.shard._op_dispatch.DTensor")
-    @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_tuple_output_non_list_layout_raises(self, mock_platform, mock_cache_cls, mock_dtensor_cls):
-        """Tuple output with non-list layout raises RuntimeError."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_platform.get_op_name.return_value = "TestOp_err"
-
-        mock_cache = MagicMock()
-        mock_cache_cls.get_instance.return_value = mock_cache
-        mock_cache.get_layout_cache.return_value = {}
-
-        mock_dist_op = MagicMock()
-        mock_cache.distributed_op.return_value = mock_dist_op
-        mock_dist_op.infer_layout.return_value = MagicMock()  # non-list
-        mock_dist_op.get_expand_impl.return_value = None
-
-        d = self._make_dispatcher()
-        func = MagicMock(return_value=(MagicMock(), MagicMock()))
-        with self.assertRaises(RuntimeError):
-            d._with_layout_infer(func, 42)
-
-    @patch("hyper_parallel.core.shard._op_dispatch.DTensor")
-    @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_tuple_output_size_mismatch_raises(self, mock_platform, mock_cache_cls, mock_dtensor_cls):
-        """Tuple output length != list layout length raises RuntimeError (line 458)."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_platform.get_op_name.return_value = "TestOp_mismatch"
-
-        mock_cache = MagicMock()
-        mock_cache_cls.get_instance.return_value = mock_cache
-        mock_cache.get_layout_cache.return_value = {}
-
-        mock_dist_op = MagicMock()
-        mock_cache.distributed_op.return_value = mock_dist_op
-        mock_dist_op.infer_layout.return_value = [MagicMock()]  # list of 1
-        mock_dist_op.get_expand_impl.return_value = None
-
-        d = self._make_dispatcher()
-        func = MagicMock(return_value=(MagicMock(), MagicMock()))  # tuple of 2
-        with self.assertRaises(RuntimeError):
-            d._with_layout_infer(func, 42)
-
-    @patch("hyper_parallel.core.shard._op_dispatch.DTensor")
-    @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
-    @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_unpack_ops_packed_call_path(self, mock_platform, mock_cache_cls, mock_dtensor_cls):
-        """unpack_ops path re-packs args and calls op_impl with 3-arg packed form."""
-        from hyper_parallel.core.shard._op_dispatch import OpDispatcher
-
-        mock_platform.get_op_name.return_value = "UnpackOp"
-        mock_output_layout = MagicMock()
-
-        mock_cache = MagicMock()
-        mock_cache_cls.get_instance.return_value = mock_cache
-        mock_cache.get_layout_cache.return_value = {}
-
-        mock_dist_op = MagicMock()
-        mock_cache.distributed_op.return_value = mock_dist_op
-        mock_dist_op.infer_layout.return_value = mock_output_layout
-        mock_dist_op.get_expand_impl.return_value = None
-
-        mock_dtensor_cls.from_local.return_value = MagicMock()
-
-        d = self._make_dispatcher(unpack_ops={"UnpackOp"})
-        prim_obj = MagicMock()
-        func = MagicMock(return_value=MagicMock())
-
-        # NOTE: aclop args are now normalized upstream by _normalize_aclop_args.
-        # Pass unpacked real args positionally and _packed_call via keyword.
-        result = d._with_layout_infer(func, 10, 20, _packed_call=(prim_obj, "UnpackOp"))
-
-        # op_impl should be called with the re-packed form
-        func.assert_called_once()
-        mock_dtensor_cls.from_local.assert_called_once()
 
 
 if __name__ == "__main__":

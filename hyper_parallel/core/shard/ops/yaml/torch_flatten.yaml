@@ -2,4 +2,3 @@ flatten:
   dist_op_name: _torch_flatten_dist_op
   distributed_op_class: FlattenDistributedOp
   distributed_op_file: parallel_flatten
-  infer_layout_suffix: WithShape
