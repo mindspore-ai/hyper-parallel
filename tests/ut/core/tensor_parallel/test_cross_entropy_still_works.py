@@ -16,6 +16,8 @@
 
 import pytest
 
+_SKIP_REASON = "loss_parallel CE dispatch disabled on r1.0.0"
+
 
 class TestCrossEntropyStillWorks:
     """Verify cross_entropy is still dispatched correctly after registry changes."""
@@ -50,6 +52,7 @@ class TestCrossEntropyStillWorks:
         assert "mint_nn_functional_cross_entropy" in LOSS_PARALLEL_OP_NAMES()
         assert is_loss_parallel_op("mint_nn_functional_cross_entropy") is True
 
+    @pytest.mark.skip(reason=_SKIP_REASON)
     def test_cross_entropy_dispatch_path_unchanged(self):
         """cross_entropy should still dispatch through loss_parallel path."""
         import os

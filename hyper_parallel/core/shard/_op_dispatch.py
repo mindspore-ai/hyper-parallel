@@ -997,6 +997,10 @@ class OpDispatcher:
         Returns:
             True when in loss_parallel context and op is a CE entry point.
         """
+        # r1.0.0: temporarily bypass loss_parallel CE routing so cross_entropy falls
+        # through to normal DTensor dispatch. Remove the return below to re-enable.
+        return False
+
         return is_loss_parallel_active() and is_loss_parallel_op(op_name)
 
     def _check_decomposed_ce_op_in_loss_parallel(self, op_name: str, args: tuple, kwargs: dict):
@@ -1011,6 +1015,10 @@ class OpDispatcher:
             ValueError: If decomposed CE op is called in loss_parallel context
                        with vocab-sharded DTensor input.
         """
+        # r1.0.0: temporarily bypass decomposed-CE guard while loss_parallel dispatch
+        # is disabled. Remove the return below to re-enable.
+        return
+
         if not is_loss_parallel_active() or not is_decomposed_ce_op(op_name):
             return
 
@@ -1069,6 +1077,11 @@ class OpDispatcher:
         Raises:
             ValueError: If CE op is called with Shard(-1) logits outside loss_parallel context.
         """
+        # r1.0.0: temporarily bypass this guard so Shard(-1) cross_entropy can fall
+        # through to normal DTensor dispatch (gather path) without requiring
+        # loss_parallel() context. Remove the return below to re-enable.
+        return
+
         if is_loss_parallel_active() or not is_loss_parallel_op(op_name):
             return
 

@@ -87,7 +87,6 @@
 
 # 6. Existing unrelated files
 "hyper-parallel/hyper_parallel/core/dtensor/placement_types.py"         "mixed-line-endings"
-"hyper-parallel/hyper_parallel/core/shard/_op_dispatch.py"              "line-too-long"
 
 # 7. Code static analysis fixes - shard ops
 "hyper-parallel/hyper_parallel/core/shard/ops/"                         "arguments-differ"
@@ -163,3 +162,9 @@
 "hyper-parallel/tests/torch/dist_module/"                               "missing-function-docstring"
 "hyper-parallel/tests/torch/dist_module/"                               "unused-import"
 "hyper-parallel/hyper_parallel/core/pipeline_parallel/scheduler.py"     "unnecessary-pass"
+
+# 18. loss_parallel dispatch disable (PR #1017) — early-return guards + related UT/ST
+"hyper-parallel/hyper_parallel/core/shard/_op_dispatch.py"              "line-too-long"
+"hyper-parallel/hyper_parallel/core/shard/_op_dispatch.py"              "unreachable"
+"hyper-parallel/tests/torch/loss_parallel/"                           "wrong-import-position"
+"hyper-parallel/tests/mindspore/st/loss_parallel/"                    "import-outside-toplevel"
