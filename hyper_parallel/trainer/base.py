@@ -795,10 +795,10 @@ class BaseTrainer:
         self.profiler_callback.on_train_begin(self.state)
         self.wandb_callback.on_train_begin(self.state)
         self.tensorboard_callback.on_train_begin(self.state)
-        self.progress_callback.on_train_begin(self.state)
-        # Checkpoint runs LAST so resume sees an already-armed TB writer
-        # (it'll record the load event via dispatch_load_event).
+        # Checkpoint runs after log writers are armed and before progress so
+        # resumed ``global_step`` is reflected in the tqdm initial position.
         self.checkpoint_callback.on_train_begin(self.state)
+        self.progress_callback.on_train_begin(self.state)
         for cb in self.user_callbacks:
             cb.on_train_begin(self.state)
 
@@ -970,6 +970,12 @@ class BaseTrainer:
         # step counter so checkpoint dirs / log indices match the steps that
         # actually trained.
         micro_batches = next(data_iterator)
+        prepare_batch_fn = getattr(self.spec, "prepare_batch_fn", None)
+        if prepare_batch_fn is not None:
+            micro_batches = [
+                prepare_batch_fn(batch, self.model)
+                for batch in micro_batches
+            ]
         self.state.global_step += 1
         num_micro = len(micro_batches)
 
@@ -978,13 +984,13 @@ class BaseTrainer:
 
         token_counts = [count_loss_token(mb) for mb in micro_batches]
         local_tokens = sum(token_counts)
-        if local_tokens == 0:
-            local_tokens = 1
         global_tokens = local_tokens
         if platform.get_world_size() > 1:
             gt = platform.full((1,), local_tokens).to(self.device)
             platform.all_reduce(gt, self._dp_group_info)
             global_tokens = max(int(gt.item()), 1)
+        else:
+            global_tokens = max(global_tokens, 1)
         # Expose for callbacks (e.g. LoggingCallback throughput).
         self._last_global_tokens = global_tokens
 
