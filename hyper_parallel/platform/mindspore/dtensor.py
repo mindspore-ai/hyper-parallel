@@ -13,28 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """mindspore dtensor base"""
-from contextlib import contextmanager
-import warnings
+from mindspore._c_expression import NoFallbackGuard, _DisableMsDispatchMode
 from mindspore.common.tensor import Tensor
 from mindspore.common.initializer import initializer
-
-try:
-    from mindspore._c_expression import NoFallbackGuard  # pylint: disable=C0415
-except ImportError:
-    warnings.warn(
-        "mindspore._c_expression.NoFallbackGuard not available; "
-        "using no-op fallback guard. This may allow recursive fallback dispatch "
-        "in some edge cases. Please upgrade MindSpore to a version that provides "
-        "NoFallbackGuard for proper protection against recursive dispatch.",
-        RuntimeWarning,
-        stacklevel=2,
-    )
-
-    @contextmanager
-    def _no_fallback_guard():
-        yield
-
-    NoFallbackGuard = _no_fallback_guard
 
 
 class DTensorBase(Tensor):
@@ -172,8 +153,9 @@ class DTensorBase(Tensor):
     def data(self, value):
         """Set the underlying tensor data, extracting the local shard if a DTensor is given."""
         local_value = value.to_local() if isinstance(value, DTensorBase) else value
-        Tensor.data.__set__(self, local_value)
-        Tensor.data.__set__(self._local_tensor, local_value)
+        with _DisableMsDispatchMode():
+            Tensor.data.__set__(self, local_value)
+            Tensor.data.__set__(self._local_tensor, local_value)
 
     # pylint: disable=W0212
     def set_data(self, data, slice_shape=False):
