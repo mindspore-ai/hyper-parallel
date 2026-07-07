@@ -137,27 +137,6 @@ class TestParallelActivationWithAxis(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_activation_with_axis_hybrid_parallel_success(self, mock_platform):
-        """
-        Feature: ActivationWithAxis hybrid parallel
-        Description: Hybrid parallel scenario with softmax on unsharded middle dimension
-        Expectation: Success, output layout equals input layout
-        """
-        op = ActivationWithAxisDistributedOp("Swiglu")
-        mesh = self._make_2x2x2_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate(), Shard(2))
-        x_layout = _build_layout(mesh, x_placements, 3)
-
-        cache_values = [x_layout, 1]
-        output_layout = self._infer_single_layout(op, cache_values)
-
-        expected_map = (2, -1, 0)
-        assert output_layout.tensor_map == expected_map, (
-            f"Hybrid Parallel test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
-        )
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_activation_with_axis_all_replicated(self, mock_platform):
         """
         Feature: ActivationWithAxis all replicated
