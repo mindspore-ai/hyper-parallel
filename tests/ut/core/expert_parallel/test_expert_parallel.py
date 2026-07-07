@@ -1052,6 +1052,69 @@ class TestDeredundencyTokenDispatcher(unittest.TestCase):
                 device_mesh=self.mock_mesh,
             )
 
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_expert_parallel_deredundency_round_trip_via_hooks(self, mock_platform):
+        """ExpertParallel+deredundency dispatch→combine runs end-to-end with a
+        matching context (regression guard for the hardcoded-AllToAll bug).
+
+        Before the fix, ``_token_dispatch`` hardcoded ``AllToAllTokenDispatcher``
+        which builds a base ``DispatchContext`` lacking the
+        ``dispatch_indices`` / ``router_coeff`` / ``gathered_shape`` / ``oep_size``
+        fields that ``DeredundencyTokenDispatcher.combine`` reads — raising
+        ``AttributeError``.  After routing ``_token_dispatch`` through
+        ``self._token_dispatcher``, the produced context is a
+        ``DeredundencyDispatchContext`` and combine consumes it cleanly.
+        """
+        self._configure_platform(mock_platform)
+        ep = ExpertParallel(token_dispatcher="deredundency")
+        module = _make_mock_module(num_experts=4, dim=self.dim)
+
+        dispatch_out = ep._token_dispatch(
+            module=module,
+            inputs=(self.routed_input, self.num_tokens_per_expert_in),
+            device_mesh=self.mock_mesh,
+        )
+        # No permuted_probs path for deredundency → 2-tuple (permuted, counts).
+        self.assertEqual(len(dispatch_out), 2)
+        permuted = dispatch_out[0]
+        # Context stored on the module must be the deredundency subtype, so
+        # combine can read its extra fields.
+        self.assertIsInstance(module._ep_dispatch_ctx, DeredundencyDispatchContext)
+
+        combined = ep._token_combine(
+            module=module,
+            routed_output=permuted,
+            device_mesh=self.mock_mesh,
+        )
+        self.assertEqual(combined.shape, (self.total_tokens, self.dim))
+        self.assertTrue(torch.allclose(combined, self.routed_input, atol=1e-6))
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_deredundency_inputs2_is_router_coeff_not_permuted_probs(self, mock_platform):
+        """The third input is router_coeff (combine weighting), not permuted_probs.
+
+        Unlike ``AllToAllTokenDispatcher.dispatch`` — which returns a 4-tuple
+        ``(permuted, counts, permuted_probs, ctx)`` when a third input is given —
+        deredundency always returns a 3-tuple: the third input is consumed as
+        ``router_coeff`` and stored on the context for the combine step, never
+        handed back for in-expert weighting.  This pins the documented
+        incompatibility with ``score_before_experts=False``.
+        """
+        self._configure_platform(mock_platform)
+        router_coeff = torch.arange(self.total_tokens, dtype=torch.float32)
+        dispatch_out = DeredundencyTokenDispatcher.dispatch(
+            module=None,
+            inputs=(self.routed_input, self.num_tokens_per_expert_in, router_coeff),
+            device_mesh=self.mock_mesh,
+        )
+        # 3-tuple, not 4 — router_coeff is NOT returned as permuted_probs.
+        self.assertEqual(len(dispatch_out), 3)
+        ctx = dispatch_out[2]
+        # router_coeff lands on the context for combine, unchanged by identity a2a.
+        self.assertTrue(torch.equal(ctx.router_coeff, router_coeff))
+        # And it is not surfaced back to the caller (no 4th element).
+        self.assertFalse(hasattr(ctx, "probs_input_shape") and ctx.probs_input_shape)
+
 
 # ---------------------------------------------------------------------------
 # C3: TensorParallel._partition_fn (mocked DTensor helpers)
@@ -1317,7 +1380,7 @@ class TestExpertTensorParallelPartition(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# C5: AsyncHandle (from platform), combine_start/combine_wait, score_before_experts guard
+# C5: AsyncHandle (from platform), combine_start/combine_wait, permuted_probs dispatch
 # ---------------------------------------------------------------------------
 
 class TestAsyncHandle(unittest.TestCase):
@@ -1573,123 +1636,318 @@ class TestExpertParallelAsyncCombine(unittest.TestCase):
         self.assertFalse(hasattr(self.module, "_ep_combine_handle"))
 
 
-@unittest.skip("Not yet supported: score_before_experts guard")
-class TestScoreBeforeExpertsGuard(unittest.TestCase):
-    """Unit tests for score_before_experts=False rejection with EP (review fix)."""
+class TestPermutedProbsDispatch(unittest.TestCase):
+    """Unit tests for optional ``permuted_probs`` (third input) on the dispatch path.
 
-    def test_ep_rejects_score_after_dispatch(self):
+    The PR replaced the old ``score_before_experts`` guard — which rejected a
+    third positional input when ``ep_size > 1`` — with first-class support for
+    ``permuted_probs``: a 1-D tensor of routing weights that is exchanged via a
+    second differentiable all-to-all and reordered rank-major → expert-major
+    alongside the tokens.  These tests pin the new contract.
+    """
+
+    def setUp(self) -> None:
+        """Set up common dispatch parameters for EP tests."""
+        self.ep_size = 2
+        self.num_local_experts = 2
+        self.dim = 8
+        self.counts_out = torch.tensor([3, 2, 1, 4])
+        self.total_tokens = int(self.counts_out.sum())  # 10
+        self.num_tokens_per_expert_in = torch.tensor([3, 2, 1, 4])
+        self.routed_input = torch.randn(self.total_tokens, self.dim)
+        # permuted_probs is a 1-D weight per token, matching total_tokens.
+        self.permuted_probs = torch.randn(self.total_tokens)
+        self.mock_mesh = _make_mock_device_mesh(self.ep_size)
+        self.module = _make_mock_module()
+
+    def _configure_platform(self, mock_platform):
+        """Set up the platform mock for dispatch with identity all-to-all."""
+        mock_platform.all_to_all_single.return_value = (self.counts_out, None)
+        mock_platform.differentiable_all_to_all_single.side_effect = (
+            lambda inp, *_args, **_kw: inp
+        )
+        mock_platform.arange.side_effect = torch.arange
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_ep_dispatch_returns_probs_when_provided(self, mock_platform):
         """
-        Feature: EP rejects score_before_experts=False (OV-04 / review xuxinglei3)
-        Description: When EP size > 1 and scores are provided as input[2],
-            _token_dispatch must raise ValueError.
-        Expectation: ValueError with message about score_before_experts.
+        Feature: ExpertParallel._token_dispatch returns permuted_probs
+        Description: When a third input (permuted_probs) is provided, dispatch
+            returns a 3-tuple (permuted_x, local_counts, permuted_probs) instead
+            of the 2-tuple returned when it is absent.
+        Expectation: result is a 3-tuple whose last element is a 1-D tensor of
+            length total_tokens.
         """
+        self._configure_platform(mock_platform)
         ep = ExpertParallel()
-        mock_mesh = _make_mock_device_mesh(ep_size=2)
-        module = _make_mock_module()
-        scores = torch.randn(10, 4)
+        result = ep._token_dispatch(
+            self.module,
+            (self.routed_input, self.num_tokens_per_expert_in, self.permuted_probs),
+            self.mock_mesh,
+        )
+        self.assertEqual(len(result), 3, f"expected 3-tuple, got len={len(result)}")
+        permuted_x, local_counts, permuted_probs = result
+        self.assertEqual(
+            permuted_x.shape, (self.total_tokens, self.dim),
+            f"permuted_x.shape={permuted_x.shape}, "
+            f"expected ({self.total_tokens}, {self.dim})"
+        )
+        self.assertEqual(
+            local_counts.shape, (self.num_local_experts,),
+            f"local_counts.shape={local_counts.shape}, "
+            f"expected ({self.num_local_experts},)"
+        )
+        self.assertEqual(
+            permuted_probs.dim(), 1,
+            f"permuted_probs should be 1-D, got dim={permuted_probs.dim()}"
+        )
+        self.assertEqual(
+            permuted_probs.shape[0], self.total_tokens,
+            f"permuted_probs len={permuted_probs.shape[0]}, "
+            f"expected {self.total_tokens}"
+        )
 
-        with self.assertRaisesRegex(ValueError, "score_before_experts"):
-            ep._token_dispatch(
-                module,
-                (torch.randn(10, 8), torch.tensor([3, 2, 1, 4]), scores),
-                mock_mesh,
-            )
-
-    def test_ep_allows_no_scores(self):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_ep_dispatch_omits_probs_when_absent(self, mock_platform):
         """
-        Feature: EP allows inputs without scores
-        Description: When inputs has only 2 elements (no scores), dispatch proceeds.
-        Expectation: no exception raised.
+        Feature: ExpertParallel._token_dispatch without permuted_probs
+        Description: When only (routed_input, num_tokens_per_expert) is given,
+            dispatch returns the original 2-tuple (permuted_x, local_counts).
+        Expectation: result is a 2-tuple.
         """
+        self._configure_platform(mock_platform)
         ep = ExpertParallel()
-        mock_mesh = _make_mock_device_mesh(ep_size=2)
-        module = _make_mock_module()
+        result = ep._token_dispatch(
+            self.module,
+            (self.routed_input, self.num_tokens_per_expert_in),
+            self.mock_mesh,
+        )
+        self.assertEqual(len(result), 2, f"expected 2-tuple, got len={len(result)}")
+        permuted_x, local_counts = result
+        self.assertEqual(
+            permuted_x.shape, (self.total_tokens, self.dim),
+            f"permuted_x.shape={permuted_x.shape}, "
+            f"expected ({self.total_tokens}, {self.dim})"
+        )
+        self.assertEqual(
+            local_counts.shape, (self.num_local_experts,),
+            f"local_counts.shape={local_counts.shape}, "
+            f"expected ({self.num_local_experts},)"
+        )
 
-        with patch("hyper_parallel.core.expert_parallel.expert_parallel.platform") as mock_plat:
-            counts_out = torch.tensor([3, 2, 1, 4])
-            mock_plat.all_to_all_single.return_value = (counts_out, None)
-            mock_plat.differentiable_all_to_all_single.side_effect = (
-                lambda inp, *_args, **_kw: inp
-            )
-            mock_plat.arange.side_effect = torch.arange
-
-            # Only 2 inputs — no scores, should succeed
-            ep._token_dispatch(
-                module,
-                (torch.randn(10, 8), torch.tensor([3, 2, 1, 4])),
-                mock_mesh,
-            )
-
-    def test_ep_allows_none_scores(self):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_ep_dispatch_none_probs_falls_back_to_two_tuple(self, mock_platform):
         """
-        Feature: EP allows inputs with None scores
-        Description: When inputs[2] is None, dispatch proceeds normally.
-        Expectation: no exception raised.
+        Feature: None permuted_probs is treated as absent
+        Description: Passing permuted_probs=None must behave like the 2-input
+            path (regression cover for the old None-scores allowance).
+        Expectation: dispatch returns a 2-tuple and does not call the second
+            all-to-all for probs.
         """
+        self._configure_platform(mock_platform)
         ep = ExpertParallel()
-        mock_mesh = _make_mock_device_mesh(ep_size=2)
-        module = _make_mock_module()
+        result = ep._token_dispatch(
+            self.module,
+            (self.routed_input, self.num_tokens_per_expert_in, None),
+            self.mock_mesh,
+        )
+        self.assertEqual(len(result), 2, f"expected 2-tuple, got len={len(result)}")
+        # Only the token-exchange a2a fires; the probs a2a must be skipped.
+        self.assertEqual(
+            mock_platform.differentiable_all_to_all_single.call_count, 1,
+            "probs all-to-all must not fire when permuted_probs is None"
+        )
 
-        with patch("hyper_parallel.core.expert_parallel.expert_parallel.platform") as mock_plat:
-            counts_out = torch.tensor([3, 2, 1, 4])
-            mock_plat.all_to_all_single.return_value = (counts_out, None)
-            mock_plat.differentiable_all_to_all_single.side_effect = (
-                lambda inp, *_args, **_kw: inp
-            )
-            mock_plat.arange.side_effect = torch.arange
-
-            ep._token_dispatch(
-                module,
-                (torch.randn(10, 8), torch.tensor([3, 2, 1, 4]), None),
-                mock_mesh,
-            )
-
-    def test_ep_size_1_allows_scores(self):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_ep_probs_exchanged_via_second_differentiable_a2a(self, mock_platform):
         """
-        Feature: EP size=1 allows scores (no cross-rank reordering)
-        Description: When ep_size=1, no all-to-all reordering occurs so scores
-            remain valid. Dispatch should not raise.
-        Expectation: no exception raised.
+        Feature: permuted_probs uses a differentiable all-to-all
+        Description: When permuted_probs is provided, the dispatch path issues a
+            second differentiable_all_to_all_single (once for tokens, once for
+            probs), both using the same input/output splits.
+        Expectation: differentiable_all_to_all_single called exactly twice;
+            the second call's input is the permuted_probs tensor.
         """
+        self._configure_platform(mock_platform)
         ep = ExpertParallel()
-        mock_mesh = _make_mock_device_mesh(ep_size=1)
-        module = _make_mock_module()
-        scores = torch.randn(10, 4)
+        ep._token_dispatch(
+            self.module,
+            (self.routed_input, self.num_tokens_per_expert_in, self.permuted_probs),
+            self.mock_mesh,
+        )
+        self.assertEqual(
+            mock_platform.differentiable_all_to_all_single.call_count, 2,
+            "expected token + probs all-to-all (2 calls)"
+        )
+        # Second a2a call carries permuted_probs as its input (first positional arg).
+        probs_call = mock_platform.differentiable_all_to_all_single.call_args_list[1]
+        self.assertIs(
+            probs_call.args[0], self.permuted_probs,
+            "second differentiable_all_to_all_single should exchange permuted_probs"
+        )
+        # Same splits as the token exchange: (input_splits, output_splits) = ([5,5],[5,5]).
+        self.assertEqual(
+            probs_call.args[1], [5, 5],
+            f"probs input_splits={probs_call.args[1]}, expected [5, 5]"
+        )
+        self.assertEqual(
+            probs_call.args[2], [5, 5],
+            f"probs output_splits={probs_call.args[2]}, expected [5, 5]"
+        )
 
-        with patch("hyper_parallel.core.expert_parallel.expert_parallel.platform") as mock_plat:
-            counts_out = torch.tensor([3, 2, 1, 4])
-            mock_plat.all_to_all_single.return_value = (counts_out, None)
-            mock_plat.differentiable_all_to_all_single.side_effect = (
-                lambda inp, *_args, **_kw: inp
-            )
-            mock_plat.arange.side_effect = torch.arange
-
-            ep._token_dispatch(
-                module,
-                (torch.randn(10, 8), torch.tensor([3, 2, 1, 4]), scores),
-                mock_mesh,
-            )
-
-    def test_etp_rejects_score_after_dispatch(self):
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_ep_probs_reordered_to_expert_major(self, mock_platform):
         """
-        Feature: ExpertTensorParallel also rejects score_before_experts=False
-        Description: Same guard as ExpertParallel but using the EP sub-mesh size.
-        Expectation: ValueError with message about score_before_experts.
+        Feature: permuted_probs reordered rank-major → expert-major
+        Description: With identity all-to-all, dispatched_probs == permuted_probs
+            in rank-major order; the returned permuted_probs must be the same
+            expert-major permutation of those weights that _permute applies to
+            the tokens (so weights stay aligned with their tokens).
+        Expectation: returned permuted_probs[i] == permuted_probs[token_perm_idx[i]]
+            for every i, where token_perm_idx is the indices _permute produces
+            for the tokens.
         """
+        self._configure_platform(mock_platform)
+        ep = ExpertParallel()
+        _, _, permuted_probs = ep._token_dispatch(
+            self.module,
+            (self.routed_input, self.num_tokens_per_expert_in, self.permuted_probs),
+            self.mock_mesh,
+        )
+        # Reference: the expert-major permutation the dispatcher applies to tokens.
+        _, _, token_perm_idx, _ = _permute(
+            self.routed_input, self.counts_out, self.ep_size, self.num_local_experts
+        )
+        expected = self.permuted_probs[token_perm_idx]
+        self.assertTrue(
+            torch.equal(permuted_probs, expected),
+            "permuted_probs must track the same expert-major permutation as tokens"
+        )
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_ep_ctx_stores_probs_input_shape_when_provided(self, mock_platform):
+        """
+        Feature: DispatchContext.probs_input_shape set on the probs path
+        Description: When permuted_probs is provided, the stored dispatch context
+            carries probs_input_shape (the pre-permutation shape of the exchanged
+            probs) for the combine step; it is None on the no-probs path.
+        Expectation: ctx.probs_input_shape == (total_tokens,) with probs,
+            None without.
+        """
+        self._configure_platform(mock_platform)
+        ep = ExpertParallel()
+
+        # With probs -> probs_input_shape populated.
+        ep._token_dispatch(
+            self.module,
+            (self.routed_input, self.num_tokens_per_expert_in, self.permuted_probs),
+            self.mock_mesh,
+        )
+        ctx_with = self.module._ep_dispatch_ctx
+        self.assertEqual(
+            ctx_with.probs_input_shape, (self.total_tokens,),
+            f"probs_input_shape={ctx_with.probs_input_shape}, "
+            f"expected ({self.total_tokens},)"
+        )
+
+        # Without probs -> probs_input_shape stays None.
+        module2 = _make_mock_module()
+        ep._token_dispatch(
+            module2,
+            (self.routed_input, self.num_tokens_per_expert_in),
+            self.mock_mesh,
+        )
+        self.assertIsNone(
+            module2._ep_dispatch_ctx.probs_input_shape,
+            "probs_input_shape should be None when permuted_probs is absent"
+        )
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_etp_dispatch_returns_probs_via_ep_submesh(self, mock_platform):
+        """
+        Feature: ExpertTensorParallel._token_dispatch propagates permuted_probs
+        Description: ETP delegates to AllToAllTokenDispatcher via the EP
+            sub-mesh; it must surface the third return value just like
+            ExpertParallel (replaces the old score_after_dispatch rejection).
+        Expectation: dispatch returns a 3-tuple; ["ep"] is used for the exchange.
+        """
+        self._configure_platform(mock_platform)
         etp = ExpertTensorParallel()
-        ep_submesh = _make_mock_device_mesh(ep_size=2)
+
+        ep_submesh = _make_mock_device_mesh(self.ep_size)
         full_mesh = MagicMock()
         full_mesh.__getitem__ = MagicMock(return_value=ep_submesh)
-        module = _make_mock_module()
-        scores = torch.randn(10, 4)
 
-        with self.assertRaisesRegex(ValueError, "score_before_experts"):
-            etp._token_dispatch(
-                module,
-                (torch.randn(10, 8), torch.tensor([3, 2, 1, 4]), scores),
-                full_mesh,
-            )
+        module = _make_mock_module()
+        result = etp._token_dispatch(
+            module,
+            (self.routed_input, self.num_tokens_per_expert_in, self.permuted_probs),
+            full_mesh,
+        )
+        self.assertEqual(len(result), 3, f"expected 3-tuple, got len={len(result)}")
+        permuted_x, local_counts, permuted_probs = result
+        self.assertEqual(
+            permuted_x.shape, (self.total_tokens, self.dim),
+            f"permuted_x.shape={permuted_x.shape}, "
+            f"expected ({self.total_tokens}, {self.dim})"
+        )
+        self.assertEqual(
+            local_counts.shape, (self.num_local_experts,),
+            f"local_counts.shape={local_counts.shape}, "
+            f"expected ({self.num_local_experts},)"
+        )
+        self.assertEqual(
+            permuted_probs.shape[0], self.total_tokens,
+            f"permuted_probs len={permuted_probs.shape[0]}, "
+            f"expected {self.total_tokens}"
+        )
+        full_mesh.__getitem__.assert_called_once_with("ep")
+
+    @patch("hyper_parallel.core.expert_parallel.expert_parallel.platform")
+    def test_dispatcher_standalone_returns_four_tuple_with_probs(self, mock_platform):
+        """
+        Feature: AllToAllTokenDispatcher.dispatch direct return with probs
+        Description: The static dispatcher returns a 4-tuple
+            (permuted, local_counts, permuted_probs, ctx) when permuted_probs is
+            provided, and a 3-tuple (permuted, local_counts, ctx) without it.
+        Expectation: lengths 4 and 3 respectively; last element is a
+            DispatchContext with probs_input_shape populated only on the
+            probs path.
+        """
+        self._configure_platform(mock_platform)
+
+        # With probs -> 4-tuple.
+        result = AllToAllTokenDispatcher.dispatch(
+            module=None,
+            inputs=(self.routed_input, self.num_tokens_per_expert_in, self.permuted_probs),
+            device_mesh=self.mock_mesh,
+        )
+        self.assertEqual(len(result), 4, f"expected 4-tuple, got len={len(result)}")
+        permuted, local_counts, permuted_probs, ctx = result
+        self.assertIsInstance(ctx, DispatchContext)
+        self.assertEqual(
+            ctx.probs_input_shape, (self.total_tokens,),
+            f"probs_input_shape={ctx.probs_input_shape}, "
+            f"expected ({self.total_tokens},)"
+        )
+        self.assertEqual(
+            permuted_probs.shape[0], self.total_tokens,
+            f"permuted_probs len={permuted_probs.shape[0]}, "
+            f"expected {self.total_tokens}"
+        )
+
+        # Without probs -> 3-tuple, ctx.probs_input_shape is None.
+        result2 = AllToAllTokenDispatcher.dispatch(
+            module=None,
+            inputs=(self.routed_input, self.num_tokens_per_expert_in),
+            device_mesh=self.mock_mesh,
+        )
+        self.assertEqual(len(result2), 3, f"expected 3-tuple, got len={len(result2)}")
+        _, _, ctx2 = result2
+        self.assertIsNone(
+            ctx2.probs_input_shape,
+            "probs_input_shape should be None when permuted_probs is absent"
+        )
 
 
 if __name__ == "__main__":

@@ -222,6 +222,7 @@ class DispatchContext:
     output_splits: List[int]
     input_shape: Tuple[int, ...]
     permuted_indices: Any
+    probs_input_shape: Optional[Tuple[int, ...]] = None
 
 
 @dataclass
@@ -503,19 +504,24 @@ class AllToAllTokenDispatcher:
 
         Args:
             module: The ``GroupedExperts`` module.
-            inputs: Tuple ``(routed_input, num_tokens_per_expert)`` where
-                ``routed_input`` has shape ``[total_tokens, dim]`` and
-                ``num_tokens_per_expert`` has shape ``[num_experts]``.
+            inputs: Tuple ``(routed_input, num_tokens_per_expert)`` or
+              ``(routed_input, num_tokens_per_expert, permuted_probs)`` where
+                ``routed_input`` has shape ``[total_tokens, dim]``, and
+                ``num_tokens_per_expert`` has shape ``[num_experts]``, and
+                ``permuted_probs`` has shape ``[total_tokens]``.
             device_mesh: EP device mesh (1-D).
 
         Returns:
-            Tuple ``(permuted_local_input, local_token_counts, ctx)`` —
+            Tuple ``(permuted_local_input, local_token_counts, ctx)`` or 
+            ``(permuted_local_input, local_token_counts, permuted_probs, ctx)``
+            depending on whether *permuted_probs* was provided - 
             the first two elements are the transformed inputs for local
             expert computation; *ctx* is a :class:`DispatchContext`
             carrying the updated state to be stored by the caller.
         """
         del module  # module unused, kept for API consistency
         routed_input, num_tokens_per_expert = inputs[0], inputs[1]
+        permuted_probs = inputs[2] if len(inputs) > 2 else None
         ep_group = device_mesh.get_group()
         ep_size = device_mesh.size()
         num_local_experts = num_tokens_per_expert.shape[0] // ep_size
@@ -548,14 +554,24 @@ class AllToAllTokenDispatcher:
         input_splits = num_tokens_per_expert.view(ep_size, num_local_experts).sum(dim=1).tolist()
         output_splits = counts_out.view(ep_size, num_local_experts).sum(dim=1).tolist()
 
-        # --- Step 3: exchange actual tokens (differentiable) ---
+        # --- Step 3a: exchange actual tokens (differentiable) ---
         dispatched = platform.differentiable_all_to_all_single(
             routed_input, input_splits, output_splits, group=ep_group,
         )
 
-        # --- Step 4: rank-major → expert-major permutation ---
+        # --- Step 4a: rank-major → expert-major permutation ---
         input_shape, permuted, permuted_indices, local_counts = _permute(
             dispatched, counts_out, ep_size, num_local_experts
+        )
+
+        # Steps 3b + 4b: exchange and reorder permuted_probs (when provided)
+        # alongside the tokens, keeping weights aligned with the expert-major
+        # token order. Extracted so dispatch stays under the Lizard NLOC cap.
+        probs_input_shape, permuted_probs_reordered = (
+            AllToAllTokenDispatcher._exchange_and_reorder_probs(
+                permuted_probs, input_splits, output_splits,
+                counts_out, ep_size, num_local_experts, ep_group,
+            )
         )
 
         # Build dispatch context for combine step.
@@ -567,9 +583,32 @@ class AllToAllTokenDispatcher:
             output_splits=output_splits,
             input_shape=input_shape,
             permuted_indices=permuted_indices,
+            probs_input_shape=probs_input_shape,
         )
 
+        if permuted_probs is not None:
+            return permuted, local_counts, permuted_probs_reordered, ctx
         return permuted, local_counts, ctx
+
+    @staticmethod
+    def _exchange_and_reorder_probs(permuted_probs, input_splits, output_splits,
+                                    counts_out, ep_size, num_local_experts, ep_group):
+        """Exchange ``permuted_probs`` via a2a and reorder to expert-major.
+
+        Returns ``(probs_input_shape, permuted_probs_reordered)``; both are
+        ``None`` when *permuted_probs* is ``None`` (no-op, no second a2a).
+        """
+        if permuted_probs is None:
+            return None, None
+        # --- Step 3b: exchange permuted_probs via all-to-all (differentiable) ---
+        dispatched_probs = platform.differentiable_all_to_all_single(
+            permuted_probs, input_splits, output_splits, group=ep_group,
+        )
+        # --- Step 4b: rank-major → expert-major permutation for probs ---
+        probs_input_shape, permuted_probs_reordered, _, _ = _permute(
+            dispatched_probs, counts_out, ep_size, num_local_experts
+        )
+        return probs_input_shape, permuted_probs_reordered
 
     @staticmethod
     def combine(module: Module, routed_output: object, device_mesh: DeviceMesh, ctx: DispatchContext) -> object:
@@ -741,18 +780,38 @@ class DeredundencyTokenDispatcher:
 
         Args:
             module: The ``GroupedExperts`` module (unused here).
-            inputs: Tuple ``(routed_input, num_tokens_per_expert)`` where
-                ``routed_input`` has shape ``[total_tokens, dim]`` and
-                ``num_tokens_per_expert`` has shape ``[num_experts]``.
+            inputs: Tuple ``(routed_input, num_tokens_per_expert)`` or
+                ``(routed_input, num_tokens_per_expert, router_coeff)`` where
+                ``routed_input`` has shape ``[total_tokens, dim]``,
+                ``num_tokens_per_expert`` has shape ``[num_experts]``, and
+                ``router_coeff`` is an optional 1-D tensor of shape
+                ``[total_tokens]``.
             device_mesh: 1-D EP mesh or 2-D ``[oep, iep]`` EP mesh.
 
         Returns:
             Tuple ``(permuted_local_input, local_token_counts, ctx)`` with the
-            same meaning as :meth:`AllToAllTokenDispatcher.dispatch`.
+            same meaning as :meth:`AllToAllTokenDispatcher.dispatch`.  Unlike
+            :meth:`AllToAllTokenDispatcher.dispatch`, this always returns a
+            3-tuple — ``router_coeff`` (when provided) is consumed by the
+            combine step, not returned for in-expert weighting.
 
         Raises:
             ValueError: If the expert count is not divisible by the full EP
                 size represented by the deredundency mesh.
+
+        Note:
+            The third input is **router_coeff**, *not* ``permuted_probs``.
+            Both occupy ``inputs[2]`` with shape ``[total_tokens]`` but differ:
+            ``permuted_probs`` (:class:`AllToAllTokenDispatcher`) is exchanged
+            with tokens and applied **inside** experts (pre-w2 activation,
+            i.e. ``score_before_experts=False``); ``router_coeff`` (here) is
+            OEP-gathered, scattered with tokens, and applied in
+            :meth:`combine` to the expert **final output**.  The w2/SiLU
+            nonlinearity makes the two mathematically distinct, so
+            deredundency does **not** support ``score_before_experts=False``
+            — passing scores as ``inputs[2]`` would be silently treated as
+            ``router_coeff``.  Use ``score_before_experts=True`` until
+            deredundency's weighting is redesigned.
         """
         del module
         routed_input, num_tokens_per_expert = inputs[0], inputs[1]
@@ -785,29 +844,21 @@ class DeredundencyTokenDispatcher:
             mesh_info.iep_size,
             num_local_experts,
         )
-        iep_input_splits = node_counts_per_expert.view(mesh_info.iep_size, num_local_experts).sum(dim=1).tolist()
-
-        iep_counts_out, handle = platform.all_to_all_single(
-            node_counts_per_expert,
-            output_shape=[node_counts_per_expert.shape[0]],
-            group=mesh_info.iep_group,
-            async_op=True,
+        iep_input_splits = node_counts_per_expert.view(
+            mesh_info.iep_size, num_local_experts).sum(dim=1).tolist()
+        iep_counts_out, iep_output_splits = (
+            DeredundencyTokenDispatcher._iep_exchange_counts(
+                node_counts_per_expert, mesh_info, num_local_experts,
+            )
         )
-        if handle is not None:
-            handle.wait()
-        iep_output_splits = iep_counts_out.view(mesh_info.iep_size, num_local_experts).sum(dim=1).tolist()
-
         outer_routed_input = gathered_routed[dispatch_indices]
         outer_router_coeff = (
             None if gathered_router_coeff is None else gathered_router_coeff[dispatch_indices]
         )
         dispatched = platform.differentiable_all_to_all_single(
-            outer_routed_input,
-            iep_input_splits,
-            iep_output_splits,
+            outer_routed_input, iep_input_splits, iep_output_splits,
             group=mesh_info.iep_group,
         )
-
         input_shape, permuted, permuted_indices, local_counts = _permute(
             dispatched, iep_counts_out, mesh_info.iep_size, num_local_experts,
         )
@@ -822,6 +873,20 @@ class DeredundencyTokenDispatcher:
             oep_size=mesh_info.oep_size,
         )
         return permuted, local_counts, ctx
+
+    @staticmethod
+    def _iep_exchange_counts(node_counts_per_expert, mesh_info, num_local_experts):
+        """IEP all-to-all of per-expert counts; return (counts_out, output_splits)."""
+        iep_counts_out, handle = platform.all_to_all_single(
+            node_counts_per_expert,
+            output_shape=[node_counts_per_expert.shape[0]],
+            group=mesh_info.iep_group, async_op=True,
+        )
+        if handle is not None:
+            handle.wait()
+        iep_output_splits = iep_counts_out.view(
+            mesh_info.iep_size, num_local_experts).sum(dim=1).tolist()
+        return iep_counts_out, iep_output_splits
 
     @staticmethod
     def combine(module: Module, routed_output: object, device_mesh: DeviceMesh,
@@ -1024,43 +1089,29 @@ class ExpertParallel(BaseExpertParallel):
 
         Args:
             module: The ``GroupedExperts`` module.
-            inputs: Tuple ``(routed_input, num_tokens_per_expert)`` or
-                ``(routed_input, num_tokens_per_expert, scores)``.
+            inputs: Tuple ``(routed_input, num_tokens_per_expert)`` or 
+                ``(routed_input, num_tokens_per_expert, routed_probs)``.
             device_mesh: EP device mesh (1-D).
 
         Returns:
-            Tuple ``(permuted_local_input, local_token_counts)``.
-
-        Raises:
-            ValueError: If ``score_before_experts=False`` (scores passed as
-                a positional argument) and EP degree > 1.  After dispatch,
-                the token order changes but scores remain in the pre-dispatch
-                order, causing a silent correctness bug.
+            Tuple ``(permuted_local_input, local_token_counts)`` or 
+            ``(permuted_local_input, local_token_counts, permuted_probs)``
+            depending on whether *routed_probs* was provided.
         """
-        ep_size = device_mesh.size()
-        # When EP reorders tokens across ranks, scores (if provided) would
-        # no longer align with the dispatched token order.  The caller must
-        # use score_before_experts=True so that scores are multiplied in
-        # before dispatch.
-        if ep_size > 1 and len(inputs) > 2 and inputs[2] is not None:
-            raise ValueError(
-                "ExpertParallel does not support score_before_experts=False "
-                "when ep_size > 1.  After all-to-all dispatch the token order "
-                "changes but scores remain in the pre-dispatch order, causing "
-                "incorrect routing weights.  Set score_before_experts=True in "
-                "MoE so that scores are multiplied before dispatch."
-            )
-
-        permuted, local_counts, ctx = (
-            self._token_dispatcher.dispatch(module, inputs, device_mesh)
-        )
+        # Delegate to the configured dispatcher (all_to_all or deredundency).
+        # Hard-coding AllToAllTokenDispatcher here would mismatch _token_combine
+        # (which uses self._token_dispatcher) and break deredundency.
+        dispatch_result = self._token_dispatcher.dispatch(module, inputs, device_mesh)
+        ctx = dispatch_result[-1]
         # Store context in module attribute for _token_combine to read.
         # Using module attribute ensures each module has its own context,
         # solving the instance sharing problem when the same ExpertParallel
         # style object is applied to multiple GroupedExperts modules.
         # pylint: disable=W0212
         module._ep_dispatch_ctx = ctx
-        return permuted, local_counts
+        # dispatch_result is either (permuted, local_counts, ctx) or
+        # (permuted, local_counts, permuted_probs, ctx); return all but ctx.
+        return dispatch_result[:-1]
 
     def _token_combine(self, module: Module, routed_output, device_mesh: DeviceMesh):
         """Gather expert outputs back to the originating ranks via all-to-all.
@@ -1266,36 +1317,30 @@ class ExpertTensorParallel(ExpertParallel):
 
         Args:
             module: The ``GroupedExperts`` module.
-            inputs: Forward inputs tuple.
+            inputs: Tuple ``(routed_input, num_tokens_per_expert)`` or
+                ``(routed_input, num_tokens_per_expert, routed_probs)``.
             device_mesh: 2-D device mesh with dims ``("ep", "tp")``.
 
         Returns:
-            Transformed inputs for local expert computation.\
-
-        Raises:
-            ValueError: If ``score_before_experts=False`` and EP degree > 1.
+            Tuple ``(permuted_local_input, local_token_counts)`` or
+            ``(permuted_local_input, local_token_counts, permuted_probs)``
+            depending on whether *routed_probs* was provided.
         """
-        ep_mesh = device_mesh["ep"]
-        # Same score_before_experts check as ExpertParallel, but using
-        # the EP sub-mesh size.
-        ep_size = ep_mesh.size()
-        if ep_size > 1 and len(inputs) > 2 and inputs[2] is not None:
-            raise ValueError(
-                "ExpertTensorParallel does not support score_before_experts=False "
-                "when ep_size > 1.  After all-to-all dispatch the token order "
-                "changes but scores remain in the pre-dispatch order, causing "
-                "incorrect routing weights.  Set score_before_experts=True in "
-                "MoE so that scores are multiplied before dispatch."
-            )
-
         dispatch_mesh = self._dispatch_mesh(device_mesh)
-        permuted, local_counts, ctx = (
-            self._token_dispatcher.dispatch(module, inputs, dispatch_mesh)
-        )
+        # Gate: _dispatch_mesh raises NotImplementedError for deredundency,
+        # keeping dispatch/combine symmetric (both reject deredundency).
+        dispatch_result = self._token_dispatcher.dispatch(module, inputs, dispatch_mesh)
+        ctx = dispatch_result[-1]
+        # Store context in module attribute for _token_combine to read.
+        # Using module attribute ensures each module has its own context,
+        # solving the instance sharing problem when the same ExpertParallel
+        # style object is applied to multiple GroupedExperts modules.
         # pylint: disable=W0212
         # Store context in module attribute for _token_combine to read.
         module._ep_dispatch_ctx = ctx
-        return permuted, local_counts
+        # dispatch_result is either (permuted, local_counts, ctx) or
+        # (permuted, local_counts, permuted_probs, ctx); return all but ctx.
+        return dispatch_result[:-1]
 
     def _token_combine(self, module: Module, routed_output, device_mesh: DeviceMesh):
         """Combine tokens using only the EP sub-mesh.
