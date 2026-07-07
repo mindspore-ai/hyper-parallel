@@ -1,0 +1,43 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Launch MindSpore fully_shard replicate_params ST."""
+import os
+
+import pytest
+
+from tests.common.mark_utils import arg_mark
+from tests.common.parallel_case import MindSporeCase, parallel_run
+
+_TEST_FILE = os.path.join(os.path.dirname(__file__), "_test_fully_shard_replicate_params.py")
+
+
+@pytest.mark.skip(
+    reason="Skipped on r1.0.0: MindSpore 2.10 raises Bus error during replicate_params msrun teardown."
+)
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level0", card_mark="allcards", essential_mark="essential")
+def test_ms_fully_shard_replicate_params():
+    """
+    Feature: fully_shard replicate_params precision and TP DTensor state (MindSpore).
+    Description: Run the replicate-weights/sharded-biases precision case (with prefetch + mixed-state check)
+                 and the TP-sharded DTensor replicate-state case in separate 4-card waves.
+    Expectation: Replicate grads match the full reference, sharded grads match the shard, DTensor state stays visible.
+    """
+    for case_name in (
+        "test_ms_fully_shard_with_replicate_params",
+        "test_ms_fully_shard_replicate_dtensor_state",
+    ):
+        parallel_run([
+            MindSporeCase(_TEST_FILE, case_name, worker_num=4, local_worker_num=4),
+        ])

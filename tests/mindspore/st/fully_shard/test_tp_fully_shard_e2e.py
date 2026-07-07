@@ -49,21 +49,16 @@ def _run_tp_fully_shard_group(case_names: list[str], worker_num: int) -> None:
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_tp_plus_fully_shard_four_card_suite() -> None:
+def test_fully_shard_under_tensor_parallel() -> None:
     """
-    Feature: TP + fully_shard on 4-card meshes.
-    Description:
-        1. Basic TP + fully_shard local loss/grad parity with standalone.
-        2. TP + fully_shard fp32-reduce main_grad local loss/grad parity and optimizer-step coverage.
-        3. Same tensor dim TP + fully_shard non-dim0 sharding parity.
-        4. Empty-weight initialization and load-state path parity.
-    Expectation: 4-card cases run in parallel batches and match standalone references.
+    Feature: fully_shard composed under tensor parallel.
+    Description: Run empty-init load (also the basic case), fp32 main_grad, and non-dim0 sharding cases.
+    Expectation: Local loss and gradient shards match the standalone reference.
     """
     _run_tp_fully_shard_group([
-        "test_tp_plus_fully_shard_loss_and_grad_match_standalone",
+        "test_tp_plus_fully_shard_empty_weight_match_standalone",
         "test_tp_plus_fully_shard_fp32_main_grad_match_standalone",
         "test_tp_plus_fully_shard_same_dim_non_dim0_match_standalone",
-        "test_tp_plus_fully_shard_empty_weight_match_standalone",
     ], worker_num=4)
 
 
@@ -73,7 +68,7 @@ def test_tp_plus_fully_shard_four_card_suite() -> None:
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_tp_plus_fully_shard_mesh_none_suite() -> None:
+def test_tp_fsdp_mesh_none() -> None:
     """
     Feature: TP + fully_shard(mesh=None) compatibility mode.
     Description:
@@ -93,7 +88,7 @@ def test_tp_plus_fully_shard_mesh_none_suite() -> None:
     card_mark="allcards",
     essential_mark="essential",
 )
-def test_hsdp_plus_tp_on_3d_root_mesh_match_standalone() -> None:
+def test_hsdp_tp_on_3d_root_mesh() -> None:
     """
     Feature: HSDP + TP on a 3D root mesh.
     Description: Run a `(dp, fsdp, tp)` mixed-parallel HSDP + TP training case and compare loss/grad.

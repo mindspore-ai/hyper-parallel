@@ -28,6 +28,7 @@ from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, checkpoi
 from hyper_parallel.core.fully_shard.api import fully_shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.autograd_compat import enable_mindspore_backward_compat
+from tests.mindspore.st.fully_shard._fsdp_precision_common import assert_shard_matches_reference
 
 ms.set_seed(42)
 ms.set_deterministic(True)
@@ -190,12 +191,11 @@ def _train_fully_shard_list(mesh, enable_prefetch=False, enable_recompute=False)
     return last_loss, last_local
 
 
-def test_ms_fully_shard_list_unit_precision():
+def test_ms_fully_shard_list_unit():
     """
-    Feature: fully_shard(list) precision vs standalone MindSpore training.
-    Description: Nested ``fully_shard([d1,d2], reshard_after_forward=False)`` list unit;
-        compare final loss and ``dense1`` grad slice to a non-sharded reference.
-    Expectation: Run success on all ranks.
+    Feature: fully_shard([d1, d2], reshard_after_forward=False) numerical parity.
+    Description: Train a nested list-unit fully_shard model and compare to a non-sharded reference.
+    Expectation: Loss and dense1 gradient shard match the reference.
     """
     ms.set_context(mode=ms.PYNATIVE_MODE)
     init()
@@ -207,25 +207,19 @@ def test_ms_fully_shard_list_unit_precision():
     ref_loss, ref_g1 = _train_reference()
     dist_loss, dist_local = _train_fully_shard_list(mesh)
 
-    assert np.allclose(ref_loss, dist_loss, rtol=1e-3, atol=1e-3), (ref_loss, dist_loss)
-
-    stride = HIDDEN // shard
-    off = (rank % shard) * stride
-    expected = ref_g1[off : off + stride, :]
-    assert np.allclose(expected, dist_local, rtol=1e-3, atol=1e-3), (
-        rank,
-        expected.shape,
-        dist_local.shape,
+    case_name = "fully_shard list unit"
+    assert np.allclose(ref_loss, dist_loss, rtol=1e-3, atol=1e-3), (
+        f"{case_name}, rank {rank}, loss: expected {ref_loss}, got {dist_loss}"
     )
+    assert_shard_matches_reference(case_name, rank, "dense1 grad", ref_g1, dist_local,
+                                   shard, rank % shard, rtol=1e-3, atol=1e-3)
 
 
-def test_ms_fully_shard_list_unit_prefetch_recompute_precision():
+def test_ms_fully_shard_list_unit_with_recompute():
     """
-    Feature: fully_shard(list) prefetch + recompute precision vs standalone MindSpore training.
-    Description: Nested ``fully_shard([d1,d2], reshard_after_forward=False)`` list unit with
-        prefetch and activation recompute; compare final loss and ``dense1`` grad slice to
-        a non-sharded reference.
-    Expectation: Run success on all ranks.
+    Feature: fully_shard(list, reshard_after_forward=False) with prefetch and recompute.
+    Description: Train the list-unit model with prefetch + recompute and compare to a non-sharded reference.
+    Expectation: Loss and dense1 gradient shard match the reference.
     """
     ms.set_context(mode=ms.PYNATIVE_MODE)
     init()
@@ -239,13 +233,9 @@ def test_ms_fully_shard_list_unit_prefetch_recompute_precision():
         mesh, enable_prefetch=True, enable_recompute=True
     )
 
-    assert np.allclose(ref_loss, dist_loss, rtol=1e-3, atol=1e-3), (ref_loss, dist_loss)
-
-    stride = HIDDEN // shard
-    off = (rank % shard) * stride
-    expected = ref_g1[off : off + stride, :]
-    assert np.allclose(expected, dist_local, rtol=1e-3, atol=1e-3), (
-        rank,
-        expected.shape,
-        dist_local.shape,
+    case_name = "fully_shard list unit with recompute"
+    assert np.allclose(ref_loss, dist_loss, rtol=1e-3, atol=1e-3), (
+        f"{case_name}, rank {rank}, loss: expected {ref_loss}, got {dist_loss}"
     )
+    assert_shard_matches_reference(case_name, rank, "dense1 grad", ref_g1, dist_local,
+                                   shard, rank % shard, rtol=1e-3, atol=1e-3)
