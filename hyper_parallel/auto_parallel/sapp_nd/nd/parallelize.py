@@ -1,4 +1,4 @@
-# Copyright 2024 Huawei Technologies Co., Ltd
+# Copyright 2024-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,8 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.logger import logger
 import hyper_parallel.auto_parallel.sapp_nd.nd.dimensions as Dim
 import hyper_parallel.auto_parallel.sapp_nd.nd.common.hardware as Hard
 import hyper_parallel.auto_parallel.sapp_nd.nd.debug as Debug
+from hyper_parallel.auto_parallel.sapp_nd.nd.dimensions import validate_cp_constraints
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import detect_attention_type
 
 # logger = proc.log_to_stderr()
 # logger.setLevel(proc.SUBDEBUG)
@@ -158,6 +160,46 @@ class ParallelizeLayer:
         if self.filtered_out(parallel_config):
             logger.warning("Config manually filtered out")
             return False
+
+        if hasattr(parallel_config, 'dims_val') and Dim.CP in parallel_config.dims_val:
+            cp_degree = parallel_config.dims_val[Dim.CP]
+            if cp_degree > 1:
+                seq_len = self.config.ccfg.s
+                tp_degree = parallel_config.dims_val.get(Dim.TP, 1)
+                pp_degree = parallel_config.dims_val.get(Dim.PP, 1)
+                device_per_node = self.machine.device.intra_node_num()
+                total_devices = self.machine.number
+
+                attention_type = detect_attention_type(self.config.ccfg).name.lower()
+
+                bw_intra = self.config.ccfg.bw_intra
+                bw_inter = self.config.ccfg.bw_inter
+
+                sp_enabled = bool(parallel_config.dims_val.get(Dim.SP, False))
+
+                cp_result = validate_cp_constraints(
+                    seq_len=seq_len,
+                    cp_degree=cp_degree,
+                    tp_degree=tp_degree,
+                    pp_degree=pp_degree,
+                    device_per_node=device_per_node,
+                    attention_type_str=attention_type,
+                    bw_intra=bw_intra,
+                    bw_inter=bw_inter,
+                    total_devices=total_devices,
+                    sp_enabled=sp_enabled,
+                    cp_algo=getattr(self.config.ccfg, 'cp_algo', 'colossalai_cp'),
+                    attention_heads=self.config.ccfg.a,
+                    num_kv_heads=getattr(self.config.ccfg, 'n_kv', 0),
+                )
+
+                if not cp_result.is_valid:
+                    logger.warning("CP constraints violated: %s", cp_result.error_message)
+                    return False
+
+                if cp_result.warning_message:
+                    logger.info("CP warning: %s", cp_result.warning_message)
+
         gbs = self.config.global_batch_size(parallel_config)
         if not gbs == self.global_batch_size:
             logger.error(

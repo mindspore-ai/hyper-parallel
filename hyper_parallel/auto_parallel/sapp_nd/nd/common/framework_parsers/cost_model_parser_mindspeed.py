@@ -290,6 +290,8 @@ class CostModelParserMindspeed(_CostModelParser):
             cc.ep > 1 or cc.n_exp > 1
         )  # expert parallel comm factor
         cc.comm_cp = float(cc.cp > 1)  # context parallel comm factor
+        cc.comm_dp_overlap = 0.9  # transitional overlap, see _cost_model_variables.py
+        cc.comm_tp_overlap = 0.5  # transitional overlap, see _cost_model_variables.py
         cc.gbs = cc.b * cc.d * cc.m
         cc.n_mtp = mod.mtp_num_layers
         # Recomputation

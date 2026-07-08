@@ -14,11 +14,20 @@
 # ============================================================================
 """Unit tests for the ND search runner (_search_runner.py)."""
 import os
+import tempfile
 import unittest
+from typing import Any, Optional
 from unittest.mock import patch, MagicMock
+
+import yaml
 
 from hyper_parallel.auto_parallel.config_adapter._normalized_config import (
     NormalizedConfig,
+)
+from hyper_parallel.auto_parallel.config_adapter import _search_runner as sr
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyper import (
+    CostModelParserHyperV2,
 )
 
 
@@ -106,7 +115,6 @@ class TestValidateBeforeSearch(unittest.TestCase):
     """Tests for _validate_before_search."""
 
     def _get_runner(self):
-        import hyper_parallel.auto_parallel.config_adapter._search_runner as sr  # pylint: disable=C0415
         return sr
 
     def test_valid_config_passes(self):
@@ -136,7 +144,6 @@ class TestBuildHpYamlDict(unittest.TestCase):
     """Tests for _build_hp_yaml_dict."""
 
     def _get_runner(self):
-        import hyper_parallel.auto_parallel.config_adapter._search_runner as sr  # pylint: disable=C0415
         return sr
 
     def test_basic_structure(self):
@@ -178,19 +185,37 @@ class TestBuildHpYamlDict(unittest.TestCase):
             "full",
         )
 
+    def test_cp_algo_propagated(self):
+        """cp_algo in estimator is written to accelerator.context_parallel_algo."""
+        runner = self._get_runner()
+        config = _make_full_config()
+        config.estimator["cp_algo"] = "ulysses_cp"
+        result = runner._build_hp_yaml_dict(config)
+        self.assertEqual(
+            result["train"]["accelerator"]["context_parallel_algo"],
+            "ulysses_cp",
+        )
+
+    def test_cp_algo_absent_omitted(self):
+        """When cp_algo is absent, accelerator has no context_parallel_algo key."""
+        runner = self._get_runner()
+        config = _make_full_config()
+        config.estimator.pop("cp_algo", None)
+        result = runner._build_hp_yaml_dict(config)
+        self.assertNotIn("context_parallel_algo", result["train"]["accelerator"])
+
 
 class TestResolveSearchDimensions(unittest.TestCase):
     """Tests for _resolve_search_dimensions."""
 
     def _get_runner(self):
-        import hyper_parallel.auto_parallel.config_adapter._search_runner as sr  # pylint: disable=C0415
         return sr
 
     @patch(
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
         return_value=_make_mock_dim_module(),
     )
-    def test_list_values_returned(self, _):  # pylint: disable=W0613
+    def test_list_values_returned(self, _):
         """Dimensions with >1 candidate are included."""
         runner = self._get_runner()
         config = _make_full_config()
@@ -204,7 +229,7 @@ class TestResolveSearchDimensions(unittest.TestCase):
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
         return_value=_make_mock_dim_module(),
     )
-    def test_no_dims_returns_empty(self, _):  # pylint: disable=W0613
+    def test_no_dims_returns_empty(self, _):
         """When all dims are single-element, search list is empty."""
         runner = self._get_runner()
         config = _make_full_config()
@@ -224,7 +249,6 @@ class TestBuildMachine(unittest.TestCase):
     """Tests for _build_machine."""
 
     def _get_runner(self):
-        import hyper_parallel.auto_parallel.config_adapter._search_runner as sr  # pylint: disable=C0415
         return sr
 
     @patch(
@@ -240,7 +264,7 @@ class TestBuildMachine(unittest.TestCase):
 
         runner = self._get_runner()
         config = _make_full_config()
-        machine = runner._build_machine(config)
+        runner._build_machine(config)
         mock_hard.Machine.assert_called_with(32, "A2")
 
 
@@ -248,14 +272,13 @@ class TestFormatResult(unittest.TestCase):
     """Tests for _format_result."""
 
     def _get_runner(self):
-        import hyper_parallel.auto_parallel.config_adapter._search_runner as sr  # pylint: disable=C0415
         return sr
 
     @patch(
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
         return_value=_make_mock_dim_module(),
     )
-    def test_basic_format(self, _):  # pylint: disable=W0613
+    def test_basic_format(self, _):
         """Result dict contains expected keys."""
         runner = self._get_runner()
         entry = _make_scored_entry()
@@ -269,7 +292,7 @@ class TestFormatResult(unittest.TestCase):
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
         return_value=_make_mock_dim_module(),
     )
-    def test_dimension_values(self, _):  # pylint: disable=W0613
+    def test_dimension_values(self, _):
         """Dimension values match the entry."""
         runner = self._get_runner()
         entry = _make_scored_entry(tp=2, pp=4)
@@ -282,14 +305,13 @@ class TestPostFilter(unittest.TestCase):
     """Tests for _post_filter."""
 
     def _get_runner(self):
-        import hyper_parallel.auto_parallel.config_adapter._search_runner as sr  # pylint: disable=C0415
         return sr
 
     @patch(
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
         return_value=_make_mock_dim_module(),
     )
-    def test_all_matching_kept(self, _):  # pylint: disable=W0613
+    def test_all_matching_kept(self, _):
         """All entries within candidate list are kept."""
         runner = self._get_runner()
         config = _make_full_config()
@@ -302,7 +324,7 @@ class TestPostFilter(unittest.TestCase):
         "hyper_parallel.auto_parallel.config_adapter._search_runner._get_dim_module",
         return_value=_make_mock_dim_module(),
     )
-    def test_non_matching_removed(self, _):  # pylint: disable=W0613
+    def test_non_matching_removed(self, _):
         """Entries outside candidate list are removed."""
         runner = self._get_runner()
         config = _make_full_config()
@@ -316,7 +338,6 @@ class TestWriteTempHpYaml(unittest.TestCase):
     """Tests for _write_temp_hp_yaml."""
 
     def _get_runner(self):
-        import hyper_parallel.auto_parallel.config_adapter._search_runner as sr  # pylint: disable=C0415
         return sr
 
     def test_temp_file_created(self):
@@ -340,10 +361,8 @@ class TestSearchStrategies(unittest.TestCase):
         return_value=_make_mock_dim_module(),
     )
     @patch("hyper_parallel.auto_parallel.sapp_nd.nd.parallelize.Parallelize")
-    def test_search_strategies_returns_result(self, mock_parallelize_cls, mock_get_dim):
+    def test_search_strategies_returns_result(self, mock_parallelize_cls, _):
         """search_strategies returns a dict with expected keys."""
-        import hyper_parallel.auto_parallel.config_adapter._search_runner as sr  # pylint: disable=C0415
-
         mock_dims = MagicMock()
         mock_dims.dims_val = {
             _MOCK_DP: 2, _MOCK_TP: 2, _MOCK_PP: 2,
@@ -360,3 +379,175 @@ class TestSearchStrategies(unittest.TestCase):
         self.assertIn("tp", result)
         self.assertIn("dp", result)
         self.assertIn("memory_estimate_mb", result)
+
+
+# ── Minimal HyperV2 yaml builder ──────────────────────────────────────────
+
+def _write_minimal_hp_yaml(cp_algo=None, cp_degree=2):
+    """Write a minimal HyperV2 train.yaml and return the file path."""
+    accel = {
+        "dp_shard": 2,
+        "tp_degree": 2,
+        "context_parallel_degree": cp_degree,
+    }
+    if cp_algo is not None:
+        accel["context_parallel_algo"] = cp_algo
+
+    content = {
+        "model": {
+            "name": "test-tiny",
+            "config_overrides": {
+                "hidden_size": 256,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "intermediate_size": 512,
+                "vocab_size": 1024,
+            },
+        },
+        "train": {
+            "global_batch_size": 4,
+            "micro_batch_size": 1,
+            "accelerator": accel,
+            "gradient_checkpointing": {"activation_checkpoint": "none"},
+        },
+        "data": {"max_seq_len": 128},
+    }
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        yaml.dump(content, fh)
+    return path
+
+
+class _MinimalCcfg:
+    """Minimal ccfg that satisfies CostModelParserHyperV2 without circular imports.
+
+    Provides the attributes the parser writes to and the ``__getattr__`` fallback
+    that ``CostModelConfig`` uses for unrecognised fields.
+    """
+
+    def __init__(self, config: Any) -> None:
+        """Initialise with a Config object and sensible defaults."""
+        self.config = config
+        self.hooks_dict: dict = {}
+        self.source_code: Optional[str] = None
+
+    def __getattr__(self, attr):
+        _ = attr
+        return 0
+
+    @staticmethod
+    def fp_bytes(precision: Any) -> int:
+        """Return bytes per element for the given precision string."""
+        if "16" in str(precision):
+            return 2
+        if "32" in str(precision):
+            return 4
+        return 0
+
+
+class TestCostModelParserCpAlgoReal(unittest.TestCase):
+    """Real end-to-end tests: CostModelParserHyperV2 reads cp_algo from yaml.
+
+    These tests instantiate the real parser with a lightweight ccfg object
+    (no ``_CostModVar`` — avoids the circular-import chain in
+    ``_cost_model_variables`` → ``generate_partitions``).  They verify
+    that ``ccfg.cp_algo`` is set correctly after ``parse()``.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Bind real Config and CostModelParserHyperV2 once for all tests."""
+        cls._Config = Config
+        cls._Parser = CostModelParserHyperV2
+
+    def _parse_yaml(self, yaml_path):
+        """Parse a yaml with the real parser and return the ccfg."""
+        ccfg = _MinimalCcfg(self._Config(yaml_path))
+        self._Parser(ccfg).parse()
+        return ccfg
+
+    def test_ulysses_cp_from_yaml(self):
+        """context_parallel_algo=ulysses_cp flows through to ccfg.cp_algo."""
+        path = _write_minimal_hp_yaml(cp_algo="ulysses_cp")
+        try:
+            ccfg = self._parse_yaml(path)
+            self.assertEqual(ccfg.cp_algo, "ulysses_cp")
+        finally:
+            os.unlink(path)
+
+    def test_colossalai_cp_from_yaml(self):
+        """context_parallel_algo=colossalai_cp flows through to ccfg.cp_algo."""
+        path = _write_minimal_hp_yaml(cp_algo="colossalai_cp")
+        try:
+            ccfg = self._parse_yaml(path)
+            self.assertEqual(ccfg.cp_algo, "colossalai_cp")
+        finally:
+            os.unlink(path)
+
+    def test_default_cp_algo_when_absent(self):
+        """When context_parallel_algo is absent, ccfg.cp_algo defaults to colossalai_cp."""
+        path = _write_minimal_hp_yaml(cp_algo=None, cp_degree=2)
+        try:
+            ccfg = self._parse_yaml(path)
+            self.assertEqual(ccfg.cp_algo, "colossalai_cp")
+        finally:
+            os.unlink(path)
+
+    def test_warning_emitted_when_cp_gt_1_and_algo_absent(self):
+        """When cp>1 and context_parallel_algo is absent, a warning is logged."""
+        path = _write_minimal_hp_yaml(cp_algo=None, cp_degree=2)
+        parser_logger_name = (
+            "hyper_parallel.auto_parallel.sapp_nd.nd.common."
+            "framework_parsers.cost_model_parser_hyper"
+        )
+        try:
+            with self.assertLogs(parser_logger_name, level="WARNING") as log_ctx:
+                ccfg = self._parse_yaml(path)
+            self.assertEqual(ccfg.cp_algo, "colossalai_cp")
+            warning_text = "\n".join(log_ctx.output)
+            self.assertIn("context_parallel_algo not set", warning_text)
+            self.assertIn("ulysses_cp", warning_text)
+        finally:
+            os.unlink(path)
+
+    def test_no_warning_when_cp_is_1_and_algo_absent(self):
+        """When cp=1 and algo absent, no warning is logged (algo is moot)."""
+        path = _write_minimal_hp_yaml(cp_algo=None, cp_degree=1)
+        parser_logger_name = (
+            "hyper_parallel.auto_parallel.sapp_nd.nd.common."
+            "framework_parsers.cost_model_parser_hyper"
+        )
+        try:
+            # assertNoLogs requires Python 3.10+; use assertLogs with try/except fallback.
+            with self.assertLogs(parser_logger_name, level="WARNING") as log_ctx:
+                self._parse_yaml(path)
+            # If we get here, a warning WAS logged — fail the test.
+            self.fail(
+                "Expected no warning when cp=1, but got: "
+                + "\n".join(log_ctx.output)
+            )
+        except AssertionError as exc:
+            # assertLogs raises AssertionError("no logs of level WARNING or higher")
+            # when nothing is logged — that is the expected outcome here.
+            if "no logs" not in str(exc).lower():
+                raise
+        finally:
+            os.unlink(path)
+
+    def test_hybrid_cp_from_yaml(self):
+        """context_parallel_algo=hybrid_cp flows through to ccfg.cp_algo."""
+        path = _write_minimal_hp_yaml(cp_algo="hybrid_cp")
+        try:
+            ccfg = self._parse_yaml(path)
+            self.assertEqual(ccfg.cp_algo, "hybrid_cp")
+        finally:
+            os.unlink(path)
+
+    def test_cp_degree_one_no_warning_on_absent_algo(self):
+        """When cp=1 and no algo, default is still colossalai_cp (no warning path)."""
+        path = _write_minimal_hp_yaml(cp_algo=None, cp_degree=1)
+        try:
+            ccfg = self._parse_yaml(path)
+            self.assertEqual(ccfg.cp_algo, "colossalai_cp")
+        finally:
+            os.unlink(path)

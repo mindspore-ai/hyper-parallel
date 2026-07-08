@@ -122,6 +122,8 @@ class _CostModelParser(ABC):
             ccfg.ep > 1 or ccfg.n_exp > 1
         )  # expert parallel comm factor
         ccfg.comm_cp = float(ccfg.cp > 1)  # context parallel comm factor
+        ccfg.comm_dp_overlap = 0.9  # transitional overlap, see _cost_model_variables.py
+        ccfg.comm_tp_overlap = 0.5  # transitional overlap, see _cost_model_variables.py
 
     def config_dp_tp_exp(self, ccfg):
         """MoE strategy variables"""

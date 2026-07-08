@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.size import Memory
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 
 if TYPE_CHECKING:
-    from typing import Union
+    from typing import Any, Optional, Union
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 MAPPING_YML = os.path.join(current_dir, "framework_parsers/mapping.yaml")
@@ -61,7 +61,7 @@ class _CostModVar:
     sel_rec: Union[list, bool] = None
     pp_sched: str = None
     n_s_split: float = 0
-    cp_algo: float = 0
+    cp_algo: str = "colossalai_cp"
     rec_op: any = None
     pp_partition: list = None
 
@@ -93,7 +93,15 @@ class _CostModVar:
     n_shared_exp: float = 0
     cap_fact: float = 0
     etp: float = 0
-    tokens_per_expert: list = None  # global per-expert token count per microbatch (all EP ranks combined, before all-to-all); None = balanced
+    tokens_per_expert: list = None  # per-expert token count per mb (all EP, pre a2a); None=balanced
+
+    # CP modeling
+    kv_lora_rank: float = 0
+    attention_type: str = None
+    device_per_node: float = 8
+    bw_intra: float = 400.0
+    bw_inter: float = 25.0
+    sp_enabled: bool = False
 
     # ZeRO
     shard_p_os_non_exp_partial: float = 0
@@ -110,6 +118,20 @@ class _CostModVar:
     comm_t: float = 0
     comm_ep: float = 0
     comm_cp: float = 0
+    # Transitional comm overlap correction (see comm_time.py).
+    # Fraction of comm volume hidden behind compute, applied as
+    #   comm[dim] *= (1 - overlap_dim)
+    # Applies to both FLOP and TIME paths; the TIME path's
+    # estimate_comm_score(overlap=...) call site is zeroed so this is the
+    # single source of overlap.
+    # Defaults (dp=0.9, tp=0.5) are validated on MindFormers: they are the
+    # overlap that made the model match real MindFormers step times.  Raw
+    # volume over-counts because communication really does overlap with
+    # compute.  Re-validating for the hyper-parallel target is a follow-up.
+    # Follow-up: source from hardware profiling, then fold into
+    # estimate_comm_score (which also needs DP dedup, EP/CP terms, latency).
+    comm_dp_overlap: float = 0.9
+    comm_tp_overlap: float = 0.5
 
     # feature flag
     has_op: bool = False
@@ -142,7 +164,8 @@ class _CostModVar:
     bytes_os: float = 0
     bytes_norm: float = 0
 
-    def __init__(self, input_config, hook_cls, framework, source_code):
+    def __init__(self, input_config: Any, hook_cls: Any, framework: Optional[str], source_code: Optional[str]) -> None:
+        """Initialise from a config path and optional hooks/framework/source."""
         super().__init__()
         if input_config:
             self.update_config(input_config, hook_cls, framework, source_code)
@@ -177,8 +200,8 @@ class _CostModVar:
             print(e)
         return None
 
-    def get_framework_parser_naive(self, input_config):
-        "yaml for MindFormers, json for Mindspeed, toml for HyperParallel"
+    def get_framework_parser_naive(self, input_config: str) -> Optional[Any]:
+        """Return parser class based on file extension (naive heuristic)."""
         mod_name = None
         if isinstance(input_config, str):
             if input_config.endswith("yaml"):
@@ -192,7 +215,7 @@ class _CostModVar:
             return self._load_parser_cls(mod_name)
         return None
 
-    def get_framework_parser(self, framework):
+    def get_framework_parser(self, framework: str) -> Any:
         """Look up and return the parser class for the given framework name.
 
         Uses the mapping YAML file to find the corresponding parser module
@@ -205,7 +228,13 @@ class _CostModVar:
             raise AttributeError(f"Cannot find parser module name from arg '{framework}'")
         return self._load_parser_cls(mod_name)
 
-    def update_config(self, input_config, hook_cls=None, framework=None, source_code=None):
+    def update_config(
+        self,
+        input_config: Any,
+        hook_cls: Any = None,
+        framework: Optional[str] = None,
+        source_code: Optional[str] = None,
+    ) -> None:
         """process input config"""
         self.hooks_dict = None if not hook_cls else hook_cls.get_hooks()
         self.source_code = source_code

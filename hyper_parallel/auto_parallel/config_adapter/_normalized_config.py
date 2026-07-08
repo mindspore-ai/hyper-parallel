@@ -51,7 +51,9 @@ class NormalizedConfig:
             ``{"dp": [1,2,4], "tp": [1,2,4,8], "pp": [1,2], "cp": [1], "ep": [1]}``.
         constraint: User-imposed constraints (global_batch_size,
             memory_limit_gb, fixed_*_degree).
-        estimator: Estimation algorithm parameters.
+        estimator: Estimation algorithm parameters.  Optional key:
+            ``cp_algo`` (``"colossalai_cp"`` | ``"ulysses_cp"`` | ``"hybrid_cp"``,
+            default ``"colossalai_cp"``).
         pp_config: Pipeline-parallel specific configuration.
         resolved_strategy: Final resolved strategy, populated after search.
     """

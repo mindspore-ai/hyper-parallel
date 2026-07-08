@@ -136,6 +136,11 @@ def _build_hp_yaml_dict(config: NormalizedConfig) -> dict:
     # Enable parallel optimizer by default.
     accel.setdefault("enable_parallel_optimizer", True)
 
+    # CP algorithm: propagate to yaml so CostModelParserHyperV2 can read it.
+    cp_algo = config.estimator.get("cp_algo")
+    if cp_algo:
+        accel["context_parallel_algo"] = cp_algo
+
     recompute = config.estimator.get("recompute_strategy", "none")
 
     hp_yaml: dict = {

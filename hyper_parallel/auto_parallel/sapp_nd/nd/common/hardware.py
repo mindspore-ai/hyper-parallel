@@ -238,3 +238,65 @@ def highest_power_of_2_divisor(divisor_of):
         if f == 2:
             divisor *= f
     return divisor
+
+
+def get_cp_topology(tp_degree: int, cp_degree: int, device_per_node: int) -> tuple:
+    """Determine CP topology and effective bandwidth.
+
+    Args:
+        tp_degree: Tensor parallelism degree.
+        cp_degree: Context parallelism degree.
+        device_per_node: Number of devices per node.
+
+    Returns:
+        Tuple of (topology_type, effective_bandwidth, is_intra_node).
+        - topology_type: "intra-node" or "cross-node"
+        - effective_bandwidth: Bandwidth in GB/s
+        - is_intra_node: True if CP stays within node
+    """
+    total_devices_needed = tp_degree * cp_degree
+
+    if total_devices_needed <= device_per_node:
+        topology_type = "intra-node"
+        is_intra_node = True
+        effective_bandwidth = 300.0
+    else:
+        topology_type = "cross-node"
+        is_intra_node = False
+        effective_bandwidth = 25.0
+
+    return topology_type, effective_bandwidth, is_intra_node
+
+
+def get_cp_bandwidth(topology_type: str, device_type: str = "A2") -> float:
+    """Get effective bandwidth for CP communication based on topology.
+
+    Args:
+        topology_type: "intra-node" or "cross-node"
+        device_type: Device type string (e.g., "A2", "A3")
+
+    Returns:
+        Bandwidth in GB/s
+    """
+    device = device_map.get(device_type, Device_A2)
+
+    if topology_type == "intra-node":
+        return device.level_bandwidth[0] if device.level_bandwidth else 300.0
+    return device.level_bandwidth[1] if len(device.level_bandwidth) > 1 else 25.0
+
+
+def recommend_cp_max_by_attention(attention_type: str) -> int:
+    """Recommend maximum CP degree based on attention type.
+
+    Args:
+        attention_type: "mla", "gqa", or "mha"
+
+    Returns:
+        Recommended maximum CP degree
+    """
+    attention_type_upper = attention_type.upper()
+    if attention_type_upper == "MLA":
+        return 16
+    if attention_type_upper == "GQA":
+        return 8
+    return 4
