@@ -166,3 +166,12 @@ class GroupQueryAttention(nn.Module):
             attn_output = attn_output * torch.sigmoid(gate)
 
         return self.o_proj(attn_output)
+
+
+def _disable_attention_compile() -> None:
+    """Keep full-attention kernels outside ``torch.compile`` graphs."""
+    GroupQueryAttention.forward = torch.compiler.disable(recursive=True)(GroupQueryAttention.forward)
+
+
+_disable_attention_compile()
+

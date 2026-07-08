@@ -38,6 +38,22 @@ def _env_flag_enabled(name: str) -> bool:
     return os.environ.get(name, "0").lower() in ("1", "true", "on", "yes")
 
 
+def _env_int(name: str) -> int | None:
+    """Return an optional non-negative integer from the environment."""
+    raw_value = os.environ.get(name)
+    if raw_value in (None, ""):
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; expected an integer.", name, raw_value)
+        return None
+    if value < 0:
+        logger.warning("Ignoring invalid %s=%r; expected a non-negative integer.", name, raw_value)
+        return None
+    return value
+
+
 def _apply_compile(model) -> None:
     """Compile Qwen3.5 decoder blocks for temporary inductor probing."""
     if not _env_flag_enabled("HYPER_QWEN_BLOCK_COMPILE"):
@@ -50,11 +66,14 @@ def _apply_compile(model) -> None:
     backend = maybe_wrap_compile_backend(backend, "qwen3_5_block")
     fullgraph = _env_flag_enabled("HYPER_QWEN_BLOCK_COMPILE_FULLGRAPH")
     layers = list(model.layers)
+    max_layers = _env_int("HYPER_QWEN_BLOCK_COMPILE_LAYERS")
+    if max_layers is not None:
+        layers = layers[:max_layers]
     for layer in layers:
         layer.compile(backend=backend, fullgraph=fullgraph)
     logger.info_rank0(
-        "torch.compile applied to %d Qwen3.5 layers: backend=%s fullgraph=%s",
-        len(layers), backend, fullgraph,
+        "torch.compile applied to %d/%d Qwen3.5 layers: backend=%s fullgraph=%s",
+        len(layers), len(model.layers), backend, fullgraph,
     )
 
 

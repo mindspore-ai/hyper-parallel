@@ -22,6 +22,7 @@ experts, and full EP requires per-model dispatch/combine wiring that lives
 here, not in a shared helper).
 """
 import logging
+import os
 
 import torch
 
@@ -29,9 +30,35 @@ from hyper_parallel import fully_shard
 from hyper_parallel.core.activation_checkpoint import checkpoint_wrapper
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.core.fully_shard.utils import MixedPrecisionPolicy
+from hyper_parallel.compile_debug import maybe_wrap_compile_backend
 from hyper_parallel.models.qwen3_5_moe.model import Qwen3_5MoeForCausalLM
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag_enabled(name: str) -> bool:
+    """Return whether an environment feature flag is enabled."""
+    return os.environ.get(name, "0").lower() in ("1", "true", "on", "yes")
+
+
+def _apply_compile(model) -> None:
+    """Compile Qwen3.5-MoE decoder blocks for temporary inductor probing."""
+    if not _env_flag_enabled("HYPER_QWEN_MOE_BLOCK_COMPILE"):
+        return
+    if not hasattr(model, "layers"):
+        logger.warning("Qwen3.5-MoE block compile enabled but model has no .layers; skipping.")
+        return
+
+    backend = os.environ.get("HYPER_QWEN_MOE_BLOCK_COMPILE_BACKEND", "inductor")
+    backend = maybe_wrap_compile_backend(backend, "qwen3_5_moe_block")
+    fullgraph = _env_flag_enabled("HYPER_QWEN_MOE_BLOCK_COMPILE_FULLGRAPH")
+    layers = list(model.layers)
+    for layer in layers:
+        layer.compile(backend=backend, fullgraph=fullgraph)
+    logger.info_rank0(
+        "torch.compile applied to %d Qwen3.5-MoE layers: backend=%s fullgraph=%s",
+        len(layers), backend, fullgraph,
+    )
 
 
 def _apply_ac(model, cfg) -> None:
@@ -163,6 +190,7 @@ def parallelize_qwen3_5_moe(
         )
 
     _apply_ac(model, cfg)
+    _apply_compile(model)
     _apply_fsdp(model, mesh, cfg)
     return model
 

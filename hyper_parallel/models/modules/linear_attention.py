@@ -270,3 +270,12 @@ class GatedDeltaNet(nn.Module):
 
         # 9. Output projection.
         return self.out_proj(core_attn_out)
+
+
+def _disable_linear_attention_compile() -> None:
+    """Keep Gated DeltaNet kernels outside ``torch.compile`` graphs."""
+    GatedDeltaNet.forward = torch.compiler.disable(recursive=True)(GatedDeltaNet.forward)
+
+
+_disable_linear_attention_compile()
+

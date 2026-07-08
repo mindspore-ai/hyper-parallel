@@ -65,7 +65,9 @@ class Qwen3_5RMSNorm(nn.Module):
         """Apply residual-style RMS normalization: ``(1 + weight) * normed``."""
         input_dtype = x.dtype
         x_fp = x.float()
-        normed = x_fp * torch.rsqrt(x_fp.pow(2).mean(-1, keepdim=True) + self.eps)
+        hidden_size = x_fp.shape[-1]
+        variance = x_fp.pow(2).sum(-1, keepdim=True) / hidden_size
+        normed = x_fp * torch.rsqrt(variance + self.eps)
         out = normed * (1.0 + self.weight.float())
         return out.to(input_dtype)
 
