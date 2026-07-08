@@ -191,34 +191,42 @@ class TestParallelSwiGLU(unittest.TestCase):
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_swiglu_split_axis_sharded_failure(self, mock_platform):
+    def test_swiglu_split_axis_sharded_success(self, mock_platform):
         """
         Feature: SwiGLU split axis sharded
-        Description: Attempting SwiGLU on a sharded split axis
-        Expectation: Raise ValueError with SwiGLU-specific error message
+        Description: SwiGLU with sharded split axis (dim 0) — local shard contains paired gate/up halves
+        Expectation: Returns output layout equal to input layout
         """
         op = SwiGLUDistributedOp("Swiglu")
         mesh = self._make_2x4_mesh(mock_platform)
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "split axis"):
-            op.infer_layout([x_layout, 0, (4, 8)])
+        result = op.infer_layout([x_layout, 0, (4, 8)])
+        assert result[1] is None, "Expected extra_info=None"
+        assert result[0][0] == x_layout, (
+            f"Output layout should equal input layout: "
+            f"expected={x_layout}, got={result[0][0]}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_swiglu_model_parallel_on_split_axis_failure(self, mock_platform):
+    def test_swiglu_model_parallel_on_split_axis_success(self, mock_platform):
         """
         Feature: SwiGLU model parallel on split axis
-        Description: Model parallel scenario where the split axis is sharded
-        Expectation: Raise ValueError
+        Description: Model parallel scenario where the split axis (dim -1) is sharded
+        Expectation: Returns output layout equal to input layout
         """
         op = SwiGLUDistributedOp("Swiglu")
         mesh = self._make_2x4_mesh(mock_platform)
         x_placements = (Replicate(), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "split axis"):
-            op.infer_layout([x_layout, -1, (4, 8)])
+        result = op.infer_layout([x_layout, -1, (4, 8)])
+        assert result[1] is None, "Expected extra_info=None"
+        assert result[0][0] == x_layout, (
+            f"Output layout should equal input layout: "
+            f"expected={x_layout}, got={result[0][0]}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_swiglu_split_axis_odd_size_failure(self, mock_platform):

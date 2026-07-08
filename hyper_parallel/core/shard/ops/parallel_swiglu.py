@@ -16,8 +16,9 @@
 SwiGLU distributed operator implementation.
 
 SwiGLU splits the input along an axis into gate and up halves, applies silu to the
-gate, and multiplies element-wise with up. This requires the split axis to be
-un-sharded to avoid gate/up separation across devices.
+gate, and multiplies element-wise with up. The split is performed on the local shard.
+When the split axis is sharded, the producer layout strategy is expected to make each
+local shard contain paired gate/up halves.
 """
 
 import copy
@@ -49,10 +50,10 @@ class SwiGLUDistributedOp(DistributedOp):
     Rules:
         1. Input must not have Partial status.
         2. axis must be an int within the valid range [-ndim, ndim-1].
-        3. The split axis must be replicated — sharding would place gate and up halves
-           on different devices, making local computation impossible.
-        4. Non-axis dimensions may be sharded (the split and element-wise operations are
-           local to each shard).
+        3. The split axis may be sharded. The split is performed on the local shard;
+           when the split axis is sharded, the producer layout strategy is expected
+           to make each local shard contain paired gate/up halves.
+        4. The split axis must have an even global size so it can be halved.
         5. Output keeps the same sharding mapping as input.
     """
 
@@ -87,8 +88,8 @@ class SwiGLUDistributedOp(DistributedOp):
             tuple: ((output_layout,), None)
 
         Raises:
-            ValueError: If input has Partial status, axis is invalid, the split
-                axis is sharded, or the split axis length is not divisible by 2.
+            ValueError: If input has Partial status, axis is invalid, or the split
+                axis length is not divisible by 2.
         """
         layout = cache_values[0]
         axis = cache_values[1]
@@ -114,22 +115,12 @@ class SwiGLUDistributedOp(DistributedOp):
                 f"(expected to be in range of [{-ndim}, {ndim - 1}], but got {cache_values[1]})"
             )
 
-        # The split axis must not be sharded — sharding would place gate and up
-        # halves on different devices.
-        mapping = alias_map[axis]
-        if isinstance(mapping, tuple):
-            is_sharded = any(m != "None" for m in mapping)
-        else:
-            is_sharded = mapping != "None"
-
-        if is_sharded:
-            raise ValueError(
-                f"For {self.op_name}, the split axis (dim {axis}) is sharded "
-                f"(mapped to {mapping}). SwiGLU splits the input along this axis "
-                f"into gate and up halves, which requires the split axis to be un-sharded."
-            )
-
-        # The split axis must have an even length so it can be halved into gate and up.
+        # The split axis may be sharded — the split is performed on the local
+        # shard. When the split axis is sharded, the producer layout strategy is
+        # expected to make each local shard contain paired gate/up halves.
+        #
+        # The split axis must have an even global length so it can be halved into
+        # gate and up within each shard.
         axis_size = input_shape[axis]
         if axis_size % 2 != 0:
             raise ValueError(
