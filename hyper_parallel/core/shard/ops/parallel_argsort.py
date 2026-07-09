@@ -16,75 +16,100 @@
 Distributed implementation for Argsort operator.
 """
 
+from typing import Tuple
+
 from .parallel_ops import DistributedOp
+
+
+def _normalize_argsort_args(x, dim=-1, descending=False, stable=False):
+    """Normalize torch.argsort arguments to (args, kwargs).
+
+    torch.argsort(input, dim=-1, descending=False, *, stable=False)
+    Only `stable` is keyword-only; all other params are positional.
+    """
+    return (x, dim, descending), {'stable': stable}
 
 
 class ArgsortDistributedOp(DistributedOp):
     """Distributed implementation for torch.argsort."""
 
-    def infer_layout(self, layouts, extra_args=None):
-        """
-        Infer output layout for torch.argsort.
+    _MS_PRIMITIVE_OP_NAMES = frozenset({'ArgSort'})
 
-        PyTorch semantics:
-          - Signature: torch.argsort(input, dim=-1, descending=False, stable=False)
-          - Returns the indices that sort a tensor along a given dimension.
-          - The output tensor has the exact same shape as the input tensor.
-          - Distributed constraint: The dimension being sorted (`dim`) MUST NOT be sharded,
-            as sorting requires full visibility of the elements along that axis.
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for Argsort operator.
 
         Args:
-            layouts (tuple): Layouts of inputs. Expected:
-                layouts[0] (Layout): Input tensor layout (required).
-            extra_args (list): Additional scalar arguments. Expected:
-                extra_args[0] (int): The dimension to sort along (default: -1).
-                extra_args[1] (bool): descending flag.
-                extra_args[2] (bool): stable flag.
+            args (tuple): Input arguments, first element is the input tensor.
+            kwargs (dict): Keyword arguments (dim, descending, stable).
 
         Returns:
-            Layout: Output tensor layout (identical to input layout, provided the sorted
-                    dimension is valid and unsharded).
+            tuple: (local_args, local_kwargs, cache_values)
         """
-        if not layouts or layouts[0] is None:
+        args, kwargs = _normalize_argsort_args(*args, **kwargs)
+        input_tensor = args[0]
+        dim = args[1]
+        descending = args[2]
+        stable = kwargs['stable']
+
+        if self.op_name in self._MS_PRIMITIVE_OP_NAMES:
+            local_args = (input_tensor.to_local(), dim, descending, stable)
+            local_kwargs = {}
+        else:
+            local_args = (input_tensor.to_local(),)
+            local_kwargs = {'dim': dim, 'descending': descending, 'stable': stable}
+
+        cache_values = [input_tensor.layout, dim]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layout for Argsort operator.
+
+        Rules:
+            1. Input must not have Partial status.
+            2. dim must be an integer within the valid range [-ndim, ndim-1].
+            3. The sort dimension must not be sharded.
+            4. Output layout is identical to the input layout.
+
+        Args:
+            cache_values (list): [input_layout, dim] where dim is the sort dimension.
+
+        Returns:
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If input has Partial status, dim is out of range, or the sort
+                dimension is sharded.
+        """
+        layout = cache_values[0]
+        dim = cache_values[1]
+
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([layout])
+
+        if not isinstance(dim, int):
             raise ValueError(
-                f"Operation {self.op_name}: argsort requires a valid input tensor layout."
+                f"For {self.op_name}, dimension should be int, but got {type(dim)}"
             )
 
-        input_layout = layouts[0]
-        in_tensor_map = input_layout.tensor_map
-        input_ndim = len(in_tensor_map)
+        alias_map = layout.alias_tensor_map
+        ndim = len(alias_map)
 
-        # 1. Parse 'dim' from extra_args (default is -1 per PyTorch semantics)
-        dim = -1
-        if extra_args and len(extra_args) > 0:
-            # We assume the first extra argument is 'dim' based on positional unpacking
-            if isinstance(extra_args[0], int):
-                dim = extra_args[0]
-            # Fallback logic in case kwargs ordering puts booleans first
-            elif isinstance(extra_args[0], bool) and len(extra_args) > 1 and isinstance(extra_args[1], int):
-                dim = extra_args[1]
-
-        # 2. Normalize negative dimensions
-        actual_dim = dim
-        if actual_dim < 0:
-            actual_dim += input_ndim
-
-        # 3. Validate dimension bounds
-        if actual_dim < 0 or actual_dim >= input_ndim:
+        if dim < -ndim or dim >= ndim:
             raise ValueError(
-                f"Operation {self.op_name}: dim {dim} is out of bounds for "
-                f"tensor of dimension {input_ndim}."
+                f"For {self.op_name}, dimension out of range "
+                f"(expected to be in range of [{-ndim}, {ndim - 1}], but got {dim})"
             )
 
-        # 4. Enforce Distributed Constraint: The sorting dimension cannot be sharded.
-        # In tensor_map, a value of -1 means unsharded. Any value >= 0 represents
-        # the device mesh axis index that shards this dimension.
-        if in_tensor_map[actual_dim] != -1:
+        if dim < 0:
+            dim += ndim
+
+        if alias_map[dim] != "None":
             raise ValueError(
-                f"Operation {self.op_name}: Cannot perform argsort along dimension {dim} "
-                f"because it is currently sharded across device mesh axis {in_tensor_map[actual_dim]}. "
-                f"Please redistribute the tensor to unshard this dimension before sorting."
+                f"For {self.op_name}, sorting along a sharded dimension "
+                f"(dim {dim} mapped to {alias_map[dim]}) is not supported. "
+                f"Please redistribute the tensor to Replicate on this dimension before sorting."
             )
 
-        # 5. The shape and distribution of the indices are identical to the input
-        return input_layout
+        return ((layout,), None)

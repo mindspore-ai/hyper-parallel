@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_stack import StackDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -34,13 +34,15 @@ op = StackDistributedOp("stack")
 
 class TestParallelStack(unittest.TestCase):
     """Test parallel_stack ops."""
-    def setUp(self):
+    def setUp(self) -> None:
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _make_2x4_mesh(self, mock_platform):
         """Mock a 2x4 device mesh."""
@@ -81,6 +83,13 @@ class TestParallelStack(unittest.TestCase):
         expected_map = (-1, 1, -1)
         self.assertEqual(out_layout.tensor_map, expected_map,
                          f"Expected {expected_map}, got {out_layout.tensor_map}")
+
+        # StackDistributedOp does not override get_expand_impl → always None.
+        # Verified once here; other test cases omit this check as per testing conventions.
+        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
+            f"get_expand_impl should return None for stack, "
+            f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_stack_layout_inference_dim_last(self, mock_platform):
@@ -293,7 +302,7 @@ class TestParallelStack(unittest.TestCase):
         # Input cache values matching different layouts from different tensors
         cache_values = [layout1, layout2, 0]
 
-        with self.assertRaisesRegex(ValueError, "All input tensors must have the same layout"):
+        with self.assertRaisesRegex(ValueError, "all input tensors must have the same layout"):
             op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -313,26 +322,42 @@ class TestParallelStack(unittest.TestCase):
 
         # For a 2D tensor, valid dims for stack are [-3, 2]. Pass 3.
         cache_values_pos = [x_layout, 3]
-        with self.assertRaisesRegex(ValueError, "Dimension out of range"):
+        with self.assertRaisesRegex(ValueError, "dimension out of range"):
             op.infer_layout(cache_values_pos)
 
         # For a 2D tensor, valid dims for stack are [-3, 2]. Pass -4.
         cache_values_neg = [x_layout, -4]
-        with self.assertRaisesRegex(ValueError, "Dimension out of range"):
+        with self.assertRaisesRegex(ValueError, "dimension out of range"):
             op.infer_layout(cache_values_neg)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_stack_partial_input_raises_error(self, mock_platform):
+        """
+        Feature: StackDistributedOp rejects inputs with Partial status.
+        Description: Input has Partial status set on dp axis (pending AllReduce).
+        Expectation: ValueError is raised about Partial status not being allowed.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
+        x_layout.set_partial_by_dev_axis("dp", "sum")
+        cache_values = [x_layout, 0]
+        with self.assertRaisesRegex(ValueError, "Partial status"):
+            op.infer_layout(cache_values)
 
 class TestParallelStackExt(unittest.TestCase):
     """Unit tests for StackExtDistributedOp."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Set up test fixtures before each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests."""
@@ -354,21 +379,19 @@ class TestParallelStackExt(unittest.TestCase):
         self._setup_mock_platform(mock_platform, world_size=4)
         return init_device_mesh(device_type="npu", mesh_shape=(2, 2, 1), mesh_dim_names=("dp", "cp", "mp"))
 
-    def _infer_layout(self, stack_ext_op, layouts, axis):
-        return stack_ext_op.infer_layout(tuple(layouts), extra_args=[axis])
+    @staticmethod
+    def _infer_layout(stack_ext_op, layouts, axis):
+        return stack_ext_op.infer_layout([tuple(layouts), axis])
 
     def _run_scenario(self, layouts, axis, expected_map):
+        """Run a StackExt scenario: infer layout and check tensor_map."""
         stack_ext_op = StackExtDistributedOp("StackExt")
-        out_layout = self._infer_layout(stack_ext_op, layouts, axis)
+        infer_result = self._infer_layout(stack_ext_op, layouts, axis)
+        out_layout = infer_result[0][0]
 
         got_map = out_layout.tensor_map
         assert got_map == expected_map, (
             f"StackExt failed. Expected {expected_map}, got {got_map}"
-        )
-
-        assert stack_ext_op.get_expand_impl(None, out_layout, tuple(layouts), [axis]) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"got {stack_ext_op.get_expand_impl(None, out_layout, tuple(layouts), [axis])}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -384,8 +407,17 @@ class TestParallelStackExt(unittest.TestCase):
         x2 = _build_layout(mesh, (Shard(0), Shard(1), Shard(2)), 3)
 
         stack_ext_op = StackExtDistributedOp("StackExt")
-        out_layout = self._infer_layout(stack_ext_op, [x1, x2], axis=0)
-        assert out_layout.tensor_map == (-1, 2, 1, 0)
+        infer_result = self._infer_layout(stack_ext_op, [x1, x2], axis=0)
+        out_layouts, _ = infer_result
+        assert out_layouts[0].tensor_map == (-1, 2, 1, 0)
+
+        # StackExtDistributedOp does not override get_expand_impl → always None.
+        # Verified once here; other test cases omit this check as per testing conventions.
+        cache_values = [tuple([x1, x2]), 0]
+        assert stack_ext_op.get_expand_impl(None, infer_result, cache_values) is None, (
+            f"get_expand_impl should return None for StackExt, "
+            f"got {stack_ext_op.get_expand_impl(None, infer_result, cache_values)}"
+        )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_stack_ext_layout_cache(self, mock_platform):
@@ -400,10 +432,10 @@ class TestParallelStackExt(unittest.TestCase):
         x2 = _build_layout(mesh, (Shard(0), Shard(1), Shard(2)), 3)
 
         stack_ext_op = StackExtDistributedOp("StackExt")
-        out1 = self._infer_layout(stack_ext_op, [x1, x2], axis=1)
-        out2 = self._infer_layout(stack_ext_op, [x1, x2], axis=1)
+        out1, _ = self._infer_layout(stack_ext_op, [x1, x2], axis=1)
+        out2, _ = self._infer_layout(stack_ext_op, [x1, x2], axis=1)
 
-        assert out1.tensor_map == out2.tensor_map
+        assert out1[0].tensor_map == out2[0].tensor_map
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_stack_ext_axis0_same_layout_1(self, mock_platform):

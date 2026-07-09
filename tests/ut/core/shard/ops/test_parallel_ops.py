@@ -203,7 +203,7 @@ class TestDistributedOpWrapOutput(unittest.TestCase):
         local_t = np.array([1.0, 2.0])
         op = DistributedOp("test_wrap")
 
-        with patch.object(DTensor, "from_local", return_value=MagicMock(spec=DTensor)) as mock_from_local:
+        with patch.object(DTensor, "from_local_with_layout", return_value=MagicMock(spec=DTensor)) as mock_from_local:
             result = op.wrap_output(local_t, (layout,))
             mock_from_local.assert_called_once()
             self.assertIsNotNone(result)
@@ -224,7 +224,7 @@ class TestDistributedOpWrapOutput(unittest.TestCase):
         local_t2 = np.array([2.0])
         op = DistributedOp("test_wrap_tuple")
 
-        with patch.object(DTensor, "from_local", return_value=MagicMock(spec=DTensor)):
+        with patch("hyper_parallel.core.dtensor.dtensor.DTensor", return_value=MagicMock(spec=DTensor)):
             result = op.wrap_output((local_t1, local_t2), (layout1, layout2))
             self.assertIsInstance(result, tuple)
             self.assertEqual(len(result), 2)

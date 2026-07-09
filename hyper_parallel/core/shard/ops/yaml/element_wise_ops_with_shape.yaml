@@ -1,7 +1,6 @@
 __default__:
   distributed_op_class: ElementWiseDistributedOp
   distributed_op_file: parallel_elementwise
-  infer_layout_suffix: WithShape
 
 LessEqual:
   dist_op_name: _less_equal_dist_op

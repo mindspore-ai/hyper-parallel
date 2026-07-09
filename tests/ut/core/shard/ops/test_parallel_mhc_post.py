@@ -167,9 +167,9 @@ class TestNpuMhcPost(unittest.TestCase):
         )
         assert extra is None, f"Expected extra=None, got {extra}"
         # get_expand_impl is not overridden — verify once here.
-        assert op.get_expand_impl(None, out_layouts, [x_layout], None) is None, (
+        assert op.get_expand_impl(None, (out_layouts, extra), [x_layout]) is None, (
             f"get_expand_impl should return None, "
-            f"got {op.get_expand_impl(None, out_layouts, [x_layout], None)}"
+            f"got {op.get_expand_impl(None, (out_layouts, extra), [x_layout])}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")

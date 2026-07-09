@@ -16,35 +16,17 @@
 Distributed implementation for ChunkView operator.
 """
 
+from typing import Tuple
+
 from .parallel_ops import DistributedOp
+
+
+def _normalize_chunk_view_args(input_tensor, chunks, dim=0):
+    return (input_tensor, chunks, dim), {}
 
 
 class ChunkViewDistributedOp(DistributedOp):
     """Distributed implementation for ChunkView operator."""
-
-    @staticmethod
-    def _parse_extra_args(extra_args):
-        """Parse and validate extra_args, returning (chunks, dim, input_shape)."""
-        if len(extra_args) < 1:
-            raise ValueError("chunk_view requires 'chunks' in extra_args.")
-
-        chunks = extra_args[0]
-        dim = extra_args[1] if len(extra_args) > 2 else 0
-        input_shapes = extra_args[-1] if len(extra_args) > 1 else None
-
-        if not isinstance(chunks, int):
-            raise TypeError(f"chunks must be an integer, got {type(chunks)}")
-        if chunks < 1:
-            raise ValueError(f"chunks must be greater than 0, got {chunks}")
-        if not isinstance(dim, int):
-            raise TypeError(f"dim must be an integer, got {type(dim)}")
-
-        if input_shapes:
-            input_shape = input_shapes[0] if isinstance(input_shapes[0], (list, tuple)) else input_shapes
-        else:
-            input_shape = None
-
-        return chunks, dim, input_shape
 
     @staticmethod
     def _calculate_output_count(dim_size, chunks):
@@ -55,48 +37,102 @@ class ChunkViewDistributedOp(DistributedOp):
         output_num = max((dim_size + split_size - 1) // split_size, 1)
         return min(output_num, chunks)
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for ChunkView operator.
+
+        Args:
+            args (tuple): Input arguments containing the input tensor, chunks, and dim.
+            kwargs (dict): Keyword arguments (none expected).
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, kwargs = _normalize_chunk_view_args(*args, **kwargs)
+        input_tensor, chunks, dim = args
+        input_shape = input_tensor.shape
+
+        local_args = (input_tensor.to_local(), chunks, dim)
+        local_kwargs = {}
+
+        cache_values = [input_tensor.layout, chunks, dim, input_shape]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layouts for ChunkView operator.
 
         Rules:
-        1. Split dimension cannot be sharded.
-        2. Default: dim = 0 if not specified.
-        3. Output count may be less than chunks if dimension size < chunks.
+            1. Input must not have Partial status.
+            2. Split dimension cannot be sharded (including StridedShard multi-axis mappings).
+            3. dim must be an integer within the valid range [-ndim, ndim-1].
+            4. Default: dim = 0 if not specified.
+            5. Output count may be less than chunks if dimension size < chunks.
+            6. All output layouts are identical to the input layout.
 
         Args:
-            layouts (Layout): Layout of input tensor
-            extra_args (list): chunks, dim, input_shape. Expected:
-                extra_args[0]: chunks (required) - number of chunks to split into
-                extra_args[1]: dim (optional, default=0) - dimension along which to split
-                extra_args[2][0]: input_shapes (optional) - shape of input tensor
+            cache_values (list): [input_layout, chunks, dim, input_shape]
 
         Returns:
-            tuple: Layouts for output tensors
+            tuple: ((output_layout_1, output_layout_2, ...), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
+            TypeError: If chunks or dim is not an integer.
         """
+        input_layout = cache_values[0]
+        chunks = cache_values[1]
+        dim = cache_values[2]
+        input_shape = cache_values[3]
 
-        if not layouts or layouts[0] is None:
-            raise ValueError("chunk_view requires a valid input tensor layout.")
+        if input_layout is None:
+            raise ValueError(
+                f"For {self.op_name}, input layout should not be None"
+            )
 
-        input_layout = layouts[0]
-        chunks, dim, input_shape = self._parse_extra_args(extra_args)
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([input_layout])
 
-        tensor_map = input_layout.tensor_map
-        input_dim = len(tensor_map)
+        if not isinstance(chunks, int):
+            raise TypeError(
+                f"For {self.op_name}, chunks must be an integer, but got {type(chunks)}"
+            )
+        if chunks < 1:
+            raise ValueError(
+                f"For {self.op_name}, chunks must be greater than 0, but got {chunks}"
+            )
+        if not isinstance(dim, int):
+            raise TypeError(
+                f"For {self.op_name}, dim must be an integer, but got {type(dim)}"
+            )
 
+        alias_map = input_layout.alias_tensor_map
+        ndim = len(alias_map)
+
+        original_dim = dim
         if dim < 0:
-            dim = input_dim + dim
+            dim = ndim + dim
 
-        if not 0 <= dim < input_dim:
-            raise ValueError(f"Dimension out of range (expected [0, {input_dim}), got {dim}).")
+        if not 0 <= dim < ndim:
+            raise ValueError(
+                f"For {self.op_name}, dimension out of range "
+                f"(expected to be in range of [{-ndim}, {ndim - 1}], but got {original_dim})"
+            )
 
-        if tensor_map[dim] != -1:
-            raise ValueError(f"Cannot split tensor at sharded axis[{dim}], layout: {input_layout}")
-
-        if input_shape is not None:
-            output_num = self._calculate_output_count(input_shape[dim], chunks)
+        mapping = alias_map[dim]
+        if isinstance(mapping, (list, tuple)):
+            is_sharded = any(m != "None" for m in mapping)
         else:
-            output_num = chunks
+            is_sharded = mapping != "None"
+
+        if is_sharded:
+            raise ValueError(
+                f"For {self.op_name}, cannot split tensor at sharded axis[{dim}], "
+                f"layout: {input_layout}"
+            )
+
+        output_num = self._calculate_output_count(input_shape[dim], chunks)
 
         output_layouts = (input_layout,) * output_num
-        return output_layouts
+        return (output_layouts, None)
+    

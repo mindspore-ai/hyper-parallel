@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_norm import NormDistributedOp, LayerNormDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -41,11 +41,13 @@ class TestRmsNorm(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -92,20 +94,21 @@ class TestRmsNorm(unittest.TestCase):
         gamma_layout = _build_layout(mesh, gamma_placements, 1)
         x_layout._partial = [None] * len(x_layout._partial)
 
-        input_layouts = (x_layout, gamma_layout, None)
-        _, output_layout = rmsnorm_op.infer_layout(input_layouts)
+        cache_values = [x_layout, gamma_layout]
+        (output_layouts, _) = rmsnorm_op.infer_layout(cache_values)
+        x_out_layout, out_layout = output_layouts
 
         expected_map = (1, -1)
-        assert output_layout.tensor_map == expected_map, (
+        assert out_layout.tensor_map == expected_map, (
             f"RmsNorm data parallel test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
+            f"got {out_layout.tensor_map}"
         )
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert rmsnorm_op.get_expand_impl(None, output_layout, input_layouts, None) is None, (
-            f"get_expand_impl should return None"
-            f"got {rmsnorm_op.get_expand_impl(None, output_layout, input_layouts, None)}"
+        assert rmsnorm_op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
+            f"get_expand_impl should return None, "
+            f"got {rmsnorm_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -122,13 +125,14 @@ class TestRmsNorm(unittest.TestCase):
         gamma_layout = _build_layout(mesh, gamma_placements, 1)
         x_layout._partial = [None] * len(x_layout._partial)
 
-        input_layouts = (x_layout, gamma_layout, None)
-        _, output_layout = rmsnorm_op.infer_layout(input_layouts)
+        cache_values = [x_layout, gamma_layout]
+        (output_layouts, _) = rmsnorm_op.infer_layout(cache_values)
+        x_out_layout, out_layout = output_layouts
 
         expected_map = (-1, 0, -1)
-        assert output_layout.tensor_map == expected_map, (
+        assert out_layout.tensor_map == expected_map, (
             f"RmsNorm model parallel test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
+            f"got {out_layout.tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -144,13 +148,14 @@ class TestRmsNorm(unittest.TestCase):
         gamma_placements = (Replicate(), Replicate(), Replicate())
         gamma_layout = _build_layout(mesh, gamma_placements, 1)
 
-        input_layouts = (x_layout, gamma_layout, None)
-        _, output_layout = rmsnorm_op.infer_layout(input_layouts)
+        cache_values = [x_layout, gamma_layout]
+        (output_layouts, _) = rmsnorm_op.infer_layout(cache_values)
+        x_out_layout, out_layout = output_layouts
 
         expected_map = (1, 0, -1)
-        assert output_layout.tensor_map == expected_map, (
+        assert out_layout.tensor_map == expected_map, (
             f"RmsNorm hybrid parallel test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
+            f"got {out_layout.tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -167,13 +172,14 @@ class TestRmsNorm(unittest.TestCase):
         gamma_layout = _build_layout(mesh, gamma_placements, 1)
         x_layout._partial = [None] * len(x_layout._partial)
 
-        input_layouts = (x_layout, gamma_layout, None)
-        _, output_layout = rmsnorm_op.infer_layout(input_layouts)
+        cache_values = [x_layout, gamma_layout]
+        (output_layouts, _) = rmsnorm_op.infer_layout(cache_values)
+        x_out_layout, out_layout = output_layouts
 
         expected_map = (-1, -1)
-        assert output_layout.tensor_map == expected_map, (
+        assert out_layout.tensor_map == expected_map, (
             f"RmsNorm all replicated test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
+            f"got {out_layout.tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -189,13 +195,14 @@ class TestRmsNorm(unittest.TestCase):
         gamma_placements = (Replicate(), Replicate())
         gamma_layout = _build_layout(mesh, gamma_placements, 1)
 
-        input_layouts = (x_layout, gamma_layout, None)
-        _, output_layout = rmsnorm_op.infer_layout(input_layouts)
+        cache_values = [x_layout, gamma_layout]
+        (output_layouts, _) = rmsnorm_op.infer_layout(cache_values)
+        x_out_layout, out_layout = output_layouts
 
         expected_map = (2, 1, -1)
-        assert output_layout.tensor_map == expected_map, (
+        assert out_layout.tensor_map == expected_map, (
             f"RmsNorm 3D tensor test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
+            f"got {out_layout.tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -211,48 +218,45 @@ class TestRmsNorm(unittest.TestCase):
         gamma_placements = (Replicate(), Replicate())
         gamma_layout = _build_layout(mesh, gamma_placements, 1)
 
-        input_layouts = (x_layout, gamma_layout, None)
+        cache_values = [x_layout, gamma_layout]
 
-        with self.assertRaisesRegex(ValueError, "RmsNorm is disabled to support the splitting"):
-            rmsnorm_op.infer_layout(input_layouts)
+        with self.assertRaisesRegex(ValueError, "splitting after begin_norm_axis"):
+            rmsnorm_op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_rmsnorm_insufficient_inputs_failure(self, mock_platform):
+    def test_rmsnorm_sharding_mismatch_failure(self, mock_platform):
         """
-        Feature: RmsNorm insufficient inputs error
-        Description: Test error when input layouts size is less than 3
+        Feature: RmsNorm sharding mismatch error
+        Description: Test error when x normalized dims sharding doesn't match gamma sharding
         Expectation: Raise ValueError
         """
         mesh = self._make_2x4_mesh(mock_platform)
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
-
-        input_layouts = (x_layout,)
-
-        with self.assertRaisesRegex(ValueError, "input layouts size .* is less than 3"):
-            rmsnorm_op.infer_layout(input_layouts)
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_rmsnorm_inconsistent_inputs_failure(self, mock_platform):
-        """
-        Feature: RmsNorm inconsistent inputs error
-        Description: Test error when input layouts are inconsistent
-        Expectation: Raise ValueError
-        """
-        mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 2)
-        x2_placements = (Replicate(), Shard(1))
-        x2_layout = _build_layout(mesh, x2_placements, 2)
-        gamma_placements = (Replicate(), Replicate())
+        # gamma has Shard(0) on its only dim — doesn't match x's normalized dim alias ("None")
+        gamma_placements = (Shard(0),)
         gamma_layout = _build_layout(mesh, gamma_placements, 1)
-        x_layout._partial = [None] * len(x_layout._partial)
-        x2_layout._partial = [None] * len(x2_layout._partial)
 
-        input_layouts = (x_layout, x2_layout, gamma_layout, None)
+        cache_values = [x_layout, gamma_layout]
 
-        with self.assertRaisesRegex(ValueError, "RmsNorm inputs must have same layout"):
-            rmsnorm_op.infer_layout(input_layouts)
+        with self.assertRaisesRegex(ValueError, "should equal"):
+            rmsnorm_op.infer_layout(cache_values)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_rmsnorm_insufficient_cache_values_failure(self, mock_platform):
+        """
+        Feature: RmsNorm insufficient cache values error
+        Description: Test error when cache_values has fewer than 2 elements
+        Expectation: Raise ValueError
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_placements = (Shard(0), Replicate())
+        x_layout = _build_layout(mesh, x_placements, 2)
+
+        cache_values = [x_layout]
+
+        with self.assertRaisesRegex(ValueError, "cache_values size .* is less than 2"):
+            rmsnorm_op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_rmsnorm_mismatched_mesh_shape_failure(self, mock_platform):
@@ -269,10 +273,10 @@ class TestRmsNorm(unittest.TestCase):
         gamma_placements = (Replicate(), Replicate())
         gamma_layout = _build_layout(mesh2, gamma_placements, 1)
 
-        input_layouts = (x_layout, gamma_layout, None)
+        cache_values = [x_layout, gamma_layout]
 
-        with self.assertRaisesRegex(ValueError, "inputs must have same mesh_shape"):
-            rmsnorm_op.infer_layout(input_layouts)
+        with self.assertRaisesRegex(ValueError, "must have same mesh_shape"):
+            rmsnorm_op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_rmsnorm_partial_input_failure(self, mock_platform):
@@ -288,10 +292,10 @@ class TestRmsNorm(unittest.TestCase):
         gamma_placements = (Replicate(), Replicate())
         gamma_layout = _build_layout(mesh, gamma_placements, 1)
 
-        input_layouts = (x_layout, gamma_layout, None)
+        cache_values = [x_layout, gamma_layout]
 
         with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
-            rmsnorm_op.infer_layout(input_layouts)
+            rmsnorm_op.infer_layout(cache_values)
 
 
 class TestLayerNorm(unittest.TestCase):
@@ -304,11 +308,13 @@ class TestLayerNorm(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -347,7 +353,9 @@ class TestLayerNorm(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = layernorm_op.infer_layout((x_layout,), extra_args=((64,),))
+        cache_values = [x_layout, (64,)]
+        (output_layouts, _) = layernorm_op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (1, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -357,9 +365,9 @@ class TestLayerNorm(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert layernorm_op.get_expand_impl(None, output_layout, (x_layout,), ((64,),)) is None, (
-            f"get_expand_impl should return None"
-            f"got {layernorm_op.get_expand_impl(None, output_layout, (x_layout,), ((64,),))}"
+        assert layernorm_op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
+            f"get_expand_impl should return None, "
+            f"got {layernorm_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -373,7 +381,9 @@ class TestLayerNorm(unittest.TestCase):
         x_placements = (Replicate(), Shard(1), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout = layernorm_op.infer_layout((x_layout,), extra_args=((64,),))
+        cache_values = [x_layout, (64,)]
+        (output_layouts, _) = layernorm_op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (-1, 0, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -392,7 +402,9 @@ class TestLayerNorm(unittest.TestCase):
         x_placements = (Shard(0), Shard(1), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout = layernorm_op.infer_layout((x_layout,), extra_args=((64,),))
+        cache_values = [x_layout, (64,)]
+        (output_layouts, _) = layernorm_op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (1, 0, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -411,7 +423,9 @@ class TestLayerNorm(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = layernorm_op.infer_layout((x_layout,), extra_args=((64,),))
+        cache_values = [x_layout, (64,)]
+        (output_layouts, _) = layernorm_op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (-1, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -430,7 +444,9 @@ class TestLayerNorm(unittest.TestCase):
         x_placements = (Shard(0), Shard(1), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout = layernorm_op.infer_layout((x_layout,), extra_args=((64,),))
+        cache_values = [x_layout, (64,)]
+        (output_layouts, _) = layernorm_op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (2, 1, -1)
         assert output_layout.tensor_map == expected_map, (
@@ -449,8 +465,10 @@ class TestLayerNorm(unittest.TestCase):
         x_placements = (Replicate(), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
+        cache_values = [x_layout, (64,)]
+
         with self.assertRaisesRegex(ValueError, "Cannot perform sharding on normalized dimension"):
-            layernorm_op.infer_layout((x_layout,), extra_args=((64,),))
+            layernorm_op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_layernorm_normalized_shape_too_large_failure(self, mock_platform):
@@ -463,8 +481,10 @@ class TestLayerNorm(unittest.TestCase):
         x_placements = (Shard(0), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
+        cache_values = [x_layout, (128, 64, 56)]
+
         with self.assertRaisesRegex(ValueError, "larger than input ndim"):
-            layernorm_op.infer_layout((x_layout,), extra_args=((128, 64, 56),))
+            layernorm_op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_layernorm_none_input_failure(self, mock_platform):
@@ -473,22 +493,10 @@ class TestLayerNorm(unittest.TestCase):
         Description: Test error when input layout is None
         Expectation: Raise ValueError
         """
+        cache_values = [None, (64,)]
+
         with self.assertRaisesRegex(ValueError, "requires a valid input tensor layout"):
-            layernorm_op.infer_layout((None,), extra_args=((64,),))
-
-    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_layernorm_missing_extra_args_failure(self, mock_platform):
-        """
-        Feature: LayerNorm missing extra_args error
-        Description: Test error when extra_args is missing
-        Expectation: Raise ValueError
-        """
-        mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate())
-        x_layout = _build_layout(mesh, x_placements, 2)
-
-        with self.assertRaisesRegex(ValueError, "requires normalized_shape in extra_args"):
-            layernorm_op.infer_layout((x_layout,))
+            layernorm_op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_layernorm_invalid_normalized_shape_type_failure(self, mock_platform):
@@ -501,8 +509,28 @@ class TestLayerNorm(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
+        cache_values = [x_layout, "invalid"]
+
         with self.assertRaisesRegex(ValueError, "normalized_shape must be int, list, or tuple"):
-            layernorm_op.infer_layout((x_layout,), extra_args=("invalid",))
+            layernorm_op.infer_layout(cache_values)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_layernorm_partial_input_failure(self, mock_platform):
+        """
+        Feature: LayerNorm partial input error
+        Description: Test error when input has partial status
+        Expectation: Raise ValueError
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_placements = (Shard(0), Replicate())
+        x_layout = _build_layout(mesh, x_placements, 2)
+        x_layout.set_partial_by_dev_axis("mp", "sum")
+
+        cache_values = [x_layout, (64,)]
+
+        with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
+            layernorm_op.infer_layout(cache_values)
+
 
 
 if __name__ == "__main__":

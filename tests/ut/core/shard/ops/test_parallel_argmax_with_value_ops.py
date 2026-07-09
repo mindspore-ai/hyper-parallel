@@ -15,10 +15,10 @@
 """parallel_argmax_with_value_ops test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_argmax_with_value_ops import ArgMaxWithValueDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -29,21 +29,21 @@ from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
 op = ArgMaxWithValueDistributedOp("ArgMaxWithValue")
 
+
 class TestParallelArgMaxWithValue(unittest.TestCase):
     """Unit tests for ArgMaxWithValueDistributedOp."""
-    def setUp(self):
-        """Set up test fixtures before each test method.
 
-        Clears global caches to ensure test isolation and initializes
-        the platform for testing.
-        """
+    def setUp(self) -> None:
+        """Clear global caches before each test to ensure isolation."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
-        """Clean up after each test method."""
+    def tearDown(self) -> None:
+        """Restore global cache state after each test."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -82,19 +82,26 @@ class TestParallelArgMaxWithValue(unittest.TestCase):
         x_placements = (Shard(0), Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout, _ = op.infer_layout((x_layout, None, None), (1, True))
+        cache_values = [x_layout, 1, True]
+        output_layouts, extra_info = op.infer_layout(cache_values)
 
+        values_layout, indices_layout = output_layouts
         expected_map = (1, -1, -1)
-        assert output_layout.tensor_map == expected_map, (
+        assert values_layout.tensor_map == expected_map, (
             f"Data Parallel test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
+            f"got {values_layout.tensor_map}"
         )
+        assert indices_layout.tensor_map == expected_map, (
+            f"Data Parallel indices layout failed. Expected {expected_map}, "
+            f"got {indices_layout.tensor_map}"
+        )
+        assert extra_info is None, f"extra_info should be None, got {extra_info}"
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
-        # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (x_layout, None, None), (1, True)) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x_layout, None, None), (1, True))}"
+        # The same applies to other test cases, so it is unnecessary to test its return value.
+        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
+            f"get_expand_impl should return None, "
+            f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -108,13 +115,16 @@ class TestParallelArgMaxWithValue(unittest.TestCase):
         x_placements = (Replicate(), Shard(1), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout, _ = op.infer_layout((x_layout, None, None), (0, True))
+        cache_values = [x_layout, 0, True]
+        output_layouts, extra_info = op.infer_layout(cache_values)
 
+        values_layout, _ = output_layouts
         expected_map = (-1, 0, -1)
-        assert output_layout.tensor_map == expected_map, (
+        assert values_layout.tensor_map == expected_map, (
             f"Model Parallel test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
+            f"got {values_layout.tensor_map}"
         )
+        assert extra_info is None, f"extra_info should be None, got {extra_info}"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_argmax_with_value_hybrid_parallel_success(self, mock_platform):
@@ -127,13 +137,16 @@ class TestParallelArgMaxWithValue(unittest.TestCase):
         x_placements = (Shard(0), Replicate(), Shard(2))
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout, _ = op.infer_layout((x_layout, None, None), (1, True))
+        cache_values = [x_layout, 1, True]
+        output_layouts, extra_info = op.infer_layout(cache_values)
 
+        values_layout, _ = output_layouts
         expected_map = (2, -1, 0)
-        assert output_layout.tensor_map == expected_map, (
+        assert values_layout.tensor_map == expected_map, (
             f"Hybrid Parallel test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
+            f"got {values_layout.tensor_map}"
         )
+        assert extra_info is None, f"extra_info should be None, got {extra_info}"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_argmax_with_value_all_replicated(self, mock_platform):
@@ -146,13 +159,16 @@ class TestParallelArgMaxWithValue(unittest.TestCase):
         x_placements = (Replicate(), Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout, _ = op.infer_layout((x_layout, None, None), (0, True))
+        cache_values = [x_layout, 0, True]
+        output_layouts, extra_info = op.infer_layout(cache_values)
 
+        values_layout, _ = output_layouts
         expected_map = (-1, -1, -1)
-        assert output_layout.tensor_map == expected_map, (
+        assert values_layout.tensor_map == expected_map, (
             f"All Replicated test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
+            f"got {values_layout.tensor_map}"
         )
+        assert extra_info is None, f"extra_info should be None, got {extra_info}"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_argmax_with_value_negative_dim(self, mock_platform):
@@ -165,13 +181,16 @@ class TestParallelArgMaxWithValue(unittest.TestCase):
         x_placements = (Shard(0), Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout, _ = op.infer_layout((x_layout, None, None), (-1, True))
+        cache_values = [x_layout, -1, True]
+        output_layouts, extra_info = op.infer_layout(cache_values)
 
+        values_layout, _ = output_layouts
         expected_map = (1, -1, -1)
-        assert output_layout.tensor_map == expected_map, (
+        assert values_layout.tensor_map == expected_map, (
             f"Negative dim test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
+            f"got {values_layout.tensor_map}"
         )
+        assert extra_info is None, f"extra_info should be None, got {extra_info}"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_argmax_with_value_keep_dims_false(self, mock_platform):
@@ -184,13 +203,16 @@ class TestParallelArgMaxWithValue(unittest.TestCase):
         x_placements = (Shard(0), Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout, _ = op.infer_layout((x_layout, None, None), (1, False))
+        cache_values = [x_layout, 1, False]
+        output_layouts, extra_info = op.infer_layout(cache_values)
 
+        values_layout, _ = output_layouts
         expected_map = (1, -1)
-        assert output_layout.tensor_map == expected_map, (
+        assert values_layout.tensor_map == expected_map, (
             f"Keep dims False test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
+            f"got {values_layout.tensor_map}"
         )
+        assert extra_info is None, f"extra_info should be None, got {extra_info}"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_argmax_with_value_sharded_dim_failure(self, mock_platform):
@@ -203,8 +225,9 @@ class TestParallelArgMaxWithValue(unittest.TestCase):
         x_placements = (Shard(0), Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
+        cache_values = [x_layout, 0, True]
         with self.assertRaisesRegex(ValueError, "cannot perform sharding on axis dim"):
-            op.infer_layout((x_layout, None, None), (0, True))
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_argmax_with_value_model_parallel_on_mp_axis_failure(self, mock_platform):
@@ -217,8 +240,9 @@ class TestParallelArgMaxWithValue(unittest.TestCase):
         x_placements = (Replicate(), Shard(1), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
+        cache_values = [x_layout, 1, True]
         with self.assertRaisesRegex(ValueError, "cannot perform sharding on axis dim"):
-            op.infer_layout((x_layout, None, None), (1, True))
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_argmax_with_value_3d_tensor(self, mock_platform):
@@ -231,13 +255,16 @@ class TestParallelArgMaxWithValue(unittest.TestCase):
         x_placements = (Shard(0), Shard(1), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout, _ = op.infer_layout((x_layout, None, None), (2, True))
+        cache_values = [x_layout, 2, True]
+        output_layouts, extra_info = op.infer_layout(cache_values)
 
+        values_layout, _ = output_layouts
         expected_map = (2, 1, -1)
-        assert output_layout.tensor_map == expected_map, (
+        assert values_layout.tensor_map == expected_map, (
             f"3D tensor test failed. Expected {expected_map}, "
-            f"got {output_layout.tensor_map}"
+            f"got {values_layout.tensor_map}"
         )
+        assert extra_info is None, f"extra_info should be None, got {extra_info}"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_argmax_with_value_partial_input(self, mock_platform):
@@ -251,54 +278,81 @@ class TestParallelArgMaxWithValue(unittest.TestCase):
         x_layout = _build_layout(mesh, x_placements, 3)
         x_layout.set_partial_by_dev_axis("dp", "sum")
 
+        cache_values = [x_layout, 1, True]
         with self.assertRaisesRegex(ValueError, "has Partial status which is not allowed"):
-            op.infer_layout((x_layout, None, None), (1, True))
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_argmax_with_value_invalid_layouts_count(self, mock_platform):
+    def test_argmax_with_value_axis_out_of_range(self, mock_platform):
         """
-        Feature: ArgMaxWithValue invalid layouts count
-        Description: Pass wrong number of layouts
+        Feature: ArgMaxWithValue axis out of range
+        Description: Pass an axis value outside the valid range for the input rank
         Expectation: Raise ValueError
         """
         mesh = self._make_2x4_mesh(mock_platform)
         x_placements = (Shard(0), Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        with self.assertRaisesRegex(ValueError, "ArgMaxWithValue requires 3 layouts"):
-            op.infer_layout((x_layout,), (1, True))
+        cache_values = [x_layout, 5, True]
+        with self.assertRaisesRegex(ValueError, "axis out of range"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_argmax_with_value_invalid_extra_args_count(self, mock_platform):
+    def test_argmax_with_value_axis_not_int(self, mock_platform):
         """
-        Feature: ArgMaxWithValue invalid extra args count
-        Description: Pass wrong number of extra args
+        Feature: ArgMaxWithValue axis type validation
+        Description: Pass a non-int axis value
         Expectation: Raise ValueError
         """
         mesh = self._make_2x4_mesh(mock_platform)
         x_placements = (Shard(0), Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        with self.assertRaisesRegex(ValueError, "ArgMaxWithValue requires 2 extra args"):
-            op.infer_layout((x_layout, None, None), (1,))
+        cache_values = [x_layout, 1.0, True]
+        with self.assertRaisesRegex(ValueError, "axis should be int"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_argmax_with_value_get_expand_impl(self, mock_platform):
+    def test_argmax_with_value_preprocess(self, mock_platform):
         """
-        Feature: ArgMaxWithValue get_expand_impl
-        Description: Verify get_expand_impl returns None
-        Expectation: Returns None
+        Feature: ArgMaxWithValueDistributedOp preprocess
+        Description: Verify preprocess routes all args as positional for MindSpore Primitive
+        Expectation: local_kwargs is empty; local_args has 3 elements; cache_values has 3 elements
         """
         mesh = self._make_2x4_mesh(mock_platform)
-        x_placements = (Shard(0), Replicate())
+        x_placements = (Shard(0), Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout, _ = op.infer_layout((x_layout, None, None), (1, True))
+        mock_tensor = MagicMock()
+        mock_tensor.layout = x_layout
+        mock_tensor.to_local.return_value = MagicMock()
 
-        assert op.get_expand_impl(None, output_layout, (x_layout, None, None), (1, True)) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x_layout, None, None), (1, True))}"
+        local_args, local_kwargs, cache_values = op.preprocess((mock_tensor, 1, True), {})
+
+        assert not local_kwargs, (
+            f"For ArgMaxWithValue, local_kwargs should be empty, got {local_kwargs}"
         )
+        assert len(local_args) == 3, (
+            f"For ArgMaxWithValue, local_args should have 3 elements "
+            f"(tensor, axis, keep_dims), got {len(local_args)}"
+        )
+        assert local_args[1] == 1, (
+            f"axis should be 1, got {local_args[1]}"
+        )
+        assert local_args[2] is True, (
+            f"keep_dims should be True, got {local_args[2]}"
+        )
+        assert len(cache_values) == 3, (
+            f"cache_values should have 3 elements, got {len(cache_values)}"
+        )
+        assert cache_values[1] == 1, (
+            f"cache_values[1] (axis) should be 1, got {cache_values[1]}"
+        )
+        assert cache_values[2] is True, (
+            f"cache_values[2] (keep_dims) should be True, got {cache_values[2]}"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+    

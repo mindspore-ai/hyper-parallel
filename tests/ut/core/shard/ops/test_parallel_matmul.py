@@ -92,7 +92,9 @@ class TestParallelMatMul(unittest.TestCase):
         x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
         w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
-        output_layout = op.infer_layout((x_layout, w_layout), (False, True))
+        cache_values = [x_layout, w_layout, False, True]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         expected_map = (1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Data Parallel with transpose_a test failed. Expected {expected_map},"
@@ -101,9 +103,9 @@ class TestParallelMatMul(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (x_layout, w_layout), (False, True)) is None, (
+        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x_layout, w_layout), (False, True))}"
+            f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -117,7 +119,9 @@ class TestParallelMatMul(unittest.TestCase):
         x_layout = _build_layout(mesh, (Shard(0), Replicate()), 2)
         w_layout = _build_layout(mesh, (Replicate(), Shard(0)), 2)
 
-        output_layout = op.infer_layout((x_layout, w_layout), (False, True))
+        cache_values = [x_layout, w_layout, False, True]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         expected_map = (1, 0)
         assert output_layout.tensor_map == expected_map, (
             f"Hybrid Parallel test failed. Expected {expected_map}, "
@@ -135,7 +139,9 @@ class TestParallelMatMul(unittest.TestCase):
         x_layout = _build_layout(mesh, (Replicate(), Shard(0)), 2)
         w_layout = _build_layout(mesh, (Replicate(), Shard(0)), 2)
 
-        output_layout = op.infer_layout((x_layout, w_layout), (True, False))
+        cache_values = [x_layout, w_layout, True, False]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         expected_map = (-1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Tensor Parallel test failed. Expected {expected_map}, "
@@ -153,7 +159,9 @@ class TestParallelMatMul(unittest.TestCase):
         x_layout = _build_layout(mesh, (Shard(1), Shard(0)), 2)
         w_layout = _build_layout(mesh, (Replicate(), Shard(1)), 2)
 
-        output_layout = op.infer_layout((x_layout, w_layout), (True, True))
+        cache_values = [x_layout, w_layout, True, True]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         expected_map = (1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Hybrid Tensor Parallel test failed. Expected {expected_map}, "
@@ -171,7 +179,9 @@ class TestParallelMatMul(unittest.TestCase):
         x_layout = _build_layout(mesh, (Shard(0), Replicate(), Shard(1)), 2)
         w_layout = _build_layout(mesh, (Replicate(), Shard(0), Shard(1)), 2)
 
-        output_layout = op.infer_layout((x_layout, w_layout), (False, True))
+        cache_values = [x_layout, w_layout, False, True]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         expected_map = (2, 1)
         assert output_layout.tensor_map == expected_map, (
             f"Multi-Shard Tensor Parallel test failed. Expected {expected_map}, "
@@ -196,7 +206,8 @@ class TestParallelMatMul(unittest.TestCase):
         w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
         op_ext = self._make_matmul_ext()
-        output_layout = op_ext.infer_layout((x_layout, w_layout))
+        output_layouts, _ = op_ext.infer_layout([x_layout, w_layout])
+        output_layout = output_layouts[0]
         expected_partial = [None, 'sum']
         assert output_layout.partial == expected_partial, (
             f"Partial propagation from x failed. Expected {expected_partial}, "
@@ -217,7 +228,8 @@ class TestParallelMatMul(unittest.TestCase):
         w_layout.set_partial_by_dev_axis("dp", "sum")
 
         op_ext = self._make_matmul_ext()
-        output_layout = op_ext.infer_layout((x_layout, w_layout))
+        output_layouts, _ = op_ext.infer_layout([x_layout, w_layout])
+        output_layout = output_layouts[0]
         expected_partial = ['sum', None]
         assert output_layout.partial == expected_partial, (
             f"Partial propagation from w failed. Expected {expected_partial}, "
@@ -239,7 +251,8 @@ class TestParallelMatMul(unittest.TestCase):
         w_layout.set_partial_by_dev_axis("dp", "sum")
 
         op_ext = self._make_matmul_ext()
-        output_layout = op_ext.infer_layout((x_layout, w_layout))
+        output_layouts, _ = op_ext.infer_layout([x_layout, w_layout])
+        output_layout = output_layouts[0]
         expected_partial = ['sum', 'sum']
         assert output_layout.partial == expected_partial, (
             f"Partial propagation from both axes failed. Expected {expected_partial}, "
@@ -262,7 +275,7 @@ class TestParallelMatMul(unittest.TestCase):
 
         op_ext = self._make_matmul_ext()
         with self.assertRaisesRegex(ValueError, "Partial on the same axis"):
-            op_ext.infer_layout((x_layout, w_layout))
+            op_ext.infer_layout([x_layout, w_layout])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_matmul_ext_partial_x_plus_contract_dim_same_axis_not_conflict(self, mock_platform):
@@ -280,7 +293,8 @@ class TestParallelMatMul(unittest.TestCase):
         w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
         op_ext = self._make_matmul_ext()
-        output_layout = op_ext.infer_layout((x_layout, w_layout))
+        output_layouts, _ = op_ext.infer_layout([x_layout, w_layout])
+        output_layout = output_layouts[0]
         expected_partial = [None, 'sum']
         assert output_layout.partial == expected_partial, (
             f"Partial + contract dim same axis failed. Expected {expected_partial}, "
@@ -301,7 +315,8 @@ class TestParallelMatMul(unittest.TestCase):
         w_layout = _build_layout(mesh, (Replicate(), Shard(0)), 2)
 
         op_ext = self._make_matmul_ext()
-        output_layout = op_ext.infer_layout((x_layout, w_layout))
+        output_layouts, _ = op_ext.infer_layout([x_layout, w_layout])
+        output_layout = output_layouts[0]
         expected_partial = ['sum', 'sum']
         assert output_layout.partial == expected_partial, (
             f"Partial + contract dim different axes failed. Expected {expected_partial}, "
@@ -323,7 +338,8 @@ class TestParallelMatMul(unittest.TestCase):
         w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
         op_ext = self._make_matmul_ext()
-        output_layout = op_ext.infer_layout((x_layout, w_layout))
+        output_layouts, _ = op_ext.infer_layout([x_layout, w_layout])
+        output_layout = output_layouts[0]
         expected_partial = [None, 'sum']
         assert output_layout.partial == expected_partial, (
             f"Partial without contract sharding failed. Expected {expected_partial}, "
@@ -346,7 +362,7 @@ class TestParallelMatMul(unittest.TestCase):
 
         op_ext = self._make_matmul_ext()
         with self.assertRaisesRegex(ValueError, "Partial dim must be replicate"):
-            op_ext.infer_layout((x_layout, w_layout))
+            op_ext.infer_layout([x_layout, w_layout])
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_matmul_distributed_partial_x_propagated(self, mock_platform):
@@ -362,7 +378,9 @@ class TestParallelMatMul(unittest.TestCase):
         _LAYOUT_CACHE.clear()
         w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
 
-        output_layout = op.infer_layout((x_layout, w_layout), (True, False))
+        cache_values = [x_layout, w_layout, True, False]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         expected_partial = ['sum', None]
         assert output_layout.partial == expected_partial, (
             f"MatMulDistributedOp partial x propagation failed. Expected {expected_partial}, "
@@ -382,7 +400,9 @@ class TestParallelMatMul(unittest.TestCase):
         w_layout = _build_layout(mesh, (Replicate(), Replicate()), 2)
         w_layout.set_partial_by_dev_axis("mp", "sum")
 
-        output_layout = op.infer_layout((x_layout, w_layout), (False, True))
+        cache_values = [x_layout, w_layout, False, True]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         expected_partial = [None, 'sum']
         assert output_layout.partial == expected_partial, (
             f"MatMulDistributedOp partial w propagation failed. Expected {expected_partial}, "
@@ -681,16 +701,19 @@ class TestParallelBatchMatMul(unittest.TestCase):
 
     def _run_scenario(self, bmm_op, x_layout, w_layout, expected_map, transpose_a=False, transpose_b=False):
         """Infer layout of BatchMatMul"""
-        output_layout = bmm_op.infer_layout((x_layout, w_layout), (transpose_a, transpose_b))
+        cache_values = [x_layout, w_layout, transpose_a, transpose_b]
+        output_layouts, _ = bmm_op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         assert output_layout.tensor_map == expected_map, (
             f"Test BatchMatMul failed. Expected {expected_map}, "
             f"got {output_layout.tensor_map}"
         )
+        # Since `get_expand_impl` is not overridden, it returns None by default.
         assert bmm_op.get_expand_impl(
-            None, output_layout, (x_layout, w_layout), (transpose_a, transpose_b)
+            None, (output_layouts, None), cache_values
         ) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {bmm_op.get_expand_impl(None, output_layout, (x_layout, w_layout), (transpose_a, transpose_b))}"
+            f"got {bmm_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -741,7 +764,9 @@ class TestParallelBatchMatMul(unittest.TestCase):
         w_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
 
         bmm_op = BatchMatMulDistributedOp("BatchMatMul")
-        output_layout = bmm_op.infer_layout((x_layout, w_layout), (False, False))
+        cache_values = [x_layout, w_layout, False, False]
+        output_layouts, _ = bmm_op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         expected_partial = [None, 'sum', None]
         assert output_layout.partial == expected_partial, (
             f"BatchMatMul partial x propagation failed. Expected {expected_partial}, "
@@ -763,7 +788,9 @@ class TestParallelBatchMatMul(unittest.TestCase):
         w_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(1)), 3)
 
         bmm_op = BatchMatMulDistributedOp("BatchMatMul")
-        output_layout = bmm_op.infer_layout((x_layout, w_layout), (False, False))
+        cache_values = [x_layout, w_layout, False, False]
+        output_layouts, _ = bmm_op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         expected_partial = [None, 'sum', 'sum']
         assert output_layout.partial == expected_partial, (
             f"BatchMatMul partial x + contract sharding failed. Expected {expected_partial}, "
@@ -783,7 +810,9 @@ class TestParallelBatchMatMul(unittest.TestCase):
         w_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
 
         bmm_op = BatchMatMulDistributedOp("BatchMatMul")
-        output_layout = bmm_op.infer_layout((x_layout, w_layout), (True, False))
+        cache_values = [x_layout, w_layout, True, False]
+        output_layouts, _ = bmm_op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         expected_partial = [None, 'sum', None]
         assert output_layout.partial == expected_partial, (
             f"BatchMatMul partial x transpose_a failed. Expected {expected_partial}, "
@@ -823,13 +852,16 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
     def _run_scenario(self, x_layout, w_layout, expected_map):
         """Infer layout of BatchMatmul operator"""
         bmm_ext_op = BatchMatMulExtDistributedOp("BatchMatMulExt")
-        output_layout = bmm_ext_op.infer_layout((x_layout, w_layout), None)
+        cache_values = [x_layout, w_layout]
+        output_layouts, _ = bmm_ext_op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
         assert output_layout.tensor_map == expected_map, (
             f"BatchMatMulExt failed. Expected {expected_map}, got {output_layout.tensor_map}"
         )
-        assert bmm_ext_op.get_expand_impl(None, output_layout, (x_layout, w_layout), None) is None, (
+        # Since `get_expand_impl` is not overridden, it returns None by default.
+        assert bmm_ext_op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
             f"get_expand_impl test failed. Expected None, "
-            f"got {bmm_ext_op.get_expand_impl(None, output_layout, (x_layout, w_layout), None)}"
+            f"got {bmm_ext_op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -923,7 +955,8 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
         w_layout = _build_layout(mesh, (Replicate(), Replicate(), Replicate()), 3)
 
         bmm_ext_op = BatchMatMulExtDistributedOp("BatchMatMulExt")
-        output_layout = bmm_ext_op.infer_layout((x_layout, w_layout), None)
+        output_layouts, _ = bmm_ext_op.infer_layout([x_layout, w_layout])
+        output_layout = output_layouts[0]
         expected_partial = [None, 'sum', None]
         assert output_layout.partial == expected_partial, (
             f"BatchMatMulExt partial x propagation failed. Expected {expected_partial}, "
@@ -943,7 +976,8 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
         w_layout.set_partial_by_dev_axis("dp", "sum")
 
         bmm_ext_op = BatchMatMulExtDistributedOp("BatchMatMulExt")
-        output_layout = bmm_ext_op.infer_layout((x_layout, w_layout), None)
+        output_layouts, _ = bmm_ext_op.infer_layout([x_layout, w_layout])
+        output_layout = output_layouts[0]
         expected_partial = ['sum', None, None]
         assert output_layout.partial == expected_partial, (
             f"BatchMatMulExt partial w propagation failed. Expected {expected_partial}, "
@@ -965,7 +999,8 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
         w_layout = _build_layout(mesh, (Replicate(), Replicate(), Shard(1)), 3)
 
         bmm_ext_op = BatchMatMulExtDistributedOp("BatchMatMulExt")
-        output_layout = bmm_ext_op.infer_layout((x_layout, w_layout), None)
+        output_layouts, _ = bmm_ext_op.infer_layout([x_layout, w_layout])
+        output_layout = output_layouts[0]
         expected_partial = [None, 'sum', 'sum']
         assert output_layout.partial == expected_partial, (
             f"BatchMatMulExt partial x + contract sharding failed. Expected {expected_partial}, "
@@ -988,7 +1023,7 @@ class TestParallelBatchMatMulExt(unittest.TestCase):
 
         bmm_ext_op = BatchMatMulExtDistributedOp("BatchMatMulExt")
         with self.assertRaisesRegex(ValueError, "Partial dim must be replicate"):
-            bmm_ext_op.infer_layout((x_layout, w_layout), None)
+            bmm_ext_op.infer_layout([x_layout, w_layout])
 
 
 if __name__ == "__main__":

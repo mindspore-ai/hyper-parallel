@@ -16,7 +16,8 @@
 Distributed implementation for OneHotExt operator.
 """
 
-# pylint: disable=import-outside-toplevel
+from typing import Tuple
+
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
@@ -24,61 +25,119 @@ from .parallel_ops import DistributedOp
 platform = get_platform()
 
 
+def _normalize_one_hot_ext_args(indices, num_classes, on_value, off_value, axis):
+    return (indices, num_classes, on_value, off_value, axis), {}
+
+
 class OneHotExtDistributedOp(DistributedOp):
     """Distributed implementation for OneHotExt operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for OneHotExt operator.
+
+        Args:
+            args (tuple): Input arguments (indices, num_classes, on_value, off_value, axis).
+            kwargs (dict): Keyword arguments (empty for this operator).
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, kwargs = _normalize_one_hot_ext_args(*args, **kwargs)
+        indices, num_classes, on_value, off_value, axis = args
+
+        indices_local = indices.to_local()
+        on_value_local = on_value.to_local() if hasattr(on_value, '_layout') else on_value
+        off_value_local = off_value.to_local() if hasattr(off_value, '_layout') else off_value
+
+        on_value_layout = on_value.layout if hasattr(on_value, '_layout') else None
+        off_value_layout = off_value.layout if hasattr(off_value, '_layout') else None
+
+        local_args = (indices_local, num_classes, on_value_local, off_value_local, axis)
+        local_kwargs = {}
+        cache_values = [indices.layout, on_value_layout, off_value_layout, num_classes, axis]
+        return local_args, local_kwargs, cache_values
+
+    # pylint: disable=W0237
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layout for OneHotExt.
 
+        Rules:
+            1. Indices must not have Partial status.
+            2. num_classes must be int >= -1.
+            3. axis must be in [-1, 1].
+            4. For multi-dimensional input (>1D), axis must be -1 and only dim0 may be sharded.
+            5. Non-indices inputs must be fully replicated.
+            6. Output layout inserts a replicated one-hot dimension at the specified axis.
+
         Args:
-            layouts (tuple): Tuple containing input layouts.
-            extra_args (tuple): Additional arguments containing [num_classes, on_value, off_value, axis].
+            cache_values (list): [indices_layout, on_value_layout, off_value_layout, num_classes, axis]
 
         Returns:
-            Layout: Output layout with one-hot dimension inserted at specified axis.
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
+            TypeError: If num_classes or axis has invalid type.
         """
-        if not layouts:
-            return None
+        indices_layout = cache_values[0]
+        on_value_layout = cache_values[1]
+        off_value_layout = cache_values[2]
+        num_classes = cache_values[3]
+        axis = cache_values[4]
 
-        indices_layout = layouts[0]
         if indices_layout is None or indices_layout.mesh_shape is None:
-            raise ValueError(f"{self.op_name}: indices layout cannot be None")
-
-        if indices_layout.is_partial():
             raise ValueError(
-                f"{self.op_name}: indices cannot be in partial state. "
-                f"Indices must contain complete index values for OneHot operation."
+                f"For {self.op_name}, indices layout cannot be None."
             )
 
-        num_classes = self._get_num_classes(extra_args)
-        self._validate_num_classes(num_classes)
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([indices_layout])
 
-        axis = self._get_axis(extra_args)
+        self._validate_num_classes(num_classes)
+        axis = self._validate_axis(axis)
 
         in_tensor_map = indices_layout.tensor_map
         if not in_tensor_map:
-            raise ValueError(f"{self.op_name}: indices tensor_map is empty")
+            raise ValueError(
+                f"For {self.op_name}, indices tensor_map is empty."
+            )
 
         self._validate_multi_dim_restriction(in_tensor_map, axis, indices_layout)
-        self._validate_inputs_layouts(layouts)
+        self._validate_inputs_layouts(
+            [indices_layout, on_value_layout, off_value_layout]
+        )
 
         out_tensor_map = self._infer_output_tensor_map(in_tensor_map, axis)
         out_layout = self._create_layout_from_tensor_map(indices_layout, out_tensor_map)
-
         out_layout.tensor_map_to_placement()
 
-        return out_layout
+        return ((out_layout,), None)
 
-    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
-        """Get expanded implementation for OneHotExt operator."""
+    # pylint: disable=W0237
+    def get_expand_impl(self, func, infer_result, cache_values):
+        """
+        Get expanded implementation for OneHotExt operator.
+
+        When indices are sharded and num_classes is -1 (auto-detect), returns a
+        closure that computes the global maximum index across all shards via
+        AllReduce(max) before calling the original operator.
+
+        Args:
+            func: Original operator callable.
+            infer_result: Result from infer_layout (unused).
+            cache_values (list): [indices_layout, on_value_layout, off_value_layout, num_classes, axis]
+
+        Returns:
+            Optional[callable]: Closure or None if no expansion is needed.
+        """
+        # pylint: disable=C0415
         import mindspore as ms
         from mindspore import ops, Tensor
 
-        del infer_result
-
-        indices_layout = layouts[0] if layouts else None
-        if indices_layout is None:
+        indices_layout = cache_values[0]
+        if indices_layout is None or indices_layout.mesh_shape is None:
             return None
 
         sharded_axes = self._get_sharded_axes(indices_layout)
@@ -102,7 +161,8 @@ class OneHotExtDistributedOp(DistributedOp):
             local_max_host = int(local_max.asnumpy())
             if local_max_host > 2147483647:
                 raise ValueError(
-                    f"{self.op_name}: indices max value {local_max_host} exceeds int32 range"
+                    f"For {self.op_name}, indices max value {local_max_host} "
+                    f"exceeds int32 range."
                 )
 
             zero_dim = local_max.ndim == 0
@@ -126,32 +186,28 @@ class OneHotExtDistributedOp(DistributedOp):
 
         return expanded_one_hot
 
-    def _get_num_classes(self, extra_args):
-        """Extract num_classes from extra arguments."""
-        if isinstance(extra_args, (list, tuple)) and len(extra_args) >= 1:
-            num_classes = extra_args[0]
-            if isinstance(num_classes, int):
-                return num_classes
-        return -1
-
     def _validate_num_classes(self, num_classes):
         """Validate num_classes parameter."""
         if not isinstance(num_classes, int):
             raise TypeError(
-                f"{self.op_name}: num_classes must be int, but got {type(num_classes).__name__}"
+                f"For {self.op_name}, num_classes should be int, "
+                f"but got {type(num_classes).__name__}."
             )
         if num_classes < -1:
             raise ValueError(
-                f"{self.op_name}: num_classes must be >= -1, but got {num_classes}"
+                f"For {self.op_name}, num_classes should be >= -1, "
+                f"but got {num_classes}."
             )
 
     def _validate_indices_dtype(self, indices):
         """Validate indices dtype."""
+        # pylint: disable=C0415
         import mindspore as ms
 
         if indices.dtype != ms.int64:
             raise TypeError(
-                f"{self.op_name}: indices dtype must be int64, but got {indices.dtype}"
+                f"For {self.op_name}, indices dtype should be int64, "
+                f"but got {indices.dtype}."
             )
 
     def _get_sharded_axes(self, layout):
@@ -174,23 +230,18 @@ class OneHotExtDistributedOp(DistributedOp):
 
         return list(sharded_axes)
 
-    def _get_axis(self, extra_args):
-        """Extract axis parameter from extra arguments."""
-        if isinstance(extra_args, (list, tuple)) and len(extra_args) >= 4:
-            axis = extra_args[3]
-            if isinstance(axis, int):
-                return self._validate_axis(axis)
-        return -1
-
     def _validate_axis(self, axis):
         """Validate axis parameter."""
         if not isinstance(axis, int):
             raise TypeError(
-                f"{self.op_name}: axis must be int, but got {type(axis).__name__}"
+                f"For {self.op_name}, axis should be int, "
+                f"but got {type(axis).__name__}."
             )
 
         if axis > 1 or axis < -1:
-            raise ValueError(f"{self.op_name}: axis {axis} is out of range[-1, 1]")
+            raise ValueError(
+                f"For {self.op_name}, axis {axis} is out of range [-1, 1]."
+            )
 
         return axis
 
@@ -202,15 +253,17 @@ class OneHotExtDistributedOp(DistributedOp):
 
         if axis != -1:
             raise ValueError(
-                f"{self.op_name}: when input dimension is > 1, axis must be -1, but got {axis}"
+                f"For {self.op_name}, when input dimension is > 1, axis should be -1, "
+                f"but got {axis}."
             )
 
         alias_map = indices_layout.alias_tensor_map
         for i in range(1, len(alias_map)):
             if alias_map[i] != "None":
                 raise ValueError(
-                    f"{self.op_name}: when input dimension is > 1, strategy must be data parallel, "
-                    f"but dimension {i} is sharded on '{alias_map[i]}'"
+                    f"For {self.op_name}, when input dimension is > 1, "
+                    f"strategy should be data parallel, "
+                    f"but dimension {i} is sharded on '{alias_map[i]}'."
                 )
 
     def _validate_inputs_layouts(self, layouts):
@@ -221,7 +274,8 @@ class OneHotExtDistributedOp(DistributedOp):
             alias_map = layout.alias_tensor_map
             if alias_map and any(x != "None" for x in alias_map):
                 raise ValueError(
-                    f"{self.op_name}: non-indices inputs must be replicated, but got {alias_map}"
+                    f"For {self.op_name}, non-indices inputs should be replicated, "
+                    f"but got {alias_map}."
                 )
 
     def _infer_output_tensor_map(self, in_tensor_map, axis):
@@ -235,7 +289,8 @@ class OneHotExtDistributedOp(DistributedOp):
 
         if insert_pos < 0 or insert_pos > in_rank:
             raise ValueError(
-                f"{self.op_name}: axis {axis} is out of range for input with rank {in_rank}"
+                f"For {self.op_name}, axis {axis} is out of range "
+                f"for input with rank {in_rank}."
             )
 
         out_tensor_map = list(in_tensor_map)
@@ -277,3 +332,4 @@ class OneHotExtDistributedOp(DistributedOp):
             alias_tensor_map.append(alias_name[len(alias_name) - 1 - dim])
 
         return tuple(alias_tensor_map)
+    

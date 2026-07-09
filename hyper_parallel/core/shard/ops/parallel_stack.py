@@ -16,6 +16,8 @@
 Distributed implementation for Stack operator.
 """
 
+from typing import Tuple
+
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
 
@@ -58,33 +60,49 @@ class StackDistributedOp(DistributedOp):
 
         return local_args, local_kwargs, cache_values
 
-    def infer_layout(self, layouts, extra_args=None):
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
-        Infer output layout based on cache values for torch.stack.
+        Infer output layout for Stack operator.
 
-        All validation logic (e.g., empty checks, layout consistency,
-        and dimension bounds) is handled here.
+        Rules:
+            1. At least one input DTensor is required.
+            2. All input tensors must have identical layouts.
+            3. A new Replicate dimension is inserted at the stack position.
+
+        Args:
+            cache_values (list): [layout_0, ..., layout_n, dim]
+
+        Returns:
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
         """
-        cache_values = layouts
         layouts = cache_values[:-1]
         dim = cache_values[-1]
 
-        # 1. Validation Logic
         if not layouts:
-            raise ValueError(f"Operation {self.op_name}: stack requires at least one input tensor.")
+            raise ValueError(
+                f"For {self.op_name}, stack requires at least one input tensor."
+            )
 
         valid_layouts = [lyt for lyt in layouts if lyt is not None]
 
         if not valid_layouts:
-            raise ValueError(f"Operation {self.op_name}: stack requires at least one input DTensor.")
+            raise ValueError(
+                f"For {self.op_name}, stack requires at least one input DTensor."
+            )
+
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs(valid_layouts)
 
         # Reference layout to validate consistency across all input tensors
         base_layout = valid_layouts[0]
         for layout in valid_layouts[1:]:
             if layout != base_layout:
                 raise ValueError(
-                    f"Operation {self.op_name}: All input tensors must have the same layout. "
-                    f"Expected layout: {base_layout}, Mismatched layout: {layout}"
+                    f"For {self.op_name}, all input tensors must have the same layout, "
+                    f"but got base: {base_layout} and mismatched: {layout}"
                 )
 
         ndim = len(base_layout.tensor_map)
@@ -93,8 +111,8 @@ class StackDistributedOp(DistributedOp):
         actual_dim = dim if dim >= 0 else dim + ndim + 1
         if actual_dim < 0 or actual_dim > ndim:
             raise ValueError(
-                f"Operation {self.op_name}: Dimension out of range (expected to be in range of "
-                f"[{-ndim - 1}, {ndim}], but got {dim})"
+                f"For {self.op_name}, dimension out of range, "
+                f"expected to be in range of [{-ndim - 1}, {ndim}], but got {dim}"
             )
 
         # 2. Layout Inference Logic
@@ -127,5 +145,4 @@ class StackDistributedOp(DistributedOp):
         # Apply the placement mappings via the __call__ method
         output_layout = output_layout(*output_alias_map)
 
-        # Returns a tuple of output layouts and None for extra_args
         return ((output_layout,), None)

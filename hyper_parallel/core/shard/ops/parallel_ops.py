@@ -78,40 +78,42 @@ class DistributedOp:
         """
         return None
 
-    # pylint: disable=W0613
-    def infer_layout(self, layouts: tuple, extra_args: Optional[tuple] = None) -> Optional[tuple]:
+    def infer_layout(self, cache_values: list) -> Optional[tuple]:
         """
-        Infer output layouts based on input layouts.
+        Infer output layouts based on cache_values built by preprocess.
 
-        Default implementation returns the first input layout for element-wise operations.
-        Subclasses can override this method to provide custom layout inference logic.
+        Default implementation extracts the first Layout from cache_values and
+        returns it as the output layout (element-wise default). Subclasses should
+        override this method to provide custom layout inference logic.
 
         Args:
-            layouts (tuple): Layouts of input tensor.
-            extra_args (list): Additional arguments (dim, keepdim, etc.).
+            cache_values (list): Values built by preprocess that affect layout inference.
+                Contains Layout objects and non-layout values (shapes, scalars, etc.).
 
         Returns:
-            tuple: Layouts for output tensors.
+            tuple: ((output_layouts,), None) or None if no layouts found.
         """
-        # Check partial inputs
         if not self._allow_partial_inputs:
-            self._check_partial_inputs(layouts)
+            self._check_partial_inputs(cache_values)
 
-        if layouts:
-            return (layouts[0],)
+        if cache_values:
+            return (cache_values[0],)
         return None
 
     # pylint: disable=W0613
-    def get_expand_impl(self, func: Optional[callable], infer_result: tuple, layouts: tuple,
-                        extra_args: Optional[tuple] = None) -> Optional[callable]:
+    def get_expand_impl(
+        self,
+        func: Optional[callable],
+        infer_result: tuple,
+        cache_values: list,
+    ) -> Optional[callable]:
         """
         Get expand implementation for the operator.
 
         Args:
             func (Optional[callable]): The underlying operator function.
             infer_result (tuple): Result returned by infer_layout (output_layouts, extra_info).
-            layouts (tuple): Input layouts passed to layout inference.
-            extra_args (Optional[tuple]): Additional arguments for layout inference.
+            cache_values (list): Values built by preprocess, forwarded from the dispatch layer.
 
         Returns:
             Optional[callable]: A closure that wraps the operator call with extra logic,
@@ -134,8 +136,10 @@ class DistributedOp:
                 raise RuntimeError(
                     f"Output tuple size ({len(py_output)}) "
                     f"does not match layout tuple size ({len(output_layouts)})")
+            # Inline the fast construction (equivalent to from_local_with_layout) to
+            # avoid an extra Python call frame per output in this hot multi-output loop.
             return tuple(
-                DTensor.from_local(item, layout.mesh, layout.alias_placements)
+                DTensor(item, layout.mesh, layout.placements, layout)
                 for item, layout in zip(py_output, output_layouts)
             )
 
@@ -148,6 +152,4 @@ class DistributedOp:
         else:
             output_layout = output_layouts
 
-        return DTensor.from_local(
-            py_output, output_layout.mesh, output_layout.alias_placements
-        )
+        return DTensor.from_local_with_layout(py_output, output_layout)

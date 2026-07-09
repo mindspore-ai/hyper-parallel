@@ -45,7 +45,7 @@ class DTensorBase(Tensor):
     device mesh and placement specifications.
     """
 
-    def __new__(cls, local_tensor, device_mesh=None, placements=None):
+    def __new__(cls, local_tensor, device_mesh=None, placements=None, layout=None):
         """
         Create a new DTensorBase instance.
 
@@ -53,8 +53,23 @@ class DTensorBase(Tensor):
             local_tensor: The local tensor shard or another DTensorBase instance.
             device_mesh: The device mesh describing the device topology.
             placements: The placement strategy for each mesh dimension.
+            layout: Optional pre-built Layout. When supplied, ``__init_data__``
+                reuses it directly and skips ``_build_layout`` (hot-path fast
+                construction, see ``DTensor.from_local_with_layout``).
             device: The device type (default: "Ascend").
         """
+        # Fast path: a pre-built layout is only ever supplied by the internal
+        # wrap_output / from_local_with_layout hot path, where local_tensor is a
+        # freshly produced plain op-output Tensor (never a DTensorBase) already on
+        # the compute device, and device_mesh/placements are known-valid. Skip the
+        # ABCMeta isinstance(local_tensor, DTensorBase) check (MindSpore Tensor's
+        # metaclass is ABCMeta, so that isinstance is ~10x a normal one), the three
+        # None guards, and the device-placement guard — all pure per-output overhead.
+        if layout is not None:
+            t = Tensor._make_subclass(cls, local_tensor)
+            t.__init_data__(local_tensor, device_mesh, placements, layout)
+            return t
+
         npu_device = "Ascend"
         if isinstance(local_tensor, DTensorBase):
             src = local_tensor
@@ -83,7 +98,7 @@ class DTensorBase(Tensor):
                 local_tensor = local_tensor.to(npu_device)
 
         t = Tensor._make_subclass(cls, local_tensor)
-        t.__init_data__(local_tensor, device_mesh, placements)
+        t.__init_data__(local_tensor, device_mesh, placements, layout)
         return t
 
     def asnumpy(self):
