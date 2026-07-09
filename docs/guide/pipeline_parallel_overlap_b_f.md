@@ -129,7 +129,7 @@ SEND 在 `overlap_p2p=True` 下追加到 `send_handles` 列表，在 `run_microb
 overlap.run(fwd_fn, bwd_fn)
 ```
 
-主线程跑 `fwd_fn`，spawn daemon 线程跑 `bwd_fn`。`coordinator.enable()` 把 Barrier + per-rendezvous Event 状态重置；任一侧异常会立即 `disable` 解除另一侧 wait，避免死锁。**不需要传 `num_layers`**——见 4.5。
+主线程跑 `fwd_fn`，持久 daemon worker 线程跑 `bwd_fn`。`coordinator.enable()` 把 Barrier + per-rendezvous Event 状态重置；任一侧异常会立即 `disable` 解除另一侧 wait，避免死锁。**不需要传 `num_layers`**——见 4.5。
 
 ### 4.4 跨层 `D → A_next` 窗口
 
