@@ -810,6 +810,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
             if self.is_sharded and shard_group is not None and shard_group_size > 1
             else 1
         )
+        grad = grad.contiguous()
         plan = build_rs_plan(self, grad, plan_world_size)
         grad_flat = pack_for_reduce_scatter(grad, plan).reshape(-1)
         # apply gradient_scaling_factor (reduce-scatter leg)

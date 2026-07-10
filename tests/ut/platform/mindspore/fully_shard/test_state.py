@@ -72,8 +72,6 @@ def _make_state():
     state.requires_all_reduce = True
     state.is_shard = True
     state.reduce_op_type = ops.ReduceOp.SUM
-    state._reduce_dtype = None
-    state._orig_dtype = None
     MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
     MindSporeHSDPStateV2.pending_all_reduce_groups.clear()
     state._reset_sharded_params = False
@@ -228,6 +226,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
             shard_size=1,
             dp_size=1,
             gradient_scaling_factor=None,
+            orig_dtype="float32",
             apply_reduced_grad=MagicMock(return_value=False),
         )
         state.replicate_params = [replicate_param]
@@ -236,7 +235,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         state._queue_replicate_params_allreduce()
 
         state._queue_compat_all_reduce.assert_not_called()
-        replicate_param.apply_reduced_grad.assert_called_once_with(grad, state._orig_dtype)
+        replicate_param.apply_reduced_grad.assert_called_once_with(grad, replicate_param.orig_dtype)
 
     def test_queue_replicate_params_allreduce_applies_local_grad_when_all_reduce_disabled(self):
         """requires_all_reduce=False should still materialize replicate_params grads locally."""
@@ -252,6 +251,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
             shard_size=1,
             dp_size=8,
             gradient_scaling_factor=None,
+            orig_dtype="float32",
             apply_reduced_grad=MagicMock(return_value=False),
         )
         state.replicate_params = [replicate_param]
@@ -260,7 +260,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         state._queue_replicate_params_allreduce()
 
         state._queue_compat_all_reduce.assert_not_called()
-        replicate_param.apply_reduced_grad.assert_called_once_with(grad, state._orig_dtype)
+        replicate_param.apply_reduced_grad.assert_called_once_with(grad, replicate_param.orig_dtype)
 
     def test_post_backward_uses_sync_reduction_on_layout_driven_sizes(self):
         """post_backward should use layout-driven sizes and waitable sync reductions before applying grads."""
@@ -291,6 +291,8 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
             unsharded_accumulated_grad_data=None,
             unsharded_grad_data=local_grad,
             unsharded_group_info=GroupInfo("group", rep_group, 8),
+            orig_dtype="float32",
+            reduce_dtype=None,
             shard_size=2,
             dp_size=2,
             shard_world_size=8,
@@ -334,6 +336,8 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
             sharded_param=SimpleNamespace(requires_grad=True, grad=grad),
             unsharded_group_info=GroupInfo("group", "layout-group", 4),
             gradient_scaling_factor=None,
+            orig_dtype="float32",
+            reduce_dtype=None,
             mp_policy=MixedPrecisionPolicy(),
         )
         state.hsdp_params = [hsdp_param]
@@ -383,6 +387,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         target_grad = MagicMock()
         hsdp_param = SimpleNamespace(
             mp_policy=MixedPrecisionPolicy(apply_grad_on_fp32_main_grad=True),
+            orig_dtype="float32",
             apply_reduced_grad=MagicMock(return_value=False),
         )
         MindSporeHSDPStateV2.pre_direct_all_reduce_grads = [
@@ -392,7 +397,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         state.reduce_params()
 
         handle.wait.assert_called_once_with()
-        hsdp_param.apply_reduced_grad.assert_called_once_with(reduced_grad, state._orig_dtype)
+        hsdp_param.apply_reduced_grad.assert_called_once_with(reduced_grad, hsdp_param.orig_dtype)
         target_grad.data.copy_.assert_not_called()
         self.assertEqual(MindSporeHSDPStateV2.pre_direct_all_reduce_grads, [])
 
@@ -465,6 +470,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
             self.assertIsNone(MindSporeHSDPStateV2._comm_fusion_unsupported_reason(param))
 
         state = _make_state()
+        state.comm_fusion = True
         state.config.comm_fusion = True
         state.hsdp_params = [param]
         with patch.object(MindSporeHSDPStateV2, "_comm_fusion_unsupported_reason", return_value=None):
@@ -486,6 +492,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
     def test_zero_grad_and_move_states_to_device(self):
         """Simple state mutators should touch only managed params and non-meta tensors."""
         state = _make_state()
+        state.comm_fusion = True
         hsdp_param = SimpleNamespace(zero_grad=MagicMock())
         replicate_param = SimpleNamespace(zero_grad=MagicMock())
         state.hsdp_params = [hsdp_param]
@@ -528,10 +535,12 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
             init_dtype_attrs=MagicMock(),
             sharded_param=SimpleNamespace(requires_grad=True, device="cpu:0"),
             orig_dtype="float32",
+            param_dtype=None,
             reduce_dtype="float16",
             _param_fqn="p0",
         )
         state = _make_state()
+        state.comm_fusion = True
         state.hsdp_params = [param]
         state.offload_policy = CPUOffloadPolicy()
 
@@ -547,6 +556,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
             init_dtype_attrs=MagicMock(),
             sharded_param=SimpleNamespace(requires_grad=True, device="cpu:0"),
             orig_dtype="float16",
+            param_dtype=None,
             reduce_dtype="float16",
             _param_fqn="p1",
         )
@@ -743,6 +753,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
             dp_size=1,
             gradient_scaling_factor=None,
             apply_reduced_grad=MagicMock(return_value=False),
+            orig_dtype="float32",
             accumulated_allreduced_grad=True,
         )
         state = _make_state()
@@ -760,7 +771,7 @@ class TestStateParamBookkeeping(MindSporeFullyShardUnitTest):
         MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
         MindSporeHSDPStateV2.pending_all_reduce_groups.clear()
         state.post_backward()
-        param.apply_reduced_grad.assert_called_once_with(grad, None)
+        param.apply_reduced_grad.assert_called_once_with(grad, param.orig_dtype)
 
     def test_post_backward_for_comm_fusion_and_reduce_op_setter(self):
         """Fused post-backward should drain staged groups and setter should validate ops."""
