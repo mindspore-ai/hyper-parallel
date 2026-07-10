@@ -81,6 +81,7 @@ def _make_state(mp_policy, hsdp_params):
     state.offload_policy = None
     state.hsdp_params = hsdp_params
     state.replicate_params = []
+    state.comm_fusion = False
     state._reset_sharded_params = True   # Skip the reset_sharded_param branch
     state.is_shard = True                # Match HSDPState.__init__ default
     return state
@@ -91,6 +92,10 @@ def _make_init_dtype_attrs(mock_param, orig_dtype_value):
 
     def _init_dtype_attrs(policy):
         mock_param.orig_dtype = orig_dtype_value
+        inferred_param_dtype = policy.param_dtype
+        if inferred_param_dtype == orig_dtype_value:
+            inferred_param_dtype = None
+        mock_param.param_dtype = inferred_param_dtype
         inferred_reduce_dtype = policy.reduce_dtype
         if inferred_reduce_dtype == policy.param_dtype:
             inferred_reduce_dtype = None
@@ -215,7 +220,7 @@ class TestInitDtypeAttrs(unittest.TestCase):
 class TestInitMpDtypes(unittest.TestCase):
     """Test _orig_dtype / _reduce_dtype inference in MindSporeHSDPStateV2._init_mp_dtypes."""
 
-    def _run(self, mp_policy, params_config):
+    def _run(self, mp_policy, params_config, comm_fusion=False):
         """
         params_config: list of (orig_dtype, reduce_dtype, requires_grad)
         """
@@ -230,6 +235,7 @@ class TestInitMpDtypes(unittest.TestCase):
             mock_params.append(mock_param)
 
         state = _make_state(mp_policy, mock_params)
+        state.comm_fusion = comm_fusion
         state._init_mp_dtypes()
         return state
 
@@ -240,7 +246,7 @@ class TestInitMpDtypes(unittest.TestCase):
         Expectation: _orig_dtype=float32 and _reduce_dtype=None (reduce matches param)
         """
         policy = MixedPrecisionPolicy(param_dtype=ms.float16, reduce_dtype=ms.float16)
-        state = self._run(policy, [(ms.float32, None, True)])
+        state = self._run(policy, [(ms.float32, None, True)], comm_fusion=True)
         self.assertEqual(state._orig_dtype, ms.float32)
         self.assertIsNone(state._reduce_dtype)
 
@@ -251,7 +257,7 @@ class TestInitMpDtypes(unittest.TestCase):
         Expectation: _orig_dtype=float32, _reduce_dtype=float32
         """
         policy = MixedPrecisionPolicy(param_dtype=ms.float16, reduce_dtype=ms.float32)
-        state = self._run(policy, [(ms.float32, ms.float32, True)])
+        state = self._run(policy, [(ms.float32, ms.float32, True)], comm_fusion=True)
         self.assertEqual(state._orig_dtype, ms.float32)
         self.assertEqual(state._reduce_dtype, ms.float32)
 
@@ -262,11 +268,21 @@ class TestInitMpDtypes(unittest.TestCase):
         Expectation: _orig_dtype is None and _reduce_dtype is None
         """
         policy = MixedPrecisionPolicy(param_dtype=ms.float16)
-        state = self._run(policy, [(ms.float32, None, False)])
+        state = self._run(policy, [(ms.float32, None, False)], comm_fusion=True)
         self.assertIsNone(state._orig_dtype)
         self.assertIsNone(state._reduce_dtype)
 
-    def test_non_uniform_orig_dtype_raises(self):
+    def test_non_fusion_allows_non_uniform_orig_dtype(self):
+        """Non-fused per-parameter communication allows mixed original dtypes."""
+        policy = MixedPrecisionPolicy(param_dtype=ms.float16)
+        state = self._run(policy, [
+            (ms.float32, None, True),
+            (ms.float16, None, True),
+        ])
+        self.assertFalse(hasattr(state, "_orig_dtype"))
+        self.assertFalse(hasattr(state, "_reduce_dtype"))
+
+    def test_comm_fusion_non_uniform_orig_dtype_raises(self):
         """
         Feature: _init_mp_dtypes
         Description: Raise AssertionError when multiple parameters have inconsistent orig_dtype values
@@ -277,7 +293,7 @@ class TestInitMpDtypes(unittest.TestCase):
             self._run(policy, [
                 (ms.float32, None, True),
                 (ms.float16, None, True),
-            ])
+            ], comm_fusion=True)
         self.assertIn("uniform original parameter dtype", str(ctx.exception))
 
 
@@ -300,6 +316,10 @@ class TestLazyInitDtypeRefresh(unittest.TestCase):
         # init_dtype_attrs reads sharded_param.dtype directly and assigns it to orig_dtype
         def init_dtype_attrs(policy):
             mock_param.orig_dtype = mock_param.sharded_param.dtype
+            param_dtype = policy.param_dtype
+            if param_dtype == mock_param.orig_dtype:
+                param_dtype = None
+            mock_param.param_dtype = param_dtype
             rd = policy.reduce_dtype
             pd = policy.param_dtype
             if rd == pd:
@@ -309,6 +329,7 @@ class TestLazyInitDtypeRefresh(unittest.TestCase):
 
         policy = MixedPrecisionPolicy(param_dtype=ms.float16, reduce_dtype=ms.float16)
         state = _make_state(policy, [mock_param])
+        state.comm_fusion = True
         state._reset_sharded_params = False  # Trigger the reset_sharded_param branch
         state.offload_policy = None
 
@@ -831,8 +852,10 @@ class TestAsyncReduceStateMachine(unittest.TestCase):
         # HCCL's contig requirement; route the mock back to ``packed_grad`` so
         # the identity assertion below still passes.
         packed_grad.contiguous.return_value = packed_grad
+        contiguous_grad = MagicMock()
+        contiguous_grad.contiguous.return_value = contiguous_grad
+        grad.contiguous.return_value = contiguous_grad
         grad.to.return_value = grad
-        grad.contiguous.return_value = grad
         param.unsharded_grad_data = grad
         param.hsdp_placement = MagicMock()
         param.hsdp_placement.dim = 1
@@ -846,8 +869,8 @@ class TestAsyncReduceStateMachine(unittest.TestCase):
         MindSporeHSDPParamV2.reduce_scatter_grad(param, async_op=True)
 
         grad.contiguous.assert_called_once()
-        mock_build_plan.assert_called_once_with(param, grad, 2)
-        mock_pack.assert_called_once_with(grad, plan)
+        mock_build_plan.assert_called_once_with(param, contiguous_grad, 2)
+        mock_pack.assert_called_once_with(contiguous_grad, plan)
         self.assertIs(mock_reduce_scatter.call_args.args[1], packed_grad)
 
     def test_reduce_scatter_output_waits_and_clears_handle(self):
@@ -1105,14 +1128,14 @@ class TestAsyncReducePostBackwardHelpers(unittest.TestCase):
         Expectation: all_reduce_grad receives dtype so local-only shard paths still cast consistently
         """
         state = object.__new__(MindSporeHSDPStateV2)
-        state._reduce_dtype = ms.float16
-        state._orig_dtype = ms.float32
         state.reduce_op_type = "reduce_op"
         state.requires_all_reduce = True
         pending_grad = MagicMock()
         state._get_pending_unsharded_grad = MagicMock(return_value=pending_grad)
         param = MagicMock()
         param.dp_size = 2
+        param.reduce_dtype = ms.float16
+        param.orig_dtype = ms.float32
 
         state._queue_compat_all_reduce(param)
 

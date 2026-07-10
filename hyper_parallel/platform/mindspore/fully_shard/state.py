@@ -105,7 +105,7 @@ class MindSporeHSDPStateV2(HSDPState):
         apply_gradient_scaling_factor(
             pending_grad, hsdp_param.gradient_scaling_factor
         )
-        return hsdp_param.apply_reduced_grad(pending_grad, self._orig_dtype)
+        return hsdp_param.apply_reduced_grad(pending_grad, hsdp_param.orig_dtype)
 
     def __init__(self, cell, mesh_info, config, platform, device=None):
         super().__init__(cell, mesh_info, config, platform, device)
@@ -256,25 +256,41 @@ class MindSporeHSDPStateV2(HSDPState):
 
     def _init_mp_dtypes(self):
         """init mp dtypes for hsdp parameters and replicate parameters"""
+        fused_trainable_params = []
+        fused_orig_dtypes = set()
+        fused_reduce_dtypes = set()
+        fused_all_gather_dtypes = set()
         for hsdp_param in self.hsdp_params:
             hsdp_param.init_dtype_attrs(self.mp_policy)
+            if not self.comm_fusion:
+                continue
+            all_gather_dtype = hsdp_param.orig_dtype
+            if hsdp_param.param_dtype is not None:
+                all_gather_dtype = hsdp_param.param_dtype
+            fused_all_gather_dtypes.add(all_gather_dtype)
+            if hsdp_param.sharded_param.requires_grad:
+                fused_trainable_params.append(hsdp_param)
+                fused_orig_dtypes.add(hsdp_param.orig_dtype)
+                fused_reduce_dtypes.add(hsdp_param.reduce_dtype)
         for replicate_param in self.replicate_params:
             replicate_param.init_dtype_attrs(self.mp_policy)
-        trainable_params: list[MindSporeHSDPParamV2] = [
-            p for p in self._iter_managed_params() if p.sharded_param.requires_grad
-        ]
-        orig_dtypes = {p.orig_dtype for p in trainable_params}
-        reduce_dtypes = {p.reduce_dtype for p in trainable_params}
-        if len(trainable_params) > 0 and len(orig_dtypes) != 1:
+        if not self.comm_fusion:
+            return
+        if len(fused_trainable_params) > 0 and len(fused_orig_dtypes) != 1:
             raise AssertionError(
-                f"hsdp expects uniform original parameter dtype but got {orig_dtypes}"
+                f"hsdp expects uniform original parameter dtype but got {fused_orig_dtypes}"
             )
-        self._orig_dtype = next(iter(orig_dtypes)) if trainable_params else None
-        if len(trainable_params) > 0 and len(reduce_dtypes) != 1:
+        self._orig_dtype = next(iter(fused_orig_dtypes)) if fused_trainable_params else None
+        if len(fused_trainable_params) > 0 and len(fused_reduce_dtypes) != 1:
             raise AssertionError(
-                f"hsdp expects uniform reduce dtype but got {reduce_dtypes}"
+                f"hsdp expects uniform reduce dtype but got {fused_reduce_dtypes}"
             )
-        self._reduce_dtype = next(iter(reduce_dtypes)) if trainable_params else None
+        self._reduce_dtype = next(iter(fused_reduce_dtypes)) if fused_trainable_params else None
+        if len(fused_all_gather_dtypes) > 1:
+            raise AssertionError(
+                "hsdp comm_fusion expects uniform all-gather parameter dtype "
+                f"but got {fused_all_gather_dtypes}"
+            )
 
     def lazy_init(self):
         """Refresh parameter views and validate runtime state before first execution."""
@@ -387,7 +403,7 @@ class MindSporeHSDPStateV2(HSDPState):
             # all-reduce already applied SUM/AVG via _resolve_reduce_op(); skip legacy manual AVG div.
             if hsdp_param.mp_policy.apply_grad_on_fp32_main_grad:
                 need_synchronize = (
-                    hsdp_param.apply_reduced_grad(reduced_grad, self._orig_dtype)
+                    hsdp_param.apply_reduced_grad(reduced_grad, hsdp_param.orig_dtype)
                     or need_synchronize
                 )
             elif reduced_grad is not target_grad:
@@ -470,11 +486,11 @@ class MindSporeHSDPStateV2(HSDPState):
             for hsdp_param in groups_by_comm[None]:
                 hsdp_param.reduce_scatter_grad(
                     async_op=True,
-                    dtype=self._reduce_dtype,
+                    dtype=hsdp_param.reduce_dtype,
                     reduce_op=self._resolve_reduce_op(),
                 )
                 HSDPState.pre_reduce_scatter_params.append(
-                    (hsdp_param, self._orig_dtype)
+                    (hsdp_param, hsdp_param.orig_dtype)
                 )
 
         for key, hsdp_params in groups_by_comm.items():
@@ -484,8 +500,8 @@ class MindSporeHSDPStateV2(HSDPState):
             group = AllReduceParamGroup(
                 replicate_group=group_info.group,
                 hsdp_params=hsdp_params,
-                orig_dtypes=[self._orig_dtype] * len(hsdp_params),
-                reduce_dtype=self._reduce_dtype,
+                orig_dtypes=[hsdp_param.orig_dtype for hsdp_param in hsdp_params],
+                reduce_dtype=hsdp_params[0].reduce_dtype,
                 reduce_op=self._resolve_reduce_op(),
                 mp_policy=self.mp_policy,
                 replicate_world_size=group_info.rank_size,
@@ -495,7 +511,7 @@ class MindSporeHSDPStateV2(HSDPState):
                 buffer_view = group.get_param_buffer_view(idx)
                 hsdp_param.reduce_scatter_grad(
                     async_op=True,
-                    dtype=self._reduce_dtype,
+                    dtype=hsdp_param.reduce_dtype,
                     reduce_op=self._resolve_reduce_op(),
                     output_buffer=buffer_view,
                 )
@@ -556,7 +572,7 @@ class MindSporeHSDPStateV2(HSDPState):
         # Pure all-reduce path: pass grad=None so all_reduce_grad fetches the
         # unsharded grad itself and owns the scaling (no reduce-scatter here).
         hsdp_param.all_reduce_grad(
-            dtype=self._reduce_dtype,
+            dtype=hsdp_param.reduce_dtype,
             async_op=True,
             reduce_op=self._resolve_reduce_op(),
         )
@@ -565,7 +581,7 @@ class MindSporeHSDPStateV2(HSDPState):
             self,
             hsdp_param,
         )
-        HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
+        HSDPState.pre_all_reduce_params.append((hsdp_param, hsdp_param.orig_dtype))
 
     def _can_direct_all_reduce_compat_grad(self, hsdp_param) -> bool:
         """Whether ``hsdp_param`` should reduce its existing ``sharded_param.grad`` directly."""
@@ -586,7 +602,7 @@ class MindSporeHSDPStateV2(HSDPState):
         grad = self._get_local_sharded_grad(hsdp_param)
         if grad is None:
             return
-        reduced_grad = _to_dtype_if_needed(grad, self._reduce_dtype)
+        reduced_grad = _to_dtype_if_needed(grad, hsdp_param.reduce_dtype)
         # All-reduce needs a contiguous buffer; the local sharded grad may be a
         # non-contiguous view. No-op when already contiguous; the copy is written
         # back to grad in reduce_params().
