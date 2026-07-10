@@ -12,11 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""ModelSpec dataclass — per-model bundle for trainer registration.
-
-Each model registers a ModelSpec that tells the trainer how to construct and
-(51 lines) with adaptations for hyper's DTensor-first architecture.
-"""
+"""ModelSpec dataclass — per-model bundle for trainer registration."""
 from dataclasses import dataclass
 from typing import Callable, Optional, Type
 
@@ -30,15 +26,20 @@ class ModelSpec:
         build_model_fn: Factory ``(cfg) -> nn.Module``. Can return any
             ``nn.Module`` — self-written or ``AutoModel.from_pretrained``.
         parallelize_fn: Optional custom parallelize ``(model, mesh, cfg) -> model``.
-            When ``None``, ``BaseTrainer._build_parallelized_model`` applies the
-            default TP → CP → AC → FSDP pipeline by reading ``model.layers``,
-            ``model._tp_plan``, and ``model._cp_modules``.
+            Model-specific TP/CP/EP/FSDP wiring should live in this callable.
         clip_grad_fn: Optional custom gradient clipping callable.
             When ``None``, hyper's DTensor-aware ``clip_grad_norm_`` is used.
         pipelining_fn: Optional PP setup ``(model, mesh, cfg) -> (schedule, stages)``.
-        state_dict_adapter: Optional class for HF ↔ hyper weight key translation.
+        state_dict_adapter: Optional class for checkpoint ↔ hyper weight key translation.
         prepare_batch_fn: Optional model-specific transform ``(batch, model) -> batch``
             applied before token counting and forward.
+        tp_load_transform_fn: Optional ``(model, mesh, cfg) -> {param_name: callable}``.
+            Returns per-parameter transforms applied to the **full** checkpoint weight
+            before it is loaded, used when ``parallelize_fn`` manually slices a
+            non-DTensor parameter to a rank-local shard (e.g. Qwen3.5
+            GatedDeltaNet ``conv1d`` / ``dt_bias`` / ``A_log`` under TP). Without
+            it the trainer's meta-init → parallelize → load order would drop the
+            size-mismatched full weight instead of slicing it onto the shard.
 
     Example:
         Standard transformer (uses defaults, ~15 lines to register)::
@@ -69,3 +70,4 @@ class ModelSpec:
     pipelining_fn: Optional[Callable] = None
     state_dict_adapter: Optional[Type] = None
     prepare_batch_fn: Optional[Callable] = None
+    tp_load_transform_fn: Optional[Callable] = None

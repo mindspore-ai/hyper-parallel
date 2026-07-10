@@ -22,6 +22,59 @@ from typing import Callable, Optional, Tuple
 from .parallel_ops import DistributedOp
 
 
+_INPLACE_ELEMENTWISE_OPS = frozenset({
+    "add_", "sub_", "InplaceAddExt", "InplaceSubExt",
+})
+
+
+def _partial_signature(layout, mesh_ndim: int) -> tuple:
+    """Return one Partial entry per output mesh dimension."""
+    if layout is None:
+        return (None,) * mesh_ndim
+    partial = tuple(layout.partial)
+    if len(partial) != mesh_ndim:
+        raise ValueError(
+            f"Input and output mesh dimensions must match, but got "
+            f"input={len(partial)} and output={mesh_ndim}."
+        )
+    return partial
+
+
+def _contributes_to_partial_output(input_layout, output_layout) -> bool:
+    """Return whether this rank contributes an input to a Partial output.
+
+    An input that is not Partial on one of the output's Partial axes is
+    replicated along that axis. Only coordinate zero may contribute that
+    replicated value, otherwise the eventual reduction would count it once
+    per rank on the added axis.
+    """
+    output_partial = tuple(output_layout.partial)
+    input_partial = _partial_signature(input_layout, len(output_partial))
+    for mesh_dim, output_partial_type in enumerate(output_partial):
+        if (
+            output_partial_type is not None
+            and input_partial[mesh_dim] is None
+            and output_layout.mesh.get_local_rank(mesh_dim) != 0
+        ):
+            return False
+    return True
+
+
+def _zero_contribution(value):
+    """Create a strict zero while retaining a floating tensor's grad edge."""
+    is_complex = getattr(value, "is_complex", None)
+    if callable(is_complex) and is_complex():
+        return value * 0
+    if hasattr(value, "clamp"):
+        # ``value * 0`` turns +/-Inf into NaN. Clamp first so the forward value
+        # is finite, then multiply by zero to make the derivative zero even at
+        # the clamp boundary.
+        return value.clamp(0, 0) * 0
+    if isinstance(value, (bool, int, float, complex)):
+        return type(value)(0)
+    return value * 0
+
+
 def _unwrap_local_value(value):
     """Convert DTensor-like values to local tensors while preserving containers."""
     if hasattr(value, "_layout"):
@@ -604,6 +657,48 @@ class AddDistributedOp(ElementWiseWithPartialDistributedOp):
     which is useful for operations like gradient accumulation where partial
     results need to be preserved through the computation graph.
     """
+
+    @staticmethod
+    def _canonicalize_binary_operands(args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+        """Move semantic ``input`` and ``other`` operands before option values."""
+        local_kwargs = dict(kwargs)
+        if args:
+            if "input" in local_kwargs:
+                raise ValueError("Binary elementwise input was provided both positionally and by keyword.")
+            lhs = args[0]
+            trailing_args = args[1:]
+        elif "input" in local_kwargs:
+            lhs = local_kwargs.pop("input")
+            trailing_args = ()
+        else:
+            return args, local_kwargs
+
+        if trailing_args:
+            if "other" in local_kwargs:
+                raise ValueError("Binary elementwise other was provided both positionally and by keyword.")
+            rhs = trailing_args[0]
+            trailing_args = trailing_args[1:]
+        elif "other" in local_kwargs:
+            rhs = local_kwargs.pop("other")
+        else:
+            return args, local_kwargs
+        return (lhs, rhs, *trailing_args), local_kwargs
+
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """Canonicalize binary operands before local unwrapping and layout caching.
+
+        Args:
+            args: Positional backend arguments.
+            kwargs: Keyword backend arguments, potentially including
+                ``input``, ``other``, and options such as ``alpha``.
+
+        Returns:
+            Local arguments, local keyword arguments, and layout cache values
+            with the semantic left and right operands in the first two slots.
+        """
+        canonical_args, canonical_kwargs = self._canonicalize_binary_operands(args, kwargs)
+        return super().preprocess(canonical_args, canonical_kwargs)
+
     def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:  # pylint: disable=W0221
         """
         Infer output layout for Add operator.
@@ -622,6 +717,22 @@ class AddDistributedOp(ElementWiseWithPartialDistributedOp):
         Raises:
             ValueError: If propagated Partial status is not "sum" or None.
         """
+        layouts = tuple(cache_values[:-1])
+        if self.op_name in _INPLACE_ELEMENTWISE_OPS and len(layouts) >= 2:
+            mesh_ndim = max(
+                (len(layout.partial) for layout in layouts[:2] if layout is not None),
+                default=0,
+            )
+            partial_signatures = tuple(
+                _partial_signature(layout, mesh_ndim)
+                for layout in layouts[:2]
+            )
+            if partial_signatures[0] != partial_signatures[1]:
+                raise ValueError(
+                    f"For {self.op_name}, input Partial placements should be identical "
+                    f"for in-place execution, but got {partial_signatures}."
+                )
+
         infer_result = super().infer_layout(cache_values)
         if infer_result is None:
             return infer_result
@@ -638,31 +749,46 @@ class AddDistributedOp(ElementWiseWithPartialDistributedOp):
 
     def get_expand_impl(self, func: Optional[Callable], infer_result: tuple,  # pylint: disable=W0221
                         cache_values: list) -> Optional[Callable]:
-        """
-        Get expand implementation for the operator
+        """Build a rank-local implementation that avoids repeated values.
+
+        Args:
+            func: Local backend add or subtract implementation.
+            infer_result: Inferred output layout and auxiliary result.
+            cache_values: Input layouts followed by input shapes.
+
+        Returns:
+            A contribution-aware local implementation, or ``None`` when both
+            inputs already have identical Partial placements.
         """
         layouts = tuple(cache_values[:-1])
         x1_layout = layouts[0]
         x2_layout = layouts[1]
-        x1_partial = x1_layout.is_partial() if x1_layout is not None else False
-        x2_partial = x2_layout.is_partial() if x2_layout is not None else False
+        output_layout = infer_result[0][0]
+        output_mesh_ndim = len(output_layout.partial)
+        x1_partial = _partial_signature(x1_layout, output_mesh_ndim)
+        x2_partial = _partial_signature(x2_layout, output_mesh_ndim)
 
         if x1_partial == x2_partial:
             return None
 
-        output_layout = infer_result[0][0]
-        scaling_factor = 1
-        for i, partial_type in enumerate(output_layout.partial):
-            if partial_type == "sum":
-                scaling_factor *= output_layout.mesh_shape[i]
+        x1_contributes = _contributes_to_partial_output(x1_layout, output_layout)
+        x2_contributes = _contributes_to_partial_output(x2_layout, output_layout)
 
-        # use expand_impl only when one of x1 and x2 is with partial placement.
-        def _expand_impl1(x1, x2, *args, **kwargs):
-            add_out = func(x1 / scaling_factor, x2, *args, **kwargs)
-            return add_out
+        # ``*args``/``**kwargs`` forward add-specific extras such as ``alpha``.
+        # A strict zero retains a valid zero-gradient autograd edge.
+        def _expand_impl(x1, x2, *args, **kwargs):
+            local_x1 = x1 if x1_contributes else _zero_contribution(x1)
+            local_x2 = x2 if x2_contributes else _zero_contribution(x2)
+            return func(local_x1, local_x2, *args, **kwargs)
 
-        def _expand_impl2(x1, x2, *args, **kwargs):
-            add_out = func(x1, x2 / scaling_factor, *args, **kwargs)
-            return add_out
+        return _expand_impl
 
-        return _expand_impl1 if not x1_partial else _expand_impl2
+
+class SubDistributedOp(AddDistributedOp):
+    """Distributed subtraction with correct replicated-minus-partial signs.
+
+    When the first operand is replicated and the second is Partial(sum), only
+    the first Partial rank may contribute the replicated value. Every other
+    rank must contribute ``0 - x2_local`` so reducing the output reconstructs
+    ``x1 - sum(x2_local)``.
+    """

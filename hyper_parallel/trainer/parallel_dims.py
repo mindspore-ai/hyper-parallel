@@ -13,8 +13,6 @@
 # limitations under the License.
 # ============================================================================
 
-# Adapted from https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/parallel_dims.py
-
 """ParallelDims — fail-fast parallel configuration validator + mesh builder.
 
 Centralises parallel-degree validation in a single dataclass so
@@ -29,17 +27,18 @@ What this provides:
    message when the product mismatches.
 
 3. **Validation against the model** — checks divisibility constraints that
-   would otherwise crash deep inside ``parallelize_module``:
+   would otherwise crash deep inside ``parallelize_module`` or the model's
+   own parallel setup:
 
    - ``num_attention_heads % tp == 0`` (TP shards heads)
    - ``num_key_value_heads % tp == 0`` (GQA constraint)
    - ``num_experts % ep == 0`` (when MoE)
-   - ``ulysses_degree <= cp`` and ``cp % ulysses_degree == 0``
+   - context-parallel modules validate ``ulysses_degree``
    - ``seq_len % (cp * tp) == 0`` (sequence parallel + CP)
    - ``etp == tp or etp == 1`` (expert TP rule)
 
 4. **Mesh building** — returns a ``DeviceMesh`` with the canonical dim order
-   ``dp_replicate → dp_shard → ep → cp → tp → pp``. Backwards compatible with
+   ``pp → dp_replicate → dp_shard → ep → cp → tp``. Backwards compatible with
    the legacy single ``dp`` field (auto-collapses to ``dp_shard``).
 
 User experience:
@@ -78,9 +77,13 @@ class ParallelDims:
         etp: Expert tensor parallel degree. Must equal ``tp`` or ``1``.
         moe_token_dispatcher_type: Expert token exchange strategy.
         npu_nums_per_device: Inner expert-parallel degree for deredundency dispatch.
-        ulysses_degree: Ulysses sub-degree inside ``cp``. ``None`` means
-            "pure Ulysses (degree == cp)".
+        ulysses_degree: Legacy direct-construction override. The YAML trainer
+            path leaves this to the context-parallel module, which owns the
+            actual Ulysses strategy validation.
         world_size: Total number of ranks.
+        _allow_pp: Whether a trainer/model path has opted into pipeline
+            parallelism. Direct ``ParallelDims`` construction keeps the legacy
+            fail-fast guard used by the existing UTs.
     """
 
     dp_replicate: int = 1
@@ -94,6 +97,7 @@ class ParallelDims:
     npu_nums_per_device: int = 8
     ulysses_degree: Optional[int] = None
     world_size: int = 1
+    _allow_pp: bool = False
     # Cached after build_mesh.
     _device_mesh: object = field(default=None, repr=False)
 
@@ -127,8 +131,8 @@ class ParallelDims:
             etp=getattr(parallel_cfg, 'etp', getattr(parallel_cfg, 'tp', 1)),
             moe_token_dispatcher_type=getattr(parallel_cfg, 'moe_token_dispatcher_type', 'all_to_all'),
             npu_nums_per_device=getattr(parallel_cfg, 'npu_nums_per_device', 8),
-            ulysses_degree=getattr(parallel_cfg, 'ulysses_degree', None),
             world_size=world_size,
+            _allow_pp=True,
         )
 
     def __post_init__(self) -> None:
@@ -136,6 +140,16 @@ class ParallelDims:
 
     def _infer_and_validate(self) -> None:
         """Auto-fill ``dp_shard=-1`` then validate ``product == world_size``."""
+        self._validate_positive_degrees()
+        self._validate_moe_dispatcher()
+        self._validate_and_infer_dp_shard()
+        self._validate_parallel_product()
+        self._validate_expert_tensor_parallel()
+        self._validate_pipeline_parallel()
+        self._validate_ulysses_degree()
+
+    def _validate_positive_degrees(self) -> None:
+        """Require every non-auto parallel degree to be positive."""
         for name, value in (
             ("dp_replicate", self.dp_replicate),
             ("cp", self.cp),
@@ -148,6 +162,8 @@ class ParallelDims:
             if value < 1:
                 raise ValueError(f"Parallel degree {name}={value} must be >= 1")
 
+    def _validate_moe_dispatcher(self) -> None:
+        """Validate the MoE dispatcher name and deredundency topology."""
         if self.moe_token_dispatcher_type not in ("all_to_all", "deredundency"):
             raise ValueError(
                 "moe_token_dispatcher_type must be 'all_to_all' or 'deredundency', "
@@ -164,6 +180,8 @@ class ParallelDims:
                 "moe_token_dispatcher_type='deredundency'."
             )
 
+    def _validate_and_infer_dp_shard(self) -> None:
+        """Validate ``dp_shard`` and resolve its auto value when requested."""
         if self.dp_shard < -1 or self.dp_shard == 0:
             raise ValueError(
                 f"dp_shard={self.dp_shard} must be -1 (auto) or a positive int"
@@ -186,6 +204,8 @@ class ParallelDims:
                 self.dp_replicate, self.cp, self.tp, self.pp, self.ep,
             )
 
+    def _validate_parallel_product(self) -> None:
+        """Require the resolved parallel degrees to cover the world exactly."""
         product = (
             self.dp_replicate * self.dp_shard
             * self.cp * self.tp * self.pp * self.ep
@@ -198,6 +218,8 @@ class ParallelDims:
                 f"world_size({self.world_size}). Set dp_shard=-1 to auto-infer."
             )
 
+    def _validate_expert_tensor_parallel(self) -> None:
+        """Validate expert tensor parallelism when expert parallelism is active."""
         # ep is an independent peer mesh dim alongside dp/cp/tp/pp (see build_mesh).
         # It does NOT need to divide the dp_shard*cp pool; it occupies its own
         # mesh axis.  We only enforce the expert-TP compatibility rule below.
@@ -208,14 +230,21 @@ class ParallelDims:
                     f"(expert tensor-parallel must align with TP or be inactive)"
                 )
 
-        # No model has implemented PP wiring yet — fail fast.
-        if self.pp > 1:
+    def _validate_pipeline_parallel(self) -> None:
+        """Require model-owned pipeline construction for a non-trivial PP axis."""
+        # PP is opt-in per model: trainer config construction sets the private
+        # ``_allow_pp`` marker and ``ModelSpec.pipelining_fn`` owns the stage split.
+        # Direct construction keeps the legacy fail-fast guard for callers that
+        # do not provide a model-level PP path.
+        if self.pp > 1 and not self._allow_pp:
             raise NotImplementedError(
-                f"Pipeline parallel (pp={self.pp}>1) is not yet implemented "
-                "for any model. Set pp=1 or add a per-model PP path in "
-                "models/<name>/parallelize.py before enabling."
+                f"Pipeline parallel (pp={self.pp}>1) requires a model-specific "
+                "pipelining_fn. Use ParallelDims.from_config() from the trainer "
+                "path, or set pp=1 for direct construction."
             )
 
+    def _validate_ulysses_degree(self) -> None:
+        """Validate the optional Ulysses degree against context parallelism."""
         # Ulysses must divide cp.
         if self.ulysses_degree is not None and self.cp > 1:
             if self.ulysses_degree > self.cp:
@@ -239,7 +268,7 @@ class ParallelDims:
     ) -> None:
         """Cross-check parallel degrees against a built model's hyperparams.
 
-        Reads ``model.config`` for standard transformer fields. Skips silently
+        Reads common decoder config fields from ``model.config``. Skips silently
         if a field is absent. Model-specific validation (e.g. "TP unsupported
         for linear-attn layers") is inlined at the top of each
         ``parallelize_<model>()`` function — convention.
@@ -258,6 +287,7 @@ class ParallelDims:
         cfg = getattr(model, 'config', None)
         if cfg is None:
             return
+        cfg = getattr(cfg, 'text_config', cfg)
 
         heads = getattr(cfg, 'num_attention_heads', None)
         if heads is not None and self.tp > 1 and heads % self.tp != 0:
@@ -292,17 +322,33 @@ class ParallelDims:
     # ------------------------------------------------------------------
     # Mesh building
     # ------------------------------------------------------------------
-    def build_mesh(self, device_type: str):
+    def build_mesh(self, device_type: str, force_dp_shard: bool = False):
         """Build the DeviceMesh with canonical dim order and named flatten aliases.
 
-        Order of base dims: ``dp_replicate → dp_shard → ep → cp → tp → pp``.
+        Order of base dims: ``pp → dp_replicate → dp_shard → ep → cp → tp``.
+        PP is placed **outermost** (lowest stride is on TP), so pipeline stages
+        consume contiguous ranges of ranks while TP shards stay co-located on
+        the same host.
         For deredundency EP, ``ep`` is materialized as ``oep → iep`` and
-        flattened back under the ``"ep"`` alias.
-        Only base dims with degree > 1 are materialized, except deredundency
-        EP keeps both ``oep`` and ``iep`` axes when ``ep > 1`` so the token
-        dispatcher can form its two communication groups. If all dims are 1,
-        a 1D ``dp_shard`` mesh of the world is created so the FSDP code path
-        runs unchanged on single-card.
+        flattened back under the ``"ep"`` alias. Only base dims with degree
+        > 1 are materialized, except deredundency EP keeps both ``oep`` and
+        ``iep`` axes when ``ep > 1`` so the token dispatcher can form its two
+        communication groups. If all dims are 1, a 1D ``dp_shard`` mesh of the
+        world is created so the FSDP code path runs unchanged on single-card.
+
+        A size-1 ``dp_shard`` dim is also materialized whenever
+        ``dp_replicate > 1``. This preserves the explicit two-dimensional
+        HSDP topology for pure replicated data parallelism: sharding over the
+        size-1 inner axis is a no-op and the outer replicate all-reduce gives
+        DDP-equivalent gradient synchronization.
+
+        ``force_dp_shard=True`` otherwise materializes the ``dp_shard`` dim
+        even at size 1 when neither ``dp_shard`` nor ``cp`` is > 1. Mixed
+        precision is realised entirely through FSDP2's
+        ``MixedPrecisionPolicy``, so a pure-TP / pure-PP mesh (no shardable
+        axis) would otherwise skip the FSDP wrap and silently run the model in
+        full precision; the size-1 axis gives ``fully_shard`` a no-op
+        communication group to hang the dtype policy on.
 
         After construction, the following flatten aliases are registered on
         the root mesh so callers can reach them with ``mesh["fsdp"]`` /
@@ -321,13 +367,26 @@ class ParallelDims:
         Returns:
             ``DeviceMesh`` instance.
         """
+        # PP is excluded: the schedule drives FSDP unshard/reshard itself and
+        # its world-1 FSDP path is not wired — the trainer rejects pure-PP
+        # low-precision runs instead (use PP x FSDP).
+        force_dp_shard = (
+            force_dp_shard and self.dp_shard == 1 and self.cp == 1
+            and self.pp == 1
+        )
         dims = []
         names = []
         for name, size in self._mesh_dim_specs():
             force_materialize = (
-                self.moe_token_dispatcher_type == "deredundency"
-                and self.ep > 1
-                and name in ("oep", "iep")
+                (
+                    name == "dp_shard"
+                    and (force_dp_shard or self.dp_replicate > 1)
+                )
+                or (
+                    self.moe_token_dispatcher_type == "deredundency"
+                    and self.ep > 1
+                    and name in ("oep", "iep")
+                )
             )
             if size > 1 or force_materialize:
                 dims.append(size)
@@ -358,12 +417,12 @@ class ParallelDims:
                 ("iep", self.npu_nums_per_device),
             )
         return (
+            ("pp", self.pp),
             ("dp_replicate", self.dp_replicate),
             ("dp_shard", self.dp_shard),
             *ep_specs,
             ("cp", self.cp),
             ("tp", self.tp),
-            ("pp", self.pp),
         )
 
     def _register_flatten_aliases(self, base_names) -> None:
@@ -411,40 +470,56 @@ class ParallelDims:
             mesh[source_dims].flatten(alias)
             flatten_keys.add(alias)
 
+        self._register_data_flatten_aliases(base_names, _flatten_unique)
+        self._register_loss_flatten_alias(
+            base_names, mesh, flatten_keys, _flatten_unique,
+        )
+
+    @staticmethod
+    def _register_data_flatten_aliases(base_names, flatten_unique) -> None:
+        """Register EP, FSDP, and DP aliases in canonical order."""
         has_replicate = "dp_replicate" in base_names
         has_shard = "dp_shard" in base_names
-        has_cp = "cp" in base_names
         has_oep = "oep" in base_names
         has_iep = "iep" in base_names
 
         # Deredundency materializes EP as ``oep`` × ``iep`` but callers keep
         # using the stable full-EP alias ``mesh["ep"]``.
         if has_oep and has_iep:
-            _flatten_unique(("oep", "iep"), "ep")
+            flatten_unique(("oep", "iep"), "ep")
 
         # ``fsdp`` — the axis ``fully_shard`` actually shards along.
         if has_shard:
-            _flatten_unique("dp_shard", "fsdp")
+            flatten_unique("dp_shard", "fsdp")
 
         # ``dp`` — combined replicate×shard data-parallel mesh.
         if has_replicate and has_shard:
-            _flatten_unique(("dp_replicate", "dp_shard"), "dp")
+            flatten_unique(("dp_replicate", "dp_shard"), "dp")
         elif has_replicate:
-            _flatten_unique("dp_replicate", "dp")
+            flatten_unique("dp_replicate", "dp")
         elif has_shard:
-            _flatten_unique("dp_shard", "dp")
+            flatten_unique("dp_shard", "dp")
+
+    @staticmethod
+    def _register_loss_flatten_alias(
+        base_names, mesh, flatten_keys, flatten_unique,
+    ) -> None:
+        """Register the loss-reduction alias after the DP aliases."""
+        has_replicate = "dp_replicate" in base_names
+        has_shard = "dp_shard" in base_names
+        has_cp = "cp" in base_names
 
         # ``loss`` — dp folded with cp when context parallelism is active so
         # loss / token counts include CP-sharded contributions.
         if has_cp:
             if has_replicate and has_shard:
-                _flatten_unique(("dp_replicate", "dp_shard", "cp"), "loss")
+                flatten_unique(("dp_replicate", "dp_shard", "cp"), "loss")
             elif has_replicate:
-                _flatten_unique(("dp_replicate", "cp"), "loss")
+                flatten_unique(("dp_replicate", "cp"), "loss")
             elif has_shard:
-                _flatten_unique(("dp_shard", "cp"), "loss")
+                flatten_unique(("dp_shard", "cp"), "loss")
             else:
-                _flatten_unique("cp", "loss")
+                flatten_unique("cp", "loss")
         else:
             # No CP — ``loss`` and ``dp`` are the same group. Re-flatten
             # the existing 1D dp mesh under the ``loss`` alias so both
@@ -465,6 +540,16 @@ class ParallelDims:
     def non_dp_size(self) -> int:
         """Product of model-side parallel dims (tp*cp*pp*ep)."""
         return self.tp * self.cp * self.pp * self.ep
+
+    @property
+    def seq_divisor(self) -> int:
+        """Sequence-length divisor the data pipeline must pad to.
+
+        SequenceParallel TP and context parallel both slice the sequence
+        dim, so variable-length batches pad up to a multiple of ``tp * cp``
+        (the trailing pad rides label ``-100`` and is masked out of the CE).
+        """
+        return self.tp * self.cp
 
     @property
     def tp_enabled(self) -> bool:

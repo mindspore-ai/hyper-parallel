@@ -106,8 +106,11 @@ def load_hf_qwen3_vl_moe_state_dict(
                     skipped += 1
                     continue
                 tensor = f.get_tensor(hf_key)
-                # Keep upstream packed layout — expert forward uses matmul
-                # not ``F.linear``, so no transpose is needed.
+                if mapped.endswith((
+                    ".mlp.experts.gate_up_proj",
+                    ".mlp.experts.down_proj",
+                )):
+                    tensor = tensor.transpose(1, 2).contiguous()
                 if dtype is not None and tensor.dtype != dtype:
                     tensor = tensor.to(dtype)
                 hyper_sd[mapped] = tensor

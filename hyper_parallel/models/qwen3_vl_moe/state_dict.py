@@ -34,10 +34,11 @@ class Qwen3VLMoeStateDictAdapter:
     ) -> Dict[str, torch.Tensor]:
         """Read an HF safetensors checkpoint and return hyper-named tensors."""
         include_visual = bool(getattr(model_config, "vl", False))
+        text_config = model_config.text_config if include_visual else model_config
         vision_config = getattr(model_config, "vision_config", None)
         return load_hf_qwen3_vl_moe_state_dict(
             weights_path,
-            num_hidden_layers=model_config.num_hidden_layers,
+            num_hidden_layers=text_config.num_hidden_layers,
             include_visual=include_visual,
             vision_depth=getattr(vision_config, "depth", None),
             dtype=dtype,

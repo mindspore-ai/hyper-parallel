@@ -25,15 +25,22 @@ No edit to this file is required. Create
 ``model.name: <name>`` in the YAML. See ``trainer/utils/discovery.py``
 for the resolution rules (built-in vs. fully-qualified external package).
 """
+# pylint: disable=wrong-import-position
+import os
+
+# Pin the backend before importing hyper_parallel because platform objects are
+# resolved at import time. Keep explicit user overrides intact.
+os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
+
+# Configure root logger BEFORE any other imports so module-level loggers in
+# downstream files pick up our format. ``init_logger`` is idempotent.
 from hyper_parallel.trainer.utils import init_logger
+
+init_logger()
+
 from hyper_parallel.trainer.config import parse_args, HyperTrainerConfig
 from hyper_parallel.trainer.utils.discovery import discover_model_spec
 from hyper_parallel.trainer.llm_trainer import LLMTrainer
-
-# Configure the root logger before training. Module-level loggers in the
-# imports above resolve their handler lazily (at first emit, which happens
-# during training), so doing this after the imports keeps the same format.
-init_logger()
 
 if __name__ == "__main__":
     args = parse_args(HyperTrainerConfig)

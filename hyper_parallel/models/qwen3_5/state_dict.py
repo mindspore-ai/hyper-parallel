@@ -20,7 +20,7 @@ can stay generic. Registered on the ``qwen3_5`` ModelSpec.
 
 __all__ = ["Qwen3_5StateDictAdapter"]
 
-# pylint: disable=C0103  # HF transformers class-name convention (Qwen3_5*)
+# pylint: disable=C0103  # Qwen class-name convention (Qwen3_5*)
 from typing import Dict, Optional
 
 import torch
@@ -37,11 +37,19 @@ class Qwen3_5StateDictAdapter:
         model_config,
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Read an HF safetensors checkpoint and return a hyper-named state dict."""
+        """Read an HF safetensors checkpoint and return a hyper-named state dict.
+
+        The dense model keeps the upstream combined
+        ``linear_attn.in_proj_qkv.weight`` key. ``linear_key_dim`` is still
+        passed for compatibility with older loader call sites but no split is
+        performed here; TP-specific block slicing happens in ``parallelize.py``.
+        """
+        linear_key_dim = model_config.linear_key_head_dim * model_config.linear_num_key_heads
         return load_hf_qwen3_5_state_dict(
             weights_path,
             num_hidden_layers=model_config.num_hidden_layers,
             dtype=dtype,
+            linear_key_dim=linear_key_dim,
         )
 
     @staticmethod

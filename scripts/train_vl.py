@@ -13,6 +13,13 @@
 # limitations under the License.
 # ============================================================================
 """VL training entry point."""
+# pylint: disable=wrong-import-position
+import os
+
+# Pin the backend before importing hyper_parallel because platform objects are
+# resolved at import time. Keep explicit user overrides intact.
+os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
+
 from hyper_parallel.trainer.utils import init_logger
 from hyper_parallel.trainer.config import HyperTrainerConfig, parse_args
 from hyper_parallel.trainer.utils.discovery import discover_model_spec

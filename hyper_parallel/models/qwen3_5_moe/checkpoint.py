@@ -37,11 +37,10 @@ to match hyper's ``nn.ModuleList`` layout::
 """
 from __future__ import annotations
 
-__all__ = ["load_hf_qwen3_5_moe_state_dict"]
-
 import json
 import logging
 import os
+import re
 from typing import Dict, Tuple
 
 import torch
@@ -79,6 +78,68 @@ def _remap_simple_key(hf_key: str, max_layer: int) -> str | None:
         return f"model.{tail}"
 
     logger.debug("Unmapped HF key dropped: %s", hf_key)
+    return None
+
+def _remap_vl_key(hf_key: str, max_layer: int, vision_depth: int) -> str | None:
+    """Identity-style remap for the VL composite (text + vision), or None to skip.
+
+    Unlike the text-only path, the VL composite keeps the ``language_model``
+    and ``visual`` prefixes (its ``Qwen3_5MoeVLModel`` owns both), so the
+    mapping is identity apart from layer-index gating::
+
+        model.visual.blocks.{j}.*   (j <= vision_depth-1)   → unchanged
+        model.visual.{patch_embed|pos_embed|merger}.*       → unchanged
+        model.language_model.layers.{i}.* (i <= max_layer)  → unchanged
+        model.language_model.{embed_tokens|norm}.*          → unchanged
+        lm_head.weight                                      → unchanged
+    """
+    if hf_key == "lm_head.weight":
+        return hf_key
+
+    if hf_key.startswith("model.visual."):
+        tail = hf_key[len("model.visual."):]
+        if tail.startswith("blocks."):
+            try:
+                block_j = int(tail.split(".")[1])
+            except (IndexError, ValueError):
+                return None
+            if block_j > vision_depth - 1:
+                return None
+        return hf_key
+
+    if hf_key.startswith("model.language_model."):
+        tail = hf_key[len("model.language_model."):]
+        if tail.startswith("layers."):
+            try:
+                layer_i = int(tail.split(".")[1])
+            except (IndexError, ValueError):
+                return None
+            if layer_i > max_layer:
+                return None
+        return hf_key
+
+    logger.debug("Unmapped HF key dropped (VL): %s", hf_key)
+    return None
+
+
+def _remap_mtp_key(hf_key: str) -> str | None:
+    """Identity-map non-expert MTP keys supported by the composite model."""
+    direct_keys = {
+        "mtp.fc.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.norm.weight",
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.mlp.gate.weight",
+        "mtp.layers.0.mlp.shared_expert_gate.weight",
+    }
+    if hf_key in direct_keys:
+        return hf_key
+    if hf_key.startswith("mtp.layers.0.self_attn."):
+        return hf_key
+    if hf_key.startswith("mtp.layers.0.mlp.shared_expert."):
+        return hf_key
     return None
 
 
@@ -119,6 +180,119 @@ def _normalize_packed_experts(
     return gate_up, down_w
 
 
+def _cast_tensor(tensor: torch.Tensor, dtype: torch.dtype | None) -> torch.Tensor:
+    """Cast a checkpoint tensor when a target dtype is configured."""
+    return tensor.to(dtype) if dtype is not None and tensor.dtype != dtype else tensor
+
+
+def _group_weight_map_by_shard(weight_map: Dict[str, str]) -> Dict[str, list]:
+    """Group checkpoint keys by safetensors shard name."""
+    shard_to_keys: Dict[str, list] = {}
+    for hf_key, shard in weight_map.items():
+        shard_to_keys.setdefault(shard, []).append(hf_key)
+    return shard_to_keys
+
+
+def _parse_layer_index(hf_key: str) -> int:
+    """Parse the decoder layer index from a HuggingFace checkpoint key."""
+    parts = hf_key.split(".")
+    try:
+        layers_idx = parts.index("layers")
+        return int(parts[layers_idx + 1])
+    except (ValueError, IndexError) as exc:
+        raise ValueError(f"Could not parse layer index from {hf_key}") from exc
+
+
+def _collect_vl_mtp_key(hf_key: str, reader, dtype, num_experts: int, hyper_sd, mtp_experts) -> bool:
+    """Collect one optional MTP key, returning whether it was handled."""
+    match = re.fullmatch(
+        r"mtp\.layers\.0\.mlp\.experts\.(\d+)\."
+        r"(gate_proj|up_proj|down_proj)\.weight",
+        hf_key,
+    )
+    if match:
+        expert_idx = int(match.group(1))
+        if expert_idx >= num_experts:
+            raise ValueError(f"MTP expert index {expert_idx} >= num_experts {num_experts}")
+        mtp_experts[(expert_idx, match.group(2))] = _cast_tensor(reader.get_tensor(hf_key), dtype)
+        return True
+    mapped_mtp = _remap_mtp_key(hf_key)
+    if mapped_mtp is not None:
+        hyper_sd[mapped_mtp] = _cast_tensor(reader.get_tensor(hf_key), dtype)
+        return True
+    return False
+
+
+def _collect_vl_expert_key(hf_key: str, reader, dtype, max_layer: int, expert_fused) -> tuple[bool, int]:
+    """Collect one packed VL expert tensor, returning ``(handled, skipped)``."""
+    if "mlp.experts.gate_up_proj" not in hf_key and "mlp.experts.down_proj" not in hf_key:
+        return False, 0
+    layer_i = _parse_layer_index(hf_key)
+    if layer_i > max_layer:
+        return True, 1
+    kind = "gate_up" if "gate_up_proj" in hf_key else "down"
+    expert_fused[(layer_i, kind)] = _cast_tensor(reader.get_tensor(hf_key), dtype)
+    return True, 0
+
+
+def _finalize_vl_packed_experts(
+    hyper_sd,
+    expert_fused,
+    num_experts: int,
+    hidden_size: int,
+    moe_intermediate_size: int,
+) -> None:
+    """Normalize and store collected VL packed experts."""
+    layer_indices = sorted({layer_i for (layer_i, _) in expert_fused})
+    for layer_i in layer_indices:
+        gate_up = expert_fused.get((layer_i, "gate_up"))
+        down = expert_fused.get((layer_i, "down"))
+        if gate_up is None or down is None:
+            raise ValueError(f"Layer {layer_i} missing one of (gate_up_proj, down_proj)")
+        prefix = f"model.language_model.layers.{layer_i}.mlp.experts"
+        gate_up, down = _normalize_packed_experts(
+            gate_up,
+            down,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=moe_intermediate_size,
+        )
+        hyper_sd[f"{prefix}.gate_up_proj"] = gate_up
+        hyper_sd[f"{prefix}.down_proj"] = down
+
+
+def _finalize_vl_mtp_experts(
+    hyper_sd,
+    mtp_experts,
+    num_experts: int,
+    hidden_size: int,
+    moe_intermediate_size: int,
+) -> None:
+    """Pack optional MTP expert tensors into hyper's expert layout."""
+    gate_up_weights = []
+    down_weights = []
+    for expert_idx in range(num_experts):
+        gate = mtp_experts.get((expert_idx, "gate_proj"))
+        up = mtp_experts.get((expert_idx, "up_proj"))
+        down = mtp_experts.get((expert_idx, "down_proj"))
+        if gate is None or up is None or down is None:
+            raise ValueError(
+                f"MTP expert {expert_idx} missing one of (gate_proj, up_proj, down_proj)"
+            )
+        gate_up_weights.append(torch.cat([gate, up], dim=0))
+        down_weights.append(down)
+    gate_up, down = _normalize_packed_experts(
+        torch.stack(gate_up_weights, dim=0),
+        torch.stack(down_weights, dim=0),
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=moe_intermediate_size,
+    )
+    prefix = "mtp.layers.0.mlp.experts"
+    hyper_sd[f"{prefix}.gate_up_proj"] = gate_up
+    hyper_sd[f"{prefix}.down_proj"] = down
+
+
 def load_hf_qwen3_5_moe_state_dict(
     weights_path: str,
     num_experts: int,
@@ -127,20 +301,7 @@ def load_hf_qwen3_5_moe_state_dict(
     num_hidden_layers: int,
     dtype: torch.dtype | None = None,
 ) -> Dict[str, torch.Tensor]:
-    """Load ``Qwen/Qwen3.5-35B-A3B`` safetensors into hyper state_dict.
-
-    Args:
-        weights_path: Directory with ``model.safetensors.index.json``.
-        num_experts:  ``config.num_experts`` (256 for the 35B-A3B).
-        hidden_size:  ``config.hidden_size`` (2048).
-        moe_intermediate_size:  ``config.moe_intermediate_size`` (512).
-        num_hidden_layers:  Truncate the checkpoint to the first
-            ``num_hidden_layers`` text-decoder layers.
-        dtype: Optional cast applied to every returned tensor.
-
-    Returns:
-        Dict keyed by hyper module paths, values on CPU.
-    """
+    """Load text-only Qwen3.5-MoE safetensors into hyper state_dict."""
     # pylint: disable=C0415
     from safetensors import safe_open
 
@@ -226,3 +387,103 @@ def load_hf_qwen3_5_moe_state_dict(
         len(hyper_sd), skipped,
     )
     return hyper_sd
+
+def load_hf_qwen3_5_moe_vl_state_dict(
+    weights_path: str,
+    num_experts: int,
+    hidden_size: int,
+    moe_intermediate_size: int,
+    num_hidden_layers: int,
+    vision_depth: int,
+    dtype: torch.dtype | None = None,
+    include_mtp: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Load the multimodal ``Qwen3_5MoeForConditionalGeneration`` checkpoint.
+
+    Keeps the ``model.visual.*`` vision tower and the ``model.language_model.*``
+    text backbone under their native prefixes (the VL composite's
+    :class:`Qwen3_5MoeVLModel` owns both). Text layers are truncated to
+    ``num_hidden_layers`` and vision blocks to ``vision_depth``; packed MoE
+    experts are normalized to hyper's ``(E, 2I, H)`` / ``(E, H, I)`` layout
+    under ``model.language_model.layers.{i}.mlp.experts.*``.
+
+    Args:
+        weights_path: Directory with ``model.safetensors.index.json``.
+        num_experts: ``text_config.num_experts`` (256 for 35B-A3B).
+        hidden_size: ``text_config.hidden_size`` (2048).
+        moe_intermediate_size: ``text_config.moe_intermediate_size`` (512).
+        num_hidden_layers: Truncate to the first N text-decoder layers.
+        vision_depth: Truncate to the first N vision blocks (27 for the full ViT).
+        dtype: Optional cast applied to every returned tensor.
+        include_mtp: Whether to load the optional ``mtp.*`` prediction head.
+
+    Returns:
+        Dict keyed by VL composite module paths, values on CPU.
+    """
+    # pylint: disable=C0415
+    from safetensors import safe_open
+
+    idx_path = os.path.join(weights_path, "model.safetensors.index.json")
+    with open(idx_path, "r", encoding="utf-8") as f:
+        idx = json.load(f)
+    weight_map: Dict[str, str] = idx["weight_map"]
+    shard_to_keys = _group_weight_map_by_shard(weight_map)
+
+    logger.info(
+        "Loading Qwen3.5-MoE-VL safetensors from %s (%d keys across %d shards), "
+        "num_hidden_layers=%d vision_depth=%d",
+        weights_path, len(weight_map), len(shard_to_keys),
+        num_hidden_layers, vision_depth,
+    )
+
+    hyper_sd: Dict[str, torch.Tensor] = {}
+    expert_fused: Dict[Tuple[int, str], torch.Tensor] = {}
+    mtp_experts: Dict[Tuple[int, str], torch.Tensor] = {}
+    max_layer = num_hidden_layers - 1
+
+    skipped = 0
+    for shard in sorted(shard_to_keys.keys()):
+        shard_path = os.path.join(weights_path, shard)
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for hf_key in shard_to_keys[shard]:
+                if include_mtp and _collect_vl_mtp_key(hf_key, f, dtype, num_experts, hyper_sd, mtp_experts):
+                    continue
+                handled, skipped_delta = _collect_vl_expert_key(hf_key, f, dtype, max_layer, expert_fused)
+                skipped += skipped_delta
+                if handled:
+                    continue
+
+                mapped = _remap_vl_key(hf_key, max_layer, vision_depth)
+                if mapped is None:
+                    skipped += 1
+                    continue
+                hyper_sd[mapped] = _cast_tensor(f.get_tensor(hf_key), dtype)
+
+    _finalize_vl_packed_experts(
+        hyper_sd,
+        expert_fused,
+        num_experts,
+        hidden_size,
+        moe_intermediate_size,
+    )
+
+    if include_mtp:
+        _finalize_vl_mtp_experts(
+            hyper_sd,
+            mtp_experts,
+            num_experts,
+            hidden_size,
+            moe_intermediate_size,
+        )
+
+    logger.info(
+        "HF → hyper VL state_dict ready: %d keys (%d skipped)",
+        len(hyper_sd), skipped,
+    )
+    return hyper_sd
+
+
+__all__ = [
+    "load_hf_qwen3_5_moe_state_dict",
+    "load_hf_qwen3_5_moe_vl_state_dict",
+]

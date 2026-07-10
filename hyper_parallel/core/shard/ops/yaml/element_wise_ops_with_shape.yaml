@@ -39,7 +39,7 @@ Add:
 
 Sub:
   dist_op_name: _sub_dist_op
-  distributed_op_class: AddDistributedOp
+  distributed_op_class: SubDistributedOp
 
 Mul:
   dist_op_name: _mul_dist_op
@@ -57,7 +57,7 @@ div_:
 
 SubExt:
   dist_op_name: _sub_ext_dist_op
-  distributed_op_class: AddDistributedOp
+  distributed_op_class: SubDistributedOp
 
 isnan:
   dist_op_name: _torch_isnan_dist_op

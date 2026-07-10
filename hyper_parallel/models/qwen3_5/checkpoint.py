@@ -28,8 +28,15 @@ Key remapping (identical to qwen3_5_moe except NO expert unpacking)::
     model.visual.*                            → (silently dropped)
     model.mtp.*                               → (silently dropped)
 
-When ``tie_word_embeddings=True`` (default for 0.8B-Base), HF drops
-``lm_head.weight`` from the safetensors index; hyper handles this
+Linear-attention layers keep the upstream combined
+``linear_attn.in_proj_qkv.weight`` of shape
+``(key_dim * 2 + value_dim, hidden_size)`` (block layout ``[Q | K | V]``
+along axis 0). Tensor parallelism slices that fused tensor by block at
+parallelize/load time so single-card and sharded runs use the same source
+checkpoint layout.
+
+When ``tie_word_embeddings=True`` (default for 0.8B-Base), some checkpoints
+omit ``lm_head.weight`` from the safetensors index; hyper handles this
 transparently because :class:`Qwen3_5ForCausalLM.__init__` re-binds
 ``self.lm_head.weight = self.embed_tokens.weight`` at construction time.
 """
@@ -48,21 +55,21 @@ logger = logging.getLogger(__name__)
 
 
 def _remap_simple_key(hf_key: str, max_layer: int) -> Optional[str]:
-    """Return hyper key for an HF dense-Qwen3.5 key, or None to skip.
+    """Return hyper key for a dense-Qwen3.5 checkpoint key, or None to skip.
 
     ``max_layer`` is ``num_hidden_layers - 1``: any layer index beyond it
     is silently dropped (so hyper can use a smaller truncated model than
     the full checkpoint without erroring).
     """
     # Vision tower & MTP head — text-only model, drop silently.
-    # HF 0.8B-Base stores MTP params at top-level ``mtp.*`` (not
+    # 0.8B-Base stores MTP params at top-level ``mtp.*`` (not
     # ``model.mtp.*``), so we match both forms.
     if hf_key.startswith("model.visual."):
         return None
     if hf_key.startswith("model.mtp.") or hf_key.startswith("mtp."):
         return None
 
-    # lm_head sits at root in HF, same in hyper.
+    # lm_head sits at root in the source checkpoint, same in hyper.
     if hf_key == "lm_head.weight":
         return "lm_head.weight"
 
@@ -82,11 +89,28 @@ def _remap_simple_key(hf_key: str, max_layer: int) -> Optional[str]:
     logger.debug("Unmapped HF key dropped: %s", hf_key)
     return None
 
+def _maybe_split_in_proj_qkv(
+    hyper_sd: Dict[str, torch.Tensor],
+    hyper_key: str,
+    tensor: torch.Tensor,
+    key_dim: int,
+) -> None:
+    """Insert ``tensor`` into ``hyper_sd``.
+
+    The legacy name is kept for callers/tests that exercise the loader helper.
+    Dense Qwen3.5 now keeps the checkpoint's fused ``in_proj_qkv`` parameter;
+    TP blockwise slicing is handled later by :func:`qwen3_5_tp_load_transforms`.
+    """
+    del key_dim
+    hyper_sd[hyper_key] = tensor
+
 
 def load_hf_qwen3_5_state_dict(
     weights_path: str,
     num_hidden_layers: int,
     dtype: Optional[torch.dtype] = None,
+    *,
+    linear_key_dim: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Load a dense Qwen3.5 safetensors checkpoint into hyper state_dict.
 
@@ -97,6 +121,8 @@ def load_hf_qwen3_5_state_dict(
             ``num_hidden_layers`` text-decoder layers (later layers are
             silently dropped).
         dtype: Optional cast applied to every returned tensor.
+        linear_key_dim: Kept for API compatibility with older split-QKV
+            loaders. Dense Qwen3.5 keeps the combined checkpoint key unchanged.
 
     Returns:
         Dict keyed by hyper module paths, values on CPU.
@@ -143,7 +169,13 @@ def load_hf_qwen3_5_state_dict(
                 if mapped is None:
                     skipped += 1
                     continue
-                hyper_sd[mapped] = _cast(f.get_tensor(hf_key))
+                tensor = _cast(f.get_tensor(hf_key))
+                if linear_key_dim is not None:
+                    _maybe_split_in_proj_qkv(
+                        hyper_sd, mapped, tensor, linear_key_dim,
+                    )
+                else:
+                    hyper_sd[mapped] = tensor
 
     # ``tie_word_embeddings=True`` checkpoints drop ``lm_head.weight``;
     # ``fully_shard`` breaks the Python-level tie, so synthesize the tensor

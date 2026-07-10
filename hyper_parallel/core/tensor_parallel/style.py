@@ -38,6 +38,14 @@ from hyper_parallel.platform import get_platform
 platform = get_platform()
 Module = platform.Module
 
+
+def _src_data_rank_for_tensor(tensor: Any, src_data_rank: Optional[int]) -> Optional[int]:
+    """Disable source-rank communication while sharding meta tensors."""
+    if getattr(tensor, "is_meta", False):
+        return None
+    return src_data_rank
+
+
 __all__ = [
     "ParallelStyle",
     "ColwiseParallel",
@@ -158,7 +166,12 @@ class ColwiseParallel(ParallelStyle):
                 continue
             src = _distribute_module_param_source(param)
             requires_grad = bool(getattr(param, "requires_grad", True))
-            dt = distribute_tensor(src, device_mesh, [Shard(0)], src_data_rank=self.src_data_rank)
+            dt = distribute_tensor(
+                src,
+                device_mesh,
+                [Shard(0)],
+                src_data_rank=_src_data_rank_for_tensor(src, self.src_data_rank),
+            )
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
 
@@ -169,7 +182,12 @@ class ColwiseParallel(ParallelStyle):
                 continue
             src = _distribute_module_param_source(param)
             requires_grad = bool(getattr(param, "requires_grad", True))
-            dt = distribute_tensor(src, device_mesh, [Shard(1)], src_data_rank=self.src_data_rank)
+            dt = distribute_tensor(
+                src,
+                device_mesh,
+                [Shard(1)],
+                src_data_rank=_src_data_rank_for_tensor(src, self.src_data_rank),
+            )
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
 
@@ -254,6 +272,10 @@ class RowwiseParallel(ParallelStyle):
         output_layouts (Placement, optional):
             Desired DTensor layout of the module output. Defaults to
             ``Replicate()`` (all-reduce / reduce-scatter from partial).
+        reduce_dtype (dtype, optional):
+            Floating-point dtype used for reducing Partial outputs; the reduced
+            output remains in this dtype. Defaults to ``None`` (reduce in the
+            output dtype).
         use_local_output (bool, optional):
             If ``True`` (default), convert the output DTensor back to a local
             tensor via ``to_local()``.
@@ -273,12 +295,14 @@ class RowwiseParallel(ParallelStyle):
         *,
         input_layouts: Optional[Placement] = None,
         output_layouts: Optional[Placement] = None,
+        reduce_dtype: Optional[Any] = None,
         use_local_output: bool = True,
     ) -> None:
         super().__init__()
         self.input_layouts: Tuple[Placement, ...] = (input_layouts or Shard(-1),)
         self.output_layouts: Tuple[Placement, ...] = (output_layouts or Replicate(),)
         self.desired_input_layouts: Tuple[Placement, ...] = (Shard(-1),)
+        self.reduce_dtype = reduce_dtype
         self.use_local_output = use_local_output
 
     def __repr__(self) -> str:
@@ -286,6 +310,7 @@ class RowwiseParallel(ParallelStyle):
             f"{self.__class__.__name__}("
             f"input_layouts={self.input_layouts}, "
             f"output_layouts={self.output_layouts}, "
+            f"reduce_dtype={self.reduce_dtype}, "
             f"use_local_output={self.use_local_output})"
         )
 
@@ -318,7 +343,12 @@ class RowwiseParallel(ParallelStyle):
             src = _distribute_module_param_source(param)
             requires_grad = bool(getattr(param, "requires_grad", True))
             placement = [Shard(1)] if key == "weight" else [Replicate()]
-            dt = distribute_tensor(src, device_mesh, placement, src_data_rank=self.src_data_rank)
+            dt = distribute_tensor(
+                src,
+                device_mesh,
+                placement,
+                src_data_rank=_src_data_rank_for_tensor(src, self.src_data_rank),
+            )
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
 
@@ -329,7 +359,12 @@ class RowwiseParallel(ParallelStyle):
                 continue
             src = _distribute_module_param_source(param)
             requires_grad = bool(getattr(param, "requires_grad", True))
-            dt = distribute_tensor(src, device_mesh, [Shard(0)], src_data_rank=self.src_data_rank)
+            dt = distribute_tensor(
+                src,
+                device_mesh,
+                [Shard(0)],
+                src_data_rank=_src_data_rank_for_tensor(src, self.src_data_rank),
+            )
             new_param = _distribute_module_new_parameter(key, dt, requires_grad)
             _distribute_module_set_param(module, key, new_param)
 
@@ -340,6 +375,7 @@ class RowwiseParallel(ParallelStyle):
         outputs: Any,
         device_mesh: DeviceMesh,
         module: Optional[Module] = None,
+        reduce_dtype: Optional[Any] = None,
     ) -> Any:
         """Redistribute partial output and optionally convert to local."""
         if not isinstance(outputs, DTensor):
@@ -352,6 +388,9 @@ class RowwiseParallel(ParallelStyle):
                     "RowwiseParallel expects a DTensor from Linear outputs; "
                     f"got {type(outputs)}. If this is an unsupported module, extend I/O hooks."
                 )
+        if reduce_dtype is not None and tuple(outputs.placements) != tuple(output_layouts):
+            local_output = platform.cast_fp_tensor(reduce_dtype, outputs.to_local())
+            outputs = DTensor.from_local(local_output, outputs.device_mesh, outputs.placements)
         if tuple(outputs.placements) != tuple(output_layouts):
             outputs = outputs.redistribute(device_mesh, output_layouts)
         if use_local_output:
@@ -403,6 +442,7 @@ class RowwiseParallel(ParallelStyle):
                 forward_outputs,
                 device_mesh,
                 forward_module,
+                self.reduce_dtype,
             )
 
         return distribute_module(
@@ -675,6 +715,8 @@ class PrepareModuleOutput(ParallelStyle):
     Keyword Args:
         output_layouts: Current or assumed placement per output tensor.
         desired_output_layouts: Target placements; length must match ``output_layouts``.
+        reduce_dtype: Floating-point dtype used before reducing Partial outputs;
+            the reduced output remains in this dtype.
         use_local_output: If ``True`` (default), return local shards after redistribution.
     """
 
@@ -683,6 +725,7 @@ class PrepareModuleOutput(ParallelStyle):
         *,
         output_layouts: Union[Placement, Tuple[Optional[Placement], ...]],
         desired_output_layouts: Union[Placement, Tuple[Optional[Placement], ...]],
+        reduce_dtype: Optional[Any] = None,
         use_local_output: bool = True,
     ) -> None:
         super().__init__()
@@ -694,6 +737,7 @@ class PrepareModuleOutput(ParallelStyle):
             if isinstance(desired_output_layouts, Placement)
             else desired_output_layouts
         )
+        self.reduce_dtype = reduce_dtype
         self.use_local_output = use_local_output
         if len(self.output_layouts) != len(self.desired_output_layouts):
             raise AssertionError(
@@ -715,6 +759,16 @@ class PrepareModuleOutput(ParallelStyle):
                     dt_out = out
                 else:
                     dt_out = DTensor.from_local(out, device_mesh, (out_layout,))
+                has_partial_output = any(
+                    placement.is_partial() for placement in dt_out.placements
+                )
+                if (
+                    self.reduce_dtype is not None
+                    and has_partial_output
+                    and out_layout != desired_out_layout
+                ):
+                    local_out = platform.cast_fp_tensor(self.reduce_dtype, dt_out.to_local())
+                    dt_out = DTensor.from_local(local_out, dt_out.device_mesh, dt_out.placements)
                 if out_layout != desired_out_layout:
                     dt_out = dt_out.redistribute(device_mesh, (desired_out_layout,))
                 prepared_outputs.append(
@@ -739,6 +793,7 @@ class PrepareModuleOutput(ParallelStyle):
             f"{self.__class__.__name__}("
             f"output_layouts={self.output_layouts}, "
             f"desired_output_layouts={self.desired_output_layouts}, "
+            f"reduce_dtype={self.reduce_dtype}, "
             f"use_local_output={self.use_local_output})"
         )
 
@@ -762,6 +817,7 @@ class PrepareModuleInputOutput(ParallelStyle):
         use_local_input: bool = False,
         output_layouts: Union[Placement, Tuple[Optional[Placement], ...]],
         desired_output_layouts: Union[Placement, Tuple[Optional[Placement], ...]],
+        reduce_dtype: Optional[Any] = None,
         use_local_output: bool = True,
     ) -> None:
         super().__init__()
@@ -775,6 +831,7 @@ class PrepareModuleInputOutput(ParallelStyle):
         self.prepare_module_output = PrepareModuleOutput(
             output_layouts=output_layouts,
             desired_output_layouts=desired_output_layouts,
+            reduce_dtype=reduce_dtype,
             use_local_output=use_local_output,
         )
 
@@ -795,6 +852,7 @@ class PrepareModuleInputOutput(ParallelStyle):
             f"use_local_input={p_in.use_local_output}, "
             f"output_layouts={p_out.output_layouts}, "
             f"desired_output_layouts={p_out.desired_output_layouts}, "
+            f"reduce_dtype={p_out.reduce_dtype}, "
             f"use_local_output={p_out.use_local_output})"
         )
 

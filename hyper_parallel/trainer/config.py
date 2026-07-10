@@ -14,8 +14,8 @@
 # ============================================================================
 """Training configuration schema — strict three-tier (model/data/train).
 
-Top-level keys are exactly ``model``, ``data``, ``train`` and nothing else.
-arguments schema.
+Top-level keys are exactly ``model``, ``data`` and ``train`` and nothing else;
+anything outside this three-tier schema is rejected by the parser.
 
 YAML shape::
 
@@ -49,7 +49,7 @@ import difflib
 import logging
 import os
 from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Any, Dict, Optional, Type, TypeVar, Union, get_args, get_origin
+from typing import Any, Dict, List, Optional, Type, TypeVar, Union, get_args, get_origin
 
 import yaml
 
@@ -107,7 +107,7 @@ class DataConfig:
     - ``shuffle``: when ``False``, sampler reads samples in dataset order.
     """
     type: str = "dummy"
-    train_path: Optional[str] = None
+    train_path: Optional[Any] = None
     subset: Optional[str] = None
     max_seq_len: int = 2048
     text_key: str = "text"
@@ -117,6 +117,8 @@ class DataConfig:
     image_key: str = "image"
     messages_key: str = "messages"
     image_token_id: int = 151655
+    video_token_id: int = 151656
+    vl_video: bool = False
     vl_grid_t: int = 2
     vl_grid_h: int = 2
     vl_grid_w: int = 2
@@ -126,6 +128,14 @@ class DataConfig:
     prefetch_factor: Optional[int] = None
     pin_memory: bool = True
     shuffle: bool = True
+    # Megatron .bin/.idx options (data.type='megatron'). ``train_path`` is a
+    # single path-prefix, or a blend spec ("w1 prefix1 w2 prefix2 ...") /
+    # list-of-pairs. ``megatron_seed`` defaults to ``train.seed`` when None.
+    megatron_seed: Optional[int] = None
+    pad_token_id: int = 0
+    eod_token_id: Optional[int] = None
+    eod_mask_loss: bool = False
+    mmap_bin_files: bool = True
 
 # ============================================================================
 # train.* — sub-configs
@@ -155,6 +165,25 @@ class AcceleratorConfig:
     tp: int = 1
     cp: int = 1
     pp: int = 1
+    # Number of pipeline micro-batches per optimizer step when ``pp > 1``.
+    # The global batch is split into this many micro-batches along dim 0 and
+    # streamed through the pipeline stages; ``global_batch_size`` must be
+    # divisible by it. Defaults to 1 (no micro-batching).
+    pp_micro_batch_num: int = 1
+    # Pipeline schedule when ``pp > 1``: ``"gpipe"`` (all-forward then
+    # all-backward) or ``"1f1b"`` (one-forward-one-backward steady state).
+    # ``None`` keeps each model's default (dense → gpipe, MoE → 1f1b).
+    pp_schedule: Optional[str] = None
+    # Virtual-pipeline (VPP) degree: number of non-contiguous stage chunks each
+    # PP rank owns. ``1`` (default) is the plain single-stage-per-rank pipeline.
+    # ``>1`` builds ``pp * pp_vpp`` interleaved global stages (rank ``r`` owns
+    # stages ``r, r+pp, r+2*pp, ...``) and drives them with interleaved 1F1B.
+    pp_vpp: int = 1
+    # Per-global-stage decoder-layer counts (length ``pp * pp_vpp``, summing to
+    # ``num_hidden_layers``). ``None`` (default) keeps the even split with the
+    # remainder on the later stages. Lets users rebalance stages whose extra
+    # modules (embed / visual tower / lm_head) dominate memory or latency.
+    pp_layer_split: Optional[List[int]] = None
     ep: int = 1
     etp: int = 1
     moe_token_dispatcher_type: str = "all_to_all"
@@ -166,16 +195,19 @@ class AcceleratorConfig:
     # Bucketed reduce-scatter: single fused RS per FSDP unit, stable fp32
     # reduction order across runs.
     comm_fusion: bool = True
+    # Offload sharded params, grads, and optimizer states to CPU so large
+    # checkpoints can fit without device-resident master weights and Adam state.
+    cpu_offload: bool = False
 
 
 @dataclass
 class MixedPrecisionConfig:
-    """``train.mixed_precision.*`` — FSDP2 mp_policy fields.
+    """``train.mixed_precision.*`` — mixed-precision forward configuration.
 
-    ``output_dtype`` controls forward-output dtype at FSDP wrap boundaries.
-    Set this to ``"bfloat16"`` to keep the cross-FSDP-unit forward output
-    in bf16 (matches the typical "uniform low-precision forward" mp_policy
-    setup); leave ``None`` to inherit from ``param_dtype``.
+    FSDP2 ``MixedPrecisionPolicy``: ``param_dtype`` is the all-gather'd
+    forward dtype, ``reduce_dtype`` is the reduce-scatter dtype for grads,
+    and ``output_dtype`` controls the forward-output dtype at FSDP wrap
+    boundaries (leave ``None`` to inherit from ``param_dtype``).
     """
     enabled: bool = False
     param_dtype: str = "bfloat16"
@@ -201,6 +233,7 @@ class OptimizerConfig:
     valid-token count; ``"rank_average"`` averages per-rank micro-batch
     means and is preferred when batches have variable valid-token counts
     across ranks.
+    ``max_grad_norm``: values <= 0 disable gradient clipping.
     """
     type: str = "adamw"
     lr: float = 1e-4
@@ -213,6 +246,9 @@ class OptimizerConfig:
     bsz_warmup_ratio: float = 0.0
     eps: float = 1e-8
     betas: tuple = (0.9, 0.999)
+    # ``None`` lets torch pick the foreach kernel; set ``False`` in YAML when a
+    # run must force the deterministic per-parameter loop.
+    foreach: Optional[bool] = None
 
 
 @dataclass

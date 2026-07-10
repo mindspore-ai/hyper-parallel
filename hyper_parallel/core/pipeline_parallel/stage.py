@@ -34,8 +34,16 @@ class SharedParameterInfo:
     Args:
         parameter (Parameter): The shared parameter object.
         shared_stage (list): The shared stage list.
+        owner_module (Module, optional): Module owning the parameter. When given
+            with ``param_name``, the current parameter is re-fetched from it each
+            access, so a meta-init pipeline that materializes the stage *after*
+            this info is created (``to_empty`` replaces the Parameter object)
+            still sees the live parameter (and its gradient) rather than a stale
+            orphan. Default ``None`` keeps the parameter object as-is.
+        param_name (str, optional): Attribute name of the parameter on
+            ``owner_module`` (e.g. ``"weight"``).
     """
-    def __init__(self, parameter, shared_stage):
+    def __init__(self, parameter, shared_stage, owner_module=None, param_name=None):
         if not isinstance(parameter, platform.Parameter):
             raise TypeError(f"Argument 'parameter' must be type of Parameter, \
                              but got type {type(parameter)}.")
@@ -44,11 +52,15 @@ class SharedParameterInfo:
                              but got type {type(shared_stage)}.")
         self._shared_stage = shared_stage
         self._parameter = parameter
+        self._owner_module = owner_module
+        self._param_name = param_name
         self.group = None
 
     @property
     def parameter(self):
         """Return the shared parameter object."""
+        if self._owner_module is not None and self._param_name is not None:
+            return getattr(self._owner_module, self._param_name)
         return self._parameter
 
     @property
@@ -178,9 +190,16 @@ class PipelineStage(PipelineStageBase):
             return
         for shared_param_info in self._shared_parameters:
             param = shared_param_info.parameter
+            # On the meta-init -> FSDP-wrap -> load path the storage is still on
+            # meta here; the trainer re-runs this after materialization, so skip
+            # until it is real (broadcasting a meta tensor is invalid).
+            if getattr(param, "is_meta", False):
+                continue
             shared_stage = shared_param_info.shared_stage
             group, group_ranks = self._init_shared_parameter_group(shared_stage)
             shared_param_info.group = group
+            # DTensor dispatch whitelists DistCommBroadcast and unwraps DTensor
+            # args to their local shards before invoking the backend collective.
             platform.broadcast(param, group_ranks[0], group)
 
     def _global_rank(self, stage_index):
@@ -193,26 +212,65 @@ class PipelineStage(PipelineStageBase):
 
     def _init_shared_parameter_group(self, shared_stage):
         """init group of shared parameter."""
-        group_ranks = []
-        for stage in shared_stage:
-            global_rank = self._global_rank(stage)
-            group_ranks.append(global_rank)
+        group_ranks = [self._global_rank(stage) for stage in shared_stage]
+        # When the shared stages span the whole PP sub-mesh (the tied-embedding
+        # pp=2 case), reuse the PP group: it is already created per dp line, so
+        # this avoids a world-collective ``new_group`` that would deadlock under
+        # FSDP where each dp line needs its own {stage0, stage1} group.
+        if self.mesh is not None and len(group_ranks) == self.mesh.size():
+            return self.mesh.get_group(), group_ranks
         group = platform.create_group(group_ranks)
         return group, group_ranks
 
-    def sync_shared_parameters_grad(self):
+    def sync_shared_parameters_grad(self) -> None:
         """sync shared parameters' grad with AllReduce."""
         if self._shared_parameters is None or not self._has_backward:
             return
         for shared_param_info in self._shared_parameters:
             param = shared_param_info.parameter
+            # Shared endpoints inherit the same tied/frozen configuration, so
+            # ``requires_grad`` is group-wide. Frozen peers can all skip.
             if not param.requires_grad:
                 continue
-            grad = param.grad
             group = shared_param_info.group
+            # ``group`` is assigned by ``_sync_shared_parameters`` once the
+            # parameter is materialized off meta; if that handshake has not run
+            # there is no peer to reduce with yet, so skip.
+            if group is None:
+                continue
+
+            grad = param.grad
+            has_local_grad = grad is not None
+            if has_local_grad:
+                # Per-stage FSDP stores the reduced boundary-parameter grad as
+                # a sharded DTensor. Reduce its local shard so matching DP
+                # shards at the tied PP endpoints sum to one gradient.
+                local_grad = grad.to_local() if isinstance(grad, DTensor) else grad
+            else:
+                # Every member of a shared-parameter group must enter the same
+                # collective even when this stage did not use the parameter in
+                # backward. Derive the zero contribution from the live local
+                # parameter shard so shape, dtype, and device match TP/FSDP.
+                local_param = param.to_local() if isinstance(param, DTensor) else param
+                local_grad = platform.full_like(local_param, 0)
+
             # platform.all_reduce expects group_info (with .group for Torch, or str for MindSpore)
             group_info = group if isinstance(group, str) else SimpleNamespace(group=group)
-            platform.all_reduce(grad, group_info)
+            reduced_grad, handle = platform.all_reduce(local_grad, group_info, async_op=True)
+            if handle is not None:
+                handle.wait()
+
+            if has_local_grad:
+                # Torch may return a contiguous communication tensor for a
+                # non-contiguous input. Preserve the original grad object (and
+                # DTensor layout) while copying the completed reduction back.
+                if reduced_grad is not local_grad:
+                    platform.load_into_param(local_grad, reduced_grad)
+            elif param.requires_grad:
+                if isinstance(param, DTensor):
+                    param.grad = DTensor.from_local(reduced_grad, param.device_mesh, param.placements)
+                else:
+                    param.grad = reduced_grad
 
     def _check_src_stage(self, src_stage):
         """check type for src_stage."""
@@ -504,27 +562,47 @@ class PipelineStage(PipelineStageBase):
         rg_infos = [info for info in self.args_recv_info[micro_index] if info.requires_grad]
         return [("isend", cur_out, info.global_rank) for cur_out, info in zip(out, rg_infos)]
 
-    def execute_reduce_grad(self):
-        """Trigger FSDP post-backward gradient reduction and root hook for the stage submodule."""
-        if not isinstance(self.submodule, HSDPModule):
-            return
-        fsdp_module = self.submodule
-        fsdp_module.set_is_last_backward(True)
-        fsdp_module.set_reshard_after_backward(True)
-        fsdp_module.set_requires_gradient_sync(True)
-
-        for _, submod in platform.get_cells_and_names(fsdp_module):
+    def execute_reduce_grad(self) -> None:
+        """Reduce nested FSDP gradients and finalize every HSDP root in the stage."""
+        fsdp_schedulers = []
+        seen_scheduler_ids = set()
+        for _, submod in platform.get_cells_and_names(self.submodule):
             if not isinstance(submod, HSDPModule):
                 continue
-            sub_mod_state = submod.hsdp_scheduler.hsdp_state
-            sub_mod_state.post_backward()
-            sub_mod_state.reduce_params()
+            scheduler = submod.hsdp_scheduler
+            scheduler_id = id(scheduler)
+            if scheduler_id in seen_scheduler_ids:
+                continue
+            seen_scheduler_ids.add(scheduler_id)
+            fsdp_schedulers.append(scheduler)
 
-        # No public API exposes the root backward finalization; call the platform hook directly.
-        # force_reduce=True: the recv buffer's PostBackwardFunction has put the root into
-        # scheduler_state==BACKWARD, so the natural gate would skip the final drain and the
-        # last module's reduce-scatter would lag one optimizer step.
-        fsdp_module.hsdp_scheduler._root_backward_hook(force_reduce=True)  # pylint: disable=protected-access
+        if not fsdp_schedulers:
+            return
+
+        for scheduler in fsdp_schedulers:
+            scheduler.scheduler_ctx.is_last_backward = True
+            scheduler.set_reshard_after_backward(True)
+            scheduler.set_requires_grad_sync(True)
+
+        for scheduler in fsdp_schedulers:
+            scheduler.hsdp_state.post_backward()
+            scheduler.hsdp_state.reduce_params()
+
+        # A plain pipeline-stage root may contain one or more independently
+        # wrapped HSDP child roots. Finalize every runtime root so each context
+        # clears its backward state; the platform hook also drains the global
+        # fused reduction queues. A pre-forward fallback retains the historical
+        # single-root behavior for callers that invoke this method directly.
+        root_schedulers = [
+            scheduler for scheduler in fsdp_schedulers
+            if scheduler._is_root  # pylint: disable=protected-access
+        ]
+        if not root_schedulers:
+            root_schedulers = fsdp_schedulers[:1]
+        for scheduler in root_schedulers:
+            # No public API exposes root backward finalization. force_reduce=True
+            # ensures a differentiable PP input cannot defer the final drain.
+            scheduler._root_backward_hook(force_reduce=True)  # pylint: disable=protected-access
 
     def _build_padded_sens(self, micro_index):
         """Build an N-length sens list aligned with the forward output structure.

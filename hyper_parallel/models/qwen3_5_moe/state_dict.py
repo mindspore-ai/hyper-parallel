@@ -21,17 +21,25 @@ Splits HF's fused per-expert tensors into hyper's per-expert layout so
 
 __all__ = ["Qwen3_5MoeStateDictAdapter"]
 
-# pylint: disable=C0103  # HF transformers class-name convention (Qwen3_5*)
+# pylint: disable=C0103  # Qwen class-name convention (Qwen3_5*)
 import re
 from typing import Dict, Optional
 
 import torch
 
-from hyper_parallel.models.qwen3_5_moe.checkpoint import load_hf_qwen3_5_moe_state_dict
+from hyper_parallel.models.qwen3_5_moe.checkpoint import (
+    load_hf_qwen3_5_moe_state_dict,
+    load_hf_qwen3_5_moe_vl_state_dict,
+)
 
 
 class Qwen3_5MoeStateDictAdapter:
-    """State-dict adapter for Qwen3.5-MoE (35B-A3B and friends)."""
+    """State-dict adapter for Qwen3.5-MoE (35B-A3B and friends).
+
+    Handles both the text-only ``Qwen3_5MoeForCausalLM`` and the multimodal
+    ``Qwen3_5MoeVLForConditionalGeneration``; the VL path is selected when the
+    model config carries ``vl=True`` (a :class:`Qwen3_5MoeVLConfig`).
+    """
 
     @staticmethod
     def load_hf_state_dict(
@@ -40,6 +48,18 @@ class Qwen3_5MoeStateDictAdapter:
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, torch.Tensor]:
         """Read an HF safetensors checkpoint and return a hyper-named state dict."""
+        if getattr(model_config, "vl", False):
+            text_config = model_config.text_config
+            return load_hf_qwen3_5_moe_vl_state_dict(
+                weights_path,
+                num_experts=text_config.num_experts,
+                hidden_size=text_config.hidden_size,
+                moe_intermediate_size=text_config.moe_intermediate_size,
+                num_hidden_layers=text_config.num_hidden_layers,
+                vision_depth=model_config.vision_config.depth,
+                dtype=dtype,
+                include_mtp=text_config.mtp_loss_weight > 0,
+            )
         return load_hf_qwen3_5_moe_state_dict(
             weights_path,
             num_experts=model_config.num_experts,
@@ -59,6 +79,12 @@ class Qwen3_5MoeStateDictAdapter:
         Inverse of load_hf_state_dict: repacks per-expert tensors back to
         HF packed format and remaps keys to HF convention.
         """
+        # The VL composite already stores keys under the HF namespace
+        # (``model.visual.*`` / ``model.language_model.*`` / ``lm_head``), so
+        # its export is an identity pass-through (packed experts stay packed).
+        if getattr(model_config, "vl", False):
+            return dict(state_dict)
+
         del model_config  # unused (HF format keeps packed expert layout intact)
         hf_sd = {}
 
