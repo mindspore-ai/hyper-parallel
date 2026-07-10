@@ -14,17 +14,15 @@
 # ============================================================================
 """LLMTrainer — Language Model pretraining and SFT.
 
-holds a ``BaseTrainer`` instance and calls
-its ``_build_*`` methods selectively. Overrides ``_build_model_assets``,
-``_build_data_transform``, ``_build_dataset``, and ``_build_collate_fn``
-for complete real-data training pipeline.
-
+Holds a ``BaseTrainer`` instance and calls its ``_build_*`` methods
+selectively. Overrides ``_build_model_assets``, ``_build_data_transform``
+and ``_build_collate_fn``; dataset construction is delegated to the
+shared :func:`hyper_parallel.data.build_dataset` registry.
 """
 import logging
 from typing import Any, Dict, List
 
 import torch
-from torch.utils.data import Dataset
 
 from hyper_parallel.trainer.base import BaseTrainer
 
@@ -37,9 +35,11 @@ class LLMTrainer:
     Composition pattern — calls BaseTrainer's _build_* methods in order,
     overriding data pipeline steps for real tokenized data.
 
-    Supports:
-    - ``data.type = "dummy"``: random tokens for quick FSDP validation
-    - ``data.type = "hf_datasets"``: real HuggingFace datasets with tokenization
+    Supports every ``data.type`` registered with
+    :data:`hyper_parallel.data.DATASET_REGISTRY` — built-in formats are
+    ``dummy`` (random tokens), ``hf_datasets`` / ``json_file`` (HF +
+    Alpaca), ``preset_pt`` (replayed batches), and ``megatron`` (Megatron
+    ``.bin``/``.idx``).
 
     Args:
         args: Training configuration parsed from YAML.
@@ -52,10 +52,10 @@ class LLMTrainer:
         self.base._setup()
         self.base._build_model()
         self.base._freeze_model()
-        self._build_model_assets()           # 覆盖: 加载 tokenizer
-        self._build_data_transform()         # 覆盖: tokenize 函数
-        self._build_dataset()                # 覆盖: 真实数据集加载 + tokenize
-        self._build_collate_fn()             # 覆盖: 支持变长 padding
+        self._build_model_assets()
+        self._build_data_transform()
+        self.base._build_dataset()
+        self._build_collate_fn()
         self.base._build_dataloader()
         self.base._build_parallelized_model()
         self.base._build_optimizer()
@@ -73,20 +73,21 @@ class LLMTrainer:
     def _build_model_assets(self):
         """Build tokenizer for data processing.
 
-        For dummy data, tokenizer is not needed.
-        For real data, loads HF AutoTokenizer from ``model.weights_path``
-        or ``model.tokenizer_path``.
+        Pre-tokenized formats (``dummy`` random tokens, ``megatron`` .bin/.idx,
+        ``preset_pt`` replayed tensors) carry no raw text, so no tokenizer is
+        built for them. Text formats (``hf_datasets`` / ``json_file``) load an
+        HF AutoTokenizer from ``model.tokenizer_path`` or ``model.weights_path``.
         """
-        data_type = getattr(self.base.args.data, 'type', 'dummy')
-        if data_type == 'dummy':
+        data_type = self.base.args.data.type
+        if data_type in ('dummy', 'megatron', 'preset_pt'):
             self.base.tokenizer = None
             return
 
         # Try tokenizer_path first, fall back to weights_path
         model_cfg = self.base.args.model
-        tokenizer_path = getattr(model_cfg, 'tokenizer_path', None)
+        tokenizer_path = model_cfg.tokenizer_path
         if not tokenizer_path:
-            tokenizer_path = getattr(model_cfg, 'weights_path', None)
+            tokenizer_path = model_cfg.weights_path
 
         if not tokenizer_path:
             raise ValueError(
@@ -115,11 +116,11 @@ class LLMTrainer:
             self.base.data_transform = None
             return
 
-        max_seq_len = getattr(self.base.args.data, 'max_seq_len', 2048)
+        max_seq_len = self.base.args.data.max_seq_len
         tokenizer = self.base.tokenizer
-        text_key = getattr(self.base.args.data, 'text_key', 'text')
-        data_type = getattr(self.base.args.data, 'type', 'dummy')
-        template = getattr(self.base.args.data, 'template', 'empty')
+        text_key = self.base.args.data.text_key
+        data_type = self.base.args.data.type
+        template = self.base.args.data.template
 
         def _tokenize_fn(examples):
             """Tokenize text and create causal LM labels.
@@ -200,164 +201,25 @@ class LLMTrainer:
         logger.info("Data transform: tokenize max_seq_len=%d, format=%s",
                      max_seq_len, "alpaca" if data_type == "json_file" else text_key)
 
-    def _build_dataset(self):
-        """Build training dataset with full tokenization pipeline.
-
-        For dummy data, delegates to BaseTrainer.
-        For hf_datasets, loads + tokenizes + filters empty examples.
-        """
-        data_type = getattr(self.base.args.data, 'type', 'dummy')
-
-        if data_type == 'dummy':
-            self.base._build_dataset()  # pylint: disable=protected-access
-            return
-
-        if data_type == 'preset_pt':
-            self._build_preset_pt_dataset()
-            return
-
-        if data_type not in ('hf_datasets', 'json_file'):
-            raise ValueError(
-                f"LLMTrainer supports data.type 'dummy', 'hf_datasets', 'json_file', or 'preset_pt', "
-                f"got '{data_type}'"
-            )
-
-        # pylint: disable=C0415
-        from datasets import load_dataset  # pylint: disable=C0415  # optional dep
-
-        train_path = self.base.args.data.train_path
-        data_subset = getattr(self.base.args.data, 'subset', None)
-
-        logger.info("Loading dataset: type=%s, path=%s", data_type, train_path)
-
-        if data_type == 'json_file':
-            # Load local JSON file (alpaca format: instruction/input/output)
-            ds = load_dataset("json", data_files=train_path, split="train")
-        elif data_subset:
-            ds = load_dataset(train_path, data_subset, split="train")
-        else:
-            ds = load_dataset(train_path, split="train")
-
-        # Limit dataset size if specified
-        train_size = getattr(self.base.args.data, 'train_size', None)
-        if train_size and train_size < len(ds):
-            ds = ds.select(range(train_size))
-            logger.info("Dataset truncated to %d samples", train_size)
-
-        # Tokenize
-        if self.base.data_transform:
-            ds = ds.map(
-                self.base.data_transform,
-                batched=True,
-                remove_columns=ds.column_names,
-                desc="Tokenizing",
-            )
-
-        # Filter empty sequences
-        ds = ds.filter(lambda x: len(x["input_ids"]) > 0)
-
-        # Convert to torch tensors
-        class TokenizedDataset(torch.utils.data.Dataset):
-            """Wrap HF dataset for torch DataLoader."""
-            def __init__(self, hf_ds):
-                self.data = hf_ds
-
-            def __len__(self):
-                return len(self.data)
-
-            def __getitem__(self, idx):
-                item = self.data[idx]
-                return {
-                    "input_ids": torch.tensor(item["input_ids"], dtype=torch.long),
-                    "labels": torch.tensor(item["labels"], dtype=torch.long),
-                }
-
-        self.base.train_dataset = TokenizedDataset(ds)
-        self.base.state.max_steps = min(
-            self.base.args.train.max_steps,
-            len(self.base.train_dataset) // max(
-                self.base.args.train.global_batch_size, 1
-            ),
-        )
-        logger.info("Dataset ready: %d samples, max_steps=%d",
-                     len(self.base.train_dataset), self.base.state.max_steps)
-
-    def _build_preset_pt_dataset(self):
-        """Load pre-tokenized batches from a .pt file (List[Dict[str, Tensor]]).
-
-        ``data.train_path`` is the .pt file. Each entry is a dict of tensors
-        with shape ``(global_batch, seq_len)``. The dataset returns a flat
-        sequence of per-sample dicts so the standard DataLoader can batch them.
-        Use this when the dataset has already been tokenized offline and the
-        token stream should be replayed deterministically.
-        """
-        # pylint: disable=C0415
-
-        train_path = self.base.args.data.train_path
-        if not train_path:
-            raise ValueError("data.train_path is required when data.type='preset_pt'")
-        batches = torch.load(train_path, map_location="cpu", weights_only=False)
-        if not isinstance(batches, list) or not batches:
-            raise ValueError(f"preset_pt expects List, got {type(batches)}")
-        per_sample = []
-        for b in batches:
-            # Two formats: stacked dict ``{input_ids: (B,S), labels: (B,S)}``,
-            # or list of per-rank dicts (preserves per-rank dynamic seq_len).
-            if isinstance(b, list):
-                for br in b:
-                    ids = br["input_ids"]
-                    labels = br["labels"]
-                    attn = br.get("attention_mask")
-                    for i in range(ids.shape[0]):
-                        rec = {
-                            "input_ids": ids[i].clone(),
-                            "labels": labels[i].clone(),
-                        }
-                        if attn is not None and attn.dim() == 2:
-                            rec["attention_mask"] = attn[i].clone()
-                        per_sample.append(rec)
-            else:
-                ids = b["input_ids"]
-                labels = b["labels"]
-                attn = b.get("attention_mask")
-                for i in range(ids.shape[0]):
-                    rec = {
-                        "input_ids": ids[i].clone(),
-                        "labels": labels[i].clone(),
-                    }
-                    if attn is not None and attn.dim() == 2:
-                        rec["attention_mask"] = attn[i].clone()
-                    per_sample.append(rec)
-
-        class PresetPtDataset(Dataset):
-            def __init__(self, samples):
-                self.samples = samples
-
-            def __len__(self):
-                return len(self.samples)
-
-            def __getitem__(self, idx):
-                return self.samples[idx]
-
-        self.base.train_dataset = PresetPtDataset(per_sample)
-        max_steps = getattr(self.base.args.train, "max_steps", None)
-        if max_steps:
-            self.base.state.max_steps = int(max_steps)
-        logger.info("preset_pt dataset: %d samples loaded from %s", len(per_sample), train_path)
-
     def _build_collate_fn(self):
         """Build collator with proper padding.
 
         Pads input_ids with pad_token_id (or 0) and labels with -100.
+        SequenceParallel TP and context parallel slice the sequence dim, so
+        variable-length batches additionally pad up to a multiple of
+        ``cp * tp``; the pad rides label ``-100`` and is masked out of the CE.
         """
 
         pad_id = 0
         if self.base.tokenizer and self.base.tokenizer.pad_token_id is not None:
             pad_id = self.base.tokenizer.pad_token_id
+        seq_divisor = self.base.parallel_dims.seq_divisor
 
         def _lm_collate(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
             """Pad sequences to max length in batch."""
             max_len = max(item["input_ids"].size(0) for item in batch)
+            if seq_divisor > 1 and max_len % seq_divisor:
+                max_len += seq_divisor - max_len % seq_divisor
             input_ids_list = []
             labels_list = []
 
@@ -378,10 +240,31 @@ class LLMTrainer:
                     input_ids_list.append(item["input_ids"])
                     labels_list.append(item["labels"])
 
-            return {
+            out = {
                 "input_ids": torch.stack(input_ids_list),
                 "labels": torch.stack(labels_list),
             }
+            if "num_items_in_batch" in batch[0]:
+                out["num_items_in_batch"] = sum(
+                    int(item["num_items_in_batch"]) for item in batch
+                )
+            if "attention_mask" in batch[0]:
+                masks = []
+                for item in batch:
+                    pad_len = max_len - item["attention_mask"].size(0)
+                    masks.append(torch.nn.functional.pad(item["attention_mask"], (0, pad_len), value=0))
+                out["attention_mask"] = torch.stack(masks)
+            if "position_ids" in batch[0]:
+                positions = []
+                for item in batch:
+                    pos = item["position_ids"]
+                    pad_len = max_len - pos.shape[-1]
+                    positions.append(torch.nn.functional.pad(pos, (0, pad_len), value=0))
+                if positions[0].dim() == 1:
+                    out["position_ids"] = torch.stack(positions)
+                else:
+                    out["position_ids"] = torch.stack(positions).transpose(0, 1).contiguous()
+            return out
 
         self.base.collate_fn = _lm_collate
 

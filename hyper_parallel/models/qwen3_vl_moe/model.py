@@ -14,19 +14,10 @@
 # ============================================================================
 """Qwen3-VL-MoE conditional generation model.
 
-Mirrors the upstream ``Qwen3VLMoeForConditionalGeneration`` text + vision
-architecture (vision tower, DeepStack visual injection, MoE text decoder).
+Implements the ``Qwen3VLMoeForConditionalGeneration`` text + vision architecture
+(vision tower, DeepStack visual injection, MoE text decoder).
 """
 from __future__ import annotations
-
-__all__ = [
-    "Qwen3VLMoeTextConfig",
-    "Qwen3VLMoeVisionConfig",
-    "Qwen3VLMoeConfig",
-    "Qwen3VLMoeForCausalLM",
-    "Qwen3VLMoeForConditionalGeneration",
-    "Qwen3VLMoeTextDecoder",
-]
 
 import os
 from dataclasses import dataclass, field
@@ -36,10 +27,25 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from hyper_parallel.models.modules.attention import GroupQueryAttention
+from hyper_parallel.models.modules.attention import GroupQueryAttention, _expand_kv_heads
 from hyper_parallel.models.modules.feed_forward import SwiGLUMLP
-from hyper_parallel.models.modules.rmsnorm import RMSNorm
 from hyper_parallel.models.modules.rope import MultiModalRotaryEmbedding, apply_rotary_pos_emb
+from hyper_parallel.models.qwen3_vl_vision import (
+    Qwen3VLMoeVisionConfig,
+    Qwen3VLMoeVisionModel,
+    Qwen3VLMoeVisionOutput,
+)
+
+
+def _shifted_ce_loss(logits, labels):
+    """Next-token cross-entropy loss from raw labels."""
+    logits_fp = logits.float()
+    targets = F.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
+    return F.cross_entropy(
+        logits_fp.view(-1, logits_fp.size(-1)),
+        targets.view(-1),
+        ignore_index=-100,
+    )
 
 
 def _use_v1_kernels() -> bool:
@@ -105,18 +111,77 @@ class _GmmFunction(torch.autograd.Function):
         return grad_x, grad_w, None
 
 
-def _gelu_pytorch_tanh(x: torch.Tensor) -> torch.Tensor:
-    return F.gelu(x, approximate="tanh")
+class _Qwen3VLMoeGroupedMM(torch.autograd.Function):
+    """Per-expert grouped matmul used by Qwen3-VL-MoE packed experts."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        sorted_input: torch.Tensor,
+        weight: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass."""
+        ctx.save_for_backward(sorted_input, weight)
+        ctx.offsets = offsets
+        output = torch.zeros(
+            sorted_input.size(0), weight.size(2), device=sorted_input.device, dtype=sorted_input.dtype,
+        )
+        start = 0
+        for expert_idx, end in enumerate(offsets.tolist()):
+            if start != end:
+                torch.mm(sorted_input[start:end], weight[expert_idx], out=output[start:end])
+            start = end
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Backward pass."""
+        sorted_input, weight = ctx.saved_tensors
+        grad_input = torch.zeros_like(sorted_input)
+        grad_weight = torch.zeros(
+            weight.shape, device=weight.device, dtype=weight.dtype,
+        )
+        start = 0
+        for expert_idx, end in enumerate(ctx.offsets.tolist()):
+            if start != end:
+                grad_input[start:end].copy_(
+                    torch.mm(grad_output[start:end], weight[expert_idx].T)
+                )
+                grad_weight[expert_idx].copy_(
+                    torch.mm(
+                        sorted_input[start:end].to(grad_weight.dtype).T,
+                        grad_output[start:end].to(grad_weight.dtype),
+                    )
+                )
+            start = end
+        return grad_input, grad_weight, None
 
 
-def _activation(name: str):
-    if name in ("silu", "swish"):
-        return F.silu
-    if name == "gelu_pytorch_tanh":
-        return _gelu_pytorch_tanh
-    if name == "gelu":
-        return F.gelu
-    raise ValueError(f"Unsupported activation: {name}")
+def _qwen3_vl_moe_grouped_mm(
+    sorted_input: torch.Tensor,
+    weight: torch.Tensor,
+    offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Run Qwen3-VL-MoE grouped matmul on already expert-major tokens."""
+    return _Qwen3VLMoeGroupedMM.apply(sorted_input, weight, offsets)
+
+
+class Qwen3VLMoeRMSNorm(nn.Module):
+    """Qwen3-VL-MoE RMSNorm with DTensor sequence placement preservation."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
+        input_dtype = hidden_states.dtype
+        hidden_states_fp = hidden_states.float()
+        variance = hidden_states_fp.pow(2).mean(-1, keepdim=True)
+        normed = hidden_states_fp * torch.rsqrt(variance + self.eps)
+        return normed.to(input_dtype) * self.weight
 
 
 @dataclass
@@ -146,30 +211,13 @@ class Qwen3VLMoeTextConfig:
     num_experts_per_tok: int = 8
     moe_intermediate_size: int = 768
 
-    # ``"flash_attention_2"`` routes through ``torch_npu.npu_fusion_attention``;
-    # ``"eager"`` / ``"sdpa"`` use the shared SDPA path.
-    _attn_implementation: str = "eager"
+    # Production / industry default (matches MindFormers ``use_flash_attention``):
+    # ``"flash_attention_2"`` routes the text decoder through the fused
+    # ``torch_npu.npu_fusion_attention`` kernel (text head_dim 128 is
+    # flash-supported). ``"eager"`` / ``"sdpa"`` use the shared SDPA path; switch
+    # to ``"eager"`` only for strict eager-kernel debugging.
+    _attn_implementation: str = "flash_attention_2"
 
-
-@dataclass
-class Qwen3VLMoeVisionConfig:
-    """Vision config fields used by Qwen3-VL-MoE."""
-
-    depth: int = 27
-    hidden_size: int = 1152
-    hidden_act: str = "gelu_pytorch_tanh"
-    intermediate_size: int = 4304
-    num_heads: int = 16
-    in_channels: int = 3
-    patch_size: int = 16
-    spatial_merge_size: int = 2
-    temporal_patch_size: int = 2
-    out_hidden_size: int = 2048
-    num_position_embeddings: int = 2304
-    deepstack_visual_indexes: List[int] = field(default_factory=lambda: [8, 16, 24])
-    # ``"flash_attention_2"`` uses ``torch_npu.npu_fusion_attention``;
-    # ``"eager"`` chunk-splits q/k/v by cu_seqlens and runs eager attention.
-    _attn_implementation: str = "eager"
 
 
 @dataclass
@@ -183,492 +231,6 @@ class Qwen3VLMoeConfig:
     vision_start_token_id: int = 151652
     vision_end_token_id: int = 151653
     vl: bool = True
-
-    def __getattr__(self, name):
-        """Expose text fields for trainer parallel validation."""
-        if hasattr(self.text_config, name):
-            return getattr(self.text_config, name)
-        raise AttributeError(name)
-
-
-class Qwen3VLMoeVisionRotaryEmbedding(nn.Module):
-    """2D rotary frequencies for Qwen3-VL vision attention."""
-
-    def __init__(self, dim: int, theta: float = 10000.0):
-        super().__init__()
-        self.dim = dim
-        self.theta = theta
-        # Force CPU init: NPU's fp32 ``pow`` rounds 1 ULP differently from
-        # CPU's libm, and the cascading norm-diff at merger output is large.
-        cpu = torch.device("cpu")
-        inv_freq = 1.0 / (
-            theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=cpu) / dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def reset_inv_freq(self) -> None:  # pylint: disable=W0613
-        # Recompute on CPU after meta-init: ``to_empty`` wipes the
-        # CPU-computed buffer, and recomputing on NPU drifts by 1 ULP
-        # against the CPU path (see ``__init__``).
-        """Reset inv freq."""
-        cpu = torch.device("cpu")
-        cpu_inv_freq = 1.0 / (
-            self.theta ** (
-                torch.arange(0, self.dim, 2, dtype=torch.float32, device=cpu)
-                / self.dim
-            )
-        )
-        self.inv_freq.copy_(cpu_inv_freq.to(self.inv_freq.device))
-
-    def forward(self, seqlen: int) -> torch.Tensor:  # pylint: disable=W0613
-        """Compute rotary position embedding frequencies for the given sequence length."""
-        seq = torch.arange(
-            seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype,
-        )
-        return torch.outer(seq, self.inv_freq)
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _apply_rotary_pos_emb_vision(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary position embeddings to vision Q/K (fp32 internal)."""
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    q_embed = q_embed.to(orig_q_dtype)
-    k_embed = k_embed.to(orig_k_dtype)
-    return q_embed, k_embed
-
-
-def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Replicate KV heads ``n_rep`` times for grouped-query attention."""
-    if n_rep == 1:
-        return hidden_states
-    batch, num_kv_heads, slen, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_kv_heads, n_rep, slen, head_dim,
-    )
-    return hidden_states.reshape(batch, num_kv_heads * n_rep, slen, head_dim)
-
-
-def _eager_attention_forward(*args, **kwargs):
-    """Eager attention forward used by the vision and text attention paths.
-
-    Delegates to ``transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.
-    eager_attention_forward``. Reusing that function (rather than a local
-    copy) keeps the Python call-stack identity stable; the NPU kernel-cache
-    key is sensitive to the calling function frame, and a local copy was
-    observed to produce a 1-ULP bf16 divergence at the first vision
-    attention block.
-    """
-    # pylint: disable=C0415
-    from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
-        eager_attention_forward as _eager,
-    )
-    return _eager(*args, **kwargs)
-
-
-class Qwen3VLMoeVisionAttention(nn.Module):
-    """Vision self-attention for Qwen3-VL-MoE."""
-
-    def __init__(self, config: Qwen3VLMoeVisionConfig):
-        super().__init__()
-        self.dim = config.hidden_size
-        self.num_heads = config.num_heads
-        self.head_dim = self.dim // self.num_heads
-        self.num_key_value_groups = 1  # needed for eager attention
-        self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
-        self.proj = nn.Linear(self.dim, self.dim)
-        self.scaling = self.head_dim ** -0.5
-        self.config = config
-        self.attention_dropout = 0.0
-        self.is_causal = False
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb=None,
-        position_embeddings=None,
-        **kwargs,
-    ) -> torch.Tensor:
-        # pylint: disable=W0613  # interface conformance
-        # Op order, variable names, and arg signature are pinned because the
-        # NPU CANN kernel cache is keyed off the Python call-site shape.
-        """Forward pass."""
-        seq_length = hidden_states.shape[0]
-        query_states, key_states, value_states = (
-            self.qkv(hidden_states)
-            .reshape(seq_length, 3, self.num_heads, -1)
-            .permute(1, 0, 2, 3)
-            .unbind(0)
-        )
-        cos, sin = position_embeddings
-        query_states, key_states = _apply_rotary_pos_emb_vision(
-            query_states, key_states, cos, sin,
-        )
-
-        query_states = query_states.transpose(0, 1).unsqueeze(0)
-        key_states = key_states.transpose(0, 1).unsqueeze(0)
-        value_states = value_states.transpose(0, 1).unsqueeze(0)
-
-        # fa2 path uses full-batch query + ``cu_seq_lens_q/k``; other
-        # implementations chunk-split q/k/v by ``cu_seqlens``.
-        attn_impl = getattr(self.config, "_attn_implementation", "eager")
-        if attn_impl == "flash_attention_2":
-            from transformers.modeling_flash_attention_utils import _flash_attention_forward  # pylint: disable=C0415
-            # Keep ``max_seqlen`` as a tensor: ``.item()`` forces a CPU-NPU
-            # sync that perturbs the CANN kernel cache.
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
-            # ``_flash_attention_forward`` consumes (B, S, H, D).
-            q_for_fa = query_states.transpose(1, 2)
-            k_for_fa = key_states.transpose(1, 2)
-            v_for_fa = value_states.transpose(1, 2)
-            attn_output = _flash_attention_forward(
-                q_for_fa, k_for_fa, v_for_fa,
-                attention_mask=None,
-                query_length=q_for_fa.shape[1],
-                is_causal=False,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                softmax_scale=self.scaling,
-                cu_seq_lens_q=cu_seqlens,
-                cu_seq_lens_k=cu_seqlens,
-                max_length_q=max_seqlen,
-                max_length_k=max_seqlen,
-                attn_implementation="flash_attention_2",
-            )
-        else:
-            # Eager path: process each variable-length chunk separately.
-            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            splits = [
-                torch.split(tensor, lengths.tolist(), dim=2)
-                for tensor in (query_states, key_states, value_states)
-            ]
-            attn_outputs = [
-                _eager_attention_forward(
-                    self,
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    scaling=self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    is_causal=False,
-                    **kwargs,
-                )[0]
-                for q, k, v in zip(*splits)
-            ]
-            attn_output = torch.cat(attn_outputs, dim=1)
-
-        attn_output = attn_output.reshape(seq_length, -1).contiguous()
-        attn_output = self.proj(attn_output)
-        return attn_output
-
-
-class Qwen3VLMoeVisionMLP(nn.Module):
-    """Vision MLP matching HF Qwen3VLMoeVisionMLP names."""
-
-    def __init__(self, config: Qwen3VLMoeVisionConfig):
-        super().__init__()
-        self.linear_fc1 = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=True,
-        )
-        self.linear_fc2 = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=True,
-        )
-        self.act_fn = _activation(config.hidden_act)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0613
-        """Apply two-layer MLP with activation: fc1 -> act -> fc2."""
-
-        return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
-
-
-class Qwen3VLMoeVisionDecoder(nn.Module):
-    """One Qwen3-VL vision encoder block."""
-
-    def __init__(self, config: Qwen3VLMoeVisionConfig):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.attn = Qwen3VLMoeVisionAttention(config)
-        self.mlp = Qwen3VLMoeVisionMLP(config)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        """Forward pass."""
-        # pylint: disable=W0613  # interface conformance
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
-        )
-
-        return hidden_states + self.mlp(self.norm2(hidden_states))
-
-
-class Qwen3VLMoeVisionPatchEmbed(nn.Module):
-    """3D patch embedding used by Qwen3-VL."""
-
-    def __init__(self, config: Qwen3VLMoeVisionConfig):
-        super().__init__()
-        self.patch_size = config.patch_size
-        self.temporal_patch_size = config.temporal_patch_size
-        self.in_channels = config.in_channels
-        self.embed_dim = config.hidden_size
-        kernel_size = [
-            self.temporal_patch_size, self.patch_size, self.patch_size,
-        ]
-        self.proj = nn.Conv3d(
-            self.in_channels, self.embed_dim,
-            kernel_size=kernel_size, stride=kernel_size, bias=True,
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0613
-        """Forward pass."""
-        target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
-            -1,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-        )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype))
-
-        return hidden_states.view(-1, self.embed_dim)
-
-
-class Qwen3VLMoeVisionPatchMerger(nn.Module):
-    """Patch merger and DeepStack merger."""
-
-    def __init__(
-        self,
-        config: Qwen3VLMoeVisionConfig,
-        use_postshuffle_norm: bool = False,
-    ):
-        super().__init__()
-        self.hidden_size = config.hidden_size * (config.spatial_merge_size ** 2)
-        self.use_postshuffle_norm = use_postshuffle_norm
-        self.norm = nn.LayerNorm(
-            self.hidden_size if use_postshuffle_norm else config.hidden_size,
-            eps=1e-6,
-        )
-        self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
-        self.act_fn = nn.GELU()
-        self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0613
-        """Apply layer norm, two-layer MLP with GELU, and project to output hidden size."""
-        x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x)
-
-        x = x.view(-1, self.hidden_size)
-        return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-
-
-@dataclass
-class Qwen3VLMoeVisionOutput:
-    """Small output container for native vision forward."""
-
-    last_hidden_state: torch.Tensor
-
-    pooler_output: torch.Tensor | list[torch.Tensor]
-    deepstack_features: list[torch.Tensor]
-
-
-class Qwen3VLMoeVisionModel(nn.Module):
-    """Native Qwen3-VL-MoE vision tower."""
-
-    def __init__(self, config: Qwen3VLMoeVisionConfig):
-        super().__init__()
-        self.config = config
-        self.spatial_merge_size = config.spatial_merge_size
-        self.patch_size = config.patch_size
-        self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
-        self.patch_embed = Qwen3VLMoeVisionPatchEmbed(config)
-        self.pos_embed = nn.Embedding(
-            config.num_position_embeddings, config.hidden_size,
-        )
-        self.num_grid_per_side = int(config.num_position_embeddings ** 0.5)
-        head_dim = config.hidden_size // config.num_heads
-        self.rotary_pos_emb = Qwen3VLMoeVisionRotaryEmbedding(head_dim // 2)
-        self.blocks = nn.ModuleList([
-            Qwen3VLMoeVisionDecoder(config) for _ in range(config.depth)
-        ])
-        self.merger = Qwen3VLMoeVisionPatchMerger(config, use_postshuffle_norm=False)
-        self.deepstack_visual_indexes = list(config.deepstack_visual_indexes)
-        self.deepstack_merger_list = nn.ModuleList([
-            Qwen3VLMoeVisionPatchMerger(config, use_postshuffle_norm=True)
-            for _ in self.deepstack_visual_indexes
-        ])
-
-    @property
-    def dtype(self):
-        """Return the dtype of the vision model's patch embedding weights."""
-        return self.patch_embed.proj.weight.dtype
-
-    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        # Compute ``max_hw`` / ``total_tokens`` via tensor reductions —
-        # ``grid_thw.tolist()`` lands ``freq_table[pos_ids]`` on a different
-        # memory layout and yields a sizable norm-diff at rotary output.
-        """Rot pos emb."""
-        merge_size = self.spatial_merge_size
-        max_hw = int(grid_thw[:, 1:].max().item())
-        freq_table = self.rotary_pos_emb(max_hw)
-        device = freq_table.device
-        total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
-        pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
-
-        offset = 0
-        for num_frames, height, width in grid_thw:
-            merged_h, merged_w = height // merge_size, width // merge_size
-            block_rows = torch.arange(merged_h, device=device)
-            block_cols = torch.arange(merged_w, device=device)
-            intra_row = torch.arange(merge_size, device=device)
-            intra_col = torch.arange(merge_size, device=device)
-
-            row_idx = (
-                block_rows[:, None, None, None] * merge_size
-                + intra_row[None, None, :, None]
-            )
-            col_idx = (
-                block_cols[None, :, None, None] * merge_size
-                + intra_col[None, None, None, :]
-            )
-            row_idx = row_idx.expand(
-                merged_h, merged_w, merge_size, merge_size,
-            ).reshape(-1)
-            col_idx = col_idx.expand(
-                merged_h, merged_w, merge_size, merge_size,
-            ).reshape(-1)
-            coords = torch.stack((row_idx, col_idx), dim=-1)
-            if num_frames > 1:
-                coords = coords.repeat(num_frames, 1)
-            num_tokens = coords.shape[0]
-            pos_ids[offset: offset + num_tokens] = coords
-            offset += num_tokens
-
-        embeddings = freq_table[pos_ids]
-        embeddings = embeddings.flatten(1)
-        return embeddings
-
-    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        """Fast pos embed interpolate."""
-        grid_thw_list = grid_thw.tolist()
-        grid_ts = [row[0] for row in grid_thw_list]
-        grid_hs = [row[1] for row in grid_thw_list]
-        grid_ws = [row[2] for row in grid_thw_list]
-        device = self.pos_embed.weight.device
-
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
-        for _, h, w in grid_thw_list:
-            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
-            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
-            h_floor = h_idxs.int()
-            w_floor = w_idxs.int()
-            h_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-            w_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-            dh = h_idxs - h_floor
-            dw = w_idxs - w_floor
-            base_h = h_floor * self.num_grid_per_side
-            base_h_ceil = h_ceil * self.num_grid_per_side
-            indices = [
-                (base_h[None].T + w_floor[None]).flatten(),
-                (base_h[None].T + w_ceil[None]).flatten(),
-                (base_h_ceil[None].T + w_floor[None]).flatten(),
-                (base_h_ceil[None].T + w_ceil[None]).flatten(),
-            ]
-            weights = [
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
-                ((1 - dh)[None].T * dw[None]).flatten(),
-                (dh[None].T * (1 - dw)[None]).flatten(),
-                (dh[None].T * dw[None]).flatten(),
-            ]
-            for i in range(4):
-                idx_list[i].extend(indices[i].tolist())
-                weight_list[i].extend(weights[i].tolist())
-
-        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
-        weight_tensor = torch.tensor(
-            weight_list, dtype=self.pos_embed.weight.dtype, device=device,
-        )
-        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
-        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
-        patch_pos_embeds = patch_pos_embeds.split([
-            h * w for h, w in zip(grid_hs, grid_ws)
-        ])
-
-        out = []
-        merge_size = self.config.spatial_merge_size
-        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-            pos_embed = pos_embed.repeat(t, 1)
-            pos_embed = (
-                pos_embed.view(
-                    t, h // merge_size, merge_size, w // merge_size, merge_size, -1,
-                )
-                .permute(0, 1, 3, 2, 4, 5)
-                .flatten(0, 4)
-            )
-            out.append(pos_embed)
-        return torch.cat(out)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        grid_thw: torch.Tensor,
-    ) -> Qwen3VLMoeVisionOutput:
-        """Forward pass."""
-        # pylint: disable=W0613  # interface conformance
-        hidden_states = self.patch_embed(hidden_states)
-        hidden_states = hidden_states + self.fast_pos_embed_interpolate(grid_thw)
-
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-        seq_len, _ = hidden_states.size()
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
-
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0],
-        ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
-        deepstack_features = []
-        for layer_idx, block in enumerate(self.blocks):
-            hidden_states = block(
-                hidden_states,
-                cu_seqlens=cu_seqlens,
-                position_embeddings=position_embeddings,
-            )
-            if layer_idx in self.deepstack_visual_indexes:
-                merge_idx = self.deepstack_visual_indexes.index(layer_idx)
-                deepstack_features.append(
-                    self.deepstack_merger_list[merge_idx](hidden_states)
-                )
-
-        return Qwen3VLMoeVisionOutput(
-            last_hidden_state=hidden_states,
-
-            pooler_output=self.merger(hidden_states),
-            deepstack_features=deepstack_features,
-        )
 
 
 class Qwen3VLMoeTextTopKRouter(nn.Module):
@@ -700,62 +262,121 @@ class Qwen3VLMoeTextTopKRouter(nn.Module):
 class Qwen3VLMoeTextExperts(nn.Module):
     """Packed expert weights for Qwen3-VL-MoE text experts.
 
-    Layout is fixed by the upstream checkpoint:
-      - ``gate_up_proj`` shape (E, H, 2I), ``down_proj`` shape (E, I, H)
-        — no transpose at load time; accessed as ``self.gate_up_proj[expert_idx]``
-      - matmul ``current_state @ self.gate_up_proj[expert_idx]``
-        (not ``F.linear``; ``@`` and ``F.linear`` can dispatch to different NPU
-        kernels with different fp32 reduction order, so the ``@`` form is fixed)
-      - dense routing_weights of shape (num_tokens, num_experts), indexed as
-        ``routing_weights[token_idx, expert_idx, None]``
+    Parameters use the HF runtime layout: ``gate_up_proj`` is ``(E, 2I, H)``
+    and ``down_proj`` is ``(E, H, I)``. The checkpoint stores the grouped-GEMM
+    layout ``(E, H, 2I)`` / ``(E, I, H)``, so the state-dict adapter transposes
+    once at load time. Eager forward uses the local grouped-mm fallback order.
     """
 
     def __init__(self, config: Qwen3VLMoeTextConfig):
         super().__init__()
         self.num_experts = config.num_experts
+        self.hidden_size = config.hidden_size
         self.hidden_dim = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
         self.intermediate_dim = config.moe_intermediate_size
-        # Stored as (E, H, 2I) / (E, I, H) — no transpose at load time.
         self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_dim, 2 * self.intermediate_dim)
+            torch.empty(self.num_experts, 2 * self.intermediate_size, self.hidden_size)
         )
         self.down_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim)
+            torch.empty(self.num_experts, self.hidden_size, self.intermediate_size)
         )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize packed expert projections for from-scratch construction."""
+        nn.init.normal_(self.gate_up_proj, mean=0.0, std=0.02)
+        nn.init.normal_(self.down_proj, mean=0.0, std=0.02)
+
+    @staticmethod
+    def _expert_offsets(
+        expert_ids_sorted: torch.Tensor,
+        num_experts: int,
+    ) -> torch.Tensor:
+        """Return cumulative per-expert token offsets."""
+        device = expert_ids_sorted.device
+        histc_input = expert_ids_sorted.float() if device.type == "cpu" else expert_ids_sorted.int()
+        tokens_per_expert = torch.histc(
+            histc_input, bins=num_experts, min=0, max=num_experts - 1,
+        )
+        return torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        routing_weights: torch.Tensor,
         router_indices: torch.Tensor,
+        routing_weights: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass."""
         # pylint: disable=W0613  # interface conformance
         if _use_v1_kernels() and hidden_states.device.type == "npu":
             return self._npu_v1_forward(hidden_states, routing_weights, router_indices)
+        num_tokens, hidden_dim = hidden_states.shape
+        num_top_k = router_indices.size(-1)
+        device = hidden_states.device
 
-        # Eager path: ``routing_weights`` dense (num_tokens, num_experts);
-        # ``router_indices`` (num_tokens, top_k).
-        next_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = F.one_hot(router_indices, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        token_idx = (
+            torch.arange(num_tokens, device=device)
+            .unsqueeze(1).expand(-1, num_top_k).reshape(-1)
+        )
+        sample_weights = routing_weights.reshape(-1)
+        expert_ids = router_indices.reshape(-1)
 
-        for expert_idx in expert_hit[:]:
-            with torch.no_grad():
-                _, token_idx = torch.where(expert_mask[expert_idx[0]])
-            current_state = hidden_states[token_idx]
-            gate_up = current_state @ self.gate_up_proj[expert_idx]
-            gate, up = gate_up.chunk(2, dim=-1)
-            gated_output = up * F.silu(gate)
-            out = gated_output @ self.down_proj[expert_idx]
-            # ``out[0]`` strips the broadcast-1 leading dim from indexing.
-            weighted_output = out[0] * routing_weights[token_idx, expert_idx, None]
-            next_states.index_add_(
-                0, token_idx, weighted_output.to(hidden_states.dtype),
-            )
-        return next_states
+        invalid_mask = expert_ids >= self.num_experts
+        expert_ids = expert_ids.clamp(0, self.num_experts - 1)
+
+        perm = torch.argsort(
+            expert_ids,
+            stable=getattr(self, "_hp_moe_stable_sort", False),
+        )
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(perm.size(0), device=device)
+
+        expert_ids_sorted = expert_ids[perm]
+        sample_weights_sorted = sample_weights[perm]
+        sorted_hidden = hidden_states[token_idx[perm]]
+        offsets = self._expert_offsets(expert_ids_sorted, self.num_experts)
+
+        gate_up = _qwen3_vl_moe_grouped_mm(
+            sorted_hidden, self.gate_up_proj.transpose(-2, -1), offsets,
+        )
+        gate, up = gate_up.chunk(2, dim=-1)
+        intermediate = F.silu(gate) * up
+        down = _qwen3_vl_moe_grouped_mm(
+            intermediate, self.down_proj.transpose(-2, -1), offsets,
+        )
+
+        if getattr(self, "_hp_moe_tp_enabled", False):
+            weighted = down.to(torch.float32) * sample_weights_sorted.to(torch.float32).unsqueeze(-1)
+        else:
+            weighted = down * sample_weights_sorted.unsqueeze(-1)
+        weighted.masked_fill_(invalid_mask[perm].unsqueeze(-1), 0.0)
+
+        unsorted = weighted[inv_perm]
+        final_hidden_states = unsorted.view(
+            num_tokens, num_top_k, hidden_dim,
+        ).sum(dim=1)
+        if getattr(self, "_hp_moe_tp_enabled", False):
+            return final_hidden_states.to(hidden_states.dtype)
+        return final_hidden_states.to(hidden_states.dtype)
+
+    def grouped_forward(
+        self,
+        routed_input: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        gate_up: Optional[torch.Tensor] = None,
+        down: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run experts on already dispatched, expert-major tokens."""
+        if gate_up is None:
+            gate_up = self.gate_up_proj
+        if down is None:
+            down = self.down_proj
+        offsets = torch.cumsum(num_tokens_per_expert, dim=0).to(torch.int32)
+        gate_up_out = _qwen3_vl_moe_grouped_mm(routed_input, gate_up.transpose(-2, -1), offsets)
+        gate_part, up_part = gate_up_out.chunk(2, dim=-1)
+        intermediate = F.silu(gate_part) * up_part
+        return _qwen3_vl_moe_grouped_mm(intermediate, down.transpose(-2, -1), offsets)
 
     def _npu_v1_forward(
         self,
@@ -778,12 +399,14 @@ class Qwen3VLMoeTextExperts(nn.Module):
         tokens_per_expert = torch.histc(
             router_indices, bins=self.num_experts, min=0, max=self.num_experts,
         ).to(torch.int64)
+        gate_up = self.gate_up_proj.transpose(1, 2).contiguous()
+        down = self.down_proj.transpose(1, 2).contiguous()
         intermediate_hidden_states = _GmmFunction.apply(
-            permuted_hidden_states, self.gate_up_proj, tokens_per_expert,
+            permuted_hidden_states, gate_up, tokens_per_expert,
         )
         intermediate_activations = torch_npu.npu_swiglu(intermediate_hidden_states, dim=-1)
         output = _GmmFunction.apply(
-            intermediate_activations, self.down_proj, tokens_per_expert,
+            intermediate_activations, down, tokens_per_expert,
         )
         next_states = torch_npu.npu_moe_token_unpermute(
 
@@ -801,8 +424,7 @@ class Qwen3VLMoeTextSparseMoE(nn.Module):
         routing_weights, router_indices = topk(routing_weights, k)
         routing_weights /= routing_weights.sum(-1, kd)
         routing_weights = routing_weights.to(hidden_states.dtype)
-        router_weights = zeros_like(router_logits).scatter_(1, indices, w)
-        routed_out = self.experts(hidden_states, router_weights, indices)
+        routed_out = self.experts(hidden_states, router_indices, routing_weights)
 
     Returns ``(routed_out, router_logits)`` as a tuple so the decoder
     callsite can unpack via ``isinstance(out, tuple)``.
@@ -820,39 +442,49 @@ class Qwen3VLMoeTextSparseMoE(nn.Module):
         """Forward pass."""
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_2d = hidden_states.view(-1, hidden_dim)
-        router_logits = F.linear(hidden_states_2d, self.gate.weight)
-        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
-        routing_weights, router_indices = torch.topk(
-            routing_weights, self.top_k, dim=-1,
-        )
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        router_logits, routing_weights, router_indices = self.gate(hidden_states_2d)
+        del router_logits
         if _use_v1_kernels() and hidden_states.device.type == "npu":
             # NPU path: pass sparse (T, top_k) routing_weights — consumed
             # directly by ``npu_moe_token_unpermute(probs=...)``.
             next_states = self.experts(
-                hidden_states_2d, routing_weights, router_indices,
+                hidden_states_2d, router_indices, routing_weights,
             )
-            return next_states.reshape(batch_size, sequence_length, hidden_dim), router_logits
+            return next_states.reshape(batch_size, sequence_length, hidden_dim)
 
-        router_weights = torch.zeros_like(router_logits).scatter_(
-            1, router_indices, routing_weights,
-        )
         next_states = self.experts(
-
-            hidden_states_2d, router_weights, router_indices,
+            hidden_states_2d, router_indices, routing_weights,
         )
-        return next_states.reshape(batch_size, sequence_length, hidden_dim), router_logits
+        return next_states.reshape(batch_size, sequence_length, hidden_dim)
+
+
+class Qwen3VLMoeTextSdpaCore(nn.Module):
+    """Causal SDPA core for Qwen3-VL-MoE text attention."""
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        scale: Optional[float] = None,
+        enable_gqa: bool = False,
+    ) -> torch.Tensor:
+        """Run causal SDPA on ``[B, H, S, D]`` Q/K/V."""
+        sdpa_kwargs = {"enable_gqa": True} if enable_gqa else {}
+        if attention_mask is not None:
+            return F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attention_mask, is_causal=False, scale=scale, **sdpa_kwargs,
+            )
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale, **sdpa_kwargs)
 
 
 class Qwen3VLMoeTextAttention(GroupQueryAttention):
     """Qwen3-VL-MoE text attention with selectable attention backend.
 
-    Subclasses :class:`GroupQueryAttention` (SDPA path) without modifying the
-    shared module; overrides ``forward`` to dispatch to flash_attention_2 when
-    ``_attn_implementation == "flash_attention_2"`` so the text path lands on
-    the NPU ``torch_npu.npu_fusion_attention`` kernel. Otherwise falls back
-    to the inherited SDPA path.
+    Subclasses :class:`GroupQueryAttention` for projection layout without
+    modifying the shared module; overrides ``forward`` to dispatch to SDPA or
+    flash_attention_2 when requested.
     """
 
     def __init__(self, attn_implementation: str = "eager", **kwargs):
@@ -861,29 +493,36 @@ class Qwen3VLMoeTextAttention(GroupQueryAttention):
         # ``eager_attention_forward`` (delegated to via the eager path) reads
         # ``module.num_key_value_groups``; alias to the local field.
         self.num_key_value_groups = self.num_kv_groups
+        self.sdpa_core = Qwen3VLMoeTextSdpaCore()
 
     def forward(self, hidden_states: torch.Tensor,
                 position_ids: Optional[torch.Tensor] = None, **kwargs):  # pylint: disable=W0613
         """Dispatch attention computation based on the configured implementation."""
-        if self._attn_implementation == "sdpa":
-            return super().forward(hidden_states, position_ids=position_ids, **kwargs)
-
-        # eager / fa2: replicate projection + rotary explicitly so the
+        # eager / sdpa / fa2: replicate projection + rotary explicitly so the
         # selected kernel (eager fp32-softmax matmul, or NPU fusion attention)
         # is exercised directly rather than the parent's SDPA path.
         bsz, seq_len, _ = hidden_states.shape
-        q_raw = self.q_proj(hidden_states).view(
-            bsz, seq_len, self.num_heads, self.head_dim,
-        )
-        q = self.q_norm(q_raw).transpose(1, 2)
-        k = self.k_norm(
-            self.k_proj(hidden_states).view(
-                bsz, seq_len, self.num_kv_heads, self.head_dim,
+        q_out = self.q_proj(hidden_states)
+        if q_out.shape[-1] % self.head_dim != 0:
+            raise ValueError(
+                f"q_proj output dim {q_out.shape[-1]} is not divisible by head_dim {self.head_dim}."
             )
+        q_raw = q_out.reshape(bsz, seq_len, -1, self.head_dim)
+        q = self.q_norm(q_raw).transpose(1, 2)
+        k_out = self.k_proj(hidden_states)
+        if k_out.shape[-1] % self.head_dim != 0:
+            raise ValueError(
+                f"k_proj output dim {k_out.shape[-1]} is not divisible by head_dim {self.head_dim}."
+            )
+        k = self.k_norm(
+            k_out.reshape(bsz, seq_len, -1, self.head_dim)
         ).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(
-            bsz, seq_len, self.num_kv_heads, self.head_dim,
-        ).transpose(1, 2)
+        v_out = self.v_proj(hidden_states)
+        if v_out.shape[-1] != k_out.shape[-1]:
+            raise ValueError(
+                f"v_proj output dim {v_out.shape[-1]} must match k_proj output dim {k_out.shape[-1]}."
+            )
+        v = v_out.reshape(bsz, seq_len, -1, self.head_dim).transpose(1, 2)
 
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=hidden_states.device)
@@ -893,6 +532,19 @@ class Qwen3VLMoeTextAttention(GroupQueryAttention):
 
         attn_mask = kwargs.get("attention_mask")
         scaling = self.head_dim ** -0.5
+
+        if self._attn_implementation == "sdpa":
+            kv_groups = q.shape[1] // k.shape[1]
+            expand_kv_for_cp = bool(getattr(self, "_hp_cp_expand_kv_before_core", False))
+            enable_gqa = kv_groups > 1 and attn_mask is None and not expand_kv_for_cp
+            if kv_groups > 1 and (expand_kv_for_cp or not enable_gqa):
+                k = _expand_kv_heads(k, kv_groups)
+                v = _expand_kv_heads(v, kv_groups)
+            attn_output = self.sdpa_core(
+                q, k, v, attention_mask=attn_mask, scale=scaling, enable_gqa=enable_gqa,
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
+            return self.o_proj(attn_output)
 
         if self._attn_implementation == "flash_attention_2":
             # pylint: disable=C0415
@@ -938,6 +590,8 @@ class Qwen3VLMoeTextDecoder(nn.Module):
         rope: MultiModalRotaryEmbedding,
     ):
         super().__init__()
+        # Pure-GQA: every VL text layer is a full-attention layer.
+        self.layer_type = "full_attention"
         self.self_attn = Qwen3VLMoeTextAttention(
             attn_implementation=getattr(config, "_attn_implementation", "eager"),
             hidden_size=config.hidden_size,
@@ -949,7 +603,7 @@ class Qwen3VLMoeTextDecoder(nn.Module):
             rope=rope,
             qk_norm=True,
             rms_norm_eps=config.rms_norm_eps,
-            norm_cls=RMSNorm,
+            norm_cls=Qwen3VLMoeRMSNorm,
         )
         if (
             layer_idx not in config.mlp_only_layers
@@ -961,8 +615,10 @@ class Qwen3VLMoeTextDecoder(nn.Module):
             self.mlp = SwiGLUMLP(
                 config.hidden_size, config.intermediate_size, bias=False,
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = Qwen3VLMoeRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps,
+        )
+        self.post_attention_layernorm = Qwen3VLMoeRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps,
         )
 
@@ -997,8 +653,6 @@ class Qwen3VLMoeTextDecoder(nn.Module):
 class Qwen3VLMoeTextModel(nn.Module):
     """Text decoder used by the multimodal conditional generation wrapper."""
 
-    _cp_modules = ["*.self_attn"]
-
     def __init__(self, config: Qwen3VLMoeTextConfig):
         super().__init__()
         self.config = config
@@ -1009,11 +663,22 @@ class Qwen3VLMoeTextModel(nn.Module):
             mrope_section=config.mrope_section,
         )
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # Per-layer rotary instances (one non-persistent inv_freq buffer
+        # each): a single shared module registered under every layer makes
+        # the activation-checkpoint wrapper see overlapping wrap regions.
         self.layers = nn.ModuleList([
-            Qwen3VLMoeTextDecoder(config, i, self.rotary_emb)
+            Qwen3VLMoeTextDecoder(config, i, MultiModalRotaryEmbedding(
+                dim=config.head_dim,
+                max_seq_len=config.max_position_embeddings,
+                theta=config.rope_theta,
+                mrope_section=config.mrope_section,
+            ))
             for i in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3VLMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.decoder_input = nn.Identity()
+        self.deepstack_input = nn.Identity()
+        self.deepstack_output = nn.Identity()
 
     @staticmethod
     def _build_causal_mask(
@@ -1059,11 +724,11 @@ class Qwen3VLMoeTextModel(nn.Module):
         visual_embeds: torch.Tensor,
     ) -> torch.Tensor:
         """Deepstack process (internal)."""
+        visual_pos_masks = visual_pos_masks.to(hidden_states.device)
         visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
         hidden_states = hidden_states.clone()
-        hidden_states[visual_pos_masks, :] = (
-            hidden_states[visual_pos_masks, :] + visual_embeds
-        )
+        local_this = hidden_states[visual_pos_masks, :] + visual_embeds
+        hidden_states[visual_pos_masks, :] = local_this
         return hidden_states
 
     def forward(
@@ -1098,10 +763,17 @@ class Qwen3VLMoeTextModel(nn.Module):
         attn_impl = getattr(self.config, "_attn_implementation", "eager")
         if attn_impl == "flash_attention_2":
             layer_attention_mask = attention_mask
+        elif (
+            attn_impl == "sdpa"
+            and (attention_mask is None or (attention_mask.ndim <= 2 and torch.all(attention_mask == 1)))
+        ):
+            layer_attention_mask = None
         else:
             layer_attention_mask = self._build_causal_mask(
                 attention_mask, bsz, seq_len, inputs_embeds,
             )
+
+        inputs_embeds, position_ids = self.decoder_input((inputs_embeds, position_ids))
 
         hidden_states = inputs_embeds
         for layer_idx, layer in enumerate(self.layers):
@@ -1115,10 +787,11 @@ class Qwen3VLMoeTextModel(nn.Module):
                 and visual_pos_masks is not None
                 and layer_idx < len(deepstack_visual_embeds)
             ):
-
+                hidden_states = self.deepstack_input(hidden_states)
                 hidden_states = self._deepstack_process(
                     hidden_states, visual_pos_masks, deepstack_visual_embeds[layer_idx],
                 )
+                hidden_states = self.deepstack_output(hidden_states)
         return self.norm(hidden_states)
 
 
@@ -1131,19 +804,22 @@ class Qwen3VLMoeModel(nn.Module):
         self.visual = Qwen3VLMoeVisionModel(config.vision_config)
         self.language_model = Qwen3VLMoeTextModel(config.text_config)
         self.rope_deltas = None
+        self.visual_injection_input = nn.Identity()
+        self.visual_injection_output = nn.Identity()
 
     @property
     def layers(self):
         """Return the language model decoder layer list."""
         return self.language_model.layers
 
-    def get_input_embeddings(self):
-        """Text token embedding accessor (restores upstream's missing method)."""
+    def get_input_embeddings(self) -> nn.Embedding:
+        """Return the text model's token embedding table."""
         return self.language_model.embed_tokens
 
     def set_input_embeddings(self, value):
         """Set the text token embedding."""
         self.language_model.embed_tokens = value
+
 
     def get_vision_position_ids(
         self,
@@ -1158,17 +834,16 @@ class Qwen3VLMoeModel(nn.Module):
         llm_grid_t = grid_thw[0].item() // temp_merge_size
         llm_grid_h = grid_thw[1].item() // spatial_merge_size
         llm_grid_w = grid_thw[2].item() // spatial_merge_size
-        image_seq_length = llm_grid_h * llm_grid_w * llm_grid_t
-        position_width = torch.arange(
-            start_position, start_position + llm_grid_w, device=device,
-        ).repeat(llm_grid_h * llm_grid_t)
-        position_height = torch.arange(
-            start_position, start_position + llm_grid_h, device=device,
-        ).repeat_interleave(llm_grid_w * llm_grid_t)
-        position_temporal = torch.full(
-            (image_seq_length,), start_position, device=device, dtype=torch.long,
+
+        position_temporal = torch.arange(llm_grid_t, device=device) * time_interval
+        position_width = torch.arange(llm_grid_w, device=device) + start_position
+        position_height = torch.arange(llm_grid_h, device=device) + start_position
+
+        position_width = position_width.repeat(llm_grid_h * llm_grid_t)
+        position_height = position_height.repeat_interleave(llm_grid_w).repeat(llm_grid_t)
+        position_temporal = (
+            position_temporal.repeat_interleave(llm_grid_h * llm_grid_w) + start_position
         )
-        position_temporal = position_temporal * time_interval
         return torch.stack([position_temporal, position_height, position_width], dim=0)
 
     def get_rope_index(
@@ -1226,9 +901,7 @@ class Qwen3VLMoeModel(nn.Module):
                     )
                     current_pos += text_len
                 else:
-                    # modality_type is 1 (image) or 2 (video) — both static keys
-                    # of grid_iters, so .get() is equivalent to indexing here.
-                    grid = next(grid_iters.get(modality_type))
+                    grid = next(grid_iters[modality_type])
                     pos_parts.append(
                         self.get_vision_position_ids(
                             current_pos, grid, 1, spatial_merge_size,
@@ -1266,16 +939,20 @@ class Qwen3VLMoeModel(nn.Module):
         inputs_embeds: torch.Tensor,
         image_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Get placeholder mask."""
+        """Get placeholder mask.
+
+        Computed from ``input_ids`` and the hidden size, matching the single-card
+        path without relying on embedding boolean-indexing side effects.
+        """
+        hidden_size = inputs_embeds.shape[-1]
         special_image_mask = input_ids == self.config.image_token_id
-        n_image_tokens = special_image_mask.sum()
-        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds)
-        if image_features is not None and inputs_embeds[special_image_mask].numel() != image_features.numel():
+        n_image_tokens = int(special_image_mask.sum())
+        if image_features is not None and n_image_tokens * hidden_size != image_features.numel():
             raise ValueError(
                 "Image features and image tokens do not match: "
-                f"tokens={int(n_image_tokens)}, features={tuple(image_features.shape)}"
+                f"tokens={n_image_tokens}, features={tuple(image_features.shape)}"
             )
-        return special_image_mask
+        return special_image_mask.unsqueeze(-1).expand(-1, -1, hidden_size)
 
     def forward(
         self,
@@ -1296,6 +973,7 @@ class Qwen3VLMoeModel(nn.Module):
         image_mask = None
         deepstack_visual_embeds = None
         if pixel_values is not None:
+            inputs_embeds = self.visual_injection_input(inputs_embeds)
             image_outputs = self.get_image_features(pixel_values, image_grid_thw)
             image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
                 inputs_embeds.device, inputs_embeds.dtype,
@@ -1304,6 +982,7 @@ class Qwen3VLMoeModel(nn.Module):
                 input_ids, inputs_embeds, image_features=image_embeds,
             )
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            inputs_embeds = self.visual_injection_output(inputs_embeds)
             deepstack_visual_embeds = image_outputs.deepstack_features
 
         visual_pos_masks = image_mask[..., 0] if image_mask is not None else None
@@ -1333,8 +1012,6 @@ class Qwen3VLMoeModel(nn.Module):
 class Qwen3VLMoeForCausalLM(nn.Module):
     """Text-only CausalLM wrapper with HF-compatible state-dict names."""
 
-    _cp_modules = ["*.self_attn"]
-
     def __init__(self, config: Qwen3VLMoeTextConfig):
         super().__init__()
         self.config = config
@@ -1345,11 +1022,19 @@ class Qwen3VLMoeForCausalLM(nn.Module):
             mrope_section=config.mrope_section,
         )
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # Per-layer rotary instances (one non-persistent inv_freq buffer
+        # each): a single shared module registered under every layer makes
+        # the activation-checkpoint wrapper see overlapping wrap regions.
         self.layers = nn.ModuleList([
-            Qwen3VLMoeTextDecoder(config, i, self.rotary_emb)
+            Qwen3VLMoeTextDecoder(config, i, MultiModalRotaryEmbedding(
+                dim=config.head_dim,
+                max_seq_len=config.max_position_embeddings,
+                theta=config.rope_theta,
+                mrope_section=config.mrope_section,
+            ))
             for i in range(config.num_hidden_layers)
         ])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3VLMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -1378,25 +1063,19 @@ class Qwen3VLMoeForCausalLM(nn.Module):
                 attention_mask=attention_mask,
             )
         hidden_states = self.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype))
 
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous().float()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            gather_logits = getattr(self, "_hp_tp_logits_gather", None)
+            if gather_logits is not None:
+                logits = gather_logits(logits, labels)
+            loss = _shifted_ce_loss(logits, labels)
         return {"loss": loss, "logits": logits}
 
 
 class Qwen3VLMoeForConditionalGeneration(nn.Module):
     """Native multimodal Qwen3-VL-MoE conditional generation model."""
-
-    _cp_modules = ["*.self_attn"]
 
     def __init__(self, config: Qwen3VLMoeConfig):
         super().__init__()
@@ -1436,14 +1115,205 @@ class Qwen3VLMoeForConditionalGeneration(nn.Module):
             image_grid_thw=image_grid_thw,
             mm_token_type_ids=mm_token_type_ids,
         )
-        logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype))
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous().float()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            gather_logits = getattr(self, "_hp_tp_logits_gather", None)
+            if gather_logits is not None:
+                logits = gather_logits(logits, labels)
+            loss = _shifted_ce_loss(logits, labels)
         return {"loss": loss, "logits": logits}
+
+
+class Qwen3VLMoeStageModule(nn.Module):
+    """One pipeline-parallel stage of Qwen3-VL-MoE.
+
+    Stage 0 holds the visual tower + ``embed_tokens`` and runs the full
+    visual-injection + 3D-mrope position-id computation (mirroring
+    :meth:`Qwen3VLMoeModel.forward`); the last stage holds ``norm`` + ``lm_head``
+    and returns a **sum-reduced** cross-entropy on pre-shifted targets (the
+    trainer divides by the global valid-token count). The base cross-stage
+    activations are ``(hidden_states, position_ids)`` — ``position_ids`` is the
+    3D mrope tensor computed on stage 0 and carried forward (it cannot be a
+    batch-split kwarg).
+
+    DeepStack visual features inject after global layers ``< len(deepstack)``.
+    When the layer split places injection layers beyond a stage's slab, the
+    stage relays ``(visual_pos_masks, *remaining_features)`` to its successor as
+    extra pipeline outputs: the mask travels as ``uint8`` (P2P rejects bool) and
+    each feature tensor keeps its own ``requires_grad`` metadata, so a frozen
+    tower relays pure data while a trainable tower's feature grads flow back
+    hop-by-hop through the regular P2P grad path. The relayed tuple always
+    covers global layers ``[layer_start, deepstack_len)`` of the *receiving*
+    stage, shrinking at each boundary; stages past the last injection layer
+    exchange the plain 2-tuple. The relay arity is part of the stage-pair P2P
+    meta, so every micro-batch of a step must agree on whether images are
+    present (the same sample-uniform layout PP micro-batching already requires).
+
+    To reuse the composite model's vision helpers without duplicating the decoder
+    layers, stage 0 holds ``visual`` + ``config`` and calls the unbound
+    :class:`Qwen3VLMoeModel` helpers with ``self`` (duck typing).
+
+    Args:
+        layers: This stage's decoder layers.
+        layer_start: Global index of ``layers[0]`` (for DeepStack mapping).
+        config: Model config (``image_token_id`` / vision config) — stage 0 only.
+        visual: Vision tower (stage 0 only, else ``None``).
+        embed_tokens: Token embedding (stage 0 only, else ``None``).
+        norm: Final RMSNorm (last stage only, else ``None``).
+        lm_head: Output projection (last stage only, else ``None``).
+        deepstack_len: Number of DeepStack features (injected after global layers
+            ``0 .. deepstack_len-1``).
+    """
+
+    def __init__(
+        self, layers, layer_start, config=None, visual=None,
+        embed_tokens=None, norm=None, lm_head=None, deepstack_len=0,
+        attn_impl="eager",
+    ):
+        super().__init__()
+        self.layer_start = layer_start
+        self.deepstack_len = deepstack_len
+        self.attn_impl = attn_impl
+        self.config = config
+        self.visual = visual
+        self.embed_tokens = embed_tokens
+        self.layers = nn.ModuleList(layers)
+        self.norm = norm
+        self.lm_head = lm_head
+
+    def get_vision_position_ids(self, *args, **kwargs):
+        """Delegate to the composite helper (it uses no decoder-layer state)."""
+        return Qwen3VLMoeModel.get_vision_position_ids(self, *args, **kwargs)
+
+    # pylint: disable=keyword-arg-before-vararg
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        visual_pos_masks: Optional[torch.Tensor] = None,
+        *deepstack_embeds_in: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        mm_token_type_ids: Optional[torch.Tensor] = None,
+    ):
+        """Run this stage.
+
+        Non-last stages return ``(hidden_states, position_ids)`` plus, while
+        injection layers remain downstream, ``(visual_pos_masks_u8,
+        *remaining_deepstack_features)``; the last stage returns sum-CE (if
+        ``targets``) else logits. ``deepstack_embeds_in`` (positional, from the
+        predecessor's relay) covers global layers ``[layer_start,
+        deepstack_len)``.
+        """
+        # Per-stage view of the DeepStack features: ``deepstack_embeds[i]``
+        # injects after global layer ``layer_start + i``.
+        deepstack_embeds = list(deepstack_embeds_in) or None
+        if self.embed_tokens is not None:  # stage 0: ``hidden_states`` is ``input_ids``
+            input_ids = hidden_states
+            inputs_embeds = self.embed_tokens(input_ids)
+            if pixel_values is not None:
+                # PP micro-batching splits pixel_values and image_grid_thw
+                # independently on dim 0 (the schedule's per-kwarg BatchDimSpec).
+                # That is only sample-aligned when every micro-chunk's grids own
+                # exactly its pixel rows, i.e. the uniform layout the splitter
+                # assumes. A ragged batch (samples with differing image/patch
+                # counts) lands the grid / pixel cuts on mismatched boundaries;
+                # fail fast here with a clear cause instead of a cryptic
+                # torch.split / vision-tower shape error deeper in.
+                expected_rows = int(image_grid_thw.prod(-1).sum())
+                if expected_rows != pixel_values.shape[0]:
+                    raise NotImplementedError(
+                        "Qwen3-VL-MoE PP micro-batching split pixel_values "
+                        f"({pixel_values.shape[0]} rows) and image_grid_thw "
+                        f"({expected_rows} grid rows) onto mismatched boundaries. "
+                        "pp_micro_batch_num>1 requires a sample-uniform VL batch "
+                        "(every sample contributing an equal, dim-0-aligned number "
+                        "of image patches); ragged per-sample image layouts are "
+                        "not supported. Use pp_micro_batch_num=1, or pad the batch "
+                        "so every sample has the same image/patch count."
+                    )
+                image_outputs = Qwen3VLMoeModel.get_image_features(
+                    self, pixel_values, image_grid_thw,
+                )
+                image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(
+                    inputs_embeds.device, inputs_embeds.dtype,
+                )
+                image_mask = Qwen3VLMoeModel.get_placeholder_mask(
+                    self, input_ids, inputs_embeds, image_features=image_embeds,
+                )
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                deepstack_embeds = list(image_outputs.deepstack_features) or None
+                # uint8 from the start: P2P meta rejects bool, and keeping one
+                # dtype on every hop lets later stages relay the buffer as-is.
+                visual_pos_masks = image_mask[..., 0].to(torch.uint8)
+            if position_ids is None and image_grid_thw is not None:
+                if mm_token_type_ids is None:
+                    mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int32)
+                    mm_token_type_ids[input_ids == self.config.image_token_id] = 1
+                position_ids, _ = Qwen3VLMoeModel.get_rope_index(
+                    self, input_ids=input_ids, mm_token_type_ids=mm_token_type_ids,
+                    image_grid_thw=image_grid_thw, attention_mask=attention_mask,
+                )
+            hidden_states = inputs_embeds
+
+        bsz, seq_len = hidden_states.shape[0], hidden_states.shape[1]
+        # fa2 consumes the raw 2D padding mask (it combines causal + padding in
+        # the kernel and drops any 4D mask); eager / sdpa get a pre-built 4D
+        # causal+padding mask. Mirror ``Qwen3VLMoeTextModel.forward`` so a padded
+        # flash-attention PP batch masks pad tokens correctly.
+        if self.attn_impl == "flash_attention_2":
+            layer_mask = attention_mask
+        else:
+            layer_mask = Qwen3VLMoeTextModel._build_causal_mask(  # pylint: disable=W0212
+                attention_mask, bsz, seq_len, hidden_states,
+            )
+        inject_mask = (
+            visual_pos_masks.to(torch.bool) if visual_pos_masks is not None else None
+        )
+        for local_idx, layer in enumerate(self.layers):
+            hidden_states = layer(
+                hidden_states, position_ids=position_ids, attention_mask=layer_mask,
+            )
+            global_idx = self.layer_start + local_idx
+            if deepstack_embeds is not None and global_idx < self.deepstack_len:
+                visual_embeds = deepstack_embeds[global_idx - self.layer_start].to(
+                    hidden_states.device, hidden_states.dtype,
+                )
+                hidden_states = hidden_states.clone()
+                hidden_states[inject_mask, :] = (
+                    hidden_states[inject_mask, :] + visual_embeds
+                )
+
+        if self.norm is None or self.lm_head is None:
+            next_start = self.layer_start + len(self.layers)
+            if deepstack_embeds is not None and next_start < self.deepstack_len:
+                # Injection layers remain downstream: relay the mask and the
+                # features for global layers [next_start, deepstack_len).
+                tail = deepstack_embeds[next_start - self.layer_start:]
+                return (hidden_states, position_ids, visual_pos_masks, *tail)
+            return hidden_states, position_ids
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+        if targets is None:
+            return logits
+        logits_fp = logits.float()
+        return F.cross_entropy(
+            logits_fp.view(-1, logits_fp.size(-1)),
+            targets.view(-1),
+            ignore_index=-100,
+            reduction="sum",
+        )
+
+
+__all__ = [
+    "Qwen3VLMoeTextConfig",
+    "Qwen3VLMoeVisionConfig",
+    "Qwen3VLMoeConfig",
+    "Qwen3VLMoeForCausalLM",
+    "Qwen3VLMoeForConditionalGeneration",
+    "Qwen3VLMoeStageModule",
+    "Qwen3VLMoeTextDecoder",
+]

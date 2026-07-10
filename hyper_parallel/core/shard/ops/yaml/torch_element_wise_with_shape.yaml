@@ -12,6 +12,7 @@ add_:
 
 sub:
   dist_op_name: _torch_sub_dist_op
+  distributed_op_class: SubDistributedOp
 
 sub_:
   dist_op_name: _torch_sub__dist_op

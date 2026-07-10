@@ -409,7 +409,10 @@ class PipelineScheduleRuntime(ABC):
         managed_stage_indices = {
             stage.stage_index
             for stage in self.stages
-            if isinstance(stage.submodule, HSDPModule)
+            if any(
+                isinstance(module, HSDPModule)
+                for _, module in platform.get_cells_and_names(stage.submodule)
+            )
         }
         if not managed_stage_indices:
             return

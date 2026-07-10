@@ -32,9 +32,15 @@ from hyper_parallel.models.qwen3_vl_moe.model import (
     Qwen3VLMoeTextConfig,
     Qwen3VLMoeVisionConfig,
 )
-from hyper_parallel.models.qwen3_vl_moe.parallelize import parallelize_qwen3_vl_moe
+from hyper_parallel.models.qwen3_vl_moe.parallelize import (
+    parallelize_qwen3_vl_moe,
+    pipeline_qwen3_vl_moe_for_trainer,
+)
 from hyper_parallel.models.qwen3_vl_moe.state_dict import (
     Qwen3VLMoeStateDictAdapter,
+)
+from hyper_parallel.models.qwen3_5_moe.parallelize import (
+    qwen3_5_moe_tp_load_transforms,
 )
 from hyper_parallel.models.spec import ModelSpec, register_spec
 
@@ -89,7 +95,7 @@ _VISION_DEFAULTS = {
 
 def _load_text_config_defaults(model_cfg) -> dict:
     """Load text config defaults (internal)."""
-    weights_path = getattr(model_cfg, "weights_path", None)
+    weights_path = model_cfg.weights_path
     if not weights_path:
         return {}
     cfg_path = os.path.join(weights_path, "config.json")
@@ -108,7 +114,7 @@ def _load_text_config_defaults(model_cfg) -> dict:
 
 def _load_full_config_defaults(model_cfg) -> dict:
     """Load full config defaults (internal)."""
-    weights_path = getattr(model_cfg, "weights_path", None)
+    weights_path = model_cfg.weights_path
     if not weights_path:
         return {}
     cfg_path = os.path.join(weights_path, "config.json")
@@ -139,14 +145,12 @@ def _load_full_config_defaults(model_cfg) -> dict:
 def _resolve_kwargs(model_cfg) -> dict:
     """Resolve config with checkpoint config between defaults and YAML."""
     kwargs = dict(_DEFAULTS)
-    if model_cfg is None:
-        return kwargs
     kwargs.update(_load_text_config_defaults(model_cfg))
     for field in _UNIVERSAL_FIELDS:
         val = getattr(model_cfg, field, None)
         if val is not None:
             kwargs[field] = val
-    extra = getattr(model_cfg, "config_overrides", None)
+    extra = model_cfg.config_overrides
     if isinstance(extra, dict):
         kwargs.update(extra)
         kwargs.pop("vl", None)
@@ -168,7 +172,7 @@ def _build_vl(cfg) -> Qwen3VLMoeForConditionalGeneration:
         val = getattr(model_cfg, field, None)
         if val is not None:
             text_kwargs[field] = val
-    extra = getattr(model_cfg, "config_overrides", None)
+    extra = model_cfg.config_overrides
     if isinstance(extra, dict):
         text_extra = extra.get("text_config", {})
         vision_extra = extra.get("vision_config", {})
@@ -190,7 +194,7 @@ def _build_vl(cfg) -> Qwen3VLMoeForConditionalGeneration:
 
 
 def _build(cfg):
-    extra = getattr(cfg.model, "config_overrides", None)
+    extra = cfg.model.config_overrides
     if isinstance(extra, dict) and extra.get("vl", False):
         return _build_vl(cfg)
     return Qwen3VLMoeForCausalLM(_build_config(cfg))
@@ -213,6 +217,8 @@ register_spec(
         name="qwen3_vl_moe",
         build_model_fn=_build,
         parallelize_fn=parallelize_qwen3_vl_moe,
+        pipelining_fn=pipeline_qwen3_vl_moe_for_trainer,
         state_dict_adapter=Qwen3VLMoeStateDictAdapter,
+        tp_load_transform_fn=qwen3_5_moe_tp_load_transforms,
     ),
 )

@@ -566,6 +566,37 @@ class OpDispatcher:
         skip_dispatch = get_dtensor_dispatch() is False and op_name not in get_no_skip_ops()
         return op_name in self.whitelist or op_name in self._INPLACE_BYPASS_OPS or skip_dispatch
 
+    @staticmethod
+    def _validate_inplace_partial_inputs(op_name: str, args: tuple, kwargs: dict) -> None:
+        """Reject local in-place add/sub when Partial contributions need gating."""
+        if op_name not in {"InplaceAddExt", "InplaceSubExt"} or not args:
+            return
+        first = args[0]
+        if len(args) >= 2:
+            second = args[1]
+        elif "other" in kwargs:
+            second = kwargs["other"]
+        else:
+            return
+        if not isinstance(first, DTensor):
+            return
+        mesh_ndim = len(first.layout.partial)
+        first_partial = tuple(first.layout.partial)
+        if isinstance(second, DTensor):
+            second_partial = tuple(second.layout.partial)
+            if len(second_partial) != mesh_ndim:
+                raise ValueError(
+                    f"For {op_name}, in-place input mesh dimensions must match, "
+                    f"but got {mesh_ndim} and {len(second_partial)}."
+                )
+        else:
+            second_partial = (None,) * mesh_ndim
+        if first_partial != second_partial:
+            raise ValueError(
+                f"For {op_name}, input Partial placements must be identical for "
+                f"local in-place execution, but got {first_partial} and {second_partial}."
+            )
+
     def _should_dispatch_loss_parallel(self, op_name: str) -> bool:
         """Check if should dispatch through loss_parallel path.
 
@@ -791,7 +822,15 @@ class OpDispatcher:
                 f"Operator '{op_name}' has not been migrated to the three-phase dispatch flow. "
                 f"Please implement preprocess() to return (local_args, local_kwargs, cache_values)."
             )
-        return self._dispatch_new(op_call, distribute_op, packed_call, result)
+        output = self._dispatch_new(op_call, distribute_op, packed_call, result)
+        return self._restore_inplace_dtensor_result(op_name, args, output)
+
+    @staticmethod
+    def _restore_inplace_dtensor_result(op_name: str, args: tuple, output: Any) -> Any:
+        """Return the original DTensor wrapper after a local in-place operation."""
+        if op_name in {"add_", "sub_"} and args and isinstance(args[0], DTensor):
+            return args[0]
+        return output
 
     @staticmethod
     def _dispatch_new(func, distribute_op, packed_call, result) -> Tensor:
@@ -852,6 +891,7 @@ class OpDispatcher:
         op_name = platform.get_op_name(op_call)
 
         if self._should_bypass_dispatch(op_name):
+            self._validate_inplace_partial_inputs(op_name, args, kwargs)
             result = op_call(*self._unwrap_args(args), **self._unwrap_kwargs(kwargs))
             if op_name in self._INPLACE_BYPASS_OPS and args and isinstance(args[0], DTensor):
                 return args[0]
