@@ -52,18 +52,35 @@ def seed_memory_time_context(seed=42):
         stats["exec_time"] = exec_time
 
 
-def prepare_data(batch_size=8, seq_len=512, num_samples=64):
+def prepare_data(batch_size=8, seq_len=512, num_samples=64, vocab_size=10000):
+    """Prepare token inputs and targets for activation checkpoint tests.
+
+    Args:
+        batch_size: Number of sequences per batch.
+        seq_len: Number of tokens per sequence.
+        num_samples: Number of sequences in the dataset.
+        vocab_size: Upper bound (exclusive) for generated token ids.
+    """
+    if vocab_size <= 0:
+        raise ValueError(f"vocab_size must be positive, but got {vocab_size}")
     dataset = TensorDataset(
-        torch.randint(0, 10000, (num_samples, seq_len)),
-        torch.randint(0, 10000, (num_samples, seq_len))
+        torch.randint(0, vocab_size, (num_samples, seq_len)),
+        torch.randint(0, vocab_size, (num_samples, seq_len))
     )
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     return dataloader
 
 
-def train_one_mode(model, dataloader, train_steps=5):
-    """Run training for one mode and return metrics."""
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+def train_one_mode(model, dataloader, train_steps=5, optimizer_cls=torch.optim.Adam):
+    """Run training for one mode and return metrics.
+
+    Args:
+        model: Model to train.
+        dataloader: Batches consumed during training.
+        train_steps: Maximum number of batches to train.
+        optimizer_cls: Optimizer class used to train the model.
+    """
+    optimizer = optimizer_cls(model.parameters(), lr=1e-4)
     losses = []
     for step, (x, y) in enumerate(dataloader):
         if step >= train_steps:

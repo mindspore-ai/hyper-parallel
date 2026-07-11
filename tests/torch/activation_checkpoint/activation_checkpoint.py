@@ -14,12 +14,20 @@
 # ============================================================================
 """Activation checkpoint memory comparison: None vs Recompute vs Save vs Swap"""
 import copy
+import multiprocessing as mp
+import queue
+import traceback
+
 import pytest
 import torch
 
 from hyper_parallel.core.activation_checkpoint import CheckpointPolicy, SwapManager, checkpoint_wrapper, swap_wrapper
 from tests.torch.common_net import SimpleTransformer
-from tests.torch.activation_checkpoint.utils import prepare_data, seed_memory_time_context, train_one_mode
+from tests.torch.activation_checkpoint.utils import prepare_data, seed_memory_time_context, set_seed, train_one_mode
+
+
+MEMORY_COMPARISON_MODES = ("none", "recompute", "save", "swap", "group_swap")
+MEMORY_COMPARISON_VOCAB_SIZE = 8192
 
 
 def apply_recompute(model, mode):
@@ -70,6 +78,57 @@ def apply_recompute(model, mode):
     return model
 
 
+def _run_memory_comparison_mode(mode, train_steps, result_queue):
+    """Run one memory-comparison mode in an isolated NPU process."""
+    try:
+        set_seed()
+        dataloader = prepare_data(num_samples=train_steps * 8, vocab_size=MEMORY_COMPARISON_VOCAB_SIZE)
+        with seed_memory_time_context() as stats:
+            base_model = SimpleTransformer(vocab_size=MEMORY_COMPARISON_VOCAB_SIZE, dim=2048, depth=16).npu()
+            base_model = base_model.bfloat16()
+            model = apply_recompute(base_model, mode)
+            losses = train_one_mode(model, dataloader, train_steps, optimizer_cls=torch.optim.SGD)
+        result_queue.put({
+            "mode": mode,
+            "losses": losses,
+            "peak_mem_gb": stats["peak_mem"],
+            "time_sec": stats["exec_time"],
+        })
+        del model
+        del base_model
+        torch.npu.empty_cache()
+    except Exception:  # pylint: disable=W0718
+        result_queue.put({"mode": mode, "error": traceback.format_exc()})
+
+
+def _run_memory_comparison_modes(modes, train_steps):
+    """Run memory-comparison modes concurrently and collect their measurements."""
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    processes = [
+        context.Process(target=_run_memory_comparison_mode, args=(mode, train_steps, result_queue))
+        for mode in modes
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join()
+        if process.exitcode != 0:
+            raise AssertionError(f"Memory comparison process exited with code {process.exitcode}")
+
+    results = {}
+    for _ in modes:
+        try:
+            result = result_queue.get(timeout=5)
+        except queue.Empty as exc:
+            raise AssertionError("Memory comparison process did not report its result") from exc
+        if "error" in result:
+            raise AssertionError(f"Memory comparison mode '{result['mode']}' failed:\n{result['error']}")
+        results[result["mode"]] = result
+    result_queue.close()
+    return results
+
+
 def test_ac_memory_comparison():
     """
     Feature: Activation Checkpointing and Swapping Memory Behavior
@@ -83,25 +142,9 @@ def test_ac_memory_comparison():
                  the memory usage trend is satisfied, and no OOM occurs.
     """
     print("🚀 Starting memory and time comparison: none vs recompute vs save vs swap")
-    dataloader = prepare_data()
     train_steps = 3
-
-    modes = ["none", "recompute", "save", "swap", "group_swap"]
-    results = {}
-
-    for mode in modes:
-        print(f"\n--- Running mode: {mode.upper()} ---")
-        with seed_memory_time_context() as stats:
-            base_model = SimpleTransformer(vocab_size=32000, dim=2048, depth=16).npu()
-            model = apply_recompute(base_model, mode)
-            losses = train_one_mode(model, dataloader, train_steps)
-        peak_mem, duration = stats.get("peak_mem"), stats.get("exec_time")
-        results[mode] = {
-            "losses": losses,
-            "peak_mem_gb": peak_mem,
-            "time_sec": duration
-        }
-        print(f"{mode}: Loss={losses[-1]:.4f}, Peak Mem={peak_mem:.5f} GB, Time={duration:.5f}s")
+    modes = MEMORY_COMPARISON_MODES
+    results = _run_memory_comparison_modes(modes, train_steps)
 
     print("\n" + "="*70)
     print("📊 FINAL COMPARISON")
@@ -117,7 +160,7 @@ def test_ac_memory_comparison():
     tol = 1e-5
     for step in range(train_steps):
         base_val = base_losses[step]
-        for mode in ["recompute", "save", "swap"]:
+        for mode in ["recompute", "save", "swap", "group_swap"]:
             val = results[mode]["losses"][step]
             diff = abs(val - base_val)
             assert diff < tol, (
