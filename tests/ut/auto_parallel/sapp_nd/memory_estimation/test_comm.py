@@ -31,10 +31,20 @@ Test IDs:
   CM-E09: ep_comm_layer_imbalanced reduces to balanced under uniform distribution
   CM-T01: tp_comm_exp MoE formula uses hff_exp for routed, hff for shared
   CM-T02: tp_comm_exp dense formula uses s*b*hff*mb
+  CM-C01: Ring CP p=1 comm is 3x p>1 (rec_factor gate by int(ccfg.p == 1))
+  CM-C02: Ulysses CP p=1 comm is 2x p>1 (rec_factor gate by int(ccfg.p == 1))
+  CM-C03: When rec_coeff=0 (SEL_REC_LAYER + gather=False), p has no effect
+  CM-C04: Ring CP exact formula at p=1 (rec_factor=1, coefficient=1.5)
+  CM-C05: Ulysses CP exact formula at p=1 (rec_factor=1, coefficient=1.0)
+  CM-C04b: Ring CP exact formula at p>1 (rec_factor=0, coefficient=0.5)
+  CM-C05b: Ulysses CP exact formula at p>1 (rec_factor=0, coefficient=0.5)
 """
 import os
 import unittest
 from unittest.mock import MagicMock
+
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 
 os.environ.setdefault("HYPER_PARALLEL_PLATFORM", "torch")
 
@@ -50,11 +60,13 @@ def _make_ccfg(
     ep=4,
     tp=1,
     cp=1,
+    p=1,
     t_exp=1,
     comm_d_non_exp=2,
     comm_d_exp=2,
     comm_ep=1.0,
     comm_t=1.0,
+    comm_cp=1.0,
     n_chosen_exp=2,
     s=1024,
     b=4,
@@ -65,7 +77,6 @@ def _make_ccfg(
     n_ffBMM=0,  # pylint: disable=invalid-name
     rec_op=None,
     cp_algo="colossalai_cp",
-    comm_cp=1.0,
     tokens_per_expert=None,
 ):
     """Create a mock CostModelConfig for comm tests."""
@@ -78,11 +89,13 @@ def _make_ccfg(
     ccfg.ep = ep
     ccfg.t = tp
     ccfg.cp = cp
+    ccfg.p = p
     ccfg.t_exp = t_exp
     ccfg.comm_d_non_exp = comm_d_non_exp
     ccfg.comm_d_exp = comm_d_exp
     ccfg.comm_ep = comm_ep
     ccfg.comm_t = comm_t
+    ccfg.comm_cp = comm_cp
     ccfg.n_chosen_exp = n_chosen_exp
     ccfg.s = s
     ccfg.b = b
@@ -92,7 +105,6 @@ def _make_ccfg(
     ccfg.n_ffMM = n_ffMM
     ccfg.n_ffBMM = n_ffBMM
     ccfg.cp_algo = cp_algo
-    ccfg.comm_cp = comm_cp
     ccfg.tokens_per_expert = tokens_per_expert
 
     # rec_op mock
@@ -433,6 +445,158 @@ class TestTpCommExp(unittest.TestCase):
         self.assertAlmostEqual(result, expected, places=0)
 
 
+class TestCpCommNonExpRecFactor(unittest.TestCase):
+    """Test cp_comm_non_exp rec_factor gating by int(ccfg.p == 1) [HYPOTHESIS].
+
+    The [HYPOTHESIS] in comm.py:135-137 assumes that when PP>1, the pipeline
+    bubble fully hides CP communication, so rec_factor is zeroed out.
+    Tests verify the gating behavior with the same mock style as DP/TP/EP tests.
+
+    Test IDs:
+      CM-C01: Ring CP p=1 comm is 3x p>1 (coefficient 1.5 vs 0.5)
+      CM-C02: Ulysses CP p=1 comm is 2x p>1 (coefficient 1.0 vs 0.5)
+      CM-C03: When rec_coeff=0 (SEL_REC_LAYER + gather=False), p makes no difference
+      CM-C04: Ring CP exact formula verification at p=1
+      CM-C05: Ulysses CP exact formula verification at p=1
+    """
+
+    def _make_ctx(self, current_node=None):
+        """Create a mock Context for CP tests (no eval.num_p needed)."""
+        ctx = MagicMock()
+        ctx.current_node = current_node
+        return ctx
+
+    def test_ring_p1_vs_p2_ratio(self):
+        """CM-C01: Ring CP comm with p=1 is 3x the comm with p>1.
+
+        rec_factor = rec_coeff * int(p == 1).
+        When p=1: rec_factor = 1, coefficient = 2*0.5*1 + 0.5 = 1.5.
+        When p>1: rec_factor = 0, coefficient = 2*0.5*0 + 0.5 = 0.5.
+        Ratio = 1.5 / 0.5 = 3.
+        """
+        ccfg_p1 = _make_ccfg(p=1, cp_algo="colossalai_cp")
+        ccfg_p2 = _make_ccfg(p=2, cp_algo="colossalai_cp")
+        ctx = self._make_ctx()
+
+        comm_p1 = EvalLayerComm.cp_comm_non_exp(ccfg_p1, ctx)
+        comm_p2 = EvalLayerComm.cp_comm_non_exp(ccfg_p2, ctx)
+
+        self.assertGreater(comm_p1, 0)
+        self.assertGreater(comm_p2, 0)
+        self.assertAlmostEqual(comm_p1 / comm_p2, 3.0, places=4)
+
+    def test_ulysses_p1_vs_p2_ratio(self):
+        """CM-C02: Ulysses CP comm with p=1 is 2x the comm with p>1.
+
+        When p=1: rec_factor = 1, coefficient = 0.5*1 + 0.5 = 1.0.
+        When p>1: rec_factor = 0, coefficient = 0.5*0 + 0.5 = 0.5.
+        Ratio = 1.0 / 0.5 = 2.
+        """
+        ccfg_p1 = _make_ccfg(p=1, cp_algo="ulysses_cp")
+        ccfg_p2 = _make_ccfg(p=2, cp_algo="ulysses_cp")
+        ctx = self._make_ctx()
+
+        comm_p1 = EvalLayerComm.cp_comm_non_exp(ccfg_p1, ctx)
+        comm_p2 = EvalLayerComm.cp_comm_non_exp(ccfg_p2, ctx)
+
+        self.assertGreater(comm_p1, 0)
+        self.assertGreater(comm_p2, 0)
+        self.assertAlmostEqual(comm_p1 / comm_p2, 2.0, places=4)
+
+    def test_rec_coeff_zero_makes_p_irrelevant(self):
+        """CM-C03: When rec_coeff=0, p has no effect on cp_comm_non_exp.
+
+        rec_coeff = int(not rec_layer) | rec_op.gather.
+        With rec_layer=True (SEL_REC_LAYER) and gather=False:
+        rec_coeff = int(not True) | False = 0 | 0 = 0.
+        Then rec_factor = 0 * int(p == 1) = 0 regardless of p.
+        """
+        ctx = self._make_ctx(current_node=LayerType.SEL_REC_LAYER)
+
+        ccfg_p1 = _make_ccfg(p=1, cp_algo="colossalai_cp")
+        ccfg_p1.rec_op = Config({
+            'attBMM': 1, 'headCast': 1, 'dropout': 1, 'softmax': 1,
+            'normOp': 1, 'gather': 0, 'ffAct': 1,
+        })
+        ccfg_p2 = _make_ccfg(p=2, cp_algo="colossalai_cp")
+        ccfg_p2.rec_op = Config({
+            'attBMM': 1, 'headCast': 1, 'dropout': 1, 'softmax': 1,
+            'normOp': 1, 'gather': 0, 'ffAct': 1,
+        })
+
+        comm_p1 = EvalLayerComm.cp_comm_non_exp(ccfg_p1, ctx)
+        comm_p2 = EvalLayerComm.cp_comm_non_exp(ccfg_p2, ctx)
+
+        self.assertAlmostEqual(comm_p1, comm_p2, places=4,
+                               msg="When rec_coeff=0, p should not affect cp_comm_non_exp")
+
+    def test_ring_exact_formula_p1(self):
+        """CM-C04: Ring CP exact formula at p=1 (rec_factor=1).
+
+        cp_comm = comm_cp * 2 * s * b * ((2*0.5*rec_factor + 0.5) * n_attMM * h) / t
+        With rec_factor=1: inner_coeff = 2*0.5*1 + 0.5 = 1.5
+        """
+        ccfg = _make_ccfg(p=1, cp_algo="colossalai_cp")
+        ctx = self._make_ctx()
+
+        result = EvalLayerComm.cp_comm_non_exp(ccfg, ctx)
+        expected = (
+            ccfg.comm_cp * 2 * ccfg.s * ccfg.b
+            * (1.5 * ccfg.n_attMM * ccfg.h)
+            / ccfg.t
+        )
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_ulysses_exact_formula_p1(self):
+        """CM-C05: Ulysses CP exact formula at p=1 (rec_factor=1).
+
+        cp_comm = comm_cp * 2 * s * b * ((0.5*rec_factor + 0.5) * n_attMM * h) / t
+        With rec_factor=1: inner_coeff = 0.5*1 + 0.5 = 1.0
+        """
+        ccfg = _make_ccfg(p=1, cp_algo="ulysses_cp")
+        ctx = self._make_ctx()
+
+        result = EvalLayerComm.cp_comm_non_exp(ccfg, ctx)
+        expected = (
+            ccfg.comm_cp * 2 * ccfg.s * ccfg.b
+            * (1.0 * ccfg.n_attMM * ccfg.h)
+            / ccfg.t
+        )
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_ring_exact_formula_p_gt1(self):
+        """CM-C04b: Ring CP exact formula at p>1 (rec_factor=0).
+
+        With rec_factor=0: inner_coeff = 2*0.5*0 + 0.5 = 0.5
+        """
+        ccfg = _make_ccfg(p=4, cp_algo="colossalai_cp")
+        ctx = self._make_ctx()
+
+        result = EvalLayerComm.cp_comm_non_exp(ccfg, ctx)
+        expected = (
+            ccfg.comm_cp * 2 * ccfg.s * ccfg.b
+            * (0.5 * ccfg.n_attMM * ccfg.h)
+            / ccfg.t
+        )
+        self.assertAlmostEqual(result, expected, places=4)
+
+    def test_ulysses_exact_formula_p_gt1(self):
+        """CM-C05b: Ulysses CP exact formula at p>1 (rec_factor=0).
+
+        With rec_factor=0: inner_coeff = 0.5*0 + 0.5 = 0.5
+        """
+        ccfg = _make_ccfg(p=4, cp_algo="ulysses_cp")
+        ctx = self._make_ctx()
+
+        result = EvalLayerComm.cp_comm_non_exp(ccfg, ctx)
+        expected = (
+            ccfg.comm_cp * 2 * ccfg.s * ccfg.b
+            * (0.5 * ccfg.n_attMM * ccfg.h)
+            / ccfg.t
+        )
+        self.assertAlmostEqual(result, expected, places=4)
+
+
 class TestNodeCommEvalRepr(unittest.TestCase):
     """Test NodeCommEval __repr__ with _qname for None safety."""
 
@@ -457,8 +621,9 @@ class TestNodeCommEvalRepr(unittest.TestCase):
     def test_qname_with_callable(self):
         """CM-Q03: _qname returns __qualname__ for callables."""
         from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import _qname
-        def my_fun():
-            pass
+        def my_fun() -> None:
+            """Trivial callable used to verify _qname reads __qualname__."""
+            return None
         self.assertEqual(_qname(my_fun), my_fun.__qualname__)
 
     def test_qname_with_none(self):

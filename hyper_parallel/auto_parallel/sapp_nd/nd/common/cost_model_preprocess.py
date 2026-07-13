@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,10 +17,69 @@ import re
 import inspect
 from copy import deepcopy
 from pprint import pformat
+from enum import Enum
 
-# from hyper_parallel.auto_parallel.sapp_nd.nd.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.generate_partitions import PartitionGenerator
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
+
+
+class AttentionType(Enum):
+    """Attention type enumeration."""
+    MHA = "mha"
+    GQA = "gqa"
+    MLA = "mla"
+
+
+def detect_attention_type(ccfg: "CostModelConfig") -> AttentionType:
+    """Detect attention type from cost model config.
+
+    Detection rules:
+    1. If kv_lora_rank > 0: MLA
+    2. If n_kv < a: GQA
+    3. Otherwise: MHA
+
+    Args:
+        ccfg: Cost model config.
+
+    Returns:
+        AttentionType enum.
+
+    Example:
+        >>> ccfg.kv_lora_rank = 512
+        >>> ccfg.a = 64
+        >>> ccfg.n_kv = 64
+        >>> detect_attention_type(ccfg)
+        <AttentionType.MLA: 'mla'>
+    """
+    if ccfg.kv_lora_rank > 0:
+        return AttentionType.MLA
+    if ccfg.n_kv < ccfg.a:
+        return AttentionType.GQA
+    return AttentionType.MHA
+
+
+def compute_kv_dim(ccfg) -> float:
+    """Return effective KV dimension per TP rank based on attention type.
+
+    When TP is active, KV heads are split across TP ranks, so each
+    rank holds only 1/t of the total KV dimension.  MLA is an
+    exception: the compressed latent vector is not split by TP,
+    so kv_lora_rank stays unchanged.
+
+    Args:
+        ccfg: Cost model config with attributes a, n_kv, dh, h, t, kv_lora_rank.
+
+    Returns:
+        Effective KV dimension per TP rank (float).
+    """
+    attention_type = detect_attention_type(ccfg)
+    t = max(1, ccfg.t)
+    if attention_type == AttentionType.MLA:
+        return float(ccfg.kv_lora_rank)
+    if attention_type == AttentionType.GQA:
+        n_kv = min(ccfg.n_kv if ccfg.n_kv > 0 else ccfg.a, ccfg.a)
+        return n_kv * ccfg.dh / t
+    return ccfg.h / t
 
 
 # class CostModelConfig(Config) :

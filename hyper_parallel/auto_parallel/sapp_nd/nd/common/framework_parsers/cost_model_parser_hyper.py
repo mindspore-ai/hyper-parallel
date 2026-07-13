@@ -413,7 +413,19 @@ class CostModelParserHyperV2(_CostModelParser):
         )
         self.ccfg.has_clip = max_grad_norm > 0
         self.ccfg.vp_less_mem = False
-        self.ccfg.cp_algo = "colossalai_cp"
+        accel = self._get_cfg_attr(train_raw, "accelerator", Config({}))
+        cp_algo = self._get_cfg_attr(accel, "context_parallel_algo", None)
+        if cp_algo:
+            self.ccfg.cp_algo = cp_algo
+        else:
+            self.ccfg.cp_algo = "colossalai_cp"
+            if self.ccfg.cp and self.ccfg.cp > 1:
+                logger.warning(
+                    "context_parallel_algo not set; defaulting to "
+                    "'colossalai_cp' (Ring CP). Set "
+                    "train.accelerator.context_parallel_algo explicitly "
+                    "to 'ulysses_cp' if Ulysses CP is intended."
+                )
 
     def _parse_recompute(self):
         """Parse recompute mode from ``train.gradient_checkpointing``."""

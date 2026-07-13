@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -132,7 +132,13 @@ class EvalAttn:
             )
         )
         micro_factor = ctx.micro_factor
-        return micro_factor * att_score / (ccfg.t * ccfg.cp)
+        # cp_sq_div=1: Ring CP shards Q along seq and all-gathers KV, so the S²
+        # score tensor has only one S dim divided → B·H·S²/cp (slope -1).
+        # Only an unimplemented blockwise-ring path (shard both Q and KV along
+        # seq → (s/cp)² scores) would need cp_sq_div=cp; do not re-add the
+        # conditional for the current Ring/Ulysses algorithms.
+        cp_sq_div = 1
+        return micro_factor * att_score / (ccfg.t * ccfg.cp * cp_sq_div)
 
     @staticmethod
     def attn_proj_activations(ccfg: CostModelConfig, ctx: Context) -> float:

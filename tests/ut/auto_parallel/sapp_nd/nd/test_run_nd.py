@@ -37,6 +37,9 @@ from hyper_parallel.auto_parallel.sapp_nd.nd import global_config as GC
 from hyper_parallel.auto_parallel.sapp_nd.nd.common import arch_hooks as ArchHooks
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.config import Config, YamlObject
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers._cost_model_parser import (
+    _CostModelParser,
+)
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.framework_parsers.cost_model_parser_hyperparallel import (
     CostModelParserHyperparallel,
 )
@@ -257,6 +260,8 @@ def _make_perf_cfg(**kwargs: Any) -> SimpleNamespace:
         "comm_d_non_exp": 3,
         "comm_t": 1.0,
         "comm_ep": 1.0,
+        "comm_dp_overlap": 0.9,
+        "comm_tp_overlap": 0.5,
         "layer_custom_config": [(2, None)],
         "n_lay": 2,
         "n_mtp": 1,
@@ -1103,6 +1108,144 @@ class TestSappNDRunND(unittest.TestCase):
             )
         self.assertEqual(len(bulk_comm), 2)
         self.assertIn(Debug.PerfParts.EP_COMM, bulk_debugger.info)
+
+    def test_comm_overlap_fields_in_parsers(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Verify the transitional comm overlap fields
+            (comm_dp_overlap, comm_tp_overlap) are populated by the real
+            framework parsers via config_comm_flag — the mechanism that
+            estimate_from_mem_comm reads on the search (FLOP) path.
+        Expectation: After parsing, both overlap fields hold the documented
+            defaults (0.9 and 0.5).  CostModelParserHyperparallel and
+            CostModelParserMindformers both call the base config_comm_flag,
+            so the hyperparallel path covers both.  CostModelParserMindspeed
+            has an inline copy (see cost_model_parser_mindspeed.py:293-294)
+            but is not tested here per project priority.
+        """
+        # --- Hyperparallel path: calls base config_comm_flag ---
+        # (same base method is also called by CostModelParserMindformers)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = os.path.join(tmp_dir, "__init__.py")
+            with open(source_path, "w", encoding="utf-8") as source_file:
+                source_file.write(
+                    "def get_train_spec():\n"
+                    "    return TrainSpec(model_args=model_args)\n"
+                    "model_args = {\n"
+                    "    'tiny': ModelArgs(dim=16, inter_dim=32, hidden_dim=0, vocab_size=64,\n"
+                    "                      n_heads=2, n_layers=2, n_kv_heads=0, kv_lora_rank=0,\n"
+                    "                      q_lora_rank=0, qk_rope_head_dim=0, n_dense_layers=0,\n"
+                    "                      moe_inter_dim=0, moe_enabled=False, moe_args=None,\n"
+                    "                      enable_weight_tying=False, multiple_of=1,\n"
+                    "                      ffn_dim_multiplier=1)\n"
+                    "}\n"
+                )
+            hp_config = Config(
+                {
+                    "model": {"name": "llama-unit", "flavor": "tiny"},
+                    "parallelism": {
+                        "data_parallel_replicate_degree": 1,
+                        "data_parallel_shard_degree": 2,
+                        "tensor_parallel_degree": 2,
+                        "pipeline_parallel_degree": 2,
+                        "context_parallel_degree": 1,
+                        "expert_parallel_degree": 1,
+                        "expert_tensor_parallel_degree": 0,
+                        "pipeline_parallel_schedule": "Interleaved1F1B",
+                    },
+                    "activation_checkpoint": {"mode": "full"},
+                    "training": {"seq_len": 8, "local_batch_size": 1},
+                }
+            )
+            hp_ccfg = _ParserCostModelConfig()
+            hp_ccfg.config = hp_config
+            hp_ccfg.source_code = source_path
+            CostModelParserHyperparallel(hp_ccfg).parse()
+            self.assertEqual(hp_ccfg.comm_dp_overlap, 0.9)
+            self.assertEqual(hp_ccfg.comm_tp_overlap, 0.5)
+
+        # --- Direct test of base _CostModelParser.config_comm_flag ---
+        # Covers the shared method used by mindformers and hyper parsers.
+        ccfg_direct = _ParserCostModelConfig()
+        ccfg_direct.d = 2
+        ccfg_direct.t = 2
+        ccfg_direct.ep = 1
+        ccfg_direct.cp = 1
+        ccfg_direct.has_op = True
+        ccfg_direct.has_grad_shard = True
+        ccfg_direct.n_exp = 1
+
+        class _ConcreteParser(_CostModelParser):
+            """Concrete subclass for testing the abstract base."""
+
+            def parse(self) -> None:
+                """No-op parse; only config_comm_flag is under test."""
+                return None
+        _ConcreteParser(ccfg_direct).config_comm_flag(ccfg_direct)
+        self.assertEqual(ccfg_direct.comm_dp_overlap, 0.9)
+        self.assertEqual(ccfg_direct.comm_tp_overlap, 0.5)
+
+    def test_cp_resolve_topology_cross_node_single_device(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover the ``intra_ranks == 1`` branch of
+            ``_cp_resolve_topology`` — cross-node CP when cp exceeds
+            devices-per-node but each node has only one device.
+        Expectation: topology is "cross-node" and bandwidth equals the
+            inter-node value (no intra-node mixing possible).
+        """
+        topology, bw = CommTime._cp_resolve_topology(
+            cp=2, device_per_node=1, bw_intra=10.0, bw_inter=2.0)
+        self.assertEqual(topology, "cross-node")
+        self.assertEqual(bw, 2.0)
+
+    def test_cp_comm_layer_detailed_rejects_zero_heads(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover the ``ccfg.a <= 0`` validation guard in
+            ``cp_comm_layer_detailed``.
+        Expectation: A ValueError is raised when attention heads is
+            non-positive, regardless of cp degree.
+        """
+        cfg = _make_perf_cfg(cp=2, a=0)
+        with self.assertRaises(ValueError):
+            CommTime.cp_comm_layer_detailed(cfg, CommTime.prepare_context())
+
+    def test_estimate_comm_time_path_and_cp_debugger(self) -> None:
+        """
+        Feature: TestSappNDRunND.
+        Description: Cover the TIME performance-type branch and the
+            ``cp > 1`` CP debugger info block in ``estimate_from_mem_comm``.
+        Expectation: With ``ttype=PerformanceType.TIME`` and ``cp > 1``,
+            the debugger receives both the standard comm keys and the
+            CP-specific detail keys (CP_KV_VOLUME, CP_EXPOSED_TIME,
+            CP_TOPOLOGY, CP_BANDWIDTH).
+        """
+        cfg = _make_perf_cfg(cp=2, n_exp=2)
+        stages = [[[LayerType.NOT_REC_LAYER, LayerType.OUTPUT_LAYER]],
+                  [[LayerType.EMBEDDING_LAYER]]]
+        debugger = Debug.Debug(
+            Dim.Dimensions([(Dim.DP, 2), (Dim.MBS, 2)], all_dims=[Dim.DP, Dim.MBS]),
+            Debug.PerfParts,
+        )
+        with patch.object(CommTime.EvalLayerComm, "dp_comm_layer", return_value=3), \
+                patch.object(CommTime.EvalLayerComm, "tp_comm_layer", return_value=5), \
+                patch.object(CommTime.EvalLayerComm, "ep_comm_layer", return_value=7), \
+                patch.object(CommTime, "cp_comm_layer_detailed",
+                             return_value=CommTime._cp_comm_zero(cfg)):
+            comm = CommTime.estimate_comm(
+                cfg,
+                CustomConfig(ttype=PerformanceType.TIME),
+                stages,
+                Hard.Device_A3,
+                debugger=debugger,
+            )
+        self.assertEqual(len(comm), 2)
+        self.assertGreater(comm[0], 0)
+        self.assertIn("CP_KV_VOLUME", debugger.info)
+        self.assertIn("CP_EXPOSED_TIME", debugger.info)
+        self.assertIn("CP_TOPOLOGY", debugger.info)
+        self.assertIn("CP_BANDWIDTH", debugger.info)
 
     def test_framework_parsers_with_synthetic_configs(self) -> None:
         """

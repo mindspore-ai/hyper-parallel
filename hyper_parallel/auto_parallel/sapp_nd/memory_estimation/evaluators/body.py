@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
+    CPMemoryBreakdown,
+    CPAlgo,
+    _resolve_cp_algo,
+)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
+    detect_attention_type,
+    compute_kv_dim,
+)
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
@@ -151,3 +161,101 @@ class EvalBody:
         if EvalBody.fullrec_layer_activ_gradclip(ccfg, ctx) > 0:
             return ctx.eval.dyn.comm.dp(ccfg, ctx)
         return 0
+
+    @staticmethod
+    def act_cp_layer(
+        ccfg: CostModelConfig,
+        ctx: Context
+    ) -> CPMemoryBreakdown:
+        """Estimate CP activation memory impact for one transformer layer.
+
+        Ring CP (colossalai_cp / hybrid_cp):
+            Each rank holds s/cp tokens (Q sharded along seq) and a/t heads;
+            KV is all-gathered, so only one S dim of the S² score tensor
+            is divided.
+            KV cache:   (s/cp) × b × kv_dim_per_rank
+            Attn scores: (s/cp) × s × b × (a/t)
+
+        Ulysses CP:
+            Each rank holds all s tokens but a/(t*cp) heads.
+            KV cache:   s × b × kv_dim_per_rank / cp
+            Attn scores: s × s × b × (a/(t*cp))
+        """
+        s, b = ccfg.s, ccfg.b
+        a = ccfg.a
+        t = max(1, ccfg.t)
+
+        if a <= 0:
+            raise ValueError(f"Number of attention heads must be positive, got {a}")
+
+        cp = ccfg.cp
+
+        if cp <= 0:
+            raise ValueError(f"CP degree must be positive, got {cp}")
+
+        attention_type = detect_attention_type(ccfg)
+        cp_algo = _resolve_cp_algo(ccfg)
+
+        attention_scores_bytes = 4
+        softmax_outputs_bytes = 4
+        dropout_mask_bytes = 1
+        fp16_bytes = 2
+        kv_bytes = fp16_bytes * 2
+
+        kv_dim = compute_kv_dim(ccfg)
+        a_per_rank = a / t
+
+        if cp_algo == CPAlgo.ULYSSES_CP:
+            a_per_cp_rank = a_per_rank / cp
+            kv_dim_per_cp_rank = kv_dim / cp
+
+            kv_cache_memory = kv_bytes * s * b * kv_dim_per_cp_rank
+            attention_scores_memory = attention_scores_bytes * s * s * b * a_per_cp_rank
+            softmax_outputs_memory = softmax_outputs_bytes * s * s * b * a_per_cp_rank
+            dropout_mask_memory = dropout_mask_bytes * s * s * b * a_per_cp_rank
+
+            s2_items_no_cp = (
+                (attention_scores_bytes + softmax_outputs_bytes + dropout_mask_bytes)
+                * s * s * b * a_per_rank
+            )
+            s2_items_with_cp = (
+                (attention_scores_bytes + softmax_outputs_bytes + dropout_mask_bytes)
+                * s * s * b * a_per_cp_rank
+            )
+            s2_items_reduction = s2_items_no_cp - s2_items_with_cp
+            kv_reduction = kv_bytes * s * b * kv_dim * ((cp - 1) / cp)
+        else:
+            kv_cache_memory = kv_bytes * (s / cp) * b * kv_dim
+            attention_scores_memory = attention_scores_bytes * (s / cp) * s * b * a_per_rank
+            softmax_outputs_memory = softmax_outputs_bytes * (s / cp) * s * b * a_per_rank
+            dropout_mask_memory = dropout_mask_bytes * (s / cp) * s * b * a_per_rank
+
+            s2_items_reduction = (
+                (attention_scores_bytes + softmax_outputs_bytes + dropout_mask_bytes)
+                * s * s * b * a_per_rank * ((cp - 1) / cp)
+            )
+            kv_reduction = kv_bytes * s * b * kv_dim * ((cp - 1) / cp)
+
+        comm_buffer = EvalLayerComm.cp_comm_buffer(ccfg, ctx)
+
+        total_memory = (
+            kv_cache_memory + attention_scores_memory +
+            softmax_outputs_memory + dropout_mask_memory + comm_buffer
+        )
+        total_reduction = s2_items_reduction + kv_reduction - comm_buffer
+
+        return CPMemoryBreakdown(
+            kv_cache_memory=kv_cache_memory,
+            attention_scores_memory=attention_scores_memory,
+            softmax_outputs_memory=softmax_outputs_memory,
+            dropout_mask_memory=dropout_mask_memory,
+            comm_buffer_memory=comm_buffer,
+            kv_reduction=kv_reduction,
+            s2_reduction=s2_items_reduction,
+            total_reduction=total_reduction,
+            total_memory=total_memory,
+            cp_degree=int(cp),
+            seq_len=int(s),
+            attention_type=attention_type,
+            cp_algo=cp_algo,
+        )

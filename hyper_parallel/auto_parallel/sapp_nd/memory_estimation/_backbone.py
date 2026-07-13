@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +30,8 @@ from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._context import Context, MemType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.body import EvalBody
+from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.comm import EvalLayerComm
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._bwd_overhead import _BackwardOverhead
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation._ppb import _PPB
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.hook_base import MemEvalHook
@@ -415,7 +417,7 @@ class _Backbone:
             tmp_evaluator = type(self._child_cls)(
                 None,
                 ccfg=self._ccfg.mm_ccfgs[m],
-                trace_fun=self.toggle_func_trace
+                trace_fun=getattr(self, "toggle_func_trace", False),
             )
             tmp_evaluator.import_eval_yaml()
             num_layer = tmp_evaluator.get_num_layers()
@@ -664,6 +666,17 @@ class _Backbone:
             ins["Norm"] = self.mb(stage_accu[MemType.NORM_ACTIV])
             ins["AllGather Comm"] = self.mb(stage_accu[MemType.AG_COMM])
             ins["All2All Comm"] = self.mb(stage_accu[MemType.A2A_COMM])
+
+            if self._ccfg.cp > 1:
+                cp_memory = EvalBody.act_cp_layer(self._ccfg, self._ctx)
+                cp_comm_buffer = EvalLayerComm.cp_comm_buffer(self._ccfg, self._ctx)
+
+                ins["CP KV Cache"] = self.mb(cp_memory.kv_cache_memory)
+                ins["CP Attn Scores"] = self.mb(cp_memory.attention_scores_memory)
+                ins["CP Softmax"] = self.mb(cp_memory.softmax_outputs_memory)
+                ins["CP Comm Buffer"] = self.mb(cp_comm_buffer)
+                ins["CP Reduction"] = self.mb(cp_memory.total_reduction)
+
             ins["Node Log"] = sm["logs"][stage_id].node_compute_log
             # VERBOSE
             if verbose and spec_stage_id in (-1, stage_id):

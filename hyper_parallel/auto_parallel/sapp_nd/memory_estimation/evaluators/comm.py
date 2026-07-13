@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +18,13 @@ from typing import TYPE_CHECKING
 from hyper_parallel.auto_parallel.sapp_nd.nd.common.layer_type import LayerType
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.evaluators.utils import EvalUtils
 from hyper_parallel.auto_parallel.sapp_nd.memory_estimation.logger import logger
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
+    CPAlgo,
+    _resolve_cp_algo,
+)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
+    compute_kv_dim,
+)
 
 if TYPE_CHECKING:
     from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import CostModelConfig
@@ -127,8 +134,11 @@ class EvalLayerComm:
         rec_layer = ctx.current_node == LayerType.SEL_REC_LAYER
         rec_factor = EvalUtils.rec_coeff(rec_layer, ccfg.rec_op.gather) * int(
             ccfg.p == 1
-        )
-        if ccfg.cp_algo in ["colossalai_cp", "hybird_cp"]:
+        )  # [HYPOTHESIS]
+        # hybird_cp is a known typo for hybrid_cp kept for backward compat
+        if ccfg.cp_algo in ["colossalai_cp", "hybrid_cp", "hybird_cp"]:
+            # FW Ring P2P + BW Ring P2P
+            # KV transfers, can be recomputed
             return (
                 ccfg.comm_cp
                 * 2
@@ -149,9 +159,12 @@ class EvalLayerComm:
         return 0
 
     @staticmethod
-    def cp_comm_exp(ccfg: CostModelConfig, _) -> float:
+    def cp_comm_exp(ccfg: CostModelConfig, _: Context) -> float:
         """CP comm for expert parameters"""
-        if ccfg.cp_algo in ["colossalai_cp", "hybird_cp", "ulysses_cp"]:
+        # hybird_cp is a known typo for hybrid_cp kept for backward compat
+        if ccfg.cp_algo in ["colossalai_cp", "hybrid_cp", "hybird_cp", "ulysses_cp"]:
+            # FW Ring P2P + BW Ring P2P
+            # or FW + BW All2Alls
             res = ccfg.comm_cp * 2 * ccfg.s * ccfg.b * ccfg.n_ffMM * ccfg.hff
             return res / ccfg.t
         return 0
@@ -165,7 +178,7 @@ class EvalLayerComm:
 
     @staticmethod
     def ep_comm_layer_balanced(
-        ccfg: CostModelConfig, ctx: Context, mb: int  # pylint: disable=unused-argument
+        ccfg: CostModelConfig, ctx: Context, mb: int
     ) -> float:
         """EP comm for balanced token distribution (byte volume).
 
@@ -174,6 +187,7 @@ class EvalLayerComm:
         Result is in bytes (like TP activation comm), unlike CP/DP which are
         in element counts (parameter comm).
         """
+        del ctx
         if ccfg.ep <= 1 or ccfg.comm_ep == 0:
             return 0
         t_local = mb * ccfg.n_chosen_exp * ccfg.s * ccfg.b / ccfg.cp
@@ -233,3 +247,51 @@ class EvalLayerComm:
         if ccfg.tokens_per_expert is not None:
             return EvalLayerComm.ep_comm_layer_imbalanced(ccfg, ctx, mb)
         return EvalLayerComm.ep_comm_layer_balanced(ccfg, ctx, mb)
+
+    @staticmethod
+    def cp_comm_buffer(ccfg: CostModelConfig, ctx: Context) -> float:
+        """Estimate CP communication buffer memory per layer.
+
+        Ring CP (colossalai_cp / hybrid_cp):
+            Intra-node: all-gather among device_per_node ranks → buffer for
+            (intra_ranks - 1) extra KV chunks.
+            Cross-node: intra-node all-gather result stays resident, plus 1
+            full-node KV chunk as ring receive buffer → peak is
+            (2 * intra_ranks - 1) extra chunks.
+
+        Ulysses CP:
+            All2All rearranges heads across CP ranks.  Peak buffer is
+            1 send chunk + 1 receive chunk = 2 chunks, where each chunk
+            is the per-rank activation slice being exchanged.
+        """
+        del ctx
+        if ccfg.cp <= 1:
+            return 0.0
+
+        s, b, cp = ccfg.s, ccfg.b, ccfg.cp
+        fp16_bytes = 2
+        kv_bytes = fp16_bytes * 2
+
+        cp_algo = _resolve_cp_algo(ccfg)
+
+        if cp_algo == CPAlgo.ULYSSES_CP:
+            kv_dim = compute_kv_dim(ccfg)
+            chunk = s * b * (kv_dim / cp) * kv_bytes
+            intra_ranks = min(int(cp), int(ccfg.device_per_node))
+            if cp <= ccfg.device_per_node:
+                extra_chunks = intra_ranks - 1
+            else:
+                extra_chunks = 2 * intra_ranks - 1
+            return extra_chunks * chunk
+
+        kv_dim = compute_kv_dim(ccfg)
+        chunk = (s / cp) * b * kv_dim * kv_bytes
+
+        intra_ranks = min(int(cp), int(ccfg.device_per_node))
+
+        if cp <= ccfg.device_per_node:
+            extra_chunks = intra_ranks - 1
+        else:
+            extra_chunks = 2 * intra_ranks - 1
+
+        return extra_chunks * chunk

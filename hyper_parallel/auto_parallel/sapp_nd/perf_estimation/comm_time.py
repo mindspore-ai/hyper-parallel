@@ -34,8 +34,143 @@ from hyper_parallel.auto_parallel.sapp_nd.perf_estimation.getters import (
     get_layer_custom_configs,
     get_table_quantity,
 )
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cp_types import (
+    CPCommunicationCost,
+    CPAlgo,
+    _resolve_cp_algo,
+)
+from hyper_parallel.auto_parallel.sapp_nd.nd.common.cost_model_preprocess import (
+    detect_attention_type,
+    AttentionType,
+    compute_kv_dim,
+    CostModelConfig,
+)
 
 COUNT_OPTIMIZER = False
+
+
+def _cp_resolve_topology(cp, device_per_node, bw_intra, bw_inter):
+    """Resolve CP topology and effective bandwidth.
+
+    Returns:
+        Tuple of (topology_str, effective_bandwidth).
+    """
+    intra_ranks = min(int(cp), int(device_per_node))
+    if cp <= device_per_node:
+        return "intra-node", bw_intra
+    if intra_ranks == 1:
+        return "cross-node", bw_inter
+    intra_fraction = (intra_ranks - 1) / (cp - 1)
+    cross_fraction = 1.0 - intra_fraction
+    bw = intra_fraction * bw_intra + cross_fraction * bw_inter
+    return "mixed", bw
+
+
+def _cp_comm_zero(ccfg):
+    """Return a zero CPCommunicationCost for cp <= 1."""
+    return CPCommunicationCost(
+        kv_volume_per_step=0.0, total_kv_volume=0.0, comm_volume=0.0,
+        ring_steps=0, ring_directions=0,
+        total_comm_time=0.0, exposed_comm_time=0.0,
+        overlap_ratio=0.5, effective_bandwidth=0.0,
+        topology="none", cp_degree=int(ccfg.cp),
+        seq_len=int(ccfg.s), batch_size=int(ccfg.b),
+        attention_type=AttentionType.MHA, kv_dim=0,
+        cp_algo=CPAlgo.COLOSSALAI_CP,
+    )
+
+
+def _cp_comm_cost_common(volume_per_step, total_kv_volume, comm_volume,
+                          ring_steps, ring_directions, cp, s, b,
+                          attention_type, kv_dim, cp_algo, topology,
+                          effective_bandwidth):
+    """Build CPCommunicationCost with standard time calculation."""
+    overlap_ratio = 0.5
+    total_comm_time = (total_kv_volume / (effective_bandwidth * 1e9)) * 1e3
+    exposed_comm_time = total_comm_time * (1 - overlap_ratio)
+    return CPCommunicationCost(
+        kv_volume_per_step=volume_per_step,
+        total_kv_volume=total_kv_volume,
+        comm_volume=comm_volume,
+        ring_steps=ring_steps, ring_directions=ring_directions,
+        total_comm_time=total_comm_time,
+        exposed_comm_time=exposed_comm_time,
+        overlap_ratio=overlap_ratio,
+        effective_bandwidth=effective_bandwidth,
+        topology=topology, cp_degree=int(cp),
+        seq_len=int(s), batch_size=int(b),
+        attention_type=attention_type, kv_dim=int(kv_dim),
+        cp_algo=cp_algo,
+    )
+
+
+def cp_comm_layer_detailed(ccfg: CostModelConfig, ctx: Context = None) -> CPCommunicationCost:
+    """Estimate CP communication cost with detailed breakdown.
+
+    Ring CP (colossalai_cp / hybrid_cp):
+        Ring P2P in both FW and BW directions.
+        Each step transfers (s/cp) tokens of KV data.
+        Total KV volume = kv_volume_per_step * (cp-1) * 2 directions.
+
+    Ulysses CP:
+        All2All in both FW and BW (2 All2All total).
+        Each All2All: every rank sends (cp-1)/cp of its local shard
+        and receives the rest from other ranks.
+        Per-All2All volume = s * b * (a/t) * bytes * (cp-1)/cp (head dims).
+        Total volume = 2 * per-All2All volume.
+    """
+    if ccfg.cp <= 1:
+        return _cp_comm_zero(ccfg)
+
+    s, b = ccfg.s, ccfg.b
+    cp = ccfg.cp
+    t = max(1, ccfg.t)
+
+    if ccfg.a <= 0:
+        raise ValueError(f"Number of attention heads must be positive, got {ccfg.a}")
+
+    kv_dim = compute_kv_dim(ccfg)
+    attention_type = detect_attention_type(ccfg)
+    cp_algo = _resolve_cp_algo(ccfg)
+    topology, effective_bandwidth = _cp_resolve_topology(
+        cp, ccfg.device_per_node, ccfg.bw_intra, ccfg.bw_inter)
+
+    # rec_factor: recompute coefficient matching old cp_comm_non_exp
+    rec_layer = (ctx.current_node == LayerType.SEL_REC_LAYER) if ctx else False
+    rec_op_gather = getattr(getattr(ccfg, 'rec_op', None), 'gather', 0)
+    rec_factor = (int(not rec_layer) | rec_op_gather) * int(ccfg.p == 1)
+
+    if cp_algo == CPAlgo.ULYSSES_CP:
+        local_qkv = s * b * (ccfg.a / t) * ccfg.dh * 2
+        a2a_vol = local_qkv * (cp - 1) / cp
+        # comm_volume: same weighted-unit as dp/tp/ep
+        # Ulysses attention coeff = 0.5*rec_factor + 0.5
+        ulysses_attn_coeff = 0.5 * rec_factor + 0.5
+        comm_vol = (
+            ccfg.comm_cp * 2 * s * b
+            * (ulysses_attn_coeff * ccfg.n_attMM * ccfg.h
+               + ccfg.n_ffMM * ccfg.hff)
+            / t
+        )
+        return _cp_comm_cost_common(
+            a2a_vol, a2a_vol * 2, comm_vol, 0, 2, cp, s, b,
+            attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
+
+    kv_bytes = 4
+    kv_vol_step = (s / cp) * b * kv_dim * kv_bytes
+    total_kv = kv_vol_step * (cp - 1) * 2
+    # comm_volume: same weighted-unit as dp/tp/ep
+    # Ring attention coeff = 2*0.5*rec_factor + 0.5 (extra /cp from (s/cp)^2)
+    ring_attn_coeff = 2 * 0.5 * rec_factor + 0.5
+    comm_vol = (
+        ccfg.comm_cp * 2 * s * b
+        * (ring_attn_coeff * ccfg.n_attMM * ccfg.h
+           + ccfg.n_ffMM * ccfg.hff)
+        / t
+    )
+    return _cp_comm_cost_common(
+        kv_vol_step, total_kv, comm_vol, int(cp - 1), 2, cp, s, b,
+        attention_type, kv_dim, cp_algo, topology, effective_bandwidth)
 
 
 def fill_dp_table(cfg, tables):
@@ -355,9 +490,9 @@ def estimate_from_mem_comm(*args, **kwargs):
                 comm[Dim.EP] += EvalLayerComm.ep_comm_layer(
                     param["cfg"], param["ctx"], 1
                 )  # * param["cfg"].ep
-                comm[Dim.CP] += EvalLayerComm.cp_comm_layer(
+                comm[Dim.CP] += cp_comm_layer_detailed(
                     param["cfg"], param["ctx"]
-                )
+                ).comm_volume
                 # min(device_type.level_bound_number[0], param["cfg"].ep)
                 # comm_cp += EvalLayerComm.cp_comm_layer
                 # (param["cfg"], param["ctx"])
@@ -365,7 +500,7 @@ def estimate_from_mem_comm(*args, **kwargs):
 
 
         if param["ccfg"].ttype == PerformanceType.TIME:
-            for dim, ov in zip([Dim.DP, Dim.TP, Dim.DP], [0.9, 0, 0.0]):
+            for dim, ov in zip([Dim.DP, Dim.TP, Dim.CP], [0.0, 0.0, 0.0]):
                 comm[dim] = estimate_comm_score(
                     param["cfg"],
                     comm[dim],
@@ -374,28 +509,24 @@ def estimate_from_mem_comm(*args, **kwargs):
                     device=param["device_type"],
                 )
 
-        # if (
-        #     not param["cfg"].gmm
-        #     and param["cfg"].ep > param["device_type"].level_bound_number[0]
-        # ):
-        #     comm[Dim.EP] *= 8
-
-        # if comm[Dim.EP] > 0:
-        # comm[Dim.EP] *= 2
-        # comm[Dim.TP] /= 2
-
-        # comm[Dim.DP] /= 100
-
-        # comm[Dim.EP] += comm[Dim.EP] * param["cfg"].ep / 100
-        # comm[Dim.TP] += comm[Dim.TP] * param["cfg"].t / 100
-
         dev_per_node = param["device_type"].level_bound_number[0]
         comm[Dim.TP] *= max(1, param["cfg"].t // dev_per_node)
         comm[Dim.EP] *= max(1, param["cfg"].ep // dev_per_node)
         comm[Dim.CP] *= max(1, param["cfg"].cp // dev_per_node)
 
-        comm[Dim.TP] /= 2 # TO REMOVE: FOR RUIWEN TEST ONLY
-        comm[Dim.DP] = 0 # /= 10 # TO REMOVE: FOR RUIWEN TEST ONLY
+        # Transitional overlap correction.
+        # The search runs the FLOP path, which has no other overlap
+        # modeling; these factors are the only overlap correction on that
+        # path.  The TIME path's estimate_comm_score(overlap=...) call
+        # above is zeroed, so this is the single source of overlap for
+        # both paths.
+        # Defaults (dp=0.9, tp=0.5) are MindFormers-validated overlap, not
+        # test hacks: they made the model match real MindFormers step times.
+        # Re-validating for the hyper-parallel target is a follow-up.
+        # Follow-up: source from hardware, fix estimate_comm_score's dim
+        # list and add latency, then fold this into estimate_comm_score.
+        comm[Dim.DP] *= (1 - param["cfg"].comm_dp_overlap)
+        comm[Dim.TP] *= (1 - param["cfg"].comm_tp_overlap)
 
         if param["device_type"].name == "A3":
             logger.info("A3 ratio")
@@ -418,6 +549,12 @@ def estimate_from_mem_comm(*args, **kwargs):
         param["debugger"].info[PerfParts.MP_COMM] = comms[Dim.TP]
         param["debugger"].info[PerfParts.EP_COMM] = comms[Dim.EP]
         param["debugger"].info[PerfParts.CP_COMM] = comms[Dim.CP]
+        if param["cfg"].cp > 1:
+            cp_comm_details = cp_comm_layer_detailed(param["cfg"], param["ctx"])
+            param["debugger"].info["CP_KV_VOLUME"] = cp_comm_details.total_kv_volume
+            param["debugger"].info["CP_EXPOSED_TIME"] = cp_comm_details.exposed_comm_time
+            param["debugger"].info["CP_TOPOLOGY"] = cp_comm_details.topology
+            param["debugger"].info["CP_BANDWIDTH"] = cp_comm_details.effective_bandwidth
 
     res = []
     for i, c in enumerate(comms[Dim.TP]):
@@ -491,7 +628,7 @@ def estimate_comm_score(
     cfg, comm_volume, dim, overlap=0.0, device=Hard.device_map["A2"]
 ):
     """score assignment"""
-    assignment = device.level_assign(dp=cfg.d, tp=cfg.t, pp=cfg.p)
+    assignment = device.level_assign(dp=cfg.d, tp=cfg.t, cp=cfg.cp, pp=cfg.p)
     score = 0
     for level in range(device.levels):
         # intra_comm = comm_volume * (1-overlap)
