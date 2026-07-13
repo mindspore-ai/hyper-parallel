@@ -700,7 +700,10 @@ class TestMindSporeParam(unittest.TestCase):
         viewed_grad.dtype = ms.float32
         viewed_grad.to.return_value = cpu_grad
         hsdp_param.sharded_size = (2,)
-        hsdp_param.sharded_param = SimpleNamespace(grad=None)
+        hsdp_param.sharded_param = SimpleNamespace(
+            grad=None,
+            _local_tensor=ms.Tensor(np.zeros((2,), dtype=np.float32)),
+        )
         hsdp_param.offload_to_cpu = True
         hsdp_param.pin_memory = True
         hsdp_param.to_sharded_dtensor = MagicMock(return_value="dtensor-grad")
@@ -805,6 +808,7 @@ class TestMindSporeParam(unittest.TestCase):
 
         self.assertIs(reduced_grad, grad)
         self.assertIsNone(handle)
+        self.assertIs(hsdp_param._all_reduce_output, grad)
 
     def test_all_reduce_grad_rejects_missing_group_for_multi_rank(self):
         """Multi-rank all-reduce requires a concrete process group."""
@@ -821,7 +825,10 @@ class TestMindSporeParam(unittest.TestCase):
         """Reduced grads should be reshaped, cast, wrapped, and assigned when no grad exists."""
         hsdp_param = _new_hsdp_param_v2()
         hsdp_param.sharded_size = (2, 2)
-        hsdp_param.sharded_param = SimpleNamespace(grad=None)
+        hsdp_param.sharded_param = SimpleNamespace(
+            grad=None,
+            _local_tensor=ms.Tensor(np.zeros((2, 2), dtype=np.float16)),
+        )
         hsdp_param.offload_to_cpu = False
         hsdp_param.to_sharded_dtensor = MagicMock(return_value="dtensor-grad")
         hsdp_param.unsharded_accumulated_grad = None
@@ -835,12 +842,41 @@ class TestMindSporeParam(unittest.TestCase):
         self.assertEqual(hsdp_param.sharded_param.grad, "dtensor-grad")
         self.assertIsNone(hsdp_param._unsharded_param.grad)
 
+    def test_apply_reduced_grad_aligns_to_sharded_storage_dtype(self):
+        """Issue #215: writeback follows ``_local_tensor.dtype``, not metadata dtype."""
+        hsdp_param = _new_hsdp_param_v2()
+        hsdp_param.sharded_size = (4,)
+        # metadata dtype may differ from local storage; writeback must follow _local_tensor.
+        hsdp_param.sharded_param = SimpleNamespace(
+            dtype=ms.float32,
+            _local_tensor=ms.Tensor(np.ones((4,), dtype=np.float16)),
+            grad=None,
+        )
+        hsdp_param.offload_to_cpu = False
+        hsdp_param.unsharded_accumulated_grad = None
+        hsdp_param._unsharded_param = SimpleNamespace(grad="old-unsharded-grad")
+        captured = {}
+
+        def _capture_dtensor(tensor):
+            captured["dtype"] = tensor.dtype
+            return "dtensor-grad"
+
+        hsdp_param.to_sharded_dtensor = _capture_dtensor
+        reduced_grad = ms.Tensor(np.ones((4,), dtype=np.float32))
+
+        MindSporeHSDPParamV2.apply_reduced_grad(hsdp_param, reduced_grad, ms.float32)
+
+        self.assertEqual(captured["dtype"], ms.float16)
+
     def test_apply_reduced_grad_accumulates_existing_local_grad(self):
         """Existing sharded DTensor grads should accumulate in-place on the local tensor."""
         hsdp_param = _new_hsdp_param_v2()
         hsdp_param.sharded_size = (2, 2)
         local_grad = ms.Tensor(np.ones((2, 2), dtype=np.float32))
-        hsdp_param.sharded_param = SimpleNamespace(grad=SimpleNamespace(_local_tensor=local_grad))
+        hsdp_param.sharded_param = SimpleNamespace(
+            grad=SimpleNamespace(_local_tensor=local_grad),
+            _local_tensor=ms.Tensor(np.ones((2, 2), dtype=np.float32)),
+        )
         hsdp_param.offload_to_cpu = False
         hsdp_param.unsharded_accumulated_grad = ms.Tensor(np.ones((2, 2), dtype=np.float32))
         hsdp_param._unsharded_param = SimpleNamespace(grad=None)

@@ -33,6 +33,7 @@ from tests.ut.platform.mindspore._ensure_mindspore_platform import (  # noqa: E4
 ensure_mindspore_platform_for_fully_shard()
 
 import mindspore as ms
+from mindspore import mint, ops
 
 from hyper_parallel.core.fully_shard.utils import DDPMeshInfo, FSDPMeshInfo, HSDPMeshInfo, MixedPrecisionPolicy
 from hyper_parallel.platform.mindspore.fully_shard import param_group as param_group_mod
@@ -40,6 +41,7 @@ from hyper_parallel.platform.mindspore.fully_shard.param_group import (
     AllGatherMetadata,
     AllGatherMetadataCache,
     AllGatherResult,
+    AllReduceParamGroup,
     HSDPParamGroup,
     PendingBucketAllReduce,
     ReplicateBucket,
@@ -48,6 +50,11 @@ from hyper_parallel.platform.mindspore.fully_shard.param_group import (
     get_all_gather_metadata,
     reduce_scatter_copy_in,
     split_with_sizes_copy,
+)
+from tests.ut.platform.mindspore.fully_shard.conftest import (
+    MindSporeFullyShardUnitTest,
+    UT_MS_DEVICE,
+    UT_MS_DEVICE_TAG,
 )
 
 
@@ -80,7 +87,6 @@ def _new_param_group():
     group._result = None
     group._reduce_output = None
     group._reduce_op = None
-    group._needs_avg_div = False
     group._reduce_hsdp_params = None
     group._active_replicate_buckets = {}
     group._active_param_flat_offsets = []
@@ -504,7 +510,6 @@ class TestMindSporeParamGroup(unittest.TestCase):
         handle = MagicMock()
         group._active_replicate_buckets = {1: bucket}
         group._pending_all_reduce_handles = [PendingBucketAllReduce(1, handle)]
-        group._needs_avg_div = True
         group._unpack_bucket_to_reduce_output = MagicMock()
         group._apply_reduced_grad = MagicMock()
 
@@ -521,7 +526,6 @@ class TestMindSporeParamGroup(unittest.TestCase):
         group = _new_param_group()
         bucket = ReplicateBucket(1, "replicate-group", 2, [0], 2, buffer=ms.Tensor(np.ones((2,), dtype=np.float32)))
         group._active_replicate_buckets = {1: bucket}
-        group._needs_avg_div = True
         group._pack_bucket_from_reduce_output = MagicMock(return_value=bucket.buffer)
         group._unpack_bucket_to_reduce_output = MagicMock()
         group._apply_reduced_grad = MagicMock()
@@ -552,6 +556,365 @@ class TestMindSporeParamGroup(unittest.TestCase):
         self.assertIsNone(group._reduce_output)
         self.assertIsNone(group._reduce_hsdp_params)
         self.assertEqual(group._active_replicate_buckets, {})
+
+
+class TestAllReduceParamGroup(MindSporeFullyShardUnitTest):
+    """Cover the non-fused HSDP all-reduce group (reduce_op-aware averaging)."""
+
+    @staticmethod
+    def _fake_param(sharded_size):
+        """Lightweight parameter double for AllReduceParamGroup apply tests."""
+        return SimpleNamespace(
+            sharded_size=sharded_size,
+            apply_reduced_grad=MagicMock(return_value=False),
+            accumulated_allreduced_grad=False,
+        )
+
+    @classmethod
+    def _build_group(cls, *, reduce_op, replicate_world_size, params, buffer_values):
+        """Build an AllReduceParamGroup with an injected, already-all-reduced buffer."""
+        group = object.__new__(AllReduceParamGroup)
+        group.replicate_group = "replicate-group"
+        group.hsdp_params = params
+        group.orig_dtypes = [ms.float32] * len(params)
+        group.reduce_dtype = ms.float32
+        group.reduce_op = reduce_op
+        group.mp_policy = None
+        group.replicate_world_size = replicate_world_size
+        group.all_reduce_handle = None
+        offsets, numels, current = [], [], 0
+        for param in params:
+            numel = _shape_numel(param.sharded_size)
+            numels.append(numel)
+            offsets.append(current)
+            current += numel
+        group.param_offsets = offsets
+        group.param_numels = numels
+        group.fused_buffer = ms.Tensor(np.array(buffer_values, dtype=np.float32))
+        return group
+
+    def test_wait_and_apply_grads_divides_by_replicate_world_size_for_avg(self):
+        """AVG must divide the SUM-ed buffer by the replicate world size (the fixed bug)."""
+        param = self._fake_param((3,))
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.AVG,
+            replicate_world_size=4,
+            params=[param],
+            buffer_values=[4.0, 8.0, 12.0],
+        )
+
+        need_synchronize = AllReduceParamGroup.wait_and_apply_grads(group)
+
+        applied_grad = param.apply_reduced_grad.call_args.args[0]
+        np.testing.assert_allclose(
+            applied_grad.asnumpy(), np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        )
+        self.assertEqual(param.apply_reduced_grad.call_args.args[1], ms.float32)
+        self.assertTrue(param.accumulated_allreduced_grad)
+        self.assertIsNone(group.fused_buffer)
+        self.assertFalse(need_synchronize)
+
+    def test_wait_and_apply_grads_keeps_sum_unscaled(self):
+        """SUM must apply the all-reduced buffer without any extra scaling."""
+        param = self._fake_param((3,))
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.SUM,
+            replicate_world_size=4,
+            params=[param],
+            buffer_values=[4.0, 8.0, 12.0],
+        )
+
+        AllReduceParamGroup.wait_and_apply_grads(group)
+
+        applied_grad = param.apply_reduced_grad.call_args.args[0]
+        np.testing.assert_allclose(
+            applied_grad.asnumpy(), np.array([4.0, 8.0, 12.0], dtype=np.float32)
+        )
+
+    def test_wait_and_apply_grads_skips_division_for_single_replica(self):
+        """AVG with a single replica must not divide (matches the Torch guard)."""
+        param = self._fake_param((2,))
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.AVG,
+            replicate_world_size=1,
+            params=[param],
+            buffer_values=[5.0, 7.0],
+        )
+
+        AllReduceParamGroup.wait_and_apply_grads(group)
+
+        applied_grad = param.apply_reduced_grad.call_args.args[0]
+        np.testing.assert_allclose(
+            applied_grad.asnumpy(), np.array([5.0, 7.0], dtype=np.float32)
+        )
+
+    def test_wait_and_apply_grads_waits_on_pending_handle(self):
+        """A pending async all-reduce handle must be waited on and then cleared."""
+        param = self._fake_param((2,))
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.SUM,
+            replicate_world_size=2,
+            params=[param],
+            buffer_values=[1.0, 2.0],
+        )
+        handle = MagicMock()
+        group.all_reduce_handle = handle
+
+        AllReduceParamGroup.wait_and_apply_grads(group)
+
+        handle.wait.assert_called_once()
+        self.assertIsNone(group.all_reduce_handle)
+
+    def test_wait_and_apply_grads_scales_each_param_independently(self):
+        """Each param should be sliced from its own fused-buffer region and averaged."""
+        first = self._fake_param((2,))
+        second = self._fake_param((3,))
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.AVG,
+            replicate_world_size=2,
+            params=[first, second],
+            buffer_values=[2.0, 4.0, 6.0, 8.0, 10.0],
+        )
+
+        AllReduceParamGroup.wait_and_apply_grads(group)
+
+        first_grad = first.apply_reduced_grad.call_args.args[0]
+        second_grad = second.apply_reduced_grad.call_args.args[0]
+        np.testing.assert_allclose(
+            first_grad.asnumpy(), np.array([1.0, 2.0], dtype=np.float32)
+        )
+        np.testing.assert_allclose(
+            second_grad.asnumpy(), np.array([3.0, 4.0, 5.0], dtype=np.float32)
+        )
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param_group.dist.all_reduce")
+    def test_issue_async_allreduce_uses_sum_op(self, mock_all_reduce):
+        """The fused all-reduce must use SUM so the AVG manual-division contract holds."""
+        param = self._fake_param((2,))
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.AVG,
+            replicate_world_size=2,
+            params=[param],
+            buffer_values=[1.0, 2.0],
+        )
+        mock_all_reduce.return_value = "ar-handle"
+
+        AllReduceParamGroup.issue_async_allreduce(group)
+
+        _, kwargs = mock_all_reduce.call_args
+        self.assertEqual(kwargs["op"], ops.ReduceOp.SUM)
+        self.assertEqual(kwargs["group"], "replicate-group")
+        self.assertTrue(kwargs["async_op"])
+        self.assertEqual(group.all_reduce_handle, "ar-handle")
+
+    def test_compute_aligned_layout_packs_params_and_pads_tail(self):
+        """Layout should pack params contiguously and pad the total to 512 bytes."""
+        group = object.__new__(AllReduceParamGroup)
+        group.hsdp_params = [self._fake_param((2, 2)), self._fake_param((3,))]
+        group.reduce_dtype = ms.float32
+
+        total_numel = AllReduceParamGroup.compute_aligned_layout(group)
+
+        self.assertEqual(group.param_numels, [4, 3])
+        self.assertEqual(group.param_offsets, [0, 4])
+        # 7 float32 = 28 bytes, padded up to 512 bytes => 128 float32 elements.
+        self.assertEqual(total_numel, 128)
+
+    def test_get_param_grad_view_returns_reshaped_slice(self):
+        """get_param_grad_view should reshape the per-param fused slice to sharded_size."""
+        param = self._fake_param((2, 2))
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.SUM,
+            replicate_world_size=1,
+            params=[param],
+            buffer_values=[1.0, 2.0, 3.0, 4.0],
+        )
+
+        grad_view = AllReduceParamGroup.get_param_grad_view(group, 0, param.sharded_size)
+
+        self.assertEqual(tuple(grad_view.shape), (2, 2))
+        np.testing.assert_allclose(
+            grad_view.asnumpy(), np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        )
+
+    def test_accumulate_existing_grads_skips_missing_main_grad(self):
+        """main_grad policy must not crash when sharded_param has no main_grad yet."""
+        param = self._fake_param((2,))
+        param.sharded_param = SimpleNamespace(grad=ms.Tensor(np.ones(2, dtype=np.float32)))
+        group = self._build_group(
+            reduce_op=ops.ReduceOp.AVG,
+            replicate_world_size=2,
+            params=[param],
+            buffer_values=[0.0, 0.0],
+        )
+        group.mp_policy = MixedPrecisionPolicy(apply_grad_on_fp32_main_grad=True)
+
+        AllReduceParamGroup.accumulate_existing_grads_to_buffer(group)
+
+        np.testing.assert_allclose(
+            group.fused_buffer.asnumpy()[:2], np.array([0.0, 0.0], dtype=np.float32)
+        )
+        self.assertIsNotNone(param.sharded_param.grad)
+
+
+class TestAllReduceParamGroupReduceOpConsistency(MindSporeFullyShardUnitTest):
+    """Test that AllReduceParamGroup.reduce_op aligns with global reduce_op_type semantics.
+
+    When _resolve_reduce_op() returns AVG, AllReduceParamGroup must divide by
+    replicate_world_size in wait_and_apply_grads. When it returns SUM, no division
+    should occur. This validates the "SUM in collective + manual AVG division"
+    contract used for padding-correctness in fused all-reduce.
+    """
+
+    def _build_group_with_reduce_op(self, reduce_op, replicate_world_size=4):
+        """Build an AllReduceParamGroup with specified reduce_op."""
+        param = MagicMock()
+        param.sharded_size = (4,)
+        param.accumulated_allreduced_grad = False
+        param.apply_reduced_grad = MagicMock(return_value=False)
+
+        group = object.__new__(AllReduceParamGroup)
+        group.replicate_group = "replicate-group"
+        group.hsdp_params = [param]
+        group.orig_dtypes = [ms.float32]
+        group.reduce_dtype = ms.float32
+        group.reduce_op = reduce_op
+        group.mp_policy = None
+        group.replicate_world_size = replicate_world_size
+        group.all_reduce_handle = None
+        group.param_offsets = [0]
+        group.param_numels = [4]
+        group.fused_buffer = ms.Tensor(
+            np.array([8.0, 12.0, 16.0, 20.0], dtype=np.float32)
+        )
+        return group, param
+
+    def test_avg_reduce_op_divides_by_world_size(self):
+        """AVG reduce_op must divide the SUM-ed buffer by replicate_world_size."""
+        group, param = self._build_group_with_reduce_op(
+            reduce_op=ops.ReduceOp.AVG, replicate_world_size=4
+        )
+
+        AllReduceParamGroup.wait_and_apply_grads(group)
+
+        applied_grad = param.apply_reduced_grad.call_args.args[0]
+        # Buffer was [8, 12, 16, 20], divided by 4 => [2, 3, 4, 5]
+        np.testing.assert_allclose(
+            applied_grad.asnumpy(),
+            np.array([2.0, 3.0, 4.0, 5.0], dtype=np.float32),
+            err_msg="AVG reduce_op must divide by replicate_world_size",
+        )
+
+    def test_sum_reduce_op_preserves_values(self):
+        """SUM reduce_op must NOT divide the buffer."""
+        group, param = self._build_group_with_reduce_op(
+            reduce_op=ops.ReduceOp.SUM, replicate_world_size=4
+        )
+
+        AllReduceParamGroup.wait_and_apply_grads(group)
+
+        applied_grad = param.apply_reduced_grad.call_args.args[0]
+        # Buffer stays [8, 12, 16, 20]
+        np.testing.assert_allclose(
+            applied_grad.asnumpy(),
+            np.array([8.0, 12.0, 16.0, 20.0], dtype=np.float32),
+            err_msg="SUM reduce_op must NOT divide by replicate_world_size",
+        )
+
+    def test_avg_with_single_replica_skips_division(self):
+        """AVG with replicate_world_size=1 must skip division (guard condition)."""
+        group, param = self._build_group_with_reduce_op(
+            reduce_op=ops.ReduceOp.AVG, replicate_world_size=1
+        )
+
+        AllReduceParamGroup.wait_and_apply_grads(group)
+
+        applied_grad = param.apply_reduced_grad.call_args.args[0]
+        # Buffer stays unchanged because world_size == 1
+        np.testing.assert_allclose(
+            applied_grad.asnumpy(),
+            np.array([8.0, 12.0, 16.0, 20.0], dtype=np.float32),
+            err_msg="AVG with single replica must skip division",
+        )
+
+    def test_issue_async_allreduce_always_uses_sum(self):
+        """issue_async_allreduce must always use SUM op regardless of reduce_op type.
+
+        This is critical for padding correctness: SUM ensures trailing padding
+        bytes (zeroed) don't affect the all-reduce result. The AVG semantics
+        are achieved by manual division in wait_and_apply_grads.
+        """
+        for reduce_op in [ops.ReduceOp.SUM, ops.ReduceOp.AVG]:
+            with self.subTest(reduce_op=reduce_op):
+                group, _ = self._build_group_with_reduce_op(
+                    reduce_op=reduce_op, replicate_world_size=2
+                )
+
+                with patch(
+                    "hyper_parallel.platform.mindspore.fully_shard.param_group.dist.all_reduce"
+                ) as mock_all_reduce:
+                    mock_all_reduce.return_value = "handle"
+                    AllReduceParamGroup.issue_async_allreduce(group)
+
+                    _, kwargs = mock_all_reduce.call_args
+                    self.assertEqual(
+                        kwargs["op"],
+                        ops.ReduceOp.SUM,
+                        f"issue_async_allreduce must use SUM even when reduce_op={reduce_op}",
+                    )
+
+
+class TestAllReduceParamGroupReduceDtypeResolution(MindSporeFullyShardUnitTest):
+    """Regression tests for issue #217 (reduce_dtype=None fused buffer dtype)."""
+
+    @staticmethod
+    def _param_with_bf16_grad():
+        """Build a lightweight param stub with a pending bf16 unsharded grad."""
+        grad = mint.ones((8,), dtype=ms.bfloat16)
+        return SimpleNamespace(
+            unsharded_accumulated_grad=None,
+            unsharded_param=SimpleNamespace(grad=grad),
+            unsharded_grad_data=grad,
+            sharded_size=(4,),
+            apply_reduced_grad=MagicMock(return_value=False),
+            accumulated_allreduced_grad=True,
+        )
+
+    def test_resolve_reduce_dtype_none_uses_pending_grad_dtype(self):
+        """None reduce_dtype must follow reduce_scatter_grad's grad.dtype semantics."""
+        param = self._param_with_bf16_grad()
+        resolved = AllReduceParamGroup._resolve_reduce_dtype(
+            None, [param], [ms.bfloat16]
+        )
+        self.assertEqual(resolved, ms.bfloat16)
+
+    @patch("hyper_parallel.platform.mindspore.fully_shard.param_group.ms.mint.empty")
+    def test_allocate_fused_buffer_none_reduce_dtype_matches_grad(self, mock_empty):
+        """Fused buffer must be allocated with grad dtype when reduce_dtype is None (issue #217).
+
+        Mock ``ms.mint.empty`` so the regression stays a device-free unit test: the
+        invariant is that the fused buffer is allocated with the resolved grad dtype,
+        which is verified through the ``dtype`` passed to the allocator rather than a
+        real on-device ``zero_()``.
+        """
+        param = self._param_with_bf16_grad()
+        fused_buffer = MagicMock()
+        mock_empty.return_value = fused_buffer
+        group = AllReduceParamGroup(
+            replicate_group="replicate-group",
+            hsdp_params=[param],
+            orig_dtypes=[ms.bfloat16],
+            reduce_dtype=None,
+            reduce_op=ops.ReduceOp.AVG,
+            replicate_world_size=2,
+        )
+        self.assertEqual(group.reduce_dtype, ms.bfloat16)
+
+        group.allocate_fused_buffer("CPU")
+
+        _, empty_kwargs = mock_empty.call_args
+        self.assertEqual(empty_kwargs["dtype"], ms.bfloat16)
+        fused_buffer.zero_.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -13,7 +13,8 @@
 # limitations under the License.
 # ============================================================================
 """MindSpore HSDP cell state"""
-from typing import Optional
+from collections import defaultdict
+from typing import List, Optional
 import mindspore as ms
 from mindspore import ops
 import mindspore.mint.distributed as dist
@@ -27,7 +28,11 @@ from hyper_parallel.core.fully_shard.hsdp_utils import (
 from hyper_parallel.platform.mindspore.fully_shard.pack_utils import build_rs_plan
 from hyper_parallel.platform.mindspore.fully_shard.param import MindSporeHSDPParamV2
 from hyper_parallel.platform.mindspore.fully_shard._version_utils import copy_without_bumping_version
-from hyper_parallel.platform.mindspore.fully_shard.param_group import HSDPParamGroup, get_comm_ctx
+from hyper_parallel.platform.mindspore.fully_shard.param_group import (
+    AllReduceParamGroup,
+    HSDPParamGroup,
+    get_comm_ctx,
+)
 from hyper_parallel.platform.mindspore.utils import normalize_runtime_device
 from hyper_parallel.core.fully_shard.utils import CPUOffloadPolicy
 
@@ -41,21 +46,21 @@ def _to_dtype_if_needed(
         tensor: The input tensor to potentially cast.
         dtype: Target dtype. If None or same as tensor dtype, no-op.
     """
-    if dtype is not None and tensor.dtype != dtype:
+    if isinstance(dtype, ms.Type) and tensor.dtype != dtype:
         return tensor.to(dtype)
     return tensor
 
 
 class MindSporeHSDPStateV2(HSDPState):
     """MindSpore HSDP cell state"""
-    # Record async all-reduces for replicate_params so they can overlap with
-    # the next module's backward before being materialized.
-    _ignored_allreduce_works = []
     # DTensor compat parameters in pure-TP mode can accumulate gradients
     # directly on ``sharded_param.grad`` without materializing an
     # ``_unsharded_param``. Track those async all-reduces separately from the
     # standard unsharded-gradient queues.
     pre_direct_all_reduce_grads = []
+    # Reserved for HSDP fused all-reduce pipeline (phase-2); kept for API parity with Torch.
+    pre_all_reduce_groups: List = []
+    pending_all_reduce_groups: List = []
 
     @staticmethod
     def _get_pending_unsharded_grad(hsdp_param):
@@ -91,6 +96,14 @@ class MindSporeHSDPStateV2(HSDPState):
             return
         ms.runtime.current_stream().synchronize()
 
+    def _apply_pending_unsharded_grad_locally(self, hsdp_param) -> bool:
+        """Materialize pending unsharded grad onto ``sharded_param.grad`` without communication."""
+        pending_grad = self._get_pending_unsharded_grad(hsdp_param)
+        apply_gradient_scaling_factor(
+            pending_grad, hsdp_param.gradient_scaling_factor
+        )
+        return hsdp_param.apply_reduced_grad(pending_grad, self._orig_dtype)
+
     def __init__(self, cell, mesh_info, config, platform, device=None):
         super().__init__(cell, mesh_info, config, platform, device)
         self.comm_fusion = config.comm_fusion
@@ -102,20 +115,29 @@ class MindSporeHSDPStateV2(HSDPState):
         self.reshard_after_backward = True
         # Requires AllReduce for grad When HSDP
         self.requires_all_reduce = True
-        # Keep historical AVG behavior for local parameters while DTensor-aware
-        # paths default to SUM semantics without extra division.
-        self.reduce_op_type = ops.ReduceOp.SUM
-        self._need_div = not any(
-            getattr(param, "param_mode", FullyShardParamMode.LOCAL_PARAM)
-            != FullyShardParamMode.LOCAL_PARAM
-            for param in self._iter_managed_params()
-        )
+        # Default reduce op is decided at the fully_shard-state level:
+        # if any managed parameter is DTensor-backed, use SUM; otherwise AVG.
+        self.reduce_op_type = self._resolve_default_reduce_op()
         self._reset_sharded_params = False
         self._init_param_group()
 
     def _iter_managed_params(self):
         """Return all fully_shard-managed parameters, including replicate_params."""
         return [*self.hsdp_params, *self.replicate_params]
+
+    def _resolve_default_reduce_op(self):
+        """Resolve the default reduce op for the whole fully_shard state."""
+        for hsdp_param in self._iter_managed_params():
+            if hsdp_param.param_mode in (
+                FullyShardParamMode.DTENSOR_COMPAT,
+                FullyShardParamMode.DTENSOR_UNIFIED,
+            ):
+                return ops.ReduceOp.SUM
+        return ops.ReduceOp.AVG
+
+    def _resolve_reduce_op(self):
+        """Resolve the gradient reduction op for the current fully_shard state."""
+        return self.reduce_op_type
 
     @staticmethod
     def _comm_fusion_unsupported_reason(hsdp_param) -> Optional[str]:
@@ -174,20 +196,6 @@ class MindSporeHSDPStateV2(HSDPState):
             hsdp_param.zero_grad()
         for hsdp_param in self.replicate_params:
             hsdp_param.zero_grad()
-
-    @staticmethod
-    def _div_if_needed(x, divisor, need_div: bool):
-        """Apply gradient averaging only when the caller-provided policy requires it.
-
-        ``need_div`` may come from the current state or from metadata captured when
-        async reduce work was queued, so this helper is safe for both immediate and
-        deferred gradient materialization paths.
-        """
-        if not need_div:
-            return
-        if divisor == 1:
-            return
-        x.div_(divisor)
 
     def _move_states_to_device(self):
         """move states to device"""
@@ -307,106 +315,62 @@ class MindSporeHSDPStateV2(HSDPState):
                 "For example, initialize the module weights on a real device before running training."
             )
 
-    def _allreduce_replicate_params(self, async_op=True) -> None:
-        """
-        DDP-style all-reduce for parameters in config.replicate_params.
-
-        Use the parameter's layout-driven unsharded group so DTensor-aware
-        compatibility and unified modes reduce over the correct axes.
-        """
-        for param in self.replicate_params:
-            if not hasattr(param, "_unsharded_param") or param.unsharded_param is None:
+    def _queue_replicate_params_allreduce(self) -> None:
+        """Queue async all-reduce for config.replicate_params (aligned with Torch)."""
+        for hsdp_param in self.replicate_params:
+            if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
                 continue
-            if (
-                param.unsharded_accumulated_grad is None
-                and param.unsharded_param.grad is None
-            ):
+            if not hsdp_param.sharded_param.requires_grad:
                 continue
+            if not self._has_pending_unsharded_grad(hsdp_param):
+                continue
+            if self._should_run_all_reduce(hsdp_param):
+                self._queue_compat_all_reduce(hsdp_param)
+            else:
+                need_synchronize = self._apply_pending_unsharded_grad_locally(hsdp_param)
+                self._synchronize_current_stream_if_needed(need_synchronize)
 
-            reduced_grad = param.unsharded_accumulated_grad_data
-            if reduced_grad is None:
-                reduced_grad = param.unsharded_grad_data
-            reduced_grad = _to_dtype_if_needed(reduced_grad, self._reduce_dtype)
-            # Replicate params reduce only through this DDP-style all-reduce (they
-            # never go through reduce_scatter_grad / all_reduce_grad), so this leg
-            # owns the scaling. The all-reduce below is in-place, so scaling
-            # in-place first keeps reduce(g_i * factor) == factor * reduce(g_i),
-            # and it also covers the no-all-reduce (single-replica) branch.
-            apply_gradient_scaling_factor(reduced_grad, param.gradient_scaling_factor)
-            reduce_group_info = getattr(param, "unsharded_group_info", None)
-            reduce_group = reduce_group_info.group if reduce_group_info is not None else None
-            reduce_group_size = reduce_group_info.rank_size if reduce_group_info is not None else 1
-
-            if reduce_group is not None and reduce_group_size > 1:
-                # Ascend HCCL DistCommAllReduce rejects non-contiguous tensors;
-                # reduced_grad here may still be a view from the no-reduce path
-                # of ``unsharded_grad_data`` / ``_to_local_unsharded_grad``.
-                # ``Tensor.contiguous()`` is a no-op when storage is already
-                # contiguous, so the unconditional call is safe.
-                reduced_grad = reduced_grad.contiguous()
-                param.all_reduce_handle = dist.all_reduce(
-                    reduced_grad, group=reduce_group, op=self.reduce_op_type, async_op=async_op
-                )
-            MindSporeHSDPStateV2._ignored_allreduce_works.append(
-                (param, reduced_grad, reduce_group_size, self._orig_dtype, self._need_div)
-            )
-
-    def _finish_ignored_allreduce(self) -> None:
-        """
-        Wait for async all-reduce of replicate_params and materialize param.grad.
-
-        For each pending work, this:
-        Waits on all associated handles to complete;
-        Casts reduced_grad back to _orig_dtype if needed;
-        Assigns the final tensor to param.grad.
-        """
-        if not MindSporeHSDPStateV2._ignored_allreduce_works:
-            return
-
-        need_synchronize = False
-        while MindSporeHSDPStateV2._ignored_allreduce_works:
-            param, reduced_grad, reduce_group_size, orig_dtype, need_div = (
-                MindSporeHSDPStateV2._ignored_allreduce_works.pop(0)
-            )
-            if param.all_reduce_handle:
-                param.all_reduce_handle.wait()
-            self._div_if_needed(reduced_grad, reduce_group_size, need_div)
-            need_synchronize = (
-                param.apply_reduced_grad(reduced_grad, orig_dtype)
-                or need_synchronize
-            )
-
-        self._synchronize_current_stream_if_needed(need_synchronize)
-
-    def reduce_params(self):
-        """Drain pending sharded parameter reductions and materialize sharded grads."""
+    def _drain_reduce_scatter_params(self) -> bool:
+        """Wait pending reduce-scatter ops and apply sharded grads."""
         need_synchronize = False
         while HSDPState.pre_reduce_scatter_params:
-            hsdp_param, pre_orig_dtype, need_div = HSDPState.pre_reduce_scatter_params.pop(0)
+            hsdp_param, pre_orig_dtype = HSDPState.pre_reduce_scatter_params.pop(0)
             reduced_grad = hsdp_param.reduce_scatter_output()
-            self._div_if_needed(reduced_grad, hsdp_param.shard_world_size, need_div)
             hsdp_param.clear_reduce_scatter_output()
             need_synchronize = (
                 hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype)
                 or need_synchronize
             )
+            hsdp_param.accumulated_allreduced_grad = False
+        return need_synchronize
 
+    def reduce_scattered_params(self):
+        """Wait pending reduce-scatter ops and apply sharded grads (FSDP pipeline step 2)."""
+        need_synchronize = self._drain_reduce_scatter_params()
+        self._synchronize_current_stream_if_needed(need_synchronize)
+
+    def reduce_params(self):
+        """Apply reduced gradients from pre-staged all-reduce queues (aligned with Torch).
+
+        Drains ``pre_all_reduce_params`` and ``pre_direct_all_reduce_grads``. For
+        pending reduce-scatter work, call ``reduce_scattered_params()`` separately.
+        """
+        need_synchronize = False
         while HSDPState.pre_all_reduce_params:
-            hsdp_param, pre_orig_dtype, need_div = HSDPState.pre_all_reduce_params.pop(0)
+            hsdp_param, pre_orig_dtype = HSDPState.pre_all_reduce_params.pop(0)
             reduced_grad = hsdp_param.all_reduce_output()
-            self._div_if_needed(reduced_grad, hsdp_param.replicate_world_size, need_div)
             hsdp_param.clear_all_reduce_output()
             need_synchronize = (
                 hsdp_param.apply_reduced_grad(reduced_grad, pre_orig_dtype)
                 or need_synchronize
             )
         while MindSporeHSDPStateV2.pre_direct_all_reduce_grads:
-            hsdp_param, handle, reduced_grad, target_grad, reduce_group_size, need_div = (
+            hsdp_param, handle, reduced_grad, target_grad, *_ = (
                 MindSporeHSDPStateV2.pre_direct_all_reduce_grads.pop(0)
             )
             if handle is not None:
                 handle.wait()
-            self._div_if_needed(reduced_grad, reduce_group_size, need_div)
+            # all-reduce already applied SUM/AVG via _resolve_reduce_op(); skip legacy manual AVG div.
             if hsdp_param.mp_policy.apply_grad_on_fp32_main_grad:
                 need_synchronize = (
                     hsdp_param.apply_reduced_grad(reduced_grad, self._orig_dtype)
@@ -418,10 +382,131 @@ class MindSporeHSDPStateV2(HSDPState):
                 copy_without_bumping_version(target_grad, reduced_grad)
         self._synchronize_current_stream_if_needed(need_synchronize)
 
+    def _wait_prev_reduce_scatter(self) -> List:
+        """Step 1: wait previous module RS for HSDP fused all-reduce groups."""
+        if MindSporeHSDPStateV2.pre_all_reduce_groups:
+            prev_groups = list(MindSporeHSDPStateV2.pre_all_reduce_groups)
+            MindSporeHSDPStateV2.pre_all_reduce_groups.clear()
+            for prev_group in prev_groups:
+                for hsdp_param in prev_group.hsdp_params:
+                    hsdp_param.reduce_scatter_output()
+                    hsdp_param.clear_reduce_scatter_output()
+                    if hsdp_param.unsharded_accumulated_grad_data is not None:
+                        hsdp_param.unsharded_accumulated_grad = None
+                    elif hsdp_param.unsharded_param.grad is not None:
+                        hsdp_param.unsharded_param.grad = None
+            return prev_groups
+        return []
+
+    def _wait_and_apply_prev_no_allreduce_params(self):
+        """Step 2: wait/apply previous reduce-scatter for pure FSDP params."""
+        self.reduce_scattered_params()
+
+    def _should_skip_reduce_scatter_issue(self, hsdp_param) -> bool:
+        """Return True when a parameter should not enter the HSDP RS/fused-AR pipeline."""
+        return (
+            not hasattr(hsdp_param, "_unsharded_param")
+            or hsdp_param.unsharded_param is None
+            or not hasattr(hsdp_param, "sharded_param")
+            or not hsdp_param.sharded_param.requires_grad
+            or hsdp_param.shard_size <= 1
+            or self._can_direct_all_reduce_compat_grad(hsdp_param)
+            or not self._has_pending_unsharded_grad(hsdp_param)
+        )
+
+    def _collect_params_for_reduce_scatter(self):
+        """Collect parameters that need the HSDP RS/fused-AR overlap pipeline."""
+        return [
+            hsdp_param
+            for hsdp_param in self._iter_managed_params()
+            if not self._should_skip_reduce_scatter_issue(hsdp_param)
+        ]
+
+    def _needs_overlap_post_backward_steps(self) -> bool:
+        """Whether the 4-step RS/AR overlap pipeline has pending work this hook."""
+        if MindSporeHSDPStateV2.pre_all_reduce_groups:
+            return True
+        if HSDPState.pre_reduce_scatter_params:
+            return True
+        return bool(self._collect_params_for_reduce_scatter())
+
+    def _run_overlap_post_backward_steps(self) -> None:
+        """Run the 4-step HSDP RS/AR overlap pipeline for the current module."""
+        prev_group = self._wait_prev_reduce_scatter()
+        self._wait_and_apply_prev_no_allreduce_params()
+        self._issue_reduce_scatter_for_current_module()
+        self._issue_prev_fused_allreduce(prev_group)
+
+    def _issue_reduce_scatter_for_current_module(self):
+        """Issue reduce_scatter for current module with fused all-reduce when needed."""
+        params_to_reduce = self._collect_params_for_reduce_scatter()
+        if not params_to_reduce:
+            return
+
+        groups_by_comm = defaultdict(list)
+        for hsdp_param in params_to_reduce:
+            if self._should_run_all_reduce(hsdp_param):
+                replicate_group = hsdp_param.unsharded_group_info.group
+                key = id(replicate_group) if replicate_group is not None else None
+                groups_by_comm[key].append(hsdp_param)
+            else:
+                groups_by_comm[None].append(hsdp_param)
+
+        if None in groups_by_comm:
+            for hsdp_param in groups_by_comm[None]:
+                hsdp_param.reduce_scatter_grad(
+                    async_op=True,
+                    dtype=self._reduce_dtype,
+                    reduce_op=self._resolve_reduce_op(),
+                )
+                HSDPState.pre_reduce_scatter_params.append(
+                    (hsdp_param, self._orig_dtype)
+                )
+
+        for key, hsdp_params in groups_by_comm.items():
+            if key is None:
+                continue
+            group_info = hsdp_params[0].unsharded_group_info
+            group = AllReduceParamGroup(
+                replicate_group=group_info.group,
+                hsdp_params=hsdp_params,
+                orig_dtypes=[self._orig_dtype] * len(hsdp_params),
+                reduce_dtype=self._reduce_dtype,
+                reduce_op=self._resolve_reduce_op(),
+                mp_policy=self.mp_policy,
+                replicate_world_size=group_info.rank_size,
+            )
+            group.allocate_fused_buffer(self.device)
+            for idx, hsdp_param in enumerate(hsdp_params):
+                buffer_view = group.get_param_buffer_view(idx)
+                hsdp_param.reduce_scatter_grad(
+                    async_op=True,
+                    dtype=self._reduce_dtype,
+                    reduce_op=self._resolve_reduce_op(),
+                    output_buffer=buffer_view,
+                )
+            MindSporeHSDPStateV2.pre_all_reduce_groups.append(group)
+
+    def _issue_prev_fused_allreduce(self, prev_groups: List) -> None:
+        """Step 4: issue async all-reduce for previous HSDP groups (no-op without fusion groups)."""
+        for prev_group in prev_groups:
+            prev_group.accumulate_existing_grads_to_buffer()
+            prev_group.issue_async_allreduce()
+            MindSporeHSDPStateV2.pending_all_reduce_groups.append(prev_group)
+
+    @classmethod
+    def delay_apply_reduce_grads(cls) -> None:
+        """Wait pending fused all-reduce groups at root backward."""
+        need_synchronize = False
+        for group in cls.pending_all_reduce_groups:
+            need_synchronize = group.wait_and_apply_grads() or need_synchronize
+        cls.pending_all_reduce_groups.clear()
+        if need_synchronize:
+            ms.runtime.current_stream().synchronize()
+
     def post_backward_for_comm_fusion(self):
         """Drive the fused gradient-reduction pipeline for sharded params."""
         self.reduce_params()
-        self._finish_ignored_allreduce()
         comm_ctx = get_comm_ctx()
         if comm_ctx.all_reduce_param_group is not None:
             comm_ctx.all_reduce_param_group.wait_all_reduce_and_apply_grad()
@@ -431,10 +516,9 @@ class MindSporeHSDPStateV2(HSDPState):
             comm_ctx.pre_param_group = None
         if self.param_group is not None:
             self.param_group.foreach_reduce(
-                reduce_scatter_reduce_op=self.reduce_op_type,
-                needs_avg_div=self._need_div,
+                reduce_scatter_reduce_op=self._resolve_reduce_op(),
             )
-        self._allreduce_replicate_params()
+        self._queue_replicate_params_allreduce()
 
     def _post_backward_without_reduce(self):
         """Finish backward when gradient communication is disabled."""
@@ -447,32 +531,6 @@ class MindSporeHSDPStateV2(HSDPState):
         """Whether the current parameter should issue an all-reduce in this backward pass."""
         return self.requires_all_reduce and hsdp_param.dp_size > 1
 
-    def _queue_reduce_scatter_then_all_reduce(self, hsdp_param):
-        """Queue the standard FSDP/HSDP reduction path."""
-        hsdp_param.reduce_scatter_grad(
-            async_op=True,
-            dtype=self._reduce_dtype,
-            reduce_op=self.reduce_op_type
-        )
-        HSDPState.pre_reduce_scatter_params.append((hsdp_param, self._orig_dtype, self._need_div))
-        if not self._should_run_all_reduce(hsdp_param):
-            return
-        reduced_grad = hsdp_param.reduce_scatter_output()
-        if (
-            HSDPState.pre_reduce_scatter_params
-            and HSDPState.pre_reduce_scatter_params[-1][0] == hsdp_param
-        ):
-            HSDPState.pre_reduce_scatter_params.pop()
-        hsdp_param.clear_reduce_scatter_output()
-        self._div_if_needed(reduced_grad, hsdp_param.shard_size, self._need_div)
-        hsdp_param.all_reduce_grad(
-            grad=reduced_grad,
-            dtype=self._reduce_dtype,
-            async_op=True,
-            reduce_op=self.reduce_op_type,
-        )
-        HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype, self._need_div))
-
     def _queue_compat_all_reduce(self, hsdp_param):
         """Queue the compatibility all-reduce path without FSDP sharding."""
         if not self._should_run_all_reduce(hsdp_param):
@@ -482,12 +540,14 @@ class MindSporeHSDPStateV2(HSDPState):
         hsdp_param.all_reduce_grad(
             dtype=self._reduce_dtype,
             async_op=True,
-            reduce_op=self.reduce_op_type,
+            reduce_op=self._resolve_reduce_op(),
         )
-        HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype, self._need_div))
+        HSDPState.pre_all_reduce_params.append((hsdp_param, self._orig_dtype))
 
     def _can_direct_all_reduce_compat_grad(self, hsdp_param) -> bool:
         """Whether ``hsdp_param`` should reduce its existing ``sharded_param.grad`` directly."""
+        if not hasattr(hsdp_param, "param_mode"):
+            return False
         return (
             hsdp_param.param_mode == FullyShardParamMode.DTENSOR_COMPAT
             and hsdp_param.enable_fsdp_shard
@@ -505,9 +565,8 @@ class MindSporeHSDPStateV2(HSDPState):
             return
         reduced_grad = _to_dtype_if_needed(grad, self._reduce_dtype)
         # All-reduce needs a contiguous buffer; the local sharded grad may be a
-        # non-contiguous view (same as _allreduce_replicate_params). No-op when
-        # already contiguous; the copy is written back to grad in
-        # _complete_direct_all_reduce.
+        # non-contiguous view. No-op when already contiguous; the copy is written
+        # back to grad in reduce_params().
         reduced_grad = reduced_grad.contiguous()
         # Pure all-reduce path (no reduce-scatter): this leg owns the scaling.
         # all-reduce below is in-place, so scale in-place before it.
@@ -522,11 +581,11 @@ class MindSporeHSDPStateV2(HSDPState):
             handle = dist.all_reduce(
                 reduced_grad,
                 group=reduce_group,
-                op=self.reduce_op_type,
+                op=self._resolve_reduce_op(),
                 async_op=True,
             )
         MindSporeHSDPStateV2.pre_direct_all_reduce_grads.append(
-            (hsdp_param, handle, reduced_grad, grad, reduce_group_size, self._need_div)
+            (hsdp_param, handle, reduced_grad, grad, reduce_group_size, False)
         )
 
     def post_backward(self, *_):
@@ -538,34 +597,33 @@ class MindSporeHSDPStateV2(HSDPState):
             return
         if not self.comm_fusion:
             self.reduce_params()
-            self._finish_ignored_allreduce()
-            self._allreduce_replicate_params()
-            for hsdp_param in self.hsdp_params:
+            for hsdp_param in self._iter_managed_params():
+                # replicate_params are queued once by _queue_replicate_params_allreduce().
+                if not getattr(hsdp_param, "enable_fsdp_shard", True):
+                    continue
                 if not hasattr(hsdp_param, "_unsharded_param") or hsdp_param.unsharded_param is None:
                     if self._can_direct_all_reduce_compat_grad(hsdp_param):
                         self._queue_direct_compat_all_reduce(hsdp_param)
                     continue
-                if not hsdp_param.sharded_param.requires_grad:
+                if not hasattr(hsdp_param, "sharded_param") or not hsdp_param.sharded_param.requires_grad:
                     continue
                 if not self._has_pending_unsharded_grad(hsdp_param):
                     continue
-                if hsdp_param.shard_size > 1:
-                    self._queue_reduce_scatter_then_all_reduce(hsdp_param)
-                elif self._should_run_all_reduce(hsdp_param):
-                    self._queue_compat_all_reduce(hsdp_param)
-                else:
-                    # No-communication path (shard_size == 1, no all-reduce):
-                    # this leg owns the scaling since the grad never goes through
-                    # reduce_scatter_grad / all_reduce_grad.
-                    pending_grad = self._get_pending_unsharded_grad(hsdp_param)
-                    apply_gradient_scaling_factor(
-                        pending_grad, hsdp_param.gradient_scaling_factor
-                    )
-                    need_synchronize = hsdp_param.apply_reduced_grad(
-                        pending_grad,
-                        self._orig_dtype,
-                    )
-                    self._synchronize_current_stream_if_needed(need_synchronize)
+                if hsdp_param.shard_size <= 1:
+                    if self._should_run_all_reduce(hsdp_param):
+                        self._queue_compat_all_reduce(hsdp_param)
+                    else:
+                        # No-communication path (shard_size == 1, no all-reduce):
+                        # this leg owns the scaling since the grad never goes through
+                        # reduce_scatter_grad / all_reduce_grad.
+                        need_synchronize = self._apply_pending_unsharded_grad_locally(
+                            hsdp_param
+                        )
+                        self._synchronize_current_stream_if_needed(need_synchronize)
+
+            if self._needs_overlap_post_backward_steps():
+                self._run_overlap_post_backward_steps()
+            self._queue_replicate_params_allreduce()
         else:
             self.post_backward_for_comm_fusion()
         if self.reshard_after_backward:
@@ -579,12 +637,11 @@ class MindSporeHSDPStateV2(HSDPState):
         """set reduce op type for gradient reduction."""
         fsdp_support_reduce_op = {
             "sum": ops.ReduceOp.SUM,
-            "avg": ops.ReduceOp.SUM,
+            "avg": ops.ReduceOp.AVG,
         }
-        if reduce_op_type not in fsdp_support_reduce_op:
+        reduce_op: str = reduce_op_type.lower().strip()
+        if reduce_op not in fsdp_support_reduce_op:
             raise ValueError(
                 f"Unsupported reduce op type {reduce_op_type}, "
                 f"supported types are {list(fsdp_support_reduce_op.keys())}")
-        self._need_div = reduce_op_type == "avg"
-        reduce_op: str = reduce_op_type.lower().strip()
-        self.reduce_op_type = fsdp_support_reduce_op.get(reduce_op)
+        self.reduce_op_type = fsdp_support_reduce_op[reduce_op]
