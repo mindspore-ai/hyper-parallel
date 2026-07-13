@@ -19,7 +19,7 @@ Tests cover:
 - Backward gradient correctness through the distributed path
 - Single-card vs multi-card forward/backward numerical parity
 - Custom ReLU activation (simple single-input op)
-- Custom column-parallel Linear (preprocess → _dispatch_new, get_expand_impl=None)
+- Custom column-parallel Linear (preprocess → _dispatch_layout_infer, get_expand_impl=None)
 - Custom row-parallel Linear with bias (preprocess + get_expand_impl non-None)
 """
 import numpy as np
@@ -126,7 +126,7 @@ class _ReLUFunc(DFunction):
 
 
 # ---------------------------------------------------------------------------
-# Op 3: Column-parallel Linear  (preprocess → _dispatch_new, no expand_impl)
+# Op 3: Column-parallel Linear  (preprocess → _dispatch_layout_infer, no expand_impl)
 #
 # x  [B, in]   Shard(0) on DP, Replicate on TP  → x_map  = ("dp",  "None")
 # w  [out, in] Replicate on DP, Replicate on TP  → w_map  = ("None","None")
@@ -171,7 +171,7 @@ def _linear_output_layout(x_layout: Layout, w_layout: Layout) -> Layout:
 class _LinColDistOp(DistributedOp):
     """Column-parallel Linear: w output dim is sharded, contracting dim is not.
 
-    Uses the ``preprocess`` → ``_dispatch_new`` path.  ``get_expand_impl`` returns
+    Uses the ``preprocess`` → ``_dispatch_layout_infer`` path.  ``get_expand_impl`` returns
     None because the contracting dimension is not sharded (no bias scaling needed).
     """
 
@@ -562,7 +562,7 @@ def test_linear_colwise_dispatch_new():
     Description:
         - x [8, 16] Shard(0) on DP, Replicate on TP.
         - w [32, 16] Replicate on both dims.
-        - _LinColFunc.apply takes the preprocess → _dispatch_new path.
+        - _LinColFunc.apply takes the preprocess → _dispatch_layout_infer path.
         - get_expand_impl returns None (contracting not sharded).
     Expectation: Output matches F.linear(x_full, w_full) gathered; backward runs.
     """

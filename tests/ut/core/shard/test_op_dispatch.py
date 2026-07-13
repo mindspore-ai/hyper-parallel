@@ -621,8 +621,8 @@ class TestOpDispatcherSetupYamlDir(unittest.TestCase):
 class TestDispatchLayoutInfer(unittest.TestCase):
     """
     Feature: OpDispatcher._dispatch_layout_infer routing paths.
-    Description: Routes to error for unregistered ops; uses three-phase dispatch
-                 (preprocess → _dispatch_new) for registered ops.
+    Description: Routes unregistered ops through _handle_unregistered_op; registered
+                 ops go through preprocess → layout lookup/infer → execute → wrap.
     Expectation: RuntimeError for unregistered ops or when preprocess returns None.
     """
 
@@ -641,20 +641,22 @@ class TestDispatchLayoutInfer(unittest.TestCase):
             d._dispatch_layout_infer("NoSuchOp", lambda: None, (), {})
 
     @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
-    def test_preprocess_non_none_calls_dispatch_new(self, mock_cache_cls):
-        """preprocess returning non-None triggers _dispatch_new."""
+    def test_preprocess_non_none_completes_dispatch(self, mock_cache_cls):
+        """preprocess returning non-None triggers full dispatch: lookup → execute → wrap."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
 
         mock_dist_op = MagicMock()
         mock_dist_op.preprocess.return_value = ([], {}, [])
+        mock_dist_op.infer_layout.return_value = (MagicMock(), None)
+        mock_dist_op.get_expand_impl.return_value = None
+        mock_dist_op.wrap_output.return_value = "dispatch_result"
         mock_cache_cls.get_instance.return_value.distributed_op.return_value = mock_dist_op
 
         d = self._make_dispatcher(layout_infer_ops={"TestOp": {}})
-        d._dispatch_new = MagicMock(return_value="new_result")
-
         result = d._dispatch_layout_infer("TestOp", lambda: None, (), {})
-        self.assertEqual(result, "new_result")
-        d._dispatch_new.assert_called_once()
+        self.assertEqual(result, "dispatch_result")
+        mock_dist_op.preprocess.assert_called_once()
+        mock_dist_op.wrap_output.assert_called_once()
 
     @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
     def test_preprocess_returns_none_raises(self, mock_cache_cls):
@@ -671,44 +673,45 @@ class TestDispatchLayoutInfer(unittest.TestCase):
             d._dispatch_layout_infer("TestOp", lambda: None, (1,), {})
 
 
-class TestDispatchNew(unittest.TestCase):
+class TestLookupOrInferLayout(unittest.TestCase):
     """
-    Feature: OpDispatcher._dispatch_new
-    Description: New dispatch flow: cache lookup, infer_layout, get_expand_impl, wrap_output.
+    Feature: OpDispatcher._lookup_or_infer_layout
+    Description: Cache lookup, infer_layout, get_expand_impl, wrap_output.
     Expectation: Cache hit returns cached result; miss calls infer/expand; output wrapped.
     """
 
     @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
     @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_dispatch_new_cache_miss_path(self, mock_platform, mock_cache_cls):
-        """Cache miss: infer_layout and get_expand_impl called; wrap_output called."""
+    def test_lookup_cache_miss_path(self, mock_platform, mock_cache_cls):
+        """Cache miss: infer_layout and get_expand_impl called; wrap_output called via dispatch."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
 
         mock_platform.get_op_name.return_value = "TestOp"
 
         mock_output_layouts = (MagicMock(),)
         mock_dist_op = MagicMock()
+        mock_dist_op.preprocess.return_value = ([], {}, [])
         mock_dist_op.infer_layout.return_value = (mock_output_layouts, None)
         mock_dist_op.get_expand_impl.return_value = None
         mock_dist_op.wrap_output.return_value = "wrapped_output"
 
         layout_cache = {}
         mock_cache_cls.get_instance.return_value.get_layout_cache.return_value = layout_cache
-
-        cache_values = ["val1"]
+        mock_cache_cls.get_instance.return_value.distributed_op.return_value = mock_dist_op
 
         def mock_func(*args, **kwargs):
             return "py_output"
 
         d = object.__new__(OpDispatcher)
-        result = d._dispatch_new(mock_func, mock_dist_op, None, ([], {}, cache_values))
+        d.layout_infer_ops = {"TestOp": {}}
+        result = d._dispatch_layout_infer("TestOp", mock_func, (), {})
         self.assertEqual(result, "wrapped_output")
         mock_dist_op.infer_layout.assert_called_once()
         mock_dist_op.wrap_output.assert_called_once()
 
     @patch("hyper_parallel.core.shard._op_dispatch.LayoutCacheManager")
     @patch("hyper_parallel.core.shard._op_dispatch.platform")
-    def test_dispatch_new_cache_hit_path(self, mock_platform, mock_cache_cls):
+    def test_lookup_cache_hit_path(self, mock_platform, mock_cache_cls):
         """Cache hit: infer_layout NOT called; cached op_impl and infer_result used."""
         from hyper_parallel.core.shard._op_dispatch import OpDispatcher
         # LayoutCacheKey is re-imported here because _reload_op_dispatch_with_env_str may have
@@ -720,6 +723,7 @@ class TestDispatchNew(unittest.TestCase):
 
         mock_output_layouts = (MagicMock(),)
         mock_dist_op = MagicMock()
+        mock_dist_op.preprocess.return_value = (["arg"], {}, ["cached_val"])
         mock_dist_op.wrap_output.return_value = "cached_wrapped"
 
         cache_values = ["cached_val"]
@@ -730,12 +734,14 @@ class TestDispatchNew(unittest.TestCase):
 
         layout_cache = {"CachedOp": {cache_key: (cached_infer, mock_impl)}}
         mock_cache_cls.get_instance.return_value.get_layout_cache.return_value = layout_cache
+        mock_cache_cls.get_instance.return_value.distributed_op.return_value = mock_dist_op
 
         def mock_func(*args, **kwargs):
             return "should_not_be_called"
 
         d = object.__new__(OpDispatcher)
-        result = d._dispatch_new(mock_func, mock_dist_op, None, (["arg"], {}, cache_values))
+        d.layout_infer_ops = {"CachedOp": {}}
+        result = d._dispatch_layout_infer("CachedOp", mock_func, (), {})
         mock_dist_op.infer_layout.assert_not_called()
         mock_impl.assert_called_once()
 

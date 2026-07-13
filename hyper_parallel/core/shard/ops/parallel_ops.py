@@ -136,8 +136,10 @@ class DistributedOp:
                 raise RuntimeError(
                     f"Output tuple size ({len(py_output)}) "
                     f"does not match layout tuple size ({len(output_layouts)})")
+            # Inline the fast construction (equivalent to from_local_with_layout) to
+            # avoid an extra Python call frame per output in this hot multi-output loop.
             return tuple(
-                DTensor.from_local(item, layout.mesh, layout.alias_placements)
+                DTensor(item, layout.mesh, layout.placements, layout)
                 for item, layout in zip(py_output, output_layouts)
             )
 
@@ -150,6 +152,4 @@ class DistributedOp:
         else:
             output_layout = output_layouts
 
-        return DTensor.from_local(
-            py_output, output_layout.mesh, output_layout.alias_placements
-        )
+        return DTensor.from_local_with_layout(py_output, output_layout)

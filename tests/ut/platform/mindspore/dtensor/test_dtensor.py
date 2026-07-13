@@ -33,7 +33,7 @@ from hyper_parallel.platform.mindspore.dtensor import DTensorBase
 # pylint: disable=redefined-outer-name
 
 
-def _stub_init_data(self, local_tensor, device_mesh, placements):
+def _stub_init_data(self, local_tensor, device_mesh, placements, layout=None):
     """Stand-in for ``DTensor.__init_data__`` so DTensorBase can be tested in
     isolation, without going through the core ``DTensor`` subclass."""
     self._local_tensor = local_tensor
