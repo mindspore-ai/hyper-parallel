@@ -572,9 +572,9 @@ def _make_overlap_b_f_callback(overlap: CommComputeOverlap):
                     overlap.coordinator.rendezvous(HookRole.COMPUTE)
 
         # Fire the BWD chunk's recompute serially on the main thread BEFORE
-        # spawning the backward thread, so the forward re-run never races
-        # fwd_fn's forward record.  ``backward_one_chunk`` then reuses the
-        # cached activations instead of re-running on the daemon thread.
+        # submitting to the backward worker, so the forward re-run never
+        # races fwd_fn's forward record.  ``backward_one_chunk`` then reuses
+        # the cached activations instead of re-running on the daemon thread.
         bwd_stage.recompute_one_chunk(bwd_mi)
         overlap.run(fwd_fn=fwd_fn, bwd_fn=bwd_fn)
 

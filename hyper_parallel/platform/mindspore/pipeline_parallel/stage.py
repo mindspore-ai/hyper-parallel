@@ -170,9 +170,9 @@ class PipelineStageBase:
 
         Must be invoked on a thread with no concurrent forward: for
         ``overlap_b_f`` the caller runs this on the main thread *before*
-        ``overlap.run`` spawns the backward thread, so the forward re-run
-        never races the paired chunk's forward.  A no-op when the chunk has
-        no checkpointed blocks.
+        ``overlap.run`` submits work to the backward worker, so the forward
+        re-run never races the paired chunk's forward.  A no-op when the
+        chunk has no checkpointed blocks.
 
         Args:
             micro_index: Micro-batch index whose checkpointed blocks are
@@ -216,13 +216,13 @@ class PipelineStageBase:
         with session_ctx:
             if self.is_first_stage:
                 sens = self._build_padded_sens(micro_index)
-                _ = grad_fn(sens=sens)
+                grad_fn.accumulate_grad(sens=sens)
             else:
                 if self.is_last_stage:
                     sens = self.get_last_stage_sens(self.last_stage_outputs)
                 else:
                     sens = self._build_padded_sens(micro_index)
-                _ = grad_fn(sens=sens)
+                grad_fn.accumulate_grad(sens=sens)
         if handles:
             platform.clear_recompute_session(session_id)
         if not self.is_first_stage:
@@ -312,7 +312,7 @@ class PipelineStageBase:
             with session_ctx:
                 if self.is_first_stage:
                     sens = self._build_padded_sens(micro_index)
-                    _ = grad_fn(sens=sens)
+                    grad_fn.accumulate_grad(sens=sens)
                 else:
                     if not grad_fn._saved_intermediates:  # pylint: disable=protected-access
                         raise RuntimeError(
