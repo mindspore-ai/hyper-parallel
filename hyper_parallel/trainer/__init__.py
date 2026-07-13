@@ -14,11 +14,23 @@
 # ============================================================================
 """HyperParallel Trainer module."""
 
-__all__ = ["ParallelDims"]
-
 # Importing utils first installs ``info_rank0`` / ``warning_rank0`` /
 # ``info_once`` / ``warning_once`` on ``logging.Logger`` so every
 # downstream module that does ``logger = logging.getLogger(__name__)``
 # can use them without explicit setup.
 from hyper_parallel.trainer import utils  # noqa: F401
+from hyper_parallel.trainer.callbacks import (
+    BaseCallback,
+    CallbackHookNames,
+    TrainerCallbackContext,
+    TrainerControl,
+)
 from hyper_parallel.trainer.parallel_dims import ParallelDims
+
+__all__ = [
+    "BaseCallback",
+    "CallbackHookNames",
+    "ParallelDims",
+    "TrainerCallbackContext",
+    "TrainerControl",
+]

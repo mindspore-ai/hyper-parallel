@@ -15,11 +15,7 @@
 """Logging callback configuration tests."""
 from types import SimpleNamespace
 
-from hyper_parallel.trainer.callbacks.base import LoggingCallback
-
-
-def _trainer(args):
-    return SimpleNamespace(args=args, lr_scheduler=None)
+from hyper_parallel.trainer.callbacks.base import LoggingCallback, build_default_callbacks
 
 
 def _args_with_train_logging(logging_cfg):
@@ -45,7 +41,7 @@ def test_logging_callback_reads_nested_train_logging():
         peak_tflops=None,
     )
 
-    callback = LoggingCallback(_trainer(_args_with_train_logging(logging_cfg)))
+    callback = build_default_callbacks(_args_with_train_logging(logging_cfg))[0]
 
     assert callback.log_steps == 1
     assert callback.report_global_loss is True
@@ -69,8 +65,29 @@ def test_logging_callback_keeps_top_level_fallback():
     data = SimpleNamespace(max_seq_len=128)
     args = SimpleNamespace(train=train, data=data, logging=logging_cfg)
 
-    callback = LoggingCallback(_trainer(args))
+    callback = build_default_callbacks(args)[0]
 
     assert callback.log_steps == 5
     assert callback.report_global_loss is False
     assert callback.report_throughput is True
+
+
+def test_logging_callback_direct_constructor_keeps_values():
+    """
+    Feature: direct logging callback construction
+    Description: Users can instantiate LoggingCallback with explicit values.
+    Expectation: provided values are stored without trainer coupling.
+    """
+    callback = LoggingCallback(
+        log_steps=9,
+        report_global_loss=True,
+        report_throughput=False,
+        model_flops_per_token=123,
+        peak_tflops=456.0,
+    )
+
+    assert callback.log_steps == 9
+    assert callback.report_global_loss is True
+    assert callback.report_throughput is False
+    assert callback.model_flops_per_token == 123
+    assert callback.peak_tflops == 456.0

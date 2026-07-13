@@ -40,11 +40,11 @@ from unittest.mock import patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-import torch
-from torch import nn
+import torch  # pylint: disable=wrong-import-position
+from torch import nn  # pylint: disable=wrong-import-position
 
-from hyper_parallel.trainer import base as trainer_base
-from hyper_parallel.trainer.base import BaseTrainer, TrainerState
+from hyper_parallel.trainer import base as trainer_base  # pylint: disable=wrong-import-position
+from hyper_parallel.trainer.base import BaseTrainer, TrainerState  # pylint: disable=wrong-import-position
 
 
 def _make_args(*, max_steps=10, lr=1.0, lr_min=0.1,
@@ -69,7 +69,7 @@ def _make_args(*, max_steps=10, lr=1.0, lr_min=0.1,
 
 def _build_trainer(args):
     with patch.object(trainer_base, "get_spec", return_value=object()):
-        trainer = BaseTrainer(args)
+        trainer = BaseTrainer(args, setup=False)
     trainer.state = TrainerState(max_steps=args.train.max_steps)
     # Need a real optimizer for LambdaLR — single trivial parameter.
     p = nn.Parameter(torch.zeros(1))

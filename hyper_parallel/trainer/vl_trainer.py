@@ -14,11 +14,12 @@
 # ============================================================================
 """VLTrainer for native Qwen3-VL multimodal training."""
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional
 
-import torch
+import torch  # pylint: disable=C9002
 
 from hyper_parallel.trainer.base import BaseTrainer
+from hyper_parallel.trainer.callbacks import BaseCallback, build_default_callbacks
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +33,15 @@ class VLTrainer:
     ``pixel_values`` and ``image_grid_thw``).
     """
 
-    def __init__(self, args):
-        self.base = BaseTrainer(args)
-        self.base._setup()
+    def __init__(
+            self,
+            args: Any,
+            callbacks: Optional[Iterable[BaseCallback]] = None,
+    ) -> None:
+        """Initialize VLTrainer, build all sub-components, and fire on_init_end."""
+        registered_callbacks = list(build_default_callbacks(args))
+        registered_callbacks.extend(callbacks or ())
+        self.base = BaseTrainer(args, callbacks=registered_callbacks)
         self.base._build_model()
         self.base._freeze_model()
         self._build_model_assets()
@@ -120,6 +127,6 @@ class VLTrainer:
         """Build collate fn (internal)."""
         self.base.collate_fn = self._vl_collate
 
-    def train(self):
+    def train(self) -> None:
         """Run the full training loop by delegating to the underlying BaseTrainer."""
         return self.base.train()

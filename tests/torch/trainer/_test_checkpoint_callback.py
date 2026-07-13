@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Distributed driver for ``CheckpointCallback`` real-DCP round trip."""
+"""Distributed driver for BaseTrainer checkpoint round trip."""
 import os
 import shutil
 import types
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -25,8 +26,8 @@ from hyper_parallel import (
     get_platform,
     init_process_group,
 )
-from hyper_parallel.trainer.base import TrainerState
-from hyper_parallel.trainer.callbacks.base import CheckpointCallback
+from hyper_parallel.trainer import base as trainer_base
+from hyper_parallel.trainer.base import BaseTrainer, TrainerState
 
 platform = get_platform()
 
@@ -62,7 +63,7 @@ class _RecordingDataloader:
 
 
 def _build_trainer(save_dir: str, *, load_path=None):
-    """Wire the minimal trainer-shaped namespace the callback reads from."""
+    """Wire the BaseTrainer fields the checkpoint lifecycle reads."""
     ckpt_cfg = types.SimpleNamespace(
         output_dir=save_dir,
         save_steps=1,
@@ -76,16 +77,26 @@ def _build_trainer(save_dir: str, *, load_path=None):
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     dataloader = _RecordingDataloader(position=42)
-    trainer = types.SimpleNamespace(
-        args=types.SimpleNamespace(checkpoint=ckpt_cfg),
-        model=model,
-        optimizer=optimizer,
-        lr_scheduler=lr_scheduler,
-        train_dataloader=dataloader,
-        dispatch_save_event=lambda *_a, **_kw: None,
-        dispatch_load_event=lambda *_a, **_kw: None,
-        spec=None,
+    args = types.SimpleNamespace(
+        model=types.SimpleNamespace(name="toy"),
+        checkpoint=ckpt_cfg,
+        train=types.SimpleNamespace(
+            max_steps=20,
+            num_train_epochs=1,
+            checkpoint=ckpt_cfg,
+        ),
     )
+    with patch.object(trainer_base, "get_spec", return_value=types.SimpleNamespace(state_dict_adapter=None)):
+        trainer = BaseTrainer(args, setup=False)
+    trainer.global_rank = int(platform.get_rank())
+    trainer.local_rank = int(_local_rank())
+    trainer.world_size = int(platform.get_world_size())
+    trainer.model = model
+    trainer.optimizer = optimizer
+    trainer.lr_scheduler = lr_scheduler
+    trainer.train_dataloader = dataloader
+    trainer.on_save = lambda *_a, **_kw: None
+    trainer.on_resume = lambda *_a, **_kw: None
     return trainer, model, dataloader
 
 
@@ -97,14 +108,14 @@ def _prepare_root():
     platform.barrier()
 
 
-def test_checkpoint_callback_round_trip_4card():
+def test_checkpoint_lifecycle_round_trip_4card():
     """
-    Feature: ``CheckpointCallback`` save → load round-trip on real DCP + torch.save.
+    Feature: BaseTrainer checkpoint save → load round-trip on real DCP + torch.save.
     Description: Build a plain ``nn.Linear`` on every rank, mutate the
-        weight to a distinctive value, invoke ``CheckpointCallback._save``
+        weight to a distinctive value, invoke ``BaseTrainer._save_checkpoint``
         at ``global_step=5 / epoch=1``. Then mutate the weight to zero, build
-        a fresh callback against the same checkpoint dir as ``load_path``,
-        and let ``on_train_begin`` restore. Exercises ``dcp_save`` /
+        a fresh checkpoint load path and call ``_resume_from_checkpoint``.
+        Exercises ``dcp_save`` /
         ``dcp_load`` for the model state-dict plus the five other artifact
         buckets via real ``torch.save`` / ``torch.load`` on a 4-card PG.
     Expectation: After load, every rank sees ``model.weight ≈ 0.42``,
@@ -117,7 +128,6 @@ def test_checkpoint_callback_round_trip_4card():
         _prepare_root()
         rank = platform.get_rank()
         trainer, model, dataloader = _build_trainer(_SAVE_ROOT)
-        cb = CheckpointCallback(trainer)
 
         with torch.no_grad():
             model.weight.fill_(0.42)
@@ -127,7 +137,7 @@ def test_checkpoint_callback_round_trip_4card():
         state = TrainerState(max_steps=20)
         state.global_step = 5
         state.epoch = 1
-        cb._save(state)  # pylint: disable=protected-access
+        trainer._save_checkpoint(state)  # pylint: disable=protected-access
 
         # Cross-rank barrier so every rank finishes its write before any
         # rank tries to read (otherwise rank N can race ahead and find an
@@ -141,15 +151,14 @@ def test_checkpoint_callback_round_trip_4card():
         save_dir = os.path.join(_SAVE_ROOT, "step_5")
         assert os.path.isdir(save_dir), f"save_dir missing: {save_dir}"
         trainer.args.checkpoint.load_path = save_dir
-        cb2 = CheckpointCallback(trainer)
-        restart_state = TrainerState(max_steps=20)
-        cb2.on_train_begin(restart_state)
+        trainer.state = TrainerState(max_steps=20)
+        trainer._resume_from_checkpoint(save_dir)  # pylint: disable=protected-access
 
-        assert restart_state.global_step == 5, (
-            f"global_step not restored: expected 5, got {restart_state.global_step}"
+        assert trainer.state.global_step == 5, (
+            f"global_step not restored: expected 5, got {trainer.state.global_step}"
         )
-        assert restart_state.epoch == 1, (
-            f"epoch not restored: expected 1, got {restart_state.epoch}"
+        assert trainer.state.epoch == 1, (
+            f"epoch not restored: expected 1, got {trainer.state.epoch}"
         )
         assert torch.allclose(model.weight.cpu(), saved_weight.cpu(), atol=1e-6), (
             f"rank={rank}: model weight not restored, "

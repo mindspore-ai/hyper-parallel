@@ -91,7 +91,10 @@ def _wire_trainer(args, mesh, world):
     with patch.object(trainer_base, "get_spec", return_value=types.SimpleNamespace(
             clip_grad_fn=None,
     )):
-        trainer = BaseTrainer(args)
+        trainer = BaseTrainer(args, setup=False)
+    trainer.global_rank = int(platform.get_rank())
+    trainer.local_rank = local_rank
+    trainer.world_size = world
     model = _ToyModel().to(device)
     trainer.model = model
     trainer.device = device
@@ -106,11 +109,6 @@ def _wire_trainer(args, mesh, world):
         group=mesh.get_group("loss"),
         rank_size=world,
     )
-    # No callback wiring — train_step calls these via the trainer's bound
-    # methods, replace with no-op lambdas so we don't drag a full callback
-    # stack into the ST.
-    trainer.on_substep_end = lambda: None
-    trainer.on_pre_optimizer_step = lambda **_: None
     return trainer, device
 
 

@@ -17,6 +17,7 @@ import math
 import os
 import types
 from contextlib import nullcontext
+from typing import Any, Optional
 from unittest.mock import patch
 
 import torch
@@ -31,7 +32,7 @@ from hyper_parallel import (
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
 from hyper_parallel.trainer import base as trainer_base
 from hyper_parallel.trainer.base import BaseTrainer
-from hyper_parallel.trainer.callbacks.base import Callback
+from hyper_parallel.trainer.callbacks.base import BaseCallback, TrainerCallbackContext, TrainerControl
 from hyper_parallel.trainer.parallel_dims import ParallelDims
 
 platform = get_platform()
@@ -87,7 +88,7 @@ class _RepeatingDataset(Dataset):
         return {"input_ids": self.input_ids.clone(), "labels": self.input_ids.clone()}
 
 
-class _ProbeCallback(Callback):
+class _ProbeCallback(BaseCallback):
     """User callback that records lifecycle dispatch order.
 
     Used to assert that ``train()`` fires hooks in the contract order
@@ -95,43 +96,50 @@ class _ProbeCallback(Callback):
     LoggingCallback's tqdm output.
     """
 
-    def __init__(self, trainer: "BaseTrainer") -> None:
+    def __init__(self) -> None:
         """Initialise the probe with an empty ``events`` log."""
-        super().__init__(trainer)
         self.events: list = []
 
-    def on_train_begin(self, state: "TrainerState", **kwargs: object) -> None:  # pylint: disable=unused-argument
+    def on_train_begin(self, context: TrainerCallbackContext, **payload: Any) -> Optional[TrainerControl]:  # pylint: disable=unused-argument
         """Record the train_begin hook fire and the live global_step."""
+        state = context.state
         self.events.append(("train_begin", state.global_step))
 
-    def on_epoch_begin(self, state: "TrainerState", **kwargs: object) -> None:  # pylint: disable=unused-argument
+    def on_epoch_begin(self, context: TrainerCallbackContext, **payload: Any) -> Optional[TrainerControl]:  # pylint: disable=unused-argument
         """Record the epoch_begin hook fire."""
+        state = context.state
         self.events.append(("epoch_begin", state.global_step))
 
-    def on_step_begin(self, state: "TrainerState", **kwargs: object) -> None:  # pylint: disable=unused-argument
+    def on_step_begin(self, context: TrainerCallbackContext, **payload: Any) -> Optional[TrainerControl]:  # pylint: disable=unused-argument
         """Record the step_begin hook fire — paired with on_step_end."""
+        state = context.state
         self.events.append(("step_begin", state.global_step))
 
-    def on_step_end(self, state: "TrainerState", *, loss: float = None,
-                    grad_norm: float = None, **kwargs: object) -> None:  # pylint: disable=unused-argument
+    def on_step_end(self, context: TrainerCallbackContext, **payload: Any) -> Optional[TrainerControl]:
         """Record the step_end hook fire and the reported loss value."""
+        state = context.state
+        loss = payload.get("loss")
         self.events.append(("step_end", state.global_step, float(loss)))
 
-    def on_substep_end(self, state: "TrainerState", **kwargs: object) -> None:  # pylint: disable=unused-argument
+    def on_micro_batch_end(self, context: TrainerCallbackContext, **payload: Any) -> Optional[TrainerControl]:  # pylint: disable=unused-argument
         """Record the substep_end hook fire — should match grad_accum count per step."""
+        state = context.state
         self.events.append(("substep_end", state.global_step))
 
-    def on_pre_optimizer_step(self, state: "TrainerState", *,
-                              grad_norm: float = None, **kwargs: object) -> None:  # pylint: disable=unused-argument
+    def on_before_optimizer_step(self, context: TrainerCallbackContext, **payload: Any) -> Optional[TrainerControl]:
         """Record the pre_optimizer_step hook fire and the grad_norm value."""
+        state = context.state
+        grad_norm = payload.get("grad_norm")
         self.events.append(("pre_optimizer_step", state.global_step, float(grad_norm)))
 
-    def on_epoch_end(self, state: "TrainerState", **kwargs: object) -> None:  # pylint: disable=unused-argument
+    def on_epoch_end(self, context: TrainerCallbackContext, **payload: Any) -> Optional[TrainerControl]:  # pylint: disable=unused-argument
         """Record the epoch_end hook fire."""
+        state = context.state
         self.events.append(("epoch_end", state.global_step))
 
-    def on_train_end(self, state: "TrainerState", **kwargs: object) -> None:  # pylint: disable=unused-argument
+    def on_train_end(self, context: TrainerCallbackContext, **payload: Any) -> Optional[TrainerControl]:  # pylint: disable=unused-argument
         """Record the train_end hook fire — must be the last event."""
+        state = context.state
         self.events.append(("train_end", state.global_step))
 
 
@@ -183,7 +191,10 @@ def _wire_trainer(args, mesh, world: int, model=None, grad_accum: int = 1):
     with patch.object(trainer_base, "get_spec", return_value=types.SimpleNamespace(
             clip_grad_fn=None,
     )):
-        trainer = BaseTrainer(args)
+        trainer = BaseTrainer(args, setup=False)
+    trainer.global_rank = int(platform.get_rank())
+    trainer.local_rank = local_rank
+    trainer.world_size = world
     if model is None:
         model = _ToyCEModel().to(device)
     trainer.model = model
@@ -212,7 +223,7 @@ def _wire_trainer(args, mesh, world: int, model=None, grad_accum: int = 1):
 
     trainer._init_callbacks()  # pylint: disable=protected-access
 
-    probe = _ProbeCallback(trainer)
+    probe = _ProbeCallback()
     trainer.add_callback(probe)
 
     return trainer, device, probe
@@ -296,10 +307,10 @@ def test_trainer_train_grad_accum_4card():
         - ``_make_micro_batch_iterator`` groups 2 batches per yield.
         - ``forward_backward_step`` runs twice per step; gradient sync
           (``set_requires_gradient_sync``) only fires on the last
-          micro-batch — verified via ``on_substep_end`` count = 2 per
+          micro-batch — verified via ``on_micro_batch_end`` count = 2 per
           step.
     Expectation: grad_accum=2 still drops loss by ≥30 % across 10
-        steps (=20 forwards), and ``on_substep_end`` fires exactly
+        steps (=20 forwards), and ``on_micro_batch_end`` fires exactly
         ``max_steps * grad_accum`` times.
     """
     init_process_group()
@@ -317,7 +328,7 @@ def test_trainer_train_grad_accum_4card():
     events = probe.events
     substeps = [e for e in events if e[0] == "substep_end"]
     assert len(substeps) == max_steps * grad_accum, (
-        f"on_substep_end must fire exactly max_steps*grad_accum="
+        f"on_micro_batch_end must fire exactly max_steps*grad_accum="
         f"{max_steps * grad_accum} times under grad_accum={grad_accum}, "
         f"got {len(substeps)}"
     )

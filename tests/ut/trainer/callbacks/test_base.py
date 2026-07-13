@@ -12,256 +12,250 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Unit tests for ``hyper_parallel.trainer.callbacks.base``.
-
-Most callbacks are I/O wrappers (TensorBoard, W&B, DCP save/load). The
-load-bearing logic worth UT here is what determines whether a callback
-**fires** or **stays silent** at all:
-
-1. ``Callback`` base class hooks are no-op (subclasses opt in).
-2. ``LoggingCallback`` only emits at multiples of ``log_steps`` and
-   computes ``tokens_per_sec`` / ``tflops`` / ``mfu`` correctly.
-3. ``GradientHealthCallback`` raises only when ``check_nan_inf`` is on
-   AND ``grad_norm`` is non-finite (silent otherwise).
-4. ``GCCallback`` fires ``gc.collect`` only at multiples of ``gc_steps``.
-5. ``ProgressCallback`` degrades gracefully when ``tqdm`` is missing.
-
-Everything else (DCP / safetensors / W&B / TB writers) needs real
-hardware or external deps and is exercised via integration tests.
-"""
-# pylint: disable=protected-access
+"""Unit tests for trainer callback base types and built-ins."""
+# pylint: disable=protected-access,wrong-import-position
 import os
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
 from hyper_parallel.trainer.base import TrainerState
 from hyper_parallel.trainer.callbacks import base as cb_mod
 from hyper_parallel.trainer.callbacks.base import (
-    Callback,
+    BaseCallback,
     GCCallback,
     GradientHealthCallback,
     LoggingCallback,
     ProgressCallback,
+    TrainerCallbackContext,
+    TrainerControl,
 )
 
 
-def _make_trainer(*, log_cfg=None, train_cfg=None, data_cfg=None, debug_cfg=None,
-                  lr_scheduler=None):
-    """Build a SimpleNamespace ``trainer`` shaped like ``BaseTrainer`` from the callbacks' POV."""
-    args = types.SimpleNamespace(
-        logging=log_cfg,
-        train=train_cfg or types.SimpleNamespace(global_batch_size=4),
-        data=data_cfg or types.SimpleNamespace(max_seq_len=8),
-        debug=debug_cfg,
-    )
-    return types.SimpleNamespace(
-        args=args,
-        lr_scheduler=lr_scheduler,
-        _last_global_tokens=None,
-        dispatch_log_event=None,
+def _context(state=None, *, rank=0, local_rank=None, world_size=1, logs=None):
+    """Build a callback context for unit tests."""
+    local_rank = rank if local_rank is None else local_rank
+    return TrainerCallbackContext(
+        state=state or TrainerState(),
+        control=TrainerControl(),
+        global_rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        is_world_rank0=rank == 0,
+        is_local_rank0=local_rank == 0,
+        logs=dict(logs or {}),
     )
 
 
-class TestCallbackBase(unittest.TestCase):
-    """The ``Callback`` base class must be a no-op for every hook."""
+class TestBaseCallback(unittest.TestCase):
+    """The BaseCallback class is a no-op for every hook."""
 
     def test_all_hooks_are_no_op(self):
-        """Each lifecycle hook can be called with a state object and returns ``None``."""
-        cb = Callback(trainer=MagicMock())
-        state = TrainerState()
-        # Every hook returns None and never raises.
-        self.assertIsNone(cb.on_init_end(state))
-        self.assertIsNone(cb.on_train_begin(state))
-        self.assertIsNone(cb.on_train_end(state))
-        self.assertIsNone(cb.on_epoch_begin(state))
-        self.assertIsNone(cb.on_epoch_end(state))
-        self.assertIsNone(cb.on_step_begin(state))
-        self.assertIsNone(cb.on_step_end(state, loss=1.0, grad_norm=0.5))
-        self.assertIsNone(cb.on_substep_end(state))
-        self.assertIsNone(cb.on_pre_optimizer_step(state, grad_norm=0.5))
-        self.assertIsNone(cb.on_log(state, metrics={}))
-        self.assertIsNone(cb.on_save(state, checkpoint_dir="/tmp/x"))
-        self.assertIsNone(cb.on_load(state, checkpoint_dir="/tmp/x"))
-        self.assertIsNone(cb.on_evaluate(state, metrics={}))
+        """Every public hook accepts context plus payload and returns None."""
+        callback = BaseCallback()
+        context = _context()
+        hook_names = [
+            name
+            for name in dir(BaseCallback)
+            if name.startswith("on_") and callable(getattr(BaseCallback, name))
+        ]
+        for hook_name in hook_names:
+            with self.subTest(hook_name=hook_name):
+                self.assertIsNone(getattr(callback, hook_name)(context, payload=1))
+
+
+class TestTrainerControl(unittest.TestCase):
+    """TrainerControl merge and reset semantics."""
+
+    def test_merge_uses_or_and_metadata_update(self):
+        """Boolean signals use OR; later metadata overwrites same keys."""
+        control = TrainerControl(should_log=True, metadata={"source": "a", "x": 1})
+        control.merge(
+            TrainerControl(
+                should_save=True,
+                should_log=False,
+                metadata={"source": "b", "y": 2},
+            )
+        )
+        self.assertTrue(control.should_log)
+        self.assertTrue(control.should_save)
+        self.assertEqual(control.metadata, {"source": "b", "x": 1, "y": 2})
+
+    def test_step_reset_keeps_training_stop(self):
+        """Step reset clears step flags but preserves training stop."""
+        control = TrainerControl(
+            should_training_stop=True,
+            should_skip_step=True,
+            should_log=True,
+            metadata={"record": 1},
+        )
+        control.reset_step_flags()
+        self.assertTrue(control.should_training_stop)
+        self.assertFalse(control.should_skip_step)
+        self.assertFalse(control.should_log)
+        self.assertEqual(control.metadata, {})
+
+
+class TestTrainerCallbackContext(unittest.TestCase):
+    """TrainerCallbackContext construction semantics."""
+
+    def test_from_trainer_reads_rank_fields_without_platform_lookup(self):
+        """Rank metadata comes from BaseTrainer attributes, not platform fallback."""
+        trainer = types.SimpleNamespace(
+            state=TrainerState(),
+            global_rank=3,
+            local_rank=1,
+            world_size=8,
+            is_world_rank0=False,
+            is_local_rank0=False,
+            _callback_logs={"loss": 1.0},
+        )
+        with (
+            patch.object(cb_mod.platform, "get_rank", side_effect=AssertionError("platform.get_rank called")),
+            patch.object(
+                cb_mod.platform,
+                "get_world_size",
+                side_effect=AssertionError("platform.get_world_size called"),
+            ),
+        ):
+            context = TrainerCallbackContext.from_trainer(trainer, TrainerControl())
+
+        self.assertEqual(context.rank, 3)
+        self.assertEqual(context.global_rank, 3)
+        self.assertEqual(context.local_rank, 1)
+        self.assertEqual(context.world_size, 8)
+        self.assertFalse(context.is_world_rank0)
+        self.assertFalse(context.is_local_rank0)
+        self.assertFalse(hasattr(context, "is_rank0"))
+        self.assertEqual(context.logs, {"loss": 1.0})
 
 
 class TestLoggingCallback(unittest.TestCase):
-    """``LoggingCallback`` gates emission on ``log_steps`` and computes throughput."""
-
-    def _build(self, *, log_steps=2, report_throughput=False,
-               model_flops_per_token=None, peak_tflops=None,
-               global_batch_size=4, max_seq_len=8, lr=1e-4):
-        """Build a ``LoggingCallback`` against a synthetic trainer with the given config."""
-        log_cfg = types.SimpleNamespace(
-            log_steps=log_steps,
-            report_global_loss=False,
-            report_throughput=report_throughput,
-            model_flops_per_token=model_flops_per_token,
-            peak_tflops=peak_tflops,
-        )
-        scheduler = MagicMock()
-        scheduler.get_last_lr.return_value = [lr]
-        trainer = _make_trainer(
-            log_cfg=log_cfg,
-            train_cfg=types.SimpleNamespace(global_batch_size=global_batch_size),
-            data_cfg=types.SimpleNamespace(max_seq_len=max_seq_len),
-            lr_scheduler=scheduler,
-        )
-        return LoggingCallback(trainer), trainer
+    """LoggingCallback emits records only on configured log steps."""
 
     def test_emits_only_on_log_steps_multiples(self):
-        """``on_step_end`` produces a metric record only when ``global_step % log_steps == 0``."""
-        cb, _ = self._build(log_steps=3)
+        """on_step_end returns should_log only on multiples of log_steps."""
+        callback = LoggingCallback(log_steps=3, report_throughput=False)
         state = TrainerState()
-        cb.on_step_begin(state)
-        for step in (1, 2, 4, 5):  # not multiples of 3
+        callback.on_step_begin(_context(state))
+        for step in (1, 2, 4, 5):
             state.global_step = step
-            cb.on_step_end(state, loss=1.0, grad_norm=0.5)
-        self.assertEqual(state.log_history, [], (
-            f"No metrics record should be emitted on non-multiples, got {state.log_history}"
-        ))
+            result = callback.on_step_end(_context(state), loss=1.0, grad_norm=0.5)
+            self.assertIsNone(result)
+        self.assertEqual(state.log_history, [])
 
         state.global_step = 3
-        cb.on_step_end(state, loss=1.0, grad_norm=0.5)
-        self.assertEqual(len(state.log_history), 1, (
-            f"Expected exactly one record at step=3, got {len(state.log_history)}"
-        ))
+        result = callback.on_step_end(_context(state), loss=1.0, grad_norm=0.5, lr=1e-4)
+        self.assertIsNotNone(result)
+        self.assertTrue(result.should_log)
+        self.assertEqual(len(state.log_history), 1)
         record = state.log_history[0]
         self.assertEqual(record["step"], 3)
         self.assertEqual(record["loss"], 1.0)
         self.assertEqual(record["grad_norm"], 0.5)
         self.assertEqual(record["lr"], 1e-4)
 
-    def test_throughput_off_omits_optional_metrics(self):
-        """``report_throughput=False`` → ``tokens_per_sec`` stays ``None`` in the record."""
-        cb, _ = self._build(log_steps=1, report_throughput=False)
-        state = TrainerState()
-        cb.on_step_begin(state)
-        state.global_step = 1
-        cb.on_step_end(state, loss=2.0, grad_norm=0.1)
-        self.assertEqual(len(state.log_history), 1)
-        self.assertIsNone(state.log_history[0]["tokens_per_sec"], (
-            f"Throughput off should leave tokens_per_sec=None, got {state.log_history[0]}"
-        ))
-
-    def test_throughput_uses_last_global_tokens_when_available(self):
-        """``tokens_per_sec`` is computed from ``trainer._last_global_tokens`` / elapsed."""
-        cb, trainer = self._build(
-            log_steps=1, report_throughput=True,
-            global_batch_size=2, max_seq_len=4,
-        )
-        trainer._last_global_tokens = 1000
+    def test_throughput_uses_payload_tokens(self):
+        """tokens_per_sec is computed from payload tokens and elapsed time."""
+        callback = LoggingCallback(log_steps=1, report_throughput=True)
         state = TrainerState()
         state.global_step = 1
-
-        # Pin elapsed = 2.0s so the expected tokens_per_sec = 500.
         with patch.object(cb_mod, "time") as mock_time:
-            cb._step_start_time = 100.0
+            callback._step_start_time = 100.0
             mock_time.time.return_value = 102.0
-            cb.on_step_end(state, loss=1.0, grad_norm=0.5)
-
-        tps = state.log_history[-1]["tokens_per_sec"]
-        self.assertAlmostEqual(tps, 1000 / 2.0, places=3, msg=(
-            f"tokens_per_sec must use _last_global_tokens / elapsed, got {tps}"
-        ))
+            callback.on_step_end(_context(state), loss=1.0, grad_norm=0.5, tokens=1000)
+        self.assertAlmostEqual(state.log_history[-1]["tokens_per_sec"], 500.0)
 
 
 class TestGradientHealthCallback(unittest.TestCase):
-    """Only fire when explicitly enabled AND grad_norm is non-finite."""
+    """GradientHealthCallback raises only when enabled and non-finite."""
 
-    def _build(self, *, check_nan_inf=True):
-        debug_cfg = types.SimpleNamespace(check_nan_inf=check_nan_inf)
-        return GradientHealthCallback(_make_trainer(debug_cfg=debug_cfg))
-
-    def test_disabled_by_default_does_not_raise(self):
-        """``check_nan_inf=False`` → guard is silent even on NaN."""
-        cb = self._build(check_nan_inf=False)
-        cb.on_pre_optimizer_step(TrainerState(), grad_norm=float("nan"))  # no raise
-
-    def test_finite_grad_norm_is_silent(self):
-        """Enabled + finite grad_norm → no error."""
-        cb = self._build()
-        cb.on_pre_optimizer_step(TrainerState(), grad_norm=1.5)  # no raise
+    def test_disabled_does_not_raise(self):
+        """Disabled callback is silent even for NaN."""
+        callback = GradientHealthCallback(enabled=False)
+        callback.on_before_optimizer_step(_context(), grad_norm=float("nan"))
 
     def test_nan_grad_raises_on_rank_zero(self):
-        """Enabled + NaN grad_norm → rank-0 raises ``RuntimeError`` with diagnostic."""
-        cb = self._build()
-        with patch.object(cb_mod, "platform") as mock_platform:
-            mock_platform.get_rank.return_value = 0
-            with self.assertRaises(RuntimeError) as ctx:
-                cb.on_pre_optimizer_step(TrainerState(), grad_norm=float("nan"))
+        """Enabled NaN grad_norm raises on rank 0."""
+        callback = GradientHealthCallback(enabled=True)
+        with self.assertRaises(RuntimeError) as ctx:
+            callback.on_before_optimizer_step(_context(rank=0), grad_norm=float("nan"))
         self.assertIn("Non-finite grad_norm", str(ctx.exception))
 
     def test_inf_grad_does_not_raise_on_non_rank_zero(self):
-        """Non-rank-0 must NOT raise on non-finite grad — only rank-0 raises; NCCL tears down the rest."""
-        cb = self._build()
-        with patch.object(cb_mod, "platform") as mock_platform:
-            mock_platform.get_rank.return_value = 3
-            cb.on_pre_optimizer_step(TrainerState(), grad_norm=float("inf"))  # no raise
+        """Non-rank-zero logs but does not raise."""
+        callback = GradientHealthCallback(enabled=True)
+        callback.on_before_optimizer_step(_context(rank=3), grad_norm=float("inf"))
 
 
 class TestGCCallback(unittest.TestCase):
-    """``GCCallback`` only fires at multiples of ``gc_steps``."""
+    """GCCallback fires at multiples of gc_steps."""
 
     def test_disabled_when_gc_steps_zero(self):
-        """``gc_steps=0`` → never invokes ``gc.collect``."""
+        """gc_steps=0 never invokes gc.collect."""
         with patch.object(cb_mod, "gc") as mock_gc:
-            cb = GCCallback(_make_trainer(debug_cfg=types.SimpleNamespace(gc_steps=0)))
+            callback = GCCallback(gc_steps=0)
             for step in range(1, 10):
                 state = TrainerState()
                 state.global_step = step
-                cb.on_step_end(state)
+                callback.on_step_end(_context(state))
             mock_gc.collect.assert_not_called()
             mock_gc.disable.assert_not_called()
 
     def test_enabled_collects_at_multiples_only(self):
-        """``gc_steps=4`` → invokes ``gc.collect`` only at step % 4 == 0."""
+        """gc_steps=4 invokes gc.collect only on multiples."""
         with patch.object(cb_mod, "gc") as mock_gc:
-            cb = GCCallback(_make_trainer(debug_cfg=types.SimpleNamespace(gc_steps=4)))
-            # Construction disables the auto generational collector once.
+            callback = GCCallback(gc_steps=4)
             mock_gc.disable.assert_called_once()
-
             collect_at = []
             for step in range(1, 13):
                 state = TrainerState()
                 state.global_step = step
-                cb.on_step_end(state)
+                callback.on_step_end(_context(state))
                 if mock_gc.collect.call_count > len(collect_at):
                     collect_at.append(step)
-        self.assertEqual(collect_at, [4, 8, 12], (
-            f"gc.collect must fire at step %4==0 only, got {collect_at}"
-        ))
+        self.assertEqual(collect_at, [4, 8, 12])
 
 
 class TestProgressCallback(unittest.TestCase):
-    """``ProgressCallback`` degrades gracefully when ``tqdm`` is unavailable."""
+    """ProgressCallback degrades gracefully when tqdm is unavailable."""
 
     def test_missing_tqdm_keeps_pbar_none(self):
-        """``ImportError`` from tqdm → ``_pbar`` stays ``None`` and updates are no-ops."""
-        cb = ProgressCallback(_make_trainer())
-        with patch.object(cb_mod, "platform") as mock_platform, \
-             patch.dict("sys.modules", {"tqdm": None}):
-            mock_platform.get_rank.return_value = 0
-            cb.on_train_begin(TrainerState())
-        self.assertIsNone(cb._pbar, (
-            f"pbar must stay None when tqdm is missing, got {cb._pbar!r}"
-        ))
-        # Subsequent on_step_end / on_train_end must be silent no-ops.
-        cb.on_step_end(TrainerState(), loss=1.0, grad_norm=0.5)
-        cb.on_train_end(TrainerState())
+        """ImportError from tqdm leaves _pbar unset."""
+        callback = ProgressCallback()
+        with patch.dict("sys.modules", {"tqdm": None}):
+            callback.on_train_begin(_context())
+        self.assertIsNone(callback._pbar)
+        callback.on_step_end(_context(), loss=1.0, grad_norm=0.5)
+        callback.on_train_end(_context())
 
     def test_non_rank_zero_skips_pbar_creation(self):
-        """Non-rank-0 must not allocate a tqdm bar (avoids per-rank noise)."""
-        cb = ProgressCallback(_make_trainer())
-        with patch.object(cb_mod, "platform") as mock_platform:
-            mock_platform.get_rank.return_value = 5
-            cb.on_train_begin(TrainerState())
-        self.assertIsNone(cb._pbar, (
-            f"Non-rank-0 must skip tqdm allocation, got {cb._pbar!r}"
-        ))
+        """Non-rank-zero must not allocate tqdm."""
+        callback = ProgressCallback()
+        callback.on_train_begin(_context(rank=3))
+        self.assertIsNone(callback._pbar)
+
+
+class TestBuildDefaultCallbacks(unittest.TestCase):
+    """Default callback factory reads nested config."""
+
+    def test_logging_config_read_from_train_logging(self):
+        """Factory applies nested logging config values."""
+        logging_cfg = types.SimpleNamespace(
+            log_steps=7,
+            report_global_loss=True,
+            report_throughput=False,
+            model_flops_per_token=None,
+            peak_tflops=None,
+        )
+        args = types.SimpleNamespace(train=types.SimpleNamespace(logging=logging_cfg))
+        callbacks = cb_mod.build_default_callbacks(args)
+        logging_callback = callbacks[0]
+        self.assertEqual(logging_callback.log_steps, 7)
+        self.assertTrue(logging_callback.report_global_loss)
+        self.assertFalse(logging_callback.report_throughput)
 
 
 if __name__ == "__main__":

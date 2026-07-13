@@ -26,8 +26,6 @@ from hyper_parallel.models.glm5.parallelize import parallelize_glm5
 from hyper_parallel.models.spec import get_spec
 from hyper_parallel.trainer import base as trainer_base
 from hyper_parallel.trainer.base import BaseTrainer, TrainerState
-from hyper_parallel.trainer.callbacks import base as callback_base
-from hyper_parallel.trainer.callbacks.base import CheckpointCallback
 from hyper_parallel.trainer.utils.discovery import discover_model_spec
 
 
@@ -135,7 +133,7 @@ def test_glm5_trainer_step_applies_prepare_batch_fn(monkeypatch):
             ),
         ),
     )
-    trainer = BaseTrainer(args)
+    trainer = BaseTrainer(args, setup=False)
     model = _build_tiny_model()
     setattr(model, "_cp_size", 2)
     setattr(model, "_cp_rank", 0)
@@ -147,8 +145,6 @@ def test_glm5_trainer_step_applies_prepare_batch_fn(monkeypatch):
     trainer.lr_scheduler = None
     trainer.parallel_dims = SimpleNamespace(dp_size=1)
     setattr(trainer, "_dp_group_info", SimpleNamespace(rank_size=1))
-    trainer.on_substep_end = lambda: None
-    trainer.on_pre_optimizer_step = lambda grad_norm=None: None
     with torch.no_grad():
         first_weight = model.model.embed_tokens.weight.clone()
     input_ids = torch.tensor([[1, 2, 3, 4, 5]])
@@ -277,7 +273,7 @@ def test_glm5_parallelize_rejects_tp_until_supported():
         parallelize_glm5(model, mesh={}, cfg=cfg)
 
 
-def test_glm5_checkpoint_callback_round_trip(tmp_path, monkeypatch):
+def test_glm5_checkpoint_lifecycle_round_trip(tmp_path, monkeypatch):
     """
     Feature: GLM5 checkpoint save and resume
     Description: Save a tiny GLM5 training state and restore it.
@@ -305,15 +301,15 @@ def test_glm5_checkpoint_callback_round_trip(tmp_path, monkeypatch):
             value.copy_(payload[key])
 
     set_rng_calls = []
-    monkeypatch.setattr(callback_base, "dcp_save", _save_state_dict)
-    monkeypatch.setattr(callback_base, "dcp_load", _load_state_dict)
-    monkeypatch.setattr(callback_base.platform, "get_rank", lambda: 0)
+    monkeypatch.setattr(trainer_base, "dcp_save", _save_state_dict)
+    monkeypatch.setattr(trainer_base, "dcp_load", _load_state_dict)
+    monkeypatch.setattr(trainer_base.platform, "get_rank", lambda: 0)
     monkeypatch.setattr(
-        callback_base.platform,
+        trainer_base.platform,
         "get_rng_state",
         lambda: torch.tensor([1, 2, 3]),
     )
-    monkeypatch.setattr(callback_base.platform, "set_rng_state", set_rng_calls.append)
+    monkeypatch.setattr(trainer_base.platform, "set_rng_state", set_rng_calls.append)
 
     torch.manual_seed(1)
     model = _build_tiny_model()
@@ -327,16 +323,22 @@ def test_glm5_checkpoint_callback_round_trip(tmp_path, monkeypatch):
         load_path=None,
         save_hf_weights=False,
     )
-    trainer = SimpleNamespace(
-        args=SimpleNamespace(train=SimpleNamespace(checkpoint=checkpoint_cfg)),
-        model=model,
-        optimizer=optimizer,
-        lr_scheduler=scheduler,
-        train_dataloader=dataloader,
-        dispatch_save_event=lambda *_args, **_kwargs: None,
-        dispatch_load_event=lambda *_args, **_kwargs: None,
+    args = SimpleNamespace(
+        model=SimpleNamespace(name="glm5"),
+        train=SimpleNamespace(
+            max_steps=10,
+            num_train_epochs=1,
+            checkpoint=checkpoint_cfg,
+        ),
     )
-    callback = CheckpointCallback(trainer)
+    monkeypatch.setattr(trainer_base, "get_spec", lambda _name: SimpleNamespace(state_dict_adapter=None))
+    trainer = BaseTrainer(args, setup=False)
+    trainer.model = model
+    trainer.optimizer = optimizer
+    trainer.lr_scheduler = scheduler
+    trainer.train_dataloader = dataloader
+    trainer.on_save = lambda *_args, **_kwargs: None
+    trainer.on_resume = lambda *_args, **_kwargs: None
 
     input_ids = torch.randint(0, model.config.vocab_size, (2, 8))
     loss = model(input_ids=input_ids, labels=input_ids)["loss"]
@@ -351,7 +353,8 @@ def test_glm5_checkpoint_callback_round_trip(tmp_path, monkeypatch):
     state = TrainerState(max_steps=10)
     state.global_step = 3
     state.epoch = 1
-    callback.on_step_end(state, loss=0.0, grad_norm=0.0)
+    trainer.state = state
+    trainer._maybe_save_checkpoint()
     save_dir = tmp_path / "step_3"
 
     with torch.no_grad():
@@ -361,9 +364,8 @@ def test_glm5_checkpoint_callback_round_trip(tmp_path, monkeypatch):
     state.global_step = 0
     state.epoch = 0
     checkpoint_cfg.load_path = str(save_dir)
-    callback.load_path = str(save_dir)
 
-    callback.on_train_begin(state)
+    trainer._resume_from_checkpoint(str(save_dir))
 
     for key, value in model.state_dict().items():
         assert torch.allclose(value, expected_state[key])

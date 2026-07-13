@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Trainer callbacks — explicit dispatch mode."""
+"""Trainer callback extension points."""
 
 __all__ = [
-    "Callback",
+    "BaseCallback",
+    "CallbackHookNames",
+    "TrainerCallbackContext",
+    "TrainerControl",
     "LoggingCallback",
-    "CheckpointCallback",
-    "SafetensorsExportCallback",
     "EvalCallback",
     "ProfilerCallback",
     "WandbCallback",
@@ -28,13 +29,15 @@ __all__ = [
     "GradientHealthCallback",
     "MemoryMonitorCallback",
     "GCCallback",
+    "build_default_callbacks",
 ]
 
 from hyper_parallel.trainer.callbacks.base import (
-    Callback,
+    BaseCallback,
+    CallbackHookNames,
+    TrainerCallbackContext,
+    TrainerControl,
     LoggingCallback,
-    CheckpointCallback,
-    SafetensorsExportCallback,
     EvalCallback,
     ProfilerCallback,
     WandbCallback,
@@ -44,4 +47,5 @@ from hyper_parallel.trainer.callbacks.base import (
     GradientHealthCallback,
     MemoryMonitorCallback,
     GCCallback,
+    build_default_callbacks,
 )

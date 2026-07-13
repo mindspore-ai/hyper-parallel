@@ -20,10 +20,11 @@ and ``_build_collate_fn``; dataset construction is delegated to the
 shared :func:`hyper_parallel.data.build_dataset` registry.
 """
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional
 
-import torch
+import torch  # pylint: disable=C9002
 
+from hyper_parallel.trainer.callbacks import BaseCallback, build_default_callbacks
 from hyper_parallel.trainer.base import BaseTrainer
 
 logger = logging.getLogger(__name__)
@@ -45,11 +46,17 @@ class LLMTrainer:
         args: Training configuration parsed from YAML.
     """
 
-    def __init__(self, args):
-        self.base = BaseTrainer(args)
+    def __init__(
+            self,
+            args: Any,
+            callbacks: Optional[Iterable[BaseCallback]] = None,
+    ) -> None:
+        """Initialize LLMTrainer, build all sub-components, and fire on_init_end."""
+        registered_callbacks = list(build_default_callbacks(args))
+        registered_callbacks.extend(callbacks or ())
+        self.base = BaseTrainer(args, callbacks=registered_callbacks)
 
-        # 13 steps — call base's methods, override where needed
-        self.base._setup()
+        # Build steps after BaseTrainer has initialized the distributed runtime.
         self.base._build_model()
         self.base._freeze_model()
         self._build_model_assets()
@@ -272,10 +279,10 @@ class LLMTrainer:
     # Delegated methods
     # ------------------------------------------------------------------
 
-    def train(self):
+    def train(self) -> None:
         """Delegate to BaseTrainer.train()."""
         self.base.train()
 
-    def train_step(self, data_iterator):
+    def train_step(self, data_iterator: Iterable[Any]) -> Dict[str, Any]:
         """Delegate to BaseTrainer.train_step()."""
         return self.base.train_step(data_iterator)

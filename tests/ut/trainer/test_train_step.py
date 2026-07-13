@@ -44,15 +44,16 @@ import os
 import types
 import unittest
 from contextlib import nullcontext
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-import torch
-from torch import nn
+import torch  # pylint: disable=wrong-import-position
+from torch import nn  # pylint: disable=wrong-import-position
 
-from hyper_parallel.trainer import base as trainer_base
-from hyper_parallel.trainer.base import BaseTrainer, TrainerState
+from hyper_parallel.trainer import base as trainer_base  # pylint: disable=wrong-import-position
+from hyper_parallel.trainer.base import BaseTrainer  # pylint: disable=wrong-import-position
 
 
 # ----------------------------------------------------------------------------
@@ -67,12 +68,14 @@ class _ToyModel(nn.Module):
     branch in ``forward_backward_step``.
     """
 
-    def __init__(self, vocab: int = 8, hidden: int = 4):
+    def __init__(self, vocab: int = 8, hidden: int = 4) -> None:
+        """Initialize toy model with embedding and projection layers."""
         super().__init__()
         self.embed = nn.Embedding(vocab, hidden)
         self.proj = nn.Linear(hidden, vocab)
 
-    def forward(self, input_ids, labels=None, use_cache=False):  # pylint: disable=unused-argument
+    def forward(self, input_ids: Any, labels: Any = None, use_cache: bool = False) -> dict:  # pylint: disable=unused-argument
+        """Run forward pass and return loss dict."""
         x = self.embed(input_ids)
         logits = self.proj(x)
         if labels is None:
@@ -93,19 +96,23 @@ class _HSDPRecordingModel(_ToyModel):
     resolves to ``True`` so the recorded calls actually fire.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialize recording model with call-recording lists."""
         super().__init__(**kwargs)
         self.sync_calls = []
         self.last_bw_calls = []
         self.reshard_calls = []
 
-    def set_requires_gradient_sync(self, value):
+    def set_requires_gradient_sync(self, value: bool) -> None:
+        """Record the gradient sync toggle value."""
         self.sync_calls.append(bool(value))
 
-    def set_is_last_backward(self, value):
+    def set_is_last_backward(self, value: bool) -> None:
+        """Record the last-backward toggle value."""
         self.last_bw_calls.append(bool(value))
 
-    def set_reshard_after_backward(self, value):
+    def set_reshard_after_backward(self, value: bool) -> None:
+        """Record the reshard-after-backward toggle value."""
         self.reshard_calls.append(bool(value))
 
 
@@ -131,7 +138,7 @@ def _build_trainer(model, *, args=None):
     with patch.object(trainer_base, "get_spec", return_value=types.SimpleNamespace(
             clip_grad_fn=None,
     )):
-        trainer = BaseTrainer(args)
+        trainer = BaseTrainer(args, setup=False)
     trainer.model = model
     trainer.device = torch.device("cpu")
     trainer.model_fwd_context = nullcontext()
@@ -142,9 +149,6 @@ def _build_trainer(model, *, args=None):
     trainer.lr_scheduler = None
     trainer.parallel_dims = types.SimpleNamespace(dp_size=1)
     trainer._dp_group_info = types.SimpleNamespace(rank_size=1)
-    # Stub the per-step callback hooks so we don't need a full callback wiring.
-    trainer.on_substep_end = MagicMock()
-    trainer.on_pre_optimizer_step = MagicMock()
     return trainer
 
 
@@ -376,13 +380,14 @@ class TestForwardBackwardStepNestedBatch(unittest.TestCase):
             leaf tensor, not just the top-level entries.
             """
 
-            def __init__(self):
+            def __init__(self) -> None:
+                """Initialize sink model with a single trainable scale parameter."""
                 super().__init__()
                 # Need at least one trainable parameter so the SGD optimizer
                 # (and the clip_grad pass downstream) have something to work on.
                 self.scale = nn.Parameter(torch.ones(()))
 
-            def forward(self, **kwargs):  # pylint: disable=arguments-differ
+            def forward(self, **kwargs: Any) -> dict:  # pylint: disable=arguments-differ
                 """Walk every tensor in kwargs and record its device."""
                 def _record(v):
                     if isinstance(v, torch.Tensor):

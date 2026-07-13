@@ -23,17 +23,20 @@ Design notes:
 Subclasses (LLMTrainer, VLMTrainer, ...) follow this pattern: instantiate a
 ``BaseTrainer`` and drive its ``_build_*`` methods selectively.
 """
+import copy
 import json
 import logging
 import math
 import os
 import random
+import threading
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Mapping, Optional
 
 import numpy as np
-import torch
-from torch.utils.data import DistributedSampler
+import torch  # pylint: disable=C9002
+from torch.utils.data import DistributedSampler  # pylint: disable=C9002
 
 from hyper_parallel import (
     get_platform,
@@ -44,46 +47,51 @@ from hyper_parallel import (
     SkipDTensorDispatch,
     HSDPModule,
 )
-from hyper_parallel.core.distributed_checkpoint import load as dcp_load
+from hyper_parallel.core.distributed_checkpoint import load as dcp_load, save as dcp_save
+from hyper_parallel.core.distributed_checkpoint.offline_transform import (
+    save_state_dict_as_huggingface_format,
+)
 from hyper_parallel.core.dtensor.dtensor import DTensor
 # ``_resolve_local_tensor`` is the canonical shard resolver used by
 # ``HSDPModule.load_state_dict``; reused (rather than duplicated) to load a
 # checkpoint into a model that holds DTensor params but is not itself an
 # ``HSDPModule`` (pipeline parallelism composed with per-module FSDP).
-from hyper_parallel.core.fully_shard.api import _resolve_local_tensor
+from hyper_parallel.core.fully_shard.api import _resolve_local_tensor, get_model_state_dict
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.data import build_dataset
 from hyper_parallel.models.spec.registry import get_spec
+from hyper_parallel.trainer.callbacks.base import (
+    BaseCallback,
+    CallbackHookNames,
+    TrainerCallbackContext,
+    TrainerControl,
+)
+from hyper_parallel.trainer.callbacks.manager import CallbackManager
 from hyper_parallel.trainer.parallel_dims import ParallelDims
 from hyper_parallel.trainer.utils.loss import count_loss_token, mean_global_loss
-from hyper_parallel.trainer.callbacks.base import (
-    LoggingCallback,
-    CheckpointCallback,
-    SafetensorsExportCallback,
-    EvalCallback,
-    ProfilerCallback,
-    WandbCallback,
-    ProgressCallback,
-    MoEMonitorCallback,
-    GradientHealthCallback,
-    GCCallback,
-    TensorBoardCallback,
-    MemoryMonitorCallback,
-)
 
-if TYPE_CHECKING:
+if TYPE_CHECKING:  # pylint: disable=C9002
     # Type-only imports — never executed at runtime, so the platform-agnostic
     # rule ("no torch/mindspore in trainer code") is preserved. Same pattern
     # as
-    from torch import nn
-    from torch.optim import Optimizer
-    from torch.optim.lr_scheduler import LRScheduler
-    from torch.utils.data import DataLoader
+    from torch import nn  # pylint: disable=C9002
+    from torch.optim import Optimizer  # pylint: disable=C9002
+    from torch.optim.lr_scheduler import LRScheduler  # pylint: disable=C9002
+    from torch.utils.data import DataLoader  # pylint: disable=C9002
     from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 
 platform = get_platform()
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TrainerDebugHookState:
+    """Cached high-frequency callback listener state for one train step."""
+
+    emit_forward_debug: bool = False
+    emit_micro_debug: bool = False
+    emit_sync_debug: bool = False
 
 
 class TrainerState:
@@ -95,22 +103,77 @@ class TrainerState:
         max_steps: Total number of training steps.
     """
 
-    def __init__(self, max_steps: int = 0):
-        self.global_step: int = 0
-        self.epoch: int = 0
-        self.max_steps: int = max_steps
-        self.log_history: list = []
+    def __init__(self, **kwargs: Any) -> None:
+        """Initialize TrainerState from keyword arguments."""
+        self.global_step: int = kwargs.get("global_step", 0)
+        self.epoch: int = kwargs.get("epoch", 0)
+        self.micro_step: int = kwargs.get("micro_step", 0)
+        self.max_steps: int = kwargs.get("max_steps", 0)
+        self.num_train_epochs: int = kwargs.get("num_train_epochs", 0)
+        self.best_metric: Optional[float] = kwargs.get("best_metric", None)
+        self.lr: float = kwargs.get("lr", 0.0)
+        self.is_training: bool = kwargs.get("is_training", False)
+        self.is_evaluating: bool = kwargs.get("is_evaluating", False)
+        self.resume_step: int = kwargs.get("resume_step", 0)
+        self.consumed_tokens: int = kwargs.get("consumed_tokens", 0)
+        self.consumed_samples: int = kwargs.get("consumed_samples", 0)
+        self.max_log_history: int = kwargs.get("max_log_history", 1000)
+        self.log_history: list = list(kwargs.get("log_history", []))
+
+    def update(self, **values: Any) -> None:
+        """Update known state fields."""
+        for key, value in values.items():
+            if not hasattr(self, key):
+                raise ValueError(f"Unknown trainer state field: {key}")
+            setattr(self, key, value)
+
+    def add_log(self, record: Mapping[str, Any]) -> None:
+        """Append a log record and keep bounded history."""
+        self.log_history.append(dict(record))
+        if 0 < self.max_log_history < len(self.log_history):
+            del self.log_history[: len(self.log_history) - self.max_log_history]
+
+    def update_consumed(self, tokens: int = 0, samples: int = 0) -> None:
+        """Accumulate consumed token and sample counters."""
+        self.consumed_tokens += int(tokens or 0)
+        self.consumed_samples += int(samples or 0)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize state to lightweight Python values."""
+        return {
+            "global_step": self.global_step,
+            "epoch": self.epoch,
+            "micro_step": self.micro_step,
+            "max_steps": self.max_steps,
+            "num_train_epochs": self.num_train_epochs,
+            "best_metric": self.best_metric,
+            "lr": self.lr,
+            "is_training": self.is_training,
+            "is_evaluating": self.is_evaluating,
+            "resume_step": self.resume_step,
+            "consumed_tokens": self.consumed_tokens,
+            "consumed_samples": self.consumed_samples,
+            "max_log_history": self.max_log_history,
+            "log_history": list(self.log_history),
+        }
+
+    @classmethod
+    def from_dict(cls, values: Mapping[str, Any]) -> "TrainerState":
+        """Build state from serialized values."""
+        return cls(**dict(values))
 
 
 class BaseTrainer:
     """Composable training skeleton.
 
-    Provides 13 ``_build_*`` methods that subclasses can call, override, or skip.
+    Provides lifecycle/build methods that task trainers can call, override, or skip.
     The default ``_build_parallelized_model`` applies TP → CP → AC → FSDP by
     iterating ``model.layers`` — matching hyper's own ``fsdp_demo.py`` style.
 
     Args:
         args: Training configuration (typically parsed from YAML).
+        callbacks: Optional callbacks registered before setup/build lifecycle starts.
+        setup: Whether to initialize distributed runtime during construction.
     """
 
     # PEP 526 annotations — populated by ``_build_*``; ``None`` until built.
@@ -128,17 +191,47 @@ class BaseTrainer:
     _pp_tie_embeddings: bool = False
     _pp_stage_fsdp_sharded: bool = False
 
-    def __init__(self, args):
-        # Only early-bound fields live here; the rest is built via
-        # ``_build_*`` methods invoked by the subclass.
+    def __init__(
+            self,
+            args: Any,
+            callbacks: Optional[Iterable[BaseCallback]] = None,
+            setup: bool = True,
+    ) -> None:
+        """Initialize BaseTrainer with training args, optional callbacks, and optional setup."""
+        # Early-bound fields are initialized before optional distributed setup;
+        # model/data/optimizer fields are built by the task trainer.
         self.args = args
         self.spec = get_spec(args.model.name)
-        self.state = TrainerState(max_steps=args.train.max_steps)
+        self.global_rank = 0
+        self.local_rank = int(getattr(args.train, "local_rank", 0))
+        self.world_size = 1
+        self.state = TrainerState(
+            max_steps=args.train.max_steps,
+            num_train_epochs=getattr(args.train, "num_train_epochs", 0),
+        )
+        self.control = TrainerControl()
+        self.callback_handler = CallbackManager(trainer=self, callbacks=callbacks)
+        self._callback_logs: dict[str, Any] = {}
+        self._checkpoint_save_thread: Optional[threading.Thread] = None
+        self._last_saved_step = -1
+        self._debug_hook_state = TrainerDebugHookState()
         self._pp_stage_modules: list["nn.Module"] = []
         self._pp_tp_loss_repeats = 1
+        if setup:
+            self._setup()
+
+    @property
+    def is_local_rank0(self) -> bool:
+        """Return whether this trainer runs on local rank 0."""
+        return self.local_rank == 0
+
+    @property
+    def is_world_rank0(self) -> bool:
+        """Return whether this trainer runs on global rank 0."""
+        return self.global_rank == 0
 
     # ------------------------------------------------------------------
-    # 13 overridable _build_* methods
+    # Overridable lifecycle/build methods
     # ------------------------------------------------------------------
 
     @property
@@ -175,17 +268,19 @@ class BaseTrainer:
         backend = self.args.train.comm_backend
         init_process_group(backend=backend)
 
-        local_rank = self.args.train.local_rank
+        self.global_rank = int(platform.get_rank())
+        self.local_rank = int(getattr(self.args.train, "local_rank", self.local_rank))
+        self.world_size = int(platform.get_world_size())
         device_type = platform.device_type()  # "npu" or "cuda"
         # Use platform.device(idx) — backend-agnostic.
-        self.device = platform.device(local_rank)
+        self.device = platform.device(self.local_rank)
         device_handle = platform.get_device_handle(device_type)
-        device_handle.set_device(local_rank)
+        device_handle.set_device(self.local_rank)
 
         # Build & validate parallel dims in one place (fail-fast).
 
         self.parallel_dims = ParallelDims.from_config(
-            self.args.train.accelerator, world_size=platform.get_world_size(),
+            self.args.train.accelerator, world_size=self.world_size,
         )
         logger.info_rank0("ParallelDims: %s", self.parallel_dims.summary())
         # Mixed precision lives in FSDP2's MixedPrecisionPolicy, so a
@@ -253,7 +348,7 @@ class BaseTrainer:
 
         logger.info_rank0(
             "Setup complete: rank=%d, world_size=%d, mesh=%s",
-            platform.get_rank(), platform.get_world_size(),
+            self.global_rank, self.world_size,
             self.mesh.mesh_dim_names,
         )
         logger.info_rank0(
@@ -1005,186 +1100,499 @@ class BaseTrainer:
                 platform.device_type(),
             )
 
-    def _init_callbacks(self):
-        """Step 13: Initialize callbacks (explicit mode).
+    def _init_callbacks(self) -> None:
+        """Step 13: Attach callback manager to this fully built trainer."""
+        self.callback_handler.set_trainer(self)
 
-        Each callback is a named field — engineer sees all callbacks and their
-        order in ``on_step_end`` at a glance. Add/remove/reorder = change one line.
-        """
-        self.logging_callback = LoggingCallback(self)
-        self.checkpoint_callback = CheckpointCallback(self)
-        self.hf_export_callback = SafetensorsExportCallback(self)
-        self.eval_callback = EvalCallback(self)
-        self.profiler_callback = ProfilerCallback(self)
-        self.wandb_callback = WandbCallback(self)
-        self.tensorboard_callback = TensorBoardCallback(self)
-        self.progress_callback = ProgressCallback(self)
-        self.moe_monitor_callback = MoEMonitorCallback(self)
-        # Health + operability (no-ops unless enabled in cfg.train.debug / .memory_monitor).
-        self.gradient_health_callback = GradientHealthCallback(self)
-        self.memory_monitor_callback = MemoryMonitorCallback(self)
-        self.gc_callback = GCCallback(self)
-        # ``user_callbacks`` lets external code append extra Callback instances
-        # (e.g. domain-specific monitors) without editing this method. They get
-        # the same lifecycle dispatch as built-ins.
-        self.user_callbacks: list = []
-        logger.info_rank0(
-            "Callbacks initialized: logging, checkpoint, hf_export, eval, "
-            "profiler, wandb, tensorboard, progress, moe_monitor, "
-            "gradient_health, memory_monitor, gc"
+    @property
+    def callbacks(self) -> tuple[BaseCallback, ...]:
+        """Registered callbacks in dispatch order."""
+        return self.callback_handler.callbacks
+
+    def add_callback(self, callback: BaseCallback) -> None:
+        """Register an extra callback."""
+        self.callback_handler.register(callback)
+        logger.info_rank0("User callback registered: %s", type(callback).__name__)
+
+    def remove_callback(self, callback: BaseCallback) -> None:
+        """Remove a previously registered callback."""
+        self.callback_handler.unregister(callback)
+        logger.info_rank0("User callback removed: %s", type(callback).__name__)
+
+    def _callback_context(self) -> TrainerCallbackContext:
+        """Build a callback context for the current trainer state."""
+        return TrainerCallbackContext.from_trainer(
+            self,
+            control=self.callback_handler.aggregate_control(),
         )
 
-    # ------------------------------------------------------------------
-    # Public API: external callback registration
-    # ------------------------------------------------------------------
+    def _dispatch_callback(
+            self,
+            event: CallbackHookNames,
+            **payload: Any,
+    ) -> TrainerControl:
+        """Dispatch one callback event through the manager."""
+        if not self.callback_handler.has_listeners(event):
+            return self.callback_handler.aggregate_control()
+        return self.callback_handler.dispatch(event, self._callback_context(), **payload)
 
-    def add_callback(self, callback) -> None:
-        """Register an extra ``Callback`` to receive every lifecycle event.
+    def _moe_group_payload(self) -> dict[str, Any]:
+        """Build MoE monitor group payload from the trainer mesh."""
+        payload = {"dp_group": getattr(self, "_dp_group_info", None)}
+        mesh = getattr(self, "mesh", None)
+        if mesh is None:
+            return payload
+        for name, key in (("tp", "tp_group"), ("cp", "cp_group")):
+            try:
+                raw_group = mesh.get_group(name)
+                payload[key] = GroupInfo(
+                    group_name=name,
+                    group=raw_group,
+                    rank_size=raw_group.size(),
+                )
+            except (KeyError, ValueError, AttributeError):
+                payload[key] = None
+        return payload
 
-        Use this to plug domain-specific monitors (custom metric sinks,
-        in-house experiment trackers, RL reward loggers) without editing
-        the trainer. Built-in callbacks always run first; user callbacks
-        run in registration order so a later user callback can read state
-        the earlier ones updated.
-        """
-        self.user_callbacks.append(callback)
-        logger.info_rank0(
-            "User callback registered: %s", type(callback).__name__,
+    def on_init_end(self) -> TrainerControl:
+        """Dispatch one-shot on_init_end after every build step."""
+        payload = {
+            "args": self.args,
+            "model": self.model,
+            "optimizer": self.optimizer,
+            "lr_scheduler": self.lr_scheduler,
+            "mesh": self.mesh,
+        }
+        payload.update(self._moe_group_payload())
+        return self._dispatch_callback(CallbackHookNames.ON_INIT_END, **payload)
+
+    def on_train_begin(self) -> TrainerControl:
+        """Dispatch on_train_begin."""
+        return self._dispatch_callback(CallbackHookNames.ON_TRAIN_BEGIN)
+
+    def on_resume(self, checkpoint_path: str, metadata: Optional[dict[str, Any]] = None) -> TrainerControl:
+        """Dispatch on_resume."""
+        return self._dispatch_callback(
+            CallbackHookNames.ON_RESUME,
+            checkpoint_path=checkpoint_path,
+            metadata=metadata or {},
         )
 
-    # ------------------------------------------------------------------
-    # Callback dispatch (explicit mode)
-    # ------------------------------------------------------------------
+    def on_train_end(self) -> TrainerControl:
+        """Dispatch on_train_end."""
+        return self._dispatch_callback(CallbackHookNames.ON_TRAIN_END)
 
-    def _builtin_callbacks(self) -> list:
-        """Return built-in callbacks in fixed dispatch order.
-
-        Centralised so every dispatcher iterates the same list — adding a
-        callback only needs an entry here plus a named field in
-        ``_init_callbacks`` (no per-event copy/paste).
-        """
-        return [
-            self.logging_callback,
-            self.eval_callback,
-            self.profiler_callback,
-            self.wandb_callback,
-            self.tensorboard_callback,
-            self.progress_callback,
-            self.checkpoint_callback,
-            self.hf_export_callback,
-            self.moe_monitor_callback,
-            self.gradient_health_callback,
-            self.memory_monitor_callback,
-            self.gc_callback,
-        ]
-
-    def _all_callbacks(self) -> list:
-        """Built-in callbacks followed by user-registered ones."""
-        return self._builtin_callbacks() + list(self.user_callbacks)
-
-    def on_init_end(self):
-        """Dispatch one-shot ``on_init_end`` after every ``_build_*`` ran.
-
-        Fired by the subclass at the end of its own ``__init__`` (see
-        ``LLMTrainer.__init__``); ``BaseTrainer.train()`` does NOT call it
-        because BaseTrainer instances are sometimes wrapped (composition
-        pattern) and the wrapper owns the init lifecycle.
-        """
-        for cb in self._all_callbacks():
-            cb.on_init_end(self.state)
-
-    def on_train_begin(self):
-        """Dispatch on_train_begin to all callbacks."""
-        # Memory monitor first so it captures the truly-initial peak.
-        self.memory_monitor_callback.on_train_begin(self.state)
-        self.moe_monitor_callback.on_train_begin(self.state)
-        self.profiler_callback.on_train_begin(self.state)
-        self.wandb_callback.on_train_begin(self.state)
-        self.tensorboard_callback.on_train_begin(self.state)
-        # Checkpoint runs after log writers are armed and before progress so
-        # resumed ``global_step`` is reflected in the tqdm initial position.
-        self.checkpoint_callback.on_train_begin(self.state)
-        self.progress_callback.on_train_begin(self.state)
-        for cb in self.user_callbacks:
-            cb.on_train_begin(self.state)
-
-    def on_train_end(self):
-        """Dispatch on_train_end to all callbacks."""
-        self.checkpoint_callback.on_train_end(self.state)
-        self.hf_export_callback.on_train_end(self.state)
-        self.progress_callback.on_train_end(self.state)
-        self.tensorboard_callback.on_train_end(self.state)
-        self.wandb_callback.on_train_end(self.state)
-        self.profiler_callback.on_train_end(self.state)
-        for cb in self.user_callbacks:
-            cb.on_train_end(self.state)
-
-    def on_step_begin(self):
-        """Dispatch on_step_begin to all callbacks."""
-        self.logging_callback.on_step_begin(self.state)
-        for cb in self.user_callbacks:
-            cb.on_step_begin(self.state)
-
-    def on_step_end(self, loss=None, grad_norm=None):
-        """Dispatch on_step_end to all callbacks (built-ins + user)."""
-        for cb in self._all_callbacks():
-            cb.on_step_end(self.state, loss=loss, grad_norm=grad_norm)
-
-    def on_substep_end(self):
-        """Dispatch on_substep_end (after each micro-batch forward/backward)."""
-        self.moe_monitor_callback.on_substep_end(self.state)
-        for cb in self.user_callbacks:
-            cb.on_substep_end(self.state)
-
-    def on_pre_optimizer_step(self, grad_norm=None):
-        """Dispatch on_pre_optimizer_step (after grad clip, before optimizer.step)."""
-        # Health check runs FIRST so a NaN aborts before the logger misleads.
-        self.gradient_health_callback.on_pre_optimizer_step(
-            self.state, grad_norm=grad_norm,
-        )
-        self.logging_callback.on_pre_optimizer_step(self.state, grad_norm=grad_norm)
-        self.wandb_callback.on_pre_optimizer_step(self.state, grad_norm=grad_norm)
-        self.tensorboard_callback.on_pre_optimizer_step(self.state, grad_norm=grad_norm)
-        for cb in self.user_callbacks:
-            cb.on_pre_optimizer_step(self.state, grad_norm=grad_norm)
-
-    def on_epoch_begin(self):
+    def on_epoch_begin(self) -> TrainerControl:
         """Dispatch on_epoch_begin."""
-        for cb in self._all_callbacks():
-            cb.on_epoch_begin(self.state)
+        self.callback_handler.reset_epoch_control()
+        return self._dispatch_callback(CallbackHookNames.ON_EPOCH_BEGIN)
 
-    def on_epoch_end(self):
+    def on_epoch_end(self) -> TrainerControl:
         """Dispatch on_epoch_end."""
-        for cb in self._all_callbacks():
-            cb.on_epoch_end(self.state)
+        return self._dispatch_callback(CallbackHookNames.ON_EPOCH_END)
 
-    # ------------------------------------------------------------------
-    # Event fan-out (LoggingCallback / CheckpointCallback emit these)
-    # ------------------------------------------------------------------
+    def on_step_begin(self) -> TrainerControl:
+        """Dispatch on_step_begin."""
+        self.callback_handler.reset_step_control()
+        return self._dispatch_callback(CallbackHookNames.ON_STEP_BEGIN)
+
+    def on_before_optimizer_step(self, grad_norm: Optional[float] = None) -> TrainerControl:
+        """Dispatch on_before_optimizer_step."""
+        return self._dispatch_callback(
+            CallbackHookNames.ON_BEFORE_OPTIMIZER_STEP,
+            grad_norm=grad_norm,
+            grad_norm_after_clip=grad_norm,
+        )
+
+    def on_pre_optimizer_step(self, grad_norm: Optional[float] = None) -> TrainerControl:
+        """Backward-compatible alias for on_before_optimizer_step."""
+        return self.on_before_optimizer_step(grad_norm=grad_norm)
+
+    def on_step_end(
+            self,
+            loss: Optional[float] = None,
+            grad_norm: Optional[float] = None,
+            metrics: Optional[dict[str, Any]] = None,
+    ) -> TrainerControl:
+        """Dispatch on_step_end."""
+        step_metrics = dict(metrics or {})
+        if loss is not None:
+            step_metrics.setdefault("loss", loss)
+        if grad_norm is not None:
+            step_metrics.setdefault("grad_norm", grad_norm)
+        tokens = getattr(self, "_last_global_tokens", None)
+        if tokens is not None:
+            step_metrics.setdefault("tokens", tokens)
+        if self.lr_scheduler is not None:
+            lr_values = self.lr_scheduler.get_last_lr()
+            if lr_values:
+                self.state.lr = float(lr_values[0])
+                step_metrics.setdefault("lr", self.state.lr)
+        self._callback_logs = step_metrics
+        return self._dispatch_callback(
+            CallbackHookNames.ON_STEP_END,
+            loss=loss,
+            grad_norm=grad_norm,
+            metrics=step_metrics,
+            tokens=tokens,
+            lr=self.state.lr,
+        )
+
+    def on_log(self, metrics: dict[str, Any]) -> TrainerControl:
+        """Dispatch on_log."""
+        self._callback_logs = dict(metrics)
+        return self._dispatch_callback(CallbackHookNames.ON_LOG, metrics=metrics)
+
+    def on_evaluate_begin(self) -> TrainerControl:
+        """Dispatch on_evaluate_begin."""
+        self.state.is_evaluating = True
+        return self._dispatch_callback(CallbackHookNames.ON_EVALUATE_BEGIN)
+
+    def on_evaluate_end(self, metrics: Optional[dict[str, Any]] = None) -> TrainerControl:
+        """Dispatch on_evaluate_end."""
+        self.state.is_evaluating = False
+        return self._dispatch_callback(CallbackHookNames.ON_EVALUATE_END, metrics=metrics or {})
+
+    def on_predict(self, results: Any = None) -> TrainerControl:
+        """Dispatch on_predict."""
+        return self._dispatch_callback(CallbackHookNames.ON_PREDICT, results=results)
+
+    def on_save(
+            self,
+            checkpoint_path: str,
+            success: bool = True,
+            metadata: Optional[dict[str, Any]] = None,
+    ) -> TrainerControl:
+        """Dispatch on_save."""
+        return self._dispatch_callback(
+            CallbackHookNames.ON_SAVE,
+            checkpoint_path=checkpoint_path,
+            checkpoint_dir=checkpoint_path,
+            success=success,
+            metadata=metadata or {},
+        )
+
+    def on_exception(self, exception: BaseException) -> TrainerControl:
+        """Dispatch on_exception."""
+        return self._dispatch_callback(CallbackHookNames.ON_EXCEPTION, exception=exception)
+
+    def on_micro_batch_end(
+            self,
+            micro_batch_index: Optional[int] = None,
+            loss: Any = None,
+            tokens: Optional[int] = None,
+    ) -> TrainerControl:
+        """Dispatch on_micro_batch_end."""
+        return self._dispatch_callback(
+            CallbackHookNames.ON_MICRO_BATCH_END,
+            micro_batch_index=micro_batch_index,
+            loss=loss,
+            tokens=tokens,
+        )
+
+    def on_substep_end(self) -> TrainerControl:
+        """Backward-compatible alias for micro-batch end callbacks."""
+        return self.on_micro_batch_end()
+
+    def on_forward_end(self, outputs: Any = None, micro_batch: Optional[dict[str, Any]] = None) -> TrainerControl:
+        """Dispatch on_forward_end."""
+        return self._dispatch_callback(
+            CallbackHookNames.ON_FORWARD_END,
+            outputs=outputs,
+            micro_batch=micro_batch,
+        )
+
+    def on_after_grad_sync(self) -> TrainerControl:
+        """Dispatch on_after_grad_sync."""
+        return self._dispatch_callback(CallbackHookNames.ON_AFTER_GRAD_SYNC)
+
+    def on_prediction_step(self, metrics: Optional[dict[str, Any]] = None) -> TrainerControl:
+        """Dispatch on_prediction_step."""
+        return self._dispatch_callback(CallbackHookNames.ON_PREDICTION_STEP, metrics=metrics or {})
+
+    def on_profiler_step(self) -> TrainerControl:
+        """Dispatch on_profiler_step."""
+        return self._dispatch_callback(CallbackHookNames.ON_PROFILER_STEP)
+
+    def on_memory_snapshot(self, metrics: Optional[dict[str, Any]] = None) -> TrainerControl:
+        """Dispatch on_memory_snapshot."""
+        return self._dispatch_callback(CallbackHookNames.ON_MEMORY_SNAPSHOT, metrics=metrics or {})
+
+    def on_communication_step(self, metrics: Optional[dict[str, Any]] = None) -> TrainerControl:
+        """Dispatch on_communication_step."""
+        return self._dispatch_callback(CallbackHookNames.ON_COMMUNICATION_STEP, metrics=metrics or {})
 
     def dispatch_log_event(self, metrics: dict) -> None:
-        """Forward a metrics record to every callback's ``on_log``.
-
-        ``LoggingCallback`` calls this so TensorBoard / W&B / external sinks
-        log the SAME numbers — single source of truth, no duplicate work.
-        """
-        for cb in self._all_callbacks():
-            cb.on_log(self.state, metrics=metrics)
+        """Backward-compatible log event fan-out."""
+        self.on_log(metrics)
 
     def dispatch_save_event(self, checkpoint_dir: str) -> None:
-        """Forward a ckpt-save event to every callback's ``on_save``."""
-        for cb in self._all_callbacks():
-            cb.on_save(self.state, checkpoint_dir=checkpoint_dir)
+        """Backward-compatible save event fan-out."""
+        self.on_save(checkpoint_dir)
 
     def dispatch_load_event(self, checkpoint_dir: str) -> None:
-        """Forward a ckpt-load event to every callback's ``on_load``."""
-        for cb in self._all_callbacks():
-            cb.on_load(self.state, checkpoint_dir=checkpoint_dir)
+        """Backward-compatible load event fan-out."""
+        self.on_resume(checkpoint_dir)
 
     def dispatch_evaluate_event(self, metrics: dict = None) -> None:
-        """Forward an eval-pass-complete event to every callback's ``on_evaluate``."""
-        for cb in self._all_callbacks():
-            cb.on_evaluate(self.state, metrics=metrics)
+        """Backward-compatible evaluate event fan-out."""
+        self.on_evaluate_end(metrics)
+
+    def _handle_step_control(self, control: TrainerControl) -> None:
+        """Honor callback control signals after a step dispatch."""
+        if control.should_log:
+            log_record = control.metadata.get("log_record")
+            if isinstance(log_record, dict):
+                self.on_log(log_record)
+        if control.should_evaluate:
+            self.on_evaluate_begin()
+            self.on_evaluate_end({})
+        if control.should_save:
+            self._dispatch_checkpoint_save(copy.copy(self.state))
+        else:
+            self._maybe_save_checkpoint()
+
+    def _refresh_debug_hook_state(self) -> None:
+        """Cache high-frequency callback listener enablement for one train step."""
+        self._debug_hook_state = TrainerDebugHookState(
+            emit_forward_debug=self.callback_handler.has_listeners(CallbackHookNames.ON_FORWARD_END),
+            emit_micro_debug=self.callback_handler.has_listeners(CallbackHookNames.ON_MICRO_BATCH_END),
+            emit_sync_debug=self.callback_handler.has_listeners(CallbackHookNames.ON_AFTER_GRAD_SYNC),
+        )
+
+    # ------------------------------------------------------------------
+    # Checkpoint lifecycle
+    # ------------------------------------------------------------------
+
+    def _checkpoint_cfg(self) -> Any:
+        """Return checkpoint config from args.train.checkpoint or top-level fallback."""
+        train_cfg = getattr(self.args, "train", None)
+        ckpt_cfg = getattr(train_cfg, "checkpoint", None) if train_cfg is not None else None
+        return ckpt_cfg if ckpt_cfg is not None else getattr(self.args, "checkpoint", None)
+
+    def _checkpoint_output_dir(self) -> str:
+        """Return checkpoint output directory."""
+        ckpt_cfg = self._checkpoint_cfg()
+        return getattr(ckpt_cfg, "output_dir", "outputs") if ckpt_cfg is not None else "outputs"
+
+    def _checkpoint_save_steps(self) -> int:
+        """Return checkpoint save interval."""
+        ckpt_cfg = self._checkpoint_cfg()
+        return int(getattr(ckpt_cfg, "save_steps", 0) or 0) if ckpt_cfg is not None else 0
+
+    def _checkpoint_load_path(self) -> Optional[str]:
+        """Return checkpoint load path."""
+        ckpt_cfg = self._checkpoint_cfg()
+        return getattr(ckpt_cfg, "load_path", None) if ckpt_cfg is not None else None
+
+    def _checkpoint_save_async(self) -> bool:
+        """Return whether checkpoint save should be asynchronous."""
+        ckpt_cfg = self._checkpoint_cfg()
+        return bool(getattr(ckpt_cfg, "save_async", False)) if ckpt_cfg is not None else False
+
+    def _resume_from_checkpoint_if_needed(self) -> None:
+        """Resume from configured checkpoint path when present."""
+        load_path = self._checkpoint_load_path()
+        if load_path:
+            self._resume_from_checkpoint(load_path)
+
+    def _resume_from_checkpoint(self, load_path: str) -> None:
+        """Restore model, optimizer, scheduler, RNG, dataloader, and trainer state."""
+        if not os.path.isdir(load_path):
+            logger.warning("Checkpoint path not found: %s", load_path)
+            return
+
+        try:
+            model_sd = self.model.state_dict()
+            dcp_load(model_sd, checkpoint_id=load_path, use_collectives=False)
+            self.model.load_state_dict(model_sd)
+            logger.info("Model restored from %s", load_path)
+
+            extra_path = os.path.join(load_path, "extra_state.json")
+            if os.path.isfile(extra_path):
+                with open(extra_path, encoding="utf-8") as file:
+                    extra = json.load(file)
+                self.state.update(
+                    global_step=int(extra.get("global_step", self.state.global_step)),
+                    epoch=int(extra.get("epoch", self.state.epoch)),
+                    resume_step=int(extra.get("global_step", self.state.global_step)),
+                    consumed_tokens=int(extra.get("consumed_tokens", self.state.consumed_tokens)),
+                    consumed_samples=int(extra.get("consumed_samples", self.state.consumed_samples)),
+                )
+                logger.info(
+                    "Resumed at step=%d, epoch=%d",
+                    self.state.global_step,
+                    self.state.epoch,
+                )
+
+            rank = platform.get_rank()
+            optim_path = os.path.join(load_path, f"optimizer_rank{rank}.pt")
+            if os.path.isfile(optim_path) and self.optimizer is not None:
+                optim_sd = torch.load(optim_path, map_location="cpu", weights_only=True)
+                self.optimizer.load_state_dict(optim_sd)
+                logger.info("Optimizer restored")
+
+            sched_path = os.path.join(load_path, "scheduler.pt")
+            if os.path.isfile(sched_path) and self.lr_scheduler is not None:
+                sched_sd = torch.load(sched_path, map_location="cpu", weights_only=True)
+                self.lr_scheduler.load_state_dict(sched_sd)
+                logger.info("LR scheduler restored")
+
+            rng_path = os.path.join(load_path, f"rng_rank{rank}.pt")
+            if os.path.isfile(rng_path):
+                rng_state = torch.load(rng_path, map_location="cpu", weights_only=True)
+                platform.set_rng_state(rng_state)
+                logger.info("RNG state restored")
+
+            dl_path = os.path.join(load_path, f"dataloader_rank{rank}.pt")
+            if os.path.isfile(dl_path) and hasattr(self.train_dataloader, "load_state_dict"):
+                dl_state = torch.load(dl_path, map_location="cpu", weights_only=False)
+                self.train_dataloader.load_state_dict(dl_state)
+                logger.info("Dataloader state restored")
+
+            self.on_resume(load_path, metadata={"global_step": self.state.global_step})
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("Failed to load checkpoint from %s: %s", load_path, exc)
+
+    def _maybe_save_checkpoint(self) -> None:
+        """Save a checkpoint when the configured step interval is reached."""
+        save_steps = self._checkpoint_save_steps()
+        if save_steps <= 0:
+            return
+        if self.state.global_step % save_steps != 0:
+            return
+        if self.state.global_step == self._last_saved_step:
+            return
+        self._dispatch_checkpoint_save(copy.copy(self.state))
+
+    def _dispatch_checkpoint_save(self, state: TrainerState) -> None:
+        """Route checkpoint save to sync or async implementation."""
+        if not self._checkpoint_save_async():
+            self._save_checkpoint(state)
+            return
+        self._join_pending_checkpoint_save()
+        self._checkpoint_save_thread = threading.Thread(
+            target=self._save_checkpoint,
+            args=(state,),
+            name=f"ckpt-save-step{state.global_step}",
+            daemon=True,
+        )
+        self._checkpoint_save_thread.start()
+        logger.info_rank0(
+            "Checkpoint save for step %d dispatched async (thread=%s)",
+            state.global_step,
+            self._checkpoint_save_thread.name,
+        )
+
+    def _join_pending_checkpoint_save(self) -> None:
+        """Wait for any running async checkpoint save."""
+        thread = self._checkpoint_save_thread
+        if thread is not None and thread.is_alive():
+            logger.info_rank0("Waiting for prior async ckpt save (%s)...", thread.name)
+            thread.join()
+        self._checkpoint_save_thread = None
+
+    def _save_checkpoint(self, state: TrainerState) -> None:
+        """Save complete training state and optional HF checkpoint."""
+        save_dir = os.path.join(self._checkpoint_output_dir(), f"step_{state.global_step}")
+        os.makedirs(save_dir, exist_ok=True)
+        rank = platform.get_rank()
+        success = False
+
+        try:
+            model_sd = self.model.state_dict()
+            dcp_save(model_sd, checkpoint_id=save_dir, use_collectives=False)
+
+            if self.optimizer is not None:
+                optim_path = os.path.join(save_dir, f"optimizer_rank{rank}.pt")
+                torch.save(self.optimizer.state_dict(), optim_path)
+
+            if self.lr_scheduler is not None and rank == 0:
+                sched_path = os.path.join(save_dir, "scheduler.pt")
+                torch.save(self.lr_scheduler.state_dict(), sched_path)
+
+            if rank == 0:
+                extra = {
+                    "global_step": state.global_step,
+                    "epoch": state.epoch,
+                    "consumed_tokens": state.consumed_tokens,
+                    "consumed_samples": state.consumed_samples,
+                }
+                extra_path = os.path.join(save_dir, "extra_state.json")
+                with open(extra_path, "w", encoding="utf-8") as file:
+                    json.dump(extra, file)
+
+            rng_state = platform.get_rng_state()
+            rng_path = os.path.join(save_dir, f"rng_rank{rank}.pt")
+            torch.save(rng_state, rng_path)
+
+            if hasattr(self.train_dataloader, "state_dict"):
+                dl_path = os.path.join(save_dir, f"dataloader_rank{rank}.pt")
+                torch.save(self.train_dataloader.state_dict(), dl_path)
+
+            self._last_saved_step = state.global_step
+            success = True
+            logger.info_rank0("Checkpoint saved to %s", save_dir)
+            self._maybe_export_hf_checkpoint(state, save_dir)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("Failed to save checkpoint: %s", exc)
+        finally:
+            self.on_save(
+                save_dir,
+                success=success,
+                metadata={"global_step": state.global_step},
+            )
+
+    def _save_final_checkpoint(self) -> None:
+        """Save a final checkpoint synchronously at train end."""
+        self._join_pending_checkpoint_save()
+        if self._checkpoint_save_steps() <= 0:
+            return
+        if self.state.global_step == self._last_saved_step:
+            return
+        self._save_checkpoint(copy.copy(self.state))
+
+    def _maybe_export_hf_checkpoint(
+            self,
+            state: TrainerState,
+            checkpoint_dir: Optional[str] = None,
+    ) -> None:
+        """Export HuggingFace safetensors checkpoint when configured."""
+        ckpt_cfg = self._checkpoint_cfg()
+        if ckpt_cfg is None or not getattr(ckpt_cfg, "save_hf_weights", False):
+            return
+
+        save_dir = os.path.join(
+            checkpoint_dir or os.path.join(self._checkpoint_output_dir(), f"step_{state.global_step}"),
+            "hf_ckpt",
+        )
+        try:
+            from torch.distributed.checkpoint.state_dict import StateDictOptions  # pylint: disable=C0415,C9002
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            full_sd = get_model_state_dict(self.model, options=options)
+            if platform.get_rank() != 0:
+                return
+
+            os.makedirs(save_dir, exist_ok=True)
+            adapter_cls = getattr(getattr(self, "spec", None), "state_dict_adapter", None)
+            save_fn = (
+                getattr(adapter_cls(), "save_hf_state_dict", None)
+                if adapter_cls is not None else None
+            )
+            if save_fn is not None:
+                hf_sd = save_fn(full_sd, self.model.config)
+                from safetensors.torch import save_file  # pylint: disable=C0415
+                save_file(hf_sd, os.path.join(save_dir, "model.safetensors"))
+                logger.info(
+                    "HF checkpoint saved via %s.save_hf_state_dict to %s",
+                    adapter_cls.__name__,
+                    save_dir,
+                )
+            else:
+                save_state_dict_as_huggingface_format(full_sd, save_dir)
+                logger.info("HF checkpoint saved to %s", save_dir)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning_rank0("Failed to save HF checkpoint: %s", exc)
 
     # ------------------------------------------------------------------
     # Training core
@@ -1287,7 +1695,7 @@ class BaseTrainer:
         micro_batch_tokens: int,
         global_tokens: int,
         num_micro: int = 1,
-    ):
+    ) -> Dict[str, Any]:
         """Run forward + backward for one micro-batch.
 
         Uses  global token normalisation: each micro-batch's
@@ -1309,6 +1717,8 @@ class BaseTrainer:
         # Forward (with training context for activation offload)
         with self.model_fwd_context:
             outputs = self.model(**micro_batch, use_cache=False)
+        if self._debug_hook_state.emit_forward_debug:
+            self.on_forward_end(outputs=outputs, micro_batch=micro_batch)
         loss, loss_sum = self._compute_micro_loss(
             outputs, labels_are_shifted, shifted_labels, micro_batch_tokens,
         )
@@ -1437,7 +1847,12 @@ class BaseTrainer:
             total_loss_sum += loss_value * micro_tokens
             total_loss_arith_sum += loss_value
             total_tokens_local += micro_tokens
-            self.on_substep_end()
+            if self._debug_hook_state.emit_micro_debug:
+                self.on_micro_batch_end(
+                    micro_batch_index=index,
+                    loss=loss_value,
+                    tokens=micro_tokens,
+                )
         return total_loss_sum, total_loss_arith_sum, total_tokens_local
 
     def _run_post_fsdp_grad_reduce(self) -> None:
@@ -1456,12 +1871,15 @@ class BaseTrainer:
         max_grad_norm = float(self.args.train.optimizer.max_grad_norm)
         grad_norm = clip_fn(max_grad_norm) if max_grad_norm > 0.0 else None
         grad_norm_value = None if grad_norm is None else grad_norm.item()
-        self.on_pre_optimizer_step(grad_norm=grad_norm_value)
+        control = self.on_before_optimizer_step(grad_norm=grad_norm_value)
 
-        with SkipDTensorDispatch():
-            self.optimizer.step()
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
+        if not control.should_skip_optimizer_step:
+            with SkipDTensorDispatch():
+                self.optimizer.step()
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
+        else:
+            logger.info_rank0("Optimizer step skipped by callback control at step %d", self.state.global_step)
         self.optimizer.zero_grad()
         return grad_norm_value
 
@@ -1512,7 +1930,7 @@ class BaseTrainer:
         platform.all_reduce(metric, ep_group_info)
         return metric.item() / ep_size
 
-    def train_step(self, data_iterator):
+    def train_step(self, data_iterator: Iterable[Any]) -> Dict[str, Any]:
         """Execute one training step with gradient accumulation.
 
         Consistent across different DP configurations by:
@@ -1525,6 +1943,7 @@ class BaseTrainer:
         """
         if self.pp_enabled:
             return self._pp_train_step(data_iterator)
+        self._refresh_debug_hook_state()
         micro_batches = next(data_iterator)
         prepare_batch_fn = getattr(self.spec, "prepare_batch_fn", None)
         if prepare_batch_fn is not None:
@@ -1548,6 +1967,8 @@ class BaseTrainer:
         #
         hsdp_sync_stream()
         self._run_post_fsdp_grad_reduce()
+        if self._debug_hook_state.emit_sync_debug:
+            self.on_after_grad_sync()
         grad_norm_value = self._optimizer_step_after_backward(self._non_pp_clip_grad_norm)
         avg_loss = self._aggregate_non_pp_loss(
             total_loss_sum,
@@ -1821,6 +2242,7 @@ class BaseTrainer:
         (:meth:`_pp_clip_grad_norm`) so every stage scales by the same
         coefficient — required so the tied embed / lm_head copies stay in sync.
         """
+        self._refresh_debug_hook_state()
         batch, targets, stop = self._pp_load_first_stage_batch(data_iterator)
         targets, attention_mask, has_attn = self._pp_prepare_broadcast_inputs(batch, targets, stop)
         self.state.global_step += 1
@@ -1829,67 +2251,84 @@ class BaseTrainer:
         outputs = self._pp_run_schedule(batch, targets, attention_mask, has_attn)
         self._pp_post_schedule_grad_reduce()
         self._pp_average_plain_dp_grads()
+        if self._debug_hook_state.emit_sync_debug:
+            self.on_after_grad_sync()
         self._pp_normalize_grads(n_valid)
         grad_norm_value = self._optimizer_step_after_backward(self._pp_clip_grad_norm)
         return {"loss": self._pp_reduce_reported_loss(outputs, n_valid), "grad_norm": grad_norm_value}
 
-    def train(self):
+    def train(self) -> None:
         """Main training loop: epoch → step → micro-batch.
 
-        Dispatches callbacks at each lifecycle point (explicit mode).
-        on_train_begin is called first — CheckpointCallback uses it to restore
-        state.global_step from a saved checkpoint, so the loop below will
-        correctly skip already-completed steps.
+        Dispatches callbacks at each lifecycle point through CallbackManager.
         """
         logger.info_rank0(
             "Training starts: max_steps=%d, epochs=%d",
             self.state.max_steps,
             self.args.train.num_train_epochs,
         )
-        # on_train_begin runs checkpoint resume — state.global_step may be
-        # updated to the resumed step before the loop starts.
-        self.on_train_begin()
-        num_epochs = self.args.train.num_train_epochs
+        self.state.is_training = True
+        try:
+            self._resume_from_checkpoint_if_needed()
+            self.on_train_begin()
+            num_epochs = self.args.train.num_train_epochs
 
-        if self.state.global_step > 0:
-            logger.info_rank0(
-                "Resuming training from step %d", self.state.global_step,
-            )
+            if self.state.global_step > 0:
+                logger.info_rank0("Resuming training from step %d", self.state.global_step)
 
-        for epoch in range(num_epochs):
-            if self.state.global_step >= self.state.max_steps:
-                break
-            self.state.epoch = epoch
-            if hasattr(self, 'sampler'):
-                self.sampler.set_epoch(epoch)
-            self.on_epoch_begin()
-
-            # Build micro-batch iterator from the stateful dataloader.
-            # StatefulDataLoader tracks iterator position internally,
-            # so after resume it skips already-consumed batches.
-            data_iterator = self._make_micro_batch_iterator()
-
-            # Drive the loop on the live ``global_step`` so total training
-            # never exceeds ``max_steps`` regardless of ``num_train_epochs``
-            # or resume offset.
-            while self.state.global_step < self.state.max_steps:
-                self.on_step_begin()
-                try:
-                    metrics = self.train_step(data_iterator)
-                except StopIteration:
-                    logger.info_rank0("Epoch %d: dataloader exhausted", epoch)
+            for epoch in range(num_epochs):
+                if self.state.global_step >= self.state.max_steps:
+                    break
+                if self.callback_handler.aggregate_control().should_training_stop:
+                    break
+                self.state.epoch = epoch
+                if hasattr(self, 'sampler'):
+                    self.sampler.set_epoch(epoch)
+                epoch_control = self.on_epoch_begin()
+                if epoch_control.should_training_stop:
                     break
 
-                self.on_step_end(
-                    loss=metrics["loss"],
-                    grad_norm=metrics["grad_norm"],
-                )
+                self._run_epoch_steps(epoch)
 
-            self.on_epoch_end()
+                epoch_control = self.on_epoch_end()
+                if epoch_control.should_training_stop:
+                    break
 
-        self.on_train_end()
-        destroy_process_group()
+            self._save_final_checkpoint()
+            self.on_train_end()
+        except BaseException as exc:
+            self.on_exception(exc)
+            raise
+        finally:
+            self.state.is_training = False
+            destroy_process_group()
         logger.info_rank0("Training completed")
+
+    def _run_epoch_steps(self, epoch: int) -> None:
+        """Run the training-step loop for one epoch."""
+        data_iterator = self._make_micro_batch_iterator()
+        while self.state.global_step < self.state.max_steps:
+            step_control = self.on_step_begin()
+            if step_control.should_training_stop or step_control.should_epoch_stop:
+                break
+            if step_control.should_skip_step:
+                logger.info_rank0("Training step skipped by callback control.")
+                self.state.global_step += 1
+                continue
+            try:
+                metrics = self.train_step(data_iterator)
+            except StopIteration:
+                logger.info_rank0("Epoch %d: dataloader exhausted", epoch)
+                break
+
+            control = self.on_step_end(
+                loss=metrics["loss"],
+                grad_norm=metrics["grad_norm"],
+                metrics=metrics,
+            )
+            self._handle_step_control(control)
+            if control.should_training_stop or control.should_epoch_stop:
+                break
 
     # ------------------------------------------------------------------
     # Helpers

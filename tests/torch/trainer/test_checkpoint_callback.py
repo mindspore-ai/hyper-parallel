@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Launch ``CheckpointCallback`` real-DCP save/load ST cases."""
+"""Launch BaseTrainer checkpoint real-DCP save/load ST cases."""
 from tests.common.mark_utils import arg_mark
 from tests.common.parallel_case import parallel_run, TorchCase
 
@@ -23,13 +23,13 @@ _TEST_CHECKPOINT = "_test_checkpoint_callback.py"
     plat_marks=["platform_ascend910b"], level_mark="level1",
     card_mark="allcards", essential_mark="essential",
 )
-def test_checkpoint_callback_group1():
+def test_checkpoint_lifecycle_group1():
     """
-    Feature: CheckpointCallback real-DCP round trip.
+    Feature: BaseTrainer checkpoint real-DCP round trip.
     Description:
-        1. test_checkpoint_callback_round_trip_4card
+        1. test_checkpoint_lifecycle_round_trip_4card
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(_TEST_CHECKPOINT, "test_checkpoint_callback_round_trip_4card", 11815, 4),
+        TorchCase(_TEST_CHECKPOINT, "test_checkpoint_lifecycle_round_trip_4card", 11815, 4),
     ])

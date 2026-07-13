@@ -37,11 +37,11 @@ from unittest.mock import patch
 
 os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
 
-import torch
-from torch import nn
+import torch  # pylint: disable=wrong-import-position
+from torch import nn  # pylint: disable=wrong-import-position
 
-from hyper_parallel.trainer import base as trainer_base
-from hyper_parallel.trainer.base import BaseTrainer
+from hyper_parallel.trainer import base as trainer_base  # pylint: disable=wrong-import-position
+from hyper_parallel.trainer.base import BaseTrainer  # pylint: disable=wrong-import-position
 
 
 def _make_args(weight_decay=0.05, lr=1e-3):
@@ -65,7 +65,7 @@ def _build_trainer(model, args=None):
     """Build a ``BaseTrainer`` with ``self.model`` already populated."""
     args = args or _make_args()
     with patch.object(trainer_base, "get_spec", return_value=object()):
-        trainer = BaseTrainer(args)
+        trainer = BaseTrainer(args, setup=False)
     trainer.model = model
     return trainer
 
@@ -73,7 +73,8 @@ def _build_trainer(model, args=None):
 class _MixedModel(nn.Module):
     """Module with the four name patterns ``_build_optimizer`` discriminates on."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize model with linear, layernorm, and embedding layers."""
         super().__init__()
         self.linear = nn.Linear(4, 4)  # linear.weight (decay), linear.bias (no_decay)
         self.norm = nn.LayerNorm(4)  # norm.weight / norm.bias both no_decay
@@ -131,7 +132,8 @@ class TestDecayNoDecaySplit(unittest.TestCase):
 
         class _UpperCaseModel(nn.Module):
 
-            def __init__(self):
+            def __init__(self) -> None:
+                """Register parameters with uppercase names for case-insensitive matching tests."""
                 super().__init__()
                 # Use ``register_parameter`` to keep arbitrary names that survive
                 # ``named_parameters`` walking.
@@ -161,7 +163,8 @@ class TestTiedParameterDedup(unittest.TestCase):
 
         class _TiedModel(nn.Module):
 
-            def __init__(self):
+            def __init__(self) -> None:
+                """Initialize model with tied embedding and output head weights."""
                 super().__init__()
                 self.embed = nn.Embedding(8, 4)
                 # Tie output head to embedding weight (HF convention).
