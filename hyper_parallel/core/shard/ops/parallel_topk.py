@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,52 +16,103 @@
 Distributed implementation for TopK operator.
 """
 
+from copy import deepcopy
+from typing import Tuple
+
 from .parallel_ops import DistributedOp
+
+
+def _normalize_topk_args(input_tensor, k, dim=-1, largest=True, sorted_output=True):
+    return (input_tensor, k, dim, largest, sorted_output), {}
 
 
 class TopKDistributedOp(DistributedOp):
     """Distributed implementation for TopK operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for TopK operator.
+
+        Args:
+            args (tuple): Input arguments, first element is the input tensor.
+            kwargs (dict): Keyword arguments.
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, kwargs = _normalize_topk_args(*args, **kwargs)
+        input_tensor = args[0]
+        k = args[1]
+        dim = args[2]
+        largest = args[3]
+        sorted_flag = args[4]
+
+        local_args = (input_tensor.to_local(), k, dim, largest, sorted_flag)
+        local_kwargs = {}
+        cache_values = [input_tensor.layout, dim]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layouts for TopK operator.
 
         TopK: values, indices = topk(input, k, dim)
 
         Rules:
-        1. dim = -1 if not specified.
-        2. The dimension `dim` MUST be unsharded to ensure global top-k correctness.
-        3. Both values and indices have same layout as input
+            1. Input must not have Partial status.
+            2. dim must be an integer within the valid range [-ndim, ndim-1].
+            3. The topk dimension must not be sharded (including StridedShard multi-axis mappings).
+            4. Both values and indices output layouts are identical to the input layout.
 
         Args:
-            layouts (tuple): Layouts of inputs. Expected:
-                layouts[0] (Layout): Input tensor layout (required).
-            extra_args (tuple, optional): Requires k and optionally contains dim. Expected:
-                extra_args[0] (int, required): K value.
-                extra_args[1] (int, optional): Dimension to compute topk. Defaults to -1.
+            cache_values (list): [input_layout, dim] where dim is the topk dimension.
 
         Returns:
-            tuple: Layouts for values and indices tensors
+            tuple: ((values_layout, indices_layout), None)
+
+        Raises:
+            ValueError: If input has Partial status, dim is out of range, or the topk dimension
+                is sharded.
         """
-        if not layouts or layouts[0] is None:
-            raise ValueError("topk requires a valid input tensor layout.")
+        layout = cache_values[0]
+        dim = cache_values[1]
 
-        input_layout = layouts[0]
-        in_tensor_map = input_layout.tensor_map
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([layout])
 
-        dim = -1 # If dim is not given, the last dimension of the input is chosen.
-        if len(extra_args) >= 2 and extra_args[1] is not None:
-            dim = extra_args[1]
-        input_dim = len(in_tensor_map)
-        if dim < 0:
-            dim = input_dim + dim # -1 represents the last dimension
-        if not 0 <= dim < input_dim:
-            raise ValueError(f"Dimension out of range (expected to be in [0, {input_dim}), but got {dim}).")
-
-        # The chosen dim must NOT be sharded
-        if in_tensor_map[dim] != -1:
+        if dim is None:
+            dim = -1
+        if not isinstance(dim, int):
             raise ValueError(
-                f"Operation {self.op_name}: Cannot perform sharding on params along the chosen dim"
+                f"For {self.op_name}, dimension should be int, but got {type(dim)}"
             )
 
-        return input_layout, input_layout
+        alias_map = layout.alias_tensor_map
+        ndim = len(alias_map)
+
+        original_dim = dim
+        if dim < 0:
+            dim += ndim
+        if not 0 <= dim < ndim:
+            raise ValueError(
+                f"For {self.op_name}, dimension out of range "
+                f"(expected to be in range of [{-ndim}, {ndim - 1}], but got {original_dim})"
+            )
+
+        # Check if the topk dimension is sharded.
+        # In alias_tensor_map, "None" means Replicate (not sharded); any other value implies sharding.
+        mapping = alias_map[dim]
+        if isinstance(mapping, (list, tuple)):
+            is_sharded = any(m != "None" for m in mapping)
+        else:
+            is_sharded = mapping != "None"
+
+        if is_sharded:
+            raise ValueError(
+                f"For {self.op_name}, topk along a sharded dimension "
+                f"(dim {dim} mapped to {mapping}) is not supported. "
+                f"Please redistribute the tensor to Replicate on this dimension before topk."
+            )
+
+        return ((deepcopy(layout), deepcopy(layout)), None)
+    

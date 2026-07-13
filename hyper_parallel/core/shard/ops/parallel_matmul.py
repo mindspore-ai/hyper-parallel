@@ -88,45 +88,74 @@ def _propagate_partial_from_inputs(out_layout, x_layout, w_layout):
             out_layout.set_partial_by_dev_axis(axis_alias, op)
 
 
+def _normalize_matmul_ext_args(x, w):
+    return (x, w), {}
+
+
 class MatMulExtDistributedOp(DistributedOp):
     """Distributed implementation for MatMul operator."""
-    def infer_layout(self, layouts: tuple, extra_args: Optional[tuple] = None) -> tuple:
+
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layout for MatMul operator.
-
-        MatMul: output = x @ w
-
-        Rules:
-        1. Batch dimensions should have same layout
-        2. Contracting dimensions should have same layout
-        3. Output dimensions inherit layouts from non-contracting dimensions
-        4. Input Partial status is propagated to the output
+        Preprocess arguments for MatMulExt operator.
 
         Args:
-            x_layout (Layout): Layout of input x
-            w_layout (Layout): Layout of input w
+            args (tuple): Input arguments containing x and w tensors.
+            kwargs (dict): Keyword arguments (unused).
 
         Returns:
-            tuple: Layout for output tensor
+            tuple: (local_args, local_kwargs, cache_values) where local_args contains
+                local tensors for x and w; cache_values contains [x_layout, w_layout].
         """
-        if len(layouts) != 2:
-            raise ValueError(f"MatMul layout length is not 2, but {len(layouts)}")
-        x_layout = layouts[0]
-        w_layout = layouts[1]
+        args, kwargs = _normalize_matmul_ext_args(*args, **kwargs)
+        x_tensor, w_tensor = args[0], args[1]
+        local_args = (x_tensor.to_local(), w_tensor.to_local())
+        local_kwargs = {}
+        cache_values = [x_tensor.layout, w_tensor.layout]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layout for MatMul operator (output = x @ w).
+
+        Rules:
+            1. Inputs must share the same mesh_shape.
+            2. Contracting dimensions must have the same layout.
+            3. Output dimensions inherit layouts from non-contracting dimensions.
+            4. Input Partial status is propagated to the output.
+
+        Args:
+            cache_values (list): [x_layout, w_layout]
+
+        Returns:
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
+        """
+        x_layout = cache_values[0]
+        w_layout = cache_values[1]
         if not x_layout or not w_layout:
-            raise ValueError(f"x_layout : {x_layout}, w_layout : {w_layout}")
+            raise ValueError(
+                f"For {self.op_name}, x_layout: {x_layout}, w_layout: {w_layout}"
+            )
         x_mesh_shape = x_layout.mesh_shape
         w_mesh_shape = w_layout.mesh_shape
         if x_mesh_shape != w_mesh_shape:
-            raise ValueError("MatMul inputs must have same mesh_shape")
+            raise ValueError(
+                f"For {self.op_name}, inputs must have same mesh_shape, "
+                f"but got x: {x_mesh_shape} and w: {w_mesh_shape}"
+            )
 
         x_map = x_layout.alias_tensor_map
         w_map = w_layout.alias_tensor_map
         contract_dim = len(x_map) - 1
         w_contract_dim = len(w_map) - 2
         if x_map[contract_dim] != w_map[w_contract_dim]:
-            raise ValueError(f"Contracting dimensions must have same layout. "
-                             f"Got {x_map[contract_dim]} and {w_map[w_contract_dim]}")
+            raise ValueError(
+                f"For {self.op_name}, contracting dimensions must have same layout, "
+                f"but got x: {x_map[contract_dim]} and w: {w_map[w_contract_dim]}"
+            )
 
         output_dim = len(w_map) - 1
         output_map = x_map[:-1] + (w_map[output_dim],)
@@ -149,38 +178,71 @@ class MatMulExtDistributedOp(DistributedOp):
             else:
                 out_layout.set_partial_by_dev_axis(x_map[contract_dim], 'sum')
 
-        return out_layout
+        return ((out_layout,), None)
+
+
+def _normalize_matmul_args(x, w, transpose_a=False, transpose_b=False):
+    return (x, w, transpose_a, transpose_b), {}
 
 
 class MatMulDistributedOp(DistributedOp):
     """Distributed implementation for MatMul operator."""
-    def infer_layout(self, layouts: tuple, extra_args: Optional[tuple] = None) -> tuple:
-        """
-        Infer output layout for MatMul operator.
 
-        MatMul: output = x @ w, with possible transpose
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for MatMul operator.
 
         Args:
-            layouts (tuple): Layouts of input tensors (x_layout, w_layout)
-            extra_args (tuple): Additional arguments (transpose_a, transpose_b)
+            args (tuple): Input arguments containing x, w tensors and optional transpose flags.
+            kwargs (dict): Keyword arguments (unused).
 
         Returns:
-            Layout: Layout for output tensor
+            tuple: (local_args, local_kwargs, cache_values) where local_args contains
+                local tensors for x and w; cache_values contains [x_layout, w_layout, transpose_a, transpose_b].
         """
-        if len(layouts) < 2:
-            raise ValueError("MatMul requires at least two input layouts")
+        args, kwargs = _normalize_matmul_args(*args, **kwargs)
+        x_tensor, w_tensor, transpose_a, transpose_b = args
+        local_args = (x_tensor.to_local(), w_tensor.to_local(), transpose_a, transpose_b)
+        local_kwargs = {}
+        cache_values = [x_tensor.layout, w_tensor.layout, transpose_a, transpose_b]
+        return local_args, local_kwargs, cache_values
 
-        x_layout, w_layout = layouts[:2]
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layout for MatMul operator (output = x @ w, with possible transpose).
 
-        if len(extra_args) != 2:
-            raise ValueError("MatMul requires two transpose input")
-        transpose_a, transpose_b = extra_args[0], extra_args[1]
+        Rules:
+            1. Inputs must share the same mesh_shape.
+            2. Contracting dimensions must have the same layout (adjusted by transpose flags).
+            3. Output dimensions inherit layouts from non-contracting dimensions.
+            4. Input Partial status is propagated to the output.
 
-        x_dict = x_layout.to_dict()
-        w_dict = w_layout.to_dict()
+        Args:
+            cache_values (list): [x_layout, w_layout, transpose_a, transpose_b]
 
-        if x_dict["mesh_shape"] != w_dict["mesh_shape"]:
-            raise ValueError("MatMul inputs must have same mesh_shape")
+        Returns:
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
+        """
+        x_layout = cache_values[0]
+        w_layout = cache_values[1]
+        transpose_a = cache_values[2]
+        transpose_b = cache_values[3]
+
+        if not x_layout or not w_layout:
+            raise ValueError(
+                f"For {self.op_name}, x_layout: {x_layout}, w_layout: {w_layout}"
+            )
+
+        x_mesh_shape = x_layout.mesh_shape
+        w_mesh_shape = w_layout.mesh_shape
+        if x_mesh_shape != w_mesh_shape:
+            raise ValueError(
+                f"For {self.op_name}, inputs must have same mesh_shape, "
+                f"but got x: {x_mesh_shape} and w: {w_mesh_shape}"
+            )
 
         x_map = x_layout.alias_tensor_map
         w_map = w_layout.alias_tensor_map
@@ -202,8 +264,10 @@ class MatMulDistributedOp(DistributedOp):
 
         # Validate contracting dimensions
         if x_map[x_contract_dim] != w_map[w_contract_dim]:
-            raise ValueError(f"Contracting dimensions must have same layout. "
-                             f"Got {x_map[x_contract_dim]} and {w_map[w_contract_dim]}")
+            raise ValueError(
+                f"For {self.op_name}, contracting dimensions must have same layout, "
+                f"but got x: {x_map[x_contract_dim]} and w: {w_map[w_contract_dim]}"
+            )
 
         # Create output layout
         output_layout = Layout(
@@ -212,20 +276,20 @@ class MatMulDistributedOp(DistributedOp):
             rank_list=x_layout.rank_list
         )
         output_map = list(x_map[:-2]) + [x_map[x_input_dim]] + [w_map[w_output_dim]]
-        output_layout = output_layout(*output_map)
+        out_layout = output_layout(*output_map)
 
         # Propagate Partial from inputs (e.g., x already has Partial from a prior matmul)
-        _propagate_partial_from_inputs(output_layout, x_layout, w_layout)
+        _propagate_partial_from_inputs(out_layout, x_layout, w_layout)
 
         # Set partial status
         if x_map[x_contract_dim] != "None":
             if isinstance(x_map[x_contract_dim], tuple):
                 for axis in x_map[x_contract_dim]:
-                    output_layout.set_partial_by_dev_axis(axis, 'sum')
+                    out_layout.set_partial_by_dev_axis(axis, 'sum')
             else:
-                output_layout.set_partial_by_dev_axis(x_map[x_contract_dim], 'sum')
+                out_layout.set_partial_by_dev_axis(x_map[x_contract_dim], 'sum')
 
-        return output_layout
+        return ((out_layout,), None)
 
 
 class BaseBatchMatMulDistributedOp(DistributedOp):
@@ -292,45 +356,67 @@ class BaseBatchMatMulDistributedOp(DistributedOp):
         return output_layout
 
 
+def _normalize_batch_matmul_ext_args(x, w):
+    return (x, w), {}
+
+
 class BatchMatMulExtDistributedOp(BaseBatchMatMulDistributedOp):
     """Distributed implementation for BatchMatMulExt operator."""
 
-    def infer_layout(self, layouts: tuple, extra_args: Optional[tuple] = None) -> tuple:
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layout for BatchMatMulExt operator. Inputs shape are x=[b, n, m] and w=[b, m, p].
-
-        BatchMatMulExt: output = x @ w.
-
-        Rules:
-        - Mesh shape must match.
-        - Contracting K dims must have identical layout: x[-1] == w[-2].
-        - Batch dims are right-aligned broadcast:
-            none vs shard -> shard
-            shard vs none -> shard
-            shard vs shard (different) -> error
-        - Output batch dims = merged batch dims
-        - Output N inherits x[-2], Output P inherits w[-1]
+        Preprocess arguments for BatchMatMulExt operator.
 
         Args:
-            x_layout (Layout): Layout of input x
-            w_layout (Layout): Layout of input w
+            args (tuple): Input arguments containing x and w tensors.
+            kwargs (dict): Keyword arguments (unused).
 
         Returns:
-            tuple: Layout for output tensor
-
-        Examples:
-            layout = Layout((2, 2, 2), ("dp", "cp", "mp"))
-            x_layout = layout("dp", "cp", "mp")
-            w_layout = layout("dp", "mp", "None")
-            out_layout = layout("dp", "cp", "None")
+            tuple: (local_args, local_kwargs, cache_values) where local_args contains
+                local tensors for x and w; cache_values contains [x_layout, w_layout].
         """
+        args, kwargs = _normalize_batch_matmul_ext_args(*args, **kwargs)
+        x_tensor, w_tensor = args[0], args[1]
+        local_args = (x_tensor.to_local(), w_tensor.to_local())
+        local_kwargs = {}
+        cache_values = [x_tensor.layout, w_tensor.layout]
+        return local_args, local_kwargs, cache_values
 
-        if len(layouts) < 2:
-            raise ValueError("BatchMatMul requires at least two input layouts")
-        x_layout, w_layout = layouts[:2]
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layout for BatchMatMulExt operator (output = x @ w).
+
+        Inputs shape are x=[b, n, m] and w=[b, m, p].
+
+        Rules:
+            1. Inputs must share the same mesh_shape.
+            2. Contracting K dims must have identical layout: x[-1] == w[-2].
+            3. Batch dims are right-aligned with broadcast semantics.
+            4. Output batch dims = merged batch dims; N inherits x[-2], P inherits w[-1].
+            5. Input Partial status is propagated to the output.
+
+        Args:
+            cache_values (list): [x_layout, w_layout]
+
+        Returns:
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
+        """
+        x_layout = cache_values[0]
+        w_layout = cache_values[1]
+
+        if not x_layout or not w_layout:
+            raise ValueError(
+                f"For {self.op_name}, x_layout: {x_layout}, w_layout: {w_layout}"
+            )
 
         if x_layout.mesh_shape != w_layout.mesh_shape:
-            raise ValueError("BatchMatMul inputs must have same mesh_shape")
+            raise ValueError(
+                f"For {self.op_name}, inputs must have same mesh_shape, "
+                f"but got x: {x_layout.mesh_shape} and w: {w_layout.mesh_shape}"
+            )
 
         x_map = x_layout.alias_tensor_map
         w_map = w_layout.alias_tensor_map
@@ -339,59 +425,82 @@ class BatchMatMulExtDistributedOp(BaseBatchMatMulDistributedOp):
         x_contract = x_map[-1]
         w_contract = w_map[-2]
         if x_contract != w_contract:
-            raise ValueError(f"Contracting (M) dim layouts must match, got {x_contract} (x) vs {w_contract} (w)")
+            raise ValueError(
+                f"For {self.op_name}, contracting (M) dim layouts must match, "
+                f"but got x: {x_contract} and w: {w_contract}"
+            )
 
         merged_batch = self._merge_batches(x_map, w_map)
         x_n = x_map[-2]
         w_p = w_map[-1]
 
-        return self._build_output_layout(x_layout, w_layout, merged_batch, x_n, w_p, x_contract)
+        return ((self._build_output_layout(x_layout, w_layout, merged_batch, x_n, w_p, x_contract),), None)
+
+
+def _normalize_batch_matmul_args(x, w, transpose_a=False, transpose_b=False):
+    return (x, w, transpose_a, transpose_b), {}
 
 
 class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
     """Distributed implementation for BatchMatMul operator."""
 
-    def infer_layout(self, layouts: tuple, extra_args: Optional[tuple] = None) -> tuple:
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layout for BatchMatMul operator. Inputs shape are x=[b, n, m] and w=[b, m, p].
-
-        BatchMatMul: output = x @ w, with possible transpose.
-
-        Rules:
-        - Mesh shape must match.
-        - Contracting K dims must have identical layout: x[-1] == w[-2].
-        - Batch dims are right-aligned broadcast:
-            none vs shard -> shard
-            shard vs none -> shard
-            shard vs shard (different) -> error
-        - Output batch dims = merged batch dims
-        - Output N inherits x[-2], Output P inherits w[-1]
+        Preprocess arguments for BatchMatMul operator.
 
         Args:
-            layouts (tuple): Layouts of input tensors (x_layout, w_layout)
-            extra_args (tuple): Additional arguments (transpose_a, transpose_b)
+            args (tuple): Input arguments containing x, w tensors and optional transpose flags.
+            kwargs (dict): Keyword arguments (unused).
 
         Returns:
-            tuple: Layout for output tensor
-
-        Examples:
-            ms.mint.bmm((x_layout, w_layout),(transpose_a=True, transpose_b=False))
-            layout = Layout((2, 2, 2), ("dp", "cp", "mp"))
-            x_layout = layout("dp", "mp", "cp")
-            w_layout = layout("dp", "mp", "None")
-            out_layout = layout("dp", "cp", "None")
+            tuple: (local_args, local_kwargs, cache_values) where local_args contains
+                local tensors for x and w; cache_values contains
+                [x_layout, w_layout, transpose_a, transpose_b].
         """
+        args, kwargs = _normalize_batch_matmul_args(*args, **kwargs)
+        x_tensor, w_tensor, transpose_a, transpose_b = args
+        local_args = (x_tensor.to_local(), w_tensor.to_local(), transpose_a, transpose_b)
+        local_kwargs = {}
+        cache_values = [x_tensor.layout, w_tensor.layout, transpose_a, transpose_b]
+        return local_args, local_kwargs, cache_values
 
-        if len(layouts) < 2:
-            raise ValueError("BatchMatMul requires at least two input layouts")
-        if len(extra_args) != 2:
-            raise ValueError("BatchMatMul requires two transpose input")
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layout for BatchMatMul operator (output = x @ w, with possible transpose).
 
-        x_layout, w_layout = layouts[:2]
-        transpose_a, transpose_b = extra_args
+        Inputs shape are x=[b, n, m] and w=[b, m, p].
+
+        Rules:
+            1. Inputs must share the same mesh_shape.
+            2. Contracting K dims must have identical layout (adjusted by transpose flags).
+            3. Batch dims are right-aligned with broadcast semantics.
+            4. Output batch dims = merged batch dims; N/P dims inherit per transpose flags.
+            5. Input Partial status is propagated to the output.
+
+        Args:
+            cache_values (list): [x_layout, w_layout, transpose_a, transpose_b]
+
+        Returns:
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
+        """
+        x_layout = cache_values[0]
+        w_layout = cache_values[1]
+        transpose_a = cache_values[2]
+        transpose_b = cache_values[3]
+
+        if not x_layout or not w_layout:
+            raise ValueError(
+                f"For {self.op_name}, x_layout: {x_layout}, w_layout: {w_layout}"
+            )
 
         if x_layout.mesh_shape != w_layout.mesh_shape:
-            raise ValueError("BatchMatMul inputs must have same mesh_shape")
+            raise ValueError(
+                f"For {self.op_name}, inputs must have same mesh_shape, "
+                f"but got x: {x_layout.mesh_shape} and w: {w_layout.mesh_shape}"
+            )
 
         x_map = x_layout.alias_tensor_map
         w_map = w_layout.alias_tensor_map
@@ -412,11 +521,14 @@ class BatchMatMulDistributedOp(BaseBatchMatMulDistributedOp):
             w_p = w_map[-1]
 
         if x_contract != w_contract:
-            raise ValueError(f"Contracting (M) dim layouts must match, got {x_contract} (x) vs {w_contract} (w)")
+            raise ValueError(
+                f"For {self.op_name}, contracting (M) dim layouts must match, "
+                f"but got x: {x_contract} and w: {w_contract}"
+            )
 
         merged_batch = self._merge_batches(x_map, w_map)
 
-        return self._build_output_layout(x_layout, w_layout, merged_batch, x_n, w_p, x_contract)
+        return ((self._build_output_layout(x_layout, w_layout, merged_batch, x_n, w_p, x_contract),), None)
 
 
 def _normalize_linear_args(x, weight, bias=None):

@@ -21,7 +21,7 @@ from torch import Tensor
 class DTensorBase(Tensor):
     """torch dtensor base"""
 
-    def __new__(cls, local_tensor, device_mesh=None, placements=None):
+    def __new__(cls, local_tensor, device_mesh=None, placements=None, layout=None):
         """
         Create a new DTensorBase instance.
 
@@ -29,6 +29,8 @@ class DTensorBase(Tensor):
             local_tensor: The local tensor shard or another DTensorBase instance.
             device_mesh: The device mesh describing the device topology.
             placements: The placement strategy for each mesh dimension.
+            layout: Optional pre-built Layout reused directly by ``__init_data__``
+                (skips ``_build_layout``; see ``DTensor.from_local_with_layout``).
         """
         if isinstance(local_tensor, DTensorBase):
             # Copy from existing DTensorBase — use alias_placements to preserve multi-axis ordering
@@ -44,7 +46,7 @@ class DTensorBase(Tensor):
 
         # Create Tensor subclass instance, sharing local_tensor's underlying storage
         t = Tensor._make_subclass(cls, local_tensor, local_tensor.requires_grad)
-        t.__init_data__(local_tensor, device_mesh, placements)
+        t.__init_data__(local_tensor, device_mesh, placements, layout)
         return t
 
     # pylint: disable=W0613

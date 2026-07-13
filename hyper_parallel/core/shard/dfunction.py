@@ -62,10 +62,10 @@ class DFunction(platform.Function):
       the single-device path), and wraps the result as a ``DTensor``.
 
     Note on non-tensor positional arguments:
-        The legacy ``_with_layout_infer`` path does not forward non-tensor
-        positional arguments to the local callable.  Pass such values as keyword
-        arguments, or implement ``preprocess()`` in your ``DistributedOp`` to
-        take the ``_dispatch_new`` path which preserves them in ``cache_values``.
+        Non-tensor positional arguments are preserved via the three-phase dispatch
+        flow (``preprocess()`` → ``infer_layout(cache_values)`` →
+        ``get_expand_impl``).  Implement ``preprocess()`` in your ``DistributedOp``
+        to collect non-tensor values into ``cache_values``.
 
     Example::
 

@@ -16,11 +16,17 @@
 Distributed implementation for HistcExt operator.
 """
 
+from typing import Tuple
+
 from hyper_parallel.core.dtensor.layout import Layout
 from hyper_parallel.platform import get_platform
 from .parallel_ops import DistributedOp
 
 platform = get_platform()
+
+
+def _normalize_histc_args(x, bins=100, min_val=0, max_val=0):
+    return (x, bins, min_val, max_val), {}
 
 
 class HistcExtDistributedOp(DistributedOp):
@@ -33,50 +39,100 @@ class HistcExtDistributedOp(DistributedOp):
     - Output is always replicated (1D tensor with shape (bins,))
     """
 
-    def __init__(self, op_name="HistcExt"):
+    def __init__(self, op_name: str = "HistcExt") -> None:
+        """Initialize HistcExtDistributedOp."""
         super().__init__(op_name)
 
-    def infer_layout(self, layouts, extra_args):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for HistcExt operator.
+
+        Args:
+            args (tuple): Input arguments, first element is the input tensor.
+            kwargs (dict): Keyword arguments (bins, min, max).
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        # Map external API parameter names (min, max) to internal names to avoid
+        # shadowing Python builtins.
+        if "min" in kwargs:
+            kwargs["min_val"] = kwargs.pop("min")
+        if "max" in kwargs:
+            kwargs["max_val"] = kwargs.pop("max")
+        args, kwargs = _normalize_histc_args(*args, **kwargs)
+        x, bins, min_val, max_val = args
+        local_args = (x.to_local(), bins, min_val, max_val)
+        local_kwargs = {}
+        cache_values = [x.layout, bins, min_val, max_val]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
         """
         Infer output layout for HistcExt operator.
 
+        Rules:
+            1. Input layout must not be None.
+            2. bins must be a positive integer.
+            3. min and max must be numbers with min <= max.
+            4. Output is always a 1D replicated tensor of shape (bins,).
+            5. When input is sharded, output carries Partial(sum) on sharded device axes.
+
         Args:
-            layouts (tuple): Layouts of input tensor.
-            extra_args (tuple): (bins, min, max) parameters.
+            cache_values (list): [input_layout, bins, min, max]
 
         Returns:
-            Layout: Layout for output histogram tensor.
-        """
-        if not layouts or len(layouts) < 1:
-            raise ValueError(
-                f"{self.__class__.__name__} requires at least one input layout, "
-                f"got {len(layouts) if layouts else 0}"
-            )
-        x_layout = layouts[0]
-        if x_layout is None or x_layout.mesh_shape is None:
-            raise ValueError("Input layout cannot be None.")
+            tuple: ((output_layout,), None)
 
-        bins = extra_args[0] if len(extra_args) > 0 else 100
-        min_val = extra_args[1] if len(extra_args) > 1 else 0
-        max_val = extra_args[2] if len(extra_args) > 2 else 0
+        Raises:
+            ValueError: If any rule above is violated.
+        """
+        x_layout = cache_values[0]
+        bins = cache_values[1]
+        min_val = cache_values[2]
+        max_val = cache_values[3]
+
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([x_layout])
+
+        if x_layout is None or x_layout.mesh_shape is None:
+            raise ValueError(
+                f"For {self.op_name}, input layout should not be None, "
+                f"but got {x_layout}"
+            )
 
         if not isinstance(bins, int):
-            raise ValueError(f"bins must be an integer, got {type(bins)}")
+            raise ValueError(
+                f"For {self.op_name}, bins should be an integer, "
+                f"but got {type(bins).__name__}"
+            )
         if bins <= 0:
-            raise ValueError(f"bins must be a positive integer, got {bins}")
+            raise ValueError(
+                f"For {self.op_name}, bins should be a positive integer, "
+                f"but got {bins}"
+            )
         if not isinstance(min_val, (int, float)):
-            raise ValueError(f"min must be a number, got {type(min_val)}")
+            raise ValueError(
+                f"For {self.op_name}, min should be a number, "
+                f"but got {type(min_val).__name__}"
+            )
         if not isinstance(max_val, (int, float)):
-            raise ValueError(f"max must be a number, got {type(max_val)}")
+            raise ValueError(
+                f"For {self.op_name}, max should be a number, "
+                f"but got {type(max_val).__name__}"
+            )
         if min_val > max_val:
-            raise ValueError(f"min must be less than or equal to max, got min={min_val}, max={max_val}")
+            raise ValueError(
+                f"For {self.op_name}, min should be less than or equal to max, "
+                f"but got min={min_val}, max={max_val}"
+            )
 
         output_layout = Layout(
             mesh_shape=x_layout.mesh_shape,
             alias_name=x_layout.alias_name,
-            rank_list=x_layout.rank_list
+            rank_list=x_layout.rank_list,
         )
-        output_layout.set_tensor_map((-1,))  # Output is 1D histogram with shape (bins,)
+        out_layout = output_layout("None",)
 
         has_sharding = any(
             alias is not None and alias != "None"
@@ -86,11 +142,6 @@ class HistcExtDistributedOp(DistributedOp):
         if has_sharding:
             for alias, tensor_map_val in zip(x_layout.alias_name, x_layout.alias_tensor_map):
                 if tensor_map_val is not None and tensor_map_val != "None":
-                    output_layout.set_partial_by_dev_axis(alias, "sum")
-        # pylint: disable=protected-access
-        output_layout._alias_tensor_map = output_layout._build_readable_tensor_map()
-        # pylint: disable=protected-access
-        output_layout.tensor_map_to_placement()
-        output_layout.update_compact_str()
+                    out_layout.set_partial_by_dev_axis(alias, "sum")
 
-        return output_layout
+        return ((out_layout,), None)

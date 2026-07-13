@@ -18,7 +18,7 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate, Partial
 from hyper_parallel.core.shard.ops.parallel_atleast_1d import Atleast1DDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -30,7 +30,7 @@ from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS
 
 class TestParallelAtleast1d(unittest.TestCase):
     """Unit tests for Atleast1DDistributedOp."""
-    def setUp(self):
+    def setUp(self) -> None:
         """Set up test fixtures before each test method.
 
         Clears global caches to ensure test isolation and initializes
@@ -38,12 +38,14 @@ class TestParallelAtleast1d(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
         self.op = Atleast1DDistributedOp("atleast_1d")
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -82,18 +84,24 @@ class TestParallelAtleast1d(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 0)
 
-        output_layout = self.op.infer_layout((x_layout,))
+        cache_values = [x_layout]
+        output_layouts, extra_info = self.op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (-1,)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"0D to 1D conversion failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+            f"0D to 1D conversion failed. Expected {expected_map}, "
+            f"got {output_layout.to_dict()['tensor_map']}"
+        )
+        assert extra_info is None, (
+            f"extra_info should be None, got {extra_info}"
         )
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert self.op.get_expand_impl(None, output_layout, (x_layout,), None) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"got {self.op.get_expand_impl(None, output_layout, (x_layout,), None)}"
+        assert self.op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
+            f"get_expand_impl should return None, "
+            f"got {self.op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -107,11 +115,17 @@ class TestParallelAtleast1d(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 1)
 
-        output_layout = self.op.infer_layout((x_layout,))
+        cache_values = [x_layout]
+        output_layouts, extra_info = self.op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (1,)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"1D preservation failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+            f"1D preservation failed. Expected {expected_map}, "
+            f"got {output_layout.to_dict()['tensor_map']}"
+        )
+        assert extra_info is None, (
+            f"extra_info should be None, got {extra_info}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -125,11 +139,17 @@ class TestParallelAtleast1d(unittest.TestCase):
         x_placements = (Shard(0), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = self.op.infer_layout((x_layout,))
+        cache_values = [x_layout]
+        output_layouts, extra_info = self.op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
         expected_map = (1, 0)
         assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"ND preservation failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+            f"ND preservation failed. Expected {expected_map}, "
+            f"got {output_layout.to_dict()['tensor_map']}"
+        )
+        assert extra_info is None, (
+            f"extra_info should be None, got {extra_info}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -143,8 +163,9 @@ class TestParallelAtleast1d(unittest.TestCase):
         x_placements = (Partial("sum"), Replicate())
         x_layout = _build_layout(mesh, x_placements, 1)
 
+        cache_values = [x_layout]
         with self.assertRaisesRegex(ValueError, "Partial status which is not allowed"):
-            self.op.infer_layout((x_layout,))
+            self.op.infer_layout(cache_values)
 
 
 if __name__ == "__main__":

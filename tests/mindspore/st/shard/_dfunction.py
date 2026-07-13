@@ -17,7 +17,7 @@
 Tests cover forward numerical correctness for:
 - Basic element-wise add (DTensor dispatch, layout, single vs multi-card parity)
 - Custom ReLU activation
-- Column-parallel Linear (preprocess → _dispatch_new path)
+- Column-parallel Linear (preprocess → _dispatch_layout_infer path)
 - Row-parallel Linear with bias (get_expand_impl non-None path)
 """
 import numpy as np
@@ -138,7 +138,7 @@ class _ReLUFunc(DFunction):
 
 
 # ---------------------------------------------------------------------------
-# Op 3: Column-parallel Linear (preprocess → _dispatch_new, get_expand_impl=None)
+# Op 3: Column-parallel Linear (preprocess → _dispatch_layout_infer, get_expand_impl=None)
 # ---------------------------------------------------------------------------
 
 def _linear_output_layout(x_layout: Layout, w_layout: Layout) -> Layout:
@@ -168,7 +168,7 @@ def _linear_output_layout(x_layout: Layout, w_layout: Layout) -> Layout:
 
 
 class _LinColDistOp(DistributedOp):
-    """Column-parallel Linear using the preprocess → _dispatch_new path."""
+    """Column-parallel Linear using the preprocess → _dispatch_layout_infer path."""
 
     def __init__(self):
         super().__init__("MsDFuncLinCol")
@@ -395,7 +395,7 @@ def test_linear_colwise_dispatch_new():
     Description:
         - x [8, 16] Shard(0) on DP, Replicate on TP.
         - w [32, 16] Replicate.
-        - _LinColFunc uses preprocess → _dispatch_new; get_expand_impl returns None.
+        - _LinColFunc uses preprocess → _dispatch_layout_infer; get_expand_impl returns None.
     Expectation: Output matches mint.nn.functional.linear(x_full, w_full) gathered.
     """
     x = Tensor(_X_NP)

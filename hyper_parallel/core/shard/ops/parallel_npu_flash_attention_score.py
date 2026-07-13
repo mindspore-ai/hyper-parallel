@@ -71,6 +71,51 @@ def _get_lb_override() -> Tuple[Optional[int], Optional[int]]:
     return getattr(_LB_OVERRIDE, 'split_id', None), getattr(_LB_OVERRIDE, 'split_num', None)
 
 
+def _normalize_npu_fusion_attention_args(
+    query, key, value, head_num, input_layout,
+    pse=None, padding_mask=None, atten_mask=None,
+    scale=1.0, keep_prob=1.0,
+    pre_tockens=2147483647, next_tockens=2147483647,
+    inner_precise=0, prefix=None,
+    actual_seq_qlen=None, actual_seq_kvlen=None,
+    sparse_mode=0, gen_mask_parallel=True, sync=False
+):
+    """Normalize positional and keyword arguments into a canonical positional tuple.
+
+    Args:
+        query: Query tensor.
+        key: Key tensor.
+        value: Value tensor.
+        head_num: Number of attention heads (global, before sharding).
+        input_layout: Input layout string ('BSH', 'BNSD', 'SBH', 'BSND', or 'TND').
+        pse: Optional positional encoding tensor.
+        padding_mask: Optional padding mask tensor.
+        atten_mask: Optional attention mask tensor.
+        scale: Softmax scaling factor.
+        keep_prob: Dropout keep probability.
+        pre_tockens: Preceding token window size.
+        next_tockens: Following token window size.
+        inner_precise: Inner precision mode selector.
+        prefix: Optional prefix tensor for KV-cache scenarios.
+        actual_seq_qlen: Actual query sequence lengths per batch (varlen).
+        actual_seq_kvlen: Actual KV sequence lengths per batch (varlen).
+        sparse_mode: Sparse attention mode (0=defaultMask, 1=allMask, 2=leftUpCausal,
+            3=rightDownCausal, 4=band).
+        gen_mask_parallel: Whether to generate mask in parallel.
+        sync: Whether to synchronize after the kernel.
+
+    Returns:
+        tuple: (positional_args_tuple, empty_kwargs_dict)
+    """
+    return (
+        query, key, value, head_num, input_layout,
+        pse, padding_mask, atten_mask,
+        scale, keep_prob, pre_tockens, next_tockens,
+        inner_precise, prefix, actual_seq_qlen, actual_seq_kvlen,
+        sparse_mode, gen_mask_parallel, sync
+    ), {}
+
+
 @dataclass
 class TndLayoutContext:
     """Groups TND layout adjustment parameters to reduce argument count."""
@@ -97,6 +142,35 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
             "BSND": {"batch": 0, "seq": 1, "head": 2, "dim": 3},
             "TND": {"total": 0, "head": 1, "dim": 2},
         }
+
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """
+        Preprocess arguments for NPUFlashAttentionScore operator.
+
+        Args:
+            args (tuple): Raw positional arguments (query, key, value, head_num, input_layout, ...).
+            kwargs (dict): Keyword arguments (empty for this torch-only op).
+
+        Returns:
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, kwargs = _normalize_npu_fusion_attention_args(*args, **kwargs)
+        query, key, value = args[0], args[1], args[2]
+        input_layout = args[4]
+
+        local_args = (
+            query.to_local() if hasattr(query, '_layout') else query,
+            key.to_local() if hasattr(key, '_layout') else key,
+            value.to_local() if hasattr(value, '_layout') else value,
+        ) + args[3:]
+        local_kwargs = {}
+
+        query_layout = query.layout if hasattr(query, "_layout") else None
+        key_layout = key.layout if hasattr(key, "_layout") else None
+        value_layout = value.layout if hasattr(value, "_layout") else None
+
+        cache_values = [query_layout, key_layout, value_layout, input_layout]
+        return local_args, local_kwargs, cache_values
 
     def _is_dynamic_shape(self, tensor: Tensor, dim: int) -> bool:
         """Check if tensor has dynamic shape at given dimension."""
@@ -282,31 +356,36 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
         if sparse_mode == SPARSE_ALL_MASK:
             return sparse_mode, pre_tockens, next_tockens
 
-        query_seq_length = query.shape[seq_dim_idx]
-        key_seq_length = key.shape[seq_dim_idx]
-
-        local_q_len_symbolic = query_seq_length // split_num
+        # query / key are local tensors (post-.to_local()), so .shape is already
+        # the local symbolic length.  No further division by split_num is needed
+        # — that would double-divide.
+        #
+        # kv_seq_split_num > 1 is blocked by a guard in
+        # _compute_adjusted_sparse_params before reaching this function,
+        # so local_kv_len == global_kv_len is guaranteed here.
+        local_q_len = query.shape[seq_dim_idx]
+        local_kv_len = key.shape[seq_dim_idx]
 
         if sparse_mode in (SPARSE_DEFAULT_MASK, SPARSE_BAND):
             new_pre_tockens = pre_tockens
             new_next_tockens = next_tockens
         else:
-            new_pre_tockens = key_seq_length
+            new_pre_tockens = local_kv_len
             new_next_tockens = 0
 
         new_sparse_mode = SPARSE_BAND if sparse_mode != SPARSE_DEFAULT_MASK else sparse_mode
         update_mode = SPARSE_MODE_UPDATE_MAP[sparse_mode]
 
         if update_mode == LEFT_UP_TO_LEFT_UP:
-            offset = -split_id * local_q_len_symbolic
+            offset = -split_id * local_q_len
             new_pre_tockens = new_pre_tockens + offset
             new_next_tockens = new_next_tockens - offset
         elif update_mode == LEFT_UP_TO_RIGHT_DOWN:
-            offset = key_seq_length - (split_id + 1) * local_q_len_symbolic
+            offset = local_kv_len - (split_id + 1) * local_q_len
             new_pre_tockens = new_pre_tockens + offset
             new_next_tockens = new_next_tockens - offset
         elif update_mode == RIGHT_DOWN_TO_RIGHT_DOWN:
-            offset = (split_num - split_id - 1) * local_q_len_symbolic
+            offset = (split_num - split_id - 1) * local_q_len
             new_pre_tockens = new_pre_tockens + offset
             new_next_tockens = new_next_tockens - offset
 
@@ -442,46 +521,98 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
         if len(pse_shape) == 4 and pse_shape[2] == 1024:
             warnings.warn("Detected Alibi positional encoding compression scenario")
 
-    def infer_layout(
-        self, layouts: List[Optional[Layout]], extra_args: Optional[dict] = None
-    ) -> Tuple[Layout, ...]:
-        """Infer output layouts."""
-        query_layout = layouts[0]
+    @staticmethod
+    def _validate_input_layouts(query_layout, key_layout, value_layout, input_layout, layout_dims, op_name):
+        """Validate input layouts for compatibility.
+
+        Rules:
+            1. Query layout must not be None.
+            2. Key and Value must have identical tensor_map when both layouts are available.
+            3. Q/K batch, hidden, and dim sharding must be consistent.
+
+        Args:
+            query_layout (Layout): Query tensor layout.
+            key_layout (Optional[Layout]): Key tensor layout, or None.
+            value_layout (Optional[Layout]): Value tensor layout, or None.
+            input_layout (str): Input layout string (e.g. "BSH", "BNSD", "TND").
+            layout_dims (dict): Mapping from layout name to dimension indices.
+            op_name (str): Operator name for error messages.
+
+        Raises:
+            ValueError: If any validation rule is violated.
+        """
         if query_layout is None:
-            raise ValueError("Query layout cannot be None")
+            raise ValueError(
+                f"For {op_name}, query layout cannot be None"
+            )
+
+        NPUFlashAttentionScoreDistributedOp._validate_sharding_consistency(
+            query_layout, key_layout, input_layout, layout_dims, op_name)
+
+        if key_layout is not None and value_layout is not None:
+            if (
+                hasattr(key_layout, "tensor_map")
+                and hasattr(value_layout, "tensor_map")
+                and key_layout.tensor_map != value_layout.tensor_map
+            ):
+                raise ValueError(
+                    f"For {op_name}, Key and Value must have identical sharding strategies, "
+                    f"but got Key tensor_map: {key_layout.tensor_map} and "
+                    f"Value tensor_map: {value_layout.tensor_map}"
+                )
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """Infer output layouts for NPUFlashAttentionScore operator.
+
+        Rules:
+            1. Query layout must not be None.
+            2. Input must not have Partial status.
+            3. K/V tensor_map must be identical when both are sharded.
+            4. Q/K batch, hidden, and dim sharding must be consistent.
+            5. Input layout string must be valid.
+            6. Attention output layout matches query layout.
+            7. Softmax layouts are derived from query layout and input_layout.
+
+        Args:
+            cache_values (list): [query_layout, key_layout, value_layout, input_layout]
+
+        Returns:
+            tuple: ((attention_out_layout, softmax_max_layout, softmax_sum_layout, softmax_out_layout), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
+        """
+        query_layout = cache_values[0]
+        key_layout = cache_values[1]
+        value_layout = cache_values[2]
+        input_layout_str = cache_values[3]
+
+        if not isinstance(input_layout_str, str):
+            raise ValueError(
+                f"For {self.op_name}, input_layout should be a string, "
+                f"but got {type(input_layout_str)}"
+            )
+
+        if input_layout_str not in self._layout_dims:
+            raise ValueError(
+                f"For {self.op_name}, unsupported input_layout: '{input_layout_str}', "
+                f"supported layouts: {list(self._layout_dims.keys())}"
+            )
+
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([query_layout, key_layout, value_layout])
+        self._validate_input_layouts(
+            query_layout, key_layout, value_layout, input_layout_str,
+            self._layout_dims, self.op_name,
+        )
 
         attention_out_layout = copy.deepcopy(query_layout)
         if attention_out_layout.placements is None and attention_out_layout.tensor_map is not None:
             attention_out_layout.tensor_map_to_placement()
 
-        input_layout_str = None
-        softmax_layout_param = ""
-
-        if len(extra_args) >= 2:
-            input_layout_str = extra_args[1]
-            if not isinstance(input_layout_str, str):
-                input_layout_str = None
-
-        softmax_layout_param = ""
-
-        if input_layout_str and input_layout_str in self._layout_dims:
-            softmax_layout = self._infer_softmax_layout_by_input_layout(
-                query_layout, input_layout_str, softmax_layout_param
-            )
-        else:
-            if input_layout_str is None:
-                raise ValueError(
-                    "Missing required parameter 'input_layout' in extra explicit input_layout specification."
-                )
-
-            if input_layout_str not in self._layout_dims:
-                raise ValueError(
-                    f"Unsupported input_layout: '{input_layout_str}'.\n"
-                    f"Supported layouts: {list(self._layout_dims.keys())}"
-                )
-
-            softmax_layout = self._infer_softmax_layout_conservatively(query_layout)
-
+        softmax_layout = self._infer_softmax_layout_by_input_layout(
+            query_layout, input_layout_str, ""
+        )
         softmax_max_layout = softmax_layout
         softmax_sum_layout = copy.deepcopy(softmax_layout)
         softmax_out_layout = self._create_replicated_scalar_layout(query_layout)
@@ -489,10 +620,8 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
             softmax_out_layout.tensor_map_to_placement()
 
         return (
-            attention_out_layout,
-            softmax_max_layout,
-            softmax_sum_layout,
-            softmax_out_layout,
+            (attention_out_layout, softmax_max_layout, softmax_sum_layout, softmax_out_layout),
+            None,
         )
 
     def _infer_softmax_layout_conservatively(self, query_layout: Layout) -> Layout:
@@ -591,28 +720,34 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
         softmax_layout.set_tensor_map((-1, -1, -1, -1))
         return softmax_layout
 
+    @staticmethod
     def _validate_sharding_consistency(
-        self,
         query_layout: Layout,
         key_layout: Optional[Layout],
-        input_layout: str
+        input_layout: str,
+        layout_dims: dict,
+        op_name: str,
     ):
-        """Validate Q/K/V sharding consistency."""
+        """Validate Q/K sharding consistency — batch, hidden, and dim dimensions."""
         if key_layout is None or not hasattr(key_layout, 'tensor_map'):
             return
 
-        dims = self._layout_dims.get(input_layout, {})
+        dims = layout_dims.get(input_layout, {})
         q_tm = query_layout.tensor_map
         k_tm = key_layout.tensor_map
 
         if q_tm is None or k_tm is None:
             return
 
-        self._check_batch_consistency(dims, q_tm, k_tm, input_layout)
-        self._check_hidden_consistency(dims, q_tm, k_tm, input_layout)
-        self._check_dim_consistency(dims, q_tm, k_tm, input_layout)
+        NPUFlashAttentionScoreDistributedOp._check_batch_consistency(
+            dims, q_tm, k_tm, input_layout, op_name)
+        NPUFlashAttentionScoreDistributedOp._check_hidden_consistency(
+            dims, q_tm, k_tm, input_layout, op_name)
+        NPUFlashAttentionScoreDistributedOp._check_dim_consistency(
+            dims, q_tm, k_tm, input_layout, op_name)
 
-    def _check_batch_consistency(self, dims, q_tm, k_tm, input_layout):
+    @staticmethod
+    def _check_batch_consistency(dims, q_tm, k_tm, input_layout, op_name):
         """Check batch dimension sharding consistency."""
         if "batch" not in dims:
             return
@@ -626,15 +761,15 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
 
         if q_batch_shard != k_batch_shard:
             raise ValueError(
-                f"Query and Key/Value must have identical batch sharding strategy.\n"
-                f"Input layout: {input_layout}\n"
-                f"Query batch sharding (dim {batch_idx}): {q_batch_shard}\n"
-                f"Key/Value batch sharding (dim {batch_idx}): {k_batch_shard}\n"
-                f"Query tensor_map: {q_tm}\n"
-                f"Key tensor_map: {k_tm}"
+                f"For {op_name}, Query and Key/Value must have identical batch sharding strategy. "
+                f"Input layout: {input_layout}, "
+                f"Query batch sharding (dim {batch_idx}): {q_batch_shard}, "
+                f"Key/Value batch sharding (dim {batch_idx}): {k_batch_shard}, "
+                f"Query tensor_map: {q_tm}, Key tensor_map: {k_tm}"
             )
 
-    def _check_hidden_consistency(self, dims, q_tm, k_tm, input_layout):
+    @staticmethod
+    def _check_hidden_consistency(dims, q_tm, k_tm, input_layout, op_name):
         """Check hidden dimension sharding consistency."""
         if "hidden" not in dims:
             return
@@ -648,17 +783,17 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
 
         if q_hidden_shard != k_hidden_shard:
             raise ValueError(
-                f"Query and Key/Value must have identical hidden sharding strategy.\n"
-                f"Input layout: {input_layout}\n"
-                f"Query hidden sharding (dim {hidden_idx}): {q_hidden_shard}\n"
-                f"Key/Value hidden sharding (dim {hidden_idx}): {k_hidden_shard}\n"
-                f"Query tensor_map: {q_tm}\n"
-                f"Key tensor_map: {k_tm}\n"
-                f"Note: This checks sharding strategy, not tensor size.\n"
+                f"For {op_name}, Query and Key/Value must have identical hidden sharding strategy. "
+                f"Input layout: {input_layout}, "
+                f"Query hidden sharding (dim {hidden_idx}): {q_hidden_shard}, "
+                f"Key/Value hidden sharding (dim {hidden_idx}): {k_hidden_shard}, "
+                f"Query tensor_map: {q_tm}, Key tensor_map: {k_tm}. "
+                f"Note: This checks sharding strategy, not tensor size. "
                 f"GQA (different head counts) is supported when sharding strategies match."
             )
 
-    def _check_dim_consistency(self, dims, q_tm, k_tm, input_layout):
+    @staticmethod
+    def _check_dim_consistency(dims, q_tm, k_tm, input_layout, op_name):
         """Check dim dimension sharding consistency."""
         if "dim" not in dims:
             return
@@ -672,12 +807,11 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
 
         if q_dim_shard != k_dim_shard:
             raise ValueError(
-                f"Query and Key/Value must have identical dim sharding strategy.\n"
-                f"Input layout: {input_layout}\n"
-                f"Query dim sharding (dim {dim_idx}): {q_dim_shard}\n"
-                f"Key/Value dim sharding (dim {dim_idx}): {k_dim_shard}\n"
-                f"Query tensor_map: {q_tm}\n"
-                f"Key tensor_map: {k_tm}"
+                f"For {op_name}, Query and Key/Value must have identical dim sharding strategy. "
+                f"Input layout: {input_layout}, "
+                f"Query dim sharding (dim {dim_idx}): {q_dim_shard}, "
+                f"Key/Value dim sharding (dim {dim_idx}): {k_dim_shard}, "
+                f"Query tensor_map: {q_tm}, Key tensor_map: {k_tm}"
             )
 
     def _check_seq_sharding_compatibility(
@@ -769,6 +903,15 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
     ) -> Tuple[int, int, int]:
         """Compute adjusted sparse parameters based on dynamic or static shape."""
         if is_dynamic:
+            if kv_seq_split_num > 1:
+                raise NotImplementedError(
+                    f"For {self.op_name}, dynamic shape with KV sequence sharding "
+                    f"(kv_seq_split_num={kv_seq_split_num}) is not yet supported. "
+                    f"The dynamic path currently uses local KV length directly, "
+                    f"while the static path multiplies by kv_seq_split_num to obtain "
+                    f"the global KV length. Supporting this requires verified "
+                    f"symbolic-integer arithmetic for local_kv_len * kv_seq_split_num."
+                )
             return self._compute_sparse_params_dynamic(
                 query, key,
                 sparse_mode, pre_tockens, next_tockens,
@@ -850,28 +993,26 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
         return (tnd_ctx.sparse_mode, tnd_ctx.pre_tockens, tnd_ctx.next_tockens,
                 adjusted_actual_seq_qlen, adjusted_actual_seq_kvlen)
 
-    def get_expand_impl(self, func, infer_result, layouts, extra_args=None):
-        """Create expanded implementation."""
-        query_layout = layouts[0]
+    def get_expand_impl(  # pylint: disable=W0237
+        self, func, infer_result, cache_values
+    ):
+        """Create expanded implementation for NPUFlashAttentionScore operator.
+
+        Args:
+            func: Original operator callable.
+            infer_result (tuple): ((out_layouts_tuple,), None) from infer_layout.
+            cache_values (list): [query_layout, key_layout, value_layout, input_layout].
+
+        Returns:
+            callable | None: expanded_impl closure, or None when query_layout is None.
+        """
+        query_layout = cache_values[0]
+        key_layout = cache_values[1]
+
         if query_layout is None:
             return None
 
-        if len(layouts) >= 3:
-            key_layout = layouts[1]
-            value_layout = layouts[2]
-
-            has_valid_layouts = (key_layout is not None and value_layout is not None)
-            has_tensor_maps = has_valid_layouts and (
-                hasattr(key_layout, 'tensor_map') and hasattr(value_layout, 'tensor_map'))
-            if has_tensor_maps:
-                if key_layout.tensor_map != value_layout.tensor_map:
-                    raise ValueError(
-                        f"Key and Value must have identical sharding strategies.\n"
-                        f"Key tensor_map: {key_layout.tensor_map}\n"
-                        f"Value tensor_map: {value_layout.tensor_map}"
-                    )
-
-        def expanded_impl(  # pylint: disable=R0913
+        def _expanded_impl(  # pylint: disable=R0913
             query,
             key,
             value,
@@ -892,9 +1033,6 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
             gen_mask_parallel=True,
             sync=False
         ):
-            key_layout = layouts[1]
-            self._validate_sharding_consistency(query_layout, key_layout, input_layout)
-
             is_varlen = input_layout == "TND" and actual_seq_qlen is not None
             self._validate_atten_mask(atten_mask, sparse_mode, input_layout, is_varlen)
             self._validate_pse_configuration(pse, sparse_mode)
@@ -946,7 +1084,7 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
 
             return NPUFlashAttentionScoreDistributedOp._truncate_result(result)
 
-        return expanded_impl
+        return _expanded_impl
 
     def _apply_seq_split_adjustments(  # pylint: disable=too-many-arguments,too-many-locals
         self,
@@ -980,6 +1118,10 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
             is_dynamic = dynamic_info.get('is_dynamic', False)
 
             if lb_split_id is not None:
+                if lb_split_num is None:
+                    raise ValueError(
+                        "lb_split_num must not be None when lb_split_id is set"
+                    )
                 split_id = lb_split_id
                 seq_split_num = lb_split_num
             else:

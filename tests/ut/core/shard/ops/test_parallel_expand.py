@@ -13,12 +13,11 @@
 # limitations under the License.
 # ============================================================================
 """parallel_expand test"""
-import os
 import unittest
 from unittest.mock import patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_expand import ExpandDistributedOp, ExpandAsDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -41,11 +40,13 @@ class TestParallelExpand(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def tearDown(self):
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -89,18 +90,41 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(-1, 5))
+        cache_values = [x_layout, (2, 1), (-1, 5)]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
-        expected_map = (1, -1)
-        assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"Basic expand failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        expected_map = ("dp", "None")
+        assert output_layout.alias_tensor_map == expected_map, (
+            f"Basic expand failed. Expected {expected_map}, got {output_layout.alias_tensor_map}"
         )
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (x_layout,), (-1, 5)) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"got {op.get_expand_impl(None, output_layout, (x_layout,), (-1, 5))}"
+        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
+            f"get_expand_impl should return None, "
+            f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_expand_same_size_preserve_sharding(self, mock_platform):
+        """
+        Feature: Expand with explicit same-size dimensions preserves sharding.
+        Description: Input shape (8, 4) with layout ("dp", "None"), expand(8, 4).
+        Expectation: Sharding is preserved on dim 0 since size is unchanged.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        x_placements = (Shard(0), Replicate())
+        x_layout = _build_layout(mesh, x_placements, 2)
+
+        cache_values = [x_layout, (8, 4), (8, 4)]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
+
+        expected_map = ("dp", "None")
+        assert output_layout.alias_tensor_map == expected_map, (
+            f"Same-size sharded dim failed. Expected {expected_map}, "
+            f"got {output_layout.alias_tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -114,11 +138,14 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Shard(0), Replicate(), Shard(2))
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(-1, 10, -1))
+        cache_values = [x_layout, (3, 1, 4), (-1, 10, -1)]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
-        expected_map = (2, -1, 0)
-        assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"Preserve with -1 failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        expected_map = ("dp", "None", "mp")
+        assert output_layout.alias_tensor_map == expected_map, (
+            f"Preserve with -1 failed. Expected {expected_map}, "
+            f"got {output_layout.alias_tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -132,11 +159,14 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Replicate(), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(2, 3, -1, -1))
+        cache_values = [x_layout, (5, 6), (2, 3, -1, -1)]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
-        expected_map = (-1, -1, -1, 0)
-        assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"Prepend multiple new dimensions failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        expected_map = ("None", "None", "None", "mp")
+        assert output_layout.alias_tensor_map == expected_map, (
+            f"Prepend multiple new dimensions failed. Expected {expected_map}, "
+            f"got {output_layout.alias_tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -150,11 +180,13 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = ()
         x_layout = _build_layout(mesh, x_placements, 0)
 
-        output_layout = op.infer_layout((x_layout,), extra_args=(3, 4))
+        cache_values = [x_layout, (), (3, 4)]
+        output_layouts, _ = op.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
-        expected_map = (-1, -1)
-        assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"Scalar expansion failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        expected_map = ("None", "None")
+        assert output_layout.alias_tensor_map == expected_map, (
+            f"Scalar expansion failed. Expected {expected_map}, got {output_layout.alias_tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -168,8 +200,9 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "Cannot expand dimension 0 which is sharded"):
-            op.infer_layout((x_layout,), extra_args=(5, -1))
+        cache_values = [x_layout, (1, 3), (5, -1)]
+        with self.assertRaisesRegex(ValueError, "cannot expand dimension 0"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_expand_layout_invalid_minus_one_for_new_dim(self, mock_platform):
@@ -182,8 +215,9 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "Cannot use -1 for new dimension at position 0"):
-            op.infer_layout((x_layout,), extra_args=(-1, 3, 4))
+        cache_values = [x_layout, (5, 6), (-1, 3, 4)]
+        with self.assertRaisesRegex(ValueError, "cannot use -1 for new dimension at position 0"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_expand_layout_invalid_dimension_reduction(self, mock_platform):
@@ -196,8 +230,9 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "Cannot reduce dimensions with expand"):
-            op.infer_layout((x_layout,), extra_args=(5,))
+        cache_values = [x_layout, (3, 4), (5,)]
+        with self.assertRaisesRegex(ValueError, "cannot reduce dimensions with expand"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_expand_as_layout_basic_expansion(self, mock_platform):
@@ -210,14 +245,20 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        input_global_shape = (8, 1)
-        target_shape = (8, 16)
+        cache_values = [x_layout, (8, 1), (8, 16)]
+        output_layouts, _ = op2.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
-        output_layout = op2.infer_layout((x_layout,), extra_args=((input_global_shape, target_shape),))
+        expected_map = ("dp", "None")
+        assert output_layout.alias_tensor_map == expected_map, (
+            f"Basic expand_as failed. Expected {expected_map}, got {output_layout.alias_tensor_map}"
+        )
 
-        expected_map = (1, -1)
-        assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"Basic expand_as failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        # Since `get_expand_impl` is not overridden, it returns None by default.
+        # The same applies to other test classes, so it is unnecessary to test its return value.
+        assert op2.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
+            f"get_expand_impl should return None, "
+            f"got {op2.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -231,14 +272,14 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Shard(0), Replicate(), Shard(2))
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        input_global_shape = (4, 1, 6)
-        target_shape = (4, 10, 6)
+        cache_values = [x_layout, (4, 1, 6), (4, 10, 6)]
+        output_layouts, _ = op2.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
-        output_layout = op2.infer_layout((x_layout,), extra_args=((input_global_shape, target_shape),))
-
-        expected_map = (2, -1, 0)
-        assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"3D expand_as preservation failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        expected_map = ("dp", "None", "mp")
+        assert output_layout.alias_tensor_map == expected_map, (
+            f"3D expand_as preservation failed. Expected {expected_map}, "
+            f"got {output_layout.alias_tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -252,14 +293,14 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        input_global_shape = (8, 1)
-        target_shape = (2, 3, 8, 16)
+        cache_values = [x_layout, (8, 1), (2, 3, 8, 16)]
+        output_layouts, _ = op2.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
-        output_layout = op2.infer_layout((x_layout,), extra_args=((input_global_shape, target_shape),))
-
-        expected_map = (-1, -1, 1, -1)
-        assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"Prepend dimensions failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        expected_map = ("None", "None", "dp", "None")
+        assert output_layout.alias_tensor_map == expected_map, (
+            f"Prepend dimensions failed. Expected {expected_map}, "
+            f"got {output_layout.alias_tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -273,14 +314,13 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = ()
         x_layout = _build_layout(mesh, x_placements, 0)
 
-        input_global_shape = ()
-        target_shape = (3, 4, 5)
+        cache_values = [x_layout, (), (3, 4, 5)]
+        output_layouts, _ = op2.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
-        output_layout = op2.infer_layout((x_layout,), extra_args=((input_global_shape, target_shape),))
-
-        expected_map = (-1, -1, -1)
-        assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"Scalar expand_as failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        expected_map = ("None", "None", "None")
+        assert output_layout.alias_tensor_map == expected_map, (
+            f"Scalar expand_as failed. Expected {expected_map}, got {output_layout.alias_tensor_map}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -294,11 +334,9 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Replicate(), Shard(1))
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        input_global_shape = (8, 1)
-        target_shape = (8, 16)
-
-        with self.assertRaisesRegex(ValueError, "Cannot expand sharded dimension 1"):
-            op2.infer_layout((x_layout,), extra_args=((input_global_shape, target_shape),))
+        cache_values = [x_layout, (8, 1), (8, 16)]
+        with self.assertRaisesRegex(ValueError, "cannot expand sharded dimension 1"):
+            op2.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_expand_as_layout_invalid_non_singleton_mismatch(self, mock_platform):
@@ -311,11 +349,9 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        input_global_shape = (8, 3)
-        target_shape = (8, 5)
-
-        with self.assertRaisesRegex(ValueError, "Cannot expand dimension 1 from size 3 to 5"):
-            op2.infer_layout((x_layout,), extra_args=((input_global_shape, target_shape),))
+        cache_values = [x_layout, (8, 3), (8, 5)]
+        with self.assertRaisesRegex(ValueError, "cannot expand dimension 1 from size 3 to 5"):
+            op2.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_expand_as_layout_invalid_rank_reduction(self, mock_platform):
@@ -328,11 +364,9 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Replicate(), Replicate(), Replicate())
         x_layout = _build_layout(mesh, x_placements, 3)
 
-        input_global_shape = (4, 5, 6)
-        target_shape = (4, 5)
-
+        cache_values = [x_layout, (4, 5, 6), (4, 5)]
         with self.assertRaisesRegex(ValueError, "target shape.*cannot be smaller than input shape"):
-            op2.infer_layout((x_layout,), extra_args=((input_global_shape, target_shape),))
+            op2.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_expand_as_layout_right_aligned_broadcast(self, mock_platform):
@@ -345,14 +379,14 @@ class TestParallelExpand(unittest.TestCase):
         x_placements = (Shard(0), Replicate())
         x_layout = _build_layout(mesh, x_placements, 2)
 
-        input_global_shape = (4, 1)
-        target_shape = (3, 4, 1)
+        cache_values = [x_layout, (4, 1), (3, 4, 1)]
+        output_layouts, _ = op2.infer_layout(cache_values)
+        output_layout = output_layouts[0]
 
-        output_layout = op2.infer_layout((x_layout,), extra_args=((input_global_shape, target_shape),))
-
-        expected_map = (-1, 1, -1)
-        assert output_layout.to_dict()["tensor_map"] == expected_map, (
-            f"Right-aligned broadcast failed. Expected {expected_map}, got {output_layout.to_dict()['tensor_map']}"
+        expected_map = ("None", "dp", "None")
+        assert output_layout.alias_tensor_map == expected_map, (
+            f"Right-aligned broadcast failed. Expected {expected_map}, "
+            f"got {output_layout.alias_tensor_map}"
         )
 
 

@@ -17,4 +17,3 @@ GatherNd:
   dist_op_name: _gather_nd_dist_op
   distributed_op_class: GatherNdDistributedOp
   distributed_op_file: parallel_gather
-  infer_layout_suffix: WithShape

@@ -7,4 +7,3 @@ expand_as:
   dist_op_name: _torch_expand_as_dist_op
   distributed_op_class: ExpandAsDistributedOp
   distributed_op_file: parallel_expand
-  infer_layout_suffix: WithShape

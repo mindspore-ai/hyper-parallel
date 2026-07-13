@@ -83,7 +83,6 @@ CellBackwardHook:
   dist_op_name: _cell_backward_hook_dist_op
   distributed_op_class: CellBackwardHookDistributedOp
   distributed_op_file: parallel_cell_backward_hook
-  infer_layout_suffix: WithTupleExpand
 
 Detach:
   dist_op_name: _detach_dist_op
@@ -105,3 +104,9 @@ EmptyLike:
 
 dropout:
   dist_op_name: _torch_dropout_dist_op
+
+SoftplusExt:
+  dist_op_name: _softplus_ext_dist_op
+
+Sqrt:
+  dist_op_name: _sqrt_dist_op

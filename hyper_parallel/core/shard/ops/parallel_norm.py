@@ -1,4 +1,4 @@
-# Copyright 2025 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,126 +13,190 @@
 # limitations under the License.
 # ============================================================================
 """
-Distributed implementation for TopK operator.
+Distributed implementation for Norm operators (RmsNorm, layer_norm).
 """
+
+from typing import Tuple
 
 from hyper_parallel.core.dtensor.layout import Layout
 from .parallel_ops import DistributedOp
 
 
+def _normalize_rmsnorm_args(x, gamma, epsilon=1e-6):
+    """Normalize RmsNorm args to positional form.
+
+    MindSpore Primitive RmsNorm receives (x, gamma, epsilon) as positional arguments.
+    """
+    return (x, gamma, epsilon), {}
+
+
+def _normalize_layernorm_args(input_tensor, normalized_shape, weight=None, bias=None, eps=1e-5):
+    """Normalize layer_norm args to positional form.
+
+    torch.nn.functional.layer_norm(input_tensor, normalized_shape, weight=None, bias=None, eps=1e-5)
+    has no keyword-only parameters, so everything stays positional.
+    """
+    return (input_tensor, normalized_shape, weight, bias, eps), {}
+
+
 class NormDistributedOp(DistributedOp):
-    """Distributed implementation for Norm operator."""
+    """Distributed implementation for RmsNorm operator."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layouts for normalization operator (e.g., RmsNorm).
-
-        This method determines the proper output layout for normalization operations
-        based on the input layouts, ensuring that the normalization operation is
-        compatible with the distributed training setup.
+        Preprocess arguments for RmsNorm operator.
 
         Args:
-            layouts (tuple): A tuple of Layout objects representing the input tensor layouts.
-                Expected to contain at least three layouts: input tensor, gamma parameter, and bias parameter.
-            extra_args (dict, optional): Additional arguments that might be needed for layout inference.
-                Defaults to None.
+            args (tuple): Positional arguments (x, gamma) where both are DTensors.
+            kwargs (dict): Keyword arguments (none expected).
 
         Returns:
-            tuple: A tuple containing two Layout objects:
-                - First layout: Layout for the input gradient tensor
-                - Second layout: Layout for the output tensor
+            tuple: (local_args, local_kwargs, cache_values)
+        """
+        args, kwargs = _normalize_rmsnorm_args(*args, **kwargs)
+        x, gamma, epsilon = args
+        local_args = (x.to_local(), gamma.to_local(), epsilon)
+        local_kwargs = {}
+        cache_values = [x.layout, gamma.layout]
+        return local_args, local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layouts for RmsNorm operator.
+
+        Rules:
+            1. Inputs must not have Partial status.
+            2. x and gamma must share the same mesh_shape.
+            3. Dimensions being normalized (the last len(gamma_tensor_map) dims of x)
+               must not be sharded.
+            4. The sharding of the normalized dimensions of x must match gamma's sharding.
+            5. Output layout keeps sharding on non-normalized dims and replicates
+               on normalized dims.
+
+        Args:
+            cache_values (list): [x_layout, gamma_layout]
+
+        Returns:
+            tuple: ((x_layout, out_layout), None)
 
         Raises:
-            ValueError: If the number of input layouts is less than 3.
-            ValueError: If input layouts are inconsistent.
-            ValueError: If device matrices of input layouts don't match.
-            ValueError: If normalization axis is sharded, which is not supported.
-            ValueError: If gamma parameter layout doesn't match the input layout in normalization dimensions.
-            ValueError: If input layouts have partial status.
+            ValueError: If any rule above is violated.
         """
-        if len(layouts) < 3:
-            raise ValueError(f"RmsNorm input layouts size {len(layouts)} is less than 3.")
+        if len(cache_values) < 2:
+            raise ValueError(
+                f"For {self.op_name}, cache_values size {len(cache_values)} is less than 2."
+            )
+        x_layout = cache_values[0]
+        gamma_layout = cache_values[1]
         # Check partial inputs
         if not self._allow_partial_inputs:
-            self._check_partial_inputs(layouts)
-        x_layout = layouts[0]
-        gamma_layout = layouts[-2]
+            self._check_partial_inputs([x_layout, gamma_layout])
         x_mesh_shape = x_layout.mesh_shape
-        for i, layout in enumerate(layouts[:-2]):
-            if layout != x_layout:
-                raise ValueError(f"RmsNorm inputs must have same layout, but input 0 layout is: {x_layout},"
-                                 f"input {i} layout is: {layout}.")
         gamma_mesh_shape = gamma_layout.mesh_shape
         if x_mesh_shape != gamma_mesh_shape:
-            raise ValueError("RmsNorm inputs must have same mesh_shape")
-        x_tensor_map = x_layout.tensor_map
-        gamma_tensor_map = gamma_layout.tensor_map
-        begin_norm_axis = len(x_tensor_map) - len(gamma_tensor_map)
-        for axis in x_tensor_map[begin_norm_axis:]:
-            if axis == -1:
-                continue
-            if isinstance(axis, tuple):
-                for iaxis in axis:
-                    if iaxis == -1:
-                        continue
-                    if x_mesh_shape[len(x_mesh_shape) - 1 - iaxis] > 1:
-                        raise ValueError(f"RmsNorm is disabled to support the splitting after "
-                                         f"begin_norm_axis {begin_norm_axis} for input 0.")
-            if x_mesh_shape[len(x_mesh_shape) - 1 - axis] > 1:
-                raise ValueError(f"RmsNorm is disabled to support the splitting after "
-                                 f"begin_norm_axis {begin_norm_axis} for input 0.")
-        if x_tensor_map[begin_norm_axis:] != gamma_tensor_map:
-            raise ValueError(f"The input sharding in the first {begin_norm_axis} dimensions "
-                             f"{x_layout.alias_tensor_map[begin_norm_axis:]} should equal to"
-                             f" the gamma sharding {gamma_layout.alias_tensor_map}")
+            raise ValueError(f"{self.op_name} inputs must have same mesh_shape")
+        x_alias_map = x_layout.alias_tensor_map
+        gamma_alias_map = gamma_layout.alias_tensor_map
+        if len(gamma_alias_map) > len(x_alias_map):
+            raise ValueError(
+                f"For {self.op_name}, gamma ndim {len(gamma_alias_map)} cannot exceed "
+                f"input ndim {len(x_alias_map)}."
+            )
+        begin_norm_axis = len(x_alias_map) - len(gamma_alias_map)
+        for alias_entry in x_alias_map[begin_norm_axis:]:
+            entries = alias_entry if isinstance(alias_entry, tuple) else (alias_entry,)
+            for name in entries:
+                if name == "None":
+                    continue
+                axis_idx = x_layout.alias_name.index(name)
+                if x_mesh_shape[axis_idx] > 1:
+                    raise ValueError(f"{self.op_name} is disabled to support the splitting after "
+                                     f"begin_norm_axis {begin_norm_axis} for input 0.")
+        if x_alias_map[begin_norm_axis:] != gamma_alias_map:
+            raise ValueError(f"For {self.op_name}, input sharding from begin_norm_axis "
+                             f"{begin_norm_axis}, {x_alias_map[begin_norm_axis:]}, should equal "
+                             f"gamma sharding {gamma_alias_map}.")
         output_layout = Layout(
             mesh_shape=x_layout.mesh_shape,
             alias_name=x_layout.alias_name,
             rank_list=x_layout.rank_list
         )
-        output_map = x_layout.alias_tensor_map[:begin_norm_axis] + ("None",) * len(gamma_tensor_map)
+        output_map = x_alias_map[:begin_norm_axis] + ("None",) * len(gamma_alias_map)
         out_layout = output_layout(*output_map)
-        return x_layout, out_layout
+        return ((x_layout, out_layout), None)
 
 
 class LayerNormDistributedOp(DistributedOp):
     """Distributed implementation for torch.nn.functional.layer_norm."""
 
-    def infer_layout(self, layouts, extra_args=None):
+    def preprocess(self, args: tuple, kwargs: dict) -> tuple:
         """
-        Infer output layout for layer_norm.
-
-        PyTorch rules:
-          - normalized_shape specifies the last N dimensions to normalize over.
-          - All dimensions in normalized_shape MUST be unsharded for correctness.
-          - Output layout is identical to input layout (shape unchanged).
+        Preprocess arguments for layer_norm operator.
 
         Args:
-        layouts (tuple): Layouts of inputs. Expected:
-            layouts[0] (Layout): Input tensor layout (required).
-        extra_args (tuple): Should contain 'normalized_shape'. Expected:
-            extra_args[0] (int | list | tuple): Normalized shape to be unsharded.
+            args (tuple): Positional arguments (input, normalized_shape, weight, bias, eps).
+            kwargs (dict): Keyword arguments (none expected for this functional API).
 
         Returns:
-            Layout object representing output tensor layout (same as input if valid).
+            tuple: (local_args, local_kwargs, cache_values)
         """
-        if not layouts or layouts[0] is None:
-            raise ValueError("layer_norm requires a valid input tensor layout.")
-        input_layout = layouts[0]
-        in_tensor_map = input_layout.tensor_map  # e.g., (-1, 0, -1) for 3D tensor
+        args, kwargs = _normalize_layernorm_args(*args, **kwargs)
+        input_tensor, normalized_shape, weight, bias, eps = args
 
-        if not extra_args or extra_args[0] is None:
-            raise ValueError("layer_norm requires normalized_shape in extra_args.")
-        normalized_shape = extra_args[0]
-
+        # Normalize normalized_shape: int → (int,), list → tuple
         if isinstance(normalized_shape, int):
             normalized_shape = (normalized_shape,)
-        elif isinstance(normalized_shape, (list, tuple)):
+        elif isinstance(normalized_shape, list):
             normalized_shape = tuple(normalized_shape)
-        else:
+
+        local_args = [
+            input_tensor.to_local(),
+            normalized_shape,
+            weight.to_local() if weight is not None and hasattr(weight, 'to_local') else weight,
+            bias.to_local() if bias is not None and hasattr(bias, 'to_local') else bias,
+            eps,
+        ]
+        local_kwargs = {}
+
+        cache_values = [input_tensor.layout, normalized_shape]
+        return tuple(local_args), local_kwargs, cache_values
+
+    def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """
+        Infer output layout for layer_norm operator.
+
+        Rules:
+            1. Input must not have Partial status.
+            2. normalized_shape must be int, list, or tuple.
+            3. normalized_shape dimensions must be ≤ input ndim.
+            4. All dimensions in normalized_shape must be unsharded.
+            5. Output layout is identical to input layout.
+
+        Args:
+            cache_values (list): [input_layout, normalized_shape]
+
+        Returns:
+            tuple: ((output_layout,), None)
+
+        Raises:
+            ValueError: If any rule above is violated.
+        """
+        input_layout = cache_values[0]
+        if input_layout is None:
+            raise ValueError(f"{self.op_name} requires a valid input tensor layout.")
+        normalized_shape = cache_values[1]
+        # Check partial inputs
+        if not self._allow_partial_inputs:
+            self._check_partial_inputs([input_layout])
+
+        if normalized_shape is None:
+            raise ValueError(f"{self.op_name} requires normalized_shape.")
+
+        if not isinstance(normalized_shape, tuple):
             raise ValueError(f"normalized_shape must be int, list, or tuple, got {type(normalized_shape)}")
 
-        input_ndim = len(in_tensor_map)
+        in_alias_map = input_layout.alias_tensor_map
+        input_ndim = len(in_alias_map)
         norm_ndim = len(normalized_shape)
 
         if norm_ndim > input_ndim:
@@ -145,27 +209,20 @@ class LayerNormDistributedOp(DistributedOp):
 
         # All normalized dims must be unsharded
         for dim in dims_to_normalize:
-            if in_tensor_map[dim] != -1:
+            alias_entry = in_alias_map[dim]
+            entries = alias_entry if isinstance(alias_entry, tuple) else (alias_entry,)
+            for name in entries:
+                if name == "None":
+                    continue
                 raise ValueError(
                     f"Operation {self.op_name}: Cannot perform sharding on normalized dimension {dim}, "
-                    f"but found sharding assignment: {in_tensor_map[dim]}"
+                    f"but found sharding assignment: {in_alias_map[dim]}"
                 )
 
-        mesh_shape = input_layout.mesh_shape
-        alias_name = input_layout.alias_name
-        rank_list = input_layout.rank_list
-
-        # Create output layout
-        def idx_to_alias(idx, aliases):
-            if idx == -1:
-                return "None"
-            return aliases[len(aliases) - idx - 1]
-        output_map = tuple(idx_to_alias(idx, alias_name) for idx in in_tensor_map)
-
         output_layout = Layout(
-            mesh_shape=mesh_shape,
-            alias_name=alias_name,
-            rank_list=rank_list
+            mesh_shape=input_layout.mesh_shape,
+            alias_name=input_layout.alias_name,
+            rank_list=input_layout.rank_list
         )
-        output_layout = output_layout(*output_map)
-        return output_layout
+        output_layout = output_layout(*in_alias_map)
+        return ((output_layout,), None)

@@ -15,10 +15,10 @@
 """parallel_isin test"""
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import numpy as np
 
-from hyper_parallel.core.dtensor.dtensor import _build_layout
+from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.shard.ops.parallel_isin import IsinDistributedOp
 from hyper_parallel.core.dtensor.device_mesh import (
@@ -32,7 +32,7 @@ op = IsinDistributedOp("isin")
 
 class TestParallelIsin(unittest.TestCase):
     """Unit tests for IsinDistributedOp."""
-    def setUp(self):
+    def setUp(self) -> None:
         """Set up test fixtures before each test method.
 
         Clears global caches to ensure test isolation and initializes
@@ -40,11 +40,13 @@ class TestParallelIsin(unittest.TestCase):
         """
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         """Clean up after each test method."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
+        _LAYOUT_CACHE.clear()
 
     def _setup_mock_platform(self, mock_platform, platform_type=None, world_size=8):
         """Configure common mock-platform attributes used across tests.
@@ -85,8 +87,11 @@ class TestParallelIsin(unittest.TestCase):
         test_elements_placements = (Replicate(), Replicate())
         test_elements_layout = _build_layout(mesh, test_elements_placements, 2)
 
-        output_layout = op.infer_layout((elements_layout, test_elements_layout), extra_args=None)
+        cache_values = [elements_layout, test_elements_layout]
+        output_layouts, extra_info = op.infer_layout(cache_values)
 
+        assert extra_info is None, f"extra_info should be None, got {extra_info}"
+        output_layout = output_layouts[0]
         expected_map = (1, -1)
         assert output_layout.tensor_map == expected_map, (
             f"Data parallel isin failed. Expected {expected_map}, "
@@ -95,11 +100,9 @@ class TestParallelIsin(unittest.TestCase):
 
         # Since `get_expand_impl` is not overridden, it returns None by default.
         # The same applies to other test classes, so it is unnecessary to test its return value.
-        assert op.get_expand_impl(None, output_layout, (elements_layout, test_elements_layout), 
-                                       extra_args=None) is None, (
-            f"get_expand_impl test failed. Expected None, "
-            f"""got {op.get_expand_impl(None, output_layout, (elements_layout, test_elements_layout),
-                                            extra_args=None)}"""
+        assert op.get_expand_impl(None, (output_layouts, None), cache_values) is None, (
+            f"get_expand_impl should return None for isin, "
+            f"got {op.get_expand_impl(None, (output_layouts, None), cache_values)}"
         )
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
@@ -115,13 +118,17 @@ class TestParallelIsin(unittest.TestCase):
         test_elements_placements = (Replicate(), Replicate(), Replicate())
         test_elements_layout = _build_layout(mesh, test_elements_placements, 3)
 
-        output_layout = op.infer_layout((elements_layout, test_elements_layout), extra_args=None)
+        cache_values = [elements_layout, test_elements_layout]
+        output_layouts, extra_info = op.infer_layout(cache_values)
 
+        assert extra_info is None, f"extra_info should be None, got {extra_info}"
+        output_layout = output_layouts[0]
         expected_map = (2, -1, 0)
         assert output_layout.tensor_map == expected_map, (
             f"Mixed parallel isin failed. Expected {expected_map}, "
             f"got {output_layout.tensor_map}"
         )
+        # No need to verify get_expand_impl here - already verified in test_isin_layout_data_parallel
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_isin_layout_invalid_test_elements_sharded(self, mock_platform):
@@ -136,25 +143,95 @@ class TestParallelIsin(unittest.TestCase):
         test_elements_placements = (Shard(0), Replicate())
         test_elements_layout = _build_layout(mesh, test_elements_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "'test_elements' must be unsharded. Current tensor_map:"):
-            op.infer_layout((elements_layout, test_elements_layout), extra_args=None)
+        cache_values = [elements_layout, test_elements_layout]
+        with self.assertRaisesRegex(ValueError, "'test_elements' must be unsharded"):
+            op.infer_layout(cache_values)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
-    def test_isin_layout_missing_test_elements(self, mock_platform):
+    def test_isin_layout_missing_elements(self, mock_platform):
         """
-        Feature: Isin without test_elements layout
-        Description: Missing second layout in tuple
+        Feature: Isin without elements layout
+        Description: elements layout is None or empty cache_values
         Expectation: ValueError raised
+        """
+        with self.assertRaisesRegex(ValueError, "'elements' requires a valid tensor layout"):
+            op.infer_layout([])
+
+        with self.assertRaisesRegex(ValueError, "'elements' requires a valid tensor layout"):
+            op.infer_layout([None, None])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_isin_preprocess(self, mock_platform):
+        """
+        Feature: IsinDistributedOp preprocess routes keyword-only params into local_kwargs.
+        Description: torch.isin has assume_unique and invert as keyword-only parameters (*).
+        Expectation: local_args has 2 tensors; local_kwargs has assume_unique and invert;
+            cache_values has 2 layouts.
+        """
+        mesh = self._make_2x4_mesh(mock_platform)
+        elements_placements = (Shard(0), Replicate())
+        elements_layout = _build_layout(mesh, elements_placements, 2)
+        test_elements_placements = (Replicate(), Replicate())
+        test_elements_layout = _build_layout(mesh, test_elements_placements, 2)
+
+        mock_elements = MagicMock()
+        mock_elements.layout = elements_layout
+        mock_elements.to_local.return_value = MagicMock()
+        mock_test_elements = MagicMock()
+        mock_test_elements.layout = test_elements_layout
+        mock_test_elements.to_local.return_value = MagicMock()
+
+        local_args, local_kwargs, cache_values = op.preprocess(
+            (mock_elements, mock_test_elements), {}
+        )
+
+        assert len(local_args) == 2, (
+            f"local_args should have 2 elements (elements, test_elements), "
+            f"got {len(local_args)}"
+        )
+        assert local_kwargs == {'assume_unique': False, 'invert': False}, (
+            f"local_kwargs should be {{'assume_unique': False, 'invert': False}}, "
+            f"got {local_kwargs}"
+        )
+        assert len(cache_values) == 2, (
+            f"cache_values should have 2 layouts, got {len(cache_values)}"
+        )
+        assert cache_values[0] is elements_layout, (
+            f"cache_values[0] should be elements_layout, got {cache_values[0]}"
+        )
+        assert cache_values[1] is test_elements_layout, (
+            f"cache_values[1] should be test_elements_layout, got {cache_values[1]}"
+        )
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_isin_preprocess_custom_kwargs(self, mock_platform):
+        """
+        Feature: IsinDistributedOp preprocess forwards custom assume_unique and invert.
+        Description: Verify that assume_unique=True and invert=True are correctly forwarded.
+        Expectation: local_kwargs reflects the custom values.
         """
         mesh = self._make_2x4_mesh(mock_platform)
         elements_placements = (Replicate(), Replicate())
         elements_layout = _build_layout(mesh, elements_placements, 2)
+        test_elements_placements = (Replicate(), Replicate())
+        test_elements_layout = _build_layout(mesh, test_elements_placements, 2)
 
-        with self.assertRaisesRegex(ValueError, "'test_elements' requires a valid tensor layout"):
-            op.infer_layout((elements_layout,), extra_args=None)
+        mock_elements = MagicMock()
+        mock_elements.layout = elements_layout
+        mock_elements.to_local.return_value = MagicMock()
+        mock_test_elements = MagicMock()
+        mock_test_elements.layout = test_elements_layout
+        mock_test_elements.to_local.return_value = MagicMock()
 
-        with self.assertRaisesRegex(ValueError, "'test_elements' requires a valid tensor layout"):
-            op.infer_layout((elements_layout, None), extra_args=None)
+        local_args, local_kwargs, cache_values = op.preprocess(
+            (mock_elements, mock_test_elements),
+            {'assume_unique': True, 'invert': True}
+        )
+
+        assert local_kwargs == {'assume_unique': True, 'invert': True}, (
+            f"local_kwargs should be {{'assume_unique': True, 'invert': True}}, "
+            f"got {local_kwargs}"
+        )
 
 
 if __name__ == "__main__":
