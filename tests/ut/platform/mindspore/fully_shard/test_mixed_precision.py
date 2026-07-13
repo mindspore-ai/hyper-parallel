@@ -831,6 +831,7 @@ class TestAsyncReduceStateMachine(unittest.TestCase):
         # the identity assertion below still passes.
         packed_grad.contiguous.return_value = packed_grad
         grad.to.return_value = grad
+        grad.contiguous.return_value = grad
         param.unsharded_grad_data = grad
         param.hsdp_placement = MagicMock()
         param.hsdp_placement.dim = 1
@@ -843,6 +844,7 @@ class TestAsyncReduceStateMachine(unittest.TestCase):
         mock_reduce_scatter.return_value = handle
         MindSporeHSDPParamV2.reduce_scatter_grad(param, async_op=True)
 
+        grad.contiguous.assert_called_once()
         mock_build_plan.assert_called_once_with(param, grad, 2)
         mock_pack.assert_called_once_with(grad, plan)
         self.assertIs(mock_reduce_scatter.call_args.args[1], packed_grad)

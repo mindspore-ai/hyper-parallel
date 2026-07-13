@@ -28,10 +28,16 @@ from hyper_parallel.platform.mindspore.activation_checkpoint.activation_swap imp
 from hyper_parallel.platform.mindspore.activation_checkpoint.sac import (
     create_selective_checkpoint_contexts
 )
+from hyper_parallel.platform.mindspore.activation_checkpoint.checkpoint_exclude_wrapper import (
+    CheckpointExcludeWrapper,
+    checkpoint_exclude_wrapper,
+)
 
 __all__ = [
     "CheckpointWrapper",
     "ckpt_wrapper",
+    "CheckpointExcludeWrapper",
+    "checkpoint_exclude_wrapper",
     "ActivationWrapper",
     "AsyncSaveOnCpu",
     "SwapWrapper",

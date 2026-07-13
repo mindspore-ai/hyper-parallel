@@ -798,6 +798,7 @@ class MindSporeHSDPParamV2(HSDPParamV2):
         reduce_dtype = dtype or grad.dtype
         if grad.dtype != reduce_dtype:
             grad = grad.to(reduce_dtype)
+        grad = grad.contiguous()
         shard_group_info = getattr(self, "sharded_group_info", None)
         shard_group = shard_group_info.group if shard_group_info is not None else None
         shard_group_size = shard_group_info.rank_size if shard_group_info is not None else 1

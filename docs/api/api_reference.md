@@ -894,6 +894,20 @@ checkpoint_wrapper(module, **checkpoint_kwargs) -> CheckpointWrapper
 
 ---
 
+### `checkpoint_exclude_wrapper`
+
+将 checkpoint 内部的指定函数或 Cell 标记为不重算区域。前向阶段保留该区域的输出及反向所需 tensor，
+重算阶段直接复用前向输出，以额外显存占用换取计算开销降低。
+
+```python
+checkpoint_exclude_wrapper(module) -> CheckpointExcludeWrapper
+```
+
+当前仅支持 MindSpore PyNative 模式，并且需要在 HyperParallel 的 `checkpoint` 或
+`checkpoint_wrapper`（`use_reentrant=False`）内部使用。支持包装 MindSpore Cell 和普通 callable。
+
+---
+
 ### `swap_wrapper`
 
 模块级纯 swap 装饰器（不重计算）。
