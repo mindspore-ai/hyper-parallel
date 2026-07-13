@@ -173,22 +173,26 @@ class ActivationWrapper(Cell, ABC):
     Not meant to be instantiated directly.
     """
 
-    def __init__(self, module: Union[Cell, Callable]):
+    def __init__(self, module: Union[Cell, Callable], *, track_overlaps: bool = True) -> None:
+        """Initialize a wrapper and optionally participate in overlap tracking."""
         if callable(module) and not isinstance(module, Cell):
-            _check_and_mark_callable(module)
+            if track_overlaps:
+                _check_and_mark_callable(module)
             module = FuncCell(module)
-            _mark_wrapped(module)
-        else:
+            if track_overlaps:
+                _mark_wrapped(module)
+        elif track_overlaps:
             _check_and_mark_wrapped(module)
         super().__init__(auto_prefix=False)
         self._ckpt_wrapped_module = module
-        self._is_wrapped = True
+        self._is_wrapped = track_overlaps
         self._wrapped_param_names = {
             id(param): param.name for _, param in module.parameters_and_names()
         }
 
     @property
-    def _wrapped_module(self):
+    def _wrapped_module(self) -> Cell:
+        """Return the wrapped callable normalized to a MindSpore Cell."""
         return self._ckpt_wrapped_module
 
     @abstractmethod

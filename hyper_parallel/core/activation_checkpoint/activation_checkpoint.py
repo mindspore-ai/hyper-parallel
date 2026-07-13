@@ -16,9 +16,10 @@
 import contextlib
 import enum
 from functools import partial
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from hyper_parallel.platform import get_platform
+from .recompute_state import create_recompute_contexts
 plat = get_platform()
 
 
@@ -67,8 +68,12 @@ class _StackedCtx:
 
     def __enter__(self):
         self._stack.__enter__()
-        for ctx in self._ctxs:
-            self._stack.enter_context(ctx)
+        try:
+            for ctx in self._ctxs:
+                self._stack.enter_context(ctx)
+        except BaseException as exc:
+            self._stack.__exit__(type(exc), exc, exc.__traceback__)
+            raise
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -129,15 +134,13 @@ def checkpoint(
     Returns:
         The result of applying the function with checkpointing.
     """
-    factories: list = []
+    factories: list = [create_recompute_contexts]
     if policy_fn is not None:
         factories.append(partial(plat.create_selective_checkpoint_contexts, policy_fn, group_swap=group_swap))
     if context_fn is not None:
         factories.append(context_fn)
 
-    if not factories:
-        composed_context_fn = plat.noop_context_fn
-    elif len(factories) == 1:
+    if len(factories) == 1:
         composed_context_fn = factories[0]
     else:
         composed_context_fn = _compose_context_fns(tuple(factories))
@@ -177,6 +180,18 @@ def swap(function, *args, policy_fn=None, group_swap=False, **kwargs):
     """
     with plat.async_save_on_cpu(policy_fn=policy_fn, group_swap=group_swap):
         return function(*args, **kwargs)
+
+
+def checkpoint_exclude_wrapper(module: Any) -> Any:
+    """Wrap a callable whose region is excluded from activation recomputation.
+
+    Args:
+        module: The module or callable to exclude from recomputation.
+
+    Returns:
+        The platform-specific checkpoint exclusion wrapper.
+    """
+    return plat.checkpoint_exclude_wrapper(module)
 
 
 checkpoint_wrapper = plat.checkpoint_wrapper

@@ -43,7 +43,7 @@ def _reset_platform_singleton() -> None:
 
 
 def _bind_platform_globals(module_names: Collection[str]) -> None:
-    """Reassign module-level ``platform`` (and common tensor aliases) without ``reload``."""
+    """Reassign module-level platform aliases and common tensor aliases without ``reload``."""
     from hyper_parallel.platform import get_platform  # pylint: disable=import-outside-toplevel
 
     plat = get_platform()
@@ -51,6 +51,14 @@ def _bind_platform_globals(module_names: Collection[str]) -> None:
         mod = importlib.import_module(name)
         if hasattr(mod, "platform"):
             mod.platform = plat
+        if hasattr(mod, "plat"):
+            mod.plat = plat
+        if hasattr(mod, "checkpoint_wrapper"):
+            mod.checkpoint_wrapper = plat.checkpoint_wrapper
+        if hasattr(mod, "swap_wrapper"):
+            mod.swap_wrapper = plat.swap_wrapper
+        if hasattr(mod, "swap_tensor_wrapper"):
+            mod.swap_tensor_wrapper = plat.swap_tensor_wrapper
         if hasattr(mod, "Tensor"):
             mod.Tensor = plat.Tensor
         if hasattr(mod, "Module"):
@@ -90,6 +98,12 @@ def ensure_mindspore_platform_for_context_parallel() -> None:
 def ensure_mindspore_platform_default() -> None:
     """Clear singleton only; next :func:`get_platform` uses ``HYPER_PARALLEL_PLATFORM``."""
     _reset_platform_singleton()
+    _bind_platform_globals(
+        (
+            "hyper_parallel.core.activation_checkpoint",
+            "hyper_parallel.core.activation_checkpoint.activation_checkpoint",
+        )
+    )
 
 
 def ensure_mindspore_platform_for_shard_and_dtensor() -> None:

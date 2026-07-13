@@ -28,6 +28,11 @@ from hyper_parallel.core.activation_checkpoint.activation_checkpoint import (
     checkpoint_wrapper,
     swap,
 )
+from hyper_parallel.core.activation_checkpoint.recompute_state import (
+    create_recompute_contexts,
+    get_recompute_state,
+    is_recomputing,
+)
 from hyper_parallel.platform.torch.activation_checkpoint.checkpoint_wrapper import CheckpointWrapper
 
 
@@ -73,7 +78,15 @@ class TestCheckpointFunction(unittest.TestCase):
         self.assertIs(call_args[0], dummy_fn)
         self.assertEqual(call_args[1], 3)
         self.assertEqual(call_kwargs.get("use_reentrant"), False)
-        self.assertEqual(call_kwargs.get("context_fn"), "noop_ctx_fn")
+        context_fn = call_kwargs.get("context_fn")
+        self.assertTrue(callable(context_fn))
+        forward_context, recompute_context = context_fn()
+        self.assertFalse(is_recomputing())
+        with forward_context:
+            self.assertFalse(is_recomputing())
+        with recompute_context:
+            self.assertTrue(is_recomputing())
+        self.assertFalse(is_recomputing())
 
     def test_checkpoint_with_swap_inputs(self, mock_plat):
         """Test checkpoint with swap_inputs=True."""
@@ -147,6 +160,78 @@ class TestCheckpointFunction(unittest.TestCase):
         self.assertEqual(result, "result")
         call_args = mock_plat.checkpoint.call_args[0]
         self.assertIn(3, call_args)
+
+    def test_checkpoint_composes_recompute_state_and_user_contexts(self, mock_plat):
+        """Unified recompute state should surround user checkpoint contexts."""
+        events = []
+
+        @contextlib.contextmanager
+        def record(name):
+            events.append(f"enter:{name}")
+            try:
+                yield
+            finally:
+                events.append(f"exit:{name}")
+
+        mock_plat.checkpoint.return_value = "result"
+
+        def user_context_fn():
+            return record("user_fwd"), record("user_rec")
+
+        checkpoint(lambda value: value, 1, context_fn=user_context_fn)
+        composed_context_fn = mock_plat.checkpoint.call_args.kwargs["context_fn"]
+        forward_context, recompute_context = composed_context_fn()
+
+        with forward_context:
+            events.append(f"forward:{is_recomputing()}")
+        with recompute_context:
+            events.append(f"recompute:{is_recomputing()}")
+
+        self.assertEqual(
+            events,
+            [
+                "enter:user_fwd",
+                "forward:False",
+                "exit:user_fwd",
+                "enter:user_rec",
+                "recompute:True",
+                "exit:user_rec",
+            ],
+        )
+
+
+class TestRecomputeState(unittest.TestCase):
+    """Unit tests for invocation-scoped recompute execution state."""
+
+    def test_contexts_share_invocation_and_switch_phase(self):
+        """Forward and recompute should expose one invocation with different phases."""
+        forward_context, recompute_context = create_recompute_contexts()
+
+        with forward_context:
+            forward_state = get_recompute_state()
+            self.assertIsNotNone(forward_state)
+            self.assertFalse(is_recomputing())
+            invocation_id = forward_state.invocation_id
+
+        with recompute_context:
+            recompute_state = get_recompute_state()
+            self.assertIsNotNone(recompute_state)
+            self.assertTrue(is_recomputing())
+            self.assertEqual(recompute_state.invocation_id, invocation_id)
+
+        self.assertIsNone(get_recompute_state())
+
+    def test_recompute_exit_clears_unconsumed_resources(self):
+        """Early recompute exit should clear resources even when wrappers are not revisited."""
+        forward_context, recompute_context = create_recompute_contexts()
+        resource = MagicMock()
+
+        with forward_context:
+            get_recompute_state().get_resource("saved_output", lambda: resource)
+        with recompute_context:
+            pass
+
+        resource.clear.assert_called_once_with()
 
 
 @patch("hyper_parallel.core.activation_checkpoint.activation_checkpoint.plat")
