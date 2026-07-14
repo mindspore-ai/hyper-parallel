@@ -296,7 +296,9 @@ class PipelineScheduleRuntime(ABC):
             the activation send ~half a slot early, but is not yet
             hardware-validated — opt in deliberately.  Must be set identically
             on every rank — HCCL cannot match a batched op against a plain one
-            (EI0005).
+            (EI0005). On backends that require full-group participation before
+            the first batched P2P call, batch-backed modes prepare the PP group
+            once at their first run boundary.
     """
 
     _P2P_TRANSPORTS = ("auto", "plain", "batch", "boundary")
@@ -376,6 +378,8 @@ class PipelineScheduleRuntime(ABC):
         # Effective mode + per-op batch gating; set by ``build_exec_order``.
         self._p2p_mode = None
         self._batch_p2p = False
+        self._batch_p2p_group = None
+        self._batch_p2p_group_initialized = False
         # OVERLAP steps whose boundary_p2p was already issued this run (the
         # stage after-forward hook and the post-step safety net are both
         # allowed to call exec_boundary_p2p; reset per run_microbatches call).
@@ -463,6 +467,7 @@ class PipelineScheduleRuntime(ABC):
             mode = "batch" if getattr(self, "_overlap_b_f", False) else "plain"
         self._p2p_mode = mode
         self._batch_p2p = mode != "plain"
+        self._batch_p2p_group = self._resolve_batch_p2p_group() if self._batch_p2p else None
         self.construct_exec_order()
         self._inject_local_pp_swap_actions()
         self._inject_local_fsdp_actions()
@@ -617,6 +622,27 @@ class PipelineScheduleRuntime(ABC):
             if handle is not None:
                 handle.wait()
 
+    def _resolve_batch_p2p_group(self):
+        """Return the common PP group required by every local stage."""
+        first_stage = self.stages[0]
+        group = first_stage.pp_group
+        for stage in self.stages[1:]:
+            if stage.pp_group is group or stage.pp_group == group:
+                continue
+            raise ValueError(
+                "Batch P2P requires all local stages to use the same PP process group, "
+                f"but stages {first_stage.stage_index} and {stage.stage_index} use different groups."
+            )
+        return group
+
+    def _ensure_batch_p2p_group_initialized(self) -> None:
+        """Run backend-specific PP-group preparation once before batched P2P."""
+        if (not self._batch_p2p or self._batch_p2p_group_initialized
+                or self.real_stage_num <= 1):
+            return
+        platform.prepare_batch_p2p_group(self._batch_p2p_group)
+        self._batch_p2p_group_initialized = True
+
     def _drain_inflight_p2p(self):
         """Wait every P2P handle still in flight — error-path cleanup.
 
@@ -648,7 +674,10 @@ class PipelineScheduleRuntime(ABC):
         """
         if not specs:
             return []
-        ops = [platform.p2p_op(op_type, tensor, peer) for op_type, tensor, peer in specs]
+        ops = [
+            platform.p2p_op(op_type, tensor, peer, group=self._batch_p2p_group)
+            for op_type, tensor, peer in specs
+        ]
         handle = platform.batch_isend_irecv(ops)
         return [handle] if handle is not None else []
 
@@ -791,13 +820,13 @@ class PipelineScheduleRuntime(ABC):
         Builds each sub-step's specs (same meta/bookkeeping side effects as the
         per-step ``recv_fwd`` / ``send_fwd`` / ...), groups every op by peer
         global rank, and issues one batch per peer so a same-peer send+recv runs
-        duplex.  Handle routing mirrors the per-step path: under
+        duplex. Handle routing mirrors the per-step path: under
         ``overlap_p2p`` a batch carrying a recv is cached for ``wait_*_recv``
         (its send rides along), a send-only batch defers to ``_send_handles``;
         without ``overlap_p2p`` every batch waits inline.
         """
-        # (op_type, tensor, peer, route) per op; route = (kind, stage, micro) for
-        # a recv, else None.
+        # (op_type, tensor, peer, route) per op; route = (kind, stage, micro)
+        # for a recv, else None.
         tagged = []
         for sub in step.sub_steps:
             builder_name, kind = self._BATCH_SUB_DISPATCH[sub.type]
@@ -812,7 +841,10 @@ class PipelineScheduleRuntime(ABC):
             by_peer.setdefault(item[2], []).append(item)
 
         for items in by_peer.values():
-            ops = [platform.p2p_op(op_type, tensor, peer) for op_type, tensor, peer, _ in items]
+            ops = [
+                platform.p2p_op(op_type, tensor, peer, group=self._batch_p2p_group)
+                for op_type, tensor, peer, _ in items
+            ]
             handle = platform.batch_isend_irecv(ops)
             if handle is None:
                 continue
@@ -936,6 +968,7 @@ class PipelineScheduleRuntime(ABC):
         .setLevel(logging.DEBUG)`` to trace per-rank schedule advancement
         (handy when diagnosing deadlocks or callback ordering issues).
         """
+        self._ensure_batch_p2p_group_initialized()
         real_stage_index = self.stages[0].stage_index % self.real_stage_num
         self._send_handles = []
         self._boundary_issued = set()

@@ -60,3 +60,20 @@ def test_vpp_schedule_group1_gloo():
     parallel_run([
         TorchCase(_VPP_SCHEDULE, "test_vpp", num_proc=4)
     ])
+
+
+@arg_mark(
+    plat_marks=["platform_ascend910b"],
+    level_mark="level0",
+    card_mark="allcards",
+    essential_mark="essential",
+)
+def test_vpp_dynamic_batch_p2p_cold_start():
+    """
+    Feature: Dynamic-shape VPP with a cold batched-P2P process group.
+    Description: Launch eight ranks as two four-rank PP groups, with two virtual stages per rank.
+    Expectation: The first batched peer operation does not hang during communicator initialization.
+    """
+    parallel_run([
+        TorchCase(_VPP_SCHEDULE, "test_vpp_dynamic_batch_p2p_cold_start", num_proc=8)
+    ])

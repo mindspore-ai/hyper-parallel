@@ -1233,6 +1233,18 @@ class MindSporePlatform(Platform):
         return handles[0] if handles else None
 
     @staticmethod
+    def prepare_batch_p2p_group(group: Any = None) -> None:  # pylint: disable=unused-argument
+        """Prepare a group for batched P2P operations.
+
+        MindSpore does not require full-group participation before its first
+        subset ``batch_isend_irecv`` call, so no synchronization is needed.
+
+        Args:
+            group: The communication group used by the batched P2P operations.
+                ``None`` uses the default group.
+        """
+
+    @staticmethod
     def p2p_exchange(tensor, peer_rank: int, group=None):  # pylint: disable=unused-argument
         raise NotImplementedError(
             "p2p_exchange is not yet supported on the MindSpore platform."

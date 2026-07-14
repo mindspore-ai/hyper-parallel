@@ -47,6 +47,13 @@ class TestTorchPlatformCore(unittest.TestCase):
         os.environ["HYPER_PARALLEL_PLATFORM"] = "torch"
         self.platform = TorchPlatform()
 
+    @mock.patch("torch.distributed.barrier")
+    def test_prepare_batch_p2p_group_uses_barrier(self, mock_barrier):
+        """Torch prepares the PP group with one full-group collective."""
+        TorchPlatform.prepare_batch_p2p_group(mock.sentinel.pp_group)
+
+        mock_barrier.assert_called_once_with(group=mock.sentinel.pp_group)
+
     def test_dtensor_data_setter_updates_wrapper_and_local_tensor(self):
         """Assigning ``dtensor.data = x`` should synchronize wrapper and local tensor payloads."""
         class FakeDataDescriptor:
