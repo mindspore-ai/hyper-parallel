@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for MindSpore activation checkpoint wrapper."""
-import functools
 import os
 import unittest
 from unittest.mock import patch
@@ -96,8 +95,10 @@ class TestCheckpointWrapper(unittest.TestCase):
         self.assertEqual(result, "result")
         call_kwargs = mock_plat.checkpoint.call_args[1]
         ctx_fn = call_kwargs.get("context_fn")
-        self.assertIsInstance(ctx_fn, functools.partial,
-                              f"Expected context_fn to be a partial, got {type(ctx_fn)}")
+        self.assertTrue(callable(ctx_fn))
+        ctx_fn()
+        mock_plat.create_selective_checkpoint_contexts.assert_called_once_with(
+            policy, group_swap=True)
 
     def test_do_checkpoint_with_swap_group_name(self, mock_plat):
         """Test _do_checkpoint with _swap_group_name attribute sets current group."""
@@ -139,8 +140,10 @@ class TestCheckpointWrapper(unittest.TestCase):
         self.assertEqual(result, "result")
         call_kwargs = mock_plat.checkpoint.call_args[1]
         ctx_fn = call_kwargs.get("context_fn")
-        self.assertIsInstance(ctx_fn, functools.partial,
-                              f"Expected context_fn to be a partial for policy_fn, got {type(ctx_fn)}")
+        self.assertTrue(callable(ctx_fn))
+        ctx_fn()
+        mock_plat.create_selective_checkpoint_contexts.assert_called_once_with(
+            policy, group_swap=False)
 
 
 class TestCkptWrapper(unittest.TestCase):
