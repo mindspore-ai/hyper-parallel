@@ -121,5 +121,60 @@ def test_vpp():
                        pp_model[1].mlp_layers[str(stage_index+4)].weight.cpu().detach().numpy())
 
 
+def test_vpp_dynamic_batch_p2p_cold_start():
+    """
+    Feature: Dynamic-shape VPP with batched P2P on cold PP subgroups.
+    Description: Run two virtual stages per rank on a ``pp=4, dp=2`` mesh with
+        ``micro_batch_num=1``, ``dyn_shape=True``, and ``overlap_b_f=True``
+        before any tensor collective.
+    Expectation: The schedule completes and the final-stage output is finite.
+    """
+    init_hccl()
+    pp_size = 4
+    world_size = dist.get_world_size()
+    if world_size % pp_size != 0:
+        raise ValueError(f"world_size must be divisible by pp_size, but got {world_size} and {pp_size}.")
+    dp_size = world_size // pp_size
+    mesh = init_device_mesh(
+        device_type=_DEVICE_TYPE,
+        mesh_shape=(pp_size, dp_size),
+        mesh_dim_names=("pp", "dp"),
+    )
+    pp_mesh = mesh["pp"]
+    stage_index = pp_mesh.get_local_rank()
+
+    chunks = [SimpleMLP(8, 16, 16), SimpleMLP(8, 16, 16)]
+    for chunk_index, chunk in enumerate(chunks):
+        model_split_manual(
+            chunk,
+            stage_index + chunk_index * pp_size,
+            pp_size * len(chunks),
+        )
+    stages = [
+        PipelineStage(
+            chunk,
+            stage_index + chunk_index * pp_size,
+            pp_size * len(chunks),
+            torch.device(_DEVICE_TYPE),
+            group=pp_mesh.get_group(),
+            mesh=pp_mesh,
+            dyn_shape=True,
+        )
+        for chunk_index, chunk in enumerate(chunks)
+    ]
+    schedule = ScheduleInterleaved1F1B(
+        stages,
+        micro_batch_num=1,
+        overlap_b_f=True,
+    )
+    assert getattr(schedule, "_p2p_mode") == "batch"
+    input_tensor = to_device(torch.ones((1, 16), dtype=torch.float32), _DEVICE_TYPE)
+    losses = schedule.run(input_tensor) if stage_index == 0 else schedule.run()
+
+    if stage_index == pp_size - 1:
+        assert len(losses) == 1
+        assert torch.isfinite(losses[0]).all()
+
+
 if __name__ == "__main__":
     test_vpp()

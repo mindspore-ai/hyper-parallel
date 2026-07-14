@@ -586,6 +586,20 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement batch_isend_irecv")
 
     @staticmethod
+    def prepare_batch_p2p_group(group: Any = None) -> None:
+        """Prepare a process group before its first batched P2P operation.
+
+        Backends that require full-group participation before subset batched
+        P2P should synchronize the group here. Other backends may implement
+        this as a no-op.
+
+        Args:
+            group: The process group used by the batched P2P operations.
+                ``None`` uses the default group.
+        """
+        raise NotImplementedError("Platform subclasses must implement prepare_batch_p2p_group")
+
+    @staticmethod
     def p2p_exchange(tensor, peer_rank: int, group=None):
         """Differentiable symmetric P2P exchange (send local tensor, receive peer's tensor).
 

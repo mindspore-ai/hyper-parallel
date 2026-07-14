@@ -1036,6 +1036,21 @@ class TorchPlatform(Platform):
         return _TorchBatchP2PWork(works) if works else None
 
     @staticmethod
+    def prepare_batch_p2p_group(group: Any = None) -> None:
+        """Synchronize a group before its first subset batched P2P call.
+
+        PyTorch requires every rank in a process group to participate when
+        ``batch_isend_irecv`` is the first collective on that group. A barrier
+        at the common pipeline run boundary initializes the communicator
+        before ranks reach peer operations at different times.
+
+        Args:
+            group: The process group used by the batched P2P operations.
+                ``None`` uses the default group.
+        """
+        dist.barrier(group=group)
+
+    @staticmethod
     def p2p_exchange(tensor, peer_rank: int, group=None):
         if peer_rank == dist.get_rank(group):
             return tensor
