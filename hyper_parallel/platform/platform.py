@@ -1400,6 +1400,18 @@ class Platform:
         raise NotImplementedError("Platform subclasses must implement checkpoint_wrapper")
 
     @staticmethod
+    def checkpoint_exclude_wrapper(module: Any) -> Any:
+        """Wrap a callable whose activations should be saved instead of recomputed.
+
+        Args:
+            module: The module or callable to exclude from activation recomputation.
+
+        Returns:
+            The wrapped module or callable.
+        """
+        raise NotImplementedError("checkpoint_exclude_wrapper is currently only supported on MindSpore")
+
+    @staticmethod
     def swap_wrapper(module, policy_fn=None, group_swap=False):
         """Wrap a module with activation swap functionality.
 

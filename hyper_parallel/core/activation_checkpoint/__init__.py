@@ -18,7 +18,9 @@ from .activation_checkpoint import (
     checkpoint,
     swap,
     checkpoint_wrapper,
+    checkpoint_exclude_wrapper,
     swap_wrapper,
     swap_tensor_wrapper,
 )
+from .recompute_state import get_recompute_state, is_recomputing
 from .swap import SwapManager
