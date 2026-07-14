@@ -2845,12 +2845,12 @@
       const conclusions = [];
       const topItem = breakdowns["type"][0];
       if (topItem) {
-        conclusions.push({ text: `最大 type 贡献: "${topItem.value}" 占 ${topItem.pct.toFixed(1)}%（${formatBytes(topItem.size)}），共 ${formatNumber(topItem.count)} 个 block。`, cls: "info" });
+        conclusions.push({ text: `最大 type 贡献: "${escapeHtml(topItem.value)}" 占 ${topItem.pct.toFixed(1)}%（${formatBytes(topItem.size)}），共 ${formatNumber(topItem.count)} 个 block。`, cls: "info" });
       }
 
       const topFrame = breakdowns["python_stack_frame"][0];
       if (topFrame && topFrame.pct > 20) {
-        conclusions.push({ text: `主要调用来源: ${topFrame.value.slice(0, 80)} 贡献 ${topFrame.pct.toFixed(1)}%。`, cls: "info" });
+        conclusions.push({ text: `主要调用来源: ${escapeHtml(topFrame.value).slice(0, 80)} 贡献 ${topFrame.pct.toFixed(1)}%。`, cls: "info" });
       }
 
       const persistentItem = breakdowns["is_persistent"].find((x) => x.value === "persistent");
@@ -4771,9 +4771,12 @@ async function loadMemoryVizModule() {
   mvizStatus.className = "";
 
   try {
-    const mod = await import(
-      "https://cdn.jsdelivr.net/gh/pytorch/pytorch@main/torch/utils/viz/MemoryViz.js"
-    );
+    // NOTE: import() does not support SRI (integrity attribute). We mitigate by
+    // pinning to a specific release version instead of @main (which is a moving target).
+    // For full SRI, a fetch()+crypto.subtle.verify()+blob URL approach would be needed.
+    const MVIZ_CDN_URL = "https://cdn.jsdelivr.net/gh/pytorch/pytorch@2.12.0/torch/utils/viz/MemoryViz.js";
+
+    const mod = await import(MVIZ_CDN_URL);
     addLocalFiles = mod.add_local_files;
     mvizModuleLoaded = true;
     markMemoryVizStyles();
