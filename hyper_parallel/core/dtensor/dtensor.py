@@ -211,11 +211,16 @@ class DTensor(DTensorBase):
         self,
         local_tensor: Tensor,
         device_mesh: DeviceMesh,
-        placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]]
+        placements: Union[Sequence[Placement], Sequence[Union[str, Tuple[str, ...]]]],
+        layout: Optional[Layout] = None,
     ):
         self._local_tensor = local_tensor
         self._device_mesh = device_mesh
-        self._layout = _build_layout(
+        # Fast path: when an already-built Layout is supplied (e.g. output layouts
+        # cached by infer_layout and passed straight through wrap_output), reuse it
+        # directly and skip _build_layout (which otherwise recomputes device_mesh.to_hash(),
+        # tuple(placements) and a cache lookup on every single output construction).
+        self._layout = layout if layout is not None else _build_layout(
             device_mesh, placements, len(local_tensor.shape)
         )
         self._placements = tuple(self._layout.placements)
@@ -265,6 +270,23 @@ class DTensor(DTensorBase):
             >>> dtensor = DTensor.from_local(local_tensor, mesh, ("dp", "None"))
         """
         return DTensor(local_tensor, device_mesh, placements)
+
+    @staticmethod
+    def from_local_with_layout(local_tensor: Tensor, layout: Layout) -> 'DTensor':
+        """Fast DTensor construction from a local tensor and a pre-built Layout.
+
+        Unlike :meth:`from_local`, this does NOT rebuild the layout via
+        ``_build_layout`` — it hands the already-built ``layout`` straight to
+        ``__init_data__``. Intended for hot paths (e.g. ``wrap_output``) where the
+        output Layout was already inferred and cached by ``infer_layout``, so
+        recomputing ``device_mesh.to_hash()`` / ``tuple(placements)`` / the layout
+        cache lookup on every output is pure waste.
+
+        ``layout.placements`` (a plain attribute) is passed only to satisfy the
+        constructor's non-None check; ``__init_data__`` ignores it when ``layout``
+        is supplied.
+        """
+        return DTensor(local_tensor, layout.mesh, layout.placements, layout)
 
     def _alias_placements(self) -> Sequence[Placement]:
         """Return alias_placements from layout, falling back to _placements."""

@@ -443,7 +443,7 @@ class TestParallelGatherNd(unittest.TestCase):
 
         NOTE: aclop packed-args normalization now happens upstream in
         ``OpDispatcher._dispatch_layout_infer`` via ``_normalize_aclop_args``.
-        The re-packing for the kernel call is handled by ``_dispatch_new``.
+        The re-packing for the kernel call is handled by ``_dispatch_layout_infer``.
         This test validates that ``preprocess`` works correctly with
         the already-unpacked (input, indices) args.
         """

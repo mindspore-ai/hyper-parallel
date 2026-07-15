@@ -112,13 +112,15 @@ class LayoutCacheKey:
         Returns:
             LayoutCacheKey: Immutable key derived from the string representation of each value.
         """
-        key_values = []
-        for v in cache_values:
-            if hasattr(v, 'compact_str'):
-                key_values.append(str(v.compact_str))
-            else:
-                key_values.append(str(v))
-        return cls(key_values)
+        # Read the cached ``_compact_str`` attribute directly instead of going through
+        # the ``compact_str`` property getter (one fewer Python frame per Layout), and
+        # build the key in one comprehension. The resulting tuple is byte-for-byte the
+        # legacy string key, so eq/hash semantics are unchanged.
+        # NOTE: the key stays a string tuple by design (cross-checked against manually
+        # built legacy keys in the UTs); CPython caches each compact_str's hash on the
+        # string object, so this is not the bottleneck a full integer key would target.
+        return cls([cs if (cs := getattr(v, '_compact_str', None)) is not None else str(v)
+                    for v in cache_values])
 
     def __eq__(self, other):
         if not isinstance(other, LayoutCacheKey):
@@ -225,14 +227,18 @@ class OpDispatcher:
         self._setup_paths_from_env()
 
         self.layout_infer_ops = self.safe_load_yaml_from_dir()
-        self.whitelist = ["typeof", "DistCommIsend",
-                          "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather", "DistCommBatchIsendIrecv",
-                          "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__", "register_hook",
-                          "is_complex", "chunk", "__bool__", "__len__", "__format__", "dim",
-                          "_has_compatible_shallow_copy_type", "is_floating_point", "is_contiguous"]
+        # frozenset for O(1) membership (checked on every dispatch's bypass test).
+        self.whitelist = frozenset({"typeof", "DistCommIsend",
+                                    "DistCommIrecv", "DistCommBroadcast", "DistCommAllReduce", "DistCommAllGather",
+                                    "DistCommBatchIsendIrecv",
+                                    "DistCommReduceScatter", "requires_grad_", "item", "__get__", "__set__",
+                                    "register_hook",
+                                    "is_complex", "chunk", "__bool__", "__len__", "__format__", "dim",
+                                    "_has_compatible_shallow_copy_type", "is_floating_point", "is_contiguous"})
 
         # Ops requiring args unpacking for layout inference (packed as prim, name, real_args).
-        self.unpack_ops = ["ScatterUpdate", "Mod", "GatherNd", "StopGradient"]
+        # frozenset so the aclop-normalization gate in _dispatch_layout_infer is O(1).
+        self.unpack_ops = frozenset({"ScatterUpdate", "Mod", "GatherNd", "StopGradient"})
 
         self._random_ops = {
             "normal_", "uniform_", "bernoulli", "bernoulli_",
@@ -251,6 +257,11 @@ class OpDispatcher:
             "FuncDropoutExt", "UniformExt",
         }
         self._rng_tracker: Optional[OffsetBasedRNGTracker] = None
+        # Op names proven to be loss/CE-irrelevant (both is_loss_parallel_op and
+        # is_decomposed_ce_op are False). For these the loss_parallel / decomposed-CE
+        # guards in dispatch() are always no-ops regardless of context, so we skip
+        # them (and their is_loss_parallel_active() contextvar reads) on later calls.
+        self._non_loss_ops: set = set()
 
         self._register_distributed_ops()
 
@@ -563,8 +574,11 @@ class OpDispatcher:
         Returns:
             True when the op is whitelisted or DTensor dispatch is globally disabled.
         """
-        skip_dispatch = get_dtensor_dispatch() is False and op_name not in get_no_skip_ops()
-        return op_name in self.whitelist or op_name in self._INPLACE_BYPASS_OPS or skip_dispatch
+        # Cheap O(1) frozenset checks first, short-circuit before the ContextVar
+        # read (get_dtensor_dispatch) which is the priciest part of this guard.
+        if op_name in self.whitelist or op_name in self._INPLACE_BYPASS_OPS:
+            return True
+        return get_dtensor_dispatch() is False and op_name not in get_no_skip_ops()
 
     @staticmethod
     def _validate_inplace_partial_inputs(op_name: str, args: tuple, kwargs: dict) -> None:
@@ -758,10 +772,15 @@ class OpDispatcher:
             return op_impl(packed_call[0], packed_call[1], tuple(args), **kwargs)
         return op_impl(*args, **kwargs)
 
-    def _dispatch_layout_infer(
+    def _handle_unregistered_op(
         self, op_name: str, op_call: callable, args: tuple, kwargs: dict
     ):
-        """Dispatch an op through the layout-inference path.
+        """Handle ops that have no registered layout-inference entry.
+
+        This is a fallback path for ops that are not registered in
+        ``layout_infer_ops``. When arguments contain DTensors it either raises
+        (with a hint to register a distributed op) or, for loss-parallel ops,
+        gathers tensors to full and dispatches through the raw callable.
 
         Args:
             op_name: Canonical operator name.
@@ -770,51 +789,72 @@ class OpDispatcher:
             kwargs: Keyword arguments for op_call.
 
         Returns:
-            Result of the layout-infer dispatch.
+            Raw dispatch result (plain Tensor, not wrapped as DTensor).
 
         Raises:
-            RuntimeError: If op_name is not registered, or preprocess returns None
-                (operator not migrated to three-phase dispatch).
+            RuntimeError: If op_name is not registered for layout inference.
+        """
+        has_dtensor = any(isinstance(arg, DTensor) for arg in args)
+        has_dtensor = has_dtensor or any(isinstance(v, DTensor) for v in kwargs.values())
+        if has_dtensor:
+            self._check_ce_op_without_loss_parallel_context(op_name, args)
+
+            if not is_loss_parallel_op(op_name):
+                raise RuntimeError(
+                    f"Operator {op_name} does not contain parallel layout infer func. "
+                    f"DTensor dispatch requires explicit layout inference registration. "
+                    f"Please register a distributed operator for '{op_name}' or use local tensors."
+                )
+
+            gathered_args, gathered_kwargs = self._gather_dtensors_to_full(args, kwargs)
+
+            # Special handling for cross_entropy with 3D logits (only when NOT in loss_parallel context)
+            # PyTorch expects: logits [N, C], targets [N]
+            # But LLM forward returns: logits [batch, seq, vocab], targets [batch, seq]
+            # Note: nll_loss input is log_probs, typically already 2D, so we only reshape for cross_entropy
+            if op_name == "cross_entropy" and len(gathered_args) >= 2:
+                logits = gathered_args[0]
+                targets = gathered_args[1]
+                if isinstance(logits, Tensor) and isinstance(targets, Tensor):
+                    if logits.ndim > 2 and targets.ndim > 1 and targets.ndim == logits.ndim - 1:
+                        vocab_size = logits.shape[-1]
+                        gathered_args[0] = logits.reshape(-1, vocab_size)
+                        gathered_args[1] = targets.reshape(-1)
+
+            return op_call(*gathered_args, **gathered_kwargs)
+        raise RuntimeError(f"Operator {op_name} does not contain parallel layout infer func.")
+
+    def _dispatch_layout_infer(
+        self, op_name: str, op_call: callable, args: tuple, kwargs: dict
+    ):
+        """Standard dispatch through layout-inference: preprocess → infer → execute → wrap.
+
+        Args:
+            op_name: Canonical operator name (already resolved by the caller).
+            op_call: The raw operator callable.
+            args: Positional arguments for op_call.
+            kwargs: Keyword arguments for op_call.
+
+        Returns:
+            DTensor: Dispatched result wrapped as DTensor.
+
+        Raises:
+            RuntimeError: If op_name is not registered, or preprocess returns None.
         """
         if op_name not in self.layout_infer_ops:
-            has_dtensor = any(isinstance(arg, DTensor) for arg in args)
-            has_dtensor = has_dtensor or any(isinstance(v, DTensor) for v in kwargs.values())
-            if has_dtensor:
-                self._check_ce_op_without_loss_parallel_context(op_name, args)
-
-                if not is_loss_parallel_op(op_name):
-                    raise RuntimeError(
-                        f"Operator {op_name} does not contain parallel layout infer func. "
-                        f"DTensor dispatch requires explicit layout inference registration. "
-                        f"Please register a distributed operator for '{op_name}' or use local tensors."
-                    )
-
-                gathered_args, gathered_kwargs = self._gather_dtensors_to_full(args, kwargs)
-
-                # Special handling for cross_entropy with 3D logits (only when NOT in loss_parallel context)
-                # PyTorch expects: logits [N, C], targets [N]
-                # But LLM forward returns: logits [batch, seq, vocab], targets [batch, seq]
-                # Note: nll_loss input is log_probs, typically already 2D, so we only reshape for cross_entropy
-                if op_name == "cross_entropy" and len(gathered_args) >= 2:
-                    logits = gathered_args[0]
-                    targets = gathered_args[1]
-                    if isinstance(logits, Tensor) and isinstance(targets, Tensor):
-                        if logits.ndim > 2 and targets.ndim > 1 and targets.ndim == logits.ndim - 1:
-                            vocab_size = logits.shape[-1]
-                            gathered_args[0] = logits.reshape(-1, vocab_size)
-                            gathered_args[1] = targets.reshape(-1)
-
-                return op_call(*gathered_args, **gathered_kwargs)
-            raise RuntimeError(f"Operator {op_name} does not contain parallel layout infer func.")
+            return self._handle_unregistered_op(op_name, op_call, args, kwargs)
 
         cache_manager = LayoutCacheManager.get_instance()
         distribute_op = cache_manager.distributed_op(op_name)
 
-        # Normalize aclop-packed args before any per-op processing.
-        # This allows all distributed op classes (ElementWiseDistributedOp,
-        # GatherNdDistributedOp, etc.) to receive clean unpacked args,
-        # avoiding duplicated unpack logic in each class's preprocess.
-        packed_call, args = self._normalize_aclop_args(op_name, getattr(self, 'unpack_ops', []), args)
+        # Normalize aclop-packed args before any per-op processing. Only the handful
+        # of (deprecation-bound) unpack_ops ever use the packed format, so gate the
+        # whole normalization behind an O(1) membership test instead of paying two
+        # function frames (_normalize_aclop_args + _is_aclop_packed) on every op.
+        if op_name in getattr(self, 'unpack_ops', ()):
+            packed_call, args = self._normalize_aclop_args(op_name, self.unpack_ops, args)
+        else:
+            packed_call = None
 
         result = distribute_op.preprocess(args, kwargs)
         if result is None:
@@ -822,8 +862,17 @@ class OpDispatcher:
                 f"Operator '{op_name}' has not been migrated to the three-phase dispatch flow. "
                 f"Please implement preprocess() to return (local_args, local_kwargs, cache_values)."
             )
-        output = self._dispatch_new(op_call, distribute_op, packed_call, result)
-        return self._restore_inplace_dtensor_result(op_name, args, output)
+        local_args, local_kwargs, cache_values = result
+        cache_key = LayoutCacheKey.from_cache_values(cache_values)
+
+        infer_result, op_impl = OpDispatcher._lookup_or_infer_layout(
+            op_call, op_name, cache_key, cache_values, distribute_op, cache_manager
+        )
+
+        op_impl = op_call if op_impl is None else op_impl
+        py_output = OpDispatcher._call_op_impl(op_impl, packed_call, local_args, local_kwargs)
+        output = distribute_op.wrap_output(py_output, infer_result[0])
+        return OpDispatcher._restore_inplace_dtensor_result(op_name, args, output)
 
     @staticmethod
     def _restore_inplace_dtensor_result(op_name: str, args: tuple, output: Any) -> Any:
@@ -833,39 +882,12 @@ class OpDispatcher:
         return output
 
     @staticmethod
-    def _dispatch_new(func, distribute_op, packed_call, result) -> Tensor:
-        """New dispatch flow using preprocess result.
-
-        Args:
-            func: Original function.
-            distribute_op: Distributed operation instance.
-            packed_call: (prim, op_name_str) tuple for aclop kernel invocation,
-                or None for regular ops.
-            result: Preprocessed result (local_args, local_kwargs, cache_values).
-
-        Returns:
-            Tensor: Dispatched result as DTensor.
-        """
-        local_args, local_kwargs, cache_values = result
-        cache_key = LayoutCacheKey.from_cache_values(cache_values)
-        func_name = platform.get_op_name(func)
-
-        infer_result, op_impl = OpDispatcher._lookup_or_infer_layout_new(
-            func, func_name, cache_key, cache_values, distribute_op
-        )
-
-        op_impl = func if op_impl is None else op_impl
-        py_output = OpDispatcher._call_op_impl(op_impl, packed_call, local_args, local_kwargs)
-        return distribute_op.wrap_output(py_output, infer_result[0])
-
-    @staticmethod
-    def _lookup_or_infer_layout_new(func, func_name, cache_key, cache_values, distribute_op):
-        """Look up cached layout or compute via distributed op (new three-phase API).
+    def _lookup_or_infer_layout(func, func_name, cache_key, cache_values, distribute_op, cache_manager):
+        """Look up cached layout or compute via distributed op.
 
         Returns:
             (infer_result, op_impl)
         """
-        cache_manager = LayoutCacheManager.get_instance()
         layout_cache = cache_manager.get_layout_cache()
         if func_name not in layout_cache:
             layout_cache[func_name] = {}
@@ -900,10 +922,17 @@ class OpDispatcher:
         if op_name in self._random_ops or op_name in self._random_ms_ops:
             return self._dispatch_random_op(op_name, op_call, args, kwargs)
 
-        self._check_decomposed_ce_op_in_loss_parallel(op_name, args, kwargs)
-
-        if self._should_dispatch_loss_parallel(op_name):
-            return self._dispatch_loss_parallel(op_call, args, kwargs)
+        # Loss/CE guards only matter for loss-relevant ops. Once an op is proven
+        # irrelevant (static, op_name-only), skip both guards — and their repeated
+        # is_loss_parallel_active() contextvar reads — on every subsequent call.
+        if op_name not in getattr(self, '_non_loss_ops', ()):
+            self._check_decomposed_ce_op_in_loss_parallel(op_name, args, kwargs)
+            if self._should_dispatch_loss_parallel(op_name):
+                return self._dispatch_loss_parallel(op_call, args, kwargs)
+            if not is_loss_parallel_op(op_name) and not is_decomposed_ce_op(op_name):
+                if not hasattr(self, '_non_loss_ops'):
+                    self._non_loss_ops = set()
+                self._non_loss_ops.add(op_name)
 
         if op_name not in self.layout_infer_ops and get_distributed_op(op_name) is not None:
             self.layout_infer_ops[op_name] = {}
