@@ -485,8 +485,8 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         attention_out, softmax_max, softmax_sum, _ = output_layouts
 
         assert attention_out.to_dict()["tensor_map"] == (1, 0, -1)
-        assert softmax_max.to_dict()["tensor_map"] == (1, 0, -1, -1)
-        assert softmax_sum.to_dict()["tensor_map"] == (1, 0, -1, -1)
+        assert softmax_max.to_dict()["tensor_map"] == (1, 0, -1)
+        assert softmax_sum.to_dict()["tensor_map"] == (1, 0, -1)
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_flash_attention_output_layouts_mixed_parallel_24(self, mock_platform):
@@ -811,8 +811,8 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         attention_out, softmax_max, softmax_sum, _ = output_layouts
 
         assert attention_out.to_dict()["tensor_map"] == (1, 0, -1)
-        assert len(softmax_max.to_dict()["tensor_map"]) == 4
-        assert len(softmax_sum.to_dict()["tensor_map"]) == 4
+        assert len(softmax_max.to_dict()["tensor_map"]) == 3
+        assert len(softmax_sum.to_dict()["tensor_map"]) == 3
 
 
     # ========================================================================
@@ -1163,6 +1163,57 @@ class TestParallelNpuFlashAttentionScore(unittest.TestCase):
         cache_values = [q_layout, k_layout, v_layout, "BSH"]
         with self.assertRaises(ValueError):
             op.infer_layout(cache_values)
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_flash_attention_tnd_softmax_wrap_output_rank_match(self, mock_platform):
+        """Verify TND softmax outputs remain rank-consistent after wrapping."""
+        self._setup_mock_platform(mock_platform, world_size=8)
+        mesh = init_device_mesh(
+            device_type="npu", mesh_shape=(4, 2), mesh_dim_names=("sp", "mp")
+        )
+        q_placements = (Shard(0), Shard(1))
+        kv_placements = (Replicate(), Shard(1))
+        q_layout = _build_layout(mesh, q_placements, 3)
+        k_layout = _build_layout(mesh, kv_placements, 3)
+        v_layout = _build_layout(mesh, kv_placements, 3)
+
+        cache_values = [q_layout, k_layout, v_layout, "TND"]
+        infer_result = op.infer_layout(cache_values)
+        output_layouts = infer_result[0]
+
+        # NPU output order: attention_out, softmax_max, softmax_sum, softmax_out.
+        local_outputs = (
+            np.empty((2, 2, 32), dtype=np.float32),
+            np.empty((2, 2, 8), dtype=np.float32),
+            np.empty((2, 2, 8), dtype=np.float32),
+            np.empty((), dtype=np.float32),
+        )
+
+        def _wrap_with_layout(local_tensor, device_mesh, placements, layout):
+            """Validate the metadata passed by wrap_output and return a test double."""
+            assert device_mesh is layout.mesh
+            assert placements == layout.placements
+            local_shape = local_tensor.shape
+            tensor_map = layout.to_dict()["tensor_map"]
+            assert len(local_shape) == len(tensor_map)
+            assert len(layout.get_global_shape(local_shape)) == len(local_shape)
+            wrapped_output = MagicMock()
+            wrapped_output.to_local.return_value = local_tensor
+            wrapped_output.layout = layout
+            return wrapped_output
+
+        with patch(
+            "hyper_parallel.core.dtensor.dtensor.DTensor",
+            side_effect=_wrap_with_layout,
+        ) as mock_dtensor:
+            wrapped = op.wrap_output(local_outputs, output_layouts)
+
+        assert mock_dtensor.call_count == len(output_layouts)
+        assert wrapped[1].layout.to_dict()["tensor_map"] == (1, 0, -1)
+        assert wrapped[2].layout.to_dict()["tensor_map"] == (1, 0, -1)
+        assert len(wrapped[1].to_local().shape) == 3
+        assert len(wrapped[2].to_local().shape) == 3
+
 
 if __name__ == "__main__":
     unittest.main()
