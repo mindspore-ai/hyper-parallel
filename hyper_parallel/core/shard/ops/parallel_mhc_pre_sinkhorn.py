@@ -100,19 +100,27 @@ def _normalize_mhc_pre_clamp_sinkhorn_args(*args, **kwargs):
 _MHC_PRE_SINKHORN_VALIDATION_RULES: Dict[int, Dict[str, Any]] = {
     4: {
         "op_name": "npu_mhc_pre_sinkhorn",
-        "forbidden_dims": {2: "N"},
+        "forbidden_dims": {2: "N", 3: "C"},
         "phi_forbidden_dims": {0: "dim0", 1: "dim1"},
         "alpha_forbidden_dims": {0: "dim0"},
         "bias_forbidden_dims": {0: "dim0"},
     },
     3: {
         "op_name": "npu_mhc_pre_sinkhorn",
-        "forbidden_dims": {1: "N"},
+        "forbidden_dims": {1: "N", 2: "C"},
         "phi_forbidden_dims": {0: "dim0", 1: "dim1"},
         "alpha_forbidden_dims": {0: "dim0"},
         "bias_forbidden_dims": {0: "dim0"},
     },
 }
+
+
+def _create_output_layout(mesh: Any, tensor_map: tuple) -> Layout:
+    """Create an output layout with placements derived from ``tensor_map``."""
+    output_layout = Layout.from_device_mesh(mesh)
+    output_layout.set_tensor_map(tensor_map)
+    output_layout.tensor_map_to_placement()
+    return output_layout
 
 
 def _validate_tensor_map_dims(
@@ -169,6 +177,7 @@ class NpuMhcPreSinkhornDistributedOp(DistributedOp):
     """
 
     def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """Unwrap DTensor inputs and cache their layouts for inference."""
         norm_args, _ = _normalize_mhc_pre_sinkhorn_args(*args, **kwargs)
         dtensor_x = norm_args[0]
         dtensor_phi = norm_args[1]
@@ -212,6 +221,7 @@ class NpuMhcPreSinkhornDistributedOp(DistributedOp):
         return local_args, local_kwargs, cache_values
 
     def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """Validate input layouts and infer the eight output layouts."""
         x_layout, phi_layout, alpha_layout, bias_layout = cache_values
 
         self._check_partial_inputs([x_layout, phi_layout, alpha_layout, bias_layout])
@@ -220,20 +230,77 @@ class NpuMhcPreSinkhornDistributedOp(DistributedOp):
             x_layout, phi_layout, alpha_layout, bias_layout
         )
 
-        out_layouts = self._infer_output_layouts(x_layout)
+        out_layouts = self.infer_output_layouts(x_layout)
         return out_layouts, None
 
     @staticmethod
-    def _infer_output_layouts(
+    def infer_output_layouts(
             x_layout: Layout,
     ) -> Tuple[Layout, Layout, Layout, Layout, Layout, Layout, Layout, Layout]:
-        out_layout = Layout.from_device_mesh(x_layout.mesh)
-        out_layout.set_tensor_map(x_layout.tensor_map)
-        out_layout.tensor_map_to_placement()
+        """Infer per-output layouts from the input x layout.
 
-        return (
-            out_layout, out_layout, out_layout, out_layout,
-            out_layout, out_layout, out_layout, out_layout,
+        The input x is either 4-D (B, S, N, C) or 3-D (T, N, C), but the
+        8 kernel outputs each have a different rank (2-D through 5-D).
+        Blindly copying the input tensor_map to every output causes
+        ``get_global_shape`` to raise because ``len(slice_shape) !=
+        len(tensor_map)``.
+
+        Each output preserves only the leading dims that remain from the
+        input, with new kernel-internal axes set to replicated (``-1``).
+        """
+        x_tm = x_layout.tensor_map
+        x_tm_len = len(x_tm)
+        mesh = x_layout.mesh
+
+        if x_tm_len == 4:
+            # (B, S, N, C)  →  outputs preserve B (dim 0) and S (dim 1)
+            b_map, s_map, _, c_map = x_tm
+
+            # 3-D: (B, S, …)
+            tm_h_in = (b_map, s_map, c_map)          # h_in:           (B, S, C)
+            tm_3d = (b_map, s_map, -1)               # h_post/h_res/h_pre/hc_before_norm: (B, S, …)
+            # 4-D: (2*iters, B, S, N)                # sum_out
+            tm_sum = (-1, b_map, s_map, -1)
+            # 5-D: (2*iters, B, S, N, N)             # norm_out
+            tm_norm = (-1, b_map, s_map, -1, -1)
+
+            return (
+                _create_output_layout(mesh, tm_h_in),  # h_in
+                _create_output_layout(mesh, tm_3d),    # h_post
+                _create_output_layout(mesh, tm_3d),    # h_res
+                _create_output_layout(mesh, tm_3d),    # h_pre
+                _create_output_layout(mesh, tm_3d),    # hc_before_norm
+                _create_output_layout(mesh, tm_3d),    # inv_rms
+                _create_output_layout(mesh, tm_sum),   # sum_out
+                _create_output_layout(mesh, tm_norm),  # norm_out
+            )
+
+        if x_tm_len == 3:
+            # (T, N, C)  →  only T (dim 0) is batch-like
+            t_map, _, c_map = x_tm
+
+            # 2-D: (T, …)
+            tm_h_in = (t_map, c_map)                 # h_in:           (T, C)
+            tm_2d = (t_map, -1)                     # h_post/h_res/h_pre/hc_before_norm: (T, …)
+            # 3-D: (2*iters, T, N)                  # sum_out
+            tm_sum = (-1, t_map, -1)
+            # 4-D: (2*iters, T, N, N)               # norm_out
+            tm_norm = (-1, t_map, -1, -1)
+
+            return (
+                _create_output_layout(mesh, tm_h_in),  # h_in
+                _create_output_layout(mesh, tm_2d),    # h_post
+                _create_output_layout(mesh, tm_2d),    # h_res
+                _create_output_layout(mesh, tm_2d),    # h_pre
+                _create_output_layout(mesh, tm_2d),    # hc_before_norm
+                _create_output_layout(mesh, tm_2d),    # inv_rms
+                _create_output_layout(mesh, tm_sum),   # sum_out
+                _create_output_layout(mesh, tm_norm),  # norm_out
+            )
+
+        raise ValueError(
+            f"For npu_mhc_pre_sinkhorn, tensor_map length should be 4 or 3, "
+            f"but got {x_tm_len}."
         )
 
 
@@ -245,6 +312,7 @@ class NpuMhcPreClampSinkhornDistributedOp(DistributedOp):
     """
 
     def preprocess(self, args: tuple, kwargs: dict) -> tuple:
+        """Unwrap clamp operator inputs and cache their layouts for inference."""
         norm_args, _ = _normalize_mhc_pre_clamp_sinkhorn_args(*args, **kwargs)
         dtensor_x = norm_args[0]
         dtensor_phi = norm_args[1]
@@ -292,6 +360,7 @@ class NpuMhcPreClampSinkhornDistributedOp(DistributedOp):
         return local_args, local_kwargs, cache_values
 
     def infer_layout(self, cache_values: list) -> Tuple[tuple, None]:
+        """Validate input layouts and infer the nine clamp output layouts."""
         x_layout, phi_layout, alpha_layout, bias_layout = cache_values
 
         self._check_partial_inputs([x_layout, phi_layout, alpha_layout, bias_layout])
@@ -299,7 +368,27 @@ class NpuMhcPreClampSinkhornDistributedOp(DistributedOp):
             x_layout, phi_layout, alpha_layout, bias_layout
         )
 
-        out_layout = Layout.from_device_mesh(x_layout.mesh)
-        out_layout.set_tensor_map(x_layout.tensor_map)
-        out_layout.tensor_map_to_placement()
-        return (out_layout,) * 9, None
+        # First 8 outputs use the same layout logic as the non-clamp variant.
+        out_layouts = NpuMhcPreSinkhornDistributedOp.infer_output_layouts(x_layout)
+
+        # 9th output h_res_logits has the same shape as norm_out (5-D for
+        # BSND, 4-D for TND).
+        x_tm = x_layout.tensor_map
+        x_tm_len = len(x_tm)
+        mesh = x_layout.mesh
+
+        if x_tm_len == 4:
+            b_map, s_map = x_tm[0], x_tm[1]
+            tm_logits = (-1, b_map, s_map, -1, -1)
+        elif x_tm_len == 3:
+            t_map = x_tm[0]
+            tm_logits = (-1, t_map, -1, -1)
+        else:
+            raise ValueError(
+                f"For npu_mhc_pre_clamp_sinkhorn, tensor_map length should be "
+                f"4 or 3, but got {x_tm_len}."
+            )
+
+        logits_layout = _create_output_layout(mesh, tm_logits)
+
+        return out_layouts + (logits_layout,), None

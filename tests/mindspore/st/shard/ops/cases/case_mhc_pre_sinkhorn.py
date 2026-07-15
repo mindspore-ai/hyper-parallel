@@ -45,7 +45,7 @@ register(OpShardCase(
         (Replicate(),),
     ],
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
-    compare_outputs=(0,),  # old test validates output[0] only
+    compare_outputs=(0, 6, 7),  # cover 3-D / 4-D / 5-D output ranks
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
     tags=("npu_level1",),
@@ -69,7 +69,7 @@ register(OpShardCase(
         (Replicate(),),
     ],
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
-    compare_outputs=(0,),  # old test validates output[0] only
+    compare_outputs=(0, 6, 7),  # cover 3-D / 4-D / 5-D output ranks
     mesh_shape=(2,),
     mesh_dim_names=("dp",),
     tags=("npu_level1",),
@@ -93,7 +93,7 @@ register(OpShardCase(
         (Replicate(), Replicate(), Replicate()),
     ],
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
-    compare_outputs=(0,),  # old test validates output[0] only
+    compare_outputs=(0, 6, 7),  # cover 3-D / 4-D / 5-D output ranks
     mesh_shape=(2, 2, 2),
     mesh_dim_names=("dp", "cp", "tp"),
     tags=("npu_level1",),
