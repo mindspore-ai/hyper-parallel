@@ -171,6 +171,10 @@ class TestCkptWrapper(unittest.TestCase):
 
         self.assertIsInstance(result, CheckpointWrapper)
 
+    def test_forward_is_available_to_torch_dynamo(self):
+        """Checkpoint wrapper must remain traceable so checkpoint becomes a HOP."""
+        self.assertFalse(getattr(CheckpointWrapper.forward, "_torchdynamo_disable", False))
+
 
 if __name__ == "__main__":
     unittest.main()

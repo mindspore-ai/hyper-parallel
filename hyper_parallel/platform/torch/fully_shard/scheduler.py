@@ -263,11 +263,15 @@ class TorchHSDPSchedulerV2(HSDPSchedulerV2):
 
     def _register_forward_backward_hooks(self):
         """Register module forward and backward hook on all managed modules."""
+        forward_pre_hook = torch._dynamo.disable(self._forward_pre_hook)
+        forward_hook = torch._dynamo.disable(self._forward_hook)
+        grouped_forward_pre_hook = torch._dynamo.disable(self._grouped_forward_pre_hook)
         if self._fsdp_group_post_pending is None:
             for mod in self.modules:
-                mod.register_forward_pre_hook(self._forward_pre_hook, with_kwargs=True)
-                mod.register_forward_hook(self._forward_hook)
+                mod.register_forward_pre_hook(forward_pre_hook, with_kwargs=True)
+                mod.register_forward_hook(forward_hook)
             return
         for mod in self.modules:
-            mod.register_forward_pre_hook(self._grouped_forward_pre_hook, with_kwargs=True)
-            self._register_forward_module_hook(mod, self._make_grouped_forward_post_hook(mod))
+            mod.register_forward_pre_hook(grouped_forward_pre_hook, with_kwargs=True)
+            grouped_forward_hook = torch._dynamo.disable(self._make_grouped_forward_post_hook(mod))
+            self._register_forward_module_hook(mod, grouped_forward_hook)

@@ -16,7 +16,7 @@
 import os
 from datetime import timedelta
 from enum import auto, Enum
-from typing import Optional, Any, Union
+from typing import Optional, Any, Callable, Union
 
 import numpy as np
 
@@ -1466,6 +1466,20 @@ class Platform:
             Context functions for selective checkpointing.
         """
         raise NotImplementedError("Platform subclasses must implement create_selective_checkpoint_contexts")
+
+    @staticmethod
+    def create_native_selective_checkpoint_contexts(policy_fn: Callable) -> Any:
+        """Create framework-native selective checkpoint contexts for compile.
+
+        Args:
+            policy_fn: Selective checkpoint policy callback.
+
+        Returns:
+            Framework-native forward and recomputation contexts.
+        """
+        raise NotImplementedError(
+            "Native selective checkpoint compile is not supported by this platform"
+        )
 
     @staticmethod
     def async_save_on_cpu(policy_fn=None, group_swap: bool = False):

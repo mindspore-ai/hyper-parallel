@@ -161,6 +161,49 @@ class TestCheckpointFunction(unittest.TestCase):
         call_args = mock_plat.checkpoint.call_args[0]
         self.assertIn(3, call_args)
 
+    def test_checkpoint_omits_default_context_while_compiling(self, mock_plat):
+        """Compile capture should let PyTorch represent checkpoint as a HOP."""
+        mock_plat.checkpoint.return_value = "result"
+        mock_plat.is_compiling.return_value = True
+
+        result = checkpoint(lambda value: value, 1)
+
+        self.assertEqual(result, "result")
+        call_kwargs = mock_plat.checkpoint.call_args.kwargs
+        self.assertNotIn("context_fn", call_kwargs)
+        self.assertFalse(call_kwargs["use_reentrant"])
+
+    def test_checkpoint_uses_native_selective_context_while_compiling(self, mock_plat):
+        """Compile SAC should bypass HyperParallel's eager DispatchModes."""
+        mock_plat.checkpoint.return_value = "result"
+        mock_plat.is_compiling.return_value = True
+        policy = MagicMock(return_value=CheckpointPolicy.MUST_SAVE)
+
+        result = checkpoint(lambda value: value, 1, policy_fn=policy)
+
+        self.assertEqual(result, "result")
+        context_fn = mock_plat.checkpoint.call_args.kwargs["context_fn"]
+        context_fn()
+        mock_plat.create_native_selective_checkpoint_contexts.assert_called_once_with(policy)
+        mock_plat.create_selective_checkpoint_contexts.assert_not_called()
+
+    def test_checkpoint_rejects_extensions_while_compiling(self, mock_plat):
+        """Compile checkpoint must fail instead of silently falling back to eager extensions."""
+        mock_plat.is_compiling.return_value = True
+        cases = (
+            {"swap_inputs": True},
+            {"group_swap": True},
+            {"context_fn": lambda: (contextlib.nullcontext(), contextlib.nullcontext())},
+            {"use_reentrant": True},
+        )
+
+        for checkpoint_kwargs in cases:
+            with self.subTest(checkpoint_kwargs=checkpoint_kwargs):
+                with self.assertRaisesRegex(ValueError, "does not support"):
+                    checkpoint(lambda value: value, 1, **checkpoint_kwargs)
+
+        mock_plat.checkpoint.assert_not_called()
+
     def test_checkpoint_composes_recompute_state_and_user_contexts(self, mock_plat):
         """Unified recompute state should surround user checkpoint contexts."""
         events = []
@@ -287,6 +330,15 @@ class TestSwapFunction(unittest.TestCase):
 
         self.assertEqual(result, 6)
         mock_plat.async_save_on_cpu.assert_called_once_with(policy_fn=None, group_swap=False)
+
+    def test_swap_rejected_while_compiling(self, mock_plat):
+        """Activation swap extensions should not silently enter a compiled graph."""
+        mock_plat.is_compiling.return_value = True
+
+        with self.assertRaisesRegex(ValueError, "activation swap"):
+            swap(lambda value: value, 1)
+
+        mock_plat.async_save_on_cpu.assert_not_called()
 
 
 class _BaseWrapperModule(torch.nn.Module):

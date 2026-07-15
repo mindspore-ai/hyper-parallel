@@ -14,7 +14,7 @@
 # ============================================================================
 """Torch platform api"""
 from datetime import timedelta
-from typing import Optional, Any, Union
+from typing import Optional, Any, Callable, Union
 import dataclasses
 from collections import OrderedDict
 
@@ -1428,6 +1428,11 @@ class TorchPlatform(Platform):
         return torch.utils.checkpoint.checkpoint
 
     @staticmethod
+    def is_compiling() -> bool:
+        """Return whether execution is currently being captured by torch.compile."""
+        return torch.compiler.is_compiling()
+
+    @staticmethod
     def checkpoint_wrapper(module, **checkpoint_kwargs):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.checkpoint_wrapper import ckpt_wrapper
@@ -1460,6 +1465,14 @@ class TorchPlatform(Platform):
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.activation_checkpoint.sac import create_selective_checkpoint_contexts
         return create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation, group_swap)
+
+    @staticmethod
+    def create_native_selective_checkpoint_contexts(policy_fn: Callable) -> Any:
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.activation_checkpoint.native_compile import (
+            create_native_selective_checkpoint_contexts,
+        )
+        return create_native_selective_checkpoint_contexts(policy_fn)
 
     @staticmethod
     def async_save_on_cpu(policy_fn=None, group_swap: bool = False):

@@ -606,8 +606,12 @@ class TestTorchSchedulerSetup(unittest.TestCase):
         scheduler.modules = (module,)
         scheduler._fsdp_group_post_pending = None
         scheduler._register_forward_backward_hooks()
-        module.register_forward_pre_hook.assert_called_once_with(scheduler._forward_pre_hook, with_kwargs=True)
-        module.register_forward_hook.assert_called_once_with(scheduler._forward_hook)
+        forward_pre_hook = module.register_forward_pre_hook.call_args.args[0]
+        forward_hook = module.register_forward_hook.call_args.args[0]
+        self.assertTrue(getattr(forward_pre_hook, "_torchdynamo_disable", False))
+        self.assertTrue(getattr(forward_hook, "_torchdynamo_disable", False))
+        module.register_forward_pre_hook.assert_called_once_with(forward_pre_hook, with_kwargs=True)
+        module.register_forward_hook.assert_called_once_with(forward_hook)
 
         module_a = MagicMock()
         module_b = MagicMock()
@@ -615,8 +619,14 @@ class TestTorchSchedulerSetup(unittest.TestCase):
         scheduler._fsdp_group_post_pending = set()
         scheduler._register_forward_module_hook = MagicMock()
         scheduler._register_forward_backward_hooks()
-        module_a.register_forward_pre_hook.assert_called_once_with(scheduler._grouped_forward_pre_hook, with_kwargs=True)
-        module_b.register_forward_pre_hook.assert_called_once_with(scheduler._grouped_forward_pre_hook, with_kwargs=True)
+        grouped_pre_hook_a = module_a.register_forward_pre_hook.call_args.args[0]
+        grouped_pre_hook_b = module_b.register_forward_pre_hook.call_args.args[0]
+        self.assertTrue(getattr(grouped_pre_hook_a, "_torchdynamo_disable", False))
+        self.assertTrue(getattr(grouped_pre_hook_b, "_torchdynamo_disable", False))
+        module_a.register_forward_pre_hook.assert_called_once_with(grouped_pre_hook_a, with_kwargs=True)
+        module_b.register_forward_pre_hook.assert_called_once_with(grouped_pre_hook_b, with_kwargs=True)
+        for call in scheduler._register_forward_module_hook.call_args_list:
+            self.assertTrue(getattr(call.args[1], "_torchdynamo_disable", False))
         self.assertEqual(scheduler._register_forward_module_hook.call_count, 2)
 
 

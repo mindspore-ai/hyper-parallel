@@ -129,6 +129,14 @@ class TestSwapWrapper(unittest.TestCase):
         self.assertIn("layer.bias", parameter_names)
         self.assertTrue(all("_swap_wrapped_module" not in name for name in parameter_names))
 
+    def test_forward_rejected_while_compiling(self):
+        """SwapWrapper should fail explicitly during Torch graph capture."""
+        wrapper = swap_wrapper(_TinyModule())
+
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            with self.assertRaisesRegex(ValueError, "swap_wrapper"):
+                wrapper(torch.randn(2, 2))
+
 
 class TestAsyncSaveOnCpu(unittest.TestCase):
     """Unit tests for AsyncSaveOnCpu."""
@@ -152,6 +160,12 @@ class TestAsyncSaveOnCpu(unittest.TestCase):
                 (x * x).sum()
 
         fake_manager.add_storage.assert_called_once()
+
+    def test_rejected_while_compiling(self):
+        """Direct async-save contexts should fail explicitly during capture."""
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            with self.assertRaisesRegex(ValueError, "AsyncSaveOnCpu"):
+                AsyncSaveOnCpu()
 
 
 class TestSwapTensorWrapper(unittest.TestCase):
@@ -196,6 +210,12 @@ class TestSwapTensorWrapper(unittest.TestCase):
         self.assertIs(result["x"], target["x"])
         self.assertIs(result["meta"][1], target["meta"][1])
         fake_manager.add_storage.assert_called_once()
+
+    def test_rejected_while_compiling(self):
+        """Tensor-level swap registration should fail explicitly during capture."""
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            with self.assertRaisesRegex(ValueError, "swap_tensor_wrapper"):
+                swap_tensor_wrapper(torch.ones(2))
 
 
 if __name__ == "__main__":
