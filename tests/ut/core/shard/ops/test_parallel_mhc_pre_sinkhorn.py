@@ -13,7 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Unit tests for NpuMhcPreSinkhornDistributedOp."""
-import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -23,7 +22,7 @@ from hyper_parallel.core.dtensor.dtensor import _build_layout, _LAYOUT_CACHE
 from hyper_parallel.core.dtensor.placement_types import Shard, Replicate
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.shard.ops.parallel_mhc_pre_sinkhorn import (
-    NpuMhcPreSinkhornDistributedOp,
+    NpuMhcPreClampSinkhornDistributedOp,
     _normalize_mhc_pre_sinkhorn_args,
 )
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
@@ -34,13 +33,13 @@ from hyper_parallel.platform.platform import EXISTING_COMM_GROUPS, PlatformType
 class TestNpuMhcPreSinkhorn(unittest.TestCase):
     """Unit tests for NpuMhcPreSinkhornDistributedOp."""
 
-    def setUp(self):
+    def setUp(self) -> None:
         """Clear global state before each test."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
         _LAYOUT_CACHE.clear()
 
-    def tearDown(self):
+    def tearDown(self) -> None:
         """Clear global state after each test."""
         EXISTING_COMM_GROUPS.clear()
         _DEVICE_MESH_MAP.clear()
@@ -63,6 +62,12 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
     def _make_2d_mesh(self, mock_platform, shape=(2, 2), names=("dp", "cp_tp")):
         """Return a 2-D mesh; cp_tp is mesh dim index 1 by default."""
         self._setup_mock_platform(mock_platform, world_size=shape[0] * shape[1])
+        return init_device_mesh(device_type="npu", mesh_shape=shape, mesh_dim_names=names)
+
+    def _make_3d_mesh(self, mock_platform, shape=(2, 2, 2), names=("dp", "cp", "tp")):
+        """Return a 3-D mesh."""
+        world_size = shape[0] * shape[1] * shape[2]
+        self._setup_mock_platform(mock_platform, world_size=world_size)
         return init_device_mesh(device_type="npu", mesh_shape=shape, mesh_dim_names=names)
 
     @staticmethod
@@ -230,8 +235,10 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
     def test_infer_layout_data_parallel_7(self, mock_platform):
         """
         Feature: infer_layout with B-dim sharded (data parallel).
-        Description: x sharded on dim 0 (batch); N replicated.
-        Expectation: All 8 output layouts mirror x sharding on B.
+        Description: x sharded on dim 0 (batch); N replicated.  Outputs
+            preserve B/S/C sharding according to their own rank.
+        Expectation: 3-D outputs carry (b_map, s_map, …); 4-D/5-D outputs
+            prefix the iteration axis as replicated.
         """
         mesh = self._make_1d_mesh(mock_platform, size=4, name="dp")
 
@@ -251,15 +258,75 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
         assert len(out_layouts) == 8, (
             f"Expected 8 output layouts, got {len(out_layouts)}"
         )
-        for i, ol in enumerate(out_layouts):
-            assert ol.tensor_map == x_layout.tensor_map, (
-                f"Output {i} tensor_map {ol.tensor_map} should match "
-                f"x tensor_map {x_layout.tensor_map}"
+        # x_tm = (0, -1, -1, -1)  →  b_map=0, c_map=-1
+        expected = [
+            (0, -1, -1),          # 0: h_in           (B, S, C)
+            (0, -1, -1),          # 1: h_post         (B, S, N)
+            (0, -1, -1),          # 2: h_res          (B, S, N*N)
+            (0, -1, -1),          # 3: h_pre          (B, S, N)
+            (0, -1, -1),          # 4: hc_before_norm (B, S, fusion)
+            (0, -1, -1),          # 5: inv_rms        (B, S, 1)
+            (-1, 0, -1, -1),      # 6: sum_out        (I, B, S, N)
+            (-1, 0, -1, -1, -1),  # 7: norm_out       (I, B, S, N, N)
+        ]
+        for i, exp_tm in enumerate(expected):
+            actual_tm = out_layouts[i].tensor_map
+            assert actual_tm == exp_tm, (
+                f"Output {i}: expected tensor_map {exp_tm}, got {actual_tm}"
             )
 
-    # ------------------------------------------------------------------
-    # infer_layout — error cases
-    # ------------------------------------------------------------------
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_infer_layout_dp_cp_tp_mixed_maps_13(self, mock_platform):
+        """
+        Feature: infer_layout with 3-D mesh (dp, cp, tp).
+        Description: x placements (Shard(0), Shard(1), Shard(1));
+            mesh (2,2,2).  Outputs must preserve B/S sharding and
+            replicate kernel-internal axes.
+        Expectation: 3-D outputs (B,S,…) use (b_map, s_map, -1);
+            4-D sum_out uses (-1, b_map, s_map, -1);
+            5-D norm_out uses (-1, b_map, s_map, -1, -1).
+        """
+        mesh = self._make_3d_mesh(mock_platform)
+        replicated = (Replicate(), Replicate(), Replicate())
+
+        x_layout = _build_layout(mesh, (Shard(0), Shard(1), Shard(1)), 4)
+        phi_layout = _build_layout(mesh, replicated, 2)
+        alpha_layout = _build_layout(mesh, replicated, 1)
+        bias_layout = _build_layout(mesh, replicated, 1)
+
+        for layout in (x_layout, phi_layout, alpha_layout, bias_layout):
+            layout.is_partial = MagicMock(return_value=False)
+
+        op = self._get_op()
+        out_layouts, extra = op.infer_layout(
+            [x_layout, phi_layout, alpha_layout, bias_layout]
+        )
+
+        assert len(out_layouts) == 8, (
+            f"Expected 8 output layouts, got {len(out_layouts)}"
+        )
+        # Derive expected maps from the input tensor_map (reverse-indexed).
+        b_map, s_map = x_layout.tensor_map[0], x_layout.tensor_map[1]
+        tm_3d = (b_map, s_map, -1)
+        tm_4d = (-1, b_map, s_map, -1)
+        tm_5d = (-1, b_map, s_map, -1, -1)
+
+        expected = [
+            tm_3d,  # 0: h_in           (B, S, C)
+            tm_3d,  # 1: h_post         (B, S, N)
+            tm_3d,  # 2: h_res          (B, S, N*N)
+            tm_3d,  # 3: h_pre          (B, S, N)
+            tm_3d,  # 4: hc_before_norm (B, S, fusion)
+            tm_3d,  # 5: inv_rms        (B, S, 1)
+            tm_4d,  # 6: sum_out        (I, B, S, N)
+            tm_5d,  # 7: norm_out       (I, B, S, N, N)
+        ]
+        for i, exp_tm in enumerate(expected):
+            actual_tm = out_layouts[i].tensor_map
+            assert actual_tm == exp_tm, (
+                f"DP+CP+TP output {i}: expected {exp_tm}, got {actual_tm}"
+            )
+        assert extra is None, f"Expected extra=None, got {extra}"
 
     @patch("hyper_parallel.core.dtensor.device_mesh.platform")
     def test_infer_layout_partial_input_raises_8(self, mock_platform):
@@ -303,7 +370,8 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
         """
         Feature: infer_layout with TND format (3D x), all replicated.
         Description: x is [T,N,C] (3D tensor_map); phi/alpha/bias Replicate.
-        Expectation: Returns 8 output layouts; all tensor_map entries -1; extra is None.
+        Expectation: Returns 8 output layouts with per-output ranks;
+            every entry is -1 because no mesh axis is used.
         """
         mesh = self._make_1d_mesh(mock_platform, size=8)
 
@@ -323,10 +391,21 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
         assert len(out_layouts) == 8, (
             f"TND replicated: expected 8 output layouts, got {len(out_layouts)}"
         )
-        for i, ol in enumerate(out_layouts):
-            assert ol.tensor_map == (-1, -1, -1), (
-                f"TND replicated output {i} tensor_map should be (-1,-1,-1), "
-                f"got {ol.tensor_map}"
+        # x_tm = (-1, -1, -1)  →  t_map=-1, c_map=-1
+        expected = [
+            (-1, -1),              # 0: h_in           (T, C)       — 2-D
+            (-1, -1),              # 1: h_post         (T, N)       — 2-D
+            (-1, -1),              # 2: h_res          (T, N*N)     — 2-D
+            (-1, -1),              # 3: h_pre          (T, N)       — 2-D
+            (-1, -1),              # 4: hc_before_norm (T, fusion)  — 2-D
+            (-1, -1),              # 5: inv_rms        (T, 1)       — 2-D
+            (-1, -1, -1),          # 6: sum_out        (I, T, N)    — 3-D
+            (-1, -1, -1, -1),      # 7: norm_out       (I, T, N, N) — 4-D
+        ]
+        for i, exp_tm in enumerate(expected):
+            actual_tm = out_layouts[i].tensor_map
+            assert actual_tm == exp_tm, (
+                f"TND output {i}: expected tensor_map {exp_tm}, got {actual_tm}"
             )
         assert extra is None, f"Expected extra=None, got {extra}"
 
@@ -350,6 +429,93 @@ class TestNpuMhcPreSinkhorn(unittest.TestCase):
         op = self._get_op()
         with self.assertRaisesRegex(ValueError, "N dimension"):
             op.infer_layout([x_layout, phi_layout, alpha_layout, bias_layout])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_infer_layout_bsnd_c_axis_raises_15(self, mock_platform):
+        """Test that BSND input cannot shard the C dimension."""
+        mesh = self._make_1d_mesh(mock_platform, size=2, name="tp")
+
+        x_layout = _build_layout(mesh, (Shard(3),), 4)
+        phi_layout = _build_layout(mesh, (Replicate(),), 2)
+        alpha_layout = _build_layout(mesh, (Replicate(),), 1)
+        bias_layout = _build_layout(mesh, (Replicate(),), 1)
+
+        for layout in (x_layout, phi_layout, alpha_layout, bias_layout):
+            layout.is_partial = MagicMock(return_value=False)
+
+        op = self._get_op()
+        with self.assertRaisesRegex(ValueError, "C dimension"):
+            op.infer_layout([x_layout, phi_layout, alpha_layout, bias_layout])
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_infer_layout_tnd_c_axis_raises_16(self, mock_platform):
+        """Test that TND input cannot shard the C dimension."""
+        mesh = self._make_1d_mesh(mock_platform, size=2, name="tp")
+
+        x_layout = _build_layout(mesh, (Shard(2),), 3)
+        phi_layout = _build_layout(mesh, (Replicate(),), 2)
+        alpha_layout = _build_layout(mesh, (Replicate(),), 1)
+        bias_layout = _build_layout(mesh, (Replicate(),), 1)
+
+        for layout in (x_layout, phi_layout, alpha_layout, bias_layout):
+            layout.is_partial = MagicMock(return_value=False)
+
+        op = self._get_op()
+        with self.assertRaisesRegex(ValueError, "C dimension"):
+            op.infer_layout([x_layout, phi_layout, alpha_layout, bias_layout])
+
+
+    # ------------------------------------------------------------------
+    # clamp variant
+    # ------------------------------------------------------------------
+
+    @patch("hyper_parallel.core.dtensor.device_mesh.platform")
+    def test_clamp_infer_layout_9_outputs_14(self, mock_platform):
+        """
+        Feature: clamp variant infer_layout returns 9 output layouts.
+        Description: 3-D mesh (dp, cp, tp); the 9th output h_res_logits
+            shares norm_out's tensor_map.
+        Expectation: 9 layouts; last one is 5-D with iter-axis replicated.
+        """
+        mesh = self._make_3d_mesh(mock_platform)
+        replicated = (Replicate(), Replicate(), Replicate())
+
+        x_layout = _build_layout(mesh, (Shard(0), Shard(1), Shard(1)), 4)
+        phi_layout = _build_layout(mesh, replicated, 2)
+        alpha_layout = _build_layout(mesh, replicated, 1)
+        bias_layout = _build_layout(mesh, replicated, 1)
+
+        for layout in (x_layout, phi_layout, alpha_layout, bias_layout):
+            layout.is_partial = MagicMock(return_value=False)
+
+        clamp_op = NpuMhcPreClampSinkhornDistributedOp("npu_mhc_pre_clamp_sinkhorn")
+        out_layouts, extra = clamp_op.infer_layout(
+            [x_layout, phi_layout, alpha_layout, bias_layout]
+        )
+
+        assert len(out_layouts) == 9, (
+            f"Expected 9 layouts, got {len(out_layouts)}"
+        )
+        # Derive expected maps from the input tensor_map (reverse-indexed).
+        b_map, s_map = x_layout.tensor_map[0], x_layout.tensor_map[1]
+        tm_3d = (b_map, s_map, -1)
+        tm_4d = (-1, b_map, s_map, -1)
+        tm_5d = (-1, b_map, s_map, -1, -1)
+        # First 8 match the non-clamp variant.
+        assert out_layouts[0].tensor_map == tm_3d, (
+            f"h_in: expected {tm_3d}, got {out_layouts[0].tensor_map}"
+        )
+        assert out_layouts[6].tensor_map == tm_4d, (
+            f"sum_out: expected {tm_4d}, got {out_layouts[6].tensor_map}"
+        )
+        assert out_layouts[7].tensor_map == tm_5d, (
+            f"norm_out: expected {tm_5d}, got {out_layouts[7].tensor_map}"
+        )
+        # 9th output: h_res_logits — same as norm_out
+        assert out_layouts[8].tensor_map == tm_5d, (
+            f"h_res_logits: expected {tm_5d}, got {out_layouts[8].tensor_map}"
+        )
+        assert extra is None, f"Expected extra=None, got {extra}"
 
 
 if __name__ == "__main__":
