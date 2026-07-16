@@ -25,11 +25,13 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from hyper_parallel import get_platform
 from hyper_parallel.core.distributed_checkpoint import load as dcp_load, save as dcp_save
@@ -237,7 +239,13 @@ class LoggingCallback(Callback):
         if aux_loss is not None:
             metrics["aux_loss"] = f"{aux_loss:.6f}"
 
-        logger.info_rank0(" | ".join(f"{k}={v}" for k, v in metrics.items()))
+        message = " | ".join(f"{k}={v}" for k, v in metrics.items())
+        monitor_cb = getattr(self.trainer, 'training_state_monitor_callback', None)
+        monitor_active = monitor_cb is not None and getattr(monitor_cb, 'active', False)
+        if monitor_active:
+            logger.info(message)
+        else:
+            logger.info_rank0(message)
 
         record = {
             "step": state.global_step,
@@ -747,6 +755,349 @@ class MoEMonitorCallback(Callback):
         """No-op; expert bias updates happen in on_step_end."""
 
 
+class TrainingStateMonitorCallback(Callback):
+    """Save training loss / gradient scalar monitors to TensorBoard and log.
+
+    Config: ``cfg.train.monitor.*``.  This mirrors the first-stage MindFormers
+    training-state monitor surface for loss and gradient norms while reusing
+    HyperParallel's callback lifecycle.
+    """
+
+    _SUPPORTED_FORMATS = frozenset({"tensorboard", "log"})
+
+    def __init__(self, trainer: "BaseTrainer") -> None:
+        super().__init__(trainer)
+        train_cfg = getattr(trainer.args, "train", None)
+        self.cfg = getattr(train_cfg, "monitor", None)
+        if self.cfg is None:
+            self.cfg = getattr(trainer.args, "monitor", None)
+
+        self.enabled = bool(getattr(self.cfg, "monitor_on", False)) if self.cfg else False
+        self.dump_path = getattr(self.cfg, "dump_path", "./dump") if self.cfg else "./dump"
+        self.step_interval = int(getattr(self.cfg, "step_interval", 1) if self.cfg else 1)
+        if self.step_interval < 1:
+            raise ValueError("train.monitor.step_interval must be >= 1.")
+
+        self.local_loss_format = self._parse_formats("local_loss_format")
+        self.device_local_loss_format = self._parse_formats("device_local_loss_format")
+        self.local_norm_format = self._parse_formats("local_norm_format")
+        self.device_local_norm_format = self._parse_formats("device_local_norm_format")
+
+        raw_patterns = getattr(self.cfg, "target", None) if self.cfg else None
+        if isinstance(raw_patterns, str):
+            raw_patterns = [raw_patterns]
+        self._target_patterns = (
+            [re.compile(pattern) for pattern in raw_patterns]
+            if raw_patterns else None
+        )
+        self._invert = bool(getattr(self.cfg, "invert", False)) if self.cfg else False
+        self._rank_writer = None
+        self._global_writer = None
+        self._rank = None
+        self._step_weighted_loss_sum = 0.0
+        self._step_token_count = 0
+        self.last_local_loss = None
+        self.last_local_grad_norm = None
+        self.last_monitor_step = -1
+        self._state = None
+        self._pending_log_metrics = {}
+        self._grad_hook_handles = []
+        self._hook_grad_stats = {}
+
+
+    def _parse_formats(self, field_name: str) -> tuple[str, ...]:
+        """Parse configured monitor output formats for a metric field."""
+        value = getattr(self.cfg, field_name, None) if self.cfg else None
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            formats = (value,)
+        else:
+            formats = tuple(value)
+        unknown = sorted(set(formats) - self._SUPPORTED_FORMATS)
+        if unknown:
+            raise ValueError(
+                f"train.monitor.{field_name} only supports "
+                f"{sorted(self._SUPPORTED_FORMATS)}, got {unknown}."
+        )
+        return formats
+
+    @staticmethod
+    def _to_scalar(value) -> float:
+        """Convert tensor-like values to a Python float."""
+        if value is None:
+            return 0.0
+        if hasattr(value, "to_local"):
+            value = value.to_local()
+        if hasattr(value, "detach"):
+            value = value.detach()
+        if hasattr(value, "float"):
+            value = value.float()
+        if hasattr(value, "item"):
+            return float(value.item())
+        return float(value)
+
+    @staticmethod
+    def _sanitize_tag(value: str) -> str:
+        value = value.replace(".", "/").replace(" ", "_")
+        return re.sub(r"[^A-Za-z0-9_/\-]", "_", value)
+
+    def _should_record_param(self, name: str) -> bool:
+        patterns = self._target_patterns
+        if not patterns:
+            matched = True
+        else:
+            matched = any(pattern.search(name) for pattern in patterns)
+        return not matched if self._invert else matched
+
+    def _uses_tensorboard(self) -> bool:
+        return any(
+            "tensorboard" in formats
+            for formats in (
+                self.local_loss_format,
+                self.device_local_loss_format,
+                self.local_norm_format,
+                self.device_local_norm_format,
+            )
+        )
+
+    def _write(self, formats: tuple[str, ...], tag: str, value: float,
+               step: int, *, global_metric: bool = False) -> None:
+        if not formats:
+            return
+        if "tensorboard" in formats:
+            writer = self._global_writer if global_metric else self._rank_writer
+            if writer is not None:
+                writer.add_scalar(tag, value, step)
+        if "log" in formats:
+            self._pending_log_metrics[tag] = value
+
+    def _flush_step_log(self, step: int) -> None:
+        """Print one compact rank-local monitor line for console output."""
+        if not self._pending_log_metrics:
+            return
+        field_map = (
+            ("loss", "loss/local_loss"),
+            ("accum_loss", "loss/device_accum_local_loss"),
+            ("grad_norm", "grad/device_local_norm"),
+        )
+        raw_tags = {tag for _, tag in field_map}
+        parts = []
+        for display_name, tag in field_map:
+            if tag in self._pending_log_metrics:
+                value = self._pending_log_metrics[tag]
+                parts.append(f"{display_name}={float(value):.8f}")
+        for tag in sorted(self._pending_log_metrics):
+            if tag in raw_tags:
+                continue
+            value = self._pending_log_metrics[tag]
+            parts.append(f"{tag}={float(value):.8f}")
+        timestamp = time.strftime("%H:%M:%S")
+        print(
+            f"[{timestamp}][rank{self._rank}][INFO] local_state: "
+            f"step={step} | " + " | ".join(parts),
+            flush=True,
+        )
+        self._pending_log_metrics = {}
+
+    @staticmethod
+    def _compute_grad_stats(grad) -> dict:
+        """Compute norm-only scalar stats for a hook-captured local gradient."""
+        local_grad = grad.to_local() if hasattr(grad, "to_local") else grad
+        local_float = local_grad.detach().float()
+        sum_sq = local_float.pow(2).sum()
+        return {
+            "sum_sq": float(sum_sq.item()),
+        }
+
+    def _accumulate_hook_grad_stats(self, name: str, grad) -> None:
+        """Accumulate local gradient stats captured before FSDP/HSDP communication."""
+        stats = self._compute_grad_stats(grad)
+        cached = self._hook_grad_stats.setdefault(
+            name,
+            {
+                "sum_sq": 0.0,
+            },
+        )
+        cached["sum_sq"] += stats["sum_sq"]
+        if (
+            "log" in self.local_norm_format
+            and self._state is not None
+            and self._state.global_step % self.step_interval == 0
+        ):
+            timestamp = time.strftime("%H:%M:%S")
+            print(
+                f"[{timestamp}][rank{self._rank}][INFO] parameter_grad: "
+                f"step={self._state.global_step} | "
+                f"name={name} | grad_norm={math.sqrt(stats['sum_sq']):.8f}",
+                flush=True,
+            )
+
+    def _clear_hook_grad_stats(self) -> None:
+        """Drop hook-collected local gradient stats for the current step."""
+        self._hook_grad_stats = {}
+
+    def _remove_grad_hooks(self) -> None:
+        """Remove parameter backward hooks registered by the monitor."""
+        for handle in self._grad_hook_handles:
+            if hasattr(handle, "remove"):
+                handle.remove()
+        self._grad_hook_handles = []
+
+    def _register_grad_hooks(self) -> None:
+        """Register parameter hooks that capture pre-communication local grads."""
+        if not (self.enabled and any((
+                self.local_norm_format,
+                self.device_local_norm_format,))):
+            return
+        self._remove_grad_hooks()
+        self._clear_hook_grad_stats()
+        for name, param in self.trainer.model.named_parameters():
+            if not self._should_record_param(name) or not getattr(param, "requires_grad", False):
+                continue
+            register_hook = getattr(param, "register_hook", None)
+            if not callable(register_hook):
+                logger.warning(
+                    "TrainingStateMonitor: parameter %s does not support register_hook, skip local grad monitor.",
+                    name,
+                )
+                continue
+
+            def hook_fn(grad, param_name=name):
+                self._accumulate_hook_grad_stats(param_name, grad)
+                return grad
+
+            self._grad_hook_handles.append(register_hook(hook_fn))
+
+    def on_train_begin(self, state: "TrainerState", **kwargs) -> None:
+        if not self.enabled:
+            return
+        self._state = state
+        self._rank = platform.get_rank()
+        if self._uses_tensorboard():
+            tb_root = os.path.join(self.dump_path, "tensorboard")
+            self._rank_writer = SummaryWriter(
+                os.path.join(tb_root, f"rank_{self._rank}")
+            )
+            if self._rank == 0:
+                self._global_writer = SummaryWriter(os.path.join(tb_root, "global"))
+        logger.info_rank0(
+            "TrainingStateMonitor enabled: dump_path=%s step_interval=%d",
+            self.dump_path, self.step_interval,
+        )
+        self._register_grad_hooks()
+
+    def on_train_end(self, state: "TrainerState", **kwargs) -> None:
+        self._remove_grad_hooks()
+        self._clear_hook_grad_stats()
+        for writer in (self._rank_writer, self._global_writer):
+            if writer is not None:
+                writer.close()
+        self._rank_writer = None
+        self._global_writer = None
+        self._state = None
+
+    def on_substep_end(self, state: "TrainerState", **kwargs) -> None:
+        if not self.enabled or state.global_step % self.step_interval != 0:
+            return
+        substep_info = getattr(state, "substep_info", {})
+        raw_loss = kwargs.get("raw_loss", substep_info.get("raw_loss"))
+        if raw_loss is None:
+            return
+        micro_tokens = int(kwargs.get("micro_tokens", substep_info.get("micro_tokens", 1)))
+        loss_value = self._to_scalar(raw_loss)
+        self._step_weighted_loss_sum += loss_value * micro_tokens
+        self._step_token_count += micro_tokens
+        self.last_local_loss = self._step_weighted_loss_sum / max(self._step_token_count, 1)
+        self.last_monitor_step = state.global_step
+
+        tag = "loss/local_loss"
+        self._write(
+            self.local_loss_format,
+            tag,
+            loss_value,
+            state.global_step,
+            global_metric=False,
+        )
+
+    def _record_hook_grad_stats(self, state: "TrainerState") -> None:
+        """Record local gradient stats captured by backward hooks."""
+        device_sum_sq = 0.0
+        for name, _ in self.trainer.model.named_parameters():
+            if not self._should_record_param(name):
+                continue
+            stats = self._hook_grad_stats.get(name)
+            if stats is None:
+                continue
+            sum_sq = float(stats["sum_sq"])
+            norm = math.sqrt(sum_sq)
+
+            device_sum_sq += sum_sq
+
+            clean_name = self._sanitize_tag(name)
+            self._write(
+                tuple(fmt for fmt in self.local_norm_format if fmt != "log"),
+                f"grad/local_norm/{clean_name}",
+                norm,
+                state.global_step,
+            )
+
+        device_norm = math.sqrt(device_sum_sq)
+        self.last_local_grad_norm = device_norm
+        self.last_monitor_step = state.global_step
+        self._write(
+            self.device_local_norm_format,
+            "grad/device_local_norm",
+            device_norm,
+            state.global_step,
+        )
+
+    def on_pre_optimizer_step(self, state: "TrainerState", **kwargs) -> None:
+        if not self.enabled:
+            return
+        if state.global_step % self.step_interval != 0:
+            self._clear_hook_grad_stats()
+            return
+        try:
+            self._record_hook_grad_stats(state)
+        finally:
+            self._clear_hook_grad_stats()
+
+    def on_step_end(self, state: "TrainerState", *, loss: Optional[float] = None,
+                    grad_norm: Optional[float] = None, **kwargs) -> None:
+        if not self.enabled:
+            return
+        if state.global_step % self.step_interval == 0:
+            if self._step_token_count > 0:
+                device_loss = self._step_weighted_loss_sum / self._step_token_count
+                self._write(
+                    self.device_local_loss_format,
+                    "loss/device_accum_local_loss",
+                    device_loss,
+                    state.global_step,
+                )
+            if self._rank == 0 and loss is not None:
+                self._write(
+                    ("tensorboard",) if self._uses_tensorboard() else (),
+                    "loss/global_loss",
+                    float(loss),
+                    state.global_step,
+                    global_metric=True,
+                )
+            if self._rank == 0 and grad_norm is not None:
+                self._write(
+                    ("tensorboard",) if self._uses_tensorboard() else (),
+                    "grad/global_grad_norm",
+                    float(grad_norm),
+                    state.global_step,
+                    global_metric=True,
+                )
+            self._flush_step_log(state.global_step)
+
+        self._step_weighted_loss_sum = 0.0
+        self._step_token_count = 0
+
+
 class GradientHealthCallback(Callback):
     """Detect NaN / Inf grad_norm and raise / warn.
 
@@ -761,7 +1112,10 @@ class GradientHealthCallback(Callback):
 
     def __init__(self, trainer: "BaseTrainer") -> None:
         super().__init__(trainer)
-        debug_cfg = getattr(trainer.args, 'debug', None)
+        train_cfg = getattr(trainer.args, "train", None)
+        debug_cfg = getattr(train_cfg, "debug", None) if train_cfg is not None else None
+        if debug_cfg is None:
+            debug_cfg = getattr(trainer.args, 'debug', None)
         self.enabled = (
             getattr(debug_cfg, 'check_nan_inf', False) if debug_cfg else False
         )

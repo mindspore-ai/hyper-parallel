@@ -293,8 +293,7 @@ class WandbConfig:
 class ProfileConfig:
     """``train.profile.*`` — torch.profiler schedule ().
 
-    Schedule semantics: wait → warmup → active.
-    """
+    Schedule semantics: wait → warmup → active."""
     enabled: bool = False
     output_dir: str = "profiler_traces"
     wait_steps: int = 1
@@ -308,6 +307,20 @@ class MemoryMonitorConfig:
     enabled: bool = False
     log_steps: int = 50
     reset_peak_each_step: bool = False
+
+
+@dataclass
+class MonitorConfig:
+    """``train.monitor.*`` — training-state monitor for loss / gradient scalars."""
+    monitor_on: bool = False
+    dump_path: str = "./dump"
+    target: Optional[list] = None
+    invert: bool = False
+    step_interval: int = 1
+    local_loss_format: Optional[list] = None
+    device_local_loss_format: Optional[list] = None
+    local_norm_format: Optional[list] = None
+    device_local_norm_format: Optional[list] = None
 
 
 @dataclass
@@ -392,6 +405,7 @@ class TrainConfig:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     memory_monitor: MemoryMonitorConfig = field(default_factory=MemoryMonitorConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
     moe_monitor: MoEMonitorConfig = field(default_factory=MoEMonitorConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
@@ -529,7 +543,7 @@ def _deep_update(source: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str,
     """Recursively update source dict with overrides dict."""
     for key, value in overrides.items():
         if isinstance(value, dict) and isinstance(source.get(key), dict):
-            source[key] = _deep_update(source[key], value)
+            _deep_update(source[key], value)
         else:
             source[key] = value
     return source
