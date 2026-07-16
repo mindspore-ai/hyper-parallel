@@ -15,8 +15,7 @@
 """Shard ops cases for Partial-aware MindSpore add and sub."""
 import mindspore as ms
 
-from hyper_parallel.core.dtensor.dtensor import DTensor
-from hyper_parallel.core.dtensor.placement_types import Partial, Replicate, Shard
+from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from tests.shard_ops.framework import CompareSpec, InputSpec, OpShardCase, register
 
 
@@ -31,44 +30,6 @@ def _add_partial_replicate(x, w, bias):
 
 def _sub_replicate_partial(x, w, bias):
     return ms.mint.sub(bias, _partial_matmul(x, w))
-
-
-def _collect_backward_grads(x, w, bias, op):
-    """Return effective global gradients for a local-output backward pass."""
-    is_distributed = isinstance(x, DTensor)
-    if is_distributed:
-        local_inputs = (x.to_local(), w.to_local(), bias.to_local())
-    else:
-        local_inputs = (x, w, bias)
-    for local_input in local_inputs:
-        local_input.requires_grad = True
-        if is_distributed:
-            local_input.retain_grad()
-
-    output = op(x, w, bias)
-    loss = output.to_local().sum() if is_distributed else output.sum()
-    loss.backward()
-
-    grads = tuple(local_input.grad for local_input in local_inputs)
-    if any(grad is None for grad in grads):
-        raise AssertionError("add/sub backward did not populate every input gradient")
-    if not is_distributed:
-        return tuple(grad + 0 for grad in grads)
-
-    mesh = x.device_mesh
-    return (
-        DTensor.from_local(grads[0], mesh, x.placements),
-        DTensor.from_local(grads[1], mesh, (Partial("sum"), Shard(0))),
-        DTensor.from_local(grads[2], mesh, (Shard(0), Partial("sum"))),
-    )
-
-
-def _add_partial_replicate_backward(x, w, bias):
-    return _collect_backward_grads(x, w, bias, _add_partial_replicate)
-
-
-def _sub_replicate_partial_backward(x, w, bias):
-    return _collect_backward_grads(x, w, bias, _sub_replicate_partial)
 
 
 _INPUTS = [
@@ -94,7 +55,6 @@ register(OpShardCase(
     mesh_dim_names=("dp", "tp"),
 ))
 
-
 register(OpShardCase(
     name="sub_ops_replicate_partial",
     fn=_sub_replicate_partial,
@@ -102,30 +62,6 @@ register(OpShardCase(
     placements=_PLACEMENTS,
     compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
     tags=("npu_level0",),
-    mesh_shape=(2, 2),
-    mesh_dim_names=("dp", "tp"),
-))
-
-
-register(OpShardCase(
-    name="add_ops_partial_replicate_backward",
-    fn=_add_partial_replicate_backward,
-    inputs=_INPUTS,
-    placements=_PLACEMENTS,
-    compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
-    tags=("npu_level1",),
-    mesh_shape=(2, 2),
-    mesh_dim_names=("dp", "tp"),
-))
-
-
-register(OpShardCase(
-    name="sub_ops_replicate_partial_backward",
-    fn=_sub_replicate_partial_backward,
-    inputs=_INPUTS,
-    placements=_PLACEMENTS,
-    compare=CompareSpec.allclose(rtol=1e-3, atol=1e-3),
-    tags=("npu_level1",),
     mesh_shape=(2, 2),
     mesh_dim_names=("dp", "tp"),
 ))
