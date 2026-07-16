@@ -683,34 +683,37 @@ class NPUFlashAttentionScoreDistributedOp(DistributedOp):
         query_tm = query_layout.tensor_map
 
         if query_tm is None:
-            return (-1, -1, -1, -1)
+            return (-1, -1, -1) if input_layout_str == "TND" else (-1, -1, -1, -1)
 
+        # TND softmax outputs are 3-D (T, N, 8) — return a 3-element map.
+        if input_layout_str == "TND":
+            return (
+                query_tm[0] if len(query_tm) > 0 else -1,
+                query_tm[1] if len(query_tm) > 1 else -1,
+                -1,
+            )
+
+        # Non-TND: 4-D softmax outputs (B, N, S, 8) — return a 4-element map.
         softmax_tm = [-1, -1, -1, -1]
 
-        if input_layout_str == "TND":
-            softmax_tm[0] = query_tm[0] if len(query_tm) > 0 else -1
-            softmax_tm[1] = query_tm[1] if len(query_tm) > 1 else -1
-        else:
-            if "batch" in dims:
-                batch_idx = dims["batch"]
-                if batch_idx < len(query_tm):
-                    softmax_tm[0] = query_tm[batch_idx]
+        if "batch" in dims:
+            batch_idx = dims["batch"]
+            if batch_idx < len(query_tm):
+                softmax_tm[0] = query_tm[batch_idx]
 
-            if "head" in dims:
-                head_idx = dims["head"]
-                if head_idx < len(query_tm):
-                    softmax_tm[1] = query_tm[head_idx]
-            elif "hidden" in dims:
-                hidden_idx = dims["hidden"]
-                if hidden_idx < len(query_tm):
-                    softmax_tm[1] = query_tm[hidden_idx]
+        if "head" in dims:
+            head_idx = dims["head"]
+            if head_idx < len(query_tm):
+                softmax_tm[1] = query_tm[head_idx]
+        elif "hidden" in dims:
+            hidden_idx = dims["hidden"]
+            if hidden_idx < len(query_tm):
+                softmax_tm[1] = query_tm[hidden_idx]
 
-            if "seq" in dims:
-                seq_idx = dims["seq"]
-                if seq_idx < len(query_tm):
-                    softmax_tm[2] = query_tm[seq_idx]
-
-        softmax_tm[3] = -1
+        if "seq" in dims:
+            seq_idx = dims["seq"]
+            if seq_idx < len(query_tm):
+                softmax_tm[2] = query_tm[seq_idx]
 
         return tuple(softmax_tm)
 
