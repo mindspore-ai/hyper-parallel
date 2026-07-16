@@ -36,6 +36,7 @@ from hyper_parallel.custom_ops.experimental.experimental_ops import (  # noqa: E
     npu_mhc_post,
     npu_mhc_pre_clamp_sinkhorn,
     npu_mhc_pre_sinkhorn,
+    npu_sparse_flash_mla_grad,
     npu_sparse_lightning_indexer_grad_kl_loss,
 )
 
@@ -194,6 +195,65 @@ class TestNpuSparseLightningIndexerGradKlLoss(unittest.TestCase):
             q_rope, k_rope,
             None, None,
             "TND", 1, 256, 32,
+        )
+
+
+class TestNpuSparseFlashMlaGrad(unittest.TestCase):
+    """
+    Feature: npu_sparse_flash_mla_grad wrapper (exposes the raw backward kernel).
+    Description: Verify the 4 required tensors plus optionals/scalars are
+                 forwarded, metadata is pinned to None (kernel self-derives), the
+                 merged ``layout`` is duplicated into layout_q/layout_kv, and the
+                 6-tuple (including ori/cmp_softmax_l1_norm) is propagated.
+    Expectation: Platform method called once with the correct args; return passed through.
+    """
+
+    @patch(_PATCH_TARGET)
+    def test_required_args_only(self, mock_platform):
+        """Only the 4 required tensors — optionals default to None, scalars to defaults."""
+        expected = (MagicMock(),) * 6  # dq, d_ori_kv, d_cmp_kv, d_sinks, ori_l1, cmp_l1
+        mock_platform.custom_ops.npu_sparse_flash_mla_grad.return_value = expected
+
+        result = npu_sparse_flash_mla_grad("q", "dout", "attn_out", "softmax_lse")
+
+        mock_platform.custom_ops.npu_sparse_flash_mla_grad.assert_called_once_with(
+            "q", "dout", "attn_out", "softmax_lse",
+            None, None, None, None,          # ori_kv, cmp_kv, ori_sparse_indices, cmp_sparse_indices
+            None, None, None,                # cu_seq_lens_q/ori_kv/cmp_kv
+            None, None, None,                # seqused_q/ori_kv/cmp_kv
+            None, None, None,                # cmp_residual_kv, ori_topk_length, cmp_topk_length
+            None, None,                      # sinks, metadata (pinned None)
+            1.0, 1, 4, 3,                    # softmax_scale, cmp_ratio, ori/cmp_mask_mode
+            127, 0, "BSND", "BSND",          # ori_win_left, ori_win_right, layout_q, layout_kv
+        )
+        self.assertIs(result, expected)
+
+    @patch(_PATCH_TARGET)
+    def test_all_kwargs_forwarded(self, mock_platform):
+        """Optionals and the merged layout are forwarded; metadata stays None."""
+        mock_platform.custom_ops.npu_sparse_flash_mla_grad.return_value = None
+        ori_kv, cmp_kv, ori_si, cmp_si, sinks = (MagicMock() for _ in range(5))
+
+        npu_sparse_flash_mla_grad(
+            "q", "dout", "attn_out", "softmax_lse",
+            ori_kv=ori_kv, cmp_kv=cmp_kv,
+            ori_sparse_indices=ori_si, cmp_sparse_indices=cmp_si,
+            sinks=sinks,
+            softmax_scale=0.125, cmp_ratio=4,
+            ori_mask_mode=0, cmp_mask_mode=3,
+            ori_win_left=-1, ori_win_right=-1,
+            layout="TND",
+        )
+
+        mock_platform.custom_ops.npu_sparse_flash_mla_grad.assert_called_once_with(
+            "q", "dout", "attn_out", "softmax_lse",
+            ori_kv, cmp_kv, ori_si, cmp_si,
+            None, None, None,
+            None, None, None,
+            None, None, None,
+            sinks, None,                     # metadata pinned None
+            0.125, 4, 0, 3,
+            -1, -1, "TND", "TND",
         )
 
 
