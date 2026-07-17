@@ -910,12 +910,30 @@ class TorchPlatform(Platform):
         return cell.named_parameters()
 
     @staticmethod
-    def get_model_state_dict(model, *, options=None):
+    def get_model_state_dict(model: Any, *, options: Any = None) -> dict[str, Any]:
+        """Get the state dictionary of a model.
+
+        Delegates to torch-specific implementation that handles DTensor
+        gathering, CPU offloading and frozen-parameter filtering.
+        """
         # pylint: disable=C0415
         from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (
             get_model_state_dict as _get_model_state_dict,
         )
         return _get_model_state_dict(model, options=options)
+
+    @staticmethod
+    def set_model_state_dict(model: Any, model_state_dict: dict[str, Any], *, options: Any = None) -> None:
+        """Set the state dictionary of a model.
+
+        Delegates to torch-specific implementation that scatters full tensors
+        into DTensor shards and performs an in-place load.
+        """
+        # pylint: disable=C0415
+        from hyper_parallel.platform.torch.fully_shard.state_dict_utils import (
+            set_model_state_dict as _set_model_state_dict,
+        )
+        return _set_model_state_dict(model, model_state_dict, options=options)
 
     @staticmethod
     def save_checkpoint(cell: Module, file_path: str, ckpt_format: str = "safetensors") -> None:
