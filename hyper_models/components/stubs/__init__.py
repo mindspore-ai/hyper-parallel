@@ -1,4 +1,4 @@
-# Copyright 2026 Huawei Technologies Co., Ltd
+# Copyright 2025-2026 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,5 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""components"""
+"""components.stubs: 并行开发接口 stub（parallel_plan §二）。
 
+各 stub 文件只 re-export canonical 定义，不复制字段——保证 stub 与实现
+永不漂移。所有消费者只 import stub，不 import 实现路径。
+"""
