@@ -12,5 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""DTensor public re-exports for the hyper_parallel package."""
-from hyper_parallel.core.dtensor.debug import CommDebugMode
+"""Debug utilities for DTensor.
+
+Public API:
+    CommDebugMode — context manager that traces DTensor ops and collectives.
+
+Internal modules (_call_records, _collective_tracer, _module_tracker) are implementation details and
+should not be imported directly by user code.
+"""
+from hyper_parallel.core.dtensor.debug._comm_debug_mode import CommDebugMode
+
+__all__ = ["CommDebugMode"]
