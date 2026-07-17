@@ -1,0 +1,3912 @@
+## 1. 模块职责
+
+定义 hyper_parallel 的 DTensor 分片配置体系——从 YAML 配置到运行时 DTensor 分片的完整链路。核心差异化能力：**ShardingPlanner 自动推导**替代 AutoModel 的手写 `parallelize_fn`（~400 行/模型 → ~20 行）。
+
+### 核心文件
+
+| 文件 | 职责 |
+|------|------|
+| `components/distributed/sharding_config.py` | `ShardingPlan` / `ModuleShardingSpec` / `NamedPlacement` 数据模型 |
+| `components/distributed/sharding_planner.py` | `ShardingPlanner`：6-phase I/O 契约推导管线 |
+| `components/distributed/sharding_applier.py` | `ShardingApplier`：双模式应用（validate / production） |
+| `components/distributed/precompiled_boundary.py` | `PrecompiledBoundary`：编译期通信规划 |
+| `components/distributed/param_role.py` | `ParamRole` 枚举 + `ParameterClassifier` |
+
+### 涉及删除的旧代码
+
+| 旧代码 | 替代方案 |
+|--------|---------|
+| `hyper_parallel/models/*/parallelize.py`（每模型 ~400 行） | `ARCH_OVERRIDES`（~20 行）+ ShardingPlanner 自动推导 |
+| `hyper_parallel/core/tensor_parallel/style.py` — `ParallelStyle` 子类 | `ShardingTemplate` + `ModuleShardingSpec` 声明式 |
+
+### 1.1 独立使用：不依赖训练流程
+
+`components/distributed/` 下的所有模块**零依赖**于 `recipes/` 和 `_transformers/`。任何 HF 模型都可以直接使用 ShardingPlanner + ShardingApplier：
+
+```python
+from transformers import AutoModelForCausalLM
+from hyper_parallel.components.distributed import (
+    MeshContext, ParallelismSizes,
+    ShardingPlanner, apply_sharding_plan,
+)
+
+# 1. 加载任意 HF 模型
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-4B")
+
+# 2. 构建 mesh
+sizes = ParallelismSizes(tp_size=4)
+mesh = MeshContext.build(FSDP2Config(), sizes)
+
+# 3. 自动推导分片策略（零模型代码改动）
+planner = ShardingPlanner()
+plan = planner.plan(model, mesh.device_mesh, tp_size=4)
+
+# 4. 应用分片（生产模式：零 DTensor dispatch）
+apply_sharding_plan(model, plan, mesh.device_mesh)
+
+# 5. 用任意框架训练（PyTorch Lightning、HF Trainer、手写循环...）
+```
+
+---
+
+## 2. 总入口调用时序：从 `ShardingPlanner` 到运行时 DTensor
+
+双模式 DTensor 在 `_build_model()` 内分两步执行——**编译期规划**（sharding_planner.plan）和**运行时应用**（apply_sharding_plan）。以下是从 `main()` 到 DTensor 分片完成的完整调用链路：
+
+```
+main() → recipe.setup(cfg)                                              # 01_hf_compatibility_layer.md §4
+└─④.3 model = cfg.model.instantiate(distributed_setup=...)
+    └─ HyperAutoModelForCausalLM.from_pretrained(...)                    # 01 §6
+        └─ _build_model(...)                                             # 01 §6.3
+            │
+            ├─④.3.2 instantiate_infrastructure(distributed_setup, device)  # 01 §8
+            │   └─ sharding_planner = ShardingPlanner()                    # hyper_parallel 核心
+            │
+            ├─④.3.5.2 _init_model() → meta device 空壳模型                # 01 §7
+            │
+            ├─④.3.5.7 plan = sharding_planner.plan(model, mesh, ...)       # ★ 编译期规划 → §3
+            │   │                                                           # └─ 详见 §3
+            │   ├─ Phase 1: ParameterClassifier.classify(model)             # §3.2: ParamRole 分类
+            │   │   ├─ 命名规则匹配（按参数名后缀识别角色）
+            │   │   └─ 架构规则覆盖（ARCH_OVERRIDES / MODEL_FAMILIES）
+            │   │
+            │   ├─ Phase 2: BoundaryGrouper.group(model)                   # §3.3: 模块边界分组
+            │   │   └─ 每个 transformer layer → attention + mlp + norm 边界
+            │   │
+            │   ├─ Phase 3: SemanticRoleInference.infer(boundary, roles)   # §3.4: 语义角色推断
+            │   │   └─ 从参数角色推断模块类型（attention / mlp / norm / embed / lm_head / moe_mlp / moe_gate）
+            │   │
+            │   ├─ Phase 4: TemplateLookup.lookup(boundary_type)           # §3.5: 查 ShardingTemplate
+            │   │   ├─ attention → {SP, non-SP} × {CP, non-CP} 模板
+            │   │   ├─ mlp       → {SP, non-SP} × {CP, non-CP} 模板
+            │   │   ├─ norm      → Replicate 模板（TP/CP 双维度）
+            │   │   ├─ embed/lm_head → Shard(0)/Shard(1) 模板（TP/CP 双维度）
+            │   │   ├─ moe_mlp   → EP Shard(0) + TP Colwise/Rowwise + local_map 模板
+            │   │   └─ moe_gate  → EP redistribute + TP Replicate 模板
+            │   │   └─ _build_spec_from_template(template, param_roles)    # §3.5.6: 填充 ModuleShardingSpec
+            │   │       ├─ COLWISE role  → {TP: template.colwise_placement, CP: Replicate()}
+            │   │       ├─ ROWWISE role  → {TP: template.rowwise_placement, CP: Replicate()}
+            │   │       ├─ NORM role     → {TP: template.norm_placement, CP: Replicate()}
+            │   │       ├─ MOE_EXPERT role → {EP: Shard(0), TP: colwise/rowwise}
+            │   │       └─ I/O 契约: Template.sp_in_src/dst/out_src/dst → spec（含 TP+CP+EP）
+            │   │
+            │   ├─ Phase 5: ChainPropagator.propagate(specs)               # §3.6: 链式传播
+            │   │   ├─ Scenario 1: 填充下游模块缺失的 in_src (A.out_dst → B.in_src)
+            │   │   ├─ Scenario 2: 检测模板错误 (A.out_dst ≠ B.in_src)
+            │   │   ├─ Scenario 3: 处理首/尾模块 (dataloader → embed, lm_head → loss)
+            │   │   └─ Scenario 4: 自定义模块插入（reshape 边界限制）
+            │   │
+            │   └─ Phase 6: SpecialHandler.apply(special_params)           # §3.7: 特殊参数处理
+            │       └─ 例如: gated_delta_tp_shard, fused_qkv 合并等
+            │
+            └─④.3.5.8 apply_sharding_plan(model, plan, mesh, validate_mode)  # ★ 运行时应用 → §4
+                │                                                              # └─ 详见 §4
+                ├─ Phase A: _shard_params(model, plan)                        # §4.2: 参数 → DTensor
+                │   ├─ for each spec in plan.modules:
+                │   │   ├─ for param_name, placements in spec.params:
+                │   │   │       distribute_tensor(param, mesh, placements)
+                │   │   │       # TP: Shard(0)/Shard(1), CP: Replicate(), EP: Shard(0)
+                │   │   └─ EP 参数分片由 spec.params 的 {EP: Shard(0)} placement
+                │   │       统一管（_shard_module_params 内置，不再调 ExpertParallel._apply）
+                │   │
+                │   └─ PEFT 参数特殊处理（LoRA 权重不参与 DTensor 分片）
+                │   注：EP token dispatcher（DeepEP/UCCL-EP）的初始化不在本层，
+                │       由 fsdp2/parallelizer 侧在 apply_sharding_plan 之后
+                │       调用 module.init_token_dispatcher(ep_mesh) 完成（见 §6.4.3）
+                │
+                ├─ Phase B: PrecompiledBoundary.build(spec, mesh)             # §4.3: 编译期通信计划
+                │   │                                                            # └─ 详见 §4.3
+                │   ├─ 输入: ModuleShardingSpec(in_src, in_dst, out_src, out_dst)
+                │   │        每个 placement 包含 {TP: ..., CP: ..., EP: ...}
+                │   ├─ 分析: 按 mesh 维度逐维度比较 src vs dst placement
+                │   │   ├─ TP 维度: Shard(1)→Replicate → all_gather
+                │   │   ├─ CP 维度: Shard(1)→Replicate → all_gather
+                │   │   ├─ EP 维度: Replicate→Shard(0) → redistribute
+                │   │   └─ identity 维度: 跳过（零开销）
+                │   └─ 输出: PrecompiledBoundary(in_plan=[...], out_plan=[...])
+                │       └─ 所有非 identity 操作统一用 DTensor.redistribute()
+                │
+                └─ Phase C: _wrap_forward(model, boundaries, validate_mode)   # §4.4: forward 包装
+                    │
+                    ├─ if validate_mode:                                       # §4.4.4: 校验模式
+                    │   ├─ 输入: DTensor（完整放置信息）
+                    │   ├─ forward 内部: DTensor 传播 → 记录实际 out_src
+                    │   └─ 校验: assert actual_out_src == spec.out_src
+                    │            assert actual_out_dst == spec.out_dst（仅终端模块）
+                    │
+                    ├─ elif spec._use_local_map (MoE EP):                      # §4.4.3: EP local_map 模式
+                    │   ├─ boundary.redistribute_inputs(args, kwargs)           # PrecompiledBoundary 入口
+                    │   ├─ _local_params_context(module)                          # build期一次性 unpack: DTensor→local（永久替换，在fully_shard前调用）
+                    │   │   └─ original_forward(*args, **kwargs)  (params already local)
+                    │   │       └─ all-to-all dispatch → expert compute → all-to-all combine
+                    │   │          (纯 local tensor, 零 DTensor overhead)
+                    │   ├─ output = DTensor.from_local(output, mesh, out_src)   # local→DTensor
+                    │   └─ boundary.redistribute_outputs(output)                # PrecompiledBoundary 出口
+                    │
+                    └─ else (生产模式):                                         # §4.4.1: 标准生产模式
+                        ├─ boundary.redistribute_inputs(args, kwargs)           # PrecompiledBoundary 入口
+                        │   └─ 同时处理 TP+CP+EP 多维度 redistribution
+                        ├─ _local_params_context(module)                        # build期一次性 unpack: DTensor→local（永久替换，在 fully_shard 之前调用，forward 内直接使用 local params）
+                        │   └─ original_forward(*args, **kwargs)  (params already local)
+                        │       ├─ [if CP enabled] CP inner attention 通信      # §4.4.2
+                        │       │   └─ K/V all-gather 在 SDPA/FlexAttention 内部
+                        │       └─ 纯 local tensor 计算（零 DTensor dispatch）
+                        └─ boundary.redistribute_outputs(output)                # PrecompiledBoundary 出口
+
+CP inner attention 的 forward 替换在 Phase C 的__init__阶段完成（非每次 forward 调用），与 PrecompiledBoundary 一样是编译期确定的:
+  └─ ShardingApplier._wrap_cp_inner_attention(attn_module, cp_mesh)    # §4.4.2
+      ├─ 调用时机: Phase C 执行时，检测到 cp_size > 1 且模块为 attention
+      ├─ SDPA 路径: _wrap_sdpa_for_cp() → 替换 inner_attention.forward
+      │   └─ 新 forward 中: Q/K/V 包装为 DTensor{CP: Shard(1)} → SDPA dispatch → to_local
+      └─ FlexAttention 路径: _wrap_flex_attn_for_cp() → 替换 inner_attention.forward
+          └─ 新 forward 中: flex_cp_allgather(K, V) → attention → 返回分片输出
+
+EP MoE 的 forward 包装在 Phase C 执行时，检测到 spec._use_local_map:
+  └─ ShardingApplier._wrap_moe_forward(module, boundary, spec, mesh, mesh_dim_names)  # §4.4.3
+      └─ 包装后的 forward: boundary入口 → local_map(ctx) → DTensor.from_local → boundary出口
+```
+
+**与 01、03 文档的时序衔接**：
+
+```
+main()                                           # 01 §4
+└─④.3 model = from_pretrained()
+    └─ _build_model()
+        ├─④.3.5.2 _init_model()                  # 01 §7: meta device 空壳
+        ├─④.3.5.7 sharding_planner.plan()         # 本文档 §3: 编译期规划 ★
+        └─④.3.5.8 apply_sharding_plan()           # 本文档 §4: 运行时应用 ★
+            ├─ Phase A: _shard_params              # §4.2
+            ├─ Phase B: PrecompiledBoundary.build  # §4.3
+            └─ Phase C: _wrap_forward              # §4.4
+                ├─ _wrap_production_forward        # §4.4.1 (标准 TP)
+                ├─ _wrap_cp_inner_attention        # §4.4.2 (CP attention)
+                ├─ _wrap_moe_forward               # §4.4.3 (EP local_map)
+                └─ _wrap_validate_forward          # §4.4.4 (校验模式)
+
+── 运行时使用（训练循环中）──
+
+⑤ run_train_validation_loop()                    # 03_training_loop.md §6
+└─⑤.1.2 _forward_backward_step()                 # 03_training_loop.md §8
+    └─ model(**batch)
+        ├─ PrecompiledBoundary.redistribute_inputs(x)   # 本文档 §4.3: TP+CP+EP 多维度通信
+        ├─ _local_params_context:  # build-time one-shot (params permanently unpacked, called before fully_shard)
+        │   ├─ [if CP] CP K/V all-gather (inner attention 内部)  # §4.4.2
+        │   ├─ [if EP] all-to-all dispatch/combine               # §4.4.3
+        │   └─ module.forward(x_local)                            # 纯 local tensor 计算
+        └─ PrecompiledBoundary.redistribute_outputs(y)   # 本文档 §4.3: TP+CP+EP 多维度通信
+```
+## 3. 并行配置的数据结构
+
+> **调用位置**: 时序树 sharding_planner.plan — ShardingPlanner 的输出格式 + ShardingApplier 的输入
+
+### 3.1 ShardingPlan：模型级分片计划
+
+```python
+# components/distributed/sharding_plan.py
+
+@dataclass
+class ShardingPlan:
+    """一个模型的完整分片计划。"""
+    # {module_fqn: ModuleShardingSpec} — 只包含 is_boundary=True 的模块
+    modules: dict[str, "ModuleShardingSpec"] = field(default_factory=dict)
+    # 全局开关
+    sequence_parallel: bool = True
+    loss_parallel: bool = False
+
+    # 特殊参数处理器: {module_fqn.param_name: handler_name}
+    special_handlers: dict[str, str] = field(default_factory=dict)
+
+    # mesh 维度名（与 DeviceMesh.mesh_dim_names 一致）
+    mesh_dim_names: tuple[str, ...] = ()
+
+    # tied-weight 对：[(fqn_a, fqn_b)]，共享存储的参数（如 embed_tokens.weight <-> lm_head.weight）。
+    # 由 ShardingPlanner 从模型 weight tying 检测填入，供 build_tp_grad_info 归一化 tp_placement。
+    tied_pairs: list[tuple[str, str]] = field(default_factory=list)
+```
+
+### 3.2 ModuleShardingSpec：单模块分片规格
+
+```python
+@dataclass
+class ModuleShardingSpec:
+    """单个模块的完整 DTensor 契约。
+
+    四个 Placement 字段构成完整的 I/O 契约——运行时不做推断，直接按声明执行：
+
+      in_src:  输入到达模块边界时的 placement（从上游模块的输出或 dataloader 来）
+      in_dst:  模块内部计算需要的 placement（如果不等于 in_src，触发通信）
+      out_src: 模块内部计算自然产生的 placement（由 DTensor 策略传播决定，校验模式使用）
+      out_dst: 下游模块期望的 placement（如果不等于 out_src，触发通信）
+
+    每个 placement 都是 NamedPlacement = dict[MeshAxisName, Placement]，
+    声明在所有活跃的 mesh 维度（TP, CP, EP）上的 placement。
+
+    例 — Llama self_attn, TP=4, CP=2, SP=true:
+        ModuleShardingSpec(
+            params={
+                "q_proj.weight": {TP: Shard(0), CP: Replicate()},
+                "k_proj.weight": {TP: Shard(0), CP: Replicate()},
+                "v_proj.weight": {TP: Shard(0), CP: Replicate()},
+                "o_proj.weight": {TP: Shard(1), CP: Replicate()},
+            },
+            in_src={"hidden_states": {TP: Shard(1), CP: Shard(1)}},       # 从 SP+CP norm 来
+            in_dst={"hidden_states": {TP: Replicate(), CP: Shard(1)}},    # 只 all-gather TP；CP 维 K/V all-gather 在 inner attention
+            out_src={TP: Partial(), CP: Shard(1)},                        # 本地 Q+全局 K/V → 输出仅覆盖本地 Q 段 → CP Shard(1)
+            out_dst={TP: Shard(1), CP: Shard(1)},                          # reduce-scatter(TP) → SP+CP；CP 维 identity
+        )
+    """
+    # ── 参数分片：子模块路径 → {MeshAxis: Placement} ──
+    params: dict[str, NamedPlacement] = field(default_factory=dict)
+
+    # ── 输入契约（必填字段） ──
+    in_src: dict[str, NamedPlacement] = field(default_factory=dict)
+    in_dst: dict[str, NamedPlacement] = field(default_factory=dict)
+
+    # ── 输出契约 ──
+    # out_src/out_dst: dict[str, NamedPlacement]（与 in_src/in_dst 对称），支持返回 tuple 的多输出模块。
+    # 单输出模块使用 {"output": NamedPlacement}（或简写为单 key dict）。
+    # out_src=None: 不做 src 校验（仅对比 out_dst），或者模块输出不是 DTensor
+    # out_dst=None: 输出不需要 redistribution（identity 路径）
+    out_src: dict[str, NamedPlacement] | None = None
+    out_dst: dict[str, NamedPlacement] | None = None
+    # out_names: 多输出模块（返回 tuple）的输出名顺序，用于把 out_src/out_dst 的
+    # key 映射到 tuple 位置（RedistOp.arg_index）。缺省时按 out_src 的 key 顺序。
+    # 例：attention 返回 (hidden_states, present_kv) → out_names=["hidden_states", "present_kv"]。
+    out_names: list[str] | None = None
+    # 注：§3.4 / §6 中的示例为简洁起见用 `out_src={TP: Partial(), ...}` 标量写法
+    # 表示单输出模块，等价于 `out_src={"output": {TP: Partial(), ...}}`。
+    # 标量简写会在归一化阶段（_normalize_out_fields，见 §3.5 _build_spec_from_template）
+    # 包装为 {"output": ...}，与 _compile_output_plan 的 dict 契约对齐。
+
+    # ── 边界标记 ──
+    is_boundary: bool = True
+
+    # ── 内部标记（由 ShardingPlanner 自动设置） ──
+    _is_terminal: bool = False  # 链式传播时自动标记
+    _use_local_map: bool = False  # MoE 模块: forward 内部需要 DTensor→local→DTensor
+    _needs_cp_attn: bool = False  # attention 模块: inner attention 需要 CP-aware forward 替换
+```
+
+### 3.2.1 NamedPlacement 的物理含义
+
+`NamedPlacement = dict[MeshAxisName, Placement]`。理解其物理含义的关键规则：
+
+> **Key 是 mesh 维度名，Value 中的 `Shard(N)` 的 N 是 tensor 维度索引。**
+
+```
+{TP: Shard(0)}
+  ↑                  ↑
+  mesh 维度名       沿 tensor 第 0 轴切分
+
+解读: 在 TP 这组 ranks 上，tensor 沿 dim 0 切分。TP=4 → 每个 rank 持有 1/4
+
+{TP: Shard(1)}
+  TP 这组 ranks 上，沿 tensor dim 1 切分（对 activation [B,S,H] 就是沿序列切 → SP）
+
+{TP: Replicate()}
+  TP 这组 ranks 上，每个 rank 持有完整副本
+
+{TP: Shard(0), EP: Replicate()}
+  TP 维度: 沿 tensor dim 0 切分
+  EP 维度: 全复制（每个 EP rank 持有完整副本）
+
+{TP: Shard(1), CP: Shard(1), EP: Replicate()}
+  TP 维度: 沿序列切（SP）
+  CP 维度: 沿序列切（CP）
+  EP 维度: 全复制
+```
+
+**对于权重** `[H_out, H_in]`：
+- `{TP: Shard(0), CP: Replicate()}` → rank i 持有 `[H_out/tp, H_in]`（Colwise 分片）
+- `{TP: Shard(1), CP: Replicate()}` → rank i 持有 `[H_out, H_in/tp]`（Rowwise 分片）
+
+**对于激活** `[B, S, H]`：
+- `{TP: Shard(1)}` → 沿 S 切分（Sequence Parallel）
+- `{TP: Shard(-1)}` → 沿 H 切分（Column-wise 输出）
+- `{CP: Shard(1)}` → CP 也沿 S 切分（不同的 rank 组，语义不同）
+
+**对于 MoE expert 权重** `[num_experts, H_out, H_in]`：
+- `{EP: Shard(0), TP: Shard(0), CP: Replicate()}` → `[n_experts/ep, H_out/tp, H_in]`
+
+### 3.3 `is_boundary` 的作用与设置者
+
+| | `is_boundary=True` | `is_boundary=False` |
+|---|---|---|
+| **行为** | 包装 forward + 构建 PrecompiledBoundary | 只做参数分片，不独立包装 forward |
+| **谁创建** | ShardingPlanner 自动生成（全部为 True）；用户手动注入时默认 True | 仅用户手动注入时显式指定 |
+| **何时使用** | 所有通信边界模块 | 已合并到父边界的子模块，但用户想单独声明其 params（罕见） |
+
+ShardingPlanner 从不创建 `is_boundary=False` 的 spec。核心规则：
+
+```python
+for module_fqn, spec in plan.modules.items():
+    if not spec.is_boundary:   # ← 跳过 forward 包装
+        continue
+    module = _resolve_module(model, module_fqn)
+    boundary = PrecompiledBoundary(spec, mesh, mesh_dim_names)
+
+    # 根据 spec 的类型选择对应的 forward 包装策略:
+    if spec._use_local_map:                  # MoE EP
+        _wrap_moe_forward(module, boundary, spec, mesh, mesh_dim_names)
+    elif cp_size > 1 and _is_attention(module):
+        _wrap_cp_inner_attention(module, cp_mesh)
+        _wrap_production_forward(module, boundary)  # 标准 PrecompiledBoundary 包装
+    else:                                    # 标准 TP/CP
+        _wrap_production_forward(module, boundary)
+```
+
+### 3.4 标准 Transformer 的 ShardingPlan 生成结果
+
+以 Llama decoder layer 0 为例，TP=4，CP=2，SP=true：
+
+```python
+plan.modules = {
+    # ── 边界 1: embed_tokens ──
+    "model.embed_tokens": ModuleShardingSpec(
+        params={"weight": {TP: Shard(0), CP: Replicate()}},
+        in_src={"input": {TP: Replicate(), CP: Replicate()}},
+        in_dst={"input": {TP: Replicate(), CP: Replicate()}},     # identity
+        out_src={TP: Partial(), CP: Replicate()},
+        out_dst={TP: Shard(1), CP: Shard(1)},                      # reduce-scatter → SP+CP
+    ),
+
+    # ── 边界 2: input_layernorm ──
+    "model.layers.0.input_layernorm": ModuleShardingSpec(
+        params={"weight": {TP: Replicate(), CP: Replicate()}},
+        in_src={"hidden_states": {TP: Shard(1), CP: Shard(1)}},
+        in_dst={"hidden_states": {TP: Shard(1), CP: Shard(1)}},   # identity
+        out_src={TP: Shard(1), CP: Shard(1)},
+        out_dst={TP: Shard(1), CP: Shard(1)},                      # identity
+    ),
+
+    # ── 边界 3: self_attn ──
+    "model.layers.0.self_attn": ModuleShardingSpec(
+        params={
+            "q_proj.weight": {TP: Shard(0), CP: Replicate()},
+            "k_proj.weight": {TP: Shard(0), CP: Replicate()},
+            "v_proj.weight": {TP: Shard(0), CP: Replicate()},
+            "o_proj.weight": {TP: Shard(1), CP: Replicate()},
+        },
+        in_src={"hidden_states": {TP: Shard(1), CP: Shard(1)}},
+        # CP 维保持 Shard(1)：只 all-gather TP，CP 维的 K/V all-gather
+        # 交给 inner attention wrapper 在 SDPA/FlexAttention 内部完成（§4.4.2）。
+        in_dst={"hidden_states": {TP: Replicate(), CP: Shard(1)}},
+        out_src={TP: Partial(), CP: Shard(1)},   # 本地 Q 段输出 → CP Shard(1)
+        out_dst={TP: Shard(1), CP: Shard(1)},
+    ),
+}
+```
+
+**关键观察**：
+- 所有 placement 都**完整声明**了 TP+CP+EP（此处 EP 未启用故省略）
+- `in_src ≠ in_dst` → PrecompiledBoundary 生成通信 op（**仅 all-gather on TP**；CP 维保持 Shard(1)，K/V all-gather 由 inner attention wrapper 在 forward 内部完成，见 §4.4.2/§6.3.3）
+- `out_src ≠ out_dst` → PrecompiledBoundary 生成通信 op（reduce-scatter on TP）；CP 维 out_src=Shard(1) 与 out_dst=Shard(1) identity，boundary 不做 CP 出口通信
+- TP 与 CP 的边界通信职责**不对称**：TP 在 boundary 做 all-gather/reduce-scatter；CP 的序列维 all-gather 仅发生在 attention 内部（K/V，§4.4.2），boundary 层 CP 维全程 identity（out_src=out_dst=Shard(1)）
+
+
+
+---
+
+### 3.5 ShardingTemplate: CP/EP dimensions in I/O Template
+
+#### ShardingTemplate Data Structure
+
+```python
+@dataclass
+class ShardingTemplate:
+    """Semantic role -> placement template.
+
+    Each field declares placements on ALL active mesh dimensions (TP+CP+EP).
+    Aligned with Titan SpmdLayout: dict[MeshAxisName, Placement].
+
+    -- Parameter sharding rules --
+    colwise_placement:   COLWISE role params on TP axis.
+                        e.g. Shard(0) -> weight [H_out, H_in] -> [H_out/tp, H_in].
+    rowwise_placement:   ROWWISE role params on TP axis.
+                        e.g. Shard(1) -> weight [H_out, H_in] -> [H_out, H_in/tp].
+    norm_placement:      NORM role params on TP+CP axes.
+                        e.g. Replicate() -> full [H] on each TP/CP rank.
+    moe_expert_placement: MOE_EXPERT role params on EP axis.
+                        e.g. Shard(0) -> expert params shard along expert dim.
+
+    -- I/O contract (SP/non-SP, each containing TP+CP+EP three dimensions) --
+    sp_in_src:    SP mode, input placement at module boundary.
+                 e.g. {"hidden_states": {TP: Shard(1), CP: Shard(1), EP: Replicate()}}
+    sp_in_dst:    SP mode, desired input placement for compute.
+                 e.g. {"hidden_states": {TP: Replicate(), CP: Replicate(), EP: Replicate()}}
+    sp_out_src:   SP mode, natural output placement (DTensor dispatch decides).
+                 e.g. {TP: Partial(), CP: Replicate(), EP: Replicate()}
+    sp_out_dst:   SP mode, downstream expected placement.
+                 e.g. {TP: Shard(1), CP: Shard(1), EP: Replicate()}
+
+    nosp_in_src / nosp_in_dst / nosp_out_src / nosp_out_dst:
+                 non-SP mode corresponding placements. Used when SP is off.
+
+    -- Special flags --
+    use_local_map:   MoE module: forward needs DTensor->local->DTensor (EP dispatch/combine).
+    needs_cp_attn:   CP module: inner attention needs CP-aware forward replacement.
+    """
+
+    # Parameter sharding rules
+    colwise_placement: Placement = Shard(0)     # TP axis
+    rowwise_placement: Placement = Shard(1)     # TP axis
+    norm_placement: Placement = Replicate()      # TP+CP axes
+    moe_expert_placement: Placement = Shard(0)   # EP axis
+
+    # CP axis: ALL parameters are Replicate() (CP only shards activations)
+
+    # SP mode I/O (complete TP+CP+EP three dimensions)
+    sp_in_src: NamedPlacement = field(default_factory=dict)
+    sp_in_dst: NamedPlacement = field(default_factory=dict)
+    sp_out_src: NamedPlacement | None = None
+    sp_out_dst: NamedPlacement | None = None
+
+    # non-SP mode I/O
+    nosp_in_src: NamedPlacement = field(default_factory=dict)
+    nosp_in_dst: NamedPlacement = field(default_factory=dict)
+    nosp_out_src: NamedPlacement | None = None
+    nosp_out_dst: NamedPlacement | None = None
+
+    # Special flags
+    use_local_map: bool = False     # MoE EP: forward needs local_map
+    needs_cp_attn: bool = False     # CP: inner attention needs CP-aware forward
+```
+
+**CP/EP dimension rules**:
+
+Each template placement field MUST include declarations for all active mesh dimensions:
+1. **TP axis**: determined by template type (Colwise/Rowwise/Replicate/Partial)
+2. **CP axis**: params always `Replicate()` (CP never shards params), activations `Shard(1)` or `Replicate()`
+3. **EP axis**: non-MoE modules `Replicate()`; MoE experts `Shard(0)`
+
+ShardingPlanner filters unused dimensions based on actual `mesh_dim_names`.
+
+#### Complete Template Enumeration
+
+```python
+TEMPLATES: dict[str, ShardingTemplate] = {
+    # -- Attention (self_attn: q/k/v Colwise + o Rowwise) --
+    "attention": ShardingTemplate(
+        colwise_placement=Shard(0),          # q/k/v: [H/tp, H]
+        rowwise_placement=Shard(1),          # o: [H, H/tp]
+        # SP: all-gather(TP only) -> compute -> reduce-scatter(TP) + CP reshard
+        # CP 维 in_dst 保持 Shard(1)：K/V all-gather 由 inner attention wrapper
+        # 在 SDPA/FlexAttention 内部完成（needs_cp_attn=True），不在 boundary 层。
+        sp_in_src={"hidden_states": {TP: Shard(1), CP: Shard(1), EP: Replicate()}},
+        sp_in_dst={"hidden_states": {TP: Replicate(), CP: Shard(1), EP: Replicate()}},
+        sp_out_src={TP: Partial(), CP: Shard(1), EP: Replicate()},   # 本地 Q 段输出 → CP Shard(1)
+        sp_out_dst={TP: Shard(1), CP: Shard(1), EP: Replicate()},
+        # non-SP: compute -> all-reduce(TP)
+        nosp_in_src={"hidden_states": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_in_dst={"hidden_states": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_out_src={TP: Partial(), CP: Replicate(), EP: Replicate()},
+        nosp_out_dst={TP: Replicate(), CP: Replicate(), EP: Replicate()},
+        needs_cp_attn=True,                  # CP: inject CP-aware inner attention
+    ),
+
+    # -- MLP (gate/up Colwise + down Rowwise) --
+    # 修订 D-06：MLP 的 CP 维全程 Shard(1)（pointwise，CP 无需 boundary 通信）。
+    # 若 in_dst CP=Replicate，TP×CP 下全序列 reduce-scatter 会产生与
+    # embed/attention（cp-major）不一致的 tp-major 序列布局（见 §12）。
+    "mlp": ShardingTemplate(
+        colwise_placement=Shard(0),
+        rowwise_placement=Shard(1),
+        sp_in_src={"hidden_states": {TP: Shard(1), CP: Shard(1), EP: Replicate()}},
+        sp_in_dst={"hidden_states": {TP: Replicate(), CP: Shard(1), EP: Replicate()}},
+        sp_out_src={TP: Partial(), CP: Shard(1), EP: Replicate()},
+        sp_out_dst={TP: Shard(1), CP: Shard(1), EP: Replicate()},
+        nosp_in_src={"hidden_states": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_in_dst={"hidden_states": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_out_src={TP: Partial(), CP: Replicate(), EP: Replicate()},
+        nosp_out_dst={TP: Replicate(), CP: Replicate(), EP: Replicate()},
+    ),
+
+    # -- Norm (RMSNorm/LayerNorm: weight fully replicated, zero communication) --
+    "norm": ShardingTemplate(
+        norm_placement=Replicate(),
+        sp_in_src={"hidden_states": {TP: Shard(1), CP: Shard(1), EP: Replicate()}},
+        sp_in_dst={"hidden_states": {TP: Shard(1), CP: Shard(1), EP: Replicate()}},  # identity
+        sp_out_src={TP: Shard(1), CP: Shard(1), EP: Replicate()},
+        sp_out_dst={TP: Shard(1), CP: Shard(1), EP: Replicate()},                    # identity
+        nosp_in_src={"hidden_states": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_in_dst={"hidden_states": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_out_src={TP: Replicate(), CP: Replicate(), EP: Replicate()},
+        nosp_out_dst={TP: Replicate(), CP: Replicate(), EP: Replicate()},
+    ),
+
+    # -- Embedding (Rowwise: weight Shard(0), output Partial -> SP+CP) --
+    # 修订 D-05：CP>1 时 embed 的 in/out CP 维为 Shard(1)（而非 Replicate）——
+    # CP 数据管道（shard_batch_for_cp，§6.3.4）已把 input_ids 按 CP 切好，
+    # 若按 Replicate 声明，boundary 会把已切分的 chunk 再 scatter 一次
+    # （序列被切两次）。该调整在 _build_spec_from_template 中按 has_cp 应用，
+    # 模板字面量保留 CP: Replicate 作为无 CP 轴时的默认（会被过滤）。
+    "embed": ShardingTemplate(
+        colwise_placement=Shard(0),          # weight: [V/tp, H]
+        sp_in_src={"input": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        sp_in_dst={"input": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        sp_out_src={TP: Partial(), CP: Replicate(), EP: Replicate()},
+        sp_out_dst={TP: Shard(1), CP: Shard(1), EP: Replicate()},
+        nosp_in_src={"input": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_in_dst={"input": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_out_src={TP: Partial(), CP: Replicate(), EP: Replicate()},
+        nosp_out_dst={TP: Replicate(), CP: Replicate(), EP: Replicate()},
+    ),
+
+    # -- LM Head (Colwise: weight Shard(0), output Shard(-1)) --
+    # 修订 D-07：lm_head 的 CP 维全程 Shard(1)（R8 统一——boundary 层 CP 维恒
+    # identity，CP 序列 all-gather 仅发生在 attention 内部 K/V）。CP 下
+    # lm_head 在本地 CP chunk 上计算 logits/loss（Megatron CP 标准做法），
+    # 不做 CP gather。
+    "lm_head": ShardingTemplate(
+        colwise_placement=Shard(0),          # weight: [V/tp, H]
+        sp_in_src={"hidden_states": {TP: Shard(1), CP: Shard(1), EP: Replicate()}},
+        sp_in_dst={"hidden_states": {TP: Replicate(), CP: Shard(1), EP: Replicate()}},
+        sp_out_src={TP: Shard(-1), CP: Shard(1), EP: Replicate()},
+        sp_out_dst={TP: Shard(-1), CP: Shard(1), EP: Replicate()},   # loss_parallel=true default; overridden in _build_spec_from_template when loss_parallel=false
+        nosp_in_src={"hidden_states": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_in_dst={"hidden_states": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_out_src={TP: Shard(-1), CP: Replicate(), EP: Replicate()},
+        nosp_out_dst={TP: Replicate(), CP: Replicate(), EP: Replicate()},
+    ),
+
+    # -- MoE Gate (Router: weight replicated, input all-gather TP, output redistribute -> EP) --
+    "moe_gate": ShardingTemplate(
+        norm_placement=Replicate(),          # router weight/bias: replicated (TP+CP+EP)
+        sp_in_src={"hidden_states": {TP: Shard(1), CP: Shard(1), EP: Replicate()}},
+        sp_in_dst={"hidden_states": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        sp_out_src={TP: Replicate(), CP: Replicate(), EP: Replicate()},
+        sp_out_dst={TP: Replicate(), CP: Replicate(), EP: Shard(0)},
+        nosp_in_src={"hidden_states": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_in_dst={"hidden_states": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_out_src={TP: Replicate(), CP: Replicate(), EP: Replicate()},
+        nosp_out_dst={TP: Replicate(), CP: Replicate(), EP: Shard(0)},
+    ),
+
+    # -- MoE MLP (Dense gate + Routed experts + Optional shared experts) --
+    # 修订 D-06：CP 维同 mlp，全程 Shard(1)（pointwise per-token）。
+    # 修订 D-08：expert 权重为 batched 3D [E, H_out, H_in] 时，TP 的
+    # colwise/rowwise 作用在 +1 维（colwise=Shard(1)、rowwise=Shard(2)），
+    # tensor dim 0 的 expert 维归 EP Shard(0)；placement 推断按参数 ndim 感知。
+    "moe_mlp": ShardingTemplate(
+        colwise_placement=Shard(0),          # expert w1/w3: Colwise on TP
+        rowwise_placement=Shard(1),          # expert w2: Rowwise on TP
+        norm_placement=Replicate(),          # gate/norm: replicated
+        moe_expert_placement=Shard(0),       # expert params: Shard(0) on EP
+        sp_in_src={"x_BLD": {TP: Shard(1), CP: Shard(1), EP: Replicate()}},
+        sp_in_dst={"x_BLD": {TP: Replicate(), CP: Shard(1), EP: Replicate()}},
+        sp_out_src={TP: Partial(), CP: Shard(1), EP: Replicate()},
+        sp_out_dst={TP: Shard(1), CP: Shard(1), EP: Replicate()},
+        nosp_in_src={"x_BLD": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_in_dst={"x_BLD": {TP: Replicate(), CP: Replicate(), EP: Replicate()}},
+        nosp_out_src={TP: Partial(), CP: Replicate(), EP: Replicate()},
+        nosp_out_dst={TP: Replicate(), CP: Replicate(), EP: Replicate()},
+        use_local_map=True,                  # EP: forward needs local_map
+    ),
+}
+```
+
+**Key change**: Old templates only had `{TP: ...}` placements. New templates have **{TP, CP, EP} three-dimensional declarations** in all I/O fields. This lets PrecompiledBoundary uniformly handle redistribution across all dimensions.
+
+#### Template -> ModuleShardingSpec Mapping
+
+```python
+def _build_spec_from_template(self, boundary_fqn, group, template,
+                              sequence_parallel, loss_parallel, mesh_dim_names):
+    has_tp = "tp" in mesh_dim_names
+    has_ep = "ep" in mesh_dim_names
+    # 注：has_cp 不在此计算——CP 不切参数，spec.params 中 CP 维恒为 Replicate()，
+    # 无需根据 has_cp 选择 placement；CP 仅影响 I/O 契约（由 template.sp_* 字段管）。
+    spec = ModuleShardingSpec()
+
+    # Step 1: Fill spec.params by ParamRole
+    for param_fqn, role in group:
+        param_path = param_fqn[len(boundary_fqn) + 1:]
+        if role == ParamRole.COLWISE:
+            spec.params[param_path] = _multi_dim(tp=template.colwise_placement if has_tp else None,
+                                                  cp=Replicate(), ep=Replicate())
+        elif role == ParamRole.ROWWISE:
+            spec.params[param_path] = _multi_dim(tp=template.rowwise_placement if has_tp else None,
+                                                  cp=Replicate(), ep=Replicate())
+        elif role == ParamRole.NORM:
+            spec.params[param_path] = _multi_dim(tp=template.norm_placement if has_tp else None,
+                                                  cp=Replicate(), ep=Replicate())
+        elif role == ParamRole.MOE_GATE:
+            spec.params[param_path] = _multi_dim(tp=template.norm_placement if has_tp else None,
+                                                  cp=Replicate(), ep=Replicate())
+        elif role == ParamRole.MOE_EXPERT:
+            # NOTE: 当 has_tp=False 时 tp_p 为 Replicate()（而非 None）。
+            # 这与 colwise/rowwise 的 has_tp=False→None（_multi_dim 中过滤掉 TP 键）
+            # 不一致。设计选择：MOE_EXPERT 参数的底层 tensor 结构为 [E, H_out, H_in]，
+            # 即使 TP 未启用，显式声明 TP: Replicate() 也比完全省略 TP 键更清晰地
+            # 表达"此参数在所有 TP rank 上完整复制"的语义，便于 future 当 TP
+            # 动态加入时迁移。如果需要严格保持 has_tp=False 时的键一致性，
+            # 可改为 tp_p = _infer_colwise_vs_rowwise(...) if has_tp else None。
+            tp_p = _infer_colwise_vs_rowwise(param_path, template) if has_tp else Replicate()
+            spec.params[param_path] = _multi_dim(tp=tp_p,
+                                                  cp=Replicate(),
+                                                  ep=template.moe_expert_placement if has_ep else None)
+        elif role == ParamRole.SHARED_EXPERT:
+            # Shared experts: EP 维度全复制（不参与 expert 切分），TP 按 w1/w3(colwise)/w2(rowwise) 切
+            tp_p = (_infer_colwise_vs_rowwise(param_path, template))
+            spec.params[param_path] = _multi_dim(tp=tp_p if has_tp else None,
+                                                  cp=Replicate(), ep=Replicate())
+        elif role == ParamRole.EMBED:
+            spec.params[param_path] = _multi_dim(tp=template.colwise_placement if has_tp else None,
+                                                  cp=Replicate(), ep=Replicate())
+        elif role == ParamRole.LM_HEAD:
+            spec.params[param_path] = _multi_dim(tp=template.colwise_placement if has_tp else None,
+                                                  cp=Replicate(), ep=Replicate())
+        elif role == ParamRole.FUSED_QKV:
+            spec.params[param_path] = _multi_dim(tp=template.colwise_placement if has_tp else None,
+                                                  cp=Replicate(), ep=Replicate())
+        elif role == ParamRole.FUSED_GATE_UP:
+            spec.params[param_path] = _multi_dim(tp=template.colwise_placement if has_tp else None,
+                                                  cp=Replicate(), ep=Replicate())
+        elif role == ParamRole.BIAS:
+            spec.params[param_path] = _multi_dim(tp=Replicate(), cp=Replicate(), ep=Replicate())
+        elif role == ParamRole.SPECIAL:
+            pass  # Handled by SpecialHandler in Phase 6
+        elif role == ParamRole.SKIP:
+            pass  # Frozen / no-shard params — skip
+
+    # Step 2: Select I/O contract based on SP switch
+    if sequence_parallel:
+        spec.in_src  = template.sp_in_src
+        spec.in_dst  = template.sp_in_dst
+        spec.out_src = template.sp_out_src
+        spec.out_dst = template.sp_out_dst
+    else:
+        spec.in_src  = template.nosp_in_src
+        spec.in_dst  = template.nosp_in_dst
+        spec.out_src = template.nosp_out_src
+        spec.out_dst = template.nosp_out_dst
+
+    # Step 2.5: lm_head output plan depends on loss_parallel (runtime decision)
+    if template is TEMPLATES.get("lm_head"):
+        if loss_parallel:
+            spec.out_dst = {TP: Shard(-1), CP: Replicate(), EP: Replicate()}
+        else:
+            spec.out_dst = {TP: Replicate(), CP: Replicate(), EP: Replicate()}
+
+    # Step 3: Transfer special flags
+    spec._use_local_map = template.use_local_map
+    if template.needs_cp_attn:
+        spec._needs_cp_attn = True
+
+    # Step 4: 归一化 out_src/out_dst 标量简写为 dict 契约
+    spec = _normalize_out_fields(spec)
+    return spec
+
+
+def _normalize_out_fields(spec):
+    """标量简写 {TP: ...} 归一化为 {'output': {TP: ...}}，与 _compile_output_plan 的 dict 契约对齐。
+
+    out_src/out_dst 声明为 dict[str, NamedPlacement] | None，但模板/示例常用
+    标量 NamedPlacement 简写（单输出模块）。_compile_output_plan 按 dict 契约逐 key
+    编译，遇到标量会 AttributeError。本函数在 spec 构造入口把标量包装成
+    {"output": <scalar>}，统一两端契约。
+    """
+    for attr in ("out_src", "out_dst"):
+        val = getattr(spec, attr, None)
+        # 检测启发式：若 val 是一个非 None 的 dict，且其任意 value 不是 dict，
+        # 则判定为标量 NamedPlacement 简写（如 {TP: Shard(1)}）。真正的 dict 契约
+        # 的 value 必定是 dict[str, Placement]（如 {"hidden_states": {TP: Shard(1)}}）。
+        # 此启发式无法区分"恰好有一个名为 Shard(0) 的输出模块"这种极端情况，
+        # 但实际不存在这种命名约定。
+        if val and not all(isinstance(v, dict) for v in val.values()):
+            setattr(spec, attr, {"output": val})
+    return spec
+
+
+def _multi_dim(tp=None, cp=None, ep=None):
+    """Build multi-dim placement dict, filtering out None dims."""
+    result = {}
+    if tp is not None: result[MeshAxisName.TP] = tp
+    if cp is not None: result[MeshAxisName.CP] = cp
+    if ep is not None: result[MeshAxisName.EP] = ep
+    return result
+
+
+# 模块级别名：本文档示例中大量使用裸 {TP: Shard(0), CP: Replicate(), EP: ...}
+# 写法，TP/CP/EP 即 MeshAxisName 枚举值的简写别名，统一在此声明一次。
+# NOTE: 这些别名必须定义在 TEMPLATES 字典之后——TEMPLATES 内部的 placement
+# 字面量在模块加载时求值，此时 TP/CP/EP 尚未绑定，故 TEMPLATES 中使用的是
+# 裸 Placement 枚举值（Shard(0)/Replicate()），而非 TP/CP/EP 别名。
+# 若将 alias 定义移到 TEMPLATES 之前，可简化 TEMPLATES 内的写法但会增加
+# 模块初始化时的依赖顺序约束。
+TP = MeshAxisName.TP
+CP = MeshAxisName.CP
+EP = MeshAxisName.EP
+
+
+def _infer_colwise_vs_rowwise(param_path: str, template: "ShardingTemplate") -> Placement:
+    """根据参数名后缀推断 shared expert 参数的 TP placement。
+    w1/w3/gate/up -> colwise(Shard(0)), w2/down -> rowwise(Shard(1))。
+    """
+    name = param_path.lower()
+    if any(k in name for k in ("w2", "down_proj", "down.")):
+        return template.rowwise_placement
+    return template.colwise_placement
+```
+
+#### ParamRole -> Template Field Mapping
+
+```
+ParamRole        -> Template field           -> placement value           -> physical meaning
+================================================================================================
+EMBED            -> colwise_placement        -> {TP: Shard(0)}            weight [V/tp, H]
+LM_HEAD          -> colwise_placement        -> {TP: Shard(0)}            weight [V/tp, H]
+COLWISE          -> colwise_placement        -> {TP: Shard(0)}            weight [H_out/tp, H_in]
+FUSED_QKV        -> colwise_placement        -> {TP: Shard(0)}            weight [3H/tp, H]
+FUSED_GATE_UP    -> colwise_placement        -> {TP: Shard(0)}            weight [8H/tp, H]
+-----------------------------------------------------------------------------------------------
+ROWWISE          -> rowwise_placement        -> {TP: Shard(1)}            weight [H_out, H_in/tp]
+-----------------------------------------------------------------------------------------------
+NORM             -> norm_placement           -> {TP: Replicate()}         weight [H] replicated
+MOE_GATE         -> norm_placement           -> {TP: Replicate()}         router weight replicated
+-----------------------------------------------------------------------------------------------
+MOE_EXPERT       -> moe_expert_placement     -> {EP: Shard(0)}            expert shard on EP
+                   + colwise/rowwise          -> {TP: Shard(0)/(1)}        also shard on TP
+-----------------------------------------------------------------------------------------------
+BIAS             -> (hardcoded)              -> {TP: Replicate()}         bias always replicated
+SPECIAL          -> (not here)               -> SpecialHandler            Phase 6 handles
+SKIP             -> (skip params)            -> --                        frozen/no-shard params
+```
+
+**CP dimension rule**: CP **never shards parameters** -- all ParamRoles are `Replicate()` on CP. CP only shards activations (sequence dimension), declared in I/O template fields `sp_in_src/sp_out_dst` as `{CP: Shard(1)}`.
+
+
+---
+
+> **调用位置**: 时序树 ④.3.5.7 — `sharding_planner.plan(model, mesh, ...)` → `ShardingPlan`
+
+### 3.6 Phase 1-2: Parameter Classification + Boundary Grouping
+
+### 3.6.1 推导不是"从参数推导 I/O"——而是多层协作
+
+仅从参数角色不足以推导 `in_src`/`in_dst`/`out_src`/`out_dst`。完整的推导管线分 **6 个阶段**：
+
+```
+Phase 1: 参数角色分类
+  named_parameters() → 命名规则匹配 → ParamRole(COLWISE/ROWWISE/NORM/...)
+
+Phase 2: 通信边界分组
+  参数 → _find_boundary() → 最近公共父模块 → boundary_groups
+
+Phase 3: 语义角色推断（独立于参数角色！）
+  boundary_fqn → 分析 FQN 模式 → boundary_type(ATTENTION/MLP/NORM/EMBED/LM_HEAD)
+
+Phase 4: 模板查表生成 I/O
+  boundary_type + sequence_parallel + loss_parallel → in_src, in_dst, out_src, out_dst
+
+Phase 5: 链式传播校验
+  上一个边界的 out_dst → 下一个边界的 in_src，自动填充缺省，校验一致
+
+Phase 6: 构建 ModuleShardingSpec
+  合并 params + I/O 契约 → ShardingPlan.modules[boundary_fqn]
+```
+
+### 3.6.2 Phase 3 详解：语义角色推断
+
+语义角色推断**不依赖参数分类结果**，只看模块完全限定名（FQN）的语义：
+
+```python
+def _infer_boundary_type(self, fqn: str, group: list) -> str:
+    """从模块 FQN 识别语义角色。
+
+    优先级：显式 FQN 模式 > 参数角色组合 > 默认
+    """
+    fqn_lower = fqn.lower()
+
+    # 1. 显式规则（最高优先级）
+    if _match_any(fqn_lower, ["embed_tokens", "wte", ".embed."]):
+        return "embed"
+    if _match_any(fqn_lower, ["lm_head", "embed_out", ".output."]):
+        return "lm_head"
+    if _match_any(fqn_lower, ["norm", "layernorm", "rmsnorm", "ln_"]):
+        return "norm"
+
+    # 2. 参数角色辅助推断
+    has_colwise = any(r in (ParamRole.COLWISE, ParamRole.FUSED_QKV) for _, r in group)
+    has_rowwise = any(r == ParamRole.ROWWISE for _, r in group)
+
+    if has_colwise and has_rowwise:
+        # 同时有 colwise + rowwise → attention 或 mlp
+        if _match_any(fqn_lower, ["attn", "attention", "self_attn"]):
+            return "attention"
+        if _match_any(fqn_lower, ["mlp", "ffn", "feed_forward"]):
+            return "mlp"
+        return "attention"  # 默认假设为 attention（更保守的 SP 通信）
+
+    if has_colwise and not has_rowwise:
+        return "mlp"        # 仅 colwise（gate+up 未合并 down）
+
+    # 3. MoE 特化
+    if _match_any(fqn_lower, ["router", "gate"]):
+        return "moe_gate"
+    if _match_any(fqn_lower, ["expert", "moe"]):
+        return "moe_block"
+
+    return "unknown"
+```
+
+### 3.6.3.1 ParamRole 的桥梁作用
+
+`ParamRole` 是命名规则和 Template 之间的**桥梁**，它连接推导管线的 3 个 Phase：
+
+```
+Phase 1: 命名规则 ──→ ParamRole ──→ Phase 2: 边界分组
+                         │
+                         └──────→ Phase 4: Template 查表时，ParamRole 决定
+                                  每个参数在 spec.params 中的 placement
+```
+
+**ParamRole 的两个作用**：
+
+1. **参数分组**（Phase 2）：`COLWISE` + `ROWWISE` 参数聚合到同一个父边界（如 `self_attn`），`NORM` 独立为边界
+2. **placement 填充**（Phase 4）：Template 根据 ParamRole 填充 `spec.params`——
+   `COLWISE → Shard(0)`，`ROWWISE → Shard(1)`，`NORM → Replicate()`
+
+ParamRole **不决定 I/O 契约**（`in_src`/`in_dst`/`out_src`/`out_dst`）——那是由 Template 的
+语义角色（attention/mlp/norm/...）决定的。
+
+#### Template → ModuleShardingSpec 的映射机制
+
+关键在于：**`ShardingTemplate` 只知道"每类角色用什么 placement"，不知道"具体哪些参数是哪个角色"。**
+后者由 Phase 1 的 `ParamRole` 分类结果提供。`_build_spec_from_template()` 把两者组合起来：
+
+> **规范的 `_build_spec_from_template` 实现见 §3.5 "Template -> ModuleShardingSpec Mapping"（第 576 行起）。**
+> 该版本包含完整的 TP+CP+EP 三维度 placement 处理，且正确定义了 `has_tp`/`has_ep` 等变量（`has_cp` 不需要——CP 不切参数，spec.params 中 CP 维恒为 Replicate()）。
+>
+> 以下保留 §3.6.4 中原有的数据流说明和 ParamRole 映射表，用于理解 Phase 4 的推导逻辑。
+
+**数据流总结**：
+
+```
+Phase 1 输出:
+  param_roles = {
+      "model.layers.0.self_attn.q_proj.weight": ParamRole.COLWISE,
+      "model.layers.0.self_attn.k_proj.weight": ParamRole.COLWISE,
+      "model.layers.0.self_attn.v_proj.weight": ParamRole.COLWISE,
+      "model.layers.0.self_attn.o_proj.weight": ParamRole.ROWWISE,
+  }
+
+Phase 2 分组:
+  boundary_groups["model.layers.0.self_attn"] = [
+      ("model.layers.0.self_attn.q_proj.weight", COLWISE),
+      ("model.layers.0.self_attn.k_proj.weight", COLWISE),
+      ("model.layers.0.self_attn.v_proj.weight", COLWISE),
+      ("model.layers.0.self_attn.o_proj.weight", ROWWISE),
+  ]
+
+Phase 3 语义推断:
+  boundary_fqn="model.layers.0.self_attn" + 含COLWISE+ROWWISE → boundary_type="attention"
+
+Phase 4 _build_spec_from_template():
+  template = TEMPLATES["attention"]
+  ↓
+  for each (param_fqn, role) in group:
+      if role == COLWISE: spec.params["q_proj.weight"] = {TP: template.colwise_placement}
+      if role == ROWWISE: spec.params["o_proj.weight"] = {TP: template.rowwise_placement}
+  ↓
+  spec.in_src  = template.sp_in_src   → {"hidden_states": {TP: Shard(1)}}
+  spec.in_dst  = template.sp_in_dst   → {"hidden_states": {TP: Replicate()}}
+  spec.out_src = template.sp_out_src  → {TP: Partial()}
+  spec.out_dst = template.sp_out_dst  → {TP: Shard(1)}
+```
+
+**`colwise_placement` / `rowwise_placement` 的本质**：它们是 Template 中的**规则字段**——
+定义"COLWISE 角色的参数统一用 Shard(0)"、"ROWWISE 角色的参数统一用 Shard(1)"。
+具体哪些参数是 COLWISE、哪些是 ROWWISE，由 Phase 1 的命名规则 + ParamRole 决定。
+
+#### 完整的 ParamRole → Template 字段映射表
+
+Template 只有 4 个 placement 字段，12 个 ParamRole 枚举值全部映射到这 4 个字段上。
+Template **不需要**为每个 Role 设独立字段——多个 Role 共享相同的 placement 规则：
+
+```
+ParamRole        → Template 字段           → placement 值        → 物理含义
+═══════════════════════════════════════════════════════════════════════════════
+EMBED            → colwise_placement        → Shard(0)            weight [V/tp, H]
+LM_HEAD          → colwise_placement        → Shard(0)            weight [V/tp, H]
+COLWISE          → colwise_placement        → Shard(0)            weight [H_out/tp, H_in]
+FUSED_QKV        → colwise_placement        → Shard(0)            weight [3H/tp, H]（后续 SpecialHandler 调整）
+FUSED_GATE_UP    → colwise_placement        → Shard(0)            weight [8H/tp, H]（后续 SpecialHandler 调整）
+─────────────────────────────────────────────────────────────────────────────────
+ROWWISE          → rowwise_placement        → Shard(1)            weight [H_out, H_in/tp]
+─────────────────────────────────────────────────────────────────────────────────
+NORM             → norm_placement           → Replicate()         weight [H] 全复制
+MOE_GATE         → norm_placement           → Replicate()         router weight/bias 全复制
+─────────────────────────────────────────────────────────────────────────────────
+MOE_EXPERT       → moe_expert_placement     → Shard(0) on EP      expert 参数沿 expert 维切
+                   + colwise_placement       → Shard(0) on TP      同时沿 TP 切 hidden 维
+─────────────────────────────────────────────────────────────────────────────────
+SHARED_EXPERT    → colwise/rowwise (按名)    → {EP: Replicate()}   shared expert 不参与 EP 切分
+                   + EP: Replicate()         → TP: Shard(0)/(1)    TP 按 w1/w3(colwise)/w2(rowwise)
+─────────────────────────────────────────────────────────────────────────────────
+BIAS             → (硬编码)                  → Replicate()         bias 始终全复制
+SPECIAL          → (不在此处理)               → SpecialHandler     留给 Phase B 自定义
+SKIP             → (不加入 params)            → —                  冻结/无需分片的参数
+```
+
+**为什么 EMBED 和 LM_HEAD 也用 `colwise_placement`？**
+Embedding `[V, H]` Shard(0) → `[V/tp, H]` 和 Colwise Linear `[H_out, H_in]` Shard(0) → `[H_out/tp, H_in]` 都是"沿第一维切"——placement 规则完全相同。只是 I/O 契约不同：
+- Embedding 的 I/O 由 `TEMPLATES["embed"]` 的 `sp_in_src`/`sp_in_dst`/... 控制
+- LM Head 的 I/O 由 `TEMPLATES["lm_head"]` 的 I/O 字段控制
+- Colwise Linear 的 I/O 由所属 boundary 的 Template（如 `TEMPLATES["attention"]`）控制
+
+**ParamRole 只管"参数怎么切"，Template 的 boundary type 管"I/O 怎么走"。两者正交。**
+
+以下给出每种 boundary type 从 Template → `ModuleShardingSpec` 的**完整构造结果**，
+以及对应的 PrecompiledBoundary 通信计划。均假设 **TP=4, SP=true**。
+
+#### Attention
+
+```
+已知: params = {q_proj:COLWISE, k_proj:COLWISE, v_proj:COLWISE, o_proj:ROWWISE}
+     boundary_type = "attention"
+
+构造:
+  params:
+    q_proj.weight → {TP: Shard(0)}    # Colwise: [H/4, H]，TP 轴沿 tensor dim 0 切
+    k_proj.weight → {TP: Shard(0)}
+    v_proj.weight → {TP: Shard(0)}
+    o_proj.weight → {TP: Shard(1)}    # Rowwise: [H, H/4]，TP 轴沿 tensor dim 1 切
+
+  in_src:  {"hidden_states": {TP: Shard(1)}}       # 从上游 SP norm 来的序列分片
+  in_dst:  {"hidden_states": {TP: Replicate()}}     # attention 需要全量序列做 matmul
+  out_src: {TP: Partial()}                          # o_proj Rowwise 天然产生 Partial(sum)
+  out_dst: {TP: Shard(1)}                           # reduce-scatter → SP，给下游 norm
+
+PrecompiledBoundary:
+  in_plan:  [RedistOp("hidden_states", Shard(1)→Replicate, "all_gather")]      ← 1次通信
+  out_plan: [RedistOp("output", Partial()→Shard(1), "reduce_scatter")]         ← 1次通信
+```
+
+#### MLP
+
+```
+已知: params = {gate_proj:COLWISE, up_proj:COLWISE, down_proj:ROWWISE}
+     boundary_type = "mlp"
+
+构造:
+  params:
+    gate_proj.weight → {TP: Shard(0)}
+    up_proj.weight   → {TP: Shard(0)}
+    down_proj.weight → {TP: Shard(1)}
+
+  in_src:  {"hidden_states": {TP: Shard(1)}}       # 从 post_attn_norm 来（SP）
+  in_dst:  {"hidden_states": {TP: Replicate()}}     # gate/up 的 matmul 需要全量
+  out_src: {TP: Partial()}                          # down_proj Rowwise → Partial
+  out_dst: {TP: Shard(1)}                           # reduce-scatter → SP
+
+PrecompiledBoundary:
+  in_plan:  [RedistOp("hidden_states", Shard(1)→Replicate, "all_gather")]
+  out_plan: [RedistOp("output", Partial()→Shard(1), "reduce_scatter")]
+```
+
+#### Norm
+
+```
+已知: params = {weight:NORM}    # RMSNorm / LayerNorm 只有一个 weight
+     boundary_type = "norm"
+
+构造:
+  params:
+    weight → {TP: Replicate()}    # Norm 权重全复制（每个 TP rank 都有完整 [H]）
+
+  in_src:  {"hidden_states": {TP: Shard(1)}}    # 从上游（attn/mlp）SP 输出
+  in_dst:  {"hidden_states": {TP: Shard(1)}}    # identity: RMSNorm 可在分片序列上算
+  out_src: {TP: Shard(1)}                        # 输出保持 SP（逐元素操作不改 placement）
+  out_dst: {TP: Shard(1)}                        # identity
+
+PrecompiledBoundary:
+  in_plan:  []   # in_src == in_dst → identity，零 NCCL 调用
+  out_plan: []   # out_src == out_dst → identity
+
+注意: 虽然 in_src==in_dst 零通信，但声明仍是必要的——它告诉链式传播
+     "我接受 SP 输入，输出 SP"，框架据此校验上下游契约一致。
+```
+
+#### Embedding
+
+```
+已知: params = {weight:EMBED}
+     boundary_type = "embed"
+
+说明: Embedding 的参数分片与 Colwise 相同（Shard(0) 沿词表维度），
+     但输入是 token ids 而非 hidden_states，语义不同。
+
+构造:
+  params:
+    weight → {TP: Shard(0)}    # [V/4, H]，词表沿 dim 0 切
+
+  in_src:  {"input": {TP: Replicate()}}          # token ids 是整数索引，全量
+  in_dst:  {"input": {TP: Replicate()}}          # identity
+  out_src: {TP: Partial()}                       # Rowwise embedding 天然 Partial
+  out_dst: {TP: Shard(1)}                        # reduce-scatter → SP
+
+PrecompiledBoundary:
+  in_plan:  []   # identity
+  out_plan: [RedistOp("output", Partial()→Shard(1), "reduce_scatter")]
+```
+
+#### LM Head
+
+```
+已知: params = {weight:LM_HEAD}
+     boundary_type = "lm_head"
+
+构造:
+  params:
+    weight → {TP: Shard(0)}    # Colwise: [V/4, H]，TP 沿 dim 0 切词表
+
+  in_src:  {"hidden_states": {TP: Shard(1)}}         # 从最后一个 norm 来（SP）
+  in_dst:  {"hidden_states": {TP: Replicate()}}      # all-gather → 全量序列
+  out_src: {TP: Shard(-1)}                           # Colwise 输出沿 vocab 分片
+  out_dst: {TP: Shard(-1) if loss_parallel else Replicate()}
+
+PrecompiledBoundary (loss_parallel=false):
+  in_plan:  [RedistOp("hidden_states", Shard(1)→Replicate, "all_gather")]
+  out_plan: [RedistOp("output", Shard(-1)→Replicate, "all_gather")]
+
+PrecompiledBoundary (loss_parallel=true):
+  in_plan:  [RedistOp("hidden_states", Shard(1)→Replicate, "all_gather")]
+  out_plan: []   # Shard(-1) 直接给 CrossEntropy loss parallel
+```
+
+#### MoE Gate
+
+```
+已知: params = {weight:MOE_GATE, bias:MOE_GATE}
+     boundary_type = "moe_gate"
+
+说明: Gate/Router 权重必须全复制——所有 rank 需要相同的路由决策。
+
+构造:
+  params:
+    weight → {TP: Replicate(), EP: Replicate()}    # 全复制
+    bias   → {TP: Replicate(), EP: Replicate()}
+
+  in_src:  {"hidden_states": {TP: Shard(1), EP: Replicate()}}      # SP + EP 未分片
+  in_dst:  {"hidden_states": {TP: Replicate(), EP: Replicate()}}   # all-gather TP
+  out_src: {TP: Replicate(), EP: Replicate()}                      # 路由 logits 全量
+  out_dst: {TP: Replicate(), EP: Shard(0)}                         # redistribute → EP
+
+PrecompiledBoundary:
+  in_plan:  [RedistOp("hidden_states", {TP:Shard(1)}→{TP:Replicate}, "all_gather")]
+  out_plan: [RedistOp("output", {EP:Replicate}→{EP:Shard(0)}, "redistribute")]
+```
+
+### 3.6.5 Phase 5 详解：链式传播 —— 填充 + 校验
+
+链式传播处理 4 种场景：
+
+| 场景 | 说明 | 链式传播行为 |
+|------|------|-------------|
+| **1. 填充缺省 in_src** | 用户手动注入部分声明的 Spec，in_src 为空 | 自动用上一个模块的 out_dst 填充 |
+| **2. 首个/末个模块** | embedding 无上游（来自 dataloader），lm_head 无下游 | 首个模块 in_src 必须由模板声明；末个模块 out_dst 无下游校验 |
+| **3. 检测模板错误** | 两个模板的 placement 声明不一致 | 编译期报告 mismatch |
+| **4. 自定义模块插入** | 用户在两个标准模块间插入自定义模块 | 自动连接契约，校验上下游一致 |
+
+场景 1（填充）的典型例子：用户手动注入了一个只声明 params 和 out_dst 的模块：
+
+```python
+# 用户只声明了 out_dst，没填 in_src
+plan.modules["model.custom_block"] = ModuleShardingSpec(
+    params={"weight": {TP: Shard(0)}},
+    in_src={},                                    # ← 空的！
+    in_dst={"x": {TP: Replicate()}},
+    out_dst={"output": {TP: Shard(1)}},           # per-arg dict
+)
+
+# 链式传播：遍历上一个模块的 out_dst keys → 当前模块的 in_src
+# 上一个是 "model.layers.0.mlp" → out_dst = {"output": {TP: Shard(1)}}
+# → custom_block.in_src["output"] 自动填充 = {TP: Shard(1)}
+```
+
+场景 3（检测模板错误）的例子：
+
+```python
+# 假设 attention 模板错误地写成了 out_dst=Replicate
+# 但下游 norm 模板声明 in_src=Shard(1)
+# → 链式传播发现: Replicate ≠ Shard(1)
+# → 报告: "placement mismatch: attn.out_dst ≠ norm.in_src"
+# → 编译期捕获，而非运行时追查
+```
+
+**注意**：对于模板齐全的标准模型（90% 场景），链式传播**主要起校验作用**——所有 in_src 已被模板声明，链式传播验证相邻模块的契约自洽。
+
+```python
+def _chain_propagate_and_validate(
+    self, plan: ShardingPlan, model: nn.Module
+) -> ShardingPlan:
+    """链式传播：填充缺省 in_src + 校验相邻模块契约一致性。"""
+    sorted_fqns = self._topological_sort_by_forward_order(
+        list(plan.modules.keys()), model
+    )
+
+    for i in range(len(sorted_fqns) - 1):
+        curr_fqn = sorted_fqns[i]
+        next_fqn = sorted_fqns[i + 1]
+        curr_spec = plan.modules[curr_fqn]
+        next_spec = plan.modules[next_fqn]
+
+        if curr_spec.out_dst is None:
+            continue
+
+        # 遍历 curr_spec.out_dst 的 per-arg keys 填充/校验 next_spec.in_src
+        # （out_dst 现为 dict[str, NamedPlacement]，与 in_src 对称）
+        for arg_name, out_placement in curr_spec.out_dst.items():
+            # 场景1: 下一个模块的 in_src 未声明该 arg → 自动填充
+            if arg_name not in next_spec.in_src or not next_spec.in_src.get(arg_name):
+                if not next_spec.in_src.get(arg_name):
+                    next_spec.in_src[arg_name] = out_placement
+                continue
+
+            # 场景3: 已声明 → 校验一致性
+            next_in = tuple(resolve_placements(
+                next_spec.in_src[arg_name], plan.mesh_dim_names
+            ))
+            curr_out = tuple(resolve_placements(
+                out_placement, plan.mesh_dim_names
+            ))
+
+            if next_in != curr_out:
+                raise PlacementMismatchError(
+                    f"Chain boundary [{curr_fqn} → {next_fqn}]: "
+                    f"out_dst={curr_out} ≠ in_src={next_in}. "
+                    f"ShardingTemplate mismatch or missing communication boundary."
+                )
+
+    return plan
+```
+
+### 3.6.6 Planner 完整入口
+
+```python
+class ShardingPlanner:
+
+    def __init__(self, plan_overrides: dict[str, ModuleShardingSpec] | None = None):
+        self._name_rules = _build_default_rules()
+        self._arch_overrides: dict[str, list] = {}
+        self._templates = TEMPLATES
+        self._special_handlers: dict[str, Callable] = {}
+        # 用户手写 spec：Phase 4.5 合并（§3.6.7），在链式传播之前生效
+        self._plan_overrides = dict(plan_overrides or {})
+
+    def plan(
+        self,
+        model: nn.Module,
+        mesh: DeviceMesh,
+        *,
+        tp_size: int = 1,
+        cp_size: int = 1,
+        ep_size: int = 1,
+        sequence_parallel: bool = True,
+        loss_parallel: bool = False,
+    ) -> ShardingPlan:
+        arch = self._get_architecture(model)
+        mesh_dim_names = self._build_mesh_dim_names(mesh, tp_size, cp_size, ep_size)
+
+        # Phase 1: 参数角色分类
+        param_roles = self._classify_all_params(model, arch)
+
+        # Phase 2: 通信边界分组
+        boundary_groups = self._group_by_boundary(param_roles)
+
+        # Phase 3+4: 语义推断 + 模板填充 I/O
+        plan = ShardingPlan(
+            mesh_dim_names=mesh_dim_names,
+            sequence_parallel=sequence_parallel,
+            loss_parallel=loss_parallel,
+        )
+        inferred_templates: dict[str, ShardingTemplate] = {}
+        for boundary_fqn, group in boundary_groups.items():
+            boundary_type = self._infer_boundary_type(boundary_fqn, group)
+            template = self._templates.get(boundary_type)
+            if template is None:
+                logger.warning("No template for boundary_type=%s at %s", boundary_type, boundary_fqn)
+                continue
+
+            spec = self._build_spec_from_template(
+                boundary_fqn, group, template,
+                sequence_parallel, loss_parallel, mesh_dim_names,
+            )
+            if spec is not None:
+                plan.modules[boundary_fqn] = spec
+                inferred_templates[boundary_fqn] = template
+
+        # Phase 4.5: 用户 plan_overrides 合并（§3.6.7）——须在 Phase 5 之前，
+        # 覆盖 spec 仍参与相邻契约校验与 _is_terminal 标记
+        self._merge_plan_overrides(plan, model, inferred_templates)
+
+        # Phase 5: 链式传播校验
+        plan = self._chain_propagate_and_validate(plan, model)
+
+        # Phase 6: 特殊参数处理
+        plan.special_handlers = self._collect_special_handlers(param_roles)
+
+        return plan
+
+    # ── Planner 内部辅助方法签名 ──
+
+    def _get_architecture(self, model: nn.Module) -> str:
+        """检测模型架构名（如 llama/qwen2/mixtral），用于选择 ARCH_OVERRIDES。
+
+        优先级：``config.architectures[0]`` > ``config.model_type`` > 类名启发式。
+        全部小写化并去 ``ForCausalLM`` / ``ForConditionalGeneration`` 等后缀，
+        得到如 ``"llama"``、``"qwen2"``、``"mixtral"`` 的 canonical 架构名。
+        """
+        cfg = getattr(model, "config", None)
+        arch_str = None
+        # 1. HF config.architectures（如 ["Qwen2ForCausalLM"]）
+        archs = getattr(cfg, "architectures", None)
+        if archs:
+            arch_str = archs[0]
+        # 2. 回退 config.model_type（如 "qwen2"）
+        if not arch_str:
+            arch_str = getattr(cfg, "model_type", None)
+        # 3. 回退类名
+        if not arch_str:
+            arch_str = type(model).__name__
+
+        s = arch_str.lower()
+        for suffix in ("forcausallm", "forconditionalgeneration",
+                       "forsequenceclassification", "forimagetexttotext"):
+            if s.endswith(suffix):
+                s = s[: -len(suffix)]
+        return s
+
+    def _build_mesh_dim_names(
+        self, mesh: DeviceMesh, tp_size: int, cp_size: int, ep_size: int,
+    ) -> tuple[str, ...]:
+        """从 mesh 和并行规模构建实际启用的 mesh_dim_names 元组。
+
+        以 ``mesh.mesh_dim_names`` 为权威顺序，过滤出 DTensor 管理的轴
+        （tp/cp/ep）。DP/PP 轴不在 DTensor 管理范围（由 FSDP2/PP runtime 管），
+        故不纳入。若 mesh 未声明 mesh_dim_names，则按 (tp, cp, ep) 顺序补全。
+        """
+        mesh_names = tuple(getattr(mesh, "mesh_dim_names", ()) or ())
+        dtensor_axes = ("tp", "cp", "ep")
+        active = {ax for ax, sz in (("tp", tp_size), ("cp", cp_size), ("ep", ep_size))
+                  if sz and sz > 1}
+        if mesh_names:
+            return tuple(n for n in mesh_names if n in dtensor_axes and n in active)
+        # 回退：按固定顺序输出启用的轴
+        return tuple(ax for ax in dtensor_axes if ax in active)
+
+    def _classify_all_params(
+        self, model: nn.Module, arch: str,
+    ) -> dict[str, ParamRole]:
+        """Phase 1：遍历所有命名参数，按命名规则 + 架构覆盖分类为 ParamRole。
+
+        规则来源（优先级递减）：
+          1. ``ARCH_OVERRIDES[arch]`` —— 显式 (fqn 模式, ParamRole) 覆盖；
+          2. ``self._name_rules`` —— ``_build_default_rules()`` 返回的默认后缀规则
+             （``list[tuple[list[str], ParamRole]]``，按顺序首匹配）；
+          3. 命中不到 → ``ParamRole.SKIP``（不分片，原样保留）。
+
+        注意：``ln`` 子串规则易误伤 ``linear``/``kernel``，默认规则用更精确的
+        ``norm``/``layernorm``/``rmsnorm``/``ln_`` 前缀匹配（见 §3.6.4）。
+        """
+        roles: dict[str, ParamRole] = {}
+        overrides = self._arch_overrides.get(arch, [])
+        for name, _ in model.named_parameters():
+            role: ParamRole | None = None
+            # 1. 架构显式覆盖（精确 FQN 或 fnmatch 模式）
+            for pattern, forced_role in overrides:
+                if _match_any(name.lower(), [pattern.lower()] if isinstance(pattern, str)
+                              else [p.lower() for p in pattern]):
+                    role = forced_role
+                    break
+            # 2. 默认命名规则（首匹配）
+            if role is None:
+                name_lower = name.lower()
+                for patterns, default_role in self._name_rules:
+                    if _match_any(name_lower, patterns):
+                        role = default_role
+                        break
+            # 3. 兜底
+            roles[name] = role if role is not None else ParamRole.SKIP
+        return roles
+
+    def _group_by_boundary(
+        self, param_roles: dict[str, ParamRole],
+    ) -> dict[str, list[tuple[str, ParamRole]]]:
+        """Phase 2：按通信边界父模块聚合参数。
+
+        一个"边界"= 一组在 forward 中连续、I/O 可链式传播的参数所属模块的
+        最近公共父模块。聚合策略：
+          - 对每个参数 FQN（如 ``layers.0.self_attn.q_proj.weight``），
+            自顶向下取其归属的边界模块 FQN（如 ``layers.0.self_attn``）；
+          - 边界模块由 ``_infer_boundary_type`` 能命中模板决定；若参数直属
+            模块（去掉 leaf 参数名后的模块 FQN）能推断出 boundary_type，
+            则该模块即边界；否则向上回溯到最近的命中祖先。
+          - ``SKIP`` 参数仍归入其所在边界（不单独成组），以保证边界完整性。
+        """
+        groups: dict[str, list[tuple[str, ParamRole]]] = {}
+        # 预计算：所有"能命中模板"的模块 FQN 集合（边界候选）
+        # 用一个简易实现：按参数 FQN 去掉最后一段（leaf param）得到模块 FQN，
+        # 再逐级回溯找最近的非 "unknown" boundary_type。
+        for fqn, role in param_roles.items():
+            module_fqn = ".".join(fqn.split(".")[:-1])  # 去掉 leaf 参数名
+            boundary_fqn = module_fqn
+            candidate = module_fqn
+            while candidate:
+                # 单参数的临时 group 仅用于类型推断
+                bt = self._infer_boundary_type(candidate, [(fqn, role)])
+                if bt != "unknown":
+                    boundary_fqn = candidate
+                    break
+                parent = candidate.rsplit(".", 1)[0] if "." in candidate else ""
+                candidate = parent
+            groups.setdefault(boundary_fqn, []).append((fqn, role))
+        return groups
+
+    def _topological_sort_by_forward_order(
+        self, fqns: list[str], model: nn.Module,
+    ) -> list[str]:
+        """按 forward 执行顺序（= 子模块注册顺序）排序 FQN 列表。
+
+        遍历 ``model.modules()``（PyTorch 保证返回顺序为注册/forward 调用顺序），
+        过滤出在 ``fqns`` 中的条目。未命中的 FQN 追加到末尾（保守处理，
+        并 ``logger.warning`` 提示，便于发现注册顺序与 forward 不一致的模型）。
+        ModuleList / 手动注册 / skip-connection 均按注册顺序处理；若模型在
+        forward 中乱序调用子模块，需通过 ``ARCH_OVERRIDES`` 显式声明。
+        """
+        fqn_set = set(fqns)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for name, _module in model.named_modules():
+            if name in fqn_set and name not in seen:
+                ordered.append(name)
+                seen.add(name)
+        # 未命中（注册名与传入 FQN 不一致）—— 追加并告警
+        missing = fqn_set - seen
+        if missing:
+            logger.warning(
+                "_topological_sort_by_forward_order: %d FQN 未在 named_modules "
+                "中命中，追加到末尾: %s", len(missing), sorted(missing)[:5],
+            )
+            ordered.extend(sorted(missing))
+        return ordered
+
+    def _collect_special_handlers(
+        self, param_roles: dict[str, ParamRole],
+    ) -> dict[str, str]:
+        """Phase 6：收集所有 SPECIAL 角色参数，映射到 handler 名。
+
+        映射规则：若参数名命中某 SpecialHandler 注册的模式（如 ``gated_delta``
+        → ``"gated_delta_tp_shard"``），则用该 handler；否则默认 ``"default"``。
+        返回的 ``{fqn: handler_name}`` 供 ShardingApplier Phase B 查表调用。
+        """
+        result: dict[str, str] = {}
+        for fqn, role in param_roles.items():
+            if role != ParamRole.SPECIAL:
+                continue
+            handler_name = "default"
+            for pattern, hname in self._special_handlers.items():
+                if _match_any(fqn.lower(), [pattern.lower()]):
+                    handler_name = hname
+                    break
+            result[fqn] = handler_name
+        return result
+```
+
+#### 链式传播的局限性：reshape / reduce 边界
+
+链式传播假设相邻模块的 **tensor 维度索引与逻辑轴的对应关系一致**。
+当模块间存在更改 tensor shape 的操作时，`Shard(N)` 可能指向不同的逻辑维度：
+
+```
+模块 A 输出: [B, S/tp, H], out_dst={TP: Shard(1)}   ← Shard(1) = 沿 S 切
+    ↓ reshape: [B, S, H] → [B, H, S]
+模块 B 输入: [B, H, S/tp], in_src={TP: Shard(1)}    ← Shard(1) = 沿 H 切！
+
+链式传播校验: Shard(1) == Shard(1) → "通过" ✅
+实际语义:  沿 S 切 ≠ 沿 H 切 → 逻辑错误 ❌
+```
+
+**这不是链式传播的问题，而是 `Shard(N)` 本身无法表达逻辑轴的固有限制。**
+`Shard(N)` 只关心 tensor 的第 N 维，不关心这一维代表什么。
+
+**处理方式**：
+
+| 场景 | 处理 |
+|------|------|
+| **标准 Transformer**（embed → layers → norm → lm_head） | activation 始终 `[B, S, H]`，Shard(1) 始终是序列维。链式传播完全有效。 |
+| **reshape 边界**（如 ViT 的 patch embedding、Qwen VL 的 mRoPE 3D→2D） | 用户必须**显式声明** reshape 后模块的 `in_src`，不依赖链式传播自动填充。 |
+| **reduce 边界**（如从 `[B, S, H]` pool 到 `[B, H]`） | `Shard(1)` 从序列维变为隐藏维，用户必须显式声明新的 `in_src`。 |
+
+**实践中**：链式传播对 95% 的 decoder 层间传播是正确且有用的（校验模板声明一致性）。
+在 reshape/reduce 边界处，用户通过显式声明 `in_src` 来覆盖自动填充。
+链式传播并非"没有必要"——它把运行时追查到 placement 不匹配的 bug 提前到编译期捕获。
+
+### 3.6.7 Phase 4.5：用户 `plan_overrides` 合并（手写 spec 的一等注入路径）
+
+> 对应 §8.5 方式 D。实现：`ShardingPlanner._merge_plan_overrides`；
+> UT：`test_s1_plan_overrides.py` + `test_dist_s5_plan_overrides.py`。
+
+**动机**：§8.4 方式 C 要求用户绕开 planner 手工构建整个 `ShardingPlan`，或
+`plan()` 返回后再打补丁——前者丢失模板推导，后者丢失 Phase 5 的链式契约校验
+与 `_is_terminal` 标记（补丁 spec 与上下游契约不一致时要等运行时 RedistOp
+执行才暴露）。`plan_overrides` 把手写 spec 的合并提前到 **Phase 5 之前**，
+使覆盖 spec 与推导 spec 走完全相同的校验路径：
+
+```python
+planner = ShardingPlanner(plan_overrides={
+    "model.layers.0.self_attn": ModuleShardingSpec(
+        params={
+            "wq.weight": {TP: Shard(0)}, "wk.weight": {TP: Shard(0)},
+            "wv.weight": {TP: Shard(0)}, "wo.weight": {TP: Shard(1)},
+        },
+        # 多输入模块：契约 key 直接写真实签名参数名（forward(self, attn_bias, x)）
+        in_src={"x": {TP: Shard(1)}},
+        in_dst={"x": {TP: Replicate()}},
+        out_src={TP: Partial()},        # 标量简写，合并时自动归一化为 {"output": ...}
+        out_dst={TP: Shard(1)},
+    ),
+})
+plan = planner.plan(model, mesh, tp_size=2)
+```
+
+**合并语义**（`_merge_plan_overrides`，在 Phase 3+4 循环之后、Phase 5 之前执行）：
+
+| 规则 | 行为 |
+|------|------|
+| fqn 命中 planner 已生成的 spec | **整体替换**（用户 spec 为权威），记录日志 |
+| fqn 未命中（漏识别/无模板/无参数容器） | **插入**，照常参与拓扑排序与链式传播 |
+| 结构标记 `_use_local_map` / `_needs_cp_attn` | 从该 fqn 推断出的模板**补齐**：模板为 True 则强制置位。这两个标记是模块结构属性（MoE all-to-all、CP K/V all-gather），缺失会导致**数值错误但不报错**，因此不允许借覆盖关闭 |
+| `out_src`/`out_dst` 标量简写 | 合并时调用 `_normalize_out_fields` 归一化 |
+| `_is_terminal` | 一律由 Phase 5 统一标记，用户预设值被覆盖 |
+| 对象隔离 | **深拷贝**用户 spec——chain 传播会就地改 `in_src`，plan() 可重复调用，不污染调用方持有的对象 |
+| fqn 未命中 `named_modules`（拼写错误） | **fail-fast `ValueError`**（显式输入不容忍静默丢弃） |
+| 值非 `ModuleShardingSpec` | `TypeError` |
+
+**关键性质**：覆盖 spec 与上下游的契约冲突在 `plan()` 内即抛
+`PlacementMismatchError`（与推导 spec 相同的校验时机）；CP>1 时被覆盖的
+attention 模块无需手写 `_needs_cp_attn=True`——模板补齐保证 D-01'' 的
+CP wrapper 注入不遗漏。
+
+**与方式 B/C 的分工**：命名非标准 → 方式 B（`ARCH_OVERRIDES`）；整模型绕开
+planner → 方式 C（§8.4）；**个别模块**的契约/参数分片需要定制（多输入契约
+key、特殊通信、reshape 边界的显式 `in_src`）→ 方式 D（本节）。
+
+---
+
+
+
+---
+
+## 4. ShardingApplier: Apply Sharding at Runtime
+
+> Call site: apply_sharding_plan() runtime application -- param sharding + PrecompiledBoundary + forward wrapping
+
+### 4.1 核心入口
+
+```python
+# components/distributed/sharding_applier.py
+
+def apply_sharding_plan(
+    model: nn.Module | list[nn.Module],
+    plan: ShardingPlan,
+    mesh: DeviceMesh,
+    *,
+    validate_mode: bool = False,
+) -> tuple[nn.Module | list[nn.Module], dict | None]:
+    """对任意 nn.Module（或 PP 多 part 列表）应用 ShardingPlan，启用双模式 DTensor。
+
+    返回 (model, tp_grad_info)：
+    - production 模式下，Phase C 入口调用一次 `_local_params_context` 把 DTensor 参数
+      永久解包为 plain local tensor，并构造 tp_grad_info 供 fully_shard 使用；
+    - validate 模式下不解包（参数保持 DTensor），tp_grad_info 为 None。
+
+    `mesh` 为包含 TP 维度的 DeviceMesh；`build_tp_grad_info` 取其 TP 子 mesh。
+    """
+    mesh_dim_names = plan.mesh_dim_names
+    tp_mesh = _get_tp_submesh(mesh, mesh_dim_names)
+    models = model if isinstance(model, list) else [model]
+
+    # ====== Phase 0: 归一化 out_src/out_dst 标量简写为 dict 契约 ======
+    # 覆盖用户注入路径（§8.4 方式 C 手动声明的 spec 可能用标量简写），
+    # 避免 _compile_output_plan 遇到标量 NamedPlacement 时 AttributeError。
+    # _build_spec_from_template 已在 planner 内部调用过一次，此处对全部 spec
+    #（含用户注入）做幂等归一化，保证下游统一 dict 契约。
+    for spec in plan.modules.values():
+        _normalize_out_fields(spec)
+
+    # ====== Phase A: 参数分片 ======
+    for part in models:
+        for module_fqn, spec in plan.modules.items():
+            module = _resolve_module(part, module_fqn)
+            _shard_module_params(module, spec.params, mesh, mesh_dim_names)
+
+    # ====== Phase B: 特殊处理器 ======
+    for part in models:
+        for param_ref, handler_name in plan.special_handlers.items():
+            handler = SPECIAL_HANDLERS[handler_name]
+            module_fqn, param_name = param_ref.rsplit(".", 1)
+            handler(_resolve_module(part, module_fqn), param_name, mesh)
+
+    # ====== Phase C 入口: build 期一次性解包（接上 _local_params_context 调用链） ======
+    # production 下一次性把 DTensor[TP] 参数替换为 _local_tensor（plain），在 fully_shard 之前。
+    # validate 下不解包，参数保持 DTensor 以走 __torch_dispatch__ 校验。
+    tp_grad_info = None
+    if not validate_mode:
+        tp_grad_records: dict = {}
+        for part in models:
+            tp_grad_records.update(_local_params_context(part))
+        if tp_grad_records and tp_mesh is not None:
+            tp_grad_info = build_tp_grad_info(plan, tp_mesh)
+
+    # ====== Phase C: 包装 forward（CP/MoE/validate/production 四分支，见 §4.4.2） ======
+    for part in models:
+        _apply_phase_c(part, plan, mesh, validate_mode)
+
+    # ====== Phase D: tied weights ======
+    for part in models:
+        _replicate_tied_weights(part, mesh)
+
+    return model, tp_grad_info
+
+
+def _get_tp_submesh(mesh: DeviceMesh, mesh_dim_names: tuple[str, ...]) -> DeviceMesh | None:
+    """从 mesh 中提取 TP 子 mesh（"tp" 维存在时），用于 build_tp_grad_info。"""
+    if "tp" not in mesh_dim_names:
+        return None
+    return mesh["tp"]  # DeviceMesh 支持按维度名取子 mesh
+
+
+def _get_cp_submesh(mesh: DeviceMesh, mesh_dim_names: tuple[str, ...]) -> DeviceMesh | None:
+    """从 mesh 中提取 CP 子 mesh（"cp" 维存在时），用于 _wrap_cp_inner_attention。"""
+    if "cp" not in mesh_dim_names:
+        return None
+    return mesh["cp"]
+```
+
+### 4.2 Phase A: 参数分片
+
+> **对应时序**: ④.3.5.8 Phase A — `distribute_tensor()` → DTensor
+
+```python
+def _shard_module_params(
+    module: nn.Module,
+    param_specs: dict[str, NamedPlacement],
+    mesh: DeviceMesh,
+    mesh_dim_names: tuple[str, ...],
+) -> None:
+    """distribute_tensor() 转换参数为 DTensor。
+
+    - meta tensor → DTensor: DTensor._local_tensor 仍为 meta（零显存）
+      → 等待后续 to_empty() 材质化 + 权重加载填充
+    - real tensor → DTensor: 物理切分，每个 rank 持有 local shard
+    """
+    for param_path, named in param_specs.items():
+        param = _get_attr_by_path(module, param_path)
+        placements = resolve_placements(named, mesh_dim_names)
+
+        if isinstance(param, DTensor):
+            if tuple(param.placements) != tuple(placements):
+                raise PlacementMismatchError(...)
+            continue
+
+        src = param.data if hasattr(param, 'data') else param
+        dt = distribute_tensor(src, mesh, placements)
+        requires_grad = getattr(param, 'requires_grad', True)
+        _set_param_by_path(module, param_path,
+                           nn.Parameter(dt, requires_grad=requires_grad))
+```
+
+
+---
+
+### 4.3 Phase B: PrecompiledBoundary
+
+#### 4.3.1 RedistOp：单个通信操作
+
+```python
+@dataclass
+class RedistOp:
+    """一个预编译的 redistribute 操作。
+
+    collective_type 的用途：
+    - "identity": 跳过通信（零开销）
+    - "all_gather" / "reduce_scatter" / "all_reduce" / "redistribute":
+      调试 + profiling 用途；实际通信统一走 DTensor.redistribute()
+    """
+    arg_name: str
+    arg_index: int | None
+    mesh: DeviceMesh
+    src_placements: tuple[Placement, ...]
+    dst_placements: tuple[Placement, ...]
+    collective_type: str  # 调试标签，非通信路径选择
+
+    def execute(self, tensor: torch.Tensor, *,
+                as_dtensor: bool = False) -> torch.Tensor:
+        """执行通信。
+
+        所有非 identity 路径统一走 DTensor.redistribute()。
+        DTensor 内部根据 (src, dst) placement 自动选择最优 NCCL collective。
+
+        Args:
+            tensor: 输入 local tensor
+            as_dtensor: True → 返回 DTensor（校验模式），False → 返回 local tensor
+        """
+        if self.collective_type == "identity":
+            if as_dtensor and not isinstance(tensor, DTensor):
+                return DTensor.from_local(
+                    tensor, self.mesh, list(self.src_placements), run_check=False
+                )
+            return tensor
+
+        # 统一路径：零拷贝包装 → redistribute → 可选 to_local
+        if isinstance(tensor, DTensor):
+            dt = tensor
+        else:
+            dt = DTensor.from_local(
+                tensor, self.mesh, list(self.src_placements), run_check=False
+            )
+        dt = dt.redistribute(
+            placements=list(self.dst_placements), async_op=False
+        )
+        return dt if as_dtensor else dt.to_local()
+
+
+def _get_arg(args, kwargs, name, idx, default=None):
+    if name in kwargs: return kwargs[name]
+    if idx is not None and idx < len(args): return args[idx]
+    return default
+
+def _set_arg(args, kwargs, name, idx, value):
+    if name in kwargs: kwargs[name] = value; return args, kwargs
+    if idx is not None and idx < len(args):
+        args = list(args); args[idx] = value; return tuple(args), kwargs
+    kwargs[name] = value; return args, kwargs
+```
+
+#### 4.3.2 Why use unified `DTensor.redistribute()` instead of explicit collectives?
+
+**结论：统一走 `redistribute()` 是最优选择。** 原因：
+
+1. **PyTorch 内部已做最优选择**：`DTensor.redistribute()` 根据 `(src_placements, dst_placements)` 自动分派到正确的 NCCL collective（`Shard→Replicate` 走 all-gather，`Partial→Shard` 走 reduce-scatter 等），不需要手动判断。
+
+2. **显式 collective 无性能收益**：`DTensor.from_local(run_check=False)` 和 `to_local()` 都是零拷贝（寄存器级操作），redistribute 内部直接调用 NCCL kernel，无额外 host 开销。
+
+3. **`collective_type` 字段的真实用途**：
+
+```python
+# 用途 1: 调试日志
+for op in boundary.in_plan:
+    if op.collective_type != "identity":
+        logger.debug(
+            "[%s] %s: %s → %s (%s)",
+            module_name, op.arg_name,
+            op.src_placements, op.dst_placements, op.collective_type,
+        )
+
+# 用途 2: Profiling
+with torch.profiler.record_function(f"boundary_{op.collective_type}"):
+    result = op.execute(tensor)
+
+# 用途 3: 未来平台特定优化（如 NPU 的 fused all-gather+matmul 指令）
+if op.collective_type == "all_gather" and _platform_has_fused_ag_matmul():
+    return _fused_all_gather_matmul(tensor, ...)
+# 当前统一走 DTensor.redistribute()
+```
+
+#### 4.3.3 PrecompiledBoundary Compilation Logic
+
+```python
+class PrecompiledBoundary:
+
+    def __init__(self, spec: ModuleShardingSpec, mesh: DeviceMesh,
+                 mesh_dim_names: tuple[str, ...]):
+        self.in_plan = self._compile_input_plan(spec, mesh, mesh_dim_names)
+        self.out_plan = self._compile_output_plan(spec, mesh, mesh_dim_names)
+
+    def _compile_input_plan(self, spec, mesh, mesh_dim_names) -> list[RedistOp]:
+        """从 in_src → in_dst 编译输入通信计划。"""
+        plan = []
+        all_names = set(spec.in_src.keys()) | set(spec.in_dst.keys())
+
+        for name in all_names:
+            src_named = spec.in_src.get(name, {})
+            dst_named = spec.in_dst.get(name, {})
+
+            src_p = tuple(resolve_placements(src_named, mesh_dim_names))
+            dst_p = tuple(resolve_placements(dst_named, mesh_dim_names))
+
+            plan.append(RedistOp(
+                arg_name=name,
+                arg_index=None,
+                mesh=mesh,
+                src_placements=src_p,
+                dst_placements=dst_p,
+                collective_type=_classify_collective(src_p, dst_p),
+            ))
+        return plan
+
+    def _compile_output_plan(self, spec, mesh, mesh_dim_names) -> list[RedistOp]:
+        """从 out_src → out_dst 编译输出通信计划（per-arg dict，支持多输出模块）。
+
+        out_src/out_dst 均为 dict[str, NamedPlacement]，按 key 逐个编译。
+        如果 out_src 为 None，则不编译（输出不需要通信，或者模块输出不是 DTensor）。
+        如果 out_dst 为 None，则不编译（identity 路径）。
+
+        多输出（模块返回 tuple）映射：RedistOp.arg_index 记录该输出在 tuple 中的
+        位置。位置来源优先级：(1) spec.out_names（显式声明的输出名顺序）；
+        (2) 否则按 out_src 的 key 顺序作为 tuple 索引。单输出模块 arg_index=0。
+        """
+        if spec.out_src is None or spec.out_dst is None:
+            return []
+
+        out_names = getattr(spec, "out_names", None) or list(spec.out_src.keys())
+        name_to_idx = {name: i for i, name in enumerate(out_names)}
+
+        plan = []
+        all_names = set(spec.out_src.keys()) | set(spec.out_dst.keys())
+        for name in all_names:
+            src_named = spec.out_src.get(name, {})
+            dst_named = spec.out_dst.get(name, {})
+            src_p = tuple(resolve_placements(src_named, mesh_dim_names))
+            dst_p = tuple(resolve_placements(dst_named, mesh_dim_names))
+            if src_p == dst_p:
+                continue  # identity，不需要通信
+            plan.append(RedistOp(
+                arg_name=name,
+                arg_index=name_to_idx.get(name, 0),
+                mesh=mesh,
+                src_placements=src_p,
+                dst_placements=dst_p,
+                collective_type=_classify_collective(src_p, dst_p),
+            ))
+        return plan
+
+    def redistribute_inputs(self, args, kwargs, *, as_dtensor=False):
+        """执行输入重分布。as_dtensor=True → 返回 DTensor（校验模式）。"""
+        for op in self.in_plan:
+            arg = _get_arg(args, kwargs, op.arg_name, op.arg_index, default=None)
+            result = op.execute(arg, as_dtensor=as_dtensor)
+            args, kwargs = _set_arg(args, kwargs, op.arg_name, op.arg_index, result)
+        return args, kwargs
+
+    def redistribute_outputs(self, outputs, *, as_dtensor_input=False):
+        """执行输出重分布。支持单输出（Tensor）与多输出（tuple/list[Tensor]）。
+
+        as_dtensor_input=True → 输入已是 DTensor（校验模式）。
+        多输出按 op.arg_index（来自 spec.out_names 或 out_src key 顺序）索引
+        outputs tuple，逐个执行 redistribute；返回与输入同构（单值或 tuple）。
+        """
+        is_tuple = isinstance(outputs, (tuple, list))
+        outputs_list = list(outputs) if is_tuple else [outputs]
+        for op in self.out_plan:
+            idx = op.arg_index if op.arg_index is not None else 0
+            if idx >= len(outputs_list):
+                # 模块未返回该命名输出（如 present_kv 在推理时省略）。
+                logger.warning(
+                    "PrecompiledBoundary: out_plan expects output '%s' at index %d, "
+                    "but module returned only %d outputs. Skipping redistribution for this output.",
+                    op.arg_name, idx, len(outputs_list)
+                )
+                continue
+            tensor = outputs_list[idx]
+            if not as_dtensor_input and not isinstance(tensor, DTensor):
+                tensor = DTensor.from_local(
+                    tensor, op.mesh, list(op.src_placements), run_check=False
+                )
+            outputs_list[idx] = op.execute(tensor, as_dtensor=False)  # 输出始终 local
+        return tuple(outputs_list) if is_tuple else outputs_list[0]
+
+
+def resolve_placements(
+    named: dict[str, Placement],
+    mesh_dim_names: tuple[str, ...],
+) -> list[Placement]:
+    """Arrange placements in mesh_dim_names order, fill missing axes with Replicate()."""
+    return [named.get(axis, Replicate()) for axis in mesh_dim_names]
+
+
+def _classify_collective(src, dst) -> str:
+    """从 placement 推导通信类型（调试/profiling 用途）。"""
+    if src == dst:
+        return "identity"
+
+    has_shard_src = any(isinstance(p, Shard) for p in src)
+    has_partial_src = any(isinstance(p, Partial) for p in src)
+    has_shard_dst = any(isinstance(p, Shard) for p in dst)
+    all_replicate_dst = all(
+        isinstance(p, Replicate) or not isinstance(p, (Shard, Partial)) for p in dst
+    )
+
+    if has_partial_src and has_shard_dst:
+        return "reduce_scatter"
+    if has_partial_src and all_replicate_dst:
+        return "all_reduce"
+    if has_shard_src and all_replicate_dst:
+        return "all_gather"
+    return "redistribute"
+```
+
+#### 4.3.4 Compile-time vs Runtime Comparison
+
+```python
+# ── 当前（dmodule.Module 运行时模式）：每次 forward 都有判断开销 ──
+def forward_with_redistribution(*args, **kwargs):
+    args, kwargs = self._redistribute_inputs(tp_mesh, mesh_axis_names, sc, args, kwargs)
+    # ↑ 内部：
+    #   for name, value in new_kwargs.items():
+    #       if not platform.is_tensor(value): continue         ← 条件判断
+    #       if src_named is None and dst_named is None: continue ← 条件判断
+    #       if not isinstance(value, DTensor):                  ← 条件判断
+    #           resolve_placements()                             ← 每次解析
+    #       if placement differs: redistribute()                 ← 条件通信
+    outputs = fn(*args, **kwargs)
+    return self._redistribute_outputs(...)
+
+# ── 新方案：PrecompiledBoundary 在 plan 阶段构建好，运行时零判断 ──
+def production_forward(*args, **kwargs):
+    args, kwargs = self._boundary.redistribute_inputs(args, kwargs)
+    # ↑ for op in self.in_plan: op.execute(value)  ← 直接执行，零判断
+    outputs = original_forward(*args, **kwargs)
+    return self._boundary.redistribute_outputs(outputs)
+```
+
+---
+
+
+
+### 4.4 Phase C: Forward Wrapping: 生产模式 forward 包装
+
+> **对应时序**: ④.3.5.8 Phase C — `_wrap_forward()`
+
+```python
+# components/distributed/sharding/apply.py
+def _local_params_context(model: nn.Module) -> dict[str, tuple[Placement, ...]]:
+    """build 期一次性解包：把 DTensor[TP] 参数替换为 _local_tensor（plain）。
+    在 apply_sharding_plan 的 Phase C 入口、fully_shard 之前调用，永久解包不恢复。
+
+    返回 {fqn: placements} 是解包前的 placement 快照（仅用于诊断/调试）。
+    注意 tp_grad_info 的 canonical 数据来源是 ShardingPlan（`build_tp_grad_info(plan, tp_mesh)`），
+    而非此返回值——production 模式下 plan 仍保留完整 placement 信息。"""
+    tp_grad_records = {}
+    for name, param in list(model.named_parameters()):
+        if isinstance(param, DTensor):
+            tp_grad_records[name] = param.placements
+            # 路径式赋值：name 是点分 FQN（如 layers.0.self_attn.q_proj.weight），
+            # object.__setattr__(model, name, ...) 只会在 model 上设一个怪属性，
+            # 不会替换子模块参数。必须沿路径定位到真正的父模块再赋值。
+            _set_param_by_path(model, name, nn.Parameter(
+                param._local_tensor, requires_grad=param.requires_grad))
+    return tp_grad_records
+
+
+def _set_param_by_path(model: nn.Module, fqn: str, new_param: nn.Parameter) -> None:
+    """沿点分 FQN 定位父模块并替换 leaf 参数。"""
+    *path, leaf = fqn.split(".")
+    obj = model
+    for p in path:
+        obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+    if hasattr(obj, "register_parameter"):
+        obj.register_parameter(leaf, new_param)
+    else:
+        object.__setattr__(obj, leaf, new_param)
+
+
+def _get_attr_by_path(model, fqn):
+    """与 _set_param_by_path 对称的路径式取属性。"""
+    obj = model
+    for p in fqn.split("."):
+        obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+    return obj
+
+
+def _resolve_module(model, fqn):
+    """按 FQN 取模块（不剥离末段，调用点传模块 FQN）。
+
+    与 _get_attr_by_path 同语义——所有调用点（Phase A/B/C）传入的 fqn 均为
+    模块完全限定名（如 `model.layers.0.self_attn`），而非参数 FQN，故不做
+    `*path, _ =` 末段剥离。若剥离会错误返回父模块（decoder layer），导致
+    后续 _shard_module_params 立即 AttributeError。
+    """
+    obj = model
+    for p in fqn.split("."):
+        obj = obj[int(p)] if p.isdigit() else getattr(obj, p)
+    return obj
+
+
+def _is_sdpa_attention(module) -> bool:
+    # HF PretrainedConfig 是对象（非 dict），attn_implementation 存于
+    # `config._attn_implementation` 属性；NeMo/Megatron config 可能是 dict。
+    # 类名用子串匹配：LlamaSdpaAttention / Qwen2SdpaAttention 等均含 "SdpaAttention"。
+    cfg = getattr(module, "config", None)
+    impl = getattr(cfg, "_attn_implementation", None)
+    if impl is None and isinstance(cfg, dict):
+        impl = cfg.get("attn_implementation")
+    cls_name = type(module).__name__
+    return (impl == "sdpa") or ("SdpaAttention" in cls_name)
+
+
+def _is_flex_attention(module) -> bool:
+    cfg = getattr(module, "config", None)
+    impl = getattr(cfg, "_attn_implementation", None)
+    if impl is None and isinstance(cfg, dict):
+        impl = cfg.get("attn_implementation")
+    cls_name = type(module).__name__
+    return (impl == "flex_attention") or ("FlexAttention" in cls_name)
+
+
+def _is_hf_style_attention(module) -> bool:
+    """判定是否 HF 标准注意力（forward(hidden_states,...)，Q/K/V 投影在 forward 内）。
+
+    HF 的 LlamaSdpaAttention / Qwen2SdpaAttention / LlamaAttention 等把 q/k/v
+    投影、RoPE、SDPA/FlexAttention 调用全部封在 forward 内，forward 首参为
+    `hidden_states`（而非预切分的 q/k/v）。这类模块需走「原语拦截」wrapper
+    （§4.4.2 `_wrap_hf_attention_for_cp`），不能复用 NeMo/Megatron 的 (q,k,v) wrapper。
+
+    NeMo/Megatron 的 inner_attention 子模块 forward 取 (q,k,v,...)，且通常不直接
+    持有 q_proj/k_proj/v_proj（投影在外层 attention 完成），走 (q,k,v) wrapper。
+    """
+    # 直接持有 q_proj/k_proj/v_proj → 投影在 forward 内 → HF 风格
+    has_proj = (hasattr(module, "q_proj") and hasattr(module, "k_proj")
+                and hasattr(module, "v_proj"))
+    if not has_proj:
+        return False
+    # forward 首参为 hidden_states（HF 约定）
+    try:
+        import inspect
+        sig = inspect.signature(module.forward)
+        first_param = next(iter(sig.parameters.values()), None)
+        return first_param is not None and first_param.name == "hidden_states"
+    except (ValueError, TypeError):
+        # 签名不可内省（C 扩展/已包装）→ 退化为类名判定
+        cls_name = type(module).__name__
+        return cls_name.endswith("Attention")
+
+
+def detect_tied_weights(model) -> list[tuple[str, str]]:
+    """检测模型中的 tied-weight 对（共享存储的参数）。
+
+    返回 [(fqn_a, fqn_b)]，典型场景：embed_tokens.weight <-> lm_head.weight。
+    优先从模型自身的 weight tying 配置读取（HF `tie_word_embeddings`），
+    退化为按 shape+dtype 一致性扫描同名参数对。
+
+    命名统一：§6.7.1 `build_tp_grad_info` 的 tied_pairs 来源即本函数
+    （或 `plan.tied_pairs`，二者择一），避免 _detect_tied_weights 与
+    detect_tied_weights 双命名竞争。
+
+    PP constraint: 当启用 Pipeline Parallel 时，embed_tokens 和 lm_head
+    通常位于不同的 PP stage（part）。此时 detect_tied_weights 在每个 part
+    上独立调用，无法检测跨 stage 的 tied 对。对于 PP 场景，tied_pairs
+    应由用户在 ShardingPlan 中显式声明（plan.tied_pairs），而非依赖
+    detect_tied_weights 自动检测。
+    """
+    tied = []
+    # HF 标准：model.tie_word_embeddings 时 embed_tokens 与 lm_head 共享
+    if getattr(getattr(model, "config", None), "tie_word_embeddings", False):
+        embed_fqn = _find_param_fqn(model, "embed_tokens.weight")
+        lm_head_fqn = _find_param_fqn(model, "lm_head.weight")
+        if embed_fqn and lm_head_fqn:
+            tied.append((embed_fqn, lm_head_fqn))
+    # TODO(hyper-parallel#<issue>): 扩展按 shape+dtype 扫描其他 tying 模式
+    # （如 ALBERT 共享层）。当前仅处理 embed_tokens <-> lm_head 的标准 HF tying，
+    # ALBERT 的跨层参数共享需要遍历所有参数对检测 data_ptr 相同但 FQN 不同的情况。
+    return tied
+
+
+def _find_param_fqn(model, suffix: str) -> str | None:
+    """按参数名后缀查 FQN（占位实现，仅返回首个匹配）。
+
+    TODO(hyper-parallel#<issue>): 替换为基于 model 结构语义的精确查找：
+    - 不应仅依赖后缀匹配（多个模块可能有同名后缀）；
+    - 应利用 HF config / model 结构感知（如 embedding 层在 model.embed_tokens）。
+    """
+    for name, _ in model.named_parameters():
+        if name.endswith(suffix):
+            return name
+    return None
+
+
+def _broadcast_tied_param(model, tied_pair: tuple[str, str], mesh: DeviceMesh) -> None:
+    """tied-weight 对本 rank 内共享存储（A 端存储为准，B 端共享）。
+
+    实现校准（§12.4.3）：**不做跨 rank 广播**。tied 对（embed/lm_head）同为
+    Shard(0) 分片，各 rank 的 local shard 承载不同 vocab 区间——把 rank0 的
+    shard 广播给 rank1 会破坏 rank1 的分片。tied 语义要求同一 rank 内两端
+    共享物理存储（梯度共享）；分片天然一致（同一 global 来源、同一 placement）。
+    """
+    fqn_a, fqn_b = tied_pair
+    param_a = _get_attr_by_path(model, fqn_a)
+    param_b = _get_attr_by_path(model, fqn_b)
+    if param_a is None or param_b is None:
+        return
+    tensor_a = getattr(param_a, "_local_tensor", param_a.data)
+    # B 与 A 共享存储（tied weight 同一物理参数）
+    if hasattr(param_b, "_local_tensor"):
+        param_b._local_tensor = tensor_a
+    else:
+        param_b.data = tensor_a
+
+
+def _replicate_tied_weights(model, mesh):
+    """Phase D：tied weights 跨 rank replicate。"""
+    for tied_pair in detect_tied_weights(model):
+        _broadcast_tied_param(model, tied_pair, mesh)
+
+
+def _wrap_production_forward(
+    module: nn.Module,
+    boundary: "PrecompiledBoundary",
+) -> None:
+    """生产模式：纯 local tensor 计算 + 预编译边界通信。
+
+    _local_params_context(module) 在 wrapping 之前已调用（Phase C 入口），
+    参数已永久 unpack 为 plain local tensor。forward 内不再需要 context manager。
+    """
+    original_forward = module.forward
+
+    def production_forward(*args, **kwargs):
+        args, kwargs = boundary.redistribute_inputs(args, kwargs)
+        outputs = original_forward(*args, **kwargs)
+        outputs = boundary.redistribute_outputs(outputs)
+        return outputs
+
+    module.forward = production_forward
+```
+
+#### 4.4.2 CP Attention Wrapper: `_wrap_cp_inner_attention`
+
+> **Call site**: Phase C, when `cp_size > 1` and module spec has `_needs_cp_attn=True` (set by `ShardingTemplate.needs_cp_attn`)
+
+CP attention's internal K/V all-gather cannot go in PrecompiledBoundary (it operates on forward-internal `q/k/v`, not module-input `hidden_states`). Phase C replaces the inner attention's forward.
+
+**Call entry** (in `ShardingApplier._apply_phase_c()`):
+
+```python
+# components/distributed/sharding_applier.py -- Phase C main flow (module-level)
+def _apply_phase_c(model, plan, mesh, validate_mode):
+    """Phase C: 包装 forward（CP/MoE/validate/production 四分支）。
+
+    由 apply_sharding_plan 调用，boundary 在此处 per-module 构建。
+    cp_mesh 从 mesh 按 mesh_dim_names 提取（"cp" 维存在时）。
+    """
+    mesh_dim_names = plan.mesh_dim_names
+    cp_mesh = _get_cp_submesh(mesh, mesh_dim_names)  # None if no "cp" dim
+    for module_fqn, spec in plan.modules.items():
+        if not spec.is_boundary:
+            continue
+        module = _resolve_module(model, module_fqn)
+        boundary = PrecompiledBoundary(spec, mesh, mesh_dim_names)
+
+        # Step 1: CP inner attention wrapper (BEFORE PrecompiledBoundary wrapping)
+        # validate 模式跳过：CP wrapper 替换 forward 会破坏 DTensor 传播，
+        # 而 validate 依赖 __torch_dispatch__ 全程传播 placement 来校验 out_src。
+        # validate 下 CP 维的 K/V all-gather 语义由 DTensor dispatch 自动处理
+        # （CP Shard(1) 的 q/k/v 经 redistribute 即可），无需 inner forward 替换。
+        if (cp_mesh is not None and cp_mesh.size() > 1
+                and not validate_mode):
+            if getattr(spec, '_needs_cp_attn', False):
+                _wrap_cp_inner_attention(module, cp_mesh)
+
+        # Step 2: Forward wrapping
+        if validate_mode:
+            _wrap_validate_forward(module, boundary, spec, mesh, mesh_dim_names)
+        elif spec._use_local_map:
+            _wrap_moe_forward(module, boundary, spec, mesh, mesh_dim_names)
+        else:
+            _wrap_production_forward(module, boundary)
+```
+
+**Implementation** (reference: Titan `context_parallel.py` `apply_cp_to_forward()`):
+
+```python
+def _wrap_cp_inner_attention(attn_module, cp_mesh):
+    """Inject CP-aware inner forward (compile-time replacement).
+
+    Executed BEFORE PrecompiledBoundary wrapping. CP wrapper at inner attention
+    level, PrecompiledBoundary at module boundary level. Combined:
+      PrecompiledBoundary.pre_forward -> CP inner attn -> PrecompiledBoundary.post_forward
+
+    **二分路由**（第六轮 P0 修复）：
+    - HF 标准风格（`_is_hf_style_attention`：forward(hidden_states,...)，Q/K/V 投影在
+      forward 内）→ 走「原语拦截」wrapper（`_wrap_hf_sdpa_for_cp`/`_wrap_hf_flex_for_cp`），
+      替换 forward 为 (hidden_states,...) 签名，内部临时拦截 SDPA/FlexAttention 原语、
+      对入参 K/V 沿 CP 维 all-gather。复用 HF 自身投影/RoPE/reshape，不重写 forward。
+    - NeMo/Megatron 风格（inner_attention 子模块，forward 取 (q,k,v)）→ 走 (q,k,v)
+      wrapper（`_wrap_sdpa_for_cp`/`_wrap_flex_attn_for_cp`），显式 all-gather K/V。
+
+    **梯度归约**：CP 维的参数梯度由 FSDP2 统一管理（CP 轴属于 FSDP2 reduce 组），
+    本 wrapper 不做额外 CP 梯度通信；K/V all-gather 的 backward（reduce-scatter）使
+    k_proj/v_proj 梯度跨 CP 聚合，与 FSDP2 的 reduce 组协同（见 03 §10.1 CP 因子）。
+    """
+    inner_attn = _find_inner_attention(attn_module)
+    if inner_attn is None:
+        return
+
+    if _is_hf_style_attention(inner_attn):
+        # HF: forward(hidden_states,...) → 原语拦截，复用 HF 投影/RoPE
+        if _is_sdpa_attention(inner_attn):
+            _wrap_hf_sdpa_for_cp(inner_attn, cp_mesh)
+        elif _is_flex_attention(inner_attn):
+            _wrap_hf_flex_for_cp(inner_attn, cp_mesh)
+    else:
+        # NeMo/Megatron: inner_attention.forward(q,k,v,...) → 直接替换
+        if _is_sdpa_attention(inner_attn):
+            _wrap_sdpa_for_cp(inner_attn, cp_mesh)
+        elif _is_flex_attention(inner_attn):
+            _wrap_flex_attn_for_cp(inner_attn, cp_mesh)
+
+
+def _wrap_sdpa_for_cp(inner_attn, cp_mesh):
+    """NeMo/Megatron SDPA 路径：inner_attention.forward(q,k,v,...) → 显式 all-gather K/V。
+
+    sixth round P0 fix: no longer using DTensor.from_local([Shard(1)]) to rely on SDPA
+    DTensor dispatch all-gathering K/V (PyTorch SDPA dispatch does not all-gather
+    Shard(1) K/V, it computes local attention). Switched to explicit flex_cp_allgather
+    consistent with Flex path: Q stays local (CP Shard(1)), K/V all-gathered to global,
+    then call original forward.
+    """
+    original_forward = inner_attn.forward
+    # flex_cp_allgather 直接收 cp_mesh，内部用 cp_mesh.get_group() 复用 DeviceMesh
+    # 已创建的 CP 通信组——不再依赖 dist._get_process_group_name 私有 API，也不
+    # 再每次 new_group（避免 process group 泄露）。
+
+    def cp_forward(q, k, v, **kwargs):
+        # Q 本地（CP Shard(1)）；K/V all-gather 为全局
+        global_k, global_v = flex_cp_allgather(
+            k.contiguous(), v.contiguous(), 1, cp_mesh)
+        return original_forward(q, global_k, global_v, **kwargs)
+
+    inner_attn.forward = cp_forward
+
+def _wrap_flex_attn_for_cp(inner_attn, cp_mesh):
+    """NeMo/Megatron FlexAttention 路径：inner_attention.forward(q,k,v,...) → 显式 all-gather K/V。
+
+    flex_cp_allgather 见本节末定义（`from ..context_parallel import flex_cp_allgather`）。
+    """
+    original_forward = inner_attn.forward
+
+    def cp_forward(q, k, v, **kwargs):
+        global_k, global_v = flex_cp_allgather(
+            k.contiguous(), v.contiguous(), 1, cp_mesh)
+        return original_forward(q, global_k, global_v, **kwargs)
+
+    inner_attn.forward = cp_forward
+
+
+def _wrap_hf_sdpa_for_cp(inner_attn, cp_mesh):
+    """HF 标准 SDPA 路径：forward(hidden_states,...) → 原语拦截。
+
+    HF 的 LlamaSdpaAttention/Qwen2SdpaAttention 等在 forward 内做 Q/K/V 投影、RoPE、
+    reshape，并直接调 `F.scaled_dot_product_attention(q,k,v,...)`。策略：替换 forward
+    为 (hidden_states,...) 签名的 CP 版本，内部临时把 `F.scaled_dot_product_attention`
+    替换为 CP-aware 版本——对入参 K/V 沿 CP 维 all-gather 后再调原 SDPA。Q 不 gather
+    （保持本地序列块）。原 forward 的投影/RoPE/reshape 全部复用，不重写。
+
+    原语拦截为临时全局函数替换（try/finally 还原），非线程安全；单进程 SPMD 训练下
+    安全（与 TorchTitan CP 实现一致）。
+    """
+    original_forward = inner_attn.forward
+    orig_sdpa = F.scaled_dot_product_attention
+
+    def cp_aware_sdpa(q, k, v, **kwargs):
+        # Q 本地（CP Shard(1)）；K/V all-gather 为全局
+        global_k, global_v = flex_cp_allgather(
+            k.contiguous(), v.contiguous(), 1, cp_mesh)
+        return orig_sdpa(q, global_k, global_v, **kwargs)
+
+    def cp_forward(hidden_states, *args, **kwargs):
+        F.scaled_dot_product_attention = cp_aware_sdpa
+        try:
+            return original_forward(hidden_states, *args, **kwargs)
+        finally:
+            F.scaled_dot_product_attention = orig_sdpa
+
+    inner_attn.forward = cp_forward
+
+def _wrap_hf_flex_for_cp(inner_attn, cp_mesh):
+    """HF 标准 FlexAttention 路径：forward(hidden_states,...) → 原语拦截 flex_attention。
+
+    同 `_wrap_hf_sdpa_for_cp`，但拦截 `torch.nn.attention.flex_attention.flex_attention`。
+    """
+    original_forward = inner_attn.forward
+    from torch.nn.attention.flex_attention import flex_attention as _orig_flex
+
+    def cp_aware_flex(q, k, v, **kwargs):
+        global_k, global_v = flex_cp_allgather(
+            k.contiguous(), v.contiguous(), 1, cp_mesh)
+        return _orig_flex(q, global_k, global_v, **kwargs)
+
+    def cp_forward(hidden_states, *args, **kwargs):
+        import torch.nn.attention.flex_attention as _flex_mod
+        _flex_mod.flex_attention = cp_aware_flex
+        try:
+            return original_forward(hidden_states, *args, **kwargs)
+        finally:
+            _flex_mod.flex_attention = _orig_flex
+
+    inner_attn.forward = cp_forward
+
+
+def flex_cp_allgather(k, v, cp_dim: int, cp_mesh):
+    """All-gather K/V along CP dimension for context parallel attention.
+
+    Forward: all-gather K and V along cp_dim so each rank has full K/V.
+    Backward: reduce-scatter gradients (automatic via autograd).
+
+    Args:
+        k: Key tensor, shape [B, N, S_local, H]
+        v: Value tensor, shape [B, N, S_local, H]
+        cp_dim: Dimension to gather along (typically seq dim, =2)
+        cp_mesh: CP 维度的 DeviceMesh。通信组直接取 ``cp_mesh.get_group()``——
+            该 group 在 DeviceMesh 构建时已创建并缓存，**此处不得再调
+            ``dist.new_group``**（否则每次 forward 泄露一个 process group，
+            且新建的全 world group 会忽略 CP 子集语义，导致通信错位）。
+    Returns:
+        (k_global, v_global): Full K/V tensors along cp_dim
+    """
+    cp_size = cp_mesh.size()
+    if cp_size <= 1:
+        return k, v
+    group = cp_mesh.get_group()  # 复用 DeviceMesh 已创建的 CP 通信组，零泄露
+
+    def _all_gather_tensor(t):
+        # All-gather along cp_dim
+        shapes = [list(t.shape) for _ in range(cp_size)]
+        shapes[dist.get_rank(group)][cp_dim] = t.shape[cp_dim]
+        world_t = [torch.empty(s, dtype=t.dtype, device=t.device) for s in shapes]
+        dist.all_gather(world_t, t.contiguous(), group=group)
+        return torch.cat(world_t, dim=cp_dim)
+
+    return _all_gather_tensor(k), _all_gather_tensor(v)
+
+
+def _find_inner_attention(module):
+    """Locate inner attention sub-module within attention module.
+
+    匹配顺序：
+    1. 显式属性名 inner_attention / attn / attention（NeMo/Megatron 风格）。
+    2. HF 标准实现：LlamaSdpaAttention / Qwen2SdpaAttention / LlamaAttention /
+       Qwen2Attention 等——这些类本身即 inner attention（无嵌套 inner_attention
+       属性），通过类名包含 "SdpaAttention"/"Attention" 子串判定。
+    3. 结构判定：模块直接持有 q_proj/k_proj/v_proj 子模块，则视为 inner attention。
+    """
+    for name in ("inner_attention", "attn", "attention"):
+        inner = getattr(module, name, None)
+        if inner is not None and hasattr(inner, "forward"):
+            return inner
+    # HF 标准模型：attention 模块本身就是 inner attention
+    cls_name = type(module).__name__
+    if "SdpaAttention" in cls_name or cls_name.endswith("Attention"):
+        return module
+    # 结构兜底：直接持有 q/k/v 投影
+    if (hasattr(module, "q_proj") and hasattr(module, "k_proj")
+            and hasattr(module, "v_proj")):
+        return module
+    return None
+```
+
+**Design points**:
+1. **Compile-time replacement**: `_wrap_cp_inner_attention` executes in Phase C, one-time (not runtime monkey-patch)
+2. **Layered with PrecompiledBoundary**: CP wrapper at inner attention level, PrecompiledBoundary at module boundary level
+3. **二分路由 by attention 架构**: HF 标准注意力（forward(hidden_states)）走「原语拦截」wrapper；NeMo/Megatron inner_attention（forward(q,k,v)）走 (q,k,v) wrapper。两条路径**统一显式 all-gather K/V**——SDPA 路径不再依赖 DTensor dispatch（PyTorch SDPA dispatch 对 Shard(1) K/V 不会 all-gather，会算成局部 attention）。
+4. **原语拦截非线程安全**: HF 路径临时替换 `F.scaled_dot_product_attention`/`flex_attention`（try/finally 还原），单进程 SPMD 训练下安全；与 TorchTitan CP 实现一致。
+5. **梯度归约由 FSDP2 统一管理**: CP 维参数梯度由 FSDP2 reduce 组统一管理（CP 轴属于 FSDP2 reduce 组），本 wrapper 不做额外 CP 梯度通信；K/V all-gather 的 backward（reduce-scatter）使 k_proj/v_proj 梯度跨 CP 聚合，与 FSDP2 协同（见 03 §10.1 CP 因子）。
+
+#### 4.4.3 EP MoE Wrapper: `_wrap_moe_forward`
+
+> **Call site**: Phase C, when `spec._use_local_map=True` (set by `ShardingTemplate.use_local_map`)
+
+EP MoE modules have internal all-to-all dispatch/combine that runs on local tensors.
+`_wrap_moe_forward` implements the Titan `LocalMapConfig` equivalent: PrecompiledBoundary manages
+module I/O redistribution, local_map manages internal DTensor->local->DTensor conversion.
+
+**Call entry**: Same as CP wrapper above (see `_apply_phase_c()` code in section 4.4.2).
+
+**Implementation**:
+
+```python
+def _wrap_moe_forward(module, boundary, spec, mesh, mesh_dim_names):
+    """MoE forward wrapper: PrecompiledBoundary + local_map.
+
+    Reference: Titan moe_sharding.py LocalMapConfig pattern.
+
+    _local_params_context(module) is called ONCE at build time (before wrapping),
+    permanently unpacking DTensor params to local tensors. The wrapped forward
+    no longer needs a context manager.
+
+    Wrapped forward flow:
+      1. boundary.redistribute_inputs(args, kwargs)    # TP all-gather (entry)
+      2. original_forward (all-to-all on local tensors) # EP dispatch/combine (params already local)
+      3. DTensor.from_local(output, mesh, out_src)      # local -> DTensor
+      4. boundary.redistribute_outputs(output)           # TP reduce-scatter (exit)
+    """
+    original_forward = module.forward
+
+    # out_src 现为 dict[str, NamedPlacement]（per-arg）；MoE 单输出取唯一值
+    out_src_placements = None
+    if spec.out_src:
+        _out_src_named = next(iter(spec.out_src.values()))
+        out_src_placements = tuple(resolve_placements(_out_src_named, mesh_dim_names))
+
+    @functools.wraps(original_forward)
+    def moe_forward(*args, **kwargs):
+        # Step 1: PrecompiledBoundary entry -- TP (+CP) all-gather
+        args, kwargs = boundary.redistribute_inputs(args, kwargs)
+
+        # Step 2: EP dispatch/combine on local tensors (params unpacked at build time)
+        output = original_forward(*args, **kwargs)
+
+        # Step 3: local -> DTensor (restore DTensor metadata lost in all-to-all)
+        if out_src_placements is not None and not isinstance(output, DTensor):
+            output = DTensor.from_local(output, mesh, out_src_placements, run_check=False)
+
+        # Step 4: PrecompiledBoundary exit -- TP (+CP) reduce-scatter
+        output = boundary.redistribute_outputs(output)
+        return output
+
+    module.forward = moe_forward
+```
+
+**Why EP needs explicit local->DTensor conversion**:
+
+Standard TP/CP modules maintain DTensor propagation through forward (Colwise Shard(0) -> Shard(-1) output,
+Rowwise Shard(1) -> Partial output). These placements are auto-derived by DTensor op rules.
+
+EP modules execute all-to-all on local tensors inside forward, breaking DTensor propagation.
+Hence `DTensor.from_local(output, mesh, out_src_placements)` explicitly restores DTensor metadata.
+
+This is why `_use_local_map=True` is exclusive to MoE templates -- only EP modules need
+internal local-tensor communication with explicit DTensor recovery.
+
+
+---
+
+
+
+---
+
+## 5. Validate 模式的 placement 校验
+
+> **调用位置**: 时序树 ④.3.5.8 Phase C validate 分支 — `_wrap_validate_forward()`
+
+### 5.1 核心校验：`out_src`
+
+Validate 模式的核心是**用 DTensor 传播的运行结果，验证参数分片声明是否正确**。
+
+```
+DTensor 传播的输出 placement ⇔ 用户声明的 out_src
+```
+
+`out_src` 由 DTensor dispatch 规则决定（Colwise 输出 `Shard(-1)`，Rowwise 输出 `Partial`）。
+如果参数 placement 声明错误（如把 Rowwise 错误声明为 Colwise），DTensor 传播会推导出不同的
+placement，校验立即捕获。
+
+### 5.2 `out_dst` 校验的冗余性分析
+
+```
+out_dst 校验: redistribute 后的 placement ≈ 声明的 out_dst
+  → 依赖链: out_src 正确 + DTensor.redistribute() 正确（PyTorch 内部保证）
+
+对于中间模块:
+  out_dst 校验 ≈ 链式传播校验（下一个模块的 in_src 检查）
+  → 冗余
+
+对于末个模块（lm_head）:
+  无下游模块做链式传播校验
+  → 唯一检查，保留价值
+```
+
+**结论**：对于中间模块，`out_dst` 校验是冗余的——链式传播中 `A.out_dst == B.in_src` 提供
+等价覆盖。仅对**末端模块**（`_is_terminal=True`）进行 `out_dst` 校验。
+
+`_is_terminal` 由 `ShardingPlanner` 在链式传播时自动标记：如果某模块的 `out_dst` 不
+被任何其他模块的 `in_src` 引用，则标记为 terminal。
+
+### 5.3 校验 forward 实现
+
+```python
+class PlacementMismatchError(ValueError):
+    """DTensor 传播结果与 ModuleShardingSpec 声明不一致。"""
+    def __init__(self, module_name: str, expected, actual, stage: str):
+        self.module_name = module_name
+        self.expected = expected
+        self.actual = actual
+        self.stage = stage
+        super().__init__(
+            f"[{module_name}] {stage} placement mismatch:\n"
+            f"  Expected (from ShardingConfig.{stage}): {expected}\n"
+            f"  Actual   (from DTensor propagation):   {actual}\n"
+            f"  → Check the ShardingConfig for this module."
+        )
+
+
+def _wrap_validate_forward(
+    module: nn.Module,
+    boundary: PrecompiledBoundary,
+    spec: ModuleShardingSpec,
+    mesh: DeviceMesh,
+    mesh_dim_names: tuple[str, ...],
+) -> None:
+    """校验模式：DTensor 全程传播 → 校验 out_src + 可选的 out_dst（仅末端模块）。
+
+    核心逻辑：
+    - 参数保持 DTensor（不进 _local_params_context）
+    - 所有 op 走 __torch_dispatch__ → 自动传播 placement
+    - out_src 校验：原生输出 vs 声明 → 验证参数分片正确性
+    - out_dst 校验：仅 _is_terminal 模块 → 防御性检查
+    """
+    original_forward = module.forward
+    module_name = type(module).__name__
+
+    def validate_forward(*args, **kwargs):
+        # Step 1: 输入 → DTensor
+        args, kwargs = boundary.redistribute_inputs(
+            args, kwargs, as_dtensor=True
+        )
+
+        # Step 2: 参数保持 DTensor，执行原始 forward
+        # self.q_proj.weight 仍是 DTensor(placements=[Shard(0)])
+        # → F.linear(DTensor(R), DTensor(S(0))) 触发 DTensor dispatch
+        outputs = original_forward(*args, **kwargs)
+
+        # Step 3: 【核心校验】out_src — DTensor 传播原生输出 vs 声明
+        # 支持单输出（DTensor）和多输出（tuple/list of DTensor）。
+        # 多输出模块通过 spec.out_names 匹配输出名 → spec.out_src key。
+        if spec.out_src is not None:
+            if isinstance(outputs, (tuple, list)):
+                # 多输出模块：迭代输出 tuple，按 spec.out_names 映射到 spec.out_src key
+                _validate_multi_output_src(
+                    outputs, spec, mesh_dim_names, module_name,
+                )
+            elif isinstance(outputs, DTensor):
+                # 单输出模块：取 out_src 唯一值校验
+                _out_src_named = next(iter(spec.out_src.values()))
+                expected = tuple(resolve_placements(_out_src_named, mesh_dim_names))
+                actual = tuple(outputs.placements)
+                if expected != actual:
+                    raise PlacementMismatchError(
+                        module_name, expected, actual, "out_src"
+                    )
+
+        # Step 4: redistribute 到 out_dst
+        outputs = boundary.redistribute_outputs(outputs, as_dtensor_input=True)
+
+        # Step 5: 【防御性校验】out_dst — 仅末端模块
+        # 中间模块的 out_dst 由链式传播校验（A.out_dst == B.in_src）覆盖
+        if spec._is_terminal and spec.out_dst is not None:
+            if isinstance(outputs, (tuple, list)):
+                _validate_multi_output_dst(
+                    outputs, spec, mesh_dim_names, module_name,
+                )
+            elif isinstance(outputs, DTensor):
+                _out_dst_named = next(iter(spec.out_dst.values()))
+                expected = tuple(resolve_placements(_out_dst_named, mesh_dim_names))
+                actual = tuple(outputs.placements)
+                if expected != actual:
+                    raise PlacementMismatchError(
+                        module_name, expected, actual, "out_dst"
+                    )
+
+        if isinstance(outputs, DTensor):
+            outputs = outputs.to_local()
+        elif isinstance(outputs, (tuple, list)):
+            outputs = tuple(
+                t.to_local() if isinstance(t, DTensor) else t for t in outputs
+            )
+        return outputs
+
+    module.forward = validate_forward
+
+
+def _validate_multi_output_src(
+    outputs: tuple, spec: ModuleShardingSpec,
+    mesh_dim_names: tuple[str, ...], module_name: str,
+) -> None:
+    """校验多输出模块各输出的 out_src placement。
+
+    按 spec.out_names 映射输出名 → spec.out_src key，逐个对比 DTensor 传播
+    的实际 placement 与声明。输出名不在 out_src 中的跳过（如模块返回了可选的
+    present_kv 但未声明其 placement）。
+    """
+    out_names = getattr(spec, "out_names", None) or list(spec.out_src.keys())
+    name_to_idx = {name: i for i, name in enumerate(out_names)}
+    for out_name, expected_named in spec.out_src.items():
+        idx = name_to_idx.get(out_name)
+        if idx is None or idx >= len(outputs):
+            continue  # 模块未返回该命名输出（如推理时省略 present_kv）
+        tensor = outputs[idx]
+        if not isinstance(tensor, DTensor):
+            continue
+        expected = tuple(resolve_placements(expected_named, mesh_dim_names))
+        actual = tuple(tensor.placements)
+        if expected != actual:
+            raise PlacementMismatchError(
+                module_name, expected, actual, f"out_src[{out_name}]"
+            )
+
+
+def _validate_multi_output_dst(
+    outputs: tuple, spec: ModuleShardingSpec,
+    mesh_dim_names: tuple[str, ...], module_name: str,
+) -> None:
+    """校验多输出模块 redistributed 后各输出的 out_dst placement。
+
+    仅对 _is_terminal 模块调用。按 spec.out_names 映射输出名 → spec.out_dst key。
+    """
+    out_names = getattr(spec, "out_names", None) or list(spec.out_dst.keys())
+    name_to_idx = {name: i for i, name in enumerate(out_names)}
+    for out_name, expected_named in spec.out_dst.items():
+        idx = name_to_idx.get(out_name)
+        if idx is None or idx >= len(outputs):
+            continue
+        tensor = outputs[idx]
+        if not isinstance(tensor, DTensor):
+            continue
+        expected = tuple(resolve_placements(expected_named, mesh_dim_names))
+        actual = tuple(tensor.placements)
+        if expected != actual:
+            raise PlacementMismatchError(
+                module_name, expected, actual, f"out_dst[{out_name}]"
+            )
+```
+
+### 5.4 校验通过 vs 失败
+
+#### 校验通过 ✅
+
+```
+self_attn, TP=4, SP=true:
+  params: q_proj{Shard(0)}, o_proj{Shard(1)}
+  out_src: {TP: Partial()}
+
+DTensor 传播:
+  q = F.linear(R, S(0)) → S(-1)
+  o = F.linear(S(-1), S(1)) → Partial()
+  → outputs.placements = [Partial()]
+
+out_src 校验: expected=[Partial()] actual=[Partial()] → ✅
+（out_dst 校验跳过：self_attn 不是末端模块）
+```
+
+#### 校验失败 ❌
+
+```
+错误: 把 o_proj 声明为 Shard(0)（应为 Shard(1)）
+
+DTensor 传播:
+  o = F.linear(S(-1), S(0)) → 推导出与 Shard(1) 不同的 placement
+
+out_src 校验:
+  expected=[Shard(-1)] actual=[Partial()] → ❌ PlacementMismatchError!
+  "out_src placement mismatch:
+    Expected: [Shard(-1)]
+    Actual:   [Partial()]
+    → Colwise/Rowwise declaration error in params."
+```
+
+### 5.5 正确性保证总结
+
+```
+① out_src 校验（每个模块，不可替代）:
+   DTensor 传播原生输出 ≈ 声明的 out_src
+   → 验证：参数 placement 声明（Colwise/Rowwise）是否正确
+   → 捕获：参数分片声明错误
+
+② 链式传播校验（中间模块，覆盖 out_dst）:
+   模块 A.out_dst ≈ 模块 B.in_src
+   → 验证：相邻模块的 placement 契约对齐
+   → 等效覆盖了中间模块的 out_dst 校验
+
+③ out_dst 校验（末端模块，防御性）:
+   redistribute 后输出 ≈ 声明的 out_dst
+   → 仅对 lm_head 等无下游的模块执行
+   → 捕获：末端通信计划错误
+
+production local-tensor forward == validation DTensor forward, if and only if:
+1. Same ModuleShardingSpec
+2. PrecompiledBoundary communication == DTensor dispatch selected communication
+3. _local_tensor shares storage with DTensor local tensor
+
+The ONLY thing not covered by validation forward is parameter gradient synchronization
+(validation uses DTensor backward, production uses FSDP). A gradient equivalence test is REQUIRED.
+
+```python
+# components/distributed/testing/grad_equiv.py
+def test_grad_equivalence(model_spec, batch):
+    """Same batch, two modes each run one step. Compare FSDP-synced param.grad
+    (production) vs DTensor backward grad (validation), within tolerance."""
+    prod_grads = run_production_step(model_spec, batch)   # FSDP handles grads
+    val_grads = run_validation_step(model_spec, batch)    # DTensor dispatch handles grads
+    for fqn in prod_grads:
+        torch.testing.assert_close(prod_grads[fqn], val_grads[fqn], rtol=1e-3, atol=1e-3)
+```
+```
+
+---
+
+
+
+---
+
+## 6. 并行策略组合：TP × CP × EP × DP
+
+> **调用位置**: 时序树 ④.3.5.7 — ShardingPlan 中的多 mesh 维度组合
+
+### 6.1 核心原则：CP/EP 与 TP 统一走 PrecompiledBoundary
+
+CP（Context Parallel）和 EP（Expert Parallel）**不是**独立于 TP 的特殊通信机制。**三者共享相同的 DTensor placement + PrecompiledBoundary 范式**：
+
+```
+统一范式: in_src -> redistribute -> in_dst -> compute(local) -> out_src -> redistribute -> out_dst
+
+Mesh 维度: {TP: placement, CP: placement, EP: placement}
+  - 每个维度独立声明 placement
+  - PrecompiledBoundary 按维度编译 RedistOp 序列
+  - 运行时: DTensor.redistribute() 在对应 mesh 维度上执行通信
+```
+
+**与 Titan `ShardingConfig` 的对齐**：Hyper-Parallel 的 `ModuleShardingSpec` 等价于 Titan 的 `ShardingConfig`，两者都用 `in_src/in_dst/out_src/out_dst` 表达通信契约，用 `params/state_shardings` 表达参数分片，用 `local_map`（Titan）= `_local_params_context`（Hyper-Parallel）表达"DTensor->local 计算->DTensor"的零开销模式。
+
+参考实现：
+- Titan `protocols/sharding.py` — `ShardingConfig` 数据模型（与 `ModuleShardingSpec` 同构）
+- Titan `models/common/moe_sharding.py` — MoE 的 `ShardingConfig` 填充（EP+TP 组合的完整 placement 声明）
+- Titan `models/common/decoder_sharding.py` — dense 层的 `ShardingConfig` 填充（CP+TP 组合）
+- AutoModel `components/moe/parallelizer.py` — HF 模型上使能 CP/EP 的 `apply_cp()`/`apply_ep()` 函数
+
+### 6.2 总体架构：4D 并行拓扑
+
+```
++--------------------------------------------------------------+
+|                      4D Parallel Topology                     |
+|                                                              |
+|  FSDP2 manages:  dp_shard, dp_replicate                      |
+|    - Applied LAST (after DTensor sharding)                    |
+|    - All-gather / reduce-scatter parameters                   |
+|                                                              |
+|  DTensor + PrecompiledBoundary manages:  TP, CP, EP           |
+|    - TP: Shard hidden dim (Shard(0)/Shard(1)/Partial)        |
+|    - CP: Shard sequence dim (Shard(1) on CP axis)             |
+|    - EP: Shard expert dim (Shard(0) on EP axis)              |
+|    - Applied FIRST (before FSDP2)                             |
+|    - ALL redistribution goes through PrecompiledBoundary      |
+|                                                              |
+|  PP (optional): Pipeline Parallel                             |
+|    - Inter-layer model splitting                              |
++--------------------------------------------------------------+
+```
+
+**Mesh 维度顺序（由内到外）**：`pp -> dp_replicate -> dp_shard -> ep -> cp -> tp`
+
+**完整 Mesh 构建示例** — TP=4, CP=2, EP=4, DP=8 (world_size=256)：
+
+```python
+# main_mesh: DTensor 直接管理的维度为 TP+CP+EP；此处把 dp_shard 与 cp 合并
+# 为单维 "dp_shard_cp" 仅为某些 mesh 构造器的简化写法（dp_shard 与 cp 共享
+# 同一 process group 维度时）。规范做法应拆为独立 "dp_shard" 与 "cp" 两维，
+# 使 DTensor 管理的轴严格为 TP/CP/EP，DP 由 FSDP2 在 DTensor 之外管理
+#（见 §6.2 "DTensor + PrecompiledBoundary manages: TP, CP, EP"）。
+# 若实际 mesh 采用 "dp_shard_cp" 合并维，需在 ShardingPlanner 的
+# mesh_dim_names 解析中显式声明该维既承载 DP 也承载 CP，且 spec.params 中
+# 该维的 placement 由 DP（FSDP）与 CP（DTensor）分工：参数 CP 维恒 Replicate()，
+# DP 维由 FSDP layout 接管。本示例以下按合并维展示，生产建议拆分。
+main_mesh = DeviceMesh("cuda", shape=(8, 4, 2, 4),
+                       mesh_dim_names=("dp_shard_cp", "ep", "cp", "tp"))
+# moe_mesh: EP 子 mesh（用于 EP 维度的 communication group）
+moe_mesh = DeviceMesh("cuda", shape=(4,), mesh_dim_names=("ep",))
+
+# placement 解析（tensor 维度索引按 mesh_dim_names 顺序）:
+# {TP: Shard(0), CP: Replicate(), EP: Shard(0)}
+# -> placements = (Shard(0), Replicate(), Shard(0))  对应 ("tp", "cp", "ep")
+```
+
+### 6.3 Context Parallel (CP)：序列维度的 TP
+
+#### 6.3.1 CP 的本质
+
+CP 的本质是**在 CP mesh 维度上沿序列维度（dim 1）做 Shard**，与 TP 的 Sequence Parallel（SP）共享完全相同的 placement 语义。差异仅在于**作用在哪个 mesh 维度**：
+
+```
+TP 的 SP:  {TP: Shard(1)}  -> 在 TP rank 组内沿序列切分
+CP:        {CP: Shard(1)}  -> 在 CP rank 组内沿序列切分
+两者组合:  {TP: Shard(1), CP: Shard(1)} -> 同时沿 TP 和 CP 切分序列
+```
+
+**为什么需要 CP？** — TP 的 SP 受到 `num_attention_heads % tp_size == 0` 约束，不能无限增大。CP 提供了**正交的**序列切分维度，不受 attention heads 数量的限制。两者组合实现 `序列切分总数 = tp_size * cp_size`。
+
+参考 Titan `decoder_sharding.py` 的 `dense_sequence_parallel_placement()`：当 SP+CP 同时启用时，`SpmdLayout({TP: Shard(1), CP: Shard(1)})` —— 两个维度都沿序列维 Shard。
+
+#### 6.3.2 CP 的 PrecompiledBoundary 表达：TP all-gather，CP 维保持 Shard
+
+CP 在 PrecompiledBoundary 中的表达**与 TP 的 SP 不对称**——TP 维做 `Shard(1) <-> Replicate()` 的 all-gather/reduce-scatter，而 **CP 维的 in_dst 保持 `Shard(1)`**（不做 boundary 层 all-gather）。CP 的 K/V all-gather 延后到 attention 内部由 inner attention wrapper 完成（见 §6.3.3）：
+
+```python
+# self_attn, TP=4, CP=2, SP=true
+ModuleShardingSpec(
+    params={
+        "q_proj.weight": {TP: Shard(0), CP: Replicate()},   # CP 不切参数
+        "k_proj.weight": {TP: Shard(0), CP: Replicate()},
+        "v_proj.weight": {TP: Shard(0), CP: Replicate()},
+        "o_proj.weight": {TP: Shard(1), CP: Replicate()},
+    },
+    in_src={
+        "hidden_states": {TP: Shard(1), CP: Shard(1)},      # SP+CP 序列分片
+    },
+    in_dst={
+        # 只 all-gather TP；CP 维保持 Shard(1)，K/V all-gather 交给
+        # inner attention wrapper（needs_cp_attn=True，§4.4.2/§6.3.3）。
+        "hidden_states": {TP: Replicate(), CP: Shard(1)},
+    },
+    out_src={TP: Partial(), CP: Shard(1)},                # 本地 Q 段输出 → CP Shard(1)；o_proj Rowwise -> TP Partial
+    out_dst={TP: Shard(1), CP: Shard(1)},                    # reduce-scatter(TP) -> SP+CP；CP 维 identity
+)
+
+# PrecompiledBoundary 编译结果:
+# in_plan:  [RedistOp("hidden_states", TP Shard(1)->TP Replicate, "all_gather")]
+#           <- CP 维 Shard(1)->Shard(1) identity，跳过
+# out_plan: [RedistOp("output", TP Partial->TP Shard(1), "reduce_scatter")]
+#           <- CP 维 out_src=Shard(1) 与 out_dst=Shard(1) identity，跳过；
+#              CP 序列维 all-gather 仅发生在 attention 内部 K/V（§4.4.2），
+#              boundary 层 CP 维不做出口通信
+```
+
+**Norm 模块在 CP 下的行为**：
+
+```python
+# post_attention_layernorm, TP=4, CP=2
+ModuleShardingSpec(
+    params={"weight": {TP: Replicate(), CP: Replicate()}},  # norm weight 全复制
+    in_src={"hidden_states": {TP: Shard(1), CP: Shard(1)}},
+    in_dst={"hidden_states": {TP: Shard(1), CP: Shard(1)}},  # identity - 零通信
+    out_src={TP: Shard(1), CP: Shard(1)},
+    out_dst={TP: Shard(1), CP: Shard(1)},                    # identity
+)
+# -> PrecompiledBoundary: in_plan=[], out_plan=[] (零通信)
+#    RMSNorm 是逐元素操作，可在分片序列上直接算
+```
+
+#### 6.3.3 CP Attention 内部的通信：K/V all-gather
+
+Attention 模块的 PrecompiledBoundary 只对 `hidden_states` 做 **TP 维的 `Shard->Replicate` all-gather**；**CP 维保持 `Shard(1)`**——进入 forward 时 `hidden_states` 在 CP 维仍是序列分片。这样 CP 的 K/V all-gather 职责完全交给 inner attention wrapper，避免 boundary 层与 inner attention 层重复 all-gather CP 维。
+
+在 forward **内部**，SDPA 需要额外的 CP 通信——K/V 的 all-gather。这与 TP 不同：
+
+- TP: `hidden_states [B, S, H]` all-gather 后，Q/K/V 投影和 SDPA 都在完整序列上进行，无额外通信
+- CP: `hidden_states [B, S/tp, H]`（TP 已 gather、CP 仍分片）进入 forward 后，CP 需要在 **SDPA 内部** all-gather K/V（因为从 CP 维度看，每个 rank 的 K/V 只覆盖了部分序列的 attention keys/values）
+
+**这个 K/V all-gather 是否应该由 PrecompiledBoundary 管理？**
+
+不能。原因：
+1. PrecompiledBoundary 操作的是**模块入口/出口的 tensor**（`hidden_states` / `output`），不是 forward 内部的中间产物（`q/k/v`）
+2. K/V all-gather 的模式与 PrecompiledBoundary 的 `in_src -> in_dst -> compute -> out_src -> out_dst` 范式不匹配——它是 attention 内部的细粒度通信
+
+**Hyper-Parallel 的解决方案**：在 `ShardingApplier` 的 Phase C 中，为 attention 模块注入一个**CP-aware inner attention forward**。这个替换是编译期确定的（模板化生成），不是运行时 monkey-patch：
+
+```python
+# _wrap_cp_inner_attention 的 canonical 实现见 §4.4.2：
+#   inner_attn = _find_inner_attention(attn_module)
+#   if _is_sdpa_attention(inner_attn):
+#       _wrap_sdpa_for_cp(inner_attn, cp_mesh)
+# 作用于 inner attention 子模块（而非整个 attention 模块），本节不再重复实现。
+```
+
+这个 CP attention wrapper 也是**编译期生成**的（从 `ModuleShardingSpec` 和 `cp_mesh` 推导），与 PrecompiledBoundary 的编译期哲学一致——只是作用在 inner attention 级别（更细粒度），而非模块边界级别。
+
+#### 6.3.4 CP 的数据管道集成
+
+CP 的数据分片发生在数据管道阶段——序列维度的 tensors（input_ids, labels, position_ids）在进入模型前就沿 CP mesh 切分好：
+
+```python
+# 参考 Titan context_parallel.py 的 prepare_context_parallel_input()
+# 参考 AutoModel cp_utils.py 的 make_cp_batch_and_ctx()
+
+def shard_batch_for_cp(batch, cp_mesh):
+    """将 batch 中的序列维度 tensors 沿 CP mesh 切分。
+
+    canonical 实现（05 单一实现，02/03 仅引用契约不重复实现）。
+    与 02 collater 产出的真实 THD 契约对齐（放弃自创的 cu_seqlens）：
+      - input_ids/labels/position_ids: [B, S] int64
+      - seq_lens:        [B, max_num_packs] int64，每行是该样本内各 pack
+                         子序列的实际长度，-1000 哨兵填充变长子序列数。
+      - seq_lens_padded: [B, max_num_packs] int64，各 pack 子序列含
+                         separator/padding 的长度，-1000 哨兵填充。
+      - qkv_format: "thd"（透传，本函数不修改）
+
+    CP 切分策略：按 token 区间 [cp_rank*chunk, (cp_rank+1)*chunk) 对
+    input_ids/labels/position_ids 切片；对 seq_lens/seq_lens_padded 按
+    CP rank 重算——遍历每个样本的 pack 累计偏移，找出与本 rank token 区间
+    相交的 pack，截断到本地区间并平移到本地坐标系。输出仍含 qkv_format="thd"。
+    """
+    cp_size = cp_mesh.size()
+    if cp_size <= 1:
+        return batch
+
+    cp_rank = cp_mesh.get_local_rank()
+    seq_len = batch["input_ids"].shape[1]
+    # 序列长度必须能整除 2*cp_size（load balancing 要求）；不足则 pad
+    pad_len = (-seq_len) % (cp_size * 2)
+    chunk = (seq_len + pad_len) // cp_size
+    lo = cp_rank * chunk
+    hi = lo + chunk
+    slc = slice(lo, hi)
+
+    # 先对序列维 tensors 做 CP 对齐 padding（pad_len>0 时），保证各 rank 切出
+    # 等长 chunk。否则最后一个 rank 的 v[..., slc] 因 tensor 只有 seq_len 元素，
+    # 会被静默截短为 seq_len-lo，导致 CP 各 rank chunk 不等长 → 通信错位。
+    # pad 值: input_ids/attention_mask->0, labels->-100(忽略), position_ids->递增。
+    _PAD_VALUE = {
+        "labels": -100,
+        "input_ids": 0,
+        "attention_mask": 0,
+    }
+    padded = dict(batch)
+    if pad_len > 0:
+        for k, v in batch.items():
+            if k == "qkv_format" or not isinstance(v, torch.Tensor) or v.ndim < 1:
+                continue
+            if k in ("seq_lens", "seq_lens_padded"):
+                continue  # 单独重算，不 pad
+            pad_val = _PAD_VALUE.get(k, 0)
+            if k == "position_ids":
+                # position_ids 递增 pad：接续末值继续递增
+                last = v[..., -1:].to(torch.long)
+                inc = torch.arange(1, pad_len + 1, device=v.device,
+                                   dtype=v.dtype).expand_as(v[..., :1])
+                inc = inc.reshape(*([1] * (v.ndim - 1)), pad_len)
+                inc = inc.expand(*v.shape[:-1], pad_len) + last
+                pad_block = inc
+            else:
+                shape = list(v.shape)
+                shape[-1] = pad_len
+                pad_block = torch.full(shape, pad_val, dtype=v.dtype, device=v.device)
+            padded[k] = torch.cat([v, pad_block], dim=-1)
+
+    # 普通序列维 tensors 直接按 CP rank 切片（已 pad，各 rank 等长）
+    out = {}
+    for k, v in padded.items():
+        if k in ("seq_lens", "seq_lens_padded"):
+            continue  # 单独重算
+        if k == "qkv_format":
+            out[k] = v  # 透传字符串
+        elif isinstance(v, torch.Tensor) and v.ndim >= 1:
+            out[k] = v[..., slc]
+        else:
+            out[k] = v
+
+    # seq_lens / seq_lens_padded 按 CP 分片重算（保留 -1000 哨兵语义）
+    if "seq_lens" in batch and "seq_lens_padded" in batch:
+        out["seq_lens"], out["seq_lens_padded"] = _shard_seq_lens_for_cp(
+            batch["seq_lens"], batch["seq_lens_padded"],
+            cp_rank=cp_rank, chunk=chunk,
+        )
+    return out
+
+
+def _shard_seq_lens_for_cp(
+    seq_lens: torch.Tensor,
+    seq_lens_padded: torch.Tensor,
+    *,
+    cp_rank: int,
+    chunk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """对 seq_lens/seq_lens_padded 按 CP 分片重算（与 02 collater 真实契约对齐）。
+
+    输入:
+      seq_lens:        [B, max_num_packs] int64，-1000 哨兵填充变长子序列数。
+      seq_lens_padded: [B, max_num_packs] int64，同上哨兵填充。
+      cp_rank / chunk: 本 rank 负责 token 区间 [cp_rank*chunk, (cp_rank+1)*chunk)。
+
+    输出: (local_seq_lens, local_seq_lens_padded)
+      形状 [B, max_local_packs] int64，-1000 哨兵填充。max_local_packs 取
+      batch 内各样本落在本 rank 的 pack 数最大值。
+
+    语义: 遍历每个样本的 pack 累计偏移（按 seq_lens_padded 累加），对每个 pack:
+      - 完全在 [lo, hi) 内: 本地 seq_lens/seq_lens_padded 原样保留
+      - 跨越 lo 或 hi 边界: 截断到 [lo, hi) 区间，按截断后的实际/含 padding
+        长度重算（separator token 若被截断则不计入 local seq_lens）
+      - 完全在区间外: 跳过
+    截断后的长度平移到本地坐标系（local offset = global offset - lo）。
+    """
+    B, K = seq_lens.shape
+    lo = cp_rank * chunk
+    hi = lo + chunk
+    device = seq_lens.device
+    SENTINEL = -1000
+
+    local_lens_b: list[list[int]] = []
+    local_lens_padded_b: list[list[int]] = []
+    max_local_packs = 0
+    for b in range(B):
+        row_lens = seq_lens[b].tolist()
+        row_padded = seq_lens_padded[b].tolist()
+        local_lens: list[int] = []
+        local_padded: list[int] = []
+        offset = 0  # 全局 token 偏移
+        for raw_len, raw_pad in zip(row_lens, row_padded):
+            if raw_len == SENTINEL:
+                break  # 哨兵之后无 pack
+            pack_start = offset
+            pack_end = offset + raw_pad  # padded 覆盖 separator
+            offset = pack_end
+            # 求与 [lo, hi) 的交集
+            inter_start = max(pack_start, lo)
+            inter_end = min(pack_end, hi)
+            if inter_start >= inter_end:
+                continue  # 无交集
+            # 实际 token（不含 separator）落在区间内的长度
+            actual_start = max(pack_start, lo)
+            actual_end = min(pack_start + raw_len, hi)
+            local_actual = max(actual_end - actual_start, 0)
+            local_pad = inter_end - inter_start
+            if local_actual > 0 or local_pad > 0:
+                local_lens.append(local_actual)
+                local_padded.append(local_pad)
+        local_lens_b.append(local_lens)
+        local_lens_padded_b.append(local_padded)
+        max_local_packs = max(max_local_packs, len(local_lens))
+
+    if max_local_packs == 0:
+        max_local_packs = 1  # 防止空 tensor
+
+    out_lens = torch.full((B, max_local_packs), SENTINEL,
+                          dtype=seq_lens.dtype, device=device)
+    out_padded = torch.full((B, max_local_packs), SENTINEL,
+                            dtype=seq_lens_padded.dtype, device=device)
+    for b in range(B):
+        n = len(local_lens_b[b])
+        if n > 0:
+            out_lens[b, :n] = torch.tensor(local_lens_b[b],
+                                            dtype=seq_lens.dtype, device=device)
+            out_padded[b, :n] = torch.tensor(local_lens_padded_b[b],
+                                              dtype=seq_lens_padded.dtype,
+                                              device=device)
+    return out_lens, out_padded
+```
+
+### 6.4 Expert Parallel (EP)：Expert 维度的 Shard + local_map
+
+#### 6.4.1 EP 的本质
+
+EP 的本质是**在 EP mesh 维度上沿 expert 维度（dim 0）做 Shard**。与 TP 的 Colwise Shard(0) 共享完全相同的 placement 语义：
+
+```python
+# TP Colwise: weight [H_out, H_in] -> Shard(0) on TP -> [H_out/tp, H_in]
+# EP Expert:  weight [n_experts, H_out, H_in] -> Shard(0) on EP -> [n_experts/ep, H_out, H_in]
+# EP+TP 组合: weight [n_experts, H_out, H_in]
+#   -> {EP: Shard(0)} -> [n_experts/ep, H_out, H_in]
+#   -> {TP: Shard(0)} -> [n_experts/ep, H_out/tp, H_in]
+```
+
+#### 6.4.2 EP 的 PrecompiledBoundary 表达 + local_map
+
+参考 Titan `moe_sharding.py` 的设计：MoE 模块的 `ShardingConfig` 包含完整的 `in_src/in_dst/out_src/out_dst`（与 dense 模块一致），同时通过 `local_map=LocalMapConfig(...)` 标记 forward 需要在 `DTensor->local->DTensor` 模式下运行。
+
+Hyper-Parallel 的等价设计：
+
+```python
+# MoE 模块（moe_mlp）, TP=4, EP=4, SP=true
+ModuleShardingSpec(
+    params={
+        # Router/gate: 全复制
+        "gate.weight": {TP: Replicate(), EP: Replicate()},
+        # Routed experts: EP Shard(0) + TP colwise/rowwise（D-08：3D [E,out,in]
+        # 权重的 TP 维按 ndim 平移——colwise=Shard(1)、rowwise=Shard(2)）
+        "experts.w1.weight": {EP: Shard(0), TP: Shard(1)},  # colwise on 3D
+        "experts.w2.weight": {EP: Shard(0), TP: Shard(2)},  # rowwise on 3D
+        "experts.w3.weight": {EP: Shard(0), TP: Shard(1)},  # colwise on 3D
+        # Shared experts (optional): 无 EP（仅 TP，2D 标准 colwise/rowwise）
+        "shared_experts.w1.weight": {EP: Replicate(), TP: Shard(0)},
+        "shared_experts.w2.weight": {EP: Replicate(), TP: Shard(1)},
+        "shared_experts.w3.weight": {EP: Replicate(), TP: Shard(0)},
+    },
+    # 入口: SP 序列分片，EP 维度 Replicate（所有 EP rank 看到相同 tokens）
+    in_src={
+        "x_BLD": {TP: Shard(1), CP: Replicate(), EP: Replicate()},
+    },
+    in_dst={
+        # all-gather TP（gate 和 shared experts 需要完整 hidden_states）
+        # EP 保持 Replicate（gate 需要全量 tokens 做路由决策）
+        "x_BLD": {TP: Replicate(), CP: Replicate(), EP: Replicate()},
+    },
+    # 出口: Experts 计算在 local_map 内部完成，输出为 Partial（Rowwise）
+    out_src={TP: Partial(), CP: Replicate(), EP: Replicate()},
+    out_dst={
+        # reduce-scatter -> SP 分片
+        TP: Shard(1),
+        CP: Replicate(),
+        EP: Replicate(),
+    },
+    # 标记: 此模块 forward 内部需要 local_map
+    # (all-to-all dispatch/combine 在 local tensor 上执行)
+    _use_local_map=True,
+)
+
+# PrecompiledBoundary 编译结果:
+# in_plan:  [RedistOp("x_BLD", TP Shard(1)->TP Replicate, "all_gather")]
+#           <- CP/EP 维度均为 Replicate->Replicate, identity 跳过
+# out_plan: [RedistOp("output", TP Partial->TP Shard(1), "reduce_scatter")]
+#           <- CP/EP 维度均为 Replicate->Replicate, identity 跳过
+```
+
+**local_map 的语义**（参考 Titan `LocalMapConfig`）：
+
+> **规范实现见 §4.4.3 `_wrap_moe_forward(module, boundary, spec, mesh, mesh_dim_names)`（5 参版）**。
+> 本节仅描述 local_map 语义，不重复实现。§4.4.3 的 5 参签名是 canonical 版本，
+> `_apply_phase_c`（§4.4.2）即按该签名调用。
+
+local_map 在 `_use_local_map=True` 时的 forward 行为：
+
+1. `boundary.redistribute_inputs(args, kwargs)` — PrecompiledBoundary 入口 redistribution（TP all-gather）
+2. `original_forward(*args, **kwargs)` — All-to-all dispatch/combine 在 local tensor 上执行（参数已由 `_local_params_context` 在 build 期永久 unpack）
+3. `DTensor.from_local(output, mesh, out_src_placements, run_check=False)` — local output 包装回 DTensor
+4. `boundary.redistribute_outputs(output)` — PrecompiledBoundary 出口 redistribution（TP reduce-scatter）
+
+**关键**：All-to-All dispatch/combine 发生在 local tensor 上（参数已在 build 期通过 `_local_params_context()` 永久 unpack），不在 PrecompiledBoundary 中。PrecompiledBoundary 只管理**模块入口/出口**的 deterministic redistribution（TP 的 all-gather/reduce-scatter），不管理模块内部的 data-dependent 通信（哪些 token 去哪个 expert 取决于 router 输出，是运行时确定的）。
+
+这与 Titan `moe_sharding.py` 的 `local_map` 模式完全一致：`ShardingConfig.local_map=LocalMapConfig(in_grad_placements=(...))`。
+
+#### 6.4.3 EP 参数分片与 token dispatcher 初始化归属
+
+**设计决策**：不保留 `ExpertParallel(ParallelStyle)` 子类（§1 已声明删除旧 `ParallelStyle` 子类，
+二者矛盾）。EP 参数分片统一由 `_shard_module_params` 按 `spec.params` 中的 `{EP: Shard(0)}`
+placement 处理——与 TP/CP 参数同路径，无需独立 `_apply` 入口。EP token dispatcher
+（DeepEP/UCCL-EP 后端）的初始化**不在 ShardingApplier 层**，而由 fsdp2/parallelizer 侧
+在 `apply_sharding_plan` 返回后调用，保持 ShardingApplier 只管"参数 DTensor 化 + forward 包装"：
+
+```python
+# components/distributed/parallelizer.py（fsdp2/parallelizer 侧，非 ShardingApplier）
+# apply_sharding_plan 之后：
+def init_ep_token_dispatchers(model, ep_mesh):
+    """EP token dispatcher 初始化（DeepEP/UCCL-EP 后端）。
+
+    在 apply_sharding_plan 之后、fully_shard 之前调用（位于 apply_model_infrastructure 中）。
+    遍历模型中所有
+    持有 init_token_dispatcher 的 MoE 模块，注入 EP mesh。
+    """
+    for module in model.modules():
+        if hasattr(module, "init_token_dispatcher"):
+            module.init_token_dispatcher(ep_mesh=ep_mesh)
+```
+
+**与 §4.1 的关系**：§4.1 的 Phase A 仅调 `_shard_module_params`（参数 DTensor 化），
+不调 `ExpertParallel._apply`——EP 参数分片已由 `spec.params` 的 `{EP: Shard(0)}`
+placement 在 `_shard_module_params` 内统一完成。token dispatcher 初始化由
+parallelizer 侧单独调用，时序在 `apply_sharding_plan` 之后。
+
+#### 6.4.4 EP+TP 组合的 Mesh 拓扑
+
+```
+world_size=32, tp=4, ep=4 -> dp=2
+
+main_mesh: DeviceMesh(shape=(2, 4, 4),
+                       names=("dp_shard", "ep", "tp"))
+moe_mesh:  DeviceMesh(shape=(4,), names=("ep",))
+
+参数视角 - expert weight [n_experts, H_inter, H]:
+  EP Shard(0) on ep -> [n_experts/ep, H_inter, H]
+  再 TP Shard(0) on tp      -> [n_experts/ep, H_inter/tp, H]
+
+通信视角:
+  EP 通信: all-to-all dispatch/combine（local tensor，参数已 build 期永久 unpack）
+  TP 通信: all-gather / reduce-scatter（PrecompiledBoundary 入口/出口）
+  两者正交 - EP 和 TP 使用不同的 process groups
+```
+
+#### 6.4.5 MoE ShardingTemplate 扩充
+
+```python
+TEMPLATES["moe_gate"] = ShardingTemplate(
+    norm_placement=Replicate(),          # gate.weight: 全复制 on TP+EP
+    moe_expert_placement=Shard(0),       # expert params: Shard(0) on EP
+    sp_in_src={"hidden_states": {TP: Shard(1), EP: Replicate()}},
+    sp_in_dst={"hidden_states": {TP: Replicate(), EP: Replicate()}},
+    sp_out_src={TP: Replicate(), EP: Replicate()},
+    sp_out_dst={TP: Replicate(), EP: Shard(0)},     # redistribute -> EP 分片
+    nosp_in_src={"hidden_states": {TP: Replicate(), EP: Replicate()}},
+    nosp_in_dst={"hidden_states": {TP: Replicate(), EP: Replicate()}},
+    nosp_out_src={TP: Replicate(), EP: Replicate()},
+    nosp_out_dst={TP: Replicate(), EP: Shard(0)},
+)
+
+TEMPLATES["moe_mlp"] = ShardingTemplate(
+    colwise_placement=Shard(0),          # expert w1/w3: Colwise on TP
+    rowwise_placement=Shard(1),          # expert w2: Rowwise on TP
+    norm_placement=Replicate(),          # gate/norm: 全复制
+    moe_expert_placement=Shard(0),       # expert params: Shard(0) on EP
+    sp_in_src={"x_BLD": {TP: Shard(1), EP: Replicate()}},
+    sp_in_dst={"x_BLD": {TP: Replicate(), EP: Replicate()}},
+    sp_out_src={TP: Partial(), EP: Replicate()},
+    sp_out_dst={TP: Shard(1), EP: Replicate()},
+    nosp_in_src={"x_BLD": {TP: Replicate(), EP: Replicate()}},
+    nosp_in_dst={"x_BLD": {TP: Replicate(), EP: Replicate()}},
+    nosp_out_src={TP: Partial(), EP: Replicate()},
+    nosp_out_dst={TP: Replicate(), EP: Replicate()},
+    # MoE 特有: 标记需要 local_map（DTensor->local 在 dispatch 前）
+    use_local_map=True,
+)
+```
+
+#### 6.4.6 MoE 模块的 ShardingPlanner 6-Phase 集成
+
+```
+Phase 1 (ParameterClassifier):
+  "model.layers.*.mlp.experts.*.weight" -> MOE_EXPERT  (命名规则: *.experts.*)
+  "model.layers.*.mlp.gate.weight"      -> MOE_GATE     (命名规则: *gate*.weight)
+  "model.layers.*.mlp.shared_experts.*" -> SHARED_EXPERT (命名规则: *shared_experts*)
+
+Phase 2 (BoundaryGrouper):
+  expert 参数(MOE_EXPERT) -> 聚合到 mlp 边界
+  gate 参数(MOE_GATE)     -> 聚合到同一边界
+  # gate + experts + shared_experts 共享同一个 MoE mlp 边界
+
+Phase 3 (SemanticRoleInference):
+  "model.layers.*.mlp" + 含 MOE_EXPERT 角色 -> boundary_type="moe_mlp"
+  "model.layers.*.mlp" + 不含 MOE_EXPERT    -> boundary_type="mlp"
+
+Phase 4 (TemplateLookup):
+  TEMPLATES["moe_mlp"] -> 自动填充 TP+EP params + I/O 契约
+
+Phase 5 (ChainPropagate):
+  标准流程 -- MoE mlp 的 in_src/out_dst 与前后模块对齐
+  注意: MoE 内部 all-to-all 不影响链式传播
+
+Phase 6 (SpecialHandler):
+  - GroupedExpertsDeepEP: init_token_dispatcher 代码注入
+  - GroupedExpertsTE: skip DTensor wrapping (TE 内部管理)
+  - shared_expert_gate: 额外的 gate projection
+  - gated_delta: 自定义 placement（跳过标准模板）
+
+gated_delta Phase 6 代码骨架（SSM/Mamba 类模块的 in_proj/A_log/dt 参数）：
+
+```python
+SPECIAL_HANDLERS["gated_delta_tp_shard"] = _shard_gated_delta
+
+def _shard_gated_delta(module, param_name, mesh):
+    """gated_delta 模块自定义 TP 分片：跳过标准模板。
+
+    识别 in_proj / A_log / dt 等参数，按 SSM head 结构切分而非标准 colwise/rowwise：
+    - in_proj: 按 head 维切（保证每个 head 完整）
+    - A_log: 按 head 维切（与 in_proj 对齐）
+    - dt: 按 head 维切
+    - out_proj: rowwise（标准）
+    """
+    tp_size = mesh.size()
+    param = getattr(module, param_name, None)
+    if param is None:
+        return
+    # 按 SSM head 分组切片，保证 head 内参数完整
+    custom_placement = _gated_delta_placement_for(param_name, param.shape, tp_size)
+    sharded = distribute_tensor(param.data, mesh, [custom_placement])
+    module.register_parameter(param_name, nn.Parameter(sharded))
+```
+```
+
+### 6.5 并行策略冲突检测
+
+```python
+class ParallelDims:
+    def validate_against_model(self, model: nn.Module, seq_len: int) -> None:
+        config = model.config
+        tp, cp, ep = self.tp, self.cp, self.ep
+
+        # TP 校验：attention heads 必须整除 tp
+        if tp > 1:
+            assert config.num_attention_heads % tp == 0, \
+                f"num_attention_heads ({config.num_attention_heads}) must be divisible by TP ({tp})"
+            assert config.num_key_value_heads % tp == 0, \
+                f"num_key_value_heads ({config.num_key_value_heads}) must be divisible by TP ({tp})"
+
+        # CP 校验：序列长度必须是 2*cp 的倍数（load balance 要求）
+        if cp > 1:
+            assert seq_len % (cp * 2) == 0, \
+                f"seq_len ({seq_len}) must be divisible by 2*cp ({2*cp})"
+
+        # TP+CP 联合校验
+        if tp > 1 and cp > 1:
+            assert seq_len % (cp * tp) == 0, \
+                f"seq_len ({seq_len}) must be divisible by cp*tp ({cp*tp})"
+
+        # EP 校验：num_experts 必须整除 ep
+        if ep > 1:
+            moe_config = getattr(getattr(model, "model", model), "moe_config", None)
+            num_experts = (
+                getattr(moe_config, "n_routed_experts", None)
+                or getattr(config, "num_experts", None)
+                or 0
+            )
+            assert num_experts % ep == 0, \
+                f"num_experts ({num_experts}) must be divisible by EP ({ep})"
+            assert num_experts > 0, \
+                "EP>1 requires MoE model (num_experts > 0)"
+
+        # TP+EP 联合校验（expert hidden dim 必须整除 tp）
+        if tp > 1 and ep > 1 and num_experts > 0:
+            moe_inter_dim = getattr(moe_config, "moe_inter_dim", None) if moe_config else None
+            if moe_inter_dim is not None:
+                assert moe_inter_dim % tp == 0, \
+                    f"moe_inter_dim ({moe_inter_dim}) must be divisible by TP ({tp})"
+```
+
+### 6.6 通信职责总结
+
+```
++--------------------------------------------------------------+
+|              Communication Responsibility Map                 |
+|                                                              |
+|  PrecompiledBoundary (compile-time plan, runtime execution):  |
+|    FORWARD activation communication ONLY:                     |
+|    * TP all-gather     (Shard->Replicate on TP mesh)          |
+|    * TP reduce-scatter (Partial->Shard on TP mesh)            |
+|    * CP all-gather     (Shard->Replicate on CP mesh)          |
+|    * CP reduce-scatter (Replicate->Shard on CP mesh)          |
+|    * EP redistribute   (Replicate->Shard on EP mesh)          |
+|    * loss_parallel     (Shard(-1) directly to CE loss)        |
+|                                                              |
+|  Inner Attention Wrapper (compile-time forward replacement):  |
+|    * CP K/V all-gather in SDPA/FlexAttention                  |
+|    Reference: Titan context_parallel.py apply_cp_to_forward() |
+|                                                              |
+|  _local_params_context (build-time one-shot unpack):          |
+|    * EP all-to-all dispatch (tokens -> expert ranks)          |
+|    * EP all-to-all combine  (expert outputs -> token ranks)   |
+|    Reference: Titan moe_sharding.py LocalMapConfig            |
+|                                                              |
+|  FSDP2 / HSDP (DP dimension + gradient sync):                 |
+|    * DP all-gather / reduce-scatter (parameters)              |
+|    * TP all-reduce (Replicate parameter gradients)            |
+|      -> norm/bias/gate params: FSDP layout-driven grad sync   |
+|      -> See §6.7 for details on gradient synchronization      |
+|    * Mixed precision / CPU offload                            |
++--------------------------------------------------------------+
+```
+
+
+---
+
+
+---
+
+
+
+---
+
+
+### 6.7 Gradient Synchronization: FSDP handles parameter gradients
+
+DTensor 和 PrecompiledBoundary **仅处理 FORWARD 过程中的 activation 通信**（all-gather / reduce-scatter / redistribute）。所有参数的梯度同步由 FSDP2 / HSDP 负责，通过 layout-driven gradient sync 机制实现。
+
+#### 6.7.1 build_tp_grad_info：从 ShardingPlan 读取梯度同步信息
+
+```python
+# components/distributed/sharding/tp_grad.py
+def build_tp_grad_info(
+    plan: ShardingPlan, tp_mesh: DeviceMesh,
+    *, tied_pairs: list[tuple[str, str]] | None = None,
+) -> dict[str, tuple[Placement, DeviceMesh]]:
+    """{param_fqn: (tp_placement, tp_mesh)}，tp_placement in {Shard, Replicate}。
+    从 ShardingPlan 读取（build 期 _local_params_context 解包前 plan 仍在）。
+
+    tied_pairs: 共享存储的参数对（如 ("embed_tokens.weight", "lm_head.weight")），
+        来源 `plan.tied_pairs` 或 `detect_tied_weights(model)`。tied 对必须映射到
+        同一 tp_placement——否则 FSDP 会把同一份物理参数当成两个不同 TP 切分,
+        梯度同步语义冲突。归一化策略：tied 对 placement 不一致时，取较细的分片
+        （Shard 优先于 Replicate），保证两端的 TP all-reduce / reduce-scatter 一致。
+    """
+    info = {}
+    for fqn, spec in plan.modules.items():            # ShardingPlan.modules
+        for param_name, named_placement in spec.params.items():  # ModuleShardingSpec.params
+            full_fqn = f"{fqn}.{param_name}"
+            tp_placement = named_placement.get("tp", Replicate())  # NamedPlacement 是 dict[str, Placement]
+            info[full_fqn] = (tp_placement, tp_mesh)
+
+    # tied-weight 归一化：embed.weight <-> lm_head.weight 等共享存储参数
+    pairs = tied_pairs if tied_pairs is not None else getattr(plan, "tied_pairs", None)
+    if pairs:
+        for a, b in pairs:
+            if a in info and b in info:
+                pa, _ = info[a]
+                pb, _ = info[b]
+                if pa != pb:
+                    # 取较细分片（Shard 优先），保证 tied 对梯度同步语义一致
+                    norm = pa if isinstance(pa, Shard) else pb
+                    info[a] = (norm, tp_mesh)
+                    info[b] = (norm, tp_mesh)
+    return info
+```
+
+**tp_grad_info 的数据来源**：从 ShardingPlan 读取 (`build_tp_grad_info(plan, tp_mesh)`)，而非从 DTensor 的 placement 推导。因为在 `_local_params_context` 解包后 DTensor 元数据已丢失，但 build 期的 `plan.modules[*].spec.params` 仍然保留完整的 placement 信息。
+
+**tied-weight 归一化**：当 embed 与 lm_head 共享权重（weight tying）时，两者必须映射到同一 tp_placement。`build_tp_grad_info` 在构造时对 `plan.tied_pairs`（或显式传入的 `tied_pairs`）做归一化——placement 不一致时取较细分片（Shard 优先于 Replicate），保证 tied 对的 TP 梯度同步（all-reduce / reduce-scatter）语义一致。这是 06 root-unit tied-weights 语义的实现归属（06 仅声明契约，归一化逻辑在此）。
+
+#### 6.7.2 _get_base_spmd_placements 新分支
+
+```python
+# In _build_layout_driven_group_info / _get_base_spmd_placements:
+def _get_base_spmd_placements(
+    param_fqn: str, dp_mesh: DeviceMesh, tp_grad_info: dict
+) -> tuple[DeviceMesh, list[Placement]]:
+    """Resolve base SPMD placements for this parameter from tp_grad_info.
+    返回 (spmd_mesh, placements)：
+    - TP-sharded param: concatenate DP+TP mesh, [Replicate(DP), tp_placement]
+    - 无 tp_grad_info: 纯 DP, (dp_mesh, [Replicate(DP)])
+    """
+    if param_fqn in tp_grad_info:
+        tp_placement, tp_mesh = tp_grad_info[param_fqn]
+        # NOTE: DeviceMesh.concatenate 是待新增的自定义 helper（PyTorch 公开 API
+        # 无此方法）。实现路径：从 dp_mesh / tp_mesh 各自的 process group 构造
+        # 一个合并的 2D DeviceMesh（shape=(dp_size, tp_size)），或用
+        # DeviceMesh(mesh_dim_names=("dp","tp"), mesh=...) 显式重建。
+        # 参考 _build_layout_driven_group_info 的 mesh 组装逻辑，若上游
+        # 已有合并 mesh 可直接复用，避免重复构造。
+        #
+        # 实现草图:
+        #   def concatenate(meshes: list[DeviceMesh]) -> DeviceMesh:
+        #       \"\"\"沿新的最外层维度拼接多个 DeviceMesh，返回一个更高维的 DeviceMesh。\"\"\"
+        #       # 1. 收集每个子 mesh 的 mesh tensor (shape 必须一致)
+        #       sub_meshes = [m.mesh for m in meshes]
+        #       # 2. 沿 dim 0 stack 为 [len(meshes), *sub_shape]
+        #       mesh_tensor = torch.stack(sub_meshes, dim=0)
+        #       # 3. 新维度名: 第一维用各 mesh 的 dim_names 拼接
+        #       #    例: dp_mesh(["dp"]), tp_mesh(["tp"]) → (["dp","tp"],)
+        #       mesh_dim_names = tuple(itertools.chain.from_iterable(
+        #           m.mesh_dim_names for m in meshes))
+        #       return DeviceMesh(device_type, mesh_tensor, mesh_dim_names)
+        spmd_mesh = DeviceMesh.concatenate([dp_mesh, tp_mesh])
+        return spmd_mesh, [Replicate(), tp_placement]   # [Replicate(DP), tp_placement]
+    return dp_mesh, [Replicate()]   # 纯 DP
+```
+
+#### 6.7.3 _normalize_unsharded_grad_to_local
+
+```python
+# In all_reduce_grad / gradient normalization:
+def _normalize_unsharded_grad_to_local(
+    grad: torch.Tensor, param_name: str, tp_grad_info: dict
+) -> torch.Tensor:
+    """把 unsharded 梯度归一化到 local shard。
+
+    - TP-Shard(N) 参数：FSDP unshard 后 grad 是 full-size，需 re-shard 到 local。
+    - TP-Replicate 参数：grad 是 Partial(TP)（各 rank 独立计算的梯度），需 TP all-reduce
+      后再 redistribute 回 Replicate。
+    - 无 tp_grad_info：grad 已是 local shard，原样返回。
+
+    NOTE: 当前实现假设 tp_mesh 是单维度 mesh（仅含 TP 维）。当 DP+TP 使用
+    合并的 2D DeviceMesh（DeviceMesh.concatenate([dp_mesh, tp_mesh])，见 §6.7.2）时，
+    DTensor.from_local 和 redistribute 的 placements 需要扩展为 [Replicate(DP), tp_placement]
+    以匹配 2D mesh 的维度结构。tp_grad_info 中存储的是纯 TP mesh，未携带 DP 维度信息，
+    此时需由调用方传入合并后的 spmd_mesh 或从 dp_mesh+tp_mesh 组装。
+    """
+    if param_name not in tp_grad_info:
+        return grad  # already local shard
+    tp_placement, tp_mesh = tp_grad_info[param_name]
+    if isinstance(tp_placement, Shard):
+        # FSDP unshard 后 grad 是 full-size，需 re-shard 到 local
+        grad_dt = DTensor.from_local(grad, tp_mesh, [Replicate()])
+        grad_dt = grad_dt.redistribute([tp_placement])   # Replicate → Shard(N)
+        return grad_dt._local_tensor
+    else:  # Replicate → grad 是 Partial(TP)
+        # TP all-reduce：Partial → Replicate（tp_placement 即 Replicate()，
+        # 无需再次 redistribute，原先的第二行 redistribute([tp_placement]) 是冗余 identity）
+        grad_dt = DTensor.from_local(grad, tp_mesh, [Partial()])
+        grad_dt = grad_dt.redistribute([Replicate()])   # Partial → Replicate（TP all-reduce）
+    return grad_dt._local_tensor
+```
+
+**TP-Replicate 参数（norm / bias / gate / router）的梯度同步**：
+
+这些参数在 TP 维度上是 `Replicate()` —— 每个 TP rank 持有完整副本。Forward 时各 rank 独立计算，产生的梯度需要 all-reduce 才能保证一致性。**这个 TP all-reduce 由 FSDP2 完成**，而非 PrecompiledBoundary：
+
+- `tp_grad_info` 由 `build_tp_grad_info(plan, tp_mesh)` 从 ShardingPlan 读取（见 §6.7.1），**而非由 `fully_shard()` 根据 DTensor placement 推导**——production 下参数已被 `_local_params_context` 解包为 plain local tensor，无 DTensor 可读，只有 plan 保留完整 placement 信息
+- `fully_shard()` 接收 `tp_grad_info` 后，`_build_layout_driven_group_info()` 检测到 TP 维度上有 `Replicate()` placement 的参数时，为该参数创建跨 TP rank 的 reduce group
+- `all_reduce_grad()` 在 backward 中自动对 Replicate 参数的梯度执行 TP all-reduce
+
+**TP-Shard 参数（colwise / rowwise）的梯度处理**：
+
+这些参数在 TP 维度上是 `Shard(0)` 或 `Shard(1)` —— 每个 TP rank 持有参数的一个分片。Forward 时各 rank 使用自己的参数分片计算，产生的梯度**已经是正确的 local shard**，无需跨 TP rank 同步。
+
+**与 HSDP 的复用关系**：
+
+该机制完全复用 HSDP 现有的 `_build_layout_driven_group_info()` / `all_reduce_grad()` 基础设施，无需为 DTensor 新增梯度同步代码路径。
+
+**总结**：
+
+```
+FORWARD 通信职责:   DTensor + PrecompiledBoundary（activation 通信）
+BACKWARD 通信职责:  FSDP2 / HSDP（参数梯度同步）
+                   ├─ TP-Replicate 参数: FSDP 执行 TP all-reduce 梯度
+                   └─ TP-Shard 参数:     梯度已是 local shard，无需同步
+```
+
+## 7. 与 FSDP2 的关系
+
+> **调用位置**: 时序树 ④.3.5.11 — `fsdp2_manager.parallelize(model)` 在 ShardingApplier 之后执行
+
+```
+分工边界:
+  DTensor 管理的维度: TP, CP, EP
+  FSDP2 管理的维度: dp_shard, dp_replicate
+
+执行顺序:
+  1. apply_sharding_plan() → 参数 → DTensor（TP/CP/EP 分片）
+     └─ Phase C 入口: _local_params_context (build-time one-shot) → DTensor 参数永久 unpack 为 plain local tensor
+        + build_tp_grad_info(plan, tp_mesh) → tp_grad_info（供 fully_shard 使用）
+     返回 (model, tp_grad_info)
+  2. FSDP2Manager.parallelize() → fully_shard(layer, mesh=dp_mesh, tp_grad_info=tp_grad_info)
+
+各阶段参数状态 (TP=4, FSDP dp_shard=8):
+
+  Stage 1 — apply_sharding_plan 后:
+    weight = DTensor(global_shape=[H, H], placements=[Shard(0)])
+    DTensor._local_tensor = [H/4, H]  (local shard)
+    参数仍是 DTensor 类型，携带完整的 global_shape + placements 元数据
+
+  Stage 2 — _local_params_context 后 (build-time, one-shot, 在 fully_shard 之前):
+    weight = plain torch.Tensor [H/4, H]  (DTensor 已 unpack 为 _local_tensor)
+    参数变为普通 local tensor，DTensor 元数据丢失（tp_grad_records 已保存 placements 快照）
+    **仅在 build 阶段执行一次（不再使用 context manager / try-finally），之后 forward 中参数始终是 local tensor**
+
+  Stage 3 — fully_shard 后:
+    weight = FSDP-managed LOCAL_PARAM [H/4, H]
+    FSDP2 接管参数的 all-gather / reduce-scatter 生命周期
+    TP-Replicate 参数附带 tp_grad_info（FSDP 在 backward 中做 TP all-reduce）
+
+  Validate 模式 (validate_mode=True):
+    参数保持为 DTensor（不执行 _local_params_context unpack）
+    Forward 全程走 __torch_dispatch__ 传播 placement
+    用于校验 out_src / out_dst 声明的正确性
+
+参数视角 (TP=4, FSDP dp_shard=8):
+  weight → distribute_tensor(weight, tp_mesh, [Shard(0)])
+         → DTensor(global_shape=[H, H], placements=[Shard(0)])
+         → _local_params_context(module) (build-time, one-shot) → plain local tensor [H/4, H]
+  fully_shard(self_attn, mesh=dp_mesh)
+         → FSDP2 管理 local tensor [H/4, H] 的 all-gather/reduce-scatter
+
+Production forward + post-backward full timing (FSDP hook + boundary interleaving):
+
+```
+─ forward ─────────────────────────────────────────────────────────
+  for each boundary module in execution order:
+    FSDP2 pre-forward hook:
+      unshard(module)                              # DP all-gather → full params
+    PrecompiledBoundary.redistribute_inputs(x)     # TP/CP/EP all-gather
+    module.forward(x_local)                        # pure local tensor compute
+    PrecompiledBoundary.redistribute_outputs(y)    # TP reduce-scatter / CP shard
+    FSDP2 post-forward hook:
+      reshard(module)                              # DP reduce-scatter → 释放 full params
+─ backward ────────────────────────────────────────────────────────
+  FSDP2 pre-backward hook:
+    rebuild_full_params(module)                    # DP all-gather → full params
+  autograd backward:
+    compute gradients on full params
+  FSDP2 post-backward hook:
+    _normalize_unsharded_grad_to_local()           # TP-Replicate: re-shard grad
+    all_reduce_grad()                              # TP-Replicate: TP all-reduce
+    reduce_scatter_grad()                          # DP: reduce-scatter → local shard
+──────────────────────────────────────────────────────────────────
+```
+
+Checkpoint (DCP):
+  DCP 记录 DTensor 元数据 (global_shape + placements)
+  → 跨 TP 配置重分片: TP=4→2, DCP 自动 all-gather + re-shard
+  → 跨 DP 配置重分片: 同样处理
+```
+
+---
+
+
+
+---
+
+## 8. 用户自定义模块的配置方式
+
+> **调用位置**: 时序树 ④.3.5.7 Phase 1 — ParameterClassifier 处理 ARCH_OVERRIDES / MODEL_FAMILIES
+
+### 8.1 三种配置方式
+
+| 方式 | 适用场景 | 用户需要做的 |
+|------|---------|-------------|
+| **A: 自动推导** | 模块遵循标准 Transformer 命名和结构 | **零代码**；默认规则自动覆盖 |
+| **B: 架构规则覆盖** | 模块结构标准但命名非标准 | 注册一条命名规则到 `ARCH_OVERRIDES` |
+| **C: 手动声明** | 完全自定义模块（无参数或有特殊通信需求） | 手动构建 `ModuleShardingSpec` 注入 `ShardingPlan` |
+| **D: plan_overrides 合并** | 个别模块的契约/分片需定制（多输入契约 key、reshape 边界、特殊通信） | 手写该模块的 `ModuleShardingSpec`，经 `ShardingPlanner(plan_overrides=...)` 在 Phase 5 前合并（§3.6.7、§8.5） |
+
+### 8.2 方式 A：自动推导（零代码）
+
+```python
+# 用户的模块使用标准 HF 结构
+class MyStandardModel(nn.Module):
+    def __init__(self, config):
+        self.embed_tokens = nn.Embedding(...)    # 标准命名 → EMBED ✅
+        self.layers = nn.ModuleList([
+            MyDecoderLayer(config) for _ in range(config.num_layers)
+        ])
+        self.norm = nn.RMSNorm(...)              # 标准命名 → NORM ✅
+        self.lm_head = nn.Linear(...)            # 标准命名 → LM_HEAD ✅
+
+class MyDecoderLayer(nn.Module):
+    def __init__(self, config):
+        self.input_layernorm = nn.RMSNorm(...)            # NORM ✅
+        self.self_attn = MyAttention(config)              # 子模块
+        self.post_attention_layernorm = nn.RMSNorm(...)   # NORM ✅
+        self.mlp = MyMLP(config)                          # 子模块
+
+class MyAttention(nn.Module):
+    def __init__(self, config):
+        self.q_proj = nn.Linear(...)   # COLWISE ✅
+        self.k_proj = nn.Linear(...)   # COLWISE ✅
+        self.v_proj = nn.Linear(...)   # COLWISE ✅
+        self.o_proj = nn.Linear(...)   # ROWWISE ✅
+
+class MyMLP(nn.Module):
+    def __init__(self, config):
+        self.gate_proj = nn.Linear(...) # COLWISE ✅
+        self.up_proj = nn.Linear(...)   # COLWISE ✅
+        self.down_proj = nn.Linear(...) # ROWWISE ✅
+
+# 使用方式——零配置
+model = HyperAutoModelForCausalLM.from_pretrained(
+    "/path/to/my-model",
+    distributed_setup={"tp": 4},
+)
+# ShardingPlanner 自动完成一切 ✅
+```
+
+### 8.3 方式 B：架构规则覆盖（一行注册）
+
+```python
+# 用户模块有非标准命名
+class MyModel(nn.Module):
+    def __init__(self, config):
+        self.token_embed = nn.Embedding(...)         # 非标准命名 "token_embed"
+        self.blocks = nn.ModuleList([...])
+        self.final_ln = nn.RMSNorm(...)              # 非标准命名 "final_ln"
+        self.output_head = nn.Linear(...)            # 非标准命名 "output_head"
+
+# 只需注册命名规则
+# 在 hyper_parallel/components/distributed/sharding_planner.py 中：
+ARCH_OVERRIDES["MyModelForCausalLM"] = [
+    (r"(?:^|\.)token_embed\.weight$",  ParamRole.EMBED),
+    (r"(?:^|\.)output_head\.weight$",  ParamRole.LM_HEAD),
+    (r"(?:^|\.)final_ln\.weight$",     ParamRole.NORM),
+]
+# 其余自动推导 ✅
+```
+
+### 8.4 方式 C：手动声明 ModuleShardingSpec
+
+适用于**无权重模块**或**特殊通信需求**的场景：
+
+#### 场景 1：无权重但有通信需求的模块
+
+```python
+class CustomCommWrapper(nn.Module):
+    """自定义通信包装器：无参数，但需要在模型 forward 中作为通信边界。
+
+    功能：对 hidden_states 做自定义的 all-to-all 重排。
+    """
+    def __init__(self): ...
+    def forward(self, hidden_states):
+        # 自定义通信逻辑
+        ...
+
+# 手动注入到 ShardingPlan
+plan = ShardingPlan(mesh_dim_names=("tp",))
+
+plan.modules["model.custom_comm"] = ModuleShardingSpec(
+    params={},                                         # 无参数
+    in_src={"hidden_states": {TP: Shard(1)}},
+    in_dst={"hidden_states": {TP: Shard(1)}},          # identity（通信在模块内部处理）
+    out_src={TP: Shard(1)},
+    out_dst={TP: Shard(1)},
+    is_boundary=True,                                   # 仍然标记为边界
+)
+
+# 应用到模型
+apply_sharding_plan(model, plan, mesh)
+```
+
+#### 场景 2：MoE Router（无权重需要分片但有 placement 声明）
+
+```python
+# MoE router 是一个简单的 nn.Linear + softmax
+# 它的 weight/bias 需要全复制（Replicate）才能保证所有 rank 路由一致
+
+plan.modules["model.layers.0.mlp.router"] = ModuleShardingSpec(
+    params={
+        "weight": {TP: Replicate(), EP: Replicate()},
+    },
+    in_src={"hidden_states": {TP: Shard(1), EP: Replicate()}},
+    in_dst={"hidden_states": {TP: Replicate(), EP: Replicate()}},  # all-gather TP
+    out_src={TP: Replicate(), EP: Replicate()},
+    out_dst={TP: Replicate(), EP: Shard(0)},  # redistribute 到 EP
+    is_boundary=True,
+)
+```
+
+#### 场景 3：完全自定义的并行模块
+
+```python
+# 用户自己设计了一个特殊的 attention variant
+# 它用 fused QKV + custom projection
+
+class MyFusedAttention(nn.Module):
+    def __init__(self, config):
+        self.fused_qkv = nn.Linear(H, 3*H)      # 融合 QKV → FUSED_QKV
+        self.custom_proj = nn.Linear(H, H)       # 非标准输出投影
+
+    def forward(self, hidden_states):
+        qkv = self.fused_qkv(hidden_states)
+        q, k, v = qkv.chunk(3, dim=-1)
+        # ... custom attention logic ...
+        return self.custom_proj(attn_out)
+
+# 步骤 1: 注册命名规则
+ARCH_OVERRIDES["MyModelForCausalLM"] = [
+    (r"fused_qkv\.weight$",    ParamRole.FUSED_QKV),  # 特殊角色
+    (r"custom_proj\.weight$",  ParamRole.ROWWISE),
+]
+
+# 步骤 2: 如果 FUSED_QKV 需要特殊分片逻辑，注册 SpecialHandler
+SPECIAL_HANDLERS["my_fused_qkv_shard"] = _shard_my_fused_qkv
+
+def _shard_my_fused_qkv(module, param_name, mesh):
+    """自定义 fused QKV 分片：按 head 维度切分，保证 Q/K/V 各 block 内的 head 完整。"""
+    tp_size = mesh.size()
+    weight = module.fused_qkv.weight  # [3*H, H]
+    n_heads = module.config.num_attention_heads
+    head_dim = H // n_heads
+    # ... 按 head 分组切片后重新拼接 ...
+    module.fused_qkv.weight = nn.Parameter(sharded_weight)
+```
+
+### 8.5 方式 D：`plan_overrides` 合并注入（个别模块定制）
+
+方式 C 的增强路径：手写 spec 不绕开 planner，而是经构造函数注入、在
+**Phase 5 链式传播之前**合并（语义细节见 §3.6.7）。相比 plan() 后打补丁，
+覆盖 spec 仍享受相邻契约校验、`_is_terminal` 标记与结构标记模板补齐。
+
+#### 场景：自研多输入 attention（契约 key 非 hidden_states 且非首个位置参数）
+
+```python
+class PanguAttention(nn.Module):
+    """forward(self, attn_bias, x, kv_cache=None)——被切张量 x 在位置 1，
+    模板默认 key "hidden_states" 签名绑定 miss、位置兜底错绑下标 0。"""
+
+# 推荐用法：先推导一次拿模板填充的 spec，只改需要定制的字段后回注
+base_plan = ShardingPlanner().plan(model, mesh, tp_size=2)
+overrides = {}
+for fqn, spec in base_plan.modules.items():
+    if fqn.endswith("attention"):
+        spec = copy.deepcopy(spec)
+        for attr in ("in_src", "in_dst"):
+            d = getattr(spec, attr)
+            d["x"] = d.pop("hidden_states")      # 契约 key 对齐真实签名
+        overrides[fqn] = spec
+
+plan = ShardingPlanner(plan_overrides=overrides).plan(model, mesh, tp_size=2)
+model, tp_grad_info = apply_sharding_plan(model, plan, mesh)
+```
+
+完全手写也可以（此时注意：`_needs_cp_attn`/`_use_local_map` 会从推断模板
+自动补齐，无需也不允许手动关闭；`out_src`/`out_dst` 支持标量简写）：
+
+```python
+overrides["layers.0.attention"] = ModuleShardingSpec(
+    params={"wq.weight": {TP: Shard(0)}, ..., "wo.weight": {TP: Shard(1)}},
+    in_src={"x": {TP: Shard(1)}},
+    in_dst={"x": {TP: Replicate()}},
+    out_src={TP: Partial()},
+    out_dst={TP: Shard(1)},
+)
+```
+
+与上下游契约冲突（如 `in_src` 声明与上游 `out_dst` 不一致）在 `plan()` 内
+即抛 `PlacementMismatchError`，不会延迟到运行时。
+
+---
+
+
+
+---
+
+## 9. 端到端流程
+
+> 汇总了本文档各阶段的完整调用链（已被 §2 总入口调用时序取代，保留作为补充视角）
+
+```python
+# 用户代码
+model = HyperAutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B",
+    distributed_setup={"tp": 4, "cp": 1, "enable_sequence_parallel": True},
+)
+
+# 内部流程：
+# ① 分布式初始化 + DeviceMesh 构建
+# ② AutoConfig.from_pretrained → hf_config
+# ③ meta device 空壳构建（零显存）
+# ④ ShardingPlanner.plan(model, mesh) → ShardingPlan
+#     Phase 1-2: 参数分类 + 边界分组
+#     Phase 3-4: 语义推断 + 模板填充 (in_src, in_dst, out_src, out_dst)
+#     Phase 5: 链式传播校验
+#     Phase 6: 特殊处理器
+# ⑤ apply_sharding_plan(model, plan, mesh, validate_mode=False) → (model, tp_grad_info)
+#     Phase A: distribute_tensor() → 参数 DTensor
+#     Phase B: 特殊处理器
+#     Phase C 入口: _local_params_context() → DTensor 永久 unpack + build_tp_grad_info()
+#     Phase C: _apply_phase_c() → forward 包装（CP/MoE/validate/production 四分支）
+# ⑥ FSDP2Manager.parallelize() → 在 meta 上 fully_shard（canonical：先于 to_empty/load）
+# ⑦ model.to_empty(device) → 材质化 sharded 参数
+# ⑧ checkpointer.load_base_model() → 每 rank 独立读 safetensors → 写入本地份
+# ⑨ 返回可训练模型
+#
+# ★ 顺序以 06 §5.2 canonical meta 链路为准：fully_shard(meta) → to_empty → load。
+#   （第六轮 P1 修复：旧文本 ⑥to_empty→⑦load→⑧parallelize 与 06 §5.2 相反，
+#    已对齐为 parallelize 在 to_empty/load 之前，避免先 load 全量再 shard 的二次显存峰值。）
+```
+
+---
+
+
+
+---
+
+## 10. 新模型上线流程
+
+以新增 **PanguForCausalLM** 为例：
+
+| 场景 | 需要做的 | 代码量 |
+|------|---------|--------|
+| 命名完全标准 | 零配置 | 0 行 |
+| 命名非标准 | 注册 `ARCH_OVERRIDES` 规则 | ~5 行 |
+| 有特殊参数（fused QKV、SSM state 等） | 注册 `SpecialHandler` | ~20 行 |
+| 完全自定义模块（无权重/特殊通信） | 手动构建 `ModuleShardingSpec` | ~15 行/模块 |
+
+```bash
+# 验证
+HYPER_VALIDATE_PLACEMENT=1 torchrun --nproc_per_node=4 train.py
+# → DTensor 双重校验 (out_src + out_dst) 全部通过 ✅
+
+# 训练
+torchrun --nproc_per_node=4 train.py
+# → 生产模式，零 DTensor dispatch 开销
+```
+
+---
+
+
+
+---
+
+## 11. 总结
+
+| 层面 | 数据 | 核心职责 |
+|------|------|---------|
+| **NamedPlacement** | `{TP: Shard(0)}` = TP mesh 轴沿 tensor dim 0 切分 | 声明式 placement，与 tensor shape 直接对应 |
+| **ModuleShardingSpec** | `params` + `in_src`/`in_dst` + `out_src`/`out_dst` | 完整 I/O 契约，运行时直接使用，无推断 |
+| **is_boundary** | `True`/`False` | 控制是否包装 forward + 构建 PrecompiledBoundary |
+| **ShardingTemplate** | 语义角色(attention/mlp/norm/embed/lm_head/moe_gate) → 完整 Spec | 自动填充 I/O 契约，含 params + 四元 placement + 通信计划 |
+| **链式传播** | 填充缺省 in_src + 校验 A.out_dst ≈ B.in_src | 自动填充 + 编译期契约一致性校验 |
+| **PrecompiledBoundary** | `list[RedistOp]` | 编译期通信计划，运行时零判断 |
+| **RedistOp.collective_type** | `str`（调试标签） | 通信统一走 `DTensor.redistribute()`，PyTorch 自动选最优 collective |
+| **Validate 模式** | out_src 校验（核心）+ out_dst 校验（仅末端模块）| out_src 不可替代；out_dst 由链式传播覆盖（中间模块） |
+| **用户自定义模块** | 3 种方式（自动/规则/手动） | 灵活适配无权重、特殊通信等场景 |
+
+---
+
+## 12. 实现回写（实施校准记录）
+
+> 本节记录 `components/distributed/` 实现阶段对本文档的校准（实现以代码为准，
+> 测试基线见 `tests/components/distributed/`，221 个用例全绿）。
+> 已在正文中就地修订的位置（§3.5 模板 D-05~D-08、§4.4、§3.6）引用本节编号。
+
+### 12.1 自研 DTensor API 适配（与正文伪代码的签名差异）
+
+正文伪代码按 PyTorch DTensor 风格书写；实现使用自研前向-only DTensor
+（`hyper_parallel.core.dtensor`），签名差异如下：
+
+| 伪代码 | 实现 |
+|--------|------|
+| `DeviceMesh("cpu", shape, mesh_dim_names=...)` | `init_device_mesh(device_type, mesh_shape, mesh_dim_names=...)`（裸构造缺 rank_list，`distribute_tensor` 会失败） |
+| `DTensor.from_local(t, mesh, placements, run_check=False)` | `DTensor.from_local(t, mesh, placements)`（无 run_check） |
+| `dt.redistribute(placements=..., async_op=False)` | `dt.redistribute(mesh, placements)`（mesh 为第一参数） |
+| 直接在传入 mesh 上分发 | `apply_sharding_plan` 入口先取 `_get_active_mesh(mesh, plan.mesh_dim_names)` 活跃子 mesh——planner 剔除 size=1 轴后 placements 元数与 mesh 维数必须对齐，否则 `distribute_tensor` 静默错轴分片（EP 分片曾因此失效） |
+
+另外 `flex_cp_allgather` 的反向由自定义 autograd.Function 显式实现
+（all-gather 前向 + reduce-scatter 语义反向）；plain `dist.all_gather` 无 autograd 核。
+
+### 12.2 新增设计修订（D-05 ~ D-08，实现期发现）
+
+| # | 问题 | 决策 |
+|---|------|------|
+| D-05 | embed 模板 CP 契约与 §6.3.4 数据管道矛盾：batch 已被 `shard_batch_for_cp` 按 CP 切分，in/out CP 维若声明 Replicate，boundary 会把已切分的 chunk 再 scatter 一次（序列被切两次） | CP>1 时 embed 的 in_src/in_dst/out_src CP 维 = `Shard(1)`（`_build_spec_from_template` 按 has_cp 应用）；out_dst 不变（TP reduce-scatter，CP identity） |
+| D-06 | mlp/moe_mlp 模板 in_dst CP=`Replicate` 会在 TP×CP 下产生 tp-major 序列布局，与 embed/attention 产出的 cp-major 布局不一致（数值错误），且 MLP 是 pointwise 无需 CP 通信 | mlp/moe_mlp 的 CP 维全程 `Shard(1)`（in_dst/out_src 同步修改） |
+| D-07 | lm_head 模板 in_dst CP=`Replicate` 违反 R8（boundary 层 CP 维恒 identity——CP 序列 all-gather 仅发生在 attention 内部 K/V） | lm_head 的 CP 维全程 `Shard(1)`；CP 下 lm_head 在本地 CP chunk 上计算 logits/loss（Megatron CP 标准做法），输出为 chunk logits |
+| D-08 | 3D expert 权重 `[E, H_out, H_in]` 的 TP placement 按 2D 写的 `Shard(0)/Shard(1)` 会错切 expert 维/H_out 维（数值错误） | MOE_EXPERT 的 TP placement 按参数 ndim 感知：ndim≥3 → colwise=`Shard(1)`、rowwise=`Shard(2)`；ndim=2（per-expert 布局）→ 标准 `Shard(0)/Shard(1)`（此时 EP Shard(0) 语义不成立，EP 需按"每 rank 持 expert 子集"的 module 级实现，归 ARCH_OVERRIDES/SpecialHandler） |
+
+### 12.3 Planner 实现修正
+
+1. **Phase 2 边界分组（§3.6.6 伪代码缺陷修正）**：伪代码对单参数临时 group 做
+   边界推断，`q_proj` 叶模块会被"仅 colwise → mlp"规则误判为独立边界。实现改为
+   **两趟分组**：趟 1 按直属模块 FQN 分组；趟 2 工作队列深度优先，unknown 则整组
+   向上合并到父模块（兄弟参数合并齐备后再推断）。回溯到根仍 unknown 归入参数
+   所在模块（无模板命中 → warning 跳过，等价不分片）。
+2. **链式传播的名字无关单 entry 配对（§3.6.5 修订）**：模板 in_src key 与上游
+   out_dst key 可能不同名（attention 的 `"output"` vs moe_mlp 的 `"x_BLD"`）。
+   双方都恰好 1 个 entry 时按"唯一 arg"配对（名字无关），否则按 key 名配对；
+   in_src 整体为空时按下游 in_dst 声明的 key 填充。
+3. **`_is_terminal` 按链式相邻标记**（不做跨模块 placement 值相等匹配——
+   lm_head 的 Replicate out_dst 会被 embed 的 Replicate in_src 误引用）。
+4. **`_bind_input_indices`**：PrecompiledBoundary 的 in_plan arg_name 在包装时
+   绑定到 forward 签名的 positional 下标（模块间调用多为 positional，kwargs 按名
+   查找会 miss）；单输入契约（in_plan 仅 1 op）回退绑定到首个 positional 参数——
+   覆盖模板 key（如 `"hidden_states"`）与叶模块签名（`nn.Linear.forward(input)`）
+   不同名的场景。`redistribute_inputs` 对未找到的 arg 跳过（不注入 None）。
+5. **`_classify_collective` 只比较有差异的维度**：identity 维（如 attention 的
+   CP 维 Shard(1)→Shard(1)）不参与分类，TP 维 Shard→Replicate 才能正确归类为
+   all_gather。
+6. **validate 的 placement 比较前做负维度归一化**：`Shard(-1)` == `Shard(ndim-1)`。
+7. **tied 检测需 `named_parameters(remove_duplicate=False)`**：tied 参数在默认
+   去重下只出现一次。
+8. **新增 Phase 4.5 `plan_overrides` 合并**（2026-07-19，§3.6.7/§8.5 特性）：
+   `ShardingPlanner(plan_overrides={fqn: spec})` 把用户手写 spec 在 Phase 5
+   之前合并（整体替换/插入），覆盖 spec 照常参与链式契约校验与 `_is_terminal`
+   标记；`_use_local_map`/`_needs_cp_attn` 从推断模板强制补齐（结构属性，缺失
+   导致数值错误，不允许借覆盖关闭）；用户 spec 深拷贝隔离，plan() 可重复调用；
+   fqn 未命中 `named_modules` fail-fast 抛 `ValueError`。
+   UT：`test_s1_plan_overrides.py`（6 例）+ `test_dist_s5_plan_overrides.py`
+   （多输入 attention 双模式 e2e，TP=2）。
+
+### 12.4 Applier 实现修正
+
+1. **`RedistOp.execute` identity 分支**：输入为 DTensor 且 `as_dtensor=False`
+   （production）时返回 `to_local()`——MoE/CP local region 出口的 `from_local`
+   重包装经 identity boundary 时必须解包，否则 DTensor 泄漏到下游产生
+   mixed dispatch。
+2. **`redistribute_outputs` 在 validate（as_dtensor_input=True）下保持 DTensor**：
+   terminal 模块的 out_dst 校验发生在 redistribute 之后，需要 DTensor 输入。
+3. **`_broadcast_tied_param` 不跨 rank 广播**（正文 §4.4 的实现是错误的）：
+   tied 对（embed/lm_head）同为 Shard(0) 分片，各 rank 的 local shard 承载不同
+   vocab 区间——把 rank0 的 shard 广播给 rank1 会破坏 rank1 的分片。tied 语义要求
+   **同一 rank 内**两端共享物理存储（梯度共享），分片天然一致（同一 global 来源、
+   同一 placement）。实现改为 rank 内 `param_b.data = param_a 的 local tensor`。
+4. **`_temp_local_params`**：validate 的 local region（MoE all-to-all、HF CP
+   attention）内部需要 local 参数——region 内临时解包 DTensor 参数、退出恢复
+   （DTensor 传播链不断）；production 已在 build 期永久解包，无需此 context。
+5. **CP (q,k,v) wrapper 的 mask 契约**：`is_causal` 且 q_len≠kv_len 时 wrapper 将
+   `is_causal` 替换为 `attn_mask`（D-04 offset-aware mask），要求 inner forward
+   接受 `attn_mask` kwarg。
+6. **MoE wrapper 边界最终出口恒为 local**（out_plan 为空时 from_local 包装也需
+   在出口解包）。
+
+### 12.5 双模式梯度语义（§5.5 补充）
+
+- 两模式 backward 均为 local autograd（§1.0），双模式梯度逐参数相等（S5.3 实测
+  rtol=1e-3 通过，覆盖 TP-Shard 与 TP-Replicate 两类参数）。
+- **replicated loss 的梯度缩放**：loss 在每个 rank 上对 all_gather 后的完整
+  logits 重复计算时，all_gather 的反向（reduce_scatter）把各 rank 相同的梯度流
+  求和——分布式梯度 = world_size × 单卡梯度（两模式语义一致，不影响双模式等价；
+  真实训练中由 loss_parallel 或 DP 梯度平均吸收该缩放）。
+- G4 实测确认：torch `is_causal` 在 q_len≠kv_len 时按**左上角对齐**（等价于假设
+  chunk 位于序列开头），rank>0 的 CP chunk 必须走 D-04 的 offset-aware mask。
+
