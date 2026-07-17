@@ -15,6 +15,7 @@
 """dtensor"""
 import copy as cp
 import inspect
+import logging
 import warnings
 from typing import Any, Callable, Optional, Sequence, Set, Tuple, Union
 
@@ -31,6 +32,8 @@ from hyper_parallel.core.utils import compute_local_shape_and_global_offset
 platform = get_platform()
 DTensorBase = platform.DTensorBase
 Tensor = platform.Tensor
+
+logger = logging.getLogger(__name__)
 
 
 class SkipDTensorDispatch():
@@ -466,6 +469,16 @@ class DTensor(DTensorBase):
             >>> new_dtensor = dtensor.redistribute(mesh, [Replicate(), Shard(1)])
             >>> new_dtensor = dtensor.redistribute(mesh, ("None", "tp"))
         """
+        logger.debug(
+            "redistribute: shape=%s, src_placements=%s -> dst_placements=%s, "
+            "mesh_shape=%s, local_shape=%s",
+            tuple(self.shape),
+            tuple(self._placements),
+            tuple(placements),
+            tuple(device_mesh.shape),
+            tuple(self._local_tensor.shape),
+        )
+
         # Build dst_layout from device_mesh and placements
         dst_layout = _build_layout(
             device_mesh, placements, len(self._local_tensor.shape)

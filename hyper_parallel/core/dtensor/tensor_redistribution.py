@@ -13,11 +13,14 @@
 # limitations under the License.
 # ============================================================================
 """tensor_redistribution"""
+import logging
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.redistribute_infer import RedistributionOperatorInfer
 from hyper_parallel.platform import get_platform
 platform = get_platform()
+
+logger = logging.getLogger(__name__)
 
 
 def _construct_layout_tuple_for_transform_operator_list(from_layout, to_layout, from_full_shape):
@@ -63,6 +66,11 @@ class TensorRedistribution:
         concat_dim = args[-1]
         group = platform.create_group(rank_list)
         concat_size = len(rank_list)
+        logger.debug(
+            "differentiable_all_gather_concat: input_shape=%s, concat_dim=%d, "
+            "concat_size=%d, rank_list=%s",
+            tuple(x.shape), concat_dim, concat_size, rank_list,
+        )
         return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
 
 
@@ -79,6 +87,11 @@ class TensorRedistribution:
         concat_dim = args[0]
         concat_size = args[1]
         group = platform.create_group(rank_list)
+        logger.debug(
+            "differentiable_all_gather_concat: input_shape=%s, concat_dim=%d, "
+            "concat_size=%d, rank_list=%s",
+            tuple(x.shape), concat_dim, concat_size, rank_list,
+        )
         return platform.differentiable_all_gather_concat(x, group, concat_size, concat_dim, rank_list)
 
     def _construct_all_split(self, x, *args):
@@ -94,6 +107,11 @@ class TensorRedistribution:
         """args: (split_dim, concat_dim, permute_size, group)"""
         split_dim, concat_dim, split_count, rank_list = args
         group = platform.create_group(rank_list)
+        logger.debug(
+            "differentiable_all_to_all: input_shape=%s, split_dim=%d, "
+            "concat_dim=%d, split_count=%d, rank_list=%s",
+            tuple(x.shape), split_dim, concat_dim, split_count, rank_list,
+        )
         original_shape = x.shape
 
         dim_size = original_shape[split_dim]
@@ -254,6 +272,10 @@ class TensorRedistribution:
     @staticmethod
     def _allreduce_along_dev_dim(x, op, layout, dev_dim):
         """Do allreduce at specified axis along dev_dim."""
+        logger.debug(
+            "differentiable_all_reduce: input_shape=%s, op=%s, dev_dim=%s",
+            tuple(x.shape), op, dev_dim,
+        )
         group = layout.get_comm_group_by_axis(dev_dim)
         zero_dim = x.dim() == 0
         if zero_dim:
@@ -276,6 +298,11 @@ class TensorRedistribution:
     def _reduce_scatter_along_dev_dim_with_axis(x, axis, op, layout, dev_dim):
         """Do reduce_scatter at specified axis along dev_dim."""
         dev_num = layout.mesh_shape[layout.alias_name.index(dev_dim)]
+        logger.debug(
+            "differentiable_reduce_scatter: input_shape=%s, axis=%d, "
+            "op=%s, dev_dim=%s, dev_num=%d",
+            tuple(x.shape), axis, op, dev_dim, dev_num,
+        )
         group = layout.get_comm_group_by_axis(dev_dim)
         output_tensor = platform.differentiable_reduce_scatter(x, dev_num, axis, op, group)
         return output_tensor

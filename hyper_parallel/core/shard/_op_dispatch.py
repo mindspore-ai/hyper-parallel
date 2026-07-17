@@ -16,6 +16,7 @@
 import atexit
 import glob
 import importlib
+import logging
 import os
 import sys
 import warnings
@@ -28,6 +29,7 @@ import yaml
 from hyper_parallel.core.shard.ops.parallel_ops_register import get_distributed_op
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.random import OffsetBasedRNGTracker, is_rng_supported_mesh
+from hyper_parallel.core.dtensor.debug._dispatch_logger import log_dispatch_enter, log_dispatch_exit
 from hyper_parallel.platform import get_platform
 from hyper_parallel.platform.platform import PlatformType
 
@@ -37,6 +39,8 @@ from hyper_parallel.core.tensor_parallel.loss_parallel_ops_common import _is_sha
 
 platform = get_platform()
 Tensor = platform.Tensor
+
+logger = logging.getLogger(__name__)
 
 
 def _apply_shard_offset_to_rng_args(args, offset_incr):
@@ -77,6 +81,7 @@ def _apply_shard_offset_to_rng_args(args, offset_incr):
 
 _dtensor_dispatch_disabled: ContextVar[bool] = ContextVar('_dtensor_dispatch_disabled', default=False)
 _no_skip_ops: ContextVar[FrozenSet[str]] = ContextVar('_no_skip_ops', default=frozenset())
+_debug_mode_observer: ContextVar = ContextVar('_debug_mode_observer', default=None)
 
 
 def get_no_skip_ops() -> FrozenSet[str]:
@@ -911,32 +916,42 @@ class OpDispatcher:
             Result of the dispatched op call.
         """
         op_name = platform.get_op_name(op_call)
+        if logger.isEnabledFor(logging.DEBUG):
+            log_dispatch_enter(op_name, args, kwargs)
 
-        if self._should_bypass_dispatch(op_name):
-            self._validate_inplace_partial_inputs(op_name, args, kwargs)
-            result = op_call(*self._unwrap_args(args), **self._unwrap_kwargs(kwargs))
-            if op_name in self._INPLACE_BYPASS_OPS and args and isinstance(args[0], DTensor):
-                return args[0]
-            return result
+        observer = _debug_mode_observer.get()
+        if observer is not None:
+            observer.on_op_dispatch_enter(op_name, op_call, args, kwargs)
 
-        if op_name in self._random_ops or op_name in self._random_ms_ops:
-            return self._dispatch_random_op(op_name, op_call, args, kwargs)
+        result = None
+        try:
+            if self._should_bypass_dispatch(op_name):
+                self._validate_inplace_partial_inputs(op_name, args, kwargs)
+                result = op_call(*self._unwrap_args(args), **self._unwrap_kwargs(kwargs))
+                if op_name in self._INPLACE_BYPASS_OPS and args and isinstance(args[0], DTensor):
+                    result = args[0]
+                return result
 
-        # Loss/CE guards only matter for loss-relevant ops. Once an op is proven
-        # irrelevant (static, op_name-only), skip both guards — and their repeated
-        # is_loss_parallel_active() contextvar reads — on every subsequent call.
-        if op_name not in getattr(self, '_non_loss_ops', ()):
+            if op_name in self._random_ops or op_name in self._random_ms_ops:
+                result = self._dispatch_random_op(op_name, op_call, args, kwargs)
+                return result
+
             self._check_decomposed_ce_op_in_loss_parallel(op_name, args, kwargs)
+
             if self._should_dispatch_loss_parallel(op_name):
-                return self._dispatch_loss_parallel(op_call, args, kwargs)
-            if not is_loss_parallel_op(op_name) and not is_decomposed_ce_op(op_name):
-                if not hasattr(self, '_non_loss_ops'):
-                    self._non_loss_ops = set()
-                self._non_loss_ops.add(op_name)
+                result = self._dispatch_loss_parallel(op_call, args, kwargs)
+                return result
 
-        if op_name not in self.layout_infer_ops and get_distributed_op(op_name) is not None:
-            self.layout_infer_ops[op_name] = {}
+            if op_name not in self.layout_infer_ops and get_distributed_op(op_name) is not None:
+                self.layout_infer_ops[op_name] = {}
 
-        return self._dispatch_layout_infer(op_name, op_call, args, kwargs)
+            result = self._dispatch_layout_infer(op_name, op_call, args, kwargs)
+            return result
+        finally:
+            if logger.isEnabledFor(logging.DEBUG):
+                log_dispatch_exit(op_name, result)
+
+            if observer is not None:
+                observer.on_op_dispatch_exit(op_name, result)
 
 _OP_DISPATCHER = OpDispatcher()
