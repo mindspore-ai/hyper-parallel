@@ -1,0 +1,4 @@
+gather:
+  dist_op_name: _torch_gather_dist_op
+  distributed_op_class: GatherDDistributedOp
+  distributed_op_file: parallel_gather
