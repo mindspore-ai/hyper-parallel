@@ -1,0 +1,9 @@
+index_add:
+  dist_op_name: _torch_index_add_dist_op
+  distributed_op_class: IndexAddDistributedOp
+  distributed_op_file: parallel_index_add
+
+index_add_:
+  dist_op_name: _torch_index_add__dist_op
+  distributed_op_class: IndexAddDistributedOp
+  distributed_op_file: parallel_index_add
